@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "browser": {
+      "command": "./agent-browser/mcp/target/release/agent-browser-mcp",
+      "args": [],
+      "disabled": false
+    },
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@anthropic-ai/mcp-server-filesystem", "/workspace"],
+      "disabled": true
+    }
+  }
+}

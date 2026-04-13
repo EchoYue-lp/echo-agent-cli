@@ -1,0 +1,34 @@
+[package]
+name = "echo-agent-cli"
+version = "1.0.0"
+edition = "2024"
+
+[[bin]]
+name = "echo-agent-cli"
+path = "src/main.rs"
+
+[dependencies]
+echo-agent = { path = "../echo-agent", package = "echo_agent", features = ["sqlite"] }
+tokio = { version = "1.47.1", features = ["full"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.143"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+axum = { version = "0.7", features = ["ws", "macros"] }
+axum-extra = { version = "0.9", features = ["typed-header"] }
+tower-http = { version = "0.5", features = ["cors", "fs", "trace"] }
+tokio-tungstenite = "0.24"
+futures = "0.3"
+async-trait = "0.1.89"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.12.23", features = ["json", "stream"] }
+dotenv = "0.15"
+thiserror = "1.0"
+anyhow = "1.0"
+# 命令行相关
+clap = { version = "4", features = ["derive", "env"] }
+reedline = "0.38"
+nu-ansi-term = "0.50"
+crossterm = "0.28"
+shellexpand = "3"

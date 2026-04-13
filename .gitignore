@@ -1,0 +1,9 @@
+/target
+/.idea
+/.vscode
+/.classpath
+.env
+/Cargo.lock
+.DS_Store
+node_modules/
+web-frontend/dist/
