@@ -6,8 +6,8 @@ use axum::{
     extract::{Path, State},
     Json,
 };
-use echo_agent::memory::conversation::{
-    ConversationFilter, NewConversation, StoredMessage,
+use echo_agent::memory::{
+    ConversationFilter, ConversationStore, NewConversation, StoredMessage,
 };
 use echo_agent::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -24,7 +24,6 @@ pub struct SaveConversationRequest {
     pub id: String,
     pub title: String,
     pub messages: Vec<SavedMessage>,
-    pub model: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -53,10 +52,66 @@ pub struct ConversationDetail {
     pub updated_at: String,
 }
 
-// -- Helper: convert ReactError -> AppError --
+// -- Constants --
+
+const MAX_CONVERSATION_ID_LEN: usize = 64;
+const MAX_TITLE_LEN: usize = 255;
+const MAX_MESSAGES: usize = 10000;
+
+// -- Helpers --
 
 fn store_err(e: echo_agent::error::ReactError) -> AppError {
     AppError::Internal(e.to_string())
+}
+
+/// Validate a conversation ID: non-empty, max length, alphanumeric + hyphens + underscores only.
+fn validate_conversation_id(id: &str) -> std::result::Result<(), AppError> {
+    if id.is_empty() {
+        return Err(AppError::Validation("conversation id must not be empty".to_string()));
+    }
+    if id.len() > MAX_CONVERSATION_ID_LEN {
+        return Err(AppError::Validation(format!(
+            "conversation id must be at most {} characters",
+            MAX_CONVERSATION_ID_LEN
+        )));
+    }
+    if !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return Err(AppError::Validation(
+            "conversation id must contain only alphanumeric characters, hyphens, and underscores"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a title string length.
+fn validate_title(title: &str) -> std::result::Result<(), AppError> {
+    if title.len() > MAX_TITLE_LEN {
+        return Err(AppError::Validation(format!(
+            "title must be at most {} characters",
+            MAX_TITLE_LEN
+        )));
+    }
+    Ok(())
+}
+
+/// Validate the number of messages in a conversation.
+fn validate_message_count(count: usize) -> std::result::Result<(), AppError> {
+    if count > MAX_MESSAGES {
+        return Err(AppError::Validation(format!(
+            "conversation must have at most {} messages",
+            MAX_MESSAGES
+        )));
+    }
+    Ok(())
+}
+
+/// Get the conversation store, or return error if disabled
+fn get_store(state: &AppState) -> std::result::Result<&Arc<dyn ConversationStore>, AppError> {
+    state
+        .storage.conversation_store
+        .as_ref()
+        .ok_or_else(|| AppError::Internal("Conversation persistence is disabled".to_string()))
 }
 
 // -- API handlers --
@@ -65,8 +120,8 @@ fn store_err(e: echo_agent::error::ReactError) -> AppError {
 pub async fn list_conversations(
     State(state): State<Arc<AppState>>,
 ) -> std::result::Result<Json<Vec<ConversationListItem>>, AppError> {
-    let metas = state
-        .conversation_store
+    let store = get_store(&state)?;
+    let metas = store
         .list_conversations(ConversationFilter::default())
         .await
         .map_err(store_err)?;
@@ -91,16 +146,20 @@ pub async fn save_conversation(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SaveConversationRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, AppError> {
+    validate_conversation_id(&req.id)?;
+    validate_title(&req.title)?;
+    validate_message_count(req.messages.len())?;
+
+    let store = get_store(&state)?;
+
     // Ensure conversation row exists
-    let existing = state
-        .conversation_store
+    let existing = store
         .get_conversation(&req.id)
         .await
         .map_err(store_err)?;
 
     if existing.is_none() {
-        state
-            .conversation_store
+        store
             .create_conversation(NewConversation {
                 conversation_id: req.id.clone(),
                 user_id: "default".to_string(),
@@ -110,9 +169,7 @@ pub async fn save_conversation(
             .await
             .map_err(store_err)?;
     } else {
-        // Update title
-        state
-            .conversation_store
+        store
             .update_conversation(&req.id, Some(&req.title), None, None)
             .await
             .map_err(store_err)?;
@@ -138,8 +195,7 @@ pub async fn save_conversation(
         })
         .collect();
 
-    state
-        .conversation_store
+    store
         .save_messages(&req.id, &stored)
         .await
         .map_err(store_err)?;
@@ -155,20 +211,21 @@ pub async fn get_conversation(
     Path(id): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> std::result::Result<Json<ConversationDetail>, AppError> {
-    let conv = state
-        .conversation_store
+    validate_conversation_id(&id)?;
+
+    let store = get_store(&state)?;
+
+    let conv = store
         .get_conversation(&id)
         .await
         .map_err(store_err)?
         .ok_or_else(|| AppError::NotFound(format!("Conversation {} not found", id)))?;
 
-    let stored = state
-        .conversation_store
+    let stored = store
         .get_messages(&id)
         .await
         .map_err(store_err)?;
 
-    // Convert StoredMessage -> SavedMessage (for frontend compatibility)
     let messages: Vec<SavedMessage> = stored
         .into_iter()
         .map(|m| SavedMessage {
@@ -196,16 +253,23 @@ pub async fn update_conversation(
     State(state): State<Arc<AppState>>,
     Json(req): Json<UpdateConversationRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, AppError> {
-    // Update title if provided
+    validate_conversation_id(&id)?;
     if let Some(title) = &req.title {
-        state
-            .conversation_store
+        validate_title(title)?;
+    }
+    if let Some(messages) = &req.messages {
+        validate_message_count(messages.len())?;
+    }
+
+    let store = get_store(&state)?;
+
+    if let Some(title) = &req.title {
+        store
             .update_conversation(&id, Some(title), None, None)
             .await
             .map_err(store_err)?;
     }
 
-    // Update messages if provided
     if let Some(messages) = &req.messages {
         let now = chrono::Utc::now().to_rfc3339();
         let stored: Vec<StoredMessage> = messages
@@ -225,8 +289,7 @@ pub async fn update_conversation(
             })
             .collect();
 
-        state
-            .conversation_store
+        store
             .save_messages(&id, &stored)
             .await
             .map_err(store_err)?;
@@ -240,8 +303,11 @@ pub async fn delete_conversation(
     Path(id): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> std::result::Result<Json<serde_json::Value>, AppError> {
-    state
-        .conversation_store
+    validate_conversation_id(&id)?;
+
+    let store = get_store(&state)?;
+
+    store
         .delete_conversation(&id)
         .await
         .map_err(store_err)?;
@@ -254,8 +320,10 @@ pub async fn export_conversation(
     Path(id): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> std::result::Result<Json<serde_json::Value>, AppError> {
+    validate_conversation_id(&id)?;
+
     // Try JSON-file-based export first (backward compat)
-    let md = state.persistence.export_conversation_markdown(&id);
+    let md = state.storage.persistence.export_conversation_markdown(&id);
 
     if let Ok(content) = md {
         return Ok(Json(serde_json::json!({
@@ -266,15 +334,15 @@ pub async fn export_conversation(
     }
 
     // Fallback: generate Markdown from ConversationStore
-    let conv = state
-        .conversation_store
+    let store = get_store(&state)?;
+
+    let conv = store
         .get_conversation(&id)
         .await
         .map_err(store_err)?
         .ok_or_else(|| AppError::NotFound(format!("Conversation {} not found", id)))?;
 
-    let stored = state
-        .conversation_store
+    let stored = store
         .get_messages(&id)
         .await
         .map_err(store_err)?;
@@ -312,7 +380,7 @@ pub async fn export_conversation(
             for tc in &calls {
                 content.push_str(&format!("- `{}`: {}\n", tc.name, tc.arguments));
             }
-            content.push_str("\n");
+            content.push('\n');
         }
     }
 
@@ -331,17 +399,19 @@ pub async fn restore_conversation(
     Path(id): Path<String>,
     State(state): State<Arc<AppState>>,
 ) -> std::result::Result<Json<serde_json::Value>, AppError> {
+    validate_conversation_id(&id)?;
+
+    let store = get_store(&state)?;
+
     // 1. Verify conversation exists
-    let _conv = state
-        .conversation_store
+    let _conv = store
         .get_conversation(&id)
         .await
         .map_err(store_err)?
         .ok_or_else(|| AppError::NotFound(format!("Conversation {} not found", id)))?;
 
     // 2. Load stored messages
-    let stored_messages = state
-        .conversation_store
+    let stored_messages = store
         .get_messages(&id)
         .await
         .map_err(store_err)?;
@@ -349,50 +419,49 @@ pub async fn restore_conversation(
     let count = stored_messages.len();
 
     // 3. Convert StoredMessage -> echo_agent Message, sanitizing for LLM compatibility
+    use echo_agent::llm::types::MessageContent as Mc;
     let mut messages: Vec<Message> = Vec::new();
     for m in stored_messages {
-        let role = m.role.clone();
-        let content = m.content.clone();
+        let role: Role = m.role.clone().into();
+        let content: MessageContent = m
+            .content
+            .map(Mc::Text)
+            .unwrap_or(Mc::Empty);
         let content_str = content.as_deref().unwrap_or("");
 
-        // Skip messages that would break LLM API calls:
-        // - Empty assistant content (no text and no tool_calls)
-        // - Error messages from previous failed agent runs
-        // - Assistant messages with empty tool_calls array
-        if role == "assistant" {
+        // Skip messages that would break LLM API calls
+        if role == Role::Assistant {
             let is_empty = content_str.is_empty();
             let is_error = content_str.starts_with("[Error]");
             let tool_calls: Option<Vec<echo_agent::llm::types::ToolCall>> =
                 m.tool_calls_json.as_ref().and_then(|j| serde_json::from_str(j).ok());
-            let has_empty_tool_calls = tool_calls.as_ref().map_or(false, |tc| tc.is_empty());
+            let has_empty_tool_calls = tool_calls.as_ref().is_some_and(|tc| tc.is_empty());
 
             if is_empty && has_empty_tool_calls {
-                continue; // Skip: empty assistant + empty tool_calls
+                continue;
             }
             if is_empty {
-                continue; // Skip: assistant with no content
+                continue;
             }
             if is_error {
-                // Replace error messages with a placeholder so conversation stays coherent
                 messages.push(Message {
                     role,
-                    content: Some("(上一轮对话出现问题，已跳过)".to_string()),
-                    content_parts: None,
-                    tool_calls: None, // Explicitly None, not empty array
+                    content: Mc::Text("(上一轮对话出现问题，已跳过)".to_string()),
+                    tool_calls: None,
                     name: None,
                     tool_call_id: None,
+                    reasoning_content: None,
                 });
                 continue;
             }
             if has_empty_tool_calls {
-                // Keep content but strip empty tool_calls
                 messages.push(Message {
                     role,
                     content,
-                    content_parts: None,
                     tool_calls: None,
                     name: None,
                     tool_call_id: None,
+                    reasoning_content: None,
                 });
                 continue;
             }
@@ -400,40 +469,44 @@ pub async fn restore_conversation(
             messages.push(Message {
                 role,
                 content,
-                content_parts: None,
                 tool_calls,
                 name: None,
                 tool_call_id: None,
+                reasoning_content: None,
             });
         } else {
             messages.push(Message {
                 role,
                 content,
-                content_parts: None,
                 tool_calls: m
                     .tool_calls_json
                     .and_then(|j| serde_json::from_str(&j).ok()),
                 name: None,
                 tool_call_id: None,
+                reasoning_content: None,
             });
         }
     }
 
     // 4. Inject into agent context (preserving system prompt)
-    let mut agent = state.agent.lock().await;
+    state.connection.agent.read_async(|agent| Box::pin(async move {
+        let system_prompt = agent.system_prompt().to_string();
 
-    // Preserve the agent's current system prompt
-    let system_prompt = agent.system_prompt().to_string();
+        if messages.first().map(|m| m.role.as_str()) != Some("system") {
+            messages.insert(0, Message::system(system_prompt));
+        }
 
-    // Ensure system prompt is present as the first message
-    if messages.first().map(|m| m.role.as_str()) != Some("system") {
-        messages.insert(0, Message::system(system_prompt));
-    }
+        let mut seen_system = false;
+        messages.retain(|m| {
+            if m.role == Role::System {
+                if seen_system { false } else { seen_system = true; true }
+            } else {
+                true
+            }
+        });
 
-    // Remove any existing system messages from loaded data to avoid duplicates
-    messages.dedup_by(|a, b| a.role == "system" && b.role == "system");
-
-    agent.load_messages(messages);
+        agent.load_messages(messages).await;
+    })).await;
 
     Ok(Json(serde_json::json!({
         "success": true,

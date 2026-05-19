@@ -5,22 +5,27 @@ interface ChatState {
   messages: ChatMessage[];
   isStreaming: boolean;
   isCancelled: boolean;
+  isThinking: boolean;
   approvalRequest: ApprovalRequest | null;
   inputRequest: { requestId: string; prompt?: string } | null;
-  pendingToolCall: { name: string; args: unknown } | null;
+  pendingToolCalls: { name: string; args: unknown }[];
   /** True when viewing a loaded historical conversation (agent has no context) */
   isHistoryView: boolean;
 
-  addUserMessage: (content: string) => void;
+  addUserMessage: (content: string, attachments?: ChatMessage['attachments']) => void;
   startAssistantMessage: () => string;
   appendToken: (id: string, token: string) => void;
+  appendThinking: (id: string, token: string) => void;
+  startThinkingSegment: (id: string) => void;
   setToolCall: (name: string, args: unknown) => void;
   completeToolCall: (name: string, result: string, success: boolean) => void;
   finalizeAssistantMessage: (id: string, content: string) => void;
   setStreaming: (v: boolean) => void;
+  setThinking: (v: boolean) => void;
   markCancelled: () => void;
   setApprovalRequest: (r: ApprovalRequest | null) => void;
   setInputRequest: (r: { requestId: string; prompt?: string } | null) => void;
+  addChartMessage: (spec: unknown) => void;
   clearMessages: () => void;
   replaceMessages: (messages: ChatMessage[]) => void;
   setCurrentSnapshot: (id: string | null) => void;
@@ -51,15 +56,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
   messages: [],
   isStreaming: false,
   isCancelled: false,
+  isThinking: false,
   approvalRequest: null,
   inputRequest: null,
-  pendingToolCall: null,
+  pendingToolCalls: [],
   isHistoryView: false,
 
-  addUserMessage: (content) => {
+  addUserMessage: (content, attachments) => {
     set((s) => ({
       isCancelled: false,
-      messages: [...s.messages, { id: nextId(), role: 'user', content, timestamp: Date.now() }],
+      messages: [...s.messages, { id: nextId(), role: 'user', content, attachments, timestamp: Date.now() }],
     }));
     autoSave();
   },
@@ -67,7 +73,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   startAssistantMessage: () => {
     const id = nextId();
     set((s) => ({
-      messages: [...s.messages, { id, role: 'assistant', content: '', toolCalls: [], isStreaming: true, timestamp: Date.now() }],
+      messages: [...s.messages, { id, role: 'assistant', content: '', thinkingSegments: [], toolCalls: [], isStreaming: true, timestamp: Date.now() }],
       isStreaming: true,
     }));
     return id;
@@ -81,16 +87,49 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }));
   },
 
+  appendThinking: (id, token) => {
+    set((s) => ({
+      messages: s.messages.map((m) => {
+        if (m.id !== id) return m;
+        const segments = m.thinkingSegments || [];
+        if (segments.length === 0) {
+          segments.push({ content: token });
+        } else {
+          const last = segments[segments.length - 1];
+          segments[segments.length - 1] = { ...last, content: last.content + token };
+        }
+        return { ...m, thinkingSegments: segments };
+      }),
+    }));
+  },
+
+  startThinkingSegment: (id) => {
+    set((s) => ({
+      messages: s.messages.map((m) =>
+        m.id === id
+          ? { ...m, thinkingSegments: [...(m.thinkingSegments || []), { content: '' }] }
+          : m
+      ),
+    }));
+  },
+
+  setThinking: (v) => set({ isThinking: v }),
+
   setToolCall: (name, args) => {
-    set({ pendingToolCall: { name, args } });
+    set((s) => ({
+      pendingToolCalls: [...s.pendingToolCalls, { name, args }],
+    }));
   },
 
   completeToolCall: (name, result, success) => {
-    const { pendingToolCall } = get();
-    if (!pendingToolCall) return;
-    const tc: ToolCallInfo = { name, args: pendingToolCall.args, result, success };
+    const { pendingToolCalls } = get();
+    // 按顺序匹配：取第一个 pending tool call（FIFO）
+    const idx = pendingToolCalls.findIndex((tc) => tc.name === name);
+    if (idx === -1) return;
+    const matched = pendingToolCalls[idx];
+    const tc: ToolCallInfo = { name, args: matched.args, result, success };
     set((s) => ({
-      pendingToolCall: null,
+      pendingToolCalls: s.pendingToolCalls.filter((_, i) => i !== idx),
       messages: s.messages.map((m) =>
         m.isStreaming ? { ...m, toolCalls: [...(m.toolCalls || []), tc] } : m
       ),
@@ -113,7 +152,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     set((s) => ({
       isStreaming: false,
       isCancelled: true,
-      pendingToolCall: null,
+      pendingToolCalls: [],
       messages: s.messages.map((m) =>
         m.isStreaming ? { ...m, isStreaming: false, content: m.content || '' } : m
       ),
@@ -123,6 +162,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   setApprovalRequest: (r) => set({ approvalRequest: r }),
   setInputRequest: (r) => set({ inputRequest: r }),
+
+  addChartMessage: (spec) => {
+    set((s) => ({
+      messages: s.messages.map((m) =>
+        m.isStreaming ? { ...m, chartSpecs: [...(m.chartSpecs || []), spec] } : m
+      ),
+    }));
+  },
 
   clearMessages: () => set({ messages: [], isStreaming: false, isCancelled: false, isHistoryView: false }),
 

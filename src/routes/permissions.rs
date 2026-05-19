@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 use crate::error::AppError;
-use crate::state::{AppState, PermissionRule};
+use crate::state::{AppState, PermissionBehavior, PermissionRuleConfig};
 
 // ── 类型定义 ─────────────────────────────────────────────────────
 
@@ -33,13 +33,25 @@ pub struct AddPermissionRuleRequest {
     pub source: Option<String>,
 }
 
+fn parse_behavior(s: &str) -> Result<PermissionBehavior, AppError> {
+    match s {
+        "allow" => Ok(PermissionBehavior::Allow),
+        "deny" => Ok(PermissionBehavior::Deny),
+        "ask" => Ok(PermissionBehavior::Ask),
+        _ => Err(AppError::Validation(format!(
+            "无效的 behavior '{}', 可选: allow, deny, ask",
+            s
+        ))),
+    }
+}
+
 // ── API 处理器 ───────────────────────────────────────────────────
 
 /// GET /api/permissions/mode
 pub async fn get_permission_mode(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<PermissionModeResponse>, AppError> {
-    let mode = state.permission_mode.read().unwrap();
+    let mode = state.config.permission_mode.read().await;
     Ok(Json(PermissionModeResponse {
         mode: mode.clone(),
     }))
@@ -59,7 +71,7 @@ pub async fn set_permission_mode(
     }
 
     tracing::info!("设置权限模式: {}", req.mode);
-    let mut mode = state.permission_mode.write().unwrap();
+    let mut mode = state.config.permission_mode.write().await;
     *mode = req.mode.clone();
     Ok(Json(serde_json::json!({"success": true, "mode": req.mode})))
 }
@@ -68,12 +80,12 @@ pub async fn set_permission_mode(
 pub async fn list_permission_rules(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<PermissionRuleInfo>>, AppError> {
-    let rules = state.permission_rules.read().unwrap();
+    let rules = state.config.permission_rules.read().await;
     let list: Vec<PermissionRuleInfo> = rules
         .iter()
         .map(|r| PermissionRuleInfo {
             matcher: r.matcher.clone(),
-            behavior: r.behavior.clone(),
+            behavior: r.behavior.to_string(),
             source: r.source.clone(),
         })
         .collect();
@@ -87,21 +99,15 @@ pub async fn add_permission_rule(
 ) -> Result<Json<serde_json::Value>, AppError> {
     tracing::info!("添加权限规则: {:?} -> {:?}", req.matcher, req.behavior);
 
-    let valid_behaviors = ["allow", "deny", "ask"];
-    if !valid_behaviors.contains(&req.behavior.as_str()) {
-        return Err(AppError::Internal(format!(
-            "无效的 behavior '{}', 可选: {:?}",
-            req.behavior, valid_behaviors
-        )));
-    }
+    let behavior = parse_behavior(&req.behavior)?;
 
-    let rule = PermissionRule {
+    let rule = PermissionRuleConfig {
         matcher: req.matcher.clone(),
-        behavior: req.behavior.clone(),
+        behavior,
         source: req.source.unwrap_or_else(|| "manual".to_string()),
     };
 
-    let mut rules = state.permission_rules.write().unwrap();
+    let mut rules = state.config.permission_rules.write().await;
     // 如果已存在同 matcher 的规则，替换
     if let Some(existing) = rules.iter_mut().find(|r| r.matcher == req.matcher) {
         *existing = rule;
@@ -118,7 +124,7 @@ pub async fn remove_permission_rule(
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     tracing::info!("删除权限规则: {}", name);
-    let mut rules = state.permission_rules.write().unwrap();
+    let mut rules = state.config.permission_rules.write().await;
     let before = rules.len();
     rules.retain(|r| r.matcher != name);
     let removed = before - rules.len();

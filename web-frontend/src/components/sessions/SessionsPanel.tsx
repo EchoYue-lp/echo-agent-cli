@@ -26,10 +26,10 @@ export function SessionsPanel() {
     setMsg(null);
     try {
       const res = await sessionApi.createCheckpoint();
-      setMsg(res.success ? `Checkpoint created: ${res.snapshot_id?.slice(0, 8)}...` : 'Failed');
+      setMsg(res.success ? `检查点已创建：${res.snapshot_id?.slice(0, 8)}...` : '失败');
       await load();
     } catch (e: unknown) {
-      setMsg(`Error: ${e instanceof Error ? e.message : 'Unknown'}`);
+      setMsg(`错误：${e instanceof Error ? e.message : '未知'}`);
     }
     setLoading(false);
   };
@@ -39,9 +39,9 @@ export function SessionsPanel() {
     setMsg(null);
     try {
       const res = await sessionApi.restoreCheckpoint(id);
-      setMsg(res.success ? `Restored to ${res.restored_to?.slice(0, 8)}...` : 'Restore failed');
+      setMsg(res.success ? `已恢复到 ${res.restored_to?.slice(0, 8)}...` : '恢复失败');
     } catch (e: unknown) {
-      setMsg(`Error: ${e instanceof Error ? e.message : 'Unknown'}`);
+      setMsg(`错误：${e instanceof Error ? e.message : '未知'}`);
     }
     setLoading(false);
   };
@@ -55,7 +55,7 @@ export function SessionsPanel() {
     <div className="p-3 space-y-3">
       <div className="flex items-center justify-between">
         <h3 className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>
-          Session Checkpoints ({snapshots.length})
+          会话检查点 ({snapshots.length})
         </h3>
         <button
           onClick={create}
@@ -64,7 +64,7 @@ export function SessionsPanel() {
           style={{ background: 'var(--accent)', color: 'white' }}
         >
           <Plus size={12} />
-          Create
+          创建
         </button>
       </div>
 
@@ -80,16 +80,16 @@ export function SessionsPanel() {
       {loading && snapshots.length === 0 && (
         <div className="py-8 text-center text-xs" style={{ color: 'var(--text-tertiary)' }}>
           <div className="spinner mx-auto mb-2" />
-          Loading...
+          加载中...
         </div>
       )}
 
       {snapshots.length === 0 && !loading && (
         <div className="py-8 text-center text-xs" style={{ color: 'var(--text-tertiary)' }}>
           <Save size={24} className="mx-auto mb-2" />
-          No checkpoints yet
+          暂无检查点
           <br />
-          Click "Create" to save the current session state
+          点击"创建"保存当前会话状态
         </div>
       )}
 
@@ -115,7 +115,7 @@ export function SessionsPanel() {
                   <Clock size={10} />
                   {formatTime(s.created_at)}
                 </span>
-                <span>Iteration: {s.iteration}</span>
+                <span>迭代：{s.iteration}</span>
               </div>
             </div>
             <button
@@ -127,7 +127,7 @@ export function SessionsPanel() {
               onMouseLeave={(e) => { e.currentTarget.style.borderColor = 'var(--border-primary)'; e.currentTarget.style.color = 'var(--text-secondary)'; }}
             >
               <RotateCcw size={10} />
-              Restore
+              恢复
             </button>
           </div>
         </div>

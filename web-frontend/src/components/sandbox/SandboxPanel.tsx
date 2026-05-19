@@ -35,7 +35,7 @@ export function SandboxPanel() {
       const res = await sandboxApi.execute({ language, code });
       setResult(res);
     } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : 'Execution failed');
+      setError(e instanceof Error ? e.message : '执行失败');
     }
     setRunning(false);
   };
@@ -55,7 +55,7 @@ export function SandboxPanel() {
     <div className="p-3 space-y-3">
       <div className="flex items-center justify-between">
         <h3 className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>
-          Sandbox
+          沙箱
         </h3>
         <button
           onClick={() => setShowConfig(!showConfig)}
@@ -70,15 +70,15 @@ export function SandboxPanel() {
       {status && (
         <div className="flex flex-wrap gap-2">
           <span className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium"
-            style={{ background: status.local_available ? '#10b98118' : '#ef444418', color: status.local_available ? '#10b981' : '#ef4444' }}>
-            <Cpu size={10} /> Local
+            style={{ background: status.local_available ? 'var(--color-success-bg)' : 'var(--color-error-bg)', color: status.local_available ? 'var(--color-success)' : 'var(--color-error)' }}>
+            <Cpu size={10} /> 本地
           </span>
           <span className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium"
-            style={{ background: status.docker_available ? '#10b98118' : '#94a3b818', color: status.docker_available ? '#10b981' : '#94a3b8' }}>
+            style={{ background: status.docker_available ? 'var(--color-success-bg)' : 'var(--bg-hover)', color: status.docker_available ? 'var(--color-success)' : 'var(--text-tertiary)' }}>
             Docker
           </span>
           <span className="inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium"
-            style={{ background: '#94a3b818', color: '#94a3b8' }}>
+            style={{ background: 'var(--bg-hover)', color: 'var(--text-tertiary)' }}>
             K8s
           </span>
         </div>
@@ -88,27 +88,27 @@ export function SandboxPanel() {
       {showConfig && config && (
         <div className="space-y-2 rounded-lg border p-3" style={{ borderColor: 'var(--border-primary)' }}>
           <label className="flex items-center justify-between text-xs" style={{ color: 'var(--text-secondary)' }}>
-            Security Level
+            安全级别
             <select value={config.security_level} onChange={(e) => updateConfig('security_level', e.target.value)}
               className="rounded border px-1.5 py-0.5 text-xs" style={{ background: 'var(--bg-input)', borderColor: 'var(--border-primary)', color: 'var(--text-primary)' }}>
-              <option value="low">Low</option>
-              <option value="medium">Medium</option>
-              <option value="high">High</option>
+            <option value="low">低</option>
+              <option value="medium">中</option>
+              <option value="high">高</option>
             </select>
           </label>
           <label className="flex items-center justify-between text-xs" style={{ color: 'var(--text-secondary)' }}>
-            Max Memory (MB)
+            最大内存 (MB)
             <input type="number" value={config.max_memory_mb ?? 512} onChange={(e) => updateConfig('max_memory_mb', parseInt(e.target.value) || 512)}
               className="w-20 rounded border px-1.5 py-0.5 text-xs" style={{ background: 'var(--bg-input)', borderColor: 'var(--border-primary)', color: 'var(--text-primary)' }} />
           </label>
           <label className="flex items-center justify-between text-xs" style={{ color: 'var(--text-secondary)' }}>
-            Max CPU (seconds)
+            最大 CPU（秒）
             <input type="number" value={config.max_cpu_seconds ?? 30} onChange={(e) => updateConfig('max_cpu_seconds', parseInt(e.target.value) || 30)}
               className="w-20 rounded border px-1.5 py-0.5 text-xs" style={{ background: 'var(--bg-input)', borderColor: 'var(--border-primary)', color: 'var(--text-primary)' }} />
           </label>
           <label className="flex items-center gap-2 text-xs" style={{ color: 'var(--text-secondary)' }}>
             <input type="checkbox" checked={config.network_enabled} onChange={(e) => updateConfig('network_enabled', e.target.checked)} />
-            Network Enabled
+            启用网络
           </label>
         </div>
       )}
@@ -124,10 +124,10 @@ export function SandboxPanel() {
         <textarea
           value={code}
           onChange={(e) => setCode(e.target.value)}
-          placeholder="Enter code to execute..."
+          placeholder="输入要执行的代码..."
           rows={6}
           className="w-full rounded-lg border px-3 py-2 font-mono text-xs leading-relaxed"
-          style={{ background: 'var(--bg-code)', borderColor: 'var(--border-primary)', color: '#e2e8f0' }}
+          style={{ background: 'var(--bg-code)', borderColor: 'var(--border-primary)', color: 'var(--color-code-text)' }}
         />
 
         <button
@@ -140,25 +140,25 @@ export function SandboxPanel() {
           }}
         >
           {running ? (
-            <><div className="spinner" /> Running...</>
+            <><div className="spinner" /> 运行中...</>
           ) : (
-            <><Play size={12} /> Run Code</>
+            <><Play size={12} /> 运行代码</>
           )}
         </button>
       </div>
 
       {/* Results */}
       {error && (
-        <div className="rounded-lg border-l-[3px] border-red-500 p-3 text-xs" style={{ background: '#ef444410' }}>
-          <p style={{ color: '#ef4444' }}>{error}</p>
+        <div className="rounded-lg border-l-[3px] p-3 text-xs" style={{ borderColor: 'var(--color-error)', background: 'var(--color-error-bg)' }}>
+          <p style={{ color: 'var(--color-error)' }}>{error}</p>
         </div>
       )}
 
       {result && (
-        <div className="space-y-2 rounded-lg border p-3" style={{ borderColor: result.success ? '#10b981' : '#ef4444' }}>
+        <div className="space-y-2 rounded-lg border p-3" style={{ borderColor: result.success ? 'var(--color-success)' : 'var(--color-error)' }}>
           <div className="flex items-center justify-between">
-            <span className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: result.success ? '#10b981' : '#ef4444' }}>
-              {result.success ? 'Success' : 'Failed'}
+            <span className="text-[10px] font-semibold uppercase tracking-wider" style={{ color: result.success ? 'var(--color-success)' : 'var(--color-error)' }}>
+              {result.success ? '成功' : '失败'}
             </span>
             <span className="text-[10px]" style={{ color: 'var(--text-tertiary)' }}>
               {result.duration_ms}ms | Exit: {result.exit_code ?? 'N/A'}
@@ -166,16 +166,16 @@ export function SandboxPanel() {
           </div>
           {result.stdout && (
             <div>
-              <span className="text-[10px] font-medium uppercase tracking-wider" style={{ color: 'var(--text-tertiary)' }}>stdout</span>
-              <pre className="mt-1 max-h-32 overflow-auto rounded-lg p-2 text-[11px]" style={{ background: 'var(--bg-code)', color: '#e2e8f0' }}>
+              <span className="text-[10px] font-medium uppercase tracking-wider" style={{ color: 'var(--text-tertiary)' }}>标准输出</span>
+              <pre className="mt-1 max-h-32 overflow-auto rounded-lg p-2 text-[11px]" style={{ background: 'var(--bg-code)', color: 'var(--color-code-text)' }}>
                 {result.stdout}
               </pre>
             </div>
           )}
           {result.stderr && (
             <div>
-              <span className="text-[10px] font-medium uppercase tracking-wider" style={{ color: '#ef4444' }}>stderr</span>
-              <pre className="mt-1 max-h-32 overflow-auto rounded-lg p-2 text-[11px]" style={{ background: 'var(--bg-code)', color: '#e2e8f0' }}>
+              <span className="text-[10px] font-medium uppercase tracking-wider" style={{ color: 'var(--color-error)' }}>标准错误</span>
+              <pre className="mt-1 max-h-32 overflow-auto rounded-lg p-2 text-[11px]" style={{ background: 'var(--bg-code)', color: 'var(--color-code-text)' }}>
                 {result.stderr}
               </pre>
             </div>

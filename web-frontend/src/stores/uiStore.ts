@@ -1,18 +1,18 @@
 import { create } from 'zustand';
 
-type TabId = 'tools' | 'mcp' | 'skills' | 'memory' | 'config' | 'audit' | 'workflow' | 'permissions' | 'sessions' | 'sandbox' | 'compress' | 'extract';
+export type SettingsTabId = 'tools' | 'mcp' | 'skills' | 'memory' | 'config' | 'sessions' | 'permissions' | 'audit' | 'workflow' | 'sandbox' | 'compress' | 'extract';
 
 type Theme = 'light' | 'dark';
 
 interface UiState {
   leftSidebarOpen: boolean;
-  rightPanelOpen: boolean;
-  activeTab: TabId;
+  settingsOpen: boolean;
+  activeSettingsTab: SettingsTabId;
   theme: Theme;
   toggleLeftSidebar: () => void;
-  toggleRightPanel: () => void;
-  setActiveTab: (tab: TabId) => void;
-  openRightPanel: (tab?: TabId) => void;
+  openSettings: () => void;
+  closeSettings: () => void;
+  setActiveSettingsTab: (tab: SettingsTabId) => void;
   toggleTheme: () => void;
   setTheme: (theme: Theme) => void;
 }
@@ -30,14 +30,14 @@ function applyTheme(theme: Theme) {
 
 export const useUiStore = create<UiState>((set, get) => ({
   leftSidebarOpen: typeof window !== 'undefined' && window.innerWidth >= 768,
-  rightPanelOpen: false,
-  activeTab: 'tools',
+  settingsOpen: false,
+  activeSettingsTab: 'tools',
   theme: getInitialTheme(),
 
   toggleLeftSidebar: () => set((s) => ({ leftSidebarOpen: !s.leftSidebarOpen })),
-  toggleRightPanel: () => set((s) => ({ rightPanelOpen: !s.rightPanelOpen })),
-  setActiveTab: (tab) => set({ activeTab: tab, rightPanelOpen: true }),
-  openRightPanel: (tab) => set({ rightPanelOpen: true, activeTab: tab ?? get().activeTab }),
+  openSettings: () => set({ settingsOpen: true }),
+  closeSettings: () => set({ settingsOpen: false }),
+  setActiveSettingsTab: (tab) => set({ activeSettingsTab: tab, settingsOpen: true }),
   toggleTheme: () => {
     const next = get().theme === 'dark' ? 'light' : 'dark';
     localStorage.setItem('echo-theme', next);
@@ -55,5 +55,3 @@ export const useUiStore = create<UiState>((set, get) => ({
 if (typeof window !== 'undefined') {
   applyTheme(getInitialTheme());
 }
-
-export type { TabId, Theme };

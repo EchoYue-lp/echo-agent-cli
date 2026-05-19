@@ -24,28 +24,35 @@ export function ToolsPanel() {
   return (
     <div className="p-3 space-y-2">
       <div className="flex items-center justify-between mb-2">
-        <h3 className="text-sm font-semibold text-gray-700">Tools ({tools.length})</h3>
+        <h3 className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>
+          工具 ({tools.length})
+        </h3>
       </div>
       {tools.map((tool) => (
-        <div key={tool.name} className="rounded border border-gray-200 bg-white">
+        <div key={tool.name} className="rounded-lg border" style={{ borderColor: 'var(--border-primary)', background: 'var(--bg-primary)' }}>
           <div className="flex items-center gap-2 px-3 py-2">
-            <button onClick={() => setExpanded(expanded === tool.name ? null : tool.name)}>
+            <button onClick={() => setExpanded(expanded === tool.name ? null : tool.name)}
+              style={{ color: 'var(--text-tertiary)' }}>
               {expanded === tool.name ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
             </button>
-            <Wrench size={12} className="text-gray-400" />
-            <span className="flex-1 truncate text-xs font-mono">{tool.name}</span>
+            <Wrench size={12} style={{ color: 'var(--text-tertiary)' }} />
+            <span className="flex-1 truncate text-xs font-mono" style={{ color: 'var(--text-primary)' }}>
+              {tool.name}
+            </span>
             <button
               onClick={() => toggle(tool.name, !tool.enabled)}
-              className={`relative h-5 w-9 rounded-full transition ${tool.enabled ? 'bg-indigo-500' : 'bg-gray-300'}`}
+              className={`relative h-5 w-9 rounded-full transition ${tool.enabled ? 'bg-[var(--accent)]' : ''}`}
+              style={{ background: tool.enabled ? 'var(--accent)' : 'var(--text-tertiary)' }}
             >
               <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition ${tool.enabled ? 'left-[18px]' : 'left-0.5'}`} />
             </button>
           </div>
           {expanded === tool.name && (
-            <div className="border-t px-3 py-2">
-              <p className="text-xs text-gray-500">{tool.description}</p>
+            <div className="border-t px-3 py-2" style={{ borderColor: 'var(--border-primary)' }}>
+              <p className="text-xs" style={{ color: 'var(--text-secondary)' }}>{tool.description}</p>
               {tool.input_schema && (
-                <pre className="mt-2 max-h-40 overflow-auto rounded bg-gray-50 p-2 text-[10px]">
+                <pre className="mt-2 max-h-40 overflow-auto rounded-lg p-2 text-[10px] leading-relaxed"
+                  style={{ background: 'var(--bg-code)', color: 'var(--color-code-text)' }}>
                   {JSON.stringify(tool.input_schema, null, 2)}
                 </pre>
               )}

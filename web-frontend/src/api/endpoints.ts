@@ -1,13 +1,13 @@
 import { get, post, put, del } from './client';
 import type {
-  SessionInfo, ToolInfo, SkillInfo, McpServerInfo,
-  ConnectMcpRequest, MemoryEntry, SnapshotInfo, ConfigInfo,
+  SessionInfo, ToolInfo, SkillInfo, McpServerInfo, McpConfig,
+  ConnectMcpRequest, MemoryEntry, NamespacesResponse, SnapshotInfo, ConfigInfo,
   PermissionRule, AuditLog, WorkflowInfo, HistoryResponse,
   SandboxStatus, SandboxConfig, SandboxExecuteRequest, SandboxExecuteResult,
   CompressResponse, CompressionStats,
   ExtractResponse, ValidateSchemaResponse, ExtractExample,
   ConversationListItem, ConversationRecord, SavedMessage,
-  ContextStats,
+  ContextStats, FullConfigResponse, FullConfigUpdateRequest,
 } from '../types/api';
 
 export const sessionApi = {
@@ -35,6 +35,8 @@ export const skillsApi = {
   list: () => get<SkillInfo[]>('/skills'),
   get: (name: string) => get<SkillInfo>(`/skills/${name}`),
   load: (dir: string) => post<{ success: boolean }>('/skills/load', { dir }),
+  upload: (rootDir: string, files: { path: string; content: string }[]) =>
+    post<{ message: string; loaded: string[]; skills: SkillInfo[] }>('/skills/upload', { root_dir: rootDir, files }),
 };
 
 export const mcpApi = {
@@ -42,19 +44,23 @@ export const mcpApi = {
   get: (name: string) => get<McpServerInfo>(`/mcp/${name}`),
   connect: (req: ConnectMcpRequest) => post<McpServerInfo>('/mcp/connect', req),
   disconnect: (name: string) => post<{ success: boolean }>(`/mcp/${name}/disconnect`),
+  getConfig: () => get<McpConfig>('/mcp/config'),
+  updateConfig: (config: McpConfig) => put<{ success: boolean; message?: string; errors?: string[] }>('/mcp/config', config),
 };
 
 export const memoryApi = {
-  list: (namespace?: string) => get<MemoryEntry[]>(`/memory${namespace ? `?namespace=${namespace}` : ''}`),
-  add: (entry: { namespace: string; key: string; value: string }) => post<{ success: boolean }>('/memory', entry),
+  list: (namespace?: string) => get<MemoryEntry[]>(`/memory/list${namespace ? `?namespace=${namespace}` : ''}`),
+  add: (entry: { namespace: string; key: string; value: any }) => post<{ success: boolean; key: string; message: string }>('/memory', entry),
   search: (query: string, namespace?: string) => post<MemoryEntry[]>('/memory/search', { query, namespace }),
-  delete: (id: string) => post<{ success: boolean }>('/memory/delete', { id }),
-  namespaces: () => get<string[]>('/memory/namespaces'),
+  delete: (entry: { namespace: string; key: string }) => post<{ success: boolean; message: string }>('/memory/delete', entry),
+  namespaces: () => get<NamespacesResponse>('/memory/namespaces'),
 };
 
 export const configApi = {
   get: () => get<ConfigInfo>('/config'),
   update: (cfg: Partial<ConfigInfo>) => put<ConfigInfo>('/config', cfg),
+  getFull: () => get<FullConfigResponse>('/config/full'),
+  updateFull: (cfg: Partial<FullConfigUpdateRequest>) => put<FullConfigResponse>('/config/full', cfg),
 };
 
 export const permissionsApi = {

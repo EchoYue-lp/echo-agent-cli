@@ -68,6 +68,12 @@ pub struct ConversationRecord {
     pub updated_at: String,
 }
 
+impl Default for Persistence {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Persistence {
     /// 创建持久化管理器，自动创建目录
     pub fn new() -> Self {
@@ -104,13 +110,12 @@ impl Persistence {
 
         // 如果文件已存在，保留 created_at
         let path = self.session_path(name);
-        if path.exists() {
-            if let Ok(existing) = self.load_session_raw(name) {
+        if path.exists()
+            && let Ok(existing) = self.load_session_raw(name) {
                 let mut updated = saved;
                 updated.created_at = existing.created_at;
                 return self.write_json(&path, &updated);
             }
-        }
 
         self.write_json(&path, &saved)
     }
@@ -131,9 +136,9 @@ impl Persistence {
 
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().map(|e| e == "json").unwrap_or(false) {
-                if let Ok(data) = fs::read_to_string(&path) {
-                    if let Ok(session) = serde_json::from_str::<SavedSession>(&data) {
+            if path.extension().map(|e| e == "json").unwrap_or(false)
+                && let Ok(data) = fs::read_to_string(&path)
+                    && let Ok(session) = serde_json::from_str::<SavedSession>(&data) {
                         sessions.push(SessionMeta {
                             name: session.name,
                             message_count: session.message_count,
@@ -142,28 +147,11 @@ impl Persistence {
                             updated_at: session.updated_at,
                         });
                     }
-                }
-            }
         }
 
         // 按更新时间降序排列
         sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         Ok(sessions)
-    }
-
-    /// 删除会话
-    pub fn delete_session(&self, name: &str) -> anyhow::Result<()> {
-        let path = self.session_path(name);
-        if path.exists() {
-            fs::remove_file(path)?;
-        }
-        Ok(())
-    }
-
-    /// 导出会话为 Markdown
-    pub fn export_markdown(&self, name: &str) -> anyhow::Result<String> {
-        let session = self.load_session(name)?;
-        Ok(Self::session_to_markdown(&session))
     }
 
     // ── 对话历史管理（前端持久化）──
@@ -173,53 +161,6 @@ impl Persistence {
         let dir = self.base_dir.join("conversations");
         fs::create_dir_all(&dir).ok();
         dir
-    }
-
-    /// 保存对话记录
-    pub fn save_conversation(&self, record: &ConversationRecord) -> anyhow::Result<()> {
-        let path = self.conversations_dir().join(format!("{}.json", record.id));
-        self.write_json(&path, record)
-    }
-
-    /// 加载对话记录
-    pub fn load_conversation(&self, id: &str) -> anyhow::Result<ConversationRecord> {
-        let path = self.conversations_dir().join(format!("{}.json", id));
-        let data = fs::read_to_string(path)?;
-        Ok(serde_json::from_str(&data)?)
-    }
-
-    /// 列出所有对话记录
-    pub fn list_conversations(&self) -> anyhow::Result<Vec<ConversationRecord>> {
-        let dir = self.conversations_dir();
-        let mut records = Vec::new();
-
-        let entries = match fs::read_dir(&dir) {
-            Ok(e) => e,
-            Err(_) => return Ok(records),
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().map(|e| e == "json").unwrap_or(false) {
-                if let Ok(data) = fs::read_to_string(&path) {
-                    if let Ok(record) = serde_json::from_str::<ConversationRecord>(&data) {
-                        records.push(record);
-                    }
-                }
-            }
-        }
-
-        records.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-        Ok(records)
-    }
-
-    /// 删除对话记录
-    pub fn delete_conversation(&self, id: &str) -> anyhow::Result<()> {
-        let path = self.conversations_dir().join(format!("{}.json", id));
-        if path.exists() {
-            fs::remove_file(path)?;
-        }
-        Ok(())
     }
 
     /// 导出对话为 Markdown
@@ -247,11 +188,18 @@ impl Persistence {
                 for tc in calls {
                     md.push_str(&format!("- `{}`: {}\n", tc.name, tc.arguments));
                 }
-                md.push_str("\n");
+                md.push('\n');
             }
         }
 
         Ok(md)
+    }
+
+    /// 加载指定 ID 的对话记录
+    pub fn load_conversation(&self, id: &str) -> anyhow::Result<ConversationRecord> {
+        let path = self.conversations_dir().join(format!("{}.json", id));
+        let data = fs::read_to_string(path)?;
+        Ok(serde_json::from_str(&data)?)
     }
 
     // ── 内部辅助 ──
@@ -282,8 +230,8 @@ impl Persistence {
 
     fn convert_message(msg: &Message) -> SavedMessage {
         SavedMessage {
-            role: msg.role.clone(),
-            content: msg.content.clone(),
+            role: msg.role.as_str().to_string(),
+            content: msg.content.as_deref().map(|s| s.to_string()),
             tool_calls: msg.tool_calls.as_ref().map(|calls| {
                 calls
                     .iter()
@@ -297,39 +245,6 @@ impl Persistence {
         }
     }
 
-    fn session_to_markdown(session: &SavedSession) -> String {
-        let mut md = String::new();
-        md.push_str(&format!("# Session: {}\n\n", session.name));
-        md.push_str(&format!(
-            "- Model: {}\n- Created: {}\n- Updated: {}\n- Messages: {}\n\n",
-            session.model, session.created_at, session.updated_at, session.message_count
-        ));
-        md.push_str("---\n\n");
-
-        for msg in &session.messages {
-            let role_label = match msg.role.as_str() {
-                "user" => "👤 **User**",
-                "assistant" => "🤖 **Assistant**",
-                "system" => "⚙️ **System**",
-                "tool" => "🔧 **Tool**",
-                _ => &msg.role,
-            };
-            md.push_str(&format!("### {}\n\n", role_label));
-            if let Some(content) = &msg.content {
-                md.push_str(content);
-                md.push_str("\n\n");
-            }
-            if let Some(calls) = &msg.tool_calls {
-                md.push_str("**Tool Calls:**\n");
-                for tc in calls {
-                    md.push_str(&format!("- `{}`: {}\n", tc.name, tc.arguments));
-                }
-                md.push_str("\n");
-            }
-        }
-
-        md
-    }
 }
 
 /// 获取用户 home 目录

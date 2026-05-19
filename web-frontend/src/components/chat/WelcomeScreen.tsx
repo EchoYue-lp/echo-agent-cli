@@ -1,67 +1,57 @@
 import { Wrench, FileSearch, Terminal, HelpCircle, Sparkles } from 'lucide-react';
 
 const suggestions = [
-  { icon: HelpCircle, text: 'What can you do? Tell me about your capabilities', color: '#6366f1' },
-  { icon: Wrench, text: 'What tools do you have available?', color: '#f59e0b' },
-  { icon: FileSearch, text: 'Help me analyze a file or document', color: '#10b981' },
-  { icon: Terminal, text: 'Run a system command for me', color: '#3b82f6' },
+  { icon: HelpCircle, text: '你能做什么？介绍一下你的能力', color: 'var(--accent)', colorHex: '#6366f1', bg: 'var(--accent-bg)' },
+  { icon: Wrench, text: '你有哪些工具可用？', color: 'var(--color-warning)', colorHex: '#f59e0b', bg: 'var(--color-warning-bg)' },
+  { icon: FileSearch, text: '帮我分析文件或文档', color: 'var(--color-success)', colorHex: '#10b981', bg: 'var(--color-success-bg)' },
+  { icon: Terminal, text: '帮我执行系统命令', color: 'var(--color-info)', colorHex: '#3b82f6', bg: 'var(--color-info-bg)' },
 ];
 
 export function WelcomeScreen({ onSuggestionClick }: { onSuggestionClick: (text: string) => void }) {
   return (
     <div className="flex h-full flex-col items-center justify-center px-4">
-      {/* Hero */}
-      <div className="mb-10 flex flex-col items-center">
+      <div className="mb-12 flex flex-col items-center">
         <div
-          className="mb-5 flex h-[72px] w-[72px] items-center justify-center rounded-2xl"
+          className="animate-slide-up mb-6 flex h-[80px] w-[80px] items-center justify-center rounded-2xl"
           style={{
-            background: 'linear-gradient(135deg, var(--accent) 0%, #a78bfa 100%)',
-            boxShadow: '0 8px 24px -4px rgba(99, 102, 241, 0.3)',
+            background: 'linear-gradient(135deg, var(--accent) 0%, var(--color-purple) 100%)',
+            boxShadow: '0 12px 40px -8px rgba(99, 102, 241, 0.35)',
           }}
         >
-          <Sparkles size={32} color="white" />
+          <Sparkles size={36} color="white" />
         </div>
-        <h1
-          className="text-2xl font-semibold tracking-tight"
-          style={{ color: 'var(--text-primary)' }}
-        >
-          How can I help you today?
+        <h1 className="animate-slide-up text-2xl font-semibold tracking-tight text-[var(--text-primary)]" style={{ animationDelay: '0.05s' }}>
+          今天有什么可以帮你的？
         </h1>
-        <p className="mt-2 text-sm" style={{ color: 'var(--text-secondary)' }}>
-          I'm Echo Agent, your intelligent AI assistant
+        <p className="animate-slide-up mt-2 text-sm text-[var(--text-secondary)]" style={{ animationDelay: '0.1s' }}>
+          我是 Echo Agent，你的智能 AI 助手
         </p>
       </div>
 
-      {/* Suggestion cards */}
       <div className="grid w-full max-w-2xl grid-cols-1 gap-3 sm:grid-cols-2">
         {suggestions.map((s, i) => (
           <button
             key={i}
             onClick={() => onSuggestionClick(s.text)}
-            className="flex items-start gap-3 rounded-xl p-4 text-left transition-all"
-            style={{
-              background: 'var(--bg-primary)',
-              border: '1px solid var(--border-primary)',
-            }}
+            className="animate-slide-up group flex items-start gap-3 rounded-xl border border-[var(--border-primary)] bg-[var(--bg-primary)] p-4 text-left transition-all duration-200 hover:-translate-y-1 hover:shadow-[var(--shadow-lg)]"
+            style={{ animationDelay: `${0.1 + i * 0.05}s` }}
             onMouseEnter={(e) => {
-              e.currentTarget.style.borderColor = s.color;
-              e.currentTarget.style.transform = 'translateY(-1px)';
-              e.currentTarget.style.boxShadow = `0 4px 12px -2px ${s.color}25`;
+              e.currentTarget.style.borderColor = s.colorHex;
+              e.currentTarget.style.boxShadow = `0 8px 28px -4px ${s.colorHex}35`;
             }}
             onMouseLeave={(e) => {
-              e.currentTarget.style.borderColor = 'var(--border-primary)';
-              e.currentTarget.style.transform = 'none';
-              e.currentTarget.style.boxShadow = 'none';
+              e.currentTarget.style.borderColor = '';
+              e.currentTarget.style.boxShadow = '';
             }}
           >
             <div
-              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg"
-              style={{ background: s.color + '15' }}
+              className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg transition-all duration-200 group-hover:scale-110 group-hover:rotate-[-4deg]"
+              style={{ background: s.bg }}
             >
-              <s.icon size={17} style={{ color: s.color }} />
+              <s.icon size={18} style={{ color: s.color }} />
             </div>
-            <div className="min-w-0">
-              <span className="text-[13px] leading-snug" style={{ color: 'var(--text-primary)' }}>
+            <div className="min-w-0 flex items-center">
+              <span className="text-[13px] leading-snug text-[var(--text-primary)]">
                 {s.text}
               </span>
             </div>

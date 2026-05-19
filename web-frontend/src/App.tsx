@@ -2,10 +2,12 @@ import { useCallback } from 'react';
 import { AppLayout } from './components/layout/AppLayout';
 import { LeftSidebar } from './components/layout/LeftSidebar';
 import { ChatPanel } from './components/chat/ChatPanel';
-import { RightPanel } from './components/layout/RightPanel';
+import { SettingsDialog } from './components/layout/SettingsDialog';
+import { ToastContainer } from './components/common/Toast';
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
 import { useConversationStore } from './stores/conversationStore';
 import { useUiStore } from './stores/uiStore';
+import { RequireAuth } from './components/Auth/RequireAuth';
 
 function App() {
   const startNew = useConversationStore((s) => s.startNew);
@@ -17,11 +19,14 @@ function App() {
   });
 
   return (
-    <AppLayout
-      left={<LeftSidebar />}
-      center={<ChatPanel />}
-      right={<RightPanel />}
-    />
+    <RequireAuth>
+      <AppLayout
+        left={<LeftSidebar />}
+        center={<ChatPanel />}
+      />
+      <SettingsDialog />
+      <ToastContainer />
+    </RequireAuth>
   );
 }
 

@@ -1,0 +1,61 @@
+# Echo Agent 配置文件
+# 复制为 echo-agent.yaml 并根据实际情况修改
+
+# ── 模型配置 ─────────────────────────────────────────────────────
+model:
+  name: "qwen-plus"           # 模型名称
+  # max_tokens: 4096          # 最大输出 token 数（可选）
+  # temperature: 0.7          # 温度参数（可选）
+
+# ── Agent 配置 ─────────────────────────────────────────────────────
+agent:
+  name: "echo-assistant"                              # Agent 名称
+  system_prompt: "你是一个智能助手，可以帮助用户回答问题、执行任务。"  # 系统提示词
+  max_iterations: 10          # ReAct 最大迭代次数
+  enable_tools: true          # 启用工具调用
+  enable_memory: true         # 启用记忆
+  enable_human_in_loop: true  # 启用人工介入
+  memory_path: "~/.echo-agent/memory"  # 记忆存储路径
+
+# ── MCP 配置 ─────────────────────────────────────────────────────
+mcp:
+  # MCP 配置文件路径（支持 mcp.json）
+  # 如果不指定，会按顺序搜索：
+  #   ./mcp.json → ./.echo-agent/mcp.json → ~/.echo-agent/mcp.json
+  # config_path: "mcp.json"
+
+# ── IM 通道配置 ─────────────────────────────────────────────────────
+channels:
+  # QQ Bot 通道
+  qq:
+    enabled: false             # 是否启用
+    app_id: ""                 # QQ Bot App ID
+    client_secret: ""          # QQ Bot Client Secret
+
+  # 飞书通道
+  feishu:
+    enabled: false             # 是否启用
+    app_id: ""                 # 飞书 App ID
+    app_secret: ""             # 飞书 App Secret
+    mode: "long_poll"          # 连接模式: long_poll | webhook
+
+  # 会话配置
+  session:
+    timeout_minutes: 60                    # 会话超时（分钟）
+    reset_keywords:                         # 触发重置的关键词
+      - "重置对话"
+      - "新对话"
+      - "清除记忆"
+    reset_commands:                         # 触发重置的命令
+      - "/reset"
+      - "/clear"
+      - "/new"
+
+# ── 服务配置 ─────────────────────────────────────────────────────
+server:
+  host: "0.0.0.0"             # 监听地址
+  port: 3000                   # 监听端口
+
+# ── 日志配置 ─────────────────────────────────────────────────────
+logging:
+  level: "info"                # 日志级别: trace | debug | info | warn | error

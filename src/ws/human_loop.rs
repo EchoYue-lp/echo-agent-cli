@@ -80,6 +80,7 @@ impl HumanLoopProvider for WsHumanLoopHandler {
                     let args = req.args.clone().unwrap_or(Value::Null);
 
                     let msg = ServerMessage::ApprovalRequest {
+                        id: None,
                         request_id: request_id.clone(),
                         tool_name,
                         args,
@@ -95,21 +96,35 @@ impl HumanLoopProvider for WsHumanLoopHandler {
                     let pending_req = PendingRequest {
                         responder: tx_response,
                     };
-                    pending.lock().await.insert(request_id, pending_req);
+                    pending.lock().await.insert(request_id.clone(), pending_req);
 
-                    match rx_response.await {
-                        Ok(PendingResponse::Approval { approved, reason }) => {
-                            if approved {
-                                Ok(HumanLoopResponse::Approved)
+                    // Use select! for atomic timeout vs response handling,
+                    // eliminating the TOCTOU window where a client response
+                    // could arrive after timeout fires but before pending cleanup.
+                    let result = tokio::select! {
+                        response = rx_response => {
+                            if let Ok(PendingResponse::Approval { approved, reason }) = response {
+                                if approved {
+                                    Ok(HumanLoopResponse::Approved)
+                                } else {
+                                    Ok(HumanLoopResponse::Rejected { reason })
+                                }
                             } else {
-                                Ok(HumanLoopResponse::Rejected { reason })
+                                // Sender dropped or unexpected variant
+                                Ok(HumanLoopResponse::Timeout)
                             }
                         }
-                        _ => Ok(HumanLoopResponse::Timeout),
-                    }
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
+                            // Timeout — clean up pending to prevent stale entries
+                            pending.lock().await.remove(&request_id);
+                            Ok(HumanLoopResponse::Timeout)
+                        }
+                    };
+                    result
                 }
                 echo_agent::human_loop::HumanLoopKind::Input => {
                     let msg = ServerMessage::InputRequest {
+                        id: None,
                         request_id: request_id.clone(),
                         prompt: req.prompt.clone(),
                     };
@@ -123,14 +138,23 @@ impl HumanLoopProvider for WsHumanLoopHandler {
                     let pending_req = PendingRequest {
                         responder: tx_response,
                     };
-                    pending.lock().await.insert(request_id, pending_req);
+                    pending.lock().await.insert(request_id.clone(), pending_req);
 
-                    match rx_response.await {
-                        Ok(PendingResponse::Input { text }) => {
-                            Ok(HumanLoopResponse::Text(text))
+                    // Use select! for atomic timeout vs response handling.
+                    let result = tokio::select! {
+                        response = rx_response => {
+                            if let Ok(PendingResponse::Input { text }) = response {
+                                Ok(HumanLoopResponse::Text(text))
+                            } else {
+                                Ok(HumanLoopResponse::Text(String::new()))
+                            }
                         }
-                        _ => Ok(HumanLoopResponse::Text(String::new())),
-                    }
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
+                            pending.lock().await.remove(&request_id);
+                            Ok(HumanLoopResponse::Text(String::new()))
+                        }
+                    };
+                    result
                 }
             }
         })

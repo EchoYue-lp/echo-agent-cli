@@ -1,5 +1,6 @@
 import { useEffect, useState, useRef } from 'react';
-import { Plus, Sun, Moon, Trash2, MessageSquare, Pencil, Check, X, Search, Download } from 'lucide-react';
+import { Plus, Sun, Moon, Trash2, MessageSquare, Pencil, Check, X, Search, Download, Settings } from 'lucide-react';
+import { BrandIcon } from '../common/BrandIcon';
 import { useChatStore } from '../../stores/chatStore';
 import { useConversationStore, type ConversationGroup } from '../../stores/conversationStore';
 import { useUiStore } from '../../stores/uiStore';
@@ -8,6 +9,7 @@ export function LeftSidebar() {
   const messages = useChatStore((s) => s.messages);
   const theme = useUiStore((s) => s.theme);
   const toggleTheme = useUiStore((s) => s.toggleTheme);
+  const openSettings = useUiStore((s) => s.openSettings);
 
   const conversations = useConversationStore((s) => s.conversations);
   const activeId = useConversationStore((s) => s.activeId);
@@ -26,12 +28,8 @@ export function LeftSidebar() {
   const editInputRef = useRef<HTMLInputElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
 
-  // Init on mount
-  useEffect(() => {
-    init();
-  }, [init]);
+  useEffect(() => { init(); }, [init]);
 
-  // Auto-focus edit input
   useEffect(() => {
     if (editingId && editInputRef.current) {
       editInputRef.current.focus();
@@ -39,7 +37,6 @@ export function LeftSidebar() {
     }
   }, [editingId]);
 
-  // Filter conversations by search query
   const allGroups = getGrouped();
   const groups = searchQuery.trim()
     ? allGroups.map(g => ({
@@ -96,86 +93,75 @@ export function LeftSidebar() {
   const isCurrentChatActive = !activeId && messages.length > 0;
 
   return (
-    <div className="flex h-full flex-col" style={{ background: 'var(--bg-sidebar)' }}>
-      {/* Header */}
-      <div className="flex items-center justify-between px-3 py-3" style={{ borderBottom: '1px solid var(--border-primary)' }}>
-        <button
-          onClick={startNew}
-          className="flex flex-1 items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium transition-colors"
-          style={{ border: '1px solid var(--border-primary)', color: 'var(--text-primary)' }}
-          onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--bg-sidebar-hover)')}
-          onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
-        >
-          <Plus size={15} />
-          New Chat
-        </button>
+    <div className="flex h-full flex-col bg-[var(--bg-sidebar)]">
+      {/* Brand Header */}
+      <div className="flex items-center justify-between border-b border-[var(--border-primary)] px-3 py-2.5">
+        <div className="flex items-center gap-2">
+          <BrandIcon size="md" />
+          <span className="text-sm font-semibold tracking-tight text-[var(--text-primary)]">
+            Echo Agent
+          </span>
+        </div>
         <button
           onClick={toggleTheme}
-          className="ml-2 rounded-lg p-2 transition-colors"
-          style={{ color: 'var(--text-secondary)' }}
-          onMouseEnter={(e) => (e.currentTarget.style.background = 'var(--bg-sidebar-hover)')}
-          onMouseLeave={(e) => (e.currentTarget.style.background = 'transparent')}
-          title={theme === 'dark' ? 'Light mode' : 'Dark mode'}
+          className="rounded-lg p-1.5 text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-sidebar-hover)] hover:text-[var(--text-primary)]"
+          title={theme === 'dark' ? '浅色模式' : '深色模式'}
         >
-          {theme === 'dark' ? <Sun size={15} /> : <Moon size={15} />}
+          {theme === 'dark' ? <Sun size={14} /> : <Moon size={14} />}
         </button>
       </div>
 
-      {/* Search */}
-      {conversations.length > 0 && (
-        <div className="px-2 pt-2 pb-1">
-          <div
-            className="flex items-center gap-2 rounded-lg px-3 py-1.5"
-            style={{ background: 'var(--bg-hover)', border: '1px solid var(--border-primary)' }}
-          >
-            <Search size={13} style={{ color: 'var(--text-tertiary)', flexShrink: 0 }} />
+      {/* New Chat + Search */}
+      <div className="space-y-2 px-3 pt-3 pb-2">
+        <button
+          onClick={startNew}
+          className="flex w-full items-center gap-2 rounded-lg border border-[var(--border-primary)] px-3 py-2 text-sm font-medium text-[var(--text-primary)] transition-all hover:bg-[var(--bg-sidebar-hover)]"
+        >
+          <Plus size={15} />
+          新建对话
+        </button>
+
+        {conversations.length > 0 && (
+          <div className="flex items-center gap-2 rounded-lg border border-[var(--border-primary)] bg-[var(--bg-hover)] px-3 py-1.5 transition-colors focus-within:border-[var(--border-focus)]">
+            <Search size={13} className="shrink-0 text-[var(--text-tertiary)]" />
             <input
               ref={searchInputRef}
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Search conversations..."
-              className="flex-1 bg-transparent text-xs outline-none"
-              style={{ color: 'var(--text-primary)' }}
+              placeholder="搜索对话..."
+              className="flex-1 bg-transparent text-xs text-[var(--text-primary)] outline-none placeholder:text-[var(--text-tertiary)]"
             />
             {searchQuery && (
               <button onClick={() => { setSearchQuery(''); searchInputRef.current?.focus(); }}
-                className="shrink-0 rounded p-0.5"
-                style={{ color: 'var(--text-tertiary)' }}
+                className="shrink-0 rounded p-0.5 text-[var(--text-tertiary)] hover:text-[var(--text-primary)]"
               >
                 <X size={12} />
               </button>
             )}
           </div>
-        </div>
-      )}
+        )}
+      </div>
 
       {/* Current Chat */}
-      <div className="px-2 pt-1 pb-1">
+      <div className="px-3 pb-1">
         <button
           onClick={() => { if (!isCurrentChatActive) startNew(); }}
-          className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2.5 text-left transition-colors"
-          style={{
-            background: isCurrentChatActive ? 'var(--bg-sidebar-active)' : 'transparent',
-            cursor: isCurrentChatActive ? 'default' : 'pointer',
-          }}
-          onMouseEnter={(e) => {
-            if (!isCurrentChatActive) e.currentTarget.style.background = 'var(--bg-sidebar-hover)';
-          }}
-          onMouseLeave={(e) => {
-            if (!isCurrentChatActive) e.currentTarget.style.background = 'transparent';
-          }}
+          className={`flex w-full items-center gap-2.5 rounded-lg px-3 py-2.5 text-left transition-colors
+            ${isCurrentChatActive
+              ? 'cursor-default bg-[var(--bg-sidebar-active)] pl-[9px] border-l-[3px] border-l-[var(--accent)]'
+              : 'border-l-[3px] border-l-transparent hover:bg-[var(--bg-sidebar-hover)]'}`}
         >
-          <MessageSquare size={15} style={{ color: 'var(--accent)', flexShrink: 0 }} />
+          <MessageSquare size={15} className="shrink-0 text-[var(--accent)]" />
           <div className="min-w-0 flex-1">
-            <div className="truncate text-[13px] font-medium" style={{ color: 'var(--text-primary)' }}>
-              Today
+            <div className="truncate text-[13px] font-medium text-[var(--text-primary)]">
+              今天
             </div>
-            <div className="text-xs" style={{ color: 'var(--text-tertiary)' }}>
-              {messages.length > 0 ? `${messages.length} messages` : 'Empty'}
+            <div className="text-xs text-[var(--text-tertiary)]">
+              {messages.length > 0 ? `${messages.length} 条消息` : '空'}
             </div>
           </div>
           {isCurrentChatActive && (
-            <div className="h-2 w-2 rounded-full" style={{ background: 'var(--accent)', flexShrink: 0 }} />
+            <div className="h-2 w-2 shrink-0 rounded-full bg-[var(--accent)]" />
           )}
         </button>
       </div>
@@ -205,27 +191,34 @@ export function LeftSidebar() {
 
         {groups.length === 0 && searchQuery && (
           <div className="px-3 py-8 text-center">
-            <Search size={24} style={{ color: 'var(--text-tertiary)', margin: '0 auto 8px' }} />
-            <p className="text-xs" style={{ color: 'var(--text-tertiary)' }}>
-              No results for "{searchQuery}"
+            <Search size={24} className="mx-auto mb-2 text-[var(--text-tertiary)]" />
+            <p className="text-xs text-[var(--text-tertiary)]">
+              没有找到 &quot;{searchQuery}&quot;
             </p>
           </div>
         )}
 
         {groups.length === 0 && !searchQuery && conversations.length === 0 && (
           <div className="px-3 py-8 text-center">
-            <MessageSquare size={24} style={{ color: 'var(--text-tertiary)', margin: '0 auto 8px' }} />
-            <p className="text-xs" style={{ color: 'var(--text-tertiary)' }}>
-              No conversations yet
-            </p>
+            <MessageSquare size={24} className="mx-auto mb-2 text-[var(--text-tertiary)]" />
+            <p className="text-xs text-[var(--text-tertiary)]">暂无对话</p>
           </div>
         )}
+      </div>
+
+      {/* Bottom actions */}
+      <div className="border-t border-[var(--border-primary)] px-2 py-2">
+        <button
+          onClick={openSettings}
+          className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-xs font-medium text-[var(--text-secondary)] transition-all hover:bg-[var(--bg-sidebar-hover)] hover:text-[var(--text-primary)]"
+        >
+          <Settings size={14} />
+          设置
+        </button>
       </div>
     </div>
   );
 }
-
-// ── Group Section ──
 
 function ConversationGroupSection({
   group,
@@ -262,7 +255,7 @@ function ConversationGroupSection({
 }) {
   return (
     <div className="mt-1">
-      <div className="px-3 py-1.5 text-[11px] font-semibold uppercase tracking-wider" style={{ color: 'var(--text-tertiary)' }}>
+      <div className="px-3 py-1.5 text-[11px] font-semibold uppercase tracking-wider text-[var(--text-tertiary)]">
         {group.label}
       </div>
       {group.conversations.map((conv) => (
@@ -289,8 +282,6 @@ function ConversationGroupSection({
     </div>
   );
 }
-
-// ── Single Conversation Item ──
 
 function ConversationItem({
   id,
@@ -329,21 +320,19 @@ function ConversationItem({
 }) {
   return (
     <div
-      className="group relative mb-0.5 cursor-pointer rounded-lg transition-all"
-      style={{
-        background: isActive ? 'var(--bg-sidebar-active)' : 'transparent',
-        paddingLeft: isActive ? '9px' : '12px',
-        borderLeft: isActive ? '3px solid var(--accent)' : '3px solid transparent',
-      }}
+      className={`group relative mb-0.5 cursor-pointer rounded-lg transition-all
+        ${isActive
+          ? 'bg-[var(--bg-sidebar-active)] pl-[9px] border-l-[3px] border-l-[var(--accent)]'
+          : 'border-l-[3px] border-l-transparent'}`}
       onClick={() => !isEditing && onSelect(id)}
       onMouseEnter={() => onHover(id)}
       onMouseLeave={() => onHover(null)}
     >
       <div className="flex items-center gap-1 py-2 pr-2">
         {loading ? (
-          <div className="spinner" style={{ flexShrink: 0 }} />
+          <div className="spinner shrink-0" />
         ) : (
-          <MessageSquare size={14} style={{ color: 'var(--text-tertiary)', flexShrink: 0 }} />
+          <MessageSquare size={14} className="shrink-0 text-[var(--text-tertiary)]" />
         )}
 
         {isEditing ? (
@@ -357,24 +346,18 @@ function ConversationItem({
                 if (e.key === 'Escape') onCancelEdit();
               }}
               onClick={(e) => e.stopPropagation()}
-              className="min-w-0 flex-1 rounded px-1.5 py-0.5 text-[13px] outline-none"
-              style={{
-                background: 'var(--bg-input)',
-                color: 'var(--text-primary)',
-                border: '1px solid var(--border-focus)',
-              }}
+              className="min-w-0 flex-1 rounded border border-[var(--border-focus)] bg-[var(--bg-input)] px-1.5 py-0.5 text-[13px] text-[var(--text-primary)] outline-none"
+              autoFocus
             />
             <button
               onClick={(e) => { e.stopPropagation(); onSaveEdit(); }}
-              className="rounded p-0.5"
-              style={{ color: '#16a34a' }}
+              className="rounded p-0.5 text-[var(--color-success)]"
             >
               <Check size={13} />
             </button>
             <button
               onClick={(e) => { e.stopPropagation(); onCancelEdit(); }}
-              className="rounded p-0.5"
-              style={{ color: 'var(--text-tertiary)' }}
+              className="rounded p-0.5 text-[var(--text-tertiary)]"
             >
               <X size={13} />
             </button>
@@ -382,44 +365,31 @@ function ConversationItem({
         ) : (
           <>
             <div className="min-w-0 flex-1">
-              <div className="truncate text-[13px]" style={{
-                color: 'var(--text-primary)',
-                fontWeight: isActive ? 500 : 400,
-              }}>
+              <div className={`truncate text-[13px] ${isActive ? 'font-medium' : ''} text-[var(--text-primary)]`}>
                 {title}
               </div>
             </div>
 
-            {/* Actions on hover */}
             {(isHovered || isActive) && !loading && (
               <div className="flex shrink-0 items-center gap-0.5">
                 <button
                   onClick={(e) => onExport(id, title, e)}
-                  className="rounded p-1 transition-colors"
-                  style={{ color: 'var(--text-tertiary)' }}
-                  onMouseEnter={(e) => (e.currentTarget.style.color = 'var(--text-primary)')}
-                  onMouseLeave={(e) => (e.currentTarget.style.color = 'var(--text-tertiary)')}
-                  title="Export"
+                  className="rounded p-1 text-[var(--text-tertiary)] transition-colors hover:text-[var(--text-primary)]"
+                  title="导出"
                 >
                   <Download size={12} />
                 </button>
                 <button
                   onClick={(e) => onStartEdit(id, e)}
-                  className="rounded p-1 transition-colors"
-                  style={{ color: 'var(--text-tertiary)' }}
-                  onMouseEnter={(e) => (e.currentTarget.style.color = 'var(--text-primary)')}
-                  onMouseLeave={(e) => (e.currentTarget.style.color = 'var(--text-tertiary)')}
-                  title="Rename"
+                  className="rounded p-1 text-[var(--text-tertiary)] transition-colors hover:text-[var(--text-primary)]"
+                  title="重命名"
                 >
                   <Pencil size={12} />
                 </button>
                 <button
                   onClick={(e) => onDelete(id, e)}
-                  className="rounded p-1 transition-colors"
-                  style={{ color: 'var(--text-tertiary)' }}
-                  onMouseEnter={(e) => (e.currentTarget.style.color = '#ef4444')}
-                  onMouseLeave={(e) => (e.currentTarget.style.color = 'var(--text-tertiary)')}
-                  title="Delete"
+                  className="rounded p-1 text-[var(--text-tertiary)] transition-colors hover:text-[var(--color-error)]"
+                  title="删除"
                 >
                   <Trash2 size={12} />
                 </button>

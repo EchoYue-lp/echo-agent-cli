@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { auditApi } from '../../api/endpoints';
 import type { AuditLog } from '../../types/api';
 import { ShieldCheck, Trash2 } from 'lucide-react';
+import { StatusBadge } from '../common/StatusBadge';
 
 export function AuditPanel() {
   const [logs, setLogs] = useState<AuditLog[]>([]);
@@ -17,55 +18,69 @@ export function AuditPanel() {
       await auditApi.clear();
       setLogs([]);
       setStats(null);
-    } catch (e) {
-      console.error(e);
-    }
+    } catch (e) { console.error(e); }
+  };
+
+  const s = {
+    text: 'var(--text-primary)',
+    textSec: 'var(--text-secondary)',
+    textTer: 'var(--text-tertiary)',
+    border: 'var(--border-primary)',
+    bg: 'var(--bg-primary)',
+    bgHover: 'var(--bg-hover)',
   };
 
   return (
     <div className="p-3 space-y-3">
       <div className="flex items-center justify-between">
-        <h3 className="text-sm font-semibold text-gray-700">Audit Log</h3>
-        <button onClick={clear} className="rounded p-1 text-gray-400 hover:bg-gray-100 hover:text-red-500">
+        <h3 className="text-sm font-semibold" style={{ color: s.text }}>审计日志</h3>
+        <button onClick={clear} className="rounded p-1 transition-colors" style={{ color: s.textTer }}>
           <Trash2 size={14} />
         </button>
       </div>
 
       {stats && (
         <div className="grid grid-cols-4 gap-2">
-          <Stat label="Total" value={stats.total} />
-          <Stat label="Allowed" value={stats.allowed} color="text-green-600" />
-          <Stat label="Denied" value={stats.denied} color="text-red-600" />
-          <Stat label="Asked" value={stats.asked} color="text-amber-600" />
+          <Stat label="总计" value={stats.total} />
+          <Stat label="已允许" value={stats.allowed} color="var(--color-success)" />
+          <Stat label="已拒绝" value={stats.denied} color="var(--color-error)" />
+          <Stat label="已询问" value={stats.asked} color="var(--color-warning)" />
         </div>
       )}
 
       {logs.map((log) => (
-        <div key={log.id} className="rounded border border-gray-200 bg-white px-3 py-2">
+        <div key={log.id} className="rounded-lg border px-3 py-2"
+          style={{ borderColor: s.border, background: s.bg }}>
           <div className="flex items-center gap-2">
-            <ShieldCheck size={12} className="text-gray-400" />
-            <span className="text-xs font-mono text-gray-700">{log.tool_name}</span>
-            <span className={`ml-auto rounded px-1.5 py-0.5 text-[10px] ${
-              log.decision === 'allow' ? 'bg-green-50 text-green-600' :
-              log.decision === 'deny' ? 'bg-red-50 text-red-600' :
-              'bg-amber-50 text-amber-600'
-            }`}>
-              {log.decision}
+            <ShieldCheck size={12} style={{ color: s.textTer }} />
+            <span className="text-xs font-mono" style={{ color: s.text }}>{log.tool_name}</span>
+            <span className="ml-auto">
+              <StatusBadge
+                status={log.decision === 'allow' ? 'success' : log.decision === 'deny' ? 'error' : 'warning'}
+                label={log.decision === 'allow' ? '已允许' : log.decision === 'deny' ? '已拒绝' : '已询问'}
+                size="sm"
+              />
             </span>
           </div>
-          <p className="mt-1 text-[10px] text-gray-400">{log.timestamp}</p>
-          {log.reason && <p className="mt-1 text-xs text-gray-500">{log.reason}</p>}
+          <p className="mt-1 text-[10px]" style={{ color: s.textTer }}>{log.timestamp}</p>
+          {log.reason && <p className="mt-1 text-xs" style={{ color: s.textSec }}>{log.reason}</p>}
         </div>
       ))}
+
+      {logs.length === 0 && !stats && (
+        <div className="py-8 text-center text-xs" style={{ color: s.textTer }}>
+          暂无审计日志
+        </div>
+      )}
     </div>
   );
 }
 
 function Stat({ label, value, color }: { label: string; value: number; color?: string }) {
   return (
-    <div className="rounded bg-gray-50 p-2 text-center">
-      <div className={`text-lg font-semibold ${color || ''}`}>{value}</div>
-      <div className="text-[10px] text-gray-400">{label}</div>
+    <div className="rounded-lg p-2 text-center" style={{ background: 'var(--bg-hover)' }}>
+      <div className="text-lg font-semibold" style={{ color: color || 'var(--text-primary)' }}>{value}</div>
+      <div className="text-[10px]" style={{ color: 'var(--text-tertiary)' }}>{label}</div>
     </div>
   );
 }

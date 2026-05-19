@@ -87,9 +87,6 @@ fn default_schema_name() -> String {
 pub struct ValidateSchemaRequest {
     /// JSON Schema 定义
     pub schema: serde_json::Value,
-    /// 要验证的数据（预留字段）
-    #[allow(dead_code)]
-    pub data: serde_json::Value,
 }
 
 // ── 响应类型 ─────────────────────────────────────────────────
@@ -143,13 +140,10 @@ pub async fn extract(
 ) -> Response {
     use echo_agent::prelude::*;
 
-    let agent = state.agent.lock().await;
-
-    // 构建 ResponseFormat
     let response_format = ResponseFormat::json_schema(&req.schema_name, req.schema.clone());
 
     // 执行提取
-    match agent.extract_json(&req.input, response_format).await {
+    match state.connection.agent.read_async(|agent| Box::pin(async move { agent.extract_json(&req.input, response_format).await })).await {
         Ok(value) => {
             Json(ExtractResponse {
                 success: true,

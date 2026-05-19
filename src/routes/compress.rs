@@ -120,12 +120,13 @@ pub async fn compress(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CompressRequest>,
 ) -> Response {
-    let mut agent = state.agent.lock().await;
-
-    // 使用滑动窗口压缩器
     let compressor = SlidingWindowCompressor::new(req.keep_messages);
 
-    match agent.force_compress_with(&compressor).await {
+    let result = state.connection.agent.read_async(|agent| Box::pin(async move {
+        agent.force_compress_with_hooks(&compressor, "manual").await
+    })).await;
+
+    match result {
         Ok(stats) => {
             Json(CompressResponse {
                 success: true,
@@ -162,10 +163,11 @@ pub async fn compress(
 pub async fn get_compression_stats(
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    let agent = state.agent.lock().await;
-
-    let (message_count, current_tokens) = agent.context_stats();
-    let token_limit = agent.config().get_token_limit();
+    let (message_count, current_tokens, token_limit) = state.connection.agent.read_async(|agent| Box::pin(async move {
+        let (mc, ct) = agent.context_stats().await;
+        let tl = agent.config().get_token_limit();
+        (mc, ct, tl)
+    })).await;
 
     // 计算压缩比例（当前 token 使用率）
     let compression_ratio = if token_limit > 0 {

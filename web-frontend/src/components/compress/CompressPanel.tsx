@@ -27,13 +27,13 @@ export function CompressPanel() {
       const res = await compressApi.trigger();
       if (res.success) {
         setLastCompress(res);
-        setMsg(`Compressed: ${res.messages_before} → ${res.messages_after} messages, saved ${res.tokens_saved} tokens`);
+        setMsg(`已压缩：${res.messages_before} → ${res.messages_after} 条消息，节省 ${res.tokens_saved} 个令牌`);
         await loadStats();
       } else {
-        setMsg(res.message || 'Compression returned no result');
+        setMsg(res.message || '压缩未返回结果');
       }
     } catch (e: unknown) {
-      setMsg(`Error: ${e instanceof Error ? e.message : 'Unknown'}`);
+      setMsg(`错误：${e instanceof Error ? e.message : '未知'}`);
     }
     setCompressing(false);
   };
@@ -46,10 +46,10 @@ export function CompressPanel() {
     <div className="p-3 space-y-3">
       <div className="flex items-center justify-between">
         <h3 className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>
-          Context Compression
+          上下文压缩
         </h3>
         <button onClick={loadStats} className="text-[10px]" style={{ color: 'var(--accent)' }}>
-          Refresh
+          刷新
         </button>
       </div>
 
@@ -58,21 +58,21 @@ export function CompressPanel() {
         <div className="rounded-lg border p-3" style={{ borderColor: 'var(--border-primary)' }}>
           <div className="flex items-center gap-2 mb-2">
             <BarChart3 size={14} style={{ color: 'var(--accent)' }} />
-            <span className="text-xs font-medium" style={{ color: 'var(--text-primary)' }}>Current Context</span>
+            <span className="text-xs font-medium" style={{ color: 'var(--text-primary)' }}>当前上下文</span>
           </div>
           <div className="space-y-1.5 text-xs" style={{ color: 'var(--text-secondary)' }}>
             <div className="flex justify-between">
-              <span>Messages</span>
+              <span>消息数</span>
               <span style={{ color: 'var(--text-primary)' }}>{stats.message_count}</span>
             </div>
             <div className="flex justify-between">
-              <span>Tokens</span>
+              <span>令牌数</span>
               <span style={{ color: 'var(--text-primary)' }}>{stats.current_tokens} / {stats.token_limit}</span>
             </div>
             <div className="mt-2">
               <div className="flex justify-between mb-1">
-                <span>Usage</span>
-                <span style={{ color: usagePct > 80 ? '#ef4444' : usagePct > 50 ? '#f59e0b' : '#10b981' }}>
+                <span>使用率</span>
+                <span style={{ color: usagePct > 80 ? 'var(--color-error)' : usagePct > 50 ? 'var(--color-warning)' : 'var(--color-success)' }}>
                   {usagePct.toFixed(1)}%
                 </span>
               </div>
@@ -81,14 +81,14 @@ export function CompressPanel() {
                   className="h-full rounded-full transition-all duration-500"
                   style={{
                     width: `${Math.min(usagePct, 100)}%`,
-                    background: usagePct > 80 ? '#ef4444' : usagePct > 50 ? '#f59e0b' : '#10b981',
+                    background: usagePct > 80 ? 'var(--color-error)' : usagePct > 50 ? 'var(--color-warning)' : 'var(--color-success)',
                   }}
                 />
               </div>
             </div>
             {stats.needs_compression && (
-              <div className="mt-1 rounded px-2 py-1 text-[10px] font-medium" style={{ background: '#f59e0b18', color: '#f59e0b' }}>
-                Compression recommended
+              <div className="mt-1 rounded px-2 py-1 text-[10px] font-medium" style={{ background: 'var(--color-warning-bg)', color: 'var(--color-warning)' }}>
+                建议压缩
               </div>
             )}
           </div>
@@ -106,9 +106,9 @@ export function CompressPanel() {
         }}
       >
         {compressing ? (
-          <><div className="spinner" /> Compressing...</>
+          <><div className="spinner" /> 压缩中...</>
         ) : (
-          <><Zap size={12} /> Compress Context</>
+          <><Zap size={12} /> 压缩上下文</>
         )}
       </button>
 
@@ -126,18 +126,18 @@ export function CompressPanel() {
         <div className="rounded-lg border p-3" style={{ borderColor: 'var(--border-primary)' }}>
           <div className="flex items-center gap-2 mb-2">
             <Minimize2 size={14} style={{ color: 'var(--accent)' }} />
-            <span className="text-xs font-medium" style={{ color: 'var(--text-primary)' }}>Last Compression</span>
+            <span className="text-xs font-medium" style={{ color: 'var(--text-primary)' }}>上次压缩</span>
           </div>
           <div className="grid grid-cols-2 gap-2 text-xs">
             <div className="rounded-lg p-2 text-center" style={{ background: 'var(--bg-hover)' }}>
-              <div style={{ color: 'var(--text-tertiary)' }}>Messages</div>
+              <div style={{ color: 'var(--text-tertiary)' }}>消息数</div>
               <div className="font-medium" style={{ color: 'var(--text-primary)' }}>
                 {lastCompress.messages_before} → {lastCompress.messages_after}
               </div>
             </div>
             <div className="rounded-lg p-2 text-center" style={{ background: 'var(--bg-hover)' }}>
-              <div style={{ color: 'var(--text-tertiary)' }}>Tokens Saved</div>
-              <div className="font-medium" style={{ color: '#10b981' }}>
+              <div style={{ color: 'var(--text-tertiary)' }}>节省令牌</div>
+              <div className="font-medium" style={{ color: 'var(--color-success)' }}>
                 {lastCompress.tokens_saved}
               </div>
             </div>
@@ -148,7 +148,7 @@ export function CompressPanel() {
       {!stats && (
         <div className="py-8 text-center text-xs" style={{ color: 'var(--text-tertiary)' }}>
           <Minimize2 size={24} className="mx-auto mb-2" />
-          Send a message to see context stats
+          发送消息以查看上下文统计
         </div>
       )}
     </div>

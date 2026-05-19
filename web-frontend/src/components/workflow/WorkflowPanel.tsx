@@ -43,42 +43,55 @@ export function WorkflowPanel() {
   return (
     <div className="p-3 space-y-3">
       <div className="flex items-center justify-between">
-        <h3 className="text-sm font-semibold text-gray-700">Workflows ({workflows.length})</h3>
+        <h3 className="text-sm font-semibold text-[var(--text-primary)]">
+          工作流 ({workflows.length})
+        </h3>
       </div>
 
       {/* Create form */}
-      <div className="space-y-2 rounded border bg-gray-50 p-3">
+      <div className="space-y-2 rounded-lg border border-[var(--border-primary)] bg-[var(--bg-hover)] p-3">
         <input
           value={name}
           onChange={(e) => setName(e.target.value)}
-          className="w-full rounded border px-2 py-1 text-sm"
-          placeholder="Workflow name"
+          className="input w-full"
+          placeholder="工作流名称"
         />
         <textarea
           value={yaml}
           onChange={(e) => setYaml(e.target.value)}
-          className="w-full rounded border px-2 py-1 text-xs font-mono"
+          className="input w-full font-mono text-xs"
           rows={5}
-          placeholder="YAML definition..."
+          placeholder="YAML 定义..."
         />
-        <button onClick={create} className="w-full rounded bg-indigo-600 py-1.5 text-sm text-white hover:bg-indigo-700">
-          <Plus size={14} className="inline mr-1" /> Create
+        <button
+          onClick={create}
+          className="btn btn-primary w-full justify-center py-1.5 text-sm"
+        >
+          <Plus size={14} /> 创建
         </button>
       </div>
 
       {/* List */}
       {workflows.map((wf) => (
-        <div key={wf.id} className="rounded border border-gray-200 bg-white px-3 py-2">
+        <div key={wf.id} className="card px-3 py-2">
           <div className="flex items-center gap-2">
-            <GitBranch size={12} className="text-blue-500" />
-            <span className="text-xs font-medium">{wf.name || wf.id}</span>
-            <span className="rounded bg-gray-100 px-1.5 py-0.5 text-[10px] text-gray-500">{wf.status}</span>
+            <GitBranch size={12} style={{ color: 'var(--text-link)' }} />
+            <span className="text-xs font-medium text-[var(--text-primary)]">{wf.name || wf.id}</span>
+            <span className="badge text-[10px]">{wf.status}</span>
             <div className="ml-auto flex gap-1">
-              <button onClick={() => execute(wf.id)} className="rounded p-1 hover:bg-green-50" title="Execute">
-                <Play size={12} className="text-green-600" />
+              <button
+                onClick={() => execute(wf.id)}
+                className="rounded p-1 transition-colors hover:bg-[var(--bg-hover)]"
+                title="执行"
+              >
+                <Play size={12} style={{ color: 'var(--accent)' }} />
               </button>
-              <button onClick={() => remove(wf.id)} className="rounded p-1 hover:bg-red-50" title="Delete">
-                <Trash2 size={12} className="text-gray-400 hover:text-red-500" />
+              <button
+                onClick={() => remove(wf.id)}
+                className="rounded p-1 transition-colors hover:bg-[var(--bg-hover)]"
+                title="删除"
+              >
+                <Trash2 size={12} className="text-[var(--text-tertiary)] hover:text-red-500" />
               </button>
             </div>
           </div>

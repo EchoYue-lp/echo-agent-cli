@@ -16,8 +16,7 @@ use crate::state::AppState;
 pub async fn list_tools(
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    let agent = state.agent.lock().await;
-    let tools = state.get_tool_infos(&agent);
+    let tools = state.get_tool_infos(&state.connection.agent).await;
     Json(tools).into_response()
 }
 
@@ -27,8 +26,7 @@ pub async fn get_tool(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Response {
-    let agent = state.agent.lock().await;
-    let tools = state.get_tool_infos(&agent);
+    let tools = state.get_tool_infos(&state.connection.agent).await;
 
     match tools.into_iter().find(|t| t.name == name) {
         Some(tool) => Json(tool).into_response(),
@@ -44,7 +42,7 @@ pub async fn enable_tool(
 ) -> Response {
     // 更新工具状态
     {
-        let mut tool_states = state.tool_states.write().unwrap();
+        let mut tool_states = state.session.tool_states.write().await;
         tool_states
             .entry(name.clone())
             .and_modify(|s| s.enabled = true)
@@ -56,8 +54,7 @@ pub async fn enable_tool(
     }
 
     // 获取更新后的工具信息
-    let agent = state.agent.lock().await;
-    let tools = state.get_tool_infos(&agent);
+    let tools = state.get_tool_infos(&state.connection.agent).await;
 
     match tools.into_iter().find(|t| t.name == name) {
         Some(tool) => Json(tool).into_response(),
@@ -73,7 +70,7 @@ pub async fn disable_tool(
 ) -> Response {
     // 更新工具状态
     {
-        let mut tool_states = state.tool_states.write().unwrap();
+        let mut tool_states = state.session.tool_states.write().await;
         tool_states
             .entry(name.clone())
             .and_modify(|s| s.enabled = false)
@@ -85,8 +82,7 @@ pub async fn disable_tool(
     }
 
     // 获取更新后的工具信息
-    let agent = state.agent.lock().await;
-    let tools = state.get_tool_infos(&agent);
+    let tools = state.get_tool_infos(&state.connection.agent).await;
 
     match tools.into_iter().find(|t| t.name == name) {
         Some(tool) => Json(tool).into_response(),

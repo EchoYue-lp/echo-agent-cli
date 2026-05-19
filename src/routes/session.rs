@@ -8,18 +8,12 @@ use axum::{
 };
 use serde::Serialize;
 use std::sync::Arc;
-use echo_agent::agent::Agent;
 
 use crate::state::AppState;
 use crate::types::SessionInfo;
+use echo_agent::agent::Agent;
 
 // ── 类型定义 ─────────────────────────────────────────────────────
-
-#[derive(Debug, Serialize)]
-pub struct CheckpointInfo {
-    pub id: String,
-    pub created_at: String,
-}
 
 #[derive(Debug, Serialize)]
 pub struct SnapshotInfo {
@@ -35,16 +29,17 @@ pub struct SnapshotInfo {
 pub async fn get_session(
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    let agent = state.agent.lock().await;
-    let (message_count, _) = agent.context_stats();
+    state.connection.agent.read_async(|agent| Box::pin(async move {
+        let (message_count, _) = agent.context_stats().await;
 
-    Json(SessionInfo {
-        session_id: agent.config().get_session_id().map(|s| s.to_string()),
-        message_count,
-        tool_count: agent.tool_names().len(),
-        skill_count: agent.skill_names().len(),
-        mcp_server_count: agent.mcp_server_names().len(),
-    }).into_response()
+        Json(SessionInfo {
+            session_id: agent.config().get_session_id().map(|s| s.to_string()),
+            message_count,
+            tool_count: agent.tool_names().len(),
+            skill_count: agent.skill_names().len(),
+            mcp_server_count: agent.mcp_server_names().len(),
+        }).into_response()
+    })).await
 }
 
 /// POST /api/session/reset - 重置会话
@@ -52,24 +47,24 @@ pub async fn get_session(
 pub async fn reset_session(
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    let mut agent = state.agent.lock().await;
-    agent.reset();
+    state.connection.agent.write_async(|agent| Box::pin(async move {
+        agent.reset().await;
 
-    Json(SessionInfo {
-        session_id: agent.config().get_session_id().map(|s| s.to_string()),
-        message_count: 0,
-        tool_count: agent.tool_names().len(),
-        skill_count: agent.skill_names().len(),
-        mcp_server_count: agent.mcp_server_names().len(),
-    }).into_response()
+        Json(SessionInfo {
+            session_id: agent.config().get_session_id().map(|s| s.to_string()),
+            message_count: 0,
+            tool_count: agent.tool_names().len(),
+            skill_count: agent.skill_names().len(),
+            mcp_server_count: agent.mcp_server_names().len(),
+        }).into_response()
+    })).await
 }
 
 /// POST /api/session/checkpoint - 创建快照
 pub async fn create_checkpoint(
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    let mut agent = state.agent.lock().await;
-    let snapshot_id = agent.snapshot();
+    let snapshot_id = state.connection.agent.write_async(|agent| Box::pin(async move { agent.snapshot().await })).await;
 
     match snapshot_id {
         Some(id) => Json(serde_json::json!({
@@ -87,14 +82,15 @@ pub async fn create_checkpoint(
 pub async fn list_checkpoints(
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    let agent = state.agent.lock().await;
-    let snapshots: Vec<SnapshotInfo> = agent.snapshots().iter().map(|s| {
-        SnapshotInfo {
-            id: s.id.clone(),
-            iteration: s.iteration,
-            created_at: s.created_at,
-        }
-    }).collect();
+    let snapshots: Vec<SnapshotInfo> = state.connection.agent.read(|agent| {
+        agent.snapshots().iter().map(|s| {
+            SnapshotInfo {
+                id: s.id.clone(),
+                iteration: s.iteration,
+                created_at: s.created_at,
+            }
+        }).collect()
+    }).await;
 
     Json(snapshots).into_response()
 }
@@ -104,8 +100,8 @@ pub async fn restore_checkpoint(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(snapshot_id): axum::extract::Path<String>,
 ) -> Response {
-    let mut agent = state.agent.lock().await;
-    let result = agent.rollback_to(&snapshot_id);
+    let sid = snapshot_id.clone();
+    let result = state.connection.agent.write_async(|agent| Box::pin(async move { agent.rollback_to(&sid).await })).await;
 
     match result {
         Some(snapshot) => Json(serde_json::json!({

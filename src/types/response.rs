@@ -15,7 +15,7 @@ pub struct ChatResponse {
     pub context_stats: ContextStats,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ToolCallInfo {
     pub name: String,
     pub args: Value,
@@ -44,8 +44,6 @@ pub struct ToolInfo {
 #[derive(Debug, Serialize)]
 pub enum ToolSource {
     Builtin,
-    Mcp { server_name: String },
-    Skill { skill_name: String },
 }
 
 // ── MCP 相关 ─────────────────────────────────────────────────
@@ -64,6 +62,10 @@ pub struct McpServerInfo {
 #[derive(Debug, Serialize)]
 pub enum McpConnectionStatus {
     Connected,
+    #[allow(dead_code)]
+    Disconnected,
+    #[serde(rename = "error")]
+    Error(String),
 }
 
 #[derive(Debug, Serialize)]
@@ -105,6 +107,67 @@ pub struct AgentConfigResponse {
     pub available_models: Vec<String>,
 }
 
+/// GET /api/config/full — 完整配置（用于前端配置面板）
+#[derive(Debug, Serialize)]
+pub struct FullConfigResponse {
+    pub model: ModelConfigResponse,
+    pub agent: AgentConfigResponse,
+    pub mcp: McpConfigResponse,
+    pub channels: ChannelsConfigResponse,
+    pub server: ServerConfigResponse,
+    pub logging: LoggingConfigResponse,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ModelConfigResponse {
+    pub name: String,
+    pub max_tokens: Option<u32>,
+    pub temperature: Option<f32>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct McpConfigResponse {
+    pub config_path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChannelsConfigResponse {
+    pub qq: QqConfigResponse,
+    pub feishu: FeishuConfigResponse,
+    pub session: SessionConfigResponse,
+}
+
+#[derive(Debug, Serialize)]
+pub struct QqConfigResponse {
+    pub enabled: bool,
+    pub app_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FeishuConfigResponse {
+    pub enabled: bool,
+    pub app_id: String,
+    pub mode: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SessionConfigResponse {
+    pub timeout_minutes: u64,
+    pub reset_keywords: Vec<String>,
+    pub reset_commands: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ServerConfigResponse {
+    pub host: String,
+    pub port: u16,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LoggingConfigResponse {
+    pub level: String,
+}
+
 // ── 会话相关 ─────────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]
@@ -123,26 +186,47 @@ pub struct SessionInfo {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
     /// Token 片段
-    Token { data: String },
+    Token {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        data: String,
+    },
 
     /// 工具开始执行
-    ToolStart { name: String, args: Value },
+    ToolStart {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        name: String,
+        args: Value,
+    },
 
     /// 工具执行结果
     ToolResult {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         name: String,
         result: String,
         success: bool,
     },
 
     /// 最终答案
-    FinalAnswer { data: String },
+    FinalAnswer {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        data: String,
+    },
 
     /// 错误
-    Error { message: String },
+    Error {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        message: String,
+    },
 
     /// 审批请求
     ApprovalRequest {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
         request_id: String,
         tool_name: String,
         args: Value,
@@ -150,8 +234,37 @@ pub enum ServerMessage {
     },
 
     /// 输入请求
-    InputRequest { request_id: String, prompt: String },
+    InputRequest {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        request_id: String,
+        prompt: String,
+    },
+
+    /// 图表（vega-lite JSON 规范）
+    Chart {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        spec: Value,
+    },
 
     /// 执行被取消
-    Cancelled {},
+    Cancelled {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
+
+    /// 思考阶段开始
+    ThinkingStart {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
+
+    /// 思考阶段结束
+    ThinkingEnd {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        prompt_tokens: usize,
+        completion_tokens: usize,
+    },
 }

@@ -115,9 +115,7 @@ fn default_format() -> String {
 pub async fn get_history(
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    let agent = state.agent.lock().await;
-
-    let messages = agent.get_messages();
+    let messages = state.connection.agent.read_async(|agent| Box::pin(async move { agent.get_messages().await })).await;
     let total = messages.len();
 
     let items: Vec<MessageItem> = messages
@@ -135,8 +133,8 @@ pub async fn get_history(
             });
 
             MessageItem {
-                role: msg.role.clone(),
-                content: msg.content.clone(),
+                role: msg.role.as_str().to_string(),
+                content: msg.content.as_deref().map(|s| s.to_string()),
                 tool_calls,
             }
         })
@@ -144,6 +142,8 @@ pub async fn get_history(
 
     Json(HistoryResponse { messages: items, total }).into_response()
 }
+
+
 
 /// GET /api/history/export - 导出对话历史
 ///
@@ -163,17 +163,15 @@ pub async fn export_history(
     State(state): State<Arc<AppState>>,
     query: axum::extract::Query<ExportQuery>,
 ) -> Response {
-    let agent = state.agent.lock().await;
-
-    let messages = agent.get_messages();
+    let messages = state.connection.agent.read_async(|agent| Box::pin(async move { agent.get_messages().await })).await;
     let message_count = messages.len();
 
     let content = match query.format.as_str() {
         "json" => {
-            export_as_json(messages)
+            export_as_json(&messages)
         }
-        "markdown" | _ => {
-            export_as_markdown(messages)
+        _ => {
+            export_as_markdown(&messages)
         }
     };
 
@@ -204,8 +202,8 @@ fn export_as_json(messages: &[echo_agent::prelude::Message]) -> String {
             });
 
             MessageItem {
-                role: msg.role.clone(),
-                content: msg.content.clone(),
+                role: msg.role.as_str().to_string(),
+                content: msg.content.as_deref().map(|s| s.to_string()),
                 tool_calls,
             }
         })
@@ -229,10 +227,10 @@ fn export_as_markdown(messages: &[echo_agent::prelude::Message]) -> String {
             _ => "💬",
         };
 
-        md.push_str(&format!("## {} {}\n\n", role_emoji, msg.role));
+        md.push_str(&format!("## {} {}\n\n", role_emoji, msg.role.as_str()));
 
         // 消息内容
-        if let Some(content) = &msg.content {
+        if let Some(content) = msg.content.as_deref() {
             md.push_str(content);
             md.push_str("\n\n");
         }
@@ -247,7 +245,7 @@ fn export_as_markdown(messages: &[echo_agent::prelude::Message]) -> String {
                     tc.function.arguments
                 ));
             }
-            md.push_str("\n");
+            md.push('\n');
         }
     }
 

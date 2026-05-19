@@ -1,14 +1,24 @@
 import { useRef, useCallback, useEffect, useState } from 'react';
 import { useChatStore } from '../stores/chatStore';
-import type { ClientMessage, ServerMessage } from '../types/api';
+import type { ClientMessage, ServerMessage, Attachment } from '../types/api';
 
 export type ConnectionStatus = 'connected' | 'disconnected' | 'connecting';
+
+const INITIAL_RECONNECT_MS = 1000;
+const MAX_RECONNECT_MS = 30000;
 
 export function useWebSocket() {
   const wsRef = useRef<WebSocket | null>(null);
   const assistantIdRef = useRef<string | null>(null);
+  const inThinkingRef = useRef(false);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const retryCount = useRef(0);
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('connecting');
+
+  const getReconnectDelay = useCallback(() => {
+    const delay = Math.min(INITIAL_RECONNECT_MS * Math.pow(2, retryCount.current), MAX_RECONNECT_MS);
+    return delay;
+  }, []);
 
   const connect = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
@@ -20,6 +30,7 @@ export function useWebSocket() {
     ws.onopen = () => {
       console.log('[WS] connected');
       setConnectionStatus('connected');
+      retryCount.current = 0; // Reset backoff on successful connection
     };
 
     ws.onmessage = (ev) => {
@@ -31,9 +42,25 @@ export function useWebSocket() {
           if (!assistantIdRef.current) {
             assistantIdRef.current = store.startAssistantMessage();
           }
-          store.appendToken(assistantIdRef.current, msg.data);
+          if (inThinkingRef.current) {
+            store.appendThinking(assistantIdRef.current, msg.data);
+          } else {
+            store.appendToken(assistantIdRef.current, msg.data);
+          }
           break;
         }
+        case 'thinking_start':
+          inThinkingRef.current = true;
+          store.setThinking(true);
+          if (!assistantIdRef.current) {
+            assistantIdRef.current = store.startAssistantMessage();
+          }
+          store.startThinkingSegment(assistantIdRef.current);
+          break;
+        case 'thinking_end':
+          inThinkingRef.current = false;
+          store.setThinking(false);
+          break;
         case 'tool_start':
           store.setToolCall(msg.name, msg.args);
           break;
@@ -58,6 +85,9 @@ export function useWebSocket() {
         case 'input_request':
           store.setInputRequest({ requestId: msg.request_id, prompt: msg.prompt });
           break;
+        case 'chart':
+          store.addChartMessage(msg.spec);
+          break;
         case 'error': {
           if (assistantIdRef.current) {
             store.finalizeAssistantMessage(assistantIdRef.current, `[Error] ${msg.message}`);
@@ -72,16 +102,18 @@ export function useWebSocket() {
     };
 
     ws.onclose = () => {
-      console.log('[WS] disconnected, reconnecting in 2s...');
+      const delay = getReconnectDelay();
+      retryCount.current += 1;
+      console.log(`[WS] disconnected, reconnecting in ${delay}ms (attempt ${retryCount.current})`);
       setConnectionStatus('disconnected');
-      reconnectTimer.current = setTimeout(connect, 2000);
+      reconnectTimer.current = setTimeout(connect, delay);
     };
 
     ws.onerror = () => {
       console.error('[WS] error');
       setConnectionStatus('disconnected');
     };
-  }, []);
+  }, [getReconnectDelay]);
 
   const send = useCallback((msg: ClientMessage) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -89,10 +121,17 @@ export function useWebSocket() {
     }
   }, []);
 
-  const sendMessage = useCallback((text: string) => {
+  const sendMessage = useCallback((text: string, attachments?: Attachment[]) => {
     const store = useChatStore.getState();
-    store.addUserMessage(text);
-    send({ type: 'message', data: text });
+    // 创建显示用的附件（data URL）
+    const displayAttachments = attachments?.map((a) => ({
+      name: a.name,
+      mime_type: a.mime_type,
+      url: `data:${a.mime_type};base64,${a.data}`,
+      size: a.size,
+    }));
+    store.addUserMessage(text || '(附件)', displayAttachments);
+    send({ type: 'message', data: text, attachments });
     assistantIdRef.current = store.startAssistantMessage();
   }, [send]);
 

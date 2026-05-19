@@ -73,7 +73,8 @@ pub struct SearchMemoryRequest {
     /// 搜索的命名空间
     #[serde(default = "default_namespace")]
     pub namespace: String,
-    /// 搜索关键词
+    /// 搜索关键词，如果为空则返回所有记忆
+    #[serde(default)]
     pub query: String,
     /// 返回结果数量限制，默认 10
     #[serde(default = "default_limit")]
@@ -100,6 +101,21 @@ pub struct GetMemoryQuery {
     pub namespace: String,
     /// 记忆键
     pub key: String,
+}
+
+/// 列出记忆查询参数
+#[derive(Debug, Deserialize)]
+pub struct ListMemoryQuery {
+    /// 命名空间
+    #[serde(default = "default_namespace")]
+    pub namespace: String,
+    /// 返回结果数量限制，默认 100
+    #[serde(default = "default_list_limit")]
+    pub limit: usize,
+}
+
+fn default_list_limit() -> usize {
+    100
 }
 
 // ── 响应类型 ─────────────────────────────────────────────────
@@ -133,15 +149,6 @@ pub struct AddMemoryResponse {
 }
 
 /// 搜索记忆响应
-#[derive(Debug, Serialize)]
-pub struct SearchMemoryResponse {
-    /// 匹配的记忆列表
-    pub items: Vec<MemoryItemResponse>,
-    /// 总数量
-    pub total: usize,
-}
-
-/// 删除记忆响应
 #[derive(Debug, Serialize)]
 pub struct DeleteMemoryResponse {
     /// 是否成功删除
@@ -177,10 +184,8 @@ pub async fn add_memory(
     State(state): State<Arc<AppState>>,
     Json(req): Json<AddMemoryRequest>,
 ) -> Response {
-    let agent = state.agent.lock().await;
-
     // 获取 Store
-    let store = match agent.store() {
+    let store = match state.connection.agent.read(|agent| agent.store().cloned()).await {
         Some(s) => s,
         None => {
             return WebError::Internal("Memory 未启用，请在配置中设置 enable_memory=true".to_string())
@@ -214,9 +219,7 @@ pub async fn get_memory(
     State(state): State<Arc<AppState>>,
     query: axum::extract::Query<GetMemoryQuery>,
 ) -> Response {
-    let agent = state.agent.lock().await;
-
-    let store = match agent.store() {
+    let store = match state.connection.agent.read(|agent| agent.store().cloned()).await {
         Some(s) => s,
         None => {
             return WebError::Internal("Memory 未启用".to_string()).into_response();
@@ -253,9 +256,7 @@ pub async fn search_memory(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SearchMemoryRequest>,
 ) -> Response {
-    let agent = state.agent.lock().await;
-
-    let store = match agent.store() {
+    let store = match state.connection.agent.read(|agent| agent.store().cloned()).await {
         Some(s) => s,
         None => {
             return WebError::Internal("Memory 未启用".to_string()).into_response();
@@ -266,7 +267,7 @@ pub async fn search_memory(
 
     match store.search(&namespace, &req.query, req.limit).await {
         Ok(items) => {
-            let total = items.len();
+            let _total = items.len();
             let response_items: Vec<MemoryItemResponse> = items
                 .into_iter()
                 .map(|item| MemoryItemResponse {
@@ -279,11 +280,7 @@ pub async fn search_memory(
                 })
                 .collect();
 
-            Json(SearchMemoryResponse {
-                items: response_items,
-                total,
-            })
-            .into_response()
+            Json(response_items).into_response()
         }
         Err(e) => WebError::Internal(format!("搜索记忆失败: {}", e)).into_response(),
     }
@@ -297,9 +294,7 @@ pub async fn delete_memory(
     State(state): State<Arc<AppState>>,
     Json(req): Json<DeleteMemoryRequest>,
 ) -> Response {
-    let agent = state.agent.lock().await;
-
-    let store = match agent.store() {
+    let store = match state.connection.agent.read(|agent| agent.store().cloned()).await {
         Some(s) => s,
         None => {
             return WebError::Internal("Memory 未启用".to_string()).into_response();
@@ -329,9 +324,7 @@ pub async fn delete_memory(
 pub async fn list_namespaces(
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    let agent = state.agent.lock().await;
-
-    let store = match agent.store() {
+    let store = match state.connection.agent.read(|agent| agent.store().cloned()).await {
         Some(s) => s,
         None => {
             return WebError::Internal("Memory 未启用".to_string()).into_response();
@@ -341,6 +334,43 @@ pub async fn list_namespaces(
     match store.list_namespaces(None).await {
         Ok(namespaces) => Json(NamespacesResponse { namespaces }).into_response(),
         Err(e) => WebError::Internal(format!("获取命名空间失败: {}", e)).into_response(),
+    }
+}
+
+/// GET /api/memory/list - 列出命名空间中的所有记忆
+///
+/// 返回指定命名空间中的所有记忆项。
+#[debug_handler]
+pub async fn list_memory(
+    State(state): State<Arc<AppState>>,
+    query: axum::extract::Query<ListMemoryQuery>,
+) -> Response {
+    let store = match state.connection.agent.read(|agent| agent.store().cloned()).await {
+        Some(s) => s,
+        None => {
+            return WebError::Internal("Memory 未启用".to_string()).into_response();
+        }
+    };
+
+    let namespace: Vec<&str> = query.namespace.split('/').collect();
+
+    // 使用空查询搜索以获取所有记忆
+    match store.search(&namespace, "", query.limit).await {
+        Ok(items) => {
+            let response_items: Vec<MemoryItemResponse> = items
+                .into_iter()
+                .map(|item| MemoryItemResponse {
+                    namespace: item.namespace.join("/"),
+                    key: item.key,
+                    value: item.value,
+                    created_at: item.created_at,
+                    updated_at: item.updated_at,
+                    score: None,
+                })
+                .collect();
+            Json(response_items).into_response()
+        }
+        Err(e) => WebError::Internal(format!("列出记忆失败: {}", e)).into_response(),
     }
 }
 

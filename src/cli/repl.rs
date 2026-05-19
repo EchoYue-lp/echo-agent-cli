@@ -5,29 +5,84 @@
 //! - 历史记录
 //! - 自动补全
 //! - 流式输出显示
+//! - 思考步骤可视化
+//! - 工具调用交互式审批
+//! - Token 用量追踪
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use futures::StreamExt;
 use nu_ansi_term::Color;
 use reedline::{
-    default_emacs_keybindings, ColumnarMenu, DefaultCompleter, Emacs,
-    FileBackedHistory, Keybindings, MenuBuilder, Prompt, PromptHistorySearchStatus,
-    Reedline, ReedlineEvent, ReedlineMenu, Signal,
+    Prompt, PromptHistorySearchStatus, Signal,
 };
 
 use echo_agent::prelude::*;
+use crate::agent_handle::AgentHandle;
 
+use crate::output::OutputRenderer;
 use super::commands::{CommandHandler, CommandResult};
+use super::editor::{create_enhanced_editor, EditorConfig};
+
+static TOTAL_INPUT_TOKENS: AtomicUsize = AtomicUsize::new(0);
+static TOTAL_OUTPUT_TOKENS: AtomicUsize = AtomicUsize::new(0);
+static TOTAL_TOOL_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+pub fn get_usage_stats() -> (usize, usize, usize) {
+    (
+        TOTAL_INPUT_TOKENS.load(Ordering::Relaxed),
+        TOTAL_OUTPUT_TOKENS.load(Ordering::Relaxed),
+        TOTAL_TOOL_CALLS.load(Ordering::Relaxed),
+    )
+}
+
+pub fn reset_usage_stats() {
+    TOTAL_INPUT_TOKENS.store(0, Ordering::Relaxed);
+    TOTAL_OUTPUT_TOKENS.store(0, Ordering::Relaxed);
+    TOTAL_TOOL_CALLS.store(0, Ordering::Relaxed);
+}
+
+// ── Trace Buffer ──────────────────────────────────────────────────
+
+/// A single trace entry captured during streaming.
+#[derive(Debug, Clone)]
+pub struct TraceEntry {
+    pub event_type: String,
+    pub detail: String,
+    pub elapsed_ms: u64,
+}
+
+static TRACE_BUFFER: std::sync::LazyLock<Mutex<Vec<TraceEntry>>> =
+    std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Record a trace entry (called during stream processing).
+pub fn push_trace(entry: TraceEntry) {
+    let mut buf = TRACE_BUFFER.lock().unwrap();
+    // Keep only last 200 entries
+    if buf.len() >= 200 {
+        let excess = buf.len() - 199;
+        buf.drain(0..excess);
+    }
+    buf.push(entry);
+}
+
+/// Clear the trace buffer at the start of a new chat.
+pub fn clear_trace() {
+    TRACE_BUFFER.lock().unwrap().clear();
+}
+
+/// Get a snapshot of the current trace buffer.
+pub fn get_trace() -> Vec<TraceEntry> {
+    TRACE_BUFFER.lock().unwrap().clone()
+}
 
 /// REPL 配置
 pub struct ReplConfig {
-    /// 提示符
     pub prompt: String,
-    /// 历史文件路径
     pub history_file: String,
-    /// 是否启用自动补全
-    pub enable_completion: bool,
+    pub mode: String,
+    pub project: Option<String>,
 }
 
 impl Default for ReplConfig {
@@ -35,26 +90,45 @@ impl Default for ReplConfig {
         Self {
             prompt: "echo".to_string(),
             history_file: "~/.echo-agent/history.txt".to_string(),
-            enable_completion: true,
+            mode: "general".to_string(),
+            project: None,
         }
     }
 }
 
 /// 运行 REPL
-pub async fn run_repl(agent: Arc<tokio::sync::Mutex<ReactAgent>>, config: ReplConfig) -> anyhow::Result<()> {
-    // 打印欢迎信息
-    print_welcome();
+pub async fn run_repl(agent: AgentHandle, config: ReplConfig) -> anyhow::Result<()> {
+    let output = OutputRenderer::default();
 
-    // 创建命令处理器
+    output.print_banner(env!("CARGO_PKG_VERSION"));
+
+    let model_name = agent.read(|a| a.model_name().to_string()).await;
+    let instructions_count = if config.project.is_some() {
+        let ctx = crate::project::context::load_project_context(
+            std::path::Path::new(config.project.as_deref().unwrap_or(".")),
+        );
+        ctx.instructions.len()
+    } else {
+        0
+    };
+    output.print_session_info(
+        &config.mode,
+        &model_name,
+        config.project.as_deref(),
+        instructions_count,
+    );
+
     let cmd_handler = CommandHandler::new(agent.clone());
 
-    // 创建 Reedline 编辑器
-    let mut line_editor = create_line_editor(&config)?;
+    let editor_config = EditorConfig {
+        prompt: config.prompt.clone(),
+        history_file: config.history_file.clone(),
+        ..Default::default()
+    };
+    let mut line_editor = create_enhanced_editor(&editor_config)?;
 
-    // 自定义提示符
     let prompt = EchoPrompt::new(&config.prompt);
 
-    // 主循环
     loop {
         let signal = line_editor.read_line(&prompt);
 
@@ -65,27 +139,23 @@ pub async fn run_repl(agent: Arc<tokio::sync::Mutex<ReactAgent>>, config: ReplCo
                     continue;
                 }
 
-                // 处理命令或对话
                 match cmd_handler.handle(line).await {
                     CommandResult::Continue => {}
                     CommandResult::Exit => break,
                     CommandResult::Chat(message) => {
-                        // 执行对话
-                        chat_with_agent(&agent, &message).await;
+                        chat_with_agent(&agent, &message, &output).await;
                     }
                 }
             }
             Ok(Signal::CtrlC) => {
-                // Ctrl+C: 取消当前输入
-                println!("\n（输入 /exit 退出）");
+                output.print_info("（输入 /exit 退出）");
             }
             Ok(Signal::CtrlD) => {
-                // Ctrl+D: 退出
-                println!("\n👋 再见！");
+                output.print_success("再见！");
                 break;
             }
             Err(err) => {
-                eprintln!("错误: {}", err);
+                output.print_error(&format!("错误: {}", err));
             }
         }
     }
@@ -94,186 +164,198 @@ pub async fn run_repl(agent: Arc<tokio::sync::Mutex<ReactAgent>>, config: ReplCo
 }
 
 /// 与 Agent 对话
-async fn chat_with_agent(agent: &Arc<tokio::sync::Mutex<ReactAgent>>, message: &str) {
-    let mut agent = agent.lock().await;
+async fn chat_with_agent(
+    agent: &AgentHandle,
+    message: &str,
+    output: &OutputRenderer,
+) {
+    let agent = agent.inner().read().await;
 
-    print_user_message(message);
+    output.print_user_message(message);
+    clear_trace();
 
-    // 使用流式输出
     match agent.chat_stream(message).await {
         Ok(mut stream) => {
-            print!("\n");
+            println!();
             let mut first_chunk = true;
+            let mut iteration_count: u32 = 0;
+            let mut tool_call_count: u32 = 0;
+            let start_time = std::time::Instant::now();
 
             while let Some(result) = stream.next().await {
                 match result {
                     Ok(event) => {
+                        // Record trace entry for significant events
+                        {
+                            let (etype, detail) = match &event {
+                                AgentEvent::ThinkStart => ("think_start".into(), format!("step {}", iteration_count + 1)),
+                                AgentEvent::ThinkEnd { prompt_tokens, completion_tokens } =>
+                                    ("think_end".into(), format!("in={prompt_tokens} out={completion_tokens}")),
+                                AgentEvent::ToolCall { name, .. } => ("tool_call".into(), name.clone()),
+                                AgentEvent::ToolResult { name, .. } => ("tool_result".into(), name.clone()),
+                                AgentEvent::ToolError { name, .. } => ("tool_error".into(), name.clone()),
+                                AgentEvent::FinalAnswer(_) => ("final_answer".into(), String::new()),
+                                AgentEvent::Cancelled => ("cancelled".into(), String::new()),
+                                AgentEvent::PlanGenerated { steps } => ("plan".into(), format!("{} steps", steps.len())),
+                                AgentEvent::StepStart { description, .. } => ("step_start".into(), description.chars().take(60).collect()),
+                                AgentEvent::HandoffStart { from, to } => ("handoff".into(), format!("{from}->{to}")),
+                                AgentEvent::ContextCompressed { before_tokens, after_tokens, .. } =>
+                                    ("compressed".into(), format!("{before_tokens}->{after_tokens}")),
+                                _ => (String::new(), String::new()),
+                            };
+                            if !etype.is_empty() {
+                                push_trace(TraceEntry {
+                                    event_type: etype,
+                                    detail,
+                                    elapsed_ms: start_time.elapsed().as_millis() as u64,
+                                });
+                            }
+                        }
                         match event {
+                            AgentEvent::ThinkStart => {
+                                if !first_chunk {
+                                    println!();
+                                }
+                                iteration_count += 1;
+                                let step_label = format!(
+                                    "  ⏳ 思考中 (步骤 {})...",
+                                    iteration_count
+                                );
+                                let styled = nu_ansi_term::Color::Fixed(8).paint(&step_label);
+                                println!("{}", styled);
+                                first_chunk = true;
+                            }
+                            AgentEvent::ThinkEnd { prompt_tokens, completion_tokens } => {
+                                TOTAL_INPUT_TOKENS.fetch_add(prompt_tokens, Ordering::Relaxed);
+                                TOTAL_OUTPUT_TOKENS.fetch_add(completion_tokens, Ordering::Relaxed);
+                            }
                             AgentEvent::Token(token) => {
                                 if first_chunk {
-                                    print_assistant_prefix();
+                                    output.print_assistant_prefix();
                                     first_chunk = false;
                                 }
-                                print!("{}", token);
-                                use std::io::Write;
-                                std::io::stdout().flush().ok();
+                                output.print_token(&token);
                             }
                             AgentEvent::ToolCall { name, args } => {
+                                tool_call_count += 1;
+                                TOTAL_TOOL_CALLS.fetch_add(1, Ordering::Relaxed);
                                 if !first_chunk {
                                     println!();
                                 }
-                                print_tool_call(&name, &args);
+                                output.print_tool_call(&name, &args);
                                 first_chunk = true;
                             }
-                            AgentEvent::ToolResult { name, output, .. } => {
-                                print_tool_result(&name, &output);
+                            AgentEvent::ToolResult { name, output: tool_output } => {
+                                output.print_tool_result(&name, &tool_output, true);
                                 first_chunk = true;
                             }
-                            AgentEvent::FinalAnswer(answer) => {
-                                if !first_chunk {
-                                    println!();
-                                }
-                                print_final_answer(&answer);
+                            AgentEvent::ToolError { name, error } => {
+                                let err_text = format!("✗ {}: {}", name, error);
+                                let styled = nu_ansi_term::Color::Red.paint(&err_text);
+                                println!("  {}", styled);
+                                crate::webhook::emitter::emit_global(
+                                    crate::webhook::WebhookEvent::ToolFailed {
+                                        name: name.clone(),
+                                        error: error.clone(),
+                                    }
+                                );
+                                first_chunk = true;
+                            }
+                            AgentEvent::FinalAnswer(_answer) if !first_chunk => {
+                                println!();
                             }
                             AgentEvent::Cancelled => {
-                                println!("\n⚠️ 执行已取消");
+                                output.print_warning("执行已取消");
+                            }
+                            AgentEvent::PlanGenerated { steps } => {
+                                let plan_label = nu_ansi_term::Color::Cyan.paint("  📋 执行计划:");
+                                println!("\n{}", plan_label);
+                                for (i, step) in steps.iter().enumerate() {
+                                    let step_text = format!("    {}. {}", i + 1, step);
+                                    let styled = nu_ansi_term::Color::Fixed(12).paint(&step_text);
+                                    println!("{}", styled);
+                                }
+                                first_chunk = true;
+                            }
+                            AgentEvent::StepStart { step_index: _, description } => {
+                                let desc_preview: String = description.chars().take(60).collect();
+                                let step_label = format!("  ▶ 执行: {}...", desc_preview);
+                                let styled = nu_ansi_term::Color::Fixed(8).paint(&step_label);
+                                println!("{}", styled);
+                            }
+                            AgentEvent::StepEnd { .. } => {}
+                            AgentEvent::HandoffStart { from, to } => {
+                                let handoff_label = format!("  🔀 交接: {} -> {}", from, to);
+                                let styled = nu_ansi_term::Color::Yellow.paint(&handoff_label);
+                                println!("\n{}", styled);
+                                first_chunk = true;
+                            }
+                            AgentEvent::HandoffEnd { .. } => {}
+                            AgentEvent::MemoryRecalled { .. } => {}
+                            AgentEvent::Chart { .. } => {}
+                            AgentEvent::GuardTriggered { .. } => {}
+                            AgentEvent::ReflectionStart { .. } => {}
+                            AgentEvent::ReflectionEnd { .. } => {}
+                            AgentEvent::CritiqueGenerated { .. } => {}
+                            AgentEvent::Refining { .. } => {}
+                            AgentEvent::Error { .. } => {}
+                            AgentEvent::ContextCompressed { before_count, after_count, before_tokens, after_tokens } => {
+                                let saved = before_tokens.saturating_sub(after_tokens);
+                                let styled = nu_ansi_term::Color::Fixed(8).paint(
+                                    format!("  📦 上下文自动压缩: {}→{} 条消息, {}→{} tokens (节省 {})", before_count, after_count, before_tokens, after_tokens, saved)
+                                );
+                                println!("{}", styled);
                             }
                             _ => {}
                         }
                     }
                     Err(e) => {
-                        println!("\n❌ 错误: {}", e);
+                        output.print_error(&format!("错误: {}", e));
                         break;
                     }
                 }
             }
+
+            let elapsed = start_time.elapsed();
+
+            // Emit ChatCompleted webhook
+            {
+                let (input_tokens, output_tokens, _) = get_usage_stats();
+                crate::webhook::emitter::emit_global(
+                    crate::webhook::WebhookEvent::ChatCompleted {
+                        model: String::new(), // model not easily available here
+                        input_tokens,
+                        output_tokens,
+                        elapsed_ms: elapsed.as_millis() as u64,
+                    }
+                );
+            }
+
+            let config = output.config();
+
+            if config.show_token_stats || config.show_tool_details {
+                println!();
+                let duration_str = if elapsed.as_secs() >= 60 {
+                    format!("{}m {}s", elapsed.as_secs() / 60, elapsed.as_secs() % 60)
+                } else {
+                    format!("{:.1}s", elapsed.as_secs_f64())
+                };
+                let stats = format!("  ⏱ {:.0}  🔧 {} 工具调用", duration_str, tool_call_count);
+                let styled = nu_ansi_term::Color::Fixed(8).paint(&stats);
+                println!("{}", styled);
+            }
+
             println!();
         }
         Err(e) => {
-            println!("\n❌ 对话失败: {}", e);
+            output.print_error(&format!("对话失败: {}", e));
+            crate::webhook::emitter::emit_global(
+                crate::webhook::WebhookEvent::AgentError {
+                    error: e.to_string(),
+                }
+            );
         }
     }
-}
-
-/// 打印欢迎信息
-fn print_welcome() {
-    println!();
-    println!("{}", Color::Cyan.paint("╭─────────────────────────────────────────────────────────────╮"));
-    println!("{}", Color::Cyan.paint("│                                                             │"));
-    println!("{}", Color::Cyan.paint("│   🤖 Echo Agent CLI - AI Agent 命令行工具                    │"));
-    println!("{}", Color::Cyan.paint("│                                                             │"));
-    println!("{}", Color::Cyan.paint("│   输入消息开始对话，或输入 /help 查看帮助                    │"));
-    println!("{}", Color::Cyan.paint("│                                                             │"));
-    println!("{}", Color::Cyan.paint("╰─────────────────────────────────────────────────────────────╯"));
-    println!();
-}
-
-/// 打印用户消息
-fn print_user_message(message: &str) {
-    println!("\n{} {}", Color::Blue.paint("👤 You:"), message);
-}
-
-/// 打印助手前缀
-fn print_assistant_prefix() {
-    print!("{} ", Color::Green.paint("🤖 Assistant:"));
-}
-
-/// 打印工具调用
-fn print_tool_call(name: &str, args: &serde_json::Value) {
-    println!(
-        "\n  {} {} {}",
-        Color::Yellow.paint("🔧 调用工具:"),
-        Color::Yellow.bold().paint(name),
-        Color::DarkGray.paint(format!("{}", args))
-    );
-}
-
-/// 打印工具结果
-fn print_tool_result(name: &str, output: &str) {
-    let preview: String = output.chars().take(200).collect();
-    let suffix = if output.len() > 200 { "..." } else { "" };
-    println!(
-        "  {} {}: {}{}",
-        Color::DarkGray.paint("↳"),
-        Color::DarkGray.paint(name),
-        Color::DarkGray.paint(preview),
-        suffix
-    );
-}
-
-/// 打印最终答案
-fn print_final_answer(answer: &str) {
-    // 已经在流式输出中打印了
-    let _ = answer;
-}
-
-/// 创建 Reedline 编辑器
-fn create_line_editor(config: &ReplConfig) -> anyhow::Result<Reedline> {
-    // 扩展历史文件路径
-    let history_path = shellexpand::tilde(&config.history_file);
-    let history_path = std::path::Path::new(history_path.as_ref());
-
-    // 创建历史目录
-    if let Some(parent) = history_path.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-
-    // 创建历史记录
-    let history = FileBackedHistory::with_file(1000, history_path.to_path_buf())?;
-
-    // 创建补全器
-    let completer = create_completer();
-
-    // 创建菜单
-    let menu = ReedlineMenu::EngineCompleter(Box::new(ColumnarMenu::default().with_name("completion_menu")));
-
-    // 创建键绑定
-    let keybindings = create_keybindings();
-
-    // 创建编辑器
-    let editor = Reedline::create()
-        .with_history(Box::new(history))
-        .with_completer(Box::new(completer))
-        .with_menu(menu)
-        .with_edit_mode(Box::new(Emacs::new(keybindings)));
-
-    Ok(editor)
-}
-
-/// 创建补全器
-fn create_completer() -> DefaultCompleter {
-    let commands = vec![
-        "/help", "/h", "/?",
-        "/exit", "/quit", "/q",
-        "/reset", "/r",
-        "/clear", "/cls",
-        "/tools", "/t",
-        "/skills", "/sk",
-        "/mcp", "/m",
-        "/history", "/hist",
-        "/compress", "/cp",
-        "/stats", "/st",
-        "/model",
-        "/system", "/sys",
-        "/save",
-        "/load",
-    ];
-
-    DefaultCompleter::new_with_wordlen(commands.into_iter().map(String::from).collect(), 2)
-}
-
-/// 创建键绑定
-fn create_keybindings() -> Keybindings {
-    let mut keybindings = default_emacs_keybindings();
-
-    // Ctrl+L: 清屏
-    keybindings.add_binding(
-        reedline::KeyModifiers::CONTROL,
-        reedline::KeyCode::Char('l'),
-        ReedlineEvent::ExecuteHostCommand("clear".to_string()),
-    );
-
-    keybindings
 }
 
 /// 自定义提示符
@@ -332,7 +414,6 @@ mod tests {
     fn test_repl_config_default() {
         let config = ReplConfig::default();
         assert_eq!(config.prompt, "echo");
-        assert!(config.enable_completion);
     }
 
     #[test]

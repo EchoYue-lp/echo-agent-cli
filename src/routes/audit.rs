@@ -5,7 +5,7 @@ use serde::Serialize;
 use std::sync::Arc;
 
 use crate::error::AppError;
-use crate::state::{AuditLogEntry, AppState};
+use crate::state::{AuditDecision, AuditLogEntry, AppState};
 
 // ── 类型定义 ─────────────────────────────────────────────────────
 
@@ -23,19 +23,19 @@ pub struct AuditStats {
 pub async fn get_audit_logs(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Vec<AuditLogEntry>>, AppError> {
-    let logs = state.audit_logs.read().unwrap();
-    Ok(Json(logs.clone()))
+    let logs = state.get_audit_logs().await;
+    Ok(Json(logs))
 }
 
 /// GET /api/audit/stats
 pub async fn get_audit_stats(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<AuditStats>, AppError> {
-    let logs = state.audit_logs.read().unwrap();
+    let logs = state.get_audit_logs().await;
     let total_entries = logs.len();
-    let allow_count = logs.iter().filter(|l| l.decision == "allow").count();
-    let deny_count = logs.iter().filter(|l| l.decision == "deny").count();
-    let ask_count = logs.iter().filter(|l| l.decision == "ask").count();
+    let allow_count = logs.iter().filter(|l| l.decision == AuditDecision::Allow).count();
+    let deny_count = logs.iter().filter(|l| l.decision == AuditDecision::Deny).count();
+    let ask_count = logs.iter().filter(|l| l.decision == AuditDecision::Ask).count();
 
     Ok(Json(AuditStats {
         total_entries,
@@ -50,9 +50,7 @@ pub async fn clear_audit_logs(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     tracing::info!("清空审计日志");
-    let mut logs = state.audit_logs.write().unwrap();
-    let count = logs.len();
-    logs.clear();
+    let count = state.clear_audit_entries().await;
     Ok(Json(serde_json::json!({
         "success": true,
         "cleared": count

@@ -16,10 +16,10 @@ use crate::types::ContextStats;
 pub async fn get_context(
     State(state): State<Arc<AppState>>,
 ) -> Response {
-    let agent = state.agent.lock().await;
-
-    // 从 agent 获取实际统计信息
-    let (message_count, estimated_tokens) = agent.context_stats();
+    let (message_count, estimated_tokens) = state
+        .connection.agent
+        .read_async(|agent| Box::pin(async move { agent.context_stats().await }))
+        .await;
 
     Json(ContextStats {
         message_count,

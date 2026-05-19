@@ -1,98 +1,139 @@
-# Web CLI
+# Echo Agent CLI
 
-基于 echo-agent 框架的 Web 终端服务。
+Multi-mode CLI + Web server for the [Echo Agent](https://github.com/EchoYue-lp/echo-agent) AI framework.
 
-## 功能
+## Quick Start
 
-- 阻塞式对话 API
-- WebSocket 流式对话
-- 工具管理 API
-- MCP 服务端管理 API
-- 配置管理 API
-- 人工介入支持
-
-## 快速开始
-
-1. 复制配置文件：
 ```bash
-cp .env.example .env
+# Install
+cargo install echo-agent-cli
+
+# Set your API key
+export OPENAI_API_KEY=sk-...
+
+# Web mode (default — starts HTTP + WebSocket server)
+echo-agent-cli
+
+# CLI REPL mode
+echo-agent-cli --cli
+
+# TUI mode
+echo-agent-cli --tui
+
+# Both Web + CLI simultaneously
+echo-agent-cli --web --cli
 ```
 
-2. 编辑 `.env` 文件，配置模型和服务地址。
+## Modes
 
-3. 运行服务：
-```bash
-cargo run --package web-cli
+| Mode | Flag | Description |
+|------|------|-------------|
+| Web | `--web` (default) | HTTP REST API + WebSocket on port 3000 |
+| CLI | `--cli` | Interactive REPL with rich output |
+| TUI | `--tui` | Terminal UI with chat/tools/context panels |
+| Channels | `--channels` | QQ Bot + Feishu IM integration |
+
+## CLI Options
+
+```
+echo-agent-cli [OPTIONS]
+
+  --web              Start web server
+  --cli              Start CLI REPL
+  --tui              Start terminal UI
+  --channels         Start IM channels (QQ/Feishu)
+  --port <PORT>      Web server port [default: 3000]
+  --host <HOST>      Web server host [default: 0.0.0.0]
+  --model <MODEL>    Model name override
+  --config <PATH>    Config file path
+  --mcp-config <PATH> MCP config file path
+  --project <DIR>    Project directory for context-aware mode
+  --mode <MODE>      Agent mode (general/code/data/customer-service)
+  --system-prompt <S> System prompt override
+  --no-color         Disable colored output
 ```
 
-4. 访问 API：
-- 健康检查: http://localhost:3000/api/session
-- WebSocket: ws://localhost:3000/ws/chat
+## Configuration
 
-## API 端点
+Create `echo-agent.yaml` in the current directory or `~/.echo-agent/config.yaml`:
 
-### 对话
-- `POST /api/chat` - 阻塞式对话
-- `WS /ws/chat` - 流式对话
+```yaml
+model:
+  name: qwen-plus
+  temperature: 0.7
+  max_tokens: 4096
 
-### 会话
-- `GET /api/session` - 获取会话状态
-- `POST /api/session/reset` - 重置会话
+agent:
+  name: echo
+  system_prompt: "You are a helpful assistant."
+  max_iterations: 20
+  enable_tools: true
+  enable_memory: true
+  token_limit: 32000
 
-### 工具
-- `GET /api/tools` - 列出工具
-- `GET /api/tools/{name}` - 获取工具详情
-- `POST /api/tools/{name}/enable` - 启用工具
-- `POST /api/tools/{name}/disable` - 禁用工具
+server:
+  host: 0.0.0.0
+  port: 3000
 
-### MCP
-- `GET /api/mcp` - 列出 MCP 服务端
-- `POST /api/mcp/connect` - 连接 MCP 服务端
-- `GET /api/mcp/{name}` - 获取 MCP 服务端详情
+logging:
+  level: info
+```
 
-### 配置
-- `GET /api/config` - 获取配置
-- `PUT /api/config` - 更新配置
+## REST API
 
-## WebSocket 消息格式
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/chat` | POST | Blocking chat |
+| `/api/history` | GET | Conversation history |
+| `/api/session` | GET | Session state |
+| `/api/session/reset` | POST | Reset session |
+| `/api/session/checkpoint` | POST | Create state snapshot |
+| `/api/tools` | GET | List tools |
+| `/api/tools/:name` | GET/POST | Tool detail / enable/disable |
+| `/api/memory` | GET/POST | Memory CRUD |
+| `/api/memory/search` | POST | Search memory |
+| `/api/skills` | GET | List skills |
+| `/api/compress` | POST | Trigger context compression |
+| `/api/extract` | POST | Structured extraction |
+| `/api/mcp` | GET | List MCP servers |
+| `/api/mcp/connect` | POST | Connect MCP server |
+| `/api/mcp/health` | GET | MCP health status |
+| `/api/config` | GET/PUT | Agent config |
+| `/api/conversations` | GET/POST | Conversation persistence |
+| `/api/sessions/search` | GET | Full-text session search |
+| `/api/scheduler/tasks` | GET/POST | Cron task management |
+| `/api/audit/logs` | GET/DELETE | Audit logs |
+| `/api/permissions/mode` | GET/PUT | Permission mode |
+| `/api/webhooks` | GET/POST | Webhook management |
+| `/api/skills-hub` | GET | Skill marketplace |
+| `/api/workflow` | GET/POST | Workflow management |
+| `/api/sandbox/status` | GET | Sandbox status |
+| `/api/health` | GET | Health check |
+| `/api/health/deep` | GET | Deep health (LLM + MCP + DB) |
+| `/ws/chat` | WS | Streaming chat |
 
-### 客户端 -> 服务端
+## WebSocket Messages
 
+### Client -> Server
 ```json
-// 发送消息
-{"type": "message", "data": "你好"}
-
-// 审批响应
-{"type": "approval_response", "request_id": "xxx", "approved": true, "reason": null}
-
-// 输入响应
-{"type": "input_response", "request_id": "xxx", "text": "用户输入"}
-
-// 取消
+{"type": "message", "data": "Hello", "attachments": []}
+{"type": "approval_response", "request_id": "...", "approved": true}
+{"type": "input_response", "request_id": "...", "text": "..."}
 {"type": "cancel"}
 ```
 
-### 服务端 -> 客户端
-
+### Server -> Client
 ```json
-// Token 片段
-{"type": "token", "data": "你"}
-
-// 工具开始
+{"type": "token", "data": "..."}
+{"type": "thinking_start"}
+{"type": "thinking_end", "prompt_tokens": 100, "completion_tokens": 50}
 {"type": "tool_start", "name": "calculator", "args": {}}
-
-// 工具结果
 {"type": "tool_result", "name": "calculator", "result": "42", "success": true}
-
-// 最终答案
-{"type": "final_answer", "data": "答案是 42"}
-
-// 错误
-{"type": "error", "message": "错误信息"}
-
-// 审批请求
-{"type": "approval_request", "request_id": "xxx", "tool_name": "shell", "args": {}, "prompt": "需要审批"}
-
-// 输入请求
-{"type": "input_request", "request_id": "xxx", "prompt": "请输入"}
+{"type": "final_answer", "data": "..."}
+{"type": "error", "message": "..."}
+{"type": "chart", "spec": {}}
 ```
+
+## License
+
+MIT

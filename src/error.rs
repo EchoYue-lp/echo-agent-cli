@@ -29,8 +29,20 @@ pub enum WebError {
     #[error("资源未找到: {0}")]
     NotFound(String),
 
+    #[error("请求验证失败: {0}")]
+    Validation(String),
+
     #[error("内部错误: {0}")]
     Internal(String),
+
+    #[error("认证失败: {0}")]
+    Auth(String),
+
+    #[error("令牌过期")]
+    TokenExpired,
+
+    #[error("速率限制超出")]
+    RateLimitExceeded,
 }
 
 impl IntoResponse for WebError {
@@ -39,6 +51,10 @@ impl IntoResponse for WebError {
             WebError::ToolNotFound(_)
             | WebError::McpServerNotFound(_)
             | WebError::NotFound(_) => (StatusCode::NOT_FOUND, self.to_string()),
+            WebError::Validation(_) => (StatusCode::BAD_REQUEST, self.to_string()),
+            WebError::Auth(_) => (StatusCode::UNAUTHORIZED, self.to_string()),
+            WebError::TokenExpired => (StatusCode::UNAUTHORIZED, self.to_string()),
+            WebError::RateLimitExceeded => (StatusCode::TOO_MANY_REQUESTS, self.to_string()),
             _ => (StatusCode::INTERNAL_SERVER_ERROR, self.to_string()),
         };
 

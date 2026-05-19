@@ -5,6 +5,7 @@ import { ApprovalCard } from './ApprovalCard';
 import { ChatInput } from './ChatInput';
 import { WelcomeScreen } from './WelcomeScreen';
 import { useWebSocket } from '../../hooks/useWebSocket';
+import type { Attachment } from '../../types/api';
 
 export function ChatPanel() {
   const messages = useChatStore((s) => s.messages);
@@ -29,15 +30,13 @@ export function ChatPanel() {
     if (content) sendMessage(content);
   };
 
-  // Track whether user is near the bottom of the scroll container
   const handleScroll = useCallback(() => {
     const el = scrollRef.current;
     if (!el) return;
-    const threshold = 120;
-    isNearBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < threshold;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+    isNearBottomRef.current = nearBottom;
   }, []);
 
-  // Smart auto-scroll: only scroll when user is near the bottom
   useEffect(() => {
     if (isNearBottomRef.current && bottomRef.current) {
       bottomRef.current.scrollIntoView({ behavior: isStreaming ? 'auto' : 'smooth' });
@@ -48,18 +47,20 @@ export function ChatPanel() {
     sendMessage(text);
   };
 
+  const handleSend = (text: string, attachments?: Attachment[]) => {
+    sendMessage(text, attachments);
+  };
+
   return (
-    <div className="flex h-full flex-col" style={{ background: 'var(--bg-chat)' }}>
-      {/* Scrollable messages area */}
-      <div ref={scrollRef} className="flex-1 overflow-y-auto" onScroll={handleScroll}>
+    <div className="flex h-full flex-col min-h-0">
+      {/* Messages area */}
+      <div ref={scrollRef} className="flex-1 overflow-y-auto min-h-0" onScroll={handleScroll}>
         {messages.length === 0 ? (
           <WelcomeScreen onSuggestionClick={handleSuggestionClick} />
         ) : (
           <div className="mx-auto max-w-3xl px-4 sm:px-6">
-            {/* Messages */}
-            <div className="space-y-1 pb-4">
+            <div className="space-y-2 pb-4 pt-2">
               {messages.map((msg, idx) => {
-                // Check if we need a date separator between messages
                 const prevMsg = idx > 0 ? messages[idx - 1] : null;
                 const showSeparator = idx === 0 || (prevMsg && msg.timestamp && prevMsg.timestamp && msg.timestamp - prevMsg.timestamp > 300000);
 
@@ -67,11 +68,11 @@ export function ChatPanel() {
                   <div key={msg.id}>
                     {showSeparator && idx > 0 && (
                       <div className="flex items-center gap-3 py-4">
-                        <div className="h-px flex-1" style={{ background: 'var(--border-primary)' }} />
-                        <span className="text-xs" style={{ color: 'var(--text-tertiary)' }}>
+                        <div className="h-px flex-1" style={{ background: 'linear-gradient(to right, transparent, var(--border-primary), transparent)' }} />
+                        <span className="text-xs text-[var(--text-tertiary)]" style={{ fontVariantNumeric: 'tabular-nums' }}>
                           {new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                         </span>
-                        <div className="h-px flex-1" style={{ background: 'var(--border-primary)' }} />
+                        <div className="h-px flex-1" style={{ background: 'linear-gradient(to right, transparent, var(--border-primary), transparent)' }} />
                       </div>
                     )}
                     <MessageBubble message={msg} onRegenerate={handleRegenerate} onEditAndResend={handleEditAndResend} />
@@ -79,24 +80,28 @@ export function ChatPanel() {
                 );
               })}
 
-              {/* Streaming thinking indicator */}
-              {isStreaming && !messages.some((m) => m.isStreaming && m.content) && (
-                <div className="flex items-center gap-2 px-1 py-2">
+              {isStreaming && !messages.some((m) => m.isStreaming && (m.content || (m.thinkingSegments && m.thinkingSegments.length > 0))) && (
+                <div className="flex items-center gap-3 px-1 py-3">
                   <div className="spinner" />
-                  <span className="text-xs" style={{ color: 'var(--text-tertiary)' }}>Thinking...</span>
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-xs text-[var(--text-tertiary)] animate-breathe">思考中</span>
+                    <span className="flex gap-0.5">
+                      <span className="h-1 w-1 rounded-full bg-[var(--text-tertiary)] animate-bounce" style={{ animationDelay: '0ms' }} />
+                      <span className="h-1 w-1 rounded-full bg-[var(--text-tertiary)] animate-bounce" style={{ animationDelay: '150ms' }} />
+                      <span className="h-1 w-1 rounded-full bg-[var(--text-tertiary)] animate-bounce" style={{ animationDelay: '300ms' }} />
+                    </span>
+                  </div>
                 </div>
               )}
 
-              {/* Cancelled indicator */}
               {isCancelled && (
-                <div className="flex items-center gap-3 py-2">
-                  <div className="h-px flex-1" style={{ background: 'var(--border-primary)' }} />
-                  <span className="text-xs" style={{ color: 'var(--text-tertiary)' }}>Response stopped</span>
-                  <div className="h-px flex-1" style={{ background: 'var(--border-primary)' }} />
+                <div className="flex items-center gap-3 py-3">
+                  <div className="h-px flex-1" style={{ background: 'linear-gradient(to right, transparent, var(--border-primary), transparent)' }} />
+                  <span className="text-xs text-[var(--text-tertiary)] italic">已停止响应</span>
+                  <div className="h-px flex-1" style={{ background: 'linear-gradient(to right, transparent, var(--border-primary), transparent)' }} />
                 </div>
               )}
 
-              {/* Approval request */}
               {approvalRequest && (
                 <div className="py-2">
                   <ApprovalCard
@@ -107,7 +112,6 @@ export function ChatPanel() {
                 </div>
               )}
 
-              {/* Input request */}
               {inputRequest && (
                 <div className="py-2">
                   <InputCard
@@ -122,47 +126,27 @@ export function ChatPanel() {
         )}
       </div>
 
-      {/* Connection status bar */}
       {connectionStatus === 'disconnected' && (
-        <div
-          className="flex items-center justify-center gap-2 px-4 py-1.5 text-xs font-medium"
-          style={{
-            background: '#ef444415',
-            color: '#fef2f2',
-          }}
-        >
-          <span className="inline-block h-2 w-2 rounded-full" style={{ background: '#fca5a5' }} />
-          Disconnected — reconnecting...
+        <div className="flex items-center justify-center gap-2 px-4 py-1.5 text-xs font-medium"
+          style={{ background: 'color-mix(in srgb, var(--accent) 10%, transparent)', color: 'var(--accent)' }}>
+          <span className="inline-block h-2 w-2 rounded-full" style={{ background: 'var(--accent)' }} />
+          已断开 — 重新连接中...
         </div>
       )}
 
-      {/* Bottom bar: stop button + input */}
-      <div style={{ background: 'var(--bg-chat)' }}>
-        {/* Floating stop button */}
+      <div>
         {isStreaming && messages.length > 0 && (
           <div className="flex justify-center pb-2">
             <button
               onClick={cancel}
-              className="flex items-center gap-2 rounded-full px-4 py-2 text-sm font-medium transition-all hover:opacity-80"
-              style={{
-                background: 'var(--bg-primary)',
-                color: 'var(--text-secondary)',
-                border: '1px solid var(--border-primary)',
-                boxShadow: 'var(--shadow-md)',
-              }}
+              className="flex items-center gap-2 rounded-full border border-[var(--border-primary)] bg-[var(--bg-primary)] px-4 py-2 text-sm font-medium text-[var(--text-secondary)] shadow-[var(--shadow-sm)] transition-all hover:text-[var(--text-primary)]"
             >
-              <div className="h-3 w-3 rounded-[2px]" style={{ background: 'var(--text-secondary)' }} />
-              Stop generating
+              <div className="h-3 w-3 rounded-[3px]" style={{ background: 'var(--text-secondary)' }} />
+              停止生成
             </button>
           </div>
         )}
-
-        {/* Input area */}
-        <ChatInput
-          onSend={sendMessage}
-          isStreaming={isStreaming}
-          onCancel={cancel}
-        />
+        <ChatInput onSend={handleSend} isStreaming={isStreaming} onCancel={cancel} />
       </div>
     </div>
   );
@@ -180,30 +164,22 @@ function InputCard({ prompt, onSubmit }: { prompt?: string; onSubmit: (text: str
   };
 
   return (
-    <div
-      className="animate-pulse-border rounded-xl border-2 p-4"
-      style={{
-        background: 'var(--bg-primary)',
-        borderColor: 'var(--accent)',
-      }}
-    >
+    <div className="animate-pulse-border rounded-xl border-2 bg-[var(--bg-primary)] p-4 shadow-[var(--shadow-sm)]">
       {prompt && (
-        <p className="mb-2 text-sm font-medium" style={{ color: 'var(--text-primary)' }}>{prompt}</p>
+        <p className="mb-2 text-sm font-medium text-[var(--text-primary)]">{prompt}</p>
       )}
       <form onSubmit={handleSubmit} className="flex gap-2">
         <input
           name="input"
-          className="flex-1 rounded-lg px-3 py-2 text-sm outline-none"
-          style={{ border: '1px solid var(--border-primary)', background: 'var(--bg-input)', color: 'var(--text-primary)' }}
-          placeholder="Type your response..."
+          className="input flex-1"
+          placeholder="输入你的回答..."
           autoFocus
         />
         <button
           type="submit"
-          className="rounded-lg px-4 py-2 text-sm font-medium text-white"
-          style={{ background: 'var(--accent)' }}
+          className="btn btn-primary"
         >
-          Respond
+          提交
         </button>
       </form>
     </div>
