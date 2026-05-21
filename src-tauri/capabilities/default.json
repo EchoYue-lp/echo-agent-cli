@@ -1,0 +1,12 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nickel-lang/json-schema-store/main/tauri.v2.schema.json",
+  "identifier": "default",
+  "description": "Capability for the main window",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "core:event:allow-listen",
+    "core:event:allow-emit"
+  ]
+}

@@ -3,6 +3,7 @@ name = "echo-agent-cli"
 version = "1.0.0"
 edition = "2024"
 rust-version = "1.85"
+resolver = "3"
 license = "MIT"
 description = "Multi-mode CLI + Web server for the Echo Agent AI framework"
 repository = "https://github.com/EchoYue-lp/echo-agent"
@@ -19,6 +20,10 @@ telemetry = ["echo-agent/telemetry"]
 [[bin]]
 name = "echo-agent-cli"
 path = "src/main.rs"
+
+[[bin]]
+name = "echo-agent-tauri"
+path = "src-tauri/src/main.rs"
 
 [dependencies]
 echo-agent = { version = "0.1.4", package = "echo_agent", path = "../echo-agent", features = ["sqlite", "mcp", "data"] }
@@ -84,3 +89,9 @@ hex = "0.4"
 # 配置文件变更监控
 notify = "7"
 tokio-util = "0.7"
+# Tauri 桌面应用
+tauri = { version = "2", features = ["devtools"] }
+tauri-plugin-shell = "2"
+
+[build-dependencies]
+tauri-build = "2"

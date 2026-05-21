@@ -26,4 +26,6 @@ pub mod types;
 pub mod webhook;
 pub mod ws;
 
+pub mod tauri;
+
 pub use state::AppState;
