@@ -100,6 +100,7 @@ pub async fn run_cli_mode(
         history_file: "~/.echo-agent/history.txt".to_string(),
         mode: args.mode.clone(),
         project: args.project.clone(),
+        no_color: args.no_color,
     };
     crate::cli::run_repl(agent, config).await
 }
@@ -130,6 +131,7 @@ pub async fn run_both_modes(
         history_file: "~/.echo-agent/history.txt".to_string(),
         mode: args.mode.clone(),
         project: args.project.clone(),
+        no_color: args.no_color,
     };
     crate::cli::run_repl(agent, config).await?;
 

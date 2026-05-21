@@ -15,8 +15,18 @@ use crate::config::AppConfig;
 pub fn create_agent(args: &crate::cli::Args, app_config: &AppConfig) -> ReactAgent {
     let model = args.model.as_deref().unwrap_or(&app_config.model.name);
 
-    let agent_mode = crate::project::modes::AgentMode::from_str(&args.mode)
-        .unwrap_or(crate::project::modes::AgentMode::General);
+    let agent_mode = match crate::project::modes::AgentMode::from_str(&args.mode) {
+        Some(mode) => mode,
+        None => {
+            let valid = ["general", "coding", "research", "data", "writing"];
+            tracing::warn!(
+                "Unknown mode '{}', falling back to 'general'. Valid modes: {}",
+                args.mode,
+                valid.join(", ")
+            );
+            crate::project::modes::AgentMode::General
+        }
+    };
 
     let base_system_prompt = args
         .system_prompt
@@ -343,17 +353,20 @@ pub fn run_base_doctor() -> DoctorResult {
 
 /// Load user hooks from YAML config into the agent's hook registry.
 pub async fn load_user_hooks(agent: &AgentHandle, app_config: &AppConfig) {
-    if app_config.hooks.is_empty() {
+    let hooks_def = app_config.hooks.clone();
+    if hooks_def.is_empty() {
         return;
     }
-    let hooks_def = app_config.hooks.clone();
+    let rule_count = hooks_def.rules.len();
     agent.write_async(|a| {
         Box::pin(async move {
             let mut registry = a.hook_registry().write().await;
+            // NOTE: register_user_hooks calls merge() which appends rules.
+            // On config reload, this may cause duplicates without clear_user_hooks API.
             registry.register_user_hooks(hooks_def);
         })
     }).await;
-    tracing::info!("User hooks loaded from config");
+    tracing::info!(count = rule_count, "User hooks loaded from config");
 }
 
 /// Fire SessionStart("startup") hook after hooks are loaded.

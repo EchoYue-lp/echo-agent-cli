@@ -53,6 +53,9 @@ pub struct TraceEntry {
     pub elapsed_ms: u64,
 }
 
+// Uses std::sync::Mutex (not tokio::sync::Mutex) because all lock acquisitions
+// are synchronous and never held across .await points.  push_trace, clear_trace,
+// and get_trace are called inline from within the streaming event loop.
 static TRACE_BUFFER: std::sync::LazyLock<Mutex<Vec<TraceEntry>>> =
     std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
 
@@ -83,6 +86,7 @@ pub struct ReplConfig {
     pub history_file: String,
     pub mode: String,
     pub project: Option<String>,
+    pub no_color: bool,
 }
 
 impl Default for ReplConfig {
@@ -92,6 +96,7 @@ impl Default for ReplConfig {
             history_file: "~/.echo-agent/history.txt".to_string(),
             mode: "general".to_string(),
             project: None,
+            no_color: false,
         }
     }
 }
@@ -99,6 +104,9 @@ impl Default for ReplConfig {
 /// 运行 REPL
 pub async fn run_repl(agent: AgentHandle, config: ReplConfig) -> anyhow::Result<()> {
     let output = OutputRenderer::default();
+    if config.no_color {
+        output.set_color(false);
+    }
 
     output.print_banner(env!("CARGO_PKG_VERSION"));
 
