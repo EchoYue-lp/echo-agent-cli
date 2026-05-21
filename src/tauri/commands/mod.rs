@@ -5,6 +5,7 @@ pub mod config;
 pub mod context;
 pub mod conversations;
 pub mod mcp;
+pub mod permissions;
 pub mod skills;
 pub mod tools;
 
@@ -24,6 +25,7 @@ pub fn register_commands(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<
             mcp::list_mcp_servers,
             mcp::connect_mcp_server,
             mcp::disconnect_mcp_server,
+            permissions::get_permission_status,
             skills::list_skills,
             skills::load_skills,
             tools::list_tools,
