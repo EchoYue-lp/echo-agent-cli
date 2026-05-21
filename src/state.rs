@@ -50,8 +50,13 @@ impl Default for WebConfig {
 
 // ── 审计日志 ──
 
-/// 审计日志最大条目数（FIFO 淘汰，防止内存无限增长）
-pub const MAX_AUDIT_LOG_ENTRIES: usize = 10_000;
+/// 审计日志最大条目数（FIFO 淘汰，可经由环境变量 ECHO_AUDIT_MAX_ENTRIES 覆盖）
+pub fn max_audit_log_entries() -> usize {
+    std::env::var("ECHO_AUDIT_MAX_ENTRIES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(10_000)
+}
 
 /// 审计日志条目
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -502,8 +507,8 @@ impl AppState {
         let mut logs = self.history.audit_logs.write().await;
         logs.push(entry);
         // Trim oldest entries if over the limit
-        if logs.len() > MAX_AUDIT_LOG_ENTRIES {
-            let excess = logs.len() - MAX_AUDIT_LOG_ENTRIES;
+        if logs.len() > max_audit_log_entries() {
+            let excess = logs.len() - max_audit_log_entries();
             logs.drain(0..excess);
         }
     }

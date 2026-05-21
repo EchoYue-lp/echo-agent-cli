@@ -181,11 +181,15 @@ async fn chat_with_agent(
 
     output.print_user_message(message);
     clear_trace();
+    // Per-chat counters (global cumulative totals in TOTAL_* statics)
+    let mut chat_input_tokens: usize = 0;
+    let mut chat_output_tokens: usize = 0;
 
     match agent.chat_stream(message).await {
         Ok(mut stream) => {
             println!();
             let mut first_chunk = true;
+            let mut in_thinking = false;
             let mut iteration_count: u32 = 0;
             let mut tool_call_count: u32 = 0;
             let start_time = std::time::Instant::now();
@@ -234,6 +238,8 @@ async fn chat_with_agent(
                                 first_chunk = true;
                             }
                             AgentEvent::ThinkEnd { prompt_tokens, completion_tokens } => {
+                                chat_input_tokens += prompt_tokens;
+                                chat_output_tokens += completion_tokens;
                                 TOTAL_INPUT_TOKENS.fetch_add(prompt_tokens, Ordering::Relaxed);
                                 TOTAL_OUTPUT_TOKENS.fetch_add(completion_tokens, Ordering::Relaxed);
                             }
@@ -348,7 +354,10 @@ async fn chat_with_agent(
                 } else {
                     format!("{:.1}s", elapsed.as_secs_f64())
                 };
-                let stats = format!("  ⏱ {:.0}  🔧 {} 工具调用", duration_str, tool_call_count);
+                let stats = format!(
+                    "  ⏱ {}  🔧 {} 工具调用  📊 in:{} out:{} tokens",
+                    duration_str, tool_call_count, chat_input_tokens, chat_output_tokens
+                );
                 let styled = nu_ansi_term::Color::Fixed(8).paint(&stats);
                 println!("{}", styled);
             }

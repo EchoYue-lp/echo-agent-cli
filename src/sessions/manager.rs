@@ -32,7 +32,14 @@ impl SessionManager {
 
     pub fn base_dir() -> PathBuf {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(home).join(".echo-agent").join("sessions_v2")
+        let new_dir = PathBuf::from(&home).join(".echo-agent").join("sessions");
+        // Migration: if legacy sessions_v2 directory exists with data, use it.
+        // New sessions use the unified "sessions" directory (same as Persistence v1).
+        let legacy_dir = PathBuf::from(&home).join(".echo-agent").join("sessions_v2");
+        if legacy_dir.exists() && !new_dir.exists() {
+            return legacy_dir;
+        }
+        new_dir
     }
 
     /// 设置是否自动保存

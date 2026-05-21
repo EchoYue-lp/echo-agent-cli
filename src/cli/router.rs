@@ -45,7 +45,7 @@ pub async fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/chat/stream", post(routes::chat::handle_chat_stream))
         .route("/api/history", get(routes::history::get_history))
         .route("/api/history/export", get(routes::history::export_history))
-        // ── 会话 API ─────────────────────────────────────────────
+        // ── 会话 API (单数: 当前活跃 agent 会话; 复数: 历史会话搜索) ──
         .route("/api/session", get(routes::session::get_session))
         .route("/api/session/reset", post(routes::session::reset_session))
         // ── 工具 API ─────────────────────────────────────────────

@@ -6,8 +6,6 @@
 //! `OutputRenderer` 是整个 CLI 输出的唯一外观 (Facade),
 //! REPL 模式和 TUI 模式都通过它输出，保证样式一致。
 
-#![allow(dead_code)]
-
 pub mod format;
 pub mod markdown;
 pub mod spinner;
