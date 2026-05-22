@@ -12,6 +12,7 @@ export function useWebSocket() {
   const assistantIdRef = useRef<string | null>(null);
   const inThinkingRef = useRef(false);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const streamTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
   const retryCount = useRef(0);
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('connecting');
 
@@ -50,6 +51,7 @@ export function useWebSocket() {
 
       switch (msg.type) {
         case 'token': {
+          clearStreamTimer();
           if (!assistantIdRef.current) {
             assistantIdRef.current = store.startAssistantMessage();
           }
@@ -100,6 +102,7 @@ export function useWebSocket() {
           store.addChartMessage(msg.spec);
           break;
         case 'error': {
+          clearStreamTimer();
           if (assistantIdRef.current) {
             store.finalizeAssistantMessage(assistantIdRef.current, `[Error] ${msg.message}`);
           }
@@ -107,6 +110,7 @@ export function useWebSocket() {
           break;
         }
         case 'cancelled':
+          clearStreamTimer();
           assistantIdRef.current = null;
           break;
       }
@@ -134,6 +138,13 @@ export function useWebSocket() {
     return false;
   }, []);
 
+  const clearStreamTimer = () => {
+    if (streamTimer.current) {
+      clearTimeout(streamTimer.current);
+      streamTimer.current = undefined;
+    }
+  };
+
   const sendMessage = useCallback((text: string, attachments?: Attachment[]) => {
     const store = useChatStore.getState();
     const displayAttachments = attachments?.map((a) => ({
@@ -145,10 +156,16 @@ export function useWebSocket() {
     store.addUserMessage(text || '(附件)', displayAttachments);
 
     if (!send({ type: 'message', data: text, attachments })) {
-      // WebSocket not connected — don't leave UI stuck in streaming
       store.markCancelled();
     } else {
       assistantIdRef.current = store.startAssistantMessage();
+      // 60s streaming timeout: if no response, cancel to prevent stuck UI
+      clearStreamTimer();
+      streamTimer.current = setTimeout(() => {
+        if (useChatStore.getState().isStreaming) {
+          useChatStore.getState().markCancelled();
+        }
+      }, 60_000);
     }
   }, [send]);
 
@@ -172,6 +189,7 @@ export function useWebSocket() {
     connect();
     return () => {
       clearTimeout(reconnectTimer.current);
+      clearStreamTimer();
       wsRef.current?.close();
     };
   }, [connect]);
