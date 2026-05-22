@@ -21,7 +21,18 @@ export function useWebSocket() {
   }, []);
 
   const connect = useCallback(() => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) return;
+    // Guard: skip if already open or connecting
+    if (wsRef.current?.readyState === WebSocket.OPEN ||
+        wsRef.current?.readyState === WebSocket.CONNECTING) return;
+
+    // Close stale socket before creating new one
+    if (wsRef.current) {
+      wsRef.current.onopen = null;
+      wsRef.current.onmessage = null;
+      wsRef.current.onclose = null;
+      wsRef.current.onerror = null;
+      wsRef.current.close();
+    }
 
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const ws = new WebSocket(`${protocol}//${location.host}/ws/chat`);
@@ -115,15 +126,16 @@ export function useWebSocket() {
     };
   }, [getReconnectDelay]);
 
-  const send = useCallback((msg: ClientMessage) => {
+  const send = useCallback((msg: ClientMessage): boolean => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify(msg));
+      return true;
     }
+    return false;
   }, []);
 
   const sendMessage = useCallback((text: string, attachments?: Attachment[]) => {
     const store = useChatStore.getState();
-    // 创建显示用的附件（data URL）
     const displayAttachments = attachments?.map((a) => ({
       name: a.name,
       mime_type: a.mime_type,
@@ -131,8 +143,13 @@ export function useWebSocket() {
       size: a.size,
     }));
     store.addUserMessage(text || '(附件)', displayAttachments);
-    send({ type: 'message', data: text, attachments });
-    assistantIdRef.current = store.startAssistantMessage();
+
+    if (!send({ type: 'message', data: text, attachments })) {
+      // WebSocket not connected — don't leave UI stuck in streaming
+      store.markCancelled();
+    } else {
+      assistantIdRef.current = store.startAssistantMessage();
+    }
   }, [send]);
 
   const sendApproval = useCallback((requestId: string, approved: boolean, reason?: string) => {
