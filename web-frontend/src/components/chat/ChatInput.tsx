@@ -233,9 +233,12 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
           )}
         </div>
       </div>
-      <p className="mx-auto mt-2 max-w-3xl text-center text-[11px] text-[var(--text-tertiary)]">
-        Echo Agent 可能会犯错，请核实重要信息
-      </p>
+      <div className="mx-auto mt-2 flex max-w-3xl items-center justify-between text-[11px] text-[var(--text-tertiary)]">
+        <span>Echo Agent 可能会犯错，请核实重要信息</span>
+        {text.length > 0 && (
+          <span>{text.length} 字符</span>
+        )}
+      </div>
     </div>
   );
 }

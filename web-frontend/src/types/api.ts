@@ -200,14 +200,6 @@ export interface SnapshotMeta {
   createdAt: number;
 }
 
-// ── Checkpoint types ──
-
-export interface SnapshotInfo {
-  id: string;
-  iteration: number;
-  created_at: number;
-}
-
 // ── Compression types ──
 
 export interface CompressionStats {
@@ -318,6 +310,7 @@ export interface FullConfigResponse {
     system_prompt: string;
     max_iterations: number;
     token_limit: number;
+    enable_tools: boolean;
     enable_memory: boolean;
     enable_human_loop: boolean;
     session_id: string | null;

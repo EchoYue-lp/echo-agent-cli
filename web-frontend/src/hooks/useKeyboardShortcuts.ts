@@ -20,7 +20,7 @@ export function useKeyboardShortcuts({ onNewChat, onToggleSidebar }: ShortcutsCo
         onToggleSidebar?.();
       }
 
-      // Escape: reserved for future use (close dialogs, etc.)
+      // Escape: handled by individual components (SettingsDialog, etc.)
     };
 
     window.addEventListener('keydown', handleKeyDown);

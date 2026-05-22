@@ -487,3 +487,17 @@ textarea.input {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
+
+/* Restore button (SessionsPanel) */
+.restore-btn {
+  border: 1px solid var(--border-primary);
+  color: var(--text-secondary);
+}
+.restore-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.restore-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}

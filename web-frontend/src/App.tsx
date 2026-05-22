@@ -4,6 +4,7 @@ import { LeftSidebar } from './components/layout/LeftSidebar';
 import { ChatPanel } from './components/chat/ChatPanel';
 import { SettingsDialog } from './components/layout/SettingsDialog';
 import { ToastContainer } from './components/common/Toast';
+import { ErrorBoundary } from './components/common/ErrorBoundary';
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
 import { useConversationStore } from './stores/conversationStore';
 import { useUiStore } from './stores/uiStore';
@@ -19,14 +20,16 @@ function App() {
   });
 
   return (
-    <RequireAuth>
-      <AppLayout
-        left={<LeftSidebar />}
-        center={<ChatPanel />}
-      />
-      <SettingsDialog />
-      <ToastContainer />
-    </RequireAuth>
+    <ErrorBoundary>
+      <RequireAuth>
+        <AppLayout
+          left={<LeftSidebar />}
+          center={<ChatPanel />}
+        />
+        <SettingsDialog />
+        <ToastContainer />
+      </RequireAuth>
+    </ErrorBoundary>
   );
 }
 

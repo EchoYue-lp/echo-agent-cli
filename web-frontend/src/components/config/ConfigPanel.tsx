@@ -73,7 +73,7 @@ export function ConfigPanel() {
           onChange={(v) => markDirty({ agent: { ...edit.agent, system_prompt: v } })} multiline />
         <Field label="最大迭代次数" value={String(edit.agent?.max_iterations ?? config.agent.max_iterations)}
           onChange={(v) => markDirty({ agent: { ...edit.agent, max_iterations: Number(v) } })} type="number" />
-        <Toggle label="工具" value={edit.agent?.enable_tools ?? config.agent.enable_memory}
+        <Toggle label="工具" value={edit.agent?.enable_tools ?? config.agent.enable_tools}
           onChange={(v) => markDirty({ agent: { ...edit.agent, enable_tools: v } })} />
         <Toggle label="记忆" value={edit.agent?.enable_memory ?? config.agent.enable_memory}
           onChange={(v) => markDirty({ agent: { ...edit.agent, enable_memory: v } })} />

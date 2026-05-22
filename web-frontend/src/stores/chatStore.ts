@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import type { ChatMessage, ApprovalRequest, ToolCallInfo } from '../types/api';
+import { useConversationStore } from './conversationStore';
 
 interface ChatState {
   messages: ChatMessage[];
@@ -43,12 +44,10 @@ const nextId = () => `msg-${++msgCounter}-${Date.now()}`;
 function autoSave() {
   // Defer to next tick so store has updated
   setTimeout(() => {
-    import('./conversationStore').then(({ useConversationStore }) => {
-      const msgs = useChatStore.getState().messages;
-      if (msgs.length > 0) {
-        useConversationStore.getState().saveCurrent(msgs);
-      }
-    });
+    const msgs = useChatStore.getState().messages;
+    if (msgs.length > 0) {
+      useConversationStore.getState().saveCurrent(msgs);
+    }
   }, 100);
 }
 

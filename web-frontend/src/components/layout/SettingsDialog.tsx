@@ -1,3 +1,4 @@
+import { useEffect } from 'react';
 import { X, Settings, Save, Lock, ShieldCheck, GitBranch, Terminal, Minimize2, FileJson, Wrench, Globe, BookOpen, Brain, Cpu, Database, Activity } from 'lucide-react';
 import { useUiStore, type SettingsTabId } from '../../stores/uiStore';
 import { ConfigPanel } from '../config/ConfigPanel';
@@ -35,7 +36,6 @@ const settingsGroups: { label: string; icon: typeof Settings; items: SettingsIte
     label: '数据',
     icon: Database,
     items: [
-      { id: 'config', label: '配置', icon: Settings },
       { id: 'sessions', label: '会话', icon: Save },
       { id: 'compress', label: '压缩', icon: Minimize2 },
       { id: 'extract', label: '提取', icon: FileJson },
@@ -77,6 +77,16 @@ const panels: Record<SettingsTabId, React.FC> = {
 export function SettingsDialog() {
   const { settingsOpen, closeSettings, activeSettingsTab, setActiveSettingsTab } = useUiStore();
   const Panel = panels[activeSettingsTab];
+
+  // Close on Escape key
+  useEffect(() => {
+    if (!settingsOpen) return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') closeSettings();
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [settingsOpen, closeSettings]);
 
   if (!settingsOpen) return null;
 

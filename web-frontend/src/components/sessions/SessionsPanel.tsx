@@ -121,10 +121,7 @@ export function SessionsPanel() {
             <button
               onClick={() => restore(s.id)}
               disabled={loading}
-              className="flex items-center gap-1 rounded-md px-2 py-1 text-[11px] font-medium transition-colors"
-              style={{ border: '1px solid var(--border-primary)', color: 'var(--text-secondary)' }}
-              onMouseEnter={(e) => { e.currentTarget.style.borderColor = 'var(--accent)'; e.currentTarget.style.color = 'var(--accent)'; }}
-              onMouseLeave={(e) => { e.currentTarget.style.borderColor = 'var(--border-primary)'; e.currentTarget.style.color = 'var(--text-secondary)'; }}
+              className="restore-btn flex items-center gap-1 rounded-md px-2 py-1 text-[11px] font-medium transition-colors"
             >
               <RotateCcw size={10} />
               恢复
