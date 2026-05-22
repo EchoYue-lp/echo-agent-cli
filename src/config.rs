@@ -4,5 +4,5 @@
 
 pub use echo_agent::config::{
     AppConfig,
-    load_config, apply_env_overrides,
+    load_config, save_config, apply_env_overrides,
 };

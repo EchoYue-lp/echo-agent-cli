@@ -196,7 +196,15 @@ pub async fn update_full_config(
             && let Some(v) = l.level { cfg.logging.level = v; }
     }
 
-    // Sync model + system_prompt to agent
+    // Persist to YAML file so config survives restart
+    {
+        let cfg = state.config.app_config.read().await;
+        if let Err(e) = echo_agent::config::save_config(&cfg) {
+            tracing::warn!("Failed to persist config to file: {e}");
+        }
+    }
+
+    // Sync model + system_prompt to agent in background
     let model_name;
     let system_prompt;
     {
@@ -204,11 +212,14 @@ pub async fn update_full_config(
         model_name = cfg.model.name.clone();
         system_prompt = cfg.agent.system_prompt.clone();
     }
-    state.connection.agent.write_async(|agent| Box::pin(async move {
+    let agent_arc = state.connection.agent.inner().clone();
+    tokio::spawn(async move {
+        let mut agent = agent_arc.write().await;
         agent.set_model(&model_name);
         agent.set_system_prompt(system_prompt).await;
-    })).await;
-    tracing::info!("完整配置已通过 API 更新");
+        tracing::info!(model = %model_name, "配置已同步到 Agent");
+    });
+    tracing::info!("完整配置已通过 API 更新（已持久化，Agent 异步同步中）");
 
     // Return updated config
     let cfg = state.config.app_config.read().await;
