@@ -50,18 +50,19 @@ export function ConfigPanel() {
     <div className="space-y-4 p-3">
       {/* Header */}
       <div className="flex items-center justify-between">
-        <h3 className="text-sm font-semibold text-[var(--text-primary)]">配置</h3>
+        <div className="flex items-center gap-2">
+          <h3 className="text-sm font-semibold text-[var(--text-primary)]">配置</h3>
+          {dirty && <span className="rounded-full bg-amber-500 px-2 py-0.5 text-[10px] font-medium text-white">未保存</span>}
+        </div>
         <div className="flex items-center gap-2">
           {message && <span className="text-xs text-emerald-500">{message}</span>}
-          {dirty && (
-            <button
-              onClick={save}
-              disabled={saving}
-              className="rounded-lg bg-[var(--accent)] px-3 py-1 text-xs font-medium text-white transition-colors hover:opacity-90 disabled:opacity-50"
-            >
-              {saving ? '保存中...' : '保存'}
-            </button>
-          )}
+          <button
+            onClick={save}
+            disabled={saving || !dirty}
+            className="rounded-lg bg-[var(--accent)] px-3 py-1 text-xs font-medium text-white transition-colors hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-30"
+          >
+            {saving ? '保存中...' : '保存'}
+          </button>
         </div>
       </div>
 
