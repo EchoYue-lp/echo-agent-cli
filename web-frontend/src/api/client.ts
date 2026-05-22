@@ -97,10 +97,11 @@ export function post<T>(path: string, body?: unknown): Promise<T> {
   });
 }
 
-export function put<T>(path: string, body?: unknown): Promise<T> {
+export function put<T>(path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
   return request<T>(path, {
     method: 'PUT',
-    body: body ? JSON.stringify(body) : undefined
+    body: body ? JSON.stringify(body) : undefined,
+    signal,
   });
 }
 

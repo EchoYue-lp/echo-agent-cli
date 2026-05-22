@@ -60,7 +60,7 @@ export const configApi = {
   get: () => get<ConfigInfo>('/config'),
   update: (cfg: Partial<ConfigInfo>) => put<ConfigInfo>('/config', cfg),
   getFull: () => get<FullConfigResponse>('/config/full'),
-  updateFull: (cfg: Partial<FullConfigUpdateRequest>) => put<FullConfigResponse>('/config/full', cfg),
+  updateFull: (cfg: Partial<FullConfigUpdateRequest>, signal?: AbortSignal) => put<FullConfigResponse>('/config/full', cfg, signal),
 };
 
 export const permissionsApi = {

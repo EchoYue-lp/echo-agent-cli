@@ -21,17 +21,25 @@ export function ConfigPanel() {
 
   const save = async () => {
     setSaving(true);
+    setMessage('');
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15_000); // 15s timeout
     try {
-      const updated = await configApi.updateFull(edit);
+      const updated = await configApi.updateFull(edit, controller.signal);
       setConfig(updated);
       setEdit({});
       setDirty(false);
       setMessage('已保存');
       setTimeout(() => setMessage(''), 2000);
-    } catch (e) {
-      setMessage('保存失败');
+    } catch (e: any) {
+      if (e?.name === 'AbortError') {
+        setMessage('保存超时，请重试');
+      } else {
+        setMessage('保存失败');
+      }
       console.error(e);
     } finally {
+      clearTimeout(timeout);
       setSaving(false);
     }
   };
