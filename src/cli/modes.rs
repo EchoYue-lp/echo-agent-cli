@@ -89,34 +89,27 @@ pub async fn run_web_mode(
     Ok(())
 }
 
-/// 运行 CLI 模式
-pub async fn run_cli_mode(
-    agent: AgentHandle,
-    args: &Args,
-    _app_config: &AppConfig,
-) -> Result<()> {
-    let config = crate::cli::ReplConfig {
+fn repl_config_for(args: &Args) -> crate::cli::ReplConfig {
+    crate::cli::ReplConfig {
         prompt: "echo".to_string(),
         history_file: "~/.echo-agent/history.txt".to_string(),
         mode: args.mode.clone(),
         project: args.project.clone(),
-        no_color: args.no_color,
-    };
-    crate::cli::run_repl(agent, config).await
+    }
+}
+
+/// 运行 CLI 模式
+pub async fn run_cli_mode(agent: AgentHandle, args: &Args, _app_config: &AppConfig) -> Result<()> {
+    crate::cli::run_repl(agent, repl_config_for(args)).await
 }
 
 /// 同时运行 Web 和 CLI 模式
-pub async fn run_both_modes(
-    agent: AgentHandle,
-    args: &Args,
-    app_config: &AppConfig,
-) -> Result<()> {
+pub async fn run_both_modes(agent: AgentHandle, args: &Args, app_config: &AppConfig) -> Result<()> {
     let infra = setup_web_infrastructure(&agent, args, app_config).await?;
     let listener = tokio::net::TcpListener::bind(&infra.addr).await?;
 
     crate::infra::print_both_startup_info(&infra.addr);
 
-    // 在后台启动 Web 服务
     let web_shutdown = infra.cancel_token.clone();
     let web_handle = tokio::spawn(async move {
         axum::serve(listener, infra.app)
@@ -125,15 +118,7 @@ pub async fn run_both_modes(
     });
     let web_abort = web_handle.abort_handle();
 
-    // 在前台运行 CLI
-    let config = crate::cli::ReplConfig {
-        prompt: "echo".to_string(),
-        history_file: "~/.echo-agent/history.txt".to_string(),
-        mode: args.mode.clone(),
-        project: args.project.clone(),
-        no_color: args.no_color,
-    };
-    crate::cli::run_repl(agent, config).await?;
+    crate::cli::run_repl(agent, repl_config_for(args)).await?;
 
     // CLI 退出后，通知 Web 服务和后台任务优雅关闭
     tracing::info!("CLI 已退出，正在关闭 Web 服务...");

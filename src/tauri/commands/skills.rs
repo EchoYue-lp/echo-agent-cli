@@ -1,17 +1,21 @@
 //! 技能管理命令
 
-use tauri::State;
 use super::super::state::TauriState;
+use tauri::State;
 
 #[tauri::command]
 pub async fn list_skills(state: State<'_, TauriState>) -> Result<Vec<serde_json::Value>, String> {
     let guard = state.agent.inner().read().await;
-    let skills: Vec<serde_json::Value> = guard.skill_names().iter().map(|name| {
-        serde_json::json!({
-            "name": name.to_string(),
-            "description": "",
+    let skills: Vec<serde_json::Value> = guard
+        .skill_names()
+        .iter()
+        .map(|name| {
+            serde_json::json!({
+                "name": name.to_string(),
+                "description": "",
+            })
         })
-    }).collect();
+        .collect();
     Ok(skills)
 }
 

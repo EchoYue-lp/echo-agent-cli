@@ -1,14 +1,17 @@
 //! 聊天相关 Tauri 命令
 
-use std::sync::Arc;
 use echo_agent::prelude::{AgentEvent, Message};
 use futures::StreamExt;
+use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
 
 use super::super::state::TauriState;
 
-static CANCEL_TOKENS: std::sync::LazyLock<Arc<tokio::sync::Mutex<std::collections::HashMap<String, bool>>>> =
-    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())));
+static CANCEL_TOKENS: std::sync::LazyLock<
+    Arc<tokio::sync::Mutex<std::collections::HashMap<String, bool>>>,
+> = std::sync::LazyLock::new(|| {
+    Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()))
+});
 
 /// 流式聊天命令
 #[tauri::command]
@@ -40,10 +43,13 @@ pub async fn chat_stream(
                     {
                         let tokens = CANCEL_TOKENS.lock().await;
                         if tokens.get(&cid_clone).copied().unwrap_or(false) {
-                            let _ = app_clone.emit("chat-event", serde_json::json!({
-                                "conversation_id": cid_clone,
-                                "type": "cancelled"
-                            }));
+                            let _ = app_clone.emit(
+                                "chat-event",
+                                serde_json::json!({
+                                    "conversation_id": cid_clone,
+                                    "type": "cancelled"
+                                }),
+                            );
                             break;
                         }
                     }
@@ -53,22 +59,28 @@ pub async fn chat_stream(
                             let _ = app_clone.emit("chat-event", payload);
                         }
                         Err(e) => {
-                            let _ = app_clone.emit("chat-event", serde_json::json!({
-                                "conversation_id": cid_clone,
-                                "type": "error",
-                                "error": e.to_string()
-                            }));
+                            let _ = app_clone.emit(
+                                "chat-event",
+                                serde_json::json!({
+                                    "conversation_id": cid_clone,
+                                    "type": "error",
+                                    "error": e.to_string()
+                                }),
+                            );
                             break;
                         }
                     }
                 }
             }
             Err(e) => {
-                let _ = app_clone.emit("chat-event", serde_json::json!({
-                    "conversation_id": cid_clone,
-                    "type": "error",
-                    "error": e.to_string()
-                }));
+                let _ = app_clone.emit(
+                    "chat-event",
+                    serde_json::json!({
+                        "conversation_id": cid_clone,
+                        "type": "error",
+                        "error": e.to_string()
+                    }),
+                );
             }
         }
         let mut tokens = CANCEL_TOKENS.lock().await;
@@ -96,7 +108,10 @@ fn agent_event_to_json(cid: &str, event: &AgentEvent) -> serde_json::Value {
         AgentEvent::ThinkStart => serde_json::json!({
             "conversation_id": cid, "type": "think_start"
         }),
-        AgentEvent::ThinkEnd { prompt_tokens, completion_tokens } => serde_json::json!({
+        AgentEvent::ThinkEnd {
+            prompt_tokens,
+            completion_tokens,
+        } => serde_json::json!({
             "conversation_id": cid, "type": "think_end",
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens
@@ -122,11 +137,19 @@ fn agent_event_to_json(cid: &str, event: &AgentEvent) -> serde_json::Value {
         AgentEvent::PlanGenerated { steps } => serde_json::json!({
             "conversation_id": cid, "type": "plan", "steps": steps
         }),
-        AgentEvent::StepStart { step_index, description } => serde_json::json!({
+        AgentEvent::StepStart {
+            step_index,
+            description,
+        } => serde_json::json!({
             "conversation_id": cid, "type": "step_start",
             "step_index": step_index, "description": description
         }),
-        AgentEvent::ContextCompressed { before_count, after_count, before_tokens, after_tokens } => serde_json::json!({
+        AgentEvent::ContextCompressed {
+            before_count,
+            after_count,
+            before_tokens,
+            after_tokens,
+        } => serde_json::json!({
             "conversation_id": cid, "type": "context_compressed",
             "before_count": before_count, "after_count": after_count,
             "before_tokens": before_tokens, "after_tokens": after_tokens

@@ -4,9 +4,9 @@
   "version": "1.0.0",
   "identifier": "com.echo-agent.app",
   "build": {
-    "beforeDevCommand": "cd web-frontend && npm run dev",
+    "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "cd web-frontend && npm run build",
+    "beforeBuildCommand": "npm run build",
     "frontendDist": "web-frontend/dist"
   },
   "app": {
@@ -25,8 +25,14 @@
     }
   },
   "bundle": {
-    "active": false,
+    "active": true,
     "targets": "all",
-    "icon": []
+    "icon": [
+      "src-tauri/icons/32x32.png",
+      "src-tauri/icons/128x128.png",
+      "src-tauri/icons/128x128@2x.png",
+      "src-tauri/icons/icon.icns",
+      "src-tauri/icons/icon.ico"
+    ]
   }
 }

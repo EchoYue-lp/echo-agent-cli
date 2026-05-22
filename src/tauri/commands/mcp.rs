@@ -1,17 +1,23 @@
 //! MCP 服务器管理命令
 
-use tauri::State;
 use super::super::state::TauriState;
+use tauri::State;
 
 #[tauri::command]
-pub async fn list_mcp_servers(state: State<'_, TauriState>) -> Result<Vec<serde_json::Value>, String> {
+pub async fn list_mcp_servers(
+    state: State<'_, TauriState>,
+) -> Result<Vec<serde_json::Value>, String> {
     let guard = state.agent.inner().read().await;
-    let servers: Vec<serde_json::Value> = guard.mcp_server_names().iter().map(|name| {
-        serde_json::json!({
-            "name": name.to_string(),
-            "connected": true,
+    let servers: Vec<serde_json::Value> = guard
+        .mcp_server_names()
+        .iter()
+        .map(|name| {
+            serde_json::json!({
+                "name": name.to_string(),
+                "connected": true,
+            })
         })
-    }).collect();
+        .collect();
     Ok(servers)
 }
 

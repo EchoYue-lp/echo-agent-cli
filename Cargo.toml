@@ -1,14 +1,21 @@
+[workspace]
+resolver = "3"
+members = [
+    "echo-agent-app-core",
+    "echo-agent-server",
+    "echo-agent-tui",
+]
+
 [package]
 name = "echo-agent-cli"
 version = "1.0.0"
 edition = "2024"
 rust-version = "1.85"
-resolver = "3"
 default-run = "echo-agent-cli"
 license = "MIT"
 description = "Multi-mode CLI + Web server for the Echo Agent AI framework"
-repository = "https://github.com/EchoYue-lp/echo-agent"
-homepage = "https://github.com/EchoYue-lp/echo-agent"
+repository = "https://github.com/EchoYue-lp/echo-agent-cli"
+homepage = "https://github.com/EchoYue-lp/echo-agent-cli"
 readme = "README.md"
 keywords = ["ai", "agent", "llm", "cli", "web"]
 categories = ["command-line-utilities", "web-programming", "development-tools"]
@@ -27,72 +34,40 @@ name = "echo-agent-tauri"
 path = "src-tauri/src/main.rs"
 
 [dependencies]
-echo-agent = { version = "0.1.4", package = "echo_agent", path = "../echo-agent", features = ["sqlite", "mcp", "data"] }
-tokio = { version = "1.47.1", features = ["full"] }
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.143"
-tracing = "0.1.44"
+echo-agent-app-core = { path = "./echo-agent-app-core" }
+echo-agent-server = { path = "./echo-agent-server" }
+echo-agent-tui = { path = "./echo-agent-tui" }
+echo-agent = { version = "0.1.4", package = "echo_agent", path = "../echo-agent", features = ["sqlite", "mcp", "data", "human-loop", "subagent"] }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-axum = { version = "0.7", features = ["ws", "macros"] }
-tower-http = { version = "0.5", features = ["cors", "fs", "trace"] }
-tokio-tungstenite = "0.24"
-futures = "0.3"
-async-trait = "0.1.89"
-uuid = { version = "1", features = ["v4"] }
-chrono = { version = "0.4", features = ["serde"] }
-reqwest = { version = "0.12.23", features = ["json", "stream"] }
-
-thiserror = "2"
-anyhow = "1.0"
-base64 = "0.22"
-serde_yaml = "0.9"
-# 命令行相关
 clap = { version = "4", features = ["derive", "env"] }
 reedline = "0.38"
 nu-ansi-term = "0.50"
 crossterm = "0.28"
-shellexpand = "3"
-# 安全相关依赖
-jsonwebtoken = "9.0"
-bcrypt = "0.16"
-time = "0.3"
-governor = "0.6"
-dashmap = "6"
+futures = "0.3"
+anyhow = "1.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
 dotenvy = "0.15"
-config = "0.14"
-validator = { version = "0.16", features = ["derive"] }
-# 指标收集
-metrics = "0.22"
-metrics-exporter-prometheus = "0.13"
-# 终端 UI
-ratatui = "0.28"
-# Markdown 渲染
-pulldown-cmark = "0.11"
-# 代码语法高亮
-syntect = { version = "5", default-features = false, features = ["parsing", "regex-onig", "default-syntaxes", "default-themes"] }
-# 进度条/Spinner
 indicatif = "0.17"
-# Shell 补全生成
-clap_complete = "4"
-# 文本差异对比
+pulldown-cmark = "0.11"
+syntect = { version = "5", default-features = false, features = ["parsing", "regex-onig", "default-syntaxes", "default-themes"] }
 similar = "2"
-# SQLite + FTS5 全文搜索
-rusqlite = { version = "0.31", features = ["bundled"] }
-# Cron 表达式解析
-cron = "0.12"
-# 终端大小检测
 terminal_size = "0.3"
-
-# Webhook 签名
-hmac = "0.12"
-sha2 = "0.10"
-hex = "0.4"
-# 配置文件变更监控
+clap_complete = "4"
+shellexpand = "3"
 notify = "7"
 tokio-util = "0.7"
-# Tauri 桌面应用
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+cron = "0.12"
+bcrypt = "0.16"
+tower-http = { version = "0.5", features = ["cors", "fs", "trace"] }
+axum = { version = "0.7", features = ["ws", "macros"] }
 tauri = { version = "2", features = ["devtools"] }
 tauri-plugin-shell = "2"
 
 [build-dependencies]
-tauri-build = "2"
+tauri-build = { version = "2", features = [] }

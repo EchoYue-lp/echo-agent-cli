@@ -33,9 +33,9 @@
 //! | `-h, --help` | 显示帮助信息 |
 //! | `-V, --version` | 显示版本信息 |
 
+use echo_agent_cli::agent_handle::AgentHandle;
 use echo_agent_cli::cli;
 use echo_agent_cli::config;
-use echo_agent_cli::agent_handle::AgentHandle;
 use echo_agent_cli::infra;
 
 use clap::Parser;
@@ -65,7 +65,13 @@ async fn main() -> anyhow::Result<()> {
     infra::init_logging(&app_config.logging.level);
 
     // 创建 Agent + 加载 MCP 配置（统一路径，消除重复）
-    let mut agent = infra::create_agent(&args, &app_config);
+    let params = echo_agent_cli::infra::AgentCreateParams {
+        model: args.model.clone(),
+        mode: args.mode.clone(),
+        system_prompt: args.system_prompt.clone(),
+        project: args.project.clone(),
+    };
+    let mut agent = infra::create_agent(&params, &app_config);
     infra::load_mcp_config(&mut agent, args.mcp_config.as_deref(), &app_config).await;
 
     // Configure auto-compression if token_limit is set
@@ -89,7 +95,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Spawn config file watcher (fires ConfigChange hooks + reloads hooks on change)
     let cancel_token = tokio_util::sync::CancellationToken::new();
-    if let Some(config_path) = echo_agent_cli::config_watcher::resolve_config_path(args.config.as_deref()) {
+    if let Some(config_path) =
+        echo_agent_cli::config_watcher::resolve_config_path(args.config.as_deref())
+    {
         echo_agent_cli::config_watcher::spawn_config_watcher(
             config_path,
             agent_handle.clone(),

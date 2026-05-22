@@ -1,0 +1,19 @@
+[package]
+name = "echo-agent-tui"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "TUI mode for Echo Agent"
+
+[dependencies]
+echo-agent-app-core = { path = "../echo-agent-app-core" }
+echo-agent = { version = "0.1.4", package = "echo_agent", path = "../../echo-agent" }
+ratatui = "0.28"
+crossterm = "0.28"
+futures = "0.3"
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+tracing = "0.1"
+nu-ansi-term = "0.50"
+anyhow = "1.0"

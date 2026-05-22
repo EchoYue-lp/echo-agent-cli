@@ -3,9 +3,9 @@
 //! 独立 binary，通过 `cargo run --bin echo-agent-tauri` 启动。
 //! 同时启动 Web 服务供前端 Vite proxy 转发 API 请求。
 
+use echo_agent_cli::agent_handle::AgentHandle;
 use echo_agent_cli::cli;
 use echo_agent_cli::config;
-use echo_agent_cli::agent_handle::AgentHandle;
 use echo_agent_cli::infra;
 use echo_agent_cli::persistence::Persistence;
 use echo_agent_cli::state;
@@ -30,7 +30,13 @@ async fn async_main() -> anyhow::Result<()> {
 
     infra::init_logging(&app_config.logging.level);
 
-    let mut agent = infra::create_agent(&args, &app_config);
+    let params = infra::AgentCreateParams {
+        model: args.model.clone(),
+        mode: args.mode.clone(),
+        system_prompt: args.system_prompt.clone(),
+        project: args.project.clone(),
+    };
+    let mut agent = infra::create_agent(&params, &app_config);
     infra::load_mcp_config(&mut agent, args.mcp_config.as_deref(), &app_config).await;
 
     if app_config.has_compressor() {
@@ -63,7 +69,10 @@ async fn async_main() -> anyhow::Result<()> {
         });
 
         let app = cli::router::build_router(state).await;
-        let addr = format!("{}:{}", server_config.server.host, server_config.server.port);
+        let addr = format!(
+            "{}:{}",
+            server_config.server.host, server_config.server.port
+        );
         let listener = match tokio::net::TcpListener::bind(&addr).await {
             Ok(l) => l,
             Err(e) => {
@@ -78,11 +87,7 @@ async fn async_main() -> anyhow::Result<()> {
 
     // Build and run the Tauri application (blocks until window closes)
     let persistence = Persistence::new();
-    let builder = echo_agent_cli::tauri::build_tauri(
-        agent_handle,
-        persistence,
-        app_config,
-    );
+    let builder = echo_agent_cli::tauri::build_tauri(agent_handle, persistence, app_config);
 
     builder
         .run(tauri::generate_context!())

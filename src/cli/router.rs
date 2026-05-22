@@ -9,10 +9,9 @@ use axum::{
     Json, Router,
 };
 use std::sync::Arc;
-use tower_http::services::ServeDir;
 
 use crate::state::AppState;
-use crate::{metrics, routes, security, ws};
+use crate::{metrics, routes, security, security_middleware, ws};
 
 /// Constant-time byte comparison to prevent timing attacks.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -45,7 +44,7 @@ pub async fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/chat/stream", post(routes::chat::handle_chat_stream))
         .route("/api/history", get(routes::history::get_history))
         .route("/api/history/export", get(routes::history::export_history))
-        // ── 会话 API (单数: 当前活跃 agent 会话; 复数: 历史会话搜索) ──
+        // ── 会话 API ─────────────────────────────────────────────
         .route("/api/session", get(routes::session::get_session))
         .route("/api/session/reset", post(routes::session::reset_session))
         // ── 工具 API ─────────────────────────────────────────────
@@ -228,35 +227,29 @@ pub async fn build_router(state: Arc<AppState>) -> Router {
         )
         .layer(middleware::from_fn_with_state(
             state.clone(),
-            security::require_auth,
+            security_middleware::require_auth,
         ))
         .layer(middleware::from_fn_with_state(
             state.clone(),
-            security::rate_limit_middleware,
+            security_middleware::rate_limit_middleware,
         ))
         .with_state(state.clone());
 
-    // 合并路由 + 静态文件（SPA fallback：非 API 路径返回 index.html）
+    // 合并路由（Web 前端已移除，仅 API）
     let app = Router::new()
         .merge(auth_routes)
-        .merge(protected_routes)
-        .fallback_service(
-            ServeDir::new("web-frontend/dist")
-                .not_found_service(tower_http::services::ServeFile::new(
-                    "web-frontend/dist/index.html",
-                )),
-        );
+        .merge(protected_routes);
 
     // 应用全局中间件: 指标收集 + CORS配置
     let app = {
         let sec_cfg = state.config.security_config.read().await;
         let app = app.layer(middleware::from_fn(metrics::metrics_middleware));
         let app = if sec_cfg.enable_request_id {
-            app.layer(middleware::from_fn(security::request_id_middleware))
+            app.layer(middleware::from_fn(security_middleware::request_id_middleware))
         } else {
             app
         };
-        let cors_layer = security::create_cors_layer(&sec_cfg);
+        let cors_layer = security_middleware::create_cors_layer(&sec_cfg);
         app.layer(cors_layer)
     };
 

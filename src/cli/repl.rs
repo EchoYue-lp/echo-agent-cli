@@ -53,9 +53,6 @@ pub struct TraceEntry {
     pub elapsed_ms: u64,
 }
 
-// Uses std::sync::Mutex (not tokio::sync::Mutex) because all lock acquisitions
-// are synchronous and never held across .await points.  push_trace, clear_trace,
-// and get_trace are called inline from within the streaming event loop.
 static TRACE_BUFFER: std::sync::LazyLock<Mutex<Vec<TraceEntry>>> =
     std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
 
@@ -86,7 +83,6 @@ pub struct ReplConfig {
     pub history_file: String,
     pub mode: String,
     pub project: Option<String>,
-    pub no_color: bool,
 }
 
 impl Default for ReplConfig {
@@ -96,7 +92,6 @@ impl Default for ReplConfig {
             history_file: "~/.echo-agent/history.txt".to_string(),
             mode: "general".to_string(),
             project: None,
-            no_color: false,
         }
     }
 }
@@ -104,9 +99,6 @@ impl Default for ReplConfig {
 /// 运行 REPL
 pub async fn run_repl(agent: AgentHandle, config: ReplConfig) -> anyhow::Result<()> {
     let output = OutputRenderer::default();
-    if config.no_color {
-        output.set_color(false);
-    }
 
     output.print_banner(env!("CARGO_PKG_VERSION"));
 
@@ -172,27 +164,39 @@ pub async fn run_repl(agent: AgentHandle, config: ReplConfig) -> anyhow::Result<
 }
 
 /// 与 Agent 对话
+#[allow(unused_assignments)]
 async fn chat_with_agent(
     agent: &AgentHandle,
     message: &str,
     output: &OutputRenderer,
 ) {
-    let agent = agent.inner().read().await;
-
     output.print_user_message(message);
     clear_trace();
-    // Per-chat counters (global cumulative totals in TOTAL_* statics)
-    let mut chat_input_tokens: usize = 0;
-    let mut chat_output_tokens: usize = 0;
 
-    match agent.chat_stream(message).await {
+    // Show spinner during connection establishment and first-token wait.
+    // chat_stream() returns quickly (spawns internal task); the real wait
+    // is in stream.next().await for the first SSE chunk.
+    let mut spinner = output.start_spinner("Connecting to model...");
+
+    let agent_guard = agent.inner().read().await;
+    match agent_guard.chat_stream(message).await {
         Ok(mut stream) => {
-            println!();
+            spinner.set_message("Waiting for response...");
+            let mut spinner_cleared = false;
             let mut first_chunk = true;
-            let mut in_thinking = false;
             let mut iteration_count: u32 = 0;
             let mut tool_call_count: u32 = 0;
             let start_time = std::time::Instant::now();
+
+            // Helper: clear spinner on first meaningful event.
+            macro_rules! clear_spinner {
+                () => {
+                    if !spinner_cleared {
+                        spinner.finish_and_clear();
+                        spinner_cleared = true;
+                    }
+                };
+            }
 
             while let Some(result) = stream.next().await {
                 match result {
@@ -225,6 +229,7 @@ async fn chat_with_agent(
                         }
                         match event {
                             AgentEvent::ThinkStart => {
+                                clear_spinner!();
                                 if !first_chunk {
                                     println!();
                                 }
@@ -238,12 +243,11 @@ async fn chat_with_agent(
                                 first_chunk = true;
                             }
                             AgentEvent::ThinkEnd { prompt_tokens, completion_tokens } => {
-                                chat_input_tokens += prompt_tokens;
-                                chat_output_tokens += completion_tokens;
                                 TOTAL_INPUT_TOKENS.fetch_add(prompt_tokens, Ordering::Relaxed);
                                 TOTAL_OUTPUT_TOKENS.fetch_add(completion_tokens, Ordering::Relaxed);
                             }
                             AgentEvent::Token(token) => {
+                                clear_spinner!();
                                 if first_chunk {
                                     output.print_assistant_prefix();
                                     first_chunk = false;
@@ -251,6 +255,7 @@ async fn chat_with_agent(
                                 output.print_token(&token);
                             }
                             AgentEvent::ToolCall { name, args } => {
+                                clear_spinner!();
                                 tool_call_count += 1;
                                 TOTAL_TOOL_CALLS.fetch_add(1, Ordering::Relaxed);
                                 if !first_chunk {
@@ -275,13 +280,18 @@ async fn chat_with_agent(
                                 );
                                 first_chunk = true;
                             }
-                            AgentEvent::FinalAnswer(_answer) if !first_chunk => {
-                                println!();
+                            AgentEvent::FinalAnswer(_answer) => {
+                                clear_spinner!();
+                                if !first_chunk {
+                                    println!();
+                                }
                             }
                             AgentEvent::Cancelled => {
+                                clear_spinner!();
                                 output.print_warning("执行已取消");
                             }
                             AgentEvent::PlanGenerated { steps } => {
+                                clear_spinner!();
                                 let plan_label = nu_ansi_term::Color::Cyan.paint("  📋 执行计划:");
                                 println!("\n{}", plan_label);
                                 for (i, step) in steps.iter().enumerate() {
@@ -312,7 +322,10 @@ async fn chat_with_agent(
                             AgentEvent::ReflectionEnd { .. } => {}
                             AgentEvent::CritiqueGenerated { .. } => {}
                             AgentEvent::Refining { .. } => {}
-                            AgentEvent::Error { .. } => {}
+                            AgentEvent::Error { source, message } => {
+                                clear_spinner!();
+                                output.print_error(&format!("[{}] {}", source, message));
+                            }
                             AgentEvent::ContextCompressed { before_count, after_count, before_tokens, after_tokens } => {
                                 let saved = before_tokens.saturating_sub(after_tokens);
                                 let styled = nu_ansi_term::Color::Fixed(8).paint(
@@ -324,6 +337,7 @@ async fn chat_with_agent(
                         }
                     }
                     Err(e) => {
+                        clear_spinner!();
                         output.print_error(&format!("错误: {}", e));
                         break;
                     }
@@ -331,6 +345,9 @@ async fn chat_with_agent(
             }
 
             let elapsed = start_time.elapsed();
+
+            // Ensure spinner is cleared even if stream produced no meaningful events
+            clear_spinner!();
 
             // Emit ChatCompleted webhook
             {
@@ -354,10 +371,7 @@ async fn chat_with_agent(
                 } else {
                     format!("{:.1}s", elapsed.as_secs_f64())
                 };
-                let stats = format!(
-                    "  ⏱ {}  🔧 {} 工具调用  📊 in:{} out:{} tokens",
-                    duration_str, tool_call_count, chat_input_tokens, chat_output_tokens
-                );
+                let stats = format!("  ⏱ {:.0}  🔧 {} 工具调用", duration_str, tool_call_count);
                 let styled = nu_ansi_term::Color::Fixed(8).paint(&stats);
                 println!("{}", styled);
             }
@@ -365,6 +379,7 @@ async fn chat_with_agent(
             println!();
         }
         Err(e) => {
+            spinner.finish_error(&format!("Connection failed: {}", e));
             output.print_error(&format!("对话失败: {}", e));
             crate::webhook::emitter::emit_global(
                 crate::webhook::WebhookEvent::AgentError {

@@ -14,11 +14,7 @@ pub struct TauriState {
 }
 
 impl TauriState {
-    pub fn new(
-        agent: AgentHandle,
-        persistence: Persistence,
-        app_config: AppConfig,
-    ) -> Self {
+    pub fn new(agent: AgentHandle, persistence: Persistence, app_config: AppConfig) -> Self {
         Self {
             agent,
             persistence,

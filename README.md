@@ -8,10 +8,12 @@ Multi-mode CLI + Web server for the [Echo Agent](https://github.com/EchoYue-lp/e
 # Install
 cargo install echo-agent-cli
 
-# Set your API key
-export OPENAI_API_KEY=sk-...
+# Default model is qwen-plus; set one of these keys
+export DASHSCOPE_API_KEY=sk-...
+# or
+export QWEN_API_KEY=sk-...
 
-# Web mode (default — starts HTTP + WebSocket server)
+# Web mode (default — starts a single-user local HTTP + WebSocket server)
 echo-agent-cli
 
 # CLI REPL mode
@@ -20,11 +22,17 @@ echo-agent-cli --cli
 # TUI mode
 echo-agent-cli --tui
 
+# Use OpenAI instead of the default Qwen provider
+export OPENAI_API_KEY=sk-...
+echo-agent-cli --cli --model openai:gpt-4o-mini
+
 # Both Web + CLI simultaneously
 echo-agent-cli --web --cli
 ```
 
 ## Modes
+
+Echo Agent CLI is designed as a single-user local application. Web, CLI, and TUI modes share one local agent session and are not intended for multi-tenant hosting.
 
 | Mode | Flag | Description |
 |------|------|-------------|
@@ -55,10 +63,11 @@ echo-agent-cli [OPTIONS]
 
 ## Configuration
 
-Create `echo-agent.yaml` in the current directory or `~/.echo-agent/config.yaml`:
+Create `echo-agent.yaml` in the current directory or `~/.echo-agent/config.yaml` for application/runtime settings:
 
 ```yaml
 model:
+  # Default provider is Qwen/DashScope. Use DASHSCOPE_API_KEY or QWEN_API_KEY.
   name: qwen-plus
   temperature: 0.7
   max_tokens: 4096
@@ -78,6 +87,24 @@ server:
 logging:
   level: info
 ```
+
+For OpenAI-compatible usage, set `OPENAI_API_KEY` and configure:
+
+```yaml
+model:
+  name: openai:gpt-4o-mini
+```
+
+Optional model registry configuration for aliases/custom endpoints belongs in `echo-agent-models.yaml` or `~/.echo-agent/models.yaml`:
+
+```yaml
+models:
+  qwen3-max:
+    provider: qwen
+    api_key: ${DASHSCOPE_API_KEY}
+```
+
+`echo-agent.yaml` is the app config; `echo-agent-models.yaml` is the provider/model registry. Keeping them separate avoids app config being parsed as a model registry.
 
 ## REST API
 

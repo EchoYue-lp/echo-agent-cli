@@ -1,31 +1,16 @@
-//! Echo Agent CLI
-//!
-//! 提供 Web、CLI (REPL/TUI)、IM Channel 三种交互模式。
-
-pub mod agent_handle;
 pub mod cli;
-pub mod config;
-pub mod config_watcher;
-pub mod error;
-pub mod infra;
 pub mod logging;
-pub mod metrics;
-pub mod output;
-pub mod persistence;
-pub mod profiles;
-pub mod project;
-pub mod scheduler;
-pub mod sessions;
-pub mod skills_hub;
 pub mod shell;
-pub mod tui;
-pub mod routes;
-pub mod security;
-pub mod state;
-pub mod types;
-pub mod webhook;
-pub mod ws;
-
 pub mod tauri;
 
-pub use state::AppState;
+// Re-export from app-core
+pub use echo_agent_app_core::{
+    agent_handle, config, config_watcher, error, infra, output, persistence, profiles, project,
+    scheduler, security, sessions, skills_hub, state, types, webhook, AppState,
+};
+
+// Re-export from server
+pub use echo_agent_server::{metrics, routes, security_middleware, ws};
+
+// Re-export from tui
+pub use echo_agent_tui::tui;

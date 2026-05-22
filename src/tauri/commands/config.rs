@@ -1,12 +1,15 @@
 //! 配置相关 Tauri 命令
 
-use tauri::State;
 use super::super::state::TauriState;
+use tauri::State;
 
 #[tauri::command]
 pub async fn get_config(state: State<'_, TauriState>) -> Result<serde_json::Value, String> {
     let guard = state.agent.inner().read().await;
-    let model = guard.llm_config().map(|c| c.model.clone()).unwrap_or_default();
+    let model = guard
+        .llm_config()
+        .map(|c| c.model.clone())
+        .unwrap_or_default();
     Ok(serde_json::json!({
         "model": model,
         "tool_count": guard.tool_names().len(),

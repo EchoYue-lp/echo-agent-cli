@@ -4,10 +4,10 @@
   "version": "1.0.0",
   "identifier": "com.echo-agent.app",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "cd ../web-frontend && npm run dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
-    "frontendDist": "../dist"
+    "beforeBuildCommand": "cd ../web-frontend && npm run build",
+    "frontendDist": "../web-frontend/dist"
   },
   "app": {
     "windows": [

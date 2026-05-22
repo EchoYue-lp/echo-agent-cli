@@ -3,11 +3,13 @@
 //! Note: Full permission management is available through the Web API.
 //! These IPC commands provide read-only status for the Tauri frontend.
 
-use tauri::State;
 use super::super::state::TauriState;
+use tauri::State;
 
 #[tauri::command]
-pub async fn get_permission_status(state: State<'_, TauriState>) -> Result<serde_json::Value, String> {
+pub async fn get_permission_status(
+    state: State<'_, TauriState>,
+) -> Result<serde_json::Value, String> {
     let guard = state.agent.inner().read().await;
     let cfg = guard.config();
     Ok(serde_json::json!({
