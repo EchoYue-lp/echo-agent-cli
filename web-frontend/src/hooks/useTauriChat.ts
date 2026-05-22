@@ -93,7 +93,7 @@ export function useTauriChat() {
 
     const store = useChatStore.getState();
     store.addUserMessage(message);
-    const assistantId = store.startAssistantMessage();
+    store.startAssistantMessage();
 
     const conversationId = cidRef.current || `conv-${Date.now()}`;
     cidRef.current = conversationId;
