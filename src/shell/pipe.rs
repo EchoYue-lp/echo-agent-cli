@@ -5,8 +5,8 @@
 
 use std::io::{self, BufRead, Read, Write};
 
-use echo_agent::prelude::*;
 use crate::agent_handle::AgentHandle;
+use echo_agent::prelude::*;
 
 /// 管道模式配置
 #[derive(Debug, Clone)]
@@ -88,18 +88,26 @@ async fn process_input(
 
     // Brief write lock for system prompt change (only when configured)
     if let Some(sp) = system_prompt {
-        agent.write_async(|a| Box::pin(async move {
-            a.set_system_prompt(sp).await;
-        })).await;
+        agent
+            .write_async(|a| {
+                Box::pin(async move {
+                    a.set_system_prompt(sp).await;
+                })
+            })
+            .await;
     }
 
     // Read lock for the chat operation
-    let result = agent.read_async(|a| Box::pin(async move {
-        match a.chat(&input).await {
-            Ok(response) => response,
-            Err(e) => format!("[Error] {}", e),
-        }
-    })).await;
+    let result = agent
+        .read_async(|a| {
+            Box::pin(async move {
+                match a.chat(&input).await {
+                    Ok(response) => response,
+                    Err(e) => format!("[Error] {}", e),
+                }
+            })
+        })
+        .await;
     Ok(result)
 }
 

@@ -102,6 +102,22 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                         attachment_count = attachments.len(),
                                         "WebSocket chat message received"
                                     );
+
+                                    // Guard: refuse new message if an active chat is still running.
+                                    // For single-user local mode, only one chat runs at a time.
+                                    {
+                                        let guard = active_chat.lock().await;
+                                        if let Some(ref handle) = *guard
+                                            && !handle.is_finished()
+                                        {
+                                            let _ = tx.send(ServerMessage::Error {
+                                                id,
+                                                message: "A chat is already in progress. Please wait for it to finish or cancel it before sending a new message.".into(),
+                                            });
+                                            continue;
+                                        }
+                                    }
+
                                     let task_tx = tx.clone();
                                     let task_state = state.clone();
                                     let task_human_loop = human_loop_handler.clone();
@@ -252,21 +268,21 @@ fn save_attachment_to_disk(
 ) -> Result<String, String> {
     use std::fs;
 
-    // 检查文件大小限制
-    if att.size > max_size {
-        return Err(format!(
-            "文件大小 {} 字节超过限制 {} 字节 ({} MB)",
-            att.size,
-            max_size,
-            max_size / (1024 * 1024)
-        ));
-    }
-
     fs::create_dir_all(upload_dir).map_err(|e| format!("创建上传目录失败: {e}"))?;
 
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(&att.data)
         .map_err(|e| format!("Base64 解码失败: {e}"))?;
+
+    // 检查文件大小限制（基于解码后的真实大小，而非客户端声明的 size 字段）
+    if bytes.len() as u64 > max_size {
+        return Err(format!(
+            "文件大小 {} 字节超过限制 {} 字节 ({} MB)",
+            bytes.len(),
+            max_size,
+            max_size / (1024 * 1024)
+        ));
+    }
 
     let safe_name = std::path::Path::new(&att.name)
         .file_name()
@@ -379,6 +395,44 @@ fn build_attachment_parts(
     parts
 }
 
+struct ChatResourceGuard {
+    cancel_tokens: dashmap::DashMap<String, echo_agent::agent::CancellationToken>,
+    cancel_key: String,
+    upload_dir: Option<std::path::PathBuf>,
+}
+
+impl ChatResourceGuard {
+    fn new(
+        cancel_tokens: dashmap::DashMap<String, echo_agent::agent::CancellationToken>,
+        cancel_key: String,
+    ) -> Self {
+        Self {
+            cancel_tokens,
+            cancel_key,
+            upload_dir: None,
+        }
+    }
+
+    fn set_upload_dir(&mut self, dir: std::path::PathBuf) {
+        self.upload_dir = Some(dir);
+    }
+}
+
+impl Drop for ChatResourceGuard {
+    fn drop(&mut self) {
+        self.cancel_tokens.remove(&self.cancel_key);
+        if let Some(dir) = self.upload_dir.take()
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            handle.spawn(async move {
+                if let Err(e) = tokio::fs::remove_dir_all(&dir).await {
+                    tracing::warn!(dir = %dir.display(), error = %e, "Failed to clean up session upload directory");
+                }
+            });
+        }
+    }
+}
+
 async fn handle_chat_message(
     id: Option<String>,
     message: String,
@@ -407,6 +461,9 @@ async fn handle_chat_message(
             .cancel_token
             .insert(message_key.clone(), cancel_token.clone());
     }
+
+    let mut chat_resources =
+        ChatResourceGuard::new(state.session.cancel_token.clone(), message_key.clone());
 
     // Acquire the chat serialization lock to prevent concurrent human-loop
     // provider overwrites across multiple WebSocket sessions.
@@ -437,9 +494,6 @@ async fn handle_chat_message(
         "WS chat agent read lock acquired"
     );
 
-    // Track session upload dir for cleanup after stream finishes
-    let mut session_upload_dir: Option<std::path::PathBuf> = None;
-
     let stream_result = if attachments.is_empty() {
         tracing::info!(id = ?id, "WS chat creating text stream");
         agent
@@ -450,23 +504,11 @@ async fn handle_chat_message(
         let dir = upload_dir().join(Uuid::new_v4().to_string());
         let max_upload_size = state.config.web_config.read().await.max_upload_size_bytes;
         let parts = build_attachment_parts(&attachments, &message, &dir, max_upload_size);
-        session_upload_dir = Some(dir);
+        chat_resources.set_upload_dir(dir.clone());
         let msg = LlmMessage::user_multimodal(parts);
         agent.chat_stream_message(msg).await
     };
     // agent guard 在此之后仍然存活，stream 处理完毕后自动 drop
-
-    // 流结束后清除此消息的取消令牌
-    {
-        state.session.cancel_token.remove(&message_key);
-    }
-
-    // Clean up session upload directory
-    if let Some(ref dir) = session_upload_dir
-        && let Err(e) = tokio::fs::remove_dir_all(dir).await
-    {
-        tracing::warn!(dir = %dir.display(), error = %e, "Failed to clean up session upload directory");
-    }
 
     match stream_result {
         Ok(mut stream) => {

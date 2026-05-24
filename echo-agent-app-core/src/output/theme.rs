@@ -66,14 +66,14 @@ impl ColorTheme {
     pub const fn monokai() -> Self {
         Self {
             name: "monokai",
-            user_color: Color::Fixed(81),      // #66d9ef
+            user_color: Color::Fixed(81),       // #66d9ef
             assistant_color: Color::Fixed(118), // #a6e22e
-            tool_color: Color::Fixed(227),       // #e6db74
-            error_color: Color::Fixed(197),      // #f92672
+            tool_color: Color::Fixed(227),      // #e6db74
+            error_color: Color::Fixed(197),     // #f92672
             success_color: Color::Fixed(118),
             warning_color: Color::Fixed(227),
             info_color: Color::Fixed(81),
-            heading_color: Color::Fixed(208),    // #fd971f
+            heading_color: Color::Fixed(208), // #fd971f
             code_block_bg: Color::DarkGray,
             border_color: Color::DarkGray,
             muted_color: Color::DarkGray,
@@ -85,14 +85,14 @@ impl ColorTheme {
     pub const fn solarized() -> Self {
         Self {
             name: "solarized",
-            user_color: Color::Fixed(33),       // #268bd2
-            assistant_color: Color::Fixed(64),   // #859900
-            tool_color: Color::Fixed(136),       // #b58900
-            error_color: Color::Fixed(160),      // #dc322f
+            user_color: Color::Fixed(33),      // #268bd2
+            assistant_color: Color::Fixed(64), // #859900
+            tool_color: Color::Fixed(136),     // #b58900
+            error_color: Color::Fixed(160),    // #dc322f
             success_color: Color::Fixed(64),
             warning_color: Color::Fixed(136),
             info_color: Color::Fixed(33),
-            heading_color: Color::Fixed(37),     // #2aa198
+            heading_color: Color::Fixed(37), // #2aa198
             code_block_bg: Color::DarkGray,
             border_color: Color::DarkGray,
             muted_color: Color::DarkGray,
@@ -104,14 +104,14 @@ impl ColorTheme {
     pub const fn dracula() -> Self {
         Self {
             name: "dracula",
-            user_color: Color::Fixed(117),      // #8be9fd
-            assistant_color: Color::Fixed(84),   // #50fa7b
-            tool_color: Color::Fixed(228),       // #f1fa8c
-            error_color: Color::Fixed(203),      // #ff5555
+            user_color: Color::Fixed(117),     // #8be9fd
+            assistant_color: Color::Fixed(84), // #50fa7b
+            tool_color: Color::Fixed(228),     // #f1fa8c
+            error_color: Color::Fixed(203),    // #ff5555
             success_color: Color::Fixed(84),
             warning_color: Color::Fixed(228),
-            info_color: Color::Fixed(141),       // #bd93f9
-            heading_color: Color::Fixed(212),    // #ff79c6
+            info_color: Color::Fixed(141),    // #bd93f9
+            heading_color: Color::Fixed(212), // #ff79c6
             code_block_bg: Color::DarkGray,
             border_color: Color::DarkGray,
             muted_color: Color::DarkGray,
@@ -124,13 +124,13 @@ impl ColorTheme {
         Self {
             name: "one-dark",
             user_color: Color::Fixed(75),       // #61afef
-            assistant_color: Color::Fixed(114),  // #98c379
-            tool_color: Color::Fixed(180),       // #e5c07b
-            error_color: Color::Fixed(168),      // #e06c75
+            assistant_color: Color::Fixed(114), // #98c379
+            tool_color: Color::Fixed(180),      // #e5c07b
+            error_color: Color::Fixed(168),     // #e06c75
             success_color: Color::Fixed(114),
             warning_color: Color::Fixed(180),
             info_color: Color::Fixed(75),
-            heading_color: Color::Fixed(177),    // #c678dd
+            heading_color: Color::Fixed(177), // #c678dd
             code_block_bg: Color::DarkGray,
             border_color: Color::DarkGray,
             muted_color: Color::DarkGray,
@@ -153,7 +153,14 @@ impl ColorTheme {
 
     /// 列出所有可用主题名
     pub fn available_names() -> &'static [&'static str] {
-        &["dark", "light", "monokai", "solarized", "dracula", "one-dark"]
+        &[
+            "dark",
+            "light",
+            "monokai",
+            "solarized",
+            "dracula",
+            "one-dark",
+        ]
     }
 
     pub fn format_user(&self, text: &str) -> String {

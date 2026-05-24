@@ -2,7 +2,7 @@
 //!
 //! 安全注意事项：
 //! - 本地执行模式 (`execute_local`) 直接运行在宿主进程环境中，不提供真正的隔离。
-//! - `SecurityLevel::High` 场景应使用 Docker/K8s 后端，但目前仅实现了本地执行。
+//! - `SandboxTier::High` 场景应使用 Docker/K8s 后端，但目前仅实现了本地执行。
 //! - 超时时会强制杀死子进程（通过 `kill_on_drop`）。
 
 use axum::{Json, extract::State};
@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tokio::sync::OnceCell;
 
 use crate::error::AppError;
-use crate::state::{AppState, SecurityLevel};
+use crate::state::{AppState, SandboxTier};
 
 // ── 类型定义 ─────────────────────────────────────────────────────
 
@@ -28,7 +28,7 @@ pub struct SandboxStatus {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SandboxConfig {
-    pub security_level: SecurityLevel,
+    pub security_level: SandboxTier,
     pub max_memory_mb: Option<u32>,
     pub max_cpu_seconds: Option<u32>,
     pub network_enabled: bool,
@@ -75,8 +75,8 @@ pub async fn get_sandbox_status(
     let docker_available = check_docker_cached().await;
     let sandbox_config = state.config.sandbox_config.read().await;
 
-    let isolation_warning = if sandbox_config.security_level == SecurityLevel::High {
-        Some("SecurityLevel is set to High but execution is local — no container/VM isolation is in effect. Consider using Docker or K8s backend.".to_string())
+    let isolation_warning = if sandbox_config.security_level == SandboxTier::High {
+        Some("SandboxTier is set to High but execution is local — no container/VM isolation is in effect. Consider using Docker or K8s backend.".to_string())
     } else {
         None
     };
@@ -184,9 +184,9 @@ pub async fn execute_in_sandbox(
     drop(sandbox_config);
 
     // Warn when High security level uses local execution (no real isolation)
-    if security_level == SecurityLevel::High {
+    if security_level == SandboxTier::High {
         tracing::warn!(
-            "SecurityLevel::High with local backend — no container/VM isolation in effect"
+            "SandboxTier::High with local backend — no container/VM isolation in effect"
         );
     }
 

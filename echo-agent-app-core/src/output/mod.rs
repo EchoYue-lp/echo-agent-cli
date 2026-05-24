@@ -288,22 +288,13 @@ impl OutputRenderer {
         println!("{}", border);
         self.print_banner_line("", width);
         let title = format!("Echo Agent CLI v{}", version);
-        self.print_banner_line(
-            &format!("{:^width$}", title, width = width - 2),
-            width,
-        );
+        self.print_banner_line(&format!("{:^width$}", title, width = width - 2), width);
         self.print_banner_line("", width);
         let tagline = "Production-grade AI Agent — ReAct / MCP / Multi-Modal";
-        self.print_banner_line(
-            &format!("{:^width$}", tagline, width = width - 2),
-            width,
-        );
+        self.print_banner_line(&format!("{:^width$}", tagline, width = width - 2), width);
         self.print_banner_line("", width);
         let hint = "输入消息开始对话，或输入 /help 查看帮助";
-        self.print_banner_line(
-            &format!("{:^width$}", hint, width = width - 2),
-            width,
-        );
+        self.print_banner_line(&format!("{:^width$}", hint, width = width - 2), width);
         self.print_banner_line("", width);
         let bottom_border = format!("╰{}╯", "─".repeat(width - 2));
         let border_end = self.paint(|t| t.heading_color, &bottom_border);
@@ -312,7 +303,13 @@ impl OutputRenderer {
     }
 
     /// 打印模式与项目信息
-    pub fn print_session_info(&self, mode: &str, model: &str, project: Option<&str>, instructions: usize) {
+    pub fn print_session_info(
+        &self,
+        mode: &str,
+        model: &str,
+        project: Option<&str>,
+        instructions: usize,
+    ) {
         let mode_icon = match mode {
             "coding" => "💻",
             "research" => "🔬",
@@ -320,7 +317,9 @@ impl OutputRenderer {
             "writing" => "✍️",
             _ => "💬",
         };
-        let mode_label = Color::Cyan.bold().paint(format!("  模式: {} {}", mode_icon, mode));
+        let mode_label = Color::Cyan
+            .bold()
+            .paint(format!("  模式: {} {}", mode_icon, mode));
         let model_label = Color::Fixed(12).paint(format!("  模型: {}", model));
 
         println!("{}", mode_label);
@@ -332,7 +331,8 @@ impl OutputRenderer {
         }
 
         if instructions > 0 {
-            let inst_label = Color::Yellow.paint(format!("  指令: {} 个项目指令已加载", instructions));
+            let inst_label =
+                Color::Yellow.paint(format!("  指令: {} 个项目指令已加载", instructions));
             println!("{}", inst_label);
         }
 

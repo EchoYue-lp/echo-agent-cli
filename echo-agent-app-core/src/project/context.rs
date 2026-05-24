@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 use tracing;
 
+use super::gitignore::GitIgnore;
+
 const PROJECT_CONTEXT_FILES: &[&str] = &[
     "AGENTS.md",
     "ECHO_AGENT.md",
@@ -30,6 +32,8 @@ pub struct ProjectContext {
     pub name: String,
     pub instructions: Vec<LoadedInstruction>,
     pub file_tree_summary: String,
+    /// Parsed .gitignore rules (empty if no .gitignore exists).
+    pub gitignore: GitIgnore,
 }
 
 #[derive(Debug, Clone)]
@@ -113,12 +117,31 @@ pub fn load_project_context(project_root: &Path) -> ProjectContext {
     }
 
     let file_tree_summary = generate_file_tree_summary(project_root);
+    let gitignore = GitIgnore::load(project_root);
 
     ProjectContext {
         root: project_root.to_path_buf(),
         name,
         instructions,
         file_tree_summary,
+        gitignore,
+    }
+}
+
+impl ProjectContext {
+    /// Check whether a path (relative to the project root) should be ignored
+    /// by file tools. The check combines:
+    ///
+    /// 1. Built-in skip directories (`target`, `node_modules`, `.git`, etc.)
+    /// 2. `.gitignore` rules loaded from the project root
+    pub fn should_ignore_path(&self, relative_path: &str, is_dir: bool) -> bool {
+        // Check built-in skip dirs first
+        let first_component = relative_path.split('/').next().unwrap_or(relative_path);
+        if SKIP_DIRS.contains(&first_component) {
+            return true;
+        }
+        // Then check gitignore rules
+        self.gitignore.is_ignored(relative_path, is_dir)
     }
 }
 

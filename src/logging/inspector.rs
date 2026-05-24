@@ -77,10 +77,7 @@ impl LlmInspector {
 
     /// 获取所有记录
     pub fn all_records(&self) -> Vec<LlmCallRecord> {
-        self.records
-            .lock()
-            .map(|r| r.clone())
-            .unwrap_or_default()
+        self.records.lock().map(|r| r.clone()).unwrap_or_default()
     }
 
     /// 获取最近 N 条记录
@@ -176,8 +173,26 @@ mod tests {
         let mut inspector = LlmInspector::new();
         inspector.set_enabled(true);
 
-        inspector.record(create_record("test", "{}", "{}", Some(10), Some(20), 100, true, None));
-        inspector.record(create_record("test", "{}", "{}", Some(5), Some(15), 200, false, Some("err".into())));
+        inspector.record(create_record(
+            "test",
+            "{}",
+            "{}",
+            Some(10),
+            Some(20),
+            100,
+            true,
+            None,
+        ));
+        inspector.record(create_record(
+            "test",
+            "{}",
+            "{}",
+            Some(5),
+            Some(15),
+            200,
+            false,
+            Some("err".into()),
+        ));
 
         let stats = inspector.stats();
         assert_eq!(stats.total_calls, 2);

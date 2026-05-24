@@ -32,12 +32,32 @@ pub fn run_onboard() -> anyhow::Result<()> {
     println!("  🔑 配置 LLM API Key");
     println!("  ─────────────────────────────────────");
     let providers = [
-        ("DASHSCOPE_API_KEY", "阿里通义千问 (Qwen)", "https://dashscope.console.aliyun.com/"),
-        ("OPENAI_API_KEY", "OpenAI (GPT)", "https://platform.openai.com/api-keys"),
-        ("ANTHROPIC_API_KEY", "Anthropic (Claude)", "https://console.anthropic.com/"),
-        ("DEEPSEEK_API_KEY", "DeepSeek", "https://platform.deepseek.com/"),
+        (
+            "DASHSCOPE_API_KEY",
+            "阿里通义千问 (Qwen)",
+            "https://dashscope.console.aliyun.com/",
+        ),
+        (
+            "OPENAI_API_KEY",
+            "OpenAI (GPT)",
+            "https://platform.openai.com/api-keys",
+        ),
+        (
+            "ANTHROPIC_API_KEY",
+            "Anthropic (Claude)",
+            "https://console.anthropic.com/",
+        ),
+        (
+            "DEEPSEEK_API_KEY",
+            "DeepSeek",
+            "https://platform.deepseek.com/",
+        ),
         ("ZHIPU_API_KEY", "智谱 (GLM)", "https://open.bigmodel.cn/"),
-        ("MOONSHOT_API_KEY", "月之暗面 (Kimi)", "https://platform.moonshot.cn/"),
+        (
+            "MOONSHOT_API_KEY",
+            "月之暗面 (Kimi)",
+            "https://platform.moonshot.cn/",
+        ),
     ];
 
     let mut has_any_key = false;

@@ -9,6 +9,10 @@ use std::collections::HashMap;
 #[derive(Debug, Deserialize)]
 pub struct ChatRequest {
     pub message: String,
+    /// Optional session ID — when provided, the agent's conversation history
+    /// is restored from the persisted session before processing this message.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 // ── MCP 相关 ─────────────────────────────────────────────────

@@ -3,10 +3,10 @@
 //! 提供 axum Router 构建、登录和健康检查处理函数。
 
 use axum::{
+    Json, Router,
     extract::State,
     http::{HeaderMap, HeaderValue},
     routing::{delete, get, post, put},
-    Json, Router,
 };
 use std::sync::Arc;
 
@@ -49,11 +49,17 @@ pub async fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/session/reset", post(routes::session::reset_session))
         // ── 工具 API ─────────────────────────────────────────────
         .route("/api/tools/:name/enable", post(routes::tools::enable_tool))
-        .route("/api/tools/:name/disable", post(routes::tools::disable_tool))
+        .route(
+            "/api/tools/:name/disable",
+            post(routes::tools::disable_tool),
+        )
         .route("/api/tools/:name", get(routes::tools::get_tool))
         .route("/api/tools", get(routes::tools::list_tools))
         // ── Skill API ─────────────────────────────────────────────
-        .route("/api/skills/load", post(routes::skills::load_skills_from_dir))
+        .route(
+            "/api/skills/load",
+            post(routes::skills::load_skills_from_dir),
+        )
         .route("/api/skills/upload", post(routes::skills::upload_skills))
         .route("/api/skills/:name", get(routes::skills::get_skill))
         .route("/api/skills", get(routes::skills::list_skills))
@@ -98,7 +104,10 @@ pub async fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/memory/search", post(routes::memory::search_memory))
         .route("/api/memory/delete", post(routes::memory::delete_memory))
-        .route("/api/memory/namespaces", get(routes::memory::list_namespaces))
+        .route(
+            "/api/memory/namespaces",
+            get(routes::memory::list_namespaces),
+        )
         .route("/api/memory/list", get(routes::memory::list_memory))
         // ── 结构化输出 API ─────────────────────────────────────────────
         .route("/api/extract", post(routes::extract::extract))
@@ -127,13 +136,11 @@ pub async fn build_router(state: Arc<AppState>) -> Router {
         // ── 工作流 API ─────────────────────────────────────────────
         .route(
             "/api/workflow",
-            get(routes::workflow::list_workflows)
-                .post(routes::workflow::create_workflow),
+            get(routes::workflow::list_workflows).post(routes::workflow::create_workflow),
         )
         .route(
             "/api/workflow/:id",
-            get(routes::workflow::get_workflow)
-                .delete(routes::workflow::delete_workflow),
+            get(routes::workflow::get_workflow).delete(routes::workflow::delete_workflow),
         )
         .route(
             "/api/workflow/:id/execute",
@@ -142,8 +149,7 @@ pub async fn build_router(state: Arc<AppState>) -> Router {
         // ── 审计 API ─────────────────────────────────────────────
         .route(
             "/api/audit/logs",
-            get(routes::audit::get_audit_logs)
-                .delete(routes::audit::clear_audit_logs),
+            get(routes::audit::get_audit_logs).delete(routes::audit::clear_audit_logs),
         )
         .route("/api/audit/stats", get(routes::audit::get_audit_stats))
         // ── 沙箱 API ─────────────────────────────────────────────
@@ -153,16 +159,21 @@ pub async fn build_router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/api/sandbox/config",
-            get(routes::sandbox::get_sandbox_config)
-                .put(routes::sandbox::update_sandbox_config),
+            get(routes::sandbox::get_sandbox_config).put(routes::sandbox::update_sandbox_config),
         )
         .route(
             "/api/sandbox/execute",
             post(routes::sandbox::execute_in_sandbox),
         )
         // ── 会话搜索 API ─────────────────────────────────────────────
-        .route("/api/sessions/search", get(routes::session_search::search_sessions))
-        .route("/api/sessions/reindex", post(routes::session_search::reindex_sessions))
+        .route(
+            "/api/sessions/search",
+            get(routes::session_search::search_sessions),
+        )
+        .route(
+            "/api/sessions/reindex",
+            post(routes::session_search::reindex_sessions),
+        )
         // ── 定时任务 API ─────────────────────────────────────────────
         .route(
             "/api/scheduler/tasks",
@@ -181,17 +192,41 @@ pub async fn build_router(state: Arc<AppState>) -> Router {
             delete(routes::scheduler::remove_task),
         )
         // ── Webhook API ─────────────────────────────────────────────
-        .route("/api/webhooks", get(routes::webhooks::list_webhooks).post(routes::webhooks::add_webhook))
-        .route("/api/webhooks/remove", post(routes::webhooks::remove_webhook))
+        .route(
+            "/api/webhooks",
+            get(routes::webhooks::list_webhooks).post(routes::webhooks::add_webhook),
+        )
+        .route(
+            "/api/webhooks/remove",
+            post(routes::webhooks::remove_webhook),
+        )
         .route("/api/webhooks/test", post(routes::webhooks::test_webhook))
         // ── Skills Hub API ─────────────────────────────────────────────
         .route("/api/skills-hub", get(routes::skills_hub::list_hub_skills))
-        .route("/api/skills-hub/search", get(routes::skills_hub::search_hub_skills))
-        .route("/api/skills-hub/:name", get(routes::skills_hub::get_hub_skill))
-        .route("/api/skills-hub/install/local", post(routes::skills_hub::install_local))
-        .route("/api/skills-hub/install/git", post(routes::skills_hub::install_git))
-        .route("/api/skills-hub/uninstall", post(routes::skills_hub::uninstall_skill))
-        .route("/api/skills-hub/refresh", post(routes::skills_hub::refresh_hub))
+        .route(
+            "/api/skills-hub/search",
+            get(routes::skills_hub::search_hub_skills),
+        )
+        .route(
+            "/api/skills-hub/:name",
+            get(routes::skills_hub::get_hub_skill),
+        )
+        .route(
+            "/api/skills-hub/install/local",
+            post(routes::skills_hub::install_local),
+        )
+        .route(
+            "/api/skills-hub/install/git",
+            post(routes::skills_hub::install_git),
+        )
+        .route(
+            "/api/skills-hub/uninstall",
+            post(routes::skills_hub::uninstall_skill),
+        )
+        .route(
+            "/api/skills-hub/refresh",
+            post(routes::skills_hub::refresh_hub),
+        )
         // ── 会话快照 API ─────────────────────────────────────────────
         .route(
             "/api/session/checkpoint",
@@ -236,16 +271,16 @@ pub async fn build_router(state: Arc<AppState>) -> Router {
         .with_state(state.clone());
 
     // 合并路由（Web 前端已移除，仅 API）
-    let app = Router::new()
-        .merge(auth_routes)
-        .merge(protected_routes);
+    let app = Router::new().merge(auth_routes).merge(protected_routes);
 
     // 应用全局中间件: 指标收集 + CORS配置
     let app = {
         let sec_cfg = state.config.security_config.read().await;
         let app = app.layer(middleware::from_fn(metrics::metrics_middleware));
         let app = if sec_cfg.enable_request_id {
-            app.layer(middleware::from_fn(security_middleware::request_id_middleware))
+            app.layer(middleware::from_fn(
+                security_middleware::request_id_middleware,
+            ))
         } else {
             app
         };
@@ -299,8 +334,7 @@ pub async fn build_router(state: Arc<AppState>) -> Router {
                         || header_name.eq_ignore_ascii_case("authorization")
                         || header_name.eq_ignore_ascii_case("x-api-key")
                     {
-                        filtered_headers
-                            .insert(name, HeaderValue::from_static("<REDACTED>"));
+                        filtered_headers.insert(name, HeaderValue::from_static("<REDACTED>"));
                     } else {
                         filtered_headers.insert(name.clone(), value.clone());
                     }
@@ -377,9 +411,7 @@ pub async fn handle_health() -> Json<HealthResponse> {
 }
 
 /// 深度健康检查：验证 LLM、MCP、SQLite 等后端依赖
-pub async fn handle_deep_health(
-    State(state): State<Arc<AppState>>,
-) -> Json<serde_json::Value> {
+pub async fn handle_deep_health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     // 并发检查各项依赖
     let (llm_ok, mcp_servers, db_ok) = tokio::join!(
         check_llm_connectivity(&state),
@@ -406,15 +438,20 @@ pub async fn handle_deep_health(
 }
 
 async fn check_llm_connectivity(state: &AppState) -> bool {
-    let model_name = state.connection.agent.read(|a| {
-        a.config().get_model_name().to_string()
-    }).await;
+    let model_name = state
+        .connection
+        .agent
+        .read(|a| a.config().get_model_name().to_string())
+        .await;
     !model_name.is_empty()
 }
 
 async fn check_mcp_health(state: &AppState) -> Vec<(String, bool)> {
     let health = state.plugins.mcp_health.read().await;
-    health.iter().map(|(name, h)| (name.clone(), h.healthy)).collect()
+    health
+        .iter()
+        .map(|(name, h)| (name.clone(), h.healthy))
+        .collect()
 }
 
 async fn check_storage(state: &AppState) -> bool {

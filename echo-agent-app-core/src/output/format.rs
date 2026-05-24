@@ -2,12 +2,11 @@
 //!
 //! 支持 Text / Json / Markdown / Table 四种输出模式。
 
-use serde::Serialize;
 use crate::types::ToolCallInfo;
+use serde::Serialize;
 
 /// 输出格式 (用于 --output / -o 标志)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, Default)]
 pub enum OutputFormat {
     /// 人类可读文本 (默认)
     #[clap(name = "text")]
@@ -23,7 +22,6 @@ pub enum OutputFormat {
     #[clap(name = "table")]
     Table,
 }
-
 
 /// 格式化上下文信息
 #[derive(Debug, Clone)]
@@ -57,11 +55,7 @@ pub struct FormattedToolCall {
 
 impl OutputFormat {
     /// 格式化 agent 响应
-    pub fn format_response(
-        &self,
-        answer: &str,
-        context: &FormatContext,
-    ) -> String {
+    pub fn format_response(&self, answer: &str, context: &FormatContext) -> String {
         match self {
             OutputFormat::Text => answer.to_string(),
             OutputFormat::Json => {

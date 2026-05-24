@@ -23,33 +23,51 @@ impl EnhancedCompleter {
     pub fn new() -> Self {
         let commands = BTreeSet::from_iter(
             [
-                "/help", "/h", "/?",
-                "/exit", "/quit", "/q",
-                "/reset", "/r",
-                "/clear", "/cls",
-                "/tools", "/t",
-                "/skills", "/sk",
-                "/mcp", "/m",
-                "/history", "/hist",
-                "/compress", "/cp",
-                "/stats", "/st",
+                "/help",
+                "/h",
+                "/?",
+                "/exit",
+                "/quit",
+                "/q",
+                "/reset",
+                "/r",
+                "/clear",
+                "/cls",
+                "/tools",
+                "/t",
+                "/skills",
+                "/sk",
+                "/mcp",
+                "/m",
+                "/history",
+                "/hist",
+                "/compress",
+                "/cp",
+                "/stats",
+                "/st",
                 "/model",
-                "/system", "/sys",
+                "/system",
+                "/sys",
                 "/save",
                 "/load",
-                "/sessions", "/ss",
+                "/sessions",
+                "/ss",
                 "/theme",
                 "/output",
                 "/verbose",
                 "/inspect",
                 "/tui",
                 "/export",
-                "/profile", "/prof",
-                "/debug", "/dbg",
+                "/profile",
+                "/prof",
+                "/debug",
+                "/dbg",
                 "/mode",
-                "/project", "/proj",
+                "/project",
+                "/proj",
                 "/cost",
-                "/undo", "/u",
+                "/undo",
+                "/u",
             ]
             .iter()
             .map(|s| s.to_string()),
@@ -59,9 +77,16 @@ impl EnhancedCompleter {
             commands,
             tool_names: BTreeSet::new(),
             model_names: BTreeSet::from_iter(
-                ["qwen-max", "qwen-plus", "qwen-turbo", "gpt-4", "gpt-3.5-turbo", "claude-3-opus"]
-                    .iter()
-                    .map(|s| s.to_string()),
+                [
+                    "qwen-max",
+                    "qwen-plus",
+                    "qwen-turbo",
+                    "gpt-4",
+                    "gpt-3.5-turbo",
+                    "claude-3-opus",
+                ]
+                .iter()
+                .map(|s| s.to_string()),
             ),
             mcp_servers: BTreeSet::new(),
             skill_names: BTreeSet::new(),
@@ -111,11 +136,18 @@ impl EnhancedCompleter {
         // /theme 后补全主题名
         if input.starts_with("/theme ") {
             let prefix = input.split_whitespace().last().unwrap_or("");
-            return ["dark", "light", "monokai", "solarized", "dracula", "one-dark"]
-                .iter()
-                .filter(|t| t.starts_with(prefix))
-                .map(|s| s.to_string())
-                .collect();
+            return [
+                "dark",
+                "light",
+                "monokai",
+                "solarized",
+                "dracula",
+                "one-dark",
+            ]
+            .iter()
+            .filter(|t| t.starts_with(prefix))
+            .map(|s| s.to_string())
+            .collect();
         }
 
         // /output 后补全输出格式

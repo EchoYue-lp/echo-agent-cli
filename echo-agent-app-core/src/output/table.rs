@@ -20,9 +20,9 @@ impl TableRenderer {
             return;
         }
 
-        let col_count = headers.len().max(
-            rows.iter().map(|r| r.len()).max().unwrap_or(0),
-        );
+        let col_count = headers
+            .len()
+            .max(rows.iter().map(|r| r.len()).max().unwrap_or(0));
         if col_count == 0 {
             return;
         }
@@ -50,7 +50,10 @@ impl TableRenderer {
         } else {
             1.0
         };
-        let widths: Vec<usize> = widths.iter().map(|w| ((*w as f64) * scale) as usize).collect();
+        let widths: Vec<usize> = widths
+            .iter()
+            .map(|w| ((*w as f64) * scale) as usize)
+            .collect();
 
         let paint = |c: Color, t: &str| -> String {
             if color_enabled {
@@ -78,7 +81,10 @@ impl TableRenderer {
         let b = paint(border_color, "│");
         let header_text: String = header_cells.join(&paint(border_color, "│"));
         let styled_header = if color_enabled {
-            nu_ansi_term::Style::new().bold().paint(&header_text).to_string()
+            nu_ansi_term::Style::new()
+                .bold()
+                .paint(&header_text)
+                .to_string()
         } else {
             header_text
         };
@@ -141,9 +147,7 @@ impl TableRenderer {
             .unwrap_or(10)
             .min(30);
 
-        let val_width = max_width
-            .saturating_sub(key_width + 7)
-            .max(10);
+        let val_width = max_width.saturating_sub(key_width + 7).max(10);
 
         let paint = |c: Color, t: &str| -> String {
             if color_enabled {

@@ -41,15 +41,15 @@ async fn setup_web_infrastructure(
             })
             .collect();
         crate::webhook::emitter::init_global(webhook_eps);
-        tracing::info!("Webhook emitter initialized with {} endpoints", app_config.webhooks.endpoints.len());
+        tracing::info!(
+            "Webhook emitter initialized with {} endpoints",
+            app_config.webhooks.endpoints.len()
+        );
     }
 
     let state = Arc::new({
-        let mut s = state::AppState::from_shared(
-            agent.clone(),
-            conversation_store,
-            app_config.clone(),
-        );
+        let mut s =
+            state::AppState::from_shared(agent.clone(), conversation_store, app_config.clone());
         s.start_scheduler();
         s
     });
@@ -64,19 +64,31 @@ async fn setup_web_infrastructure(
     crate::ws::handler::cleanup_stale_uploads().await;
 
     let app = build_router(state.clone()).await;
-    let host = if args.host != "0.0.0.0" { &args.host } else { &app_config.server.host };
-    let port = if args.port != 3000 { args.port } else { app_config.server.port };
+    let host = if args.host != "127.0.0.1" {
+        &args.host
+    } else {
+        &app_config.server.host
+    };
+    let port = if args.port != 3000 {
+        args.port
+    } else {
+        app_config.server.port
+    };
     let addr = format!("{}:{}", host, port);
 
-    Ok(WebInfra { app, addr, cancel_token })
+    // Warn if binding to non-localhost, especially with auth disabled
+    let auth_enabled = state.config.security_config.read().await.auth_enabled;
+    crate::infra::warn_non_localhost_bind(host, &addr, auth_enabled);
+
+    Ok(WebInfra {
+        app,
+        addr,
+        cancel_token,
+    })
 }
 
 /// 运行 Web 模式
-pub async fn run_web_mode(
-    agent: AgentHandle,
-    args: &Args,
-    app_config: &AppConfig,
-) -> Result<()> {
+pub async fn run_web_mode(agent: AgentHandle, args: &Args, app_config: &AppConfig) -> Result<()> {
     let infra = setup_web_infrastructure(&agent, args, app_config).await?;
     let listener = tokio::net::TcpListener::bind(&infra.addr).await?;
 

@@ -24,6 +24,7 @@ categories = ["command-line-utilities", "web-programming", "development-tools"]
 default = []
 channels = ["echo-agent/channels"]
 telemetry = ["echo-agent/telemetry"]
+devtools = ["tauri/devtools"]
 
 [[bin]]
 name = "echo-agent-cli"
@@ -59,6 +60,7 @@ terminal_size = "0.3"
 clap_complete = "4"
 shellexpand = "3"
 notify = "7"
+parking_lot = "0.12"
 tokio-util = "0.7"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
@@ -66,7 +68,7 @@ cron = "0.12"
 bcrypt = "0.16"
 tower-http = { version = "0.5", features = ["cors", "fs", "trace"] }
 axum = { version = "0.7", features = ["ws", "macros"] }
-tauri = { version = "2", features = ["devtools"] }
+tauri = { version = "2", features = [] }
 tauri-plugin-shell = "2"
 
 [build-dependencies]

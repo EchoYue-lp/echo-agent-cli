@@ -3,8 +3,8 @@
 //! 处理 Run、Profiles、Sessions、Completions 子命令。
 
 use anyhow::Result;
-use std::io::Read;
 use futures::StreamExt;
+use std::io::Read;
 
 use crate::cli::args::{Commands, ProfileAction, SessionAction};
 use crate::config;
@@ -68,56 +68,63 @@ pub async fn handle_run_command(
         return Ok(());
     }
 
-    let agent =
-        ReactAgent::new(AgentConfig::standard(model, "echo-agent", "你是一个智能助手"));
+    let agent = ReactAgent::new(AgentConfig::standard(
+        model,
+        "echo-agent",
+        "你是一个智能助手",
+    ));
 
     match output {
-        "json" => {
-            match agent.chat(&input).await {
-                Ok(response) => {
-                    let json = serde_json::json!({
-                        "model": model,
-                        "input": input,
-                        "response": response,
-                    });
-                    println!("{}", serde_json::to_string_pretty(&json)?);
-                }
-                Err(e) => {
-                    let json = serde_json::json!({
-                        "error": e.to_string(),
-                    });
-                    eprintln!("{}", serde_json::to_string_pretty(&json)?);
-                }
+        "json" => match agent.chat(&input).await {
+            Ok(response) => {
+                let json = serde_json::json!({
+                    "model": model,
+                    "input": input,
+                    "response": response,
+                });
+                println!("{}", serde_json::to_string_pretty(&json)?);
             }
-        }
-        _ => {
-            match agent.chat_stream(&input).await {
-                Ok(mut stream) => {
-                    while let Some(result) = stream.next().await {
-                        match result {
-                            Ok(AgentEvent::Token(token)) => print!("{}", token),
-                            Ok(AgentEvent::ToolCall { name, .. }) => {
-                                eprintln!("\n🔧 调用工具: {}", name);
-                            }
-                            Ok(AgentEvent::ToolResult { name, output: tool_output, .. }) => {
-                                eprintln!("\n✓ {}: {}", name, tool_output.chars().take(100).collect::<String>());
-                            }
-                            Ok(AgentEvent::FinalAnswer(_)) => {}
-                            Ok(AgentEvent::Cancelled) => {
-                                eprintln!("\n⚠ 执行已取消");
-                            }
-                            Err(e) => {
-                                eprintln!("\n错误: {}", e);
-                                break;
-                            }
-                            _ => {}
+            Err(e) => {
+                let json = serde_json::json!({
+                    "error": e.to_string(),
+                });
+                eprintln!("{}", serde_json::to_string_pretty(&json)?);
+            }
+        },
+        _ => match agent.chat_stream(&input).await {
+            Ok(mut stream) => {
+                while let Some(result) = stream.next().await {
+                    match result {
+                        Ok(AgentEvent::Token(token)) => print!("{}", token),
+                        Ok(AgentEvent::ToolCall { name, .. }) => {
+                            eprintln!("\n🔧 调用工具: {}", name);
                         }
+                        Ok(AgentEvent::ToolResult {
+                            name,
+                            output: tool_output,
+                            ..
+                        }) => {
+                            eprintln!(
+                                "\n✓ {}: {}",
+                                name,
+                                tool_output.chars().take(100).collect::<String>()
+                            );
+                        }
+                        Ok(AgentEvent::FinalAnswer(_)) => {}
+                        Ok(AgentEvent::Cancelled) => {
+                            eprintln!("\n⚠ 执行已取消");
+                        }
+                        Err(e) => {
+                            eprintln!("\n错误: {}", e);
+                            break;
+                        }
+                        _ => {}
                     }
-                    println!();
                 }
-                Err(e) => eprintln!("错误: {}", e),
+                println!();
             }
-        }
+            Err(e) => eprintln!("错误: {}", e),
+        },
     }
 
     Ok(())
@@ -133,7 +140,10 @@ pub async fn handle_profile_action(action: &ProfileAction) -> Result<()> {
             if list.is_empty() {
                 println!("暂无配置档案。使用 echo-agent-cli profiles create <名称> 创建。");
             } else {
-                println!("{:<20} {:<20} {:<10} {:<8} 更新时间", "名称", "模型", "主题", "激活");
+                println!(
+                    "{:<20} {:<20} {:<10} {:<8} 更新时间",
+                    "名称", "模型", "主题", "激活"
+                );
                 println!("{}", "─".repeat(80));
                 for p in &list {
                     let active = if p.active { "★" } else { "" };
@@ -217,7 +227,10 @@ pub async fn handle_session_action(action: &SessionAction) -> Result<()> {
             if list.is_empty() {
                 println!("暂无会话记录。");
             } else {
-                println!("{:<36} {:<24} {:<12} {:<8} 更新时间", "ID", "名称", "模型", "消息");
+                println!(
+                    "{:<36} {:<24} {:<12} {:<8} 更新时间",
+                    "ID", "名称", "模型", "消息"
+                );
                 println!("{}", "─".repeat(100));
                 for s in &list {
                     let updated: String = s.updated_at.chars().take(19).collect();

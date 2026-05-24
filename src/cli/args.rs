@@ -23,7 +23,7 @@ pub struct Args {
     pub port: u16,
 
     /// Web 服务地址
-    #[arg(long, default_value = "0.0.0.0")]
+    #[arg(long, default_value = "127.0.0.1")]
     pub host: String,
 
     /// 模型名称（不指定则使用配置文件中的值）
@@ -166,10 +166,7 @@ pub enum SessionAction {
         branch_name: String,
     },
     /// 对比两个会话
-    Diff {
-        id_a: String,
-        id_b: String,
-    },
+    Diff { id_a: String, id_b: String },
     /// 导出会话
     Export {
         id: String,

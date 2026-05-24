@@ -9,21 +9,19 @@
 //! - 工具调用交互式审批
 //! - Token 用量追踪
 
+use parking_lot::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
 
 use futures::StreamExt;
 use nu_ansi_term::Color;
-use reedline::{
-    Prompt, PromptHistorySearchStatus, Signal,
-};
+use reedline::{Prompt, PromptHistorySearchStatus, Signal};
 
-use echo_agent::prelude::*;
 use crate::agent_handle::AgentHandle;
+use echo_agent::prelude::*;
 
-use crate::output::OutputRenderer;
 use super::commands::{CommandHandler, CommandResult};
-use super::editor::{create_enhanced_editor, EditorConfig};
+use super::editor::{EditorConfig, create_enhanced_editor};
+use crate::output::OutputRenderer;
 
 static TOTAL_INPUT_TOKENS: AtomicUsize = AtomicUsize::new(0);
 static TOTAL_OUTPUT_TOKENS: AtomicUsize = AtomicUsize::new(0);
@@ -58,7 +56,7 @@ static TRACE_BUFFER: std::sync::LazyLock<Mutex<Vec<TraceEntry>>> =
 
 /// Record a trace entry (called during stream processing).
 pub fn push_trace(entry: TraceEntry) {
-    let mut buf = TRACE_BUFFER.lock().unwrap();
+    let mut buf = TRACE_BUFFER.lock();
     // Keep only last 200 entries
     if buf.len() >= 200 {
         let excess = buf.len() - 199;
@@ -69,12 +67,12 @@ pub fn push_trace(entry: TraceEntry) {
 
 /// Clear the trace buffer at the start of a new chat.
 pub fn clear_trace() {
-    TRACE_BUFFER.lock().unwrap().clear();
+    TRACE_BUFFER.lock().clear();
 }
 
 /// Get a snapshot of the current trace buffer.
 pub fn get_trace() -> Vec<TraceEntry> {
-    TRACE_BUFFER.lock().unwrap().clone()
+    TRACE_BUFFER.lock().clone()
 }
 
 /// REPL 配置
@@ -103,18 +101,30 @@ pub async fn run_repl(agent: AgentHandle, config: ReplConfig) -> anyhow::Result<
     output.print_banner(env!("CARGO_PKG_VERSION"));
 
     let model_name = agent.read(|a| a.model_name().to_string()).await;
-    let instructions_count = if config.project.is_some() {
-        let ctx = crate::project::context::load_project_context(
-            std::path::Path::new(config.project.as_deref().unwrap_or(".")),
-        );
-        ctx.instructions.len()
-    } else {
-        0
+
+    // Load project context: use explicit --project path, or auto-discover from cwd.
+    let project_ctx = {
+        let project_path = config.project.as_deref().unwrap_or(".");
+        let explicit = config.project.is_some();
+        let root = if explicit {
+            Some(std::path::PathBuf::from(project_path))
+        } else {
+            crate::project::context::discover_project_root(Some(std::path::Path::new(".")))
+        };
+        root.map(|r| crate::project::context::load_project_context(&r))
     };
+    let instructions_count = project_ctx
+        .as_ref()
+        .map(|c| c.instructions.len())
+        .unwrap_or(0);
+    let project_display = project_ctx
+        .as_ref()
+        .map(|c| c.root.to_string_lossy().to_string());
+
     output.print_session_info(
         &config.mode,
         &model_name,
-        config.project.as_deref(),
+        project_display.as_deref(),
         instructions_count,
     );
 
@@ -165,11 +175,7 @@ pub async fn run_repl(agent: AgentHandle, config: ReplConfig) -> anyhow::Result<
 
 /// 与 Agent 对话
 #[allow(unused_assignments)]
-async fn chat_with_agent(
-    agent: &AgentHandle,
-    message: &str,
-    output: &OutputRenderer,
-) {
+async fn chat_with_agent(agent: &AgentHandle, message: &str, output: &OutputRenderer) {
     output.print_user_message(message);
     clear_trace();
 
@@ -204,19 +210,47 @@ async fn chat_with_agent(
                         // Record trace entry for significant events
                         {
                             let (etype, detail) = match &event {
-                                AgentEvent::ThinkStart => ("think_start".into(), format!("step {}", iteration_count + 1)),
-                                AgentEvent::ThinkEnd { prompt_tokens, completion_tokens } =>
-                                    ("think_end".into(), format!("in={prompt_tokens} out={completion_tokens}")),
-                                AgentEvent::ToolCall { name, .. } => ("tool_call".into(), name.clone()),
-                                AgentEvent::ToolResult { name, .. } => ("tool_result".into(), name.clone()),
-                                AgentEvent::ToolError { name, .. } => ("tool_error".into(), name.clone()),
-                                AgentEvent::FinalAnswer(_) => ("final_answer".into(), String::new()),
+                                AgentEvent::ThinkStart => (
+                                    "think_start".into(),
+                                    format!("step {}", iteration_count + 1),
+                                ),
+                                AgentEvent::ThinkEnd {
+                                    prompt_tokens,
+                                    completion_tokens,
+                                } => (
+                                    "think_end".into(),
+                                    format!("in={prompt_tokens} out={completion_tokens}"),
+                                ),
+                                AgentEvent::ToolCall { name, .. } => {
+                                    ("tool_call".into(), name.clone())
+                                }
+                                AgentEvent::ToolResult { name, .. } => {
+                                    ("tool_result".into(), name.clone())
+                                }
+                                AgentEvent::ToolError { name, .. } => {
+                                    ("tool_error".into(), name.clone())
+                                }
+                                AgentEvent::FinalAnswer(_) => {
+                                    ("final_answer".into(), String::new())
+                                }
                                 AgentEvent::Cancelled => ("cancelled".into(), String::new()),
-                                AgentEvent::PlanGenerated { steps } => ("plan".into(), format!("{} steps", steps.len())),
-                                AgentEvent::StepStart { description, .. } => ("step_start".into(), description.chars().take(60).collect()),
-                                AgentEvent::HandoffStart { from, to } => ("handoff".into(), format!("{from}->{to}")),
-                                AgentEvent::ContextCompressed { before_tokens, after_tokens, .. } =>
-                                    ("compressed".into(), format!("{before_tokens}->{after_tokens}")),
+                                AgentEvent::PlanGenerated { steps } => {
+                                    ("plan".into(), format!("{} steps", steps.len()))
+                                }
+                                AgentEvent::StepStart { description, .. } => {
+                                    ("step_start".into(), description.chars().take(60).collect())
+                                }
+                                AgentEvent::HandoffStart { from, to } => {
+                                    ("handoff".into(), format!("{from}->{to}"))
+                                }
+                                AgentEvent::ContextCompressed {
+                                    before_tokens,
+                                    after_tokens,
+                                    ..
+                                } => (
+                                    "compressed".into(),
+                                    format!("{before_tokens}->{after_tokens}"),
+                                ),
                                 _ => (String::new(), String::new()),
                             };
                             if !etype.is_empty() {
@@ -234,15 +268,16 @@ async fn chat_with_agent(
                                     println!();
                                 }
                                 iteration_count += 1;
-                                let step_label = format!(
-                                    "  ⏳ 思考中 (步骤 {})...",
-                                    iteration_count
-                                );
+                                let step_label =
+                                    format!("  ⏳ 思考中 (步骤 {})...", iteration_count);
                                 let styled = nu_ansi_term::Color::Fixed(8).paint(&step_label);
                                 println!("{}", styled);
                                 first_chunk = true;
                             }
-                            AgentEvent::ThinkEnd { prompt_tokens, completion_tokens } => {
+                            AgentEvent::ThinkEnd {
+                                prompt_tokens,
+                                completion_tokens,
+                            } => {
                                 TOTAL_INPUT_TOKENS.fetch_add(prompt_tokens, Ordering::Relaxed);
                                 TOTAL_OUTPUT_TOKENS.fetch_add(completion_tokens, Ordering::Relaxed);
                             }
@@ -264,7 +299,10 @@ async fn chat_with_agent(
                                 output.print_tool_call(&name, &args);
                                 first_chunk = true;
                             }
-                            AgentEvent::ToolResult { name, output: tool_output } => {
+                            AgentEvent::ToolResult {
+                                name,
+                                output: tool_output,
+                            } => {
                                 output.print_tool_result(&name, &tool_output, true);
                                 first_chunk = true;
                             }
@@ -276,7 +314,7 @@ async fn chat_with_agent(
                                     crate::webhook::WebhookEvent::ToolFailed {
                                         name: name.clone(),
                                         error: error.clone(),
-                                    }
+                                    },
                                 );
                                 first_chunk = true;
                             }
@@ -301,7 +339,10 @@ async fn chat_with_agent(
                                 }
                                 first_chunk = true;
                             }
-                            AgentEvent::StepStart { step_index: _, description } => {
+                            AgentEvent::StepStart {
+                                step_index: _,
+                                description,
+                            } => {
                                 let desc_preview: String = description.chars().take(60).collect();
                                 let step_label = format!("  ▶ 执行: {}...", desc_preview);
                                 let styled = nu_ansi_term::Color::Fixed(8).paint(&step_label);
@@ -326,11 +367,17 @@ async fn chat_with_agent(
                                 clear_spinner!();
                                 output.print_error(&format!("[{}] {}", source, message));
                             }
-                            AgentEvent::ContextCompressed { before_count, after_count, before_tokens, after_tokens } => {
+                            AgentEvent::ContextCompressed {
+                                before_count,
+                                after_count,
+                                before_tokens,
+                                after_tokens,
+                            } => {
                                 let saved = before_tokens.saturating_sub(after_tokens);
-                                let styled = nu_ansi_term::Color::Fixed(8).paint(
-                                    format!("  📦 上下文自动压缩: {}→{} 条消息, {}→{} tokens (节省 {})", before_count, after_count, before_tokens, after_tokens, saved)
-                                );
+                                let styled = nu_ansi_term::Color::Fixed(8).paint(format!(
+                                    "  📦 上下文自动压缩: {}→{} 条消息, {}→{} tokens (节省 {})",
+                                    before_count, after_count, before_tokens, after_tokens, saved
+                                ));
                                 println!("{}", styled);
                             }
                             _ => {}
@@ -352,14 +399,12 @@ async fn chat_with_agent(
             // Emit ChatCompleted webhook
             {
                 let (input_tokens, output_tokens, _) = get_usage_stats();
-                crate::webhook::emitter::emit_global(
-                    crate::webhook::WebhookEvent::ChatCompleted {
-                        model: String::new(), // model not easily available here
-                        input_tokens,
-                        output_tokens,
-                        elapsed_ms: elapsed.as_millis() as u64,
-                    }
-                );
+                crate::webhook::emitter::emit_global(crate::webhook::WebhookEvent::ChatCompleted {
+                    model: String::new(), // model not easily available here
+                    input_tokens,
+                    output_tokens,
+                    elapsed_ms: elapsed.as_millis() as u64,
+                });
             }
 
             let config = output.config();
@@ -381,11 +426,9 @@ async fn chat_with_agent(
         Err(e) => {
             spinner.finish_error(&format!("Connection failed: {}", e));
             output.print_error(&format!("对话失败: {}", e));
-            crate::webhook::emitter::emit_global(
-                crate::webhook::WebhookEvent::AgentError {
-                    error: e.to_string(),
-                }
-            );
+            crate::webhook::emitter::emit_global(crate::webhook::WebhookEvent::AgentError {
+                error: e.to_string(),
+            });
         }
     }
 }
@@ -412,7 +455,10 @@ impl Prompt for EchoPrompt {
         std::borrow::Cow::Borrowed("")
     }
 
-    fn render_prompt_indicator(&self, _prompt_mode: reedline::PromptEditMode) -> std::borrow::Cow<'_, str> {
+    fn render_prompt_indicator(
+        &self,
+        _prompt_mode: reedline::PromptEditMode,
+    ) -> std::borrow::Cow<'_, str> {
         std::borrow::Cow::Borrowed("")
     }
 

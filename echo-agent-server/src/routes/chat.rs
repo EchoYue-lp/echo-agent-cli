@@ -18,6 +18,16 @@ use crate::types::{ChatRequest, ChatResponse, ContextStats, ToolCallInfo};
 const MAX_MESSAGE_LENGTH: usize = 32768;
 
 /// POST /api/chat - 阻塞式对话
+///
+/// Spawns stream processing into a background task. Note: the agent read lock
+/// is still held for the full duration of stream consumption because
+/// `chat_stream()` returns a stream that borrows `&self`. The spawned task
+/// isolates the lock from the HTTP handler, but does NOT reduce the lock
+/// duration.
+///
+/// True lock reduction requires either:
+/// - `chat_stream()` returning an owned stream (internal state snapshot), or
+/// - per-session agent instances so each session has its own lock.
 #[debug_handler]
 pub async fn handle_chat(
     State(state): State<Arc<AppState>>,
@@ -36,77 +46,90 @@ pub async fn handle_chat(
         )));
     }
 
-    state
-        .connection
-        .agent
-        .read_async(|agent| {
-            Box::pin(async move {
-                let max_iterations = agent.config().get_max_iterations();
-                let mut final_answer = String::new();
-                let mut tool_calls = Vec::new();
+    let agent_arc = state.connection.agent.inner().clone();
+    let message = msg.to_string();
 
-                {
-                    let stream_result = agent.chat_stream(&req.message).await;
-                    let mut stream = stream_result?;
-                    let mut current_tool: Option<(String, Value)> = None;
+    // session_id context restore is not yet supported on the shared agent.
+    // See handle_chat_stream for details.
+    if req.session_id.is_some() {
+        tracing::warn!("session_id is not yet supported on the shared agent; ignoring");
+    }
 
-                    while let Some(event_result) = stream.next().await {
-                        match event_result {
-                            Ok(event) => match event {
-                                echo_agent::prelude::AgentEvent::Token(_) => {}
-                                echo_agent::prelude::AgentEvent::ToolCall { name, args } => {
-                                    current_tool = Some((name, args));
-                                }
-                                echo_agent::prelude::AgentEvent::ToolResult { name: _, output } => {
-                                    if let Some((tool_name, args)) = current_tool.take() {
-                                        tool_calls.push(ToolCallInfo {
-                                            name: tool_name,
-                                            args,
-                                            result: output,
-                                            success: true,
-                                        });
-                                    }
-                                }
-                                echo_agent::prelude::AgentEvent::ToolError { name: _, error } => {
-                                    if let Some((tool_name, args)) = current_tool.take() {
-                                        tool_calls.push(ToolCallInfo {
-                                            name: tool_name,
-                                            args,
-                                            result: error,
-                                            success: false,
-                                        });
-                                    }
-                                }
-                                echo_agent::prelude::AgentEvent::FinalAnswer(data) => {
-                                    final_answer = data;
-                                }
-                                echo_agent::prelude::AgentEvent::Cancelled => {
-                                    break;
-                                }
-                                _ => {}
-                            },
-                            Err(e) => {
-                                return Err(WebError::Agent(e));
+    let (tx, rx) = tokio::sync::oneshot::channel();
+
+    tokio::spawn(async move {
+        let agent = agent_arc.read().await;
+
+        let max_iterations = agent.config().get_max_iterations();
+        let mut final_answer = String::new();
+        let mut tool_calls = Vec::new();
+
+        let stream_result = agent.chat_stream(&message).await;
+        let result = match stream_result {
+            Ok(mut stream) => {
+                let mut current_tool: Option<(String, Value)> = None;
+
+                while let Some(event_result) = stream.next().await {
+                    match event_result {
+                        Ok(event) => match event {
+                            echo_agent::prelude::AgentEvent::Token(_) => {}
+                            echo_agent::prelude::AgentEvent::ToolCall { name, args } => {
+                                current_tool = Some((name, args));
                             }
+                            echo_agent::prelude::AgentEvent::ToolResult { name: _, output } => {
+                                if let Some((tool_name, args)) = current_tool.take() {
+                                    tool_calls.push(ToolCallInfo {
+                                        name: tool_name,
+                                        args,
+                                        result: output,
+                                        success: true,
+                                    });
+                                }
+                            }
+                            echo_agent::prelude::AgentEvent::ToolError { name: _, error } => {
+                                if let Some((tool_name, args)) = current_tool.take() {
+                                    tool_calls.push(ToolCallInfo {
+                                        name: tool_name,
+                                        args,
+                                        result: error,
+                                        success: false,
+                                    });
+                                }
+                            }
+                            echo_agent::prelude::AgentEvent::FinalAnswer(data) => {
+                                final_answer = data;
+                            }
+                            echo_agent::prelude::AgentEvent::Cancelled => {
+                                break;
+                            }
+                            _ => {}
+                        },
+                        Err(e) => {
+                            let _ = tx.send(Err(WebError::Agent(e)));
+                            return;
                         }
                     }
                 }
 
                 let (message_count, estimated_tokens) = agent.context_stats().await;
-                let context_stats = ContextStats {
-                    message_count,
-                    estimated_tokens,
-                };
-
                 Ok(Json(ChatResponse {
                     answer: final_answer,
                     tool_calls,
                     iterations: max_iterations,
-                    context_stats,
+                    context_stats: ContextStats {
+                        message_count,
+                        estimated_tokens,
+                    },
                 }))
-            })
-        })
-        .await
+            }
+            Err(e) => Err(WebError::Agent(e)),
+        };
+
+        let _ = tx.send(result);
+    });
+
+    rx.await
+        .map_err(|_| WebError::Internal("Chat task panicked or was cancelled".to_string()))?
 }
 
 /// POST /api/chat/stream - SSE 流式对话
@@ -116,19 +139,46 @@ pub async fn handle_chat_stream(
     Json(req): Json<ChatRequest>,
 ) -> Sse<impl futures::Stream<Item = Result<SseEvent, Infallible>>> {
     let msg = req.message.trim().to_string();
-    let events = if msg.is_empty() {
-        // Return a single error event for empty messages
-        let error_event = SseEvent::default()
-            .event("error")
-            .data("{\"error\": \"Message cannot be empty\"}");
-        stream::once(async move { Ok(error_event) }).left_stream()
+    let session_id = req.session_id.clone();
+
+    // session_id context restore is NOT supported on the shared agent because
+    // load_messages() replaces the agent's global context, which would corrupt
+    // other concurrent sessions (CLI, WebSocket, other REST requests).
+    //
+    // When per-session agent isolation is implemented, the session_id will
+    // route to a dedicated AgentHandle and restore context there safely.
+    if session_id.is_some() {
+        tracing::warn!("session_id is not yet supported on the shared agent; ignoring");
+    }
+
+    // Spawn agent execution into a channel so the stream is 'static
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<SseEvent, Infallible>>();
+
+    // Validate input — send error directly through the channel if invalid,
+    // matching the validation rules of the blocking /api/chat endpoint.
+    if msg.is_empty() {
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(Ok(SseEvent::default()
+                .event("error")
+                .data("{\"error\": \"Message cannot be empty\"}")));
+            let _ = tx.send(Ok(SseEvent::default().event("done").data("{}")));
+        });
+    } else if msg.len() > MAX_MESSAGE_LENGTH {
+        let tx = tx.clone();
+        let payload = serde_json::json!({"error": format!("Message too long: {} bytes (max {})", msg.len(), MAX_MESSAGE_LENGTH)});
+        tokio::spawn(async move {
+            let _ = tx.send(Ok(SseEvent::default()
+                .event("error")
+                .data(payload.to_string())));
+            let _ = tx.send(Ok(SseEvent::default().event("done").data("{}")));
+        });
     } else {
-        // Spawn agent execution into a channel so the stream is 'static
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<SseEvent, Infallible>>();
         let agent_arc = state.connection.agent.inner().clone();
 
         tokio::spawn(async move {
             let agent = agent_arc.read().await;
+
             match agent.chat_stream(&msg).await {
                 Ok(mut agent_stream) => {
                     while let Some(result) = agent_stream.next().await {
@@ -195,13 +245,12 @@ pub async fn handle_chat_stream(
             // Signal completion
             let _ = tx.send(Ok(SseEvent::default().event("done").data("{}")));
         });
+    }
 
-        // Build a stream from the channel receiver
-        stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|event| (event, rx))
-        })
-        .right_stream()
-    };
+    // Build a stream from the channel receiver (single return type for the function)
+    let events = stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|event| (event, rx))
+    });
 
     Sse::new(events)
 }

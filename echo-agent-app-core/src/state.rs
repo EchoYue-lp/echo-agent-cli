@@ -93,7 +93,15 @@ impl std::fmt::Display for AuditDecision {
 
 // ── 权限管理 ──
 
-/// CLI 权限规则配置（注意：与 echo-agent PermissionService 中的权限模型不同）
+/// CLI permission rule — simplified serializable form for the REST API.
+///
+/// This serves as an adapter over the framework's richer [`PermissionRule`]
+/// type (in `echo_core::tools::permission`). The `matcher` field is a string
+/// that maps to `RuleMatcher` variants (`tool:<name>`, `pattern:<glob>`,
+/// `permission:<flag>`, or `*` for catch-all). The `behavior` field maps to
+/// `RuleBehavior` (see [`PermissionBehavior`]).
+///
+/// [`PermissionRule`]: https://docs.rs/echo_agent/latest/echo_agent/tools/permission/struct.PermissionRule.html
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PermissionRuleConfig {
     pub matcher: String,
@@ -101,7 +109,13 @@ pub struct PermissionRuleConfig {
     pub source: String,
 }
 
-/// 权限行为类型
+/// Permission behavior — mirrors `echo_core::tools::permission::RuleBehavior`.
+///
+/// | Variant | Framework `RuleBehavior` equivalent |
+/// |---------|-------------------------------------|
+/// | `Allow` | `RuleBehavior::Allow` |
+/// | `Deny`  | `RuleBehavior::Deny { reason: String }` |
+/// | `Ask`   | `RuleBehavior::Ask { suggestions: Vec<String> }` |
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PermissionBehavior {
@@ -116,6 +130,71 @@ impl std::fmt::Display for PermissionBehavior {
             PermissionBehavior::Allow => write!(f, "allow"),
             PermissionBehavior::Deny => write!(f, "deny"),
             PermissionBehavior::Ask => write!(f, "ask"),
+        }
+    }
+}
+
+impl PermissionBehavior {
+    /// Convert to the framework's `PermissionDecision` (re-exported in
+    /// `echo_agent::prelude`).
+    ///
+    /// The `Ask` and `Deny` variants carry data — the caller is responsible
+    /// for providing reason/suggestions where needed.
+    pub fn to_permission_decision(
+        &self,
+        reason: Option<&str>,
+    ) -> echo_agent::prelude::PermissionDecision {
+        match self {
+            PermissionBehavior::Allow => echo_agent::prelude::PermissionDecision::Allow,
+            PermissionBehavior::Deny => echo_agent::prelude::PermissionDecision::Deny {
+                reason: reason.unwrap_or("denied by rule").to_string(),
+            },
+            PermissionBehavior::Ask => echo_agent::prelude::PermissionDecision::Ask {
+                suggestions: reason.map(|r| vec![r.to_string()]).unwrap_or_default(),
+            },
+        }
+    }
+}
+
+impl PermissionRuleConfig {
+    /// Check whether this rule applies to a given tool by name.
+    ///
+    /// Supported matcher patterns:
+    /// - `tool:<name>` — exact tool name match
+    /// - `perm:<flag>` — matches if the tool declares the given permission
+    ///   (checked via the caller, not here — this method returns `true`
+    ///    for all `perm:` matchers, leaving permission-checking to the caller)
+    /// - `*` — catch-all, matches every tool
+    pub fn matches_tool(&self, tool_name: &str) -> bool {
+        if self.matcher == "*" {
+            return true;
+        }
+        if let Some(name) = self.matcher.strip_prefix("tool:") {
+            return name == tool_name;
+        }
+        // perm:<flag> — tool-level; caller checks the flag
+        if self.matcher.starts_with("perm:") {
+            return true;
+        }
+        false
+    }
+
+    /// Parse a `perm:<flag>` matcher into the corresponding [`ToolPermission`].
+    ///
+    /// Returns `None` for non-permission matchers (`tool:`, `*`).
+    /// Returns `None` for unrecognized flag names.
+    pub fn parse_permission_flag(&self) -> Option<echo_agent::prelude::ToolPermission> {
+        let flag = self.matcher.strip_prefix("perm:")?;
+        match flag {
+            "read" => Some(echo_agent::prelude::ToolPermission::Read),
+            "write" => Some(echo_agent::prelude::ToolPermission::Write),
+            "network" => Some(echo_agent::prelude::ToolPermission::Network),
+            "execute" => Some(echo_agent::prelude::ToolPermission::Execute),
+            "sensitive" => Some(echo_agent::prelude::ToolPermission::Sensitive),
+            _ => {
+                tracing::warn!(%flag, "Unrecognized permission flag in matcher");
+                None
+            }
         }
     }
 }
@@ -147,7 +226,11 @@ pub struct WorkflowStep {
     pub tool_args: Option<serde_json::Value>,
 }
 
-/// CLI 工作流定义（注意：与 echo-agent WorkflowDefinition 不同，后者是 DAG 图结构）
+/// CLI workflow definition — a simple linear sequence of steps stored/edited
+/// via the REST API. The framework also provides a full DAG-based
+/// [`WorkflowDefinition`] (`echo_agent::workflow::WorkflowDefinition`) with
+/// nodes, edges, entry/exit points and concurrent execution for advanced use
+/// cases. This type covers the common "prompt → tool → prompt" pattern.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowDef {
     pub name: String,
@@ -156,11 +239,15 @@ pub struct WorkflowDef {
 
 // ── 沙箱配置 ──
 
-/// 沙箱安全级别
+/// Sandbox safety tier for the CLI's local-execution sandbox.
+///
+/// This controls the runtime restrictions applied to shell/code execution.
+/// Distinct from `echo_agent::prelude::SecurityLevel` in the framework,
+/// which is a 4-level sandbox *isolation* policy (Trusted → Maximum).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 #[derive(Default)]
-pub enum SecurityLevel {
+pub enum SandboxTier {
     Low,
     #[default]
     Medium,
@@ -170,7 +257,7 @@ pub enum SecurityLevel {
 /// 沙箱运行时配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxConfigData {
-    pub security_level: SecurityLevel,
+    pub security_level: SandboxTier,
     pub max_memory_mb: u32,
     pub max_cpu_seconds: u32,
     pub network_enabled: bool,
@@ -179,7 +266,7 @@ pub struct SandboxConfigData {
 impl Default for SandboxConfigData {
     fn default() -> Self {
         Self {
-            security_level: SecurityLevel::default(),
+            security_level: SandboxTier::default(),
             max_memory_mb: 512,
             max_cpu_seconds: 30,
             network_enabled: false,

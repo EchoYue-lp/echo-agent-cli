@@ -3,7 +3,7 @@
 //! 基于 `pulldown-cmark` 解析 Markdown 并渲染为 ANSI 终端输出。
 //! 支持标题、代码块、列表、表格、引用块、链接等常见元素。
 
-use pulldown_cmark::{CowStr, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, CowStr, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 
 use super::syntax::SyntaxHighlighter;
 use super::theme::ColorTheme;
@@ -150,10 +150,9 @@ impl<'a> MarkdownRenderer<'a> {
             }
             Tag::Emphasis => {}
             Tag::Strong => {}
-            Tag::Strikethrough
-                if self.color_enabled => {
-                    print!("{}", nu_ansi_term::Style::new().strikethrough().prefix());
-                }
+            Tag::Strikethrough if self.color_enabled => {
+                print!("{}", nu_ansi_term::Style::new().strikethrough().prefix());
+            }
             Tag::BlockQuote(_) => {
                 self.indent_level += 1;
                 print!("{}", self.paint(self.theme.muted_color, "▍ "));
@@ -195,10 +194,9 @@ impl<'a> MarkdownRenderer<'a> {
                 println!();
             }
             TagEnd::Item => {}
-            TagEnd::Strikethrough
-                if self.color_enabled => {
-                    print!("{}", nu_ansi_term::Style::new().strikethrough().suffix());
-                }
+            TagEnd::Strikethrough if self.color_enabled => {
+                print!("{}", nu_ansi_term::Style::new().strikethrough().suffix());
+            }
             TagEnd::BlockQuote => {
                 self.indent_level = self.indent_level.saturating_sub(1);
                 println!();
@@ -246,8 +244,14 @@ impl<'a> MarkdownRenderer<'a> {
         };
 
         let width = self.max_width.min(80);
-        let top = self.paint(self.theme.border_color, &format!("┌─ {} ─┐", if lang.is_empty() { "code" } else { lang }));
-        let bottom = self.paint(self.theme.border_color, &format!("└{}┘", "─".repeat(width.saturating_sub(2))));
+        let top = self.paint(
+            self.theme.border_color,
+            &format!("┌─ {} ─┐", if lang.is_empty() { "code" } else { lang }),
+        );
+        let bottom = self.paint(
+            self.theme.border_color,
+            &format!("└{}┘", "─".repeat(width.saturating_sub(2))),
+        );
 
         println!("{}", top);
 
@@ -284,9 +288,9 @@ impl<'a> MarkdownRenderer<'a> {
         );
 
         // Determine column widths
-        let col_count = all_headers.len().max(
-            all_rows.iter().map(|r| r.len()).max().unwrap_or(0),
-        );
+        let col_count = all_headers
+            .len()
+            .max(all_rows.iter().map(|r| r.len()).max().unwrap_or(0));
         if col_count == 0 {
             return;
         }
@@ -302,9 +306,10 @@ impl<'a> MarkdownRenderer<'a> {
         }
         for header in &all_headers {
             if let Some(i) = all_headers.iter().position(|h| h == header)
-                && i < col_count {
-                    col_widths[i] = col_widths[i].max(header.len().min(40));
-                }
+                && i < col_count
+            {
+                col_widths[i] = col_widths[i].max(header.len().min(40));
+            }
         }
 
         let total: usize = col_widths.iter().sum::<usize>() + col_count * 3 + 1;
@@ -372,7 +377,10 @@ impl<'a> MarkdownRenderer<'a> {
                 .collect();
             let border = self.paint(self.theme.border_color, "│");
             let text = if self.color_enabled && row_idx % 2 == 1 {
-                self.paint(Color::DarkGray, &cells.join(&self.paint(self.theme.border_color, "│")))
+                self.paint(
+                    Color::DarkGray,
+                    &cells.join(&self.paint(self.theme.border_color, "│")),
+                )
             } else {
                 cells.join(&self.paint(self.theme.border_color, "│"))
             };

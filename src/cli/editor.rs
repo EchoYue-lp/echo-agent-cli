@@ -3,12 +3,14 @@
 //! 封装编辑器创建流程，集成增强补全器、键绑定、菜单和历史。
 
 use reedline::{
-    default_vi_normal_keybindings, ColumnarMenu, Emacs, FileBackedHistory, MenuBuilder, Reedline,
-    ReedlineMenu, Vi,
+    ColumnarMenu, Emacs, FileBackedHistory, MenuBuilder, Reedline, ReedlineMenu, Vi,
+    default_vi_normal_keybindings,
 };
 
 use super::completion::EnhancedCompleter;
-use super::keybindings::{create_enhanced_keybindings, KeybindingMode};
+use super::keybindings::{
+    KeybindingMode, apply_custom_keybindings, create_enhanced_keybindings, load_custom_keybindings,
+};
 
 /// 编辑器配置
 pub struct EditorConfig {
@@ -22,6 +24,9 @@ pub struct EditorConfig {
     pub keybinding_mode: KeybindingMode,
     /// 是否显示补全菜单
     pub show_completion_menu: bool,
+    /// 自定义键绑定文件路径 (`~/.echo-agent/keybindings.yaml`)。
+    /// 如果文件不存在或解析失败，则使用默认绑定。
+    pub keybindings_path: Option<String>,
 }
 
 impl Default for EditorConfig {
@@ -32,6 +37,7 @@ impl Default for EditorConfig {
             history_size: 10000,
             keybinding_mode: KeybindingMode::Emacs,
             show_completion_menu: true,
+            keybindings_path: Some("~/.echo-agent/keybindings.yaml".to_string()),
         }
     }
 }
@@ -53,8 +59,23 @@ pub fn create_enhanced_editor(config: &EditorConfig) -> anyhow::Result<Reedline>
     // 创建补全器
     let completer = EnhancedCompleter::new();
 
-    // 创建键绑定
-    let keybindings = create_enhanced_keybindings(config.keybinding_mode);
+    // 创建键绑定（默认）
+    let mut keybindings = create_enhanced_keybindings(config.keybinding_mode);
+
+    // 加载并应用自定义键绑定
+    if let Some(ref path_str) = config.keybindings_path {
+        let expanded = shellexpand::tilde(path_str);
+        let custom_path = std::path::Path::new(expanded.as_ref());
+        let custom_entries = load_custom_keybindings(custom_path);
+        if !custom_entries.is_empty() {
+            tracing::info!(
+                count = custom_entries.len(),
+                path = %custom_path.display(),
+                "Loaded custom keybindings"
+            );
+            apply_custom_keybindings(&mut keybindings, &custom_entries);
+        }
+    }
 
     // 构建编辑器
     let mut builder = Reedline::create()

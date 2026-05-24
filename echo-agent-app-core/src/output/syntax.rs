@@ -5,7 +5,7 @@
 
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Style, ThemeSet};
-use syntect::parsing::{SyntaxSet, SyntaxReference};
+use syntect::parsing::{SyntaxReference, SyntaxSet};
 use syntect::util::LinesWithEndings;
 
 /// 高亮后的代码片段
@@ -55,10 +55,11 @@ impl SyntaxHighlighter {
                     let ansi_style = syntect_style_to_ansi(style);
                     // Merge with previous span if same style
                     if let Some(last) = spans.last_mut()
-                        && last.style == ansi_style {
-                            last.text.push_str(text);
-                            continue;
-                        }
+                        && last.style == ansi_style
+                    {
+                        last.text.push_str(text);
+                        continue;
+                    }
                     spans.push(HighlightedSpan {
                         text: text.to_string(),
                         style: ansi_style,
@@ -110,13 +111,22 @@ fn syntect_style_to_ansi(style: Style) -> nu_ansi_term::Style {
         style.foreground.b,
     ));
 
-    if style.font_style.contains(syntect::highlighting::FontStyle::BOLD) {
+    if style
+        .font_style
+        .contains(syntect::highlighting::FontStyle::BOLD)
+    {
         ansi = ansi.bold();
     }
-    if style.font_style.contains(syntect::highlighting::FontStyle::ITALIC) {
+    if style
+        .font_style
+        .contains(syntect::highlighting::FontStyle::ITALIC)
+    {
         ansi = ansi.italic();
     }
-    if style.font_style.contains(syntect::highlighting::FontStyle::UNDERLINE) {
+    if style
+        .font_style
+        .contains(syntect::highlighting::FontStyle::UNDERLINE)
+    {
         ansi = ansi.underline();
     }
 

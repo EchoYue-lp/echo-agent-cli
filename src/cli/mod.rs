@@ -21,11 +21,11 @@ pub mod router;
 
 pub use args::{Args, Commands, ProfileAction, SessionAction};
 pub use handlers::{
-    handle_completions_command, handle_profile_action, handle_run_command,
-    handle_session_action, handle_subcommand,
+    handle_completions_command, handle_profile_action, handle_run_command, handle_session_action,
+    handle_subcommand,
 };
-pub use modes::{run_both_modes, run_cli_mode, run_web_mode};
 #[cfg(feature = "channels")]
 pub use modes::run_channels_mode;
+pub use modes::{run_both_modes, run_cli_mode, run_web_mode};
 pub use repl::{ReplConfig, run_repl};
 pub use router::build_router;

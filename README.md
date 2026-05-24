@@ -51,7 +51,7 @@ echo-agent-cli [OPTIONS]
   --tui              Start terminal UI
   --channels         Start IM channels (QQ/Feishu)
   --port <PORT>      Web server port [default: 3000]
-  --host <HOST>      Web server host [default: 0.0.0.0]
+  --host <HOST>      Web server host [default: 127.0.0.1]
   --model <MODEL>    Model name override
   --config <PATH>    Config file path
   --mcp-config <PATH> MCP config file path
@@ -81,7 +81,7 @@ agent:
   token_limit: 32000
 
 server:
-  host: 0.0.0.0
+  host: 127.0.0.1
   port: 3000
 
 logging:

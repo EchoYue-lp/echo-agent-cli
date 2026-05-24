@@ -207,6 +207,32 @@ pub async fn shutdown_signal() {
     }
 }
 
+/// Print a security warning if the server binds to a non-localhost address.
+///
+/// Echo Agent CLI is designed as a single-user local application. Binding to
+/// 0.0.0.0 or a public IP exposes the agent to the network. Users should enable
+/// JWT authentication (see SecurityConfig) before accepting remote connections.
+pub fn warn_non_localhost_bind(host: &str, addr: &str, auth_enabled: bool) {
+    // Check if host is a non-localhost address
+    let is_localhost = host == "127.0.0.1" || host == "localhost" || host == "::1";
+    if !is_localhost {
+        tracing::warn!(
+            "⚠️  Server binding to non-localhost address: http://{}",
+            addr
+        );
+        tracing::warn!("   Echo Agent CLI is designed for single-user local use.");
+        if !auth_enabled {
+            tracing::warn!(
+                "   Authentication is DISABLED — anyone on the network can access the agent."
+            );
+            tracing::warn!("   Enable JWT auth in config or set ECHO_AUTH_ENABLED=true.");
+        }
+        tracing::warn!(
+            "   For remote access, use a reverse proxy with TLS and enable authentication."
+        );
+    }
+}
+
 /// 打印 Web 模式启动信息
 pub fn print_web_startup_info(addr: &str) {
     tracing::info!("🚀 Echo Agent CLI (Web 模式)");
@@ -363,7 +389,9 @@ async fn probe_model_connectivity(model: &str) -> echo_agent::error::Result<()> 
     .await?;
 
     if response.choices.is_empty() {
-        return Err(ReactError::Other("Model returned empty response".to_string()));
+        return Err(ReactError::Other(
+            "Model returned empty response".to_string(),
+        ));
     }
 
     Ok(())

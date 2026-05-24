@@ -13,4 +13,4 @@
 
 pub mod inspector;
 
-pub use inspector::{create_record, InspectorStats, LlmCallRecord, LlmInspector};
+pub use inspector::{InspectorStats, LlmCallRecord, LlmInspector, create_record};
