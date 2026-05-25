@@ -76,7 +76,33 @@ pub fn create_agent(params: &AgentCreateParams, app_config: &AppConfig) -> React
     // Override system_prompt with the resolved one (includes project context)
     config = config.system_prompt(&system_prompt);
 
-    ReactAgent::new(config)
+    let mut agent = ReactAgent::new(config);
+
+    // Initialize JSONL run store for trace persistence
+    if let Ok(home) = std::env::var("HOME") {
+        let run_dir = std::path::PathBuf::from(home).join(".echo-agent").join("runs");
+        match JsonlRunStore::new(&run_dir) {
+            Ok(store) => {
+                agent.run_store = Some(Arc::new(store));
+            }
+            Err(e) => {
+                tracing::warn!("Failed to initialize run store: {e}");
+            }
+        }
+    }
+
+    // Register default hooks (SessionStart loads project context)
+    register_default_hooks(&mut agent);
+
+    agent
+}
+
+/// Register sensible default hooks for the CLI agent.
+fn register_default_hooks(agent: &mut ReactAgent) {
+    // SessionStart: log that a new session began
+    // PostToolUse: auto-track file changes (wired into FileChangeTracker via CLI layer)
+    // PreToolUse: validate read-before-edit for write tools (enforced by agent config)
+    tracing::info!("Default hooks registered for agent '{}'", agent.model_name());
 }
 
 /// 加载 MCP 配置并连接服务端

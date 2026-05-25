@@ -171,7 +171,7 @@ mod tests {
             web: false,
             cli: false,
             port: 3000,
-            host: "0.0.0.0".to_string(),
+            host: "127.0.0.1".to_string(),
             model: Some("test-model".to_string()),
             system_prompt: Some("test prompt".to_string()),
             mode: "general".to_string(),
@@ -181,13 +181,20 @@ mod tests {
             no_color: false,
             channels: false,
             tui: false,
+            gui: false,
             output: "text".to_string(),
             verbose: false,
             command: None,
         };
 
+        let params = infra::AgentCreateParams {
+            model: args.model.clone(),
+            mode: args.mode.clone(),
+            system_prompt: args.system_prompt.clone(),
+            project: args.project.clone(),
+        };
         let app_config = config::AppConfig::default();
-        let agent = infra::create_agent(&args, &app_config);
+        let agent = infra::create_agent(&params, &app_config);
         assert_eq!(agent.model_name(), "test-model");
     }
 

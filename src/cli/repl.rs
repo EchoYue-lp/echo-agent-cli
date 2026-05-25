@@ -9,8 +9,8 @@
 //! - 工具调用交互式审批
 //! - Token 用量追踪
 
-use parking_lot::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use futures::StreamExt;
 use nu_ansi_term::Color;
@@ -26,6 +26,7 @@ use crate::output::OutputRenderer;
 static TOTAL_INPUT_TOKENS: AtomicUsize = AtomicUsize::new(0);
 static TOTAL_OUTPUT_TOKENS: AtomicUsize = AtomicUsize::new(0);
 static TOTAL_TOOL_CALLS: AtomicUsize = AtomicUsize::new(0);
+static FILE_CHANGE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 pub fn get_usage_stats() -> (usize, usize, usize) {
     (
@@ -39,40 +40,7 @@ pub fn reset_usage_stats() {
     TOTAL_INPUT_TOKENS.store(0, Ordering::Relaxed);
     TOTAL_OUTPUT_TOKENS.store(0, Ordering::Relaxed);
     TOTAL_TOOL_CALLS.store(0, Ordering::Relaxed);
-}
-
-// ── Trace Buffer ──────────────────────────────────────────────────
-
-/// A single trace entry captured during streaming.
-#[derive(Debug, Clone)]
-pub struct TraceEntry {
-    pub event_type: String,
-    pub detail: String,
-    pub elapsed_ms: u64,
-}
-
-static TRACE_BUFFER: std::sync::LazyLock<Mutex<Vec<TraceEntry>>> =
-    std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
-
-/// Record a trace entry (called during stream processing).
-pub fn push_trace(entry: TraceEntry) {
-    let mut buf = TRACE_BUFFER.lock();
-    // Keep only last 200 entries
-    if buf.len() >= 200 {
-        let excess = buf.len() - 199;
-        buf.drain(0..excess);
-    }
-    buf.push(entry);
-}
-
-/// Clear the trace buffer at the start of a new chat.
-pub fn clear_trace() {
-    TRACE_BUFFER.lock().clear();
-}
-
-/// Get a snapshot of the current trace buffer.
-pub fn get_trace() -> Vec<TraceEntry> {
-    TRACE_BUFFER.lock().clone()
+    FILE_CHANGE_COUNT.store(0, Ordering::Relaxed);
 }
 
 /// REPL 配置
@@ -128,7 +96,29 @@ pub async fn run_repl(agent: AgentHandle, config: ReplConfig) -> anyhow::Result<
         instructions_count,
     );
 
-    let cmd_handler = CommandHandler::new(agent.clone());
+    // Build command registry with trait-based commands
+    let mut registry = crate::cli::command::CommandRegistry::new();
+    crate::cli::cmd_impls::coding::register_all(&mut registry);
+    crate::cli::cmd_impls::session::register_all(&mut registry);
+    crate::cli::cmd_impls::info::register_all(&mut registry);
+    crate::cli::cmd_impls::context::register_all(&mut registry);
+    crate::cli::cmd_impls::advanced::register_all(&mut registry);
+    crate::cli::cmd_impls::skills::register_all(&mut registry);
+    crate::cli::cmd_impls::eval::register_all(&mut registry);
+    crate::cli::cmd_impls::all::register_all(&mut registry);
+
+    // Create CodingLoop for coding-mode commands (C6 fix).
+    let project_root = project_ctx
+        .as_ref()
+        .map(|c| c.root.clone())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let coding_loop = Arc::new(tokio::sync::Mutex::new(
+        crate::project::coding_loop::CodingLoop::new(&project_root),
+    ));
+
+    let cmd_handler = CommandHandler::new(agent.clone())
+        .with_registry(Arc::new(registry))
+        .with_coding_loop(coding_loop);
 
     let editor_config = EditorConfig {
         prompt: config.prompt.clone(),
@@ -177,7 +167,6 @@ pub async fn run_repl(agent: AgentHandle, config: ReplConfig) -> anyhow::Result<
 #[allow(unused_assignments)]
 async fn chat_with_agent(agent: &AgentHandle, message: &str, output: &OutputRenderer) {
     output.print_user_message(message);
-    clear_trace();
 
     // Show spinner during connection establishment and first-token wait.
     // chat_stream() returns quickly (spawns internal task); the real wait
@@ -209,7 +198,7 @@ async fn chat_with_agent(agent: &AgentHandle, message: &str, output: &OutputRend
                     Ok(event) => {
                         // Record trace entry for significant events
                         {
-                            let (etype, detail) = match &event {
+                            let (_etype, _detail) = match &event {
                                 AgentEvent::ThinkStart => (
                                     "think_start".into(),
                                     format!("step {}", iteration_count + 1),
@@ -251,15 +240,12 @@ async fn chat_with_agent(agent: &AgentHandle, message: &str, output: &OutputRend
                                     "compressed".into(),
                                     format!("{before_tokens}->{after_tokens}"),
                                 ),
+                                AgentEvent::SafetyNotice { action, risk, .. } => (
+                                    "safety_notice".into(),
+                                    format!("{action} — {risk}"),
+                                ),
                                 _ => (String::new(), String::new()),
                             };
-                            if !etype.is_empty() {
-                                push_trace(TraceEntry {
-                                    event_type: etype,
-                                    detail,
-                                    elapsed_ms: start_time.elapsed().as_millis() as u64,
-                                });
-                            }
                         }
                         match event {
                             AgentEvent::ThinkStart => {
@@ -289,12 +275,39 @@ async fn chat_with_agent(agent: &AgentHandle, message: &str, output: &OutputRend
                                 }
                                 output.print_token(&token);
                             }
+                            AgentEvent::SafetyNotice { action, reason, risk, permission } => {
+                                clear_spinner!();
+                                if !first_chunk { println!(); }
+                                let icon = nu_ansi_term::Color::Yellow.paint("Safety");
+                                println!("  {}  {}", icon, action);
+                                println!("       Reason: {}", reason);
+                                println!("       Risk: {} | Permission: {}", risk, permission);
+                                first_chunk = true;
+                            }
+                            AgentEvent::ParameterError { tool, parameter, expected, got } => {
+                                clear_spinner!();
+                                if !first_chunk { println!(); }
+                                let icon = nu_ansi_term::Color::Red.paint("ParamError");
+                                println!("  {}  {}: parameter '{}' expected {}, got {}", icon, tool, parameter, expected, got);
+                                first_chunk = true;
+                            }
                             AgentEvent::ToolCall { name, args } => {
                                 clear_spinner!();
                                 tool_call_count += 1;
                                 TOTAL_TOOL_CALLS.fetch_add(1, Ordering::Relaxed);
                                 if !first_chunk {
                                     println!();
+                                }
+                                // Danger warning for destructive operations
+                                if name == "shell" || name == "delete_file" || name == "git_commit" {
+                                    let danger = nu_ansi_term::Color::Red
+                                        .paint(format!("DANGER: {} — irreversible operation", name));
+                                    println!("  {}", danger);
+                                    if name == "shell" {
+                                        if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
+                                            println!("     Command: {}", cmd);
+                                        }
+                                    }
                                 }
                                 output.print_tool_call(&name, &args);
                                 first_chunk = true;
@@ -303,6 +316,10 @@ async fn chat_with_agent(agent: &AgentHandle, message: &str, output: &OutputRend
                                 name,
                                 output: tool_output,
                             } => {
+                                // Auto-track file changes for coding loop
+                                if matches!(name.as_str(), "write_file" | "edit_file" | "append_file" | "create_file" | "delete_file" | "update_file" | "move_file") {
+                                    FILE_CHANGE_COUNT.fetch_add(1, Ordering::Relaxed);
+                                }
                                 output.print_tool_result(&name, &tool_output, true);
                                 first_chunk = true;
                             }
@@ -421,6 +438,12 @@ async fn chat_with_agent(agent: &AgentHandle, message: &str, output: &OutputRend
                 println!("{}", styled);
             }
 
+            // Auto-eval suggestion
+            if tool_call_count > 0 {
+                let hint = nu_ansi_term::Color::Fixed(8)
+                    .paint("  Tip: /self-review to analyze, /test to verify, /diff to review");
+                println!("{}", hint);
+            }
             println!();
         }
         Err(e) => {

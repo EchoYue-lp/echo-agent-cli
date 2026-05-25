@@ -5,6 +5,7 @@
 use anyhow::Result;
 use futures::StreamExt;
 use std::io::Read;
+use std::sync::Arc;
 
 use crate::cli::args::{Commands, ProfileAction, SessionAction};
 use crate::config;
@@ -41,6 +42,9 @@ pub async fn handle_subcommand(cmd: &Commands) -> Result<()> {
         }
         Commands::Doctor => {
             handle_doctor_command()?;
+        }
+        Commands::Eval { path, json } => {
+            handle_eval_command(path, *json).await?;
         }
     }
     Ok(())
@@ -369,6 +373,17 @@ fn dirs_home_path() -> std::path::PathBuf {
         .ok()
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
+/// Handle the `eval` subcommand.
+async fn handle_eval_command(path: &str, json_output: bool) -> anyhow::Result<()> {
+    let app_config = config::load_config(None);
+    let model = &app_config.model.name;
+    let mut agent = ReactAgent::new(AgentConfig::standard(model, "echo-eval", "You are a helpful coding assistant"));
+    // N1 fix: attach a RunStore so trace metrics are populated during eval
+    agent.run_store = Some(Arc::new(echo_agent::trace::InMemoryRunStore::new()));
+    let handle = crate::agent_handle::AgentHandle::new(agent);
+    super::eval::run_eval(handle, path, json_output).await
 }
 
 /// 截断字符串到指定字符数

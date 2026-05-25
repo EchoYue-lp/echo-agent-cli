@@ -9,9 +9,13 @@
 //! 同时包含 CLI 参数解析、子命令处理、运行模式和路由构建。
 
 pub mod args;
+pub mod cmd_impls;
+pub mod command;
 pub mod commands;
 pub mod completion;
 pub mod editor;
+pub mod eval;
+pub mod export;
 pub mod handlers;
 pub mod keybindings;
 pub mod modes;

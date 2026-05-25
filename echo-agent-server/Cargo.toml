@@ -2,7 +2,7 @@
 name = "echo-agent-server"
 version = "1.0.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.95"
 license = "MIT"
 description = "Web server (REST + SSE + WebSocket) for Echo Agent"
 

@@ -120,6 +120,14 @@ pub enum Commands {
     Onboard,
     /// 诊断配置问题
     Doctor,
+    /// 运行 eval 测试用例
+    Eval {
+        /// eval 用例目录或文件路径
+        path: String,
+        /// 输出 JSON 格式报告
+        #[arg(long, short = 'j')]
+        json: bool,
+    },
 }
 
 /// 档案子命令

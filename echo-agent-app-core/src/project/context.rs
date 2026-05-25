@@ -165,7 +165,48 @@ pub fn build_system_prompt_with_context(base_prompt: &str, context: &ProjectCont
         ));
     }
 
+    // Inject git context if available
+    if let Some(git_ctx) = load_git_context(&context.root) {
+        prompt.push_str("\n## Git Status\n\n");
+        prompt.push_str(&git_ctx);
+        prompt.push('\n');
+    }
+
     prompt
+}
+
+/// Load git status and diff summary from the project root.
+pub fn load_git_context(project_root: &std::path::Path) -> Option<String> {
+    let git_dir = project_root.join(".git");
+    if !git_dir.exists() {
+        return None;
+    }
+
+    let status = std::process::Command::new("git")
+        .args(["status", "--short"])
+        .current_dir(project_root)
+        .output()
+        .ok()?;
+    let status_str = String::from_utf8_lossy(&status.stdout).to_string();
+
+    let diff = std::process::Command::new("git")
+        .args(["diff", "--stat"])
+        .current_dir(project_root)
+        .output()
+        .ok()?;
+    let diff_str = String::from_utf8_lossy(&diff.stdout).to_string();
+
+    let mut result = String::new();
+    if !status_str.trim().is_empty() {
+        result.push_str(&format!("```\n{}\n```\n", status_str.trim()));
+    }
+    if !diff_str.trim().is_empty() {
+        result.push_str(&format!("```\n{}\n```\n", diff_str.trim()));
+    }
+    if result.is_empty() {
+        return None;
+    }
+    Some(result)
 }
 
 fn generate_file_tree_summary(root: &Path) -> String {

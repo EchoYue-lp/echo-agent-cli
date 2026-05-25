@@ -8,6 +8,7 @@ pub mod persistence;
 pub mod profiles;
 pub mod project;
 pub mod scheduler;
+pub mod sensitive;
 pub mod security;
 pub mod sessions;
 pub mod skills_hub;
