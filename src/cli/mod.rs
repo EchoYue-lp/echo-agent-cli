@@ -16,6 +16,7 @@ pub mod completion;
 pub mod editor;
 pub mod eval;
 pub mod export;
+pub mod git_ops;
 pub mod handlers;
 pub mod keybindings;
 pub mod modes;

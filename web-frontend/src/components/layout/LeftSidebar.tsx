@@ -1,11 +1,12 @@
 import { useEffect, useState, useRef } from 'react';
-import { Plus, Sun, Moon, Trash2, MessageSquare, Pencil, Check, X, Search, Download, Settings } from 'lucide-react';
+import { Plus, Sun, Moon, Trash2, MessageSquare, Pencil, Check, X, Search, Settings, FolderOpen } from 'lucide-react';
 import { BrandIcon } from '../common/BrandIcon';
 import { useChatStore } from '../../stores/chatStore';
 import { useConversationStore, type ConversationGroup } from '../../stores/conversationStore';
 import { useUiStore } from '../../stores/uiStore';
+import { useWorkspaceStore } from '../../stores/workspaceStore';
 
-export function LeftSidebar() {
+export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
   const messages = useChatStore((s) => s.messages);
   const theme = useUiStore((s) => s.theme);
   const toggleTheme = useUiStore((s) => s.toggleTheme);
@@ -18,8 +19,9 @@ export function LeftSidebar() {
   const loadConversation = useConversationStore((s) => s.loadConversation);
   const deleteConversation = useConversationStore((s) => s.deleteConversation);
   const renameConversation = useConversationStore((s) => s.renameConversation);
-  const startNew = useConversationStore((s) => s.startNew);
   const getGrouped = useConversationStore((s) => s.getGroupedConversations);
+
+  const currentWorkspace = useWorkspaceStore((s) => s.current);
 
   const [hoveredId, setHoveredId] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -73,20 +75,14 @@ export function LeftSidebar() {
     deleteConversation(id);
   };
 
-  const handleExport = async (id: string, title: string, e: React.MouseEvent) => {
+  const handleOpenFolder = async (e: React.MouseEvent) => {
     e.stopPropagation();
+    if (!currentWorkspace) return;
     try {
-      const { conversationApi } = await import('../../api/endpoints');
-      const res = await conversationApi.export(id);
-      const blob = new Blob([res.content], { type: 'text/markdown' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `${title.replace(/[^a-zA-Z0-9\u4e00-\u9fff]/g, '_')}.md`;
-      a.click();
-      URL.revokeObjectURL(url);
+      const { fileSystem } = await import('../../lib/tauri-bridge');
+      await fileSystem.openPath(currentWorkspace.root);
     } catch (err) {
-      console.error('Export failed:', err);
+      console.error('Open folder failed:', err);
     }
   };
 
@@ -99,8 +95,28 @@ export function LeftSidebar() {
         <div className="flex items-center gap-2">
           <BrandIcon size="md" />
           <span className="text-sm font-semibold tracking-tight text-[var(--text-primary)]">
-            Echo Agent
+            EchoCoWork
           </span>
+          {currentWorkspace && (
+            <div className="flex items-center gap-1">
+              <button
+                onClick={onNewTask}
+                className="flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] font-medium transition-colors hover:opacity-80"
+                style={{ background: 'var(--accent)', color: 'white' }}
+                title={`当前: ${currentWorkspace.name}\n${currentWorkspace.root}\n点击切换工作区`}
+              >
+                <FolderOpen size={11} />
+                {currentWorkspace.name}
+              </button>
+              <button
+                onClick={handleOpenFolder}
+                className="rounded p-1 text-[var(--text-tertiary)] transition-colors hover:text-[var(--text-primary)]"
+                title="在文件管理器中打开工作区文件夹"
+              >
+                <FolderOpen size={13} />
+              </button>
+            </div>
+          )}
         </div>
         <button
           onClick={toggleTheme}
@@ -114,11 +130,11 @@ export function LeftSidebar() {
       {/* New Chat + Search */}
       <div className="space-y-2 px-3 pt-3 pb-2">
         <button
-          onClick={startNew}
+          onClick={onNewTask}
           className="flex w-full items-center gap-2 rounded-lg border border-[var(--border-primary)] px-3 py-2 text-sm font-medium text-[var(--text-primary)] transition-all hover:bg-[var(--bg-sidebar-hover)]"
         >
           <Plus size={15} />
-          新建对话
+          新建任务
         </button>
 
         {conversations.length > 0 && (
@@ -145,7 +161,7 @@ export function LeftSidebar() {
       {/* Current Chat */}
       <div className="px-3 pb-1">
         <button
-          onClick={() => { if (!isCurrentChatActive) startNew(); }}
+          onClick={() => { if (!isCurrentChatActive) onNewTask(); }}
           className={`flex w-full items-center gap-2.5 rounded-lg px-3 py-2.5 text-left transition-colors
             ${isCurrentChatActive
               ? 'cursor-default bg-[var(--bg-sidebar-active)] pl-[9px] border-l-[3px] border-l-[var(--accent)]'
@@ -185,7 +201,6 @@ export function LeftSidebar() {
             onCancelEdit={() => setEditingId(null)}
             onEditTitleChange={setEditTitle}
             onDelete={handleDelete}
-            onExport={handleExport}
           />
         ))}
 
@@ -235,7 +250,6 @@ function ConversationGroupSection({
   onCancelEdit,
   onEditTitleChange,
   onDelete,
-  onExport,
 }: {
   group: ConversationGroup;
   activeId: string | null;
@@ -251,7 +265,6 @@ function ConversationGroupSection({
   onCancelEdit: () => void;
   onEditTitleChange: (v: string) => void;
   onDelete: (id: string, e: React.MouseEvent) => void;
-  onExport: (id: string, title: string, e: React.MouseEvent) => void;
 }) {
   return (
     <div className="mt-1">
@@ -276,7 +289,6 @@ function ConversationGroupSection({
           onCancelEdit={onCancelEdit}
           onEditTitleChange={onEditTitleChange}
           onDelete={onDelete}
-          onExport={onExport}
         />
       ))}
     </div>
@@ -299,7 +311,6 @@ function ConversationItem({
   onCancelEdit,
   onEditTitleChange,
   onDelete,
-  onExport,
 }: {
   id: string;
   title: string;
@@ -316,7 +327,6 @@ function ConversationItem({
   onCancelEdit: () => void;
   onEditTitleChange: (v: string) => void;
   onDelete: (id: string, e: React.MouseEvent) => void;
-  onExport: (id: string, title: string, e: React.MouseEvent) => void;
 }) {
   return (
     <div
@@ -372,13 +382,6 @@ function ConversationItem({
 
             {(isHovered || isActive) && !loading && (
               <div className="flex shrink-0 items-center gap-0.5">
-                <button
-                  onClick={(e) => onExport(id, title, e)}
-                  className="rounded p-1 text-[var(--text-tertiary)] transition-colors hover:text-[var(--text-primary)]"
-                  title="导出"
-                >
-                  <Download size={12} />
-                </button>
                 <button
                   onClick={(e) => onStartEdit(id, e)}
                   className="rounded p-1 text-[var(--text-tertiary)] transition-colors hover:text-[var(--text-primary)]"

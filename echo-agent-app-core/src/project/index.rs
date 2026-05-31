@@ -94,18 +94,33 @@ impl ProjectIndex {
 
         // Directories to always skip (build artifacts, caches)
         let skip_dirs = [
-            "target", "node_modules", "dist", "build",
-            ".next", "vendor", "__pycache__", "venv", ".tox", ".mypy_cache",
+            "target",
+            "node_modules",
+            "dist",
+            "build",
+            ".next",
+            "vendor",
+            "__pycache__",
+            "venv",
+            ".tox",
+            ".mypy_cache",
         ];
         // Dotfile directories that should be indexed (important config)
-        let allow_dot_dirs = [
-            ".github", ".cargo", ".config", ".claude", ".cursor",
-        ];
+        let allow_dot_dirs = [".github", ".cargo", ".config", ".claude", ".cursor"];
         // Important dotfiles to always include
         let include_dotfiles = [
-            ".env.example", ".python-version", ".nvmrc", ".node-version",
-            ".prettierrc", ".prettierrc.json", ".eslintrc", ".eslintrc.js",
-            ".eslintrc.json", ".editorconfig", ".gitignore", ".dockerignore",
+            ".env.example",
+            ".python-version",
+            ".nvmrc",
+            ".node-version",
+            ".prettierrc",
+            ".prettierrc.json",
+            ".eslintrc",
+            ".eslintrc.js",
+            ".eslintrc.json",
+            ".editorconfig",
+            ".gitignore",
+            ".dockerignore",
         ];
 
         index.walk(root, root, &skip_dirs, &allow_dot_dirs, &include_dotfiles);
@@ -114,7 +129,14 @@ impl ProjectIndex {
     }
 
     /// Recursively walk a directory.
-    fn walk(&mut self, root: &Path, dir: &Path, skip: &[&str], allow_dot_dirs: &[&str], include_dotfiles: &[&str]) {
+    fn walk(
+        &mut self,
+        root: &Path,
+        dir: &Path,
+        skip: &[&str],
+        allow_dot_dirs: &[&str],
+        include_dotfiles: &[&str],
+    ) {
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
             Err(_) => return,
@@ -157,7 +179,9 @@ impl ProjectIndex {
                         relative_path: relative,
                         size: meta.len(),
                         modified: meta.modified().ok().and_then(|t| {
-                            t.duration_since(SystemTime::UNIX_EPOCH).ok().map(|d| d.as_secs())
+                            t.duration_since(SystemTime::UNIX_EPOCH)
+                                .ok()
+                                .map(|d| d.as_secs())
                         }),
                         language,
                         symbols,
@@ -177,10 +201,7 @@ impl ProjectIndex {
         for (i, file) in self.files.iter().enumerate() {
             self.by_path.insert(file.relative_path.clone(), i);
             for sym in &file.symbols {
-                self.by_symbol
-                    .entry(sym.clone())
-                    .or_default()
-                    .push(i);
+                self.by_symbol.entry(sym.clone()).or_default().push(i);
             }
         }
     }
@@ -314,32 +335,50 @@ fn extract_symbols_and_imports(path: &Path, language: Option<&str>) -> (Vec<Stri
         match language {
             Some("rust") => {
                 if trimmed.starts_with("pub fn ") {
-                    if let Some(name) = trimmed.strip_prefix("pub fn ").and_then(|s| s.split('(').next()) {
+                    if let Some(name) = trimmed
+                        .strip_prefix("pub fn ")
+                        .and_then(|s| s.split('(').next())
+                    {
                         symbols.push(name.trim().to_string());
                     }
                 } else if trimmed.starts_with("pub struct ") {
-                    if let Some(name) = trimmed.strip_prefix("pub struct ").and_then(|s| s.split(|c: char| c == '<' || c == '{' || c == '(').next()) {
+                    if let Some(name) = trimmed
+                        .strip_prefix("pub struct ")
+                        .and_then(|s| s.split(|c: char| c == '<' || c == '{' || c == '(').next())
+                    {
                         symbols.push(name.trim().to_string());
                     }
                 } else if trimmed.starts_with("pub enum ") {
-                    if let Some(name) = trimmed.strip_prefix("pub enum ").and_then(|s| s.split('{').next()) {
+                    if let Some(name) = trimmed
+                        .strip_prefix("pub enum ")
+                        .and_then(|s| s.split('{').next())
+                    {
                         symbols.push(name.trim().to_string());
                     }
                 } else if trimmed.starts_with("use ") {
                     imports.push(trimmed.to_string());
                 } else if trimmed.starts_with("mod ") {
-                    if let Some(name) = trimmed.strip_prefix("mod ").and_then(|s| s.split(';').next()) {
+                    if let Some(name) = trimmed
+                        .strip_prefix("mod ")
+                        .and_then(|s| s.split(';').next())
+                    {
                         symbols.push(format!("mod {name}").trim().to_string());
                     }
                 }
             }
             Some("python") => {
                 if trimmed.starts_with("def ") {
-                    if let Some(name) = trimmed.strip_prefix("def ").and_then(|s| s.split('(').next()) {
+                    if let Some(name) = trimmed
+                        .strip_prefix("def ")
+                        .and_then(|s| s.split('(').next())
+                    {
                         symbols.push(name.trim().to_string());
                     }
                 } else if trimmed.starts_with("class ") {
-                    if let Some(name) = trimmed.strip_prefix("class ").and_then(|s| s.split(|c: char| c == '(' || c == ':').next()) {
+                    if let Some(name) = trimmed
+                        .strip_prefix("class ")
+                        .and_then(|s| s.split(|c: char| c == '(' || c == ':').next())
+                    {
                         symbols.push(name.trim().to_string());
                     }
                 } else if trimmed.starts_with("import ") || trimmed.starts_with("from ") {
@@ -348,11 +387,17 @@ fn extract_symbols_and_imports(path: &Path, language: Option<&str>) -> (Vec<Stri
             }
             Some("go") => {
                 if trimmed.starts_with("func ") {
-                    if let Some(name) = trimmed.strip_prefix("func ").and_then(|s| s.split('(').next()) {
+                    if let Some(name) = trimmed
+                        .strip_prefix("func ")
+                        .and_then(|s| s.split('(').next())
+                    {
                         symbols.push(name.trim().to_string());
                     }
                 } else if trimmed.starts_with("type ") {
-                    if let Some(name) = trimmed.strip_prefix("type ").and_then(|s| s.split(' ').next()) {
+                    if let Some(name) = trimmed
+                        .strip_prefix("type ")
+                        .and_then(|s| s.split(' ').next())
+                    {
                         symbols.push(name.trim().to_string());
                     }
                 } else if trimmed.starts_with("import ") {
@@ -361,7 +406,9 @@ fn extract_symbols_and_imports(path: &Path, language: Option<&str>) -> (Vec<Stri
             }
             _ => {
                 // Generic: look for function-like patterns
-                if (trimmed.starts_with("fn ") || trimmed.starts_with("func ") || trimmed.starts_with("def "))
+                if (trimmed.starts_with("fn ")
+                    || trimmed.starts_with("func ")
+                    || trimmed.starts_with("def "))
                     && trimmed.contains('(')
                 {
                     if let Some(name) = trimmed.split_whitespace().nth(1) {
@@ -388,10 +435,16 @@ mod tests {
 
     #[test]
     fn test_detect_language() {
-        assert_eq!(detect_language(Path::new("src/main.rs")), Some("rust".into()));
+        assert_eq!(
+            detect_language(Path::new("src/main.rs")),
+            Some("rust".into())
+        );
         assert_eq!(detect_language(Path::new("app.py")), Some("python".into()));
         assert_eq!(detect_language(Path::new("main.go")), Some("go".into()));
-        assert_eq!(detect_language(Path::new("README.md")), Some("markdown".into()));
+        assert_eq!(
+            detect_language(Path::new("README.md")),
+            Some("markdown".into())
+        );
         assert_eq!(detect_language(Path::new("Makefile")), None);
     }
 

@@ -38,8 +38,15 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     // 创建人工介入处理器
     let human_loop_handler = Arc::new(WsHumanLoopHandler::new(tx.clone()));
 
+    // Register WS HITL provider to dispatcher on connect (coexists with REPL provider)
+    state.connection.hitl_dispatcher.register("ws", human_loop_handler.clone()).await;
+
     // 跟踪当前活跃的 chat 任务，以便在客户端断开时取消
     let active_chat: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
+
+    // 保存 state 和 session_id 用于清理
+    let state_for_cleanup = state.clone();
+    let session_id_for_cleanup = session_id.clone();
 
     // 发送任务：将 ServerMessage 发送到 WebSocket，每 30s 发一次 ping 保活
     let send_task = {
@@ -80,6 +87,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     };
 
     // 接收任务：持续读取客户端消息，chat 请求 spawn 到独立 task
+    let state_for_recv_task = state.clone();
+    let human_loop_handler_for_recv = human_loop_handler.clone();
+
     let recv_task = {
         let session_id = session_id.clone();
         let active_chat = active_chat.clone();
@@ -119,8 +129,8 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                     }
 
                                     let task_tx = tx.clone();
-                                    let task_state = state.clone();
-                                    let task_human_loop = human_loop_handler.clone();
+                                    let task_state = state_for_recv_task.clone();
+                                    let task_human_loop = human_loop_handler_for_recv.clone();
                                     let handle = tokio::spawn(async move {
                                         handle_chat_message(
                                             id,
@@ -147,7 +157,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                         reason
                                     );
                                     // 记录审计日志
-                                    state
+                                    state_for_recv_task
                                         .add_audit_entry(AuditLogEntry {
                                             id: Uuid::new_v4().to_string(),
                                             tool_name: String::new(),
@@ -164,7 +174,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                             timestamp: chrono::Utc::now().to_rfc3339(),
                                         })
                                         .await;
-                                    human_loop_handler
+                                    human_loop_handler_for_recv
                                         .handle_approval_response(&request_id, approved, reason)
                                         .await;
                                 }
@@ -176,18 +186,22 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                                         request_id,
                                         text.len()
                                     );
-                                    human_loop_handler
+                                    human_loop_handler_for_recv
                                         .handle_input_response(&request_id, text)
                                         .await;
                                 }
                                 ClientMessage::Cancel { id } => {
                                     tracing::info!("收到取消请求");
                                     let cancel_key = id.clone().unwrap_or_default();
-                                    if let Some(token) = state.session.cancel_token.get(&cancel_key)
+                                    if let Some(token) = state_for_recv_task.session.cancel_token.get(&cancel_key)
                                     {
                                         token.cancel();
                                     }
                                     let _ = tx.send(ServerMessage::Cancelled { id });
+                                }
+                                ClientMessage::Ping => {
+                                    // 心跳响应
+                                    let _ = tx.send(ServerMessage::Pong);
                                 }
                             }
                         }
@@ -222,7 +236,14 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
         handle.abort();
     }
 
-    tracing::info!("WebSocket 连接关闭: {}", session_id);
+    // Unregister WS HITL provider to prevent stale provider accumulation
+    state_for_cleanup
+        .connection
+        .hitl_dispatcher
+        .unregister("ws")
+        .await;
+
+    tracing::info!(session_id = %session_id_for_cleanup, "WebSocket 连接关闭，HITL provider 已注销");
 }
 
 use base64::Engine;
@@ -438,12 +459,10 @@ async fn handle_chat_message(
     message: String,
     attachments: Vec<AttachmentData>,
     tx: &mpsc::UnboundedSender<ServerMessage>,
-    state: Arc<AppState>,
-    human_loop_handler: Arc<WsHumanLoopHandler>,
+    state_for_recv: Arc<AppState>,
+    _human_loop_handler: Arc<WsHumanLoopHandler>,
 ) {
-    use echo_agent::agent::Agent;
     use echo_agent::prelude::*;
-    use futures::StreamExt;
 
     let start = std::time::Instant::now();
     tracing::info!(
@@ -456,179 +475,172 @@ async fn handle_chat_message(
     let cancel_token = echo_agent::agent::CancellationToken::new();
     let message_key = id.clone().unwrap_or_default();
     {
-        state
+        state_for_recv
             .session
             .cancel_token
             .insert(message_key.clone(), cancel_token.clone());
     }
 
-    let mut chat_resources =
-        ChatResourceGuard::new(state.session.cancel_token.clone(), message_key.clone());
+    let _chat_resources =
+        ChatResourceGuard::new(state_for_recv.session.cancel_token.clone(), message_key.clone());
 
-    // Acquire the chat serialization lock to prevent concurrent human-loop
-    // provider overwrites across multiple WebSocket sessions.
-    // For single-user local mode this is correct; multi-user deployments
-    // should use per-session agent instances instead.
-    let _chat_guard = state.connection.chat_serializer.lock().await;
+    // 使用 channel 解耦 agent 读锁和 stream 处理
+    // 生成独立任务持有 agent 引用并处理 stream，通过 channel 发送事件
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<std::result::Result<AgentEvent, String>>();
 
-    // Brief write lock to configure human-in-the-loop provider.
-    // SAFETY NOTE: Protected by chat_serializer — only one session at a time
-    // can set the provider, so concurrent sessions won't overwrite each other.
-    state
-        .connection
-        .agent
-        .write(|a| {
-            a.set_human_loop_provider(human_loop_handler);
-        })
-        .await;
+    let agent_inner = state_for_recv.connection.agent.inner().clone();
+    let message_clone = message.clone();
+    let attachments_clone = attachments.clone();
+    let cancel_token_clone = cancel_token.clone();
+    let id_for_task = id.clone();
+    let upload_dir_for_task = upload_dir();
+    let max_upload_size = state_for_recv.config.web_config.read().await.max_upload_size_bytes;
 
-    // 使用 inner() 逃生舱口：chat_stream_with_cancel 返回的流同时借用
-    // agent 和 message 字符串，其生命周期无法用 read_async 的 HRTB 表达。
-    // 注意：agent guard 必须存活到 stream 处理完毕。
-    tracing::debug!(id = ?id, "WS chat acquiring agent read lock");
-    let agent = state.connection.agent.inner().read().await;
-    tracing::info!(
-        id = ?id,
-        elapsed_ms = start.elapsed().as_millis() as u64,
-        model = %agent.model_name(),
-        "WS chat agent read lock acquired"
-    );
+    // 生成独立任务处理 stream，释放读锁
+    tokio::spawn(async move {
+        use echo_agent::agent::Agent;
+        use echo_agent::prelude::*;
+        use futures::StreamExt;
 
-    let stream_result = if attachments.is_empty() {
-        tracing::info!(id = ?id, "WS chat creating text stream");
-        agent
-            .chat_stream_with_cancel(&message, cancel_token.clone())
-            .await
-    } else {
-        tracing::info!(id = ?id, attachment_count = attachments.len(), "WS chat creating multimodal stream");
-        let dir = upload_dir().join(Uuid::new_v4().to_string());
-        let max_upload_size = state.config.web_config.read().await.max_upload_size_bytes;
-        let parts = build_attachment_parts(&attachments, &message, &dir, max_upload_size);
-        chat_resources.set_upload_dir(dir.clone());
-        let msg = LlmMessage::user_multimodal(parts);
-        agent.chat_stream_message(msg).await
-    };
-    // agent guard 在此之后仍然存活，stream 处理完毕后自动 drop
+        // 在任务内获取读锁（短暂持有）
+        let agent = agent_inner.read().await;
 
-    match stream_result {
-        Ok(mut stream) => {
-            tracing::info!(
-                id = ?id,
-                elapsed_ms = start.elapsed().as_millis() as u64,
-                "WS chat stream created"
-            );
-            let mut event_count: u64 = 0;
-            while let Some(event_result) = stream.next().await {
-                match event_result {
-                    Ok(event) => {
-                        event_count += 1;
-                        tracing::debug!(
-                            id = ?id,
-                            event_count,
-                            event = ?event,
-                            elapsed_ms = start.elapsed().as_millis() as u64,
-                            "WS chat agent event"
-                        );
-                        let server_msg = match event {
-                            AgentEvent::Token(data) => ServerMessage::Token {
-                                id: id.clone(),
-                                data,
-                            },
-                            AgentEvent::ThinkStart => {
-                                ServerMessage::ThinkingStart { id: id.clone() }
+        let stream_result = if attachments_clone.is_empty() {
+            tracing::info!(id = ?id_for_task, "WS chat creating text stream");
+            agent
+                .chat_stream_with_cancel(&message_clone, cancel_token_clone)
+                .await
+        } else {
+            tracing::info!(id = ?id_for_task, attachment_count = attachments_clone.len(), "WS chat creating multimodal stream");
+            let dir = upload_dir_for_task.join(Uuid::new_v4().to_string());
+            let parts = build_attachment_parts(&attachments_clone, &message_clone, &dir, max_upload_size);
+            let msg = LlmMessage::user_multimodal(parts);
+            agent.chat_stream_message(msg).await
+        };
+        // 读锁在这里释放
+
+        match stream_result {
+            Ok(mut stream) => {
+                while let Some(event_result) = stream.next().await {
+                    match event_result {
+                        Ok(event) => {
+                            if event_tx.send(Ok(event)).is_err() {
+                                break;
                             }
-                            AgentEvent::ThinkEnd {
-                                prompt_tokens,
-                                completion_tokens,
-                            } => ServerMessage::ThinkingEnd {
-                                id: id.clone(),
-                                prompt_tokens,
-                                completion_tokens,
-                            },
-                            AgentEvent::ToolCall { name, args } => ServerMessage::ToolStart {
-                                id: id.clone(),
-                                name,
-                                args,
-                            },
-                            AgentEvent::ToolResult { name, output } => ServerMessage::ToolResult {
-                                id: id.clone(),
-                                name,
-                                result: output,
-                                success: true,
-                            },
-                            AgentEvent::ToolError { name, error } => ServerMessage::ToolResult {
-                                id: id.clone(),
-                                name,
-                                result: error,
-                                success: false,
-                            },
-                            AgentEvent::MemoryRecalled { count } => {
-                                tracing::debug!(count = count, "Memory recalled event received");
-                                continue;
-                            }
-                            AgentEvent::Chart { spec } => ServerMessage::Chart {
-                                id: id.clone(),
-                                spec,
-                            },
-                            AgentEvent::FinalAnswer(data) => {
-                                tracing::info!(
-                                    id = ?id,
-                                    event_count,
-                                    elapsed_ms = start.elapsed().as_millis() as u64,
-                                    answer_len = data.len(),
-                                    "WS chat final answer"
-                                );
-                                ServerMessage::FinalAnswer {
-                                    id: id.clone(),
-                                    data,
-                                }
-                            }
-                            AgentEvent::Cancelled => ServerMessage::Cancelled { id: id.clone() },
-                            AgentEvent::Error { source, message } => ServerMessage::Error {
-                                id: id.clone(),
-                                message: format!("{source}: {message}"),
-                            },
-                            _ => continue, // 忽略其他事件类型
-                        };
-
-                        if tx.send(server_msg).is_err() {
-                            tracing::warn!(id = ?id, "WS chat client channel closed while sending event");
+                        }
+                        Err(e) => {
+                            let _ = event_tx.send(Err(e.to_string()));
                             break;
                         }
                     }
-                    Err(e) => {
-                        tracing::error!(
-                            id = ?id,
-                            error = %e,
-                            elapsed_ms = start.elapsed().as_millis() as u64,
-                            "WS chat stream item error"
-                        );
-                        let _ = tx.send(ServerMessage::Error {
-                            id: id.clone(),
-                            message: e.to_string(),
-                        });
-                        break;
-                    }
                 }
             }
-            tracing::info!(
-                id = ?id,
-                event_count,
-                elapsed_ms = start.elapsed().as_millis() as u64,
-                "WS chat stream finished"
-            );
+            Err(e) => {
+                let _ = event_tx.send(Err(e.to_string()));
+            }
         }
-        Err(e) => {
-            tracing::error!(
-                id = ?id,
-                error = %e,
-                elapsed_ms = start.elapsed().as_millis() as u64,
-                "WS chat stream creation failed"
-            );
-            let _ = tx.send(ServerMessage::Error {
-                id,
-                message: e.to_string(),
-            });
+    });
+
+    // 主处理循环：从 channel 接收事件（无需持有 agent 读锁）
+    let mut event_count: u64 = 0;
+
+    while let Some(event_result) = event_rx.recv().await {
+        match event_result {
+            Ok(event) => {
+                event_count += 1;
+                tracing::debug!(
+                    id = ?id,
+                    event_count,
+                    event = ?event,
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    "WS chat agent event"
+                );
+                let server_msg = match event {
+                    AgentEvent::Token(data) => ServerMessage::Token {
+                        id: id.clone(),
+                        data,
+                    },
+                    AgentEvent::ThinkStart => {
+                        ServerMessage::ThinkingStart { id: id.clone() }
+                    }
+                    AgentEvent::ThinkEnd {
+                        prompt_tokens,
+                        completion_tokens,
+                    } => ServerMessage::ThinkingEnd {
+                        id: id.clone(),
+                        prompt_tokens,
+                        completion_tokens,
+                    },
+                    AgentEvent::ToolCall { name, args } => ServerMessage::ToolStart {
+                        id: id.clone(),
+                        name,
+                        args,
+                    },
+                    AgentEvent::ToolResult { name, output } => ServerMessage::ToolResult {
+                        id: id.clone(),
+                        name,
+                        result: output,
+                        success: true,
+                    },
+                    AgentEvent::ToolError { name, error } => ServerMessage::ToolResult {
+                        id: id.clone(),
+                        name,
+                        result: error,
+                        success: false,
+                    },
+                    AgentEvent::MemoryRecalled { count } => {
+                        tracing::debug!(count = count, "Memory recalled event received");
+                        continue;
+                    }
+                    AgentEvent::Chart { spec } => ServerMessage::Chart {
+                        id: id.clone(),
+                        spec,
+                    },
+                    AgentEvent::FinalAnswer(data) => {
+                        tracing::info!(
+                            id = ?id,
+                            event_count,
+                            elapsed_ms = start.elapsed().as_millis() as u64,
+                            answer_len = data.len(),
+                            "WS chat final answer"
+                        );
+                        ServerMessage::FinalAnswer {
+                            id: id.clone(),
+                            data,
+                        }
+                    }
+                    AgentEvent::Cancelled => ServerMessage::Cancelled { id: id.clone() },
+                    AgentEvent::Error { source, message } => ServerMessage::Error {
+                        id: id.clone(),
+                        message: format!("{source}: {message}"),
+                    },
+                    _ => continue, // 忽略其他事件类型
+                };
+
+                if tx.send(server_msg).is_err() {
+                    tracing::warn!(id = ?id, "WS chat client channel closed while sending event");
+                    break;
+                }
+            }
+            Err(e) => {
+                tracing::error!(
+                    id = ?id,
+                    error = %e,
+                    elapsed_ms = start.elapsed().as_millis() as u64,
+                    "WS chat stream item error"
+                );
+                let _ = tx.send(ServerMessage::Error {
+                    id: id.clone(),
+                    message: e,
+                });
+                break;
+            }
         }
     }
+    tracing::info!(
+        id = ?id,
+        event_count,
+        elapsed_ms = start.elapsed().as_millis() as u64,
+        "WS chat stream finished"
+    );
 }

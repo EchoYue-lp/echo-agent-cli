@@ -1,9 +1,10 @@
 //! 沙箱执行 API
 //!
-//! 安全注意事项：
-//! - 本地执行模式 (`execute_local`) 直接运行在宿主进程环境中，不提供真正的隔离。
-//! - `SandboxTier::High` 场景应使用 Docker/K8s 后端，但目前仅实现了本地执行。
-//! - 超时时会强制杀死子进程（通过 `kill_on_drop`）。
+//! 本地执行模式注意事项：
+//! - echo-agent-cli 定位为本地 CoWork 工具，代码执行在本地环境中进行
+//! - 沙箱主要用于安全性（防止意外损害）而非隔离
+//! - 通过进程级限制（超时、内存限制）提供基本保护
+//! - 超时时会强制杀死子进程（通过 `kill_on_drop`）
 
 use axum::{Json, extract::State};
 use serde::{Deserialize, Serialize};
@@ -18,12 +19,10 @@ use crate::state::{AppState, SandboxTier};
 #[derive(Debug, Serialize)]
 pub struct SandboxStatus {
     pub local_available: bool,
-    pub docker_available: bool,
-    pub k8s_available: bool,
     pub current_backend: String,
-    /// 当前安全级别下的隔离警告
+    /// 当前安全级别下的保护说明
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub isolation_warning: Option<String>,
+    pub protection_info: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -49,44 +48,24 @@ pub struct SandboxExecuteResult {
     pub duration_ms: u64,
 }
 
-// ── 缓存的 Docker 可用性检查 ─────────────────────────────────────
-
-static DOCKER_AVAILABLE: OnceCell<bool> = OnceCell::const_new();
-
-async fn check_docker_cached() -> bool {
-    *DOCKER_AVAILABLE
-        .get_or_init(|| async {
-            tokio::process::Command::new("docker")
-                .arg("--version")
-                .output()
-                .await
-                .map(|o| o.status.success())
-                .unwrap_or(false)
-        })
-        .await
-}
-
 // ── API 处理器 ───────────────────────────────────────────────────
 
 /// GET /api/sandbox/status
 pub async fn get_sandbox_status(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<SandboxStatus>, AppError> {
-    let docker_available = check_docker_cached().await;
     let sandbox_config = state.config.sandbox_config.read().await;
 
-    let isolation_warning = if sandbox_config.security_level == SandboxTier::High {
-        Some("SandboxTier is set to High but execution is local — no container/VM isolation is in effect. Consider using Docker or K8s backend.".to_string())
-    } else {
-        None
+    let protection_info = match sandbox_config.security_level {
+        SandboxTier::Low => Some("基础保护：仅限制危险命令（rm -rf / 等）".to_string()),
+        SandboxTier::Medium => Some("中等保护：限制危险命令 + 超时保护（默认）".to_string()),
+        SandboxTier::High => Some("高保护：限制危险命令 + 超时保护 + 内存限制".to_string()),
     };
 
     Ok(Json(SandboxStatus {
         local_available: true,
-        docker_available,
-        k8s_available: false,
         current_backend: "local".to_string(),
-        isolation_warning,
+        protection_info,
     }))
 }
 

@@ -11,7 +11,7 @@ model:
 agent:
   name: "echo-assistant"                              # Agent 名称
   system_prompt: "你是一个智能助手，可以帮助用户回答问题、执行任务。"  # 系统提示词
-  max_iterations: 10          # ReAct 最大迭代次数
+  max_iterations: 0            # ReAct 最大迭代次数（0 = 无限制，直到任务完成或用户取消）
   enable_tools: true          # 启用工具调用
   enable_memory: true         # 启用记忆
   enable_human_in_loop: true  # 启用人工介入

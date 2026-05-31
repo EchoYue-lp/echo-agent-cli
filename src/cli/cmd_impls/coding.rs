@@ -1,8 +1,11 @@
-//! Coding mode slash commands — plan, tasks, diff, test, fix, commit, review, agents, agent, pr, patch.
+//! Coding mode slash commands — plan, tasks, test, code-review, fix, agents, agent.
+//!
+//! Git commands moved to `/git` subcommand group (see `git.rs`).
 
+use crate::cli::command::{CommandCategory, CommandContext, CommandOutcome, cmd};
+use crate::project::test_runner;
+use echo_agent_app_core::tasks::{BackgroundTaskKind, ResearchOutputFormat, TaskStatus};
 use std::sync::Arc;
-use crate::cli::command::{cmd, CommandCategory, CommandContext, CommandOutcome};
-use crate::project::{coding_task::TaskStatus, test_runner};
 
 // ── PlanCommand ──────────────────────────────────────────────────────
 
@@ -24,171 +27,476 @@ async fn cmd_plan(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 println!("Usage: /plan [on|off]");
             } else {
                 ctx.agent.write(|a| a.set_plan_mode(true)).await;
-                if let Some(ref cl) = ctx.coding_loop {
-                    let task = args.join(" ");
-                    cl.lock().await.add_task(&task);
-                    println!("Plan mode ON. Task added: {task}");
-                } else {
-                    println!("Plan mode ON (read-only).");
-                }
+                // TODO: Phase 2 — submit task via BackgroundTaskService
+                let task = args.join(" ");
+                println!("Plan mode ON. Task noted: {task}");
             }
         }
     }
     CommandOutcome::Continue
 }
-cmd!(PlanCommand, "plan", CommandCategory::Coding, "Toggle plan mode (read-only enforcement)", cmd_plan);
+cmd!(
+    PlanCommand,
+    "plan",
+    CommandCategory::Coding,
+    "Toggle plan mode (read-only enforcement)",
+    cmd_plan
+);
 
 // ── TasksCommand ─────────────────────────────────────────────────────
 
 async fn cmd_tasks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
-    let sub = args.first().copied().unwrap_or("");
-    let rest: String = args.iter().skip(1).copied().collect::<Vec<_>>().join(" ");
-    if let Some(ref cl) = ctx.coding_loop {
-        let mut guard = cl.lock().await;
-        match sub {
-            "add" if !rest.is_empty() => { let t = guard.add_task(&rest); println!("Added: {} ({})", t.id, t.description); }
-            "done" if !rest.is_empty() => { if guard.task_tracker.mark_done(&rest) { println!("Done: {rest}"); } else { println!("Not found: {rest}"); } }
-            "start" if !rest.is_empty() => { if guard.task_tracker.mark_in_progress(&rest) { println!("Started: {rest}"); } else { println!("Not found: {rest}"); } }
-            _ => {
-                let tasks = guard.task_tracker.list();
-                if tasks.is_empty() { println!("No tasks. Use /tasks add <desc>"); }
-                else { for t in tasks { let icon = match t.status { TaskStatus::Pending=>"[ ]", TaskStatus::InProgress=>"[>]", TaskStatus::Done=>"[x]", TaskStatus::Cancelled=>"[-]" }; println!("  {icon} {} - {}", t.id, t.description); } }
-            }
+    let service = match &ctx.task_service {
+        Some(svc) => svc.clone(),
+        None => {
+            println!("Background task service not configured.");
+            println!("Use the --tasks flag when starting the agent to enable background task support.");
+            return CommandOutcome::Continue;
         }
-    } else { println!("Coding mode not active."); }
-    CommandOutcome::Continue
-}
-cmd!(TasksCommand, "tasks", CommandCategory::Coding, "List, add, or update tasks", cmd_tasks);
+    };
 
-// ── DiffCommand ──────────────────────────────────────────────────────
-
-async fn cmd_diff(ctx: &CommandContext, _args: &[&str]) -> CommandOutcome {
-    if let Some(ref cl) = ctx.coding_loop {
-        let root = { cl.lock().await.project_root.clone() };
-        println!("\n--- Changes ---");
-        if root.join(".git").exists() {
-            for (label, args) in &[("Staged", &["diff", "--cached", "--stat"] as &[&str]), ("Unstaged", &["diff", "--stat"])] {
-                if let Ok(o) = tokio::process::Command::new("git").args(*args).current_dir(&root).output().await {
-                    let s = String::from_utf8_lossy(&o.stdout);
-                    if !s.trim().is_empty() { println!("\n--- {} ---\n{s}", label); }
+    let sub = args.first().copied().unwrap_or("");
+    match sub {
+        "list" | "" => {
+            let tasks = service.list(None);
+            if tasks.is_empty() {
+                println!("No background tasks.");
+            } else {
+                println!("\nBackground Tasks:");
+                println!("{:-<80}", "");
+                for t in &tasks {
+                    let status = task_status_display(&t.status);
+                    println!(
+                        "  [{:>12}] {} (id: {}, created_at: {})",
+                        status, t.description, t.id, t.created_at
+                    );
                 }
             }
+        }
+        "status" => {
+            let id = args.get(1).copied().unwrap_or("");
+            if id.is_empty() {
+                println!("Usage: /tasks status <id>");
+                return CommandOutcome::Continue;
+            }
+            match service.get(id).await {
+                Some((task, meta)) => {
+                    println!("\nTask: {}", task.id);
+                    println!("  Description: {}", task.description);
+                    println!("  Status: {}", task_status_display(&task.status));
+                    println!("  Created At: {}", task.created_at);
+                    if let Some(ref result) = task.result {
+                        println!("  Result: {}", result);
+                    }
+                    if let Some(ref meta) = meta {
+                        println!("  Type: {}", meta.kind.display_name());
+                        println!("  Progress: {}%", meta.progress);
+                        if let Some(ref msg) = meta.progress_message {
+                            println!("  Progress Message: {}", msg);
+                        }
+                    }
+                }
+                None => {
+                    println!("Task not found: {}", id);
+                }
+            }
+        }
+        "cancel" => {
+            let id = args.get(1).copied().unwrap_or("");
+            if id.is_empty() {
+                println!("Usage: /tasks cancel <id>");
+                return CommandOutcome::Continue;
+            }
+            if service.cancel(id).await {
+                println!("Task cancelled: {}", id);
+            } else {
+                println!("Failed to cancel task (not found or not running): {}", id);
+            }
+        }
+        "research" => {
+            let topic = args.get(1..).map(|s| s.join(" ")).unwrap_or_default();
+            if topic.is_empty() {
+                println!("Usage: /tasks research <topic>");
+                return CommandOutcome::Continue;
+            }
+            match service
+                .submit(
+                    BackgroundTaskKind::Research {
+                        topic: topic.clone(),
+                        max_papers: 20,
+                        output_format: ResearchOutputFormat::Markdown,
+                    },
+                    &format!("Research: {}", topic),
+                    Some("cli".to_string()),
+                )
+                .await
+            {
+                Ok(task_id) => {
+                    println!("Research task submitted: {} (id: {})", topic, task_id)
+                }
+                Err(e) => println!("Failed to submit research task: {}", e),
+            }
+        }
+        _ => {
+            println!("Usage: /tasks [list|status <id>|cancel <id>|research <topic>]");
+        }
+    }
+    CommandOutcome::Continue
+}
+
+/// Format a TaskStatus for display.
+fn task_status_display(status: &TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Pending => "Pending",
+        TaskStatus::InProgress => "InProgress",
+        TaskStatus::Completed => "Completed",
+        TaskStatus::Cancelled => "Cancelled",
+        TaskStatus::Failed(_) => "Failed",
+        TaskStatus::Blocked(_) => "Blocked",
+        TaskStatus::TimedOut { .. } => "TimedOut",
+        TaskStatus::Retrying { .. } => "Retrying",
+    }
+}
+cmd!(
+    TasksCommand,
+    "tasks",
+    CommandCategory::Coding,
+    "List, add, or update tasks",
+    cmd_tasks
+);
+
+// ── TestCommand ──────────────────────────────────────────────────────
+
+async fn cmd_test(ctx: &CommandContext, _args: &[&str]) -> CommandOutcome {
+    if let Some(ref cl) = ctx.coding_loop {
+        let (cmd, root) = {
+            let g = cl.lock().await;
+            (g.test_command().to_string(), g.project_root.clone())
+        };
+        if cmd.is_empty() {
+            println!("No test command configured.");
+            return CommandOutcome::Continue;
+        }
+        println!("\nRunning: {cmd}");
+        match test_runner::run_test_command(&cmd, &root).await {
+            Ok(r) => {
+                if r.passed {
+                    println!("\nAll tests passed.");
+                } else {
+                    println!("\n{} failure(s)", r.failures.len());
+                    for f in &r.failures {
+                        println!("  FAIL: {}", f.test_name);
+                    }
+                }
+            }
+            Err(e) => println!("Error: {e}"),
         }
     } else {
         println!("Coding mode not active.");
     }
     CommandOutcome::Continue
 }
-cmd!(DiffCommand, "diff", CommandCategory::Coding, "Show file changes and git diff", cmd_diff);
-
-// ── TestCommand ──────────────────────────────────────────────────────
-
-async fn cmd_test(ctx: &CommandContext, _args: &[&str]) -> CommandOutcome {
-    if let Some(ref cl) = ctx.coding_loop {
-        let (cmd, root) = { let g = cl.lock().await; (g.test_command().to_string(), g.project_root.clone()) };
-        if cmd.is_empty() { println!("No test command configured."); return CommandOutcome::Continue; }
-        println!("\nRunning: {cmd}");
-        match test_runner::run_test_command(&cmd, &root).await {
-            Ok(r) => {
-                if r.passed { println!("\nAll tests passed."); }
-                else { println!("\n{} failure(s)", r.failures.len()); for f in &r.failures { println!("  FAIL: {}", f.test_name); } }
-            }
-            Err(e) => println!("Error: {e}"),
-        }
-    } else { println!("Coding mode not active."); }
-    CommandOutcome::Continue
-}
-cmd!(TestCommand, "test", CommandCategory::Coding, "Run project test command", cmd_test);
+cmd!(
+    TestCommand,
+    "test",
+    CommandCategory::Coding,
+    "Run project test command",
+    cmd_test
+);
 
 // ── ReviewCommand ────────────────────────────────────────────────────
 
 async fn cmd_review(ctx: &CommandContext, _args: &[&str]) -> CommandOutcome {
     if let Some(ref cl) = ctx.coding_loop {
-        let (summary, count) = { let g = cl.lock().await; (g.diff_summary(), g.change_count()) };
-        println!("\n--- Review ---\n{summary}\n");
-        println!("  Risk: {}", match count { 0=>"None", 1..=2=>"Low", 3..=5=>"Medium", _=>"High" });
-    } else { println!("Coding mode not active."); }
-    CommandOutcome::Continue
-}
-cmd!(ReviewCommand, "review", CommandCategory::Coding, "Review accumulated changes", cmd_review);
-
-// ── CommitCommand ────────────────────────────────────────────────────
-
-async fn cmd_commit(ctx: &CommandContext, _args: &[&str]) -> CommandOutcome {
-    if let Some(ref cl) = ctx.coding_loop {
         let root = { cl.lock().await.project_root.clone() };
-        if !root.join(".git").exists() { println!("Not a git repo."); return CommandOutcome::Continue; }
-        let status = tokio::process::Command::new("git").args(["status","--short"]).current_dir(&root).output().await;
-        if let Ok(s) = status {
-            let out = String::from_utf8_lossy(&s.stdout);
-            if out.trim().is_empty() { println!("Nothing to commit."); }
-            else { println!("\n--- Changes ---\n{out}\nRun: git add -A && git commit -m \"...\""); }
+        if !root.join(".git").exists() {
+            println!("Not a git repo.");
+            return CommandOutcome::Continue;
         }
-    } else { println!("Coding mode not active."); }
-    CommandOutcome::Continue
-}
-cmd!(CommitCommand, "commit", CommandCategory::Coding, "Show changes and commit message", cmd_commit);
 
-// ── AgentsCommand ────────────────────────────────────────────────────
+        // Get the actual diff
+        let diff_output = tokio::process::Command::new("git")
+            .args(["diff", "HEAD"])
+            .current_dir(&root)
+            .output()
+            .await;
 
-async fn cmd_agents(_ctx: &CommandContext, _args: &[&str]) -> CommandOutcome {
-    println!("\nAvailable SubAgents:");
-    for (n, d) in &[("code-explorer","Explore codebases"),("test-runner","Run tests"),("security-reviewer","Find vulnerabilities"),("build-fixer","Fix compile errors"),("doc-writer","Write docs"),("refactor-planner","Plan refactoring"),("performance-profiler","Profile performance"),("release-engineer","Manage releases")] {
-        println!("  {n} — {d}");
+        let diff_text = match diff_output {
+            Ok(output) if output.status.success() => {
+                String::from_utf8_lossy(&output.stdout).to_string()
+            }
+            _ => {
+                // Fallback to accumulated changes summary
+                let g = cl.lock().await;
+                g.diff_summary()
+            }
+        };
+
+        if diff_text.trim().is_empty() {
+            println!("No changes to review.");
+            return CommandOutcome::Continue;
+        }
+
+        // Count changed lines for risk assessment
+        let added = diff_text.lines().filter(|l| l.starts_with('+') && !l.starts_with("+++")).count();
+        let removed = diff_text.lines().filter(|l| l.starts_with('-') && !l.starts_with("---")).count();
+        let changed_files = diff_text.lines().filter(|l| l.starts_with("diff --git")).count();
+
+        println!("\n=== Code Review ===\n");
+        println!("Changes: +{} -{} across {} file(s)", added, removed, changed_files);
+
+        // Risk assessment
+        let risk = if added + removed > 500 {
+            "High"
+        } else if added + removed > 100 {
+            "Medium"
+        } else if added + removed > 0 {
+            "Low"
+        } else {
+            "None"
+        };
+        println!("Risk: {}\n", risk);
+
+        // Show diff (truncated if too long)
+        let max_lines = 50;
+        let diff_lines: Vec<&str> = diff_text.lines().collect();
+        if diff_lines.len() > max_lines {
+            for line in diff_lines.iter().take(max_lines) {
+                println!("{}", line);
+            }
+            println!("\n... ({} more lines, use 'git diff' to see all)", diff_lines.len() - max_lines);
+        } else {
+            println!("{}", diff_text);
+        }
+
+        // Suggest agent review for larger changes
+        if added + removed > 50 {
+            println!("\nTip: Ask the agent to review these changes:");
+            println!("  'Review the recent code changes and suggest improvements'");
+        }
+    } else {
+        println!("Coding mode not active.");
     }
     CommandOutcome::Continue
 }
-cmd!(AgentsCommand, "agents", CommandCategory::Coding, "List available subagents", cmd_agents);
+cmd!(
+    CodeReviewCommand,
+    "code-review",
+    ["cr"],
+    CommandCategory::Coding,
+    "Review accumulated changes",
+    cmd_review
+);
+
+// ── AgentsCommand ────────────────────────────────────────────────────
+
+async fn cmd_agents(ctx: &CommandContext, _args: &[&str]) -> CommandOutcome {
+    println!("\nAvailable SubAgents:");
+
+    // Query the agent's actual tool registry for agent-like tool names
+    let agent_like_names: Vec<String> = ctx
+        .agent
+        .read(|a| {
+            a.tool_names()
+                .into_iter()
+                .filter(|name| name.contains("agent"))
+                .collect()
+        })
+        .await;
+
+    if !agent_like_names.is_empty() {
+        println!("\n  Agent Dispatch Tools (from registry):");
+        for name in &agent_like_names {
+            println!("    - {}", name);
+        }
+    } else {
+        println!("\n  (No agent dispatch tools currently registered)");
+    }
+
+    // Show common pre-registered subagents as a reference
+    println!("\n  Common SubAgents (pre-registered):");
+    for (n, d) in &[
+        ("code-explorer", "Explore codebases"),
+        ("test-runner", "Run tests"),
+        ("security-reviewer", "Find vulnerabilities"),
+        ("build-fixer", "Fix compile errors"),
+        ("doc-writer", "Write docs"),
+        ("refactor-planner", "Plan refactoring"),
+        ("performance-profiler", "Profile performance"),
+        ("release-engineer", "Manage releases"),
+    ] {
+        println!("    {} — {}", n, d);
+    }
+
+    println!();
+    println!("  Use /agent run <name> <task> to dispatch to a subagent.");
+    println!("  Full subagent registry listing planned for future release.");
+
+    CommandOutcome::Continue
+}
+cmd!(
+    AgentsCommand,
+    "agents",
+    CommandCategory::Coding,
+    "List available subagents",
+    cmd_agents
+);
 
 // ── AgentCommand ─────────────────────────────────────────────────────
 
-async fn cmd_agent(_ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
-    if args.len() < 2 { println!("Usage: /agent run <name> <task>"); }
-    else { println!("Running agent: {} — {}", args[1], args.get(2..).map(|s| s.join(" ")).unwrap_or_default()); }
+async fn cmd_agent(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
+    if args.len() < 3 {
+        println!("Usage: /agent run <name> <task>");
+        println!();
+        println!("Examples:");
+        println!("  /agent run code-explorer 'Explain the architecture of src/'");
+        println!("  /agent run doc-writer 'Write documentation for the API'");
+        println!("  /agent run build-fixer 'Fix the current build errors'");
+        return CommandOutcome::Continue;
+    }
+
+    let subcommand = args[0];
+    if subcommand != "run" {
+        println!("Unknown subcommand '{}'. Usage: /agent run <name> <task>", subcommand);
+        return CommandOutcome::Continue;
+    }
+
+    let agent_name = args[1];
+    let task = args[2..].join(" ");
+
+    // If task service is available, submit as a background AgentChat task
+    if let Some(ref service) = ctx.task_service {
+        match service
+            .submit(
+                BackgroundTaskKind::AgentChat {
+                    prompt: format!("Run as subagent '{}': {}", agent_name, task),
+                    session_id: None,
+                },
+                &format!("Agent run: {} — {}", agent_name, task),
+                Some("cli".to_string()),
+            )
+            .await
+        {
+            Ok(task_id) => {
+                println!("Agent task submitted as background task.");
+                println!("  Agent: {}", agent_name);
+                println!("  Task description: {}", task);
+                println!("  Task ID: {}", task_id);
+                println!("  Use /tasks status {} to check progress.", task_id);
+            }
+            Err(e) => {
+                println!("Failed to submit agent task: {}", e);
+            }
+        }
+    } else {
+        println!("Agent dispatch requested:");
+        println!("  Agent: {}", agent_name);
+        println!("  Task: {}", task);
+        println!();
+        println!("Background task service not configured. Try submitting via chat:");
+        println!("  'Use the {} subagent to: {}'", agent_name, task);
+    }
+
     CommandOutcome::Continue
 }
-cmd!(AgentCommand, "agent", CommandCategory::Coding, "Run a subagent", cmd_agent);
+cmd!(
+    AgentCommand,
+    "agent",
+    CommandCategory::Coding,
+    "Run a subagent",
+    cmd_agent
+);
 
 // ── FixCommand ───────────────────────────────────────────────────────
 
-async fn cmd_fix(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
+async fn cmd_fix(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     if let Some(ref cl) = ctx.coding_loop {
-        let cmd = { cl.lock().await.test_command().to_string() };
-        println!("\nFix loop: running {cmd}...");
-        println!("  If tests fail, use /test to see details and manually fix.");
-    } else { println!("Coding mode not active."); }
+        let (cmd, root) = {
+            let g = cl.lock().await;
+            (g.test_command().to_string(), g.project_root.clone())
+        };
+
+        let max_rounds: u32 = args.first().and_then(|s| s.parse().ok()).unwrap_or(3);
+
+        println!("Starting test-fix loop (max {} rounds)", max_rounds);
+
+        for round in 1..=max_rounds {
+            println!("\n--- Round {}/{} ---", round, max_rounds);
+            println!("Running: {}", cmd);
+
+            let parts: Vec<&str> = cmd.split_whitespace().collect();
+            let (program, cmd_args) = if parts.is_empty() {
+                ("echo", vec!["no test command"])
+            } else {
+                (parts[0], parts[1..].to_vec())
+            };
+
+            let result = tokio::process::Command::new(program)
+                .args(&cmd_args)
+                .current_dir(&root)
+                .output()
+                .await;
+
+            match result {
+                Ok(output) if output.status.success() => {
+                    println!("✅ Tests PASSED on round {}!", round);
+                    return CommandOutcome::Continue;
+                }
+                Ok(output) => {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let combined = format!("{}\n{}", stdout, stderr);
+
+                    println!("❌ Tests FAILED on round {}", round);
+                    println!("\nError output:");
+                    println!("{}", combined);
+
+                    if round < max_rounds {
+                        println!("\nAsking agent to analyze and fix the errors...");
+
+                        let fix_prompt = format!(
+                            "The test command '{}' failed with the following output:\n\n{}\n\n\
+                             Please analyze the errors and fix the code. \
+                             Focus on the root cause, not just symptoms.",
+                            cmd, combined
+                        );
+
+                        // Return to REPL with the fix prompt - the agent will process it
+                        return CommandOutcome::Chat(fix_prompt);
+                    } else {
+                        println!("\n⚠️  Max rounds reached. Tests still failing.");
+                        println!("Consider reviewing the errors manually.");
+                    }
+                }
+                Err(e) => {
+                    println!("❌ Failed to run test command: {}", e);
+                    return CommandOutcome::Continue;
+                }
+            }
+        }
+
+        println!("\n⚠️  Test-fix loop completed after {} rounds", max_rounds);
+    } else {
+        println!("Coding mode not active.");
+    }
     CommandOutcome::Continue
 }
-cmd!(FixCommand, "fix", CommandCategory::Coding, "Run test/fix loop", cmd_fix);
-
-// ── PrCommand ────────────────────────────────────────────────────────
-
-async fn cmd_pr(_ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
-    println!("\nPR summary generated. Use /commit to prepare changes.");
-    CommandOutcome::Continue
-}
-cmd!(PrCommand, "pr", CommandCategory::Coding, "Generate PR summary", cmd_pr);
-
-// ── PatchCommand ─────────────────────────────────────────────────────
-
-async fn cmd_patch(_ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
-    println!("\nPatch generation: use /diff to see changes first.");
-    CommandOutcome::Continue
-}
-cmd!(PatchCommand, "patch", CommandCategory::Coding, "Generate patch", cmd_patch);
+cmd!(
+    FixCommand,
+    "fix",
+    CommandCategory::Coding,
+    "Run test/fix loop",
+    cmd_fix
+);
 
 // ── Register ─────────────────────────────────────────────────────────
 
 pub fn register_all(registry: &mut crate::cli::command::CommandRegistry) {
     registry.register(Arc::new(PlanCommand));
     registry.register(Arc::new(TasksCommand));
-    registry.register(Arc::new(DiffCommand));
     registry.register(Arc::new(TestCommand));
-    registry.register(Arc::new(ReviewCommand));
-    registry.register(Arc::new(CommitCommand));
+    registry.register(Arc::new(CodeReviewCommand));
     registry.register(Arc::new(AgentsCommand));
     registry.register(Arc::new(AgentCommand));
     registry.register(Arc::new(FixCommand));
-    registry.register(Arc::new(PrCommand));
-    registry.register(Arc::new(PatchCommand));
 }

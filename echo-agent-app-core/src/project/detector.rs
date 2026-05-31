@@ -34,7 +34,10 @@ impl ProjectType {
         if root.join("go.mod").exists() {
             return Self::Go;
         }
-        if root.join("pom.xml").exists() || root.join("build.gradle").exists() || root.join("build.gradle.kts").exists() {
+        if root.join("pom.xml").exists()
+            || root.join("build.gradle").exists()
+            || root.join("build.gradle.kts").exists()
+        {
             return Self::Java;
         }
         Self::Unknown

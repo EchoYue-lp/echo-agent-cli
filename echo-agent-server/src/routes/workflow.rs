@@ -130,6 +130,10 @@ pub async fn delete_workflow(
 }
 
 /// POST /api/workflow/:id/execute
+///
+/// Executes a stored workflow definition. For complex multi-step workflows
+/// with checkpoint/resume, use the BackgroundTaskService API (`/api/tasks`)
+/// with `kind: "workflow"` instead.
 pub async fn execute_workflow(
     axum::extract::Path(id): axum::extract::Path<String>,
     State(state): State<Arc<AppState>>,
@@ -148,68 +152,116 @@ pub async fn execute_workflow(
         parsed
     };
 
-    // 构建执行计划
+    // 构建执行计划并顺序执行所有步骤
     let mut results = Vec::new();
-    let context_input = serde_json::to_string(&req.input).unwrap_or_default();
+    let mut context_input = serde_json::to_string(&req.input).unwrap_or_default();
 
     for (i, step) in def.steps.iter().enumerate() {
         match step.step_type.as_str() {
             "prompt" => {
                 let prompt = step.content.replace("{input}", &context_input);
-                results.push(serde_json::json!({
-                    "step": i,
-                    "type": "prompt",
-                    "content": prompt,
-                    "status": "recorded"
-                }));
+                let prompt_for_agent = prompt.clone();
+
+                // 执行 prompt 步骤
+                match state
+                    .connection
+                    .agent
+                    .read_async(|agent| Box::pin(async move { agent.chat(&prompt_for_agent).await }))
+                    .await
+                {
+                    Ok(answer) => {
+                        results.push(serde_json::json!({
+                            "step": i,
+                            "type": "prompt",
+                            "content": prompt,
+                            "output": answer,
+                            "status": "completed"
+                        }));
+                        // 将输出作为下一步的输入
+                        context_input = answer;
+                    }
+                    Err(e) => {
+                        results.push(serde_json::json!({
+                            "step": i,
+                            "type": "prompt",
+                            "content": prompt,
+                            "status": "failed",
+                            "error": e.to_string()
+                        }));
+                        return Ok(Json(WorkflowResult {
+                            success: false,
+                            output: serde_json::json!({"results": results}),
+                            error: Some(format!("步骤 {} 执行失败: {}", i, e)),
+                        }));
+                    }
+                }
             }
             "tool" => {
                 let tool_name = step.tool_name.as_deref().unwrap_or(&step.content);
-                results.push(serde_json::json!({
-                    "step": i,
-                    "type": "tool",
-                    "tool": tool_name,
-                    "status": "recorded"
-                }));
+                let tool_args = step.tool_args.clone().unwrap_or_else(|| {
+                    serde_json::json!({"input": context_input})
+                });
+
+                // 构造指令让 agent 调用指定工具
+                let tool_prompt = format!(
+                    "Please use the '{}' tool with the following arguments: {}. Execute the tool and return the result.",
+                    tool_name,
+                    serde_json::to_string(&tool_args).unwrap_or_default()
+                );
+
+                match state
+                    .connection
+                    .agent
+                    .read_async(|agent| {
+                        let tool_prompt = tool_prompt.clone();
+                        Box::pin(async move { agent.chat(&tool_prompt).await })
+                    })
+                    .await
+                {
+                    Ok(output) => {
+                        results.push(serde_json::json!({
+                            "step": i,
+                            "type": "tool",
+                            "tool": tool_name,
+                            "args": tool_args,
+                            "output": output,
+                            "status": "completed"
+                        }));
+                        // 将输出作为下一步的输入
+                        context_input = output;
+                    }
+                    Err(e) => {
+                        results.push(serde_json::json!({
+                            "step": i,
+                            "type": "tool",
+                            "tool": tool_name,
+                            "status": "failed",
+                            "error": e.to_string()
+                        }));
+                        return Ok(Json(WorkflowResult {
+                            success: false,
+                            output: serde_json::json!({"results": results}),
+                            error: Some(format!("步骤 {} 工具执行失败: {}", i, e)),
+                        }));
+                    }
+                }
             }
             _ => {
                 results.push(serde_json::json!({
                     "step": i,
                     "type": step.step_type,
-                    "status": "skipped"
+                    "status": "skipped",
+                    "reason": "unsupported step type"
                 }));
             }
         }
     }
 
-    // 如果有 prompt 步骤，执行第一个
-    let output = if let Some(prompt_step) = def.steps.iter().find(|s| s.step_type == "prompt") {
-        let prompt = prompt_step.content.replace("{input}", &context_input);
-        match state
-            .connection
-            .agent
-            .read_async(|agent| Box::pin(async move { agent.chat(&prompt).await }))
-            .await
-        {
-            Ok(answer) => serde_json::json!({
-                "answer": answer,
-                "steps_executed": results.len(),
-                "results": results
-            }),
-            Err(e) => {
-                return Ok(Json(WorkflowResult {
-                    success: false,
-                    output: serde_json::json!({"results": results}),
-                    error: Some(format!("执行失败: {}", e)),
-                }));
-            }
-        }
-    } else {
-        serde_json::json!({
-            "steps": results,
-            "message": "工作流无 prompt 步骤，仅记录执行计划"
-        })
-    };
+    let output = serde_json::json!({
+        "steps_executed": results.len(),
+        "results": results,
+        "final_output": context_input
+    });
 
     Ok(Json(WorkflowResult {
         success: true,

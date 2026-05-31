@@ -11,6 +11,3 @@ pub use echo_agent_app_core::{
 
 // Re-export from server
 pub use echo_agent_server::{metrics, routes, security_middleware, ws};
-
-// Re-export from tui
-pub use echo_agent_tui::tui;

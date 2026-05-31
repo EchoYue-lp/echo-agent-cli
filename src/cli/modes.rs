@@ -23,8 +23,10 @@ struct WebInfra {
 
 async fn setup_web_infrastructure(
     agent: &AgentHandle,
+    hitl_dispatcher: std::sync::Arc<crate::state::HitlDispatcher>,
     args: &Args,
     app_config: &AppConfig,
+    task_store: std::sync::Arc<dyn echo_agent::memory::Store>,
 ) -> Result<WebInfra> {
     let conversation_store = crate::infra::create_conversation_store();
     crate::infra::inject_conversation_store(agent, &conversation_store);
@@ -47,12 +49,11 @@ async fn setup_web_infrastructure(
         );
     }
 
-    let state = Arc::new({
-        let mut s =
-            state::AppState::from_shared(agent.clone(), conversation_store, app_config.clone());
-        s.start_scheduler();
-        s
-    });
+    let mut state_inner =
+        state::AppState::from_shared(agent.clone(), hitl_dispatcher.clone(), conversation_store, app_config.clone());
+    state_inner.start_task_service(task_store.clone()).await;
+    state_inner.start_scheduler_with_store(Some(task_store));
+    let state = Arc::new(state_inner);
 
     let cancel_token = CancellationToken::new();
     crate::infra::spawn_mcp_health_check(state.clone(), cancel_token.clone());
@@ -88,8 +89,14 @@ async fn setup_web_infrastructure(
 }
 
 /// 运行 Web 模式
-pub async fn run_web_mode(agent: AgentHandle, args: &Args, app_config: &AppConfig) -> Result<()> {
-    let infra = setup_web_infrastructure(&agent, args, app_config).await?;
+pub async fn run_web_mode(
+    agent: AgentHandle,
+    hitl_dispatcher: std::sync::Arc<crate::state::HitlDispatcher>,
+    args: &Args,
+    app_config: &AppConfig,
+    task_store: std::sync::Arc<dyn echo_agent::memory::Store>,
+) -> Result<()> {
+    let infra = setup_web_infrastructure(&agent, hitl_dispatcher, args, app_config, task_store).await?;
     let listener = tokio::net::TcpListener::bind(&infra.addr).await?;
 
     crate::infra::print_web_startup_info(&infra.addr);
@@ -107,17 +114,46 @@ fn repl_config_for(args: &Args) -> crate::cli::ReplConfig {
         history_file: "~/.echo-agent/history.txt".to_string(),
         mode: args.mode.clone(),
         project: args.project.clone(),
+        task_service: None,
     }
 }
 
 /// 运行 CLI 模式
-pub async fn run_cli_mode(agent: AgentHandle, args: &Args, _app_config: &AppConfig) -> Result<()> {
-    crate::cli::run_repl(agent, repl_config_for(args)).await
+pub async fn run_cli_mode(
+    agent: AgentHandle,
+    hitl_dispatcher: std::sync::Arc<crate::state::HitlDispatcher>,
+    args: &Args,
+    app_config: &AppConfig,
+    task_store: std::sync::Arc<dyn echo_agent::memory::Store>,
+) -> Result<()> {
+    // Start BackgroundTaskService for CLI mode
+    let task_service = {
+        use crate::state::AppState;
+        let mut state = AppState::from_shared(
+            agent.clone(),
+            hitl_dispatcher.clone(),
+            None,
+            app_config.clone(),
+        );
+        state.start_task_service(task_store).await;
+        state.tasks.service.clone()
+    };
+
+    let mut repl_config = repl_config_for(args);
+    repl_config.task_service = task_service;
+
+    crate::cli::run_repl(agent, repl_config).await
 }
 
 /// 同时运行 Web 和 CLI 模式
-pub async fn run_both_modes(agent: AgentHandle, args: &Args, app_config: &AppConfig) -> Result<()> {
-    let infra = setup_web_infrastructure(&agent, args, app_config).await?;
+pub async fn run_both_modes(
+    agent: AgentHandle,
+    hitl_dispatcher: std::sync::Arc<crate::state::HitlDispatcher>,
+    args: &Args,
+    app_config: &AppConfig,
+    task_store: std::sync::Arc<dyn echo_agent::memory::Store>,
+) -> Result<()> {
+    let infra = setup_web_infrastructure(&agent, hitl_dispatcher.clone(), args, app_config, task_store).await?;
     let listener = tokio::net::TcpListener::bind(&infra.addr).await?;
 
     crate::infra::print_both_startup_info(&infra.addr);

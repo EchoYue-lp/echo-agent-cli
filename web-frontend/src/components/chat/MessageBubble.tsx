@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, memo } from 'react';
 import type { ChatMessage } from '../../types/api';
 import { ToolCallCard } from './ToolCallCard';
 import { ChartCard } from './ChartCard';
@@ -45,7 +45,7 @@ function isImageFile(mime: string): boolean {
   return mime.startsWith('image/');
 }
 
-export function MessageBubble({ message, onRegenerate, onEditAndResend }: MessageBubbleProps) {
+export const MessageBubble = memo(function MessageBubble({ message, onRegenerate, onEditAndResend }: MessageBubbleProps) {
   const isUser = message.role === 'user';
   const [editing, setEditing] = useState(false);
   const [editText, setEditText] = useState(message.content);
@@ -247,7 +247,7 @@ export function MessageBubble({ message, onRegenerate, onEditAndResend }: Messag
       </div>
     </div>
   );
-}
+});
 
 function ThinkingBlock({ content, index, total, isStreaming }: { content: string; index: number; total: number; isStreaming?: boolean }) {
   const [expanded, setExpanded] = useState(isStreaming ?? false);

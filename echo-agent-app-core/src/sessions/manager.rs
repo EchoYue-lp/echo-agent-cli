@@ -30,6 +30,16 @@ impl SessionManager {
         }
     }
 
+    /// 创建会话管理器，使用指定基础目录（工作区模式）。
+    pub fn with_base_dir(base_dir: PathBuf) -> Self {
+        fs::create_dir_all(&base_dir).ok();
+        Self {
+            base_dir,
+            auto_save: true,
+            active_session_id: None,
+        }
+    }
+
     pub fn base_dir() -> PathBuf {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
         let new_dir = PathBuf::from(&home).join(".echo-agent").join("sessions");

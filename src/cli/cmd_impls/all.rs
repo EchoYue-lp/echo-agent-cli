@@ -1,7 +1,7 @@
 //! All remaining slash commands — help, exit, clear, remember, forget, memory.
 
+use crate::cli::command::{CommandCategory, CommandContext, CommandOutcome, cmd};
 use std::sync::Arc;
-use crate::cli::command::{cmd, CommandCategory, CommandContext, CommandOutcome};
 
 // ── HelpCommand ────────────────────────────────────────────────────────
 
@@ -25,7 +25,9 @@ async fn cmd_help(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
         println!("  Available commands:");
         for cat in &cat_order {
             if let Some(cmds) = by_cat.get(cat) {
-                if cmds.is_empty() { continue; }
+                if cmds.is_empty() {
+                    continue;
+                }
                 println!();
                 println!("  [{}]", cat.display_name());
                 for cmd in cmds {
@@ -33,8 +35,17 @@ async fn cmd_help(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
                     if aliases.is_empty() {
                         println!("    /{} — {}", cmd.name(), cmd.description());
                     } else {
-                        let alias_str = aliases.iter().map(|a| format!("/{a}")).collect::<Vec<_>>().join(", ");
-                        println!("    /{} ({}) — {}", cmd.name(), alias_str, cmd.description());
+                        let alias_str = aliases
+                            .iter()
+                            .map(|a| format!("/{a}"))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        println!(
+                            "    /{} ({}) — {}",
+                            cmd.name(),
+                            alias_str,
+                            cmd.description()
+                        );
                     }
                 }
             }
@@ -47,7 +58,14 @@ async fn cmd_help(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
     }
     CommandOutcome::Continue
 }
-cmd!(HelpCommand, "help", ["h", "?"], CommandCategory::Help, "Show help", cmd_help);
+cmd!(
+    HelpCommand,
+    "help",
+    ["h", "?"],
+    CommandCategory::Help,
+    "Show help",
+    cmd_help
+);
 
 // ── ExitCommand ────────────────────────────────────────────────────────
 
@@ -59,7 +77,14 @@ async fn cmd_exit(_: &CommandContext, _: &[&str]) -> CommandOutcome {
     println!("\nGoodbye!");
     CommandOutcome::Exit
 }
-cmd!(ExitCommand, "exit", ["quit", "q"], CommandCategory::Session, "Exit the REPL", cmd_exit);
+cmd!(
+    ExitCommand,
+    "exit",
+    ["quit", "q"],
+    CommandCategory::Session,
+    "Exit the REPL",
+    cmd_exit
+);
 
 // ── ClearCommand ───────────────────────────────────────────────────────
 
@@ -67,25 +92,50 @@ async fn cmd_clear(_: &CommandContext, _: &[&str]) -> CommandOutcome {
     print!("\x1b[2J\x1b[H");
     CommandOutcome::Continue
 }
-cmd!(ClearCommand, "clear", ["cls"], CommandCategory::Session, "Clear screen", cmd_clear);
+cmd!(
+    ClearCommand,
+    "clear",
+    ["cls"],
+    CommandCategory::Session,
+    "Clear screen",
+    cmd_clear
+);
 
 // ── RememberCommand ────────────────────────────────────────────────────
 
 async fn cmd_remember(_: &CommandContext, args: &[&str]) -> CommandOutcome {
-    if args.len() < 2 { println!("Usage: /remember [scope] <key> <value>"); }
-    else { println!("Remembered: {}", args.join(" ")); }
+    if args.len() < 2 {
+        println!("Usage: /remember [scope] <key> <value>");
+    } else {
+        println!("Remembered: {}", args.join(" "));
+    }
     CommandOutcome::Continue
 }
-cmd!(RememberCommand, "remember", CommandCategory::Context, "Store a memory", cmd_remember);
+cmd!(
+    RememberCommand,
+    "remember",
+    CommandCategory::Context,
+    "Store a memory",
+    cmd_remember
+);
 
 // ── ForgetCommand ──────────────────────────────────────────────────────
 
 async fn cmd_forget(_: &CommandContext, args: &[&str]) -> CommandOutcome {
-    if args.is_empty() { println!("Usage: /forget <key>"); }
-    else { println!("Forgotten: {}", args[0]); }
+    if args.is_empty() {
+        println!("Usage: /forget <key>");
+    } else {
+        println!("Forgotten: {}", args[0]);
+    }
     CommandOutcome::Continue
 }
-cmd!(ForgetCommand, "forget", CommandCategory::Context, "Remove a memory", cmd_forget);
+cmd!(
+    ForgetCommand,
+    "forget",
+    CommandCategory::Context,
+    "Remove a memory",
+    cmd_forget
+);
 
 // ── MemoryCommand ──────────────────────────────────────────────────────
 
@@ -93,7 +143,13 @@ async fn cmd_memory(_: &CommandContext, _: &[&str]) -> CommandOutcome {
     println!("\nMemory scopes: user, project, repo, task, session, run");
     CommandOutcome::Continue
 }
-cmd!(MemoryCommand, "memory", CommandCategory::Context, "List memories", cmd_memory);
+cmd!(
+    MemoryCommand,
+    "memory",
+    CommandCategory::Context,
+    "List memories",
+    cmd_memory
+);
 
 // ── Register ───────────────────────────────────────────────────────────
 

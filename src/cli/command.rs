@@ -89,6 +89,8 @@ pub struct CommandContext {
     pub coding_loop: Option<Arc<tokio::sync::Mutex<crate::project::coding_loop::CodingLoop>>>,
     /// Command registry (for /help to list commands dynamically).
     pub registry: Option<Arc<CommandRegistry>>,
+    /// Background task service for submitting long-running tasks.
+    pub task_service: Option<Arc<echo_agent_app_core::tasks::BackgroundTaskService>>,
 }
 
 impl CommandContext {
@@ -98,6 +100,7 @@ impl CommandContext {
             current_mode: "general".into(),
             coding_loop: None,
             registry: None,
+            task_service: None,
         }
     }
 
@@ -119,9 +122,26 @@ impl CommandContext {
         self
     }
 
+    pub fn with_task_service(
+        mut self,
+        service: Arc<echo_agent_app_core::tasks::BackgroundTaskService>,
+    ) -> Self {
+        self.task_service = Some(service);
+        self
+    }
+
     pub fn is_coding_mode(&self) -> bool {
         self.current_mode == "coding"
     }
+}
+
+// ── SubCommandDef ───────────────────────────────────────────────────
+
+/// A subcommand definition for commands that group related operations.
+pub struct SubCommandDef {
+    pub name: &'static str,
+    pub aliases: &'static [&'static str],
+    pub description: &'static str,
 }
 
 // ── SlashCommand trait ───────────────────────────────────────────────
@@ -143,6 +163,11 @@ pub trait SlashCommand: Send + Sync {
 
     /// Category for /help grouping.
     fn category(&self) -> CommandCategory;
+
+    /// Subcommand definitions. Empty by default (flat command).
+    fn subcommands(&self) -> Vec<SubCommandDef> {
+        vec![]
+    }
 
     /// Execute the command. Returns what the REPL should do next.
     fn run<'a>(
@@ -227,6 +252,10 @@ impl CommandRegistry {
     }
 
     /// Dispatch a command by name. Returns None if the command doesn't exist.
+    ///
+    /// For commands with subcommands, the first arg is treated as the subcommand name.
+    /// If no matching subcommand is found, the command receives all args and handles
+    /// the error/help display itself.
     pub async fn dispatch(
         &self,
         name: &str,
@@ -234,6 +263,24 @@ impl CommandRegistry {
         args: &[&str],
     ) -> Option<CommandOutcome> {
         let cmd = self.get(name)?;
+        let subs = cmd.subcommands();
+
+        if !subs.is_empty() {
+            if let Some(sub_name) = args.first() {
+                let mut matched = false;
+                for sub in &subs {
+                    if sub.name == *sub_name || sub.aliases.contains(sub_name) {
+                        matched = true;
+                        break;
+                    }
+                }
+                if matched {
+                    return Some(cmd.run(ctx, args).await);
+                }
+                // No subcommand matched — pass through for command to handle help
+            }
+        }
+
         Some(cmd.run(ctx, args).await)
     }
 

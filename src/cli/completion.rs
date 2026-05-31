@@ -56,7 +56,6 @@ impl EnhancedCompleter {
                 "/output",
                 "/verbose",
                 "/inspect",
-                "/tui",
                 "/export",
                 "/profile",
                 "/prof",

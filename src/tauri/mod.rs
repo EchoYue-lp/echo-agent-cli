@@ -1,24 +1,48 @@
-//! Tauri 桌面应用 — 命令模块
+//! Tauri desktop app module.
 //!
-//! 前端为 React (Vite) SPA，位于 `web-frontend/` 目录。
-//! Rust 后端通过 Tauri IPC commands 暴露 Agent API。
+//! The Tauri builder is configured here with native plugins and IPC commands.
+//! Critical paths (file I/O, notifications) use IPC for low latency.
+//! Everything else goes through the embedded Axum HTTP server.
 
-pub mod commands;
-pub mod state;
+pub mod ipc;
 
-use crate::agent_handle::AgentHandle;
-use crate::config::AppConfig;
-use crate::persistence::Persistence;
-
-/// 构建已配置好的 Tauri Builder（由 src-tauri/src/main.rs 调用）
-pub fn build_tauri(
-    agent_handle: AgentHandle,
-    persistence: Persistence,
-    app_config: AppConfig,
-) -> tauri::Builder<tauri::Wry> {
-    let state = state::TauriState::new(agent_handle, persistence, app_config);
-
-    commands::register_commands(tauri::Builder::default())
-        .manage(state)
+pub fn build_tauri_app() -> tauri::Builder<tauri::Wry> {
+    tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .invoke_handler(tauri::generate_handler![
+            ipc::native_read_file,
+            ipc::native_write_file,
+            ipc::native_notify,
+            ipc::get_system_info,
+        ])
+        .setup(|app| {
+            // Register global shortcut: CmdOrCtrl+Shift+E toggles window visibility
+            use tauri::Manager;
+            use tauri_plugin_global_shortcut::GlobalShortcutExt;
+
+            let handle = app.handle().clone();
+            app.global_shortcut()
+                .on_shortcut(
+                    "CmdOrCtrl+Shift+E",
+                    move |_app, _window, shortcut| {
+                        if shortcut.state == tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                            if let Some(window) = handle.get_webview_window("main") {
+                                if window.is_visible().unwrap_or(false) {
+                                    let _ = window.hide();
+                                } else {
+                                    let _ = window.show();
+                                    let _ = window.set_focus();
+                                }
+                            }
+                        }
+                    },
+                )
+                .ok();
+
+            Ok(())
+        })
 }

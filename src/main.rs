@@ -56,9 +56,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 处理其他子命令 (不需要创建 Agent 即可执行的命令)
     if let Some(ref cmd) = args.command {
-        if !matches!(cmd, cli::Commands::Tui) {
-            return cli::handle_subcommand(cmd).await;
-        }
+        return cli::handle_subcommand(cmd).await;
     }
 
     // 初始化日志（使用配置中的级别）
@@ -87,8 +85,328 @@ async fn main() -> anyhow::Result<()> {
 
     let agent_handle = AgentHandle::new(agent);
 
+    // ── Wire HITL dispatcher to agent (all modes) ──
+    let hitl_dispatcher = {
+        use echo_agent_app_core::hitl::HitlDispatcher;
+        use std::sync::Arc;
+        let dispatcher = Arc::new(HitlDispatcher::new());
+        // Register REPL provider for human-in-the-loop
+        let repl_provider = Arc::new(echo_agent_app_core::hitl::ReplHumanLoopProvider::new());
+        dispatcher.register("repl", repl_provider).await;
+        agent_handle
+            .write_async(|a| {
+                let d = dispatcher.clone();
+                Box::pin(async move {
+                    a.set_human_loop_provider(d);
+                })
+            })
+            .await;
+        tracing::info!("HITL dispatcher wired to agent");
+        dispatcher // Keep dispatcher reference for AppState
+    };
+
     // Load user hooks from YAML config
     infra::load_user_hooks(&agent_handle, &app_config).await;
+
+    // Also load hooks from hooks.yaml files (global + project-local)
+    let hooks_load = echo_agent_app_core::hooks_config::load_hooks_files();
+    if !hooks_load.definition.is_empty() {
+        let hooks_def = hooks_load.definition;
+        agent_handle
+            .write_async(|a| {
+                Box::pin(async move {
+                    let mut registry = a.hook_registry().write().await;
+                    registry.clear_user_hooks();
+                    registry.register_user_hooks(hooks_def);
+                })
+            })
+            .await;
+        tracing::info!("Hooks loaded from hooks.yaml files");
+    }
+
+    // Create hook bridges so task/subagent lifecycle events fire in the central HookRegistry.
+    // These must stay alive for the duration of the application.
+    let task_hook_bridge = agent_handle
+        .read(|a| a.create_task_hook_bridge())
+        .await;
+    let subagent_hook_bridge = agent_handle
+        .read(|a| a.create_subagent_hook_bridge())
+        .await;
+    tracing::info!("Hook bridges created (task + subagent lifecycle events → HookRegistry)");
+
+    // Initialize unified memory API — must stay alive for the application lifetime
+    let unified_memory = {
+        use echo_agent_app_core::unified_memory::UnifiedMemory;
+        let mem = UnifiedMemory::load();
+        tracing::info!(
+            user = mem.get_instructions(echo_agent_app_core::unified_memory::InstructionTier::User).is_some(),
+            project = mem.get_instructions(echo_agent_app_core::unified_memory::InstructionTier::Project).is_some(),
+            local = mem.get_instructions(echo_agent_app_core::unified_memory::InstructionTier::Local).is_some(),
+            "Unified memory loaded (instructions)"
+        );
+        mem
+    };
+
+    // Load plugins and wire components
+    {
+        use echo_agent::plugin::{PluginRegistry, PluginScope};
+        let project_root = args.project.as_ref().map(|p| std::path::PathBuf::from(p));
+        let mut plugin_registry = PluginRegistry::new(project_root);
+
+        if let Err(e) = plugin_registry.scan_all() {
+            tracing::warn!("Failed to scan plugins: {e}");
+        } else {
+            let plugin_count = plugin_registry.count();
+            let enabled_count = plugin_registry.list_enabled().len();
+
+            if plugin_count > 0 {
+                tracing::info!("Discovered {plugin_count} plugins ({enabled_count} enabled)");
+
+                // Resolve dependencies and load in order
+                match plugin_registry.resolve_dependencies() {
+                    Ok(ordered_ids) => {
+                        let mut skills_to_load: Vec<std::path::PathBuf> = Vec::new();
+                        let mut hooks_to_register: Vec<(String, String, echo_agent::skills::hooks::HooksDefinition)> = Vec::new();
+                        let mut mcp_files_to_load: Vec<std::path::PathBuf> = Vec::new();
+
+                        for plugin_id in &ordered_ids {
+                            // First pass: collect entry info without mutable borrow
+                            let entry_info = plugin_registry.get(plugin_id).map(|entry| {
+                                (entry.enabled, entry.root.display().to_string())
+                            });
+
+                            let Some((enabled, source_dir)) = entry_info else {
+                                continue;
+                            };
+
+                            if !enabled {
+                                continue;
+                            }
+
+                            // Second pass: resolve components (needs &mut)
+                            if let Ok(resolved) = plugin_registry.resolve_components(plugin_id) {
+                                tracing::info!(
+                                    plugin = %plugin_id,
+                                    skills = resolved.skill_dirs.len(),
+                                    agents = resolved.agent_files.len(),
+                                    hooks = resolved.hooks_file.is_some(),
+                                    mcp = resolved.mcp_config_file.is_some(),
+                                    "Plugin components resolved"
+                                );
+
+                                // Collect skill directories for loading
+                                for skill_dir in &resolved.skill_dirs {
+                                    skills_to_load.push(skill_dir.clone());
+                                }
+
+                                // Collect hooks files for registration
+                                if let Some(ref hooks_file) = resolved.hooks_file {
+                                    if let Ok(content) = std::fs::read_to_string(hooks_file) {
+                                        match serde_yaml_ng::from_str::<echo_agent::skills::hooks::HooksDefinition>(&content) {
+                                            Ok(def) => {
+                                                hooks_to_register.push((
+                                                    plugin_id.clone(),
+                                                    source_dir.clone(),
+                                                    def,
+                                                ));
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    plugin = %plugin_id,
+                                                    path = %hooks_file.display(),
+                                                    "Failed to parse plugin hooks YAML: {e}"
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Collect MCP config files for loading
+                                if let Some(ref mcp_file) = resolved.mcp_config_file {
+                                    mcp_files_to_load.push(mcp_file.clone());
+                                }
+                            }
+                        }
+
+                        // Wire skills into agent
+                        if !skills_to_load.is_empty() {
+                            let count = skills_to_load.len();
+                            agent_handle
+                                .write_async(|a| {
+                                    Box::pin(async move {
+                                        for dir in &skills_to_load {
+                                            match a.load_skills_from_dir(dir).await {
+                                                Ok(names) => {
+                                                    tracing::info!(
+                                                        dir = %dir.display(),
+                                                        skills = names.len(),
+                                                        "Plugin skills loaded"
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                        dir = %dir.display(),
+                                                        "Failed to load plugin skills: {e}"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    })
+                                })
+                                .await;
+                            tracing::info!("Wired {count} skill directories from plugins");
+                        }
+
+                        // Wire hooks into agent
+                        if !hooks_to_register.is_empty() {
+                            let count = hooks_to_register.len();
+                            agent_handle
+                                .write_async(|a| {
+                                    Box::pin(async move {
+                                        let mut registry = a.hook_registry().write().await;
+                                        for (plugin_name, source_dir, def) in &hooks_to_register {
+                                            registry.register(
+                                                &format!("plugin:{plugin_name}"),
+                                                source_dir,
+                                                def.clone(),
+                                            );
+                                            tracing::info!(
+                                                plugin = %plugin_name,
+                                                "Plugin hooks registered"
+                                            );
+                                        }
+                                    })
+                                })
+                                .await;
+                            tracing::info!("Wired {count} hook definitions from plugins");
+                        }
+
+                        // Wire MCP servers into agent
+                        if !mcp_files_to_load.is_empty() {
+                            let count = mcp_files_to_load.len();
+                            agent_handle
+                                .write_async(|a| {
+                                    Box::pin(async move {
+                                        for mcp_file in &mcp_files_to_load {
+                                            match a.load_mcp_from_file(mcp_file).await {
+                                                Ok(tools) => {
+                                                    tracing::info!(
+                                                        file = %mcp_file.display(),
+                                                        tools = tools.len(),
+                                                        "Plugin MCP servers connected"
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                        file = %mcp_file.display(),
+                                                        "Failed to load plugin MCP config: {e}"
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    })
+                                })
+                                .await;
+                            tracing::info!("Wired {count} MCP config files from plugins");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to resolve plugin dependencies: {e}");
+                    }
+                }
+            }
+        }
+    }
+
+    // ── LSP tool registration ──
+    // Create an LspManager, load config from .lsp.yaml, and register LSP tools.
+    {
+        use echo_agent::lsp::{LspConfig, LspManager};
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        let mut lsp_manager = LspManager::new();
+        let mut lsp_configured = false;
+
+        // Try loading project-level .lsp.yaml
+        let project_lsp = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| {
+                let mut dir = cwd.as_path();
+                loop {
+                    let candidate = dir.join(".lsp.yaml");
+                    if candidate.exists() {
+                        return Some(candidate);
+                    }
+                    dir = dir.parent()?;
+                }
+            });
+
+        if let Some(ref lsp_path) = project_lsp {
+            match LspConfig::from_file(lsp_path) {
+                Ok(config) => {
+                    lsp_manager.load_config(&config);
+                    lsp_configured = true;
+                    tracing::info!(
+                        path = %lsp_path.display(),
+                        languages = config.servers.len(),
+                        "LSP config loaded (project)"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(path = %lsp_path.display(), "Failed to load LSP config: {e}");
+                }
+            }
+        }
+
+        // Try loading global ~/.echo-agent/.lsp.yaml
+        let home = std::env::var("HOME").ok().map(std::path::PathBuf::from);
+        if let Some(ref home_dir) = home {
+            let global_lsp = home_dir.join(".echo-agent").join(".lsp.yaml");
+            if global_lsp.exists() {
+                match LspConfig::from_file(&global_lsp) {
+                    Ok(config) => {
+                        lsp_manager.load_config(&config);
+                        lsp_configured = true;
+                        tracing::info!(
+                            path = %global_lsp.display(),
+                            languages = config.servers.len(),
+                            "LSP config loaded (global)"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(path = %global_lsp.display(), "Failed to load global LSP config: {e}");
+                    }
+                }
+            }
+        }
+
+        // Set project root for LSP workspace
+        if let Ok(cwd) = std::env::current_dir() {
+            lsp_manager.set_project_root(&cwd);
+        }
+
+        if lsp_configured {
+            let shared_lsp = Arc::new(RwLock::new(lsp_manager));
+            agent_handle
+                .write_async(|a| {
+                    let shared_lsp = shared_lsp.clone();
+                    Box::pin(async move {
+                        use echo_agent::tools::lsp::{
+                            LspDiagnosticsTool, LspGotoDefinitionTool, LspFindReferencesTool,
+                            LspHoverTool, LspStatusTool,
+                        };
+                        a.add_tool(Box::new(LspDiagnosticsTool::new(shared_lsp.clone())));
+                        a.add_tool(Box::new(LspGotoDefinitionTool::new(shared_lsp.clone())));
+                        a.add_tool(Box::new(LspFindReferencesTool::new(shared_lsp.clone())));
+                        a.add_tool(Box::new(LspHoverTool::new(shared_lsp.clone())));
+                        a.add_tool(Box::new(LspStatusTool::new(shared_lsp)));
+                    })
+                })
+                .await;
+            tracing::info!("LSP tools registered (diagnostics, goto_definition, find_references, hover, status)");
+        }
+    }
 
     // Fire SessionStart("startup") hook — after hooks are loaded so they can react
     infra::fire_startup_hook(&agent_handle).await;
@@ -105,20 +423,34 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // 处理 TUI 子命令
-    if matches!(args.command, Some(cli::Commands::Tui)) {
-        return echo_agent_cli::tui::run_tui(agent_handle.clone()).await;
-    }
+    // ── Background task store (all modes) ──
+    // Create a SQLite store for background task persistence.
+    // Passed to mode functions so they can start BackgroundTaskService.
+    let task_store: std::sync::Arc<dyn echo_agent::memory::Store> = {
+        let db_path = echo_agent_app_core::persistence::Persistence::base_dir()
+            .join("tasks.db");
+        match echo_agent::memory::SqliteStore::new(&db_path) {
+            Ok(store) => std::sync::Arc::new(store),
+            Err(e) => {
+                tracing::warn!("Failed to create SQLite store for tasks: {e}");
+                // Fallback: use FileStore
+                let file_path = echo_agent_app_core::persistence::Persistence::base_dir()
+                    .join("tasks_store");
+                match echo_agent::memory::FileStore::new(&file_path) {
+                    Ok(store) => std::sync::Arc::new(store),
+                    Err(e2) => {
+                        tracing::error!("Failed to create FileStore for tasks: {e2}");
+                        std::sync::Arc::new(echo_agent::memory::InMemoryStore::new())
+                    }
+                }
+            }
+        }
+    };
 
-    // 决定运行模式
-    let run_web = args.web || (!args.cli && !args.channels && !args.tui);
+    
+        let run_web = args.web || (!args.cli && !args.channels);
     let run_cli = args.cli;
     let run_channels = args.channels;
-    let run_tui = args.tui;
-
-    if run_tui {
-        return echo_agent_cli::tui::run_tui(agent_handle.clone()).await;
-    }
 
     if run_channels {
         #[cfg(feature = "channels")]
@@ -126,11 +458,11 @@ async fn main() -> anyhow::Result<()> {
             let channels_handle = tokio::spawn(cli::run_channels_mode(&app_config));
 
             if run_web && run_cli {
-                cli::run_both_modes(agent_handle, &args, &app_config).await?;
+                cli::run_both_modes(agent_handle, hitl_dispatcher.clone(), &args, &app_config, task_store.clone()).await?;
             } else if run_cli {
-                cli::run_cli_mode(agent_handle, &args, &app_config).await?;
+                cli::run_cli_mode(agent_handle, hitl_dispatcher.clone(), &args, &app_config, task_store.clone()).await?;
             } else if run_web {
-                cli::run_web_mode(agent_handle, &args, &app_config).await?;
+                cli::run_web_mode(agent_handle, hitl_dispatcher.clone(), &args, &app_config, task_store.clone()).await?;
             } else {
                 // 仅 channels 模式，等待 channels 或 Ctrl+C
                 channels_handle.await??;
@@ -145,14 +477,19 @@ async fn main() -> anyhow::Result<()> {
             );
         }
     } else if run_web && run_cli {
-        cli::run_both_modes(agent_handle, &args, &app_config).await?;
+        cli::run_both_modes(agent_handle, hitl_dispatcher.clone(), &args, &app_config, task_store.clone()).await?;
     } else if run_cli {
         // 仅 CLI 模式
-        cli::run_cli_mode(agent_handle, &args, &app_config).await?;
+        cli::run_cli_mode(agent_handle, hitl_dispatcher.clone(), &args, &app_config, task_store.clone()).await?;
     } else {
         // 仅 Web 模式
-        cli::run_web_mode(agent_handle, &args, &app_config).await?;
+        cli::run_web_mode(agent_handle, hitl_dispatcher.clone(), &args, &app_config, task_store.clone()).await?;
     }
+
+    // Keep hook bridges and unified memory alive until shutdown
+    drop(task_hook_bridge);
+    drop(subagent_hook_bridge);
+    drop(unified_memory);
 
     Ok(())
 }
@@ -180,8 +517,6 @@ mod tests {
             config: None,
             no_color: false,
             channels: false,
-            tui: false,
-            gui: false,
             output: "text".to_string(),
             verbose: false,
             command: None,

@@ -2,11 +2,13 @@
 
 use serde::Deserialize;
 use std::collections::HashMap;
+use ts_rs::TS;
 
 // ── 对话相关 ─────────────────────────────────────────────────
 
 /// POST /api/chat
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, TS)]
+#[ts(export, rename = "ChatRequest")]
 pub struct ChatRequest {
     pub message: String,
     /// Optional session ID — when provided, the agent's conversation history
@@ -18,7 +20,8 @@ pub struct ChatRequest {
 // ── MCP 相关 ─────────────────────────────────────────────────
 
 /// POST /api/mcp/connect
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, TS)]
+#[ts(export, rename = "ConnectMcpRequest")]
 pub struct ConnectMcpRequest {
     pub name: String,
     #[serde(flatten)]
@@ -26,7 +29,8 @@ pub struct ConnectMcpRequest {
 }
 
 /// MCP 传输配置
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, TS)]
+#[ts(export, rename = "McpTransportConfig")]
 #[serde(tag = "transport", rename_all = "lowercase")]
 pub enum McpTransportConfig {
     Stdio {
@@ -51,7 +55,8 @@ pub enum McpTransportConfig {
 // ── 配置相关 ─────────────────────────────────────────────────
 
 /// PUT /api/config
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, TS)]
+#[ts(export, rename = "UpdateConfigRequest")]
 pub struct UpdateConfigRequest {
     pub model: Option<String>,
     pub system_prompt: Option<String>,
@@ -59,7 +64,8 @@ pub struct UpdateConfigRequest {
 }
 
 /// PUT /api/config/full — 完整配置更新
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, TS)]
+#[ts(export, rename = "UpdateFullConfigRequest")]
 pub struct UpdateFullConfigRequest {
     pub model: Option<ModelUpdate>,
     pub agent: Option<AgentUpdate>,
@@ -69,14 +75,16 @@ pub struct UpdateFullConfigRequest {
     pub logging: Option<LoggingUpdate>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, TS)]
+#[ts(export, rename = "ModelUpdate")]
 pub struct ModelUpdate {
     pub name: Option<String>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, TS)]
+#[ts(export, rename = "AgentUpdate")]
 pub struct AgentUpdate {
     pub name: Option<String>,
     pub system_prompt: Option<String>,
@@ -87,26 +95,30 @@ pub struct AgentUpdate {
     pub memory_path: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, TS)]
+#[ts(export, rename = "McpUpdate")]
 pub struct McpUpdate {
     pub config_path: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, TS)]
+#[ts(export, rename = "ChannelsUpdate")]
 pub struct ChannelsUpdate {
     pub qq: Option<QqUpdate>,
     pub feishu: Option<FeishuUpdate>,
     pub session: Option<SessionUpdate>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, TS)]
+#[ts(export, rename = "QqUpdate")]
 pub struct QqUpdate {
     pub enabled: Option<bool>,
     pub app_id: Option<String>,
     pub client_secret: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, TS)]
+#[ts(export, rename = "FeishuUpdate")]
 pub struct FeishuUpdate {
     pub enabled: Option<bool>,
     pub app_id: Option<String>,
@@ -114,20 +126,23 @@ pub struct FeishuUpdate {
     pub mode: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, TS)]
+#[ts(export, rename = "SessionUpdate")]
 pub struct SessionUpdate {
     pub timeout_minutes: Option<u64>,
     pub reset_keywords: Option<Vec<String>>,
     pub reset_commands: Option<Vec<String>>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, TS)]
+#[ts(export, rename = "ServerUpdate")]
 pub struct ServerUpdate {
     pub host: Option<String>,
     pub port: Option<u16>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, TS)]
+#[ts(export, rename = "LoggingUpdate")]
 pub struct LoggingUpdate {
     pub level: Option<String>,
 }
@@ -135,7 +150,8 @@ pub struct LoggingUpdate {
 // ── WebSocket 消息类型 ─────────────────────────────────────────────────
 
 /// 附件数据
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, TS)]
+#[ts(export, rename = "AttachmentData")]
 pub struct AttachmentData {
     pub name: String,
     pub mime_type: String,
@@ -145,7 +161,8 @@ pub struct AttachmentData {
 }
 
 /// 客户端 -> 服务端 WebSocket 消息
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, TS)]
+#[ts(export, rename = "ClientMessage")]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
     /// 发送消息（可带附件）
@@ -179,4 +196,7 @@ pub enum ClientMessage {
         #[serde(default)]
         id: Option<String>,
     },
+
+    /// 心跳检测
+    Ping,
 }

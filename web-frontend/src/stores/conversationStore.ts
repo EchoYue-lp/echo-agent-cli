@@ -148,9 +148,10 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
       }
     } catch (e) {
       console.error('Failed to save conversation to backend:', e);
+      return; // Don't attempt list refresh if save failed
     }
 
-    // Refresh list
+    // Refresh list (best-effort, must not throw)
     try {
       const items = await conversationApi.list();
       const metas: ConversationMeta[] = items.map((item) => ({
@@ -194,7 +195,6 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
       const chatStore = useChatStore.getState();
       chatStore.replaceMessages(chatMessages);
       chatStore.setHistoryView(false);  // Agent has context, can continue chatting
-      chatStore.setCurrentSnapshot(id);
 
       set({ activeId: id, isLoading: false });
     } catch (e) {
@@ -236,19 +236,24 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
   },
 
   startNew: async () => {
-    // Save current conversation first
+    // Save current conversation first — must not block clearing even if save fails
     const currentMessages = useChatStore.getState().messages;
     if (currentMessages.length > 0) {
-      await get().saveCurrent(currentMessages);
+      try {
+        await get().saveCurrent(currentMessages);
+      } catch (e) {
+        console.error('Failed to save conversation before new chat:', e);
+      }
     }
 
-    // Reset backend
+    // Reset backend session
     try {
       await sessionApi.reset();
     } catch {
       // ignore
     }
 
+    // Always clear — this is the user's expected outcome
     useChatStore.getState().clearMessages();
     set({ activeId: null });
   },

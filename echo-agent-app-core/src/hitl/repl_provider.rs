@@ -1,0 +1,100 @@
+//! REPL HITL Provider — stdin/stdout human-in-the-loop for CLI mode.
+//!
+//! Prints approval/input requests to stdout and reads responses from stdin.
+//! Similar to `ConsoleHumanLoopProvider` but integrated with the REPL's
+//! output formatting.
+
+use echo_agent::human_loop::{
+    ApprovalScope, HumanLoopKind, HumanLoopProvider, HumanLoopRequest, HumanLoopResponse,
+};
+use futures::future::BoxFuture;
+
+/// REPL-based HumanLoopProvider that uses stdin/stdout.
+pub struct ReplHumanLoopProvider;
+
+impl ReplHumanLoopProvider {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for ReplHumanLoopProvider {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl HumanLoopProvider for ReplHumanLoopProvider {
+    fn request(&self, req: HumanLoopRequest) -> BoxFuture<'_, Result<HumanLoopResponse, echo_agent::error::ReactError>> {
+        Box::pin(async move {
+            match req.kind {
+                HumanLoopKind::Approval => handle_approval(&req),
+                HumanLoopKind::Input => handle_input(&req),
+            }
+        })
+    }
+}
+
+fn handle_approval(req: &HumanLoopRequest) -> Result<HumanLoopResponse, echo_agent::error::ReactError> {
+    println!("\n╔══════════════════════════════════════════╗");
+    println!("║         TOOL APPROVAL REQUIRED           ║");
+    println!("╚══════════════════════════════════════════╝");
+
+    if let Some(ref tool_name) = req.tool_name {
+        println!("  Tool: {}", tool_name);
+    }
+    if let Some(ref risk) = req.risk_level {
+        println!("  Risk: {:?}", risk);
+    }
+    println!("  {}", req.prompt);
+
+    if let Some(ref args) = req.args {
+        println!("\n  Arguments:");
+        let formatted = serde_json::to_string_pretty(args).unwrap_or_default();
+        for line in formatted.lines() {
+            println!("    {}", line);
+        }
+    }
+
+    println!("\n  [y] Approve  [n] Reject  [a] Approve for session");
+    println!("  Choice: ");
+
+    // Read from stdin (blocking — acceptable for REPL mode)
+    let mut input = String::new();
+    std::io::stdin()
+        .read_line(&mut input)
+        .map_err(|e| echo_agent::error::ReactError::Other(format!("stdin read error: {e}")))?;
+
+    let choice = input.trim().to_lowercase();
+    match choice.as_str() {
+        "y" | "yes" | "" => Ok(HumanLoopResponse::Approved),
+        "a" | "all" | "session" => Ok(HumanLoopResponse::ApprovedWithScope {
+            scope: ApprovalScope::Session,
+        }),
+        _ => Ok(HumanLoopResponse::Rejected {
+            reason: Some("User rejected".to_string()),
+        }),
+    }
+}
+
+fn handle_input(req: &HumanLoopRequest) -> Result<HumanLoopResponse, echo_agent::error::ReactError> {
+    println!("\n╔══════════════════════════════════════════╗");
+    println!("║         INPUT REQUESTED                  ║");
+    println!("╚══════════════════════════════════════════╝");
+    println!("  {}", req.prompt);
+    println!("\n  > ");
+
+    let mut input = String::new();
+    std::io::stdin()
+        .read_line(&mut input)
+        .map_err(|e| echo_agent::error::ReactError::Other(format!("stdin read error: {e}")))?;
+
+    let text = input.trim().to_string();
+    if text.is_empty() {
+        Ok(HumanLoopResponse::Rejected {
+            reason: Some("Empty input".to_string()),
+        })
+    } else {
+        Ok(HumanLoopResponse::Text(text))
+    }
+}

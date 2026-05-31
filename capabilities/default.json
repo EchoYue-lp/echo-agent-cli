@@ -7,6 +7,11 @@
     "core:default",
     "core:event:default",
     "core:event:allow-listen",
-    "core:event:allow-emit"
+    "core:event:allow-emit",
+    "dialog:default",
+    "fs:default",
+    "shell:default",
+    "notification:default",
+    "global-shortcut:default"
   ]
 }

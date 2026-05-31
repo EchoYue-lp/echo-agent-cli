@@ -9,8 +9,8 @@
 //! - 工具调用交互式审批
 //! - Token 用量追踪
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use futures::StreamExt;
 use nu_ansi_term::Color;
@@ -49,6 +49,7 @@ pub struct ReplConfig {
     pub history_file: String,
     pub mode: String,
     pub project: Option<String>,
+    pub task_service: Option<Arc<echo_agent_app_core::tasks::BackgroundTaskService>>,
 }
 
 impl Default for ReplConfig {
@@ -58,6 +59,7 @@ impl Default for ReplConfig {
             history_file: "~/.echo-agent/history.txt".to_string(),
             mode: "general".to_string(),
             project: None,
+            task_service: None,
         }
     }
 }
@@ -99,12 +101,21 @@ pub async fn run_repl(agent: AgentHandle, config: ReplConfig) -> anyhow::Result<
     // Build command registry with trait-based commands
     let mut registry = crate::cli::command::CommandRegistry::new();
     crate::cli::cmd_impls::coding::register_all(&mut registry);
+    crate::cli::cmd_impls::git::register_all(&mut registry);
     crate::cli::cmd_impls::session::register_all(&mut registry);
     crate::cli::cmd_impls::info::register_all(&mut registry);
     crate::cli::cmd_impls::context::register_all(&mut registry);
     crate::cli::cmd_impls::advanced::register_all(&mut registry);
     crate::cli::cmd_impls::skills::register_all(&mut registry);
+    crate::cli::cmd_impls::hooks::register_all(&mut registry);
     crate::cli::cmd_impls::eval::register_all(&mut registry);
+    crate::cli::cmd_impls::evolution::register_all(&mut registry);
+    crate::cli::cmd_impls::tasks_ext::register_all(&mut registry);
+    crate::cli::cmd_impls::research::register_all(&mut registry);
+    crate::cli::cmd_impls::pipelines::register_all(&mut registry);
+    crate::cli::cmd_impls::pipeline::register_all(&mut registry);
+    crate::cli::cmd_impls::workspace::register_all(&mut registry);
+    crate::cli::cmd_impls::plugins::register_all(&mut registry);
     crate::cli::cmd_impls::all::register_all(&mut registry);
 
     // Create CodingLoop for coding-mode commands (C6 fix).
@@ -118,7 +129,8 @@ pub async fn run_repl(agent: AgentHandle, config: ReplConfig) -> anyhow::Result<
 
     let cmd_handler = CommandHandler::new(agent.clone())
         .with_registry(Arc::new(registry))
-        .with_coding_loop(coding_loop);
+        .with_coding_loop(coding_loop)
+        .with_task_service_opt(config.task_service);
 
     let editor_config = EditorConfig {
         prompt: config.prompt.clone(),
@@ -240,10 +252,9 @@ async fn chat_with_agent(agent: &AgentHandle, message: &str, output: &OutputRend
                                     "compressed".into(),
                                     format!("{before_tokens}->{after_tokens}"),
                                 ),
-                                AgentEvent::SafetyNotice { action, risk, .. } => (
-                                    "safety_notice".into(),
-                                    format!("{action} — {risk}"),
-                                ),
+                                AgentEvent::SafetyNotice { action, risk, .. } => {
+                                    ("safety_notice".into(), format!("{action} — {risk}"))
+                                }
                                 _ => (String::new(), String::new()),
                             };
                         }
@@ -275,20 +286,37 @@ async fn chat_with_agent(agent: &AgentHandle, message: &str, output: &OutputRend
                                 }
                                 output.print_token(&token);
                             }
-                            AgentEvent::SafetyNotice { action, reason, risk, permission } => {
+                            AgentEvent::SafetyNotice {
+                                action,
+                                reason,
+                                risk,
+                                permission,
+                            } => {
                                 clear_spinner!();
-                                if !first_chunk { println!(); }
+                                if !first_chunk {
+                                    println!();
+                                }
                                 let icon = nu_ansi_term::Color::Yellow.paint("Safety");
                                 println!("  {}  {}", icon, action);
                                 println!("       Reason: {}", reason);
                                 println!("       Risk: {} | Permission: {}", risk, permission);
                                 first_chunk = true;
                             }
-                            AgentEvent::ParameterError { tool, parameter, expected, got } => {
+                            AgentEvent::ParameterError {
+                                tool,
+                                parameter,
+                                expected,
+                                got,
+                            } => {
                                 clear_spinner!();
-                                if !first_chunk { println!(); }
+                                if !first_chunk {
+                                    println!();
+                                }
                                 let icon = nu_ansi_term::Color::Red.paint("ParamError");
-                                println!("  {}  {}: parameter '{}' expected {}, got {}", icon, tool, parameter, expected, got);
+                                println!(
+                                    "  {}  {}: parameter '{}' expected {}, got {}",
+                                    icon, tool, parameter, expected, got
+                                );
                                 first_chunk = true;
                             }
                             AgentEvent::ToolCall { name, args } => {
@@ -299,12 +327,17 @@ async fn chat_with_agent(agent: &AgentHandle, message: &str, output: &OutputRend
                                     println!();
                                 }
                                 // Danger warning for destructive operations
-                                if name == "shell" || name == "delete_file" || name == "git_commit" {
-                                    let danger = nu_ansi_term::Color::Red
-                                        .paint(format!("DANGER: {} — irreversible operation", name));
+                                if name == "shell" || name == "delete_file" || name == "git_commit"
+                                {
+                                    let danger = nu_ansi_term::Color::Red.paint(format!(
+                                        "DANGER: {} — irreversible operation",
+                                        name
+                                    ));
                                     println!("  {}", danger);
                                     if name == "shell" {
-                                        if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
+                                        if let Some(cmd) =
+                                            args.get("command").and_then(|v| v.as_str())
+                                        {
                                             println!("     Command: {}", cmd);
                                         }
                                     }
@@ -317,7 +350,16 @@ async fn chat_with_agent(agent: &AgentHandle, message: &str, output: &OutputRend
                                 output: tool_output,
                             } => {
                                 // Auto-track file changes for coding loop
-                                if matches!(name.as_str(), "write_file" | "edit_file" | "append_file" | "create_file" | "delete_file" | "update_file" | "move_file") {
+                                if matches!(
+                                    name.as_str(),
+                                    "write_file"
+                                        | "edit_file"
+                                        | "append_file"
+                                        | "create_file"
+                                        | "delete_file"
+                                        | "update_file"
+                                        | "move_file"
+                                ) {
                                     FILE_CHANGE_COUNT.fetch_add(1, Ordering::Relaxed);
                                 }
                                 output.print_tool_result(&name, &tool_output, true);
@@ -444,6 +486,54 @@ async fn chat_with_agent(agent: &AgentHandle, message: &str, output: &OutputRend
                     .paint("  Tip: /self-review to analyze, /test to verify, /diff to review");
                 println!("{}", hint);
             }
+
+            // Auto-save trajectory (background, non-blocking)
+            {
+                let agent_clone = agent.clone();
+                tokio::spawn(async move {
+                    use echo_agent::agent::Agent;
+                    let result = agent_clone
+                        .read(|a| (a.run_store.clone(), a.model_name().to_string()))
+                        .await;
+                    let (store, model_name) = result;
+                    if let Some(ref store) = store {
+                        if let Ok(runs) = store.list_all(1).await {
+                            if let Some(summary) = runs.first() {
+                                if let Ok(Some(run)) = store.load(&summary.run_id).await {
+                                    if let Ok(saver) =
+                                        echo_agent::improve::TrajectorySaver::default_dir()
+                                    {
+                                        let _ = saver.save(&run, &model_name).await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+
+            // Interactive git change handling (replaces auto-commit)
+            let changes = FILE_CHANGE_COUNT.swap(0, Ordering::Relaxed);
+            if changes > 0 {
+                let cwd = std::env::current_dir().unwrap_or_default();
+                if cwd.join(".git").exists() {
+                    let choice = crate::cli::git_ops::prompt_for_git_action(changes);
+                    match choice {
+                        'c' => {
+                            if let Err(e) = crate::cli::git_ops::interactive_commit(&cwd, changes) {
+                                println!("  {} {}", nu_ansi_term::Color::Red.paint("✗"), e);
+                            }
+                        }
+                        's' => {
+                            if let Err(e) = crate::cli::git_ops::interactive_stage(&cwd) {
+                                println!("  {} {}", nu_ansi_term::Color::Red.paint("✗"), e);
+                            }
+                        }
+                        _ => {} // 'n' — do nothing
+                    }
+                }
+            }
+
             println!();
         }
         Err(e) => {

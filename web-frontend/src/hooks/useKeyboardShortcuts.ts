@@ -3,9 +3,10 @@ import { useEffect } from 'react';
 interface ShortcutsConfig {
   onNewChat?: () => void;
   onToggleSidebar?: () => void;
+  onCommandPalette?: () => void;
 }
 
-export function useKeyboardShortcuts({ onNewChat, onToggleSidebar }: ShortcutsConfig) {
+export function useKeyboardShortcuts({ onNewChat, onToggleSidebar, onCommandPalette }: ShortcutsConfig) {
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       // Cmd/Ctrl + Shift + O: New Chat
@@ -20,6 +21,12 @@ export function useKeyboardShortcuts({ onNewChat, onToggleSidebar }: ShortcutsCo
         onToggleSidebar?.();
       }
 
+      // Cmd/Ctrl + K: Command Palette
+      if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+        e.preventDefault();
+        onCommandPalette?.();
+      }
+
       // Escape: handled by individual components (SettingsDialog, etc.)
     };
 
@@ -27,5 +34,5 @@ export function useKeyboardShortcuts({ onNewChat, onToggleSidebar }: ShortcutsCo
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
     };
-  }, [onNewChat, onToggleSidebar]);
+  }, [onNewChat, onToggleSidebar, onCommandPalette]);
 }

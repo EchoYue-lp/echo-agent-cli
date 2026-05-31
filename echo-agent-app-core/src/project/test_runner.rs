@@ -67,7 +67,11 @@ pub async fn run_lint_command(cmd: &str, cwd: &Path) -> std::io::Result<(bool, S
 }
 
 /// Parse test output into structured failures.
-pub fn parse_test_output(stdout: &str, stderr: &str, project_type: &ProjectType) -> Vec<TestFailure> {
+pub fn parse_test_output(
+    stdout: &str,
+    stderr: &str,
+    project_type: &ProjectType,
+) -> Vec<TestFailure> {
     match project_type {
         ProjectType::Rust => parse_rust_test_output(stdout),
         _ => parse_generic_test_output(stdout, stderr),

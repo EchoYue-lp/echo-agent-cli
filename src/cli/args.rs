@@ -58,14 +58,6 @@ pub struct Args {
     #[arg(long)]
     pub channels: bool,
 
-    /// 启动终端 UI (TUI) 模式
-    #[arg(long)]
-    pub tui: bool,
-
-    /// 启动桌面 GUI 模式 (需要 gui feature)
-    #[arg(long)]
-    pub gui: bool,
-
     /// 输出格式 (text, json, markdown, table)
     #[arg(long, short = 'o', default_value = "text")]
     pub output: String,
@@ -114,8 +106,6 @@ pub enum Commands {
         #[arg(long)]
         all: bool,
     },
-    /// 启动终端 UI 模式
-    Tui,
     /// 交互式引导配置 (Onboarding Wizard)
     Onboard,
     /// 诊断配置问题

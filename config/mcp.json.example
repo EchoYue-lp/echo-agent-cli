@@ -1,5 +1,11 @@
 {
   "mcpServers": {
+    "playwright": {
+      "command": "npx",
+      "args": ["-y", "@anthropic-ai/mcp-server-playwright"],
+      "disabled": false,
+      "description": "Playwright MCP Server - browser automation via MCP"
+    },
     "browser": {
       "command": "./agent-browser/mcp/target/release/agent-browser-mcp",
       "args": [],

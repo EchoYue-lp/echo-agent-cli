@@ -3,7 +3,6 @@
 //! Provides the understand → explore → plan → edit → test → fix cycle
 //! for coding mode in the CLI.
 
-use super::coding_task::TaskTracker;
 use super::detector::ProjectType;
 use super::file_tracker::FileChangeTracker;
 use std::path::{Path, PathBuf};
@@ -12,7 +11,6 @@ use std::path::{Path, PathBuf};
 pub struct CodingLoop {
     pub project_root: PathBuf,
     pub project_type: ProjectType,
-    pub task_tracker: TaskTracker,
     pub file_tracker: FileChangeTracker,
 }
 
@@ -22,7 +20,6 @@ impl CodingLoop {
         Self {
             project_root: project_root.to_path_buf(),
             project_type: ProjectType::detect(project_root),
-            task_tracker: TaskTracker::new(),
             file_tracker: FileChangeTracker::new(),
         }
     }
@@ -32,7 +29,6 @@ impl CodingLoop {
         Self {
             project_root: project_root.to_path_buf(),
             project_type,
-            task_tracker: TaskTracker::new(),
             file_tracker: FileChangeTracker::new(),
         }
     }
@@ -45,11 +41,6 @@ impl CodingLoop {
     /// Return the lint command for the current project.
     pub fn lint_command(&self) -> &str {
         self.project_type.lint_command()
-    }
-
-    /// Add a task to the tracker.
-    pub fn add_task(&mut self, description: &str) -> &super::coding_task::CodingTask {
-        self.task_tracker.add(description)
     }
 
     /// Record a file write in the change tracker.
@@ -80,14 +71,10 @@ impl CodingLoop {
     /// Get a summary of current state.
     pub fn status_summary(&self) -> String {
         let mut lines = vec![
-            format!("Project: {} ({})",
+            format!(
+                "Project: {} ({})",
                 self.project_root.display(),
                 self.project_type.name()
-            ),
-            format!("Tasks: {} pending, {} in progress, {} done",
-                self.task_tracker.list_by_status(super::coding_task::TaskStatus::Pending).len(),
-                self.task_tracker.list_by_status(super::coding_task::TaskStatus::InProgress).len(),
-                self.task_tracker.list_by_status(super::coding_task::TaskStatus::Done).len(),
             ),
             format!("Files changed: {}", self.file_tracker.change_count()),
         ];

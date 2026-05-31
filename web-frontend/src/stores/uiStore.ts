@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 
-export type SettingsTabId = 'tools' | 'mcp' | 'skills' | 'memory' | 'config' | 'sessions' | 'permissions' | 'audit' | 'workflow' | 'sandbox' | 'compress' | 'extract';
+export type SettingsTabId = 'tools' | 'mcp' | 'skills' | 'memory' | 'config' | 'providers' | 'sessions' | 'permissions' | 'audit' | 'workflow' | 'sandbox' | 'compress' | 'extract' | 'evolution' | 'plugins';
 
 type Theme = 'light' | 'dark';
 

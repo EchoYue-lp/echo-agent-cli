@@ -101,7 +101,11 @@ impl SecurityConfig {
                 }
                 Err(e) => {
                     tracing::error!("管理员密码 bcrypt 哈希失败: {}", e);
-                    // 回退：不更新哈希值（使用默认空值）
+                    // Do NOT silently fall back to empty hash — that would allow
+                    // authentication with an empty password. Leave hash unchanged
+                    // so validate() will reject the configuration.
+                    self.auth_enabled = false;
+                    tracing::error!("认证已自动禁用（密码哈希失败，安全降级）");
                 }
             }
         }

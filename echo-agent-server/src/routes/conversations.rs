@@ -315,7 +315,10 @@ pub async fn export_conversation(
     validate_conversation_id(&id)?;
 
     // Try JSON-file-based export first (backward compat)
-    let md = state.storage.persistence.export_conversation_markdown(&id);
+    let md = {
+        let persistence = state.storage.persistence.read().await;
+        persistence.export_conversation_markdown(&id)
+    };
 
     if let Ok(content) = md {
         return Ok(Json(serde_json::json!({
@@ -474,6 +477,13 @@ pub async fn restore_conversation(
     }
 
     // 4. Inject into agent context (preserving system prompt)
+    // WARNING: This replaces the entire conversation context. Any ongoing conversation will be lost.
+    tracing::warn!(
+        conversation_id = %id,
+        message_count = count,
+        "Restoring conversation - this will replace the current conversation context"
+    );
+
     state
         .connection
         .agent
@@ -507,6 +517,7 @@ pub async fn restore_conversation(
     Ok(Json(serde_json::json!({
         "success": true,
         "message_count": count,
-        "conversation_id": id
+        "conversation_id": id,
+        "warning": "Conversation restored. Previous conversation context has been replaced."
     })))
 }

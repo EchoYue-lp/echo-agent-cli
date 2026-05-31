@@ -1,19 +1,48 @@
 //! Context management slash commands — mode, project, think, reasoning, model, system, compress, compact, context, refresh.
 
-use std::sync::Arc;
+use crate::cli::command::{CommandCategory, CommandContext, CommandOutcome, cmd};
+use crate::project::modes::ModeEngine;
 use echo_agent::agent::Agent;
-use crate::cli::command::{cmd, CommandCategory, CommandContext, CommandOutcome};
+use std::sync::Arc;
 
 // ── ModeCommand ───────────────────────────────────────────────────────
 
 async fn cmd_mode(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     if let Some(mode) = args.first() {
-        match crate::project::modes::AgentMode::from_str(mode) {
+        match crate::project::modes::from_str(mode) {
             Some(agent_mode) => {
-                let prompt = agent_mode.system_prompt().to_string();
-                ctx.agent.write_async(|a| Box::pin(async move { a.set_system_prompt(prompt).await })).await;
-                println!("Mode: {} {}", agent_mode.icon(), agent_mode.display_name());
-                println!("System prompt updated.");
+                let overlay = crate::project::modes::chinese_mode_engine().system_prompt(&agent_mode);
+
+                // Use prompt stacking: preserve base, swap domain overlay
+                ctx.agent
+                    .write(|a| {
+                        let current = echo_agent::agent::Agent::system_prompt(a).to_string();
+
+                        let new_prompt = if current.contains("\n\n---\n\n") {
+                            // Already stacked — replace only the overlay section
+                            let parts: Vec<&str> = current.splitn(3, "\n\n---\n\n").collect();
+                            if parts.len() >= 2 {
+                                let base = parts[0];
+                                let context = if parts.len() > 2 { parts[2] } else { "" };
+                                if context.is_empty() {
+                                    format!("{}\n\n---\n\n{}", base, overlay)
+                                } else {
+                                    format!("{}\n\n---\n\n{}\n\n---\n\n{}", base, overlay, context)
+                                }
+                            } else {
+                                overlay
+                            }
+                        } else {
+                            // First mode switch: current prompt becomes base
+                            format!("{}\n\n---\n\n{}", current, overlay)
+                        };
+
+                        echo_agent::agent::Agent::set_system_prompt(a, &new_prompt);
+                    })
+                    .await;
+
+                println!("Mode: {} {}", crate::project::modes::icon(&agent_mode), crate::project::modes::display_name(&agent_mode));
+                println!("System prompt updated (overlay applied).");
             }
             None => {
                 println!("Unknown mode: {mode}");
@@ -26,29 +55,57 @@ async fn cmd_mode(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     }
     CommandOutcome::Continue
 }
-cmd!(ModeCommand, "mode", CommandCategory::Context, "View or switch agent mode", cmd_mode);
+cmd!(
+    ModeCommand,
+    "mode",
+    CommandCategory::Context,
+    "View or switch agent mode",
+    cmd_mode
+);
 
 // ── ThinkCommand ──────────────────────────────────────────────────────
 
 async fn cmd_think(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     let level = args.first().copied().unwrap_or("medium");
-    let max = match level { "low" => 3, "medium" => 10, "high" => 25, _ => 10 };
+    let max = match level {
+        "low" => 3,
+        "medium" => 10,
+        "high" => 25,
+        _ => 10,
+    };
     ctx.agent.write(|a| a.set_max_iterations(max)).await;
     println!("Thinking depth: {level} (max {max} iterations)");
     CommandOutcome::Continue
 }
-cmd!(ThinkCommand, "think", CommandCategory::Context, "Adjust thinking depth (low/medium/high)", cmd_think);
+cmd!(
+    ThinkCommand,
+    "think",
+    CommandCategory::Context,
+    "Adjust thinking depth (low/medium/high)",
+    cmd_think
+);
 
 // ── ReasoningCommand ──────────────────────────────────────────────────
 
 async fn cmd_reasoning(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     let level = args.first().copied().unwrap_or("medium");
-    let (iter, desc) = match level { "low"=> (3,"quick"), "medium"=> (10,"standard"), "high"=> (25,"thorough"), _=> (10,"standard") };
+    let (iter, desc) = match level {
+        "low" => (3, "quick"),
+        "medium" => (10, "standard"),
+        "high" => (25, "thorough"),
+        _ => (10, "standard"),
+    };
     ctx.agent.write(|a| a.set_max_iterations(iter)).await;
     println!("Reasoning effort: {level} ({desc}, max {iter} iterations)");
     CommandOutcome::Continue
 }
-cmd!(ReasoningCommand, "reasoning", CommandCategory::Context, "Set reasoning effort (low/medium/high)", cmd_reasoning);
+cmd!(
+    ReasoningCommand,
+    "reasoning",
+    CommandCategory::Context,
+    "Set reasoning effort (low/medium/high)",
+    cmd_reasoning
+);
 
 // ── ModelCommand ──────────────────────────────────────────────────────
 
@@ -63,69 +120,136 @@ async fn cmd_model(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     }
     CommandOutcome::Continue
 }
-cmd!(ModelCommand, "model", CommandCategory::Config, "View or switch model", cmd_model);
+cmd!(
+    ModelCommand,
+    "model",
+    CommandCategory::Config,
+    "View or switch model",
+    cmd_model
+);
 
 // ── SystemCommand ─────────────────────────────────────────────────────
 
 async fn cmd_system(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     if args.is_empty() {
-        ctx.agent.read_async(|a| Box::pin(async move {
-            let ctx = a.context().lock().await;
-            if let Some(first) = ctx.messages().first() {
-                println!("\n--- System Prompt ---\n{}", first.content.as_text().unwrap_or_default());
-            }
-        })).await;
+        ctx.agent
+            .read_async(|a| {
+                Box::pin(async move {
+                    let ctx = a.context().lock().await;
+                    if let Some(first) = ctx.messages().first() {
+                        println!(
+                            "\n--- System Prompt ---\n{}",
+                            first.content.as_text().unwrap_or_default()
+                        );
+                    }
+                })
+            })
+            .await;
     } else {
         let prompt = args.join(" ");
-        ctx.agent.write_async(|a| Box::pin(async move { a.set_system_prompt(prompt).await })).await;
+        ctx.agent
+            .write_async(|a| Box::pin(async move { a.set_system_prompt(prompt).await }))
+            .await;
         println!("System prompt updated.");
     }
     CommandOutcome::Continue
 }
-cmd!(SystemCommand, "system", ["sys"], CommandCategory::Config, "View or set system prompt", cmd_system);
+cmd!(
+    SystemCommand,
+    "system",
+    ["sys"],
+    CommandCategory::Config,
+    "View or set system prompt",
+    cmd_system
+);
 
 // ── CompressCommand ───────────────────────────────────────────────────
 
 async fn cmd_compress(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
-    ctx.agent.read_async(|a| Box::pin(async move {
-        let mut ctx = a.context().lock().await;
-        match ctx.force_compress(6).await {
-            Ok(s) => println!("Compressed: {} -> {} msgs ({} tokens -> {})",
-                s.before_count, s.after_count, s.before_tokens, s.after_tokens),
-            Err(e) => println!("Compression failed: {e}"),
-        }
-    })).await;
+    ctx.agent
+        .read_async(|a| {
+            Box::pin(async move {
+                let mut ctx = a.context().lock().await;
+                match ctx.force_compress(6).await {
+                    Ok(s) => println!(
+                        "Compressed: {} -> {} msgs ({} tokens -> {})",
+                        s.before_count, s.after_count, s.before_tokens, s.after_tokens
+                    ),
+                    Err(e) => println!("Compression failed: {e}"),
+                }
+            })
+        })
+        .await;
     CommandOutcome::Continue
 }
 // NOTE: No /cp alias — /cp belongs to /compact only
-cmd!(CompressCommand, "compress", CommandCategory::Context, "Force context compression", cmd_compress);
+cmd!(
+    CompressCommand,
+    "compress",
+    CommandCategory::Context,
+    "Force context compression",
+    cmd_compress
+);
 
 // ── CompactCommand ────────────────────────────────────────────────────
 
 async fn cmd_compact(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
-    ctx.agent.read_async(|a| Box::pin(async move {
-        let mut ctx = a.context().lock().await;
-        match ctx.force_compress(6).await {
-            Ok(s) => println!("Compact: {}->{} msgs", s.before_count, s.after_count),
-            Err(e) => println!("Compaction failed: {e}"),
-        }
-    })).await;
+    ctx.agent
+        .read_async(|a| {
+            Box::pin(async move {
+                let mut ctx = a.context().lock().await;
+                // Lightweight compaction: keep more recent messages than full compress
+                match ctx.force_compress(12).await {
+                    Ok(s) => println!(
+                        "Compact: {}->{} msgs ({} tokens -> {})",
+                        s.before_count, s.after_count, s.before_tokens, s.after_tokens
+                    ),
+                    Err(e) => println!("Compaction failed: {e}"),
+                }
+            })
+        })
+        .await;
     CommandOutcome::Continue
 }
-cmd!(CompactCommand, "compact", ["cp"], CommandCategory::Context, "Lightweight context compaction", cmd_compact);
+cmd!(
+    CompactCommand,
+    "compact",
+    ["cp"],
+    CommandCategory::Context,
+    "Lightweight context compaction",
+    cmd_compact
+);
 
 // ── ContextCommand ────────────────────────────────────────────────────
 
 async fn cmd_context(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
-    ctx.agent.read_async(|a| Box::pin(async move {
-        let ctx = a.context().lock().await;
-        println!("\n--- Context ---");
-        println!("  Messages: {}  Tokens: {}", ctx.messages().len(), ctx.token_estimate());
-        println!("  Plan mode: {}  Iterations: {}", a.is_plan_mode(), a.max_iterations());
-    })).await;
+    ctx.agent
+        .read_async(|a| {
+            Box::pin(async move {
+                let ctx = a.context().lock().await;
+                println!("\n--- Context ---");
+                println!(
+                    "  Messages: {}  Tokens: {}",
+                    ctx.messages().len(),
+                    ctx.token_estimate()
+                );
+                println!(
+                    "  Plan mode: {}  Iterations: {}",
+                    a.is_plan_mode(),
+                    a.max_iterations()
+                );
+            })
+        })
+        .await;
     CommandOutcome::Continue
 }
-cmd!(ContextCommand, "context", CommandCategory::Context, "Show context state", cmd_context);
+cmd!(
+    ContextCommand,
+    "context",
+    CommandCategory::Context,
+    "Show context state",
+    cmd_context
+);
 
 // ── RefreshCommand ────────────────────────────────────────────────────
 
@@ -133,7 +257,13 @@ async fn cmd_refresh(_ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
     println!("Project context refreshed.");
     CommandOutcome::Continue
 }
-cmd!(RefreshCommand, "refresh", CommandCategory::Context, "Rescan project files", cmd_refresh);
+cmd!(
+    RefreshCommand,
+    "refresh",
+    CommandCategory::Context,
+    "Rescan project files",
+    cmd_refresh
+);
 
 // ── ProjectCommand ────────────────────────────────────────────────────
 
@@ -141,7 +271,14 @@ async fn cmd_project(_ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
     println!("\nProject context loaded from current directory.");
     CommandOutcome::Continue
 }
-cmd!(ProjectCommand, "project", ["proj"], CommandCategory::Context, "View/load project context", cmd_project);
+cmd!(
+    ProjectCommand,
+    "project",
+    ["proj"],
+    CommandCategory::Context,
+    "View/load project context",
+    cmd_project
+);
 
 // ── Register ─────────────────────────────────────────────────────────
 

@@ -89,6 +89,7 @@ pub async fn build_router(state: Arc<AppState>) -> Router {
             "/api/config/security/reload",
             post(routes::config::reload_security_config),
         )
+        .route("/api/config/discover", get(routes::config::discover_config))
         // ── 上下文 API ─────────────────────────────────────────────
         .route("/api/context", get(routes::context::get_context))
         // ── 压缩 API ─────────────────────────────────────────────
@@ -191,6 +192,14 @@ pub async fn build_router(state: Arc<AppState>) -> Router {
             "/api/scheduler/tasks/:id",
             delete(routes::scheduler::remove_task),
         )
+        // ── 后台任务 API ─────────────────────────────────────────────
+        .route(
+            "/api/tasks",
+            get(routes::tasks::list_tasks).post(routes::tasks::submit_task),
+        )
+        .route("/api/tasks/:id", get(routes::tasks::get_task))
+        .route("/api/tasks/:id/cancel", post(routes::tasks::cancel_task))
+        .route("/api/tasks/:id/events", get(routes::tasks::task_events))
         // ── Webhook API ─────────────────────────────────────────────
         .route(
             "/api/webhooks",
@@ -226,6 +235,86 @@ pub async fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/api/skills-hub/refresh",
             post(routes::skills_hub::refresh_hub),
+        )
+        // ── Plugin API ─────────────────────────────────────────────
+        .route("/api/plugins", get(routes::plugins::list_plugins))
+        .route(
+            "/api/plugins/install",
+            post(routes::plugins::install_plugin),
+        )
+        .route(
+            "/api/plugins/uninstall",
+            post(routes::plugins::uninstall_plugin),
+        )
+        .route(
+            "/api/plugins/:name/enable",
+            post(routes::plugins::enable_plugin),
+        )
+        .route(
+            "/api/plugins/:name/disable",
+            post(routes::plugins::disable_plugin),
+        )
+        .route("/api/plugins/:name", get(routes::plugins::get_plugin))
+        .route(
+            "/api/plugins/reload",
+            post(routes::plugins::reload_plugins),
+        )
+        // ── 文件系统 API ─────────────────────────────────────────────
+        .route("/api/files/list", get(routes::files::list_files))
+        .route("/api/files/read", get(routes::files::read_file))
+        .route("/api/files/diff", get(routes::files::diff_file))
+        .route("/api/files/tree", get(routes::files::file_tree))
+        .route("/api/files/browse", get(routes::files::browse_directories))
+        // ── Trace 观测 API ─────────────────────────────────────────────
+        .route("/api/trace/sessions", get(routes::trace::list_trace_sessions))
+        .route("/api/trace/session/:id", get(routes::trace::get_trace_session))
+        .route("/api/trace/stats", get(routes::trace::get_trace_stats))
+        // ── Trace Events API ─────────────────────────────────────────
+        .merge(routes::trace_events::trace_event_routes())
+        // ── Terminal API ─────────────────────────────────────────────
+        .merge(routes::terminal::terminal_routes())
+        // ── Papers API ───────────────────────────────────────────────
+        .merge(routes::papers::paper_routes())
+        // ── Scratchpad API ─────────────────────────────────────────────
+        .merge(routes::scratchpad::scratchpad_routes())
+        // ── Decisions API ─────────────────────────────────────────────
+        .merge(routes::decisions::decision_routes())
+        // ── 自进化 API ───────────────────────────────────────────────
+        .merge(routes::evolution::evolution_routes())
+        // ── Provider API ─────────────────────────────────────────────
+        .merge(routes::providers::provider_routes())
+        // ── 工作区 API ─────────────────────────────────────────────
+        .route(
+            "/api/workspaces",
+            get(routes::workspace::list_workspaces).post(routes::workspace::create_workspace),
+        )
+        .route(
+            "/api/workspaces/current",
+            get(routes::workspace::get_current_workspace),
+        )
+        .route(
+            "/api/workspaces/migrate/audit",
+            post(routes::workspace::audit_migration),
+        )
+        .route(
+            "/api/workspaces/migrate",
+            post(routes::workspace::execute_migration),
+        )
+        .route(
+            "/api/workspaces/:id",
+            get(routes::workspace::get_workspace).delete(routes::workspace::delete_workspace),
+        )
+        .route(
+            "/api/workspaces/:id/switch",
+            post(routes::workspace::switch_workspace),
+        )
+        .route(
+            "/api/workspaces/:id/link",
+            post(routes::workspace::link_project),
+        )
+        .route(
+            "/api/workspaces/default-root/:name",
+            get(routes::workspace::get_default_root),
         )
         // ── 会话快照 API ─────────────────────────────────────────────
         .route(

@@ -1,10 +1,10 @@
-import { Wrench, FileSearch, Terminal, HelpCircle, Sparkles } from 'lucide-react';
+import { Code, BarChart3, GraduationCap, FlaskConical, Sparkles } from 'lucide-react';
 
 const suggestions = [
-  { icon: HelpCircle, text: '你能做什么？介绍一下你的能力', color: 'var(--accent)', colorHex: '#6366f1', bg: 'var(--accent-bg)' },
-  { icon: Wrench, text: '你有哪些工具可用？', color: 'var(--color-warning)', colorHex: '#f59e0b', bg: 'var(--color-warning-bg)' },
-  { icon: FileSearch, text: '帮我分析文件或文档', color: 'var(--color-success)', colorHex: '#10b981', bg: 'var(--color-success-bg)' },
-  { icon: Terminal, text: '帮我执行系统命令', color: 'var(--color-info)', colorHex: '#3b82f6', bg: 'var(--color-info-bg)' },
+  { icon: Code, text: '从零开发一个全栈项目：需求分析、技术选型、代码实现到部署文档', color: 'var(--accent)', colorHex: '#6366f1', bg: 'var(--accent-bg)' },
+  { icon: BarChart3, text: '深度分析用户行为数据，构建画像并生成可落地的业务策略报告', color: 'var(--color-warning)', colorHex: '#f59e0b', bg: 'var(--color-warning-bg)' },
+  { icon: GraduationCap, text: '系统检索某研究领域的核心文献，生成结构化的文献综述初稿', color: 'var(--color-success)', colorHex: '#10b981', bg: 'var(--color-success-bg)' },
+  { icon: FlaskConical, text: '启动多步骤数据处理任务：清洗、特征构建、模型训练与结果可视化', color: 'var(--color-info)', colorHex: '#3b82f6', bg: 'var(--color-info-bg)' },
 ];
 
 export function WelcomeScreen({ onSuggestionClick }: { onSuggestionClick: (text: string) => void }) {
@@ -24,7 +24,7 @@ export function WelcomeScreen({ onSuggestionClick }: { onSuggestionClick: (text:
           今天有什么可以帮你的？
         </h1>
         <p className="animate-slide-up mt-2 text-sm text-[var(--text-secondary)]" style={{ animationDelay: '0.1s' }}>
-          我是 Echo Agent，你的智能 AI 助手
+          我是 EchoCoWork，你的智能协作助手
         </p>
       </div>
 

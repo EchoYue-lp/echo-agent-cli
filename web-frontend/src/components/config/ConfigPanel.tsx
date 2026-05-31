@@ -66,18 +66,6 @@ export function ConfigPanel() {
         </div>
       </div>
 
-      {/* Model */}
-      <Section title="模型">
-        <SelectField label="模型名称"
-          value={edit.model?.name ?? config.model.name}
-          options={config.agent.available_models}
-          onChange={(v) => markDirty({ model: { ...edit.model, name: v } })} />
-        <Field label="最大令牌数" value={String(edit.model?.max_tokens ?? config.model.max_tokens ?? '')}
-          onChange={(v) => markDirty({ model: { ...edit.model, max_tokens: v ? Number(v) : undefined } })} type="number" />
-        <Field label="温度" value={String(edit.model?.temperature ?? config.model.temperature ?? '')}
-          onChange={(v) => markDirty({ model: { ...edit.model, temperature: v ? Number(v) : undefined } })} type="number" />
-      </Section>
-
       {/* Agent */}
       <Section title="智能体">
         <Field label="系统提示词" value={edit.agent?.system_prompt ?? config.agent.system_prompt}
@@ -170,28 +158,6 @@ function Field({ label, value, onChange, multiline, type }: {
       ) : (
         <input type={type} value={value} onChange={(e) => onChange(e.target.value)} className={cls} />
       )}
-    </div>
-  );
-}
-
-function SelectField({ label, value, options, onChange }: {
-  label: string;
-  value: string;
-  options: string[];
-  onChange: (v: string) => void;
-}) {
-  return (
-    <div>
-      <label className="mb-1 block text-xs text-[var(--text-secondary)]">{label}</label>
-      <select
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        className="w-full rounded-lg border border-[var(--border-primary)] bg-[var(--bg-input)] px-2 py-1.5 text-sm text-[var(--text-primary)] outline-none focus:border-[var(--border-focus)]"
-      >
-        {options.map((opt) => (
-          <option key={opt} value={opt}>{opt}</option>
-        ))}
-      </select>
     </div>
   );
 }

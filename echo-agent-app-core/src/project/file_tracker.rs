@@ -99,11 +99,7 @@ impl FileChangeTracker {
                 ChangeType::Modified => "M",
                 ChangeType::Deleted => "-",
             };
-            lines.push(format!(
-                "  {} {}",
-                icon,
-                change.path.display()
-            ));
+            lines.push(format!("  {} {}", icon, change.path.display()));
         }
         lines.join("\n")
     }

@@ -9,7 +9,7 @@ export function AuditPanel() {
   const [stats, setStats] = useState<{ total: number; allowed: number; denied: number; asked: number } | null>(null);
 
   useEffect(() => {
-    auditApi.logs().then(setLogs).catch(console.error);
+    auditApi.logs().then((res) => setLogs(res.logs)).catch(console.error);
     auditApi.stats().then(setStats).catch(console.error);
   }, []);
 

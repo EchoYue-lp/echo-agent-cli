@@ -27,9 +27,9 @@ pub async fn get_config(State(state): State<Arc<AppState>>) -> Response {
             Json(AgentConfigResponse {
                 model: agent.model_name().to_string(),
                 system_prompt: agent.system_prompt().to_string(),
-                max_iterations: 10,
-                token_limit: 8000,
-                enable_memory: true,
+                max_iterations: agent.config().get_max_iterations(),
+                token_limit: agent.config().get_token_limit(),
+                enable_memory: agent.config().is_memory_enabled(),
                 enable_human_loop: agent.config().is_human_in_loop_enabled(),
                 session_id: agent.config().get_session_id().map(|s| s.to_string()),
                 available_models,
@@ -95,11 +95,11 @@ pub async fn update_config(
             Json(AgentConfigResponse {
                 model: agent.model_name().to_string(),
                 system_prompt: agent.system_prompt().to_string(),
-                max_iterations: 10,
-                token_limit: 8000,
-                enable_memory: true,
-                enable_human_loop: true,
-                session_id: None,
+                max_iterations: agent.config().get_max_iterations(),
+                token_limit: agent.config().get_token_limit(),
+                enable_memory: agent.config().is_memory_enabled(),
+                enable_human_loop: agent.config().is_human_in_loop_enabled(),
+                session_id: agent.config().get_session_id().map(|s| s.to_string()),
                 available_models,
             })
             .into_response()
@@ -278,7 +278,7 @@ pub async fn update_full_config(
     tokio::spawn(async move {
         let mut agent = agent_arc.write().await;
         agent.set_model(&model_name);
-        agent.set_system_prompt(system_prompt).await;
+        agent.set_system_prompt(&system_prompt);
         tracing::info!(model = %model_name, "配置已同步到 Agent");
     });
     tracing::info!("完整配置已通过 API 更新（已持久化，Agent 异步同步中）");
@@ -352,4 +352,36 @@ pub async fn reload_security_config(State(state): State<Arc<AppState>>) -> Respo
             .into_response()
         }
     }
+}
+
+/// GET /api/config/discover — Discover all configuration files.
+///
+/// Returns a structured inventory of all EchoAgent configuration files
+/// found across global, project, and local scopes.
+#[debug_handler]
+pub async fn discover_config() -> Response {
+    use echo_agent_app_core::config_discovery::ConfigDiscovery;
+
+    let discovery = ConfigDiscovery::new();
+    let inventory = discovery.discover_all();
+
+    let files: Vec<serde_json::Value> = inventory
+        .all_files()
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "name": f.name,
+                "path": f.path.display().to_string(),
+                "scope": f.scope.to_string(),
+                "category": f.category.to_string(),
+                "accessible": f.accessible,
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({
+        "total": inventory.total_count(),
+        "files": files,
+    }))
+    .into_response()
 }

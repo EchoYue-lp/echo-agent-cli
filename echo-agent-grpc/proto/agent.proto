@@ -1,0 +1,94 @@
+syntax = "proto3";
+
+package echoagent;
+
+// Agent 服务
+service AgentService {
+  // 执行单次任务
+  rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+
+  // 流式对话
+  rpc ChatStream(ChatStreamRequest) returns (stream ChatStreamChunk);
+
+  // 获取 Agent 状态
+  rpc GetStatus(StatusRequest) returns (StatusResponse);
+}
+
+// 执行任务请求
+message ExecuteRequest {
+  string task = 1;
+  string session_id = 2;
+}
+
+// 执行任务响应
+message ExecuteResponse {
+  string result = 1;
+  int32 iterations = 2;
+  bool success = 3;
+}
+
+// 流式对话请求
+message ChatStreamRequest {
+  string message = 1;
+  string session_id = 2;
+}
+
+// 流式对话片段
+message ChatStreamChunk {
+  oneof event {
+    TokenChunk token = 1;
+    ToolStartEvent tool_start = 2;
+    ToolResultEvent tool_result = 3;
+    FinalAnswerEvent final_answer = 4;
+    ErrorEvent error = 5;
+    ThinkingStartEvent thinking_start = 6;
+    ThinkingEndEvent thinking_end = 7;
+  }
+}
+
+// Token 片段
+message TokenChunk {
+  string data = 1;
+}
+
+// 工具开始事件
+message ToolStartEvent {
+  string name = 1;
+  string args_json = 2;
+}
+
+// 工具结果事件
+message ToolResultEvent {
+  string name = 1;
+  string result = 2;
+  bool success = 3;
+}
+
+// 最终答案事件
+message FinalAnswerEvent {
+  string data = 1;
+}
+
+// 错误事件
+message ErrorEvent {
+  string message = 1;
+}
+
+// 思考开始事件
+message ThinkingStartEvent {}
+
+// 思考结束事件
+message ThinkingEndEvent {
+  uint64 prompt_tokens = 1;
+  uint64 completion_tokens = 2;
+}
+
+// 状态请求
+message StatusRequest {}
+
+// 状态响应
+message StatusResponse {
+  string version = 1;
+  string status = 2;
+  uint64 uptime_seconds = 3;
+}

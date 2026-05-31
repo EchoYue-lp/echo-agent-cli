@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { X, Settings, Save, Lock, ShieldCheck, GitBranch, Terminal, Minimize2, FileJson, Wrench, Globe, BookOpen, Brain, Cpu, Database, Activity } from 'lucide-react';
+import { X, Settings, Save, Lock, ShieldCheck, GitBranch, Terminal, Minimize2, FileJson, Wrench, Globe, BookOpen, Brain, Cpu, Database, Activity, Sparkles, Package } from 'lucide-react';
 import { useUiStore, type SettingsTabId } from '../../stores/uiStore';
 import { ConfigPanel } from '../config/ConfigPanel';
 import { SessionsPanel } from '../sessions/SessionsPanel';
@@ -13,6 +13,9 @@ import { ToolsPanel } from '../tools/ToolsPanel';
 import { McpPanel } from '../mcp/McpPanel';
 import { SkillsPanel } from '../skills/SkillsPanel';
 import { MemoryPanel } from '../memory/MemoryPanel';
+import { EvolutionPanel } from '../evolution/EvolutionPanel';
+import { ProviderPanel } from '../providers/ProviderPanel';
+import { PluginPanel } from '../plugins/PluginPanel';
 
 interface SettingsItem {
   id: SettingsTabId;
@@ -26,9 +29,11 @@ const settingsGroups: { label: string; icon: typeof Settings; items: SettingsIte
     icon: Cpu,
     items: [
       { id: 'config', label: '配置', icon: Settings },
+      { id: 'providers', label: '模型供应商', icon: Cpu },
       { id: 'tools', label: '工具', icon: Wrench },
       { id: 'mcp', label: 'MCP', icon: Globe },
       { id: 'skills', label: '技能', icon: BookOpen },
+      { id: 'plugins', label: '插件', icon: Package },
       { id: 'memory', label: '记忆', icon: Brain },
     ],
   },
@@ -57,6 +62,13 @@ const settingsGroups: { label: string; icon: typeof Settings; items: SettingsIte
       { id: 'sandbox', label: '沙箱', icon: Terminal },
     ],
   },
+  {
+    label: '智能',
+    icon: Sparkles,
+    items: [
+      { id: 'evolution', label: '自进化', icon: Sparkles },
+    ],
+  },
 ];
 
 const panels: Record<SettingsTabId, React.FC> = {
@@ -65,6 +77,7 @@ const panels: Record<SettingsTabId, React.FC> = {
   skills: SkillsPanel,
   memory: MemoryPanel,
   config: ConfigPanel,
+  providers: ProviderPanel,
   sessions: SessionsPanel,
   permissions: PermissionsPanel,
   audit: AuditPanel,
@@ -72,6 +85,8 @@ const panels: Record<SettingsTabId, React.FC> = {
   sandbox: SandboxPanel,
   compress: CompressPanel,
   extract: ExtractPanel,
+  evolution: EvolutionPanel,
+  plugins: PluginPanel,
 };
 
 export function SettingsDialog() {

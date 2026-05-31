@@ -25,11 +25,16 @@ const SENSITIVE_PATTERNS: &[&str] = &[
     "**/.git-credentials",
     "**/.gitconfig",
     // Private keys / certs
-    "**.pem",
-    "**.key",
-    "**.pfx",
-    "**.p12",
-    "**.jks",
+    "**/*.pem",
+    "**/*.key",
+    "**/*.pfx",
+    "**/*.p12",
+    "**/*.jks",
+    "*.pem",
+    "*.key",
+    "*.pfx",
+    "*.p12",
+    "*.jks",
     // Docker / container auth
     "**/.docker/config.json",
     // GitHub CLI
@@ -87,7 +92,7 @@ fn glob_match(pattern: &str, path: &str) -> bool {
             star_idx = Some((pi + 1, si));
             pi += 1;
         } else if pi < pattern_parts.len()
-            && (pattern_parts[pi] == "*" || pattern_parts[pi].eq_ignore_ascii_case(path_parts[si]))
+            && segment_match(pattern_parts[pi], path_parts[si])
         {
             pi += 1;
             si += 1;
@@ -107,11 +112,62 @@ fn glob_match(pattern: &str, path: &str) -> bool {
     pi >= pattern_parts.len()
 }
 
+/// Match a single path segment against a pattern segment.
+/// Supports `*` as wildcard within the segment (e.g. `*.pem` matches `server.pem`).
+fn segment_match(pattern: &str, segment: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if pattern.eq_ignore_ascii_case(segment) {
+        return true;
+    }
+    // Handle intra-segment `*` wildcards (e.g. "*.pem", "id_*")
+    if pattern.contains('*') {
+        return segment_glob_match(pattern, segment);
+    }
+    false
+}
+
+/// Simple wildcard matching within a single string segment.
+/// `*` matches zero or more characters (not `/`).
+fn segment_glob_match(pattern: &str, text: &str) -> bool {
+    let pat: Vec<char> = pattern.chars().collect();
+    let txt: Vec<char> = text.chars().collect();
+    let mut pi = 0;
+    let mut ti = 0;
+    let mut star_pi: Option<usize> = None;
+    let mut star_ti: Option<usize> = None;
+
+    while ti < txt.len() {
+        if pi < pat.len() && (pat[pi] == '?' || pat[pi].to_ascii_lowercase() == txt[ti].to_ascii_lowercase()) {
+            pi += 1;
+            ti += 1;
+        } else if pi < pat.len() && pat[pi] == '*' {
+            star_pi = Some(pi);
+            star_ti = Some(ti);
+            pi += 1;
+        } else if let (Some(sp), Some(st)) = (star_pi, star_ti) {
+            pi = sp + 1;
+            ti = st + 1;
+            star_ti = Some(ti);
+        } else {
+            return false;
+        }
+    }
+
+    while pi < pat.len() && pat[pi] == '*' {
+        pi += 1;
+    }
+
+    pi >= pat.len()
+}
+
 /// Check if a write path escapes the project root (work directory isolation).
 /// Returns true if the path is outside the allowed project directory.
 pub fn is_outside_project(path: &std::path::Path, project_root: &std::path::Path) -> bool {
     let canonical_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let canonical_root = std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    let canonical_root =
+        std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
     !canonical_path.starts_with(&canonical_root)
 }
 

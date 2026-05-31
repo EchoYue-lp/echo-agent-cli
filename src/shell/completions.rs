@@ -64,7 +64,6 @@ pub fn build_clap_command() -> clap::Command {
         .arg(clap::arg!(--config <PATH> "配置文件路径"))
         .arg(clap::arg!(--no_color "禁用彩色输出"))
         .arg(clap::arg!(--channels "启用 IM 通道模式"))
-        .arg(clap::arg!(--tui "启动终端 UI 模式"))
         .arg(clap::arg!(-o --output <FORMAT> "输出格式").default_value("text"))
         .arg(clap::arg!(-v --verbose "详细输出模式"))
         .subcommand(
@@ -138,7 +137,6 @@ pub fn build_clap_command() -> clap::Command {
                 .arg(clap::arg!(<MESSAGE> ... "用户消息"))
                 .arg(clap::arg!(--pipe "从 stdin 读取")),
         )
-        .subcommand(clap::Command::new("tui").about("启动终端 UI 模式"))
 }
 
 /// 生成指定 Shell 的补全脚本

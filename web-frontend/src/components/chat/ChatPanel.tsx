@@ -52,9 +52,9 @@ export function ChatPanel() {
   };
 
   return (
-    <div className="flex h-full flex-col min-h-0">
+    <div className="flex h-full flex-col min-h-0" role="main" aria-label="聊天面板">
       {/* Messages area */}
-      <div ref={scrollRef} className="flex-1 overflow-y-auto min-h-0" onScroll={handleScroll}>
+      <div ref={scrollRef} className="flex-1 overflow-y-auto min-h-0" onScroll={handleScroll} role="log" aria-live="polite" aria-label="消息列表">
         {messages.length === 0 ? (
           <WelcomeScreen onSuggestionClick={handleSuggestionClick} />
         ) : (
@@ -127,7 +127,7 @@ export function ChatPanel() {
       </div>
 
       {connectionStatus === 'disconnected' && (
-        <div className="flex items-center justify-center gap-2 px-4 py-1.5 text-xs font-medium"
+        <div role="status" aria-live="assertive" className="flex items-center justify-center gap-2 px-4 py-1.5 text-xs font-medium"
           style={{ background: 'color-mix(in srgb, var(--accent) 10%, transparent)', color: 'var(--accent)' }}>
           <span className="inline-block h-2 w-2 rounded-full" style={{ background: 'var(--accent)' }} />
           已断开 — 重新连接中...
@@ -139,6 +139,7 @@ export function ChatPanel() {
           <div className="flex justify-center pb-2">
             <button
               onClick={cancel}
+              aria-label="停止生成"
               className="flex items-center gap-2 rounded-full border border-[var(--border-primary)] bg-[var(--bg-primary)] px-4 py-2 text-sm font-medium text-[var(--text-secondary)] shadow-[var(--shadow-sm)] transition-all hover:text-[var(--text-primary)]"
             >
               <div className="h-3 w-3 rounded-[3px]" style={{ background: 'var(--text-secondary)' }} />
