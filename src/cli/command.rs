@@ -91,6 +91,8 @@ pub struct CommandContext {
     pub registry: Option<Arc<CommandRegistry>>,
     /// Background task service for submitting long-running tasks.
     pub task_service: Option<Arc<echo_agent_app_core::tasks::BackgroundTaskService>>,
+    /// Scheduler runner for managing cron tasks.
+    pub scheduler: Option<Arc<echo_agent_app_core::scheduler::SchedulerRunner>>,
 }
 
 impl CommandContext {
@@ -101,6 +103,7 @@ impl CommandContext {
             coding_loop: None,
             registry: None,
             task_service: None,
+            scheduler: None,
         }
     }
 
@@ -127,6 +130,14 @@ impl CommandContext {
         service: Arc<echo_agent_app_core::tasks::BackgroundTaskService>,
     ) -> Self {
         self.task_service = Some(service);
+        self
+    }
+
+    pub fn with_scheduler(
+        mut self,
+        runner: Arc<echo_agent_app_core::scheduler::SchedulerRunner>,
+    ) -> Self {
+        self.scheduler = Some(runner);
         self
     }
 

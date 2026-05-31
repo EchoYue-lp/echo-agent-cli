@@ -7,6 +7,8 @@ pub mod advanced;
 pub mod all;
 pub mod coding;
 pub mod context;
+pub mod cron;
+pub mod diff_cmd;
 pub mod eval;
 pub mod evolution;
 pub mod git;

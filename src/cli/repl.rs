@@ -50,6 +50,7 @@ pub struct ReplConfig {
     pub mode: String,
     pub project: Option<String>,
     pub task_service: Option<Arc<echo_agent_app_core::tasks::BackgroundTaskService>>,
+    pub scheduler_runner: Option<Arc<echo_agent_app_core::scheduler::SchedulerRunner>>,
 }
 
 impl Default for ReplConfig {
@@ -60,6 +61,7 @@ impl Default for ReplConfig {
             mode: "general".to_string(),
             project: None,
             task_service: None,
+            scheduler_runner: None,
         }
     }
 }
@@ -101,6 +103,7 @@ pub async fn run_repl(agent: AgentHandle, config: ReplConfig) -> anyhow::Result<
     // Build command registry with trait-based commands
     let mut registry = crate::cli::command::CommandRegistry::new();
     crate::cli::cmd_impls::coding::register_all(&mut registry);
+    crate::cli::cmd_impls::diff_cmd::register_all(&mut registry);
     crate::cli::cmd_impls::git::register_all(&mut registry);
     crate::cli::cmd_impls::session::register_all(&mut registry);
     crate::cli::cmd_impls::info::register_all(&mut registry);
@@ -116,6 +119,7 @@ pub async fn run_repl(agent: AgentHandle, config: ReplConfig) -> anyhow::Result<
     crate::cli::cmd_impls::pipeline::register_all(&mut registry);
     crate::cli::cmd_impls::workspace::register_all(&mut registry);
     crate::cli::cmd_impls::plugins::register_all(&mut registry);
+    crate::cli::cmd_impls::cron::register_all(&mut registry);
     crate::cli::cmd_impls::all::register_all(&mut registry);
 
     // Create CodingLoop for coding-mode commands (C6 fix).
@@ -130,7 +134,8 @@ pub async fn run_repl(agent: AgentHandle, config: ReplConfig) -> anyhow::Result<
     let cmd_handler = CommandHandler::new(agent.clone())
         .with_registry(Arc::new(registry))
         .with_coding_loop(coding_loop)
-        .with_task_service_opt(config.task_service);
+        .with_task_service_opt(config.task_service)
+        .with_scheduler_opt(config.scheduler_runner);
 
     let editor_config = EditorConfig {
         prompt: config.prompt.clone(),

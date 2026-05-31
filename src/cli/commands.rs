@@ -26,6 +26,7 @@ pub struct CommandHandler {
     coding_loop: Option<Arc<tokio::sync::Mutex<crate::project::coding_loop::CodingLoop>>>,
     registry: Option<Arc<crate::cli::command::CommandRegistry>>,
     task_service: Option<Arc<echo_agent_app_core::tasks::BackgroundTaskService>>,
+    scheduler: Option<Arc<echo_agent_app_core::scheduler::SchedulerRunner>>,
 }
 
 impl CommandHandler {
@@ -36,6 +37,7 @@ impl CommandHandler {
             coding_loop: None,
             registry: None,
             task_service: None,
+            scheduler: None,
         }
     }
 
@@ -77,6 +79,15 @@ impl CommandHandler {
         self
     }
 
+    /// Attach an optional SchedulerRunner for cron task management.
+    pub fn with_scheduler_opt(
+        mut self,
+        scheduler: Option<Arc<echo_agent_app_core::scheduler::SchedulerRunner>>,
+    ) -> Self {
+        self.scheduler = scheduler;
+        self
+    }
+
     /// Process user input.
     pub async fn handle(&self, input: &str) -> CommandResult {
         let input = input.trim();
@@ -113,6 +124,7 @@ impl CommandHandler {
                 coding_loop: self.coding_loop.clone(),
                 registry: Some(registry.clone()),
                 task_service: self.task_service.clone(),
+                scheduler: self.scheduler.clone(),
             };
 
             if let Some(outcome) = registry.dispatch(cmd_name, &ctx, args).await {

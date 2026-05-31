@@ -19,6 +19,8 @@ struct WebInfra {
     app: axum::Router,
     addr: String,
     cancel_token: CancellationToken,
+    task_service: Option<Arc<crate::tasks::BackgroundTaskService>>,
+    scheduler_runner: Option<Arc<crate::scheduler::SchedulerRunner>>,
 }
 
 async fn setup_web_infrastructure(
@@ -85,6 +87,8 @@ async fn setup_web_infrastructure(
         app,
         addr,
         cancel_token,
+        task_service: state.tasks.service.clone(),
+        scheduler_runner: state.scheduler.runner.clone(),
     })
 }
 
@@ -115,6 +119,7 @@ fn repl_config_for(args: &Args) -> crate::cli::ReplConfig {
         mode: args.mode.clone(),
         project: args.project.clone(),
         task_service: None,
+        scheduler_runner: None,
     }
 }
 
@@ -127,7 +132,7 @@ pub async fn run_cli_mode(
     task_store: std::sync::Arc<dyn echo_agent::memory::Store>,
 ) -> Result<()> {
     // Start BackgroundTaskService for CLI mode
-    let task_service = {
+    let (task_service, scheduler_runner) = {
         use crate::state::AppState;
         let mut state = AppState::from_shared(
             agent.clone(),
@@ -135,12 +140,14 @@ pub async fn run_cli_mode(
             None,
             app_config.clone(),
         );
-        state.start_task_service(task_store).await;
-        state.tasks.service.clone()
+        state.start_task_service(task_store.clone()).await;
+        state.start_scheduler_with_store(Some(task_store));
+        (state.tasks.service.clone(), state.scheduler.runner.clone())
     };
 
     let mut repl_config = repl_config_for(args);
     repl_config.task_service = task_service;
+    repl_config.scheduler_runner = scheduler_runner;
 
     crate::cli::run_repl(agent, repl_config).await
 }
@@ -158,6 +165,10 @@ pub async fn run_both_modes(
 
     crate::infra::print_both_startup_info(&infra.addr);
 
+    // Extract shared services before moving infra into the web server task
+    let cli_task_service = infra.task_service.clone();
+    let cli_scheduler = infra.scheduler_runner.clone();
+
     let web_shutdown = infra.cancel_token.clone();
     let web_handle = tokio::spawn(async move {
         axum::serve(listener, infra.app)
@@ -166,7 +177,10 @@ pub async fn run_both_modes(
     });
     let web_abort = web_handle.abort_handle();
 
-    crate::cli::run_repl(agent, repl_config_for(args)).await?;
+    let mut repl_config = repl_config_for(args);
+    repl_config.task_service = cli_task_service;
+    repl_config.scheduler_runner = cli_scheduler;
+    crate::cli::run_repl(agent, repl_config).await?;
 
     // CLI 退出后，通知 Web 服务和后台任务优雅关闭
     tracing::info!("CLI 已退出，正在关闭 Web 服务...");
