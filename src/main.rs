@@ -40,44 +40,6 @@ use echo_agent_cli::infra;
 
 use clap::Parser;
 
-// ── Stderr 重定向 RAII Guard ─────────────────────────────────────
-
-/// RAII guard that redirects stderr to a file on creation and restores it on drop.
-/// Used in TUI mode to prevent log output from corrupting the terminal.
-struct StderrRedirectGuard {
-    saved_fd: i32,
-    _log_file: std::fs::File,
-}
-
-impl StderrRedirectGuard {
-    fn new(log_path: &str) -> Self {
-        use std::os::fd::AsRawFd;
-        let file = std::fs::File::create(log_path)
-            .expect("Failed to create TUI log file");
-        unsafe {
-            let log_fd = file.as_raw_fd();
-            let saved = libc::dup(2);
-            if saved < 0 {
-                panic!("Failed to dup stderr");
-            }
-            libc::dup2(log_fd, 2);
-            Self {
-                saved_fd: saved,
-                _log_file: file,
-            }
-        }
-    }
-}
-
-impl Drop for StderrRedirectGuard {
-    fn drop(&mut self) {
-        unsafe {
-            libc::dup2(self.saved_fd, 2);
-            libc::close(self.saved_fd);
-        }
-    }
-}
-
 // ── 主入口 ─────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -97,13 +59,12 @@ async fn main() -> anyhow::Result<()> {
         return cli::handle_subcommand(cmd).await;
     }
 
-    // TUI 模式：在 init_logging 之前重定向 stderr 到文件，
-    // 防止初始化阶段的日志输出到真实终端
-    let _tui_stderr_guard = if args.tui {
-        Some(StderrRedirectGuard::new("/tmp/echo-agent-tui.log"))
-    } else {
-        None
-    };
+    // TUI 模式：设置环境变量让 init_logging 将日志写入文件
+    if args.tui {
+        // SAFETY: This is called early in main() before any threads are spawned,
+        // so there's no concurrent access to the environment.
+        unsafe { std::env::set_var("ECHO_TUI_MODE", "1"); }
+    }
 
     // 初始化日志（使用配置中的级别）
     infra::init_logging(&app_config.logging.level);

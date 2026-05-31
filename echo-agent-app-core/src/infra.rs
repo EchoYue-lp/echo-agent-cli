@@ -398,14 +398,39 @@ pub fn init_logging(level: &str) {
             use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
             let default_filter =
                 format!("echo_agent_cli={level},echo_agent={level},tower_http=info");
-            let _ = tracing_subscriber::registry()
-                .with(
-                    tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                        tracing_subscriber::filter::EnvFilter::new(&default_filter)
-                    }),
-                )
-                .with(tracing_subscriber::fmt::layer())
-                .try_init();
+
+            // In TUI mode, write logs to a file instead of stderr to prevent
+            // log output from corrupting the terminal UI.
+            let tui_mode = std::env::var("ECHO_TUI_MODE").is_ok();
+
+            if tui_mode {
+                // TUI mode: log to file
+                if let Ok(file) = std::fs::File::create("/tmp/echo-agent-tui.log") {
+                    let _ = tracing_subscriber::registry()
+                        .with(
+                            tracing_subscriber::EnvFilter::try_from_default_env()
+                                .unwrap_or_else(|_| {
+                                    tracing_subscriber::filter::EnvFilter::new(&default_filter)
+                                }),
+                        )
+                        .with(
+                            tracing_subscriber::fmt::layer()
+                                .with_writer(std::sync::Mutex::new(file))
+                                .with_ansi(false),
+                        )
+                        .try_init();
+                }
+            } else {
+                // Normal mode: log to stderr as usual
+                let _ = tracing_subscriber::registry()
+                    .with(
+                        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                            tracing_subscriber::filter::EnvFilter::new(&default_filter)
+                        }),
+                    )
+                    .with(tracing_subscriber::fmt::layer())
+                    .try_init();
+            }
         }
     });
 }
