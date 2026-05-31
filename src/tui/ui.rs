@@ -50,10 +50,10 @@ pub fn draw(f: &mut Frame, app: &TuiApp) {
 
     // ── Popups (drawn on top) ──────────────────────────────────────────
     if let Some(ref diff) = app.diff_popup {
-        draw_diff_popup(f, diff, size);
+        draw_diff_popup(f, diff, size, &app.theme);
     }
     if let Some(ref approval) = app.approval {
-        draw_approval_popup(f, approval, size);
+        draw_approval_popup(f, approval, size, &app.theme);
     }
 
     // ── Picker (drawn on top of everything) ────────────────────────────

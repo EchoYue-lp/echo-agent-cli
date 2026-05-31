@@ -1,42 +1,45 @@
 //! Left sidebar widget — tabs for Files, Tools, Tasks.
-//! Catppuccin Mocha palette with Unicode icons.
+//! Adaptive theme with Unicode icons.
 
-use crate::tui::TuiApp;
+use crate::tui::{Theme, TuiApp};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, Tabs};
+use ratatui::widgets::{List, ListItem, Paragraph, Tabs};
 use ratatui::Frame;
 
 use super::Widget;
-
-// Catppuccin Mocha
-const BASE: Color = Color::Rgb(30, 30, 46);
-const SURFACE0: Color = Color::Rgb(49, 50, 68);
-const SURFACE1: Color = Color::Rgb(69, 71, 90);
-const OVERLAY0: Color = Color::Rgb(108, 112, 134);
-const TEXT: Color = Color::Rgb(205, 214, 244);
-const SUBTEXT: Color = Color::Rgb(166, 173, 200);
-const BLUE: Color = Color::Rgb(137, 180, 250);
-const GREEN: Color = Color::Rgb(166, 227, 161);
-const YELLOW: Color = Color::Rgb(249, 226, 175);
-const CYAN: Color = Color::Rgb(137, 220, 235);
-const LAVENDER: Color = Color::Rgb(180, 190, 254);
-const TEAL: Color = Color::Rgb(148, 226, 213);
 
 pub struct Sidebar;
 
 impl Widget for Sidebar {
     fn render(&self, f: &mut Frame, area: Rect, app: &TuiApp) {
-        let block = Block::default()
-            .borders(Borders::RIGHT)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(SURFACE1));
+        let t = &app.theme;
+
+        // No border block — draw a subtle vertical line separator on the right edge
+        let sep_line = Paragraph::new(
+            "\u{2502}\n".repeat(area.height as usize)
+        ).style(Style::default().fg(t.surface0));
+        let sep_area = Rect {
+            x: area.x + area.width - 1,
+            y: area.y,
+            width: 1,
+            height: area.height,
+        };
+        f.render_widget(sep_line, sep_area);
+
+        // Use area minus the separator column
+        let content_area = Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width.saturating_sub(1),
+            height: area.height,
+        };
 
         let sidebar_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(2), Constraint::Min(5)])
-            .split(area);
+            .split(content_area);
 
         // Tab selector with icons
         let titles = vec![
@@ -46,31 +49,29 @@ impl Widget for Sidebar {
         ];
         let tabs = Tabs::new(titles)
             .select(app.sidebar_tab)
-            .style(Style::default().fg(OVERLAY0))
+            .style(Style::default().fg(t.overlay0))
             .highlight_style(
                 Style::default()
-                    .fg(CYAN)
+                    .fg(t.cyan)
                     .add_modifier(Modifier::BOLD),
             )
-            .divider(Span::styled(" \u{2502} ", Style::default().fg(SURFACE0)));
+            .divider(Span::styled(" \u{2502} ", Style::default().fg(t.surface0)));
         f.render_widget(tabs, sidebar_chunks[0]);
 
         // Tab content
         match app.sidebar_tab {
-            0 => render_file_tree(f, sidebar_chunks[1]),
-            1 => render_tools_list(f, app, sidebar_chunks[1]),
-            2 => render_tasks_list(f, app, sidebar_chunks[1]),
+            0 => render_file_tree(f, sidebar_chunks[1], t),
+            1 => render_tools_list(f, app, sidebar_chunks[1], t),
+            2 => render_tasks_list(f, app, sidebar_chunks[1], t),
             _ => {}
         }
-
-        f.render_widget(block, area);
     }
 }
 
-fn render_file_tree(f: &mut Frame, area: Rect) {
-    let dir = Style::default().fg(BLUE).add_modifier(Modifier::BOLD);
-    let file = Style::default().fg(TEXT);
-    let toml = Style::default().fg(YELLOW);
+fn render_file_tree(f: &mut Frame, area: Rect, t: &Theme) {
+    let dir = Style::default().fg(t.blue).add_modifier(Modifier::BOLD);
+    let file = Style::default().fg(t.text);
+    let toml = Style::default().fg(t.yellow);
 
     let items = vec![
         ListItem::new(Line::from(vec![
@@ -86,11 +87,11 @@ fn render_file_tree(f: &mut Frame, area: Rect) {
             Span::styled("cli/", dir),
         ])),
         ListItem::new(Line::from(vec![
-            Span::styled("     \u{1f980} ", Style::default().fg(TEAL)),
+            Span::styled("     \u{1f980} ", Style::default().fg(t.teal)),
             Span::styled("main.rs", file),
         ])),
         ListItem::new(Line::from(vec![
-            Span::styled("     \u{1f980} ", Style::default().fg(TEAL)),
+            Span::styled("     \u{1f980} ", Style::default().fg(t.teal)),
             Span::styled("lib.rs", file),
         ])),
         ListItem::new(Line::from(vec![
@@ -110,7 +111,7 @@ fn render_file_tree(f: &mut Frame, area: Rect) {
     f.render_widget(list, area);
 }
 
-fn render_tools_list(f: &mut Frame, app: &TuiApp, area: Rect) {
+fn render_tools_list(f: &mut Frame, app: &TuiApp, area: Rect, t: &Theme) {
     let tools = [
         ("read_file", "\u{1f4d6}"),
         ("write_file", "\u{1f4dd}"),
@@ -125,29 +126,29 @@ fn render_tools_list(f: &mut Frame, app: &TuiApp, area: Rect) {
     let header = ListItem::new(Line::from(vec![
         Span::styled(
             format!("  {} Tools ", "\u{1f527}"),
-            Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+            Style::default().fg(t.cyan).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!("({})", app.tool_count),
-            Style::default().fg(OVERLAY0),
+            Style::default().fg(t.overlay0),
         ),
     ]));
     let mut all_items = vec![header];
     for (name, icon) in &tools {
         all_items.push(ListItem::new(Line::from(vec![
-            Span::styled(format!("    {} ", icon), Style::default().fg(SUBTEXT)),
-            Span::styled(*name, Style::default().fg(LAVENDER)),
+            Span::styled(format!("    {} ", icon), Style::default().fg(t.subtext)),
+            Span::styled(*name, Style::default().fg(t.lavender)),
         ])));
     }
     let list = List::new(all_items);
     f.render_widget(list, area);
 }
 
-fn render_tasks_list(f: &mut Frame, app: &TuiApp, area: Rect) {
+fn render_tasks_list(f: &mut Frame, app: &TuiApp, area: Rect, t: &Theme) {
     let header = ListItem::new(Line::from(vec![
         Span::styled(
             format!("  {} Active Tasks", "\u{1f4cb}"),
-            Style::default().fg(CYAN).add_modifier(Modifier::BOLD),
+            Style::default().fg(t.cyan).add_modifier(Modifier::BOLD),
         ),
     ]));
 
@@ -155,15 +156,15 @@ fn render_tasks_list(f: &mut Frame, app: &TuiApp, area: Rect) {
         ListItem::new(Line::from(vec![
             Span::styled(
                 format!("    {} ", "\u{25b6}"),
-                Style::default().fg(GREEN),
+                Style::default().fg(t.green),
             ),
-            Span::styled(task.clone(), Style::default().fg(TEXT)),
+            Span::styled(task.clone(), Style::default().fg(t.text)),
         ]))
     } else {
         ListItem::new(Line::from(vec![
             Span::styled(
                 format!("    {} No active tasks", "\u{25cb}"),
-                Style::default().fg(OVERLAY0).add_modifier(Modifier::ITALIC),
+                Style::default().fg(t.overlay0).add_modifier(Modifier::ITALIC),
             ),
         ]))
     };

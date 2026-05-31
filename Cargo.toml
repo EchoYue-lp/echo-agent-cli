@@ -79,6 +79,7 @@ unicode-width = "0.2"
 textwrap = "0.16"
 strum = "0.26"
 strum_macros = "0.26"
+libc = "0.2"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

@@ -1,10 +1,9 @@
-//! Chat area widget — modern message display with Catppuccin Mocha palette.
+//! Chat area widget — modern message display with adaptive theme.
 
 use crate::tui::markdown::render_markdown;
-use crate::tui::{MessageRole, ToolCallStatus, TuiApp};
+use crate::tui::{MessageRole, Theme, ToolCallStatus, TuiApp};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::symbols;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
@@ -13,46 +12,20 @@ use ratatui::Frame;
 
 use super::Widget;
 
-// Catppuccin Mocha palette
-const BASE: Color = Color::Rgb(30, 30, 46);
-const MANTLE: Color = Color::Rgb(24, 24, 37);
-const SURFACE0: Color = Color::Rgb(49, 50, 68);
-const SURFACE1: Color = Color::Rgb(69, 71, 90);
-const OVERLAY0: Color = Color::Rgb(108, 112, 134);
-const TEXT: Color = Color::Rgb(205, 214, 244);
-const SUBTEXT: Color = Color::Rgb(166, 173, 200);
-const BLUE: Color = Color::Rgb(137, 180, 250);
-const GREEN: Color = Color::Rgb(166, 227, 161);
-const YELLOW: Color = Color::Rgb(249, 226, 175);
-const PEACH: Color = Color::Rgb(250, 179, 135);
-const MAUVE: Color = Color::Rgb(203, 166, 247);
-const TEAL: Color = Color::Rgb(148, 226, 213);
-const RED: Color = Color::Rgb(243, 139, 168);
-const LAVENDER: Color = Color::Rgb(180, 190, 254);
-
 pub struct Chat;
 
 impl Widget for Chat {
     fn render(&self, f: &mut Frame, area: Rect, app: &TuiApp) {
-        // Rounded border with subtle color
-        let block = Block::default()
-            .title(format!(
-                " {} {} messages ",
-                "\u{1f4ac}",
-                app.messages.len()
-            ))
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(SURFACE1));
+        let t = &app.theme;
 
-        let inner = block.inner(area);
-        f.render_widget(block, area);
+        // No border — use full area for a seamless look
+        let inner = area;
 
         // Build all chat lines.
         let mut lines: Vec<Line<'static>> = Vec::new();
 
         for msg in &app.messages {
-            render_message(&mut lines, &msg.role, &msg.content, &msg.tool_calls);
+            render_message(&mut lines, &msg.role, &msg.content, &msg.tool_calls, t);
         }
 
         // Show streaming text if processing.
@@ -62,18 +35,18 @@ impl Widget for Chat {
                 Span::styled(
                     format!(" {} Agent ", "\u{2728}"),
                     Style::default()
-                        .fg(BASE)
-                        .bg(GREEN)
+                        .fg(t.bg)
+                        .bg(t.green)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     " streaming...",
-                    Style::default().fg(YELLOW).add_modifier(Modifier::ITALIC),
+                    Style::default().fg(t.yellow).add_modifier(Modifier::ITALIC),
                 ),
             ]));
             let md_lines = render_markdown(&app.streaming_text);
             for line in md_lines {
-                lines.push(indent_line(line));
+                lines.push(indent_line(line, t.surface0));
             }
         } else if app.is_processing {
             lines.push(Line::from(""));
@@ -81,14 +54,14 @@ impl Widget for Chat {
                 Span::styled(
                     format!(" {} Agent ", "\u{2728}"),
                     Style::default()
-                        .fg(BASE)
-                        .bg(GREEN)
+                        .fg(t.bg)
+                        .bg(t.green)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!(" {} thinking...", "\u{25dc}"),
                     Style::default()
-                        .fg(YELLOW)
+                        .fg(t.yellow)
                         .add_modifier(Modifier::ITALIC),
                 ),
             ]));
@@ -108,12 +81,12 @@ impl Widget for Chat {
             .scroll((scroll, 0));
         f.render_widget(paragraph, inner);
 
-        // Scrollbar with Catppuccin colors
+        // Scrollbar with theme colors
         if total_lines > visible {
             let mut state = ScrollbarState::new(total_lines).position(scroll as usize);
             let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                .style(Style::default().fg(SURFACE0))
-                .thumb_style(Style::default().fg(OVERLAY0));
+                .style(Style::default().fg(t.surface0))
+                .thumb_style(Style::default().fg(t.overlay0));
             f.render_stateful_widget(
                 scrollbar,
                 Rect {
@@ -133,6 +106,7 @@ fn render_message(
     role: &MessageRole,
     content: &str,
     tool_calls: &[crate::tui::ToolCallInfo],
+    t: &Theme,
 ) {
     match role {
         MessageRole::User => {
@@ -142,8 +116,8 @@ fn render_message(
                 Span::styled(
                     format!(" {} You ", "\u{1f464}"),
                     Style::default()
-                        .fg(BASE)
-                        .bg(BLUE)
+                        .fg(t.bg)
+                        .bg(t.blue)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" "),
@@ -151,8 +125,8 @@ fn render_message(
             // User content as plain text with subtle indent
             for line in content.lines() {
                 lines.push(Line::from(vec![
-                    Span::styled("    ", Style::default().fg(SUBTEXT)),
-                    Span::styled(line.to_string(), Style::default().fg(TEXT)),
+                    Span::styled("    ", Style::default().fg(t.subtext)),
+                    Span::styled(line.to_string(), Style::default().fg(t.text)),
                 ]));
             }
         }
@@ -163,8 +137,8 @@ fn render_message(
                 Span::styled(
                     format!(" {} Agent ", "\u{2728}"),
                     Style::default()
-                        .fg(BASE)
-                        .bg(GREEN)
+                        .fg(t.bg)
+                        .bg(t.green)
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" "),
@@ -172,17 +146,17 @@ fn render_message(
             // Render with markdown
             let md_lines = render_markdown(content);
             for line in md_lines {
-                lines.push(indent_line(line));
+                lines.push(indent_line(line, t.surface0));
             }
             // Show tool calls with better icons
             for tc in tool_calls {
                 let (icon, color) = match tc.status {
-                    ToolCallStatus::Running => ("\u{25dc}", YELLOW),
-                    ToolCallStatus::Success => ("\u{2714}", GREEN),
-                    ToolCallStatus::Failed => ("\u{2718}", RED),
+                    ToolCallStatus::Running => ("\u{25dc}", t.yellow),
+                    ToolCallStatus::Success => ("\u{2714}", t.green),
+                    ToolCallStatus::Failed => ("\u{2718}", t.red),
                 };
                 lines.push(Line::from(vec![
-                    Span::styled("    ", Style::default().fg(SUBTEXT)),
+                    Span::styled("    ", Style::default().fg(t.subtext)),
                     Span::styled(
                         format!("{} ", icon),
                         Style::default().fg(color),
@@ -190,7 +164,7 @@ fn render_message(
                     Span::styled(
                         tc.name.clone(),
                         Style::default()
-                            .fg(LAVENDER)
+                            .fg(t.lavender)
                             .add_modifier(Modifier::BOLD),
                     ),
                 ]));
@@ -201,12 +175,12 @@ fn render_message(
             lines.push(Line::from(vec![
                 Span::styled(
                     format!(" {} ", "\u{2139}"),
-                    Style::default().fg(BASE).bg(SURFACE1),
+                    Style::default().fg(t.bg).bg(t.surface1),
                 ),
                 Span::styled(
                     format!(" {}", content.to_string()),
                     Style::default()
-                        .fg(SUBTEXT)
+                        .fg(t.subtext)
                         .add_modifier(Modifier::ITALIC),
                 ),
             ]));
@@ -215,11 +189,11 @@ fn render_message(
             lines.push(Line::from(vec![
                 Span::styled(
                     format!(" {} Tool ", "\u{1f527}"),
-                    Style::default().fg(BASE).bg(MAUVE),
+                    Style::default().fg(t.bg).bg(t.mauve),
                 ),
                 Span::styled(
                     format!(" {}", content.to_string()),
-                    Style::default().fg(MAUVE),
+                    Style::default().fg(t.mauve),
                 ),
             ]));
         }
@@ -227,8 +201,8 @@ fn render_message(
 }
 
 /// Indent a rendered markdown line with a subtle guide character.
-fn indent_line(line: Line<'static>) -> Line<'static> {
-    let mut spans = vec![Span::styled("  \u{2502} ", Style::default().fg(SURFACE0))];
+fn indent_line(line: Line<'static>, guide_color: Color) -> Line<'static> {
+    let mut spans = vec![Span::styled("  \u{2502} ", Style::default().fg(guide_color))];
     spans.extend(line.spans.into_iter());
     Line::from(spans)
 }

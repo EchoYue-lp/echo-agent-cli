@@ -29,8 +29,139 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use ratatui::style::Color;
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io;
+
+// ── Theme ───────────────────────────────────────────────────────────────────
+
+/// Color theme that adapts to terminal background.
+#[derive(Clone, Debug)]
+pub struct Theme {
+    /// Whether terminal has a dark background.
+    pub is_dark: bool,
+    // Base colors
+    pub bg: Color,
+    pub surface0: Color,
+    pub surface1: Color,
+    pub overlay0: Color,
+    // Text colors
+    pub text: Color,
+    pub subtext: Color,
+    // Accent colors (same for both themes)
+    pub blue: Color,
+    pub green: Color,
+    pub yellow: Color,
+    pub peach: Color,
+    pub mauve: Color,
+    pub teal: Color,
+    pub red: Color,
+    pub cyan: Color,
+    pub lavender: Color,
+}
+
+impl Theme {
+    /// Dark theme — black background, white text.
+    fn dark() -> Self {
+        Self {
+            is_dark: true,
+            bg: Color::Rgb(0, 0, 0),
+            surface0: Color::Rgb(20, 20, 20),
+            surface1: Color::Rgb(40, 40, 40),
+            overlay0: Color::Rgb(100, 100, 100),
+            text: Color::Rgb(255, 255, 255),
+            subtext: Color::Rgb(180, 180, 180),
+            blue: Color::Rgb(100, 149, 237),    // cornflower blue
+            green: Color::Rgb(80, 220, 100),
+            yellow: Color::Rgb(255, 215, 0),     // gold
+            peach: Color::Rgb(255, 165, 80),
+            mauve: Color::Rgb(180, 130, 255),
+            teal: Color::Rgb(0, 200, 180),
+            red: Color::Rgb(255, 80, 80),
+            cyan: Color::Rgb(0, 200, 220),
+            lavender: Color::Rgb(170, 150, 255),
+        }
+    }
+
+    /// Catppuccin Latte — for light terminal backgrounds.
+    fn light() -> Self {
+        Self {
+            is_dark: false,
+            bg: Color::Rgb(239, 241, 245),
+            surface0: Color::Rgb(204, 208, 218),
+            surface1: Color::Rgb(188, 192, 204),
+            overlay0: Color::Rgb(124, 127, 143),
+            text: Color::Rgb(76, 79, 105),
+            subtext: Color::Rgb(92, 95, 119),
+            blue: Color::Rgb(30, 102, 245),
+            green: Color::Rgb(64, 160, 43),
+            yellow: Color::Rgb(223, 142, 29),
+            peach: Color::Rgb(254, 100, 11),
+            mauve: Color::Rgb(136, 57, 239),
+            teal: Color::Rgb(23, 146, 153),
+            red: Color::Rgb(210, 15, 57),
+            cyan: Color::Rgb(4, 165, 229),
+            lavender: Color::Rgb(114, 135, 253),
+        }
+    }
+}
+
+/// Detect terminal background brightness via OSC 11 query.
+/// Returns `true` if the terminal has a dark background.
+fn detect_terminal_theme() -> bool {
+    use std::io::{Read, Write};
+    use std::time::Duration;
+
+    // Enter raw mode temporarily if not already.
+    let was_raw = crossterm::terminal::is_raw_mode_enabled().unwrap_or(false);
+    if !was_raw {
+        let _ = enable_raw_mode();
+    }
+
+    // Send OSC 11 background color query.
+    let _ = io::stderr().write_all(b"\x1b]11;?\x07");
+    let _ = io::stderr().flush();
+
+    // Read response with timeout.
+    let mut buf = [0u8; 64];
+    let mut stdin = io::stdin();
+    let mut n = 0;
+
+    // Use crossterm poll for timeout.
+    if crossterm::event::poll(Duration::from_millis(200)).unwrap_or(false) {
+        n = stdin.read(&mut buf).unwrap_or(0);
+    }
+
+    if !was_raw {
+        let _ = disable_raw_mode();
+    }
+
+    if n == 0 {
+        return true; // Default to dark if no response.
+    }
+
+    let response = String::from_utf8_lossy(&buf[..n]);
+
+    // Parse: \x1b]11;rgb:RRRR/GGGG/BBBB\x07 or \x1b]11;rgb:rr/gg/bb\x07
+    if let Some(rgb_start) = response.find("rgb:") {
+        let rest = &response[rgb_start + 4..];
+        let parts: Vec<&str> = rest.split('/').collect();
+        if parts.len() >= 3 {
+            let r = parts[0].trim_end_matches(|c: char| !c.is_ascii_hexdigit());
+            let g = parts[1].trim_end_matches(|c: char| !c.is_ascii_hexdigit());
+            let b = parts[2].trim_end_matches(|c: char| !c.is_ascii_hexdigit());
+            // Take first 2 hex digits.
+            let r = u8::from_str_radix(&r[..r.len().min(2)], 16).unwrap_or(128);
+            let g = u8::from_str_radix(&g[..g.len().min(2)], 16).unwrap_or(128);
+            let b = u8::from_str_radix(&b[..b.len().min(2)], 16).unwrap_or(128);
+            // Luminance: if < 128, it's dark.
+            let luminance = 0.299 * r as f64 + 0.587 * g as f64 + 0.114 * b as f64;
+            return luminance < 128.0;
+        }
+    }
+
+    true // Default to dark.
+}
 
 // ── Public types ────────────────────────────────────────────────────────────
 
@@ -86,6 +217,8 @@ pub struct TuiApp {
     pub picker: Option<picker::Picker>,
     /// Keymap.
     pub keymap: keymap::Keymap,
+    /// Color theme (auto-detected from terminal).
+    pub theme: Theme,
 }
 
 #[derive(Clone, Debug)]
@@ -133,7 +266,7 @@ pub struct ApprovalRequest {
 // ── TuiApp methods ──────────────────────────────────────────────────────────
 
 impl TuiApp {
-    pub fn new(model: String, mode: String) -> Self {
+    pub fn new(model: String, mode: String, theme: Theme) -> Self {
         let mut km = keymap::Keymap::default();
         km.load_overrides();
 
@@ -170,6 +303,7 @@ impl TuiApp {
             permission_mode: "ask".to_string(),
             picker: None,
             keymap: km,
+            theme,
         }
     }
 
@@ -178,8 +312,10 @@ impl TuiApp {
         if self.input.starts_with('/') && !self.input.contains(' ') {
             self.suggestions = commands::SlashCommand::complete(&self.input);
             self.selected_suggestion = 0;
+            self.suggestion_scroll = 0;
         } else {
             self.suggestions.clear();
+            self.suggestion_scroll = 0;
         }
     }
 
@@ -267,27 +403,25 @@ impl TuiApp {
 
 /// RAII guard that sets up the terminal on creation and restores it on drop.
 ///
-/// Also installs a panic hook that restores the terminal before the default
-/// panic handler runs, preventing terminal corruption on crash.
+/// Redirects stderr to a log file at the OS file-descriptor level, so the
+/// existing tracing subscriber (set up in `main()`) writes to the file
+/// instead of corrupting the TUI screen.
 struct TerminalGuard {
-    _log_guard: Option<LogGuard>,
-}
-
-/// Holds the tracing subscriber guard so logs go to file instead of stderr.
-struct LogGuard {
-    _file: std::fs::File,
+    saved_stderr: Option<i32>,
+    _log_file: Option<std::fs::File>,
 }
 
 impl TerminalGuard {
     fn new() -> Self {
-        // 1. Redirect tracing to a file before entering alternate screen.
-        let log_guard = Self::setup_file_logging();
+        // 1. Redirect stderr to a log file via dup2.
+        let (saved_stderr, log_file) = Self::redirect_stderr();
 
         // 2. Enter raw mode + alternate screen.
         let _ = enable_raw_mode();
         let _ = execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture);
 
         // 3. Install panic hook that restores terminal.
+        let saved = saved_stderr;
         let default_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             let _ = disable_raw_mode();
@@ -297,40 +431,51 @@ impl TerminalGuard {
                 DisableMouseCapture,
                 Show
             );
+            // Restore stderr so panic message goes to real terminal.
+            if let Some(fd) = saved {
+                unsafe { libc::dup2(fd, 2); }
+            }
             default_hook(info);
         }));
 
         TerminalGuard {
-            _log_guard: log_guard,
+            saved_stderr,
+            _log_file: log_file,
         }
     }
 
-    fn setup_file_logging() -> Option<LogGuard> {
-        use tracing_subscriber::fmt;
-        use tracing_subscriber::EnvFilter;
-
+    /// Redirect stderr to a log file using dup2.
+    /// Returns (saved_stderr_fd, log_file) so we can restore on drop.
+    fn redirect_stderr() -> (Option<i32>, Option<std::fs::File>) {
         let log_path = "/tmp/echo-agent-tui.log";
         let file = match std::fs::File::create(log_path) {
             Ok(f) => f,
-            Err(_) => return None,
+            Err(_) => return (None, None),
         };
 
-        // Try to set as the global default. If one is already set (which it
-        // usually is from main()), this will silently fail — that's fine,
-        // the existing subscriber's output will go wherever it was configured.
-        // We still keep the file handle alive so we can return it.
-        let _ = fmt()
-            .with_env_filter(EnvFilter::from_default_env())
-            .with_writer(file.try_clone().ok()?)
-            .with_ansi(false)
-            .try_init();
-
-        Some(LogGuard { _file: file })
+        unsafe {
+            use std::os::fd::AsRawFd;
+            let log_fd = file.as_raw_fd();
+            // Save the original stderr fd.
+            let saved = libc::dup(2);
+            if saved < 0 {
+                return (None, Some(file));
+            }
+            // Redirect stderr (fd 2) to the log file.
+            libc::dup2(log_fd, 2);
+            (Some(saved), Some(file))
+        }
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        // Restore stderr first so any error output goes to the real terminal.
+        if let Some(saved) = self.saved_stderr.take() {
+            unsafe { libc::dup2(saved, 2); }
+            unsafe { libc::close(saved); }
+        }
+
         let _ = disable_raw_mode();
         let _ = execute!(
             io::stdout(),
@@ -338,7 +483,6 @@ impl Drop for TerminalGuard {
             DisableMouseCapture,
             Show
         );
-        // Flush stdout to ensure any pending output is written.
         use std::io::Write;
         let _ = io::stdout().flush();
     }
@@ -351,7 +495,11 @@ impl Drop for TerminalGuard {
 /// This function handles all terminal setup/teardown via [`TerminalGuard`],
 /// so the terminal is always restored even on panic or early return.
 pub async fn run_tui(agent: AgentHandle) -> anyhow::Result<()> {
-    // Create the RAII guard — sets up terminal + logging redirect.
+    // Detect terminal theme BEFORE creating the guard (queries terminal).
+    let is_dark = detect_terminal_theme();
+    let theme = if is_dark { Theme::dark() } else { Theme::light() };
+
+    // Create the RAII guard — redirects stderr + sets up terminal.
     let _guard = TerminalGuard::new();
 
     // Build the terminal.
@@ -372,7 +520,7 @@ pub async fn run_tui(agent: AgentHandle) -> anyhow::Result<()> {
         })
         .await;
 
-    let mut app = TuiApp::new(model, mode);
+    let mut app = TuiApp::new(model, mode, theme);
     app.tool_count = 24; // Default estimate, updated dynamically.
 
     // Main event loop.
