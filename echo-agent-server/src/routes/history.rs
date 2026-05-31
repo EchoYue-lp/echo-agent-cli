@@ -110,7 +110,7 @@ fn default_format() -> String {
 ///   "total": 2
 /// }
 /// ```
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn get_history(State(state): State<Arc<AppState>>) -> Response {
     let messages = state
         .connection
@@ -161,7 +161,7 @@ pub async fn get_history(State(state): State<Arc<AppState>>) -> Response {
 /// ```text
 /// GET /api/history/export?format=markdown
 /// ```
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn export_history(
     State(state): State<Arc<AppState>>,
     query: axum::extract::Query<ExportQuery>,

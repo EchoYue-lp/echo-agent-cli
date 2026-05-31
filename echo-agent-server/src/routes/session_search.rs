@@ -46,7 +46,7 @@ pub struct ReindexResponse {
 // ── Handlers ──────────────────────────────────────────────────────
 
 /// GET /api/sessions/search?q=<query>&limit=20
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn search_sessions(
     State(state): State<Arc<AppState>>,
     Query(params): Query<SearchQuery>,
@@ -83,7 +83,7 @@ pub async fn search_sessions(
 }
 
 /// POST /api/sessions/reindex — 重建全文索引
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn reindex_sessions(State(state): State<Arc<AppState>>) -> Response {
     match state.storage.search_engine.reindex_all() {
         Ok(count) => Json(ReindexResponse {

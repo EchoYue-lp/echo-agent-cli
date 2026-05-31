@@ -132,7 +132,7 @@ pub struct ValidateSchemaResponse {
 ///   }
 /// }
 /// ```
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn extract(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ExtractRequest>,
@@ -174,7 +174,7 @@ pub async fn extract(
 ///   "errors": []
 /// }
 /// ```
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn validate_schema(Json(req): Json<ValidateSchemaRequest>) -> Response {
     let mut errors = Vec::new();
 
@@ -195,7 +195,7 @@ pub async fn validate_schema(Json(req): Json<ValidateSchemaRequest>) -> Response
 /// GET /api/extract/examples - 获取结构化输出示例
 ///
 /// 返回一些常见场景的 JSON Schema 示例。
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn get_examples() -> Response {
     Json(json!({
         "examples": [

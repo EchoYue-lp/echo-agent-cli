@@ -11,14 +11,14 @@ use crate::error::WebError;
 use crate::state::AppState;
 
 /// GET /api/tools - 列出所有已注册工具
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn list_tools(State(state): State<Arc<AppState>>) -> Response {
     let tools = state.get_tool_infos(&state.connection.agent).await;
     Json(tools).into_response()
 }
 
 /// GET /api/tools/{name} - 获取工具详情
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn get_tool(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
     let tools = state.get_tool_infos(&state.connection.agent).await;
 
@@ -29,7 +29,7 @@ pub async fn get_tool(State(state): State<Arc<AppState>>, Path(name): Path<Strin
 }
 
 /// POST /api/tools/{name}/enable - 启用工具
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn enable_tool(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
     // 更新工具状态
     {
@@ -54,7 +54,7 @@ pub async fn enable_tool(State(state): State<Arc<AppState>>, Path(name): Path<St
 }
 
 /// POST /api/tools/{name}/disable - 禁用工具
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn disable_tool(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,

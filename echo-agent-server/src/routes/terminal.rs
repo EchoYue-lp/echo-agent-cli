@@ -108,6 +108,10 @@ impl Default for TerminalManager {
     }
 }
 
+// Global terminal manager — sessions are intentionally persistent across
+// the server lifetime so that users can reconnect to existing terminals.
+// This is acceptable for a single-user local tool; a multi-tenant server
+// would scope sessions per-user instead.
 lazy_static::lazy_static! {
     static ref TERMINAL_MANAGER: TerminalManager = TerminalManager::new();
 }

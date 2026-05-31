@@ -114,7 +114,7 @@ pub struct CompressionStatsResponse {
 ///   "message": "压缩完成: 50 -> 20 消息, 节省 30 tokens"
 /// }
 /// ```
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn compress(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CompressRequest>,
@@ -160,7 +160,7 @@ pub async fn compress(
 ///   "needs_compression": false
 /// }
 /// ```
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn get_compression_stats(State(state): State<Arc<AppState>>) -> Response {
     let (message_count, current_tokens, token_limit) = state
         .connection

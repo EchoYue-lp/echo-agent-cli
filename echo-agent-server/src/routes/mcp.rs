@@ -74,7 +74,7 @@ fn transport_to_entry(transport: &McpTransportConfig) -> echo_agent::mcp::McpSer
 }
 
 /// GET /api/mcp - 列出所有 MCP 服务端状态
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 #[allow(clippy::unnecessary_filter_map)]
 pub async fn list_mcp_servers(State(state): State<Arc<AppState>>) -> Response {
     let mcp_config = state.plugins.mcp_config.read().await;
@@ -212,7 +212,7 @@ fn validate_mcp_stdio_command(command: &str, args: &[String]) -> Result<(), WebE
 }
 
 /// POST /api/mcp/connect - 连接新的 MCP 服务端
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn connect_mcp_server(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ConnectMcpRequest>,
@@ -243,10 +243,16 @@ pub async fn connect_mcp_server(
             )
         }
         McpTransportConfig::Http { url, headers } => {
+            if let Err(e) = validate_mcp_url(url) {
+                return e.into_response();
+            }
             let headers_clone = headers.clone();
             McpServerConfig::http_with_headers(req.name.as_str(), url.as_str(), headers_clone)
         }
         McpTransportConfig::Sse { url, headers } => {
+            if let Err(e) = validate_mcp_url(url) {
+                return e.into_response();
+            }
             let headers_clone = headers.clone();
             McpServerConfig::sse_with_headers(req.name.as_str(), url.as_str(), headers_clone)
         }
@@ -303,7 +309,7 @@ pub async fn connect_mcp_server(
 }
 
 /// GET /api/mcp/{name} - 获取指定 MCP 服务端详情
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn get_mcp_server(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -370,7 +376,7 @@ pub async fn get_mcp_server(
 }
 
 /// POST /api/mcp/{name}/disconnect - 断开 MCP 服务端
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn disconnect_mcp_server(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -428,7 +434,7 @@ pub async fn disconnect_mcp_server(
 }
 
 /// GET /api/mcp/health - 获取所有 MCP 服务端健康状态
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn get_mcp_health(State(state): State<Arc<AppState>>) -> Response {
     let health = state.plugins.mcp_health.read().await;
     let health_list: Vec<&crate::state::McpHealthStatus> = health.values().collect();
@@ -436,18 +442,94 @@ pub async fn get_mcp_health(State(state): State<Arc<AppState>>) -> Response {
 }
 
 /// GET /api/mcp/config - 获取完整的 MCP 配置文件
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn get_mcp_config(State(state): State<Arc<AppState>>) -> Response {
     let config = state.plugins.mcp_config.read().await;
     Json(config.clone()).into_response()
 }
 
+/// 验证 MCP HTTP/SSE URL 是否指向私有 IP（SSRF 防护）
+fn validate_mcp_url(url: &str) -> Result<(), WebError> {
+    let parsed = url::Url::parse(url)
+        .map_err(|e| WebError::Validation(format!("Invalid URL '{}': {}", url, e)))?;
+
+    let scheme = parsed.scheme();
+    if scheme != "http" && scheme != "https" {
+        return Err(WebError::Validation(format!(
+            "URL scheme must be http or https, got '{}'",
+            scheme
+        )));
+    }
+
+    let host = parsed.host_str().unwrap_or("");
+
+    // Block well-known local hostnames
+    if host == "localhost" || host.ends_with(".localhost") || host == "[::1]" {
+        return Err(WebError::Validation(format!(
+            "MCP URL must not point to localhost: {}",
+            url
+        )));
+    }
+
+    // Block private/reserved IP addresses
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        if is_private_ip(&ip) {
+            return Err(WebError::Validation(format!(
+                "MCP URL must not point to a private/reserved IP address: {}",
+                url
+            )));
+        }
+    }
+    // Note: DNS resolution for hostname-based SSRF checks is intentionally
+    // not performed here to avoid TOCTOU issues. IP-based checks and
+    // hostname blocklists provide the primary defense layer.
+
+    Ok(())
+}
+
+/// Check whether an IP address is private or reserved (RFC 1918, loopback, link-local, etc.)
+fn is_private_ip(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ipv4) => {
+            ipv4.is_loopback()
+                || ipv4.is_private()
+                || ipv4.is_link_local()
+                || ipv4.is_broadcast()
+                || ipv4.is_unspecified()
+                // Additional reserved ranges
+                || ipv4.octets()[0] == 100 && (ipv4.octets()[1] & 0xC0) == 64 // 100.64.0.0/10 (CGNAT)
+                || ipv4.octets()[0] == 192 && ipv4.octets()[1] == 0 && ipv4.octets()[2] == 0 // 192.0.0.0/24
+                || ipv4.octets()[0] == 198 && (ipv4.octets()[1] & 0xFE) == 18 // 198.18.0.0/15 (benchmarking)
+        }
+        std::net::IpAddr::V6(ipv6) => {
+            ipv6.is_loopback() || ipv6.is_unspecified()
+        }
+    }
+}
+
 /// PUT /api/mcp/config - 更新完整的 MCP 配置文件
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn update_mcp_config(
     State(state): State<Arc<AppState>>,
     Json(config): Json<McpConfigFile>,
 ) -> Response {
+    // SSRF validation: check all HTTP/SSE URLs in the config
+    for (name, entry) in &config.mcp_servers {
+        if let Some(ref url) = entry.url {
+            if let Err(e) = validate_mcp_url(url) {
+                return WebError::Validation(format!(
+                    "MCP server '{}': {}",
+                    name,
+                    match e {
+                        WebError::Validation(msg) => msg,
+                        _ => "URL validation failed".to_string(),
+                    }
+                ))
+                .into_response();
+            }
+        }
+    }
+
     // 验证配置
     match config.to_server_configs() {
         Ok(server_configs) => {

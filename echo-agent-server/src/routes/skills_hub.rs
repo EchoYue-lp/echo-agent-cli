@@ -36,7 +36,7 @@ pub struct UninstallRequest {
 // ── Handlers ────────────────────────────────────────────────────
 
 /// GET /api/skills-hub — 列出 Skills Hub 中所有可用技能
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn list_hub_skills(State(state): State<Arc<AppState>>) -> Response {
     let hub = state.skills_hub.read().await;
     let entries = hub.list();
@@ -44,7 +44,7 @@ pub async fn list_hub_skills(State(state): State<Arc<AppState>>) -> Response {
 }
 
 /// GET /api/skills-hub/search?q=xxx — 搜索技能
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn search_hub_skills(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
@@ -59,7 +59,7 @@ pub async fn search_hub_skills(
 }
 
 /// GET /api/skills-hub/:name — 获取技能详情
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn get_hub_skill(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(name): axum::extract::Path<String>,
@@ -73,7 +73,7 @@ pub async fn get_hub_skill(
 }
 
 /// POST /api/skills-hub/install/local — 从本地目录安装
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn install_local(
     State(state): State<Arc<AppState>>,
     Json(req): Json<InstallLocalRequest>,
@@ -97,7 +97,7 @@ pub async fn install_local(
 }
 
 /// POST /api/skills-hub/install/git — 从 Git 仓库安装
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn install_git(
     State(state): State<Arc<AppState>>,
     Json(req): Json<InstallGitRequest>,
@@ -121,7 +121,7 @@ pub async fn install_git(
 }
 
 /// POST /api/skills-hub/uninstall — 卸载技能
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn uninstall_skill(
     State(state): State<Arc<AppState>>,
     Json(req): Json<UninstallRequest>,
@@ -137,7 +137,7 @@ pub async fn uninstall_skill(
 }
 
 /// POST /api/skills-hub/refresh — 刷新索引
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn refresh_hub(State(state): State<Arc<AppState>>) -> Response {
     let mut hub = state.skills_hub.write().await;
     hub.refresh();

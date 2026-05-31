@@ -27,7 +27,7 @@ async fn cmd_plan(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 println!("Usage: /plan [on|off]");
             } else {
                 ctx.agent.write(|a| a.set_plan_mode(true)).await;
-                // TODO: Phase 2 — submit task via BackgroundTaskService
+                // TODO(v0.3): submit task via BackgroundTaskService
                 let task = args.join(" ");
                 println!("Plan mode ON. Task noted: {task}");
             }

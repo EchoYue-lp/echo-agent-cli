@@ -14,7 +14,7 @@ use crate::types::{SkillInfo, SkillSource};
 use serde::Deserialize;
 
 /// GET /api/skills - 列出所有已安装的 Skill
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn list_skills(State(state): State<Arc<AppState>>) -> Response {
     let skills = state
         .connection
@@ -38,7 +38,7 @@ pub async fn list_skills(State(state): State<Arc<AppState>>) -> Response {
 }
 
 /// GET /api/skills/:name - 获取指定 Skill 详情
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn get_skill(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
     let skill_opt = state
         .connection
@@ -69,7 +69,7 @@ pub async fn get_skill(State(state): State<Arc<AppState>>, Path(name): Path<Stri
 }
 
 /// POST /api/skills/load - 从目录加载 Skill
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn load_skills_from_dir(
     State(state): State<Arc<AppState>>,
     Json(req): Json<LoadSkillsRequest>,
@@ -145,7 +145,7 @@ fn is_flat_md_file(path: &str) -> bool {
 }
 
 /// POST /api/skills/upload - 从浏览器上传的目录文件加载 Skill
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn upload_skills(
     State(state): State<Arc<AppState>>,
     Json(req): Json<UploadSkillsRequest>,

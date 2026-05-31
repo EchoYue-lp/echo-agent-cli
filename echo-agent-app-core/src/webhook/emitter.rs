@@ -13,11 +13,14 @@ static GLOBAL_EMITTER: std::sync::LazyLock<WebhookEmitter> =
     std::sync::LazyLock::new(WebhookEmitter::new);
 
 /// 初始化全局 WebhookEmitter（应在启动时调用一次）
+///
+/// Non-blocking: spawns endpoint registration on the runtime instead of
+/// using `block_on`, which would panic if called from an async context.
 pub fn init_global(endpoints: Vec<WebhookEndpoint>) {
-    let rt = tokio::runtime::Handle::current();
-    rt.block_on(async {
+    let emitter = GLOBAL_EMITTER.clone();
+    tokio::spawn(async move {
         for ep in endpoints {
-            GLOBAL_EMITTER.add_endpoint(ep).await;
+            emitter.add_endpoint(ep).await;
         }
     });
 }

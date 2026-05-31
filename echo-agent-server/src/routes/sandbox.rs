@@ -89,6 +89,16 @@ pub async fn update_sandbox_config(
 ) -> Result<Json<serde_json::Value>, AppError> {
     tracing::info!("更新沙箱配置: {:?}", config);
     let mut sandbox_config = state.config.sandbox_config.write().await;
+
+    // Audit: warn when security level is being downgraded
+    if config.security_level < sandbox_config.security_level {
+        tracing::warn!(
+            from = ?sandbox_config.security_level,
+            to = ?config.security_level,
+            "AUDIT: Sandbox security level is being downgraded via API"
+        );
+    }
+
     sandbox_config.security_level = config.security_level;
     if let Some(mem) = config.max_memory_mb {
         sandbox_config.max_memory_mb = mem;
@@ -282,21 +292,29 @@ async fn execute_local(
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let exit_code = output.status.code();
 
-    // 截断过长的输出
+    // 截断过长的输出（使用 char-boundary-safe 截断避免切割多字节字符）
     let max_len = 100_000;
     let stdout = if stdout.len() > max_len {
+        let safe_len = (0..=max_len.min(stdout.len()))
+            .rev()
+            .find(|&i| stdout.is_char_boundary(i))
+            .unwrap_or(0);
         format!(
             "{}...(truncated, total {} bytes)",
-            &stdout[..max_len],
+            &stdout[..safe_len],
             stdout.len()
         )
     } else {
         stdout
     };
     let stderr = if stderr.len() > max_len {
+        let safe_len = (0..=max_len.min(stderr.len()))
+            .rev()
+            .find(|&i| stderr.is_char_boundary(i))
+            .unwrap_or(0);
         format!(
             "{}...(truncated, total {} bytes)",
-            &stderr[..max_len],
+            &stderr[..safe_len],
             stderr.len()
         )
     } else {

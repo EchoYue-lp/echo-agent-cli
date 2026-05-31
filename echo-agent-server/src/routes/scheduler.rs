@@ -64,7 +64,7 @@ pub struct SetStatusRequest {
 // ── Handlers ───────────────────────────────────────────────────────
 
 /// GET /api/scheduler/tasks — 列出所有定时任务
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn list_tasks(State(_state): State<Arc<AppState>>) -> Response {
     let store = TaskStore::new();
     match store.load_all() {
@@ -80,7 +80,7 @@ pub async fn list_tasks(State(_state): State<Arc<AppState>>) -> Response {
 }
 
 /// POST /api/scheduler/tasks — 添加定时任务
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn add_task(
     State(_state): State<Arc<AppState>>,
     Json(req): Json<AddTaskRequest>,
@@ -108,7 +108,7 @@ pub async fn add_task(
 }
 
 /// DELETE /api/scheduler/tasks/:id — 删除定时任务
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn remove_task(
     State(_state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
@@ -122,7 +122,7 @@ pub async fn remove_task(
 }
 
 /// PUT /api/scheduler/tasks/:id/status — 启用/禁用任务
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn set_task_status(
     State(_state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,
@@ -148,7 +148,7 @@ pub async fn set_task_status(
 }
 
 /// POST /api/scheduler/tasks/:id/run — 手动触发一次任务
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn run_task(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<String>,

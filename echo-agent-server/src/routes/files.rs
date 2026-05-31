@@ -102,7 +102,7 @@ pub struct TreeNode {
 // ── Handlers ───────────────────────────────────────────────────────
 
 /// GET /api/files/list — list directory entries
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn list_files(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ListParams>,
@@ -166,7 +166,7 @@ pub async fn list_files(
 }
 
 /// GET /api/files/read — read file content
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn read_file(
     State(state): State<Arc<AppState>>,
     Query(params): Query<ReadParams>,
@@ -212,7 +212,7 @@ pub async fn read_file(
 }
 
 /// GET /api/files/diff — compute git diff for a file
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn diff_file(
     State(state): State<Arc<AppState>>,
     Query(params): Query<DiffParams>,
@@ -333,7 +333,7 @@ pub async fn diff_file(
 }
 
 /// GET /api/files/tree — recursive file tree
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn file_tree(
     State(state): State<Arc<AppState>>,
     Query(params): Query<TreeParams>,
@@ -460,7 +460,7 @@ pub struct BrowseEntry {
 }
 
 /// GET /api/files/browse — browse directories for workspace selection
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn browse_directories(
     Query(params): Query<BrowseParams>,
 ) -> Response {

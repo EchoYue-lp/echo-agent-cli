@@ -126,7 +126,7 @@ fn get_providers() -> Vec<ProviderInfo> {
 // ── Endpoints ─────────────────────────────────────────────────────────────────
 
 /// GET /api/providers — 列出所有供应商及配置状态
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 async fn list_providers(State(_state): State<Arc<AppState>>) -> Response {
     let providers = get_providers();
 
@@ -200,7 +200,7 @@ pub struct TestConnectionRequest {
     pub base_url: Option<String>,
 }
 
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 async fn test_connection(
     State(_state): State<Arc<AppState>>,
     Json(req): Json<TestConnectionRequest>,
@@ -278,7 +278,7 @@ pub struct SwitchModelRequest {
     pub max_tokens: Option<u32>,
 }
 
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 async fn switch_model(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SwitchModelRequest>,

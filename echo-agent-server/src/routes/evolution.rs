@@ -40,7 +40,7 @@ pub struct CuratorActionRequest {
 
 // ── Trajectory Endpoints ──────────────────────────────────────────
 
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn list_trajectories(
     State(_state): State<Arc<AppState>>,
     Query(params): Query<TrajectoryListParams>,
@@ -61,7 +61,7 @@ pub async fn list_trajectories(
     }
 }
 
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn trajectory_stats(
     State(_state): State<Arc<AppState>>,
 ) -> Response {
@@ -88,7 +88,7 @@ pub async fn trajectory_stats(
 
 // ── Background Review ─────────────────────────────────────────────
 
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn run_review(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ReviewRequest>,
@@ -176,7 +176,7 @@ pub async fn run_review(
 
 // ── Curator ───────────────────────────────────────────────────────
 
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn curator_action(
     State(_state): State<Arc<AppState>>,
     Json(req): Json<CuratorActionRequest>,

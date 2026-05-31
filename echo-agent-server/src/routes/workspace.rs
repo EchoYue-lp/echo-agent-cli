@@ -91,7 +91,7 @@ pub struct LinkProjectRequest {
 
 // ── GET /api/workspaces — list all workspaces ────────────────────────
 
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn list_workspaces(State(state): State<Arc<AppState>>) -> Response {
     match state.workspace.registry.list() {
         Ok(workspaces) => Json(serde_json::json!({
@@ -108,7 +108,7 @@ pub async fn list_workspaces(State(state): State<Arc<AppState>>) -> Response {
 
 // ── POST /api/workspaces — create workspace ──────────────────────────
 
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn create_workspace(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreateWorkspaceRequest>,
@@ -155,7 +155,7 @@ pub async fn create_workspace(
 
 // ── GET /api/workspaces/default-root/:name — get default root path ───
 
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn get_default_root(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -169,7 +169,7 @@ pub async fn get_default_root(
 
 // ── GET /api/workspaces/current — get current workspace ──────────────
 
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn get_current_workspace(State(state): State<Arc<AppState>>) -> Response {
     match state.current_workspace().await {
         Some(ws) => Json(serde_json::json!({
@@ -188,7 +188,7 @@ pub async fn get_current_workspace(State(state): State<Arc<AppState>>) -> Respon
 
 // ── GET /api/workspaces/:id — get workspace by ID ────────────────────
 
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn get_workspace(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -208,7 +208,7 @@ pub async fn get_workspace(
 
 // ── DELETE /api/workspaces/:id — delete workspace ────────────────────
 
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn delete_workspace(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -242,7 +242,7 @@ pub async fn delete_workspace(
 
 // ── POST /api/workspaces/:id/switch — switch to workspace ────────────
 
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn switch_workspace(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -274,7 +274,7 @@ pub async fn switch_workspace(
 
 // ── POST /api/workspaces/:id/link — link project directory ───────────
 
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn link_project(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -306,7 +306,7 @@ pub async fn link_project(
 
 // ── POST /api/workspaces/migrate/audit — audit legacy data ───────────
 
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn audit_migration(State(_state): State<Arc<AppState>>) -> Response {
     let migrator = LegacyMigrator::new();
 
@@ -333,7 +333,7 @@ pub async fn audit_migration(State(_state): State<Arc<AppState>>) -> Response {
 
 // ── POST /api/workspaces/migrate — execute migration ─────────────────
 
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn execute_migration(State(state): State<Arc<AppState>>) -> Response {
     let migrator = LegacyMigrator::new();
 

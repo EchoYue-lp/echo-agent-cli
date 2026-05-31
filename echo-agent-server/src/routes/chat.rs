@@ -28,7 +28,7 @@ const MAX_MESSAGE_LENGTH: usize = 32768;
 /// True lock reduction requires either:
 /// - `chat_stream()` returning an owned stream (internal state snapshot), or
 /// - per-session agent instances so each session has its own lock.
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn handle_chat(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatRequest>,
@@ -133,7 +133,7 @@ pub async fn handle_chat(
 }
 
 /// POST /api/chat/stream - SSE 流式对话
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn handle_chat_stream(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ChatRequest>,

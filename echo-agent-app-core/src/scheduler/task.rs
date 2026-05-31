@@ -146,8 +146,10 @@ impl TaskStore {
 
     fn load_from_backend(&self) -> anyhow::Result<Vec<CronTask>> {
         let store = self.backend.as_ref().unwrap();
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| anyhow::anyhow!("No tokio runtime available for async store access"))?;
         let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
+            handle.block_on(async {
                 store.get(CRON_NAMESPACE, CRON_KEY).await
             })
         });
@@ -165,8 +167,10 @@ impl TaskStore {
     fn save_to_backend(&self, tasks: &[CronTask]) -> anyhow::Result<()> {
         let store = self.backend.as_ref().unwrap();
         let value = serde_json::to_value(tasks)?;
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| anyhow::anyhow!("No tokio runtime available for async store access"))?;
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
+            handle.block_on(async {
                 store.put(CRON_NAMESPACE, CRON_KEY, value).await
             })
         })

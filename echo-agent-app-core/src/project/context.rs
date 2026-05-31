@@ -111,7 +111,13 @@ pub fn load_project_context(project_root: &Path) -> ProjectContext {
                         });
                     }
                 }
-                Err(_) => {}
+                Err(e) => {
+                    tracing::debug!(
+                        path = %path.display(),
+                        error = %e,
+                        "Failed to read global instruction file"
+                    );
+                }
             }
         }
     }

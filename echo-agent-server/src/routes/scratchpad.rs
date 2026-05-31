@@ -4,8 +4,8 @@
 //! 存储在 {workspace}/scratchpad.md。
 
 use axum::{
-    extract::State,
     Json, Router,
+    extract::State,
     routing::{get, put},
 };
 use serde::{Deserialize, Serialize};
@@ -48,17 +48,29 @@ async fn get_scratchpad(
 async fn update_scratchpad(
     State(state): State<Arc<AppState>>,
     Json(req): Json<UpdateScratchpadRequest>,
-) -> Json<ScratchpadContent> {
+) -> Result<Json<ScratchpadContent>, (axum::http::StatusCode, String)> {
     let path = get_scratchpad_path(&state).await;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).ok();
+        std::fs::create_dir_all(parent).map_err(|e| {
+            tracing::error!(path = %path.display(), error = %e, "Failed to create scratchpad directory");
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to create scratchpad directory: {e}"),
+            )
+        })?;
     }
-    std::fs::write(&path, &req.content).ok();
+    std::fs::write(&path, &req.content).map_err(|e| {
+        tracing::error!(path = %path.display(), error = %e, "Failed to write scratchpad");
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to write scratchpad: {e}"),
+        )
+    })?;
 
-    Json(ScratchpadContent {
+    Ok(Json(ScratchpadContent {
         content: req.content,
         modified_at: chrono::Utc::now().to_rfc3339(),
-    })
+    }))
 }
 
 async fn get_scratchpad_path(state: &AppState) -> std::path::PathBuf {

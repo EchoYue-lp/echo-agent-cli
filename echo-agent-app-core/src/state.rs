@@ -248,7 +248,7 @@ pub struct WorkflowDef {
 /// This controls the runtime restrictions applied to shell/code execution.
 /// Distinct from `echo_agent::prelude::SecurityLevel` in the framework,
 /// which is a 4-level sandbox *isolation* policy (Trusted → Maximum).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord)]
 #[serde(rename_all = "lowercase")]
 #[derive(Default)]
 pub enum SandboxTier {
@@ -554,18 +554,26 @@ impl AppState {
         if self.tasks.service.is_some() {
             return;
         }
-        let service = Arc::new(
-            crate::tasks::BackgroundTaskService::new(
-                self.connection.agent.clone(),
-                store_backend,
-                self.tasks.cancel_token.clone(),
-            )
-            .await
-            .expect("BackgroundTaskService init should not fail"),
-        );
-        service.clone().spawn();
-        self.tasks.service = Some(service);
-        tracing::info!("BackgroundTaskService started");
+        match crate::tasks::BackgroundTaskService::new(
+            self.connection.agent.clone(),
+            store_backend,
+            self.tasks.cancel_token.clone(),
+        )
+        .await
+        {
+            Ok(service) => {
+                let service = Arc::new(service);
+                service.clone().spawn();
+                self.tasks.service = Some(service);
+                tracing::info!("BackgroundTaskService started");
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "BackgroundTaskService failed to initialize — background tasks will be unavailable"
+                );
+            }
+        }
     }
 
     /// 获取工具列表信息
@@ -653,7 +661,12 @@ impl AppState {
 
         let mut guard = self.config.security_config.write().await;
         *guard = new_config;
-        tracing::info!("安全配置已热更新生效");
+        // Clear the cached JWT manager so it gets recreated with the new secret
+        {
+            let mut jwt_guard = self.config.jwt_manager.write().await;
+            *jwt_guard = None;
+        }
+        tracing::info!("安全配置已热更新生效 (JWT cache cleared)");
         Ok(())
     }
 

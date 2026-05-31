@@ -37,6 +37,16 @@ pub fn write_pid(port: u16) -> anyhow::Result<()> {
     };
     let json = serde_json::to_string_pretty(&info)?;
     std::fs::write(&path, json)?;
+
+    // On Unix, restrict PID file to owner-only read/write (0o600)
+    // to prevent other users from discovering the server port/PID.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(&path, perms)?;
+    }
+
     tracing::debug!(port = port, "Wrote server PID file");
     Ok(())
 }

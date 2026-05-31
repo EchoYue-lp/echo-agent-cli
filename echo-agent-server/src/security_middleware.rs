@@ -161,22 +161,76 @@ pub fn create_cors_layer(
     security_config: &crate::security::SecurityConfig,
 ) -> tower_http::cors::CorsLayer {
     use axum::http::{HeaderValue, Method};
-    use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+    use tower_http::cors::{AllowOrigin, CorsLayer};
 
     if security_config.cors_origins.is_empty() {
-        // 如果没有配置来源，允许所有来源（开发环境）
-        // 注意：`allow_origin(Any)` 与 `allow_credentials(true)` 互斥，
-        // 浏览器会拒绝此类响应。因此开发模式下禁用 credentials。
-        CorsLayer::new()
-            .allow_origin(Any)
-            .allow_methods([
-                Method::GET,
-                Method::POST,
-                Method::PUT,
-                Method::DELETE,
-                Method::OPTIONS,
-            ])
-            .allow_headers(Any)
+        if security_config.auth_enabled {
+            // Auth enabled with no configured origins: restrict to same-origin only.
+            // This prevents cross-origin requests from arbitrary sites while still
+            // allowing same-origin browser requests (e.g. the built-in UI).
+            tracing::warn!(
+                "CORS: no origins configured with auth enabled — restricting to same-origin only"
+            );
+            CorsLayer::new()
+                .allow_origin(AllowOrigin::predicate(
+                    |origin: &HeaderValue, parts: &axum::http::request::Parts| {
+                        // Same-origin check: compare Origin header against Host header
+                        let origin_str = match origin.to_str() {
+                            Ok(s) => s,
+                            Err(_) => return false,
+                        };
+                        if let Some(host) = parts.headers.get("host").and_then(|h| h.to_str().ok()) {
+                            // Accept if origin's host:port matches the request's Host header
+                            if let Ok(parsed) = url::Url::parse(origin_str) {
+                                if let Some(origin_host) = parsed.host_str() {
+                                    let origin_port = parsed.port_or_known_default();
+                                    let matches = origin_host == host
+                                        || host.starts_with(&format!("{}:", origin_host))
+                                        || origin_host == "127.0.0.1"
+                                        || origin_host == "localhost"
+                                        || origin_host == "[::1]";
+                                    // Also accept if port matches
+                                    if let Some(port) = origin_port {
+                                        return matches
+                                            || host == format!("{}:{}", origin_host, port);
+                                    }
+                                    return matches;
+                                }
+                            }
+                        }
+                        false
+                    },
+                ))
+                .allow_methods([
+                    Method::GET,
+                    Method::POST,
+                    Method::PUT,
+                    Method::DELETE,
+                    Method::OPTIONS,
+                ])
+                .allow_headers([
+                    axum::http::header::AUTHORIZATION,
+                    axum::http::header::CONTENT_TYPE,
+                ])
+                .allow_credentials(true)
+        } else {
+            // Auth disabled — allow any origin (local dev mode).
+            // Note: `allow_origin(Any)` with `allow_credentials(true)` is rejected
+            // by browsers, so credentials are disabled in this mode.
+            tracing::warn!(
+                "CORS: allowing all origins (auth is disabled — local dev mode only)"
+            );
+            CorsLayer::new()
+                .allow_origin(tower_http::cors::Any)
+                .allow_methods([
+                    Method::GET,
+                    Method::POST,
+                    Method::PUT,
+                    Method::DELETE,
+                    Method::OPTIONS,
+                ])
+                .allow_headers(tower_http::cors::Any)
+        }
     } else {
         // 配置指定的来源（使用 AllowOrigin::list 支持多个 origin）
         let origins: Vec<HeaderValue> = security_config

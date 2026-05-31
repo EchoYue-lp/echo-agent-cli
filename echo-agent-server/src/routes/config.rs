@@ -17,7 +17,7 @@ use crate::types::{
 };
 
 /// GET /api/config - 获取当前配置
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn get_config(State(state): State<Arc<AppState>>) -> Response {
     let available_models = Config::list_models();
     state
@@ -40,7 +40,7 @@ pub async fn get_config(State(state): State<Arc<AppState>>) -> Response {
 }
 
 /// PUT /api/config - 更新配置
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn update_config(
     State(state): State<Arc<AppState>>,
     Json(req): Json<UpdateConfigRequest>,
@@ -108,7 +108,7 @@ pub async fn update_config(
 }
 
 /// GET /api/config/full — 获取完整配置（YAML 级别）
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn get_full_config(State(state): State<Arc<AppState>>) -> Response {
     let cfg = state.config.app_config.read().await;
     Json(FullConfigResponse {
@@ -158,7 +158,7 @@ pub async fn get_full_config(State(state): State<Arc<AppState>>) -> Response {
 }
 
 /// PUT /api/config/full — 更新完整配置
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn update_full_config(
     State(state): State<Arc<AppState>>,
     Json(req): Json<UpdateFullConfigRequest>,
@@ -332,7 +332,7 @@ pub async fn update_full_config(
 }
 
 /// POST /api/config/security/reload — 重新加载安全配置（从环境变量）
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn reload_security_config(State(state): State<Arc<AppState>>) -> Response {
     match state.reload_security_config().await {
         Ok(_) => {
@@ -358,7 +358,7 @@ pub async fn reload_security_config(State(state): State<Arc<AppState>>) -> Respo
 ///
 /// Returns a structured inventory of all EchoAgent configuration files
 /// found across global, project, and local scopes.
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn discover_config() -> Response {
     use echo_agent_app_core::config_discovery::ConfigDiscovery;
 

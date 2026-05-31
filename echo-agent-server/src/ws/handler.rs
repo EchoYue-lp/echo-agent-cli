@@ -17,13 +17,48 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 use uuid::Uuid;
 
+use base64::Engine;
 use crate::state::{AppState, AuditDecision, AuditLogEntry};
 use crate::types::{AttachmentData, ClientMessage, ServerMessage};
 use crate::ws::WsHumanLoopHandler;
 
 /// GET /ws/chat - WebSocket 流式对话
-pub async fn ws_chat_handler(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> Response {
+pub async fn ws_chat_handler(
+    ws: WebSocketUpgrade,
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<AppState>>,
+) -> Response {
+    // Origin validation: when bound to localhost, only allow local origins
+    if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) {
+        if !is_valid_ws_origin(origin) {
+            tracing::warn!(origin = %origin, "WebSocket connection rejected: invalid origin");
+            return axum::http::Response::builder()
+                .status(axum::http::StatusCode::FORBIDDEN)
+                .body(axum::body::Body::from("Origin not allowed"))
+                .unwrap_or_default();
+        }
+    }
     ws.on_upgrade(move |socket| handle_socket(socket, state))
+}
+
+/// Validate WebSocket Origin header for localhost-bound servers.
+///
+/// Allows origins matching `http://127.0.0.1:*`, `http://localhost:*`,
+/// or `tauri://*` (Tauri desktop app).
+fn is_valid_ws_origin(origin: &str) -> bool {
+    let origin = origin.trim_end_matches('/');
+    if origin.starts_with("tauri://") {
+        return true;
+    }
+    // Accept http://127.0.0.1:<port> or http://localhost:<port>
+    if let Ok(parsed) = url::Url::parse(origin) {
+        if parsed.scheme() == "http" {
+            if let Some(host) = parsed.host_str() {
+                return host == "127.0.0.1" || host == "localhost" || host == "[::1]";
+            }
+        }
+    }
+    false
 }
 
 async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
@@ -246,7 +281,6 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     tracing::info!(session_id = %session_id_for_cleanup, "WebSocket 连接关闭，HITL provider 已注销");
 }
 
-use base64::Engine;
 use echo_agent::llm::types::{ContentPart, ImageUrl, Message as LlmMessage};
 use std::path::PathBuf;
 

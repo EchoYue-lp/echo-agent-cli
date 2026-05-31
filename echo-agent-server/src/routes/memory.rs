@@ -178,7 +178,7 @@ pub struct NamespacesResponse {
 ///   "value": { "name": "张三" }
 /// }
 /// ```
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn add_memory(
     State(state): State<Arc<AppState>>,
     Json(req): Json<AddMemoryRequest>,
@@ -220,7 +220,7 @@ pub async fn add_memory(
 ///
 /// - `namespace`: 命名空间
 /// - `key`: 记忆键
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn get_memory(
     State(state): State<Arc<AppState>>,
     query: axum::extract::Query<GetMemoryQuery>,
@@ -262,7 +262,7 @@ pub async fn get_memory(
 ///
 /// 在指定命名空间中使用关键词搜索记忆。
 /// 返回结果按相关度排序。
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn search_memory(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SearchMemoryRequest>,
@@ -305,7 +305,7 @@ pub async fn search_memory(
 /// POST /api/memory/delete - 删除记忆
 ///
 /// 删除指定命名空间和键的记忆。
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn delete_memory(
     State(state): State<Arc<AppState>>,
     Json(req): Json<DeleteMemoryRequest>,
@@ -341,7 +341,7 @@ pub async fn delete_memory(
 /// GET /api/memory/namespaces - 列出所有命名空间
 ///
 /// 返回所有已存在的命名空间列表。
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn list_namespaces(State(state): State<Arc<AppState>>) -> Response {
     let store = match state
         .connection
@@ -364,7 +364,7 @@ pub async fn list_namespaces(State(state): State<Arc<AppState>>) -> Response {
 /// GET /api/memory/list - 列出命名空间中的所有记忆
 ///
 /// 返回指定命名空间中的所有记忆项。
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn list_memory(
     State(state): State<Arc<AppState>>,
     query: axum::extract::Query<ListMemoryQuery>,

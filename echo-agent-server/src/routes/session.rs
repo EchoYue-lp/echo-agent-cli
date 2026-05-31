@@ -24,7 +24,7 @@ pub struct SnapshotInfo {
 // ── API 处理器 ───────────────────────────────────────────────────
 
 /// GET /api/session - 获取当前会话状态
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn get_session(State(state): State<Arc<AppState>>) -> Response {
     state
         .connection
@@ -47,7 +47,7 @@ pub async fn get_session(State(state): State<Arc<AppState>>) -> Response {
 }
 
 /// POST /api/session/reset - 重置会话
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn reset_session(State(state): State<Arc<AppState>>) -> Response {
     state
         .connection

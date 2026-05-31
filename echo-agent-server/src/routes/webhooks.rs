@@ -36,7 +36,7 @@ pub struct RemoveWebhookRequest {
 // ── Handlers ───────────────────────────────────────────────────────
 
 /// GET /api/webhooks — 列出所有 Webhook 端点
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn list_webhooks(State(state): State<Arc<AppState>>) -> Response {
     let endpoints = state.webhook.emitter.list_endpoints().await;
     let items: Vec<WebhookEndpointResponse> = endpoints
@@ -51,7 +51,7 @@ pub async fn list_webhooks(State(state): State<Arc<AppState>>) -> Response {
 }
 
 /// POST /api/webhooks — 添加 Webhook 端点
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn add_webhook(
     State(state): State<Arc<AppState>>,
     Json(req): Json<AddWebhookRequest>,
@@ -75,7 +75,7 @@ pub async fn add_webhook(
 }
 
 /// POST /api/webhooks/remove — 移除 Webhook 端点
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn remove_webhook(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RemoveWebhookRequest>,
@@ -85,7 +85,7 @@ pub async fn remove_webhook(
 }
 
 /// POST /api/webhooks/test — 发送测试事件
-#[debug_handler]
+#[cfg_attr(debug_assertions, debug_handler)]
 pub async fn test_webhook(State(state): State<Arc<AppState>>) -> Response {
     state
         .webhook
