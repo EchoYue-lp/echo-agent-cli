@@ -464,20 +464,34 @@ pub struct BrowseEntry {
 pub async fn browse_directories(
     Query(params): Query<BrowseParams>,
 ) -> Response {
+    let home = dirs_home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"));
+    let home_canonical = home.canonicalize().unwrap_or_else(|_| home.clone());
+
     let target = if let Some(ref p) = params.path {
         std::path::PathBuf::from(p)
     } else {
         // Default to home directory
-        dirs_home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"))
+        home.clone()
     };
 
     let target = if target.exists() && target.is_dir() {
         target
     } else {
-        dirs_home_dir().unwrap_or_else(|| std::path::PathBuf::from("/"))
+        home.clone()
     };
 
     let canonical = target.canonicalize().unwrap_or_else(|_| target.clone());
+
+    // Security: restrict browsing to within the user's home directory.
+    // This prevents arbitrary filesystem enumeration via the directory browser.
+    if !canonical.starts_with(&home_canonical) && canonical != home_canonical {
+        return (
+            StatusCode::FORBIDDEN,
+            "Access denied: cannot browse outside home directory",
+        )
+            .into_response();
+    }
+
     let parent = canonical.parent().map(|p| p.to_string_lossy().to_string());
 
     let mut entries = Vec::new();

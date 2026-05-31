@@ -219,7 +219,7 @@ struct LocalExecuteOutput {
 async fn execute_local(
     language: &str,
     code: &str,
-    _network_enabled: bool,
+    network_enabled: bool,
 ) -> Result<LocalExecuteOutput, String> {
     let (cmd, args) = match language.to_lowercase().as_str() {
         "shell" | "bash" | "sh" => ("sh", vec!["-c".to_string(), code.to_string()]),
@@ -233,11 +233,42 @@ async fn execute_local(
         }
     };
 
-    let child = tokio::process::Command::new(cmd)
-        .args(&args)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true) // Ensure child is killed if the future is dropped (e.g. on timeout)
+    // NOTE: This is process-level restriction, not true network isolation.
+    // A determined process can still make network calls via raw syscalls.
+    // For real isolation, use container/VM-based sandboxing.
+    let mut command = tokio::process::Command::new(cmd);
+    command.args(&args);
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+    command.kill_on_drop(true); // Ensure child is killed if the future is dropped (e.g. on timeout)
+
+    if !network_enabled {
+        // Clear inherited environment and whitelist only minimal safe vars.
+        // Also blank out proxy variables to hinder network access.
+        command.env_clear();
+        if let Ok(path) = std::env::var("PATH") {
+            command.env("PATH", path);
+        }
+        if let Ok(home) = std::env::var("HOME") {
+            command.env("HOME", home);
+        }
+        if let Ok(user) = std::env::var("USER") {
+            command.env("USER", user);
+        }
+        if let Ok(lang) = std::env::var("LANG") {
+            command.env("LANG", lang);
+        }
+        if let Ok(term) = std::env::var("TERM") {
+            command.env("TERM", term);
+        }
+        // Explicitly blank proxy variables (defense in depth even after env_clear)
+        command.env("HTTP_PROXY", "");
+        command.env("HTTPS_PROXY", "");
+        command.env("http_proxy", "");
+        command.env("https_proxy", "");
+    }
+
+    let child = command
         .spawn()
         .map_err(|e| format!("启动进程 '{}' 失败: {}", cmd, e))?;
 

@@ -103,9 +103,9 @@ async fn main() -> anyhow::Result<()> {
     echo_agent_cli::ws::handler::cleanup_stale_uploads().await;
 
     let app = cli::build_router(state.clone()).await;
-    let host = &app_config.server.host;
+    // Tauri desktop mode always binds to localhost for security
     let port = app_config.server.port;
-    let addr = format!("{}:{}", host, port);
+    let addr = format!("127.0.0.1:{}", port);
 
     infra::print_web_startup_info(&addr);
 

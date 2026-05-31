@@ -44,8 +44,14 @@ pub struct SecurityConfig {
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
-            auth_enabled: false,
-            jwt_secret: String::new(),
+            auth_enabled: true,
+            // Generate a random JWT secret if none is configured.
+            // This ensures auth is usable out-of-the-box without manual setup.
+            jwt_secret: format!(
+                "{}{}",
+                uuid::Uuid::new_v4().as_simple(),
+                uuid::Uuid::new_v4().as_simple()
+            ),
             jwt_expiry_hours: 24,
             cors_origins: vec!["http://localhost:5173".to_string()],
             rate_limit_requests_per_minute: 60,

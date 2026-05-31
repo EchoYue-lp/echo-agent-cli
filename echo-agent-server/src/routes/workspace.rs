@@ -26,6 +26,52 @@ use crate::state::AppState;
 use echo_agent_app_core::workspace::WorkspaceKind;
 use echo_agent_app_core::workspace::migration::LegacyMigrator;
 
+// ── Security helpers ──────────────────────────────────────────────────
+
+/// Validate that a workspace root path is within a reasonable base directory.
+///
+/// Rejects paths outside the user's home directory (e.g., /etc, /root, /var)
+/// to prevent arbitrary filesystem writes via workspace creation.
+fn validate_workspace_root(root: &str) -> Result<(), String> {
+    if root.trim().is_empty() {
+        return Err("Workspace root path cannot be empty".to_string());
+    }
+
+    let root_path = std::path::PathBuf::from(root);
+
+    // Determine allowed base: user home directory
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+        .map_err(|_| "Cannot determine home directory".to_string())?;
+
+    // Resolve the root path (or its nearest existing ancestor)
+    let mut check = root_path.as_path();
+    while !check.exists() {
+        match check.parent() {
+            Some(p) if p != check => check = p,
+            _ => break,
+        }
+    }
+
+    let canonical_check = check
+        .canonicalize()
+        .map_err(|e| format!("Cannot resolve workspace root path: {}", e))?;
+    let canonical_home = home
+        .canonicalize()
+        .map_err(|e| format!("Cannot resolve home directory: {}", e))?;
+
+    if !canonical_check.starts_with(&canonical_home) {
+        return Err(format!(
+            "Workspace root must be within the home directory ({}). Got: {}",
+            canonical_home.display(),
+            canonical_check.display()
+        ));
+    }
+
+    Ok(())
+}
+
 // ── Request types ────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -74,6 +120,16 @@ pub async fn create_workspace(
         .unwrap_or_default();
 
     let result = if let Some(ref root_str) = req.root {
+        // Security: validate that the root path is within a reasonable base
+        // (user home directory). Don't allow writing to /etc, /root, /var, etc.
+        if let Err(e) = validate_workspace_root(root_str) {
+            return Json(serde_json::json!({
+                "success": false,
+                "error": e,
+            }))
+            .into_response();
+        }
+
         let root = std::path::PathBuf::from(root_str);
         state.workspace.registry.create_at(&req.name, kind, root)
     } else {

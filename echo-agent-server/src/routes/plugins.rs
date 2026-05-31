@@ -69,6 +69,57 @@ pub struct DependencyInfo {
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
+/// Check whether a source string looks like a URL (contains ://)
+fn looks_like_url(source: &str) -> bool {
+    source.contains("://")
+}
+
+/// Validate that a plugin install URL uses an allowed scheme (https only).
+/// Rejects file://, ssh://, git://, http://, and other potentially dangerous schemes.
+/// Also rejects URLs pointing to private/reserved IP ranges.
+fn validate_install_url(url: &str) -> Result<(), String> {
+    let parsed = url::Url::parse(url).map_err(|e| format!("Invalid URL: {e}"))?;
+
+    // Only allow https scheme
+    if parsed.scheme() != "https" {
+        return Err(format!(
+            "Only https:// URLs are allowed for plugin installation. Got: {}://",
+            parsed.scheme()
+        ));
+    }
+
+    // Reject private/reserved IP hostnames to prevent SSRF
+    if let Some(host) = parsed.host_str() {
+        if is_private_hostname(host) {
+            return Err("URLs pointing to private or reserved IP addresses are not allowed".to_string());
+        }
+    }
+
+    Ok(())
+}
+
+/// Check if a hostname resolves to or is a private/reserved IP.
+fn is_private_hostname(host: &str) -> bool {
+    // Check literal IP addresses
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_broadcast()
+                    || v4.is_unspecified()
+            }
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback() || v6.is_unspecified()
+            }
+        };
+    }
+    // Also block localhost aliases
+    let lower = host.to_lowercase();
+    lower == "localhost" || lower.ends_with(".localhost") || lower == "0.0.0.0"
+}
+
 fn build_registry(_state: &AppState) -> PluginRegistry {
     // Detect project root from cwd
     let project_root = std::env::current_dir().ok().and_then(|cwd| {
@@ -138,6 +189,19 @@ pub async fn install_plugin(
     Json(req): Json<InstallRequest>,
 ) -> Response {
     let mut registry = build_registry(&state);
+
+    // Security: validate URL scheme for remote sources.
+    // Only allow https:// URLs. Reject file://, ssh://, git://, and other schemes
+    // to prevent SSRF and arbitrary code execution via dangerous protocols.
+    if looks_like_url(&req.source) {
+        if let Err(e) = validate_install_url(&req.source) {
+            return Json(serde_json::json!({
+                "success": false,
+                "error": e,
+            }))
+            .into_response();
+        }
+    }
 
     let scope = PluginScope::from_arg(&req.scope).unwrap_or(PluginScope::User);
     let source = InstallSource::parse(&req.source);

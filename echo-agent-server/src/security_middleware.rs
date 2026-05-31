@@ -77,33 +77,59 @@ pub async fn rate_limit_middleware(
 
 /// Extract client IP with proper proxy header handling.
 ///
-/// Priority: socket peer IP > last value of X-Forwarded-For > X-Real-IP > CF-Connecting-IP.
-/// For X-Forwarded-For, the last entry is the most trustworthy (set by the nearest proxy).
+/// Priority: ConnectInfo (socket peer) > X-Forwarded-For (only from trusted proxies) >
+///           X-Real-IP > CF-Connecting-IP.
+///
+/// The socket peer address from ConnectInfo is the most trustworthy source since it
+/// cannot be spoofed. X-Forwarded-For headers are only used when the direct connection
+/// comes from a trusted proxy (currently: localhost only).
+///
+/// `trusted_proxies` is reserved for future configuration; currently defaults to empty
+/// (only localhost connections may supply proxy headers).
 fn extract_client_ip(request: &Request) -> String {
-    if let Some(forwarded) = request.headers().get("X-Forwarded-For") {
-        if let Ok(val) = forwarded.to_str() {
-            if let Some(last) = val.rsplit(',').next() {
-                let trimmed = last.trim();
-                if !trimmed.is_empty() {
-                    return trimmed.to_string();
+    // Primary source: socket peer address from axum's ConnectInfo.
+    // This is the actual TCP connection source and cannot be spoofed.
+    let peer_ip = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip());
+
+    // Only trust proxy headers if the direct connection is from localhost
+    let is_trusted_proxy = peer_ip
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false);
+
+    if is_trusted_proxy {
+        // Trusted proxy: check X-Forwarded-For (last entry = nearest proxy, most trustworthy)
+        if let Some(forwarded) = request.headers().get("X-Forwarded-For") {
+            if let Ok(val) = forwarded.to_str() {
+                if let Some(last) = val.rsplit(',').next() {
+                    let trimmed = last.trim();
+                    if !trimmed.is_empty() {
+                        return trimmed.to_string();
+                    }
                 }
+            }
+        }
+
+        // Fall back to other proxy headers
+        if let Some(real_ip) = request
+            .headers()
+            .get("X-Real-IP")
+            .or_else(|| request.headers().get("CF-Connecting-IP"))
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.trim().to_string())
+        {
+            if !real_ip.is_empty() {
+                return real_ip;
             }
         }
     }
 
-    request
-        .headers()
-        .get("X-Real-IP")
-        .or_else(|| request.headers().get("CF-Connecting-IP"))
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| {
-            request
-                .extensions()
-                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-                .map(|ci| ci.0.ip().to_string())
-                .unwrap_or_else(|| "unknown".to_string())
-        })
+    // Default: use the peer IP (or "unknown" if ConnectInfo not available)
+    peer_ip
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 /// 请求ID中间件

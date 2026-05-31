@@ -156,7 +156,24 @@ async fn git_log(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             return CommandOutcome::Continue;
         }
 
-        let count = args.first().copied().unwrap_or("20");
+        let count_str = args.first().copied().unwrap_or("20");
+        // Validate count is a positive integer to prevent argument injection
+        let count: u32 = match count_str.parse::<u32>() {
+            Ok(n) if n > 0 && n <= 10000 => n,
+            Ok(0) => {
+                println!("Git log count must be a positive integer.");
+                return CommandOutcome::Continue;
+            }
+            Ok(n) => {
+                // Cap at 10000 to prevent excessive output
+                println!("Git log count capped at 10000 (requested {}).", n);
+                10000
+            }
+            Err(_) => {
+                println!("Invalid git log count: '{count_str}'. Must be a positive integer.");
+                return CommandOutcome::Continue;
+            }
+        };
         let log = tokio::process::Command::new("git")
             .args(["log", "--oneline", &format!("-{}", count)])
             .current_dir(&root)

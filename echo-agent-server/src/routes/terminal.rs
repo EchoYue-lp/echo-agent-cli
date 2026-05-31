@@ -12,7 +12,7 @@
 use axum::{
     Json, Router,
     extract::{Path, State, WebSocketUpgrade},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
 use futures::StreamExt;
@@ -116,11 +116,30 @@ lazy_static::lazy_static! {
 
 /// POST /api/terminal — create a new terminal session
 async fn create_terminal(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Json(req): Json<CreateTerminalRequest>,
-) -> Json<TerminalSession> {
+) -> Response {
+    // Validate cwd is within the workspace root (if a workspace is active)
+    if let Some(ref cwd) = req.cwd {
+        let cwd_path = std::path::PathBuf::from(cwd);
+        if let Some(ws) = state.current_workspace().await {
+            let ws_root = ws.project_root.unwrap_or(ws.root);
+            if let (Ok(canonical_cwd), Ok(canonical_root)) =
+                (cwd_path.canonicalize(), ws_root.canonicalize())
+            {
+                if !canonical_cwd.starts_with(&canonical_root) {
+                    return (
+                        axum::http::StatusCode::FORBIDDEN,
+                        "Terminal cwd must be within the workspace root",
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
+
     let session = TERMINAL_MANAGER.create(req.cwd).await;
-    Json(session)
+    Json(session).into_response()
 }
 
 /// GET /api/terminal — list active terminal sessions
