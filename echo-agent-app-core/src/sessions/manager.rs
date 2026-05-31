@@ -103,6 +103,15 @@ impl SessionManager {
         Ok(())
     }
 
+    /// 获取最近更新的会话
+    pub fn get_latest(&self) -> anyhow::Result<Option<Session>> {
+        let list = self.list()?;
+        match list.first() {
+            Some(summary) => self.load(&summary.id).map(Some),
+            None => Ok(None),
+        }
+    }
+
     /// 列出所有会话摘要
     pub fn list(&self) -> anyhow::Result<Vec<SessionSummary>> {
         let mut sessions = Vec::new();

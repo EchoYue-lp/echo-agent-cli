@@ -186,6 +186,71 @@ pub async fn run_both_modes(
     Ok(())
 }
 
+/// Run headless mode: execute a single prompt, print output, exit.
+///
+/// Designed for CI/CD pipelines and non-interactive scripting.
+/// Uses the existing `AgentHandle` (fully configured with tools, MCP, hooks).
+pub async fn run_headless_mode(
+    agent: &AgentHandle,
+    prompt: &str,
+    output_format: &str,
+    max_iterations: Option<usize>,
+) -> Result<i32> {
+    use echo_agent::agent::Agent;
+
+    // Optionally apply max_iterations safety limit
+    if let Some(max) = max_iterations {
+        agent
+            .write_async(|a| {
+                Box::pin(async move {
+                    a.set_max_iterations(max);
+                })
+            })
+            .await;
+    }
+
+    // Execute the prompt
+    let result = agent
+        .read_async(|a| {
+            let prompt = prompt.to_string();
+            Box::pin(async move { a.execute(&prompt).await })
+        })
+        .await;
+
+    match result {
+        Ok(output) => {
+            match output_format {
+                "json" => {
+                    let json = serde_json::json!({
+                        "success": true,
+                        "output": output,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&json)?);
+                }
+                _ => {
+                    println!("{}", output);
+                }
+            }
+            Ok(0)
+        }
+        Err(e) => {
+            match output_format {
+                "json" => {
+                    let json = serde_json::json!({
+                        "success": false,
+                        "error": e.to_string(),
+                    });
+                    eprintln!("{}", serde_json::to_string_pretty(&json)?);
+                }
+                _ => {
+                    eprintln!("Error: {}", e);
+                }
+            }
+            Ok(1)
+        }
+    }
+}
+
 /// 运行 IM 通道模式（QQ Bot、飞书等）
 #[cfg(feature = "channels")]
 pub async fn run_channels_mode(app_config: &AppConfig) -> Result<()> {

@@ -31,6 +31,6 @@ pub use handlers::{
 };
 #[cfg(feature = "channels")]
 pub use modes::run_channels_mode;
-pub use modes::{run_both_modes, run_cli_mode, run_web_mode};
+pub use modes::{run_both_modes, run_cli_mode, run_headless_mode, run_web_mode};
 pub use repl::{ReplConfig, run_repl};
 pub use router::build_router;

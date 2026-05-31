@@ -62,9 +62,26 @@ pub struct Args {
     #[arg(long, short = 'o', default_value = "text")]
     pub output: String,
 
+    /// 继续最近一次会话 (resume latest session)
+    #[arg(long, short = 'c', default_value_t = false)]
+    pub r#continue: bool,
+
+    /// 恢复指定会话 ID (resume a specific session)
+    #[arg(long, short = 'r', value_name = "SESSION_ID")]
+    pub resume: Option<String>,
+
     /// 详细输出模式
     #[arg(long, short = 'v')]
     pub verbose: bool,
+
+    /// Headless mode: run a single prompt, print output, exit (for CI/CD).
+    /// Skips REPL/Web initialization. Combine with --model and --mode.
+    #[arg(long, value_name = "PROMPT")]
+    pub headless: Option<String>,
+
+    /// Maximum iterations for headless mode (safety limit)
+    #[arg(long, value_name = "N")]
+    pub max_iterations: Option<usize>,
 
     /// 子命令
     #[command(subcommand)]

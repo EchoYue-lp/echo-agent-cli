@@ -172,7 +172,81 @@ pub async fn run_repl(agent: AgentHandle, config: ReplConfig) -> anyhow::Result<
         }
     }
 
+    // ── Auto-memory: extract observations on session end ────────────
+    run_auto_memory_on_exit(&agent).await;
+
     Ok(())
+}
+
+/// Run auto-memory extraction when the session ends.
+///
+/// Non-blocking: errors are silently ignored to avoid disrupting exit flow.
+async fn run_auto_memory_on_exit(agent: &AgentHandle) {
+    use echo_agent_app_core::auto_memory::{
+        AutoMemoryConfig, extract_observations, format_observations_for_memory,
+        append_to_project_memory,
+    };
+
+    // Check if auto-memory is enabled (shared with /auto-memory command)
+    // Use the global flag from the cmd_impls module
+    let enabled = crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED
+        .load(std::sync::atomic::Ordering::Relaxed);
+    if !enabled {
+        return;
+    }
+
+    // Extract messages from the agent context
+    let messages: Vec<(String, String)> = agent
+        .read_async(|a| {
+            Box::pin(async move {
+                let ctx = a.context().lock().await;
+                ctx.messages()
+                    .iter()
+                    .map(|m| {
+                        (
+                            m.role.as_str().to_string(),
+                            m.content.as_text().unwrap_or_default().to_string(),
+                        )
+                    })
+                    .collect()
+            })
+        })
+        .await;
+
+    // Need a minimum number of messages to extract meaningful observations
+    if messages.len() < 2 {
+        return;
+    }
+
+    let config = AutoMemoryConfig::default();
+    let observations = extract_observations(&messages, &config);
+
+    if observations.is_empty() {
+        return;
+    }
+
+    let count = observations.len();
+    let formatted = format_observations_for_memory(&observations);
+
+    match append_to_project_memory(&observations) {
+        Ok(()) => {
+            println!(
+                "  💾 Auto-memory: saved {} observation(s) to project memory.",
+                count
+            );
+            // Print a brief summary of what was saved
+            for line in formatted.lines().take(8) {
+                println!("     {}", line);
+            }
+            if formatted.lines().count() > 8 {
+                println!("     ...");
+            }
+        }
+        Err(e) => {
+            // Silently report but don't block exit
+            println!("  Auto-memory: failed to save ({})", e);
+        }
+    }
 }
 
 /// 与 Agent 对话

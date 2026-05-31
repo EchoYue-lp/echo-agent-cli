@@ -447,8 +447,152 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    
-        let run_web = args.web || (!args.cli && !args.channels);
+    // ── G3: Session resume (--continue / --resume) ──────────────────
+    if args.r#continue || args.resume.is_some() {
+        use echo_agent::llm::types::{
+            FunctionCall, Message, MessageContent, ToolCall,
+        };
+        use echo_agent_cli::sessions::{Session, SessionManager};
+
+        /// Convert persisted session messages back into agent `Message` values,
+        /// re-linking tool-result messages to their parent assistant tool-call IDs.
+        fn restore_messages(session: &Session) -> Vec<Message> {
+            let mut out: Vec<Message> = Vec::new();
+            let mut pending_tc_ids: Vec<String> = Vec::new();
+            let mut tc_idx: usize = 0;
+
+            for sm in &session.messages {
+                let text = sm.content.clone().unwrap_or_default();
+                match sm.role.as_str() {
+                    "system" => {
+                        out.push(Message::system(text));
+                        pending_tc_ids.clear();
+                        tc_idx = 0;
+                    }
+                    "user" => {
+                        out.push(Message::user(text));
+                        pending_tc_ids.clear();
+                        tc_idx = 0;
+                    }
+                    "assistant" => {
+                        if let Some(ref tcs) = sm.tool_calls {
+                            let calls: Vec<ToolCall> = tcs
+                                .iter()
+                                .map(|tc| ToolCall {
+                                    id: tc.id.clone(),
+                                    call_type: "function".to_string(),
+                                    function: FunctionCall {
+                                        name: tc.name.clone(),
+                                        arguments: tc.arguments.clone(),
+                                    },
+                                })
+                                .collect();
+                            pending_tc_ids = calls.iter().map(|c| c.id.clone()).collect();
+                            tc_idx = 0;
+                            let mut msg = Message::assistant_with_tools(calls);
+                            if !text.is_empty() {
+                                msg.content = MessageContent::Text(text);
+                            }
+                            out.push(msg);
+                        } else {
+                            out.push(Message::assistant(text));
+                            pending_tc_ids.clear();
+                            tc_idx = 0;
+                        }
+                    }
+                    "tool" => {
+                        let id = pending_tc_ids.get(tc_idx).cloned().unwrap_or_default();
+                        tc_idx += 1;
+                        out.push(Message::tool_result(id, String::new(), text));
+                    }
+                    _ => {
+                        out.push(Message::user(text));
+                    }
+                }
+            }
+            out
+        }
+
+        let manager = SessionManager::new();
+        let resume_result: anyhow::Result<Option<echo_agent_cli::sessions::Session>> =
+            if let Some(ref session_id) = args.resume {
+                match manager.load(session_id) {
+                    Ok(s) => Ok(Some(s)),
+                    Err(_) => {
+                        eprintln!(
+                            "\u{2717} Session '{}' not found. Use `echo-agent-cli sessions list` to see available sessions.",
+                            session_id
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                manager.get_latest()
+            };
+
+        match resume_result {
+            Ok(Some(session)) => {
+                let messages = restore_messages(&session);
+                let msg_count = messages.len();
+                if !messages.is_empty() {
+                    agent_handle
+                        .read_async(|a| {
+                            Box::pin(async move {
+                                a.load_messages(messages).await;
+                            })
+                        })
+                        .await;
+                }
+                let date: String = session.updated_at.chars().take(19).collect();
+                let short_id = if session.id.len() >= 8 {
+                    &session.id[..8]
+                } else {
+                    &session.id
+                };
+                println!(
+                    "\u{2713} Resuming session {} from {}, {} messages",
+                    short_id, date, msg_count
+                );
+                tracing::info!(
+                    session_id = %session.id,
+                    messages = msg_count,
+                    "Session resumed"
+                );
+            }
+            Ok(None) => {
+                eprintln!(
+                    "\u{2717} No previous sessions found. Start a new session normally, then use --continue to resume it later."
+                );
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!(
+                    "\u{26a0} Failed to load session data: {e}. Starting a fresh session instead."
+                );
+                tracing::warn!("Session resume failed, falling back to new session: {e}");
+            }
+        }
+    }
+
+    // ── G13: Headless mode (--headless <prompt>) ─────────────────
+    if let Some(ref prompt) = args.headless {
+        let exit_code = cli::run_headless_mode(
+            &agent_handle,
+            prompt,
+            &args.output,
+            args.max_iterations,
+        )
+        .await?;
+
+        // Keep hook bridges and unified memory alive until shutdown
+        drop(task_hook_bridge);
+        drop(subagent_hook_bridge);
+        drop(unified_memory);
+
+        std::process::exit(exit_code);
+    }
+
+    let run_web = args.web || (!args.cli && !args.channels);
     let run_cli = args.cli;
     let run_channels = args.channels;
 
@@ -519,6 +663,10 @@ mod tests {
             channels: false,
             output: "text".to_string(),
             verbose: false,
+            r#continue: false,
+            resume: None,
+            headless: None,
+            max_iterations: None,
             command: None,
         };
 
@@ -560,5 +708,31 @@ mod tests {
     fn test_args_custom_port() {
         let args = cli::Args::parse_from(["echo-agent-cli", "--port", "8080"]);
         assert_eq!(args.port, 8080);
+    }
+
+    #[test]
+    fn test_args_continue_flag() {
+        let args = cli::Args::parse_from(["echo-agent-cli", "--continue"]);
+        assert!(args.r#continue);
+        assert!(args.resume.is_none());
+    }
+
+    #[test]
+    fn test_args_continue_short_flag() {
+        let args = cli::Args::parse_from(["echo-agent-cli", "-c"]);
+        assert!(args.r#continue);
+    }
+
+    #[test]
+    fn test_args_resume_flag() {
+        let args = cli::Args::parse_from(["echo-agent-cli", "--resume", "abc-123"]);
+        assert!(!args.r#continue);
+        assert_eq!(args.resume.as_deref(), Some("abc-123"));
+    }
+
+    #[test]
+    fn test_args_resume_short_flag() {
+        let args = cli::Args::parse_from(["echo-agent-cli", "-r", "xyz-789"]);
+        assert_eq!(args.resume.as_deref(), Some("xyz-789"));
     }
 }
