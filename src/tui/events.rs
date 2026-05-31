@@ -1,7 +1,8 @@
 //! TUI event loop — handles keyboard input, terminal resize, and agent streaming.
 
-use super::{TuiApp, ChatMessage, MessageRole, ToolCallInfo, ToolCallStatus};
+use super::{ChatMessage, MessageRole, TuiApp};
 use crate::agent_handle::AgentHandle;
+use crate::tui::commands::SlashCommand;
 use crate::tui::ui;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{backend::CrosstermBackend, Terminal};
@@ -18,13 +19,15 @@ pub async fn run_event_loop(
     agent: AgentHandle,
 ) -> anyhow::Result<()> {
     loop {
-        // Draw UI
+        // Draw UI.
         terminal.draw(|f| ui::draw(f, app))?;
 
-        // Handle events
+        // Handle events.
         if event::poll(POLL_INTERVAL)? {
-            if let Event::Key(key) = event::read()? {
-                handle_key(app, key, &agent).await;
+            match event::read()? {
+                Event::Key(key) => handle_key(app, key, &agent).await,
+                Event::Resize(_, _) => {} // ratatui handles resize automatically
+                _ => {}
             }
         }
 
@@ -36,52 +39,31 @@ pub async fn run_event_loop(
     Ok(())
 }
 
-/// Handle a keyboard event.
+/// Handle a keyboard event using context-aware dispatch.
 async fn handle_key(app: &mut TuiApp, key: KeyEvent, agent: &AgentHandle) {
-    // Global shortcuts
-    if key.modifiers.contains(KeyModifiers::CONTROL) {
-        match key.code {
-            KeyCode::Char('c') | KeyCode::Char('q') => {
-                app.should_quit = true;
-                return;
-            }
-            KeyCode::Char('b') => {
-                app.sidebar_visible = !app.sidebar_visible;
-                return;
-            }
-            KeyCode::Char('l') => {
-                // Clear chat
-                app.messages.clear();
-                app.chat_scroll = 0;
-                return;
-            }
-            _ => {}
-        }
+    // ── Picker mode (session resume, model selection, etc.) ────────────────
+    if app.picker.is_some() {
+        handle_picker_key(app, &key);
+        return;
     }
 
-    // If diff popup is open, handle popup keys
+    // ── Diff popup ─────────────────────────────────────────────────────────
     if app.diff_popup.is_some() {
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => {
-                app.diff_popup = None;
-            }
-            _ => {}
+        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+            app.diff_popup = None;
         }
         return;
     }
 
-    // If approval is showing, handle approval keys
+    // ── Approval card ──────────────────────────────────────────────────────
     if app.approval.is_some() {
         match key.code {
             KeyCode::Char('y') | KeyCode::Enter => {
-                // Approve
                 if let Some(ref approval) = app.approval.take() {
                     app.status_msg = format!("Approved: {}", approval.tool_name);
-                    // TODO: send approval to agent via HITL dispatcher
                 }
             }
             KeyCode::Char('n') | KeyCode::Esc => {
-                // Deny
                 if let Some(ref approval) = app.approval.take() {
                     app.status_msg = format!("Denied: {}", approval.tool_name);
                 }
@@ -91,7 +73,7 @@ async fn handle_key(app: &mut TuiApp, key: KeyEvent, agent: &AgentHandle) {
         return;
     }
 
-    // If suggestions are showing
+    // ── Slash-command completion popup ─────────────────────────────────────
     if !app.suggestions.is_empty() {
         match key.code {
             KeyCode::Tab | KeyCode::Down => {
@@ -108,7 +90,6 @@ async fn handle_key(app: &mut TuiApp, key: KeyEvent, agent: &AgentHandle) {
                 return;
             }
             KeyCode::Enter => {
-                // Apply selected suggestion
                 if let Some(cmd) = app.suggestions.get(app.selected_suggestion) {
                     app.input = format!("{} ", cmd);
                     app.cursor = app.input.len();
@@ -124,15 +105,41 @@ async fn handle_key(app: &mut TuiApp, key: KeyEvent, agent: &AgentHandle) {
         }
     }
 
-    // Normal input handling
+    // ── Global shortcuts (Ctrl+...) ────────────────────────────────────────
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::Char('c') | KeyCode::Char('q') => {
+                app.should_quit = true;
+                return;
+            }
+            KeyCode::Char('b') => {
+                app.sidebar_visible = !app.sidebar_visible;
+                return;
+            }
+            KeyCode::Char('l') => {
+                app.messages.clear();
+                app.chat_scroll = 0;
+                return;
+            }
+            _ => {}
+        }
+    }
+
+    // ── Shift+Enter: newline ───────────────────────────────────────────────
+    if key.modifiers.contains(KeyModifiers::SHIFT) && key.code == KeyCode::Enter {
+        app.input.insert(app.cursor, '\n');
+        app.cursor += 1;
+        return;
+    }
+
+    // ── Normal input handling ──────────────────────────────────────────────
     match key.code {
         KeyCode::Enter => {
-            if key.modifiers.contains(KeyModifiers::SHIFT) || app.is_processing {
-                // Shift+Enter: insert newline
+            if app.is_processing {
+                // Can't send while processing; insert newline instead.
                 app.input.insert(app.cursor, '\n');
                 app.cursor += 1;
             } else if let Some(text) = app.submit_input() {
-                // Send message to agent
                 send_to_agent(app, agent, text).await;
             }
         }
@@ -143,24 +150,45 @@ async fn handle_key(app: &mut TuiApp, key: KeyEvent, agent: &AgentHandle) {
         }
         KeyCode::Backspace => {
             if app.cursor > 0 {
-                app.cursor -= 1;
-                app.input.remove(app.cursor);
+                // Handle multi-byte chars properly.
+                let prev = app.input[..app.cursor]
+                    .char_indices()
+                    .next_back()
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                app.input.drain(prev..app.cursor);
+                app.cursor = prev;
                 app.update_suggestions();
             }
         }
         KeyCode::Delete => {
             if app.cursor < app.input.len() {
-                app.input.remove(app.cursor);
+                let next = app.input[self_cursor(app)..]
+                    .char_indices()
+                    .nth(1)
+                    .map(|(i, _)| self_cursor(app) + i)
+                    .unwrap_or(app.input.len());
+                app.input.drain(app.cursor..next);
             }
         }
         KeyCode::Left => {
             if app.cursor > 0 {
-                app.cursor -= 1;
+                let prev = app.input[..app.cursor]
+                    .char_indices()
+                    .next_back()
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                app.cursor = prev;
             }
         }
         KeyCode::Right => {
             if app.cursor < app.input.len() {
-                app.cursor += 1;
+                let next = app.input[app.cursor..]
+                    .char_indices()
+                    .nth(1)
+                    .map(|(i, _)| app.cursor + i)
+                    .unwrap_or(app.input.len());
+                app.cursor = next;
             }
         }
         KeyCode::Home => {
@@ -182,12 +210,10 @@ async fn handle_key(app: &mut TuiApp, key: KeyEvent, agent: &AgentHandle) {
             app.chat_scroll = app.chat_scroll.saturating_sub(5);
         }
         KeyCode::Tab => {
-            // Cycle sidebar tabs
             app.sidebar_tab = (app.sidebar_tab + 1) % 3;
         }
         KeyCode::Esc => {
             if app.is_processing {
-                // Cancel current generation
                 app.is_processing = false;
                 app.streaming_text.clear();
                 app.status_msg = "Cancelled".to_string();
@@ -197,15 +223,40 @@ async fn handle_key(app: &mut TuiApp, key: KeyEvent, agent: &AgentHandle) {
     }
 }
 
+fn self_cursor(app: &TuiApp) -> usize {
+    app.cursor
+}
+
+fn handle_picker_key(app: &mut TuiApp, key: &KeyEvent) {
+    let picker = match app.picker.as_mut() {
+        Some(p) => p,
+        None => return,
+    };
+    match key.code {
+        KeyCode::Up => picker.move_up(),
+        KeyCode::Down => picker.move_down(),
+        KeyCode::Enter => {
+            let value = picker.selected_value().map(|s| s.to_string());
+            app.picker = None;
+            if let Some(val) = value {
+                app.status_msg = format!("Selected: {}", val);
+            }
+        }
+        KeyCode::Esc => {
+            app.picker = None;
+        }
+        _ => {}
+    }
+}
+
 /// Send a message to the agent and handle the streaming response.
 async fn send_to_agent(app: &mut TuiApp, agent: &AgentHandle, text: String) {
-    // Handle slash commands locally first
+    // Handle slash commands locally first.
     if text.starts_with('/') {
-        handle_slash_command(app, &text);
+        handle_slash_command(app, agent, &text).await;
         return;
     }
 
-    // Send to agent via execute (uses Agent trait)
     let agent_clone = agent.clone();
     let text_clone = text.clone();
 
@@ -237,39 +288,57 @@ async fn send_to_agent(app: &mut TuiApp, agent: &AgentHandle, text: String) {
 }
 
 /// Handle slash commands locally in the TUI.
-fn handle_slash_command(app: &mut TuiApp, cmd: &str) {
+async fn handle_slash_command(app: &mut TuiApp, agent: &AgentHandle, cmd: &str) {
     let parts: Vec<&str> = cmd.trim().splitn(2, ' ').collect();
     let command = parts[0].to_lowercase();
     let args = parts.get(1).unwrap_or(&"");
 
-    match command.as_str() {
-        "/help" => {
+    // Try to parse as a SlashCommand enum.
+    let slash_cmd = command
+        .strip_prefix('/')
+        .and_then(|name| name.parse::<SlashCommand>().ok());
+
+    match slash_cmd {
+        Some(SlashCommand::Help) => {
+            let mut help = String::from("Available commands:\n\n");
+            for (cat, cmds) in SlashCommand::grouped() {
+                help.push_str(&format!(
+                    "  {} {}\n",
+                    cat.icon(),
+                    cat.label()
+                ));
+                for c in cmds {
+                    let usage = c.usage();
+                    help.push_str(&format!(
+                        "    {:<18} {}{}\n",
+                        c.slash_name(),
+                        c.description(),
+                        if usage.is_empty() {
+                            String::new()
+                        } else {
+                            format!("  {}", usage)
+                        }
+                    ));
+                }
+                help.push('\n');
+            }
+            help.push_str("  Keybindings:\n");
+            help.push_str("    Ctrl+C / Ctrl+Q    Quit\n");
+            help.push_str("    Ctrl+B             Toggle sidebar\n");
+            help.push_str("    Ctrl+L             Clear chat\n");
+            help.push_str("    Shift+Enter        Newline in input\n");
+            help.push_str("    Esc                Cancel generation\n");
+            help.push_str("    Tab                Cycle sidebar tabs\n");
+            help.push_str("    Up/Down            Navigate input history\n");
+            help.push_str("    PageUp/PageDown    Scroll chat\n");
+
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
-                content: r#"Available commands:
-  /help          Show this help
-  /mode <name>   Switch mode (general/coding/research/data/writing)
-  /model <name>  Switch model
-  /permission    Show/set permission mode
-  /tools         List available tools
-  /diff [file]   Show git diff or file diff
-  /reset         Reset conversation
-  /history       Show session history
-  /stats         Show session statistics
-  /compact       Compress context
-  /plan          Enter plan mode (read-only)
-  Ctrl+B         Toggle sidebar
-  Ctrl+L         Clear chat
-  Ctrl+C         Quit
-  Esc            Cancel generation
-  Tab            Cycle sidebar tabs
-  Shift+Enter    Newline in input
-  ↑/↓            Navigate input history"#
-                    .to_string(),
+                content: help,
                 tool_calls: vec![],
             });
         }
-        "/mode" => {
+        Some(SlashCommand::Mode) => {
             if args.is_empty() {
                 app.messages.push(ChatMessage {
                     role: MessageRole::System,
@@ -285,7 +354,7 @@ fn handle_slash_command(app: &mut TuiApp, cmd: &str) {
                 });
             }
         }
-        "/model" => {
+        Some(SlashCommand::Model) => {
             if args.is_empty() {
                 app.messages.push(ChatMessage {
                     role: MessageRole::System,
@@ -301,35 +370,48 @@ fn handle_slash_command(app: &mut TuiApp, cmd: &str) {
                 });
             }
         }
-        "/reset" => {
+        Some(SlashCommand::Reset) => {
             app.messages.clear();
             app.tokens = (0, 0, 0);
+            // Reset the agent.
+            agent
+                .read_async(|a| {
+                    Box::pin(async move {
+                        use echo_agent::agent::Agent;
+                        a.reset().await;
+                    })
+                })
+                .await;
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
                 content: "Conversation reset.".to_string(),
                 tool_calls: vec![],
             });
         }
-        "/compact" => {
+        Some(SlashCommand::Stats) => {
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content: format!(
+                    "Session stats:\n  Model: {}\n  Mode: {}\n  Messages: {}\n  Tokens: {}/{}/{} (prompt/completion/total)\n  Tools: {}",
+                    app.model,
+                    app.mode,
+                    app.messages.len(),
+                    app.tokens.0,
+                    app.tokens.1,
+                    app.tokens.2,
+                    app.tool_count
+                ),
+                tool_calls: vec![],
+            });
+        }
+        Some(SlashCommand::Compact) => {
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
                 content: "Context compression requested. (Will be wired to agent)".to_string(),
                 tool_calls: vec![],
             });
         }
-        "/stats" => {
-            app.messages.push(ChatMessage {
-                role: MessageRole::System,
-                content: format!(
-                    "Session stats:\n  Model: {}\n  Mode: {}\n  Messages: {}\n  Tokens: {}/{}/{} (prompt/completion/total)\n  Tools: {}",
-                    app.model, app.mode, app.messages.len(),
-                    app.tokens.0, app.tokens.1, app.tokens.2,
-                    app.tool_count
-                ),
-                tool_calls: vec![],
-            });
-        }
-        "/plan" => {
+        Some(SlashCommand::Plan) => {
             app.mode = "plan".to_string();
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
@@ -337,7 +419,58 @@ fn handle_slash_command(app: &mut TuiApp, cmd: &str) {
                 tool_calls: vec![],
             });
         }
+        Some(SlashCommand::Permission) => {
+            if args.is_empty() {
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: format!("Permission mode: {}", app.permission_mode),
+                    tool_calls: vec![],
+                });
+            } else {
+                app.permission_mode = args.to_string();
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: format!("Permission mode set to: {}", app.permission_mode),
+                    tool_calls: vec![],
+                });
+            }
+        }
+        Some(SlashCommand::Quit) | Some(SlashCommand::Exit) => {
+            app.should_quit = true;
+        }
+        Some(SlashCommand::Status) => {
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content: format!(
+                    "Status: model={}, mode={}, processing={}, messages={}, tools={}",
+                    app.model,
+                    app.mode,
+                    app.is_processing,
+                    app.messages.len(),
+                    app.tool_count
+                ),
+                tool_calls: vec![],
+            });
+        }
+        Some(SlashCommand::Cost) => {
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content: format!(
+                    "Token usage: prompt={}, completion={}, total={}",
+                    app.tokens.0, app.tokens.1, app.tokens.2
+                ),
+                tool_calls: vec![],
+            });
+        }
+        Some(SlashCommand::Tools) => {
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content: format!("Available tools: {} (see sidebar for list)", app.tool_count),
+                tool_calls: vec![],
+            });
+        }
         _ => {
+            // Unknown or unhandled — send to agent.
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
                 content: format!("Command '{}' sent to agent for processing.", command),
@@ -345,6 +478,7 @@ fn handle_slash_command(app: &mut TuiApp, cmd: &str) {
             });
         }
     }
+
     app.is_processing = false;
     app.status_msg = "Ready".to_string();
 }

@@ -77,6 +77,8 @@ tauri-plugin-global-shortcut = "2"
 ratatui = { version = "0.29", features = ["crossterm"] }
 unicode-width = "0.2"
 textwrap = "0.16"
+strum = "0.26"
+strum_macros = "0.26"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
