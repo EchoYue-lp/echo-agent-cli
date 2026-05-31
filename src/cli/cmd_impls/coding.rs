@@ -137,8 +137,45 @@ async fn cmd_tasks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 Err(e) => println!("Failed to submit research task: {}", e),
             }
         }
+        "checkpoints" => {
+            let pending = service.pending_checkpoints().await;
+            if pending.is_empty() {
+                println!("No pending human checkpoints.");
+            } else {
+                println!("\nPending Human Checkpoints:");
+                println!("{:-<80}", "");
+                for (task_id, req) in &pending {
+                    println!("  Task: {}", task_id);
+                    println!("  Phase: {}", req.waiting_phase);
+                    println!("  Prompt: {}", req.prompt);
+                    println!("  Options: {}", req.options.join(", "));
+                    println!();
+                }
+            }
+        }
+        "respond" => {
+            let task_id = args.get(1).copied().unwrap_or("");
+            let selection = args.get(2).copied().unwrap_or("");
+            if task_id.is_empty() || selection.is_empty() {
+                println!("Usage: /tasks respond <task_id> <selection> [instructions]");
+                println!("  Use '/tasks checkpoints' to see pending requests.");
+                return CommandOutcome::Continue;
+            }
+            let instructions = args.get(3..).map(|s| s.join(" "));
+            if service
+                .respond_to_checkpoint(task_id, selection, instructions)
+                .await
+            {
+                println!("Checkpoint response sent for task {}.", task_id);
+            } else {
+                println!(
+                    "No pending checkpoint found for task {}. Use '/tasks checkpoints' to list pending requests.",
+                    task_id
+                );
+            }
+        }
         _ => {
-            println!("Usage: /tasks [list|status <id>|cancel <id>|research <topic>]");
+            println!("Usage: /tasks [list|status <id>|cancel <id>|research <topic>|checkpoints|respond <id> <selection>]");
         }
     }
     CommandOutcome::Continue
@@ -489,6 +526,70 @@ cmd!(
     cmd_fix
 );
 
+// ── PermissionCommand ─────────────────────────────────────────────────
+
+async fn cmd_permission(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
+    let mode = args.first().copied().unwrap_or("");
+
+    if mode.is_empty() {
+        // Show current permission mode
+        let current = ctx
+            .agent
+            .read(|a| a.get_permission_mode().to_string())
+            .await;
+        println!("Current permission mode: {}", current);
+        println!();
+        println!("Available modes:");
+        println!("  default    — Ask before dangerous operations (file writes, shell commands)");
+        println!("  plan       — Read-only; all write operations are blocked");
+        println!("  auto-edit  — File edits are auto-approved; shell still requires confirmation");
+        println!("  full-auto  — All operations auto-approved (bypass permissions)");
+        println!("  auto       — AI classifier decides (when available)");
+        println!("  dontask    — Silently reject operations not matching an allow rule");
+        println!();
+        println!("Usage: /permission <mode>");
+        return CommandOutcome::Continue;
+    }
+
+    // Validate the mode
+    let normalized = match mode {
+        "default" => "default",
+        "plan" => "plan",
+        "auto-edit" | "autoedit" | "accept-edits" => "auto-edit",
+        "full-auto" | "fullauto" | "bypass" => "full-auto",
+        "auto" => "auto",
+        "dontask" | "dont-ask" => "dontask",
+        _ => {
+            println!("Unknown permission mode: '{}'", mode);
+            println!("Valid modes: default, plan, auto-edit, full-auto, auto, dontask");
+            return CommandOutcome::Continue;
+        }
+    };
+
+    ctx.agent
+        .write(|a| a.set_permission_mode(normalized))
+        .await;
+
+    match normalized {
+        "plan" => println!("Permission mode: plan — write operations are now BLOCKED."),
+        "auto-edit" => println!("Permission mode: auto-edit — file edits are auto-approved."),
+        "full-auto" => println!("Permission mode: full-auto — all operations auto-approved. Use with caution."),
+        "dontask" => println!("Permission mode: dontask — silent rejection for disallowed operations."),
+        "auto" => println!("Permission mode: auto — AI classifier decides."),
+        _ => println!("Permission mode: default — standard approval flow."),
+    }
+
+    CommandOutcome::Continue
+}
+cmd!(
+    PermissionCommand,
+    "permission",
+    ["perm"],
+    CommandCategory::Config,
+    "View or change the agent permission mode",
+    cmd_permission
+);
+
 // ── Register ─────────────────────────────────────────────────────────
 
 pub fn register_all(registry: &mut crate::cli::command::CommandRegistry) {
@@ -499,4 +600,5 @@ pub fn register_all(registry: &mut crate::cli::command::CommandRegistry) {
     registry.register(Arc::new(AgentsCommand));
     registry.register(Arc::new(AgentCommand));
     registry.register(Arc::new(FixCommand));
+    registry.register(Arc::new(PermissionCommand));
 }

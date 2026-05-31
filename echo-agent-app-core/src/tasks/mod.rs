@@ -12,6 +12,7 @@ pub use echo_agent::tasks::{
 };
 
 pub mod background;
+pub mod long_running;
 pub mod pipelines;
 pub mod service;
 

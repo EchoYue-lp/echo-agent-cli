@@ -8,6 +8,7 @@
 //! or the process exits (in which case they are resumed on next start).
 
 use super::background::*;
+use super::long_running::{HumanCheckpointGate, HumanCheckpointResponse};
 use super::*;
 use crate::agent_handle::AgentHandle;
 use echo_agent::agent::Agent; // Import Agent trait to call chat()
@@ -27,6 +28,7 @@ pub struct BackgroundTaskService {
     agent: AgentHandle,
     event_bus: Arc<TaskEventBus>,
     cancel: echo_agent::agent::CancellationToken,
+    human_gate: Arc<HumanCheckpointGate>,
 }
 
 impl BackgroundTaskService {
@@ -83,6 +85,7 @@ impl BackgroundTaskService {
             agent,
             event_bus,
             cancel,
+            human_gate: Arc::new(HumanCheckpointGate::new()),
         })
     }
 
@@ -225,6 +228,36 @@ impl BackgroundTaskService {
     /// Get the underlying AgentHandle.
     pub fn agent(&self) -> &AgentHandle {
         &self.agent
+    }
+
+    /// Get the human checkpoint gate (for responding to checkpoint requests).
+    pub fn human_gate(&self) -> &Arc<HumanCheckpointGate> {
+        &self.human_gate
+    }
+
+    /// Respond to a pending human checkpoint request.
+    pub async fn respond_to_checkpoint(
+        &self,
+        task_id: &str,
+        selection: &str,
+        instructions: Option<String>,
+    ) -> bool {
+        self.human_gate
+            .respond(
+                task_id,
+                HumanCheckpointResponse {
+                    selection: selection.to_string(),
+                    instructions,
+                },
+            )
+            .await
+    }
+
+    /// List pending human checkpoint requests.
+    pub async fn pending_checkpoints(
+        &self,
+    ) -> Vec<(String, super::long_running::HumanCheckpointRequest)> {
+        self.human_gate.pending_requests().await
     }
 
     // ── Internal helpers ──
