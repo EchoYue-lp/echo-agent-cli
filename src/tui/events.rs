@@ -75,10 +75,15 @@ async fn handle_key(app: &mut TuiApp, key: KeyEvent, agent: &AgentHandle) {
 
     // ── Slash-command completion popup ─────────────────────────────────────
     if !app.suggestions.is_empty() {
+        const MAX_VISIBLE: usize = 8;
         match key.code {
             KeyCode::Tab | KeyCode::Down => {
                 app.selected_suggestion =
                     (app.selected_suggestion + 1) % app.suggestions.len();
+                // Scroll down if selection moved past visible window
+                if app.selected_suggestion >= app.suggestion_scroll + MAX_VISIBLE {
+                    app.suggestion_scroll = app.selected_suggestion - MAX_VISIBLE + 1;
+                }
                 return;
             }
             KeyCode::BackTab | KeyCode::Up => {
@@ -86,12 +91,18 @@ async fn handle_key(app: &mut TuiApp, key: KeyEvent, agent: &AgentHandle) {
                     app.selected_suggestion -= 1;
                 } else {
                     app.selected_suggestion = app.suggestions.len() - 1;
+                    // Wrap around: scroll to show last items
+                    app.suggestion_scroll = app.suggestions.len().saturating_sub(MAX_VISIBLE);
+                }
+                // Scroll up if selection moved before visible window
+                if app.selected_suggestion < app.suggestion_scroll {
+                    app.suggestion_scroll = app.selected_suggestion;
                 }
                 return;
             }
             KeyCode::Enter => {
                 if let Some(cmd) = app.suggestions.get(app.selected_suggestion) {
-                    app.input = format!("{} ", cmd);
+                    app.input = format!("{} ", cmd.slash_name());
                     app.cursor = app.input.len();
                 }
                 app.suggestions.clear();
@@ -145,7 +156,7 @@ async fn handle_key(app: &mut TuiApp, key: KeyEvent, agent: &AgentHandle) {
         }
         KeyCode::Char(c) => {
             app.input.insert(app.cursor, c);
-            app.cursor += 1;
+            app.cursor += c.len_utf8();
             app.update_suggestions();
         }
         KeyCode::Backspace => {
@@ -163,12 +174,13 @@ async fn handle_key(app: &mut TuiApp, key: KeyEvent, agent: &AgentHandle) {
         }
         KeyCode::Delete => {
             if app.cursor < app.input.len() {
-                let next = app.input[self_cursor(app)..]
+                let cur = app.cursor;
+                let next = app.input[cur..]
                     .char_indices()
                     .nth(1)
-                    .map(|(i, _)| self_cursor(app) + i)
+                    .map(|(i, _)| cur + i)
                     .unwrap_or(app.input.len());
-                app.input.drain(app.cursor..next);
+                app.input.drain(cur..next);
             }
         }
         KeyCode::Left => {
@@ -183,12 +195,14 @@ async fn handle_key(app: &mut TuiApp, key: KeyEvent, agent: &AgentHandle) {
         }
         KeyCode::Right => {
             if app.cursor < app.input.len() {
-                let next = app.input[app.cursor..]
-                    .char_indices()
-                    .nth(1)
-                    .map(|(i, _)| app.cursor + i)
-                    .unwrap_or(app.input.len());
-                app.cursor = next;
+                let cur = app.cursor;
+                // Advance past the current character (use its byte length).
+                let ch_len = app.input[cur..]
+                    .chars()
+                    .next()
+                    .map(|c| c.len_utf8())
+                    .unwrap_or(1);
+                app.cursor = (cur + ch_len).min(app.input.len());
             }
         }
         KeyCode::Home => {
@@ -221,10 +235,6 @@ async fn handle_key(app: &mut TuiApp, key: KeyEvent, agent: &AgentHandle) {
         }
         _ => {}
     }
-}
-
-fn self_cursor(app: &TuiApp) -> usize {
-    app.cursor
 }
 
 fn handle_picker_key(app: &mut TuiApp, key: &KeyEvent) {

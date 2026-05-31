@@ -47,9 +47,11 @@ pub struct TuiApp {
     /// Current streaming text being received.
     pub streaming_text: String,
     /// Slash command suggestions (shown as completion popup).
-    pub suggestions: Vec<String>,
+    pub suggestions: Vec<commands::SlashCommand>,
     /// Selected suggestion index.
     pub selected_suggestion: usize,
+    /// Scroll offset for suggestion popup (first visible index).
+    pub suggestion_scroll: usize,
     /// Whether sidebar is visible.
     pub sidebar_visible: bool,
     /// Sidebar active tab (0=files, 1=tools, 2=tasks).
@@ -150,6 +152,7 @@ impl TuiApp {
             streaming_text: String::new(),
             suggestions: vec![],
             selected_suggestion: 0,
+            suggestion_scroll: 0,
             sidebar_visible: true,
             sidebar_tab: 0,
             diff_popup: None,
@@ -173,8 +176,7 @@ impl TuiApp {
     /// Update slash command suggestions based on current input.
     pub fn update_suggestions(&mut self) {
         if self.input.starts_with('/') && !self.input.contains(' ') {
-            let matches = commands::SlashCommand::complete(&self.input);
-            self.suggestions = matches.iter().map(|c| c.slash_name()).collect();
+            self.suggestions = commands::SlashCommand::complete(&self.input);
             self.selected_suggestion = 0;
         } else {
             self.suggestions.clear();
