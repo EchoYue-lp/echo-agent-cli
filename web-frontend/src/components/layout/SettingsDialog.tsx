@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { X, Settings, Save, Lock, ShieldCheck, GitBranch, Terminal, Minimize2, FileJson, Wrench, Globe, BookOpen, Brain, Cpu, Database, Activity, Sparkles, Package } from 'lucide-react';
+import { X, Settings, Save, Lock, ShieldCheck, GitBranch, Terminal, Minimize2, FileJson, Wrench, Globe, BookOpen, Brain, Cpu, Database, Activity, Sparkles, Package, Timer, BrainCircuit, GitFork } from 'lucide-react';
 import { useUiStore, type SettingsTabId } from '../../stores/uiStore';
 import { ConfigPanel } from '../config/ConfigPanel';
 import { SessionsPanel } from '../sessions/SessionsPanel';
@@ -16,6 +16,9 @@ import { MemoryPanel } from '../memory/MemoryPanel';
 import { EvolutionPanel } from '../evolution/EvolutionPanel';
 import { ProviderPanel } from '../providers/ProviderPanel';
 import { PluginPanel } from '../plugins/PluginPanel';
+import { SchedulerPanel } from '../scheduler/SchedulerPanel';
+import { AutoMemoryPanel } from '../memory/AutoMemoryPanel';
+import { WorktreePanel } from '../coding/WorktreePanel';
 
 interface SettingsItem {
   id: SettingsTabId;
@@ -35,6 +38,7 @@ const settingsGroups: { label: string; icon: typeof Settings; items: SettingsIte
       { id: 'skills', label: '技能', icon: BookOpen },
       { id: 'plugins', label: '插件', icon: Package },
       { id: 'memory', label: '记忆', icon: Brain },
+      { id: 'auto-memory', label: '自动记忆', icon: BrainCircuit },
     ],
   },
   {
@@ -60,6 +64,14 @@ const settingsGroups: { label: string; icon: typeof Settings; items: SettingsIte
     items: [
       { id: 'workflow', label: '工作流', icon: GitBranch },
       { id: 'sandbox', label: '沙箱', icon: Terminal },
+      { id: 'scheduler', label: '定时任务', icon: Timer },
+    ],
+  },
+  {
+    label: '开发',
+    icon: GitFork,
+    items: [
+      { id: 'worktree', label: '工作树', icon: GitFork },
     ],
   },
   {
@@ -76,6 +88,7 @@ const panels: Record<SettingsTabId, React.FC> = {
   mcp: McpPanel,
   skills: SkillsPanel,
   memory: MemoryPanel,
+  'auto-memory': AutoMemoryPanel,
   config: ConfigPanel,
   providers: ProviderPanel,
   sessions: SessionsPanel,
@@ -87,6 +100,8 @@ const panels: Record<SettingsTabId, React.FC> = {
   extract: ExtractPanel,
   evolution: EvolutionPanel,
   plugins: PluginPanel,
+  scheduler: SchedulerPanel,
+  worktree: WorktreePanel,
 };
 
 export function SettingsDialog() {

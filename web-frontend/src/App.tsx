@@ -19,6 +19,7 @@ function App() {
   const openSettings = useUiStore((s) => s.openSettings);
   const setActiveSettingsTab = useUiStore((s) => s.setActiveSettingsTab);
   const toggleTheme = useUiStore((s) => s.toggleTheme);
+  const toggleTerminal = useUiStore((s) => s.toggleTerminal);
   const initWorkspaces = useWorkspaceStore((s) => s.init);
 
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -106,7 +107,14 @@ function App() {
       action: () => { toggleSidebar(); },
       category: 'Appearance',
     },
-  ], [startNew, openSettings, setActiveSettingsTab, toggleTheme, toggleSidebar]);
+    {
+      id: 'toggle-terminal',
+      label: 'Toggle Terminal',
+      description: 'Show or hide the integrated terminal',
+      action: () => { toggleTerminal(); },
+      category: 'Navigation',
+    },
+  ], [startNew, openSettings, setActiveSettingsTab, toggleTheme, toggleSidebar, toggleTerminal]);
 
   return (
     <ErrorBoundary>

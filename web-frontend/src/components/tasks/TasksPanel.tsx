@@ -1,6 +1,6 @@
-import { useEffect, useState, useCallback } from 'react';
-import { tasksApi, type BackgroundTask, type SubmitTaskRequest } from '../../api/endpoints';
-import { Play, XCircle, RefreshCw, Plus, ChevronDown, ChevronUp } from 'lucide-react';
+import { useEffect, useState, useCallback, useRef } from 'react';
+import { tasksApi, humanGateApi, type BackgroundTask, type SubmitTaskRequest, type HumanGateCheckpoint } from '../../api/endpoints';
+import { Play, XCircle, RefreshCw, Plus, ChevronDown, ChevronUp, CheckCircle2, Edit3, AlertTriangle, HandMetal } from 'lucide-react';
 
 const STATUS_COLORS: Record<string, string> = {
   pending: 'var(--color-warning)',
@@ -11,6 +11,7 @@ const STATUS_COLORS: Record<string, string> = {
   blocked: 'var(--color-warning)',
   timed_out: 'var(--color-error)',
   retrying: 'var(--color-info)',
+  waiting_for_human: 'var(--color-purple, #a855f7)',
 };
 
 const STATUS_LABELS: Record<string, string> = {
@@ -22,6 +23,7 @@ const STATUS_LABELS: Record<string, string> = {
   blocked: '已阻塞',
   timed_out: '超时',
   retrying: '重试中',
+  waiting_for_human: '等待审批',
 };
 
 const KIND_LABELS: Record<string, string> = {
@@ -31,6 +33,15 @@ const KIND_LABELS: Record<string, string> = {
   'bg:kind:research': '研究',
 };
 
+// Extended task with progress/phase data (from SSE)
+interface TaskProgress {
+  percentage?: number;
+  phase?: string;
+  phases?: string[];
+  currentPhaseIdx?: number;
+  eta?: string;
+}
+
 export function TasksPanel() {
   const [tasks, setTasks] = useState<BackgroundTask[]>([]);
   const [loading, setLoading] = useState(true);
@@ -39,6 +50,16 @@ export function TasksPanel() {
   const [submitKind, setSubmitKind] = useState('agent_chat');
   const [submitDesc, setSubmitDesc] = useState('');
   const [submitParams, setSubmitParams] = useState('');
+
+  // Progress data keyed by task ID
+  const [progressMap, setProgressMap] = useState<Record<string, TaskProgress>>({});
+
+  // Human gate checkpoints
+  const [gates, setGates] = useState<HumanGateCheckpoint[]>([]);
+  const [gateResponse, setGateResponse] = useState<Record<string, { selection: string; instructions: string }>>({});
+
+  // SSE event sources keyed by task ID
+  const eventSourcesRef = useRef<Record<string, EventSource>>({});
 
   const fetchTasks = useCallback(async () => {
     try {
@@ -51,11 +72,97 @@ export function TasksPanel() {
     }
   }, []);
 
+  const fetchGates = useCallback(async () => {
+    try {
+      const data = await humanGateApi.list();
+      setGates(data);
+    } catch (e) {
+      // Checkpoints endpoint might not exist yet, that's fine
+      console.debug('Failed to fetch gates:', e);
+    }
+  }, []);
+
   useEffect(() => {
     fetchTasks();
-    const interval = setInterval(fetchTasks, 5000);
+    fetchGates();
+    const interval = setInterval(() => { fetchTasks(); fetchGates(); }, 5000);
     return () => clearInterval(interval);
-  }, [fetchTasks]);
+  }, [fetchTasks, fetchGates]);
+
+  // Subscribe to SSE for active tasks
+  useEffect(() => {
+    const activeTasks = tasks.filter((t) =>
+      !['completed', 'failed', 'cancelled', 'timed_out'].includes(t.status)
+    );
+
+    const currentIds = new Set(activeTasks.map((t) => t.id));
+    const existingIds = new Set(Object.keys(eventSourcesRef.current));
+
+    // Close SSE for completed tasks
+    existingIds.forEach((id) => {
+      if (!currentIds.has(id)) {
+        eventSourcesRef.current[id]?.close();
+        delete eventSourcesRef.current[id];
+      }
+    });
+
+    // Open SSE for new active tasks
+    activeTasks.forEach((task) => {
+      if (eventSourcesRef.current[task.id]) return;
+
+      const protocol = window.location.protocol === 'https:' ? 'https:' : 'http:';
+      const url = `${protocol}//${window.location.host}/api/tasks/${task.id}/events`;
+      try {
+        const es = new EventSource(url);
+        eventSourcesRef.current[task.id] = es;
+
+        es.addEventListener('progress', (e) => {
+          try {
+            const data = JSON.parse(e.data) as TaskProgress;
+            setProgressMap((prev) => ({ ...prev, [task.id]: data }));
+          } catch { /* ignore */ }
+        });
+
+        es.addEventListener('phase', (e) => {
+          try {
+            const data = JSON.parse(e.data) as { phase: string; phases?: string[]; current_phase_idx?: number };
+            setProgressMap((prev) => ({
+              ...prev,
+              [task.id]: {
+                ...prev[task.id],
+                phase: data.phase,
+                phases: data.phases,
+                currentPhaseIdx: data.current_phase_idx,
+              },
+            }));
+          } catch { /* ignore */ }
+        });
+
+        es.addEventListener('done', () => {
+          es.close();
+          delete eventSourcesRef.current[task.id];
+          fetchTasks();
+        });
+
+        es.addEventListener('error', () => {
+          // EventSource will auto-reconnect, but if the task is done it won't
+          // We'll let the polling handle the final state
+        });
+
+        es.onerror = () => {
+          es.close();
+          delete eventSourcesRef.current[task.id];
+        };
+      } catch {
+        // EventSource not supported or URL invalid
+      }
+    });
+
+    return () => {
+      // Cleanup on unmount
+      Object.values(eventSourcesRef.current).forEach((es) => es.close());
+    };
+  }, [tasks, fetchTasks]);
 
   const handleSubmit = async () => {
     if (!submitDesc.trim()) return;
@@ -92,6 +199,17 @@ export function TasksPanel() {
     }
   };
 
+  const handleGateRespond = async (taskId: string, selection: string) => {
+    const instructions = gateResponse[taskId]?.instructions || '';
+    try {
+      await humanGateApi.respond(taskId, selection, instructions || undefined);
+      setGates((prev) => prev.filter((g) => g.task_id !== taskId));
+      fetchTasks();
+    } catch (e) {
+      console.error('Failed to respond to gate:', e);
+    }
+  };
+
   const s = {
     text: 'var(--text-primary)',
     textSec: 'var(--text-secondary)',
@@ -117,7 +235,7 @@ export function TasksPanel() {
           后台任务 ({tasks.length})
         </h3>
         <div className="flex gap-1">
-          <button onClick={fetchTasks} className="rounded p-1 transition-colors" style={{ color: s.textTer }}>
+          <button onClick={() => { fetchTasks(); fetchGates(); }} className="rounded p-1 transition-colors" style={{ color: s.textTer }}>
             <RefreshCw size={14} />
           </button>
           <button onClick={() => setShowSubmit(!showSubmit)} className="rounded p-1 transition-colors" style={{ color: s.textTer }}>
@@ -168,84 +286,274 @@ export function TasksPanel() {
         </div>
       )}
 
+      {/* Human Gate Alerts */}
+      {gates.filter((g) => g.status === 'pending').map((gate) => (
+        <HumanGateCard
+          key={gate.task_id}
+          gate={gate}
+          response={gateResponse[gate.task_id] || { selection: '', instructions: '' }}
+          onResponseChange={(r) =>
+            setGateResponse((prev) => ({ ...prev, [gate.task_id]: r }))
+          }
+          onSubmit={(selection) => handleGateRespond(gate.task_id, selection)}
+          styles={s}
+        />
+      ))}
+
       {tasks.length === 0 ? (
         <p className="text-xs py-4 text-center" style={{ color: s.textTer }}>
           暂无后台任务
         </p>
       ) : (
         <div className="space-y-2">
-          {tasks.map((task) => (
-            <div
-              key={task.id}
-              className="rounded-lg border px-3 py-2 transition-colors"
-              style={{ borderColor: s.border, background: s.bg }}
-            >
-              <div
-                className="flex items-center gap-2 cursor-pointer"
-                onClick={() => setExpandedId(expandedId === task.id ? null : task.id)}
-              >
-                <span
-                  className="inline-block w-2 h-2 rounded-full flex-shrink-0"
-                  style={{ background: STATUS_COLORS[task.status] || s.textTer }}
-                />
-                <span className="text-xs font-medium truncate flex-1" style={{ color: s.text }}>
-                  {task.description}
-                </span>
-                {task.kind && (
-                  <span
-                    className="text-[10px] px-1.5 py-0.5 rounded flex-shrink-0"
-                    style={{ background: s.bgHover, color: s.textSec }}
-                  >
-                    {KIND_LABELS[task.kind] || task.kind}
-                  </span>
-                )}
-                <span className="text-[10px] flex-shrink-0" style={{ color: s.textTer }}>
-                  {STATUS_LABELS[task.status] || task.status}
-                </span>
-                {expandedId === task.id ? (
-                  <ChevronUp size={12} style={{ color: s.textTer }} />
-                ) : (
-                  <ChevronDown size={12} style={{ color: s.textTer }} />
-                )}
-              </div>
+          {tasks.map((task) => {
+            const progress = progressMap[task.id];
+            const isExpanded = expandedId === task.id;
 
-              {expandedId === task.id && (
-                <div className="mt-2 pt-2 space-y-2" style={{ borderTop: `1px solid ${s.border}` }}>
-                  <div className="text-[10px] space-y-1" style={{ color: s.textSec }}>
-                    <p>ID: {task.id}</p>
-                    <p>创建: {new Date(task.created_at).toLocaleString()}</p>
-                    <p>更新: {new Date(task.updated_at).toLocaleString()}</p>
-                  </div>
-                  {task.result && (
-                    <div className="rounded p-2 text-xs" style={{ background: s.bgCard, color: s.text }}>
-                      <p className="font-medium mb-1">结果:</p>
-                      <pre className="whitespace-pre-wrap text-[10px]" style={{ color: s.textSec }}>
-                        {task.result.slice(0, 2000)}
-                        {task.result.length > 2000 && '...'}
-                      </pre>
-                    </div>
+            return (
+              <div
+                key={task.id}
+                className="rounded-lg border px-3 py-2 transition-colors"
+                style={{ borderColor: s.border, background: s.bg }}
+              >
+                <div
+                  className="flex items-center gap-2 cursor-pointer"
+                  onClick={() => setExpandedId(isExpanded ? null : task.id)}
+                >
+                  <span
+                    className="inline-block w-2 h-2 rounded-full flex-shrink-0"
+                    style={{ background: STATUS_COLORS[task.status] || s.textTer }}
+                  />
+                  <span className="text-xs font-medium truncate flex-1" style={{ color: s.text }}>
+                    {task.description}
+                  </span>
+                  {/* Inline progress percentage */}
+                  {progress?.percentage != null && task.status === 'in_progress' && (
+                    <span className="text-[10px] font-mono flex-shrink-0" style={{ color: 'var(--color-info)' }}>
+                      {progress.percentage}%
+                    </span>
                   )}
-                  {task.error && (
-                    <div className="rounded p-2 text-xs" style={{ background: 'rgba(239,68,68,0.1)', color: 'var(--color-error)' }}>
-                      <p className="font-medium mb-1">错误:</p>
-                      <pre className="whitespace-pre-wrap text-[10px]">{task.error}</pre>
-                    </div>
-                  )}
-                  {!['completed', 'failed', 'cancelled', 'timed_out'].includes(task.status) && (
-                    <button
-                      onClick={() => handleCancel(task.id)}
-                      className="flex items-center gap-1 rounded px-2 py-1 text-xs transition-colors"
-                      style={{ background: 'rgba(239,68,68,0.1)', color: 'var(--color-error)' }}
+                  {task.kind && (
+                    <span
+                      className="text-[10px] px-1.5 py-0.5 rounded flex-shrink-0"
+                      style={{ background: s.bgHover, color: s.textSec }}
                     >
-                      <XCircle size={12} /> 取消任务
-                    </button>
+                      {KIND_LABELS[task.kind] || task.kind}
+                    </span>
+                  )}
+                  {/* Human gate indicator */}
+                  {task.status === 'waiting_for_human' && (
+                    <HandMetal size={12} className="flex-shrink-0" style={{ color: 'var(--color-purple, #a855f7)' }} />
+                  )}
+                  <span className="text-[10px] flex-shrink-0" style={{ color: s.textTer }}>
+                    {STATUS_LABELS[task.status] || task.status}
+                  </span>
+                  {isExpanded ? (
+                    <ChevronUp size={12} style={{ color: s.textTer }} />
+                  ) : (
+                    <ChevronDown size={12} style={{ color: s.textTer }} />
                   )}
                 </div>
-              )}
-            </div>
-          ))}
+
+                {/* Progress bar (inline, always visible when progress exists) */}
+                {progress?.percentage != null && task.status === 'in_progress' && (
+                  <div className="mt-1.5">
+                    <div
+                      className="h-1 rounded-full overflow-hidden"
+                      style={{ background: s.bgHover }}
+                    >
+                      <div
+                        className="h-full rounded-full transition-all duration-300"
+                        style={{
+                          width: `${Math.min(100, progress.percentage)}%`,
+                          background: 'var(--color-info)',
+                        }}
+                      />
+                    </div>
+                    <div className="flex items-center justify-between mt-0.5 text-[10px]" style={{ color: s.textTer }}>
+                      {progress.phase && <span>{progress.phase}</span>}
+                      {progress.eta && <span>ETA: {progress.eta}</span>}
+                    </div>
+                  </div>
+                )}
+
+                {/* Phase visualization */}
+                {progress?.phases && progress.phases.length > 1 && isExpanded && (
+                  <div className="mt-2">
+                    <div className="flex items-center gap-0.5">
+                      {progress.phases.map((phase, idx) => {
+                        const isCurrent = idx === progress.currentPhaseIdx;
+                        const isDone = progress.currentPhaseIdx != null && idx < progress.currentPhaseIdx;
+                        return (
+                          <div
+                            key={idx}
+                            className="flex-1 relative"
+                          >
+                            <div
+                              className="h-1.5 rounded-full transition-all duration-300"
+                              style={{
+                                background: isDone
+                                  ? 'var(--color-success)'
+                                  : isCurrent
+                                  ? 'var(--color-info)'
+                                  : s.bgHover,
+                                opacity: isDone || isCurrent ? 1 : 0.5,
+                              }}
+                            />
+                            <span
+                              className="mt-0.5 block text-[9px] truncate text-center"
+                              style={{
+                                color: isCurrent ? 'var(--color-info)' : s.textTer,
+                                fontWeight: isCurrent ? 600 : 400,
+                              }}
+                            >
+                              {phase}
+                            </span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                {isExpanded && (
+                  <div className="mt-2 pt-2 space-y-2" style={{ borderTop: `1px solid ${s.border}` }}>
+                    <div className="text-[10px] space-y-1" style={{ color: s.textSec }}>
+                      <p>ID: {task.id}</p>
+                      <p>创建: {new Date(task.created_at).toLocaleString()}</p>
+                      <p>更新: {new Date(task.updated_at).toLocaleString()}</p>
+                      {task.progress != null && <p>进度: {task.progress}%</p>}
+                    </div>
+                    {task.result && (
+                      <div className="rounded p-2 text-xs" style={{ background: s.bgCard, color: s.text }}>
+                        <p className="font-medium mb-1">结果:</p>
+                        <pre className="whitespace-pre-wrap text-[10px]" style={{ color: s.textSec }}>
+                          {task.result.slice(0, 2000)}
+                          {task.result.length > 2000 && '...'}
+                        </pre>
+                      </div>
+                    )}
+                    {task.error && (
+                      <div className="rounded p-2 text-xs" style={{ background: 'rgba(239,68,68,0.1)', color: 'var(--color-error)' }}>
+                        <p className="font-medium mb-1">错误:</p>
+                        <pre className="whitespace-pre-wrap text-[10px]">{task.error}</pre>
+                      </div>
+                    )}
+                    {!['completed', 'failed', 'cancelled', 'timed_out'].includes(task.status) && (
+                      <button
+                        onClick={() => handleCancel(task.id)}
+                        className="flex items-center gap-1 rounded px-2 py-1 text-xs transition-colors"
+                        style={{ background: 'rgba(239,68,68,0.1)', color: 'var(--color-error)' }}
+                      >
+                        <XCircle size={12} /> 取消任务
+                      </button>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </div>
       )}
+    </div>
+  );
+}
+
+// ── Human Gate Card ──────────────────────────────────────────────────
+
+interface HumanGateCardProps {
+  gate: HumanGateCheckpoint;
+  response: { selection: string; instructions: string };
+  onResponseChange: (r: { selection: string; instructions: string }) => void;
+  onSubmit: (selection: string) => void;
+  styles: Record<string, string>;
+}
+
+function HumanGateCard({ gate, response, onResponseChange, onSubmit, styles: s }: HumanGateCardProps) {
+  const [contextOpen, setContextOpen] = useState(false);
+  const options = gate.options || ['approve', 'revise', 'cancel'];
+  const optionLabels: Record<string, { label: string; color: string; icon: typeof CheckCircle2 }> = {
+    approve: { label: '批准', color: 'var(--color-success, #22c55e)', icon: CheckCircle2 },
+    revise: { label: '修改', color: 'var(--color-warning, #eab308)', icon: Edit3 },
+    cancel: { label: '取消', color: 'var(--color-error, #ef4444)', icon: XCircle },
+  };
+
+  return (
+    <div
+      className="rounded-lg border-2 p-3 space-y-2"
+      style={{ borderColor: 'var(--color-purple, #a855f7)', background: 'rgba(168,85,247,0.04)' }}
+    >
+      <div className="flex items-center gap-2">
+        <HandMetal size={14} style={{ color: 'var(--color-purple, #a855f7)' }} />
+        <span className="text-xs font-semibold" style={{ color: 'var(--color-purple, #a855f7)' }}>
+          等待人工审批
+        </span>
+        <span className="text-[10px]" style={{ color: s.textTer }}>
+          任务: {gate.task_id.slice(0, 8)}
+        </span>
+      </div>
+
+      {/* Prompt */}
+      <div
+        className="rounded-lg p-2.5 text-xs leading-relaxed"
+        style={{ background: s.bgCard, color: s.text }}
+      >
+        {gate.prompt}
+      </div>
+
+      {/* Context (collapsible) */}
+      {gate.context && Object.keys(gate.context).length > 0 && (
+        <div>
+          <button
+            onClick={() => setContextOpen(!contextOpen)}
+            className="flex items-center gap-1 text-[10px]"
+            style={{ color: s.textTer }}
+          >
+            {contextOpen ? <ChevronUp size={10} /> : <ChevronDown size={10} />}
+            上下文数据
+          </button>
+          {contextOpen && (
+            <pre
+              className="mt-1 rounded p-2 text-[10px] overflow-x-auto"
+              style={{ background: s.bgCard, color: s.textSec }}
+            >
+              {JSON.stringify(gate.context, null, 2)}
+            </pre>
+          )}
+        </div>
+      )}
+
+      {/* Revision instructions (shown when revise is selected or always) */}
+      <input
+        type="text"
+        value={response.instructions}
+        onChange={(e) => onResponseChange({ ...response, instructions: e.target.value })}
+        placeholder="修改说明（可选）..."
+        className="w-full rounded-lg border px-2 py-1.5 text-xs"
+        style={{ borderColor: s.border, background: s.bg, color: s.text }}
+      />
+
+      {/* Option buttons */}
+      <div className="flex gap-2">
+        {options.map((opt) => {
+          const cfg = optionLabels[opt] || { label: opt, color: s.textSec, icon: AlertTriangle };
+          const Icon = cfg.icon;
+          return (
+            <button
+              key={opt}
+              onClick={() => onSubmit(opt)}
+              className="flex items-center gap-1 rounded-lg px-3 py-1.5 text-[11px] font-medium transition-colors"
+              style={{
+                background: `${cfg.color}18`,
+                color: cfg.color,
+              }}
+            >
+              <Icon size={12} />
+              {cfg.label}
+            </button>
+          );
+        })}
+      </div>
     </div>
   );
 }

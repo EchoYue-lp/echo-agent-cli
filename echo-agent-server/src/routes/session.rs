@@ -11,6 +11,7 @@ use std::sync::Arc;
 use crate::state::AppState;
 use crate::types::SessionInfo;
 use echo_agent::agent::Agent;
+use echo_agent::memory::{ConversationFilter, ConversationStore};
 
 // ── 类型定义 ─────────────────────────────────────────────────────
 
@@ -133,6 +134,53 @@ pub async fn restore_checkpoint(
         None => Json(serde_json::json!({
             "success": false,
             "error": format!("快照 '{}' 未找到", snapshot_id)
+        }))
+        .into_response(),
+    }
+}
+
+/// GET /api/session/latest - 获取最近的会话信息
+///
+/// Returns the most recent conversation from the store so the GUI can
+/// offer a "Continue last session" affordance without loading the full list.
+pub async fn get_latest_session(
+    State(state): State<Arc<AppState>>,
+) -> Response {
+    let store = match state.storage.conversation_store.as_ref() {
+        Some(s) => s,
+        None => {
+            return Json(serde_json::json!({
+                "found": false,
+                "error": "Conversation persistence is disabled",
+            }))
+            .into_response();
+        }
+    };
+
+    let filter = ConversationFilter {
+        limit: Some(1),
+        ..Default::default()
+    };
+
+    match store.list_conversations(filter).await {
+        Ok(metas) if !metas.is_empty() => {
+            let latest = &metas[0];
+            Json(serde_json::json!({
+                "found": true,
+                "id": latest.conversation_id,
+                "title": latest.title,
+                "updated_at": latest.updated_at,
+                "message_count": latest.message_count,
+            }))
+            .into_response()
+        }
+        Ok(_) => Json(serde_json::json!({
+            "found": false,
+        }))
+        .into_response(),
+        Err(e) => Json(serde_json::json!({
+            "found": false,
+            "error": format!("Failed to query latest session: {e}"),
         }))
         .into_response(),
     }

@@ -15,6 +15,7 @@ import type {
 export const sessionApi = {
   get: () => get<SessionInfo>('/session'),
   reset: () => post<SessionInfo>('/session/reset'),
+  getLatest: () => get<{ found: boolean; id?: string; title?: string; updated_at?: string; message_count?: number; error?: string }>('/session/latest'),
 
   createCheckpoint: () => post<{ success: boolean; snapshot_id?: string }>('/session/checkpoint'),
   listCheckpoints: () => get<SnapshotInfo[]>('/session/checkpoints'),
@@ -445,5 +446,82 @@ export const pluginApi = {
     post<{ success: boolean; message?: string; error?: string }>(`/plugins/${name}/disable`),
   reload: () =>
     post<{ success: boolean; total?: number; enabled?: number; message?: string; error?: string }>('/plugins/reload'),
+};
+
+// ── Scheduler API (定时任务) ──────────────────────────────────────
+
+export interface SchedulerTask {
+  id: string;
+  name: string;
+  cron_expr: string;
+  prompt: string;
+  status: string;
+  last_run_at: string | null;
+  last_result: string | null;
+  created_at: string;
+  next_run: string | null;
+}
+
+export const schedulerApi = {
+  list: () => get<SchedulerTask[]>('/scheduler/tasks'),
+  create: (data: { name: string; cron_expr: string; prompt: string }) =>
+    post<{ success: boolean }>('/scheduler/tasks', data),
+  updateStatus: (id: string, enabled: boolean) =>
+    put<{ success: boolean }>(`/scheduler/tasks/${id}/status`, { status: enabled ? 'enabled' : 'disabled' }),
+  run: (id: string) =>
+    post<{ success: boolean; result?: string; error?: string }>(`/scheduler/tasks/${id}/run`),
+  delete: (id: string) => del<{ success: boolean }>(`/scheduler/tasks/${id}`),
+};
+
+// ── Auto Memory API (自动记忆) ───────────────────────────────────
+
+export interface AutoMemoryStatus {
+  enabled: boolean;
+  observations_count: number;
+}
+
+export interface AutoMemoryObservation {
+  category: string;
+  text: string;
+  confidence: number;
+}
+
+export const autoMemoryApi = {
+  status: () => get<AutoMemoryStatus>('/auto-memory/status'),
+  toggle: (enabled: boolean) => post<{ enabled: boolean }>('/auto-memory/toggle', { enabled }),
+  extract: () => post<{ success: boolean; observations: AutoMemoryObservation[] }>('/auto-memory/extract'),
+  observations: () => get<AutoMemoryObservation[]>('/auto-memory/observations'),
+};
+
+// ── Human Gate API (人工审批) ────────────────────────────────────
+
+export interface HumanGateCheckpoint {
+  task_id: string;
+  prompt: string;
+  context?: Record<string, unknown>;
+  options?: string[];
+  status: string;
+  created_at: string;
+}
+
+export const humanGateApi = {
+  list: () => get<HumanGateCheckpoint[]>('/tasks/checkpoints'),
+  respond: (taskId: string, selection: string, instructions?: string) =>
+    post<{ success: boolean }>(`/tasks/${taskId}/respond`, { selection, instructions }),
+};
+
+// ── Worktree API (Git 工作树) ─────────────────────────────────────
+
+export interface WorktreeInfo {
+  path: string;
+  branch: string;
+  managed: boolean;
+  head: string;
+}
+
+export const worktreeApi = {
+  list: () => get<WorktreeInfo[]>('/worktrees'),
+  create: (req: { branch: string; base?: string }) => post<WorktreeInfo>('/worktrees', req),
+  remove: (branch: string) => del<{ success: boolean }>(`/worktrees?branch=${encodeURIComponent(branch)}`),
 };
 

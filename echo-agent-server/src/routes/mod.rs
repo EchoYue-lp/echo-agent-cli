@@ -1,6 +1,7 @@
 //! 路由模块
 
 pub mod audit;
+pub mod auto_memory;
 pub mod chat;
 pub mod compress;
 pub mod config;
@@ -32,3 +33,4 @@ pub mod tools;
 pub mod webhooks;
 pub mod workflow;
 pub mod workspace;
+pub mod worktree;

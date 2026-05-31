@@ -47,6 +47,7 @@ pub async fn build_router(state: Arc<AppState>) -> Router {
         // ── 会话 API ─────────────────────────────────────────────
         .route("/api/session", get(routes::session::get_session))
         .route("/api/session/reset", post(routes::session::reset_session))
+        .route("/api/session/latest", get(routes::session::get_latest_session))
         // ── 工具 API ─────────────────────────────────────────────
         .route("/api/tools/:name/enable", post(routes::tools::enable_tool))
         .route(
@@ -283,6 +284,10 @@ pub async fn build_router(state: Arc<AppState>) -> Router {
         .merge(routes::evolution::evolution_routes())
         // ── Provider API ─────────────────────────────────────────────
         .merge(routes::providers::provider_routes())
+        // ── Worktree API ─────────────────────────────────────────────
+        .merge(routes::worktree::worktree_routes())
+        // ── Auto Memory API ───────────────────────────────────────────
+        .merge(routes::auto_memory::auto_memory_routes())
         // ── 工作区 API ─────────────────────────────────────────────
         .route(
             "/api/workspaces",

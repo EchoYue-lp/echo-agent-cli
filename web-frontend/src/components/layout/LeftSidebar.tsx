@@ -1,5 +1,5 @@
 import { useEffect, useState, useRef } from 'react';
-import { Plus, Sun, Moon, Trash2, MessageSquare, Pencil, Check, X, Search, Settings, FolderOpen } from 'lucide-react';
+import { Plus, Sun, Moon, Trash2, MessageSquare, Pencil, Check, X, Search, Settings, FolderOpen, Terminal } from 'lucide-react';
 import { BrandIcon } from '../common/BrandIcon';
 import { useChatStore } from '../../stores/chatStore';
 import { useConversationStore, type ConversationGroup } from '../../stores/conversationStore';
@@ -11,6 +11,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
   const theme = useUiStore((s) => s.theme);
   const toggleTheme = useUiStore((s) => s.toggleTheme);
   const openSettings = useUiStore((s) => s.openSettings);
+  const toggleTerminal = useUiStore((s) => s.toggleTerminal);
 
   const conversations = useConversationStore((s) => s.conversations);
   const activeId = useConversationStore((s) => s.activeId);
@@ -223,6 +224,13 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
 
       {/* Bottom actions */}
       <div className="border-t border-[var(--border-primary)] px-2 py-2">
+        <button
+          onClick={toggleTerminal}
+          className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-xs font-medium text-[var(--text-secondary)] transition-all hover:bg-[var(--bg-sidebar-hover)] hover:text-[var(--text-primary)]"
+        >
+          <Terminal size={14} />
+          终端
+        </button>
         <button
           onClick={openSettings}
           className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-xs font-medium text-[var(--text-secondary)] transition-all hover:bg-[var(--bg-sidebar-hover)] hover:text-[var(--text-primary)]"
