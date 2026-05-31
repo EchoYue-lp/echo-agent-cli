@@ -2,6 +2,7 @@ pub mod cli;
 pub mod logging;
 pub mod shell;
 pub mod tauri;
+pub mod tui;
 
 // Re-export from app-core
 pub use echo_agent_app_core::{

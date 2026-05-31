@@ -592,6 +592,17 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(exit_code);
     }
 
+    // ── TUI mode (--tui) ─────────────────────────────────────────────
+    if args.tui {
+        echo_agent_cli::tui::run_tui(agent_handle.clone()).await?;
+
+        drop(task_hook_bridge);
+        drop(subagent_hook_bridge);
+        drop(unified_memory);
+
+        return Ok(());
+    }
+
     let run_web = args.web || (!args.cli && !args.channels);
     let run_cli = args.cli;
     let run_channels = args.channels;
@@ -651,6 +662,7 @@ mod tests {
         let args = cli::Args {
             web: false,
             cli: false,
+            tui: false,
             port: 3000,
             host: "127.0.0.1".to_string(),
             model: Some("test-model".to_string()),

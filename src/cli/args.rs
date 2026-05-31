@@ -18,6 +18,10 @@ pub struct Args {
     #[arg(long, short = 'i', default_value_t = false)]
     pub cli: bool,
 
+    /// 启动全屏 TUI 交互 (ratatui-based terminal UI)
+    #[arg(long, short = 't', default_value_t = false)]
+    pub tui: bool,
+
     /// Web 服务端口
     #[arg(long, short = 'p', default_value = "3000")]
     pub port: u16,
