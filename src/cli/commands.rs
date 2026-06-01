@@ -25,6 +25,8 @@ pub struct CommandHandler {
     current_mode: String,
     coding_loop: Option<Arc<tokio::sync::Mutex<crate::project::coding_loop::CodingLoop>>>,
     registry: Option<Arc<crate::cli::command::CommandRegistry>>,
+    task_service: Option<Arc<echo_agent_app_core::tasks::BackgroundTaskService>>,
+    scheduler: Option<Arc<echo_agent_app_core::scheduler::SchedulerRunner>>,
 }
 
 impl CommandHandler {
@@ -34,6 +36,8 @@ impl CommandHandler {
             current_mode: "general".to_string(),
             coding_loop: None,
             registry: None,
+            task_service: None,
+            scheduler: None,
         }
     }
 
@@ -52,11 +56,35 @@ impl CommandHandler {
     }
 
     /// Attach a CommandRegistry for trait-based command dispatch.
-    pub fn with_registry(
-        mut self,
-        registry: Arc<crate::cli::command::CommandRegistry>,
-    ) -> Self {
+    pub fn with_registry(mut self, registry: Arc<crate::cli::command::CommandRegistry>) -> Self {
         self.registry = Some(registry);
+        self
+    }
+
+    /// Attach a BackgroundTaskService for submitting long-running tasks.
+    pub fn with_task_service(
+        mut self,
+        service: Arc<echo_agent_app_core::tasks::BackgroundTaskService>,
+    ) -> Self {
+        self.task_service = Some(service);
+        self
+    }
+
+    /// Attach an optional BackgroundTaskService.
+    pub fn with_task_service_opt(
+        mut self,
+        service: Option<Arc<echo_agent_app_core::tasks::BackgroundTaskService>>,
+    ) -> Self {
+        self.task_service = service;
+        self
+    }
+
+    /// Attach an optional SchedulerRunner for cron task management.
+    pub fn with_scheduler_opt(
+        mut self,
+        scheduler: Option<Arc<echo_agent_app_core::scheduler::SchedulerRunner>>,
+    ) -> Self {
+        self.scheduler = scheduler;
         self
     }
 
@@ -95,13 +123,19 @@ impl CommandHandler {
                 current_mode: self.current_mode.clone(),
                 coding_loop: self.coding_loop.clone(),
                 registry: Some(registry.clone()),
+                task_service: self.task_service.clone(),
+                scheduler: self.scheduler.clone(),
             };
 
             if let Some(outcome) = registry.dispatch(cmd_name, &ctx, args).await {
                 match outcome {
-                    crate::cli::command::CommandOutcome::Continue => return CommandResult::Continue,
+                    crate::cli::command::CommandOutcome::Continue => {
+                        return CommandResult::Continue;
+                    }
                     crate::cli::command::CommandOutcome::Exit => return CommandResult::Exit,
-                    crate::cli::command::CommandOutcome::Chat(msg) => return CommandResult::Chat(msg),
+                    crate::cli::command::CommandOutcome::Chat(msg) => {
+                        return CommandResult::Chat(msg);
+                    }
                 }
             }
         }

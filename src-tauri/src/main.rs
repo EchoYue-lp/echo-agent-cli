@@ -1,35 +1,25 @@
-//! Echo Agent Tauri 桌面应用入口
+//! Echo Agent — Tauri desktop entry point.
 //!
-//! 独立 binary，通过 `cargo run --bin echo-agent-tauri` 启动。
-//! 同时启动 Web 服务供前端 Vite proxy 转发 API 请求。
-
-use echo_agent_cli::agent_handle::AgentHandle;
-use echo_agent_cli::cli;
-use echo_agent_cli::config;
-use echo_agent_cli::infra;
-use echo_agent_cli::persistence::Persistence;
-use echo_agent_cli::state;
+//! The frontend (React) communicates via Tauri IPC commands,
+//! not HTTP. No Axum server is started.
 
 use clap::Parser;
+use echo_agent_cli::{
+    agent_handle::AgentHandle, cli, config, config_watcher, infra, state::AppState,
+};
 use std::sync::Arc;
 
-fn main() -> anyhow::Result<()> {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .thread_stack_size(64 * 1024 * 1024)
-        .enable_all()
-        .build()?;
-    rt.block_on(async_main())
-}
-
-async fn async_main() -> anyhow::Result<()> {
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
-    let args = cli::Args::parse();
 
+    let args = cli::Args::parse_from(["echo-agent-tauri"]);
     let mut app_config = config::load_config(args.config.as_deref());
     config::apply_env_overrides(&mut app_config);
 
     infra::init_logging(&app_config.logging.level);
 
+    // ── Create agent + MCP ──
     let params = infra::AgentCreateParams {
         model: args.model.clone(),
         mode: args.mode.clone(),
@@ -39,57 +29,88 @@ async fn async_main() -> anyhow::Result<()> {
     let mut agent = infra::create_agent(&params, &app_config);
     infra::load_mcp_config(&mut agent, args.mcp_config.as_deref(), &app_config).await;
 
+    // Configure auto-compression
     if app_config.has_compressor() {
         app_config.apply_compressor(&agent).await;
     }
 
     let agent_handle = AgentHandle::new(agent);
+
+    // ── HITL dispatcher ──
+    let hitl_dispatcher = {
+        use echo_agent_app_core::hitl::HitlDispatcher;
+        let dispatcher = Arc::new(HitlDispatcher::new());
+        let repl_provider = Arc::new(echo_agent_app_core::hitl::ReplHumanLoopProvider::new());
+        dispatcher.register("repl", repl_provider).await;
+        agent_handle
+            .write_async(|a| {
+                let d = dispatcher.clone();
+                Box::pin(async move { a.set_human_loop_provider(d) })
+            })
+            .await;
+        dispatcher // Keep dispatcher reference for AppState
+    };
+
+    // ── Load hooks ──
     infra::load_user_hooks(&agent_handle, &app_config).await;
+    let hooks_load = echo_agent_app_core::hooks_config::load_hooks_files();
+    if !hooks_load.definition.is_empty() {
+        let hooks_def = hooks_load.definition;
+        agent_handle
+            .write_async(|a| {
+                Box::pin(async move {
+                    let mut registry = a.hook_registry().write().await;
+                    registry.clear_user_hooks();
+                    registry.register_user_hooks(hooks_def);
+                })
+            })
+            .await;
+    }
+
     infra::fire_startup_hook(&agent_handle).await;
 
-    // Clone agent for the web server (AgentHandle is cheap Clone via Arc)
-    let web_agent = agent_handle.clone();
-    let web_config = app_config.clone();
-
-    // Spawn the Web API server in background so the frontend can use HTTP/WS
-    let server_agent = web_agent.clone();
-    let server_config = web_config.clone();
-    tokio::spawn(async move {
-        let conversation_store = infra::create_conversation_store();
-        infra::inject_conversation_store(&server_agent, &conversation_store);
-
-        let state = Arc::new({
-            let mut s = state::AppState::from_shared(
-                server_agent.clone(),
-                conversation_store,
-                server_config.clone(),
-            );
-            s.start_scheduler();
-            s
-        });
-
-        let app = cli::router::build_router(state).await;
-        let addr = format!(
-            "{}:{}",
-            server_config.server.host, server_config.server.port
+    // ── Config watcher ──
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+    if let Some(config_path) = config_watcher::resolve_config_path(args.config.as_deref()) {
+        config_watcher::spawn_config_watcher(
+            config_path,
+            agent_handle.clone(),
+            cancel_token.clone(),
         );
-        let listener = match tokio::net::TcpListener::bind(&addr).await {
-            Ok(l) => l,
-            Err(e) => {
-                tracing::error!("Failed to bind web server: {e}");
-                return;
-            }
-        };
+    }
 
-        tracing::info!("Tauri: Web API server listening on http://{addr}");
-        let _ = axum::serve(listener, app).await;
-    });
+    // ── Task store ──
+    let task_store: Arc<dyn echo_agent::memory::Store> = {
+        let db_path = echo_agent_app_core::persistence::Persistence::base_dir().join("tasks.db");
+        match echo_agent::memory::SqliteStore::new(&db_path) {
+            Ok(store) => Arc::new(store),
+            Err(_) => Arc::new(echo_agent::memory::InMemoryStore::new()),
+        }
+    };
 
-    // Build and run the Tauri application (blocks until window closes)
-    let persistence = Persistence::new();
-    let builder = echo_agent_cli::tauri::build_tauri(agent_handle, persistence, app_config);
+    // ── Build application state ──
+    let conversation_store = infra::create_conversation_store();
+    infra::inject_conversation_store(&agent_handle, &conversation_store);
 
-    builder
+    let mut state_inner = AppState::from_shared(
+        agent_handle.clone(),
+        hitl_dispatcher,
+        conversation_store,
+        app_config.clone(),
+    );
+    state_inner.start_task_service(task_store.clone()).await;
+    state_inner.start_scheduler_with_store(Some(task_store));
+    let state = Arc::new(state_inner);
+
+    infra::spawn_mcp_health_check(state.clone(), cancel_token.clone());
+
+    // ── Launch Tauri window ──
+    echo_agent_cli::tauri::build_tauri_app(state.clone())
         .run(tauri::generate_context!())
-        .map_err(|e| anyhow::anyhow!("Tauri error: {}", e))
+        .expect("error while running Tauri application");
+
+    // Tauri window closed → cancel background tasks
+    cancel_token.cancel();
+
+    Ok(())
 }

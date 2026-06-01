@@ -1,32 +1,22 @@
-//! Tauri IPC 命令模块
+//! Tauri IPC command modules.
+//!
+//! Each module provides `#[tauri::command]` functions that:
+//! - Deserialize parameters
+//! - Call into `echo-agent-app-core` via `AppState`
+//! - Convert errors to `IpcError`
+//! - Return DTOs
 
 pub mod chat;
 pub mod config;
-pub mod context;
 pub mod conversations;
+pub mod files;
 pub mod mcp;
-pub mod permissions;
-pub mod skills;
+pub mod memory;
+pub mod panels;
+pub mod plugins;
+pub mod providers;
+pub mod scheduler;
+pub mod session;
+pub mod tasks;
 pub mod tools;
-
-pub fn register_commands(builder: tauri::Builder<tauri::Wry>) -> tauri::Builder<tauri::Wry> {
-    builder.invoke_handler(tauri::generate_handler![
-        chat::chat_stream,
-        chat::cancel_chat,
-        config::get_config,
-        config::update_config,
-        context::get_context,
-        context::compress_context,
-        conversations::list_conversations,
-        conversations::get_conversation,
-        conversations::delete_conversation,
-        conversations::export_conversation,
-        mcp::list_mcp_servers,
-        mcp::connect_mcp_server,
-        mcp::disconnect_mcp_server,
-        permissions::get_permission_status,
-        skills::list_skills,
-        skills::load_skills,
-        tools::list_tools,
-    ])
-}
+pub mod workspace;

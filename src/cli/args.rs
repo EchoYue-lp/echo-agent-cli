@@ -1,29 +1,33 @@
 //! CLI 命令行参数定义
 //!
-//! 使用 clap derive 模式定义所有命令行选项和子命令。
+//! 使用 clap derive 模式定义 TUI/GUI 产品入口和工具子命令。
 
 use clap::Parser;
 
-/// Echo Agent CLI - AI Agent 命令行与 Web 服务
+/// EchoCoWork - TUI/GUI 通用 Agent
 #[derive(Parser, Debug)]
 #[command(name = "echo-agent-cli")]
 #[command(version = "1.0.0")]
-#[command(about = "AI Agent 命令行与 Web 服务 — 对标业界主流通用 Agent", long_about = None)]
+#[command(about = "EchoCoWork TUI/GUI 通用 Agent", long_about = None)]
 pub struct Args {
-    /// 启动 Web 服务
-    #[arg(long, default_value_t = false)]
+    /// 启动全屏 TUI 交互（默认）
+    #[arg(long, short = 't', default_value_t = false)]
+    pub tui: bool,
+
+    /// 内部 Web 服务入口（仅供 GUI/调试使用；默认隐藏）
+    #[arg(long, default_value_t = false, hide = true)]
     pub web: bool,
 
-    /// 启动命令行交互
-    #[arg(long, short = 'i', default_value_t = false)]
+    /// 旧 REPL 入口（默认隐藏）
+    #[arg(long, short = 'i', default_value_t = false, hide = true)]
     pub cli: bool,
 
-    /// Web 服务端口
-    #[arg(long, short = 'p', default_value = "3000")]
+    /// Web 服务端口（仅内部 Web/GUI 使用）
+    #[arg(long, short = 'p', default_value = "3000", hide = true)]
     pub port: u16,
 
-    /// Web 服务地址
-    #[arg(long, default_value = "127.0.0.1")]
+    /// Web 服务地址（仅内部 Web/GUI 使用）
+    #[arg(long, default_value = "127.0.0.1", hide = true)]
     pub host: String,
 
     /// 模型名称（不指定则使用配置文件中的值）
@@ -54,25 +58,34 @@ pub struct Args {
     #[arg(long)]
     pub no_color: bool,
 
-    /// 启用 IM 通道模式（QQ Bot、飞书等），需启用 channels feature
-    #[arg(long)]
+    /// 启用 IM 通道模式（内部/实验入口，默认隐藏）
+    #[arg(long, hide = true)]
     pub channels: bool,
-
-    /// 启动终端 UI (TUI) 模式
-    #[arg(long)]
-    pub tui: bool,
-
-    /// 启动桌面 GUI 模式 (需要 gui feature)
-    #[arg(long)]
-    pub gui: bool,
 
     /// 输出格式 (text, json, markdown, table)
     #[arg(long, short = 'o', default_value = "text")]
     pub output: String,
 
+    /// 继续最近一次会话 (resume latest session)
+    #[arg(long, short = 'c', default_value_t = false)]
+    pub r#continue: bool,
+
+    /// 恢复指定会话 ID (resume a specific session)
+    #[arg(long, short = 'r', value_name = "SESSION_ID")]
+    pub resume: Option<String>,
+
     /// 详细输出模式
     #[arg(long, short = 'v')]
     pub verbose: bool,
+
+    /// Headless mode: run a single prompt, print output, exit (for CI/CD).
+    /// Skips TUI/GUI initialization. Combine with --model and --mode.
+    #[arg(long, value_name = "PROMPT")]
+    pub headless: Option<String>,
+
+    /// Maximum iterations for headless mode (safety limit)
+    #[arg(long, value_name = "N")]
+    pub max_iterations: Option<usize>,
 
     /// 子命令
     #[command(subcommand)]
@@ -114,8 +127,6 @@ pub enum Commands {
         #[arg(long)]
         all: bool,
     },
-    /// 启动终端 UI 模式
-    Tui,
     /// 交互式引导配置 (Onboarding Wizard)
     Onboard,
     /// 诊断配置问题

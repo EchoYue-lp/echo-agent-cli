@@ -14,12 +14,165 @@
 //!
 //! `read_async` and `write_async` hold the lock across `.await`; do not use them
 //! for long-running streams or request/response loops.
+//!
+//! The handle also provides [`as_shared_agent`](AgentHandle::as_shared_agent) which
+//! produces a [`SharedAgent`] (`Arc<dyn Agent>`) suitable for use with the framework's
+//! Graph workflow `add_shared_agent_node_with_mode`.
 
+use echo_agent::agent::Agent;
+use echo_agent::agent::AgentEvent;
+use echo_agent::error::Result;
 use echo_agent::prelude::ReactAgent;
+use echo_agent::workflow::SharedAgent;
+use futures::future::BoxFuture;
+use futures::stream::BoxStream;
+use futures::stream::StreamExt;
+use futures::Stream;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+// ── RwLockAgentWrapper ─────────────────────────────────────────────────────────
+
+/// Wrapper that implements [`Agent`] by delegating through a `RwLock<ReactAgent>`.
+///
+/// This enables `AgentHandle -> SharedAgent` conversion for use with
+/// [`add_shared_agent_node_with_mode`](echo_agent::workflow::GraphBuilder::add_shared_agent_node_with_mode).
+/// Each `Agent` trait method acquires a read lock, calls the corresponding
+/// `ReactAgent` method, and awaits the result within the lock scope.
+///
+/// Immutable fields (`name`, `model_name`, `system_prompt`) are cached at
+/// construction time to avoid holding the lock for sync trait methods that
+/// return `&str`.
+struct RwLockAgentWrapper {
+    inner: Arc<RwLock<ReactAgent>>,
+    name: String,
+    model_name: String,
+    system_prompt: String,
+}
+
+impl RwLockAgentWrapper {
+    /// Construct from an [`AgentHandle`], caching immutable fields.
+    ///
+    /// Must be called in an async context because it acquires a read lock
+    /// to snapshot `name`, `model_name`, and `system_prompt`.
+    async fn from_handle(handle: &AgentHandle) -> Self {
+        let guard = handle.agent.read().await;
+        Self {
+            inner: handle.agent.clone(),
+            name: guard.name().to_string(),
+            model_name: guard.model_name().to_string(),
+            system_prompt: guard.system_prompt().to_string(),
+        }
+    }
+}
+
+impl Agent for RwLockAgentWrapper {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn model_name(&self) -> &str {
+        &self.model_name
+    }
+    fn system_prompt(&self) -> &str {
+        &self.system_prompt
+    }
+
+    fn execute<'a>(&'a self, task: &'a str) -> BoxFuture<'a, Result<String>> {
+        let inner = self.inner.clone();
+        let task = task.to_string();
+        Box::pin(async move {
+            let guard = inner.read().await;
+            guard.execute(&task).await
+        })
+    }
+
+    fn chat<'a>(&'a self, message: &'a str) -> BoxFuture<'a, Result<String>> {
+        let inner = self.inner.clone();
+        let message = message.to_string();
+        Box::pin(async move {
+            let guard = inner.read().await;
+            guard.chat(&message).await
+        })
+    }
+
+    fn execute_stream<'a>(
+        &'a self,
+        task: &'a str,
+    ) -> BoxFuture<'a, Result<BoxStream<'a, Result<AgentEvent>>>> {
+        let inner = self.inner.clone();
+        let task = task.to_string();
+        Box::pin(async move {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Result<AgentEvent>>();
+
+            tokio::spawn(async move {
+                let guard = inner.read().await;
+                match guard.execute_stream(&task).await {
+                    Ok(mut stream) => {
+                        while let Some(event) = stream.next().await {
+                            if tx.send(event).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                    }
+                }
+            });
+
+            let stream = futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|event| (event, rx))
+            });
+
+            Ok(stream.boxed())
+        })
+    }
+
+    fn chat_stream<'a>(
+        &'a self,
+        message: &'a str,
+    ) -> BoxFuture<'a, Result<BoxStream<'a, Result<AgentEvent>>>> {
+        let inner = self.inner.clone();
+        let message = message.to_string();
+        Box::pin(async move {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Result<AgentEvent>>();
+
+            tokio::spawn(async move {
+                let guard = inner.read().await;
+                match guard.chat_stream(&message).await {
+                    Ok(mut stream) => {
+                        while let Some(event) = stream.next().await {
+                            if tx.send(event).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                    }
+                }
+            });
+
+            let stream = futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|event| (event, rx))
+            });
+
+            Ok(stream.boxed())
+        })
+    }
+
+    fn reset(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        let inner = self.inner.clone();
+        Box::pin(async move {
+            let guard = inner.read().await;
+            guard.reset().await;
+        })
+    }
+}
+
+// ── AgentHandle ────────────────────────────────────────────────────────────────
 
 /// Scoped-access handle for a shared [`ReactAgent`].
 ///
@@ -45,6 +198,18 @@ impl AgentHandle {
     /// Escape hatch — return the inner `Arc<RwLock<ReactAgent>>`.
     pub fn inner(&self) -> &Arc<RwLock<ReactAgent>> {
         &self.agent
+    }
+
+    /// Produce a [`SharedAgent`] view of the same underlying `ReactAgent`.
+    ///
+    /// The returned `SharedAgent` delegates all [`Agent`] trait calls through
+    /// the `RwLock`, using `ReactAgent`'s interior mutability. Immutable fields
+    /// are cached at conversion time.
+    ///
+    /// Use this to pass the agent to Graph workflow methods like
+    /// [`add_shared_agent_node_with_mode`](echo_agent::workflow::GraphBuilder::add_shared_agent_node_with_mode).
+    pub async fn as_shared_agent(&self) -> SharedAgent {
+        Arc::new(RwLockAgentWrapper::from_handle(self).await) as SharedAgent
     }
 
     /// Acquire read lock, run a **sync** closure, return its result.

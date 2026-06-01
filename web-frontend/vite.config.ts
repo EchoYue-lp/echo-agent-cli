@@ -4,6 +4,11 @@ import tailwindcss from '@tailwindcss/vite'
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
+  build: {
+    rollupOptions: {
+      external: ['@tauri-apps/plugin-shell', '@tauri-apps/plugin-dialog'],
+    },
+  },
   server: {
     port: 1420,
     strictPort: true,

@@ -3,8 +3,9 @@
   "productName": "Echo Agent",
   "version": "1.0.0",
   "identifier": "com.echo-agent.app",
+  "mainBinaryName": "echo-agent-tauri",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "cd web-frontend && npm run dev",
     "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "npm run build",
     "frontendDist": "web-frontend/dist"
@@ -12,12 +13,16 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "Echo Agent",
-        "width": 1200,
-        "height": 800,
+        "width": 1400,
+        "height": 900,
+        "minWidth": 900,
+        "minHeight": 600,
         "resizable": true,
         "fullscreen": false,
-        "center": true
+        "center": true,
+        "dragDropEnabled": true
       }
     ],
     "security": {

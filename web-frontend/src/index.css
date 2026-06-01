@@ -134,7 +134,7 @@ body {
 
 #root {
   width: 100vw;
-  height: 100vh;
+  min-height: 100dvh;
 }
 
 /* Selection */
@@ -143,7 +143,12 @@ body {
   color: white;
 }
 
-/* Scrollbar */
+/* Scrollbar - WebKit + Firefox */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--text-tertiary) transparent;
+}
+
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;
@@ -246,6 +251,15 @@ body {
 }
 .animate-breathe {
   animation: breathe 2s ease-in-out infinite;
+}
+
+/* Respect prefers-reduced-motion */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }
 
 /* Glass morphism - refined */

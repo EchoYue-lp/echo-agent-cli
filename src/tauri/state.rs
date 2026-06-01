@@ -1,24 +1,21 @@
-//! Tauri 托管状态
-//!
-//! 在 Tauri 应用中共享 AgentHandle、Persistence 和 AppConfig。
+//! Tauri shared state wrapper.
 
-use crate::agent_handle::AgentHandle;
-use crate::config::AppConfig;
-use crate::persistence::Persistence;
+use echo_agent_app_core::AppState;
+use std::sync::Arc;
 
-/// Tauri 应用的全局托管状态
+use super::terminal::TerminalManager;
+
+/// Shared state accessible from all Tauri IPC commands.
 pub struct TauriState {
-    pub agent: AgentHandle,
-    pub persistence: Persistence,
-    pub app_config: AppConfig,
+    pub app_state: Arc<AppState>,
+    pub terminal_manager: Arc<TerminalManager>,
 }
 
 impl TauriState {
-    pub fn new(agent: AgentHandle, persistence: Persistence, app_config: AppConfig) -> Self {
+    pub fn new(app_state: Arc<AppState>) -> Self {
         Self {
-            agent,
-            persistence,
-            app_config,
+            app_state,
+            terminal_manager: Arc::new(TerminalManager::new()),
         }
     }
 }

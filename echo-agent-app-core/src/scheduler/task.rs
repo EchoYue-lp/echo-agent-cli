@@ -1,8 +1,13 @@
 //! Cron 任务定义与持久化
+//!
+//! TaskStore 支持两种后端：
+//! - `Store` trait（SQLite / InMemory 等）— 推荐
+//! - 文件存储（`~/.echo-agent/scheduler/tasks.json`）— 向后兼容
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// 定时任务
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,11 +69,17 @@ impl CronTask {
     }
 }
 
-/// 任务持久化存储
+/// Cron task storage — uses `Store` trait (SQLite) when available, falls back to file-based JSON.
 #[derive(Clone)]
 pub struct TaskStore {
+    /// Optional Store backend (SQLite / InMemory)
+    backend: Option<Arc<dyn echo_agent::memory::Store>>,
+    /// Legacy file path (used as fallback and for migration)
     path: PathBuf,
 }
+
+const CRON_NAMESPACE: &[&str] = &["scheduler", "cron_tasks"];
+const CRON_KEY: &str = "all_cron_tasks";
 
 impl TaskStore {
     fn default_path() -> PathBuf {
@@ -79,17 +90,95 @@ impl TaskStore {
             .join("tasks.json")
     }
 
-    /// 打开或创建任务存储
+    /// Open or create task store with file-based backend (legacy).
     pub fn new() -> Self {
         let path = Self::default_path();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        Self { path }
+        Self {
+            backend: None,
+            path,
+        }
     }
 
-    /// 加载所有任务
+    /// Create task store backed by a `Store` trait implementation (e.g. SQLite).
+    /// Automatically migrates data from the legacy file if it exists.
+    pub fn with_store(store: Arc<dyn echo_agent::memory::Store>) -> Self {
+        let path = Self::default_path();
+        let mut ts = Self {
+            backend: Some(store),
+            path: path.clone(),
+        };
+        // Migrate from legacy file if it exists
+        if path.exists() {
+            if let Ok(tasks) = ts.load_from_file() {
+                if !tasks.is_empty() {
+                    if let Err(e) = ts.save_to_backend(&tasks) {
+                        tracing::warn!("Failed to migrate cron tasks to store: {e}");
+                    } else {
+                        tracing::info!("Migrated {} cron tasks from file to store", tasks.len());
+                        // Remove legacy file after successful migration
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            }
+        }
+        ts
+    }
+
+    /// Load all tasks — tries backend first, falls back to file.
     pub fn load_all(&self) -> anyhow::Result<Vec<CronTask>> {
+        if self.backend.is_some() {
+            self.load_from_backend()
+        } else {
+            self.load_from_file()
+        }
+    }
+
+    /// Save all tasks to the active backend.
+    pub fn save_all(&self, tasks: &[CronTask]) -> anyhow::Result<()> {
+        if self.backend.is_some() {
+            self.save_to_backend(tasks)
+        } else {
+            self.save_to_file(tasks)
+        }
+    }
+
+    // ── Store backend ──
+
+    fn load_from_backend(&self) -> anyhow::Result<Vec<CronTask>> {
+        let store = self.backend.as_ref().unwrap();
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| anyhow::anyhow!("No tokio runtime available for async store access"))?;
+        let result = tokio::task::block_in_place(|| {
+            handle.block_on(async { store.get(CRON_NAMESPACE, CRON_KEY).await })
+        });
+        match result {
+            Ok(Some(item)) => {
+                let tasks: Vec<CronTask> = serde_json::from_value(item.value)
+                    .map_err(|e| anyhow::anyhow!("Failed to deserialize cron tasks: {e}"))?;
+                Ok(tasks)
+            }
+            Ok(None) => Ok(Vec::new()),
+            Err(e) => Err(anyhow::anyhow!("Failed to load cron tasks from store: {e}")),
+        }
+    }
+
+    fn save_to_backend(&self, tasks: &[CronTask]) -> anyhow::Result<()> {
+        let store = self.backend.as_ref().unwrap();
+        let value = serde_json::to_value(tasks)?;
+        let handle = tokio::runtime::Handle::try_current()
+            .map_err(|_| anyhow::anyhow!("No tokio runtime available for async store access"))?;
+        tokio::task::block_in_place(|| {
+            handle.block_on(async { store.put(CRON_NAMESPACE, CRON_KEY, value).await })
+        })
+        .map_err(|e| anyhow::anyhow!("Failed to save cron tasks to store: {e}"))
+    }
+
+    // ── File backend (legacy) ──
+
+    fn load_from_file(&self) -> anyhow::Result<Vec<CronTask>> {
         if !self.path.exists() {
             return Ok(Vec::new());
         }
@@ -100,8 +189,7 @@ impl TaskStore {
         serde_json::from_str(&data).map_err(|e| anyhow::anyhow!("Failed to parse tasks: {e}"))
     }
 
-    /// 保存所有任务
-    pub fn save_all(&self, tasks: &[CronTask]) -> anyhow::Result<()> {
+    fn save_to_file(&self, tasks: &[CronTask]) -> anyhow::Result<()> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -186,6 +274,7 @@ mod tests {
         std::fs::create_dir_all(&dir).ok();
 
         let store = TaskStore {
+            backend: None,
             path: dir.join("tasks.json"),
         };
 

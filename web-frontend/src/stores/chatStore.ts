@@ -29,7 +29,6 @@ interface ChatState {
   addChartMessage: (spec: unknown) => void;
   clearMessages: () => void;
   replaceMessages: (messages: ChatMessage[]) => void;
-  setCurrentSnapshot: (id: string | null) => void;
   setHistoryView: (v: boolean) => void;
   /** Delete last assistant message, return last user message content for resend */
   prepareRegenerate: () => string | null;
@@ -42,13 +41,10 @@ const nextId = () => `msg-${++msgCounter}-${Date.now()}`;
 
 /** Auto-save to conversationStore after state changes that add messages */
 function autoSave() {
-  // Defer to next tick so store has updated
-  setTimeout(() => {
-    const msgs = useChatStore.getState().messages;
-    if (msgs.length > 0) {
-      useConversationStore.getState().saveCurrent(msgs);
-    }
-  }, 100);
+  const msgs = useChatStore.getState().messages;
+  if (msgs.length > 0) {
+    useConversationStore.getState().saveCurrent(msgs);
+  }
 }
 
 export const useChatStore = create<ChatState>((set, get) => ({
@@ -79,27 +75,31 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   appendToken: (id, token) => {
-    set((s) => ({
-      messages: s.messages.map((m) =>
-        m.id === id ? { ...m, content: m.content + token } : m
-      ),
-    }));
+    set((s) => {
+      const idx = s.messages.findIndex(m => m.id === id);
+      if (idx === -1) return { messages: s.messages };
+      const updated = [...s.messages];
+      updated[idx] = { ...updated[idx], content: updated[idx].content + token };
+      return { messages: updated };
+    });
   },
 
   appendThinking: (id, token) => {
-    set((s) => ({
-      messages: s.messages.map((m) => {
-        if (m.id !== id) return m;
-        const segments = m.thinkingSegments || [];
-        if (segments.length === 0) {
-          segments.push({ content: token });
-        } else {
-          const last = segments[segments.length - 1];
-          segments[segments.length - 1] = { ...last, content: last.content + token };
-        }
-        return { ...m, thinkingSegments: segments };
-      }),
-    }));
+    set((s) => {
+      const idx = s.messages.findIndex(m => m.id === id);
+      if (idx === -1) return { messages: s.messages };
+      const m = s.messages[idx];
+      const segments = [...(m.thinkingSegments || [])];
+      if (segments.length === 0) {
+        segments.push({ content: token });
+      } else {
+        const last = { ...segments[segments.length - 1] };
+        segments[segments.length - 1] = { ...last, content: last.content + token };
+      }
+      const updated = [...s.messages];
+      updated[idx] = { ...m, thinkingSegments: segments };
+      return { messages: updated };
+    });
   },
 
   startThinkingSegment: (id) => {
@@ -173,10 +173,6 @@ export const useChatStore = create<ChatState>((set, get) => ({
   clearMessages: () => set({ messages: [], isStreaming: false, isCancelled: false, isHistoryView: false }),
 
   replaceMessages: (messages) => set({ messages, isStreaming: false, isCancelled: false, isHistoryView: true }),
-
-  setCurrentSnapshot: (_id) => {
-    // Kept for compatibility - actual ID tracking is in conversationStore
-  },
 
   setHistoryView: (v) => set({ isHistoryView: v }),
 

@@ -10,15 +10,17 @@ use echo_agent::agent::CancellationToken;
 use echo_agent::mcp::McpConfigFile;
 use echo_agent::memory::ConversationStore;
 use echo_agent::prelude::*;
-use governor::{Quota, RateLimiter, clock, state::keyed::DashMapStateStore};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+
+pub use crate::hitl::HitlDispatcher;
 use tokio::sync::RwLock;
 
 use crate::agent_handle::AgentHandle;
 use crate::persistence::Persistence;
-use crate::security::SecurityConfig;
+use crate::workspace::Workspace;
+use crate::workspace::registry::WorkspaceRegistry;
 
 /// 工具状态
 #[derive(Debug, Clone)]
@@ -244,7 +246,7 @@ pub struct WorkflowDef {
 /// This controls the runtime restrictions applied to shell/code execution.
 /// Distinct from `echo_agent::prelude::SecurityLevel` in the framework,
 /// which is a 4-level sandbox *isolation* policy (Trusted → Maximum).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord)]
 #[serde(rename_all = "lowercase")]
 #[derive(Default)]
 pub enum SandboxTier {
@@ -285,33 +287,28 @@ pub struct McpHealthStatus {
 
 // ── 子状态拆分 ──
 
-/// 连接管理状态：Agent 句柄
+/// 连接管理状态：Agent 句柄 + HITL Dispatcher
 pub struct ConnectionState {
     pub agent: AgentHandle,
-    /// 对话串行化锁：确保同一时间只有一个 chat 在运行。
-    ///
-    /// 对于单用户本地应用，此锁防止多 WS 连接并发修改
-    /// human-loop provider 等全局 agent 状态。
-    /// 多用户部署需要通过 per-session agent 实例来隔离。
-    pub chat_serializer: tokio::sync::Mutex<()>,
+    /// HITL dispatcher — 多 Provider 协作（repl, ws, webhook 等）
+    /// WS handler 注册到 dispatcher 而非替换 agent 的 provider，
+    /// 确保多模式下 HITL 请求能路由到正确的 Provider。
+    pub hitl_dispatcher: Arc<crate::hitl::HitlDispatcher>,
 }
 
-/// 配置状态：应用 / Web / 安全 / 沙箱 / 权限
+/// 配置状态：应用 / Web / 沙箱 / 权限
 pub struct ConfigState {
     pub app_config: RwLock<crate::config::AppConfig>,
     pub web_config: RwLock<WebConfig>,
-    pub security_config: RwLock<SecurityConfig>,
-    pub jwt_manager: RwLock<Option<crate::security::JwtManager>>,
     pub sandbox_config: RwLock<SandboxConfigData>,
     pub permission_mode: RwLock<String>,
     pub permission_rules: RwLock<Vec<PermissionRuleConfig>>,
 }
 
-/// 会话状态：工具状态 + 取消令牌 + 速率限制
+/// 会话状态：工具状态 + 取消令牌
 pub struct SessionState {
     pub tool_states: RwLock<HashMap<String, ToolState>>,
     pub cancel_token: DashMap<String, CancellationToken>,
-    pub rate_limiter: Arc<RateLimiter<String, DashMapStateStore<String>, clock::DefaultClock>>,
 }
 
 /// 插件状态：MCP 服务管理
@@ -322,8 +319,8 @@ pub struct PluginState {
 
 /// 持久化存储状态
 pub struct StorageState {
-    pub conversation_store: Option<Arc<dyn ConversationStore>>,
-    pub persistence: Persistence,
+    pub conversation_store: RwLock<Option<Arc<dyn ConversationStore>>>,
+    pub persistence: RwLock<Persistence>,
     pub search_engine: crate::sessions::SessionSearchEngine,
 }
 
@@ -339,14 +336,37 @@ pub struct SchedulerState {
     pub cancel_token: echo_agent::agent::CancellationToken,
 }
 
+/// 后台任务状态
+pub struct TaskState {
+    pub service: Option<Arc<crate::tasks::BackgroundTaskService>>,
+    pub cancel_token: CancellationToken,
+}
+
 /// Webhook 状态
 pub struct WebhookState {
     pub emitter: crate::webhook::WebhookEmitter,
 }
 
+/// Trace 观测状态
+pub struct TraceState {
+    /// TraceAnalyzer backed by the agent's RunStore.
+    /// None until infra initialization extracts the store from the agent.
+    pub analyzer: RwLock<Option<echo_agent::trace::TraceAnalyzer>>,
+    /// 实时追踪事件收集器。
+    pub collector: std::sync::Arc<crate::observability::TraceCollector>,
+}
+
+/// 工作区状态
+pub struct WorkspaceState {
+    /// 当前活跃工作区（None 表示使用全局默认路径）。
+    pub current: RwLock<Option<Workspace>>,
+    /// 工作区注册表。
+    pub registry: Arc<WorkspaceRegistry>,
+}
+
 /// 全局应用状态
 ///
-/// 按功能域拆分为 8 个子状态，通过 `Arc<AppState>` 共享。
+/// 按功能域拆分为子状态，通过 `Arc<AppState>` 共享。
 pub struct AppState {
     /// 连接管理（Agent 句柄）
     pub connection: ConnectionState,
@@ -362,16 +382,23 @@ pub struct AppState {
     pub history: HistoryState,
     /// 调度器（定时任务）
     pub scheduler: SchedulerState,
+    /// 后台任务系统
+    pub tasks: TaskState,
     /// Webhook 事件回调
     pub webhook: WebhookState,
+    /// Trace 观测分析
+    pub trace: TraceState,
+    /// 工作区管理
+    pub workspace: WorkspaceState,
     /// Skills Hub（本地技能市场）
     pub skills_hub: Arc<RwLock<crate::skills_hub::SkillsHub>>,
 }
 
 impl AppState {
-    /// 从共享的 Agent 创建状态（用于双模式）
+    /// 从共享的 Agent 和 HITL Dispatcher 创建状态（用于双模式）
     pub fn from_shared(
         agent: AgentHandle,
+        hitl_dispatcher: Arc<crate::hitl::HitlDispatcher>,
         conversation_store: Option<Arc<dyn ConversationStore>>,
         app_config: crate::config::AppConfig,
     ) -> Self {
@@ -383,30 +410,6 @@ impl AppState {
                 ..Default::default()
             })
             .unwrap_or_default();
-
-        // 加载安全配置（环境变量覆盖默认值）
-        let security_config = SecurityConfig::from_env();
-
-        // 验证安全配置
-        if let Err(e) = security_config.validate() {
-            tracing::warn!("安全配置验证失败: {}", e);
-        }
-
-        // 创建速率限制器
-        let rate_limit_per_minute = security_config.rate_limit_requests_per_minute;
-        let rate_limiter = if rate_limit_per_minute > 0 {
-            let quota = Quota::per_minute(
-                std::num::NonZeroU32::new(rate_limit_per_minute)
-                    .unwrap_or(std::num::NonZeroU32::new(1).unwrap()),
-            );
-            Arc::new(RateLimiter::keyed(quota))
-        } else {
-            // 如果速率为0，创建一个允许所有请求的限制器
-            let quota = Quota::per_minute(std::num::NonZeroU32::new(u32::MAX).unwrap());
-            Arc::new(RateLimiter::keyed(quota))
-        };
-
-        let security_config = RwLock::new(security_config);
 
         // Extract webhook endpoints before moving app_config
         let webhook_endpoints: Vec<crate::webhook::emitter::WebhookEndpoint> = app_config
@@ -423,13 +426,11 @@ impl AppState {
         Self {
             connection: ConnectionState {
                 agent,
-                chat_serializer: tokio::sync::Mutex::new(()),
+                hitl_dispatcher,
             },
             config: ConfigState {
                 app_config: RwLock::new(app_config),
                 web_config: RwLock::new(config),
-                security_config,
-                jwt_manager: RwLock::new(None),
                 sandbox_config: RwLock::new(SandboxConfigData::default()),
                 permission_mode: RwLock::new("default".to_string()),
                 permission_rules: RwLock::new(Vec::new()),
@@ -437,15 +438,14 @@ impl AppState {
             session: SessionState {
                 tool_states: RwLock::new(HashMap::new()),
                 cancel_token: DashMap::new(),
-                rate_limiter,
             },
             plugins: PluginState {
                 mcp_config: RwLock::new(McpConfigFile::default()),
                 mcp_health: RwLock::new(HashMap::new()),
             },
             storage: StorageState {
-                conversation_store,
-                persistence: Persistence::new(),
+                conversation_store: RwLock::new(conversation_store),
+                persistence: RwLock::new(Persistence::new()),
                 search_engine: crate::sessions::SessionSearchEngine::new().unwrap_or_else(|e| {
                     tracing::warn!("Failed to init search engine: {e}, creating empty");
                     // Fallback: create an in-memory engine that won't persist
@@ -461,8 +461,25 @@ impl AppState {
                 runner: None,
                 cancel_token: echo_agent::agent::CancellationToken::new(),
             },
+            tasks: TaskState {
+                service: None,
+                cancel_token: CancellationToken::new(),
+            },
             webhook: WebhookState {
                 emitter: crate::webhook::WebhookEmitter::with_endpoints(webhook_endpoints),
+            },
+            trace: TraceState {
+                analyzer: RwLock::new(None),
+                collector: std::sync::Arc::new(crate::observability::TraceCollector::new()),
+            },
+            workspace: WorkspaceState {
+                current: RwLock::new(None),
+                registry: Arc::new(WorkspaceRegistry::new().unwrap_or_else(|e| {
+                    tracing::warn!("Failed to init workspace registry: {e}");
+                    // Fallback: use a temp directory registry
+                    WorkspaceRegistry::with_base_dir(std::env::temp_dir().join("echo-workspaces"))
+                        .expect("temp workspace registry should always init")
+                })),
             },
             skills_hub: Arc::new(RwLock::new(crate::skills_hub::SkillsHub::new())),
         }
@@ -472,16 +489,59 @@ impl AppState {
     ///
     /// Call this **before** wrapping in `Arc`.
     pub fn start_scheduler(&mut self) {
+        self.start_scheduler_with_store(None);
+    }
+
+    /// 启动定时任务调度器，可选 Store 后端
+    pub fn start_scheduler_with_store(
+        &mut self,
+        backend: Option<Arc<dyn echo_agent::memory::Store>>,
+    ) {
         if self.scheduler.runner.is_some() {
             return;
         }
-        let runner = Arc::new(crate::scheduler::SchedulerRunner::new(
+        let mut runner = crate::scheduler::SchedulerRunner::with_store(
             self.connection.agent.clone(),
             self.scheduler.cancel_token.clone(),
-        ));
+            backend,
+        );
+        // Wire BackgroundTaskService if available
+        if let Some(ref svc) = self.tasks.service {
+            runner.set_task_service(svc.clone());
+        }
+        let runner = Arc::new(runner);
         runner.clone().spawn();
         self.scheduler.runner = Some(runner);
         tracing::info!("Scheduler runner started");
+    }
+
+    /// 启动后台任务服务（所有模式都应调用）
+    ///
+    /// Call this **before** wrapping in `Arc`.
+    pub async fn start_task_service(&mut self, store_backend: Arc<dyn echo_agent::memory::Store>) {
+        if self.tasks.service.is_some() {
+            return;
+        }
+        match crate::tasks::BackgroundTaskService::new(
+            self.connection.agent.clone(),
+            store_backend,
+            self.tasks.cancel_token.clone(),
+        )
+        .await
+        {
+            Ok(service) => {
+                let service = Arc::new(service);
+                service.clone().spawn();
+                self.tasks.service = Some(service);
+                tracing::info!("BackgroundTaskService started");
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "BackgroundTaskService failed to initialize — background tasks will be unavailable"
+                );
+            }
+        }
     }
 
     /// 获取工具列表信息
@@ -562,37 +622,6 @@ impl AppState {
         *health_map = new_health;
     }
 
-    /// 重新加载安全配置（热更新，无需重启）
-    pub async fn reload_security_config(&self) -> std::result::Result<(), String> {
-        let new_config = SecurityConfig::from_env();
-        new_config.validate()?;
-
-        let mut guard = self.config.security_config.write().await;
-        *guard = new_config;
-        tracing::info!("安全配置已热更新生效");
-        Ok(())
-    }
-
-    /// 获取或创建缓存的 JWT 管理器（避免每个请求重新构造密钥）
-    pub async fn get_or_create_jwt_manager(&self, secret: &str) -> crate::security::JwtManager {
-        // Fast path: already cached
-        {
-            let guard = self.config.jwt_manager.read().await;
-            if let Some(ref mgr) = *guard {
-                return mgr.clone();
-            }
-        }
-        // Slow path: create and cache
-        let mgr = crate::security::JwtManager::new(secret);
-        let mut guard = self.config.jwt_manager.write().await;
-        // Double-check: another thread may have created it while we waited
-        if let Some(ref existing) = *guard {
-            return existing.clone();
-        }
-        *guard = Some(mgr.clone());
-        mgr
-    }
-
     /// 添加审计日志条目（FIFO 淘汰，防止内存无限增长）
     pub async fn add_audit_entry(&self, entry: AuditLogEntry) {
         let mut logs = self.history.audit_logs.write().await;
@@ -609,11 +638,153 @@ impl AppState {
         self.history.audit_logs.read().await.clone()
     }
 
+    /// 获取审计日志分页
+    pub async fn get_audit_logs_paged(&self, offset: usize, limit: usize) -> Vec<AuditLogEntry> {
+        let logs = self.history.audit_logs.read().await;
+        logs.iter().skip(offset).take(limit).cloned().collect()
+    }
+
+    /// 获取审计日志总数
+    pub async fn audit_log_count(&self) -> usize {
+        self.history.audit_logs.read().await.len()
+    }
+
     /// 清空审计日志，返回清除的条目数
     pub async fn clear_audit_entries(&self) -> usize {
         let mut logs = self.history.audit_logs.write().await;
         let count = logs.len();
         logs.clear();
         count
+    }
+
+    // ── 工作区管理 ──
+
+    /// 获取当前活跃工作区（None 表示使用全局默认路径）。
+    pub async fn current_workspace(&self) -> Option<Workspace> {
+        self.workspace.current.read().await.clone()
+    }
+
+    /// 切换到指定工作区。
+    ///
+    /// 这会重新初始化 persistence 和 session manager 以使用工作区路径。
+    pub async fn switch_workspace(&self, workspace: Workspace) -> anyhow::Result<()> {
+        // 更新当前工作区
+        {
+            let mut current = self.workspace.current.write().await;
+            *current = Some(workspace.clone());
+        }
+
+        // 切换进程工作目录到工作区根目录。
+        // 这样所有工具（shell、文件读写、搜索等）都会自动在工作区目录下执行。
+        if workspace.root.exists() {
+            if let Err(e) = std::env::set_current_dir(&workspace.root) {
+                tracing::warn!(
+                    root = %workspace.root.display(),
+                    "Failed to set_current_dir to workspace root: {e}"
+                );
+            } else {
+                tracing::info!(
+                    root = %workspace.root.display(),
+                    "Process CWD switched to workspace root"
+                );
+            }
+        } else {
+            tracing::warn!(
+                root = %workspace.root.display(),
+                "Workspace root does not exist, skipping CWD switch"
+            );
+        }
+
+        // 更新 agent 的 working_dir 配置（影响 project rules 注入等）
+        self.connection.agent.try_write(|a| {
+            a.set_working_dir(Some(workspace.root.clone()));
+        });
+
+        // 重新初始化 persistence 以使用工作区路径
+        let new_persistence = Persistence::with_base_dir(
+            crate::workspace::layout::WorkspaceLayout::sessions(&workspace.root),
+        );
+        {
+            let mut persistence = self.storage.persistence.write().await;
+            *persistence = new_persistence;
+        }
+
+        // 重新初始化 conversation_store 到工作区的数据库
+        let conv_dir = crate::workspace::layout::WorkspaceLayout::conversations(&workspace.root);
+        std::fs::create_dir_all(&conv_dir).ok();
+        let db_path = conv_dir.join("conversations.db");
+        match echo_agent::memory::SqliteConversationStore::new(&db_path) {
+            Ok(store) => {
+                let new_store: Arc<dyn echo_agent::memory::ConversationStore> = Arc::new(store);
+                {
+                    let mut guard = self.storage.conversation_store.write().await;
+                    *guard = Some(new_store.clone());
+                }
+                self.connection
+                    .agent
+                    .try_write(|a| a.set_conversation_store(new_store));
+                tracing::info!(
+                    workspace = %workspace.id,
+                    db = %db_path.display(),
+                    "Switched conversation store to workspace"
+                );
+            }
+            Err(e) => {
+                tracing::warn!("Failed to reinit conversation store for workspace: {e}");
+            }
+        }
+
+        tracing::info!(
+            workspace = %workspace.id,
+            root = %workspace.root.display(),
+            "Switched to workspace"
+        );
+
+        Ok(())
+    }
+
+    /// 退出工作区（回到全局默认路径）。
+    pub async fn exit_workspace(&self) {
+        let mut current = self.workspace.current.write().await;
+        *current = None;
+
+        // 重置 persistence 到全局默认路径
+        let global_persistence = Persistence::new();
+        {
+            let mut persistence = self.storage.persistence.write().await;
+            *persistence = global_persistence;
+        }
+
+        // 重置 conversation_store 到全局默认路径
+        let global_db = crate::persistence::Persistence::base_dir().join("conversations.db");
+        match echo_agent::memory::SqliteConversationStore::new(&global_db) {
+            Ok(store) => {
+                let mut guard = self.storage.conversation_store.write().await;
+                *guard = Some(Arc::new(store));
+            }
+            Err(e) => {
+                tracing::warn!("Failed to reset conversation store to global: {e}");
+            }
+        }
+
+        tracing::info!("Exited workspace, using global default paths");
+    }
+
+    /// 获取工作区感知的 sessions 目录。
+    pub async fn sessions_dir(&self) -> std::path::PathBuf {
+        if let Some(ref ws) = *self.workspace.current.read().await {
+            crate::workspace::layout::WorkspaceLayout::sessions(&ws.root)
+        } else {
+            Persistence::base_dir()
+        }
+    }
+
+    /// 获取工作区感知的 tasks DB 路径。
+    pub async fn tasks_db_path(&self) -> std::path::PathBuf {
+        if let Some(ref ws) = *self.workspace.current.read().await {
+            crate::workspace::layout::WorkspaceLayout::tasks(&ws.root).join("tasks.db")
+        } else {
+            Persistence::base_dir().join("tasks.db")
+        }
     }
 }

@@ -34,9 +34,6 @@ pub async fn handle_subcommand(cmd: &Commands) -> Result<()> {
         Commands::Completions { shell, all } => {
             handle_completions_command(shell, *all)?;
         }
-        Commands::Tui => {
-            unreachable!("Tui subcommand should be handled before handle_subcommand");
-        }
         Commands::Onboard => {
             super::onboard::run_onboard()?;
         }
@@ -314,9 +311,13 @@ pub async fn handle_session_action(action: &SessionAction) -> Result<()> {
                         return Ok(());
                     }
                 };
-                let path = output
-                    .clone()
-                    .unwrap_or_else(|| format!("session-{}.{}", &session.id[..8], ext));
+                let path = output.clone().unwrap_or_else(|| {
+                    format!(
+                        "session-{}.{}",
+                        session.id.get(..8).unwrap_or(&session.id),
+                        ext
+                    )
+                });
                 let path = std::path::Path::new(&path);
                 match format.as_str() {
                     "json" => manager.export_json(id, path)?,
@@ -379,7 +380,11 @@ fn dirs_home_path() -> std::path::PathBuf {
 async fn handle_eval_command(path: &str, json_output: bool) -> anyhow::Result<()> {
     let app_config = config::load_config(None);
     let model = &app_config.model.name;
-    let mut agent = ReactAgent::new(AgentConfig::standard(model, "echo-eval", "You are a helpful coding assistant"));
+    let mut agent = ReactAgent::new(AgentConfig::standard(
+        model,
+        "echo-eval",
+        "You are a helpful coding assistant",
+    ));
     // N1 fix: attach a RunStore so trace metrics are populated during eval
     agent.run_store = Some(Arc::new(echo_agent::trace::InMemoryRunStore::new()));
     let handle = crate::agent_handle::AgentHandle::new(agent);
@@ -390,6 +395,8 @@ async fn handle_eval_command(path: &str, json_output: bool) -> anyhow::Result<()
 fn truncate_str_max(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
+    } else if max <= 3 {
+        ".".repeat(max)
     } else {
         format!("{}...", s.chars().take(max - 3).collect::<String>())
     }

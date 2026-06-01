@@ -1,29 +1,49 @@
 //! Cron 调度运行器
 //!
 //! 后台 tokio 任务，按 cron 表达式触发 Agent 对话。
+//! 每次触发通过 BackgroundTaskService 提交为独立的 AgentChat 任务，
+//! 获得任务追踪、重试和持久化能力。
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use super::task::{CronTask, CronTaskStatus, TaskStore};
 use crate::agent_handle::AgentHandle;
-use echo_agent::agent::{Agent, CancellationToken};
+use crate::tasks::background::BackgroundTaskKind;
+use crate::tasks::service::BackgroundTaskService;
+use echo_agent::agent::CancellationToken;
 
 /// 调度运行器
 #[derive(Clone)]
 pub struct SchedulerRunner {
     store: TaskStore,
     agent: AgentHandle,
+    task_service: Option<Arc<BackgroundTaskService>>,
     tasks: Arc<RwLock<Vec<CronTask>>>,
+    /// Track last fire time per task_id to prevent double-firing
+    last_fired: Arc<RwLock<HashMap<String, DateTime<Utc>>>>,
     cancel: CancellationToken,
 }
 
 impl SchedulerRunner {
-    /// 创建调度运行器
+    /// 创建调度运行器（使用文件存储）
     pub fn new(agent: AgentHandle, cancel: CancellationToken) -> Self {
-        let store = TaskStore::new();
+        Self::with_store(agent, cancel, None)
+    }
+
+    /// 创建调度运行器（可选 Store 后端）
+    pub fn with_store(
+        agent: AgentHandle,
+        cancel: CancellationToken,
+        backend: Option<Arc<dyn echo_agent::memory::Store>>,
+    ) -> Self {
+        let store = match backend {
+            Some(b) => TaskStore::with_store(b),
+            None => TaskStore::new(),
+        };
         let tasks = match store.load_all() {
             Ok(t) => t,
             Err(e) => {
@@ -43,9 +63,21 @@ impl SchedulerRunner {
         Self {
             store,
             agent,
+            task_service: None,
             tasks: Arc::new(RwLock::new(tasks)),
+            last_fired: Arc::new(RwLock::new(HashMap::new())),
             cancel,
         }
+    }
+
+    /// Set the BackgroundTaskService for task submission.
+    /// 获取 TaskStore 引用（Clone 是廉价的，共享底层 Arc）
+    pub fn store(&self) -> TaskStore {
+        self.store.clone()
+    }
+
+    pub fn set_task_service(&mut self, service: Arc<BackgroundTaskService>) {
+        self.task_service = Some(service);
     }
 
     /// 后台启动调度循环
@@ -73,37 +105,81 @@ impl SchedulerRunner {
 
     /// 单次 tick：检查所有启用任务是否到达触发时间
     async fn tick(&self) {
-        let tasks = self.tasks.read().await;
-        let now = Utc::now();
+        // 1. 收集需要触发的任务（持有读锁期间只做判断，不执行）
+        let to_fire: Vec<(String, String, String)> = {
+            let tasks = self.tasks.read().await;
+            let mut fired = self.last_fired.write().await;
+            let now = Utc::now();
+            let mut pending = Vec::new();
 
-        for task in tasks.iter() {
-            if task.status != CronTaskStatus::Enabled {
-                continue;
-            }
+            for task in tasks.iter() {
+                if task.status != CronTaskStatus::Enabled {
+                    continue;
+                }
 
-            // 检查是否在最近 30 秒内应该触发
-            if let Ok(next_run) = task.next_run() {
-                let diff = (next_run - now).num_seconds();
-                // 如果下次触发时间在 -30s ~ 0s 之间，说明刚刚到达触发时刻
-                if diff >= -30 && diff <= 0 {
-                    let task_id = task.id.clone();
-                    let prompt = task.prompt.clone();
-                    // 并行触发所有到期任务
-                    let self_ = self.clone();
-                    tokio::spawn(async move {
-                        self_.execute_task(&task_id, &prompt).await;
-                    });
+                // 检查是否在最近 30 秒内应该触发
+                if let Ok(next_run) = task.next_run() {
+                    let diff = (next_run - now).num_seconds();
+                    // 如果下次触发时间在 -30s ~ 0s 之间，说明刚刚到达触发时刻
+                    if diff >= -30 && diff <= 0 {
+                        // Prevent double-firing: skip if already fired within this window
+                        if let Some(last) = fired.get(&task.id) {
+                            let since_last = (now - *last).num_seconds();
+                            if since_last < 30 {
+                                continue;
+                            }
+                        }
+                        fired.insert(task.id.clone(), now);
+                        pending.push((task.id.clone(), task.name.clone(), task.prompt.clone()));
+                    }
                 }
             }
+            pending
+        }; // 读锁在此处释放
+
+        // 2. 在锁外执行任务（避免 fire_task → execute_direct 尝试写锁导致死锁）
+        for (task_id, name, prompt) in &to_fire {
+            self.fire_task(task_id, name, prompt).await;
         }
     }
 
-    /// 执行一个定时任务
-    async fn execute_task(&self, task_id: &str, prompt: &str) {
-        info!("Executing cron task: {task_id}");
-        let prompt = prompt.to_string();
+    /// Fire a cron task — submits via BackgroundTaskService if available,
+    /// falls back to direct agent.chat() otherwise.
+    async fn fire_task(&self, task_id: &str, name: &str, prompt: &str) {
+        info!("Firing cron task: {name} ({task_id})");
+
+        if let Some(ref service) = self.task_service {
+            // Submit as a tracked background task
+            let description = format!("Cron [{name}]: {prompt}");
+            let kind = BackgroundTaskKind::AgentChat {
+                prompt: prompt.to_string(),
+                session_id: None,
+            };
+            match service
+                .submit(kind, &description, Some("cron".to_string()))
+                .await
+            {
+                Ok(bg_task_id) => {
+                    debug!("Cron task {task_id} submitted as background task {bg_task_id}");
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to submit cron task via BackgroundTaskService: {e}, falling back to direct execution"
+                    );
+                    self.execute_direct(task_id, prompt).await;
+                }
+            }
+        } else {
+            // Fallback: direct execution (no tracking)
+            self.execute_direct(task_id, prompt).await;
+        }
+    }
+
+    /// Direct execution fallback — used when BackgroundTaskService is not available.
+    async fn execute_direct(&self, task_id: &str, prompt: &str) {
+        use echo_agent::agent::Agent;
         let guard = self.agent.inner().read().await;
-        let result = guard.chat(&prompt).await;
+        let result = guard.chat(prompt).await;
 
         let summary = match result {
             Ok(answer) => {
@@ -172,9 +248,14 @@ impl SchedulerRunner {
             .find(|t| t.id == id)
             .ok_or_else(|| anyhow::anyhow!("Task not found: {id}"))?;
         let prompt = task.prompt.clone();
+        let name = task.name.clone();
         let task_id = task.id.clone();
         drop(tasks);
 
+        self.fire_task(&task_id, &name, &prompt).await;
+
+        // For manual runs, also do direct execution to return result immediately
+        use echo_agent::agent::Agent;
         let guard = self.agent.inner().read().await;
         let result = guard.chat(&prompt).await?;
 

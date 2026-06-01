@@ -1,6 +1,7 @@
 import { type ReactNode } from 'react';
 import { PanelLeftClose, PanelLeftOpen } from 'lucide-react';
 import { useUiStore } from '../../stores/uiStore';
+import { TerminalDrawer } from '../terminal/TerminalDrawer';
 
 export function AppLayout({ left, center }: { left: ReactNode; center: ReactNode }) {
   const { leftSidebarOpen, toggleLeftSidebar } = useUiStore();
@@ -30,7 +31,7 @@ export function AppLayout({ left, center }: { left: ReactNode; center: ReactNode
         <div className="h-full w-[280px]">{left}</div>
       </div>
 
-      {/* Center */}
+      {/* Center + Terminal drawer */}
       <div className="relative flex min-w-0 flex-1 flex-col min-h-0">
         {/* Left toggle */}
         <button
@@ -43,6 +44,8 @@ export function AppLayout({ left, center }: { left: ReactNode; center: ReactNode
         <div onClick={closeSidebarMobile} className="flex flex-1 flex-col min-h-0">
           {center}
         </div>
+        {/* Terminal drawer at bottom */}
+        <TerminalDrawer />
       </div>
 
     </div>

@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 
-export type SettingsTabId = 'tools' | 'mcp' | 'skills' | 'memory' | 'config' | 'sessions' | 'permissions' | 'audit' | 'workflow' | 'sandbox' | 'compress' | 'extract';
+export type SettingsTabId = 'tools' | 'mcp' | 'skills' | 'memory' | 'auto-memory' | 'config' | 'providers' | 'sessions' | 'permissions' | 'audit' | 'workflow' | 'sandbox' | 'compress' | 'extract' | 'evolution' | 'plugins' | 'scheduler' | 'worktree';
 
 type Theme = 'light' | 'dark';
 
@@ -9,12 +9,16 @@ interface UiState {
   settingsOpen: boolean;
   activeSettingsTab: SettingsTabId;
   theme: Theme;
+  terminalOpen: boolean;
   toggleLeftSidebar: () => void;
   openSettings: () => void;
   closeSettings: () => void;
   setActiveSettingsTab: (tab: SettingsTabId) => void;
   toggleTheme: () => void;
   setTheme: (theme: Theme) => void;
+  openTerminal: () => void;
+  closeTerminal: () => void;
+  toggleTerminal: () => void;
 }
 
 function getInitialTheme(): Theme {
@@ -33,6 +37,7 @@ export const useUiStore = create<UiState>((set, get) => ({
   settingsOpen: false,
   activeSettingsTab: 'tools',
   theme: getInitialTheme(),
+  terminalOpen: false,
 
   toggleLeftSidebar: () => set((s) => ({ leftSidebarOpen: !s.leftSidebarOpen })),
   openSettings: () => set({ settingsOpen: true }),
@@ -49,6 +54,9 @@ export const useUiStore = create<UiState>((set, get) => ({
     applyTheme(theme);
     set({ theme });
   },
+  openTerminal: () => set({ terminalOpen: true }),
+  closeTerminal: () => set({ terminalOpen: false }),
+  toggleTerminal: () => set((s) => ({ terminalOpen: !s.terminalOpen })),
 }));
 
 // Apply theme on load

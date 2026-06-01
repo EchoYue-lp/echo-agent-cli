@@ -91,7 +91,12 @@ fn export_trace(run: &Run) -> String {
     // Tool events
     for event in &run.events {
         let line = match event {
-            RunEvent::ToolCall { call_id, name, args, .. } => {
+            RunEvent::ToolCall {
+                call_id,
+                name,
+                args,
+                ..
+            } => {
                 serde_json::json!({
                     "type": "tool_call",
                     "call_id": call_id,
@@ -99,7 +104,13 @@ fn export_trace(run: &Run) -> String {
                     "args": args
                 })
             }
-            RunEvent::ToolResult { call_id, name, success, output_preview, .. } => {
+            RunEvent::ToolResult {
+                call_id,
+                name,
+                success,
+                output_preview,
+                ..
+            } => {
                 serde_json::json!({
                     "type": "tool_result",
                     "call_id": call_id,
@@ -108,7 +119,11 @@ fn export_trace(run: &Run) -> String {
                     "output_preview": output_preview
                 })
             }
-            RunEvent::ToolError { call_id, name, message } => {
+            RunEvent::ToolError {
+                call_id,
+                name,
+                message,
+            } => {
                 serde_json::json!({
                     "type": "tool_error",
                     "call_id": call_id,

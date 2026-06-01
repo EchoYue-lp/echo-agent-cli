@@ -3,11 +3,13 @@
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use serde_json::Value;
+use ts_rs::TS;
 
 // ── 对话相关 ─────────────────────────────────────────────────
 
 /// POST /api/chat 响应
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
+#[ts(export, rename = "ChatResponse")]
 pub struct ChatResponse {
     pub answer: String,
     pub tool_calls: Vec<ToolCallInfo>,
@@ -15,7 +17,8 @@ pub struct ChatResponse {
     pub context_stats: ContextStats,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, rename = "ToolCallInfo")]
 pub struct ToolCallInfo {
     pub name: String,
     pub args: Value,
@@ -23,7 +26,8 @@ pub struct ToolCallInfo {
     pub success: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
+#[ts(export, rename = "ContextStats")]
 pub struct ContextStats {
     pub message_count: usize,
     pub estimated_tokens: usize,
@@ -31,7 +35,8 @@ pub struct ContextStats {
 
 // ── 工具相关 ─────────────────────────────────────────────────
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
+#[ts(export, rename = "ToolInfo")]
 pub struct ToolInfo {
     pub name: String,
     pub description: String,
@@ -41,14 +46,16 @@ pub struct ToolInfo {
     pub source: ToolSource,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
+#[ts(export, rename = "ToolSource")]
 pub enum ToolSource {
     Builtin,
 }
 
 // ── MCP 相关 ─────────────────────────────────────────────────
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
+#[ts(export, rename = "McpServerInfo")]
 pub struct McpServerInfo {
     pub name: String,
     pub status: McpConnectionStatus,
@@ -59,7 +66,8 @@ pub struct McpServerInfo {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
+#[ts(export, rename = "McpConnectionStatus")]
 pub enum McpConnectionStatus {
     Connected,
     #[allow(dead_code)]
@@ -68,7 +76,8 @@ pub enum McpConnectionStatus {
     Error(String),
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
+#[ts(export, rename = "McpToolInfo")]
 pub struct McpToolInfo {
     pub name: String,
     pub description: String,
@@ -77,7 +86,8 @@ pub struct McpToolInfo {
 
 // ── 技能相关 ─────────────────────────────────────────────────
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
+#[ts(export, rename = "SkillInfo")]
 pub struct SkillInfo {
     pub name: String,
     pub description: String,
@@ -86,7 +96,8 @@ pub struct SkillInfo {
     pub source: SkillSource,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
+#[ts(export, rename = "SkillSource")]
 pub enum SkillSource {
     Builtin,
     External { path: String },
@@ -94,7 +105,8 @@ pub enum SkillSource {
 
 // ── 配置相关 ─────────────────────────────────────────────────
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
+#[ts(export, rename = "AgentConfigResponse")]
 pub struct AgentConfigResponse {
     pub model: String,
     pub system_prompt: String,
@@ -108,7 +120,8 @@ pub struct AgentConfigResponse {
 }
 
 /// GET /api/config/full — 完整配置（用于前端配置面板）
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
+#[ts(export, rename = "FullConfigResponse")]
 pub struct FullConfigResponse {
     pub model: ModelConfigResponse,
     pub agent: AgentConfigResponse,
@@ -118,59 +131,68 @@ pub struct FullConfigResponse {
     pub logging: LoggingConfigResponse,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
+#[ts(export, rename = "ModelConfigResponse")]
 pub struct ModelConfigResponse {
     pub name: String,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
+#[ts(export, rename = "McpConfigResponse")]
 pub struct McpConfigResponse {
     pub config_path: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
+#[ts(export, rename = "ChannelsConfigResponse")]
 pub struct ChannelsConfigResponse {
     pub qq: QqConfigResponse,
     pub feishu: FeishuConfigResponse,
     pub session: SessionConfigResponse,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
+#[ts(export, rename = "QqConfigResponse")]
 pub struct QqConfigResponse {
     pub enabled: bool,
     pub app_id: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
+#[ts(export, rename = "FeishuConfigResponse")]
 pub struct FeishuConfigResponse {
     pub enabled: bool,
     pub app_id: String,
     pub mode: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
+#[ts(export, rename = "SessionConfigResponse")]
 pub struct SessionConfigResponse {
     pub timeout_minutes: u64,
     pub reset_keywords: Vec<String>,
     pub reset_commands: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
+#[ts(export, rename = "ServerConfigResponse")]
 pub struct ServerConfigResponse {
     pub host: String,
     pub port: u16,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
+#[ts(export, rename = "LoggingConfigResponse")]
 pub struct LoggingConfigResponse {
     pub level: String,
 }
 
 // ── 会话相关 ─────────────────────────────────────────────────
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
+#[ts(export, rename = "SessionInfo")]
 pub struct SessionInfo {
     pub session_id: Option<String>,
     pub message_count: usize,
@@ -182,7 +204,8 @@ pub struct SessionInfo {
 // ── WebSocket 消息类型 ─────────────────────────────────────────────────
 
 /// 服务端 -> 客户端 WebSocket 消息
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, TS)]
+#[ts(export, rename = "ServerMessage")]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
     /// Token 片段
@@ -267,4 +290,7 @@ pub enum ServerMessage {
         prompt_tokens: usize,
         completion_tokens: usize,
     },
+
+    /// 心跳响应
+    Pong,
 }

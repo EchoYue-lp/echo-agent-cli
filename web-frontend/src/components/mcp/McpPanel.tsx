@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { mcpApi } from '../../api/endpoints';
 import type { McpServerInfo, McpConfig } from '../../types/api';
-import { Globe, Trash2, ChevronDown, ChevronRight, Save, RefreshCw } from 'lucide-react';
+import { Globe, Trash2, ChevronDown, ChevronRight, Save, RefreshCw, Power } from 'lucide-react';
 
 export function McpPanel() {
   const [servers, setServers] = useState<McpServerInfo[]>([]);
@@ -49,7 +49,7 @@ export function McpPanel() {
       } else {
         setSaveMessage({
           type: 'error',
-          text: result.message || '保存失败' + (result.errors ? `: ${result.errors.join(', ')}` : '')
+          text: result.message || '保存失败'
         });
       }
     } catch (e: any) {
@@ -64,6 +64,15 @@ export function McpPanel() {
   const disconnect = async (name: string) => {
     try {
       await mcpApi.disconnect(name);
+      await loadData();
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const toggle = async (name: string, currentEnabled: boolean) => {
+    try {
+      await mcpApi.toggle(name, !currentEnabled);
       await loadData();
     } catch (e) {
       console.error(e);
@@ -198,16 +207,27 @@ export function McpPanel() {
             暂无 MCP 服务器连接
           </div>
         ) : (
-          servers.map((srv) => (
-            <div key={srv.name} className="rounded-lg border" style={{ borderColor: s.border, background: s.bg }}>
+          servers.map((srv) => {
+            const isEnabled = srv.enabled !== false;
+            return (
+            <div key={srv.name} className="rounded-lg border" style={{ borderColor: s.border, background: s.bg, opacity: isEnabled ? 1 : 0.6 }}>
               <div className="flex items-center gap-2 px-3 py-2">
                 <button onClick={() => setExpanded(expanded === srv.name ? null : srv.name)}
                   style={{ color: s.textTer }}>
                   {expanded === srv.name ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
                 </button>
-                <Globe size={12} style={{ color: 'var(--color-success)' }} />
+                <Globe size={12} style={{ color: isEnabled && srv.status === 'connected' ? 'var(--color-success)' : 'var(--text-tertiary)' }} />
                 <span className="flex-1 truncate text-xs font-medium" style={{ color: s.text }}>{srv.name}</span>
-                <span className="text-[10px]" style={{ color: s.textTer }}>{srv.transport} • {srv.tool_count} tools</span>
+                <span className="text-[10px]" style={{ color: s.textTer }}>{srv.transport} • {srv.tool_count ?? 0} tools</span>
+                {/* Toggle enable/disable */}
+                <button
+                  onClick={() => toggle(srv.name, isEnabled)}
+                  title={isEnabled ? '禁用' : '启用'}
+                  className="rounded p-1 transition-colors"
+                  style={{ color: isEnabled ? 'var(--color-success)' : 'var(--text-tertiary)' }}
+                >
+                  <Power size={12} />
+                </button>
                 <button onClick={() => disconnect(srv.name)} style={{ color: s.textTer }}>
                   <Trash2 size={12} />
                 </button>
@@ -242,10 +262,10 @@ export function McpPanel() {
                     )}
                   </div>
 
-                  {srv.tools.length > 0 && (
+                  {(srv.tools?.length ?? 0) > 0 && (
                     <div className="space-y-1">
-                      <div className="text-xs font-medium" style={{ color: s.textSec }}>Tools ({srv.tools.length}):</div>
-                      {srv.tools.map((t) => (
+                      <div className="text-xs font-medium" style={{ color: s.textSec }}>Tools ({srv.tools!.length}):</div>
+                      {srv.tools!.map((t) => (
                         <div key={t.name} className="text-xs pl-2">
                           <span className="font-mono" style={{ color: s.text }}>{t.name}</span>
                           <span className="ml-2" style={{ color: s.textTer }}>{t.description}</span>
@@ -256,7 +276,8 @@ export function McpPanel() {
                 </div>
               )}
             </div>
-          ))
+            );
+          })
         )}
       </div>
     </div>

@@ -1,4 +1,5 @@
 import type { LoginResponse, HealthResponse } from '../types/api';
+import { useToastStore } from '../stores/toastStore';
 
 const BASE = '/api';
 
@@ -73,13 +74,15 @@ async function request<T>(path: string, opts?: RequestInit): Promise<T> {
   // 处理401未授权响应（令牌可能过期）
   if (res.status === 401) {
     clearToken();
-    // 可以在这里触发重新登录逻辑
+    useToastStore.getState().addToast('error', '认证已过期，请重新登录');
     throw new Error('认证已过期，请重新登录');
   }
 
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`API ${res.status}: ${text}`);
+    const message = `API ${res.status}: ${text}`;
+    useToastStore.getState().addToast('error', message);
+    throw new Error(message);
   }
 
   return res.json();

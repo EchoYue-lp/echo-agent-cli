@@ -6,13 +6,20 @@ export type ConnectionStatus = 'connected' | 'disconnected' | 'connecting';
 
 const INITIAL_RECONNECT_MS = 1000;
 const MAX_RECONNECT_MS = 30000;
+const MAX_RECONNECT_ATTEMPTS = 20;
+const HEARTBEAT_INTERVAL_MS = 15000;
+const HEARTBEAT_TIMEOUT_MS = 10000;
 
 export function useWebSocket() {
   const wsRef = useRef<WebSocket | null>(null);
   const assistantIdRef = useRef<string | null>(null);
   const inThinkingRef = useRef(false);
+  const isCancelledRef = useRef(false);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
   const streamTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const heartbeatTimer = useRef<ReturnType<typeof setInterval>>(undefined);
+  const heartbeatTimeout = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const messageQueue = useRef<ClientMessage[]>([]);
   const retryCount = useRef(0);
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('connecting');
 
@@ -42,16 +49,42 @@ export function useWebSocket() {
     ws.onopen = () => {
       console.log('[WS] connected');
       setConnectionStatus('connected');
-      retryCount.current = 0; // Reset backoff on successful connection
+      retryCount.current = 0;
+
+      // Start heartbeat to detect silent disconnects
+      clearHeartbeat();
+      heartbeatTimer.current = setInterval(() => {
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+          wsRef.current.send(JSON.stringify({ type: 'ping' }));
+          heartbeatTimeout.current = setTimeout(() => {
+            console.warn('[WS] Heartbeat timeout, closing connection');
+            wsRef.current?.close();
+          }, HEARTBEAT_TIMEOUT_MS);
+        }
+      }, HEARTBEAT_INTERVAL_MS);
+
+      // Flush queued messages
+      const queued = messageQueue.current;
+      messageQueue.current = [];
+      for (const msg of queued) {
+        ws.send(JSON.stringify(msg));
+      }
     };
 
     ws.onmessage = (ev) => {
-      const msg: ServerMessage = JSON.parse(ev.data);
+      let msg: ServerMessage;
+      try {
+        msg = JSON.parse(ev.data);
+      } catch {
+        console.error('[WS] Failed to parse message:', ev.data);
+        return;
+      }
       const store = useChatStore.getState();
 
       switch (msg.type) {
         case 'token': {
           clearStreamTimer();
+          if (isCancelledRef.current) break;
           if (!assistantIdRef.current) {
             assistantIdRef.current = store.startAssistantMessage();
           }
@@ -63,6 +96,7 @@ export function useWebSocket() {
           break;
         }
         case 'thinking_start':
+          if (isCancelledRef.current) break;
           inThinkingRef.current = true;
           store.setThinking(true);
           if (!assistantIdRef.current) {
@@ -75,19 +109,23 @@ export function useWebSocket() {
           store.setThinking(false);
           break;
         case 'tool_start':
+          if (isCancelledRef.current) break;
           store.setToolCall(msg.name, msg.args);
           break;
         case 'tool_result':
+          if (isCancelledRef.current) break;
           store.completeToolCall(msg.name, msg.result, msg.success);
           break;
         case 'final_answer': {
-          if (assistantIdRef.current) {
+          if (!isCancelledRef.current && assistantIdRef.current) {
             store.finalizeAssistantMessage(assistantIdRef.current, msg.data);
           }
           assistantIdRef.current = null;
+          isCancelledRef.current = false;
           break;
         }
         case 'approval_request':
+          if (isCancelledRef.current) break;
           store.setApprovalRequest({
             requestId: msg.request_id,
             toolName: msg.tool_name,
@@ -96,30 +134,49 @@ export function useWebSocket() {
           });
           break;
         case 'input_request':
+          if (isCancelledRef.current) break;
           store.setInputRequest({ requestId: msg.request_id, prompt: msg.prompt });
           break;
+        case 'pong':
+          // Heartbeat response received, clear timeout
+          if (heartbeatTimeout.current) {
+            clearTimeout(heartbeatTimeout.current);
+            heartbeatTimeout.current = undefined;
+          }
+          break;
         case 'chart':
+          if (isCancelledRef.current) break;
           store.addChartMessage(msg.spec);
           break;
         case 'error': {
           clearStreamTimer();
-          if (assistantIdRef.current) {
+          if (!isCancelledRef.current && assistantIdRef.current) {
             store.finalizeAssistantMessage(assistantIdRef.current, `[Error] ${msg.message}`);
           }
           assistantIdRef.current = null;
+          isCancelledRef.current = false;
           break;
         }
         case 'cancelled':
           clearStreamTimer();
           assistantIdRef.current = null;
+          isCancelledRef.current = false;
           break;
       }
     };
 
     ws.onclose = () => {
-      const delay = getReconnectDelay();
+      clearHeartbeat();
       retryCount.current += 1;
-      console.log(`[WS] disconnected, reconnecting in ${delay}ms (attempt ${retryCount.current})`);
+
+      if (retryCount.current > MAX_RECONNECT_ATTEMPTS) {
+        console.error(`[WS] Max reconnect attempts (${MAX_RECONNECT_ATTEMPTS}) reached, giving up`);
+        setConnectionStatus('disconnected');
+        return;
+      }
+
+      const delay = getReconnectDelay();
+      console.log(`[WS] disconnected, reconnecting in ${delay}ms (attempt ${retryCount.current}/${MAX_RECONNECT_ATTEMPTS})`);
       setConnectionStatus('disconnected');
       reconnectTimer.current = setTimeout(connect, delay);
     };
@@ -130,10 +187,25 @@ export function useWebSocket() {
     };
   }, [getReconnectDelay]);
 
+  const clearHeartbeat = () => {
+    if (heartbeatTimer.current) {
+      clearInterval(heartbeatTimer.current);
+      heartbeatTimer.current = undefined;
+    }
+    if (heartbeatTimeout.current) {
+      clearTimeout(heartbeatTimeout.current);
+      heartbeatTimeout.current = undefined;
+    }
+  };
+
   const send = useCallback((msg: ClientMessage): boolean => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify(msg));
       return true;
+    }
+    // Queue message for when reconnection succeeds
+    if (msg.type !== 'ping' && msg.type !== 'cancel') {
+      messageQueue.current.push(msg);
     }
     return false;
   }, []);
@@ -158,6 +230,7 @@ export function useWebSocket() {
     if (!send({ type: 'message', data: text, attachments })) {
       store.markCancelled();
     } else {
+      isCancelledRef.current = false;
       assistantIdRef.current = store.startAssistantMessage();
       // 60s streaming timeout: if no response, cancel to prevent stuck UI
       clearStreamTimer();
@@ -182,6 +255,7 @@ export function useWebSocket() {
   const cancel = useCallback(() => {
     useChatStore.getState().markCancelled();
     assistantIdRef.current = null;
+    isCancelledRef.current = true;
     send({ type: 'cancel' });
   }, [send]);
 
@@ -190,6 +264,7 @@ export function useWebSocket() {
     return () => {
       clearTimeout(reconnectTimer.current);
       clearStreamTimer();
+      clearHeartbeat();
       wsRef.current?.close();
     };
   }, [connect]);

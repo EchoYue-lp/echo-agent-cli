@@ -56,6 +56,10 @@ pub async fn install_from_git(
     subdir: Option<&str>,
     hub: &mut SkillsHub,
 ) -> Result<InstallResult, String> {
+    // Security: validate the repo URL — only allow https:// scheme,
+    // reject private IP hostnames to prevent SSRF.
+    validate_git_url(repo_url)?;
+
     // 克隆到临时目录
     let temp_dir = std::env::temp_dir().join(format!("echo-agent-skill-{}", std::process::id()));
     if temp_dir.exists() {
@@ -149,4 +153,52 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Validate a git repository URL for safe cloning.
+///
+/// Only allows `https://` scheme. Rejects `file://`, `ssh://`, `git://`,
+/// `http://` (plaintext), and URLs pointing to private/reserved IPs.
+fn validate_git_url(url: &str) -> Result<(), String> {
+    // Basic scheme check without pulling in the `url` crate (app-core
+    // doesn't depend on it). This is sufficient for our security needs.
+    if !url.starts_with("https://") {
+        return Err(format!(
+            "Only https:// git URLs are allowed for skill installation. Got: {}",
+            url.split("://").next().unwrap_or(url)
+        ));
+    }
+
+    // Extract hostname for private IP check
+    if let Some(rest) = url.strip_prefix("https://") {
+        let host = rest.split('/').next().unwrap_or("");
+        // Strip port if present
+        let host = host.split(':').next().unwrap_or(host);
+
+        if is_private_hostname(host) {
+            return Err(
+                "Git URLs pointing to private or reserved IP addresses are not allowed".to_string(),
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Check if a hostname is a private/reserved IP or localhost alias.
+fn is_private_hostname(host: &str) -> bool {
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_broadcast()
+                    || v4.is_unspecified()
+            }
+            std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.is_unspecified(),
+        };
+    }
+    let lower = host.to_lowercase();
+    lower == "localhost" || lower.ends_with(".localhost") || lower == "0.0.0.0"
 }

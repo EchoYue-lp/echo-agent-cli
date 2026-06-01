@@ -30,6 +30,16 @@ impl SessionManager {
         }
     }
 
+    /// 创建会话管理器，使用指定基础目录（工作区模式）。
+    pub fn with_base_dir(base_dir: PathBuf) -> Self {
+        fs::create_dir_all(&base_dir).ok();
+        Self {
+            base_dir,
+            auto_save: true,
+            active_session_id: None,
+        }
+    }
+
     pub fn base_dir() -> PathBuf {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
         let new_dir = PathBuf::from(&home).join(".echo-agent").join("sessions");
@@ -93,6 +103,15 @@ impl SessionManager {
         Ok(())
     }
 
+    /// 获取最近更新的会话
+    pub fn get_latest(&self) -> anyhow::Result<Option<Session>> {
+        let list = self.list()?;
+        match list.first() {
+            Some(summary) => self.load(&summary.id).map(Some),
+            None => Ok(None),
+        }
+    }
+
     /// 列出所有会话摘要
     pub fn list(&self) -> anyhow::Result<Vec<SessionSummary>> {
         let mut sessions = Vec::new();
@@ -111,6 +130,7 @@ impl SessionManager {
                     id: s.id,
                     name: s.name,
                     model: s.model,
+                    parent_id: s.parent_id,
                     branch: s.branch,
                     message_count: s.message_count,
                     estimated_tokens: s.estimated_tokens,
@@ -138,18 +158,12 @@ impl SessionManager {
 
     /// 获取会话的所有分支
     pub fn list_branches(&self, root_id: &str) -> anyhow::Result<Vec<SessionSummary>> {
+        // 先加载 root 会话，避免在 filter 闭包内做 N 次磁盘读取
+        let _root = self.load(root_id)?;
         Ok(self
             .list()?
             .into_iter()
-            .filter(|s| {
-                s.id == root_id
-                    || s.id
-                        == self
-                            .load(root_id)
-                            .ok()
-                            .and_then(|r| r.parent_id)
-                            .unwrap_or_default()
-            })
+            .filter(|s| s.parent_id.as_deref() == Some(root_id))
             .collect())
     }
 

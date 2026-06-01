@@ -82,6 +82,19 @@ impl Persistence {
         Self { base_dir }
     }
 
+    /// 创建持久化管理器，使用指定基础目录（工作区模式）。
+    ///
+    /// 当工作区激活时，使用工作区的 `sessions/` 目录替代全局路径。
+    pub fn with_base_dir(base_dir: PathBuf) -> Self {
+        fs::create_dir_all(&base_dir).ok();
+        Self { base_dir }
+    }
+
+    /// 基础存储目录（可能已重定向到工作区）。
+    pub fn current_base_dir(&self) -> &Path {
+        &self.base_dir
+    }
+
     /// 获取基础存储目录
     pub fn base_dir() -> PathBuf {
         let home = dirs_home();

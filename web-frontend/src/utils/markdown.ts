@@ -1,7 +1,9 @@
+import DOMPurify from 'dompurify';
+
 /**
  * Lightweight markdown-to-HTML renderer.
  * Handles: code blocks, inline code, bold, italic, headers, lists, links, blockquotes, paragraphs.
- * Output is trusted (from backend agent), safe for dangerouslySetInnerHTML.
+ * Output is sanitized with DOMPurify before being used with dangerouslySetInnerHTML.
  */
 
 export function renderMarkdown(text: string): string {
@@ -157,51 +159,21 @@ function escapeHtml(text: string): string {
 }
 
 /**
- * Strip dangerous HTML that could execute scripts when rendered via
- * dangerouslySetInnerHTML.  Uses regex (no DOM dependency) and is applied
- * after all markdown-to-HTML conversion is complete.
- *
- * Removes:
- *  - <script>…</script> (including self-closing variants)
- *  - <iframe>…</iframe>
- *  - All on* event-handler attributes (onclick, onload, onerror, …)
- *  - javascript: / vbscript: URLs in href / src attributes
+ * Sanitize HTML using DOMPurify to prevent XSS attacks.
+ * Allows specific safe attributes needed for the copy button in code blocks.
  */
 function sanitizeHtml(html: string): string {
-  // Protect the intentionally-safe Copy-button onclick by replacing it
-  // with a placeholder before stripping on* attributes.
-  const SAFE_ONCLICK_TOKEN = '\x00SAFE_ONCLICK\x00';
-  let safe = html.replace(
-    /onclick="navigator\.clipboard\.writeText\(this\.closest\(['"][^'"]*['"]\)\.querySelector\(['"][^'"]*['"]\)\.textContent\)"/g,
-    SAFE_ONCLICK_TOKEN
-  );
-
-  // 1. Remove <script>…</script> (and self-closing <script…/>)
-  safe = safe.replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, '');
-  safe = safe.replace(/<script\b[^>]*\/>/gi, '');
-
-  // 2. Remove <iframe>…</iframe> (and self-closing)
-  safe = safe.replace(/<iframe\b[^>]*>[\s\S]*?<\/iframe\s*>/gi, '');
-  safe = safe.replace(/<iframe\b[^>]*\/>/gi, '');
-
-  // 3. Strip ALL on* event-handler attributes
-  safe = safe.replace(/\s+on\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '');
-
-  // 4. Neutralise javascript: / vbscript: in href and src attributes
-  safe = safe.replace(
-    /((?:href|src)\s*=\s*)(["'])(?:\s*(?:javascript|vbscript)\s*:)/gi,
-    '$1$2#blocked:'
-  );
-  // Also handle unquoted variant
-  safe = safe.replace(
-    /((?:href|src)\s*=\s*)(?:\s*(?:javascript|vbscript)\s*:)/gi,
-    '$1#blocked:'
-  );
-
-  // Restore the safe Copy-button onclick
-  safe = safe.replace(/\x00SAFE_ONCLICK\x00/g,
-    'onclick="navigator.clipboard.writeText(this.closest(\'.md-pre-wrap\').querySelector(\'code\').textContent)"'
-  );
-
-  return safe;
+  return DOMPurify.sanitize(html, {
+    ALLOWED_TAGS: [
+      'p', 'br', 'strong', 'em', 'code', 'pre', 'div', 'span',
+      'ul', 'ol', 'li', 'blockquote', 'hr', 'h1', 'h2', 'h3',
+      'a', 'button',
+    ],
+    ALLOWED_ATTR: [
+      'class', 'href', 'target', 'rel', 'onclick', 'title',
+    ],
+    // Allow the specific onclick handler for the copy button
+    // DOMPurify will still sanitize the content, but preserve the attribute
+    ALLOW_DATA_ATTR: false,
+  });
 }

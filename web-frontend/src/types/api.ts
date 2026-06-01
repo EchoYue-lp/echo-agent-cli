@@ -47,12 +47,13 @@ export interface SkillInfo {
 
 export interface McpServerInfo {
   name: string;
-  status: 'connected' | 'disconnected' | 'error';
+  status: 'connected' | 'disconnected' | 'error' | 'disabled';
   transport: string;
-  tool_count: number;
-  tools: McpToolInfo[];
-  connected_at: string | null;
-  error: string | null;
+  tool_count?: number;
+  tools?: McpToolInfo[];
+  connected_at?: string | null;
+  error?: string | null;
+  enabled?: boolean;
 }
 
 export interface McpToolInfo {
@@ -138,7 +139,8 @@ export type ClientMessage =
   | { type: 'message'; data: string; attachments?: Attachment[] }
   | { type: 'approval_response'; request_id: string; approved: boolean; reason?: string }
   | { type: 'input_response'; request_id: string; text: string }
-  | { type: 'cancel' };
+  | { type: 'cancel' }
+  | { type: 'ping' };
 
 export type ServerMessage =
   | { type: 'token'; data: string }
@@ -151,7 +153,8 @@ export type ServerMessage =
   | { type: 'error'; message: string }
   | { type: 'cancelled' }
   | { type: 'thinking_start' }
-  | { type: 'thinking_end'; prompt_tokens: number; completion_tokens: number };
+  | { type: 'thinking_end'; prompt_tokens: number; completion_tokens: number }
+  | { type: 'pong' };
 
 // Chat store types
 export interface ChatMessage {
@@ -396,4 +399,85 @@ export interface AuthState {
 export interface HealthResponse {
   status: string;
   timestamp: string;
+}
+
+// ── Evolution / 自进化 types ──
+
+export interface ShareGPTMessage {
+  from: string;
+  value: string;
+}
+
+export interface TrajectoryEntry {
+  id: string;
+  session_id: string;
+  conversations: ShareGPTMessage[];
+  model: string;
+  completed: boolean;
+  timestamp: string;
+  token_usage: number;
+  tool_call_count: number;
+  duration_ms: number;
+}
+
+export interface TrajectoryStats {
+  total: number;
+  completed: number;
+  failed: number;
+  total_tokens: number;
+  total_tool_calls: number;
+  avg_duration_ms: number;
+}
+
+export interface ReviewOutcome {
+  run_id: string;
+  actions: string[];
+  nothing_to_save: boolean;
+  error?: string | null;
+}
+
+export interface CuratorStatus {
+  total: number;
+  active: number;
+  stale: number;
+  archived: number;
+  pinned: number;
+  last_run_at: string | null;
+}
+
+export interface CuratorTransition {
+  skill: string;
+  from: string;
+  to: string;
+}
+
+// ── Provider types ──────────────────────────────────────────────────────────
+
+export interface ProviderInfo {
+  id: string;
+  name: string;
+  icon: string;
+  models?: string[];
+  api_key_env: string;
+  base_url: string;
+  requires_api_key: boolean;
+  configured: boolean;
+}
+
+export interface ProviderListResponse {
+  providers: ProviderInfo[];
+  current_model: string;
+}
+
+export interface TestConnectionResponse {
+  success: boolean;
+  response?: string;
+  error?: string;
+  model?: string;
+}
+
+export interface SwitchModelResponse {
+  success: boolean;
+  model: string;
+  message: string;
 }

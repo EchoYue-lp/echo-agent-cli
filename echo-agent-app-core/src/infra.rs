@@ -10,6 +10,7 @@ use echo_agent::prelude::*;
 
 use crate::agent_handle::AgentHandle;
 use crate::config::AppConfig;
+use crate::project::prompt::PromptAssembler;
 
 /// Agent creation parameters (extracted from CLI args or config).
 pub struct AgentCreateParams {
@@ -20,70 +21,102 @@ pub struct AgentCreateParams {
 }
 
 /// 创建 Agent 实例
+///
+/// Uses `ReactAgentBuilder` with `.mode()` and `.mode_engine()` to
+/// leverage the framework's mode auto-configuration (system prompt,
+/// recommended tools, display name) instead of manual prompt/tool wiring.
 pub fn create_agent(params: &AgentCreateParams, app_config: &AppConfig) -> ReactAgent {
     let model = params.model.as_deref().unwrap_or(&app_config.model.name);
 
-    let agent_mode = match crate::project::modes::AgentMode::from_str(&params.mode) {
-        Some(mode) => mode,
-        None => {
+    // Parse mode with bilingual support via LocalizedModeEngine
+    let agent_mode = LocalizedModeEngine::from_str(&params.mode)
+        .or_else(|| AgentMode::from_name(&params.mode))
+        .unwrap_or_else(|| {
             let valid = ["general", "coding", "research", "data", "writing"];
             tracing::warn!(
                 "Unknown mode '{}', falling back to 'general'. Valid modes: {}",
                 params.mode,
                 valid.join(", ")
             );
-            crate::project::modes::AgentMode::General
-        }
-    };
+            AgentMode::General
+        });
 
     let base_system_prompt = params
         .system_prompt
         .as_deref()
         .unwrap_or(&app_config.agent.system_prompt);
 
-    let system_prompt = if base_system_prompt != app_config.agent.system_prompt {
-        base_system_prompt.to_string()
-    } else {
-        agent_mode.system_prompt().to_string()
-    };
-
-    let system_prompt = if let Some(ref project_dir) = params.project {
+    // Load project context if available
+    let project_ctx = if let Some(ref project_dir) = params.project {
         let project_root = std::path::Path::new(project_dir);
         if project_root.exists() {
-            let ctx = crate::project::context::load_project_context(project_root);
-            crate::project::context::build_system_prompt_with_context(&system_prompt, &ctx)
+            Some(crate::project::context::load_project_context(project_root))
         } else {
             tracing::warn!("项目目录不存在: {}", project_dir);
-            system_prompt
+            None
         }
     } else if let Some(project_root) = crate::project::context::discover_project_root(None) {
         let ctx = crate::project::context::load_project_context(&project_root);
         if !ctx.instructions.is_empty() {
-            crate::project::context::build_system_prompt_with_context(&system_prompt, &ctx)
+            Some(ctx)
         } else {
-            system_prompt
+            None
         }
     } else {
-        system_prompt
+        None
     };
 
-    // Use to_agent_config() which includes token_limit from YAML config
-    let mut config = app_config.to_agent_config();
-    // Override model if CLI arg is provided
-    if params.model.is_some() {
-        config = config.model_name(model);
-    }
-    // Override system_prompt with the resolved one (includes project context)
-    config = config.system_prompt(&system_prompt);
+    // Use PromptAssembler for modular, budget-aware prompt construction
+    // (project context, mode-specific prompt, etc.)
+    let model_window = if app_config.agent.token_limit > 0 {
+        app_config.agent.token_limit
+    } else {
+        8000 // default context window estimate
+    };
+    let assembler = PromptAssembler::default_for_mode(
+        &agent_mode,
+        base_system_prompt,
+        project_ctx.as_ref(),
+        model_window,
+    );
+    let system_prompt = assembler.assemble_no_vars();
 
-    let mut agent = ReactAgent::new(config);
+    // Determine config values from AppConfig
+    let token_limit = if app_config.agent.token_limit > 0 {
+        app_config.agent.token_limit
+    } else {
+        usize::MAX
+    };
 
-    // Initialize JSONL run store for trace persistence
+    let mode_engine = Arc::new(LocalizedModeEngine::with_chinese());
+
+    // Use ReactAgentBuilder with mode and mode_engine for framework-level
+    // auto-configuration (Chinese prompts, recommended tools, allowed_tools)
+    let mut builder = ReactAgentBuilder::new()
+        .model(model)
+        .name(&app_config.agent.name)
+        .system_prompt(&system_prompt)
+        .mode(agent_mode)
+        .mode_engine(mode_engine)
+        .enable_tools()
+        .enable_memory()
+        .enable_human_in_loop()
+        .enable_cot()
+        .max_iterations(app_config.agent.max_iterations)
+        .token_limit(token_limit)
+        .tool_execution(echo_agent::tools::ToolExecutionConfig {
+            timeout_ms: app_config.agent.tool_timeout_ms,
+            ..Default::default()
+        });
+
+    // Initialize JSONL run store for trace persistence (before build)
     if let Ok(home) = std::env::var("HOME") {
-        let run_dir = std::path::PathBuf::from(home).join(".echo-agent").join("runs");
+        let run_dir = std::path::PathBuf::from(home)
+            .join(".echo-agent")
+            .join("runs");
         match JsonlRunStore::new(&run_dir) {
             Ok(store) => {
-                agent.run_store = Some(Arc::new(store));
+                builder = builder.with_run_store(Arc::new(store));
             }
             Err(e) => {
                 tracing::warn!("Failed to initialize run store: {e}");
@@ -91,18 +124,44 @@ pub fn create_agent(params: &AgentCreateParams, app_config: &AppConfig) -> React
         }
     }
 
-    // Register default hooks (SessionStart loads project context)
+    let mut agent = match builder.build() {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::error!("Failed to build agent: {e}");
+            eprintln!("Error: Failed to initialize agent: {e}");
+            eprintln!("Please check your configuration and try again.");
+            std::process::exit(1);
+        }
+    };
+
+    // Register default hooks
     register_default_hooks(&mut agent);
 
     agent
 }
 
 /// Register sensible default hooks for the CLI agent.
+///
+/// Register default hooks that should always be present.
+///
+/// Currently a placeholder — hooks are registered via hooks.yaml files
+/// and the plugin system. This function can be extended to add
+/// built-in hooks that should always be present.
+///
+/// The hook system uses YAML configuration files:
+/// - `~/.echo-agent/hooks.yaml` (global hooks)
+/// - `.echo-agent/hooks.yaml` (project-specific hooks)
+///
+/// Hooks can be defined for various events:
+/// - SessionStart, SessionEnd
+/// - PreToolUse, PostToolUse
+/// - Stop, StopFailure
+/// - And more (see echo_agent::skills::hooks::HookEvent)
 fn register_default_hooks(agent: &mut ReactAgent) {
-    // SessionStart: log that a new session began
-    // PostToolUse: auto-track file changes (wired into FileChangeTracker via CLI layer)
-    // PreToolUse: validate read-before-edit for write tools (enforced by agent config)
-    tracing::info!("Default hooks registered for agent '{}'", agent.model_name());
+    tracing::info!(
+        agent = %agent.model_name(),
+        "Agent created, ready to register hooks from config/plugins"
+    );
 }
 
 /// 加载 MCP 配置并连接服务端
@@ -233,11 +292,10 @@ pub async fn shutdown_signal() {
     }
 }
 
-/// Print a security warning if the server binds to a non-localhost address.
+/// Print a warning if the server binds to a non-localhost address.
 ///
 /// Echo Agent CLI is designed as a single-user local application. Binding to
-/// 0.0.0.0 or a public IP exposes the agent to the network. Users should enable
-/// JWT authentication (see SecurityConfig) before accepting remote connections.
+/// 0.0.0.0 or a public IP exposes the agent to the network.
 pub fn warn_non_localhost_bind(host: &str, addr: &str, auth_enabled: bool) {
     // Check if host is a non-localhost address
     let is_localhost = host == "127.0.0.1" || host == "localhost" || host == "::1";
@@ -256,6 +314,28 @@ pub fn warn_non_localhost_bind(host: &str, addr: &str, auth_enabled: bool) {
         tracing::warn!(
             "   For remote access, use a reverse proxy with TLS and enable authentication."
         );
+    }
+}
+
+/// Initialize TraceAnalyzer in AppState from the agent's RunStore.
+///
+/// Call this after the agent has been created (and its `run_store` set)
+/// and before the AppState is wrapped in `Arc`. This extracts the
+/// `Arc<dyn RunStore>` from the agent and creates a `TraceAnalyzer`
+/// that routes can use for observability queries.
+pub async fn init_trace_analyzer(state: &crate::state::AppState) {
+    let run_store = state
+        .connection
+        .agent
+        .read_async(|a| Box::pin(async move { a.run_store.clone() }))
+        .await;
+
+    if let Some(store) = run_store {
+        let analyzer = echo_agent::trace::TraceAnalyzer::new(store);
+        *state.trace.analyzer.write().await = Some(analyzer);
+        tracing::info!("TraceAnalyzer initialized from agent RunStore");
+    } else {
+        tracing::warn!("No RunStore available on agent — TraceAnalyzer disabled");
     }
 }
 
@@ -281,12 +361,26 @@ pub fn print_both_startup_info(addr: &str) {
     tracing::info!("💡 输入 /help 查看命令帮助");
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogTarget {
+    Stderr,
+    TuiFile,
+}
+
+pub fn init_logging_for_tui(level: &str) {
+    init_logging_with_target(level, LogTarget::TuiFile);
+}
+
+pub fn init_logging(level: &str) {
+    init_logging_with_target(level, LogTarget::Stderr);
+}
+
 /// 初始化日志系统（线程安全，仅执行一次）
 ///
 /// When the `telemetry` feature is enabled, this delegates to
 /// [`echo_agent::telemetry::init_telemetry`] which sets up OTLP tracing + metrics
 /// configured via `OTEL_EXPORTER_OTLP_ENDPOINT` (defaults to `http://localhost:4317`).
-pub fn init_logging(level: &str) {
+pub fn init_logging_with_target(level: &str, target: LogTarget) {
     use std::sync::OnceLock;
     static INIT: OnceLock<()> = OnceLock::new();
 
@@ -301,16 +395,11 @@ pub fn init_logging(level: &str) {
             let config = echo_agent::telemetry::TelemetryConfig {
                 otlp_endpoint,
                 service_name,
-                enable_console: true,
+                enable_console: target == LogTarget::Stderr,
             };
             // Use env filter matching the requested level
-            // SAFETY: called during init before any other threads start
-            unsafe {
-                std::env::set_var(
-                    "RUST_LOG",
-                    format!("echo_agent_cli={level},echo_agent={level},tower_http=info"),
-                );
-            }
+            // Note: We don't set RUST_LOG env var to avoid thread-safety issues
+            // Instead, we rely on tracing_subscriber's EnvFilter::new() to parse the filter
             let _ = echo_agent::telemetry::init_telemetry(config);
             return;
         }
@@ -320,16 +409,62 @@ pub fn init_logging(level: &str) {
             use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
             let default_filter =
                 format!("echo_agent_cli={level},echo_agent={level},tower_http=info");
-            let _ = tracing_subscriber::registry()
-                .with(
-                    tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                        tracing_subscriber::filter::EnvFilter::new(&default_filter)
-                    }),
-                )
-                .with(tracing_subscriber::fmt::layer())
-                .try_init();
+            let env_filter = || {
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::filter::EnvFilter::new(&default_filter))
+            };
+
+            match target {
+                LogTarget::TuiFile => {
+                    if let Ok(file) = std::fs::File::create(tui_log_path()) {
+                        let _ = tracing_subscriber::registry()
+                            .with(env_filter())
+                            .with(
+                                tracing_subscriber::fmt::layer()
+                                    .with_writer(std::sync::Mutex::new(file))
+                                    .with_ansi(false),
+                            )
+                            .try_init();
+                    }
+                }
+                LogTarget::Stderr => {
+                    let _ = tracing_subscriber::registry()
+                        .with(env_filter())
+                        .with(tracing_subscriber::fmt::layer())
+                        .try_init();
+                }
+            }
         }
     });
+}
+
+fn tui_log_path() -> std::path::PathBuf {
+    if let Ok(cwd) = std::env::current_dir() {
+        let mut current = cwd.as_path();
+        loop {
+            let state_dir = crate::workspace::layout::WorkspaceLayout::state_dir(current);
+            if state_dir.exists()
+                || crate::workspace::layout::WorkspaceLayout::manifest(current).exists()
+                || crate::workspace::layout::WorkspaceLayout::legacy_manifest(current).exists()
+            {
+                let dir = state_dir.join("logs");
+                let _ = std::fs::create_dir_all(&dir);
+                return dir.join("tui.log");
+            }
+
+            match current.parent() {
+                Some(parent) => current = parent,
+                None => break,
+            }
+        }
+    }
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let dir = std::path::PathBuf::from(home)
+        .join(".echo-agent")
+        .join("logs");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join("tui.log")
 }
 
 // ── Doctor 诊断 ──────────────────────────────────────────────────
@@ -558,8 +693,8 @@ pub async fn load_user_hooks(agent: &AgentHandle, app_config: &AppConfig) {
         .write_async(|a| {
             Box::pin(async move {
                 let mut registry = a.hook_registry().write().await;
-                // NOTE: register_user_hooks calls merge() which appends rules.
-                // On config reload, this may cause duplicates without clear_user_hooks API.
+                // Clear existing user hooks first to avoid duplicates on config reload
+                registry.clear_user_hooks();
                 registry.register_user_hooks(hooks_def);
             })
         })

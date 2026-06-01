@@ -48,7 +48,7 @@ export function LoginForm() {
             <Sparkles size={28} color="white" />
           </div>
           <h1 className="text-xl font-semibold tracking-tight text-[var(--text-primary)]">
-            Echo Agent
+            EchoCoWork
           </h1>
           <p className="mt-1 text-sm text-[var(--text-secondary)]">
             登录以继续使用

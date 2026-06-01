@@ -3,9 +3,20 @@
 //! Replaces the fixed three-section prompt construction with priority-ordered,
 //! budget-aware module composition. Each module has a token budget; when the
 //! total exceeds the model's context window, non-required modules are truncated.
+//!
+//! # Prompt Template Integration
+//!
+//! The `PromptAssembler` can optionally delegate variable substitution to a
+//! `PromptTemplateManager` (from `echo_core`). When a template engine is
+//! provided, module content containing `{{variable}}` syntax is rendered
+//! through the engine before assembly. This enables dynamic prompt templates
+//! such as mode-specific prompts with runtime variable injection.
+
+use echo_agent::prelude::PromptTemplateManager;
+use std::sync::Arc;
 
 use super::context::ProjectContext;
-use super::modes::AgentMode;
+use super::modes::{AgentMode, ModeEngine};
 
 /// A single module of the system prompt.
 #[derive(Debug, Clone)]
@@ -26,6 +37,10 @@ pub struct PromptModule {
 pub struct PromptAssembler {
     modules: Vec<PromptModule>,
     total_budget: usize,
+    /// Optional prompt template engine for variable substitution.
+    /// When set, module content containing `{{variable}}` syntax is
+    /// rendered through the engine before assembly.
+    template_engine: Option<Arc<PromptTemplateManager>>,
 }
 
 impl PromptAssembler {
@@ -34,7 +49,25 @@ impl PromptAssembler {
         Self {
             modules: Vec::new(),
             total_budget,
+            template_engine: None,
         }
+    }
+
+    /// Create a new assembler with a prompt template engine.
+    ///
+    /// When provided, module content that contains `{{variable}}` markers
+    /// will be rendered through the template engine during assembly.
+    pub fn with_template_engine(total_budget: usize, engine: Arc<PromptTemplateManager>) -> Self {
+        Self {
+            modules: Vec::new(),
+            total_budget,
+            template_engine: Some(engine),
+        }
+    }
+
+    /// Set the prompt template engine on an existing assembler.
+    pub fn set_template_engine(&mut self, engine: Arc<PromptTemplateManager>) {
+        self.template_engine = Some(engine);
     }
 
     /// Add a module. Modules with the same priority are placed in insertion order.
@@ -47,12 +80,23 @@ impl PromptAssembler {
     ///
     /// Required modules are always included. Non-required modules are truncated
     /// to their token budget when the total exceeds `total_budget`.
-    pub fn assemble(&self) -> String {
+    ///
+    /// When a `PromptTemplateManager` is set, module content containing
+    /// `{{variable}}` markers is rendered through the template engine before
+    /// assembly. Variables are resolved from the provided `template_vars`.
+    pub fn assemble(&self, template_vars: &[(&str, &str)]) -> String {
         let mut parts = Vec::new();
         let mut used_tokens = 0usize;
 
         for module in &self.modules {
-            let est_tokens = module.content.len() / 4; // rough token estimate
+            // Render module content through template engine if available
+            let rendered_content = if let Some(engine) = &self.template_engine {
+                engine.render_template(&module.content, template_vars)
+            } else {
+                module.content.clone()
+            };
+
+            let est_tokens = rendered_content.len() / 4; // rough token estimate
             if module.required || used_tokens + est_tokens <= self.total_budget {
                 let content = if !module.required
                     && module.token_budget > 0
@@ -60,10 +104,10 @@ impl PromptAssembler {
                 {
                     // Truncate to budget
                     let max_chars = module.token_budget * 4;
-                    let truncated: String = module.content.chars().take(max_chars).collect();
+                    let truncated: String = rendered_content.chars().take(max_chars).collect();
                     format!("{truncated}\n[Module truncated to {max_chars} chars]")
                 } else {
-                    module.content.clone()
+                    rendered_content
                 };
                 used_tokens += content.len() / 4;
                 parts.push(content);
@@ -77,6 +121,14 @@ impl PromptAssembler {
         }
 
         parts.join("\n\n")
+    }
+
+    /// Build the system prompt from all modules without template substitution.
+    ///
+    /// Convenience wrapper for `assemble(&[])` when no template variables
+    /// are needed.
+    pub fn assemble_no_vars(&self) -> String {
+        self.assemble(&[])
     }
 
     /// Build default modules for a coding session.
@@ -100,7 +152,115 @@ impl PromptAssembler {
         // P1: Mode-specific instructions (required)
         assembler.add_module(PromptModule {
             name: "mode".into(),
-            content: mode.system_prompt().to_string(),
+            content: super::modes::chinese_mode_engine().system_prompt(mode),
+            priority: 1,
+            token_budget: 0,
+            required: true,
+        });
+
+        // P2: Project rules (high priority but can be truncated)
+        if let Some(ctx) = project_ctx {
+            if !ctx.instructions.is_empty() {
+                let rules: String = ctx
+                    .instructions
+                    .iter()
+                    .map(|i| format!("### From: {}\n\n{}\n", i.source, i.content))
+                    .collect();
+                assembler.add_module(PromptModule {
+                    name: "project_rules".into(),
+                    content: format!("## Project Instructions\n\n{rules}"),
+                    priority: 2,
+                    token_budget: model_window / 10, // 10% for rules
+                    required: false,
+                });
+            }
+
+            // P3: Project structure
+            if !ctx.file_tree_summary.is_empty() {
+                assembler.add_module(PromptModule {
+                    name: "project_structure".into(),
+                    content: format!(
+                        "## Project Structure ({})\n\n```\n{}\n```",
+                        ctx.name, ctx.file_tree_summary
+                    ),
+                    priority: 3,
+                    token_budget: model_window / 8, // 12.5% for structure
+                    required: false,
+                });
+            }
+
+            // P4: Git context (low priority)
+            if let Some(git_ctx) = super::context::load_git_context(&ctx.root) {
+                assembler.add_module(PromptModule {
+                    name: "git_context".into(),
+                    content: format!("## Git Status\n\n{git_ctx}"),
+                    priority: 4,
+                    token_budget: model_window / 12, // ~8% for git
+                    required: false,
+                });
+            }
+        }
+
+        // P5: Task state placeholder (lowest priority)
+        assembler.add_module(PromptModule {
+            name: "task_state".into(),
+            content: "[Task state: no active tasks]".into(),
+            priority: 5,
+            token_budget: model_window / 20, // 5% for task state
+            required: false,
+        });
+
+        assembler
+    }
+
+    /// Build default modules for a mode with a prompt template engine.
+    ///
+    /// Same as `default_for_mode`, but also attaches a `PromptTemplateManager`
+    /// so that module content containing `{{variable}}` markers can be rendered
+    /// dynamically during `assemble()`.
+    ///
+    /// This enables the mode's system prompt to contain template variables
+    /// (e.g., `{{project_name}}`, `{{language}}`) that are resolved at
+    /// assembly time rather than at registration time.
+    pub fn default_for_mode_with_engine(
+        mode: &AgentMode,
+        base_prompt: &str,
+        project_ctx: Option<&ProjectContext>,
+        model_window: usize,
+        engine: Arc<PromptTemplateManager>,
+    ) -> Self {
+        let mut assembler = Self::with_template_engine(model_window, engine);
+
+        // P0: Base system prompt (required)
+        assembler.add_module(PromptModule {
+            name: "base".into(),
+            content: base_prompt.to_string(),
+            priority: 0,
+            token_budget: 0,
+            required: true,
+        });
+
+        // P1: Mode-specific instructions (required)
+        // Use the template engine to look up the mode prompt template if available.
+        // The template name follows the pattern "mode_{kebab_case_name}"
+        // (e.g., "mode_general", "mode_coding", "mode_research", "mode_data", "mode_writing").
+        let mode_template_name = match mode {
+            AgentMode::General => "mode_general",
+            AgentMode::Coding => "mode_coding",
+            AgentMode::Research => "mode_research",
+            AgentMode::Data => "mode_data",
+            AgentMode::Writing => "mode_writing",
+            _ => "mode_general", // fallback for future modes
+        };
+        let mode_content = assembler
+            .template_engine
+            .as_ref()
+            .and_then(|engine| engine.get_template(&mode_template_name))
+            .unwrap_or_else(|| super::modes::chinese_mode_engine().system_prompt(mode));
+
+        assembler.add_module(PromptModule {
+            name: "mode".into(),
+            content: mode_content,
             priority: 1,
             token_budget: 0,
             required: true,
