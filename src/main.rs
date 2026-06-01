@@ -492,7 +492,12 @@ async fn main() -> anyhow::Result<()> {
                         }
                     }
                     "tool" => {
-                        let id = pending_tc_ids.get(tc_idx).cloned().unwrap_or_default();
+                        let id = pending_tc_ids.get(tc_idx).cloned().unwrap_or_else(|| {
+                            tracing::warn!(
+                                "restore_messages: tool result at index {tc_idx} has no matching tool call ID, using placeholder"
+                            );
+                            format!("unknown_{tc_idx}")
+                        });
                         tc_idx += 1;
                         out.push(Message::tool_result(id, String::new(), text));
                     }
@@ -594,35 +599,21 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ── Hidden legacy/internal modes ───────────────────────────────────
-    let run_web = args.web;
     let run_cli = args.cli;
     let run_channels = args.channels;
+
+    if args.web {
+        eprintln!("Web 模式已移除。请使用 Tauri 桌面模式（cargo tauri dev）或 CLI 模式（--cli）。");
+        std::process::exit(1);
+    }
 
     if run_channels {
         #[cfg(feature = "channels")]
         {
             let channels_handle = tokio::spawn(cli::run_channels_mode(&app_config));
 
-            if run_web && run_cli {
-                cli::run_both_modes(
-                    agent_handle,
-                    hitl_dispatcher.clone(),
-                    &args,
-                    &app_config,
-                    task_store.clone(),
-                )
-                .await?;
-            } else if run_cli {
+            if run_cli {
                 cli::run_cli_mode(
-                    agent_handle,
-                    hitl_dispatcher.clone(),
-                    &args,
-                    &app_config,
-                    task_store.clone(),
-                )
-                .await?;
-            } else if run_web {
-                cli::run_web_mode(
                     agent_handle,
                     hitl_dispatcher.clone(),
                     &args,
@@ -643,15 +634,6 @@ async fn main() -> anyhow::Result<()> {
                 "--channels 需要启用 channels feature: cargo build --features channels"
             );
         }
-    } else if run_web && run_cli {
-        cli::run_both_modes(
-            agent_handle,
-            hitl_dispatcher.clone(),
-            &args,
-            &app_config,
-            task_store.clone(),
-        )
-        .await?;
     } else if run_cli {
         // 仅 CLI 模式
         cli::run_cli_mode(
@@ -663,15 +645,9 @@ async fn main() -> anyhow::Result<()> {
         )
         .await?;
     } else {
-        // 仅 Web 模式
-        cli::run_web_mode(
-            agent_handle,
-            hitl_dispatcher.clone(),
-            &args,
-            &app_config,
-            task_store.clone(),
-        )
-        .await?;
+        // No legacy mode specified — should have entered TUI above
+        eprintln!("请使用 TUI（默认）、Tauri 桌面模式、或 --cli 模式。");
+        std::process::exit(1);
     }
 
     // Keep hook bridges and unified memory alive until shutdown

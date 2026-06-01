@@ -61,7 +61,10 @@ impl Default for HitlDispatcher {
 }
 
 impl HumanLoopProvider for HitlDispatcher {
-    fn request(&self, req: HumanLoopRequest) -> BoxFuture<'_, Result<HumanLoopResponse, echo_agent::error::ReactError>> {
+    fn request(
+        &self,
+        req: HumanLoopRequest,
+    ) -> BoxFuture<'_, Result<HumanLoopResponse, echo_agent::error::ReactError>> {
         Box::pin(async move {
             let providers = self.providers.read().await;
 
@@ -73,22 +76,37 @@ impl HumanLoopProvider for HitlDispatcher {
             }
 
             // Try each provider in order — first to respond wins
+            // with a 5-minute timeout per provider
+            const TIMEOUT_DURATION: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
             for named in providers.iter() {
-                match named.provider.request(req.clone()).await {
-                    Ok(response) => return Ok(response),
-                    Err(e) => {
+                let provider_result = tokio::time::timeout(
+                    TIMEOUT_DURATION,
+                    named.provider.request(req.clone()),
+                )
+                .await;
+
+                match provider_result {
+                    Ok(Ok(response)) => return Ok(response),
+                    Ok(Err(e)) => {
                         tracing::debug!(
                             provider = %named.name,
                             error = %e,
                             "HITL provider failed, trying next"
                         );
                     }
+                    Err(_) => {
+                        tracing::warn!(
+                            provider = %named.name,
+                            "HITL provider timed out after 5 minutes, trying next"
+                        );
+                    }
                 }
             }
 
-            // All providers failed
+            // All providers failed or timed out
             Ok(HumanLoopResponse::Rejected {
-                reason: Some("All HITL providers failed".to_string()),
+                reason: Some("All HITL providers failed or timed out".to_string()),
             })
         })
     }

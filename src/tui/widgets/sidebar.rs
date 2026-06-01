@@ -64,60 +64,16 @@ impl Widget for Sidebar {
 }
 
 fn render_file_tree(f: &mut Frame, area: Rect, t: &Theme) {
-    let dir = Style::default().fg(t.blue).add_modifier(Modifier::BOLD);
-    let file = Style::default().fg(t.text);
-    let toml = Style::default().fg(t.yellow);
-
-    let items = vec![
-        ListItem::new(Line::from(vec![
-            Span::styled("  \u{1f4c2} ", dir),
-            Span::styled("src/", dir),
-        ])),
-        ListItem::new(Line::from(vec![
-            Span::styled("     \u{1f4c2} ", dir),
-            Span::styled("tui/", dir),
-        ])),
-        ListItem::new(Line::from(vec![
-            Span::styled("     \u{1f4c2} ", dir),
-            Span::styled("cli/", dir),
-        ])),
-        ListItem::new(Line::from(vec![
-            Span::styled("     \u{1f980} ", Style::default().fg(t.teal)),
-            Span::styled("main.rs", file),
-        ])),
-        ListItem::new(Line::from(vec![
-            Span::styled("     \u{1f980} ", Style::default().fg(t.teal)),
-            Span::styled("lib.rs", file),
-        ])),
-        ListItem::new(Line::from(vec![
-            Span::styled("  \u{1f4c2} ", dir),
-            Span::styled("echo-agent-app-core/", dir),
-        ])),
-        ListItem::new(Line::from(vec![
-            Span::styled("  \u{1f4c2} ", dir),
-            Span::styled("echo-agent-server/", dir),
-        ])),
-        ListItem::new(Line::from(vec![
-            Span::styled("  \u{2699} ", toml),
-            Span::styled("Cargo.toml", toml),
-        ])),
-    ];
+    let hint = Style::default().fg(t.overlay0).add_modifier(Modifier::ITALIC);
+    let items = vec![ListItem::new(Line::from(vec![Span::styled(
+        "  No project loaded\n  Press /workspace to open",
+        hint,
+    )]))];
     let list = List::new(items);
     f.render_widget(list, area);
 }
 
 fn render_tools_list(f: &mut Frame, app: &TuiApp, area: Rect, t: &Theme) {
-    let tools = [
-        ("read_file", "\u{1f4d6}"),
-        ("write_file", "\u{1f4dd}"),
-        ("edit_file", "\u{270f}"),
-        ("shell", "\u{1f4bb}"),
-        ("code_search", "\u{1f50d}"),
-        ("web_fetch", "\u{1f310}"),
-        ("arxiv_search", "\u{1f4da}"),
-        ("chart", "\u{1f4c8}"),
-        ("data_analyze", "\u{1f4ca}"),
-    ];
     let header = ListItem::new(Line::from(vec![
         Span::styled(
             format!("  {} Tools ", "\u{1f527}"),
@@ -128,14 +84,26 @@ fn render_tools_list(f: &mut Frame, app: &TuiApp, area: Rect, t: &Theme) {
             Style::default().fg(t.overlay0),
         ),
     ]));
-    let mut all_items = vec![header];
-    for (name, icon) in &tools {
-        all_items.push(ListItem::new(Line::from(vec![
-            Span::styled(format!("    {} ", icon), Style::default().fg(t.subtext)),
-            Span::styled(*name, Style::default().fg(t.lavender)),
-        ])));
-    }
-    let list = List::new(all_items);
+
+    let items = if app.tool_count == 0 {
+        vec![
+            header,
+            ListItem::new(Line::from(vec![Span::styled(
+                "    No tools registered",
+                Style::default().fg(t.overlay0).add_modifier(Modifier::ITALIC),
+            )])),
+        ]
+    } else {
+        vec![
+            header,
+            ListItem::new(Line::from(vec![Span::styled(
+                "    Tool list available via API",
+                Style::default().fg(t.overlay0).add_modifier(Modifier::ITALIC),
+            )])),
+        ]
+    };
+
+    let list = List::new(items);
     f.render_widget(list, area);
 }
 

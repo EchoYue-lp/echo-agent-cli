@@ -19,9 +19,7 @@ fn pid_file_path() -> PathBuf {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home)
-        .join(".echo-agent")
-        .join("server.pid")
+    PathBuf::from(home).join(".echo-agent").join("server.pid")
 }
 
 /// Write PID info to disk.

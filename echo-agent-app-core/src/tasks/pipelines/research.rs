@@ -15,7 +15,7 @@
 //! a shared-agent node that reads the prompt and writes the output.
 
 use crate::agent_handle::AgentHandle;
-use echo_agent::workflow::{Graph, GraphBuilder, SharedState, SharedAgent};
+use echo_agent::workflow::{Graph, GraphBuilder, SharedAgent, SharedState};
 use futures::future::BoxFuture;
 
 // ── Configuration ──────────────────────────────────────────────────────────────
@@ -94,8 +94,12 @@ pub struct QualityAssessment {
     pub needs_revision: bool,
 }
 
-fn default_quality_score() -> u32 { 60 }
-fn default_confidence() -> f64 { 0.5 }
+fn default_quality_score() -> u32 {
+    60
+}
+fn default_confidence() -> f64 {
+    0.5
+}
 
 /// Extract structured quality assessment from review text.
 ///
@@ -651,15 +655,11 @@ pub async fn run_research_with_config(
         "Research pipeline completed"
     );
 
-    let final_output: String = result
-        .state
-        .get("final_output")
-        .unwrap_or_else(|| {
-            result
-                .state
-                .get("paper_draft")
-                .unwrap_or_else(|| "Research pipeline completed but no paper was generated.".to_string())
-        });
+    let final_output: String = result.state.get("final_output").unwrap_or_else(|| {
+        result.state.get("paper_draft").unwrap_or_else(|| {
+            "Research pipeline completed but no paper was generated.".to_string()
+        })
+    });
 
     Ok(final_output)
 }

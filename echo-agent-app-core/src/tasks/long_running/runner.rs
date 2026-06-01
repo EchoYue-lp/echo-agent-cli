@@ -37,7 +37,8 @@ pub struct PhaseContext {
 }
 
 /// A phase executor function.
-pub type PhaseExecutor = Box<dyn Fn(PhaseContext) -> BoxFuture<'static, PhaseOutcome> + Send + Sync>;
+pub type PhaseExecutor =
+    Box<dyn Fn(PhaseContext) -> BoxFuture<'static, PhaseOutcome> + Send + Sync>;
 
 /// Executes a long-running pipeline with full lifecycle support.
 pub struct LongRunningTaskRunner {
@@ -74,9 +75,7 @@ impl LongRunningTaskRunner {
     }
 
     /// Get a subscriber for progress updates.
-    pub fn progress_receiver(
-        &self,
-    ) -> tokio::sync::watch::Receiver<super::progress::TaskProgress> {
+    pub fn progress_receiver(&self) -> tokio::sync::watch::Receiver<super::progress::TaskProgress> {
         self.progress.subscribe()
     }
 
@@ -100,10 +99,7 @@ impl LongRunningTaskRunner {
             .map(|cp| cp.phase_state.clone())
             .unwrap_or_default();
 
-        let resume_count = resume_from
-            .as_ref()
-            .map(|cp| cp.resume_count)
-            .unwrap_or(0);
+        let resume_count = resume_from.as_ref().map(|cp| cp.resume_count).unwrap_or(0);
 
         if start_idx > 0 {
             tracing::info!(
@@ -199,9 +195,9 @@ impl LongRunningTaskRunner {
                                 ],
                                 waiting_phase: phase.id.clone(),
                             };
-                            let response =
-                                gate.request_input(&self.task_id, request, &self.cancel)
-                                    .await?;
+                            let response = gate
+                                .request_input(&self.task_id, request, &self.cancel)
+                                .await?;
                             if response.selection == "cancel" {
                                 return Err(anyhow::anyhow!(
                                     "Task cancelled by user at checkpoint"
@@ -218,9 +214,9 @@ impl LongRunningTaskRunner {
                 }
                 PhaseOutcome::NeedsHumanInput(request) => {
                     if let Some(ref gate) = self.human_gate {
-                        let response =
-                            gate.request_input(&self.task_id, request, &self.cancel)
-                                .await?;
+                        let response = gate
+                            .request_input(&self.task_id, request, &self.cancel)
+                            .await?;
                         if response.selection == "cancel" {
                             return Err(anyhow::anyhow!("Task cancelled by user"));
                         }

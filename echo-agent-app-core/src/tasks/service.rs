@@ -72,10 +72,8 @@ impl BackgroundTaskService {
             ..Default::default()
         };
 
-        let executor = Arc::new(
-            TaskExecutor::new(manager.clone(), config)
-                .with_execute_fn(execute_fn),
-        );
+        let executor =
+            Arc::new(TaskExecutor::new(manager.clone(), config).with_execute_fn(execute_fn));
 
         Ok(Self {
             manager,
@@ -104,8 +102,7 @@ impl BackgroundTaskService {
         let meta = BackgroundTaskMeta::new(kind.clone(), submitted_via);
 
         // Create framework Task — description is kept clean (no kind encoding)
-        let task = Task::new(task_id.clone(), description.to_string())
-            .with_tags(vec![kind.tag()]);
+        let task = Task::new(task_id.clone(), description.to_string()).with_tags(vec![kind.tag()]);
         // No timeout by default — tasks run until completion
         // No max_retries by default — let the caller decide
 
@@ -179,7 +176,10 @@ impl BackgroundTaskService {
         }
 
         if resumed > 0 {
-            tracing::info!(count = resumed, "Resumed pending background tasks from store");
+            tracing::info!(
+                count = resumed,
+                "Resumed pending background tasks from store"
+            );
         }
         Ok(resumed)
     }
@@ -301,10 +301,7 @@ impl BackgroundTaskService {
 // ── Task dispatch ──
 
 /// Look up the BackgroundTaskKind for a given task_id from the meta_store.
-async fn lookup_kind(
-    meta_store: &Arc<dyn Store>,
-    task_id: &str,
-) -> Option<BackgroundTaskKind> {
+async fn lookup_kind(meta_store: &Arc<dyn Store>, task_id: &str) -> Option<BackgroundTaskKind> {
     let key = format!("bg_meta:{task_id}");
     let item = meta_store.get(&["bg_meta"], &key).await.ok()??;
     let meta: BackgroundTaskMeta = serde_json::from_value(item.value).ok()?;
@@ -331,7 +328,9 @@ async fn dispatch_task(
         BackgroundTaskKind::Cron { .. } => execute_cron(ctx, agent).await,
         BackgroundTaskKind::Workflow { .. } => execute_workflow(ctx, agent).await,
         BackgroundTaskKind::Research { .. } => execute_research(ctx, agent).await,
-        BackgroundTaskKind::ResearchToWriting { .. } => execute_research_to_writing(ctx, agent).await,
+        BackgroundTaskKind::ResearchToWriting { .. } => {
+            execute_research_to_writing(ctx, agent).await
+        }
         BackgroundTaskKind::DataPipeline { .. } => execute_data_pipeline(ctx, agent).await,
         BackgroundTaskKind::WritingPipeline { .. } => execute_writing_pipeline(ctx, agent).await,
         BackgroundTaskKind::Composite { steps, strategy } => {
@@ -349,9 +348,7 @@ async fn execute_agent_chat(
     let prompt = ctx.description.clone();
 
     let result = agent
-        .read_async(|guard| {
-            Box::pin(async move { guard.chat(&prompt).await })
-        })
+        .read_async(|guard| Box::pin(async move { guard.chat(&prompt).await }))
         .await;
 
     result.map_err(|e| echo_agent::error::ReactError::Other(format!("Agent chat failed: {e}")))
@@ -374,12 +371,12 @@ async fn execute_workflow(
     // The description contains the workflow definition as JSON or a prompt to execute
     let prompt = ctx.description.clone();
     let result = agent
-        .read_async(|guard| {
-            Box::pin(async move { guard.execute(&prompt).await })
-        })
+        .read_async(|guard| Box::pin(async move { guard.execute(&prompt).await }))
         .await;
 
-    result.map_err(|e| echo_agent::error::ReactError::Other(format!("Workflow execution failed: {e}")))
+    result.map_err(|e| {
+        echo_agent::error::ReactError::Other(format!("Workflow execution failed: {e}"))
+    })
 }
 
 /// Execute a research pipeline using the Graph workflow.
@@ -392,7 +389,8 @@ async fn execute_research(
 
     let result = super::pipelines::run_research(agent, &topic, 20).await;
 
-    result.map_err(|e| echo_agent::error::ReactError::Other(format!("Research pipeline failed: {e}")))
+    result
+        .map_err(|e| echo_agent::error::ReactError::Other(format!("Research pipeline failed: {e}")))
 }
 
 /// Execute a research-to-writing continuous workflow using the Graph workflow.
@@ -406,7 +404,9 @@ async fn execute_research_to_writing(
     let config = super::pipelines::ResearchToWritingConfig::new(&topic);
     let result = super::pipelines::run_research_to_writing(agent, config).await;
 
-    result.map_err(|e| echo_agent::error::ReactError::Other(format!("Research-to-writing pipeline failed: {e}")))
+    result.map_err(|e| {
+        echo_agent::error::ReactError::Other(format!("Research-to-writing pipeline failed: {e}"))
+    })
 }
 
 /// Execute a data analysis pipeline using the Graph workflow.
@@ -419,7 +419,9 @@ async fn execute_data_pipeline(
 
     let result = super::pipelines::run_data_pipeline(agent, &dataset_path, 3).await;
 
-    result.map_err(|e| echo_agent::error::ReactError::Other(format!("Data analysis pipeline failed: {e}")))
+    result.map_err(|e| {
+        echo_agent::error::ReactError::Other(format!("Data analysis pipeline failed: {e}"))
+    })
 }
 
 /// Execute a writing pipeline using the Graph workflow.
@@ -432,7 +434,8 @@ async fn execute_writing_pipeline(
 
     let result = super::pipelines::run_writing_pipeline(agent, &topic).await;
 
-    result.map_err(|e| echo_agent::error::ReactError::Other(format!("Writing pipeline failed: {e}")))
+    result
+        .map_err(|e| echo_agent::error::ReactError::Other(format!("Writing pipeline failed: {e}")))
 }
 
 /// Execute a composite task: chain multiple tasks together with dependencies.
@@ -450,9 +453,10 @@ async fn execute_composite(
             let mut results: Vec<(String, String)> = Vec::new();
             for (i, step) in steps.iter().enumerate() {
                 // Create a sub-context for this step
-                let step_description = step.description.clone().unwrap_or_else(|| {
-                    format!("Composite step {}: {:?}", i + 1, step.kind)
-                });
+                let step_description = step
+                    .description
+                    .clone()
+                    .unwrap_or_else(|| format!("Composite step {}: {:?}", i + 1, step.kind));
 
                 let step_id = format!("{}_step_{}", ctx.task_id, i);
                 let step_ctx = TaskContext {
@@ -464,24 +468,30 @@ async fn execute_composite(
                 };
 
                 // Dispatch the sub-task
-                let result = dispatch_sub_task(step_ctx, agent.clone(), meta_store.clone(), &step.kind).await?;
+                let result =
+                    dispatch_sub_task(step_ctx, agent.clone(), meta_store.clone(), &step.kind)
+                        .await?;
                 results.push((step_id, result));
             }
 
             Ok(format!(
                 "Composite task completed {} steps:\n{}",
                 results.len(),
-                results.iter().map(|(_, r)| r.as_str()).collect::<Vec<_>>().join("\n---\n")
+                results
+                    .iter()
+                    .map(|(_, r)| r.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n---\n")
             ))
         }
         CompositeStrategy::Parallel => {
-            // For parallel execution, we'd use tokio::join! or similar
-            // For now, fall back to sequential with a note
-            let mut results: Vec<(String, String)> = Vec::new();
+            // Execute steps in parallel using tokio::spawn + join_all
+            let mut handles = Vec::new();
             for (i, step) in steps.iter().enumerate() {
-                let step_description = step.description.clone().unwrap_or_else(|| {
-                    format!("Composite step {}: {:?}", i + 1, step.kind)
-                });
+                let step_description = step
+                    .description
+                    .clone()
+                    .unwrap_or_else(|| format!("Composite step {}: {:?}", i + 1, step.kind));
 
                 let step_id = format!("{}_step_{}", ctx.task_id, i);
                 let step_ctx = TaskContext {
@@ -492,14 +502,35 @@ async fn execute_composite(
                     attempt: 1,
                 };
 
-                let result = dispatch_sub_task(step_ctx, agent.clone(), meta_store.clone(), &step.kind).await?;
+                let agent_clone = agent.clone();
+                let meta_clone = meta_store.clone();
+                let kind_clone = step.kind.clone();
+                let handle = tokio::spawn(async move {
+                    let result = dispatch_sub_task(step_ctx, agent_clone, meta_clone, &kind_clone).await;
+                    (step_id, result)
+                });
+                handles.push(handle);
+            }
+
+            let mut results: Vec<(String, String)> = Vec::new();
+            for handle in handles {
+                let (step_id, result) = handle.await.map_err(|e| {
+                    echo_agent::error::ReactError::Other(format!("Parallel sub-task failed: {}", e))
+                })?;
+                let result = result.map_err(|e| {
+                    echo_agent::error::ReactError::Other(format!("Sub-task {} failed: {}", step_id, e))
+                })?;
                 results.push((step_id, result));
             }
 
             Ok(format!(
                 "Composite task completed {} parallel steps:\n{}",
                 results.len(),
-                results.iter().map(|(_, r)| r.as_str()).collect::<Vec<_>>().join("\n---\n")
+                results
+                    .iter()
+                    .map(|(_, r)| r.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n---\n")
             ))
         }
     }
@@ -519,13 +550,13 @@ async fn dispatch_sub_task(
         BackgroundTaskKind::Cron { .. } => execute_cron(ctx, agent).await,
         BackgroundTaskKind::Workflow { .. } => execute_workflow(ctx, agent).await,
         BackgroundTaskKind::Research { .. } => execute_research(ctx, agent).await,
-        BackgroundTaskKind::ResearchToWriting { .. } => execute_research_to_writing(ctx, agent).await,
+        BackgroundTaskKind::ResearchToWriting { .. } => {
+            execute_research_to_writing(ctx, agent).await
+        }
         BackgroundTaskKind::DataPipeline { .. } => execute_data_pipeline(ctx, agent).await,
         BackgroundTaskKind::WritingPipeline { .. } => execute_writing_pipeline(ctx, agent).await,
-        BackgroundTaskKind::Composite { .. } => {
-            Err(echo_agent::error::ReactError::Other(
-                "Nested composite tasks are not supported".to_string(),
-            ))
-        }
+        BackgroundTaskKind::Composite { .. } => Err(echo_agent::error::ReactError::Other(
+            "Nested composite tasks are not supported".to_string(),
+        )),
     }
 }

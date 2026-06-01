@@ -1,121 +1,14 @@
 //! 运行模式管理
 //!
-//! 提供 Web 模式、CLI 模式、双模式和 IM 通道模式的启动逻辑。
+//! 提供 CLI 模式和 IM 通道模式的启动逻辑。
+//! Web 模式已移除 — GUI 通过 Tauri IPC 通信。
 
 use anyhow::Result;
-use std::sync::Arc;
-use std::time::Duration;
-
-use echo_agent::agent::CancellationToken;
 
 use crate::agent_handle::AgentHandle;
 use crate::cli::args::Args;
-use crate::cli::router::build_router;
 use crate::config::AppConfig;
 use crate::state;
-
-/// Shared web infrastructure setup, used by both `run_web_mode` and `run_both_modes`.
-struct WebInfra {
-    app: axum::Router,
-    addr: String,
-    cancel_token: CancellationToken,
-    task_service: Option<Arc<crate::tasks::BackgroundTaskService>>,
-    scheduler_runner: Option<Arc<crate::scheduler::SchedulerRunner>>,
-}
-
-async fn setup_web_infrastructure(
-    agent: &AgentHandle,
-    hitl_dispatcher: std::sync::Arc<crate::state::HitlDispatcher>,
-    args: &Args,
-    app_config: &AppConfig,
-    task_store: std::sync::Arc<dyn echo_agent::memory::Store>,
-) -> Result<WebInfra> {
-    let conversation_store = crate::infra::create_conversation_store();
-    crate::infra::inject_conversation_store(agent, &conversation_store);
-
-    if !app_config.webhooks.endpoints.is_empty() {
-        let webhook_eps: Vec<crate::webhook::emitter::WebhookEndpoint> = app_config
-            .webhooks
-            .endpoints
-            .iter()
-            .map(|e| crate::webhook::emitter::WebhookEndpoint {
-                url: e.url.clone(),
-                events: e.events.clone(),
-                secret: e.secret.clone(),
-            })
-            .collect();
-        crate::webhook::emitter::init_global(webhook_eps);
-        tracing::info!(
-            "Webhook emitter initialized with {} endpoints",
-            app_config.webhooks.endpoints.len()
-        );
-    }
-
-    let mut state_inner = state::AppState::from_shared(
-        agent.clone(),
-        hitl_dispatcher.clone(),
-        conversation_store,
-        app_config.clone(),
-    );
-    state_inner.start_task_service(task_store.clone()).await;
-    state_inner.start_scheduler_with_store(Some(task_store));
-    let state = Arc::new(state_inner);
-
-    let cancel_token = CancellationToken::new();
-    crate::infra::spawn_mcp_health_check(state.clone(), cancel_token.clone());
-
-    if let Err(e) = crate::metrics::init_metrics() {
-        tracing::warn!("Failed to initialize metrics: {}", e);
-    }
-
-    crate::ws::handler::cleanup_stale_uploads().await;
-
-    let app = build_router(state.clone()).await;
-    let host = if args.host != "127.0.0.1" {
-        &args.host
-    } else {
-        &app_config.server.host
-    };
-    let port = if args.port != 3000 {
-        args.port
-    } else {
-        app_config.server.port
-    };
-    let addr = format!("{}:{}", host, port);
-
-    // Warn if binding to non-localhost, especially with auth disabled
-    let auth_enabled = state.config.security_config.read().await.auth_enabled;
-    crate::infra::warn_non_localhost_bind(host, &addr, auth_enabled);
-
-    Ok(WebInfra {
-        app,
-        addr,
-        cancel_token,
-        task_service: state.tasks.service.clone(),
-        scheduler_runner: state.scheduler.runner.clone(),
-    })
-}
-
-/// 运行 Web 模式
-pub async fn run_web_mode(
-    agent: AgentHandle,
-    hitl_dispatcher: std::sync::Arc<crate::state::HitlDispatcher>,
-    args: &Args,
-    app_config: &AppConfig,
-    task_store: std::sync::Arc<dyn echo_agent::memory::Store>,
-) -> Result<()> {
-    let infra =
-        setup_web_infrastructure(&agent, hitl_dispatcher, args, app_config, task_store).await?;
-    let listener = tokio::net::TcpListener::bind(&infra.addr).await?;
-
-    crate::infra::print_web_startup_info(&infra.addr);
-
-    axum::serve(listener, infra.app)
-        .with_graceful_shutdown(crate::infra::shutdown_signal())
-        .await?;
-
-    Ok(())
-}
 
 fn repl_config_for(args: &Args) -> crate::cli::ReplConfig {
     crate::cli::ReplConfig {
@@ -155,61 +48,6 @@ pub async fn run_cli_mode(
     repl_config.scheduler_runner = scheduler_runner;
 
     crate::cli::run_repl(agent, repl_config).await
-}
-
-/// 同时运行 Web 和 CLI 模式
-pub async fn run_both_modes(
-    agent: AgentHandle,
-    hitl_dispatcher: std::sync::Arc<crate::state::HitlDispatcher>,
-    args: &Args,
-    app_config: &AppConfig,
-    task_store: std::sync::Arc<dyn echo_agent::memory::Store>,
-) -> Result<()> {
-    let infra = setup_web_infrastructure(
-        &agent,
-        hitl_dispatcher.clone(),
-        args,
-        app_config,
-        task_store,
-    )
-    .await?;
-    let listener = tokio::net::TcpListener::bind(&infra.addr).await?;
-
-    crate::infra::print_both_startup_info(&infra.addr);
-
-    // Extract shared services before moving infra into the web server task
-    let cli_task_service = infra.task_service.clone();
-    let cli_scheduler = infra.scheduler_runner.clone();
-
-    let web_shutdown = infra.cancel_token.clone();
-    let web_handle = tokio::spawn(async move {
-        axum::serve(listener, infra.app)
-            .with_graceful_shutdown(async move { web_shutdown.cancelled().await })
-            .await
-    });
-    let web_abort = web_handle.abort_handle();
-
-    let mut repl_config = repl_config_for(args);
-    repl_config.task_service = cli_task_service;
-    repl_config.scheduler_runner = cli_scheduler;
-    crate::cli::run_repl(agent, repl_config).await?;
-
-    // CLI 退出后，通知 Web 服务和后台任务优雅关闭
-    tracing::info!("CLI 已退出，正在关闭 Web 服务...");
-    infra.cancel_token.cancel();
-
-    // 等待 Web 服务优雅关闭（最多 30 秒）
-    match tokio::time::timeout(Duration::from_secs(30), web_handle).await {
-        Ok(Ok(Ok(()))) => tracing::info!("Web 服务已优雅关闭"),
-        Ok(Ok(Err(e))) => tracing::error!("Web 服务异常退出: {e}"),
-        Ok(Err(join_err)) => tracing::error!("Web 服务任务异常: {join_err}"),
-        Err(_) => {
-            tracing::warn!("Web 服务未在 30 秒内关闭，强制终止");
-            web_abort.abort();
-        }
-    }
-
-    Ok(())
 }
 
 /// Run headless mode: execute a single prompt, print output, exit.

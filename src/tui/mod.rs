@@ -104,6 +104,49 @@ impl Theme {
             lavender: Color::Magenta,
         }
     }
+
+    /// Create a Theme from a CLI ColorTheme, unifying both theme systems.
+    pub fn from_color_theme(ct: &echo_agent_app_core::output::theme::ColorTheme) -> Self {
+        use ratatui::style::Color as RatatuiColor;
+        use nu_ansi_term::Color as AnsiColor;
+
+        fn ansi_to_ratatui(c: &AnsiColor) -> RatatuiColor {
+            match c {
+                AnsiColor::Black => RatatuiColor::Black,
+                AnsiColor::Red => RatatuiColor::Red,
+                AnsiColor::Green => RatatuiColor::Green,
+                AnsiColor::Yellow => RatatuiColor::Yellow,
+                AnsiColor::Blue => RatatuiColor::Blue,
+                AnsiColor::Magenta => RatatuiColor::Magenta,
+                AnsiColor::Cyan => RatatuiColor::Cyan,
+                AnsiColor::White => RatatuiColor::White,
+                AnsiColor::Fixed(n) => RatatuiColor::Indexed(*n),
+                AnsiColor::Rgb(r, g, b) => RatatuiColor::Rgb(*r, *g, *b),
+                AnsiColor::DarkGray => RatatuiColor::DarkGray,
+                AnsiColor::LightGray => RatatuiColor::Gray,
+                _ => RatatuiColor::Reset,
+            }
+        }
+
+        Self {
+            is_dark: ct.name != "light",
+            bg: RatatuiColor::Reset,
+            surface0: ansi_to_ratatui(&ct.border_color),
+            surface1: ansi_to_ratatui(&ct.border_color),
+            overlay0: ansi_to_ratatui(&ct.muted_color),
+            text: RatatuiColor::Reset,
+            subtext: ansi_to_ratatui(&ct.muted_color),
+            blue: ansi_to_ratatui(&ct.info_color),
+            green: ansi_to_ratatui(&ct.success_color),
+            yellow: ansi_to_ratatui(&ct.tool_color),
+            peach: ansi_to_ratatui(&ct.heading_color),
+            mauve: ansi_to_ratatui(&ct.assistant_color),
+            teal: ansi_to_ratatui(&ct.user_color),
+            red: ansi_to_ratatui(&ct.error_color),
+            cyan: ansi_to_ratatui(&ct.user_color),
+            lavender: ansi_to_ratatui(&ct.assistant_color),
+        }
+    }
 }
 
 // ── Public types ────────────────────────────────────────────────────────────
@@ -397,8 +440,9 @@ impl Drop for TerminalGuard {
 /// This function handles all terminal setup/teardown via [`TerminalGuard`],
 /// so the terminal is always restored even on panic or early return.
 pub async fn run_tui(agent: AgentHandle) -> anyhow::Result<()> {
-    // Use terminal-safe colors so text remains readable on macOS light terminals.
-    let theme = Theme::terminal_safe();
+    // Use ColorTheme to generate Theme, unifying both theme systems.
+    let color_theme = echo_agent_app_core::output::theme::ColorTheme::dark();
+    let theme = Theme::from_color_theme(&color_theme);
 
     // Create the RAII guard — redirects stderr + sets up terminal.
     let _guard = TerminalGuard::new();

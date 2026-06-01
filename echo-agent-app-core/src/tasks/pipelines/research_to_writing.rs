@@ -30,10 +30,10 @@
 //! Uses the canonical prompt-construction + `add_shared_agent_node_with_mode`
 //! pattern for all agent-calling stages.
 
-use crate::agent_handle::AgentHandle;
-use echo_agent::workflow::{Graph, GraphBuilder, SharedState, SharedAgent};
-use futures::future::BoxFuture;
 use super::research::extract_quality_score;
+use crate::agent_handle::AgentHandle;
+use echo_agent::workflow::{Graph, GraphBuilder, SharedAgent, SharedState};
+use futures::future::BoxFuture;
 
 // ── Configuration ──────────────────────────────────────────────────────────────
 
@@ -140,8 +140,12 @@ pub struct R2WWritingQualityAssessment {
     pub needs_revision: bool,
 }
 
-fn default_r2w_writing_quality_score() -> u32 { 60 }
-fn default_r2w_writing_confidence() -> f64 { 0.5 }
+fn default_r2w_writing_quality_score() -> u32 {
+    60
+}
+fn default_r2w_writing_confidence() -> f64 {
+    0.5
+}
 
 /// Extract structured writing quality assessment from review text.
 ///
@@ -163,7 +167,8 @@ pub fn extract_r2w_writing_quality_assessment(review_text: &str) -> R2WWritingQu
     }
 
     // Strategy 2: Try parsing the entire text as JSON
-    if let Ok(assessment) = serde_json::from_str::<R2WWritingQualityAssessment>(review_text.trim()) {
+    if let Ok(assessment) = serde_json::from_str::<R2WWritingQualityAssessment>(review_text.trim())
+    {
         return assessment;
     }
 
@@ -260,9 +265,7 @@ fn extract_writing_quality_score_legacy(review_text: &str) -> u32 {
 /// All agent-calling stages use the canonical prompt-construction +
 /// `add_shared_agent_node_with_mode` pattern. Non-agent stages (merge,
 /// evaluate, increment, finalize formatting) remain as function nodes.
-pub fn build_research_to_writing_graph(
-    agent: SharedAgent,
-) -> anyhow::Result<Graph> {
+pub fn build_research_to_writing_graph(agent: SharedAgent) -> anyhow::Result<Graph> {
     let agent_search_arxiv = agent.clone();
     let agent_search_semantic = agent.clone();
     let agent_fetch = agent.clone();
@@ -971,11 +974,20 @@ pub async fn run_research_to_writing(
     state.set("audience", config.audience.clone())?;
     state.set("format", config.format.clone())?;
     state.set("research_revision_count", 0i64)?;
-    state.set("research_max_revisions", config.research_max_revisions as i64)?;
-    state.set("research_quality_threshold", config.research_quality_threshold as i64)?;
+    state.set(
+        "research_max_revisions",
+        config.research_max_revisions as i64,
+    )?;
+    state.set(
+        "research_quality_threshold",
+        config.research_quality_threshold as i64,
+    )?;
     state.set("writing_revision_count", 0i64)?;
     state.set("writing_max_revisions", config.writing_max_revisions as i64)?;
-    state.set("writing_quality_threshold", config.writing_quality_threshold as i64)?;
+    state.set(
+        "writing_quality_threshold",
+        config.writing_quality_threshold as i64,
+    )?;
 
     tracing::info!(
         pipeline = "research_to_writing",
@@ -1000,15 +1012,11 @@ pub async fn run_research_to_writing(
     );
 
     // Extract the final output from the state
-    let final_output: String = result
-        .state
-        .get("final_output")
-        .unwrap_or_else(|| {
-            result
-                .state
-                .get("writing_draft")
-                .unwrap_or_else(|| "Research-to-writing pipeline completed but no final output was generated.".to_string())
-        });
+    let final_output: String = result.state.get("final_output").unwrap_or_else(|| {
+        result.state.get("writing_draft").unwrap_or_else(|| {
+            "Research-to-writing pipeline completed but no final output was generated.".to_string()
+        })
+    });
 
     Ok(final_output)
 }

@@ -42,10 +42,7 @@ pub enum TraceKind {
         thought_preview: Option<String>,
     },
     /// Pipeline 阶段。
-    PipelineStage {
-        pipeline: String,
-        stage: String,
-    },
+    PipelineStage { pipeline: String, stage: String },
     /// 记忆访问。
     MemoryAccess {
         operation: String,
@@ -53,10 +50,7 @@ pub enum TraceKind {
         results_count: Option<usize>,
     },
     /// MCP 服务调用。
-    McpCall {
-        server: String,
-        method: String,
-    },
+    McpCall { server: String, method: String },
     /// 上下文压缩。
     ContextCompression {
         before_messages: usize,

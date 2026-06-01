@@ -89,6 +89,32 @@ impl SkillsHub {
         }
     }
 
+    /// 启用单个技能（添加到已加载列表）
+    pub fn enable_skill(&mut self, name: &str) -> Result<(), String> {
+        if !self.entries.contains_key(name) {
+            return Err(format!("Skill '{}' not found", name));
+        }
+        if !self.loaded_skills.contains(&name.to_string()) {
+            self.loaded_skills.push(name.to_string());
+            if let Some(entry) = self.entries.get_mut(name) {
+                entry.loaded = true;
+            }
+        }
+        Ok(())
+    }
+
+    /// 禁用单个技能（从已加载列表移除）
+    pub fn disable_skill(&mut self, name: &str) -> Result<(), String> {
+        if !self.entries.contains_key(name) {
+            return Err(format!("Skill '{}' not found", name));
+        }
+        self.loaded_skills.retain(|s| s != name);
+        if let Some(entry) = self.entries.get_mut(name) {
+            entry.loaded = false;
+        }
+        Ok(())
+    }
+
     /// 列出所有条目
     pub fn list(&self) -> Vec<&SkillHubEntry> {
         let mut entries: Vec<_> = self.entries.values().collect();

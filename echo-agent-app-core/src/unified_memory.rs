@@ -149,11 +149,7 @@ impl UnifiedMemory {
     }
 
     /// Set instructions for a specific tier (writes to disk).
-    pub fn set_instructions(
-        &self,
-        tier: InstructionTier,
-        content: &str,
-    ) -> Result<(), String> {
+    pub fn set_instructions(&self, tier: InstructionTier, content: &str) -> Result<(), String> {
         let path = self.instruction_path(tier)?;
 
         // Ensure parent directory exists
@@ -170,20 +166,16 @@ impl UnifiedMemory {
     fn instruction_path(&self, tier: InstructionTier) -> Result<PathBuf, String> {
         match tier {
             InstructionTier::User => {
-                let home = dirs::home_dir()
-                    .ok_or("Could not determine home directory")?;
+                let home = dirs::home_dir().ok_or("Could not determine home directory")?;
                 Ok(home.join(".echo-agent").join("user.md"))
             }
             InstructionTier::Project => {
-                let pwd = std::env::current_dir()
-                    .map_err(|e| format!("Failed to get cwd: {e}"))?;
-                let root = find_project_root(&pwd)
-                    .ok_or("Not in a project directory")?;
+                let pwd = std::env::current_dir().map_err(|e| format!("Failed to get cwd: {e}"))?;
+                let root = find_project_root(&pwd).ok_or("Not in a project directory")?;
                 Ok(root.join(".echo-agent").join("project.md"))
             }
             InstructionTier::Local => {
-                let pwd = std::env::current_dir()
-                    .map_err(|e| format!("Failed to get cwd: {e}"))?;
+                let pwd = std::env::current_dir().map_err(|e| format!("Failed to get cwd: {e}"))?;
                 Ok(pwd.join(".echo-agent").join("local.md"))
             }
         }
@@ -195,10 +187,7 @@ impl UnifiedMemory {
     pub async fn remember(&self, content: &str, importance: f32) -> Result<String, String> {
         let store = self.memories.as_ref().ok_or("No memory store configured")?;
 
-        let key = format!(
-            "memory_{}",
-            chrono::Utc::now().timestamp_millis()
-        );
+        let key = format!("memory_{}", chrono::Utc::now().timestamp_millis());
 
         let value = serde_json::json!({
             "content": content,

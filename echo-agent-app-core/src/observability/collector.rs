@@ -99,8 +99,14 @@ impl TraceCollector {
             }
         }
 
-        let first_ts = session_events.first().map(|e| e.timestamp).unwrap_or_else(Utc::now);
-        let last_ts = session_events.last().map(|e| e.timestamp).unwrap_or_else(Utc::now);
+        let first_ts = session_events
+            .first()
+            .map(|e| e.timestamp)
+            .unwrap_or_else(Utc::now);
+        let last_ts = session_events
+            .last()
+            .map(|e| e.timestamp)
+            .unwrap_or_else(Utc::now);
         let total_duration_ms = (last_ts - first_ts).num_milliseconds().max(0) as u64;
 
         Some(TraceSummary {

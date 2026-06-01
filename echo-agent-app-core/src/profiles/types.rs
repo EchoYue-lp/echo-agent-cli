@@ -49,7 +49,7 @@ fn default_output_format() -> String {
 }
 
 fn default_max_iterations() -> usize {
-    0  // 0 = unlimited (no iteration limit)
+    0 // 0 = unlimited (no iteration limit)
 }
 
 impl Profile {

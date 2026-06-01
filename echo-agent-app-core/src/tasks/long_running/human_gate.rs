@@ -57,10 +57,7 @@ impl HumanCheckpointGate {
 
         {
             let mut pending = self.pending.lock().await;
-            pending.insert(
-                task_id.to_string(),
-                PendingRequest { request, sender },
-            );
+            pending.insert(task_id.to_string(), PendingRequest { request, sender });
         }
 
         tracing::info!("Human checkpoint: waiting for input on task {}", task_id);

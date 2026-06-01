@@ -10,7 +10,6 @@ use echo_agent::agent::CancellationToken;
 use echo_agent::mcp::McpConfigFile;
 use echo_agent::memory::ConversationStore;
 use echo_agent::prelude::*;
-use governor::{Quota, RateLimiter, clock, state::keyed::DashMapStateStore};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,7 +19,6 @@ use tokio::sync::RwLock;
 
 use crate::agent_handle::AgentHandle;
 use crate::persistence::Persistence;
-use crate::security::SecurityConfig;
 use crate::workspace::Workspace;
 use crate::workspace::registry::WorkspaceRegistry;
 
@@ -298,22 +296,19 @@ pub struct ConnectionState {
     pub hitl_dispatcher: Arc<crate::hitl::HitlDispatcher>,
 }
 
-/// 配置状态：应用 / Web / 安全 / 沙箱 / 权限
+/// 配置状态：应用 / Web / 沙箱 / 权限
 pub struct ConfigState {
     pub app_config: RwLock<crate::config::AppConfig>,
     pub web_config: RwLock<WebConfig>,
-    pub security_config: RwLock<SecurityConfig>,
-    pub jwt_manager: RwLock<Option<crate::security::JwtManager>>,
     pub sandbox_config: RwLock<SandboxConfigData>,
     pub permission_mode: RwLock<String>,
     pub permission_rules: RwLock<Vec<PermissionRuleConfig>>,
 }
 
-/// 会话状态：工具状态 + 取消令牌 + 速率限制
+/// 会话状态：工具状态 + 取消令牌
 pub struct SessionState {
     pub tool_states: RwLock<HashMap<String, ToolState>>,
     pub cancel_token: DashMap<String, CancellationToken>,
-    pub rate_limiter: Arc<RateLimiter<String, DashMapStateStore<String>, clock::DefaultClock>>,
 }
 
 /// 插件状态：MCP 服务管理
@@ -324,7 +319,7 @@ pub struct PluginState {
 
 /// 持久化存储状态
 pub struct StorageState {
-    pub conversation_store: Option<Arc<dyn ConversationStore>>,
+    pub conversation_store: RwLock<Option<Arc<dyn ConversationStore>>>,
     pub persistence: RwLock<Persistence>,
     pub search_engine: crate::sessions::SessionSearchEngine,
 }
@@ -416,30 +411,6 @@ impl AppState {
             })
             .unwrap_or_default();
 
-        // 加载安全配置（环境变量覆盖默认值）
-        let security_config = SecurityConfig::from_env();
-
-        // 验证安全配置
-        if let Err(e) = security_config.validate() {
-            tracing::warn!("安全配置验证失败: {}", e);
-        }
-
-        // 创建速率限制器
-        let rate_limit_per_minute = security_config.rate_limit_requests_per_minute;
-        let rate_limiter = if rate_limit_per_minute > 0 {
-            let quota = Quota::per_minute(
-                std::num::NonZeroU32::new(rate_limit_per_minute)
-                    .unwrap_or(std::num::NonZeroU32::new(1).unwrap()),
-            );
-            Arc::new(RateLimiter::keyed(quota))
-        } else {
-            // 如果速率为0，创建一个允许所有请求的限制器
-            let quota = Quota::per_minute(std::num::NonZeroU32::new(u32::MAX).unwrap());
-            Arc::new(RateLimiter::keyed(quota))
-        };
-
-        let security_config = RwLock::new(security_config);
-
         // Extract webhook endpoints before moving app_config
         let webhook_endpoints: Vec<crate::webhook::emitter::WebhookEndpoint> = app_config
             .webhooks
@@ -460,8 +431,6 @@ impl AppState {
             config: ConfigState {
                 app_config: RwLock::new(app_config),
                 web_config: RwLock::new(config),
-                security_config,
-                jwt_manager: RwLock::new(None),
                 sandbox_config: RwLock::new(SandboxConfigData::default()),
                 permission_mode: RwLock::new("default".to_string()),
                 permission_rules: RwLock::new(Vec::new()),
@@ -469,14 +438,13 @@ impl AppState {
             session: SessionState {
                 tool_states: RwLock::new(HashMap::new()),
                 cancel_token: DashMap::new(),
-                rate_limiter,
             },
             plugins: PluginState {
                 mcp_config: RwLock::new(McpConfigFile::default()),
                 mcp_health: RwLock::new(HashMap::new()),
             },
             storage: StorageState {
-                conversation_store,
+                conversation_store: RwLock::new(conversation_store),
                 persistence: RwLock::new(Persistence::new()),
                 search_engine: crate::sessions::SessionSearchEngine::new().unwrap_or_else(|e| {
                     tracing::warn!("Failed to init search engine: {e}, creating empty");
@@ -654,42 +622,6 @@ impl AppState {
         *health_map = new_health;
     }
 
-    /// 重新加载安全配置（热更新，无需重启）
-    pub async fn reload_security_config(&self) -> std::result::Result<(), String> {
-        let new_config = SecurityConfig::from_env();
-        new_config.validate()?;
-
-        let mut guard = self.config.security_config.write().await;
-        *guard = new_config;
-        // Clear the cached JWT manager so it gets recreated with the new secret
-        {
-            let mut jwt_guard = self.config.jwt_manager.write().await;
-            *jwt_guard = None;
-        }
-        tracing::info!("安全配置已热更新生效 (JWT cache cleared)");
-        Ok(())
-    }
-
-    /// 获取或创建缓存的 JWT 管理器（避免每个请求重新构造密钥）
-    pub async fn get_or_create_jwt_manager(&self, secret: &str) -> crate::security::JwtManager {
-        // Fast path: already cached
-        {
-            let guard = self.config.jwt_manager.read().await;
-            if let Some(ref mgr) = *guard {
-                return mgr.clone();
-            }
-        }
-        // Slow path: create and cache
-        let mgr = crate::security::JwtManager::new(secret);
-        let mut guard = self.config.jwt_manager.write().await;
-        // Double-check: another thread may have created it while we waited
-        if let Some(ref existing) = *guard {
-            return existing.clone();
-        }
-        *guard = Some(mgr.clone());
-        mgr
-    }
-
     /// 添加审计日志条目（FIFO 淘汰，防止内存无限增长）
     pub async fn add_audit_entry(&self, entry: AuditLogEntry) {
         let mut logs = self.history.audit_logs.write().await;
@@ -709,11 +641,7 @@ impl AppState {
     /// 获取审计日志分页
     pub async fn get_audit_logs_paged(&self, offset: usize, limit: usize) -> Vec<AuditLogEntry> {
         let logs = self.history.audit_logs.read().await;
-        logs.iter()
-            .skip(offset)
-            .take(limit)
-            .cloned()
-            .collect()
+        logs.iter().skip(offset).take(limit).cloned().collect()
     }
 
     /// 获取审计日志总数
@@ -746,19 +674,70 @@ impl AppState {
             *current = Some(workspace.clone());
         }
 
+        // 切换进程工作目录到工作区根目录。
+        // 这样所有工具（shell、文件读写、搜索等）都会自动在工作区目录下执行。
+        if workspace.root.exists() {
+            if let Err(e) = std::env::set_current_dir(&workspace.root) {
+                tracing::warn!(
+                    root = %workspace.root.display(),
+                    "Failed to set_current_dir to workspace root: {e}"
+                );
+            } else {
+                tracing::info!(
+                    root = %workspace.root.display(),
+                    "Process CWD switched to workspace root"
+                );
+            }
+        } else {
+            tracing::warn!(
+                root = %workspace.root.display(),
+                "Workspace root does not exist, skipping CWD switch"
+            );
+        }
+
+        // 更新 agent 的 working_dir 配置（影响 project rules 注入等）
+        self.connection.agent.try_write(|a| {
+            a.set_working_dir(Some(workspace.root.clone()));
+        });
+
         // 重新初始化 persistence 以使用工作区路径
         let new_persistence = Persistence::with_base_dir(
-            crate::workspace::layout::WorkspaceLayout::sessions(&workspace.root)
+            crate::workspace::layout::WorkspaceLayout::sessions(&workspace.root),
         );
         {
             let mut persistence = self.storage.persistence.write().await;
             *persistence = new_persistence;
         }
 
+        // 重新初始化 conversation_store 到工作区的数据库
+        let conv_dir = crate::workspace::layout::WorkspaceLayout::conversations(&workspace.root);
+        std::fs::create_dir_all(&conv_dir).ok();
+        let db_path = conv_dir.join("conversations.db");
+        match echo_agent::memory::SqliteConversationStore::new(&db_path) {
+            Ok(store) => {
+                let new_store: Arc<dyn echo_agent::memory::ConversationStore> = Arc::new(store);
+                {
+                    let mut guard = self.storage.conversation_store.write().await;
+                    *guard = Some(new_store.clone());
+                }
+                self.connection
+                    .agent
+                    .try_write(|a| a.set_conversation_store(new_store));
+                tracing::info!(
+                    workspace = %workspace.id,
+                    db = %db_path.display(),
+                    "Switched conversation store to workspace"
+                );
+            }
+            Err(e) => {
+                tracing::warn!("Failed to reinit conversation store for workspace: {e}");
+            }
+        }
+
         tracing::info!(
             workspace = %workspace.id,
             root = %workspace.root.display(),
-            "Switched to workspace and reinitialized persistence"
+            "Switched to workspace"
         );
 
         Ok(())
@@ -774,6 +753,18 @@ impl AppState {
         {
             let mut persistence = self.storage.persistence.write().await;
             *persistence = global_persistence;
+        }
+
+        // 重置 conversation_store 到全局默认路径
+        let global_db = crate::persistence::Persistence::base_dir().join("conversations.db");
+        match echo_agent::memory::SqliteConversationStore::new(&global_db) {
+            Ok(store) => {
+                let mut guard = self.storage.conversation_store.write().await;
+                *guard = Some(Arc::new(store));
+            }
+            Err(e) => {
+                tracing::warn!("Failed to reset conversation store to global: {e}");
+            }
         }
 
         tracing::info!("Exited workspace, using global default paths");

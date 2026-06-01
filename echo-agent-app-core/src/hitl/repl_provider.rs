@@ -25,7 +25,10 @@ impl Default for ReplHumanLoopProvider {
 }
 
 impl HumanLoopProvider for ReplHumanLoopProvider {
-    fn request(&self, req: HumanLoopRequest) -> BoxFuture<'_, Result<HumanLoopResponse, echo_agent::error::ReactError>> {
+    fn request(
+        &self,
+        req: HumanLoopRequest,
+    ) -> BoxFuture<'_, Result<HumanLoopResponse, echo_agent::error::ReactError>> {
         Box::pin(async move {
             match req.kind {
                 HumanLoopKind::Approval => handle_approval(&req),
@@ -35,7 +38,9 @@ impl HumanLoopProvider for ReplHumanLoopProvider {
     }
 }
 
-fn handle_approval(req: &HumanLoopRequest) -> Result<HumanLoopResponse, echo_agent::error::ReactError> {
+fn handle_approval(
+    req: &HumanLoopRequest,
+) -> Result<HumanLoopResponse, echo_agent::error::ReactError> {
     println!("\n╔══════════════════════════════════════════╗");
     println!("║         TOOL APPROVAL REQUIRED           ║");
     println!("╚══════════════════════════════════════════╝");
@@ -77,7 +82,9 @@ fn handle_approval(req: &HumanLoopRequest) -> Result<HumanLoopResponse, echo_age
     }
 }
 
-fn handle_input(req: &HumanLoopRequest) -> Result<HumanLoopResponse, echo_agent::error::ReactError> {
+fn handle_input(
+    req: &HumanLoopRequest,
+) -> Result<HumanLoopResponse, echo_agent::error::ReactError> {
     println!("\n╔══════════════════════════════════════════╗");
     println!("║         INPUT REQUESTED                  ║");
     println!("╚══════════════════════════════════════════╝");

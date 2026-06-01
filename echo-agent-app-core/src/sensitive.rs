@@ -91,9 +91,7 @@ fn glob_match(pattern: &str, path: &str) -> bool {
         if pi < pattern_parts.len() && pattern_parts[pi] == "**" {
             star_idx = Some((pi + 1, si));
             pi += 1;
-        } else if pi < pattern_parts.len()
-            && segment_match(pattern_parts[pi], path_parts[si])
-        {
+        } else if pi < pattern_parts.len() && segment_match(pattern_parts[pi], path_parts[si]) {
             pi += 1;
             si += 1;
         } else if let Some((p_back, s_back)) = star_idx {
@@ -139,7 +137,9 @@ fn segment_glob_match(pattern: &str, text: &str) -> bool {
     let mut star_ti: Option<usize> = None;
 
     while ti < txt.len() {
-        if pi < pat.len() && (pat[pi] == '?' || pat[pi].to_ascii_lowercase() == txt[ti].to_ascii_lowercase()) {
+        if pi < pat.len()
+            && (pat[pi] == '?' || pat[pi].to_ascii_lowercase() == txt[ti].to_ascii_lowercase())
+        {
             pi += 1;
             ti += 1;
         } else if pi < pat.len() && pat[pi] == '*' {

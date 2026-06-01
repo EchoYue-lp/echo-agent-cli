@@ -113,11 +113,7 @@ impl WorkspaceRegistry {
     // ── CRUD ──
 
     /// 创建新工作区（使用默认路径）。
-    pub fn create(
-        &self,
-        name: &str,
-        kind: WorkspaceKind,
-    ) -> anyhow::Result<Workspace> {
+    pub fn create(&self, name: &str, kind: WorkspaceKind) -> anyhow::Result<Workspace> {
         let root = self.default_root(name);
         self.create_at(name, kind, root)
     }
@@ -143,10 +139,7 @@ impl WorkspaceRegistry {
         let manifest = WorkspaceLayout::manifest(&root);
         let legacy_manifest = WorkspaceLayout::legacy_manifest(&root);
         if manifest.exists() || legacy_manifest.exists() {
-            anyhow::bail!(
-                "Directory already contains a workspace: {}",
-                root.display()
-            );
+            anyhow::bail!("Directory already contains a workspace: {}", root.display());
         }
 
         // 创建目录结构
@@ -282,12 +275,27 @@ impl WorkspaceRegistry {
             anyhow::bail!("Workspace '{}' not found", id);
         }
 
-        // 判断是否在基础目录下
-        let is_under_base = root.starts_with(&self.base_dir);
+        // 安全检查：使用 canonicalize 解析符号链接，防止路径穿越攻击
+        let canonical_root = root.canonicalize()
+            .map_err(|e| anyhow::anyhow!("无法解析工作区路径: {} ({})", root.display(), e))?;
+        let canonical_base = self.base_dir.canonicalize()
+            .unwrap_or_else(|_| self.base_dir.clone());
+
+        // 判断是否在基础目录下（使用解析后的路径）
+        let is_under_base = canonical_root.starts_with(&canonical_base);
 
         if is_under_base {
             // 在基础目录下 → 整个删除
-            fs::remove_dir_all(&root)?;
+            // 二次确认：确保路径确实是工作区目录（包含 manifest）
+            let manifest = WorkspaceLayout::manifest(&canonical_root);
+            let legacy_manifest = WorkspaceLayout::legacy_manifest(&canonical_root);
+            if !manifest.exists() && !legacy_manifest.exists() {
+                anyhow::bail!(
+                    "拒绝删除：'{}' 不是一个有效的工作区目录（缺少 manifest 文件）",
+                    canonical_root.display()
+                );
+            }
+            fs::remove_dir_all(&canonical_root)?;
         } else {
             // 自定义路径 → 只删除 EchoCoWork 系统目录，保留用户原有文件
             let state_dir = WorkspaceLayout::state_dir(&root);
@@ -299,7 +307,14 @@ impl WorkspaceRegistry {
                 fs::remove_file(&legacy_manifest).ok();
             }
             // 清理旧版本创建的系统子目录，不删除 data/papers/artifacts 等用户内容。
-            for subdir in ["sessions", "conversations", "memory", "tasks", "traces", "uploads"] {
+            for subdir in [
+                "sessions",
+                "conversations",
+                "memory",
+                "tasks",
+                "traces",
+                "uploads",
+            ] {
                 let dir = root.join(subdir);
                 if dir.exists() {
                     fs::remove_dir_all(&dir).ok();
@@ -330,9 +345,7 @@ impl WorkspaceRegistry {
     ) -> anyhow::Result<Workspace> {
         let mut workspace = self.open(id)?;
 
-        let canonical = project_root
-            .canonicalize()
-            .unwrap_or(project_root.clone());
+        let canonical = project_root.canonicalize().unwrap_or(project_root.clone());
 
         if !canonical.exists() {
             anyhow::bail!("Project root does not exist: {}", canonical.display());
@@ -460,7 +473,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let registry = WorkspaceRegistry::with_base_dir(tmp.path().to_path_buf()).unwrap();
 
-        registry.create("project-a", WorkspaceKind::General).unwrap();
+        registry
+            .create("project-a", WorkspaceKind::General)
+            .unwrap();
         registry
             .create("project-b", WorkspaceKind::Research { topics: vec![] })
             .unwrap();
@@ -474,7 +489,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let registry = WorkspaceRegistry::with_base_dir(tmp.path().to_path_buf()).unwrap();
 
-        let ws = registry.create("to-delete", WorkspaceKind::General).unwrap();
+        let ws = registry
+            .create("to-delete", WorkspaceKind::General)
+            .unwrap();
         assert!(ws.root.exists());
 
         registry.delete(&ws.id).unwrap();
@@ -521,7 +538,9 @@ mod tests {
         let custom = tmp.path().join("external-project");
         let registry = WorkspaceRegistry::with_base_dir(base).unwrap();
 
-        registry.create("default-ws", WorkspaceKind::General).unwrap();
+        registry
+            .create("default-ws", WorkspaceKind::General)
+            .unwrap();
         registry
             .create_at("custom-ws", WorkspaceKind::Code { repo_url: None }, custom)
             .unwrap();

@@ -292,11 +292,10 @@ pub async fn shutdown_signal() {
     }
 }
 
-/// Print a security warning if the server binds to a non-localhost address.
+/// Print a warning if the server binds to a non-localhost address.
 ///
 /// Echo Agent CLI is designed as a single-user local application. Binding to
-/// 0.0.0.0 or a public IP exposes the agent to the network. Users should enable
-/// JWT authentication (see SecurityConfig) before accepting remote connections.
+/// 0.0.0.0 or a public IP exposes the agent to the network.
 pub fn warn_non_localhost_bind(host: &str, addr: &str, auth_enabled: bool) {
     // Check if host is a non-localhost address
     let is_localhost = host == "127.0.0.1" || host == "localhost" || host == "::1";
@@ -328,9 +327,7 @@ pub async fn init_trace_analyzer(state: &crate::state::AppState) {
     let run_store = state
         .connection
         .agent
-        .read_async(|a| {
-            Box::pin(async move { a.run_store.clone() })
-        })
+        .read_async(|a| Box::pin(async move { a.run_store.clone() }))
         .await;
 
     if let Some(store) = run_store {
@@ -413,9 +410,8 @@ pub fn init_logging_with_target(level: &str, target: LogTarget) {
             let default_filter =
                 format!("echo_agent_cli={level},echo_agent={level},tower_http=info");
             let env_filter = || {
-                tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                    tracing_subscriber::filter::EnvFilter::new(&default_filter)
-                })
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::filter::EnvFilter::new(&default_filter))
             };
 
             match target {
@@ -464,7 +460,9 @@ fn tui_log_path() -> std::path::PathBuf {
     }
 
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let dir = std::path::PathBuf::from(home).join(".echo-agent").join("logs");
+    let dir = std::path::PathBuf::from(home)
+        .join(".echo-agent")
+        .join("logs");
     let _ = std::fs::create_dir_all(&dir);
     dir.join("tui.log")
 }

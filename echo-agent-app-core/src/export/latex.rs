@@ -11,7 +11,8 @@ impl LatexExporter {
         let mut latex = String::new();
 
         // Document preamble
-        latex.push_str(r#"\documentclass[11pt,a4paper]{article}
+        latex.push_str(
+            r#"\documentclass[11pt,a4paper]{article}
 \usepackage[utf8]{inputenc}
 \usepackage[T1]{fontenc}
 \usepackage{amsmath,amssymb}
@@ -23,7 +24,8 @@ impl LatexExporter {
 
 \begin{document}
 
-"#);
+"#,
+        );
 
         // Convert markdown to LaTeX
         for line in markdown.lines() {
@@ -77,7 +79,9 @@ impl LatexExporter {
                     chars.next(); // consume second [
                     let mut num = String::new();
                     while let Some(&nc) = chars.peek() {
-                        if nc == ']' { break; }
+                        if nc == ']' {
+                            break;
+                        }
                         num.push(nc);
                         chars.next();
                     }
@@ -158,8 +162,14 @@ mod tests {
 
     #[test]
     fn test_headers() {
-        assert_eq!(LatexExporter::convert_line("# Introduction"), "\\section{Introduction}");
-        assert_eq!(LatexExporter::convert_line("## Methods"), "\\subsection{Methods}");
+        assert_eq!(
+            LatexExporter::convert_line("# Introduction"),
+            "\\section{Introduction}"
+        );
+        assert_eq!(
+            LatexExporter::convert_line("## Methods"),
+            "\\subsection{Methods}"
+        );
     }
 
     #[test]

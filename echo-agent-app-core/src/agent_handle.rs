@@ -24,9 +24,10 @@ use echo_agent::agent::AgentEvent;
 use echo_agent::error::Result;
 use echo_agent::prelude::ReactAgent;
 use echo_agent::workflow::SharedAgent;
+use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use futures::stream::StreamExt;
-use futures::future::BoxFuture;
+use futures::Stream;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -68,9 +69,15 @@ impl RwLockAgentWrapper {
 }
 
 impl Agent for RwLockAgentWrapper {
-    fn name(&self) -> &str { &self.name }
-    fn model_name(&self) -> &str { &self.model_name }
-    fn system_prompt(&self) -> &str { &self.system_prompt }
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn model_name(&self) -> &str {
+        &self.model_name
+    }
+    fn system_prompt(&self) -> &str {
+        &self.system_prompt
+    }
 
     fn execute<'a>(&'a self, task: &'a str) -> BoxFuture<'a, Result<String>> {
         let inner = self.inner.clone();
@@ -94,17 +101,32 @@ impl Agent for RwLockAgentWrapper {
         &'a self,
         task: &'a str,
     ) -> BoxFuture<'a, Result<BoxStream<'a, Result<AgentEvent>>>> {
-        // Pipeline nodes collect the full output; streaming is not needed.
-        // Collect the execute result into a single-event stream.
         let inner = self.inner.clone();
         let task = task.to_string();
         Box::pin(async move {
-            let guard = inner.read().await;
-            let result = guard.execute(&task).await?;
-            let stream = futures::stream::once(async move {
-                Ok(AgentEvent::FinalAnswer(result))
-            }).boxed();
-            Ok(stream)
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Result<AgentEvent>>();
+
+            tokio::spawn(async move {
+                let guard = inner.read().await;
+                match guard.execute_stream(&task).await {
+                    Ok(mut stream) => {
+                        while let Some(event) = stream.next().await {
+                            if tx.send(event).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                    }
+                }
+            });
+
+            let stream = futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|event| (event, rx))
+            });
+
+            Ok(stream.boxed())
         })
     }
 
@@ -115,12 +137,29 @@ impl Agent for RwLockAgentWrapper {
         let inner = self.inner.clone();
         let message = message.to_string();
         Box::pin(async move {
-            let guard = inner.read().await;
-            let result = guard.chat(&message).await?;
-            let stream = futures::stream::once(async move {
-                Ok(AgentEvent::FinalAnswer(result))
-            }).boxed();
-            Ok(stream)
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Result<AgentEvent>>();
+
+            tokio::spawn(async move {
+                let guard = inner.read().await;
+                match guard.chat_stream(&message).await {
+                    Ok(mut stream) => {
+                        while let Some(event) = stream.next().await {
+                            if tx.send(event).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                    }
+                }
+            });
+
+            let stream = futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|event| (event, rx))
+            });
+
+            Ok(stream.boxed())
         })
     }
 

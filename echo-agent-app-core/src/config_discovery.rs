@@ -165,8 +165,7 @@ pub struct ConfigDiscovery {
 impl ConfigDiscovery {
     /// Create a new discovery service.
     pub fn new() -> Self {
-        let home_dir = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."));
+        let home_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
 
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
@@ -205,7 +204,11 @@ impl ConfigDiscovery {
 
     /// List all discovered files as a flat vector.
     pub fn list_files(&self) -> Vec<ConfigFile> {
-        self.discover_all().all_files().into_iter().cloned().collect()
+        self.discover_all()
+            .all_files()
+            .into_iter()
+            .cloned()
+            .collect()
     }
 
     // ── Discovery methods ────────────────────────────────────────────
@@ -319,7 +322,10 @@ impl ConfigDiscovery {
     fn discover_plugin_manifests(&self, inv: &mut ConfigInventory) {
         // Scan plugin directories in all scopes
         let scopes = [
-            (ConfigScope::Global, self.home_dir.join(".echo-agent").join("plugins")),
+            (
+                ConfigScope::Global,
+                self.home_dir.join(".echo-agent").join("plugins"),
+            ),
             (
                 ConfigScope::Project,
                 self.project_root
@@ -363,10 +369,7 @@ impl ConfigDiscovery {
                 let ws_file = entry.path().join(".workspace.json");
                 if ws_file.exists() {
                     inv.workspace_configs.push(ConfigFile {
-                        name: format!(
-                            ".workspace.json ({})",
-                            entry.file_name().to_string_lossy()
-                        ),
+                        name: format!(".workspace.json ({})", entry.file_name().to_string_lossy()),
                         path: ws_file,
                         scope: ConfigScope::Global,
                         category: ConfigCategory::Workspace,
@@ -458,11 +461,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
 
-        let discovery = ConfigDiscovery::with_paths(
-            tmp.clone(),
-            tmp.clone(),
-            Some(tmp.clone()),
-        );
+        let discovery = ConfigDiscovery::with_paths(tmp.clone(), tmp.clone(), Some(tmp.clone()));
 
         let inv = discovery.discover_all();
         // Should have entries (even if not accessible)

@@ -53,22 +53,21 @@ pub fn render_markdown(text: &str) -> Vec<Line<'static>> {
 
 struct MarkdownRenderer {
     lines: Vec<Line<'static>>,
-    /// Current inline spans being accumulated for the current paragraph / block.
     current_spans: Vec<Span<'static>>,
-    /// Stack of active inline styles.
     style_stack: Vec<Style>,
-    /// Whether we are inside a code block.
     in_code_block: bool,
-    /// Language of the current code block (if any).
     code_block_lang: Option<String>,
-    /// Accumulated code block text.
     code_block_text: String,
-    /// Heading level (1-6, 0 = not in heading).
     heading_level: u8,
-    /// Current list nesting depth.
     list_depth: usize,
-    /// Whether we are in a blockquote.
     in_blockquote: bool,
+    // Table rendering state
+    in_table: bool,
+    table_rows: Vec<Vec<String>>,
+    current_row: Vec<String>,
+    current_cell: String,
+    // Task list state
+    task_list_checked: Option<bool>,
 }
 
 impl MarkdownRenderer {
@@ -83,6 +82,11 @@ impl MarkdownRenderer {
             heading_level: 0,
             list_depth: 0,
             in_blockquote: false,
+            in_table: false,
+            table_rows: Vec::new(),
+            current_row: Vec::new(),
+            current_cell: String::new(),
+            task_list_checked: None,
         }
     }
 
@@ -161,11 +165,64 @@ impl MarkdownRenderer {
             Event::Start(Tag::Item) => {
                 self.lines.push(Line::from(""));
                 let indent = "  ".repeat(self.list_depth.saturating_sub(1));
-                let bullet = format!("{}  - ", indent);
-                self.push_span(Span::styled(bullet, Style::default().fg(Color::Cyan)));
+                // Check if this is a task list item
+                if let Some(checked) = self.task_list_checked {
+                    let marker = if checked { "[x] " } else { "[ ] " };
+                    self.push_span(Span::styled(
+                        format!("{}{}", indent, marker),
+                        Style::default().fg(Color::Cyan),
+                    ));
+                    self.task_list_checked = None;
+                } else {
+                    let bullet = format!("{}  - ", indent);
+                    self.push_span(Span::styled(bullet, Style::default().fg(Color::Cyan)));
+                }
             }
             Event::End(TagEnd::Item) => {
                 self.flush_line();
+            }
+
+            // ── Task list markers ────────────────────────────────────────────
+            Event::TaskListMarker(checked) => {
+                self.task_list_checked = Some(checked);
+            }
+
+            // ── Tables ───────────────────────────────────────────────────────
+            Event::Start(Tag::Table { .. }) => {
+                self.in_table = true;
+                self.table_rows.clear();
+                self.current_row.clear();
+                self.current_cell.clear();
+            }
+            Event::End(TagEnd::Table) => {
+                self.render_table();
+                self.in_table = false;
+                self.table_rows.clear();
+                self.current_row.clear();
+                self.current_cell.clear();
+            }
+            Event::Start(Tag::TableHead) => {
+                // Table head begins a new row
+            }
+            Event::End(TagEnd::TableHead) => {
+                // End of header row - add to rows
+                if !self.current_row.is_empty() {
+                    self.table_rows.push(std::mem::take(&mut self.current_row));
+                }
+            }
+            Event::Start(Tag::TableRow) => {
+                self.current_row.clear();
+            }
+            Event::End(TagEnd::TableRow) => {
+                if !self.current_row.is_empty() {
+                    self.table_rows.push(std::mem::take(&mut self.current_row));
+                }
+            }
+            Event::Start(Tag::TableCell { .. }) => {
+                self.current_cell.clear();
+            }
+            Event::End(TagEnd::TableCell) => {
+                self.current_row.push(std::mem::take(&mut self.current_cell));
             }
 
             // ── Inline formatting ────────────────────────────────────────────
@@ -213,6 +270,8 @@ impl MarkdownRenderer {
             Event::Text(text) => {
                 if self.in_code_block {
                     self.code_block_text.push_str(&text);
+                } else if self.in_table {
+                    self.current_cell.push_str(&text);
                 } else {
                     let style = self.current_style();
                     let style = if self.heading_level > 0 {
@@ -302,6 +361,86 @@ impl MarkdownRenderer {
         }
     }
 
+    fn render_table(&mut self) {
+        if self.table_rows.is_empty() {
+            return;
+        }
+
+        // Determine column widths
+        let num_cols = self.table_rows.iter().map(|r| r.len()).max().unwrap_or(0);
+        if num_cols == 0 {
+            return;
+        }
+
+        let mut col_widths = vec![0usize; num_cols];
+        for row in &self.table_rows {
+            for (i, cell) in row.iter().enumerate().take(num_cols) {
+                col_widths[i] = col_widths[i].max(cell.len().min(40));
+            }
+        }
+
+        // Clamp column widths to a reasonable total
+        let total_width: usize = col_widths.iter().sum::<usize>() + num_cols * 3 + 1;
+        if total_width > 120 {
+            // Scale down proportionally
+            let scale = 120.0 / total_width as f64;
+            for w in &mut col_widths {
+                *w = (*w as f64 * scale).max(3.0) as usize;
+            }
+        }
+
+        let mut table_lines = Vec::new();
+
+        // Separator line
+        let sep_parts: Vec<String> = col_widths
+            .iter()
+            .map(|w| "─".repeat(*w + 2))
+            .collect();
+        let sep = format!("┌{}┐", sep_parts.join("┬"));
+        table_lines.push(sep);
+
+        for (row_idx, row) in self.table_rows.iter().enumerate() {
+            let mut line = String::from("│");
+            for (col_idx, cell) in row.iter().enumerate() {
+                let width = col_widths.get(col_idx).copied().unwrap_or(10);
+                let truncated = if cell.len() > width {
+                    format!("{:.width$}...", cell, width = width.saturating_sub(3))
+                } else {
+                    cell.to_string()
+                };
+                let style = if row_idx == 0 {
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                line.push_str(&format!(" {:<width$} │", truncated, width = width));
+            }
+            table_lines.push(line);
+
+            // Separator after header row
+            if row_idx == 0 {
+                let sep_inner: Vec<String> = col_widths
+                    .iter()
+                    .map(|w| "─".repeat(*w + 2))
+                    .collect();
+                table_lines.push(format!("├{}┤", sep_inner.join("┼")));
+            }
+        }
+
+        // Bottom border
+        let bottom_parts: Vec<String> = col_widths
+            .iter()
+            .map(|w| "─".repeat(*w + 2))
+            .collect();
+        table_lines.push(format!("└{}┘", bottom_parts.join("┴")));
+
+        for line in table_lines {
+            self.lines.push(Line::from(Span::styled(
+                line,
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
     fn render_code_block(&mut self) {
         if self.code_block_text.is_empty() {
             return;

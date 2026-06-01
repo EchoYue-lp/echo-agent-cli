@@ -66,6 +66,8 @@ pub struct SessionSummary {
     pub id: String,
     pub name: String,
     pub model: String,
+    #[serde(default)]
+    pub parent_id: Option<String>,
     pub branch: Option<String>,
     pub message_count: usize,
     pub estimated_tokens: usize,

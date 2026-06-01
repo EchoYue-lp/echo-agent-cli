@@ -301,14 +301,8 @@ pub fn render_diff_ansi(diff: &FileDiff) -> String {
     let mut out = String::new();
 
     // Header
-    out.push_str(&format!(
-        "\x1b[1m--- a/{}\x1b[0m\n",
-        diff.file_path
-    ));
-    out.push_str(&format!(
-        "\x1b[1m+++ b/{}\x1b[0m\n",
-        diff.file_path
-    ));
+    out.push_str(&format!("\x1b[1m--- a/{}\x1b[0m\n", diff.file_path));
+    out.push_str(&format!("\x1b[1m+++ b/{}\x1b[0m\n", diff.file_path));
 
     for hunk in &diff.hunks {
         // Hunk header (cyan)
@@ -349,8 +343,10 @@ pub fn colorize_unified_diff(diff_text: &str) -> String {
     let mut out = String::with_capacity(diff_text.len() + diff_text.len() / 4);
 
     for line in diff_text.lines() {
-        if line.starts_with("---") || line.starts_with("+++") {
-            // File header — bold
+        if (line.starts_with("--- ") && line.len() > 4)
+            || (line.starts_with("+++ ") && line.len() > 4)
+        {
+            // File header — bold (matches "--- a/file" or "+++ b/file", not bare "---")
             out.push_str(&format!("\x1b[1m{}\x1b[0m\n", line));
         } else if line.starts_with("@@") {
             // Hunk header — cyan
@@ -394,14 +390,8 @@ pub fn render_diff_html(diff: &FileDiff) -> String {
                 DiffLineKind::Removed => ("diff-removed", "-"),
                 DiffLineKind::Context => ("diff-context", " "),
             };
-            let old_num = line
-                .old_line_num
-                .map(|n| n.to_string())
-                .unwrap_or_default();
-            let new_num = line
-                .new_line_num
-                .map(|n| n.to_string())
-                .unwrap_or_default();
+            let old_num = line.old_line_num.map(|n| n.to_string()).unwrap_or_default();
+            let new_num = line.new_line_num.map(|n| n.to_string()).unwrap_or_default();
             html.push_str(&format!(
                 "<tr class=\"{}\"><td class=\"diff-line-num\">{}{}</td><td class=\"diff-line-content\">{}{}</td></tr>\n",
                 class, old_num, new_num, prefix, html_escape(&line.content)
@@ -455,24 +445,14 @@ mod tests {
 
     #[test]
     fn test_addition() {
-        let diff = generate_unified_diff(
-            "test.rs",
-            "line1\nline3\n",
-            "line1\nline2\nline3\n",
-            3,
-        );
+        let diff = generate_unified_diff("test.rs", "line1\nline3\n", "line1\nline2\nline3\n", 3);
         assert!(!diff.hunks.is_empty());
         assert_eq!(diff.stats.lines_added, 1);
     }
 
     #[test]
     fn test_removal() {
-        let diff = generate_unified_diff(
-            "test.rs",
-            "line1\nline2\nline3\n",
-            "line1\nline3\n",
-            3,
-        );
+        let diff = generate_unified_diff("test.rs", "line1\nline2\nline3\n", "line1\nline3\n", 3);
         assert!(!diff.hunks.is_empty());
         assert_eq!(diff.stats.lines_removed, 1);
     }

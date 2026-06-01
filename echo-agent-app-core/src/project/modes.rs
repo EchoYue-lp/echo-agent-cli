@@ -15,7 +15,7 @@ pub fn display_name(mode: &AgentMode) -> &str {
         AgentMode::Research => "研究",
         AgentMode::Data => "数据",
         AgentMode::Writing => "写作",
-        _ => mode.name(),  // fallback to English name
+        _ => mode.name(), // fallback to English name
     }
 }
 
@@ -23,11 +23,11 @@ pub fn display_name(mode: &AgentMode) -> &str {
 pub fn icon(mode: &AgentMode) -> &'static str {
     match mode {
         AgentMode::General => "💬",
-        AgentMode::Coding  => "💻",
+        AgentMode::Coding => "💻",
         AgentMode::Research => "🔬",
-        AgentMode::Data    => "📊",
+        AgentMode::Data => "📊",
         AgentMode::Writing => "✍️",
-        _                  => "🤖",
+        _ => "🤖",
     }
 }
 

@@ -219,7 +219,9 @@ pub fn extract_observations(
         if config.categories.contains(&ObservationCategory::FilePath) {
             // Simple heuristic: detect paths like src/foo/bar.rs or ./foo/bar
             for word in content.split_whitespace() {
-                let trimmed = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '/' && c != '.' && c != '-' && c != '_');
+                let trimmed = word.trim_matches(|c: char| {
+                    !c.is_alphanumeric() && c != '/' && c != '.' && c != '-' && c != '_'
+                });
                 if (trimmed.contains('/') && trimmed.len() > 5)
                     && (trimmed.ends_with(".rs")
                         || trimmed.ends_with(".ts")
@@ -271,7 +273,10 @@ pub fn format_observations_for_memory(observations: &[Observation]) -> String {
     let mut by_category: std::collections::HashMap<ObservationCategory, Vec<&Observation>> =
         std::collections::HashMap::new();
     for obs in observations {
-        by_category.entry(obs.category.clone()).or_default().push(obs);
+        by_category
+            .entry(obs.category.clone())
+            .or_default()
+            .push(obs);
     }
 
     let category_names = [
@@ -313,8 +318,7 @@ pub fn append_to_project_memory(observations: &[Observation]) -> Result<(), Stri
 
     // Ensure parent directory exists
     if let Some(parent) = memory_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create directory: {e}"))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create directory: {e}"))?;
     }
 
     // Read existing content
@@ -419,7 +423,9 @@ mod tests {
             "Should extract at least one user preference"
         );
         assert!(
-            user_obs.iter().any(|o| o.text.contains("prefer") || o.text.contains("concise")),
+            user_obs
+                .iter()
+                .any(|o| o.text.contains("prefer") || o.text.contains("concise")),
             "Should contain the preference about concise comments"
         );
     }
@@ -461,7 +467,9 @@ mod tests {
             "Should extract at least one bug observation"
         );
         assert!(
-            bug_obs.iter().any(|o| o.text.contains("race condition") || o.text.contains("bug")),
+            bug_obs
+                .iter()
+                .any(|o| o.text.contains("race condition") || o.text.contains("bug")),
             "Should contain the bug description"
         );
     }
@@ -491,7 +499,10 @@ mod tests {
             ..Default::default()
         };
         let observations = extract_observations(&messages, &config);
-        assert!(observations.is_empty(), "Disabled config should return no observations");
+        assert!(
+            observations.is_empty(),
+            "Disabled config should return no observations"
+        );
     }
 
     #[test]
@@ -555,12 +566,11 @@ mod tests {
 
     #[test]
     fn test_deduplication() {
-        let messages = vec![
-            (
-                "assistant".to_string(),
-                "The bug was in the parser module. The bug was causing crashes on malformed input.".to_string(),
-            ),
-        ];
+        let messages = vec![(
+            "assistant".to_string(),
+            "The bug was in the parser module. The bug was causing crashes on malformed input."
+                .to_string(),
+        )];
         let config = AutoMemoryConfig::default();
         let observations = extract_observations(&messages, &config);
 

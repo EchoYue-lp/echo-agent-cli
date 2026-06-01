@@ -57,10 +57,7 @@ impl PromptAssembler {
     ///
     /// When provided, module content that contains `{{variable}}` markers
     /// will be rendered through the template engine during assembly.
-    pub fn with_template_engine(
-        total_budget: usize,
-        engine: Arc<PromptTemplateManager>,
-    ) -> Self {
+    pub fn with_template_engine(total_budget: usize, engine: Arc<PromptTemplateManager>) -> Self {
         Self {
             modules: Vec::new(),
             total_budget,

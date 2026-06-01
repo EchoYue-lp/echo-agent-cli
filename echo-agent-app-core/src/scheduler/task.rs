@@ -96,7 +96,10 @@ impl TaskStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        Self { backend: None, path }
+        Self {
+            backend: None,
+            path,
+        }
     }
 
     /// Create task store backed by a `Store` trait implementation (e.g. SQLite).
@@ -149,9 +152,7 @@ impl TaskStore {
         let handle = tokio::runtime::Handle::try_current()
             .map_err(|_| anyhow::anyhow!("No tokio runtime available for async store access"))?;
         let result = tokio::task::block_in_place(|| {
-            handle.block_on(async {
-                store.get(CRON_NAMESPACE, CRON_KEY).await
-            })
+            handle.block_on(async { store.get(CRON_NAMESPACE, CRON_KEY).await })
         });
         match result {
             Ok(Some(item)) => {
@@ -170,9 +171,7 @@ impl TaskStore {
         let handle = tokio::runtime::Handle::try_current()
             .map_err(|_| anyhow::anyhow!("No tokio runtime available for async store access"))?;
         tokio::task::block_in_place(|| {
-            handle.block_on(async {
-                store.put(CRON_NAMESPACE, CRON_KEY, value).await
-            })
+            handle.block_on(async { store.put(CRON_NAMESPACE, CRON_KEY, value).await })
         })
         .map_err(|e| anyhow::anyhow!("Failed to save cron tasks to store: {e}"))
     }

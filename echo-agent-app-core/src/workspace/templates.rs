@@ -97,7 +97,10 @@ Your abstract here.
                 fs::write(root.join("drafts/main.tex"), main_tex)?;
 
                 // Create empty BibTeX
-                fs::write(root.join("references/references.bib"), "% Add your references here\n")?;
+                fs::write(
+                    root.join("references/references.bib"),
+                    "% Add your references here\n",
+                )?;
 
                 // Create research notes template
                 let notes = "# Research Notes\n\n## Key Questions\n\n- \n\n## Reading Log\n\n| Paper | Key Finding | Relevance |\n|-------|-------------|----------|\n| | | |\n";

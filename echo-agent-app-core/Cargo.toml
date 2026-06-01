@@ -24,7 +24,6 @@ anyhow = "1.0"
 base64 = "0.22"
 serde_yaml = "0.9"
 dashmap = "6"
-governor = "0.6"
 config = "0.14"
 notify = "7"
 tokio-util = "0.7"
@@ -39,8 +38,6 @@ clap = { version = "4", features = ["derive", "env"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 similar = "2"
 dirs = "6"
-jsonwebtoken = "9.0"
-bcrypt = "0.16"
 axum = { version = "0.7" }
 nu-ansi-term = "0.50"
 syntect = { version = "5", default-features = false, features = ["parsing", "regex-onig", "default-syntaxes", "default-themes"] }

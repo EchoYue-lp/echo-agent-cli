@@ -30,10 +30,7 @@ pub enum BackgroundTaskKind {
 
     /// Recurring cron job: fires on a schedule.
     /// Each firing creates a child `AgentChat` task for tracking.
-    Cron {
-        cron_expr: String,
-        prompt: String,
-    },
+    Cron { cron_expr: String, prompt: String },
 
     /// Multi-step workflow: executes a Graph workflow definition.
     Workflow {

@@ -258,10 +258,9 @@ pub async fn run_data_pipeline_with_config(
         "Data analysis pipeline completed"
     );
 
-    let final_output: String = result
-        .state
-        .get("final_output")
-        .unwrap_or_else(|| "Data analysis pipeline completed but no summary was generated.".to_string());
+    let final_output: String = result.state.get("final_output").unwrap_or_else(|| {
+        "Data analysis pipeline completed but no summary was generated.".to_string()
+    });
 
     Ok(final_output)
 }

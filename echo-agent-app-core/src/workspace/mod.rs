@@ -85,7 +85,11 @@ impl WorkspaceId {
                 sanitized = %sanitized,
                 "WorkspaceId from_raw: sanitized potentially unsafe input"
             );
-            Self(if sanitized.is_empty() { "default".to_string() } else { sanitized })
+            Self(if sanitized.is_empty() {
+                "default".to_string()
+            } else {
+                sanitized
+            })
         } else {
             Self(raw.chars().take(64).collect())
         }
@@ -144,9 +148,9 @@ impl WorkspaceKind {
     pub fn from_str_loose(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "code" | "coding" | "编程" | "代码" => Self::Code { repo_url: None },
-            "data" | "data_analysis" | "数据" | "数据分析" => Self::DataAnalysis {
-                datasets: vec![],
-            },
+            "data" | "data_analysis" | "数据" | "数据分析" => {
+                Self::DataAnalysis { datasets: vec![] }
+            }
             "research" | "研究" | "论文" | "academic" => Self::Research { topics: vec![] },
             _ => Self::General,
         }

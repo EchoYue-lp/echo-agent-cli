@@ -130,6 +130,7 @@ impl SessionManager {
                     id: s.id,
                     name: s.name,
                     model: s.model,
+                    parent_id: s.parent_id,
                     branch: s.branch,
                     message_count: s.message_count,
                     estimated_tokens: s.estimated_tokens,
@@ -157,18 +158,12 @@ impl SessionManager {
 
     /// 获取会话的所有分支
     pub fn list_branches(&self, root_id: &str) -> anyhow::Result<Vec<SessionSummary>> {
+        // 先加载 root 会话，避免在 filter 闭包内做 N 次磁盘读取
+        let _root = self.load(root_id)?;
         Ok(self
             .list()?
             .into_iter()
-            .filter(|s| {
-                s.id == root_id
-                    || s.id
-                        == self
-                            .load(root_id)
-                            .ok()
-                            .and_then(|r| r.parent_id)
-                            .unwrap_or_default()
-            })
+            .filter(|s| s.parent_id.as_deref() == Some(root_id))
             .collect())
     }
 

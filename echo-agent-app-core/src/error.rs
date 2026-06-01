@@ -36,15 +36,27 @@ pub enum StreamingEvent {
     /// Token 片段
     Token { data: String },
     /// 工具开始执行
-    ToolStart { name: String, args: serde_json::Value },
+    ToolStart {
+        name: String,
+        args: serde_json::Value,
+    },
     /// 工具执行结果
-    ToolResult { name: String, result: String, success: bool },
+    ToolResult {
+        name: String,
+        result: String,
+        success: bool,
+    },
     /// 最终答案
     FinalAnswer { data: String },
     /// 错误
     Error { message: String },
     /// 审批请求
-    ApprovalRequest { request_id: String, tool_name: String, args: serde_json::Value, prompt: String },
+    ApprovalRequest {
+        request_id: String,
+        tool_name: String,
+        args: serde_json::Value,
+        prompt: String,
+    },
     /// 输入请求
     InputRequest { request_id: String, prompt: String },
     /// 图表
@@ -54,7 +66,10 @@ pub enum StreamingEvent {
     /// 思考阶段开始
     ThinkingStart,
     /// 思考阶段结束
-    ThinkingEnd { prompt_tokens: usize, completion_tokens: usize },
+    ThinkingEnd {
+        prompt_tokens: usize,
+        completion_tokens: usize,
+    },
     /// 流式结束标记
     Done,
 }
@@ -91,9 +106,6 @@ pub enum WebError {
 
     #[error("令牌过期")]
     TokenExpired,
-
-    #[error("速率限制超出")]
-    RateLimitExceeded,
 }
 
 impl WebError {
@@ -106,7 +118,6 @@ impl WebError {
             WebError::Validation(_) => (StatusCode::BAD_REQUEST, "VALIDATION_ERROR"),
             WebError::Auth(_) => (StatusCode::UNAUTHORIZED, "AUTH_ERROR"),
             WebError::TokenExpired => (StatusCode::UNAUTHORIZED, "TOKEN_EXPIRED"),
-            WebError::RateLimitExceeded => (StatusCode::TOO_MANY_REQUESTS, "RATE_LIMIT_EXCEEDED"),
             _ => (StatusCode::INTERNAL_SERVER_ERROR, "INTERNAL_ERROR"),
         };
 
@@ -123,7 +134,8 @@ impl WebError {
 impl IntoResponse for WebError {
     fn into_response(self) -> Response {
         let api_error = self.to_api_error(None);
-        let status = StatusCode::from_u16(api_error.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        let status =
+            StatusCode::from_u16(api_error.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let body = Json(&api_error);
         (status, body).into_response()
     }

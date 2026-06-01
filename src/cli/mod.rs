@@ -1,6 +1,6 @@
 //! TUI/GUI 产品入口与工具子命令。
 //!
-//! 默认用户入口是全屏 TUI；GUI 使用 Tauri 入口。旧 REPL/Web 运行模式保留为内部兼容实现。
+//! 默认用户入口是全屏 TUI；GUI 使用 Tauri 入口。旧 REPL 运行模式保留为内部兼容实现。
 
 pub mod args;
 pub mod cmd_impls;
@@ -16,7 +16,6 @@ pub mod keybindings;
 pub mod modes;
 pub mod onboard;
 pub mod repl;
-pub mod router;
 
 pub use args::{Args, Commands, ProfileAction, SessionAction};
 pub use handlers::{
@@ -25,6 +24,5 @@ pub use handlers::{
 };
 #[cfg(feature = "channels")]
 pub use modes::run_channels_mode;
-pub use modes::{run_both_modes, run_cli_mode, run_headless_mode, run_web_mode};
+pub use modes::{run_cli_mode, run_headless_mode};
 pub use repl::{ReplConfig, run_repl};
-pub use router::build_router;

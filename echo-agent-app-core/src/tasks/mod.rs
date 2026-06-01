@@ -6,9 +6,9 @@
 // 框架层类型 re-export
 pub use echo_agent::tasks::{
     CheckpointStore, ExecutionCheckpoint, LoggingHooks, NoopHooks, SqliteCheckpointStore,
-    SqliteTaskStore, Task, TaskContext, TaskEvent, TaskEventBus, TaskExecuteFn, TaskExecutor,
-    TaskExecutorConfig, TaskExecutionResult, TaskHookContext, TaskHookRegistry, TaskHooks,
-    TaskManager, TaskStatus, TaskStore,
+    SqliteTaskStore, Task, TaskContext, TaskEvent, TaskEventBus, TaskExecuteFn,
+    TaskExecutionResult, TaskExecutor, TaskExecutorConfig, TaskHookContext, TaskHookRegistry,
+    TaskHooks, TaskManager, TaskStatus, TaskStore,
 };
 
 pub mod background;
@@ -18,5 +18,7 @@ pub mod service;
 
 // Re-export key types for convenience
 pub use background::{BackgroundTaskKind, BackgroundTaskMeta, ResearchOutputFormat};
-pub use pipelines::{DataPipelineConfig, ResearchConfig, ResearchToWritingConfig, WritingPipelineConfig};
+pub use pipelines::{
+    DataPipelineConfig, ResearchConfig, ResearchToWritingConfig, WritingPipelineConfig,
+};
 pub use service::BackgroundTaskService;

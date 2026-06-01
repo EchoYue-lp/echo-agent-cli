@@ -29,7 +29,10 @@ impl EmbeddedServer {
         cancel: CancellationToken,
     ) -> anyhow::Result<Self>
     where
-        F: FnOnce(Arc<AppState>) -> std::pin::Pin<Box<dyn std::future::Future<Output = axum::Router> + Send>>,
+        F: FnOnce(
+            Arc<AppState>,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = axum::Router> + Send>>,
     {
         let app = build_router(state).await;
 

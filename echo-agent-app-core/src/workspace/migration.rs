@@ -9,9 +9,9 @@ use std::path::{Path, PathBuf};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
+use super::WorkspaceKind;
 use super::layout::WorkspaceLayout;
 use super::registry::WorkspaceRegistry;
-use super::WorkspaceKind;
 
 // ── 迁移计划 ────────────────────────────────────────────────────────
 
@@ -162,9 +162,10 @@ impl LegacyMigrator {
             let workspace = match registry.create(&ws_plan.name, ws_plan.kind.clone()) {
                 Ok(ws) => ws,
                 Err(e) => {
-                    report
-                        .errors
-                        .push(format!("Failed to create workspace '{}': {}", ws_plan.name, e));
+                    report.errors.push(format!(
+                        "Failed to create workspace '{}': {}",
+                        ws_plan.name, e
+                    ));
                     continue;
                 }
             };
@@ -220,9 +221,12 @@ impl LegacyMigrator {
         // 检查是否有 JSON 文件
         fs::read_dir(&sessions_dir)
             .map(|entries| {
-                entries
-                    .flatten()
-                    .any(|e| e.path().extension().map(|ext| ext == "json").unwrap_or(false))
+                entries.flatten().any(|e| {
+                    e.path()
+                        .extension()
+                        .map(|ext| ext == "json")
+                        .unwrap_or(false)
+                })
             })
             .unwrap_or(false)
     }

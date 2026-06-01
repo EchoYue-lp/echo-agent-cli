@@ -12,8 +12,8 @@ use tracing::{debug, info, warn};
 
 use super::task::{CronTask, CronTaskStatus, TaskStore};
 use crate::agent_handle::AgentHandle;
-use crate::tasks::service::BackgroundTaskService;
 use crate::tasks::background::BackgroundTaskKind;
+use crate::tasks::service::BackgroundTaskService;
 use echo_agent::agent::CancellationToken;
 
 /// 调度运行器
@@ -71,6 +71,11 @@ impl SchedulerRunner {
     }
 
     /// Set the BackgroundTaskService for task submission.
+    /// 获取 TaskStore 引用（Clone 是廉价的，共享底层 Arc）
+    pub fn store(&self) -> TaskStore {
+        self.store.clone()
+    }
+
     pub fn set_task_service(&mut self, service: Arc<BackgroundTaskService>) {
         self.task_service = Some(service);
     }
@@ -100,36 +105,41 @@ impl SchedulerRunner {
 
     /// 单次 tick：检查所有启用任务是否到达触发时间
     async fn tick(&self) {
-        let tasks = self.tasks.read().await;
-        let mut fired = self.last_fired.write().await;
-        let now = Utc::now();
+        // 1. 收集需要触发的任务（持有读锁期间只做判断，不执行）
+        let to_fire: Vec<(String, String, String)> = {
+            let tasks = self.tasks.read().await;
+            let mut fired = self.last_fired.write().await;
+            let now = Utc::now();
+            let mut pending = Vec::new();
 
-        for task in tasks.iter() {
-            if task.status != CronTaskStatus::Enabled {
-                continue;
-            }
+            for task in tasks.iter() {
+                if task.status != CronTaskStatus::Enabled {
+                    continue;
+                }
 
-            // 检查是否在最近 30 秒内应该触发
-            if let Ok(next_run) = task.next_run() {
-                let diff = (next_run - now).num_seconds();
-                // 如果下次触发时间在 -30s ~ 0s 之间，说明刚刚到达触发时刻
-                if diff >= -30 && diff <= 0 {
-                    // Prevent double-firing: skip if already fired within this window
-                    if let Some(last) = fired.get(&task.id) {
-                        let since_last = (now - *last).num_seconds();
-                        if since_last < 30 {
-                            continue;
+                // 检查是否在最近 30 秒内应该触发
+                if let Ok(next_run) = task.next_run() {
+                    let diff = (next_run - now).num_seconds();
+                    // 如果下次触发时间在 -30s ~ 0s 之间，说明刚刚到达触发时刻
+                    if diff >= -30 && diff <= 0 {
+                        // Prevent double-firing: skip if already fired within this window
+                        if let Some(last) = fired.get(&task.id) {
+                            let since_last = (now - *last).num_seconds();
+                            if since_last < 30 {
+                                continue;
+                            }
                         }
+                        fired.insert(task.id.clone(), now);
+                        pending.push((task.id.clone(), task.name.clone(), task.prompt.clone()));
                     }
-                    let task_id = task.id.clone();
-                    let prompt = task.prompt.clone();
-                    let name = task.name.clone();
-                    fired.insert(task_id.clone(), now);
-                    drop(fired);
-                    self.fire_task(&task_id, &name, &prompt).await;
-                    fired = self.last_fired.write().await;
                 }
             }
+            pending
+        }; // 读锁在此处释放
+
+        // 2. 在锁外执行任务（避免 fire_task → execute_direct 尝试写锁导致死锁）
+        for (task_id, name, prompt) in &to_fire {
+            self.fire_task(task_id, name, prompt).await;
         }
     }
 
@@ -145,12 +155,17 @@ impl SchedulerRunner {
                 prompt: prompt.to_string(),
                 session_id: None,
             };
-            match service.submit(kind, &description, Some("cron".to_string())).await {
+            match service
+                .submit(kind, &description, Some("cron".to_string()))
+                .await
+            {
                 Ok(bg_task_id) => {
                     debug!("Cron task {task_id} submitted as background task {bg_task_id}");
                 }
                 Err(e) => {
-                    warn!("Failed to submit cron task via BackgroundTaskService: {e}, falling back to direct execution");
+                    warn!(
+                        "Failed to submit cron task via BackgroundTaskService: {e}, falling back to direct execution"
+                    );
                     self.execute_direct(task_id, prompt).await;
                 }
             }

@@ -40,21 +40,36 @@ fn is_essential_tool(name: &str) -> bool {
 fn recommended_tools_for_mode(mode: &AgentMode) -> Vec<&'static str> {
     match mode {
         AgentMode::Coding => vec![
-            "shell", "read_file", "write_file", "edit_file", "create_file",
-            "glob", "grep", "diff", "git",
+            "shell",
+            "read_file",
+            "write_file",
+            "edit_file",
+            "create_file",
+            "glob",
+            "grep",
+            "diff",
+            "git",
         ],
         AgentMode::Research => vec![
-            "arxiv_search", "semantic_scholar_search", "pdf_fetch",
-            "bibtex_generate", "web_fetch", "web_search",
-            "read_file", "write_file",
+            "arxiv_search",
+            "semantic_scholar_search",
+            "pdf_fetch",
+            "bibtex_generate",
+            "web_fetch",
+            "web_search",
+            "read_file",
+            "write_file",
         ],
         AgentMode::Data => vec![
-            "shell", "read_file", "write_file", "data_analyze",
-            "chart", "excel_read", "csv_read",
+            "shell",
+            "read_file",
+            "write_file",
+            "data_analyze",
+            "chart",
+            "excel_read",
+            "csv_read",
         ],
-        AgentMode::Writing => vec![
-            "read_file", "write_file", "edit_file", "web_search",
-        ],
+        AgentMode::Writing => vec!["read_file", "write_file", "edit_file", "web_search"],
         AgentMode::General => vec![], // empty = all visible
         _ => vec![],
     }

@@ -74,219 +74,54 @@ pub async fn run_event_loop(
     Ok(())
 }
 
-/// Handle a keyboard event using context-aware dispatch.
+// ── State machine dispatch ────────────────────────────────────────────
+
+/// Determine which mode the app is in and dispatch to the appropriate handler.
 async fn handle_key(
     app: &mut TuiApp,
     key: KeyEvent,
     agent: &AgentHandle,
     agent_tx: mpsc::UnboundedSender<AgentEvent>,
 ) {
-    // ── Picker mode (session resume, model selection, etc.) ────────────────
-    if app.picker.is_some() {
-        handle_picker_key(app, &key);
-        return;
-    }
+    // Determine active mode based on app state
+    let mode = if app.picker.is_some() {
+        AppMode::Picker
+    } else if app.diff_popup.is_some() {
+        AppMode::DiffPopup
+    } else if app.approval.is_some() {
+        AppMode::Approval
+    } else if !app.suggestions.is_empty() {
+        AppMode::CommandPalette
+    } else {
+        AppMode::Normal
+    };
 
-    // ── Diff popup ─────────────────────────────────────────────────────────
-    if app.diff_popup.is_some() {
-        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
-            app.diff_popup = None;
-        }
-        return;
-    }
-
-    // ── Approval card ──────────────────────────────────────────────────────
-    if app.approval.is_some() {
-        match key.code {
-            KeyCode::Char('y') | KeyCode::Enter => {
-                if let Some(ref approval) = app.approval.take() {
-                    app.status_msg = format!("Approved: {}", approval.tool_name);
+    match mode {
+        AppMode::Picker => handle_picker_key(app, &key),
+        AppMode::DiffPopup => handle_diff_popup_key(app, &key),
+        AppMode::Approval => handle_approval_key(app, &key),
+        AppMode::CommandPalette => handle_command_palette_key(app, &key),
+        AppMode::Normal => {
+            if let Some(result) = handle_global_shortcuts(app, &key) {
+                if result {
+                    return;
                 }
             }
-            KeyCode::Char('n') | KeyCode::Esc => {
-                if let Some(ref approval) = app.approval.take() {
-                    app.status_msg = format!("Denied: {}", approval.tool_name);
-                }
-            }
-            _ => {}
+            handle_normal_key(app, &key, agent, agent_tx).await;
         }
-        return;
-    }
-
-    // ── Slash-command completion popup ─────────────────────────────────────
-    if !app.suggestions.is_empty() {
-        const MAX_VISIBLE: usize = 8;
-        match key.code {
-            KeyCode::Tab | KeyCode::Down => {
-                app.selected_suggestion = (app.selected_suggestion + 1) % app.suggestions.len();
-                // Scroll down if selection moved past visible window
-                if app.selected_suggestion >= app.suggestion_scroll + MAX_VISIBLE {
-                    app.suggestion_scroll = app.selected_suggestion - MAX_VISIBLE + 1;
-                }
-                return;
-            }
-            KeyCode::BackTab | KeyCode::Up => {
-                if app.selected_suggestion > 0 {
-                    app.selected_suggestion -= 1;
-                } else {
-                    app.selected_suggestion = app.suggestions.len() - 1;
-                    // Wrap around: scroll to show last items
-                    app.suggestion_scroll = app.suggestions.len().saturating_sub(MAX_VISIBLE);
-                }
-                // Scroll up if selection moved before visible window
-                if app.selected_suggestion < app.suggestion_scroll {
-                    app.suggestion_scroll = app.selected_suggestion;
-                }
-                return;
-            }
-            KeyCode::Enter => {
-                if let Some(cmd) = app.suggestions.get(app.selected_suggestion) {
-                    app.input = format!("{} ", cmd.slash_name());
-                    app.cursor = app.input.len();
-                }
-                app.suggestions.clear();
-                return;
-            }
-            KeyCode::Esc => {
-                app.suggestions.clear();
-                return;
-            }
-            _ => {}
-        }
-    }
-
-    // ── Global shortcuts (Ctrl+...) ────────────────────────────────────────
-    if key.modifiers.contains(KeyModifiers::CONTROL) {
-        match key.code {
-            KeyCode::Char('c') | KeyCode::Char('q') => {
-                app.should_quit = true;
-                return;
-            }
-            KeyCode::Char('b') => {
-                app.sidebar_visible = !app.sidebar_visible;
-                return;
-            }
-            KeyCode::Char('l') => {
-                app.messages.clear();
-                app.chat_scroll = 0;
-                return;
-            }
-            _ => {}
-        }
-    }
-
-    // ── Shift+Enter: newline ───────────────────────────────────────────────
-    if key.modifiers.contains(KeyModifiers::SHIFT) && key.code == KeyCode::Enter {
-        app.input.insert(app.cursor, '\n');
-        app.cursor += 1;
-        return;
-    }
-
-    // ── Normal input handling ──────────────────────────────────────────────
-    match key.code {
-        KeyCode::Enter => {
-            if app.is_processing {
-                // Can't send while processing; insert newline instead.
-                app.input.insert(app.cursor, '\n');
-                app.cursor += 1;
-            } else if let Some(text) = app.submit_input() {
-                if text.starts_with('/') {
-                    handle_slash_command(app, agent, &text).await;
-                } else {
-                    send_to_agent(agent, text, agent_tx.clone()).await;
-                }
-            }
-        }
-        KeyCode::Char(c) => {
-            app.input.insert(app.cursor, c);
-            app.cursor += c.len_utf8();
-            app.update_suggestions();
-        }
-        KeyCode::Backspace => {
-            if app.cursor > 0 {
-                // Handle multi-byte chars properly.
-                let prev = app.input[..app.cursor]
-                    .char_indices()
-                    .next_back()
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
-                app.input.drain(prev..app.cursor);
-                app.cursor = prev;
-                app.update_suggestions();
-            }
-        }
-        KeyCode::Delete => {
-            if app.cursor < app.input.len() {
-                let cur = app.cursor;
-                let next = app.input[cur..]
-                    .char_indices()
-                    .nth(1)
-                    .map(|(i, _)| cur + i)
-                    .unwrap_or(app.input.len());
-                app.input.drain(cur..next);
-            }
-        }
-        KeyCode::Left => {
-            if app.cursor > 0 {
-                let prev = app.input[..app.cursor]
-                    .char_indices()
-                    .next_back()
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
-                app.cursor = prev;
-            }
-        }
-        KeyCode::Right => {
-            if app.cursor < app.input.len() {
-                let cur = app.cursor;
-                // Advance past the current character (use its byte length).
-                let ch_len = app.input[cur..]
-                    .chars()
-                    .next()
-                    .map(|c| c.len_utf8())
-                    .unwrap_or(1);
-                app.cursor = (cur + ch_len).min(app.input.len());
-            }
-        }
-        KeyCode::Home => {
-            app.cursor = 0;
-        }
-        KeyCode::End => {
-            app.cursor = app.input.len();
-        }
-        KeyCode::Up => {
-            if key.modifiers.contains(KeyModifiers::SHIFT) {
-                app.chat_scroll = app.chat_scroll.saturating_add(10);
-            } else {
-                app.history_up();
-            }
-        }
-        KeyCode::Down => {
-            if key.modifiers.contains(KeyModifiers::SHIFT) {
-                app.chat_scroll = app.chat_scroll.saturating_sub(10);
-            } else {
-                app.history_down();
-            }
-        }
-        KeyCode::PageUp => {
-            app.chat_scroll = app.chat_scroll.saturating_add(30);
-        }
-        KeyCode::PageDown => {
-            app.chat_scroll = app.chat_scroll.saturating_sub(30);
-        }
-        KeyCode::Tab => {
-            app.sidebar_tab = (app.sidebar_tab + 1) % 3;
-        }
-        KeyCode::Esc => {
-            if app.is_processing {
-                app.is_processing = false;
-                app.streaming_text.clear();
-                app.status_msg = "Cancelled".to_string();
-            }
-        }
-        _ => {}
     }
 }
+
+/// Application interaction modes for state-machine dispatch.
+enum AppMode {
+    Normal,
+    Picker,
+    DiffPopup,
+    Approval,
+    CommandPalette,
+}
+
+// ── Mode-specific handlers ──────────────────────────────────────────────
 
 fn handle_picker_key(app: &mut TuiApp, key: &KeyEvent) {
     let picker = match app.picker.as_mut() {
@@ -309,6 +144,220 @@ fn handle_picker_key(app: &mut TuiApp, key: &KeyEvent) {
         _ => {}
     }
 }
+
+fn handle_diff_popup_key(app: &mut TuiApp, key: &KeyEvent) {
+    if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+        app.diff_popup = None;
+    }
+}
+
+fn handle_approval_key(app: &mut TuiApp, key: &KeyEvent) {
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Enter => {
+            if let Some(ref approval) = app.approval.take() {
+                app.status_msg = format!("Approved: {}", approval.tool_name);
+            }
+        }
+        KeyCode::Char('n') | KeyCode::Esc => {
+            if let Some(ref approval) = app.approval.take() {
+                app.status_msg = format!("Denied: {}", approval.tool_name);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn handle_command_palette_key(app: &mut TuiApp, key: &KeyEvent) {
+    const MAX_VISIBLE: usize = 8;
+    match key.code {
+        KeyCode::Tab | KeyCode::Down => {
+            app.selected_suggestion = (app.selected_suggestion + 1) % app.suggestions.len();
+            if app.selected_suggestion >= app.suggestion_scroll + MAX_VISIBLE {
+                app.suggestion_scroll = app.selected_suggestion - MAX_VISIBLE + 1;
+            }
+        }
+        KeyCode::BackTab | KeyCode::Up => {
+            if app.selected_suggestion > 0 {
+                app.selected_suggestion -= 1;
+            } else {
+                app.selected_suggestion = app.suggestions.len() - 1;
+                app.suggestion_scroll = app.suggestions.len().saturating_sub(MAX_VISIBLE);
+            }
+            if app.selected_suggestion < app.suggestion_scroll {
+                app.suggestion_scroll = app.selected_suggestion;
+            }
+        }
+        KeyCode::Enter => {
+            if let Some(cmd) = app.suggestions.get(app.selected_suggestion) {
+                app.input = format!("{} ", cmd.slash_name());
+                app.cursor = app.input.len();
+            }
+            app.suggestions.clear();
+        }
+        KeyCode::Esc => {
+            app.suggestions.clear();
+        }
+        _ => {}
+    }
+}
+
+// ── Global shortcuts ──────────────────────────────────────────────────
+
+/// Returns true if the key was handled (shortcut consumed).
+fn handle_global_shortcuts(app: &mut TuiApp, key: &KeyEvent) -> Option<bool> {
+    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+        return None;
+    }
+
+    match key.code {
+        KeyCode::Char('c') | KeyCode::Char('q') => {
+            app.should_quit = true;
+            Some(true)
+        }
+        KeyCode::Char('b') => {
+            app.sidebar_visible = !app.sidebar_visible;
+            Some(true)
+        }
+        KeyCode::Char('l') => {
+            app.messages.clear();
+            app.chat_scroll = 0;
+            Some(true)
+        }
+        _ => None,
+    }
+}
+
+// ── Normal mode input handling ────────────────────────────────────────
+
+async fn handle_normal_key(
+    app: &mut TuiApp,
+    key: &KeyEvent,
+    agent: &AgentHandle,
+    agent_tx: mpsc::UnboundedSender<AgentEvent>,
+) {
+    // Shift+Enter: newline
+    if key.modifiers.contains(KeyModifiers::SHIFT) && key.code == KeyCode::Enter {
+        app.input.insert(app.cursor, '\n');
+        app.cursor += 1;
+        return;
+    }
+
+    match key.code {
+        KeyCode::Enter => handle_enter(app, agent, agent_tx).await,
+        KeyCode::Char(c) => handle_char_input(app, c),
+        KeyCode::Backspace => handle_backspace(app),
+        KeyCode::Delete => handle_delete(app),
+        KeyCode::Left => handle_cursor_left(app),
+        KeyCode::Right => handle_cursor_right(app),
+        KeyCode::Home => app.cursor = 0,
+        KeyCode::End => app.cursor = app.input.len(),
+        KeyCode::Up => handle_up(app, key),
+        KeyCode::Down => handle_down(app, key),
+        KeyCode::PageUp => app.chat_scroll = app.chat_scroll.saturating_add(30),
+        KeyCode::PageDown => app.chat_scroll = app.chat_scroll.saturating_sub(30),
+        KeyCode::Tab => app.sidebar_tab = (app.sidebar_tab + 1) % 3,
+        KeyCode::Esc => handle_esc(app),
+        _ => {}
+    }
+}
+
+async fn handle_enter(
+    app: &mut TuiApp,
+    agent: &AgentHandle,
+    agent_tx: mpsc::UnboundedSender<AgentEvent>,
+) {
+    if app.is_processing {
+        // Can't send while processing; insert newline instead.
+        app.input.insert(app.cursor, '\n');
+        app.cursor += 1;
+    } else if let Some(text) = app.submit_input() {
+        if text.starts_with('/') {
+            handle_slash_command(app, agent, &text).await;
+        } else {
+            send_to_agent(agent, text, agent_tx.clone()).await;
+        }
+    }
+}
+
+fn handle_char_input(app: &mut TuiApp, c: char) {
+    app.input.insert(app.cursor, c);
+    app.cursor += c.len_utf8();
+    app.update_suggestions();
+}
+
+fn handle_backspace(app: &mut TuiApp) {
+    if app.cursor > 0 {
+        let prev = app.input[..app.cursor]
+            .char_indices()
+            .next_back()
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        app.input.drain(prev..app.cursor);
+        app.cursor = prev;
+        app.update_suggestions();
+    }
+}
+
+fn handle_delete(app: &mut TuiApp) {
+    if app.cursor < app.input.len() {
+        let cur = app.cursor;
+        let next = app.input[cur..]
+            .char_indices()
+            .nth(1)
+            .map(|(i, _)| cur + i)
+            .unwrap_or(app.input.len());
+        app.input.drain(cur..next);
+    }
+}
+
+fn handle_cursor_left(app: &mut TuiApp) {
+    if app.cursor > 0 {
+        let prev = app.input[..app.cursor]
+            .char_indices()
+            .next_back()
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+        app.cursor = prev;
+    }
+}
+
+fn handle_cursor_right(app: &mut TuiApp) {
+    if app.cursor < app.input.len() {
+        let cur = app.cursor;
+        let ch_len = app.input[cur..]
+            .chars()
+            .next()
+            .map(|c| c.len_utf8())
+            .unwrap_or(1);
+        app.cursor = (cur + ch_len).min(app.input.len());
+    }
+}
+
+fn handle_up(app: &mut TuiApp, key: &KeyEvent) {
+    if key.modifiers.contains(KeyModifiers::SHIFT) {
+        app.chat_scroll = app.chat_scroll.saturating_add(10);
+    } else {
+        app.history_up();
+    }
+}
+
+fn handle_down(app: &mut TuiApp, key: &KeyEvent) {
+    if key.modifiers.contains(KeyModifiers::SHIFT) {
+        app.chat_scroll = app.chat_scroll.saturating_sub(10);
+    } else {
+        app.history_down();
+    }
+}
+
+fn handle_esc(app: &mut TuiApp) {
+    if app.is_processing {
+        app.is_processing = false;
+        app.streaming_text.clear();
+        app.status_msg = "Cancelled".to_string();
+    }
+}
+
+// ── Agent communication ─────────────────────────────────────────────────
 
 /// Send a message to the agent and handle the response without blocking the UI loop.
 async fn send_to_agent(
@@ -336,13 +385,14 @@ async fn send_to_agent(
     });
 }
 
+// ── Slash command handling ────────────────────────────────────────────
+
 /// Handle slash commands locally in the TUI.
 async fn handle_slash_command(app: &mut TuiApp, agent: &AgentHandle, cmd: &str) {
     let parts: Vec<&str> = cmd.trim().splitn(2, ' ').collect();
     let command = parts[0].to_lowercase();
     let args = parts.get(1).unwrap_or(&"");
 
-    // Try to parse as a SlashCommand enum.
     let slash_cmd = command
         .strip_prefix('/')
         .and_then(|name| name.parse::<SlashCommand>().ok());
@@ -420,7 +470,6 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &AgentHandle, cmd: &str) 
         Some(SlashCommand::Reset) => {
             app.messages.clear();
             app.tokens = (0, 0, 0);
-            // Reset the agent.
             agent
                 .read_async(|a| {
                     Box::pin(async move {
@@ -517,7 +566,6 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &AgentHandle, cmd: &str) 
             });
         }
         _ => {
-            // Unknown or unhandled — send to agent.
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
                 content: format!("Command '{}' sent to agent for processing.", command),

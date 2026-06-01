@@ -17,9 +17,12 @@ impl WorkspaceLayout {
     // ── 基础目录 ──
 
     /// 工作区基础目录：`~/.echo-agent/workspaces/`
+    ///
+    /// # Panics
+    /// 如果无法确定用户主目录，将 panic。
     pub fn base_dir() -> PathBuf {
-        let home = home_dir();
-        PathBuf::from(home).join(".echo-agent").join("workspaces")
+        let home = home_dir().expect("无法确定用户主目录 (HOME 环境变量未设置)");
+        home.join(".echo-agent").join("workspaces")
     }
 
     /// 工作区根目录：`~/.echo-agent/workspaces/{id}/`
@@ -153,8 +156,8 @@ impl WorkspaceLayout {
 }
 
 /// 获取用户 home 目录。
-fn home_dir() -> String {
-    std::env::var("HOME").unwrap_or_else(|_| "~".to_string())
+fn home_dir() -> Option<PathBuf> {
+    dirs::home_dir()
 }
 
 // ── Tests ───────────────────────────────────────────────────────────

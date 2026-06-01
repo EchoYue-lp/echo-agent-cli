@@ -311,9 +311,13 @@ pub async fn handle_session_action(action: &SessionAction) -> Result<()> {
                         return Ok(());
                     }
                 };
-                let path = output
-                    .clone()
-                    .unwrap_or_else(|| format!("session-{}.{}", &session.id[..8], ext));
+                let path = output.clone().unwrap_or_else(|| {
+                    format!(
+                        "session-{}.{}",
+                        session.id.get(..8).unwrap_or(&session.id),
+                        ext
+                    )
+                });
                 let path = std::path::Path::new(&path);
                 match format.as_str() {
                     "json" => manager.export_json(id, path)?,
@@ -391,6 +395,8 @@ async fn handle_eval_command(path: &str, json_output: bool) -> anyhow::Result<()
 fn truncate_str_max(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
+    } else if max <= 3 {
+        ".".repeat(max)
     } else {
         format!("{}...", s.chars().take(max - 3).collect::<String>())
     }

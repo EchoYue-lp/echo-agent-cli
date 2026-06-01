@@ -101,8 +101,12 @@ pub struct WritingQualityAssessment {
     pub needs_revision: bool,
 }
 
-fn default_writing_quality_score() -> u32 { 50 }
-fn default_writing_confidence() -> f64 { 0.5 }
+fn default_writing_quality_score() -> u32 {
+    50
+}
+fn default_writing_confidence() -> f64 {
+    0.5
+}
 
 /// Extract structured quality assessment from writing review text.
 ///
@@ -505,10 +509,7 @@ pub fn build_writing_graph(agent: &SharedAgent) -> anyhow::Result<Graph> {
 // ── Pipeline Execution ─────────────────────────────────────────────────────────
 
 /// Execute the writing pipeline for a given topic with default config.
-pub async fn run_writing_pipeline(
-    agent: AgentHandle,
-    topic: &str,
-) -> anyhow::Result<String> {
+pub async fn run_writing_pipeline(agent: AgentHandle, topic: &str) -> anyhow::Result<String> {
     let config = WritingPipelineConfig::new(topic);
     run_writing_pipeline_with_config(agent, config).await
 }
@@ -552,15 +553,12 @@ pub async fn run_writing_pipeline_with_config(
         "Writing pipeline completed"
     );
 
-    let final_output: String = result
-        .state
-        .get("final_output")
-        .unwrap_or_else(|| {
-            result
-                .state
-                .get("draft")
-                .unwrap_or_else(|| "Writing pipeline completed but no draft was generated.".to_string())
-        });
+    let final_output: String = result.state.get("final_output").unwrap_or_else(|| {
+        result
+            .state
+            .get("draft")
+            .unwrap_or_else(|| "Writing pipeline completed but no draft was generated.".to_string())
+    });
 
     Ok(final_output)
 }
