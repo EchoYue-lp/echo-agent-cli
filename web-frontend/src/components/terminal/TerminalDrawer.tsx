@@ -3,6 +3,7 @@ import { X, Plus, Minimize2 } from 'lucide-react';
 import { useUiStore } from '../../stores/uiStore';
 import { Terminal } from '../terminal/Terminal';
 import { terminalApi } from '../../api/endpoints';
+import { isTauri, apiInvoke } from '../../lib/tauri-bridge';
 
 interface TerminalTab {
   id: string;
@@ -26,28 +27,43 @@ export function TerminalDrawer() {
   }, [terminalOpen]);
 
   const createNewTerminal = async () => {
-    try {
-      const session = await terminalApi.create();
-      const newTab: TerminalTab = {
-        id: session.id,
-        label: `Terminal ${tabs.length + 1}`,
-      };
-      setTabs((prev) => [...prev, newTab]);
-      setActiveTabId(session.id);
-    } catch (e) {
-      console.error('Failed to create terminal session:', e);
-      // Fallback: create a local-only tab
-      const fallbackId = `local-${Date.now()}`;
-      setTabs((prev) => [...prev, { id: fallbackId, label: `Terminal ${prev.length + 1}` }]);
-      setActiveTabId(fallbackId);
+    const newId = `term-${Date.now()}`;
+    const newLabel = `Terminal ${tabs.length + 1}`;
+
+    if (isTauri()) {
+      try {
+        await apiInvoke('create_terminal', { id: newId, rows: 24, cols: 80 });
+      } catch (e) {
+        console.error('Failed to create terminal via IPC:', e);
+      }
+    } else {
+      try {
+        const session = await terminalApi.create();
+        setTabs((prev) => [...prev, { id: session.id, label: newLabel }]);
+        setActiveTabId(session.id);
+        return;
+      } catch (e) {
+        console.error('Failed to create terminal session:', e);
+      }
     }
+
+    setTabs((prev) => [...prev, { id: newId, label: newLabel }]);
+    setActiveTabId(newId);
   };
 
   const closeTab = async (tabId: string) => {
-    try {
-      await terminalApi.close(tabId);
-    } catch {
-      // ignore
+    if (isTauri()) {
+      try {
+        await apiInvoke('close_terminal', { id: tabId });
+      } catch {
+        // ignore
+      }
+    } else {
+      try {
+        await terminalApi.close(tabId);
+      } catch {
+        // ignore
+      }
     }
     setTabs((prev) => {
       const next = prev.filter((t) => t.id !== tabId);
@@ -145,8 +161,8 @@ export function TerminalDrawer() {
         </div>
       </div>
 
-      {/* Terminal content */}
-      <div className="flex-1 min-h-0">
+      {/* Terminal content — min-h-0 is critical for xterm.js flex sizing */}
+      <div className="flex-1 min-h-0 overflow-hidden">
         {activeTab ? (
           <Terminal sessionId={activeTab.id} />
         ) : (

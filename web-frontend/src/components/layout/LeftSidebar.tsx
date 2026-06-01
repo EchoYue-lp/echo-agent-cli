@@ -1,93 +1,97 @@
-import { useEffect, useState, useRef } from 'react';
-import { Plus, Sun, Moon, Trash2, MessageSquare, Pencil, Check, X, Search, Settings, FolderOpen, Terminal } from 'lucide-react';
+import { useState, useRef } from 'react';
+import { Plus, Sun, Moon, Trash2, FolderOpen, Terminal, Settings, Code, BarChart3, GraduationCap, MessageSquare, Search, X, ChevronDown, ChevronRight, Loader2 } from 'lucide-react';
 import { BrandIcon } from '../common/BrandIcon';
-import { useChatStore } from '../../stores/chatStore';
-import { useConversationStore, type ConversationGroup } from '../../stores/conversationStore';
 import { useUiStore } from '../../stores/uiStore';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
+import { useConversationStore } from '../../stores/conversationStore';
+import type { Workspace } from '../../api/endpoints';
+
+const KIND_ICONS: Record<string, { icon: typeof Code; color: string }> = {
+  code: { icon: Code, color: '#6366f1' },
+  data: { icon: BarChart3, color: '#f59e0b' },
+  data_analysis: { icon: BarChart3, color: '#f59e0b' },
+  research: { icon: GraduationCap, color: '#10b981' },
+  general: { icon: MessageSquare, color: '#6b7280' },
+};
+
+const MAX_RECENT_CONVERSATIONS = 5;
 
 export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
-  const messages = useChatStore((s) => s.messages);
   const theme = useUiStore((s) => s.theme);
   const toggleTheme = useUiStore((s) => s.toggleTheme);
   const openSettings = useUiStore((s) => s.openSettings);
   const toggleTerminal = useUiStore((s) => s.toggleTerminal);
 
+  const workspaces = useWorkspaceStore((s) => s.workspaces);
+  const current = useWorkspaceStore((s) => s.current);
+  const switchTo = useWorkspaceStore((s) => s.switchTo);
+  const deleteWorkspace = useWorkspaceStore((s) => s.delete);
+
   const conversations = useConversationStore((s) => s.conversations);
-  const activeId = useConversationStore((s) => s.activeId);
-  const isLoading = useConversationStore((s) => s.isLoading);
-  const init = useConversationStore((s) => s.init);
+  const activeConvId = useConversationStore((s) => s.activeId);
+  const isConvLoading = useConversationStore((s) => s.isLoading);
   const loadConversation = useConversationStore((s) => s.loadConversation);
-  const deleteConversation = useConversationStore((s) => s.deleteConversation);
-  const renameConversation = useConversationStore((s) => s.renameConversation);
-  const getGrouped = useConversationStore((s) => s.getGroupedConversations);
 
-  const currentWorkspace = useWorkspaceStore((s) => s.current);
-
-  const [hoveredId, setHoveredId] = useState<string | null>(null);
-  const [editingId, setEditingId] = useState<string | null>(null);
-  const [editTitle, setEditTitle] = useState('');
+  const [expandedId, setExpandedId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
-  const editInputRef = useRef<HTMLInputElement>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
 
-  useEffect(() => { init(); }, [init]);
+  const filtered = searchQuery.trim()
+    ? workspaces.filter(w => w.name.toLowerCase().includes(searchQuery.toLowerCase()))
+    : workspaces;
 
-  useEffect(() => {
-    if (editingId && editInputRef.current) {
-      editInputRef.current.focus();
-      editInputRef.current.select();
+  const handleSwitch = async (ws: Workspace) => {
+    if (current?.id === ws.id) {
+      // Already active — toggle expand
+      setExpandedId(expandedId === ws.id ? null : ws.id);
+      return;
     }
-  }, [editingId]);
-
-  const allGroups = getGrouped();
-  const groups = searchQuery.trim()
-    ? allGroups.map(g => ({
-        ...g,
-        conversations: g.conversations.filter(c =>
-          c.title.toLowerCase().includes(searchQuery.toLowerCase())
-        ),
-      })).filter(g => g.conversations.length > 0)
-    : allGroups;
-
-  const handleSelect = async (id: string) => {
-    if (id === activeId) return;
-    await loadConversation(id);
-  };
-
-  const handleStartEdit = (id: string, e: React.MouseEvent) => {
-    e.stopPropagation();
-    const conv = conversations.find((c) => c.id === id);
-    if (conv) {
-      setEditingId(id);
-      setEditTitle(conv.title);
+    try {
+      await switchTo(ws.id);
+      setExpandedId(ws.id);
+    } catch (e) {
+      console.error('Switch workspace failed:', e);
     }
   };
 
-  const handleSaveEdit = () => {
-    if (editingId && editTitle.trim()) {
-      renameConversation(editingId, editTitle.trim());
+  const handleDelete = async (id: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!confirm('确定删除此任务？所有数据将被清除。')) return;
+    try {
+      await deleteWorkspace(id);
+      if (expandedId === id) setExpandedId(null);
+    } catch (e) {
+      console.error('Delete workspace failed:', e);
     }
-    setEditingId(null);
   };
 
-  const handleDelete = (id: string, e: React.MouseEvent) => {
+  const handleOpenFolder = async (e: React.MouseEvent, ws: Workspace) => {
     e.stopPropagation();
-    deleteConversation(id);
-  };
-
-  const handleOpenFolder = async (e: React.MouseEvent) => {
-    e.stopPropagation();
-    if (!currentWorkspace) return;
     try {
       const { fileSystem } = await import('../../lib/tauri-bridge');
-      await fileSystem.openPath(currentWorkspace.root);
+      await fileSystem.openPath(ws.root);
     } catch (err) {
       console.error('Open folder failed:', err);
     }
   };
 
-  const isCurrentChatActive = !activeId && messages.length > 0;
+  const handleSelectConv = async (convId: string) => {
+    if (convId === activeConvId) return;
+    await loadConversation(convId);
+  };
+
+  const getKindIcon = (kind: { type: string }) => {
+    const k = KIND_ICONS[kind.type] || KIND_ICONS['general'];
+    const Icon = k.icon;
+    return <Icon size={14} style={{ color: k.color }} />;
+  };
+
+  // Recent conversations for the currently expanded workspace
+  // TODO: Filter by workspaceId once backend supports it
+  const recentConvs = current
+    ? conversations.slice(0, MAX_RECENT_CONVERSATIONS)
+    : [];
+  const hasMoreConvs = current && conversations.length > MAX_RECENT_CONVERSATIONS;
 
   return (
     <div className="flex h-full flex-col bg-[var(--bg-sidebar)]">
@@ -98,21 +102,21 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
           <span className="text-sm font-semibold tracking-tight text-[var(--text-primary)]">
             EchoCoWork
           </span>
-          {currentWorkspace && (
+          {current && (
             <div className="flex items-center gap-1">
               <button
                 onClick={onNewTask}
                 className="flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] font-medium transition-colors hover:opacity-80"
                 style={{ background: 'var(--accent)', color: 'white' }}
-                title={`当前: ${currentWorkspace.name}\n${currentWorkspace.root}\n点击切换工作区`}
+                title={`当前: ${current.name}\n${current.root}`}
               >
                 <FolderOpen size={11} />
-                {currentWorkspace.name}
+                {current.name}
               </button>
               <button
-                onClick={handleOpenFolder}
+                onClick={(e) => handleOpenFolder(e, current)}
                 className="rounded p-1 text-[var(--text-tertiary)] transition-colors hover:text-[var(--text-primary)]"
-                title="在文件管理器中打开工作区文件夹"
+                title="在文件管理器中打开"
               >
                 <FolderOpen size={13} />
               </button>
@@ -128,7 +132,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
         </button>
       </div>
 
-      {/* New Chat + Search */}
+      {/* New Task + Search */}
       <div className="space-y-2 px-3 pt-3 pb-2">
         <button
           onClick={onNewTask}
@@ -138,14 +142,14 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
           新建任务
         </button>
 
-        {conversations.length > 0 && (
+        {workspaces.length > 0 && (
           <div className="flex items-center gap-2 rounded-lg border border-[var(--border-primary)] bg-[var(--bg-hover)] px-3 py-1.5 transition-colors focus-within:border-[var(--border-focus)]">
             <Search size={13} className="shrink-0 text-[var(--text-tertiary)]" />
             <input
               ref={searchInputRef}
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="搜索对话..."
+              placeholder="搜索任务..."
               className="flex-1 bg-transparent text-xs text-[var(--text-primary)] outline-none placeholder:text-[var(--text-tertiary)]"
             />
             {searchQuery && (
@@ -159,53 +163,16 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
         )}
       </div>
 
-      {/* Current Chat */}
-      <div className="px-3 pb-1">
-        <button
-          onClick={() => { if (!isCurrentChatActive) onNewTask(); }}
-          className={`flex w-full items-center gap-2.5 rounded-lg px-3 py-2.5 text-left transition-colors
-            ${isCurrentChatActive
-              ? 'cursor-default bg-[var(--bg-sidebar-active)] pl-[9px] border-l-[3px] border-l-[var(--accent)]'
-              : 'border-l-[3px] border-l-transparent hover:bg-[var(--bg-sidebar-hover)]'}`}
-        >
-          <MessageSquare size={15} className="shrink-0 text-[var(--accent)]" />
-          <div className="min-w-0 flex-1">
-            <div className="truncate text-[13px] font-medium text-[var(--text-primary)]">
-              今天
-            </div>
-            <div className="text-xs text-[var(--text-tertiary)]">
-              {messages.length > 0 ? `${messages.length} 条消息` : '空'}
-            </div>
-          </div>
-          {isCurrentChatActive && (
-            <div className="h-2 w-2 shrink-0 rounded-full bg-[var(--accent)]" />
-          )}
-        </button>
-      </div>
-
-      {/* Conversation Groups */}
+      {/* Task (Workspace) List — expandable with conversations */}
       <div className="flex-1 overflow-y-auto px-2 pb-2">
-        {groups.map((group) => (
-          <ConversationGroupSection
-            key={group.label}
-            group={group}
-            activeId={activeId}
-            hoveredId={hoveredId}
-            editingId={editingId}
-            editTitle={editTitle}
-            editInputRef={editInputRef}
-            isLoading={isLoading}
-            onSelect={handleSelect}
-            onHover={setHoveredId}
-            onStartEdit={handleStartEdit}
-            onSaveEdit={handleSaveEdit}
-            onCancelEdit={() => setEditingId(null)}
-            onEditTitleChange={setEditTitle}
-            onDelete={handleDelete}
-          />
-        ))}
+        {filtered.length === 0 && !searchQuery && (
+          <div className="px-3 py-8 text-center">
+            <FolderOpen size={24} className="mx-auto mb-2 text-[var(--text-tertiary)]" />
+            <p className="text-xs text-[var(--text-tertiary)]">暂无任务，点击上方创建</p>
+          </div>
+        )}
 
-        {groups.length === 0 && searchQuery && (
+        {filtered.length === 0 && searchQuery && (
           <div className="px-3 py-8 text-center">
             <Search size={24} className="mx-auto mb-2 text-[var(--text-tertiary)]" />
             <p className="text-xs text-[var(--text-tertiary)]">
@@ -214,12 +181,110 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
           </div>
         )}
 
-        {groups.length === 0 && !searchQuery && conversations.length === 0 && (
-          <div className="px-3 py-8 text-center">
-            <MessageSquare size={24} className="mx-auto mb-2 text-[var(--text-tertiary)]" />
-            <p className="text-xs text-[var(--text-tertiary)]">暂无对话</p>
-          </div>
-        )}
+        {filtered.map((ws) => {
+          const isActive = current?.id === ws.id;
+          const isExpanded = expandedId === ws.id && isActive;
+          return (
+            <div key={ws.id} className="mb-0.5">
+              {/* Workspace row */}
+              <div
+                className={`group relative cursor-pointer rounded-lg transition-all
+                  ${isActive
+                    ? 'bg-[var(--bg-sidebar-active)] pl-[9px] border-l-[3px] border-l-[var(--accent)]'
+                    : 'border-l-[3px] border-l-transparent hover:bg-[var(--bg-sidebar-hover)]'}`}
+                onClick={() => handleSwitch(ws)}
+              >
+                <div className="flex items-center gap-2 py-2.5 pr-2">
+                  {/* Expand arrow */}
+                  {isActive ? (
+                    isExpanded
+                      ? <ChevronDown size={13} className="shrink-0 text-[var(--text-tertiary)]" />
+                      : <ChevronRight size={13} className="shrink-0 text-[var(--text-tertiary)]" />
+                  ) : (
+                    getKindIcon(ws.kind)
+                  )}
+
+                  <div className="min-w-0 flex-1">
+                    <div className={`truncate text-[13px] ${isActive ? 'font-medium' : ''} text-[var(--text-primary)]`}>
+                      {ws.name}
+                    </div>
+                    <div className="truncate text-[11px] text-[var(--text-tertiary)]">
+                      {ws.root}
+                    </div>
+                  </div>
+
+                  {isActive && (
+                    <div className="h-2 w-2 shrink-0 rounded-full bg-[var(--accent)]" />
+                  )}
+
+                  <div className="flex shrink-0 items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+                    <button
+                      onClick={(e) => handleOpenFolder(e, ws)}
+                      className="rounded p-1 text-[var(--text-tertiary)] transition-colors hover:text-[var(--text-primary)]"
+                      title="打开文件夹"
+                    >
+                      <FolderOpen size={12} />
+                    </button>
+                    <button
+                      onClick={(e) => handleDelete(ws.id, e)}
+                      className="rounded p-1 text-[var(--text-tertiary)] transition-colors hover:text-[var(--color-error)]"
+                      title="删除"
+                    >
+                      <Trash2 size={12} />
+                    </button>
+                  </div>
+                </div>
+              </div>
+
+              {/* Expanded conversations */}
+              {isExpanded && (
+                <div className="ml-7 border-l border-[var(--border-primary)] pl-2 pb-1">
+                  {isConvLoading && recentConvs.length === 0 && (
+                    <div className="flex items-center gap-2 py-2 px-1">
+                      <Loader2 size={12} className="animate-spin text-[var(--text-tertiary)]" />
+                      <span className="text-[11px] text-[var(--text-tertiary)]">加载中...</span>
+                    </div>
+                  )}
+
+                  {!isConvLoading && recentConvs.length === 0 && (
+                    <div className="py-2 px-1 text-[11px] text-[var(--text-tertiary)]">
+                      暂无对话，开始聊天吧
+                    </div>
+                  )}
+
+                  {recentConvs.map((conv) => (
+                    <div
+                      key={conv.id}
+                      className={`cursor-pointer rounded-md px-2 py-1.5 text-[12px] transition-colors
+                        ${activeConvId === conv.id
+                          ? 'bg-[var(--bg-sidebar-active)] text-[var(--text-primary)] font-medium'
+                          : 'text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'}`}
+                      onClick={(e) => { e.stopPropagation(); handleSelectConv(conv.id); }}
+                    >
+                      <div className="flex items-center gap-1.5">
+                        <MessageSquare size={11} className="shrink-0 text-[var(--text-tertiary)]" />
+                        <span className="truncate">{conv.title || '新对话'}</span>
+                      </div>
+                      {conv.messageCount > 0 && (
+                        <div className="mt-0.5 text-[10px] text-[var(--text-tertiary)] pl-[17px]">
+                          {conv.messageCount} 条消息
+                        </div>
+                      )}
+                    </div>
+                  ))}
+
+                  {hasMoreConvs && (
+                    <div className="mt-1 text-center">
+                      <span className="text-[11px] text-[var(--accent)] cursor-pointer hover:underline">
+                        查看更多 ({conversations.length - MAX_RECENT_CONVERSATIONS})...
+                      </span>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          );
+        })}
       </div>
 
       {/* Bottom actions */}
@@ -238,176 +303,6 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
           <Settings size={14} />
           设置
         </button>
-      </div>
-    </div>
-  );
-}
-
-function ConversationGroupSection({
-  group,
-  activeId,
-  hoveredId,
-  editingId,
-  editTitle,
-  editInputRef,
-  isLoading,
-  onSelect,
-  onHover,
-  onStartEdit,
-  onSaveEdit,
-  onCancelEdit,
-  onEditTitleChange,
-  onDelete,
-}: {
-  group: ConversationGroup;
-  activeId: string | null;
-  hoveredId: string | null;
-  editingId: string | null;
-  editTitle: string;
-  editInputRef: React.RefObject<HTMLInputElement | null>;
-  isLoading: boolean;
-  onSelect: (id: string) => void;
-  onHover: (id: string | null) => void;
-  onStartEdit: (id: string, e: React.MouseEvent) => void;
-  onSaveEdit: () => void;
-  onCancelEdit: () => void;
-  onEditTitleChange: (v: string) => void;
-  onDelete: (id: string, e: React.MouseEvent) => void;
-}) {
-  return (
-    <div className="mt-1">
-      <div className="px-3 py-1.5 text-[11px] font-semibold uppercase tracking-wider text-[var(--text-tertiary)]">
-        {group.label}
-      </div>
-      {group.conversations.map((conv) => (
-        <ConversationItem
-          key={conv.id}
-          id={conv.id}
-          title={conv.title}
-          isActive={activeId === conv.id}
-          isHovered={hoveredId === conv.id}
-          isEditing={editingId === conv.id}
-          editTitle={editTitle}
-          editInputRef={editInputRef}
-          isLoading={isLoading && activeId === conv.id}
-          onSelect={onSelect}
-          onHover={onHover}
-          onStartEdit={onStartEdit}
-          onSaveEdit={onSaveEdit}
-          onCancelEdit={onCancelEdit}
-          onEditTitleChange={onEditTitleChange}
-          onDelete={onDelete}
-        />
-      ))}
-    </div>
-  );
-}
-
-function ConversationItem({
-  id,
-  title,
-  isActive,
-  isHovered,
-  isEditing,
-  editTitle,
-  editInputRef,
-  isLoading: loading,
-  onSelect,
-  onHover,
-  onStartEdit,
-  onSaveEdit,
-  onCancelEdit,
-  onEditTitleChange,
-  onDelete,
-}: {
-  id: string;
-  title: string;
-  isActive: boolean;
-  isHovered: boolean;
-  isEditing: boolean;
-  editTitle: string;
-  editInputRef: React.RefObject<HTMLInputElement | null>;
-  isLoading: boolean;
-  onSelect: (id: string) => void;
-  onHover: (id: string | null) => void;
-  onStartEdit: (id: string, e: React.MouseEvent) => void;
-  onSaveEdit: () => void;
-  onCancelEdit: () => void;
-  onEditTitleChange: (v: string) => void;
-  onDelete: (id: string, e: React.MouseEvent) => void;
-}) {
-  return (
-    <div
-      className={`group relative mb-0.5 cursor-pointer rounded-lg transition-all
-        ${isActive
-          ? 'bg-[var(--bg-sidebar-active)] pl-[9px] border-l-[3px] border-l-[var(--accent)]'
-          : 'border-l-[3px] border-l-transparent'}`}
-      onClick={() => !isEditing && onSelect(id)}
-      onMouseEnter={() => onHover(id)}
-      onMouseLeave={() => onHover(null)}
-    >
-      <div className="flex items-center gap-1 py-2 pr-2">
-        {loading ? (
-          <div className="spinner shrink-0" />
-        ) : (
-          <MessageSquare size={14} className="shrink-0 text-[var(--text-tertiary)]" />
-        )}
-
-        {isEditing ? (
-          <div className="flex min-w-0 flex-1 items-center gap-1">
-            <input
-              ref={editInputRef}
-              value={editTitle}
-              onChange={(e) => onEditTitleChange(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') onSaveEdit();
-                if (e.key === 'Escape') onCancelEdit();
-              }}
-              onClick={(e) => e.stopPropagation()}
-              className="min-w-0 flex-1 rounded border border-[var(--border-focus)] bg-[var(--bg-input)] px-1.5 py-0.5 text-[13px] text-[var(--text-primary)] outline-none"
-              autoFocus
-            />
-            <button
-              onClick={(e) => { e.stopPropagation(); onSaveEdit(); }}
-              className="rounded p-0.5 text-[var(--color-success)]"
-            >
-              <Check size={13} />
-            </button>
-            <button
-              onClick={(e) => { e.stopPropagation(); onCancelEdit(); }}
-              className="rounded p-0.5 text-[var(--text-tertiary)]"
-            >
-              <X size={13} />
-            </button>
-          </div>
-        ) : (
-          <>
-            <div className="min-w-0 flex-1">
-              <div className={`truncate text-[13px] ${isActive ? 'font-medium' : ''} text-[var(--text-primary)]`}>
-                {title}
-              </div>
-            </div>
-
-            {(isHovered || isActive) && !loading && (
-              <div className="flex shrink-0 items-center gap-0.5">
-                <button
-                  onClick={(e) => onStartEdit(id, e)}
-                  className="rounded p-1 text-[var(--text-tertiary)] transition-colors hover:text-[var(--text-primary)]"
-                  title="重命名"
-                >
-                  <Pencil size={12} />
-                </button>
-                <button
-                  onClick={(e) => onDelete(id, e)}
-                  className="rounded p-1 text-[var(--text-tertiary)] transition-colors hover:text-[var(--color-error)]"
-                  title="删除"
-                >
-                  <Trash2 size={12} />
-                </button>
-              </div>
-            )}
-          </>
-        )}
       </div>
     </div>
   );

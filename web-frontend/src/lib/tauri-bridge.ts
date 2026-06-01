@@ -69,11 +69,17 @@ export const fileSystem = {
   async openPath(path: string): Promise<void> {
     if (isTauri()) {
       try {
-        // @ts-ignore - @tauri-apps/plugin-shell may not be installed in dev
         const shell = await import('@tauri-apps/plugin-shell');
         await shell.open(path);
       } catch (e) {
-        console.warn('Failed to open path via Tauri shell:', e);
+        console.error('Failed to open path via Tauri shell:', e, 'Path:', path);
+        // Fallback: try using invoke directly
+        try {
+          await invoke('native_open_path', { path });
+        } catch (e2) {
+          console.error('Fallback also failed:', e2);
+          alert(`无法打开文件夹: ${path}\n请手动在 Finder 中打开`);
+        }
       }
     }
     // Web mode: not supported, silently ignore
@@ -104,5 +110,16 @@ export const system = {
     return { os: 'web', arch: 'web', home_dir: '' };
   },
 };
+
+/**
+ * Generic Tauri IPC invoke for API endpoints.
+ * Use this in endpoints.ts to replace HTTP calls with Tauri commands.
+ */
+export async function apiInvoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  if (!isTauri()) {
+    throw new Error('apiInvoke requires Tauri environment');
+  }
+  return invoke<T>(command, args);
+}
 
 export { isTauri };

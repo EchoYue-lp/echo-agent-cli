@@ -47,12 +47,13 @@ export interface SkillInfo {
 
 export interface McpServerInfo {
   name: string;
-  status: 'connected' | 'disconnected' | 'error';
+  status: 'connected' | 'disconnected' | 'error' | 'disabled';
   transport: string;
-  tool_count: number;
-  tools: McpToolInfo[];
-  connected_at: string | null;
-  error: string | null;
+  tool_count?: number;
+  tools?: McpToolInfo[];
+  connected_at?: string | null;
+  error?: string | null;
+  enabled?: boolean;
 }
 
 export interface McpToolInfo {
@@ -456,7 +457,7 @@ export interface ProviderInfo {
   id: string;
   name: string;
   icon: string;
-  models: string[];
+  models?: string[];
   api_key_env: string;
   base_url: string;
   requires_api_key: boolean;

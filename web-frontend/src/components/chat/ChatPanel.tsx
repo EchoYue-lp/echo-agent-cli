@@ -5,7 +5,15 @@ import { ApprovalCard } from './ApprovalCard';
 import { ChatInput } from './ChatInput';
 import { WelcomeScreen } from './WelcomeScreen';
 import { useWebSocket } from '../../hooks/useWebSocket';
+import { useTauriChat } from '../../hooks/useTauriChat';
+import { isTauri } from '../../lib/tauri-bridge';
 import type { Attachment } from '../../types/api';
+
+function useChatTransport() {
+  const ws = useWebSocket();
+  const tauri = useTauriChat();
+  return isTauri() ? tauri : ws;
+}
 
 export function ChatPanel() {
   const messages = useChatStore((s) => s.messages);
@@ -16,7 +24,7 @@ export function ChatPanel() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const isNearBottomRef = useRef(true);
-  const { sendMessage, sendApproval, sendInput, cancel, connectionStatus } = useWebSocket();
+  const { sendMessage, sendApproval, sendInput, cancel, connectionStatus } = useChatTransport();
 
   const handleRegenerate = () => {
     const store = useChatStore.getState();

@@ -38,7 +38,6 @@ const settingsGroups: { label: string; icon: typeof Settings; items: SettingsIte
       { id: 'skills', label: '技能', icon: BookOpen },
       { id: 'plugins', label: '插件', icon: Package },
       { id: 'memory', label: '记忆', icon: Brain },
-      { id: 'auto-memory', label: '自动记忆', icon: BrainCircuit },
     ],
   },
   {
@@ -79,6 +78,7 @@ const settingsGroups: { label: string; icon: typeof Settings; items: SettingsIte
     icon: Sparkles,
     items: [
       { id: 'evolution', label: '自进化', icon: Sparkles },
+      { id: 'auto-memory', label: '自动记忆', icon: BrainCircuit },
     ],
   },
 ];
@@ -128,7 +128,7 @@ export function SettingsDialog() {
       <div className="fixed inset-0 z-50" style={{ background: 'var(--bg-overlay)' }} onClick={closeSettings} />
 
       {/* Dialog */}
-      <div className="animate-scale-in fixed left-1/2 top-1/2 z-50 flex h-[85vh] w-[92vw] max-w-6xl -translate-x-1/2 -translate-y-1/2 overflow-hidden rounded-2xl border border-[var(--border-primary)] bg-[var(--bg-primary)] shadow-2xl">
+      <div className="animate-scale-in fixed left-1/2 top-1/2 z-50 flex h-[85vh] w-[92vw] max-w-6xl -translate-x-1/2 -translate-y-1/2 overflow-hidden rounded-2xl border border-[var(--border-primary)] bg-[var(--bg-primary)] shadow-2xl max-sm:h-screen max-sm:w-screen max-sm:max-w-none max-sm:rounded-none">
         {/* Left sidebar — settings nav */}
         <div className="flex w-[220px] shrink-0 flex-col border-r border-[var(--border-primary)] bg-[var(--bg-sidebar)]">
           <div className="flex items-center justify-between border-b border-[var(--border-primary)] px-5 py-4">

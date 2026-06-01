@@ -39,7 +39,7 @@ export function ProviderPanel() {
 
       // Auto-select provider matching current model
       const match = allProviders.find((p) =>
-        p.models.some((m) => m === res.current_model)
+        (p.models ?? []).some((m: string) => m === res.current_model)
       );
       if (match) {
         setSelectedId(match.id);
@@ -58,7 +58,7 @@ export function ProviderPanel() {
 
   const handleSelectProvider = (p: ProviderInfo) => {
     setSelectedId(p.id);
-    setSelectedModel(p.models[0] ?? '');
+    setSelectedModel((p.models ?? [])[0] ?? '');
     setCustomModel('');
     setBaseUrl(p.base_url);
     setApiKey('');
@@ -226,7 +226,7 @@ export function ProviderPanel() {
           {/* Model selection */}
           <div>
             <label className="mb-1 block text-xs text-[var(--text-secondary)]">模型</label>
-            {isCustom || selected.models.length === 0 ? (
+            {isCustom || (selected.models ?? []).length === 0 ? (
               <input
                 type="text"
                 value={isCustom ? (customModel || selectedModel) : customModel}
@@ -256,7 +256,7 @@ export function ProviderPanel() {
                     }}
                     className="flex-1 rounded-lg border border-[var(--border-primary)] bg-[var(--bg-input)] px-2 py-2 text-sm text-[var(--text-primary)] outline-none focus:border-[var(--border-focus)]"
                   >
-                    {selected.models.map((m) => (
+                    {(selected.models ?? []).map((m) => (
                       <option key={m} value={m}>{m}</option>
                     ))}
                     <option value="__custom__">自定义模型...</option>

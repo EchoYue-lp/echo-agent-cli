@@ -355,10 +355,34 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   };
 
+  const [isDragging, setIsDragging] = useState(false);
+
+  // ── Drag & drop handling ──
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(true);
+  }, []);
+
+  const handleDragLeave = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(false);
+  }, []);
+
+  const handleDrop = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragging(false);
+    if (e.dataTransfer.files?.length) {
+      addFiles(e.dataTransfer.files);
+    }
+  }, [addFiles]);
+
   const hasContent = text.trim().length > 0 || pendingFiles.length > 0;
 
   return (
-    <div className="px-4 pb-4 pt-2">
+    <div className="px-4 pb-4 pt-2" onDragOver={handleDragOver} onDragLeave={handleDragLeave} onDrop={handleDrop}>
       {/* Relative container so the absolute-positioned palette anchors here */}
       <div className="relative mx-auto max-w-3xl">
 
@@ -371,7 +395,13 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
           />
         )}
 
-        <div className="glass flex flex-col rounded-2xl shadow-[var(--shadow-sm)] transition-shadow focus-within:shadow-[var(--shadow-md)]">
+        <div className="glass flex flex-col rounded-2xl shadow-[var(--shadow-sm)] transition-shadow focus-within:shadow-[var(--shadow-md)] relative">
+          {/* Drag overlay */}
+          {isDragging && (
+            <div className="absolute inset-0 z-10 flex items-center justify-center rounded-2xl border-2 border-dashed border-[var(--accent)] bg-[var(--accent)]/5">
+              <span className="text-sm font-medium text-[var(--accent)]">Drop files here to upload</span>
+            </div>
+          )}
           {/* Attachment previews */}
           {pendingFiles.length > 0 && (
             <div className="flex flex-wrap gap-2 px-4 pt-3">

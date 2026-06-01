@@ -15,6 +15,7 @@ import { RequireAuth } from './components/Auth/RequireAuth';
 
 function App() {
   const startNew = useConversationStore((s) => s.startNew);
+  const initConversations = useConversationStore((s) => s.init);
   const toggleSidebar = useUiStore((s) => s.toggleLeftSidebar);
   const openSettings = useUiStore((s) => s.openSettings);
   const setActiveSettingsTab = useUiStore((s) => s.setActiveSettingsTab);
@@ -25,8 +26,11 @@ function App() {
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [newTaskOpen, setNewTaskOpen] = useState(false);
 
-  // Initialize workspace store on mount
-  useEffect(() => { initWorkspaces(); }, [initWorkspaces]);
+  // Initialize workspace and conversation stores on mount
+  useEffect(() => {
+    initWorkspaces();
+    initConversations();
+  }, [initWorkspaces, initConversations]);
 
   const handleNewTask = useCallback(() => { setNewTaskOpen(true); }, []);
 
