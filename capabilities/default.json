@@ -10,6 +10,12 @@
     "core:event:allow-emit",
     "dialog:default",
     "notification:default",
-    "global-shortcut:default"
+    "global-shortcut:default",
+    {
+      "identifier": "shell:allow-open",
+      "allow": [
+        { "path": "**" }
+      ]
+    }
   ]
 }

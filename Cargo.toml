@@ -2,7 +2,6 @@
 resolver = "3"
 members = [
     "echo-agent-app-core",
-    "echo-agent-server",
 ]
 
 [package]
@@ -10,7 +9,7 @@ name = "echo-agent-cli"
 version = "1.0.0"
 edition = "2024"
 rust-version = "1.95"
-default-run = "echo-agent-cli"
+default-run = "echo-agent-tauri"
 license = "MIT"
 description = "Multi-mode CLI + Web server for the Echo Agent AI framework"
 repository = "https://github.com/EchoYue-lp/echo-agent-cli"
@@ -35,7 +34,6 @@ path = "src-tauri/src/main.rs"
 
 [dependencies]
 echo-agent-app-core = { path = "./echo-agent-app-core" }
-echo-agent-server = { path = "./echo-agent-server" }
 echo-agent = { version = "0.2.0", package = "echo_agent", path = "../echo-agent", features = ["sqlite", "mcp", "lsp", "human-loop", "subagent", "tasks", "eval", "improve"] }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
@@ -64,9 +62,6 @@ tokio-util = "0.7"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 cron = "0.12"
-bcrypt = "0.16"
-tower-http = { version = "0.5", features = ["cors", "fs", "trace"] }
-axum = { version = "0.7", features = ["ws", "macros"] }
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-shell = "2"
 tauri-plugin-dialog = "2"
@@ -78,6 +73,9 @@ unicode-width = "0.2"
 textwrap = "0.16"
 strum = "0.26"
 strum_macros = "0.26"
+portable-pty = "0.8"
+dashmap = "6"
+base64 = "0.22"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
