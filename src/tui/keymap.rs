@@ -161,8 +161,14 @@ impl Default for Keymap {
             // Input
             (KeyBinding::plain(KeyCodeDef::Enter), KeyAction::Send),
             (KeyBinding::plain(KeyCodeDef::Esc), KeyAction::Cancel),
-            (KeyBinding::plain(KeyCodeDef::Backspace), KeyAction::DeleteBack),
-            (KeyBinding::plain(KeyCodeDef::Delete), KeyAction::DeleteForward),
+            (
+                KeyBinding::plain(KeyCodeDef::Backspace),
+                KeyAction::DeleteBack,
+            ),
+            (
+                KeyBinding::plain(KeyCodeDef::Delete),
+                KeyAction::DeleteForward,
+            ),
             (KeyBinding::plain(KeyCodeDef::Left), KeyAction::CursorLeft),
             (KeyBinding::plain(KeyCodeDef::Right), KeyAction::CursorRight),
             (KeyBinding::plain(KeyCodeDef::Home), KeyAction::CursorHome),
@@ -170,23 +176,29 @@ impl Default for Keymap {
             (KeyBinding::plain(KeyCodeDef::Up), KeyAction::HistoryUp),
             (KeyBinding::plain(KeyCodeDef::Down), KeyAction::HistoryDown),
             (KeyBinding::plain(KeyCodeDef::PageUp), KeyAction::ScrollUp),
-            (KeyBinding::plain(KeyCodeDef::PageDown), KeyAction::ScrollDown),
-            (KeyBinding::plain(KeyCodeDef::Tab), KeyAction::NextSidebarTab),
+            (
+                KeyBinding::plain(KeyCodeDef::PageDown),
+                KeyAction::ScrollDown,
+            ),
+            (
+                KeyBinding::plain(KeyCodeDef::Tab),
+                KeyAction::NextSidebarTab,
+            ),
             // Completion
-            (KeyBinding::plain(KeyCodeDef::BackTab), KeyAction::CompletionPrev),
+            (
+                KeyBinding::plain(KeyCodeDef::BackTab),
+                KeyAction::CompletionPrev,
+            ),
             // Approval
-            (
-                KeyBinding::plain(KeyCodeDef::Char('y')),
-                KeyAction::Approve,
-            ),
-            (
-                KeyBinding::plain(KeyCodeDef::Char('n')),
-                KeyAction::Deny,
-            ),
+            (KeyBinding::plain(KeyCodeDef::Char('y')), KeyAction::Approve),
+            (KeyBinding::plain(KeyCodeDef::Char('n')), KeyAction::Deny),
             // Picker
             (KeyBinding::plain(KeyCodeDef::Up), KeyAction::PickerUp),
             (KeyBinding::plain(KeyCodeDef::Down), KeyAction::PickerDown),
-            (KeyBinding::plain(KeyCodeDef::Enter), KeyAction::PickerSelect),
+            (
+                KeyBinding::plain(KeyCodeDef::Enter),
+                KeyAction::PickerSelect,
+            ),
         ];
 
         // NewLine is Shift+Enter which we handle specially
@@ -264,8 +276,7 @@ impl Keymap {
         let Ok(content) = std::fs::read_to_string(&path) else {
             return;
         };
-        let Ok(overrides): Result<Vec<(KeyBinding, KeyAction)>, _> =
-            serde_yaml::from_str(&content)
+        let Ok(overrides): Result<Vec<(KeyBinding, KeyAction)>, _> = serde_yaml::from_str(&content)
         else {
             return;
         };

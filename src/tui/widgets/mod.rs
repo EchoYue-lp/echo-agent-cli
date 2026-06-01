@@ -6,8 +6,8 @@ pub mod popup;
 pub mod sidebar;
 pub mod status_bar;
 
-use ratatui::layout::Rect;
 use ratatui::Frame;
+use ratatui::layout::Rect;
 
 use super::TuiApp;
 

@@ -2,11 +2,11 @@
 //! Adaptive theme with Unicode icons.
 
 use crate::tui::{Theme, TuiApp};
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem, Paragraph, Tabs};
-use ratatui::Frame;
 
 use super::Widget;
 
@@ -17,9 +17,8 @@ impl Widget for Sidebar {
         let t = &app.theme;
 
         // No border block — draw a subtle vertical line separator on the right edge
-        let sep_line = Paragraph::new(
-            "\u{2502}\n".repeat(area.height as usize)
-        ).style(Style::default().fg(t.surface0));
+        let sep_line = Paragraph::new("\u{2502}\n".repeat(area.height as usize))
+            .style(Style::default().fg(t.surface0));
         let sep_area = Rect {
             x: area.x + area.width - 1,
             y: area.y,
@@ -50,11 +49,7 @@ impl Widget for Sidebar {
         let tabs = Tabs::new(titles)
             .select(app.sidebar_tab)
             .style(Style::default().fg(t.overlay0))
-            .highlight_style(
-                Style::default()
-                    .fg(t.cyan)
-                    .add_modifier(Modifier::BOLD),
-            )
+            .highlight_style(Style::default().fg(t.cyan).add_modifier(Modifier::BOLD))
             .divider(Span::styled(" \u{2502} ", Style::default().fg(t.surface0)));
         f.render_widget(tabs, sidebar_chunks[0]);
 
@@ -145,28 +140,23 @@ fn render_tools_list(f: &mut Frame, app: &TuiApp, area: Rect, t: &Theme) {
 }
 
 fn render_tasks_list(f: &mut Frame, app: &TuiApp, area: Rect, t: &Theme) {
-    let header = ListItem::new(Line::from(vec![
-        Span::styled(
-            format!("  {} Active Tasks", "\u{1f4cb}"),
-            Style::default().fg(t.cyan).add_modifier(Modifier::BOLD),
-        ),
-    ]));
+    let header = ListItem::new(Line::from(vec![Span::styled(
+        format!("  {} Active Tasks", "\u{1f4cb}"),
+        Style::default().fg(t.cyan).add_modifier(Modifier::BOLD),
+    )]));
 
     let task_item = if let Some(ref task) = app.active_task {
         ListItem::new(Line::from(vec![
-            Span::styled(
-                format!("    {} ", "\u{25b6}"),
-                Style::default().fg(t.green),
-            ),
+            Span::styled(format!("    {} ", "\u{25b6}"), Style::default().fg(t.green)),
             Span::styled(task.clone(), Style::default().fg(t.text)),
         ]))
     } else {
-        ListItem::new(Line::from(vec![
-            Span::styled(
-                format!("    {} No active tasks", "\u{25cb}"),
-                Style::default().fg(t.overlay0).add_modifier(Modifier::ITALIC),
-            ),
-        ]))
+        ListItem::new(Line::from(vec![Span::styled(
+            format!("    {} No active tasks", "\u{25cb}"),
+            Style::default()
+                .fg(t.overlay0)
+                .add_modifier(Modifier::ITALIC),
+        )]))
     };
 
     let list = List::new(vec![header, task_item]);

@@ -50,7 +50,9 @@ async fn cmd_tasks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         Some(svc) => svc.clone(),
         None => {
             println!("Background task service not configured.");
-            println!("Use the --tasks flag when starting the agent to enable background task support.");
+            println!(
+                "Use the --tasks flag when starting the agent to enable background task support."
+            );
             return CommandOutcome::Continue;
         }
     };
@@ -175,7 +177,9 @@ async fn cmd_tasks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             }
         }
         _ => {
-            println!("Usage: /tasks [list|status <id>|cancel <id>|research <topic>|checkpoints|respond <id> <selection>]");
+            println!(
+                "Usage: /tasks [list|status <id>|cancel <id>|research <topic>|checkpoints|respond <id> <selection>]"
+            );
         }
     }
     CommandOutcome::Continue
@@ -275,12 +279,24 @@ async fn cmd_review(ctx: &CommandContext, _args: &[&str]) -> CommandOutcome {
         }
 
         // Count changed lines for risk assessment
-        let added = diff_text.lines().filter(|l| l.starts_with('+') && !l.starts_with("+++")).count();
-        let removed = diff_text.lines().filter(|l| l.starts_with('-') && !l.starts_with("---")).count();
-        let changed_files = diff_text.lines().filter(|l| l.starts_with("diff --git")).count();
+        let added = diff_text
+            .lines()
+            .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+            .count();
+        let removed = diff_text
+            .lines()
+            .filter(|l| l.starts_with('-') && !l.starts_with("---"))
+            .count();
+        let changed_files = diff_text
+            .lines()
+            .filter(|l| l.starts_with("diff --git"))
+            .count();
 
         println!("\n=== Code Review ===\n");
-        println!("Changes: +{} -{} across {} file(s)", added, removed, changed_files);
+        println!(
+            "Changes: +{} -{} across {} file(s)",
+            added, removed, changed_files
+        );
 
         // Risk assessment
         let risk = if added + removed > 500 {
@@ -301,7 +317,10 @@ async fn cmd_review(ctx: &CommandContext, _args: &[&str]) -> CommandOutcome {
             for line in diff_lines.iter().take(max_lines) {
                 println!("{}", line);
             }
-            println!("\n... ({} more lines, use 'git diff' to see all)", diff_lines.len() - max_lines);
+            println!(
+                "\n... ({} more lines, use 'git diff' to see all)",
+                diff_lines.len() - max_lines
+            );
         } else {
             println!("{}", diff_text);
         }
@@ -394,7 +413,10 @@ async fn cmd_agent(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
 
     let subcommand = args[0];
     if subcommand != "run" {
-        println!("Unknown subcommand '{}'. Usage: /agent run <name> <task>", subcommand);
+        println!(
+            "Unknown subcommand '{}'. Usage: /agent run <name> <task>",
+            subcommand
+        );
         return CommandOutcome::Continue;
     }
 
@@ -566,15 +588,17 @@ async fn cmd_permission(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         }
     };
 
-    ctx.agent
-        .write(|a| a.set_permission_mode(normalized))
-        .await;
+    ctx.agent.write(|a| a.set_permission_mode(normalized)).await;
 
     match normalized {
         "plan" => println!("Permission mode: plan — write operations are now BLOCKED."),
         "auto-edit" => println!("Permission mode: auto-edit — file edits are auto-approved."),
-        "full-auto" => println!("Permission mode: full-auto — all operations auto-approved. Use with caution."),
-        "dontask" => println!("Permission mode: dontask — silent rejection for disallowed operations."),
+        "full-auto" => {
+            println!("Permission mode: full-auto — all operations auto-approved. Use with caution.")
+        }
+        "dontask" => {
+            println!("Permission mode: dontask — silent rejection for disallowed operations.")
+        }
         "auto" => println!("Permission mode: auto — AI classifier decides."),
         _ => println!("Permission mode: default — standard approval flow."),
     }

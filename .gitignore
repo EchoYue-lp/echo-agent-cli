@@ -3,11 +3,9 @@
 /.vscode
 /.classpath
 .env
-/Cargo.lock
 .DS_Store
 node_modules/
 web-frontend/dist/
-.vite/ gen/ echo-agent.yaml
 .vite/
 gen/
 echo-agent.yaml

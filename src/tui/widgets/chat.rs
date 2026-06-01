@@ -2,13 +2,11 @@
 
 use crate::tui::markdown::render_markdown;
 use crate::tui::{MessageRole, Theme, ToolCallStatus, TuiApp};
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Block, BorderType, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
-};
-use ratatui::Frame;
+use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap};
 
 use super::Widget;
 
@@ -34,10 +32,7 @@ impl Widget for Chat {
             lines.push(Line::from(vec![
                 Span::styled(
                     format!(" {} Agent ", "\u{2728}"),
-                    Style::default()
-                        .fg(t.bg)
-                        .bg(t.green)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(t.green).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     " streaming...",
@@ -53,28 +48,20 @@ impl Widget for Chat {
             lines.push(Line::from(vec![
                 Span::styled(
                     format!(" {} Agent ", "\u{2728}"),
-                    Style::default()
-                        .fg(t.bg)
-                        .bg(t.green)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(t.green).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!(" {} thinking...", "\u{25dc}"),
-                    Style::default()
-                        .fg(t.yellow)
-                        .add_modifier(Modifier::ITALIC),
+                    Style::default().fg(t.yellow).add_modifier(Modifier::ITALIC),
                 ),
             ]));
         }
 
-        // Auto-scroll: if chat_scroll is 0, show the bottom.
+        // chat_scroll is measured from the bottom: 0 = auto-scroll/latest.
         let total_lines = lines.len();
         let visible = inner.height as usize;
-        let scroll = if app.chat_scroll == 0 && total_lines > visible {
-            (total_lines - visible) as u16
-        } else {
-            app.chat_scroll
-        };
+        let max_scroll = total_lines.saturating_sub(visible) as u16;
+        let scroll = max_scroll.saturating_sub(app.chat_scroll.min(max_scroll));
 
         let paragraph = Paragraph::new(lines)
             .wrap(Wrap { trim: false })
@@ -115,10 +102,7 @@ fn render_message(
             lines.push(Line::from(vec![
                 Span::styled(
                     format!(" {} You ", "\u{1f464}"),
-                    Style::default()
-                        .fg(t.bg)
-                        .bg(t.blue)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(t.blue).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" "),
             ]));
@@ -126,7 +110,7 @@ fn render_message(
             for line in content.lines() {
                 lines.push(Line::from(vec![
                     Span::styled("    ", Style::default().fg(t.subtext)),
-                    Span::styled(line.to_string(), Style::default().fg(t.text)),
+                    Span::raw(line.to_string()),
                 ]));
             }
         }
@@ -136,10 +120,7 @@ fn render_message(
             lines.push(Line::from(vec![
                 Span::styled(
                     format!(" {} Agent ", "\u{2728}"),
-                    Style::default()
-                        .fg(t.bg)
-                        .bg(t.green)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(t.green).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(" "),
             ]));
@@ -157,15 +138,10 @@ fn render_message(
                 };
                 lines.push(Line::from(vec![
                     Span::styled("    ", Style::default().fg(t.subtext)),
-                    Span::styled(
-                        format!("{} ", icon),
-                        Style::default().fg(color),
-                    ),
+                    Span::styled(format!("{} ", icon), Style::default().fg(color)),
                     Span::styled(
                         tc.name.clone(),
-                        Style::default()
-                            .fg(t.lavender)
-                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(t.lavender).add_modifier(Modifier::BOLD),
                     ),
                 ]));
             }
@@ -173,10 +149,7 @@ fn render_message(
         MessageRole::System => {
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
-                Span::styled(
-                    format!(" {} ", "\u{2139}"),
-                    Style::default().fg(t.bg).bg(t.surface1),
-                ),
+                Span::styled(format!(" {} ", "\u{2139}"), Style::default().fg(t.subtext)),
                 Span::styled(
                     format!(" {}", content.to_string()),
                     Style::default()
@@ -189,7 +162,7 @@ fn render_message(
             lines.push(Line::from(vec![
                 Span::styled(
                     format!(" {} Tool ", "\u{1f527}"),
-                    Style::default().fg(t.bg).bg(t.mauve),
+                    Style::default().fg(t.mauve).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!(" {}", content.to_string()),
@@ -202,7 +175,10 @@ fn render_message(
 
 /// Indent a rendered markdown line with a subtle guide character.
 fn indent_line(line: Line<'static>, guide_color: Color) -> Line<'static> {
-    let mut spans = vec![Span::styled("  \u{2502} ", Style::default().fg(guide_color))];
+    let mut spans = vec![Span::styled(
+        "  \u{2502} ",
+        Style::default().fg(guide_color),
+    )];
     spans.extend(line.spans.into_iter());
     Line::from(spans)
 }

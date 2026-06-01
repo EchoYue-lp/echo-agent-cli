@@ -1,12 +1,6 @@
-//! 命令行交互模块
+//! TUI/GUI 产品入口与工具子命令。
 //!
-//! 提供 REPL (Read-Eval-Print-Loop) 交互界面，支持：
-//! - 多轮对话
-//! - 斜杠命令（/help, /reset, /tools 等）
-//! - 流式输出
-//! - 富文本格式化
-//!
-//! 同时包含 CLI 参数解析、子命令处理、运行模式和路由构建。
+//! 默认用户入口是全屏 TUI；GUI 使用 Tauri 入口。旧 REPL/Web 运行模式保留为内部兼容实现。
 
 pub mod args;
 pub mod cmd_impls;

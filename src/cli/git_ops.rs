@@ -8,9 +8,19 @@ use std::process::Command;
 
 /// 敏感文件模式 — 永不自动暂存。
 const PROTECTED_PATTERNS: &[&str] = &[
-    ".env", ".env.", "*.pem", "*.key", "*.p12", "*.pfx",
-    "credentials", "*secret*", "id_rsa", "id_ed25519",
-    ".npmrc", ".pypirc", "netrc",
+    ".env",
+    ".env.",
+    "*.pem",
+    "*.key",
+    "*.p12",
+    "*.pfx",
+    "credentials",
+    "*secret*",
+    "id_rsa",
+    "id_ed25519",
+    ".npmrc",
+    ".pypirc",
+    "netrc",
 ];
 
 /// 检查文件是否匹配保护模式。
@@ -19,12 +29,18 @@ pub fn is_protected_file(path: &str) -> bool {
     for pattern in PROTECTED_PATTERNS {
         if pattern.starts_with('*') {
             let suffix = &pattern[1..];
-            if filename.contains(suffix) { return true; }
+            if filename.contains(suffix) {
+                return true;
+            }
         } else if pattern.ends_with('*') {
-            let prefix = &pattern[..pattern.len()-1];
-            if filename.starts_with(prefix) { return true; }
+            let prefix = &pattern[..pattern.len() - 1];
+            if filename.starts_with(prefix) {
+                return true;
+            }
         } else {
-            if filename == *pattern || filename.starts_with(pattern) { return true; }
+            if filename == *pattern || filename.starts_with(pattern) {
+                return true;
+            }
         }
     }
     false
@@ -81,7 +97,8 @@ pub fn interactive_commit(cwd: &Path, change_count: usize) -> anyhow::Result<()>
 
     if commit.status.success() {
         let stderr = String::from_utf8_lossy(&commit.stderr);
-        let short = stderr.lines()
+        let short = stderr
+            .lines()
             .find(|l| l.contains('['))
             .and_then(|l| l.split('[').nth(1))
             .and_then(|l| l.split(']').next())
@@ -110,10 +127,17 @@ pub fn interactive_stage(cwd: &Path) -> anyhow::Result<()> {
         .output()?;
 
     if stage.status.success() {
-        println!("  {} 已暂存跟踪文件的变更", nu_ansi_term::Color::Green.paint("✓"));
+        println!(
+            "  {} 已暂存跟踪文件的变更",
+            nu_ansi_term::Color::Green.paint("✓")
+        );
     } else {
         let stderr = String::from_utf8_lossy(&stage.stderr);
-        println!("  {} stage failed: {}", nu_ansi_term::Color::Red.paint("✗"), stderr.trim());
+        println!(
+            "  {} stage failed: {}",
+            nu_ansi_term::Color::Red.paint("✗"),
+            stderr.trim()
+        );
     }
     Ok(())
 }

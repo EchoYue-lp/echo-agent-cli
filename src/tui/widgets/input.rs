@@ -2,11 +2,12 @@
 //! Adaptive theme, scrollable suggestions with descriptions.
 
 use crate::tui::TuiApp;
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, BorderType, Clear, List, ListItem, Paragraph};
-use ratatui::Frame;
+use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph};
+use unicode_width::UnicodeWidthStr;
 
 use super::Widget;
 
@@ -27,18 +28,20 @@ impl Widget for Input {
         } else {
             Style::default().fg(t.surface0)
         };
-        let separator = Paragraph::new(
-            "\u{2500}".repeat(area.width as usize)
-        ).style(sep_style);
-        let sep_area = Rect { x: area.x, y: area.y, width: area.width, height: 1 };
+        let separator = Paragraph::new("─".repeat(area.width as usize)).style(sep_style);
+        let sep_area = Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: 1,
+        };
         f.render_widget(separator, sep_area);
 
-        // Input area below the separator
         let inner = Rect {
             x: area.x,
             y: area.y + 1,
             width: area.width,
-            height: area.height.saturating_sub(1),
+            height: 1,
         };
 
         // Draw suggestions popup above the input if any.
@@ -48,30 +51,41 @@ impl Widget for Input {
 
         // Prompt indicator
         let prompt_icon = if app.is_processing {
-            Span::styled("\u{25dc} ", Style::default().fg(t.yellow).add_modifier(Modifier::BOLD))
+            Span::styled(
+                "… ",
+                Style::default().fg(t.yellow).add_modifier(Modifier::BOLD),
+            )
         } else {
-            Span::styled("\u{276f} ", Style::default().fg(t.cyan).add_modifier(Modifier::BOLD))
+            Span::styled(
+                "> ",
+                Style::default().fg(t.cyan).add_modifier(Modifier::BOLD),
+            )
         };
 
         // Render the input text or placeholder.
         let (text_span, style) = if app.input.is_empty() && !app.is_processing {
             (
-                Span::styled("Type a message or / for commands...", Style::default().fg(t.overlay0).add_modifier(Modifier::ITALIC)),
+                Span::styled(
+                    "输入消息，或输入 / 查看命令",
+                    Style::default()
+                        .fg(t.overlay0)
+                        .add_modifier(Modifier::ITALIC),
+                ),
                 Style::default(),
             )
         } else {
-            (
-                Span::styled(app.input.clone(), Style::default().fg(t.text)),
-                Style::default(),
-            )
+            (Span::raw(app.input.clone()), Style::default())
         };
 
         let input = Paragraph::new(Line::from(vec![prompt_icon, text_span])).style(style);
         f.render_widget(input, inner);
 
-        // Show cursor (offset by 2 for the prompt icon).
+        // Show cursor (offset by prompt display width).
         if !app.is_processing {
-            let cursor_x = inner.x + 2 + (app.cursor as u16).min(inner.width.saturating_sub(3));
+            let before_cursor = app.input.get(..app.cursor).unwrap_or("");
+            let display_width = UnicodeWidthStr::width(before_cursor) as u16;
+            let max_x = inner.width.saturating_sub(1);
+            let cursor_x = inner.x + 2 + display_width.min(max_x.saturating_sub(2));
             f.set_cursor_position((cursor_x, inner.y));
         }
     }
@@ -127,9 +141,7 @@ fn render_suggestions(f: &mut Frame, app: &TuiApp, input_inner: Rect) {
             }
             items.push(ListItem::new(Line::from(Span::styled(
                 format!("  {} {}", cat.icon(), cat.label()),
-                Style::default()
-                    .fg(t.overlay0)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(t.overlay0).add_modifier(Modifier::BOLD),
             ))));
             last_cat = Some(cat);
         }
@@ -142,14 +154,9 @@ fn render_suggestions(f: &mut Frame, app: &TuiApp, input_inner: Rect) {
         let mut spans = vec![Span::styled(
             format!("    {}", name),
             if is_selected {
-                Style::default()
-                    .fg(t.bg)
-                    .bg(t.cyan)
-                    .add_modifier(Modifier::BOLD)
+                Style::default().fg(t.cyan).add_modifier(Modifier::BOLD)
             } else {
-                Style::default()
-                    .fg(t.cyan)
-                    .add_modifier(Modifier::BOLD)
+                Style::default().fg(t.cyan).add_modifier(Modifier::BOLD)
             },
         )];
 
@@ -157,7 +164,7 @@ fn render_suggestions(f: &mut Frame, app: &TuiApp, input_inner: Rect) {
             spans.push(Span::styled(
                 format!(" {}", usage),
                 if is_selected {
-                    Style::default().fg(t.bg).bg(t.cyan)
+                    Style::default().fg(t.cyan)
                 } else {
                     Style::default().fg(t.overlay0)
                 },
@@ -170,7 +177,7 @@ fn render_suggestions(f: &mut Frame, app: &TuiApp, input_inner: Rect) {
         spans.push(Span::styled(
             format!("{}{}", " ".repeat(pad), desc),
             if is_selected {
-                Style::default().fg(t.bg).bg(t.cyan)
+                Style::default().fg(t.cyan)
             } else {
                 Style::default().fg(t.subtext)
             },
@@ -198,7 +205,7 @@ fn render_suggestions(f: &mut Frame, app: &TuiApp, input_inner: Rect) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(t.cyan))
-        .style(Style::default().bg(t.bg));
+        .style(Style::default());
     let sug_list = List::new(items).block(sug_block);
     f.render_widget(sug_list, sug_area);
 }

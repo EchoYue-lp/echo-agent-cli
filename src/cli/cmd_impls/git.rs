@@ -479,8 +479,7 @@ async fn git_pr(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                     .await;
 
                 if let Ok(output) = branch_output {
-                    let current_branch =
-                        String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    let current_branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
                     println!("  To create a PR with gh CLI:");
                     println!(

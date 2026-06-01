@@ -7,16 +7,19 @@
 //!
 //! ```text
 //! ~/.echo-agent/workspaces/{id}/
-//! ├── .workspace.json        # 清单文件
-//! ├── sessions/              # 会话历史
-//! ├── conversations/         # 对话记录（前端持久化）
-//! ├── memory/                # 向量存储、压缩历史
+//! ├── .echocowork/           # 系统数据（默认隐藏）
+//! │   ├── workspace.json     # 清单文件
+//! │   ├── sessions/          # 会话历史
+//! │   ├── conversations/     # 对话记录（前端持久化）
+//! │   ├── memory/            # 向量存储、压缩历史
+//! │   ├── tasks/             # 后台任务 SQLite DB
+//! │   ├── traces/            # 执行轨迹 JSONL
+//! │   ├── uploads/           # 上传临时文件
+//! │   └── decisions.jsonl    # 决策日志
+//! ├── scratchpad.md          # 共享草稿
 //! ├── data/                  # 数据集（数据分析工作区）
 //! ├── papers/                # PDF、参考文献、阅读笔记
-//! ├── artifacts/             # 生成的报告、论文、图表
-//! ├── tasks/                 # 后台任务 SQLite DB
-//! ├── traces/                # 执行轨迹 JSONL
-//! └── scratchpad.md          # 共享草稿
+//! └── artifacts/             # 生成的报告、论文、图表
 //! ```
 
 pub mod layout;

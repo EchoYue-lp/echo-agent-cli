@@ -50,10 +50,7 @@ async fn cmd_plugins(_ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                     .join(", ");
                 println!(
                     "  * {} v{} [{}] — {}",
-                    entry.manifest.name,
-                    entry.manifest.version,
-                    status,
-                    entry.manifest.description
+                    entry.manifest.name, entry.manifest.version, status, entry.manifest.description
                 );
                 if !cap_str.is_empty() {
                     println!("    Capabilities: {cap_str}");
@@ -276,7 +273,10 @@ async fn cmd_plugins(_ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             let manifest_dir = dir.join(".echo-plugin");
 
             if manifest_dir.exists() {
-                println!("Plugin directory already exists: {}", manifest_dir.display());
+                println!(
+                    "Plugin directory already exists: {}",
+                    manifest_dir.display()
+                );
                 return CommandOutcome::Continue;
             }
 
@@ -299,8 +299,7 @@ components:
   hooks: "./hooks/hooks.yaml"
   mcp_servers: "./.mcp.json"
 "#,
-                name
-                    .split('-')
+                name.split('-')
                     .map(|w| {
                         let mut c = w.chars();
                         match c.next() {
@@ -324,10 +323,7 @@ components:
 
             // Create placeholder files
             let _ = std::fs::write(dir.join("hooks").join("hooks.yaml"), "# Hook definitions\n");
-            let _ = std::fs::write(
-                dir.join(".mcp.json"),
-                "{\n  \"mcpServers\": {}\n}\n",
-            );
+            let _ = std::fs::write(dir.join(".mcp.json"), "{\n  \"mcpServers\": {}\n}\n");
 
             println!("Plugin scaffolded at: {}", dir.display());
             println!("  .echo-plugin/manifest.yaml");
@@ -380,7 +376,9 @@ components:
 
         _ => {
             println!("Unknown subcommand: {sub}");
-            println!("Available: list, install, uninstall, enable, disable, info, reload, init, validate");
+            println!(
+                "Available: list, install, uninstall, enable, disable, info, reload, init, validate"
+            );
         }
     }
 

@@ -1,37 +1,16 @@
-//! Echo Agent CLI - AI Agent 命令行与 Web 服务
+//! EchoCoWork - TUI/GUI 通用 Agent
 //!
-//! 提供两种交互模式：
-//! - **Web 模式**: 启动 HTTP/WebSocket 服务，提供完整的 REST API
-//! - **CLI 模式**: 启动交互式命令行界面，支持 REPL 对话
+//! 默认启动全屏 TUI；GUI 使用独立的 Tauri 入口。Web/REPL 仅保留为内部兼容入口。
 //!
 //! # 快速开始
 //!
 //! ```bash
-//! # 仅启动 Web 服务（默认）
+//! # 启动 TUI（默认）
 //! echo-agent-cli
 //!
-//! # 仅启动 CLI 交互
-//! echo-agent-cli --cli
-//!
-//! # 同时启动 Web 服务和 CLI 交互
-//! echo-agent-cli --web --cli
-//!
-//! # 指定端口
-//! echo-agent-cli --web --port 8080
+//! # 指定模型和模式
+//! echo-agent-cli --model claude-sonnet-4-6 --mode coding
 //! ```
-//!
-//! # 命令行选项
-//!
-//! | 选项 | 说明 |
-//! |------|------|
-//! | `--web` | 启动 Web 服务 |
-//! | `--cli` | 启动命令行交互 |
-//! | `--port <PORT>` | Web 服务端口 |
-//! | `--host <HOST>` | Web 服务地址 |
-//! | `--model <MODEL>` | 使用的模型名称 |
-//! | `--no-color` | 禁用彩色输出 |
-//! | `-h, --help` | 显示帮助信息 |
-//! | `-V, --version` | 显示版本信息 |
 
 use echo_agent_cli::agent_handle::AgentHandle;
 use echo_agent_cli::cli;
@@ -59,15 +38,14 @@ async fn main() -> anyhow::Result<()> {
         return cli::handle_subcommand(cmd).await;
     }
 
-    // TUI 模式：设置环境变量让 init_logging 将日志写入文件
-    if args.tui {
-        // SAFETY: This is called early in main() before any threads are spawned,
-        // so there's no concurrent access to the environment.
-        unsafe { std::env::set_var("ECHO_TUI_MODE", "1"); }
-    }
+    let is_tui_entry = !args.web && !args.cli && !args.channels;
 
-    // 初始化日志（使用配置中的级别）
-    infra::init_logging(&app_config.logging.level);
+    // 初始化日志。默认用户入口是 TUI，日志必须写入文件，避免污染全屏界面。
+    if is_tui_entry {
+        infra::init_logging_for_tui(&app_config.logging.level);
+    } else {
+        infra::init_logging(&app_config.logging.level);
+    }
 
     // 创建 Agent + 加载 MCP 配置（统一路径，消除重复）
     let params = echo_agent_cli::infra::AgentCreateParams {
@@ -133,12 +111,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Create hook bridges so task/subagent lifecycle events fire in the central HookRegistry.
     // These must stay alive for the duration of the application.
-    let task_hook_bridge = agent_handle
-        .read(|a| a.create_task_hook_bridge())
-        .await;
-    let subagent_hook_bridge = agent_handle
-        .read(|a| a.create_subagent_hook_bridge())
-        .await;
+    let task_hook_bridge = agent_handle.read(|a| a.create_task_hook_bridge()).await;
+    let subagent_hook_bridge = agent_handle.read(|a| a.create_subagent_hook_bridge()).await;
     tracing::info!("Hook bridges created (task + subagent lifecycle events → HookRegistry)");
 
     // Initialize unified memory API — must stay alive for the application lifetime
@@ -146,9 +120,15 @@ async fn main() -> anyhow::Result<()> {
         use echo_agent_app_core::unified_memory::UnifiedMemory;
         let mem = UnifiedMemory::load();
         tracing::info!(
-            user = mem.get_instructions(echo_agent_app_core::unified_memory::InstructionTier::User).is_some(),
-            project = mem.get_instructions(echo_agent_app_core::unified_memory::InstructionTier::Project).is_some(),
-            local = mem.get_instructions(echo_agent_app_core::unified_memory::InstructionTier::Local).is_some(),
+            user = mem
+                .get_instructions(echo_agent_app_core::unified_memory::InstructionTier::User)
+                .is_some(),
+            project = mem
+                .get_instructions(echo_agent_app_core::unified_memory::InstructionTier::Project)
+                .is_some(),
+            local = mem
+                .get_instructions(echo_agent_app_core::unified_memory::InstructionTier::Local)
+                .is_some(),
             "Unified memory loaded (instructions)"
         );
         mem
@@ -173,14 +153,18 @@ async fn main() -> anyhow::Result<()> {
                 match plugin_registry.resolve_dependencies() {
                     Ok(ordered_ids) => {
                         let mut skills_to_load: Vec<std::path::PathBuf> = Vec::new();
-                        let mut hooks_to_register: Vec<(String, String, echo_agent::skills::hooks::HooksDefinition)> = Vec::new();
+                        let mut hooks_to_register: Vec<(
+                            String,
+                            String,
+                            echo_agent::skills::hooks::HooksDefinition,
+                        )> = Vec::new();
                         let mut mcp_files_to_load: Vec<std::path::PathBuf> = Vec::new();
 
                         for plugin_id in &ordered_ids {
                             // First pass: collect entry info without mutable borrow
-                            let entry_info = plugin_registry.get(plugin_id).map(|entry| {
-                                (entry.enabled, entry.root.display().to_string())
-                            });
+                            let entry_info = plugin_registry
+                                .get(plugin_id)
+                                .map(|entry| (entry.enabled, entry.root.display().to_string()));
 
                             let Some((enabled, source_dir)) = entry_info else {
                                 continue;
@@ -209,7 +193,10 @@ async fn main() -> anyhow::Result<()> {
                                 // Collect hooks files for registration
                                 if let Some(ref hooks_file) = resolved.hooks_file {
                                     if let Ok(content) = std::fs::read_to_string(hooks_file) {
-                                        match serde_yaml_ng::from_str::<echo_agent::skills::hooks::HooksDefinition>(&content) {
+                                        match serde_yaml_ng::from_str::<
+                                            echo_agent::skills::hooks::HooksDefinition,
+                                        >(&content)
+                                        {
                                             Ok(def) => {
                                                 hooks_to_register.push((
                                                     plugin_id.clone(),
@@ -336,18 +323,16 @@ async fn main() -> anyhow::Result<()> {
         let mut lsp_configured = false;
 
         // Try loading project-level .lsp.yaml
-        let project_lsp = std::env::current_dir()
-            .ok()
-            .and_then(|cwd| {
-                let mut dir = cwd.as_path();
-                loop {
-                    let candidate = dir.join(".lsp.yaml");
-                    if candidate.exists() {
-                        return Some(candidate);
-                    }
-                    dir = dir.parent()?;
+        let project_lsp = std::env::current_dir().ok().and_then(|cwd| {
+            let mut dir = cwd.as_path();
+            loop {
+                let candidate = dir.join(".lsp.yaml");
+                if candidate.exists() {
+                    return Some(candidate);
                 }
-            });
+                dir = dir.parent()?;
+            }
+        });
 
         if let Some(ref lsp_path) = project_lsp {
             match LspConfig::from_file(lsp_path) {
@@ -400,7 +385,7 @@ async fn main() -> anyhow::Result<()> {
                     let shared_lsp = shared_lsp.clone();
                     Box::pin(async move {
                         use echo_agent::tools::lsp::{
-                            LspDiagnosticsTool, LspGotoDefinitionTool, LspFindReferencesTool,
+                            LspDiagnosticsTool, LspFindReferencesTool, LspGotoDefinitionTool,
                             LspHoverTool, LspStatusTool,
                         };
                         a.add_tool(Box::new(LspDiagnosticsTool::new(shared_lsp.clone())));
@@ -411,7 +396,9 @@ async fn main() -> anyhow::Result<()> {
                     })
                 })
                 .await;
-            tracing::info!("LSP tools registered (diagnostics, goto_definition, find_references, hover, status)");
+            tracing::info!(
+                "LSP tools registered (diagnostics, goto_definition, find_references, hover, status)"
+            );
         }
     }
 
@@ -434,15 +421,14 @@ async fn main() -> anyhow::Result<()> {
     // Create a SQLite store for background task persistence.
     // Passed to mode functions so they can start BackgroundTaskService.
     let task_store: std::sync::Arc<dyn echo_agent::memory::Store> = {
-        let db_path = echo_agent_app_core::persistence::Persistence::base_dir()
-            .join("tasks.db");
+        let db_path = echo_agent_app_core::persistence::Persistence::base_dir().join("tasks.db");
         match echo_agent::memory::SqliteStore::new(&db_path) {
             Ok(store) => std::sync::Arc::new(store),
             Err(e) => {
                 tracing::warn!("Failed to create SQLite store for tasks: {e}");
                 // Fallback: use FileStore
-                let file_path = echo_agent_app_core::persistence::Persistence::base_dir()
-                    .join("tasks_store");
+                let file_path =
+                    echo_agent_app_core::persistence::Persistence::base_dir().join("tasks_store");
                 match echo_agent::memory::FileStore::new(&file_path) {
                     Ok(store) => std::sync::Arc::new(store),
                     Err(e2) => {
@@ -456,9 +442,7 @@ async fn main() -> anyhow::Result<()> {
 
     // ── G3: Session resume (--continue / --resume) ──────────────────
     if args.r#continue || args.resume.is_some() {
-        use echo_agent::llm::types::{
-            FunctionCall, Message, MessageContent, ToolCall,
-        };
+        use echo_agent::llm::types::{FunctionCall, Message, MessageContent, ToolCall};
         use echo_agent_cli::sessions::{Session, SessionManager};
 
         /// Convert persisted session messages back into agent `Message` values,
@@ -521,21 +505,24 @@ async fn main() -> anyhow::Result<()> {
         }
 
         let manager = SessionManager::new();
-        let resume_result: anyhow::Result<Option<echo_agent_cli::sessions::Session>> =
-            if let Some(ref session_id) = args.resume {
-                match manager.load(session_id) {
-                    Ok(s) => Ok(Some(s)),
-                    Err(_) => {
-                        eprintln!(
-                            "\u{2717} Session '{}' not found. Use `echo-agent-cli sessions list` to see available sessions.",
-                            session_id
-                        );
-                        std::process::exit(1);
-                    }
+        let resume_result: anyhow::Result<Option<echo_agent_cli::sessions::Session>> = if let Some(
+            ref session_id,
+        ) =
+            args.resume
+        {
+            match manager.load(session_id) {
+                Ok(s) => Ok(Some(s)),
+                Err(_) => {
+                    eprintln!(
+                        "\u{2717} Session '{}' not found. Use `echo-agent-cli sessions list` to see available sessions.",
+                        session_id
+                    );
+                    std::process::exit(1);
                 }
-            } else {
-                manager.get_latest()
-            };
+            }
+        } else {
+            manager.get_latest()
+        };
 
         match resume_result {
             Ok(Some(session)) => {
@@ -583,13 +570,9 @@ async fn main() -> anyhow::Result<()> {
 
     // ── G13: Headless mode (--headless <prompt>) ─────────────────
     if let Some(ref prompt) = args.headless {
-        let exit_code = cli::run_headless_mode(
-            &agent_handle,
-            prompt,
-            &args.output,
-            args.max_iterations,
-        )
-        .await?;
+        let exit_code =
+            cli::run_headless_mode(&agent_handle, prompt, &args.output, args.max_iterations)
+                .await?;
 
         // Keep hook bridges and unified memory alive until shutdown
         drop(task_hook_bridge);
@@ -599,8 +582,8 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(exit_code);
     }
 
-    // ── TUI mode (--tui) ─────────────────────────────────────────────
-    if args.tui {
+    // ── User-facing TUI mode (default) ─────────────────────────────────
+    if is_tui_entry {
         echo_agent_cli::tui::run_tui(agent_handle.clone()).await?;
 
         drop(task_hook_bridge);
@@ -610,7 +593,8 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let run_web = args.web || (!args.cli && !args.channels);
+    // ── Hidden legacy/internal modes ───────────────────────────────────
+    let run_web = args.web;
     let run_cli = args.cli;
     let run_channels = args.channels;
 
@@ -620,11 +604,32 @@ async fn main() -> anyhow::Result<()> {
             let channels_handle = tokio::spawn(cli::run_channels_mode(&app_config));
 
             if run_web && run_cli {
-                cli::run_both_modes(agent_handle, hitl_dispatcher.clone(), &args, &app_config, task_store.clone()).await?;
+                cli::run_both_modes(
+                    agent_handle,
+                    hitl_dispatcher.clone(),
+                    &args,
+                    &app_config,
+                    task_store.clone(),
+                )
+                .await?;
             } else if run_cli {
-                cli::run_cli_mode(agent_handle, hitl_dispatcher.clone(), &args, &app_config, task_store.clone()).await?;
+                cli::run_cli_mode(
+                    agent_handle,
+                    hitl_dispatcher.clone(),
+                    &args,
+                    &app_config,
+                    task_store.clone(),
+                )
+                .await?;
             } else if run_web {
-                cli::run_web_mode(agent_handle, hitl_dispatcher.clone(), &args, &app_config, task_store.clone()).await?;
+                cli::run_web_mode(
+                    agent_handle,
+                    hitl_dispatcher.clone(),
+                    &args,
+                    &app_config,
+                    task_store.clone(),
+                )
+                .await?;
             } else {
                 // 仅 channels 模式，等待 channels 或 Ctrl+C
                 channels_handle.await??;
@@ -639,13 +644,34 @@ async fn main() -> anyhow::Result<()> {
             );
         }
     } else if run_web && run_cli {
-        cli::run_both_modes(agent_handle, hitl_dispatcher.clone(), &args, &app_config, task_store.clone()).await?;
+        cli::run_both_modes(
+            agent_handle,
+            hitl_dispatcher.clone(),
+            &args,
+            &app_config,
+            task_store.clone(),
+        )
+        .await?;
     } else if run_cli {
         // 仅 CLI 模式
-        cli::run_cli_mode(agent_handle, hitl_dispatcher.clone(), &args, &app_config, task_store.clone()).await?;
+        cli::run_cli_mode(
+            agent_handle,
+            hitl_dispatcher.clone(),
+            &args,
+            &app_config,
+            task_store.clone(),
+        )
+        .await?;
     } else {
         // 仅 Web 模式
-        cli::run_web_mode(agent_handle, hitl_dispatcher.clone(), &args, &app_config, task_store.clone()).await?;
+        cli::run_web_mode(
+            agent_handle,
+            hitl_dispatcher.clone(),
+            &args,
+            &app_config,
+            task_store.clone(),
+        )
+        .await?;
     }
 
     // Keep hook bridges and unified memory alive until shutdown
@@ -701,30 +727,32 @@ mod tests {
     }
 
     #[test]
-    fn test_args_default() {
+    fn test_args_default_starts_tui_product() {
         let args = cli::Args::parse_from(["echo-agent-cli"]);
         assert!(!args.web);
         assert!(!args.cli);
+        assert!(!args.channels);
         assert_eq!(args.port, 3000);
         assert_eq!(args.model, None);
     }
 
     #[test]
-    fn test_args_cli_mode() {
-        let args = cli::Args::parse_from(["echo-agent-cli", "--cli"]);
-        assert!(args.cli);
+    fn test_args_tui_mode() {
+        let args = cli::Args::parse_from(["echo-agent-cli", "--tui"]);
+        assert!(args.tui);
         assert!(!args.web);
+        assert!(!args.cli);
     }
 
     #[test]
-    fn test_args_both_modes() {
+    fn test_args_internal_modes_remain_parseable() {
         let args = cli::Args::parse_from(["echo-agent-cli", "--web", "--cli"]);
         assert!(args.web);
         assert!(args.cli);
     }
 
     #[test]
-    fn test_args_custom_port() {
+    fn test_args_custom_port_for_internal_web() {
         let args = cli::Args::parse_from(["echo-agent-cli", "--port", "8080"]);
         assert_eq!(args.port, 8080);
     }

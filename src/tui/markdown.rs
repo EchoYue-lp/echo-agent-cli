@@ -162,9 +162,7 @@ impl MarkdownRenderer {
                 self.lines.push(Line::from(""));
                 let indent = "  ".repeat(self.list_depth.saturating_sub(1));
                 let bullet = format!("{}  - ", indent);
-                self.push_span(
-                    Span::styled(bullet, Style::default().fg(Color::Cyan)),
-                );
+                self.push_span(Span::styled(bullet, Style::default().fg(Color::Cyan)));
             }
             Event::End(TagEnd::Item) => {
                 self.flush_line();
@@ -240,11 +238,8 @@ impl MarkdownRenderer {
                 // Inline code.
                 let style = Style::default()
                     .fg(Color::Magenta)
-                    .bg(Color::Rgb(30, 30, 46));
-                self.push_span(Span::styled(
-                    format!(" {} ", code),
-                    style,
-                ));
+                    .add_modifier(Modifier::BOLD);
+                self.push_span(Span::styled(format!(" {} ", code), style));
             }
 
             Event::SoftBreak => {
@@ -293,15 +288,9 @@ impl MarkdownRenderer {
 
     fn heading_style(&self, base: Style) -> Style {
         match self.heading_level {
-            1 => base
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-            2 => base
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-            3 => base
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
+            1 => base.fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            2 => base.fg(Color::Green).add_modifier(Modifier::BOLD),
+            3 => base.fg(Color::Yellow).add_modifier(Modifier::BOLD),
             _ => base.add_modifier(Modifier::BOLD),
         }
     }
@@ -356,10 +345,7 @@ impl MarkdownRenderer {
         for line in LinesWithEndings::from(&self.code_block_text) {
             let mut spans = Vec::new();
             // Indent for code block
-            spans.push(Span::styled(
-                "  ",
-                Style::default().bg(Color::Rgb(30, 30, 46)),
-            ));
+            spans.push(Span::styled("  ", Style::default().fg(Color::DarkGray)));
 
             match h.highlight_line(line, ss) {
                 Ok(regions) => {
@@ -367,12 +353,7 @@ impl MarkdownRenderer {
                         let fg = syntect_color_to_ratatui(style.foreground);
                         let text = text.trim_end_matches('\n');
                         if !text.is_empty() {
-                            spans.push(Span::styled(
-                                text.to_string(),
-                                Style::default()
-                                    .fg(fg)
-                                    .bg(Color::Rgb(30, 30, 46)),
-                            ));
+                            spans.push(Span::styled(text.to_string(), Style::default().fg(fg)));
                         }
                     }
                 }
@@ -380,9 +361,7 @@ impl MarkdownRenderer {
                     let text = line.trim_end_matches('\n');
                     spans.push(Span::styled(
                         text.to_string(),
-                        Style::default()
-                            .fg(Color::Rgb(205, 214, 244))
-                            .bg(Color::Rgb(30, 30, 46)),
+                        Style::default().fg(Color::DarkGray),
                     ));
                 }
             }

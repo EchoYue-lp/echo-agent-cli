@@ -27,10 +27,10 @@ use crossterm::{
     cursor::Show,
     event::{DisableMouseCapture, EnableMouseCapture},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::style::Color;
-use ratatui::{backend::CrosstermBackend, Terminal};
+use ratatui::{Terminal, backend::CrosstermBackend};
 use std::io;
 
 // ── Theme ───────────────────────────────────────────────────────────────────
@@ -65,43 +65,43 @@ impl Theme {
     fn dark() -> Self {
         Self {
             is_dark: true,
-            bg: Color::Rgb(0, 0, 0),
-            surface0: Color::Rgb(20, 20, 20),
-            surface1: Color::Rgb(40, 40, 40),
-            overlay0: Color::Rgb(100, 100, 100),
-            text: Color::Rgb(255, 255, 255),
-            subtext: Color::Rgb(180, 180, 180),
-            blue: Color::Rgb(100, 149, 237),    // cornflower blue
-            green: Color::Rgb(80, 220, 100),
-            yellow: Color::Rgb(255, 215, 0),     // gold
-            peach: Color::Rgb(255, 165, 80),
-            mauve: Color::Rgb(180, 130, 255),
-            teal: Color::Rgb(0, 200, 180),
-            red: Color::Rgb(255, 80, 80),
-            cyan: Color::Rgb(0, 200, 220),
-            lavender: Color::Rgb(170, 150, 255),
+            bg: Color::Rgb(12, 12, 12),
+            surface0: Color::Rgb(32, 32, 32),
+            surface1: Color::Rgb(52, 52, 52),
+            overlay0: Color::Rgb(115, 115, 115),
+            text: Color::Rgb(235, 235, 235),
+            subtext: Color::Rgb(160, 160, 160),
+            blue: Color::Rgb(96, 165, 250),
+            green: Color::Rgb(74, 222, 128),
+            yellow: Color::Rgb(250, 204, 21),
+            peach: Color::Rgb(251, 146, 60),
+            mauve: Color::Rgb(192, 132, 252),
+            teal: Color::Rgb(45, 212, 191),
+            red: Color::Rgb(248, 113, 113),
+            cyan: Color::Rgb(34, 211, 238),
+            lavender: Color::Rgb(165, 180, 252),
         }
     }
 
-    /// Catppuccin Latte — for light terminal backgrounds.
-    fn light() -> Self {
+    /// Neutral theme that stays readable on both light and dark terminal backgrounds.
+    fn terminal_safe() -> Self {
         Self {
             is_dark: false,
-            bg: Color::Rgb(239, 241, 245),
-            surface0: Color::Rgb(204, 208, 218),
-            surface1: Color::Rgb(188, 192, 204),
-            overlay0: Color::Rgb(124, 127, 143),
-            text: Color::Rgb(76, 79, 105),
-            subtext: Color::Rgb(92, 95, 119),
-            blue: Color::Rgb(30, 102, 245),
-            green: Color::Rgb(64, 160, 43),
-            yellow: Color::Rgb(223, 142, 29),
-            peach: Color::Rgb(254, 100, 11),
-            mauve: Color::Rgb(136, 57, 239),
-            teal: Color::Rgb(23, 146, 153),
-            red: Color::Rgb(210, 15, 57),
-            cyan: Color::Rgb(4, 165, 229),
-            lavender: Color::Rgb(114, 135, 253),
+            bg: Color::Reset,
+            surface0: Color::DarkGray,
+            surface1: Color::Gray,
+            overlay0: Color::DarkGray,
+            text: Color::Reset,
+            subtext: Color::DarkGray,
+            blue: Color::Blue,
+            green: Color::Green,
+            yellow: Color::Yellow,
+            peach: Color::LightRed,
+            mauve: Color::Magenta,
+            teal: Color::Cyan,
+            red: Color::Red,
+            cyan: Color::Blue,
+            lavender: Color::Magenta,
         }
     }
 }
@@ -219,8 +219,7 @@ impl TuiApp {
             messages: vec![ChatMessage {
                 role: MessageRole::System,
                 content: format!(
-                    "EchoCoWork TUI \u{2014} mode: {mode}, model: {model}\n\
-                     Type a message or / for commands. Ctrl+C to quit."
+                    "EchoCoWork · {mode} · {model}\n输入消息开始协作，/ 查看命令，Ctrl+C 退出。"
                 ),
                 tool_calls: vec![],
             }],
@@ -229,7 +228,7 @@ impl TuiApp {
             suggestions: vec![],
             selected_suggestion: 0,
             suggestion_scroll: 0,
-            sidebar_visible: true,
+            sidebar_visible: false,
             sidebar_tab: 0,
             diff_popup: None,
             approval: None,
@@ -398,8 +397,8 @@ impl Drop for TerminalGuard {
 /// This function handles all terminal setup/teardown via [`TerminalGuard`],
 /// so the terminal is always restored even on panic or early return.
 pub async fn run_tui(agent: AgentHandle) -> anyhow::Result<()> {
-    // Always use dark theme (black bg, white text).
-    let theme = Theme::dark();
+    // Use terminal-safe colors so text remains readable on macOS light terminals.
+    let theme = Theme::terminal_safe();
 
     // Create the RAII guard — redirects stderr + sets up terminal.
     let _guard = TerminalGuard::new();

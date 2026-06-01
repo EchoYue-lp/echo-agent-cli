@@ -141,7 +141,8 @@ impl WorkspaceRegistry {
 
         // 如果目录已存在且有清单文件，拒绝覆盖
         let manifest = WorkspaceLayout::manifest(&root);
-        if manifest.exists() {
+        let legacy_manifest = WorkspaceLayout::legacy_manifest(&root);
+        if manifest.exists() || legacy_manifest.exists() {
             anyhow::bail!(
                 "Directory already contains a workspace: {}",
                 root.display()
@@ -195,7 +196,7 @@ impl WorkspaceRegistry {
             anyhow::bail!("Workspace '{}' not found at {:?}", id, root);
         }
 
-        let manifest_path = WorkspaceLayout::manifest(&root);
+        let manifest_path = WorkspaceLayout::existing_manifest(&root);
         let data = fs::read_to_string(&manifest_path)?;
         let mut workspace: Workspace = serde_json::from_str(&data)?;
 
@@ -223,7 +224,7 @@ impl WorkspaceRegistry {
         let index = self.load_index();
         for (id_str, root_str) in &index.entries {
             let root = PathBuf::from(root_str);
-            let manifest = WorkspaceLayout::manifest(&root);
+            let manifest = WorkspaceLayout::existing_manifest(&root);
             if manifest.exists() {
                 if let Ok(data) = fs::read_to_string(&manifest) {
                     if let Ok(ws) = serde_json::from_str::<Workspace>(&data) {
@@ -248,7 +249,7 @@ impl WorkspaceRegistry {
                 if !path.is_dir() {
                     continue;
                 }
-                let manifest = WorkspaceLayout::manifest(&path);
+                let manifest = WorkspaceLayout::existing_manifest(&path);
                 if !manifest.exists() {
                     continue;
                 }
@@ -288,34 +289,25 @@ impl WorkspaceRegistry {
             // 在基础目录下 → 整个删除
             fs::remove_dir_all(&root)?;
         } else {
-            // 自定义路径 → 只删除清单文件和 echo 子目录，保留用户原有文件
-            let manifest = WorkspaceLayout::manifest(&root);
-            if manifest.exists() {
-                fs::remove_file(&manifest)?;
+            // 自定义路径 → 只删除 EchoCoWork 系统目录，保留用户原有文件
+            let state_dir = WorkspaceLayout::state_dir(&root);
+            if state_dir.exists() {
+                fs::remove_dir_all(&state_dir).ok();
             }
-            // 清理 echo 创建的子目录
-            for subdir in [
-                "sessions",
-                "conversations",
-                "memory",
-                "data",
-                "papers",
-                "artifacts",
-                "tasks",
-                "traces",
-                "uploads",
-            ] {
+            let legacy_manifest = WorkspaceLayout::legacy_manifest(&root);
+            if legacy_manifest.exists() {
+                fs::remove_file(&legacy_manifest).ok();
+            }
+            // 清理旧版本创建的系统子目录，不删除 data/papers/artifacts 等用户内容。
+            for subdir in ["sessions", "conversations", "memory", "tasks", "traces", "uploads"] {
                 let dir = root.join(subdir);
                 if dir.exists() {
                     fs::remove_dir_all(&dir).ok();
                 }
             }
-            // 清理 scratchpad 和 decisions
-            for file in ["scratchpad.md", "decisions.jsonl"] {
-                let f = root.join(file);
-                if f.exists() {
-                    fs::remove_file(&f).ok();
-                }
+            let old_decisions = root.join("decisions.jsonl");
+            if old_decisions.exists() {
+                fs::remove_file(&old_decisions).ok();
             }
         }
 
@@ -377,11 +369,11 @@ impl WorkspaceRegistry {
         None
     }
 
-    /// 通过向上遍历目录查找 `.workspace.json` 来检测工作区。
+    /// 通过向上遍历目录查找 `.echocowork/workspace.json` 或旧版 `.workspace.json` 来检测工作区。
     pub fn detect_from_manifest(cwd: &Path) -> Option<Workspace> {
         let mut current = cwd.to_path_buf();
         loop {
-            let manifest = WorkspaceLayout::manifest(&current);
+            let manifest = WorkspaceLayout::existing_manifest(&current);
             if manifest.exists() {
                 if let Ok(data) = fs::read_to_string(&manifest) {
                     if let Ok(ws) = serde_json::from_str::<Workspace>(&data) {
@@ -401,6 +393,9 @@ impl WorkspaceRegistry {
     /// 保存工作区清单文件。
     fn save_manifest(&self, workspace: &Workspace) -> anyhow::Result<()> {
         let manifest_path = WorkspaceLayout::manifest(&workspace.root);
+        if let Some(parent) = manifest_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         let json = serde_json::to_string_pretty(workspace)?;
         fs::write(&manifest_path, json)?;
         Ok(())
@@ -504,8 +499,8 @@ mod tests {
 
         // Custom path: user's original file should be preserved
         assert!(custom.join("README.md").exists());
-        // But echo-created dirs should be cleaned up
-        assert!(!custom.join("sessions").exists());
+        // But EchoCoWork system data should be cleaned up
+        assert!(!WorkspaceLayout::state_dir(&custom).exists());
         assert!(!WorkspaceLayout::manifest(&custom).exists());
     }
 

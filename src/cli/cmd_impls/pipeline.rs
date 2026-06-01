@@ -169,11 +169,7 @@ async fn pipeline_writing(ctx: &CommandContext, args: &[&str]) -> CommandOutcome
     };
 
     match service
-        .submit(
-            kind,
-            &format!("Write: {}", topic),
-            Some("cli".to_string()),
-        )
+        .submit(kind, &format!("Write: {}", topic), Some("cli".to_string()))
         .await
     {
         Ok(task_id) => {
@@ -196,7 +192,9 @@ async fn pipeline_data(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     if dataset_path.is_empty() {
         println!("Usage: /pipeline data <dataset-path>");
         println!("  Example: /pipeline data data/sales_2024.csv");
-        println!("  This will run a full data analysis pipeline: load -> profile -> analyze -> visualize -> summarize");
+        println!(
+            "  This will run a full data analysis pipeline: load -> profile -> analyze -> visualize -> summarize"
+        );
         return CommandOutcome::Continue;
     }
 

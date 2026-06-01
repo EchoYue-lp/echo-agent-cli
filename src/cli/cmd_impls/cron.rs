@@ -123,7 +123,9 @@ async fn cmd_cron_create(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
     let runner = match ctx.scheduler {
         Some(ref r) => r,
         None => {
-            println!("  Scheduler not available. Start with web mode or ensure scheduler is initialized.");
+            println!(
+                "  Scheduler not available. Start with web mode or ensure scheduler is initialized."
+            );
             return CommandOutcome::Continue;
         }
     };
@@ -339,7 +341,12 @@ async fn set_task_status(
             let full_id = task.id.clone();
             let name = task.name.clone();
             match runner.set_status(&full_id, status).await {
-                Ok(true) => println!("  {} cron task '{}' [{}].", action_label, name, &full_id[..8]),
+                Ok(true) => println!(
+                    "  {} cron task '{}' [{}].",
+                    action_label,
+                    name,
+                    &full_id[..8]
+                ),
                 Ok(false) => println!("  Task not found (race condition?)."),
                 Err(e) => println!("  Failed to update task: {}", e),
             }

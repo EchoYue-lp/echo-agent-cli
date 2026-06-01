@@ -364,12 +364,26 @@ pub fn print_both_startup_info(addr: &str) {
     tracing::info!("💡 输入 /help 查看命令帮助");
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogTarget {
+    Stderr,
+    TuiFile,
+}
+
+pub fn init_logging_for_tui(level: &str) {
+    init_logging_with_target(level, LogTarget::TuiFile);
+}
+
+pub fn init_logging(level: &str) {
+    init_logging_with_target(level, LogTarget::Stderr);
+}
+
 /// 初始化日志系统（线程安全，仅执行一次）
 ///
 /// When the `telemetry` feature is enabled, this delegates to
 /// [`echo_agent::telemetry::init_telemetry`] which sets up OTLP tracing + metrics
 /// configured via `OTEL_EXPORTER_OTLP_ENDPOINT` (defaults to `http://localhost:4317`).
-pub fn init_logging(level: &str) {
+pub fn init_logging_with_target(level: &str, target: LogTarget) {
     use std::sync::OnceLock;
     static INIT: OnceLock<()> = OnceLock::new();
 
@@ -384,7 +398,7 @@ pub fn init_logging(level: &str) {
             let config = echo_agent::telemetry::TelemetryConfig {
                 otlp_endpoint,
                 service_name,
-                enable_console: true,
+                enable_console: target == LogTarget::Stderr,
             };
             // Use env filter matching the requested level
             // Note: We don't set RUST_LOG env var to avoid thread-safety issues
@@ -398,41 +412,61 @@ pub fn init_logging(level: &str) {
             use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
             let default_filter =
                 format!("echo_agent_cli={level},echo_agent={level},tower_http=info");
+            let env_filter = || {
+                tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                    tracing_subscriber::filter::EnvFilter::new(&default_filter)
+                })
+            };
 
-            // In TUI mode, write logs to a file instead of stderr to prevent
-            // log output from corrupting the terminal UI.
-            let tui_mode = std::env::var("ECHO_TUI_MODE").is_ok();
-
-            if tui_mode {
-                // TUI mode: log to file
-                if let Ok(file) = std::fs::File::create("/tmp/echo-agent-tui.log") {
+            match target {
+                LogTarget::TuiFile => {
+                    if let Ok(file) = std::fs::File::create(tui_log_path()) {
+                        let _ = tracing_subscriber::registry()
+                            .with(env_filter())
+                            .with(
+                                tracing_subscriber::fmt::layer()
+                                    .with_writer(std::sync::Mutex::new(file))
+                                    .with_ansi(false),
+                            )
+                            .try_init();
+                    }
+                }
+                LogTarget::Stderr => {
                     let _ = tracing_subscriber::registry()
-                        .with(
-                            tracing_subscriber::EnvFilter::try_from_default_env()
-                                .unwrap_or_else(|_| {
-                                    tracing_subscriber::filter::EnvFilter::new(&default_filter)
-                                }),
-                        )
-                        .with(
-                            tracing_subscriber::fmt::layer()
-                                .with_writer(std::sync::Mutex::new(file))
-                                .with_ansi(false),
-                        )
+                        .with(env_filter())
+                        .with(tracing_subscriber::fmt::layer())
                         .try_init();
                 }
-            } else {
-                // Normal mode: log to stderr as usual
-                let _ = tracing_subscriber::registry()
-                    .with(
-                        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                            tracing_subscriber::filter::EnvFilter::new(&default_filter)
-                        }),
-                    )
-                    .with(tracing_subscriber::fmt::layer())
-                    .try_init();
             }
         }
     });
+}
+
+fn tui_log_path() -> std::path::PathBuf {
+    if let Ok(cwd) = std::env::current_dir() {
+        let mut current = cwd.as_path();
+        loop {
+            let state_dir = crate::workspace::layout::WorkspaceLayout::state_dir(current);
+            if state_dir.exists()
+                || crate::workspace::layout::WorkspaceLayout::manifest(current).exists()
+                || crate::workspace::layout::WorkspaceLayout::legacy_manifest(current).exists()
+            {
+                let dir = state_dir.join("logs");
+                let _ = std::fs::create_dir_all(&dir);
+                return dir.join("tui.log");
+            }
+
+            match current.parent() {
+                Some(parent) => current = parent,
+                None => break,
+            }
+        }
+    }
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let dir = std::path::PathBuf::from(home).join(".echo-agent").join("logs");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join("tui.log")
 }
 
 // ── Doctor 诊断 ──────────────────────────────────────────────────

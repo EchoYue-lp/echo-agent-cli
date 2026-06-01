@@ -188,14 +188,14 @@ pub async fn run_repl(agent: AgentHandle, config: ReplConfig) -> anyhow::Result<
 /// Non-blocking: errors are silently ignored to avoid disrupting exit flow.
 async fn run_auto_memory_on_exit(agent: &AgentHandle) {
     use echo_agent_app_core::auto_memory::{
-        AutoMemoryConfig, extract_observations, format_observations_for_memory,
-        append_to_project_memory,
+        AutoMemoryConfig, append_to_project_memory, extract_observations,
+        format_observations_for_memory,
     };
 
     // Check if auto-memory is enabled (shared with /auto-memory command)
     // Use the global flag from the cmd_impls module
-    let enabled = crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED
-        .load(std::sync::atomic::Ordering::Relaxed);
+    let enabled =
+        crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
     if !enabled {
         return;
     }

@@ -35,7 +35,11 @@ async fn cmd_search_papers(ctx: &CommandContext, args: &[&str]) -> CommandOutcom
     };
 
     match service
-        .submit(kind, &format!("Research: {}", query), Some("cli".to_string()))
+        .submit(
+            kind,
+            &format!("Research: {}", query),
+            Some("cli".to_string()),
+        )
         .await
     {
         Ok(task_id) => {
@@ -130,11 +134,7 @@ async fn cmd_papers(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 let tasks = service.list(None);
                 let research_tasks: Vec<_> = tasks
                     .iter()
-                    .filter(|t| {
-                        t.tags
-                            .iter()
-                            .any(|tag| tag == "bg:kind:research")
-                    })
+                    .filter(|t| t.tags.iter().any(|tag| tag == "bg:kind:research"))
                     .collect();
 
                 if research_tasks.is_empty() {
@@ -188,7 +188,9 @@ async fn cmd_papers(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         }
         "workflow" => {
             println!("\n--- Paper Writing Workflow ---");
-            println!("  1. /search-papers <topic>    — Submit research task (search + synthesize + write)");
+            println!(
+                "  1. /search-papers <topic>    — Submit research task (search + synthesize + write)"
+            );
             println!("  2. /fetch-paper <url>        — Download and read a specific paper");
             println!("  3. /papers list              — Check research task status");
             println!("  4. /tasks status <id>        — View detailed task progress");

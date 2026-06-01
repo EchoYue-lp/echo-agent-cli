@@ -254,7 +254,10 @@ fn ws_migrate(sub: &str) {
             match migrator.execute(&plan, &registry) {
                 Ok(report) => {
                     println!("\n  Migration complete:");
-                    println!("    Workspaces created: {}", report.workspaces_created.len());
+                    println!(
+                        "    Workspaces created: {}",
+                        report.workspaces_created.len()
+                    );
                     println!("    Sessions migrated:  {}", report.sessions_migrated);
                     println!("    Conversations:      {}", report.conversations_migrated);
                     if !report.errors.is_empty() {

@@ -51,8 +51,12 @@ async fn setup_web_infrastructure(
         );
     }
 
-    let mut state_inner =
-        state::AppState::from_shared(agent.clone(), hitl_dispatcher.clone(), conversation_store, app_config.clone());
+    let mut state_inner = state::AppState::from_shared(
+        agent.clone(),
+        hitl_dispatcher.clone(),
+        conversation_store,
+        app_config.clone(),
+    );
     state_inner.start_task_service(task_store.clone()).await;
     state_inner.start_scheduler_with_store(Some(task_store));
     let state = Arc::new(state_inner);
@@ -100,7 +104,8 @@ pub async fn run_web_mode(
     app_config: &AppConfig,
     task_store: std::sync::Arc<dyn echo_agent::memory::Store>,
 ) -> Result<()> {
-    let infra = setup_web_infrastructure(&agent, hitl_dispatcher, args, app_config, task_store).await?;
+    let infra =
+        setup_web_infrastructure(&agent, hitl_dispatcher, args, app_config, task_store).await?;
     let listener = tokio::net::TcpListener::bind(&infra.addr).await?;
 
     crate::infra::print_web_startup_info(&infra.addr);
@@ -160,7 +165,14 @@ pub async fn run_both_modes(
     app_config: &AppConfig,
     task_store: std::sync::Arc<dyn echo_agent::memory::Store>,
 ) -> Result<()> {
-    let infra = setup_web_infrastructure(&agent, hitl_dispatcher.clone(), args, app_config, task_store).await?;
+    let infra = setup_web_infrastructure(
+        &agent,
+        hitl_dispatcher.clone(),
+        args,
+        app_config,
+        task_store,
+    )
+    .await?;
     let listener = tokio::net::TcpListener::bind(&infra.addr).await?;
 
     crate::infra::print_both_startup_info(&infra.addr);

@@ -29,8 +29,7 @@ fn validate_ipc_path(path: &str, must_exist: bool) -> Result<PathBuf, String> {
     let requested = PathBuf::from(path);
 
     // Determine the allowed base directory (user home)
-    let base = dirs_home_path()
-        .ok_or_else(|| "Cannot determine home directory".to_string())?;
+    let base = dirs_home_path().ok_or_else(|| "Cannot determine home directory".to_string())?;
 
     if must_exist {
         // For read operations: file must exist, canonicalize resolves symlinks and `..`

@@ -4,13 +4,19 @@ use super::{ChatMessage, MessageRole, TuiApp};
 use crate::agent_handle::AgentHandle;
 use crate::tui::commands::SlashCommand;
 use crate::tui::ui;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
-use ratatui::{backend::CrosstermBackend, Terminal};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
+use ratatui::{Terminal, backend::CrosstermBackend};
 use std::io;
 use std::time::Duration;
+use tokio::sync::mpsc;
 
 /// Poll interval for non-blocking event check.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+enum AgentEvent {
+    Response(String),
+    Error(String),
+}
 
 /// Run the main event loop.
 pub async fn run_event_loop(
@@ -18,14 +24,43 @@ pub async fn run_event_loop(
     app: &mut TuiApp,
     agent: AgentHandle,
 ) -> anyhow::Result<()> {
+    let (agent_tx, mut agent_rx) = mpsc::unbounded_channel();
+
     loop {
         // Draw UI.
         terminal.draw(|f| ui::draw(f, app))?;
 
+        while let Ok(event) = agent_rx.try_recv() {
+            match event {
+                AgentEvent::Response(response) => {
+                    app.append_stream(&response);
+                    app.finalize_stream();
+                }
+                AgentEvent::Error(e) => {
+                    app.messages.push(ChatMessage {
+                        role: MessageRole::System,
+                        content: format!("Error: {e}"),
+                        tool_calls: vec![],
+                    });
+                    app.is_processing = false;
+                    app.status_msg = "Error".to_string();
+                }
+            }
+        }
+
         // Handle events.
         if event::poll(POLL_INTERVAL)? {
             match event::read()? {
-                Event::Key(key) => handle_key(app, key, &agent).await,
+                Event::Key(key) => handle_key(app, key, &agent, agent_tx.clone()).await,
+                Event::Mouse(mouse) => match mouse.kind {
+                    MouseEventKind::ScrollUp => {
+                        app.chat_scroll = app.chat_scroll.saturating_add(10)
+                    }
+                    MouseEventKind::ScrollDown => {
+                        app.chat_scroll = app.chat_scroll.saturating_sub(10)
+                    }
+                    _ => {}
+                },
                 Event::Resize(_, _) => {} // ratatui handles resize automatically
                 _ => {}
             }
@@ -40,7 +75,12 @@ pub async fn run_event_loop(
 }
 
 /// Handle a keyboard event using context-aware dispatch.
-async fn handle_key(app: &mut TuiApp, key: KeyEvent, agent: &AgentHandle) {
+async fn handle_key(
+    app: &mut TuiApp,
+    key: KeyEvent,
+    agent: &AgentHandle,
+    agent_tx: mpsc::UnboundedSender<AgentEvent>,
+) {
     // ── Picker mode (session resume, model selection, etc.) ────────────────
     if app.picker.is_some() {
         handle_picker_key(app, &key);
@@ -78,8 +118,7 @@ async fn handle_key(app: &mut TuiApp, key: KeyEvent, agent: &AgentHandle) {
         const MAX_VISIBLE: usize = 8;
         match key.code {
             KeyCode::Tab | KeyCode::Down => {
-                app.selected_suggestion =
-                    (app.selected_suggestion + 1) % app.suggestions.len();
+                app.selected_suggestion = (app.selected_suggestion + 1) % app.suggestions.len();
                 // Scroll down if selection moved past visible window
                 if app.selected_suggestion >= app.suggestion_scroll + MAX_VISIBLE {
                     app.suggestion_scroll = app.selected_suggestion - MAX_VISIBLE + 1;
@@ -151,7 +190,11 @@ async fn handle_key(app: &mut TuiApp, key: KeyEvent, agent: &AgentHandle) {
                 app.input.insert(app.cursor, '\n');
                 app.cursor += 1;
             } else if let Some(text) = app.submit_input() {
-                send_to_agent(app, agent, text).await;
+                if text.starts_with('/') {
+                    handle_slash_command(app, agent, &text).await;
+                } else {
+                    send_to_agent(agent, text, agent_tx.clone()).await;
+                }
             }
         }
         KeyCode::Char(c) => {
@@ -212,16 +255,24 @@ async fn handle_key(app: &mut TuiApp, key: KeyEvent, agent: &AgentHandle) {
             app.cursor = app.input.len();
         }
         KeyCode::Up => {
-            app.history_up();
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                app.chat_scroll = app.chat_scroll.saturating_add(10);
+            } else {
+                app.history_up();
+            }
         }
         KeyCode::Down => {
-            app.history_down();
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                app.chat_scroll = app.chat_scroll.saturating_sub(10);
+            } else {
+                app.history_down();
+            }
         }
         KeyCode::PageUp => {
-            app.chat_scroll = app.chat_scroll.saturating_add(5);
+            app.chat_scroll = app.chat_scroll.saturating_add(30);
         }
         KeyCode::PageDown => {
-            app.chat_scroll = app.chat_scroll.saturating_sub(5);
+            app.chat_scroll = app.chat_scroll.saturating_sub(30);
         }
         KeyCode::Tab => {
             app.sidebar_tab = (app.sidebar_tab + 1) % 3;
@@ -259,42 +310,30 @@ fn handle_picker_key(app: &mut TuiApp, key: &KeyEvent) {
     }
 }
 
-/// Send a message to the agent and handle the streaming response.
-async fn send_to_agent(app: &mut TuiApp, agent: &AgentHandle, text: String) {
-    // Handle slash commands locally first.
-    if text.starts_with('/') {
-        handle_slash_command(app, agent, &text).await;
-        return;
-    }
-
+/// Send a message to the agent and handle the response without blocking the UI loop.
+async fn send_to_agent(
+    agent: &AgentHandle,
+    text: String,
+    agent_tx: mpsc::UnboundedSender<AgentEvent>,
+) {
     let agent_clone = agent.clone();
-    let text_clone = text.clone();
-
-    let result: Result<String, String> = agent_clone
-        .read_async(|a| {
-            let task = text_clone.clone();
-            Box::pin(async move {
-                use echo_agent::agent::Agent;
-                a.execute(&task).await.map_err(|e| e.to_string())
+    tokio::spawn(async move {
+        let text_clone = text.clone();
+        let result: Result<String, String> = agent_clone
+            .read_async(|a| {
+                let task = text_clone.clone();
+                Box::pin(async move {
+                    use echo_agent::agent::Agent;
+                    a.execute(&task).await.map_err(|e| e.to_string())
+                })
             })
-        })
-        .await;
+            .await;
 
-    match result {
-        Ok(response) => {
-            app.append_stream(&response);
-            app.finalize_stream();
-        }
-        Err(e) => {
-            app.messages.push(ChatMessage {
-                role: MessageRole::System,
-                content: format!("Error: {e}"),
-                tool_calls: vec![],
-            });
-            app.is_processing = false;
-            app.status_msg = "Error".to_string();
-        }
-    }
+        let _ = match result {
+            Ok(response) => agent_tx.send(AgentEvent::Response(response)),
+            Err(e) => agent_tx.send(AgentEvent::Error(e)),
+        };
+    });
 }
 
 /// Handle slash commands locally in the TUI.
@@ -312,11 +351,7 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &AgentHandle, cmd: &str) 
         Some(SlashCommand::Help) => {
             let mut help = String::from("Available commands:\n\n");
             for (cat, cmds) in SlashCommand::grouped() {
-                help.push_str(&format!(
-                    "  {} {}\n",
-                    cat.icon(),
-                    cat.label()
-                ));
+                help.push_str(&format!("  {} {}\n", cat.icon(), cat.label()));
                 for c in cmds {
                     let usage = c.usage();
                     help.push_str(&format!(
@@ -340,7 +375,9 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &AgentHandle, cmd: &str) 
             help.push_str("    Esc                Cancel generation\n");
             help.push_str("    Tab                Cycle sidebar tabs\n");
             help.push_str("    Up/Down            Navigate input history\n");
-            help.push_str("    PageUp/PageDown    Scroll chat\n");
+            help.push_str("    Shift+Up/Down      Scroll chat\n");
+            help.push_str("    PageUp/PageDown    Scroll chat faster\n");
+            help.push_str("    Mouse wheel        Scroll chat\n");
 
             app.messages.push(ChatMessage {
                 role: MessageRole::System,

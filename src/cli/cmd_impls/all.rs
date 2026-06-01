@@ -234,7 +234,10 @@ async fn cmd_auto_memory(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
                 println!("No observations would be extracted from this session.");
             } else {
                 let formatted = format_observations_for_memory(&observations);
-                println!("\n--- Auto-memory preview ({} observations) ---\n", observations.len());
+                println!(
+                    "\n--- Auto-memory preview ({} observations) ---\n",
+                    observations.len()
+                );
                 println!("{}", formatted);
             }
         }

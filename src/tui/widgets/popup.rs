@@ -1,11 +1,11 @@
 //! Popup widget — modal dialogs for diff preview and tool approval.
 
 use crate::tui::{ApprovalRequest, DiffPopup, Theme};
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
-use ratatui::Frame;
 
 /// Draw a centered diff popup.
 pub fn draw_diff_popup(f: &mut Frame, diff: &DiffPopup, area: Rect, theme: &Theme) {
@@ -32,9 +32,7 @@ pub fn draw_diff_popup(f: &mut Frame, diff: &DiffPopup, area: Rect, theme: &Them
             } else if line.starts_with("@@") {
                 Line::from(Span::styled(
                     line,
-                    Style::default()
-                        .fg(t.cyan)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(t.cyan).add_modifier(Modifier::BOLD),
                 ))
             } else {
                 Line::from(Span::styled(line, Style::default().fg(t.text)))
@@ -42,9 +40,7 @@ pub fn draw_diff_popup(f: &mut Frame, diff: &DiffPopup, area: Rect, theme: &Them
         })
         .collect();
 
-    let paragraph = Paragraph::new(lines)
-        .style(Style::default().bg(t.bg))
-        .wrap(Wrap { trim: false });
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     f.render_widget(paragraph, inner);
 }
 
@@ -79,27 +75,24 @@ pub fn draw_approval_popup(f: &mut Frame, approval: &ApprovalRequest, area: Rect
             Span::styled(&approval.args, Style::default().fg(t.text)),
         ]),
         Line::from(""),
-        Line::from(Span::styled(approval.prompt.clone(), Style::default().fg(t.text))),
+        Line::from(Span::styled(
+            approval.prompt.clone(),
+            Style::default().fg(t.text),
+        )),
         Line::from(""),
         Line::from(vec![
             Span::styled(
                 " [y] Approve  ",
-                Style::default()
-                    .fg(t.green)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(t.green).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 " [n] Deny  ",
-                Style::default()
-                    .fg(t.red)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(t.red).add_modifier(Modifier::BOLD),
             ),
         ]),
     ];
 
-    let paragraph = Paragraph::new(text)
-        .style(Style::default().bg(t.bg))
-        .wrap(Wrap { trim: false });
+    let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
     f.render_widget(paragraph, inner);
 }
 

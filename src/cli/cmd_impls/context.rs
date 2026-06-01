@@ -11,7 +11,8 @@ async fn cmd_mode(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     if let Some(mode) = args.first() {
         match crate::project::modes::from_str(mode) {
             Some(agent_mode) => {
-                let overlay = crate::project::modes::chinese_mode_engine().system_prompt(&agent_mode);
+                let overlay =
+                    crate::project::modes::chinese_mode_engine().system_prompt(&agent_mode);
 
                 // Use prompt stacking: preserve base, swap domain overlay
                 ctx.agent
@@ -41,7 +42,11 @@ async fn cmd_mode(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                     })
                     .await;
 
-                println!("Mode: {} {}", crate::project::modes::icon(&agent_mode), crate::project::modes::display_name(&agent_mode));
+                println!(
+                    "Mode: {} {}",
+                    crate::project::modes::icon(&agent_mode),
+                    crate::project::modes::display_name(&agent_mode)
+                );
                 println!("System prompt updated (overlay applied).");
             }
             None => {

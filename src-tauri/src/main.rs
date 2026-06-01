@@ -72,7 +72,11 @@ async fn main() -> anyhow::Result<()> {
     // ── Config watcher ──
     let cancel_token = tokio_util::sync::CancellationToken::new();
     if let Some(config_path) = config_watcher::resolve_config_path(args.config.as_deref()) {
-        config_watcher::spawn_config_watcher(config_path, agent_handle.clone(), cancel_token.clone());
+        config_watcher::spawn_config_watcher(
+            config_path,
+            agent_handle.clone(),
+            cancel_token.clone(),
+        );
     }
 
     // ── Task store ──
@@ -88,8 +92,12 @@ async fn main() -> anyhow::Result<()> {
     let conversation_store = infra::create_conversation_store();
     infra::inject_conversation_store(&agent_handle, &conversation_store);
 
-    let mut state_inner =
-        AppState::from_shared(agent_handle.clone(), hitl_dispatcher, conversation_store, app_config.clone());
+    let mut state_inner = AppState::from_shared(
+        agent_handle.clone(),
+        hitl_dispatcher,
+        conversation_store,
+        app_config.clone(),
+    );
     state_inner.start_task_service(task_store.clone()).await;
     state_inner.start_scheduler_with_store(Some(task_store));
     let state = Arc::new(state_inner);

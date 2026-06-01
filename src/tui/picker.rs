@@ -2,11 +2,13 @@
 //!
 //! Used for session resume, model selection, mode selection, etc.
 
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Scrollbar, ScrollbarOrientation, ScrollbarState};
-use ratatui::Frame;
+use ratatui::widgets::{
+    Block, Borders, Clear, List, ListItem, Scrollbar, ScrollbarOrientation, ScrollbarState,
+};
 
 /// A single item in the picker list.
 #[derive(Debug, Clone)]
@@ -137,21 +139,17 @@ impl Picker {
                 let is_selected = i == self.selected;
                 let label_style = if is_selected {
                     Style::default()
-                        .fg(Color::Black)
-                        .bg(Color::Cyan)
+                        .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::White)
                 };
 
-                let mut spans = vec![Span::styled(
-                    format!("  {}  ", item.label),
-                    label_style,
-                )];
+                let mut spans = vec![Span::styled(format!("  {}  ", item.label), label_style)];
 
                 if let Some(ref detail) = item.detail {
                     let detail_style = if is_selected {
-                        Style::default().fg(Color::Black).bg(Color::Cyan)
+                        Style::default().fg(Color::Cyan)
                     } else {
                         Style::default().fg(Color::DarkGray)
                     };
@@ -167,8 +165,7 @@ impl Picker {
 
         // Scrollbar if needed.
         if self.items.len() > visible_height {
-            let mut state = ScrollbarState::new(self.items.len())
-                .position(self.selected);
+            let mut state = ScrollbarState::new(self.items.len()).position(self.selected);
             let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .style(Style::default().fg(Color::DarkGray));
             f.render_stateful_widget(

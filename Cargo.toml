@@ -3,7 +3,6 @@ resolver = "3"
 members = [
     "echo-agent-app-core",
     "echo-agent-server",
-    "echo-agent-grpc",
 ]
 
 [package]

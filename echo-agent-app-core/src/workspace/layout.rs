@@ -29,19 +29,24 @@ impl WorkspaceLayout {
 
     // ── 子目录 ──
 
-    /// 会话历史目录：`{root}/sessions/`
+    /// 工作区系统数据目录：`{root}/.echocowork/`
+    pub fn state_dir(root: &Path) -> PathBuf {
+        root.join(".echocowork")
+    }
+
+    /// 会话历史目录：`{root}/.echocowork/sessions/`
     pub fn sessions(root: &Path) -> PathBuf {
-        root.join("sessions")
+        Self::state_dir(root).join("sessions")
     }
 
-    /// 对话记录目录（前端持久化）：`{root}/conversations/`
+    /// 对话记录目录（前端持久化）：`{root}/.echocowork/conversations/`
     pub fn conversations(root: &Path) -> PathBuf {
-        root.join("conversations")
+        Self::state_dir(root).join("conversations")
     }
 
-    /// 记忆存储目录：`{root}/memory/`
+    /// 记忆存储目录：`{root}/.echocowork/memory/`
     pub fn memory(root: &Path) -> PathBuf {
-        root.join("memory")
+        Self::state_dir(root).join("memory")
     }
 
     /// 数据集目录（数据分析工作区）：`{root}/data/`
@@ -59,21 +64,41 @@ impl WorkspaceLayout {
         root.join("artifacts")
     }
 
-    /// 任务状态目录（SQLite DB）：`{root}/tasks/`
+    /// 任务状态目录（SQLite DB）：`{root}/.echocowork/tasks/`
     pub fn tasks(root: &Path) -> PathBuf {
-        root.join("tasks")
+        Self::state_dir(root).join("tasks")
     }
 
-    /// 执行轨迹目录（JSONL）：`{root}/traces/`
+    /// 执行轨迹目录（JSONL）：`{root}/.echocowork/traces/`
     pub fn traces(root: &Path) -> PathBuf {
-        root.join("traces")
+        Self::state_dir(root).join("traces")
+    }
+
+    /// 日志目录：`{root}/.echocowork/logs/`
+    pub fn logs(root: &Path) -> PathBuf {
+        Self::state_dir(root).join("logs")
     }
 
     // ── 特殊文件 ──
 
-    /// 工作区清单文件：`{root}/.workspace.json`
+    /// 工作区清单文件：`{root}/.echocowork/workspace.json`
     pub fn manifest(root: &Path) -> PathBuf {
+        Self::state_dir(root).join("workspace.json")
+    }
+
+    /// 旧版工作区清单文件：`{root}/.workspace.json`
+    pub fn legacy_manifest(root: &Path) -> PathBuf {
         root.join(".workspace.json")
+    }
+
+    /// 返回当前存在的清单路径，优先使用新版路径。
+    pub fn existing_manifest(root: &Path) -> PathBuf {
+        let manifest = Self::manifest(root);
+        if manifest.exists() {
+            manifest
+        } else {
+            Self::legacy_manifest(root)
+        }
     }
 
     /// 共享草稿文件：`{root}/scratchpad.md`
@@ -81,14 +106,14 @@ impl WorkspaceLayout {
         root.join("scratchpad.md")
     }
 
-    /// 决策日志文件：`{root}/decisions.jsonl`
+    /// 决策日志文件：`{root}/.echocowork/decisions.jsonl`
     pub fn decisions(root: &Path) -> PathBuf {
-        root.join("decisions.jsonl")
+        Self::state_dir(root).join("decisions.jsonl")
     }
 
-    /// 上传文件临时目录：`{root}/uploads/`
+    /// 上传文件临时目录：`{root}/.echocowork/uploads/`
     pub fn uploads(root: &Path) -> PathBuf {
-        root.join("uploads")
+        Self::state_dir(root).join("uploads")
     }
 
     // ── 目录操作 ──
@@ -105,6 +130,7 @@ impl WorkspaceLayout {
             Self::tasks(root),
             Self::traces(root),
             Self::uploads(root),
+            Self::logs(root),
         ];
 
         for dir in &dirs {
@@ -122,7 +148,7 @@ impl WorkspaceLayout {
 
     /// 检查工作区目录是否有效（存在且包含清单文件）。
     pub fn is_valid_workspace(root: &Path) -> bool {
-        root.exists() && Self::manifest(root).exists()
+        root.exists() && (Self::manifest(root).exists() || Self::legacy_manifest(root).exists())
     }
 }
 
@@ -143,7 +169,7 @@ mod tests {
 
         assert_eq!(
             WorkspaceLayout::sessions(root),
-            PathBuf::from("/tmp/test-workspace/sessions")
+            PathBuf::from("/tmp/test-workspace/.echocowork/sessions")
         );
         assert_eq!(
             WorkspaceLayout::papers(root),
@@ -151,7 +177,7 @@ mod tests {
         );
         assert_eq!(
             WorkspaceLayout::manifest(root),
-            PathBuf::from("/tmp/test-workspace/.workspace.json")
+            PathBuf::from("/tmp/test-workspace/.echocowork/workspace.json")
         );
     }
 
@@ -162,6 +188,7 @@ mod tests {
 
         WorkspaceLayout::ensure_dirs(root).unwrap();
 
+        assert!(WorkspaceLayout::state_dir(root).exists());
         assert!(WorkspaceLayout::sessions(root).exists());
         assert!(WorkspaceLayout::conversations(root).exists());
         assert!(WorkspaceLayout::memory(root).exists());
@@ -170,6 +197,8 @@ mod tests {
         assert!(WorkspaceLayout::artifacts(root).exists());
         assert!(WorkspaceLayout::tasks(root).exists());
         assert!(WorkspaceLayout::traces(root).exists());
+        assert!(WorkspaceLayout::uploads(root).exists());
+        assert!(WorkspaceLayout::logs(root).exists());
         assert!(WorkspaceLayout::scratchpad(root).exists());
     }
 }

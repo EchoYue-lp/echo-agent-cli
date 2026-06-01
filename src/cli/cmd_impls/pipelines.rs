@@ -13,7 +13,9 @@ async fn cmd_analyze(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     if dataset_path.is_empty() {
         println!("Usage: /analyze <dataset-path>");
         println!("  Example: /analyze data/sales_2024.csv");
-        println!("  This will run a full data analysis pipeline: load -> profile -> analyze -> visualize -> summarize");
+        println!(
+            "  This will run a full data analysis pipeline: load -> profile -> analyze -> visualize -> summarize"
+        );
         return CommandOutcome::Continue;
     }
 
@@ -34,7 +36,11 @@ async fn cmd_analyze(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     };
 
     match service
-        .submit(kind, &format!("Data analysis: {}", dataset_path), Some("cli".to_string()))
+        .submit(
+            kind,
+            &format!("Data analysis: {}", dataset_path),
+            Some("cli".to_string()),
+        )
         .await
     {
         Ok(task_id) => {
@@ -65,7 +71,9 @@ async fn cmd_write(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     if topic.is_empty() {
         println!("Usage: /write <topic>");
         println!("  Example: /write introduction to machine learning");
-        println!("  This will run a writing pipeline: outline -> draft -> review-revise loop -> finalize");
+        println!(
+            "  This will run a writing pipeline: outline -> draft -> review-revise loop -> finalize"
+        );
         return CommandOutcome::Continue;
     }
 

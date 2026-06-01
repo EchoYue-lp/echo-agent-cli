@@ -26,21 +26,18 @@ pub fn build_tauri_app() -> tauri::Builder<tauri::Wry> {
 
             let handle = app.handle().clone();
             app.global_shortcut()
-                .on_shortcut(
-                    "CmdOrCtrl+Shift+E",
-                    move |_app, _window, shortcut| {
-                        if shortcut.state == tauri_plugin_global_shortcut::ShortcutState::Pressed {
-                            if let Some(window) = handle.get_webview_window("main") {
-                                if window.is_visible().unwrap_or(false) {
-                                    let _ = window.hide();
-                                } else {
-                                    let _ = window.show();
-                                    let _ = window.set_focus();
-                                }
+                .on_shortcut("CmdOrCtrl+Shift+E", move |_app, _window, shortcut| {
+                    if shortcut.state == tauri_plugin_global_shortcut::ShortcutState::Pressed {
+                        if let Some(window) = handle.get_webview_window("main") {
+                            if window.is_visible().unwrap_or(false) {
+                                let _ = window.hide();
+                            } else {
+                                let _ = window.show();
+                                let _ = window.set_focus();
                             }
                         }
-                    },
-                )
+                    }
+                })
                 .ok();
 
             Ok(())

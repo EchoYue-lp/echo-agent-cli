@@ -47,7 +47,10 @@ pub async fn build_router(state: Arc<AppState>) -> Router {
         // ── 会话 API ─────────────────────────────────────────────
         .route("/api/session", get(routes::session::get_session))
         .route("/api/session/reset", post(routes::session::reset_session))
-        .route("/api/session/latest", get(routes::session::get_latest_session))
+        .route(
+            "/api/session/latest",
+            get(routes::session::get_latest_session),
+        )
         // ── 工具 API ─────────────────────────────────────────────
         .route("/api/tools/:name/enable", post(routes::tools::enable_tool))
         .route(
@@ -256,10 +259,7 @@ pub async fn build_router(state: Arc<AppState>) -> Router {
             post(routes::plugins::disable_plugin),
         )
         .route("/api/plugins/:name", get(routes::plugins::get_plugin))
-        .route(
-            "/api/plugins/reload",
-            post(routes::plugins::reload_plugins),
-        )
+        .route("/api/plugins/reload", post(routes::plugins::reload_plugins))
         // ── 文件系统 API ─────────────────────────────────────────────
         .route("/api/files/list", get(routes::files::list_files))
         .route("/api/files/read", get(routes::files::read_file))
@@ -267,8 +267,14 @@ pub async fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/files/tree", get(routes::files::file_tree))
         .route("/api/files/browse", get(routes::files::browse_directories))
         // ── Trace 观测 API ─────────────────────────────────────────────
-        .route("/api/trace/sessions", get(routes::trace::list_trace_sessions))
-        .route("/api/trace/session/:id", get(routes::trace::get_trace_session))
+        .route(
+            "/api/trace/sessions",
+            get(routes::trace::list_trace_sessions),
+        )
+        .route(
+            "/api/trace/session/:id",
+            get(routes::trace::get_trace_session),
+        )
         .route("/api/trace/stats", get(routes::trace::get_trace_stats))
         // ── Trace Events API ─────────────────────────────────────────
         .merge(routes::trace_events::trace_event_routes())

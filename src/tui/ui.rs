@@ -2,27 +2,27 @@
 //!
 //! Delegates to individual widgets for each panel.
 
+use super::TuiApp;
+use super::widgets::Widget;
 use super::widgets::chat::Chat;
 use super::widgets::input::Input;
 use super::widgets::popup::{draw_approval_popup, draw_diff_popup};
 use super::widgets::sidebar::Sidebar;
 use super::widgets::status_bar::StatusBar;
-use super::widgets::Widget;
-use super::TuiApp;
-use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::Frame;
+use ratatui::layout::{Constraint, Direction, Layout};
 
 /// Main draw function — renders the complete TUI layout.
 pub fn draw(f: &mut Frame, app: &TuiApp) {
     let size = f.area();
 
-    // Main layout: status bar + body + input.
+    // Main layout: compact status + chat + compact input.
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),   // Status bar
-            Constraint::Min(10),     // Body (sidebar + chat)
-            Constraint::Length(3),   // Input box
+            Constraint::Length(1),
+            Constraint::Min(8),
+            Constraint::Length(2),
         ])
         .split(size);
 
@@ -34,8 +34,8 @@ pub fn draw(f: &mut Frame, app: &TuiApp) {
         let body_chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Length(28),  // Sidebar
-                Constraint::Min(30),     // Chat area
+                Constraint::Length(24), // Sidebar
+                Constraint::Min(40),    // Chat area
             ])
             .split(main_chunks[1]);
 
@@ -59,8 +59,7 @@ pub fn draw(f: &mut Frame, app: &TuiApp) {
     // ── Picker (drawn on top of everything) ────────────────────────────
     if let Some(ref picker) = app.picker {
         if picker.visible {
-            let picker_area =
-                super::widgets::popup::centered_rect(50, 60, size);
+            let picker_area = super::widgets::popup::centered_rect(50, 60, size);
             picker.render(f, picker_area);
         }
     }

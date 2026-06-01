@@ -392,7 +392,6 @@ cmd!(
     cmd_doctor
 );
 
-
 // ── DelegateCommand ───────────────────────────────────────────────────
 
 async fn cmd_delegate(_ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
@@ -556,24 +555,47 @@ async fn cmd_trace(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                             let tools = analyzer.tool_usage_stats(50).await.unwrap_or_default();
                             println!("\n--- Tool Usage Stats ---");
                             for t in &tools {
-                                println!("  {:<20} calls={} success={} avg={}ms total={}ms ({:.1}%)", t.name, t.call_count, t.success_count, t.avg_duration_ms, t.total_duration_ms, t.pct_of_total_time);
+                                println!(
+                                    "  {:<20} calls={} success={} avg={}ms total={}ms ({:.1}%)",
+                                    t.name,
+                                    t.call_count,
+                                    t.success_count,
+                                    t.avg_duration_ms,
+                                    t.total_duration_ms,
+                                    t.pct_of_total_time
+                                );
                             }
 
-                            let tokens = analyzer.token_usage_breakdown(50).await.unwrap_or_else(|_| echo_agent::trace::TokenBreakdown {
-                                prompt_tokens: 0,
-                                completion_tokens: 0,
-                                total_tokens: 0,
-                                per_run: std::collections::HashMap::new(),
-                                per_llm_call: std::collections::HashMap::new(),
-                            });
+                            let tokens =
+                                analyzer
+                                    .token_usage_breakdown(50)
+                                    .await
+                                    .unwrap_or_else(|_| echo_agent::trace::TokenBreakdown {
+                                        prompt_tokens: 0,
+                                        completion_tokens: 0,
+                                        total_tokens: 0,
+                                        per_run: std::collections::HashMap::new(),
+                                        per_llm_call: std::collections::HashMap::new(),
+                                    });
                             println!("\n--- Token Breakdown ---");
-                            println!("  Total: prompt={}, completion={}, total={}", tokens.prompt_tokens, tokens.completion_tokens, tokens.total_tokens);
+                            println!(
+                                "  Total: prompt={}, completion={}, total={}",
+                                tokens.prompt_tokens, tokens.completion_tokens, tokens.total_tokens
+                            );
 
-                            let errors = analyzer.error_pattern_analysis(50).await.unwrap_or_default();
+                            let errors = analyzer
+                                .error_pattern_analysis(50)
+                                .await
+                                .unwrap_or_default();
                             if !errors.is_empty() {
                                 println!("\n--- Error Patterns ---");
                                 for e in &errors {
-                                    println!("  [{}x] {} (tools: {})", e.occurrence_count, e.pattern, e.associated_tools.join(", "));
+                                    println!(
+                                        "  [{}x] {} (tools: {})",
+                                        e.occurrence_count,
+                                        e.pattern,
+                                        e.associated_tools.join(", ")
+                                    );
                                 }
                             }
                         } else {
