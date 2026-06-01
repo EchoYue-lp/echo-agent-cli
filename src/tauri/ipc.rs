@@ -156,3 +156,27 @@ fn dirs_home() -> String {
         .or_else(|_| std::env::var("USERPROFILE"))
         .unwrap_or_else(|_| "~".to_string())
 }
+
+/// Open a path in the system file explorer / default application.
+#[tauri::command]
+pub fn native_open_path(path: String) -> Result<(), String> {
+    let path_buf = PathBuf::from(&path);
+    if !path_buf.exists() {
+        return Err(format!("Path does not exist: {}", path));
+    }
+
+    // Use platform-specific command to open the path
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("open").arg(&path).spawn();
+
+    #[cfg(target_os = "linux")]
+    let result = std::process::Command::new("xdg-open").arg(&path).spawn();
+
+    #[cfg(target_os = "windows")]
+    let result = std::process::Command::new("explorer").arg(&path).spawn();
+
+    match result {
+        Ok(_) => Ok(()),
+        Err(e) => Err(format!("Failed to open path '{}': {}", path, e)),
+    }
+}

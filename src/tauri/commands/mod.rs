@@ -1,0 +1,22 @@
+//! Tauri IPC command modules.
+//!
+//! Each module provides `#[tauri::command]` functions that:
+//! - Deserialize parameters
+//! - Call into `echo-agent-app-core` via `AppState`
+//! - Convert errors to `IpcError`
+//! - Return DTOs
+
+pub mod chat;
+pub mod config;
+pub mod conversations;
+pub mod files;
+pub mod mcp;
+pub mod memory;
+pub mod panels;
+pub mod plugins;
+pub mod providers;
+pub mod scheduler;
+pub mod session;
+pub mod tasks;
+pub mod tools;
+pub mod workspace;

@@ -1,7 +1,7 @@
 //! Echo Agent — Tauri desktop entry point.
 //!
-//! The Tauri window is a thin shell around the Axum web server.
-//! The frontend (React) talks to the server via HTTP, not IPC.
+//! The frontend (React) communicates via Tauri IPC commands,
+//! not HTTP. No Axum server is started.
 
 use clap::Parser;
 use echo_agent_cli::{
@@ -88,7 +88,7 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    // ── Start Axum HTTP server (background) ──
+    // ── Build application state ──
     let conversation_store = infra::create_conversation_store();
     infra::inject_conversation_store(&agent_handle, &conversation_store);
 
@@ -104,30 +104,8 @@ async fn main() -> anyhow::Result<()> {
 
     infra::spawn_mcp_health_check(state.clone(), cancel_token.clone());
 
-    if let Err(e) = echo_agent_cli::metrics::init_metrics() {
-        tracing::warn!("Failed to initialize metrics: {}", e);
-    }
-
-    echo_agent_cli::ws::handler::cleanup_stale_uploads().await;
-
-    let app = cli::build_router(state.clone()).await;
-    // Tauri desktop mode always binds to localhost for security
-    let port = app_config.server.port;
-    let addr = format!("127.0.0.1:{}", port);
-
-    infra::print_web_startup_info(&addr);
-
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    let web_cancel = cancel_token.clone();
-    tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async move { web_cancel.cancelled().await })
-            .await
-            .expect("Axum server error");
-    });
-
     // ── Launch Tauri window ──
-    echo_agent_cli::tauri::build_tauri_app()
+    echo_agent_cli::tauri::build_tauri_app(state.clone())
         .run(tauri::generate_context!())
         .expect("error while running Tauri application");
 
