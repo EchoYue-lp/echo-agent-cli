@@ -3,7 +3,7 @@
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
 use echo_agent::memory::{NewConversation, StoredMessage};
-use echo_agent_app_core::persistence::{SavedMessage, SavedToolCall};
+use echo_agent_app_core::persistence::SavedMessage;
 
 #[tauri::command]
 pub async fn list_conversations(
@@ -288,32 +288,31 @@ pub async fn restore_conversation(
                     tc_idx = 0;
                 }
                 "assistant" => {
-                    if let Some(ref tc_json) = sm.tool_calls_json {
-                        if let Ok(tcs) = serde_json::from_str::<
+                    if let Some(ref tc_json) = sm.tool_calls_json
+                        && let Ok(tcs) = serde_json::from_str::<
                             Vec<echo_agent_app_core::persistence::SavedToolCall>,
                         >(tc_json)
-                        {
-                            use echo_agent::llm::types::{FunctionCall, ToolCall};
-                            let calls: Vec<ToolCall> = tcs
-                                .iter()
-                                .map(|tc| ToolCall {
-                                    id: tc.id.clone(),
-                                    call_type: "function".to_string(),
-                                    function: FunctionCall {
-                                        name: tc.name.clone(),
-                                        arguments: tc.arguments.clone(),
-                                    },
-                                })
-                                .collect();
-                            pending_tc_ids = calls.iter().map(|c| c.id.clone()).collect();
-                            tc_idx = 0;
-                            let mut msg = Message::assistant_with_tools(calls);
-                            if !text.is_empty() {
-                                msg.content = MessageContent::Text(text);
-                            }
-                            messages.push(msg);
-                            continue;
+                    {
+                        use echo_agent::llm::types::{FunctionCall, ToolCall};
+                        let calls: Vec<ToolCall> = tcs
+                            .iter()
+                            .map(|tc| ToolCall {
+                                id: tc.id.clone(),
+                                call_type: "function".to_string(),
+                                function: FunctionCall {
+                                    name: tc.name.clone(),
+                                    arguments: tc.arguments.clone(),
+                                },
+                            })
+                            .collect();
+                        pending_tc_ids = calls.iter().map(|c| c.id.clone()).collect();
+                        tc_idx = 0;
+                        let mut msg = Message::assistant_with_tools(calls);
+                        if !text.is_empty() {
+                            msg.content = MessageContent::Text(text);
                         }
+                        messages.push(msg);
+                        continue;
                     }
                     messages.push(Message::assistant(text));
                     pending_tc_ids.clear();

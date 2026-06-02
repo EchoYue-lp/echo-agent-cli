@@ -1,13 +1,46 @@
 import { useEffect, useState } from 'react';
-import { Code, BarChart3, GraduationCap, FlaskConical, Sparkles, Play, Clock, Loader2 } from 'lucide-react';
+import {
+  Code,
+  BarChart3,
+  GraduationCap,
+  FlaskConical,
+  Sparkles,
+  Play,
+  Clock,
+  Loader2,
+} from 'lucide-react';
 import { sessionApi } from '../../api/endpoints';
 import { useConversationStore } from '../../stores/conversationStore';
 
 const suggestions = [
-  { icon: Code, text: '从零开发一个全栈项目：需求分析、技术选型、代码实现到部署文档', color: 'var(--accent)', colorHex: '#6366f1', bg: 'var(--accent-bg)' },
-  { icon: BarChart3, text: '深度分析用户行为数据，构建画像并生成可落地的业务策略报告', color: 'var(--color-warning)', colorHex: '#f59e0b', bg: 'var(--color-warning-bg)' },
-  { icon: GraduationCap, text: '系统检索某研究领域的核心文献，生成结构化的文献综述初稿', color: 'var(--color-success)', colorHex: '#10b981', bg: 'var(--color-success-bg)' },
-  { icon: FlaskConical, text: '启动多步骤数据处理任务：清洗、特征构建、模型训练与结果可视化', color: 'var(--color-info)', colorHex: '#3b82f6', bg: 'var(--color-info-bg)' },
+  {
+    icon: Code,
+    text: '从零开发一个全栈项目：需求分析、技术选型、代码实现到部署文档',
+    color: 'var(--accent)',
+    colorHex: '#6366f1',
+    bg: 'var(--accent-bg)',
+  },
+  {
+    icon: BarChart3,
+    text: '深度分析用户行为数据，构建画像并生成可落地的业务策略报告',
+    color: 'var(--color-warning)',
+    colorHex: '#f59e0b',
+    bg: 'var(--color-warning-bg)',
+  },
+  {
+    icon: GraduationCap,
+    text: '系统检索某研究领域的核心文献，生成结构化的文献综述初稿',
+    color: 'var(--color-success)',
+    colorHex: '#10b981',
+    bg: 'var(--color-success-bg)',
+  },
+  {
+    icon: FlaskConical,
+    text: '启动多步骤数据处理任务：清洗、特征构建、模型训练与结果可视化',
+    color: 'var(--color-info)',
+    colorHex: '#3b82f6',
+    bg: 'var(--color-info-bg)',
+  },
 ];
 
 interface LatestSession {
@@ -17,7 +50,11 @@ interface LatestSession {
   message_count: number;
 }
 
-export function WelcomeScreen({ onSuggestionClick }: { onSuggestionClick: (text: string) => void }) {
+export function WelcomeScreen({
+  onSuggestionClick,
+}: {
+  onSuggestionClick: (text: string) => void;
+}) {
   const loadConversation = useConversationStore((s) => s.loadConversation);
 
   const [latestSession, setLatestSession] = useState<LatestSession | null>(null);
@@ -46,7 +83,9 @@ export function WelcomeScreen({ onSuggestionClick }: { onSuggestionClick: (text:
     };
 
     checkLatest();
-    return () => { cancelled = true; };
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const handleResume = async () => {
@@ -88,10 +127,16 @@ export function WelcomeScreen({ onSuggestionClick }: { onSuggestionClick: (text:
         >
           <Sparkles size={36} color="white" />
         </div>
-        <h1 className="animate-slide-up text-2xl font-semibold tracking-tight text-[var(--text-primary)]" style={{ animationDelay: '0.05s' }}>
+        <h1
+          className="animate-slide-up text-2xl font-semibold tracking-tight text-[var(--text-primary)]"
+          style={{ animationDelay: '0.05s' }}
+        >
           今天有什么可以帮你的？
         </h1>
-        <p className="animate-slide-up mt-2 text-sm text-[var(--text-secondary)]" style={{ animationDelay: '0.1s' }}>
+        <p
+          className="animate-slide-up mt-2 text-sm text-[var(--text-secondary)]"
+          style={{ animationDelay: '0.1s' }}
+        >
           我是 EchoCoWork，你的智能协作助手
         </p>
       </div>
@@ -170,9 +215,7 @@ export function WelcomeScreen({ onSuggestionClick }: { onSuggestionClick: (text:
               <s.icon size={18} style={{ color: s.color }} />
             </div>
             <div className="min-w-0 flex items-center">
-              <span className="text-[13px] leading-snug text-[var(--text-primary)]">
-                {s.text}
-              </span>
+              <span className="text-[13px] leading-snug text-[var(--text-primary)]">{s.text}</span>
             </div>
           </button>
         ))}

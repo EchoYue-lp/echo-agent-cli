@@ -16,9 +16,9 @@ interface Dimension {
 }
 
 const DEFAULT_DIMENSIONS: Dimension[] = [
-  { id: 'method',     label: 'Method' },
-  { id: 'dataset',    label: 'Dataset' },
-  { id: 'finding',    label: 'Key Finding' },
+  { id: 'method', label: 'Method' },
+  { id: 'dataset', label: 'Dataset' },
+  { id: 'finding', label: 'Key Finding' },
   { id: 'limitation', label: 'Limitation' },
   { id: 'contribution', label: 'Contribution' },
 ];
@@ -71,11 +71,11 @@ export function ReviewMatrix() {
 
   const getCell = useCallback(
     (paperId: string, dimId: string): string => matrix[paperId]?.[dimId] ?? '',
-    [matrix],
+    [matrix]
   );
 
   const setCell = (paperId: string, dimId: string, value: string) => {
-    setMatrix(prev => ({
+    setMatrix((prev) => ({
       ...prev,
       [paperId]: { ...(prev[paperId] ?? {}), [dimId]: value },
     }));
@@ -85,15 +85,15 @@ export function ReviewMatrix() {
   const addDimension = () => {
     if (!newDimLabel.trim()) return;
     const id = newDimLabel.trim().toLowerCase().replace(/\s+/g, '_');
-    if (dimensions.some(d => d.id === id)) return;
-    setDimensions(prev => [...prev, { id, label: newDimLabel.trim() }]);
+    if (dimensions.some((d) => d.id === id)) return;
+    setDimensions((prev) => [...prev, { id, label: newDimLabel.trim() }]);
     setNewDimLabel('');
     setShowAddDim(false);
   };
 
   const removeDimension = (dimId: string) => {
-    setDimensions(prev => prev.filter(d => d.id !== dimId));
-    setMatrix(prev => {
+    setDimensions((prev) => prev.filter((d) => d.id !== dimId));
+    setMatrix((prev) => {
       const next = { ...prev };
       for (const pid of Object.keys(next)) {
         if (next[pid][dimId] !== undefined) {
@@ -107,19 +107,23 @@ export function ReviewMatrix() {
 
   // Agent extract — removed: paper analysis should be done through Agent conversation
   const agentExtract = async (paperId: string) => {
-    const paper = papers.find(p => p.id === paperId);
+    const paper = papers.find((p) => p.id === paperId);
     if (!paper) return;
 
     // Paper analysis is now handled by the Agent through conversation
     // Users should ask the Agent to analyze papers using tools like arxiv_search
-    alert('💡 论文分析请通过 Agent 对话使用研究工具。\n\n例如：\n- "分析这篇论文的方法和数据集"\n- "提取这篇论文的关键发现"\n- "总结这篇论文的贡献和局限性"');
+    alert(
+      '💡 论文分析请通过 Agent 对话使用研究工具。\n\n例如：\n- "分析这篇论文的方法和数据集"\n- "提取这篇论文的关键发现"\n- "总结这篇论文的贡献和局限性"'
+    );
   };
 
   // Export to CSV
   const exportCsv = () => {
-    const header = ['Dimension', ...papers.map(p => `"${p.title.replace(/"/g, '""')}"`)].join(',');
-    const rows = dimensions.map(d => {
-      const cells = papers.map(p => `"${getCell(p.id, d.id).replace(/"/g, '""')}"`);
+    const header = ['Dimension', ...papers.map((p) => `"${p.title.replace(/"/g, '""')}"`)].join(
+      ','
+    );
+    const rows = dimensions.map((d) => {
+      const cells = papers.map((p) => `"${getCell(p.id, d.id).replace(/"/g, '""')}"`);
       return [`"${d.label}"`, ...cells].join(',');
     });
     const csv = [header, ...rows].join('\n');
@@ -146,7 +150,9 @@ export function ReviewMatrix() {
   if (loading) {
     return (
       <div className="p-4">
-        <p className="text-xs" style={{ color: s.textTer }}>Loading papers…</p>
+        <p className="text-xs" style={{ color: s.textTer }}>
+          Loading papers…
+        </p>
       </div>
     );
   }
@@ -172,7 +178,7 @@ export function ReviewMatrix() {
         </h3>
         <div className="flex items-center gap-1.5">
           <button
-            onClick={() => setShowAddDim(v => !v)}
+            onClick={() => setShowAddDim((v) => !v)}
             className="flex items-center gap-1 px-2 py-1 rounded text-[11px] font-medium transition-colors"
             style={{ background: s.bgCard, color: s.textSec, border: `1px solid ${s.border}` }}
             title="Add dimension row"
@@ -196,8 +202,8 @@ export function ReviewMatrix() {
           <input
             type="text"
             value={newDimLabel}
-            onChange={e => setNewDimLabel(e.target.value)}
-            onKeyDown={e => e.key === 'Enter' && addDimension()}
+            onChange={(e) => setNewDimLabel(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && addDimension()}
             placeholder="New dimension label…"
             className="flex-1 rounded border px-2 py-1 text-xs outline-none"
             style={{ borderColor: s.border, background: s.bg, color: s.text }}
@@ -220,11 +226,16 @@ export function ReviewMatrix() {
             <tr style={{ background: s.bgCard }}>
               <th
                 className="text-left px-3 py-2 font-medium sticky left-0 z-10"
-                style={{ color: s.text, background: s.bgCard, borderBottom: `1px solid ${s.border}`, minWidth: 110 }}
+                style={{
+                  color: s.text,
+                  background: s.bgCard,
+                  borderBottom: `1px solid ${s.border}`,
+                  minWidth: 110,
+                }}
               >
                 Dimension
               </th>
-              {papers.map(paper => (
+              {papers.map((paper) => (
                 <th
                   key={paper.id}
                   className="px-3 py-2 text-left align-top"
@@ -234,7 +245,8 @@ export function ReviewMatrix() {
                     {paper.title}
                   </p>
                   <p className="text-[10px] mt-0.5 truncate" style={{ color: s.textTer }}>
-                    {paper.authors[0] ?? 'Unknown'}{paper.authors.length > 1 ? ' et al.' : ''}
+                    {paper.authors[0] ?? 'Unknown'}
+                    {paper.authors.length > 1 ? ' et al.' : ''}
                     {paper.year ? ` (${paper.year})` : ''}
                   </p>
                   <button
@@ -250,14 +262,18 @@ export function ReviewMatrix() {
             </tr>
           </thead>
           <tbody>
-            {dimensions.map(dim => (
+            {dimensions.map((dim) => (
               <tr key={dim.id} style={{ borderBottom: `1px solid ${s.border}` }}>
                 <td
                   className="px-3 py-2 font-medium sticky left-0 z-10 flex items-center gap-1"
-                  style={{ background: s.bgCard, borderBottom: `1px solid ${s.border}`, color: s.textSec }}
+                  style={{
+                    background: s.bgCard,
+                    borderBottom: `1px solid ${s.border}`,
+                    color: s.textSec,
+                  }}
                 >
                   <span className="flex-1">{dim.label}</span>
-                  {!DEFAULT_DIMENSIONS.some(d => d.id === dim.id) && (
+                  {!DEFAULT_DIMENSIONS.some((d) => d.id === dim.id) && (
                     <button
                       onClick={() => removeDimension(dim.id)}
                       className="p-0.5 rounded transition-colors hover:text-red-500"
@@ -268,7 +284,7 @@ export function ReviewMatrix() {
                     </button>
                   )}
                 </td>
-                {papers.map(paper => {
+                {papers.map((paper) => {
                   const isEditing =
                     editingCell?.paperId === paper.id && editingCell?.dimId === dim.id;
                   const value = getCell(paper.id, dim.id);
@@ -282,7 +298,7 @@ export function ReviewMatrix() {
                       {isEditing ? (
                         <textarea
                           value={value}
-                          onChange={e => setCell(paper.id, dim.id, e.target.value)}
+                          onChange={(e) => setCell(paper.id, dim.id, e.target.value)}
                           onBlur={() => setEditingCell(null)}
                           className="w-full p-1.5 text-xs rounded border outline-none resize-y"
                           style={{
@@ -318,7 +334,8 @@ export function ReviewMatrix() {
 
       {/* Footer hint */}
       <p className="text-[10px]" style={{ color: s.textTer }}>
-        Click any cell to edit. Use "Agent Extract" to auto-fill from paper abstracts. Data is saved locally.
+        Click any cell to edit. Use "Agent Extract" to auto-fill from paper abstracts. Data is saved
+        locally.
       </p>
     </div>
   );

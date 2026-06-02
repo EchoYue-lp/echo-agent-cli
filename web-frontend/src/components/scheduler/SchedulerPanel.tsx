@@ -1,8 +1,5 @@
 import { useEffect, useState, useCallback } from 'react';
-import {
-  schedulerApi,
-  type SchedulerTask,
-} from '../../api/endpoints';
+import { schedulerApi, type SchedulerTask } from '../../api/endpoints';
 import {
   Plus,
   Play,
@@ -64,7 +61,11 @@ export function SchedulerPanel() {
   const [loading, setLoading] = useState(true);
   const [showAdd, setShowAdd] = useState(false);
   const [form, setForm] = useState({ name: '', cron_expr: '', prompt: '' });
-  const [runResult, setRunResult] = useState<{ id: string; result?: string; error?: string } | null>(null);
+  const [runResult, setRunResult] = useState<{
+    id: string;
+    result?: string;
+    error?: string;
+  } | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
@@ -144,7 +145,9 @@ export function SchedulerPanel() {
   if (loading) {
     return (
       <div className="p-3">
-        <p className="text-xs" style={{ color: s.textTer }}>加载中...</p>
+        <p className="text-xs" style={{ color: s.textTer }}>
+          加载中...
+        </p>
       </div>
     );
   }
@@ -235,7 +238,9 @@ export function SchedulerPanel() {
 
           <button
             onClick={handleCreate}
-            disabled={submitting || !form.name.trim() || !form.cron_expr.trim() || !form.prompt.trim()}
+            disabled={
+              submitting || !form.name.trim() || !form.cron_expr.trim() || !form.prompt.trim()
+            }
             className="flex items-center gap-1.5 rounded-lg px-3 py-2 text-xs font-medium text-white transition-colors disabled:opacity-50"
             style={{ background: s.accent }}
           >
@@ -296,7 +301,10 @@ export function SchedulerPanel() {
                 </div>
 
                 {/* Row 3: ID + times */}
-                <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[10px]" style={{ color: s.textTer }}>
+                <div
+                  className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[10px]"
+                  style={{ color: s.textTer }}
+                >
                   <span>ID: {task.id.slice(0, 8)}</span>
                   {task.last_run_at && (
                     <span className="flex items-center gap-1">
@@ -324,13 +332,19 @@ export function SchedulerPanel() {
                   <button
                     onClick={() => handleRun(task.id)}
                     className="flex items-center gap-1 rounded px-2 py-1 text-[11px] font-medium transition-colors"
-                    style={{ background: 'rgba(59,130,246,0.1)', color: 'var(--color-info, #3b82f6)' }}
+                    style={{
+                      background: 'rgba(59,130,246,0.1)',
+                      color: 'var(--color-info, #3b82f6)',
+                    }}
                   >
                     <Play size={11} /> 手动运行
                   </button>
                   {confirmDelete === task.id ? (
                     <div className="flex items-center gap-1">
-                      <span className="text-[10px]" style={{ color: 'var(--color-error, #ef4444)' }}>
+                      <span
+                        className="text-[10px]"
+                        style={{ color: 'var(--color-error, #ef4444)' }}
+                      >
                         确认删除?
                       </span>
                       <button
@@ -374,17 +388,26 @@ export function SchedulerPanel() {
                       </div>
                     )}
                     {runResult.error && (
-                      <div className="flex items-start gap-1.5" style={{ color: 'var(--color-error, #ef4444)' }}>
+                      <div
+                        className="flex items-start gap-1.5"
+                        style={{ color: 'var(--color-error, #ef4444)' }}
+                      >
                         <AlertCircle size={11} className="mt-0.5 flex-shrink-0" />
                         <pre className="whitespace-pre-wrap">{runResult.error}</pre>
                       </div>
                     )}
                     {runResult.result && (
                       <div className="space-y-1">
-                        <div className="flex items-center gap-1 font-medium" style={{ color: 'var(--color-success, #22c55e)' }}>
+                        <div
+                          className="flex items-center gap-1 font-medium"
+                          style={{ color: 'var(--color-success, #22c55e)' }}
+                        >
                           <CheckCircle2 size={11} /> 运行完成
                         </div>
-                        <pre className="whitespace-pre-wrap text-[10px]" style={{ color: s.textSec }}>
+                        <pre
+                          className="whitespace-pre-wrap text-[10px]"
+                          style={{ color: s.textSec }}
+                        >
                           {runResult.result.slice(0, 1000)}
                           {(runResult.result?.length ?? 0) > 1000 && '...'}
                         </pre>

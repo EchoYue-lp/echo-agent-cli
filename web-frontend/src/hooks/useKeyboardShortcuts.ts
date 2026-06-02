@@ -6,7 +6,11 @@ interface ShortcutsConfig {
   onCommandPalette?: () => void;
 }
 
-export function useKeyboardShortcuts({ onNewChat, onToggleSidebar, onCommandPalette }: ShortcutsConfig) {
+export function useKeyboardShortcuts({
+  onNewChat,
+  onToggleSidebar,
+  onCommandPalette,
+}: ShortcutsConfig) {
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       // Cmd/Ctrl + Shift + O: New Chat

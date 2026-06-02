@@ -1,4 +1,4 @@
-//! Echo Agent — Tauri desktop entry point.
+//! EchoCoWork — Tauri desktop entry point.
 //!
 //! The frontend (React) communicates via Tauri IPC commands,
 //! not HTTP. No Axum server is started.

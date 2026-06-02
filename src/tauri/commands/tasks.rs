@@ -127,7 +127,6 @@ pub async fn get_task(
 
     let (task, _meta) = service
         .get(&id)
-        .await
         .ok_or_else(|| IpcError::NotFound(format!("Task '{}' not found", id)))?;
 
     Ok(task_to_info(task))

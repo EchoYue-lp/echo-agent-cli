@@ -276,20 +276,20 @@ impl CommandRegistry {
         let cmd = self.get(name)?;
         let subs = cmd.subcommands();
 
-        if !subs.is_empty() {
-            if let Some(sub_name) = args.first() {
-                let mut matched = false;
-                for sub in &subs {
-                    if sub.name == *sub_name || sub.aliases.contains(sub_name) {
-                        matched = true;
-                        break;
-                    }
+        if !subs.is_empty()
+            && let Some(sub_name) = args.first()
+        {
+            let mut matched = false;
+            for sub in &subs {
+                if sub.name == *sub_name || sub.aliases.contains(sub_name) {
+                    matched = true;
+                    break;
                 }
-                if matched {
-                    return Some(cmd.run(ctx, args).await);
-                }
-                // No subcommand matched — pass through for command to handle help
             }
+            if matched {
+                return Some(cmd.run(ctx, args).await);
+            }
+            // No subcommand matched — pass through for command to handle help
         }
 
         Some(cmd.run(ctx, args).await)

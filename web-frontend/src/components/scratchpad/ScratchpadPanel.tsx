@@ -12,12 +12,15 @@ export function ScratchpadPanel() {
 
   // Load on mount
   useEffect(() => {
-    scratchpadApi.get().then((data: ScratchpadContent) => {
-      setContent(data.content);
-      setModifiedAt(data.modified_at);
-    }).catch(() => {
-      // ignore
-    });
+    scratchpadApi
+      .get()
+      .then((data: ScratchpadContent) => {
+        setContent(data.content);
+        setModifiedAt(data.modified_at);
+      })
+      .catch(() => {
+        // ignore
+      });
   }, []);
 
   // Debounced auto-save

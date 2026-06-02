@@ -1,6 +1,24 @@
 import { create } from 'zustand';
 
-export type SettingsTabId = 'tools' | 'mcp' | 'skills' | 'memory' | 'auto-memory' | 'config' | 'providers' | 'sessions' | 'permissions' | 'audit' | 'workflow' | 'sandbox' | 'compress' | 'extract' | 'evolution' | 'plugins' | 'scheduler' | 'worktree';
+export type SettingsTabId =
+  | 'tools'
+  | 'mcp'
+  | 'skills'
+  | 'memory'
+  | 'auto-memory'
+  | 'config'
+  | 'providers'
+  | 'sessions'
+  | 'permissions'
+  | 'audit'
+  | 'workflow'
+  | 'sandbox'
+  | 'compress'
+  | 'extract'
+  | 'evolution'
+  | 'plugins'
+  | 'scheduler'
+  | 'worktree';
 
 type Theme = 'light' | 'dark';
 

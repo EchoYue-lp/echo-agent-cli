@@ -159,8 +159,8 @@ pub static AUTO_MEMORY_ENABLED: std::sync::atomic::AtomicBool =
 
 async fn cmd_auto_memory(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     use echo_agent_app_core::auto_memory::{
-        AutoMemoryConfig, ObservationCategory, extract_observations,
-        format_observations_for_memory, run_auto_memory_extraction,
+        AutoMemoryConfig, extract_observations, format_observations_for_memory,
+        run_auto_memory_extraction,
     };
 
     let sub = args.first().copied().unwrap_or("");

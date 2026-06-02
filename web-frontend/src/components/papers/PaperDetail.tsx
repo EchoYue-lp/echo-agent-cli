@@ -1,8 +1,16 @@
 import { useState, useEffect } from 'react';
 import { papersApi, type Paper } from '../../api/endpoints';
 import {
-  X, Save, Tag, ExternalLink, FileText, Calendar, Users,
-  BookOpen, Hash, Edit3,
+  X,
+  Save,
+  Tag,
+  ExternalLink,
+  FileText,
+  Calendar,
+  Users,
+  BookOpen,
+  Hash,
+  Edit3,
 } from 'lucide-react';
 
 interface PaperDetailProps {
@@ -105,15 +113,9 @@ export function PaperDetail({ paper, onClose, onUpdated }: PaperDetailProps) {
           className="grid grid-cols-2 gap-3 rounded-lg border p-3"
           style={{ borderColor: s.border, background: s.bgCard }}
         >
-          {paper.year && (
-            <MetaItem icon={Calendar} label="Year" value={String(paper.year)} s={s} />
-          )}
-          {paper.venue && (
-            <MetaItem icon={BookOpen} label="Venue" value={paper.venue} s={s} />
-          )}
-          {paper.doi && (
-            <MetaItem icon={Hash} label="DOI" value={paper.doi} s={s} />
-          )}
+          {paper.year && <MetaItem icon={Calendar} label="Year" value={String(paper.year)} s={s} />}
+          {paper.venue && <MetaItem icon={BookOpen} label="Venue" value={paper.venue} s={s} />}
+          {paper.doi && <MetaItem icon={Hash} label="DOI" value={paper.doi} s={s} />}
           {paper.arxiv_id && (
             <MetaItem
               icon={ExternalLink}
@@ -123,9 +125,7 @@ export function PaperDetail({ paper, onClose, onUpdated }: PaperDetailProps) {
               s={s}
             />
           )}
-          {paper.pdf_path && (
-            <MetaItem icon={FileText} label="PDF" value={paper.pdf_path} s={s} />
-          )}
+          {paper.pdf_path && <MetaItem icon={FileText} label="PDF" value={paper.pdf_path} s={s} />}
           <MetaItem
             icon={Calendar}
             label="Added"
@@ -151,7 +151,10 @@ export function PaperDetail({ paper, onClose, onUpdated }: PaperDetailProps) {
 
         {/* Tags */}
         <div>
-          <h3 className="text-xs font-semibold mb-1.5 flex items-center gap-1.5" style={{ color: s.text }}>
+          <h3
+            className="text-xs font-semibold mb-1.5 flex items-center gap-1.5"
+            style={{ color: s.text }}
+          >
             <Tag size={11} />
             Tags
           </h3>
@@ -182,7 +185,10 @@ export function PaperDetail({ paper, onClose, onUpdated }: PaperDetailProps) {
         {/* Notes */}
         <div>
           <div className="flex items-center justify-between mb-1.5">
-            <h3 className="text-xs font-semibold flex items-center gap-1.5" style={{ color: s.text }}>
+            <h3
+              className="text-xs font-semibold flex items-center gap-1.5"
+              style={{ color: s.text }}
+            >
               <Edit3 size={11} />
               Notes
             </h3>
@@ -221,9 +227,7 @@ export function PaperDetail({ paper, onClose, onUpdated }: PaperDetailProps) {
               style={{ borderColor: s.border, background: s.bgCard, color: s.textSec }}
               onClick={() => setEditingNotes(true)}
             >
-              {paper.notes || (
-                <span style={{ color: s.textTer }}>Click to add notes...</span>
-              )}
+              {paper.notes || <span style={{ color: s.textTer }}>Click to add notes...</span>}
             </div>
           )}
         </div>

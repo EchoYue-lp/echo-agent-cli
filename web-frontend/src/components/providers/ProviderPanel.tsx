@@ -28,29 +28,34 @@ export function ProviderPanel() {
   const [testing, setTesting] = useState(false);
   const [switching, setSwitching] = useState(false);
   const [testResult, setTestResult] = useState<{ success: boolean; message: string } | null>(null);
-  const [switchResult, setSwitchResult] = useState<{ success: boolean; message: string } | null>(null);
+  const [switchResult, setSwitchResult] = useState<{ success: boolean; message: string } | null>(
+    null
+  );
 
   useEffect(() => {
-    providerApi.list().then((res) => {
-      // 在列表末尾追加自定义供应商
-      const allProviders = [...res.providers, CUSTOM_PROVIDER];
-      setProviders(allProviders);
-      setCurrentModel(res.current_model);
+    providerApi
+      .list()
+      .then((res) => {
+        // 在列表末尾追加自定义供应商
+        const allProviders = [...res.providers, CUSTOM_PROVIDER];
+        setProviders(allProviders);
+        setCurrentModel(res.current_model);
 
-      // Auto-select provider matching current model
-      const match = allProviders.find((p) =>
-        (p.models ?? []).some((m: string) => m === res.current_model)
-      );
-      if (match) {
-        setSelectedId(match.id);
-        setSelectedModel(res.current_model);
-        setBaseUrl(match.base_url);
-      }
-      setLoading(false);
-    }).catch((e) => {
-      console.error(e);
-      setLoading(false);
-    });
+        // Auto-select provider matching current model
+        const match = allProviders.find((p) =>
+          (p.models ?? []).some((m: string) => m === res.current_model)
+        );
+        if (match) {
+          setSelectedId(match.id);
+          setSelectedModel(res.current_model);
+          setBaseUrl(match.base_url);
+        }
+        setLoading(false);
+      })
+      .catch((e) => {
+        console.error(e);
+        setLoading(false);
+      });
   }, []);
 
   const selected = providers.find((p) => p.id === selectedId) ?? null;
@@ -78,7 +83,7 @@ export function ProviderPanel() {
         provider: selected.id,
         model,
         api_key: apiKey || undefined,
-        base_url: (baseUrl && baseUrl !== selected.base_url) ? baseUrl : undefined,
+        base_url: baseUrl && baseUrl !== selected.base_url ? baseUrl : undefined,
       });
       setTestResult({
         success: res.success,
@@ -131,7 +136,8 @@ export function ProviderPanel() {
         <div>
           <h3 className="text-sm font-semibold text-[var(--text-primary)]">模型供应商</h3>
           <p className="mt-0.5 text-xs text-[var(--text-tertiary)]">
-            当前模型: <span className="font-medium text-[var(--accent)]">{currentModel || '未设置'}</span>
+            当前模型:{' '}
+            <span className="font-medium text-[var(--accent)]">{currentModel || '未设置'}</span>
           </p>
         </div>
       </div>
@@ -143,14 +149,17 @@ export function ProviderPanel() {
             key={p.id}
             onClick={() => handleSelectProvider(p)}
             className={`flex items-center gap-3 rounded-lg border p-3 text-left transition-all
-              ${selectedId === p.id
-                ? 'border-[var(--accent)] bg-[var(--accent)]/5 shadow-sm'
-                : 'border-[var(--border-primary)] bg-[var(--bg-primary)] hover:border-[var(--border-focus)] hover:bg-[var(--bg-hover)]'
+              ${
+                selectedId === p.id
+                  ? 'border-[var(--accent)] bg-[var(--accent)]/5 shadow-sm'
+                  : 'border-[var(--border-primary)] bg-[var(--bg-primary)] hover:border-[var(--border-focus)] hover:bg-[var(--bg-hover)]'
               }`}
           >
             <span className="text-xl">{p.icon}</span>
             <div className="min-w-0 flex-1">
-              <div className="truncate text-sm font-medium text-[var(--text-primary)]">{p.name}</div>
+              <div className="truncate text-sm font-medium text-[var(--text-primary)]">
+                {p.name}
+              </div>
               {p.id !== 'custom' && (
                 <div className="flex items-center gap-1.5 mt-0.5">
                   <span
@@ -229,7 +238,7 @@ export function ProviderPanel() {
             {isCustom || (selected.models ?? []).length === 0 ? (
               <input
                 type="text"
-                value={isCustom ? (customModel || selectedModel) : customModel}
+                value={isCustom ? customModel || selectedModel : customModel}
                 onChange={(e) => {
                   if (isCustom) {
                     setSelectedModel(e.target.value);
@@ -257,7 +266,9 @@ export function ProviderPanel() {
                     className="flex-1 rounded-lg border border-[var(--border-primary)] bg-[var(--bg-input)] px-2 py-2 text-sm text-[var(--text-primary)] outline-none focus:border-[var(--border-focus)]"
                   >
                     {(selected.models ?? []).map((m) => (
-                      <option key={m} value={m}>{m}</option>
+                      <option key={m} value={m}>
+                        {m}
+                      </option>
                     ))}
                     <option value="__custom__">自定义模型...</option>
                   </select>
@@ -313,14 +324,26 @@ export function ProviderPanel() {
           <div className="flex items-center gap-2 pt-1">
             <button
               onClick={handleTest}
-              disabled={testing || (isCustom && (!apiKey.trim() || !baseUrl.trim() || !(customModel.trim() || selectedModel.trim())))}
+              disabled={
+                testing ||
+                (isCustom &&
+                  (!apiKey.trim() ||
+                    !baseUrl.trim() ||
+                    !(customModel.trim() || selectedModel.trim())))
+              }
               className="rounded-lg border border-[var(--border-primary)] bg-[var(--bg-primary)] px-4 py-1.5 text-xs font-medium text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-hover)] disabled:cursor-not-allowed disabled:opacity-40"
             >
               {testing ? '测试中...' : '测试连接'}
             </button>
             <button
               onClick={handleSwitch}
-              disabled={switching || (isCustom && (!apiKey.trim() || !baseUrl.trim() || !(customModel.trim() || selectedModel.trim())))}
+              disabled={
+                switching ||
+                (isCustom &&
+                  (!apiKey.trim() ||
+                    !baseUrl.trim() ||
+                    !(customModel.trim() || selectedModel.trim())))
+              }
               className="rounded-lg bg-[var(--accent)] px-4 py-1.5 text-xs font-medium text-white transition-colors hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-40"
             >
               {switching ? '切换中...' : '切换模型'}

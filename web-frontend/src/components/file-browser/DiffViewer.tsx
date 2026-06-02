@@ -63,15 +63,10 @@ export function DiffViewer({ hunks, path }: DiffViewerProps) {
                     ? 'var(--color-error, #ef4444)'
                     : 'var(--text-secondary)';
 
-              const prefix =
-                line.tag === 'insert' ? '+' : line.tag === 'delete' ? '-' : ' ';
+              const prefix = line.tag === 'insert' ? '+' : line.tag === 'delete' ? '-' : ' ';
 
               return (
-                <div
-                  key={lineIdx}
-                  className="flex"
-                  style={{ background: bgColor }}
-                >
+                <div key={lineIdx} className="flex" style={{ background: bgColor }}>
                   {/* Old line number */}
                   <span className="w-12 shrink-0 select-none px-2 text-right text-[var(--text-tertiary)]">
                     {line.old_line ?? ''}
@@ -81,10 +76,7 @@ export function DiffViewer({ hunks, path }: DiffViewerProps) {
                     {line.new_line ?? ''}
                   </span>
                   {/* Prefix + content */}
-                  <span
-                    className="shrink-0 select-none px-1"
-                    style={{ color: textColor }}
-                  >
+                  <span className="shrink-0 select-none px-1" style={{ color: textColor }}>
                     {prefix}
                   </span>
                   <span className="flex-1 whitespace-pre px-2 text-[var(--text-primary)]">

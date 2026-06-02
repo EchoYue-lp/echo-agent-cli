@@ -500,15 +500,16 @@ impl AppState {
         if self.scheduler.runner.is_some() {
             return;
         }
-        let mut runner = crate::scheduler::SchedulerRunner::with_store(
-            self.connection.agent.clone(),
+        let store = match backend {
+            Some(b) => crate::scheduler::CronTaskStore::with_store(b),
+            None => crate::scheduler::CronTaskStore::new(),
+        };
+        let runner = crate::scheduler::new_scheduler_runner(
+            store,
             self.scheduler.cancel_token.clone(),
-            backend,
+            self.connection.agent.clone(),
+            self.tasks.service.clone(),
         );
-        // Wire BackgroundTaskService if available
-        if let Some(ref svc) = self.tasks.service {
-            runner.set_task_service(svc.clone());
-        }
         let runner = Arc::new(runner);
         runner.clone().spawn();
         self.scheduler.runner = Some(runner);

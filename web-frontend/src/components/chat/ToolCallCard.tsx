@@ -32,12 +32,17 @@ export function ToolCallCard({ toolCall }: { toolCall: ToolCallInfo }) {
           {toolCall.name}
         </span>
         <span className="ml-auto">
-          <StatusBadge status={toolCall.success ? 'success' : 'error'} label={toolCall.success ? '成功' : '失败'} size="sm" />
+          <StatusBadge
+            status={toolCall.success ? 'success' : 'error'}
+            label={toolCall.success ? '成功' : '失败'}
+            size="sm"
+          />
         </span>
-        {expanded
-          ? <ChevronDown size={14} className="shrink-0 text-[var(--text-tertiary)]" />
-          : <ChevronRight size={14} className="shrink-0 text-[var(--text-tertiary)]" />
-        }
+        {expanded ? (
+          <ChevronDown size={14} className="shrink-0 text-[var(--text-tertiary)]" />
+        ) : (
+          <ChevronRight size={14} className="shrink-0 text-[var(--text-tertiary)]" />
+        )}
       </button>
 
       {expanded && (
@@ -47,7 +52,12 @@ export function ToolCallCard({ toolCall }: { toolCall: ToolCallInfo }) {
               <span className="text-[11px] font-medium uppercase tracking-wider text-[var(--text-tertiary)]">
                 参数
               </span>
-              <CopyBtn text={JSON.stringify(toolCall.args, null, 2)} label="args" copied={copied} onCopy={copyText} />
+              <CopyBtn
+                text={JSON.stringify(toolCall.args, null, 2)}
+                label="args"
+                copied={copied}
+                onCopy={copyText}
+              />
             </div>
             <pre className="max-h-40 overflow-auto rounded-lg bg-[var(--bg-code)] p-3 text-xs leading-relaxed text-[var(--color-code-text)]">
               {JSON.stringify(toolCall.args, null, 2)}
@@ -64,7 +74,9 @@ export function ToolCallCard({ toolCall }: { toolCall: ToolCallInfo }) {
               <ChartCard spec={chartSpec} />
             ) : (
               <pre className="max-h-40 overflow-auto rounded-lg bg-[var(--bg-code)] p-3 text-xs leading-relaxed text-[var(--color-code-text)]">
-                {toolCall.result.length > 2000 ? toolCall.result.slice(0, 2000) + '\n...' : toolCall.result}
+                {toolCall.result.length > 2000
+                  ? toolCall.result.slice(0, 2000) + '\n...'
+                  : toolCall.result}
               </pre>
             )}
           </div>
@@ -74,7 +86,12 @@ export function ToolCallCard({ toolCall }: { toolCall: ToolCallInfo }) {
   );
 }
 
-function CopyBtn({ text, label, copied, onCopy }: {
+function CopyBtn({
+  text,
+  label,
+  copied,
+  onCopy,
+}: {
   text: string;
   label: string;
   copied: string | null;
@@ -82,7 +99,10 @@ function CopyBtn({ text, label, copied, onCopy }: {
 }) {
   return (
     <button
-      onClick={(e) => { e.stopPropagation(); onCopy(text, label); }}
+      onClick={(e) => {
+        e.stopPropagation();
+        onCopy(text, label);
+      }}
       className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] text-[var(--text-tertiary)] transition-colors"
     >
       {copied === label ? <Check size={10} /> : <Copy size={10} />}

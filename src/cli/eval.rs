@@ -98,12 +98,12 @@ fn load_cases_recursive(dir: &Path, cases: &mut Vec<EvalCase>) -> anyhow::Result
         let path = entry.path();
         if path.is_dir() {
             load_cases_recursive(&path, cases)?;
-        } else if let Some(ext) = path.extension() {
-            if ext == "json" {
-                match load_case_from_file(&path) {
-                    Ok(case) => cases.push(case),
-                    Err(e) => eprintln!("Warning: skipping {}: {e}", path.display()),
-                }
+        } else if let Some(ext) = path.extension()
+            && ext == "json"
+        {
+            match load_case_from_file(&path) {
+                Ok(case) => cases.push(case),
+                Err(e) => eprintln!("Warning: skipping {}: {e}", path.display()),
             }
         }
     }

@@ -3,4 +3,8 @@
 /**
  * POST /api/mcp/connect
  */
-export type ConnectMcpRequest = { name: string, } & ({ "transport": "stdio", command: string, args: Array<string>, env: { [key: string]: string }, } | { "transport": "http", url: string, headers: { [key: string]: string }, } | { "transport": "sse", url: string, headers: { [key: string]: string }, });
+export type ConnectMcpRequest = { name: string } & (
+  | { transport: 'stdio'; command: string; args: Array<string>; env: { [key: string]: string } }
+  | { transport: 'http'; url: string; headers: { [key: string]: string } }
+  | { transport: 'sse'; url: string; headers: { [key: string]: string } }
+);

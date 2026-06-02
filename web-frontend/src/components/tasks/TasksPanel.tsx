@@ -1,6 +1,23 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
-import { tasksApi, humanGateApi, type BackgroundTask, type SubmitTaskRequest, type HumanGateCheckpoint } from '../../api/endpoints';
-import { Play, XCircle, RefreshCw, Plus, ChevronDown, ChevronUp, CheckCircle2, Edit3, AlertTriangle, HandMetal } from 'lucide-react';
+import {
+  tasksApi,
+  humanGateApi,
+  type BackgroundTask,
+  type SubmitTaskRequest,
+  type HumanGateCheckpoint,
+} from '../../api/endpoints';
+import {
+  Play,
+  XCircle,
+  RefreshCw,
+  Plus,
+  ChevronDown,
+  ChevronUp,
+  CheckCircle2,
+  Edit3,
+  AlertTriangle,
+  HandMetal,
+} from 'lucide-react';
 
 const STATUS_COLORS: Record<string, string> = {
   pending: 'var(--color-warning)',
@@ -56,7 +73,9 @@ export function TasksPanel() {
 
   // Human gate checkpoints
   const [gates, setGates] = useState<HumanGateCheckpoint[]>([]);
-  const [gateResponse, setGateResponse] = useState<Record<string, { selection: string; instructions: string }>>({});
+  const [gateResponse, setGateResponse] = useState<
+    Record<string, { selection: string; instructions: string }>
+  >({});
 
   // SSE event sources keyed by task ID
   const eventSourcesRef = useRef<Record<string, EventSource>>({});
@@ -85,14 +104,17 @@ export function TasksPanel() {
   useEffect(() => {
     fetchTasks();
     fetchGates();
-    const interval = setInterval(() => { fetchTasks(); fetchGates(); }, 5000);
+    const interval = setInterval(() => {
+      fetchTasks();
+      fetchGates();
+    }, 5000);
     return () => clearInterval(interval);
   }, [fetchTasks, fetchGates]);
 
   // Subscribe to SSE for active tasks
   useEffect(() => {
-    const activeTasks = tasks.filter((t) =>
-      !['completed', 'failed', 'cancelled', 'timed_out'].includes(t.status)
+    const activeTasks = tasks.filter(
+      (t) => !['completed', 'failed', 'cancelled', 'timed_out'].includes(t.status)
     );
 
     const currentIds = new Set(activeTasks.map((t) => t.id));
@@ -120,12 +142,18 @@ export function TasksPanel() {
           try {
             const data = JSON.parse(e.data) as TaskProgress;
             setProgressMap((prev) => ({ ...prev, [task.id]: data }));
-          } catch { /* ignore */ }
+          } catch {
+            /* ignore */
+          }
         });
 
         es.addEventListener('phase', (e) => {
           try {
-            const data = JSON.parse(e.data) as { phase: string; phases?: string[]; current_phase_idx?: number };
+            const data = JSON.parse(e.data) as {
+              phase: string;
+              phases?: string[];
+              current_phase_idx?: number;
+            };
             setProgressMap((prev) => ({
               ...prev,
               [task.id]: {
@@ -135,7 +163,9 @@ export function TasksPanel() {
                 currentPhaseIdx: data.current_phase_idx,
               },
             }));
-          } catch { /* ignore */ }
+          } catch {
+            /* ignore */
+          }
         });
 
         es.addEventListener('done', () => {
@@ -223,7 +253,9 @@ export function TasksPanel() {
   if (loading) {
     return (
       <div className="p-3">
-        <p className="text-xs" style={{ color: s.textTer }}>加载中...</p>
+        <p className="text-xs" style={{ color: s.textTer }}>
+          加载中...
+        </p>
       </div>
     );
   }
@@ -235,17 +267,31 @@ export function TasksPanel() {
           后台任务 ({tasks.length})
         </h3>
         <div className="flex gap-1">
-          <button onClick={() => { fetchTasks(); fetchGates(); }} className="rounded p-1 transition-colors" style={{ color: s.textTer }}>
+          <button
+            onClick={() => {
+              fetchTasks();
+              fetchGates();
+            }}
+            className="rounded p-1 transition-colors"
+            style={{ color: s.textTer }}
+          >
             <RefreshCw size={14} />
           </button>
-          <button onClick={() => setShowSubmit(!showSubmit)} className="rounded p-1 transition-colors" style={{ color: s.textTer }}>
+          <button
+            onClick={() => setShowSubmit(!showSubmit)}
+            className="rounded p-1 transition-colors"
+            style={{ color: s.textTer }}
+          >
             <Plus size={14} />
           </button>
         </div>
       </div>
 
       {showSubmit && (
-        <div className="rounded-lg border p-3 space-y-2" style={{ borderColor: s.border, background: s.bgCard }}>
+        <div
+          className="rounded-lg border p-3 space-y-2"
+          style={{ borderColor: s.border, background: s.bgCard }}
+        >
           <select
             value={submitKind}
             onChange={(e) => setSubmitKind(e.target.value)}
@@ -287,18 +333,18 @@ export function TasksPanel() {
       )}
 
       {/* Human Gate Alerts */}
-      {gates.filter((g) => g.status === 'pending').map((gate) => (
-        <HumanGateCard
-          key={gate.task_id}
-          gate={gate}
-          response={gateResponse[gate.task_id] || { selection: '', instructions: '' }}
-          onResponseChange={(r) =>
-            setGateResponse((prev) => ({ ...prev, [gate.task_id]: r }))
-          }
-          onSubmit={(selection) => handleGateRespond(gate.task_id, selection)}
-          styles={s}
-        />
-      ))}
+      {gates
+        .filter((g) => g.status === 'pending')
+        .map((gate) => (
+          <HumanGateCard
+            key={gate.task_id}
+            gate={gate}
+            response={gateResponse[gate.task_id] || { selection: '', instructions: '' }}
+            onResponseChange={(r) => setGateResponse((prev) => ({ ...prev, [gate.task_id]: r }))}
+            onSubmit={(selection) => handleGateRespond(gate.task_id, selection)}
+            styles={s}
+          />
+        ))}
 
       {tasks.length === 0 ? (
         <p className="text-xs py-4 text-center" style={{ color: s.textTer }}>
@@ -329,7 +375,10 @@ export function TasksPanel() {
                   </span>
                   {/* Inline progress percentage */}
                   {progress?.percentage != null && task.status === 'in_progress' && (
-                    <span className="text-[10px] font-mono flex-shrink-0" style={{ color: 'var(--color-info)' }}>
+                    <span
+                      className="text-[10px] font-mono flex-shrink-0"
+                      style={{ color: 'var(--color-info)' }}
+                    >
                       {progress.percentage}%
                     </span>
                   )}
@@ -343,7 +392,11 @@ export function TasksPanel() {
                   )}
                   {/* Human gate indicator */}
                   {task.status === 'waiting_for_human' && (
-                    <HandMetal size={12} className="flex-shrink-0" style={{ color: 'var(--color-purple, #a855f7)' }} />
+                    <HandMetal
+                      size={12}
+                      className="flex-shrink-0"
+                      style={{ color: 'var(--color-purple, #a855f7)' }}
+                    />
                   )}
                   <span className="text-[10px] flex-shrink-0" style={{ color: s.textTer }}>
                     {STATUS_LABELS[task.status] || task.status}
@@ -370,7 +423,10 @@ export function TasksPanel() {
                         }}
                       />
                     </div>
-                    <div className="flex items-center justify-between mt-0.5 text-[10px]" style={{ color: s.textTer }}>
+                    <div
+                      className="flex items-center justify-between mt-0.5 text-[10px]"
+                      style={{ color: s.textTer }}
+                    >
                       {progress.phase && <span>{progress.phase}</span>}
                       {progress.eta && <span>ETA: {progress.eta}</span>}
                     </div>
@@ -383,20 +439,18 @@ export function TasksPanel() {
                     <div className="flex items-center gap-0.5">
                       {progress.phases.map((phase, idx) => {
                         const isCurrent = idx === progress.currentPhaseIdx;
-                        const isDone = progress.currentPhaseIdx != null && idx < progress.currentPhaseIdx;
+                        const isDone =
+                          progress.currentPhaseIdx != null && idx < progress.currentPhaseIdx;
                         return (
-                          <div
-                            key={idx}
-                            className="flex-1 relative"
-                          >
+                          <div key={idx} className="flex-1 relative">
                             <div
                               className="h-1.5 rounded-full transition-all duration-300"
                               style={{
                                 background: isDone
                                   ? 'var(--color-success)'
                                   : isCurrent
-                                  ? 'var(--color-info)'
-                                  : s.bgHover,
+                                    ? 'var(--color-info)'
+                                    : s.bgHover,
                                 opacity: isDone || isCurrent ? 1 : 0.5,
                               }}
                             />
@@ -417,7 +471,10 @@ export function TasksPanel() {
                 )}
 
                 {isExpanded && (
-                  <div className="mt-2 pt-2 space-y-2" style={{ borderTop: `1px solid ${s.border}` }}>
+                  <div
+                    className="mt-2 pt-2 space-y-2"
+                    style={{ borderTop: `1px solid ${s.border}` }}
+                  >
                     <div className="text-[10px] space-y-1" style={{ color: s.textSec }}>
                       <p>ID: {task.id}</p>
                       <p>创建: {new Date(task.created_at).toLocaleString()}</p>
@@ -425,16 +482,25 @@ export function TasksPanel() {
                       {task.progress != null && <p>进度: {task.progress}%</p>}
                     </div>
                     {task.result && (
-                      <div className="rounded p-2 text-xs" style={{ background: s.bgCard, color: s.text }}>
+                      <div
+                        className="rounded p-2 text-xs"
+                        style={{ background: s.bgCard, color: s.text }}
+                      >
                         <p className="font-medium mb-1">结果:</p>
-                        <pre className="whitespace-pre-wrap text-[10px]" style={{ color: s.textSec }}>
+                        <pre
+                          className="whitespace-pre-wrap text-[10px]"
+                          style={{ color: s.textSec }}
+                        >
                           {task.result.slice(0, 2000)}
                           {task.result.length > 2000 && '...'}
                         </pre>
                       </div>
                     )}
                     {task.error && (
-                      <div className="rounded p-2 text-xs" style={{ background: 'rgba(239,68,68,0.1)', color: 'var(--color-error)' }}>
+                      <div
+                        className="rounded p-2 text-xs"
+                        style={{ background: 'rgba(239,68,68,0.1)', color: 'var(--color-error)' }}
+                      >
                         <p className="font-medium mb-1">错误:</p>
                         <pre className="whitespace-pre-wrap text-[10px]">{task.error}</pre>
                       </div>
@@ -469,14 +535,21 @@ interface HumanGateCardProps {
   styles: Record<string, string>;
 }
 
-function HumanGateCard({ gate, response, onResponseChange, onSubmit, styles: s }: HumanGateCardProps) {
+function HumanGateCard({
+  gate,
+  response,
+  onResponseChange,
+  onSubmit,
+  styles: s,
+}: HumanGateCardProps) {
   const [contextOpen, setContextOpen] = useState(false);
   const options = gate.options || ['approve', 'revise', 'cancel'];
-  const optionLabels: Record<string, { label: string; color: string; icon: typeof CheckCircle2 }> = {
-    approve: { label: '批准', color: 'var(--color-success, #22c55e)', icon: CheckCircle2 },
-    revise: { label: '修改', color: 'var(--color-warning, #eab308)', icon: Edit3 },
-    cancel: { label: '取消', color: 'var(--color-error, #ef4444)', icon: XCircle },
-  };
+  const optionLabels: Record<string, { label: string; color: string; icon: typeof CheckCircle2 }> =
+    {
+      approve: { label: '批准', color: 'var(--color-success, #22c55e)', icon: CheckCircle2 },
+      revise: { label: '修改', color: 'var(--color-warning, #eab308)', icon: Edit3 },
+      cancel: { label: '取消', color: 'var(--color-error, #ef4444)', icon: XCircle },
+    };
 
   return (
     <div

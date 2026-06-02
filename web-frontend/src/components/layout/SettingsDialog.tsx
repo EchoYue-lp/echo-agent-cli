@@ -1,5 +1,27 @@
 import { useEffect } from 'react';
-import { X, Settings, Save, Lock, ShieldCheck, GitBranch, Terminal, Minimize2, FileJson, Wrench, Globe, BookOpen, Brain, Cpu, Database, Activity, Sparkles, Package, Timer, BrainCircuit, GitFork } from 'lucide-react';
+import {
+  X,
+  Settings,
+  Save,
+  Lock,
+  ShieldCheck,
+  GitBranch,
+  Terminal,
+  Minimize2,
+  FileJson,
+  Wrench,
+  Globe,
+  BookOpen,
+  Brain,
+  Cpu,
+  Database,
+  Activity,
+  Sparkles,
+  Package,
+  Timer,
+  BrainCircuit,
+  GitFork,
+} from 'lucide-react';
 import { useUiStore, type SettingsTabId } from '../../stores/uiStore';
 import { ConfigPanel } from '../config/ConfigPanel';
 import { SessionsPanel } from '../sessions/SessionsPanel';
@@ -69,9 +91,7 @@ const settingsGroups: { label: string; icon: typeof Settings; items: SettingsIte
   {
     label: '开发',
     icon: GitFork,
-    items: [
-      { id: 'worktree', label: '工作树', icon: GitFork },
-    ],
+    items: [{ id: 'worktree', label: '工作树', icon: GitFork }],
   },
   {
     label: '智能',
@@ -120,19 +140,25 @@ export function SettingsDialog() {
 
   if (!settingsOpen) return null;
 
-  const activeItem = settingsGroups.flatMap(g => g.items).find(i => i.id === activeSettingsTab);
+  const activeItem = settingsGroups.flatMap((g) => g.items).find((i) => i.id === activeSettingsTab);
 
   return (
     <>
       {/* Backdrop */}
-      <div className="fixed inset-0 z-50" style={{ background: 'var(--bg-overlay)' }} onClick={closeSettings} />
+      <div
+        className="fixed inset-0 z-50"
+        style={{ background: 'var(--bg-overlay)' }}
+        onClick={closeSettings}
+      />
 
       {/* Dialog */}
       <div className="animate-scale-in fixed left-1/2 top-1/2 z-50 flex h-[85vh] w-[92vw] max-w-6xl -translate-x-1/2 -translate-y-1/2 overflow-hidden rounded-2xl border border-[var(--border-primary)] bg-[var(--bg-primary)] shadow-2xl max-sm:h-screen max-sm:w-screen max-sm:max-w-none max-sm:rounded-none">
         {/* Left sidebar — settings nav */}
         <div className="flex w-[220px] shrink-0 flex-col border-r border-[var(--border-primary)] bg-[var(--bg-sidebar)]">
           <div className="flex items-center justify-between border-b border-[var(--border-primary)] px-5 py-4">
-            <h2 className="text-sm font-semibold tracking-tight text-[var(--text-primary)]">设置</h2>
+            <h2 className="text-sm font-semibold tracking-tight text-[var(--text-primary)]">
+              设置
+            </h2>
             <button
               onClick={closeSettings}
               className="flex h-7 w-7 items-center justify-center rounded-lg text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
@@ -155,9 +181,10 @@ export function SettingsDialog() {
                     key={id}
                     onClick={() => setActiveSettingsTab(id)}
                     className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-[13px] font-medium transition-all duration-150
-                      ${activeSettingsTab === id
-                        ? 'bg-[var(--accent)]/10 text-[var(--accent)] shadow-sm'
-                        : 'text-[var(--text-secondary)] hover:bg-[var(--bg-sidebar-hover)] hover:text-[var(--text-primary)]'
+                      ${
+                        activeSettingsTab === id
+                          ? 'bg-[var(--accent)]/10 text-[var(--accent)] shadow-sm'
+                          : 'text-[var(--text-secondary)] hover:bg-[var(--bg-sidebar-hover)] hover:text-[var(--text-primary)]'
                       }`}
                   >
                     <Icon size={15} className="shrink-0" />

@@ -108,9 +108,12 @@ if (typeof window !== 'undefined') {
   useAuthStore.getState().initFromStorage();
 
   // Set up periodic auth check (every 5 minutes)
-  setInterval(() => {
-    useAuthStore.getState().checkAuth();
-  }, 5 * 60 * 1000);
+  setInterval(
+    () => {
+      useAuthStore.getState().checkAuth();
+    },
+    5 * 60 * 1000
+  );
 
   // Also check auth when window regains focus
   window.addEventListener('focus', () => {

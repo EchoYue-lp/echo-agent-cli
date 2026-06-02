@@ -88,14 +88,19 @@ export function SkillsPanel() {
   return (
     <div className="p-3 space-y-3">
       <div className="flex items-center justify-between">
-        <h3 className="text-sm font-semibold" style={{ color: s.text }}>技能 ({skills.length})</h3>
+        <h3 className="text-sm font-semibold" style={{ color: s.text }}>
+          技能 ({skills.length})
+        </h3>
       </div>
 
       <div className="flex gap-2">
-        <input value={dir} onChange={(e) => setDir(e.target.value)}
+        <input
+          value={dir}
+          onChange={(e) => setDir(e.target.value)}
           className="flex-1 rounded-lg border px-2 py-1.5 text-xs"
           style={{ background: s.bgInput, borderColor: s.border, color: s.text }}
-          placeholder="技能目录路径" />
+          placeholder="技能目录路径"
+        />
         <button
           onClick={load}
           disabled={!dir.trim() || loadingAny}
@@ -133,14 +138,25 @@ export function SkillsPanel() {
       )}
 
       {skills.map((sk) => (
-        <div key={sk.name} className="rounded-lg border px-3 py-2"
-          style={{ borderColor: s.border, background: s.bg }}>
+        <div
+          key={sk.name}
+          className="rounded-lg border px-3 py-2"
+          style={{ borderColor: s.border, background: s.bg }}
+        >
           <div className="flex items-center gap-2">
             <BookOpen size={12} style={{ color: s.accent }} />
-            <span className="text-xs font-medium" style={{ color: s.text }}>{sk.name}</span>
+            <span className="text-xs font-medium" style={{ color: s.text }}>
+              {sk.name}
+            </span>
           </div>
-          <p className="mt-1 text-xs" style={{ color: s.textSec }}>{sk.description}</p>
-          {sk.file && <p className="mt-1 text-[10px]" style={{ color: s.textTer }}>{sk.file}</p>}
+          <p className="mt-1 text-xs" style={{ color: s.textSec }}>
+            {sk.description}
+          </p>
+          {sk.file && (
+            <p className="mt-1 text-[10px]" style={{ color: s.textTer }}>
+              {sk.file}
+            </p>
+          )}
         </div>
       ))}
     </div>

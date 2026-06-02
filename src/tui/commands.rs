@@ -205,11 +205,11 @@ impl SlashCommand {
         let mut groups: Vec<(Category, Vec<SlashCommand>)> = Vec::new();
         for cmd in SlashCommand::iter() {
             let cat = cmd.category();
-            if let Some(last) = groups.last_mut() {
-                if last.0 == cat {
-                    last.1.push(cmd);
-                    continue;
-                }
+            if let Some(last) = groups.last_mut()
+                && last.0 == cat
+            {
+                last.1.push(cmd);
+                continue;
             }
             groups.push((cat, vec![cmd]));
         }

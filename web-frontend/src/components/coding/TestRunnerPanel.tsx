@@ -1,4 +1,3 @@
-
 interface TestResult {
   name: string;
   status: 'passed' | 'failed' | 'skipped';
@@ -86,14 +85,34 @@ export function TestRunnerPanel({
               <div className="mt-0.5">
                 {result.status === 'passed' ? (
                   <div className="w-5 h-5 rounded-full bg-green-100 dark:bg-green-900/30 flex items-center justify-center">
-                    <svg className="w-3 h-3 text-green-600 dark:text-green-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" />
+                    <svg
+                      className="w-3 h-3 text-green-600 dark:text-green-400"
+                      fill="none"
+                      viewBox="0 0 24 24"
+                      stroke="currentColor"
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth={3}
+                        d="M5 13l4 4L19 7"
+                      />
                     </svg>
                   </div>
                 ) : result.status === 'failed' ? (
                   <div className="w-5 h-5 rounded-full bg-red-100 dark:bg-red-900/30 flex items-center justify-center">
-                    <svg className="w-3 h-3 text-red-600 dark:text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M6 18L18 6M6 6l12 12" />
+                    <svg
+                      className="w-3 h-3 text-red-600 dark:text-red-400"
+                      fill="none"
+                      viewBox="0 0 24 24"
+                      stroke="currentColor"
+                    >
+                      <path
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                        strokeWidth={3}
+                        d="M6 18L18 6M6 6l12 12"
+                      />
                     </svg>
                   </div>
                 ) : (
@@ -112,8 +131,8 @@ export function TestRunnerPanel({
                       result.status === 'passed'
                         ? 'bg-green-50 text-green-700 dark:bg-green-900/20 dark:text-green-400'
                         : result.status === 'failed'
-                        ? 'bg-red-50 text-red-700 dark:bg-red-900/20 dark:text-red-400'
-                        : 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400'
+                          ? 'bg-red-50 text-red-700 dark:bg-red-900/20 dark:text-red-400'
+                          : 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400'
                     }`}
                   >
                     {result.status}
@@ -126,7 +145,9 @@ export function TestRunnerPanel({
                 )}
                 {result.error && (
                   <div className="mt-2 p-2.5 rounded-lg bg-red-50 dark:bg-red-900/10 border border-red-100 dark:border-red-900/20">
-                    <p className="text-xs text-red-700 dark:text-red-300 font-mono leading-relaxed">{result.error}</p>
+                    <p className="text-xs text-red-700 dark:text-red-300 font-mono leading-relaxed">
+                      {result.error}
+                    </p>
                   </div>
                 )}
               </div>

@@ -147,7 +147,13 @@ export type ServerMessage =
   | { type: 'tool_start'; name: string; args: unknown }
   | { type: 'tool_result'; name: string; result: string; success: boolean }
   | { type: 'final_answer'; data: string }
-  | { type: 'approval_request'; request_id: string; tool_name: string; args: unknown; prompt?: string }
+  | {
+      type: 'approval_request';
+      request_id: string;
+      tool_name: string;
+      args: unknown;
+      prompt?: string;
+    }
   | { type: 'input_request'; request_id: string; prompt?: string }
   | { type: 'chart'; spec: unknown }
   | { type: 'error'; message: string }
@@ -283,7 +289,7 @@ export interface SandboxStatus {
 }
 
 export interface SandboxConfig {
-  security_level: "low" | "medium" | "high";
+  security_level: 'low' | 'medium' | 'high';
   max_memory_mb: number | null;
   max_cpu_seconds: number | null;
   network_enabled: boolean;

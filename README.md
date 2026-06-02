@@ -1,4 +1,4 @@
-# Echo Agent CLI
+# EchoCoWork
 
 > 一个基于 [echo-agent](https://github.com/EchoYue-lp/echo-agent) 的通用 AI Agent 产品，支持 Coding、数据分析和学术研究三大核心能力。
 
@@ -7,7 +7,7 @@
 
 ## 📋 项目简介
 
-Echo Agent CLI 是一个生产级的通用 Agent 产品，基于 Rust 生态构建，提供 **TUI（终端界面）** 和 **GUI（桌面应用）** 两种交互模式，专注于以下核心场景：
+EchoCoWork 是一个生产级的通用 Agent 产品，基于 Rust 生态构建，提供 **TUI（终端界面）** 和 **GUI（桌面应用）** 两种交互模式，专注于以下核心场景：
 
 - **💻 Coding** — 代码生成、审查、重构、调试、测试
 - **📊 数据分析** — 结构化数据分析、统计、可视化、报告生成
@@ -17,7 +17,6 @@ Echo Agent CLI 是一个生产级的通用 Agent 产品，基于 Rust 生态构�
 
 - 🤖 **双模式交互**：全屏终端（TUI）、桌面应用（Tauri GUI）
 - 🔄 **长程任务支持**：断点续传、进度追踪、人机协作检查点
-- 🛡️ **安全优先**：JWT 认证、速率限制、审计日志
 - 🧩 **可扩展架构**：MCP 服务器、插件系统、技能管理
 - 🎨 **现代化 GUI**：React + Tailwind CSS + WebSocket 实时通信
 
@@ -28,32 +27,64 @@ Echo Agent CLI 是一个生产级的通用 Agent 产品，基于 Rust 生态构�
 ```
 echo-agent-cli/
 ├── Cargo.toml                    # Rust 工作区配置
-├── src/                          # TUI 入口
-│   ├── main.rs                   # 主入口（默认启动 TUI）
-│   └── tui/                      # 终端 UI
-│       ├── mod.rs                # TUI 主循环
-│       ├── events.rs             # 事件处理（状态机模式）
-│       ├── markdown.rs           # Markdown 渲染（表格/任务列表）
-│       ├── widgets/              # UI 组件
-│       └── keymap.rs             # 键盘映射
+├── init.sh                       # 初始化脚本（环境检查、依赖安装）
+├── build.rs                      # Tauri 构建脚本
+├── tauri.conf.json               # Tauri 应用配置
+├── config/                       # 配置文件示例
+│   ├── echo-agent.yaml
+│   └── echo-agent.example.yaml
+├── src/                          # 应用入口
+│   ├── main.rs                   # TUI 主入口（默认启动 TUI）
+│   ├── lib.rs                    # 库导出
+│   ├── cli/                      # CLI 参数解析、REPL、子命令
+│   │   ├── args.rs               # Clap 参数定义
+│   │   ├── commands.rs           # 子命令处理
+│   │   ├── command.rs            # SlashCommand trait 和 CommandRegistry
+│   │   ├── cmd_impls/            # 各类 slash 命令实现
+│   │   ├── repl.rs               # REPL 交互循环
+│   │   ├── modes.rs              # CLI / Headless / Channels 运行模式
+│   │   ├── onboard.rs            # 交互式引导配置
+│   │   └── handlers.rs           # 子命令分发
+│   ├── tui/                      # 终端 UI（ratatui）
+│   │   ├── mod.rs                # TUI 主循环 + Theme
+│   │   ├── events.rs             # 事件处理（状态机模式）
+│   │   ├── commands.rs           # TUI 命令面板（enum 驱动）
+│   │   ├── keymap.rs             # 键盘映射（支持 keymap.yaml 覆盖）
+│   │   ├── markdown.rs           # Markdown 渲染
+│   │   ├── picker.rs             # 选择器组件
+│   │   └── widgets/              # UI 组件（chat/input/sidebar/popup/status_bar）
+│   ├── tauri/                    # Tauri IPC 层（state/terminal/ipc/error）
+│   ├── shell/                    # Shell 补全与管道
+│   └── logging/                  # 日志 inspector
 ├── echo-agent-app-core/          # 核心应用库
 │   ├── src/
-│   │   ├── state.rs              # 应用状态管理
-│   │   ├── agent_handle.rs       # Agent 流式输出封装
-│   │   ├── security/             # JWT/认证/权限
-│   │   ├── tasks/                # 后台任务系统
-│   │   ├── hitl/                 # 人机协作循环
-│   │   ├── workspace/            # 工作区管理
-│   │   └── output/               # 输出渲染（Markdown/表格/主题）
-│   └── Cargo.toml
-├── src-tauri/                    # Tauri 桌面应用
+│   │   ├── state.rs              # 应用状态管理（多子域 AppState）
+│   │   ├── agent_handle.rs       # Agent 并发访问封装
+│   │   ├── infra.rs              # Agent 创建、MCP 加载、启动流程
+│   │   ├── config.rs             # 配置（re-export from echo-agent）
+│   │   ├── unified_memory.rs     # 统一记忆 API（Instructions + Memories）
+│   │   ├── output/               # 输出渲染（Markdown/表格/主题/Spinner）
+│   │   ├── tasks/                # 后台任务系统（BackgroundTaskKind）
+│   │   ├── hitl/                 # 人机协作循环（Dispatcher + REPL Provider）
+│   │   ├── workspace/            # 工作区管理（Layout + Registry + Migration）
+│   │   ├── sessions/             # 会话管理（持久化 + 全文搜索）
+│   │   ├── project/              # 项目上下文（CodingLoop + PromptAssembler）
+│   │   ├── profiles/             # 配置档案管理
+│   │   ├── scheduler/            # 定时任务调度（SchedulerRunner）
+│   │   ├── skills_hub/           # 技能市场（本地）
+│   │   ├── webhook/              # Webhook 事件回调
+│   │   └── observability/        # Trace 观测收集
+│   └── bindings/                 # TypeScript 类型绑定（自动生成）
+├── src-tauri/                    # Tauri 桌面应用入口
 │   └── src/main.rs
 └── web-frontend/                 # GUI 前端（React + Tailwind）
     ├── src/
-    │   ├── App.tsx               # 主应用
     │   ├── components/           # React 组件
-    │   ├── stores/               # Zustand 状态管理
-    │   └── hooks/                # 自定义 Hooks
+    │   ├── generated/            # 自动生成的 TypeScript 类型
+    │   ├── api/                  # API 层
+    │   ├── hooks/                # React Hooks
+    │   ├── stores/               # 状态管理
+    │   └── main.tsx              # 前端入口
     └── package.json
 ```
 
@@ -177,25 +208,73 @@ sudo cp target/release/echo-agent-tauri /Applications/EchoCoWork.app/Contents/Ma
 | `Enter` | 发送消息 |
 | `Esc` | 取消生成 / 关闭弹窗 |
 | `Tab` | 切换侧边栏标签 |
+| `S-Tab` | 补全列表上一项 |
 | `↑/↓` | 浏览输入历史 |
-| `Shift+↑/↓` | 滚动聊天 |
-| `PageUp/PageDown` | 快速滚动 |
+| `PageUp/PageDown` | 快速滚动聊天 |
+| `y` / `n` | 批准 / 拒绝工具执行（HITL 审批） |
 
 ### Slash 命令
 
-在输入框输入 `/` 可查看可用命令：
+在输入框输入 `/` 可查看可用命令（命令面板，支持模糊搜索）：
 
-| 命令 | 描述 |
-|------|------|
-| `/help` | 显示帮助信息 |
-| `/mode <mode>` | 切换 Agent 模式 |
-| `/model <name>` | 切换模型 |
-| `/reset` | 重置会话 |
-| `/stats` | 显示会话统计 |
-| `/status` | 显示当前状态 |
-| `/cost` | 显示 Token 用量 |
-| `/tools` | 显示可用工具 |
-| `/quit` / `/exit` | 退出应用 |
+| 分组 | 命令 | 描述 |
+|------|------|------|
+| **Session** | `/reset` | 重置对话历史 |
+| | `/history` | 查看会话历史 |
+| | `/stats` | 显示会话统计 |
+| | `/status` | 显示 Agent 状态 |
+| | `/new` | 创建新会话 |
+| | `/compact` | 压缩上下文窗口 |
+| **Context** | `/mode <mode>` | 切换模式（general/coding/research/data/writing） |
+| | `/model <name>` | 切换模型 |
+| | `/think` | 切换推理/思考显示 |
+| | `/system [prompt]` | 查看或设置系统提示词 |
+| | `/memory` | 查看记忆内容 |
+| | `/remember <fact>` | 保存一条记忆 |
+| | `/forget <fact>` | 删除一条记忆 |
+| **Coding** | `/plan` | 进入计划模式（只读分析） |
+| | `/tasks` | 查看活跃任务 |
+| | `/test [name]` | 运行测试 |
+| | `/code-review [path]` | 请求代码审查 |
+| | `/diff [file]` | 查看 git 或文件差异 |
+| **Git** | `/git <args>` | 运行 git 命令 |
+| **Pipeline** | `/pipeline [list\|run]` | 管理流水线 |
+| **Security** | `/permission [mode]` | 查看/设置权限模式 |
+| **Scheduling** | `/cron [list\|add\|remove]` | 管理定时任务 |
+| | `/auto-memory` | 切换自动记忆 |
+| **Info** | `/tools` | 显示可用工具 |
+| | `/cost` | 显示 Token 用量 |
+| | `/help` | 显示帮助信息 |
+| **Exit** | `/quit` / `/exit` | 退出应用 |
+
+### CLI 子命令
+
+```bash
+echo-agent-cli run <message>              # 单次对话（从参数或 stdin）
+echo-agent-cli onboard                     # 交互式引导配置
+echo-agent-cli doctor                      # 诊断配置问题
+echo-agent-cli sessions list|show|export|delete  # 会话管理
+echo-agent-cli profiles list|create|use|delete   # 配置档案管理
+echo-agent-cli completions <shell>         # 生成 Shell 补全脚本
+echo-agent-cli eval <path>                 # 运行 eval 测试用例
+```
+
+### CLI 常用参数
+
+| 参数 | 短形式 | 描述 |
+|------|--------|------|
+| `--model <name>` | `-m` | 指定模型名称 |
+| `--mode <mode>` | | Agent 模式（general/coding/research/data/writing） |
+| `--config <path>` | | 指定配置文件路径 |
+| `--mcp-config <path>` | | 指定 MCP 配置文件路径 |
+| `--project <path>` | | 指定项目目录 |
+| `--continue` | `-c` | 继续最近一次会话 |
+| `--resume <id>` | `-r` | 恢复指定会话 |
+| `--headless <prompt>` | | Headless 模式（CI/CD 非交互执行） |
+| `--max-iterations <n>` | | Headless 模式最大迭代次数 |
+| `--output <format>` | `-o` | 输出格式（text/json/markdown/table） |
+| `--no-color` | | 禁用彩色输出 |
+| `--verbose` | `-v` | 详细输出模式 |
 
 ---
 
@@ -254,21 +333,15 @@ npx tsc -b
 
 ### 后台任务
 
-支持多种任务类型：
+支持多种任务类型（`BackgroundTaskKind`）：
 
 - `AgentChat` — 单次对话
 - `Cron` — 定时任务
 - `Workflow` — 工作流编排
-- `Research` — 学术研究流水线
-- `DataPipeline` — 数据处理流水线
-- `Composite` — 组合任务（支持并行/顺序执行）
-
-### 安全机制
-
-- **JWT 认证**：自动生成密钥、bcrypt 密码哈希、令牌过期
-- **速率限制**：基于 governor 的直接模式（避免 keyed 内存泄漏）
-- **审计日志**：FIFO 淘汰的审计日志
-- **权限控制**：工具级别的细粒度权限
+- `Research` — 学术研究流水线（论文检索 → 综合 → 撰写）
+- `ResearchToWriting` — 研究到写作端到端流水线
+- `DataPipeline` — 数据处理流水线（加载 → 分析 → 可视化 → 总结）
+- `Writing` — 文档写作流水线
 
 ---
 

@@ -120,15 +120,19 @@ export function TerminalDrawer() {
             <div
               key={tab.id}
               className={`group flex items-center gap-1.5 rounded-t-md px-3 py-1.5 text-xs cursor-pointer transition-colors
-                ${tab.id === activeTabId
-                  ? 'bg-[var(--bg-primary)] text-[var(--text-primary)] border-b-2 border-b-[var(--accent)]'
-                  : 'text-[var(--text-secondary)] hover:bg-[var(--bg-sidebar-hover)] hover:text-[var(--text-primary)]'
+                ${
+                  tab.id === activeTabId
+                    ? 'bg-[var(--bg-primary)] text-[var(--text-primary)] border-b-2 border-b-[var(--accent)]'
+                    : 'text-[var(--text-secondary)] hover:bg-[var(--bg-sidebar-hover)] hover:text-[var(--text-primary)]'
                 }`}
               onClick={() => setActiveTabId(tab.id)}
             >
               <span>{tab.label}</span>
               <button
-                onClick={(e) => { e.stopPropagation(); closeTab(tab.id); }}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  closeTab(tab.id);
+                }}
                 className="ml-1 rounded p-0.5 opacity-0 group-hover:opacity-100 hover:bg-[var(--bg-hover)] transition-opacity"
               >
                 <X size={10} />

@@ -27,7 +27,9 @@ export function DecisionLogPanel() {
     }
   }, []);
 
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    load();
+  }, [load]);
 
   const handleAdd = async () => {
     if (!decision.trim() || !rationale.trim()) return;
@@ -37,7 +39,10 @@ export function DecisionLogPanel() {
         decision: decision.trim(),
         rationale: rationale.trim(),
         alternatives: alternatives
-          ? alternatives.split('\n').map((s) => s.trim()).filter(Boolean)
+          ? alternatives
+              .split('\n')
+              .map((s) => s.trim())
+              .filter(Boolean)
           : undefined,
         context: context.trim() || undefined,
       };
@@ -207,9 +212,17 @@ export function DecisionLogPanel() {
                     onClick={() => setExpandedId(expanded ? null : d.id)}
                   >
                     {expanded ? (
-                      <ChevronUp size={14} className="mt-0.5 shrink-0" style={{ color: 'var(--text-tertiary)' }} />
+                      <ChevronUp
+                        size={14}
+                        className="mt-0.5 shrink-0"
+                        style={{ color: 'var(--text-tertiary)' }}
+                      />
                     ) : (
-                      <ChevronDown size={14} className="mt-0.5 shrink-0" style={{ color: 'var(--text-tertiary)' }} />
+                      <ChevronDown
+                        size={14}
+                        className="mt-0.5 shrink-0"
+                        style={{ color: 'var(--text-tertiary)' }}
+                      />
                     )}
                     <div className="flex-1 min-w-0">
                       <div className="text-sm font-medium" style={{ color: 'var(--text-primary)' }}>
@@ -235,7 +248,10 @@ export function DecisionLogPanel() {
                           <span className="font-medium" style={{ color: 'var(--text-secondary)' }}>
                             Alternatives:
                           </span>
-                          <ul className="mt-0.5 list-disc list-inside" style={{ color: 'var(--text-primary)' }}>
+                          <ul
+                            className="mt-0.5 list-disc list-inside"
+                            style={{ color: 'var(--text-primary)' }}
+                          >
                             {d.alternatives.map((a, i) => (
                               <li key={i}>{a}</li>
                             ))}

@@ -5,6 +5,7 @@ pub mod input;
 pub mod popup;
 pub mod sidebar;
 pub mod status_bar;
+pub mod task_strip;
 
 use ratatui::Frame;
 use ratatui::layout::Rect;

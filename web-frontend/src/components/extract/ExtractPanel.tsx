@@ -3,14 +3,18 @@ import { FileJson, Play, CheckCircle, AlertCircle } from 'lucide-react';
 import { extractApi } from '../../api/endpoints';
 import type { ExtractExample, ValidateSchemaResponse } from '../../types/api';
 
-const DEFAULT_SCHEMA = JSON.stringify({
-  type: 'object',
-  properties: {
-    name: { type: 'string', description: 'The name' },
-    value: { type: 'number', description: 'The value' },
+const DEFAULT_SCHEMA = JSON.stringify(
+  {
+    type: 'object',
+    properties: {
+      name: { type: 'string', description: 'The name' },
+      value: { type: 'number', description: 'The value' },
+    },
+    required: ['name'],
   },
-  required: ['name'],
-}, null, 2);
+  null,
+  2
+);
 
 export function ExtractPanel() {
   const [input, setInput] = useState('');
@@ -66,7 +70,10 @@ export function ExtractPanel() {
       {/* Examples */}
       {examples.length > 0 && (
         <div>
-          <span className="text-[10px] font-medium uppercase tracking-wider" style={{ color: 'var(--text-tertiary)' }}>
+          <span
+            className="text-[10px] font-medium uppercase tracking-wider"
+            style={{ color: 'var(--text-tertiary)' }}
+          >
             示例
           </span>
           <div className="mt-1 flex flex-wrap gap-1">
@@ -86,7 +93,10 @@ export function ExtractPanel() {
 
       {/* Input */}
       <div>
-        <label className="text-[10px] font-medium uppercase tracking-wider" style={{ color: 'var(--text-tertiary)' }}>
+        <label
+          className="text-[10px] font-medium uppercase tracking-wider"
+          style={{ color: 'var(--text-tertiary)' }}
+        >
           输入文本
         </label>
         <textarea
@@ -95,7 +105,11 @@ export function ExtractPanel() {
           placeholder="输入自然语言文本以提取结构化数据..."
           rows={3}
           className="mt-1 w-full rounded-lg border px-3 py-2 text-xs"
-          style={{ background: 'var(--bg-input)', borderColor: 'var(--border-primary)', color: 'var(--text-primary)' }}
+          style={{
+            background: 'var(--bg-input)',
+            borderColor: 'var(--border-primary)',
+            color: 'var(--text-primary)',
+          }}
         />
       </div>
 
@@ -105,37 +119,64 @@ export function ExtractPanel() {
         onChange={(e) => setSchemaName(e.target.value)}
         placeholder="模式名称（可选）"
         className="w-full rounded-lg border px-3 py-1.5 text-xs"
-        style={{ background: 'var(--bg-input)', borderColor: 'var(--border-primary)', color: 'var(--text-primary)' }}
+        style={{
+          background: 'var(--bg-input)',
+          borderColor: 'var(--border-primary)',
+          color: 'var(--text-primary)',
+        }}
       />
 
       {/* Schema editor */}
       <div>
         <div className="flex items-center justify-between">
-          <label className="text-[10px] font-medium uppercase tracking-wider" style={{ color: 'var(--text-tertiary)' }}>
+          <label
+            className="text-[10px] font-medium uppercase tracking-wider"
+            style={{ color: 'var(--text-tertiary)' }}
+          >
             JSON 模式
           </label>
-          <button onClick={validate} className="flex items-center gap-1 text-[10px]" style={{ color: 'var(--accent)' }}>
+          <button
+            onClick={validate}
+            className="flex items-center gap-1 text-[10px]"
+            style={{ color: 'var(--accent)' }}
+          >
             <FileJson size={10} /> 验证
           </button>
         </div>
         <textarea
           value={schema}
-          onChange={(e) => { setSchema(e.target.value); setValidation(null); }}
+          onChange={(e) => {
+            setSchema(e.target.value);
+            setValidation(null);
+          }}
           rows={8}
           className="mt-1 w-full rounded-lg border px-3 py-2 font-mono text-[11px] leading-relaxed"
-          style={{ background: 'var(--bg-code)', borderColor: 'var(--border-primary)', color: 'var(--color-code-text)' }}
+          style={{
+            background: 'var(--bg-code)',
+            borderColor: 'var(--border-primary)',
+            color: 'var(--color-code-text)',
+          }}
         />
       </div>
 
       {/* Validation result */}
       {validation && (
-        <div className="flex items-center gap-2 rounded-lg px-3 py-2 text-xs" style={{
-          background: validation.valid ? 'var(--color-success-bg)' : 'var(--color-error-bg)',
-        }}>
+        <div
+          className="flex items-center gap-2 rounded-lg px-3 py-2 text-xs"
+          style={{
+            background: validation.valid ? 'var(--color-success-bg)' : 'var(--color-error-bg)',
+          }}
+        >
           {validation.valid ? (
-            <><CheckCircle size={14} style={{ color: 'var(--color-success)' }} /> <span style={{ color: 'var(--color-success)' }}>模式有效</span></>
+            <>
+              <CheckCircle size={14} style={{ color: 'var(--color-success)' }} />{' '}
+              <span style={{ color: 'var(--color-success)' }}>模式有效</span>
+            </>
           ) : (
-            <><AlertCircle size={14} style={{ color: 'var(--color-error)' }} /> <span style={{ color: 'var(--color-error)' }}>{validation.errors.join(', ')}</span></>
+            <>
+              <AlertCircle size={14} style={{ color: 'var(--color-error)' }} />{' '}
+              <span style={{ color: 'var(--color-error)' }}>{validation.errors.join(', ')}</span>
+            </>
           )}
         </div>
       )}
@@ -146,20 +187,30 @@ export function ExtractPanel() {
         disabled={extracting || !input.trim() || !schema.trim()}
         className="flex w-full items-center justify-center gap-2 rounded-lg py-2.5 text-xs font-medium transition-colors"
         style={{
-          background: (extracting || !input.trim() || !schema.trim()) ? 'var(--border-primary)' : 'var(--accent)',
-          color: (extracting || !input.trim() || !schema.trim()) ? 'var(--text-tertiary)' : 'white',
+          background:
+            extracting || !input.trim() || !schema.trim()
+              ? 'var(--border-primary)'
+              : 'var(--accent)',
+          color: extracting || !input.trim() || !schema.trim() ? 'var(--text-tertiary)' : 'white',
         }}
       >
         {extracting ? (
-          <><div className="spinner" /> 提取中...</>
+          <>
+            <div className="spinner" /> 提取中...
+          </>
         ) : (
-          <><Play size={12} /> 提取</>
+          <>
+            <Play size={12} /> 提取
+          </>
         )}
       </button>
 
       {/* Error */}
       {error && (
-        <div className="rounded-lg border-l-[3px] p-3 text-xs" style={{ borderColor: 'var(--color-error)', background: 'var(--color-error-bg)' }}>
+        <div
+          className="rounded-lg border-l-[3px] p-3 text-xs"
+          style={{ borderColor: 'var(--color-error)', background: 'var(--color-error-bg)' }}
+        >
           <p style={{ color: 'var(--color-error)' }}>{error}</p>
         </div>
       )}
@@ -167,11 +218,16 @@ export function ExtractPanel() {
       {/* Result */}
       {result !== null && (
         <div>
-          <span className="text-[10px] font-medium uppercase tracking-wider" style={{ color: 'var(--text-tertiary)' }}>
+          <span
+            className="text-[10px] font-medium uppercase tracking-wider"
+            style={{ color: 'var(--text-tertiary)' }}
+          >
             提取的数据
           </span>
-          <pre className="mt-1 max-h-64 overflow-auto rounded-lg p-3 text-[11px] leading-relaxed"
-            style={{ background: 'var(--bg-code)', color: 'var(--color-code-text)' }}>
+          <pre
+            className="mt-1 max-h-64 overflow-auto rounded-lg p-3 text-[11px] leading-relaxed"
+            style={{ background: 'var(--bg-code)', color: 'var(--color-code-text)' }}
+          >
             {JSON.stringify(result, null, 2)}
           </pre>
         </div>

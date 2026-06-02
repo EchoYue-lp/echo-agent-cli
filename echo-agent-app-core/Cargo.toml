@@ -4,7 +4,7 @@ version = "1.0.0"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT"
-description = "Shared state and infrastructure for Echo Agent CLI"
+description = "Shared state and infrastructure for EchoCoWork"
 
 [package.metadata.ts-rs]
 export_dir = "../web-frontend/src/generated"

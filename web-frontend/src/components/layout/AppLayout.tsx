@@ -47,7 +47,6 @@ export function AppLayout({ left, center }: { left: ReactNode; center: ReactNode
         {/* Terminal drawer at bottom */}
         <TerminalDrawer />
       </div>
-
     </div>
   );
 }

@@ -30,7 +30,9 @@ function kindDetail(kind: TraceKind): { title: string; fields: [string, string][
         title: `Agent Step #${kind.step_number}`,
         fields: [
           ['Step Number', String(kind.step_number)],
-          ...(kind.thought_preview ? [['Thought Preview', kind.thought_preview] as [string, string]] : []),
+          ...(kind.thought_preview
+            ? [['Thought Preview', kind.thought_preview] as [string, string]]
+            : []),
         ],
       };
     case 'pipeline_stage':
@@ -46,7 +48,9 @@ function kindDetail(kind: TraceKind): { title: string; fields: [string, string][
         title: `Memory: ${kind.operation}`,
         fields: [
           ['Operation', kind.operation],
-          ...(kind.results_count != null ? [['Results Count', String(kind.results_count)] as [string, string]] : []),
+          ...(kind.results_count != null
+            ? [['Results Count', String(kind.results_count)] as [string, string]]
+            : []),
         ],
       };
     case 'mcp_call':
@@ -65,7 +69,10 @@ function kindDetail(kind: TraceKind): { title: string; fields: [string, string][
           ['After Messages', String(kind.after_messages)],
           ['Before Tokens', kind.before_tokens.toLocaleString()],
           ['After Tokens', kind.after_tokens.toLocaleString()],
-          ['Reduction', `${(((kind.before_tokens - kind.after_tokens) / Math.max(kind.before_tokens, 1)) * 100).toFixed(1)}%`],
+          [
+            'Reduction',
+            `${(((kind.before_tokens - kind.after_tokens) / Math.max(kind.before_tokens, 1)) * 100).toFixed(1)}%`,
+          ],
         ],
       };
   }
@@ -95,13 +102,19 @@ export function StepInspector({ event }: StepInspectorProps) {
   return (
     <div className="space-y-3">
       {/* Title */}
-      <h4 className="text-sm font-semibold" style={{ color: s.text }}>{title}</h4>
+      <h4 className="text-sm font-semibold" style={{ color: s.text }}>
+        {title}
+      </h4>
 
       {/* Timestamp & duration */}
       <div className="flex items-center gap-4 text-[10px] font-mono" style={{ color: s.textTer }}>
         <span>{new Date(event.timestamp).toLocaleString()}</span>
         {event.duration_ms != null && (
-          <span>{event.duration_ms < 1000 ? `${event.duration_ms}ms` : `${(event.duration_ms / 1000).toFixed(2)}s`}</span>
+          <span>
+            {event.duration_ms < 1000
+              ? `${event.duration_ms}ms`
+              : `${(event.duration_ms / 1000).toFixed(2)}s`}
+          </span>
         )}
       </div>
 
@@ -110,8 +123,15 @@ export function StepInspector({ event }: StepInspectorProps) {
         <table className="w-full text-xs">
           <tbody>
             {fields.map(([label, value]) => (
-              <tr key={label} className="border-b last:border-b-0" style={{ borderColor: s.border }}>
-                <td className="px-3 py-1.5 font-medium whitespace-nowrap" style={{ color: s.textSec, background: s.bgHover }}>
+              <tr
+                key={label}
+                className="border-b last:border-b-0"
+                style={{ borderColor: s.border }}
+              >
+                <td
+                  className="px-3 py-1.5 font-medium whitespace-nowrap"
+                  style={{ color: s.textSec, background: s.bgHover }}
+                >
                   {label}
                 </td>
                 <td className="px-3 py-1.5 break-all" style={{ color: s.text, background: s.bg }}>
@@ -126,7 +146,9 @@ export function StepInspector({ event }: StepInspectorProps) {
       {/* Raw metadata */}
       {hasMetadata && (
         <div>
-          <h5 className="text-xs font-medium mb-1" style={{ color: s.textSec }}>Metadata</h5>
+          <h5 className="text-xs font-medium mb-1" style={{ color: s.textSec }}>
+            Metadata
+          </h5>
           <pre
             className="rounded-lg border p-3 text-[10px] font-mono overflow-x-auto whitespace-pre-wrap break-all"
             style={{ borderColor: s.border, background: s.bgHover, color: s.textSec }}

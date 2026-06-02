@@ -1,4 +1,3 @@
-
 interface DiffLine {
   type: 'add' | 'remove' | 'context';
   content: string;
@@ -39,10 +38,10 @@ export function DiffViewer({ diff, oldFileName = 'old', newFileName = 'new' }: D
         </div>
         <div className="flex items-center gap-2 ml-auto">
           <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-green-50 text-green-700 text-xs font-medium dark:bg-green-900/20 dark:text-green-400">
-            +{parsedLines.filter(l => l.type === 'add').length}
+            +{parsedLines.filter((l) => l.type === 'add').length}
           </span>
           <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-red-50 text-red-700 text-xs font-medium dark:bg-red-900/20 dark:text-red-400">
-            -{parsedLines.filter(l => l.type === 'remove').length}
+            -{parsedLines.filter((l) => l.type === 'remove').length}
           </span>
         </div>
       </div>
@@ -56,8 +55,8 @@ export function DiffViewer({ diff, oldFileName = 'old', newFileName = 'new' }: D
                   line.type === 'add'
                     ? 'bg-green-50/50 dark:bg-green-900/10'
                     : line.type === 'remove'
-                    ? 'bg-red-50/50 dark:bg-red-900/10'
-                    : 'hover:bg-[var(--bg-hover)]'
+                      ? 'bg-red-50/50 dark:bg-red-900/10'
+                      : 'hover:bg-[var(--bg-hover)]'
                 }
               >
                 <td className="w-8 px-2 py-0.5 text-right select-none">
@@ -66,8 +65,8 @@ export function DiffViewer({ diff, oldFileName = 'old', newFileName = 'new' }: D
                       line.type === 'add'
                         ? 'text-green-600 dark:text-green-400 font-bold'
                         : line.type === 'remove'
-                        ? 'text-red-600 dark:text-red-400 font-bold'
-                        : 'text-[var(--text-tertiary)]'
+                          ? 'text-red-600 dark:text-red-400 font-bold'
+                          : 'text-[var(--text-tertiary)]'
                     }
                   >
                     {line.type === 'add' ? '+' : line.type === 'remove' ? '-' : ' '}

@@ -21,9 +21,10 @@ export default function CommandPalette({ isOpen, onClose, commands }: Props) {
   const [selectedIndex, setSelectedIndex] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  const filtered = commands.filter(cmd =>
-    cmd.label.toLowerCase().includes(query.toLowerCase()) ||
-    cmd.description?.toLowerCase().includes(query.toLowerCase())
+  const filtered = commands.filter(
+    (cmd) =>
+      cmd.label.toLowerCase().includes(query.toLowerCase()) ||
+      cmd.description?.toLowerCase().includes(query.toLowerCase())
   );
 
   useEffect(() => {
@@ -39,23 +40,26 @@ export default function CommandPalette({ isOpen, onClose, commands }: Props) {
     setSelectedIndex(0);
   }, [query]);
 
-  const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
-    if (e.key === 'ArrowDown') {
-      e.preventDefault();
-      setSelectedIndex(i => Math.min(i + 1, filtered.length - 1));
-    } else if (e.key === 'ArrowUp') {
-      e.preventDefault();
-      setSelectedIndex(i => Math.max(i - 1, 0));
-    } else if (e.key === 'Enter') {
-      e.preventDefault();
-      if (filtered[selectedIndex]) {
-        filtered[selectedIndex].action();
+  const handleKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        setSelectedIndex((i) => Math.min(i + 1, filtered.length - 1));
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        setSelectedIndex((i) => Math.max(i - 1, 0));
+      } else if (e.key === 'Enter') {
+        e.preventDefault();
+        if (filtered[selectedIndex]) {
+          filtered[selectedIndex].action();
+          onClose();
+        }
+      } else if (e.key === 'Escape') {
         onClose();
       }
-    } else if (e.key === 'Escape') {
-      onClose();
-    }
-  }, [filtered, selectedIndex, onClose]);
+    },
+    [filtered, selectedIndex, onClose]
+  );
 
   if (!isOpen) return null;
 
@@ -74,22 +78,31 @@ export default function CommandPalette({ isOpen, onClose, commands }: Props) {
       <div
         className="relative w-full max-w-lg rounded-xl shadow-2xl overflow-hidden"
         style={{ background: 'var(--bg-primary, #1e1e1e)' }}
-        onClick={e => e.stopPropagation()}
+        onClick={(e) => e.stopPropagation()}
       >
         {/* Search input */}
-        <div className="flex items-center gap-2 px-4 py-3 border-b" style={{ borderColor: 'var(--border-primary, #333)' }}>
+        <div
+          className="flex items-center gap-2 px-4 py-3 border-b"
+          style={{ borderColor: 'var(--border-primary, #333)' }}
+        >
           <Search size={16} style={{ color: 'var(--text-secondary, #888)' }} />
           <input
             ref={inputRef}
             type="text"
             value={query}
-            onChange={e => setQuery(e.target.value)}
+            onChange={(e) => setQuery(e.target.value)}
             onKeyDown={handleKeyDown}
             placeholder="Type a command..."
             className="flex-1 bg-transparent outline-none text-sm"
             style={{ color: 'var(--text-primary, #eee)' }}
           />
-          <kbd className="text-xs px-1.5 py-0.5 rounded" style={{ background: 'var(--bg-secondary, #2a2a2a)', color: 'var(--text-secondary, #888)' }}>
+          <kbd
+            className="text-xs px-1.5 py-0.5 rounded"
+            style={{
+              background: 'var(--bg-secondary, #2a2a2a)',
+              color: 'var(--text-secondary, #888)',
+            }}
+          >
             ESC
           </kbd>
         </div>
@@ -97,7 +110,10 @@ export default function CommandPalette({ isOpen, onClose, commands }: Props) {
         {/* Results */}
         <div className="max-h-80 overflow-y-auto py-2">
           {filtered.length === 0 ? (
-            <div className="px-4 py-8 text-center text-sm" style={{ color: 'var(--text-secondary, #888)' }}>
+            <div
+              className="px-4 py-8 text-center text-sm"
+              style={{ color: 'var(--text-secondary, #888)' }}
+            >
               No results found
             </div>
           ) : (
@@ -118,19 +134,28 @@ export default function CommandPalette({ isOpen, onClose, commands }: Props) {
                         idx === selectedIndex ? 'bg-[var(--accent)]/10' : ''
                       }`}
                       style={{ color: 'var(--text-primary, #eee)' }}
-                      onClick={() => { cmd.action(); onClose(); }}
+                      onClick={() => {
+                        cmd.action();
+                        onClose();
+                      }}
                       onMouseEnter={() => setSelectedIndex(idx)}
                     >
                       <Command size={14} style={{ color: 'var(--text-secondary, #888)' }} />
                       <div className="flex-1 min-w-0">
                         <div className="truncate">{cmd.label}</div>
                         {cmd.description && (
-                          <div className="text-xs truncate" style={{ color: 'var(--text-secondary, #888)' }}>
+                          <div
+                            className="text-xs truncate"
+                            style={{ color: 'var(--text-secondary, #888)' }}
+                          >
                             {cmd.description}
                           </div>
                         )}
                       </div>
-                      <span className="ml-auto text-xs shrink-0" style={{ color: 'var(--text-tertiary, #666)' }}>
+                      <span
+                        className="ml-auto text-xs shrink-0"
+                        style={{ color: 'var(--text-tertiary, #666)' }}
+                      >
                         {cmd.category}
                       </span>
                     </button>

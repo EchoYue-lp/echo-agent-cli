@@ -29,14 +29,23 @@ export function ToolsPanel() {
         </h3>
       </div>
       {tools.map((tool) => (
-        <div key={tool.name} className="rounded-lg border" style={{ borderColor: 'var(--border-primary)', background: 'var(--bg-primary)' }}>
+        <div
+          key={tool.name}
+          className="rounded-lg border"
+          style={{ borderColor: 'var(--border-primary)', background: 'var(--bg-primary)' }}
+        >
           <div className="flex items-center gap-2 px-3 py-2">
-            <button onClick={() => setExpanded(expanded === tool.name ? null : tool.name)}
-              style={{ color: 'var(--text-tertiary)' }}>
+            <button
+              onClick={() => setExpanded(expanded === tool.name ? null : tool.name)}
+              style={{ color: 'var(--text-tertiary)' }}
+            >
               {expanded === tool.name ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
             </button>
             <Wrench size={12} style={{ color: 'var(--text-tertiary)' }} />
-            <span className="flex-1 truncate text-xs font-mono" style={{ color: 'var(--text-primary)' }}>
+            <span
+              className="flex-1 truncate text-xs font-mono"
+              style={{ color: 'var(--text-primary)' }}
+            >
               {tool.name}
             </span>
             <button
@@ -44,15 +53,21 @@ export function ToolsPanel() {
               className={`relative h-5 w-9 rounded-full transition ${tool.enabled ? 'bg-[var(--accent)]' : ''}`}
               style={{ background: tool.enabled ? 'var(--accent)' : 'var(--text-tertiary)' }}
             >
-              <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition ${tool.enabled ? 'left-[18px]' : 'left-0.5'}`} />
+              <span
+                className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition ${tool.enabled ? 'left-[18px]' : 'left-0.5'}`}
+              />
             </button>
           </div>
           {expanded === tool.name && (
             <div className="border-t px-3 py-2" style={{ borderColor: 'var(--border-primary)' }}>
-              <p className="text-xs" style={{ color: 'var(--text-secondary)' }}>{tool.description}</p>
+              <p className="text-xs" style={{ color: 'var(--text-secondary)' }}>
+                {tool.description}
+              </p>
               {tool.input_schema && (
-                <pre className="mt-2 max-h-40 overflow-auto rounded-lg p-2 text-[10px] leading-relaxed"
-                  style={{ background: 'var(--bg-code)', color: 'var(--color-code-text)' }}>
+                <pre
+                  className="mt-2 max-h-40 overflow-auto rounded-lg p-2 text-[10px] leading-relaxed"
+                  style={{ background: 'var(--bg-code)', color: 'var(--color-code-text)' }}
+                >
                   {JSON.stringify(tool.input_schema, null, 2)}
                 </pre>
               )}

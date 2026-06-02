@@ -8,7 +8,6 @@ use anyhow::Result;
 use crate::agent_handle::AgentHandle;
 use crate::cli::args::Args;
 use crate::config::AppConfig;
-use crate::state;
 
 fn repl_config_for(args: &Args) -> crate::cli::ReplConfig {
     crate::cli::ReplConfig {

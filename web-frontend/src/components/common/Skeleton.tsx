@@ -1,4 +1,12 @@
-export function Skeleton({ className = '', width, height = 16 }: { className?: string; width?: number | string; height?: number }) {
+export function Skeleton({
+  className = '',
+  width,
+  height = 16,
+}: {
+  className?: string;
+  width?: number | string;
+  height?: number;
+}) {
   return (
     <div
       className={`rounded-md animate-pulse ${className}`}
@@ -13,7 +21,10 @@ export function Skeleton({ className = '', width, height = 16 }: { className?: s
 
 export function CardSkeleton() {
   return (
-    <div className="rounded-lg border p-3 space-y-2" style={{ borderColor: 'var(--border-primary)', background: 'var(--bg-primary)' }}>
+    <div
+      className="rounded-lg border p-3 space-y-2"
+      style={{ borderColor: 'var(--border-primary)', background: 'var(--bg-primary)' }}
+    >
       <div className="flex items-center gap-2">
         <Skeleton width={14} height={14} />
         <Skeleton width="40%" height={14} />

@@ -105,7 +105,7 @@ async fn cmd_plugins(_ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             }
 
             let name = rest[0];
-            let keep_data = rest.iter().any(|&s| s == "--keep-data");
+            let keep_data = rest.contains(&"--keep-data");
 
             if let Err(e) = registry.scan_all() {
                 println!("Error scanning plugins: {e}");

@@ -3,4 +3,7 @@
 /**
  * MCP 传输配置
  */
-export type McpTransportConfig = { "transport": "stdio", command: string, args: Array<string>, env: { [key: string]: string }, } | { "transport": "http", url: string, headers: { [key: string]: string }, } | { "transport": "sse", url: string, headers: { [key: string]: string }, };
+export type McpTransportConfig =
+  | { transport: 'stdio'; command: string; args: Array<string>; env: { [key: string]: string } }
+  | { transport: 'http'; url: string; headers: { [key: string]: string } }
+  | { transport: 'sse'; url: string; headers: { [key: string]: string } };

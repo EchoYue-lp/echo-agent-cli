@@ -1,18 +1,23 @@
 //! Tauri IPC commands for scheduled tasks (cron).
+//!
+//! All commands operate on the framework's `SchedulerRunner` directly —
+//! there is no separate `store()` accessor; the runner wraps the store
+//! and exposes high-level management methods.
 
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
-use echo_agent::agent::Agent;
-use echo_agent_app_core::scheduler::task::{CronTask, CronTaskStatus, TaskStore};
+use echo_agent_app_core::scheduler::{CronTask, CronTaskStatus};
 
-/// 获取与 SchedulerRunner 共享的 TaskStore（共享底层 Arc<dyn Store>）
-fn get_shared_store(state: &TauriState) -> Result<TaskStore, IpcError> {
+/// Helper: borrow the scheduler runner from Tauri state, returning an IPC
+/// error if the scheduler was never initialized.
+fn get_runner(
+    state: &TauriState,
+) -> Result<&std::sync::Arc<echo_agent_app_core::scheduler::SchedulerRunner>, IpcError> {
     state
         .app_state
         .scheduler
         .runner
         .as_ref()
-        .map(|runner| runner.store())
         .ok_or_else(|| IpcError::Internal("Scheduler not initialized".to_string()))
 }
 
@@ -20,10 +25,8 @@ fn get_shared_store(state: &TauriState) -> Result<TaskStore, IpcError> {
 pub async fn list_scheduler_tasks(
     state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
-    let store = get_shared_store(&state)?;
-    let tasks = store
-        .load_all()
-        .map_err(|e| IpcError::Internal(e.to_string()))?;
+    let runner = get_runner(&state)?;
+    let tasks = runner.list_tasks().await;
     serde_json::to_value(tasks).map_err(|e| IpcError::Internal(e.to_string()))
 }
 
@@ -34,10 +37,11 @@ pub async fn add_scheduler_task(
     cron_expr: String,
     prompt: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let store = get_shared_store(&state)?;
+    let runner = get_runner(&state)?;
     let task = CronTask::new(&name, &cron_expr, &prompt);
-    store
-        .add(task)
+    runner
+        .add_task(task)
+        .await
         .map_err(|e| IpcError::Internal(e.to_string()))?;
     Ok(serde_json::json!({"success": true}))
 }
@@ -47,9 +51,10 @@ pub async fn remove_scheduler_task(
     state: tauri::State<'_, TauriState>,
     id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let store = get_shared_store(&state)?;
-    match store
-        .remove(&id)
+    let runner = get_runner(&state)?;
+    match runner
+        .remove_task(&id)
+        .await
         .map_err(|e| IpcError::Internal(e.to_string()))?
     {
         true => Ok(serde_json::json!({"success": true})),
@@ -63,14 +68,15 @@ pub async fn set_scheduler_task_status(
     id: String,
     status: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let store = get_shared_store(&state)?;
+    let runner = get_runner(&state)?;
     let s = match status.as_str() {
         "enabled" => CronTaskStatus::Enabled,
         "disabled" => CronTaskStatus::Disabled,
         _ => return Err(IpcError::Validation(format!("Invalid status: {}", status))),
     };
-    match store
+    match runner
         .set_status(&id, s)
+        .await
         .map_err(|e| IpcError::Internal(e.to_string()))?
     {
         true => Ok(serde_json::json!({"success": true})),
@@ -83,28 +89,11 @@ pub async fn run_scheduler_task(
     state: tauri::State<'_, TauriState>,
     id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let store = get_shared_store(&state)?;
-    let task = store
-        .get(&id)
-        .map_err(|e| IpcError::Internal(e.to_string()))?
-        .ok_or_else(|| IpcError::NotFound(format!("Task '{}' not found", id)))?;
-
-    let prompt = task.prompt.clone();
-    let result = state
-        .app_state
-        .connection
-        .agent
-        .read_async(|agent| {
-            let prompt = prompt.clone();
-            Box::pin(async move { agent.chat(&prompt).await })
-        })
+    let runner = get_runner(&state)?;
+    let result = runner
+        .run_once(&id)
         .await
         .map_err(|e| IpcError::Internal(e.to_string()))?;
-
-    store
-        .update_last_run(&id, &result)
-        .map_err(|e| IpcError::Internal(e.to_string()))?;
-
     Ok(serde_json::json!({
         "success": true,
         "result": result,

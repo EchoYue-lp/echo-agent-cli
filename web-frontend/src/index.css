@@ -1,4 +1,4 @@
-@import "tailwindcss";
+@import 'tailwindcss';
 
 @theme {
   --color-primary: #6366f1;
@@ -124,7 +124,9 @@
 
 body {
   margin: 0;
-  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Inter, Roboto, 'Helvetica Neue', sans-serif;
+  font-family:
+    -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Inter, Roboto, 'Helvetica Neue',
+    sans-serif;
   background: var(--bg-chat);
   color: var(--text-primary);
   -webkit-font-smoothing: antialiased;
@@ -166,55 +168,120 @@ body {
 
 /* Animations */
 @keyframes fadeSlideUp {
-  from { opacity: 0; transform: translateY(8px); }
-  to { opacity: 1; transform: translateY(0); }
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 @keyframes fadeIn {
-  from { opacity: 0; }
-  to { opacity: 1; }
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
 }
 @keyframes slideInRight {
-  from { opacity: 0; transform: translateX(12px); }
-  to { opacity: 1; transform: translateX(0); }
+  from {
+    opacity: 0;
+    transform: translateX(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
 }
 @keyframes slideInLeft {
-  from { opacity: 0; transform: translateX(-12px); }
-  to { opacity: 1; transform: translateX(0); }
+  from {
+    opacity: 0;
+    transform: translateX(-12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
 }
 @keyframes pulse-border {
-  0%, 100% { border-color: var(--accent); }
-  50% { border-color: transparent; }
+  0%,
+  100% {
+    border-color: var(--accent);
+  }
+  50% {
+    border-color: transparent;
+  }
 }
 @keyframes spin {
-  to { transform: rotate(360deg); }
+  to {
+    transform: rotate(360deg);
+  }
 }
 @keyframes blink {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0; }
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0;
+  }
 }
 @keyframes shimmer {
-  0% { background-position: -200px 0; }
-  100% { background-position: calc(200px + 100%) 0; }
+  0% {
+    background-position: -200px 0;
+  }
+  100% {
+    background-position: calc(200px + 100%) 0;
+  }
 }
 @keyframes float {
-  0%, 100% { transform: translateY(0); }
-  50% { transform: translateY(-8px); }
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-8px);
+  }
 }
 @keyframes glow-pulse {
-  0%, 100% { box-shadow: var(--shadow-glow); }
-  50% { box-shadow: 0 0 32px rgba(99, 102, 241, 0.18); }
+  0%,
+  100% {
+    box-shadow: var(--shadow-glow);
+  }
+  50% {
+    box-shadow: 0 0 32px rgba(99, 102, 241, 0.18);
+  }
 }
 @keyframes scaleIn {
-  from { opacity: 0; transform: scale(0.95); }
-  to { opacity: 1; transform: scale(1); }
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
 }
 @keyframes slideUp {
-  from { opacity: 0; transform: translateY(20px); }
-  to { opacity: 1; transform: translateY(0); }
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 @keyframes breathe {
-  0%, 100% { opacity: 0.6; }
-  50% { opacity: 1; }
+  0%,
+  100% {
+    opacity: 0.6;
+  }
+  50% {
+    opacity: 1;
+  }
 }
 
 .animate-fade-up {
@@ -233,7 +300,12 @@ body {
   animation: pulse-border 1.5s ease-in-out infinite;
 }
 .animate-shimmer {
-  background: linear-gradient(90deg, var(--bg-hover) 25%, var(--bg-primary) 50%, var(--bg-hover) 75%);
+  background: linear-gradient(
+    90deg,
+    var(--bg-hover) 25%,
+    var(--bg-primary) 50%,
+    var(--bg-hover) 75%
+  );
   background-size: 200px 100%;
   animation: shimmer 1.5s ease-in-out infinite;
 }
@@ -255,7 +327,9 @@ body {
 
 /* Respect prefers-reduced-motion */
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after {
+  *,
+  *::before,
+  *::after {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
     transition-duration: 0.01ms !important;
@@ -302,15 +376,45 @@ body {
 }
 
 /* Markdown content */
-.md-content h1 { font-size: 1.5em; font-weight: 700; margin: 0.6em 0 0.3em; }
-.md-content h2 { font-size: 1.3em; font-weight: 600; margin: 0.5em 0 0.25em; }
-.md-content h3 { font-size: 1.1em; font-weight: 600; margin: 0.4em 0 0.2em; }
-.md-content p { margin: 0.4em 0; line-height: 1.75; }
-.md-content ul, .md-content ol { margin: 0.4em 0; padding-left: 1.5em; }
-.md-content li { margin: 0.15em 0; line-height: 1.65; }
-.md-content strong { font-weight: 600; }
-.md-content em { font-style: italic; }
-.md-content a { color: var(--text-link); text-decoration: underline; text-underline-offset: 2px; }
+.md-content h1 {
+  font-size: 1.5em;
+  font-weight: 700;
+  margin: 0.6em 0 0.3em;
+}
+.md-content h2 {
+  font-size: 1.3em;
+  font-weight: 600;
+  margin: 0.5em 0 0.25em;
+}
+.md-content h3 {
+  font-size: 1.1em;
+  font-weight: 600;
+  margin: 0.4em 0 0.2em;
+}
+.md-content p {
+  margin: 0.4em 0;
+  line-height: 1.75;
+}
+.md-content ul,
+.md-content ol {
+  margin: 0.4em 0;
+  padding-left: 1.5em;
+}
+.md-content li {
+  margin: 0.15em 0;
+  line-height: 1.65;
+}
+.md-content strong {
+  font-weight: 600;
+}
+.md-content em {
+  font-style: italic;
+}
+.md-content a {
+  color: var(--text-link);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
 .md-content blockquote {
   border-left: 3px solid var(--accent);
   margin: 0.5em 0;
@@ -443,7 +547,9 @@ body {
   padding: 9px 13px;
   font-size: 13px;
   color: var(--text-primary);
-  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  transition:
+    border-color 0.15s ease,
+    box-shadow 0.15s ease;
 }
 
 .input:focus {
@@ -490,7 +596,9 @@ textarea.input {
   border-radius: inherit;
   padding: 1px;
   background: linear-gradient(135deg, var(--accent), var(--color-purple));
-  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  -webkit-mask:
+    linear-gradient(#fff 0 0) content-box,
+    linear-gradient(#fff 0 0);
   -webkit-mask-composite: xor;
   mask-composite: exclude;
   pointer-events: none;

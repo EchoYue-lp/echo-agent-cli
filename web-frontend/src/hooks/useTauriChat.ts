@@ -13,7 +13,13 @@ type ChatEvent =
   | { type: 'final_answer'; data: string }
   | { type: 'cancelled' }
   | { type: 'error'; message: string }
-  | { type: 'approval_request'; request_id: string; tool_name: string; args: unknown; prompt: string }
+  | {
+      type: 'approval_request';
+      request_id: string;
+      tool_name: string;
+      args: unknown;
+      prompt: string;
+    }
   | { type: 'input_request'; request_id: string; prompt: string }
   | { type: 'done' };
 
@@ -178,14 +184,17 @@ export function useTauriChat() {
     }
   }, []);
 
-  const sendApproval = useCallback(async (requestId: string, approved: boolean, reason?: string) => {
-    try {
-      await apiInvoke('send_approval_response', { request_id: requestId, approved, reason });
-      useChatStore.getState().setApprovalRequest(null);
-    } catch (e) {
-      console.error('[TauriChat] Failed to send approval:', e);
-    }
-  }, []);
+  const sendApproval = useCallback(
+    async (requestId: string, approved: boolean, reason?: string) => {
+      try {
+        await apiInvoke('send_approval_response', { request_id: requestId, approved, reason });
+        useChatStore.getState().setApprovalRequest(null);
+      } catch (e) {
+        console.error('[TauriChat] Failed to send approval:', e);
+      }
+    },
+    []
+  );
 
   const sendInput = useCallback(async (requestId: string, text: string) => {
     try {

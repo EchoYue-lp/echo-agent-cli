@@ -136,8 +136,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Load plugins and wire components
     {
-        use echo_agent::plugin::{PluginRegistry, PluginScope};
-        let project_root = args.project.as_ref().map(|p| std::path::PathBuf::from(p));
+        use echo_agent::plugin::PluginRegistry;
+        let project_root = args.project.as_ref().map(std::path::PathBuf::from);
         let mut plugin_registry = PluginRegistry::new(project_root);
 
         if let Err(e) = plugin_registry.scan_all() {
@@ -191,26 +191,26 @@ async fn main() -> anyhow::Result<()> {
                                 }
 
                                 // Collect hooks files for registration
-                                if let Some(ref hooks_file) = resolved.hooks_file {
-                                    if let Ok(content) = std::fs::read_to_string(hooks_file) {
-                                        match serde_yaml_ng::from_str::<
-                                            echo_agent::skills::hooks::HooksDefinition,
-                                        >(&content)
-                                        {
-                                            Ok(def) => {
-                                                hooks_to_register.push((
-                                                    plugin_id.clone(),
-                                                    source_dir.clone(),
-                                                    def,
-                                                ));
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(
-                                                    plugin = %plugin_id,
-                                                    path = %hooks_file.display(),
-                                                    "Failed to parse plugin hooks YAML: {e}"
-                                                );
-                                            }
+                                if let Some(ref hooks_file) = resolved.hooks_file
+                                    && let Ok(content) = std::fs::read_to_string(hooks_file)
+                                {
+                                    match serde_yaml_ng::from_str::<
+                                        echo_agent::skills::hooks::HooksDefinition,
+                                    >(&content)
+                                    {
+                                        Ok(def) => {
+                                            hooks_to_register.push((
+                                                plugin_id.clone(),
+                                                source_dir.clone(),
+                                                def,
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                plugin = %plugin_id,
+                                                path = %hooks_file.display(),
+                                                "Failed to parse plugin hooks YAML: {e}"
+                                            );
                                         }
                                     }
                                 }
@@ -589,7 +589,30 @@ async fn main() -> anyhow::Result<()> {
 
     // ── User-facing TUI mode (default) ─────────────────────────────────
     if is_tui_entry {
-        echo_agent_cli::tui::run_tui(agent_handle.clone()).await?;
+        // Start BackgroundTaskService for parallel task progress display.
+        let tui_task_service = {
+            let cancel = echo_agent::agent::CancellationToken::new();
+            match echo_agent_app_core::tasks::BackgroundTaskService::new(
+                agent_handle.clone(),
+                task_store.clone(),
+                cancel,
+            )
+            .await
+            {
+                Ok(svc) => {
+                    let svc = std::sync::Arc::new(svc);
+                    svc.clone().spawn();
+                    tracing::info!("BackgroundTaskService started for TUI mode");
+                    Some(svc)
+                }
+                Err(e) => {
+                    tracing::warn!("BackgroundTaskService unavailable in TUI: {e}");
+                    None
+                }
+            }
+        };
+
+        echo_agent_cli::tui::run_tui(agent_handle.clone(), tui_task_service).await?;
 
         drop(task_hook_bridge);
         drop(subagent_hook_bridge);

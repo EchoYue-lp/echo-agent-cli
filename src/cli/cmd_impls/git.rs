@@ -336,8 +336,7 @@ async fn git_blame(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                                 .map(|d| d.format("%Y-%m-%d").to_string())
                                 .unwrap_or_else(|| date.to_string());
                         }
-                    } else if line.starts_with('\t') {
-                        let content = &line[1..];
+                    } else if let Some(content) = line.strip_prefix('\t') {
                         results.push(format!(
                             "{:<10} {:<12} {}",
                             current_date, current_author, content

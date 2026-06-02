@@ -59,13 +59,19 @@ export function PaperPanel() {
       const req: CreatePaperRequest = {
         title: addTitle.trim(),
         authors: addAuthors
-          ? addAuthors.split(',').map((a) => a.trim()).filter(Boolean)
+          ? addAuthors
+              .split(',')
+              .map((a) => a.trim())
+              .filter(Boolean)
           : undefined,
         year: addYear ? parseInt(addYear, 10) : undefined,
         venue: addVenue || undefined,
         arxiv_id: addArxiv || undefined,
         tags: addTags
-          ? addTags.split(',').map((t) => t.trim()).filter(Boolean)
+          ? addTags
+              .split(',')
+              .map((t) => t.trim())
+              .filter(Boolean)
           : undefined,
         abstract_text: addAbstract || undefined,
       };
@@ -236,7 +242,10 @@ export function PaperPanel() {
         ) : selectedPaper ? (
           <div className="h-full flex flex-col md:flex-row">
             {/* List side */}
-            <div className="w-full md:w-1/2 h-1/2 md:h-full overflow-hidden" style={{ borderRight: `1px solid ${s.border}` }}>
+            <div
+              className="w-full md:w-1/2 h-1/2 md:h-full overflow-hidden"
+              style={{ borderRight: `1px solid ${s.border}` }}
+            >
               <PaperList
                 papers={papers}
                 selectedId={selectedPaper.id}
@@ -253,11 +262,7 @@ export function PaperPanel() {
             </div>
           </div>
         ) : (
-          <PaperList
-            papers={papers}
-            selectedId={null}
-            onSelect={handleSelectPaper}
-          />
+          <PaperList papers={papers} selectedId={null} onSelect={handleSelectPaper} />
         )}
       </div>
     </div>

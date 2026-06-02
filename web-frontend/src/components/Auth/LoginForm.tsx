@@ -50,9 +50,7 @@ export function LoginForm() {
           <h1 className="text-xl font-semibold tracking-tight text-[var(--text-primary)]">
             EchoCoWork
           </h1>
-          <p className="mt-1 text-sm text-[var(--text-secondary)]">
-            登录以继续使用
-          </p>
+          <p className="mt-1 text-sm text-[var(--text-secondary)]">登录以继续使用</p>
         </div>
 
         {/* Form */}
@@ -85,14 +83,19 @@ export function LoginForm() {
           </div>
 
           {error && (
-            <div className="animate-fade-in flex items-start gap-2 rounded-lg border p-3 text-sm"
+            <div
+              className="animate-fade-in flex items-start gap-2 rounded-lg border p-3 text-sm"
               style={{
                 borderColor: 'var(--border-primary)',
                 background: 'color-mix(in srgb, var(--accent) 8%, transparent)',
                 color: 'var(--text-primary)',
               }}
             >
-              <AlertCircle size={14} className="mt-0.5 shrink-0" style={{ color: 'var(--accent)' }} />
+              <AlertCircle
+                size={14}
+                className="mt-0.5 shrink-0"
+                style={{ color: 'var(--accent)' }}
+              />
               <span>{error}</span>
             </div>
           )}
@@ -104,7 +107,10 @@ export function LoginForm() {
           >
             {isLoading ? (
               <span className="flex items-center gap-2">
-                <span className="spinner h-3.5 w-3.5" style={{ borderColor: 'rgba(255,255,255,0.3)', borderTopColor: 'white' }} />
+                <span
+                  className="spinner h-3.5 w-3.5"
+                  style={{ borderColor: 'rgba(255,255,255,0.3)', borderTopColor: 'white' }}
+                />
                 登录中...
               </span>
             ) : (
@@ -112,9 +118,7 @@ export function LoginForm() {
             )}
           </button>
 
-          <p className="text-center text-xs text-[var(--text-tertiary)]">
-            默认凭证: admin / admin
-          </p>
+          <p className="text-center text-xs text-[var(--text-tertiary)]">默认凭证: admin / admin</p>
         </form>
 
         <div className="mt-6 rounded-lg border border-[var(--border-primary)] bg-[var(--bg-hover)] p-3">

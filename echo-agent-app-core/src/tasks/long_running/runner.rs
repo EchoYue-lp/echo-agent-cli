@@ -193,11 +193,10 @@ impl LongRunningTaskRunner {
                                     "revise".to_string(),
                                     "cancel".to_string(),
                                 ],
-                                waiting_phase: phase.id.clone(),
+                                phase: phase.id.clone(),
                             };
-                            let response = gate
-                                .request_input(&self.task_id, request, &self.cancel)
-                                .await?;
+                            let response =
+                                gate.request(&self.task_id, request, &self.cancel).await?;
                             if response.selection == "cancel" {
                                 return Err(anyhow::anyhow!(
                                     "Task cancelled by user at checkpoint"
@@ -214,9 +213,7 @@ impl LongRunningTaskRunner {
                 }
                 PhaseOutcome::NeedsHumanInput(request) => {
                     if let Some(ref gate) = self.human_gate {
-                        let response = gate
-                            .request_input(&self.task_id, request, &self.cancel)
-                            .await?;
+                        let response = gate.request(&self.task_id, request, &self.cancel).await?;
                         if response.selection == "cancel" {
                             return Err(anyhow::anyhow!("Task cancelled by user"));
                         }

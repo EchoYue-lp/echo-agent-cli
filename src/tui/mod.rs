@@ -32,6 +32,7 @@ use crossterm::{
 use ratatui::style::Color;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::io;
+use std::time::Instant;
 
 // ── Theme ───────────────────────────────────────────────────────────────────
 
@@ -107,8 +108,8 @@ impl Theme {
 
     /// Create a Theme from a CLI ColorTheme, unifying both theme systems.
     pub fn from_color_theme(ct: &echo_agent_app_core::output::theme::ColorTheme) -> Self {
-        use ratatui::style::Color as RatatuiColor;
         use nu_ansi_term::Color as AnsiColor;
+        use ratatui::style::Color as RatatuiColor;
 
         fn ansi_to_ratatui(c: &AnsiColor) -> RatatuiColor {
             match c {
@@ -150,6 +151,42 @@ impl Theme {
 }
 
 // ── Public types ────────────────────────────────────────────────────────────
+
+/// Status of a parallel task displayed in the task strip.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TaskStripStatus {
+    /// Waiting to start.
+    Pending,
+    /// Currently running.
+    Running,
+    /// Completed successfully.
+    Completed,
+    /// Failed with an error message.
+    Failed(String),
+    /// Cancelled.
+    Cancelled,
+}
+
+/// A single entry in the parallel task progress strip.
+#[derive(Clone, Debug)]
+pub struct TaskProgressEntry {
+    /// Unique task identifier.
+    pub task_id: String,
+    /// Short display name (e.g. "Research papers", "Generate report").
+    pub name: String,
+    /// Current status.
+    pub status: TaskStripStatus,
+    /// Progress percentage (0.0–100.0), used for gauge bar.
+    pub progress_pct: f64,
+    /// Current phase label (e.g. "Searching", "Analyzing").
+    pub phase: String,
+    /// Optional detail message (e.g. "12/20 papers found").
+    pub message: Option<String>,
+    /// When this task was first seen (for elapsed time display).
+    pub started_at: Instant,
+    /// Elapsed description cache (e.g. "2m 8s").
+    pub elapsed_label: String,
+}
 
 /// TUI application state.
 pub struct TuiApp {
@@ -205,6 +242,8 @@ pub struct TuiApp {
     pub keymap: keymap::Keymap,
     /// Color theme (auto-detected from terminal).
     pub theme: Theme,
+    /// Parallel task progress entries shown in the task strip.
+    pub parallel_tasks: Vec<TaskProgressEntry>,
 }
 
 #[derive(Clone, Debug)]
@@ -289,6 +328,7 @@ impl TuiApp {
             picker: None,
             keymap: km,
             theme,
+            parallel_tasks: vec![],
         }
     }
 
@@ -439,7 +479,10 @@ impl Drop for TerminalGuard {
 ///
 /// This function handles all terminal setup/teardown via [`TerminalGuard`],
 /// so the terminal is always restored even on panic or early return.
-pub async fn run_tui(agent: AgentHandle) -> anyhow::Result<()> {
+pub async fn run_tui(
+    agent: AgentHandle,
+    task_service: Option<std::sync::Arc<echo_agent_app_core::tasks::BackgroundTaskService>>,
+) -> anyhow::Result<()> {
     // Use ColorTheme to generate Theme, unifying both theme systems.
     let color_theme = echo_agent_app_core::output::theme::ColorTheme::dark();
     let theme = Theme::from_color_theme(&color_theme);
@@ -469,7 +512,7 @@ pub async fn run_tui(agent: AgentHandle) -> anyhow::Result<()> {
     app.tool_count = 24; // Default estimate, updated dynamically.
 
     // Main event loop.
-    let result = events::run_event_loop(&mut terminal, &mut app, agent).await;
+    let result = events::run_event_loop(&mut terminal, &mut app, agent, task_service).await;
 
     // Guard drop will restore the terminal.
     result

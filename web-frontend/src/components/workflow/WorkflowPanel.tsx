@@ -63,10 +63,7 @@ export function WorkflowPanel() {
           rows={5}
           placeholder="YAML 定义..."
         />
-        <button
-          onClick={create}
-          className="btn btn-primary w-full justify-center py-1.5 text-sm"
-        >
+        <button onClick={create} className="btn btn-primary w-full justify-center py-1.5 text-sm">
           <Plus size={14} /> 创建
         </button>
       </div>
@@ -76,7 +73,9 @@ export function WorkflowPanel() {
         <div key={wf.id} className="card px-3 py-2">
           <div className="flex items-center gap-2">
             <GitBranch size={12} style={{ color: 'var(--text-link)' }} />
-            <span className="text-xs font-medium text-[var(--text-primary)]">{wf.name || wf.id}</span>
+            <span className="text-xs font-medium text-[var(--text-primary)]">
+              {wf.name || wf.id}
+            </span>
             <span className="badge text-[10px]">{wf.status}</span>
             <div className="ml-auto flex gap-1">
               <button

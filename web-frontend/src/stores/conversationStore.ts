@@ -76,7 +76,9 @@ function groupByDate(conversations: ConversationMeta[]): ConversationGroup[] {
     }
   }
 
-  return groups.filter((g) => g.items.length > 0).map((g) => ({ label: g.label, conversations: g.items }));
+  return groups
+    .filter((g) => g.items.length > 0)
+    .map((g) => ({ label: g.label, conversations: g.items }));
 }
 
 // ── Helpers ──
@@ -107,15 +109,24 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
   init: async () => {
     try {
       const items = await conversationApi.list();
-      console.log('[conversationStore] init: loaded', items.length, 'items:', JSON.stringify(items.map(i => ({ id: i.conversation_id, title: i.title, msgs: i.message_count }))));
-      const metas: ConversationMeta[] = items.map((item) => ({
-        id: item.conversation_id,
-        title: item.title,
-        lastMessage: '',
-        messageCount: item.message_count,
-        createdAt: new Date(item.created_at).getTime(),
-        updatedAt: new Date(item.updated_at).getTime(),
-      })).sort((a, b) => b.updatedAt - a.updatedAt);
+      console.log(
+        '[conversationStore] init: loaded',
+        items.length,
+        'items:',
+        JSON.stringify(
+          items.map((i) => ({ id: i.conversation_id, title: i.title, msgs: i.message_count }))
+        )
+      );
+      const metas: ConversationMeta[] = items
+        .map((item) => ({
+          id: item.conversation_id,
+          title: item.title,
+          lastMessage: '',
+          messageCount: item.message_count,
+          createdAt: new Date(item.created_at).getTime(),
+          updatedAt: new Date(item.updated_at).getTime(),
+        }))
+        .sort((a, b) => b.updatedAt - a.updatedAt);
       set({ conversations: metas });
     } catch (e) {
       console.error('[conversationStore] init FAILED:', e);
@@ -161,14 +172,16 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
     try {
       const items = await conversationApi.list();
       console.log('[saveCurrent] refreshed list:', items.length, 'conversations');
-      const metas: ConversationMeta[] = items.map((item) => ({
-        id: item.conversation_id,
-        title: item.title,
-        lastMessage: '',
-        messageCount: item.message_count,
-        createdAt: new Date(item.created_at).getTime(),
-        updatedAt: new Date(item.updated_at).getTime(),
-      })).sort((a, b) => b.updatedAt - a.updatedAt);
+      const metas: ConversationMeta[] = items
+        .map((item) => ({
+          id: item.conversation_id,
+          title: item.title,
+          lastMessage: '',
+          messageCount: item.message_count,
+          createdAt: new Date(item.created_at).getTime(),
+          updatedAt: new Date(item.updated_at).getTime(),
+        }))
+        .sort((a, b) => b.updatedAt - a.updatedAt);
       set({ conversations: metas });
     } catch (e) {
       console.error('[saveCurrent] refresh FAILED:', e);
@@ -201,7 +214,7 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
 
       const chatStore = useChatStore.getState();
       chatStore.replaceMessages(chatMessages);
-      chatStore.setHistoryView(false);  // Agent has context, can continue chatting
+      chatStore.setHistoryView(false); // Agent has context, can continue chatting
 
       set({ activeId: id, isLoading: false });
     } catch (e) {
@@ -236,9 +249,7 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
 
     // Update local state
     set((s) => ({
-      conversations: s.conversations.map((c) =>
-        c.id === id ? { ...c, title } : c
-      ),
+      conversations: s.conversations.map((c) => (c.id === id ? { ...c, title } : c)),
     }));
   },
 

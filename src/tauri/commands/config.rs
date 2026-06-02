@@ -37,14 +37,14 @@ pub async fn update_config(
     state: tauri::State<'_, TauriState>,
     req: UpdateConfigRequest,
 ) -> Result<AgentConfigResponse, IpcError> {
-    if let Some(ref model) = req.model {
-        if !Config::has_model(model) {
-            let available = Config::list_models();
-            return Err(IpcError::Validation(format!(
-                "模型 '{}' 未配置，可用模型: {:?}",
-                model, available
-            )));
-        }
+    if let Some(ref model) = req.model
+        && !Config::has_model(model)
+    {
+        let available = Config::list_models();
+        return Err(IpcError::Validation(format!(
+            "模型 '{}' 未配置，可用模型: {:?}",
+            model, available
+        )));
     }
 
     {
@@ -240,10 +240,10 @@ pub async fn update_full_config(
             }
         }
 
-        if let Some(l) = req.logging {
-            if let Some(v) = l.level {
-                cfg.logging.level = v;
-            }
+        if let Some(l) = req.logging
+            && let Some(v) = l.level
+        {
+            cfg.logging.level = v;
         }
     }
 

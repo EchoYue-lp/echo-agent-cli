@@ -27,13 +27,11 @@ const PROTECTED_PATTERNS: &[&str] = &[
 pub fn is_protected_file(path: &str) -> bool {
     let filename = path.rsplit('/').next().unwrap_or(path);
     for pattern in PROTECTED_PATTERNS {
-        if pattern.starts_with('*') {
-            let suffix = &pattern[1..];
+        if let Some(suffix) = pattern.strip_prefix('*') {
             if filename.contains(suffix) {
                 return true;
             }
-        } else if pattern.ends_with('*') {
-            let prefix = &pattern[..pattern.len() - 1];
+        } else if let Some(prefix) = pattern.strip_suffix('*') {
             if filename.starts_with(prefix) {
                 return true;
             }

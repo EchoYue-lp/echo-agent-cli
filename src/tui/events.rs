@@ -1,14 +1,18 @@
 //! TUI event loop — handles keyboard input, terminal resize, and agent streaming.
 
-use super::{ChatMessage, MessageRole, TuiApp};
+use super::{ChatMessage, MessageRole, TaskProgressEntry, TaskStripStatus, TuiApp};
 use crate::agent_handle::AgentHandle;
 use crate::tui::commands::SlashCommand;
 use crate::tui::ui;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::io;
-use std::time::Duration;
-use tokio::sync::mpsc;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::sync::{broadcast, mpsc};
+
+use echo_agent::tasks::TaskEvent;
+use echo_agent_app_core::tasks::BackgroundTaskService;
 
 /// Poll interval for non-blocking event check.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -23,10 +27,22 @@ pub async fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut TuiApp,
     agent: AgentHandle,
+    task_service: Option<Arc<BackgroundTaskService>>,
 ) -> anyhow::Result<()> {
     let (agent_tx, mut agent_rx) = mpsc::unbounded_channel();
 
+    // Subscribe to task events for the parallel task progress strip.
+    let mut task_event_rx: Option<broadcast::Receiver<Arc<TaskEvent>>> =
+        task_service.as_ref().map(|svc| svc.subscribe_events());
+
     loop {
+        // ── Drain task events into parallel_tasks ──────────────────────
+        if let Some(ref mut rx) = task_event_rx {
+            while let Ok(event) = rx.try_recv() {
+                update_parallel_tasks(app, &event);
+            }
+        }
+
         // Draw UI.
         terminal.draw(|f| ui::draw(f, app))?;
 
@@ -102,10 +118,10 @@ async fn handle_key(
         AppMode::Approval => handle_approval_key(app, &key),
         AppMode::CommandPalette => handle_command_palette_key(app, &key),
         AppMode::Normal => {
-            if let Some(result) = handle_global_shortcuts(app, &key) {
-                if result {
-                    return;
-                }
+            if let Some(result) = handle_global_shortcuts(app, &key)
+                && result
+            {
+                return;
             }
             handle_normal_key(app, &key, agent, agent_tx).await;
         }
@@ -576,4 +592,134 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &AgentHandle, cmd: &str) 
 
     app.is_processing = false;
     app.status_msg = "Ready".to_string();
+}
+
+// ── Parallel task progress strip ────────────────────────────────────────
+
+/// Format elapsed time from an Instant to a human-readable label like "2m 8s".
+fn format_elapsed(start: Instant) -> String {
+    let secs = start.elapsed().as_secs();
+    if secs < 60 {
+        format!("{}s", secs)
+    } else {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    }
+}
+
+/// Process a TaskEvent and update `app.parallel_tasks` accordingly.
+///
+/// - `Created` → add a new entry with Pending status
+/// - `Updated` → update status (InProgress/Completed/Failed/Cancelled)
+/// - `Progress` → update percentage, phase, message
+/// - `Completed` → mark as Completed
+/// - `Failed` → mark as Failed
+fn update_parallel_tasks(app: &mut TuiApp, event: &TaskEvent) {
+    match event {
+        TaskEvent::Created { task } => {
+            // Only show if not already present
+            if app.parallel_tasks.iter().any(|e| e.task_id == task.id) {
+                return;
+            }
+            let name = if task.subject.is_empty() {
+                task.description.clone()
+            } else {
+                task.subject.clone()
+            };
+            app.parallel_tasks.push(TaskProgressEntry {
+                task_id: task.id.clone(),
+                name: truncate_name(&name, 30),
+                status: TaskStripStatus::Pending,
+                progress_pct: 0.0,
+                phase: String::new(),
+                message: None,
+                started_at: Instant::now(),
+                elapsed_label: "0s".to_string(),
+            });
+        }
+
+        TaskEvent::Updated {
+            task_id,
+            new_status,
+            ..
+        } => {
+            if let Some(entry) = app
+                .parallel_tasks
+                .iter_mut()
+                .find(|e| e.task_id == *task_id)
+            {
+                use echo_agent::tasks::TaskStatus;
+                entry.status = match new_status {
+                    TaskStatus::InProgress => TaskStripStatus::Running,
+                    TaskStatus::Completed => TaskStripStatus::Completed,
+                    TaskStatus::Cancelled => TaskStripStatus::Cancelled,
+                    TaskStatus::Failed(e) => TaskStripStatus::Failed(e.clone()),
+                    TaskStatus::TimedOut { error } => {
+                        TaskStripStatus::Failed(format!("Timeout: {error}"))
+                    }
+                    _ => entry.status.clone(),
+                };
+                entry.elapsed_label = format_elapsed(entry.started_at);
+            }
+        }
+
+        TaskEvent::Progress { task_id, progress } => {
+            if let Some(entry) = app
+                .parallel_tasks
+                .iter_mut()
+                .find(|e| e.task_id == *task_id)
+            {
+                entry.progress_pct = progress.percentage;
+                entry.phase = progress.current_phase.clone();
+                entry.message = progress.message.clone();
+                entry.elapsed_label = format_elapsed(entry.started_at);
+                // If we get progress, it's definitely running
+                if entry.status == TaskStripStatus::Pending {
+                    entry.status = TaskStripStatus::Running;
+                }
+            }
+        }
+
+        TaskEvent::Completed { task_id, .. } => {
+            if let Some(entry) = app
+                .parallel_tasks
+                .iter_mut()
+                .find(|e| e.task_id == *task_id)
+            {
+                entry.status = TaskStripStatus::Completed;
+                entry.progress_pct = 100.0;
+                entry.elapsed_label = format_elapsed(entry.started_at);
+            }
+        }
+
+        TaskEvent::Failed { task_id, error, .. } => {
+            if let Some(entry) = app
+                .parallel_tasks
+                .iter_mut()
+                .find(|e| e.task_id == *task_id)
+            {
+                entry.status = TaskStripStatus::Failed(error.clone());
+                entry.elapsed_label = format_elapsed(entry.started_at);
+            }
+        }
+
+        _ => {} // Deleted, Assigned — ignore
+    }
+
+    // Prune completed/failed entries older than 30 seconds to keep the strip clean.
+    app.parallel_tasks.retain(|e| match e.status {
+        TaskStripStatus::Completed | TaskStripStatus::Cancelled => {
+            e.started_at.elapsed().as_secs() < 30
+        }
+        TaskStripStatus::Failed(_) => e.started_at.elapsed().as_secs() < 60,
+        _ => true,
+    });
+}
+
+/// Truncate a task name to fit the strip width.
+fn truncate_name(name: &str, max_len: usize) -> String {
+    if name.len() <= max_len {
+        name.to_string()
+    } else {
+        format!("{}…", &name[..max_len - 1])
+    }
 }

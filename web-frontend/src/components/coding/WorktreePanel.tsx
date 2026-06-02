@@ -1,14 +1,5 @@
 import { useEffect, useState } from 'react';
-import {
-  GitBranch,
-  Plus,
-  Trash2,
-  Loader2,
-  AlertCircle,
-  Check,
-  X,
-  FolderOpen,
-} from 'lucide-react';
+import { GitBranch, Plus, Trash2, Loader2, AlertCircle, Check, X, FolderOpen } from 'lucide-react';
 import { worktreeApi, type WorktreeInfo } from '../../api/endpoints';
 
 export function WorktreePanel() {
@@ -87,8 +78,8 @@ export function WorktreePanel() {
       <div className="flex items-center justify-between">
         <div>
           <p className="text-sm text-[var(--text-secondary)]">
-            Manage git worktrees for parallel development. Worktrees let you check out
-            multiple branches simultaneously in separate directories.
+            Manage git worktrees for parallel development. Worktrees let you check out multiple
+            branches simultaneously in separate directories.
           </p>
         </div>
         <button
@@ -152,7 +143,8 @@ export function WorktreePanel() {
                 }}
               />
               <p className="mt-1 text-[11px] text-[var(--text-tertiary)]">
-                Leave empty to branch from HEAD. Specify a ref (e.g. main, v1.0) to branch from that point.
+                Leave empty to branch from HEAD. Specify a ref (e.g. main, v1.0) to branch from that
+                point.
               </p>
             </div>
             <div className="flex items-center gap-2 pt-1">

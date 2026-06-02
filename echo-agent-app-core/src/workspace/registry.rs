@@ -276,9 +276,12 @@ impl WorkspaceRegistry {
         }
 
         // 安全检查：使用 canonicalize 解析符号链接，防止路径穿越攻击
-        let canonical_root = root.canonicalize()
+        let canonical_root = root
+            .canonicalize()
             .map_err(|e| anyhow::anyhow!("无法解析工作区路径: {} ({})", root.display(), e))?;
-        let canonical_base = self.base_dir.canonicalize()
+        let canonical_base = self
+            .base_dir
+            .canonicalize()
             .unwrap_or_else(|_| self.base_dir.clone());
 
         // 判断是否在基础目录下（使用解析后的路径）

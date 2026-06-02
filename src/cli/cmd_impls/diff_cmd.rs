@@ -12,8 +12,7 @@
 
 use crate::cli::command::{CommandCategory, CommandContext, CommandOutcome, cmd};
 use echo_agent_app_core::diff::{
-    colorize_unified_diff, generate_unified_diff, parse_unified_diff, render_diff_ansi,
-    render_diff_html,
+    generate_unified_diff, parse_unified_diff, render_diff_ansi, render_diff_html,
 };
 use std::path::Path;
 

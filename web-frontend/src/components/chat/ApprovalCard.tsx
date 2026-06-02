@@ -23,12 +23,17 @@ export function ApprovalCard({
         <div className="flex-1">
           <p className="text-sm font-semibold text-red-800 dark:text-red-300">需要批准</p>
           <p className="mt-1 text-sm text-red-700 dark:text-red-400">
-            工具：<code className="rounded bg-red-100 px-1.5 py-0.5 font-mono text-xs dark:bg-red-900/40">{request.toolName}</code>
+            工具：
+            <code className="rounded bg-red-100 px-1.5 py-0.5 font-mono text-xs dark:bg-red-900/40">
+              {request.toolName}
+            </code>
           </p>
           <pre className="mt-2 max-h-32 overflow-auto rounded-lg bg-[var(--bg-code)] p-3 text-xs text-[var(--color-code-text)]">
             {JSON.stringify(request.args, null, 2)}
           </pre>
-          {request.prompt && <p className="mt-2 text-sm text-red-700 dark:text-red-400">{request.prompt}</p>}
+          {request.prompt && (
+            <p className="mt-2 text-sm text-red-700 dark:text-red-400">{request.prompt}</p>
+          )}
 
           <div className="mt-3 flex items-center gap-2">
             <button
