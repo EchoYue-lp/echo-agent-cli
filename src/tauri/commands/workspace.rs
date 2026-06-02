@@ -145,10 +145,10 @@ pub async fn delete_workspace(
 ) -> Result<serde_json::Value, IpcError> {
     let ws_id = echo_agent_app_core::workspace::WorkspaceId::from_raw(id.clone());
 
-    if let Some(ref current) = state.app_state.current_workspace().await {
-        if current.id == ws_id {
-            state.app_state.exit_workspace().await;
-        }
+    if let Some(ref current) = state.app_state.current_workspace().await
+        && current.id == ws_id
+    {
+        state.app_state.exit_workspace().await;
     }
 
     match state.app_state.workspace.registry.delete(&ws_id) {

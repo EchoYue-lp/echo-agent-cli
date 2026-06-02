@@ -96,7 +96,7 @@ export function get<T>(path: string): Promise<T> {
 export function post<T>(path: string, body?: unknown): Promise<T> {
   return request<T>(path, {
     method: 'POST',
-    body: body ? JSON.stringify(body) : undefined
+    body: body ? JSON.stringify(body) : undefined,
   });
 }
 

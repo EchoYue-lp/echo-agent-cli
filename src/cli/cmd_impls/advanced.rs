@@ -56,7 +56,7 @@ cmd!(
 
 // ── LoadCommand ───────────────────────────────────────────────────────
 
-async fn cmd_load(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
+async fn cmd_load(_ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     let name = args.first().copied().unwrap_or("session");
     let sessions_dir = std::env::var("HOME")
         .ok()
@@ -198,7 +198,7 @@ async fn cmd_export(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                     let mut md = format!("# Session Export: {}\n\n", name);
                     for msg in ctx.messages() {
                         md.push_str(&format!("### {}\n\n", msg.role.as_str()));
-                        if let Some(ref text) = msg.content.as_text_ref() {
+                        if let Some(text) = msg.content.as_text_ref() {
                             md.push_str(text);
                             md.push_str("\n\n---\n\n");
                         }
@@ -433,16 +433,16 @@ async fn cmd_search(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
 
                 let mut found = 0;
                 for (i, msg) in messages.iter().enumerate() {
-                    if let Some(text) = msg.content.as_text_ref() {
-                        if text.to_lowercase().contains(&q) {
-                            let preview: String = text.chars().take(120).collect();
-                            let role = msg.role.as_str();
-                            println!("  [{i}] {role}: {preview}...");
-                            found += 1;
-                            if found >= 20 {
-                                println!("  ... (showing first 20 matches)");
-                                break;
-                            }
+                    if let Some(text) = msg.content.as_text_ref()
+                        && text.to_lowercase().contains(&q)
+                    {
+                        let preview: String = text.chars().take(120).collect();
+                        let role = msg.role.as_str();
+                        println!("  [{i}] {role}: {preview}...");
+                        found += 1;
+                        if found >= 20 {
+                            println!("  ... (showing first 20 matches)");
+                            break;
                         }
                     }
                 }

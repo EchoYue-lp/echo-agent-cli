@@ -24,7 +24,6 @@ pub struct BackgroundTaskService {
     manager: Arc<TaskManager>,
     executor: Arc<TaskExecutor>,
     store: Arc<SqliteTaskStore>,
-    meta_store: Arc<dyn Store>,
     agent: AgentHandle,
     event_bus: Arc<TaskEventBus>,
     cancel: echo_agent::agent::CancellationToken,
@@ -34,15 +33,15 @@ pub struct BackgroundTaskService {
 impl BackgroundTaskService {
     /// Create a new BackgroundTaskService.
     ///
-    /// `store_backend` is the SQLite (or in-memory) store used for both
-    /// task persistence and metadata storage.
+    /// `store_backend` is the SQLite (or in-memory) store used for task
+    /// persistence. Metadata is stored directly on the framework `Task`
+    /// via `metadata_json`.
     pub async fn new(
         agent: AgentHandle,
         store_backend: Arc<dyn Store>,
         cancel: echo_agent::agent::CancellationToken,
     ) -> anyhow::Result<Self> {
-        let store = Arc::new(SqliteTaskStore::new(store_backend.clone()));
-        let meta_store = store_backend.clone();
+        let store = Arc::new(SqliteTaskStore::new(store_backend));
 
         // Create event bus with logging listener
         let manager = Arc::new(TaskManager::with_logging_and_events());
@@ -54,14 +53,14 @@ impl BackgroundTaskService {
             .expect("with_logging_and_events always creates an event bus");
         let event_bus = Arc::new(event_bus);
 
-        // Build the execute_fn that dispatches by kind — uses meta_store
-        // lookup by task_id instead of fragile string parsing in description
+        // Build the execute_fn that dispatches by kind — reads metadata_json
+        // from the Task in the manager instead of a separate meta_store
         let agent_clone = agent.clone();
-        let meta_clone: Arc<dyn Store> = store_backend.clone();
+        let manager_clone = manager.clone();
         let execute_fn: TaskExecuteFn = Arc::new(move |ctx: TaskContext| {
             let agent = agent_clone.clone();
-            let meta_store: Arc<dyn Store> = meta_clone.clone();
-            Box::pin(async move { dispatch_task(ctx, agent, meta_store).await })
+            let manager = manager_clone.clone();
+            Box::pin(async move { dispatch_task(ctx, agent, manager).await })
         });
 
         // Create executor — no default timeout (tasks run until done)
@@ -79,7 +78,6 @@ impl BackgroundTaskService {
             manager,
             executor,
             store,
-            meta_store,
             agent,
             event_bus,
             cancel,
@@ -89,8 +87,8 @@ impl BackgroundTaskService {
 
     /// Submit a new background task.
     ///
-    /// Creates a framework `Task`, persists it to SQLite, stores the
-    /// `BackgroundTaskMeta`, and schedules it for execution.
+    /// Creates a framework `Task` with `BackgroundTaskMeta` stored as
+    /// `metadata_json`, persists it to SQLite, and schedules it for execution.
     /// Returns the task ID.
     pub async fn submit(
         &self,
@@ -101,13 +99,10 @@ impl BackgroundTaskService {
         let task_id = uuid::Uuid::new_v4().to_string();
         let meta = BackgroundTaskMeta::new(kind.clone(), submitted_via);
 
-        // Create framework Task — description is kept clean (no kind encoding)
-        let task = Task::new(task_id.clone(), description.to_string()).with_tags(vec![kind.tag()]);
-        // No timeout by default — tasks run until completion
-        // No max_retries by default — let the caller decide
-
-        // Persist meta
-        self.save_meta(&task_id, &meta).await?;
+        // Create framework Task with metadata embedded directly
+        let task = Task::new(task_id.clone(), description.to_string())
+            .with_tags(vec![kind.tag()])
+            .with_metadata(meta);
 
         // Add to manager (also persists to store via event)
         self.manager.add_task(task);
@@ -144,9 +139,14 @@ impl BackgroundTaskService {
     }
 
     /// Get a single task with its metadata.
-    pub async fn get(&self, task_id: &str) -> Option<(Task, Option<BackgroundTaskMeta>)> {
+    ///
+    /// Reads `BackgroundTaskMeta` from the task's `metadata_json` field.
+    pub fn get(&self, task_id: &str) -> Option<(Task, Option<BackgroundTaskMeta>)> {
         let task = self.manager.get_task(task_id)?;
-        let meta = self.load_meta(task_id).await.ok().flatten();
+        let meta = task
+            .metadata_json
+            .as_ref()
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
         Some((task, meta))
     }
 
@@ -257,37 +257,10 @@ impl BackgroundTaskService {
     pub async fn pending_checkpoints(
         &self,
     ) -> Vec<(String, super::long_running::HumanCheckpointRequest)> {
-        self.human_gate.pending_requests().await
+        self.human_gate.pending().await
     }
 
     // ── Internal helpers ──
-
-    fn meta_key(task_id: &str) -> String {
-        format!("bg_meta:{task_id}")
-    }
-
-    async fn save_meta(&self, task_id: &str, meta: &BackgroundTaskMeta) -> anyhow::Result<()> {
-        let value = serde_json::to_value(meta)?;
-        self.meta_store
-            .put(&["bg_meta"], &Self::meta_key(task_id), value)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to save meta: {e}"))
-    }
-
-    async fn load_meta(&self, task_id: &str) -> anyhow::Result<Option<BackgroundTaskMeta>> {
-        match self
-            .meta_store
-            .get(&["bg_meta"], &Self::meta_key(task_id))
-            .await
-        {
-            Ok(Some(item)) => {
-                let meta: BackgroundTaskMeta = serde_json::from_value(item.value)?;
-                Ok(Some(meta))
-            }
-            Ok(None) => Ok(None),
-            Err(e) => Err(anyhow::anyhow!("Failed to load meta: {e}")),
-        }
-    }
 
     async fn persist_all(&self) -> anyhow::Result<()> {
         let tasks = self.manager.get_all_tasks();
@@ -300,30 +273,34 @@ impl BackgroundTaskService {
 
 // ── Task dispatch ──
 
-/// Look up the BackgroundTaskKind for a given task_id from the meta_store.
-async fn lookup_kind(meta_store: &Arc<dyn Store>, task_id: &str) -> Option<BackgroundTaskKind> {
-    let key = format!("bg_meta:{task_id}");
-    let item = meta_store.get(&["bg_meta"], &key).await.ok()??;
-    let meta: BackgroundTaskMeta = serde_json::from_value(item.value).ok()?;
-    Some(meta.kind)
-}
-
-/// Dispatch a task to the appropriate handler based on its kind (from meta_store).
+/// Dispatch a task to the appropriate handler based on its kind (from Task.metadata_json).
 async fn dispatch_task(
     ctx: TaskContext,
     agent: AgentHandle,
-    meta_store: Arc<dyn Store>,
+    manager: Arc<TaskManager>,
 ) -> Result<String, echo_agent::error::ReactError> {
-    let kind = lookup_kind(&meta_store, &ctx.task_id)
-        .await
-        .ok_or_else(|| {
+    let task = manager.get_task(&ctx.task_id).ok_or_else(|| {
+        echo_agent::error::ReactError::Other(format!(
+            "Task not found in manager: task_id={}",
+            ctx.task_id
+        ))
+    })?;
+
+    let meta: BackgroundTaskMeta =
+        serde_json::from_value(task.metadata_json.clone().ok_or_else(|| {
             echo_agent::error::ReactError::Other(format!(
-                "No background task kind found for task_id={}",
+                "No metadata found for task_id={}",
                 ctx.task_id
+            ))
+        })?)
+        .map_err(|e| {
+            echo_agent::error::ReactError::Other(format!(
+                "Failed to deserialize metadata for task_id={}: {}",
+                ctx.task_id, e
             ))
         })?;
 
-    match kind {
+    match meta.kind {
         BackgroundTaskKind::AgentChat { .. } => execute_agent_chat(ctx, agent).await,
         BackgroundTaskKind::Cron { .. } => execute_cron(ctx, agent).await,
         BackgroundTaskKind::Workflow { .. } => execute_workflow(ctx, agent).await,
@@ -334,7 +311,7 @@ async fn dispatch_task(
         BackgroundTaskKind::DataPipeline { .. } => execute_data_pipeline(ctx, agent).await,
         BackgroundTaskKind::WritingPipeline { .. } => execute_writing_pipeline(ctx, agent).await,
         BackgroundTaskKind::Composite { steps, strategy } => {
-            execute_composite(ctx, agent, meta_store, steps, strategy).await
+            execute_composite(ctx, agent, steps, strategy).await
         }
     }
 }
@@ -438,109 +415,76 @@ async fn execute_writing_pipeline(
         .map_err(|e| echo_agent::error::ReactError::Other(format!("Writing pipeline failed: {e}")))
 }
 
-/// Execute a composite task: chain multiple tasks together with dependencies.
+/// Execute a composite task by delegating to the framework's composite module.
+///
+/// Converts CLI-domain `CompositeStep` / `CompositeStrategy` into their
+/// framework counterparts, then lets `echo_orchestration::tasks::composite`
+/// handle the sequential / parallel orchestration.
 async fn execute_composite(
-    ctx: TaskContext,
+    _ctx: TaskContext,
     agent: AgentHandle,
-    meta_store: Arc<dyn Store>,
     steps: Vec<super::background::CompositeStep>,
     strategy: super::background::CompositeStrategy,
 ) -> Result<String, echo_agent::error::ReactError> {
-    use super::background::CompositeStrategy;
+    use echo_agent::tasks::composite::{
+        CompositePlan as FrameworkCompositePlan, CompositeStep as FrameworkCompositeStep,
+        CompositeStrategy as FrameworkCompositeStrategy,
+        execute_composite as framework_execute_composite,
+    };
 
-    match strategy {
-        CompositeStrategy::Sequential => {
-            let mut results: Vec<(String, String)> = Vec::new();
-            for (i, step) in steps.iter().enumerate() {
-                // Create a sub-context for this step
-                let step_description = step
-                    .description
-                    .clone()
-                    .unwrap_or_else(|| format!("Composite step {}: {:?}", i + 1, step.kind));
-
-                let step_id = format!("{}_step_{}", ctx.task_id, i);
-                let step_ctx = TaskContext {
-                    task_id: step_id.clone(),
-                    description: step_description,
-                    upstream_results: results.clone(),
-                    upstream_errors: Vec::new(),
-                    attempt: 1,
-                };
-
-                // Dispatch the sub-task
-                let result =
-                    dispatch_sub_task(step_ctx, agent.clone(), meta_store.clone(), &step.kind)
-                        .await?;
-                results.push((step_id, result));
+    // Convert CLI CompositeStep → Framework CompositeStep
+    let framework_steps: Vec<FrameworkCompositeStep> = steps
+        .iter()
+        .enumerate()
+        .map(|(i, step)| {
+            let agent = agent.clone();
+            let kind = step.kind.clone();
+            let step_id = step
+                .description
+                .clone()
+                .unwrap_or_else(|| format!("step_{}", i + 1));
+            FrameworkCompositeStep {
+                id: step_id.clone(),
+                name: step_id,
+                execute_fn: Arc::new(move |ctx| {
+                    let agent = agent.clone();
+                    let kind = kind.clone();
+                    Box::pin(async move { dispatch_sub_task(ctx, agent, &kind).await })
+                }),
+                input_from: step.input_from.clone(),
             }
+        })
+        .collect();
 
-            Ok(format!(
-                "Composite task completed {} steps:\n{}",
-                results.len(),
-                results
-                    .iter()
-                    .map(|(_, r)| r.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n---\n")
-            ))
-        }
-        CompositeStrategy::Parallel => {
-            // Execute steps in parallel using tokio::spawn + join_all
-            let mut handles = Vec::new();
-            for (i, step) in steps.iter().enumerate() {
-                let step_description = step
-                    .description
-                    .clone()
-                    .unwrap_or_else(|| format!("Composite step {}: {:?}", i + 1, step.kind));
+    let framework_strategy = match strategy {
+        super::background::CompositeStrategy::Sequential => FrameworkCompositeStrategy::Sequential,
+        super::background::CompositeStrategy::Parallel => FrameworkCompositeStrategy::Parallel,
+    };
 
-                let step_id = format!("{}_step_{}", ctx.task_id, i);
-                let step_ctx = TaskContext {
-                    task_id: step_id.clone(),
-                    description: step_description,
-                    upstream_results: Vec::new(),
-                    upstream_errors: Vec::new(),
-                    attempt: 1,
-                };
+    let plan = FrameworkCompositePlan {
+        steps: framework_steps,
+        strategy: framework_strategy,
+    };
 
-                let agent_clone = agent.clone();
-                let meta_clone = meta_store.clone();
-                let kind_clone = step.kind.clone();
-                let handle = tokio::spawn(async move {
-                    let result = dispatch_sub_task(step_ctx, agent_clone, meta_clone, &kind_clone).await;
-                    (step_id, result)
-                });
-                handles.push(handle);
-            }
+    let results = framework_execute_composite(plan).await?;
 
-            let mut results: Vec<(String, String)> = Vec::new();
-            for handle in handles {
-                let (step_id, result) = handle.await.map_err(|e| {
-                    echo_agent::error::ReactError::Other(format!("Parallel sub-task failed: {}", e))
-                })?;
-                let result = result.map_err(|e| {
-                    echo_agent::error::ReactError::Other(format!("Sub-task {} failed: {}", step_id, e))
-                })?;
-                results.push((step_id, result));
-            }
-
-            Ok(format!(
-                "Composite task completed {} parallel steps:\n{}",
-                results.len(),
-                results
-                    .iter()
-                    .map(|(_, r)| r.as_str())
-                    .collect::<Vec<_>>()
-                    .join("\n---\n")
-            ))
-        }
-    }
+    // Join results into a single string (backward compatible with the previous
+    // manual implementation).
+    Ok(format!(
+        "Composite task completed {} steps:\n{}",
+        results.len(),
+        results
+            .iter()
+            .map(|(id, output)| format!("[{id}]: {output}"))
+            .collect::<Vec<_>>()
+            .join("\n---\n")
+    ))
 }
 
 /// Dispatch a sub-task within a composite task.
 async fn dispatch_sub_task(
     ctx: TaskContext,
     agent: AgentHandle,
-    meta_store: Arc<dyn Store>,
     kind: &super::background::BackgroundTaskKind,
 ) -> Result<String, echo_agent::error::ReactError> {
     use super::background::BackgroundTaskKind;

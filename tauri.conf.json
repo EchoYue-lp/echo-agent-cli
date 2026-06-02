@@ -1,6 +1,6 @@
 {
   "$schema": "https://raw.githubusercontent.com/nickel-lang/json-schema-store/main/tauri.v2.schema.json",
-  "productName": "Echo Agent",
+  "productName": "EchoCoWork",
   "version": "1.0.0",
   "identifier": "com.echo-agent.app",
   "mainBinaryName": "echo-agent-tauri",
@@ -14,7 +14,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Echo Agent",
+        "title": "EchoCoWork",
         "width": 1400,
         "height": 900,
         "minWidth": 900,

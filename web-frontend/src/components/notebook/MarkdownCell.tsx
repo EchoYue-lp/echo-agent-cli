@@ -14,7 +14,7 @@ export default function MarkdownCell({ cell, onChange }: Props) {
     return (
       <textarea
         value={cell.content}
-        onChange={e => onChange(e.target.value)}
+        onChange={(e) => onChange(e.target.value)}
         onBlur={() => cell.content && setEditing(false)}
         className="w-full p-3 text-sm resize-none outline-none"
         style={{ background: 'transparent', color: 'var(--text-primary)', minHeight: '60px' }}

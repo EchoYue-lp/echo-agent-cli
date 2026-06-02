@@ -79,7 +79,7 @@ impl PtySession {
         }
 
         // Spawn child process on the slave side
-        let mut child = pair
+        let child = pair
             .slave
             .spawn_command(cmd)
             .map_err(|e| format!("Failed to spawn shell: {e}"))?;
@@ -258,7 +258,7 @@ pub async fn create_terminal(
     let pid = state
         .terminal_manager
         .create(id.clone(), cwd, rows, cols, app)
-        .map_err(|e| IpcError::Internal(e))?;
+        .map_err(IpcError::Internal)?;
     Ok(serde_json::json!({ "id": id, "pid": pid }))
 }
 
@@ -271,15 +271,12 @@ pub async fn write_terminal(
     let session = state
         .terminal_manager
         .get(&id)
-        .map_err(|e| IpcError::NotFound(e))?;
+        .map_err(IpcError::NotFound)?;
     // Data is base64-encoded from the frontend
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(&data)
         .map_err(|e| IpcError::Validation(format!("Invalid base64: {e}")))?;
-    session
-        .write(&bytes)
-        .await
-        .map_err(|e| IpcError::Internal(e))?;
+    session.write(&bytes).await.map_err(IpcError::Internal)?;
     Ok(serde_json::json!({"success": true}))
 }
 
@@ -293,11 +290,11 @@ pub async fn resize_terminal(
     let session = state
         .terminal_manager
         .get(&id)
-        .map_err(|e| IpcError::NotFound(e))?;
+        .map_err(IpcError::NotFound)?;
     session
         .resize(rows, cols)
         .await
-        .map_err(|e| IpcError::Internal(e))?;
+        .map_err(IpcError::Internal)?;
     Ok(serde_json::json!({"success": true}))
 }
 
@@ -310,7 +307,7 @@ pub async fn close_terminal(
         .terminal_manager
         .remove(&id)
         .ok_or_else(|| IpcError::NotFound(format!("Terminal '{id}' not found")))?;
-    session.kill().await.map_err(|e| IpcError::Internal(e))?;
+    session.kill().await.map_err(IpcError::Internal)?;
     info!("Terminal '{id}' closed");
     Ok(serde_json::json!({"success": true}))
 }

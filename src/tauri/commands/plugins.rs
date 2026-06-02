@@ -3,7 +3,6 @@
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
 use echo_agent::plugin::{PluginEntry, PluginRegistry};
-use echo_agent_app_core::skills_hub::install;
 use serde::{Deserialize, Serialize};
 
 // ── PluginInfo structure (matches previous server API) ──────────────────────

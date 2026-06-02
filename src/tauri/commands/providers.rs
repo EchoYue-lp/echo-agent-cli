@@ -216,10 +216,10 @@ pub async fn switch_model(
 }
 
 fn resolve_api_key(user_key: &Option<String>, provider: &str) -> String {
-    if let Some(key) = user_key {
-        if !key.is_empty() {
-            return key.clone();
-        }
+    if let Some(key) = user_key
+        && !key.is_empty()
+    {
+        return key.clone();
     }
     let env_var = match provider {
         "openai" => "OPENAI_API_KEY",

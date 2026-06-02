@@ -413,12 +413,11 @@ async fn chat_with_agent(agent: &AgentHandle, message: &str, output: &OutputRend
                                         name
                                     ));
                                     println!("  {}", danger);
-                                    if name == "shell" {
-                                        if let Some(cmd) =
+                                    if name == "shell"
+                                        && let Some(cmd) =
                                             args.get("command").and_then(|v| v.as_str())
-                                        {
-                                            println!("     Command: {}", cmd);
-                                        }
+                                    {
+                                        println!("     Command: {}", cmd);
                                     }
                                 }
                                 output.print_tool_call(&name, &args);
@@ -575,18 +574,13 @@ async fn chat_with_agent(agent: &AgentHandle, message: &str, output: &OutputRend
                         .read(|a| (a.run_store.clone(), a.model_name().to_string()))
                         .await;
                     let (store, model_name) = result;
-                    if let Some(ref store) = store {
-                        if let Ok(runs) = store.list_all(1).await {
-                            if let Some(summary) = runs.first() {
-                                if let Ok(Some(run)) = store.load(&summary.run_id).await {
-                                    if let Ok(saver) =
-                                        echo_agent::improve::TrajectorySaver::default_dir()
-                                    {
-                                        let _ = saver.save(&run, &model_name).await;
-                                    }
-                                }
-                            }
-                        }
+                    if let Some(ref store) = store
+                        && let Ok(runs) = store.list_all(1).await
+                        && let Some(summary) = runs.first()
+                        && let Ok(Some(run)) = store.load(&summary.run_id).await
+                        && let Ok(saver) = echo_agent::improve::TrajectorySaver::default_dir()
+                    {
+                        let _ = saver.save(&run, &model_name).await;
                     }
                 });
             }

@@ -10,9 +10,10 @@ interface PaperListProps {
 export function PaperList({ papers, selectedId, onSelect }: PaperListProps) {
   const [searchQuery, setSearchQuery] = useState('');
 
-  const filtered = papers.filter((p) =>
-    p.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
-    p.authors.some((a) => a.toLowerCase().includes(searchQuery.toLowerCase()))
+  const filtered = papers.filter(
+    (p) =>
+      p.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
+      p.authors.some((a) => a.toLowerCase().includes(searchQuery.toLowerCase()))
   );
 
   return (
@@ -24,7 +25,11 @@ export function PaperList({ papers, selectedId, onSelect }: PaperListProps) {
           onChange={(e) => setSearchQuery(e.target.value)}
           placeholder="搜索论文..."
           className="w-full rounded-lg border px-3 py-2 text-sm outline-none"
-          style={{ background: 'var(--bg-input)', borderColor: 'var(--border-primary)', color: 'var(--text-primary)' }}
+          style={{
+            background: 'var(--bg-input)',
+            borderColor: 'var(--border-primary)',
+            color: 'var(--text-primary)',
+          }}
         />
       </div>
       <div className="flex-1 overflow-y-auto">
@@ -49,7 +54,10 @@ export function PaperList({ papers, selectedId, onSelect }: PaperListProps) {
                 if (selectedId !== paper.id) e.currentTarget.style.background = 'transparent';
               }}
             >
-              <div className="text-sm font-medium truncate" style={{ color: 'var(--text-primary)' }}>
+              <div
+                className="text-sm font-medium truncate"
+                style={{ color: 'var(--text-primary)' }}
+              >
                 {paper.title}
               </div>
               <div className="text-xs mt-1 truncate" style={{ color: 'var(--text-secondary)' }}>
@@ -58,7 +66,11 @@ export function PaperList({ papers, selectedId, onSelect }: PaperListProps) {
               {paper.tags.length > 0 && (
                 <div className="flex gap-1 mt-1.5 flex-wrap">
                   {paper.tags.map((tag) => (
-                    <span key={tag} className="text-[10px] px-1.5 py-0.5 rounded" style={{ background: 'var(--bg-secondary)', color: 'var(--text-tertiary)' }}>
+                    <span
+                      key={tag}
+                      className="text-[10px] px-1.5 py-0.5 rounded"
+                      style={{ background: 'var(--bg-secondary)', color: 'var(--text-tertiary)' }}
+                    >
                       {tag}
                     </span>
                   ))}

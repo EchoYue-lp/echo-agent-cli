@@ -10,7 +10,12 @@ interface ChartCardProps {
 function extractVegaLiteSpec(result: string): unknown | null {
   try {
     const parsed = JSON.parse(result);
-    if (parsed && typeof parsed === 'object' && typeof parsed.$schema === 'string' && parsed.$schema.includes('vega-lite')) {
+    if (
+      parsed &&
+      typeof parsed === 'object' &&
+      typeof parsed.$schema === 'string' &&
+      parsed.$schema.includes('vega-lite')
+    ) {
       return parsed;
     }
   } catch {
@@ -19,7 +24,12 @@ function extractVegaLiteSpec(result: string): unknown | null {
     if (fenced) {
       try {
         const parsed = JSON.parse(fenced[1]);
-        if (parsed && typeof parsed === 'object' && typeof parsed.$schema === 'string' && parsed.$schema.includes('vega-lite')) {
+        if (
+          parsed &&
+          typeof parsed === 'object' &&
+          typeof parsed.$schema === 'string' &&
+          parsed.$schema.includes('vega-lite')
+        ) {
           return parsed;
         }
       } catch {

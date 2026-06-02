@@ -19,7 +19,9 @@ export function SessionsPanel() {
     setLoading(false);
   };
 
-  useEffect(() => { load(); }, []);
+  useEffect(() => {
+    load();
+  }, []);
 
   const create = async () => {
     setLoading(true);
@@ -69,10 +71,13 @@ export function SessionsPanel() {
       </div>
 
       {msg && (
-        <div className="rounded-lg px-3 py-2 text-xs" style={{
-          background: 'var(--accent-bg)',
-          color: 'var(--accent)',
-        }}>
+        <div
+          className="rounded-lg px-3 py-2 text-xs"
+          style={{
+            background: 'var(--accent-bg)',
+            color: 'var(--accent)',
+          }}
+        >
           {msg}
         </div>
       )}
@@ -106,11 +111,17 @@ export function SessionsPanel() {
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-2">
                 <Save size={12} style={{ color: 'var(--accent)' }} />
-                <span className="truncate font-mono text-xs font-medium" style={{ color: 'var(--text-primary)' }}>
+                <span
+                  className="truncate font-mono text-xs font-medium"
+                  style={{ color: 'var(--text-primary)' }}
+                >
                   {s.id.slice(0, 12)}...
                 </span>
               </div>
-              <div className="mt-1 flex items-center gap-3 text-[11px]" style={{ color: 'var(--text-tertiary)' }}>
+              <div
+                className="mt-1 flex items-center gap-3 text-[11px]"
+                style={{ color: 'var(--text-tertiary)' }}
+              >
                 <span className="flex items-center gap-1">
                   <Clock size={10} />
                   {formatTime(s.created_at)}

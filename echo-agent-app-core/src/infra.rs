@@ -294,7 +294,7 @@ pub async fn shutdown_signal() {
 
 /// Print a warning if the server binds to a non-localhost address.
 ///
-/// Echo Agent CLI is designed as a single-user local application. Binding to
+/// EchoCoWork is designed as a single-user local application. Binding to
 /// 0.0.0.0 or a public IP exposes the agent to the network.
 pub fn warn_non_localhost_bind(host: &str, addr: &str, auth_enabled: bool) {
     // Check if host is a non-localhost address
@@ -304,7 +304,7 @@ pub fn warn_non_localhost_bind(host: &str, addr: &str, auth_enabled: bool) {
             "⚠️  Server binding to non-localhost address: http://{}",
             addr
         );
-        tracing::warn!("   Echo Agent CLI is designed for single-user local use.");
+        tracing::warn!("   EchoCoWork is designed for single-user local use.");
         if !auth_enabled {
             tracing::warn!(
                 "   Authentication is DISABLED — anyone on the network can access the agent."
@@ -341,7 +341,7 @@ pub async fn init_trace_analyzer(state: &crate::state::AppState) {
 
 /// 打印 Web 模式启动信息
 pub fn print_web_startup_info(addr: &str) {
-    tracing::info!("🚀 Echo Agent CLI (Web 模式)");
+    tracing::info!("🚀 EchoCoWork (Web 模式)");
     tracing::info!("✅ 服务已启动: http://{}", addr);
     tracing::info!("📖 API 端点:");
     tracing::info!("   POST /api/chat          - 阻塞式对话");
@@ -355,7 +355,7 @@ pub fn print_web_startup_info(addr: &str) {
 
 /// 打印双模式启动信息
 pub fn print_both_startup_info(addr: &str) {
-    tracing::info!("🚀 Echo Agent CLI (Web + CLI 模式)");
+    tracing::info!("🚀 EchoCoWork (Web + CLI 模式)");
     tracing::info!("✅ Web 服务: http://{}", addr);
     tracing::info!("✅ CLI 交互: 已启动");
     tracing::info!("💡 输入 /help 查看命令帮助");
@@ -724,7 +724,7 @@ pub async fn fire_startup_hook(agent: &AgentHandle) {
 pub fn print_doctor_result(result: &DoctorResult) {
     println!();
     println!("╭─────────────────────────────────────────────────────────────╮");
-    println!("│                    🏥 Echo Agent 诊断                        │");
+    println!("│                    🏥 EchoCoWork 诊断                        │");
     println!("╰─────────────────────────────────────────────────────────────╯");
 
     if !result.issues.is_empty() {

@@ -59,9 +59,7 @@ export class ErrorBoundary extends Component<Props, State> {
           >
             <AlertTriangle size={24} style={{ color: 'var(--color-error, #ef4444)' }} />
           </div>
-          <h1 style={{ fontSize: 18, fontWeight: 600, marginBottom: 8 }}>
-            出了一些问题
-          </h1>
+          <h1 style={{ fontSize: 18, fontWeight: 600, marginBottom: 8 }}>出了一些问题</h1>
           <p
             style={{
               fontSize: 13,

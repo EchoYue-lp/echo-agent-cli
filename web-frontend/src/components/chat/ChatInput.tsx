@@ -1,7 +1,12 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
 import { ArrowUp, Square, Paperclip, X, File, Terminal } from 'lucide-react';
 import type { Attachment } from '../../types/api';
-import { filterCommands, groupByCategory, CATEGORY_META, type SlashCommand } from '../../lib/slashCommands';
+import {
+  filterCommands,
+  groupByCategory,
+  CATEGORY_META,
+  type SlashCommand,
+} from '../../lib/slashCommands';
 
 interface PendingFile {
   id: string;
@@ -73,9 +78,7 @@ function CommandPalette({ commands, selectedIndex, onSelect }: CommandPalettePro
     return (
       <div className="absolute bottom-full left-0 right-0 z-50 mb-2 px-4">
         <div className="glass mx-auto max-w-3xl rounded-xl border border-[var(--border-primary)] bg-[var(--bg-primary)] p-3 shadow-[var(--shadow-md)]">
-          <p className="text-center text-xs text-[var(--text-tertiary)]">
-            No matching commands
-          </p>
+          <p className="text-center text-xs text-[var(--text-tertiary)]">No matching commands</p>
         </div>
       </div>
     );
@@ -91,19 +94,14 @@ function CommandPalette({ commands, selectedIndex, onSelect }: CommandPalettePro
         {/* Header */}
         <div className="flex items-center gap-2 border-b border-[var(--border-primary)] px-4 py-2">
           <Terminal size={13} className="text-[var(--text-tertiary)]" />
-          <span className="text-xs font-medium text-[var(--text-secondary)]">
-            Slash Commands
-          </span>
+          <span className="text-xs font-medium text-[var(--text-secondary)]">Slash Commands</span>
           <span className="ml-auto text-[10px] text-[var(--text-tertiary)]">
             ↑↓ navigate · ↵ select · esc close
           </span>
         </div>
 
         {/* Command list */}
-        <div
-          ref={listRef}
-          className="max-h-[280px] overflow-y-auto px-2 py-2"
-        >
+        <div ref={listRef} className="max-h-[280px] overflow-y-auto px-2 py-2">
           {Array.from(grouped.entries()).map(([category, cmds]) => {
             const meta = CATEGORY_META[category];
             return (
@@ -179,7 +177,7 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
   const slashQuery = getSlashQuery(text, cursorPos);
   const filteredCommands = useMemo(
     () => (slashQuery !== null ? filterCommands(slashQuery) : []),
-    [slashQuery],
+    [slashQuery]
   );
   const showPalette = slashQuery !== null;
 
@@ -217,30 +215,36 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
     });
   }, []);
 
-  const handleFileSelect = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files?.length) {
-      addFiles(e.target.files);
-      e.target.value = '';
-    }
-  }, [addFiles]);
-
-  const handlePaste = useCallback((e: React.ClipboardEvent<HTMLTextAreaElement>) => {
-    const items = e.clipboardData?.items;
-    if (!items) return;
-
-    const imageFiles: File[] = [];
-    for (let i = 0; i < items.length; i++) {
-      const item = items[i];
-      if (item.type.startsWith('image/')) {
-        const file = item.getAsFile();
-        if (file) imageFiles.push(file);
+  const handleFileSelect = useCallback(
+    (e: React.ChangeEvent<HTMLInputElement>) => {
+      if (e.target.files?.length) {
+        addFiles(e.target.files);
+        e.target.value = '';
       }
-    }
-    if (imageFiles.length > 0) {
-      e.preventDefault();
-      addFiles(imageFiles);
-    }
-  }, [addFiles]);
+    },
+    [addFiles]
+  );
+
+  const handlePaste = useCallback(
+    (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+
+      const imageFiles: File[] = [];
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        if (item.type.startsWith('image/')) {
+          const file = item.getAsFile();
+          if (file) imageFiles.push(file);
+        }
+      }
+      if (imageFiles.length > 0) {
+        e.preventDefault();
+        addFiles(imageFiles);
+      }
+    },
+    [addFiles]
+  );
 
   // ── Send ──
 
@@ -307,17 +311,13 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
 
       if (e.key === 'ArrowDown') {
         e.preventDefault();
-        setPaletteSelectedIndex((prev) =>
-          prev < filteredCommands.length - 1 ? prev + 1 : 0,
-        );
+        setPaletteSelectedIndex((prev) => (prev < filteredCommands.length - 1 ? prev + 1 : 0));
         return;
       }
 
       if (e.key === 'ArrowUp') {
         e.preventDefault();
-        setPaletteSelectedIndex((prev) =>
-          prev > 0 ? prev - 1 : filteredCommands.length - 1,
-        );
+        setPaletteSelectedIndex((prev) => (prev > 0 ? prev - 1 : filteredCommands.length - 1));
         return;
       }
 
@@ -370,22 +370,29 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
     setIsDragging(false);
   }, []);
 
-  const handleDrop = useCallback((e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setIsDragging(false);
-    if (e.dataTransfer.files?.length) {
-      addFiles(e.dataTransfer.files);
-    }
-  }, [addFiles]);
+  const handleDrop = useCallback(
+    (e: React.DragEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      setIsDragging(false);
+      if (e.dataTransfer.files?.length) {
+        addFiles(e.dataTransfer.files);
+      }
+    },
+    [addFiles]
+  );
 
   const hasContent = text.trim().length > 0 || pendingFiles.length > 0;
 
   return (
-    <div className="px-4 pb-4 pt-2" onDragOver={handleDragOver} onDragLeave={handleDragLeave} onDrop={handleDrop}>
+    <div
+      className="px-4 pb-4 pt-2"
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+    >
       {/* Relative container so the absolute-positioned palette anchors here */}
       <div className="relative mx-auto max-w-3xl">
-
         {/* ── Slash Command Palette ── */}
         {showPalette && (
           <CommandPalette
@@ -399,7 +406,9 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
           {/* Drag overlay */}
           {isDragging && (
             <div className="absolute inset-0 z-10 flex items-center justify-center rounded-2xl border-2 border-dashed border-[var(--accent)] bg-[var(--accent)]/5">
-              <span className="text-sm font-medium text-[var(--accent)]">Drop files here to upload</span>
+              <span className="text-sm font-medium text-[var(--accent)]">
+                Drop files here to upload
+              </span>
             </div>
           )}
           {/* Attachment previews */}
@@ -493,9 +502,7 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
       </div>
       <div className="mx-auto mt-2 flex max-w-3xl items-center justify-between text-[11px] text-[var(--text-tertiary)]">
         <span>EchoCoWork may make mistakes; verify important information</span>
-        {text.length > 0 && (
-          <span>{text.length} chars</span>
-        )}
+        {text.length > 0 && <span>{text.length} chars</span>}
       </div>
     </div>
   );

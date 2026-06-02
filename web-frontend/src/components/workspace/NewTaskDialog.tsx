@@ -1,7 +1,16 @@
 import { useState, useEffect, useCallback } from 'react';
 import {
-  X, FolderPlus, Code, BarChart3, GraduationCap, MessageSquare,
-  ArrowRight, Trash2, FolderOpen, Edit3, RotateCcw,
+  X,
+  FolderPlus,
+  Code,
+  BarChart3,
+  GraduationCap,
+  MessageSquare,
+  ArrowRight,
+  Trash2,
+  FolderOpen,
+  Edit3,
+  RotateCcw,
 } from 'lucide-react';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
 import { workspaceApi } from '../../api/endpoints';
@@ -15,9 +24,27 @@ interface Props {
 
 const WORKSPACE_KIND = [
   { value: 'code', label: '代码项目', icon: Code, desc: '代码开发、调试、重构', color: '#6366f1' },
-  { value: 'data', label: '数据分析', icon: BarChart3, desc: '数据清洗、分析、可视化', color: '#f59e0b' },
-  { value: 'research', label: '学术研究', icon: GraduationCap, desc: '文献检索、论文阅读与写作', color: '#10b981' },
-  { value: 'general', label: '通用', icon: MessageSquare, desc: '通用对话与任务', color: '#6b7280' },
+  {
+    value: 'data',
+    label: '数据分析',
+    icon: BarChart3,
+    desc: '数据清洗、分析、可视化',
+    color: '#f59e0b',
+  },
+  {
+    value: 'research',
+    label: '学术研究',
+    icon: GraduationCap,
+    desc: '文献检索、论文阅读与写作',
+    color: '#10b981',
+  },
+  {
+    value: 'general',
+    label: '通用',
+    icon: MessageSquare,
+    desc: '通用对话与任务',
+    color: '#6b7280',
+  },
 ];
 
 export default function NewTaskDialog({ isOpen, onClose }: Props) {
@@ -59,12 +86,17 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
       return;
     }
     let cancelled = false;
-    workspaceApi.defaultRoot(trimmed).then((res) => {
-      if (!cancelled) setDefaultRoot(res.default_root);
-    }).catch(() => {
-      if (!cancelled) setDefaultRoot('');
-    });
-    return () => { cancelled = true; };
+    workspaceApi
+      .defaultRoot(trimmed)
+      .then((res) => {
+        if (!cancelled) setDefaultRoot(res.default_root);
+      })
+      .catch(() => {
+        if (!cancelled) setDefaultRoot('');
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [newName]);
 
   const handleBrowse = useCallback(async () => {
@@ -143,17 +175,27 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
       {/* Dialog */}
       <div
         className="fixed left-1/2 top-1/2 z-50 flex w-[540px] -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-2xl border shadow-2xl"
-        style={{ background: 'var(--bg-primary)', borderColor: 'var(--border-primary)', maxHeight: '85vh' }}
+        style={{
+          background: 'var(--bg-primary)',
+          borderColor: 'var(--border-primary)',
+          maxHeight: '85vh',
+        }}
       >
         {/* Header */}
-        <div className="flex items-center justify-between border-b px-5 py-4" style={{ borderColor: 'var(--border-primary)' }}>
+        <div
+          className="flex items-center justify-between border-b px-5 py-4"
+          style={{ borderColor: 'var(--border-primary)' }}
+        >
           <h2 className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>
             {view === 'list' ? '新建任务' : '创建新任务'}
           </h2>
           <div className="flex items-center gap-2">
             {view === 'create' && (
               <button
-                onClick={() => { setView('list'); setError(''); }}
+                onClick={() => {
+                  setView('list');
+                  setError('');
+                }}
                 className="text-xs px-2 py-1 rounded hover:opacity-80"
                 style={{ color: 'var(--text-secondary)' }}
               >
@@ -172,7 +214,10 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
 
         {/* Error */}
         {error && (
-          <div className="mx-5 mt-3 rounded-lg px-3 py-2 text-xs" style={{ background: '#fee2e2', color: '#dc2626' }}>
+          <div
+            className="mx-5 mt-3 rounded-lg px-3 py-2 text-xs"
+            style={{ background: '#fee2e2', color: '#dc2626' }}
+          >
             {error}
           </div>
         )}
@@ -183,18 +228,35 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
             <div className="space-y-4">
               {/* Current workspace */}
               {current && (
-                <div className="rounded-lg border p-3" style={{ borderColor: 'var(--accent)', background: 'var(--bg-sidebar-active, rgba(99,102,241,0.05))' }}>
-                  <div className="text-[11px] font-medium uppercase tracking-wider mb-1" style={{ color: 'var(--accent)' }}>
+                <div
+                  className="rounded-lg border p-3"
+                  style={{
+                    borderColor: 'var(--accent)',
+                    background: 'var(--bg-sidebar-active, rgba(99,102,241,0.05))',
+                  }}
+                >
+                  <div
+                    className="text-[11px] font-medium uppercase tracking-wider mb-1"
+                    style={{ color: 'var(--accent)' }}
+                  >
                     当前工作区
                   </div>
                   <div className="flex items-center gap-2">
                     {kindIcon(current.kind)}
-                    <span className="text-sm font-medium" style={{ color: 'var(--text-primary)' }}>{current.name}</span>
-                    <span className="text-[11px] px-1.5 py-0.5 rounded" style={{ background: 'var(--bg-secondary)', color: 'var(--text-tertiary)' }}>
+                    <span className="text-sm font-medium" style={{ color: 'var(--text-primary)' }}>
+                      {current.name}
+                    </span>
+                    <span
+                      className="text-[11px] px-1.5 py-0.5 rounded"
+                      style={{ background: 'var(--bg-secondary)', color: 'var(--text-tertiary)' }}
+                    >
                       {current.kind.type}
                     </span>
                   </div>
-                  <div className="text-[11px] mt-1 truncate" style={{ color: 'var(--text-tertiary)' }}>
+                  <div
+                    className="text-[11px] mt-1 truncate"
+                    style={{ color: 'var(--text-tertiary)' }}
+                  >
                     {current.root}
                   </div>
                 </div>
@@ -205,21 +267,34 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
                 onClick={() => setView('create')}
                 className="flex w-full items-center gap-3 rounded-xl border-2 border-dashed px-4 py-3.5 text-left transition-all hover:border-solid"
                 style={{ borderColor: 'var(--border-primary)', color: 'var(--text-primary)' }}
-                onMouseEnter={(e) => { e.currentTarget.style.borderColor = 'var(--accent)'; }}
-                onMouseLeave={(e) => { e.currentTarget.style.borderColor = 'var(--border-primary)'; }}
+                onMouseEnter={(e) => {
+                  e.currentTarget.style.borderColor = 'var(--accent)';
+                }}
+                onMouseLeave={(e) => {
+                  e.currentTarget.style.borderColor = 'var(--border-primary)';
+                }}
               >
                 <FolderPlus size={20} style={{ color: 'var(--accent)' }} />
                 <div>
                   <div className="text-sm font-medium">创建新任务</div>
-                  <div className="text-[11px]" style={{ color: 'var(--text-tertiary)' }}>新建工作区，隔离所有数据</div>
+                  <div className="text-[11px]" style={{ color: 'var(--text-tertiary)' }}>
+                    新建工作区，隔离所有数据
+                  </div>
                 </div>
-                <ArrowRight size={16} className="ml-auto" style={{ color: 'var(--text-tertiary)' }} />
+                <ArrowRight
+                  size={16}
+                  className="ml-auto"
+                  style={{ color: 'var(--text-tertiary)' }}
+                />
               </button>
 
               {/* Existing workspaces */}
               {workspaces.length > 0 && (
                 <div>
-                  <div className="text-[11px] font-semibold uppercase tracking-wider mb-2" style={{ color: 'var(--text-tertiary)' }}>
+                  <div
+                    className="text-[11px] font-semibold uppercase tracking-wider mb-2"
+                    style={{ color: 'var(--text-tertiary)' }}
+                  >
                     已有工作区
                   </div>
                   <div className="space-y-1">
@@ -233,8 +308,16 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
                       >
                         {kindIcon(ws.kind)}
                         <div className="min-w-0 flex-1">
-                          <div className="text-sm truncate" style={{ color: 'var(--text-primary)' }}>{ws.name}</div>
-                          <div className="text-[11px] truncate" style={{ color: 'var(--text-tertiary)' }}>
+                          <div
+                            className="text-sm truncate"
+                            style={{ color: 'var(--text-primary)' }}
+                          >
+                            {ws.name}
+                          </div>
+                          <div
+                            className="text-[11px] truncate"
+                            style={{ color: 'var(--text-tertiary)' }}
+                          >
                             {ws.kind.type} · {ws.root}
                           </div>
                         </div>
@@ -259,24 +342,36 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
             <div className="space-y-4">
               {/* Name input */}
               <div>
-                <label className="block text-xs font-medium mb-1.5" style={{ color: 'var(--text-secondary)' }}>
+                <label
+                  className="block text-xs font-medium mb-1.5"
+                  style={{ color: 'var(--text-secondary)' }}
+                >
                   任务名称
                 </label>
                 <input
                   type="text"
                   value={newName}
                   onChange={(e) => setNewName(e.target.value)}
-                  onKeyDown={(e) => { if (e.key === 'Enter' && !useCustomRoot) handleCreate(); }}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && !useCustomRoot) handleCreate();
+                  }}
                   placeholder="例：用户行为分析、NLP论文综述..."
                   className="w-full rounded-lg border px-3 py-2.5 text-sm outline-none transition-colors focus:border-[var(--accent)]"
-                  style={{ background: 'var(--bg-input)', borderColor: 'var(--border-primary)', color: 'var(--text-primary)' }}
+                  style={{
+                    background: 'var(--bg-input)',
+                    borderColor: 'var(--border-primary)',
+                    color: 'var(--text-primary)',
+                  }}
                   autoFocus
                 />
               </div>
 
               {/* Kind selector */}
               <div>
-                <label className="block text-xs font-medium mb-1.5" style={{ color: 'var(--text-secondary)' }}>
+                <label
+                  className="block text-xs font-medium mb-1.5"
+                  style={{ color: 'var(--text-secondary)' }}
+                >
                   任务类型
                 </label>
                 <div className="grid grid-cols-2 gap-2">
@@ -297,8 +392,15 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
                       >
                         <Icon size={18} style={{ color: k.color }} />
                         <div>
-                          <div className="text-sm font-medium" style={{ color: 'var(--text-primary)' }}>{k.label}</div>
-                          <div className="text-[11px]" style={{ color: 'var(--text-tertiary)' }}>{k.desc}</div>
+                          <div
+                            className="text-sm font-medium"
+                            style={{ color: 'var(--text-primary)' }}
+                          >
+                            {k.label}
+                          </div>
+                          <div className="text-[11px]" style={{ color: 'var(--text-tertiary)' }}>
+                            {k.desc}
+                          </div>
                         </div>
                       </button>
                     );
@@ -308,7 +410,10 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
 
               {/* Folder path */}
               <div>
-                <label className="block text-xs font-medium mb-2" style={{ color: 'var(--text-secondary)' }}>
+                <label
+                  className="block text-xs font-medium mb-2"
+                  style={{ color: 'var(--text-secondary)' }}
+                >
                   工作目录
                 </label>
 
@@ -321,7 +426,11 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
                         onChange={(e) => setCustomRoot(e.target.value)}
                         placeholder="输入目录路径，或点击浏览..."
                         className="flex-1 rounded-lg border px-3 py-2.5 text-sm outline-none transition-colors focus:border-[var(--accent)]"
-                        style={{ background: 'var(--bg-input)', borderColor: 'var(--border-primary)', color: 'var(--text-primary)' }}
+                        style={{
+                          background: 'var(--bg-input)',
+                          borderColor: 'var(--border-primary)',
+                          color: 'var(--text-primary)',
+                        }}
                         autoFocus
                       />
                       <button
@@ -351,7 +460,11 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
                   <div className="space-y-2">
                     <div
                       className="rounded-lg border px-3 py-2.5 text-sm"
-                      style={{ background: 'var(--bg-secondary)', borderColor: 'var(--border-primary)', color: 'var(--text-tertiary)' }}
+                      style={{
+                        background: 'var(--bg-secondary)',
+                        borderColor: 'var(--border-primary)',
+                        color: 'var(--text-tertiary)',
+                      }}
                     >
                       <span className="flex items-center gap-1.5">
                         <FolderOpen size={14} />
@@ -374,9 +487,15 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
 
         {/* Footer (create view only) */}
         {view === 'create' && (
-          <div className="flex items-center justify-end gap-2 border-t px-5 py-3" style={{ borderColor: 'var(--border-primary)' }}>
+          <div
+            className="flex items-center justify-end gap-2 border-t px-5 py-3"
+            style={{ borderColor: 'var(--border-primary)' }}
+          >
             <button
-              onClick={() => { setView('list'); setError(''); }}
+              onClick={() => {
+                setView('list');
+                setError('');
+              }}
               className="rounded-lg px-4 py-2 text-sm transition-colors hover:opacity-80"
               style={{ color: 'var(--text-secondary)' }}
             >

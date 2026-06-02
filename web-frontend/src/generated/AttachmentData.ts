@@ -3,8 +3,12 @@
 /**
  * 附件数据
  */
-export type AttachmentData = { name: string, mime_type: string, 
-/**
- * Base64 编码的文件内容
- */
-data: string, size: bigint, };
+export type AttachmentData = {
+  name: string;
+  mime_type: string;
+  /**
+   * Base64 编码的文件内容
+   */
+  data: string;
+  size: bigint;
+};

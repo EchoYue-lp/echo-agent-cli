@@ -82,9 +82,12 @@ export const useFileStore = create<FileStore>((set) => ({
   loadDiff: async (path: string, gitRef = 'HEAD') => {
     set({ selectedFile: path, loading: true, error: null, viewMode: 'diff' });
     try {
-      const data = await get<{ path: string; old_content: string; new_content: string; hunks: DiffHunk[] }>(
-        `/files/diff?path=${encodeURIComponent(path)}&git_ref=${gitRef}`
-      );
+      const data = await get<{
+        path: string;
+        old_content: string;
+        new_content: string;
+        hunks: DiffHunk[];
+      }>(`/files/diff?path=${encodeURIComponent(path)}&git_ref=${gitRef}`);
       set({ diffHunks: data.hunks, fileContent: null, loading: false });
     } catch (e: unknown) {
       set({ error: e instanceof Error ? e.message : String(e), loading: false });

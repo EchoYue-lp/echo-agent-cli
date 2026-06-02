@@ -80,11 +80,9 @@ impl HumanLoopProvider for HitlDispatcher {
             const TIMEOUT_DURATION: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
             for named in providers.iter() {
-                let provider_result = tokio::time::timeout(
-                    TIMEOUT_DURATION,
-                    named.provider.request(req.clone()),
-                )
-                .await;
+                let provider_result =
+                    tokio::time::timeout(TIMEOUT_DURATION, named.provider.request(req.clone()))
+                        .await;
 
                 match provider_result {
                     Ok(Ok(response)) => return Ok(response),

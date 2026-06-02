@@ -68,8 +68,6 @@ cmd!(
 // ── ReviewCommand ───────────────────────────────────────────────────
 
 async fn cmd_review(ctx: &CommandContext, _args: &[&str]) -> CommandOutcome {
-    use echo_agent::agent::Agent;
-
     // Get the run store and LLM client from the agent
     let (run_store, llm_client, memory_store) = ctx
         .agent
@@ -139,20 +137,23 @@ async fn cmd_review(ctx: &CommandContext, _args: &[&str]) -> CommandOutcome {
         Some(run_store),
     );
 
-    match reviewer.review(&run).await {
-        Ok(outcome) => {
-            if outcome.nothing_to_save {
-                println!("Nothing to save.");
-            } else {
-                println!("Review actions:");
-                for action in &outcome.actions {
-                    println!("  - {action}");
+    match reviewer.review(&run) {
+        Ok(handle) => match handle.await {
+            Ok(outcome) => {
+                if outcome.nothing_to_save {
+                    println!("Nothing to save.");
+                } else {
+                    println!("Review actions:");
+                    for action in &outcome.actions {
+                        println!("  - {action}");
+                    }
+                }
+                if let Some(ref err) = outcome.error {
+                    println!("Warning: {err}");
                 }
             }
-            if let Some(ref err) = outcome.error {
-                println!("Warning: {err}");
-            }
-        }
+            Err(e) => println!("Review task panicked: {e}"),
+        },
         Err(e) => println!("Review failed: {e}"),
     }
 

@@ -24,14 +24,20 @@ export function useWebSocket() {
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('connecting');
 
   const getReconnectDelay = useCallback(() => {
-    const delay = Math.min(INITIAL_RECONNECT_MS * Math.pow(2, retryCount.current), MAX_RECONNECT_MS);
+    const delay = Math.min(
+      INITIAL_RECONNECT_MS * Math.pow(2, retryCount.current),
+      MAX_RECONNECT_MS
+    );
     return delay;
   }, []);
 
   const connect = useCallback(() => {
     // Guard: skip if already open or connecting
-    if (wsRef.current?.readyState === WebSocket.OPEN ||
-        wsRef.current?.readyState === WebSocket.CONNECTING) return;
+    if (
+      wsRef.current?.readyState === WebSocket.OPEN ||
+      wsRef.current?.readyState === WebSocket.CONNECTING
+    )
+      return;
 
     // Close stale socket before creating new one
     if (wsRef.current) {
@@ -176,7 +182,9 @@ export function useWebSocket() {
       }
 
       const delay = getReconnectDelay();
-      console.log(`[WS] disconnected, reconnecting in ${delay}ms (attempt ${retryCount.current}/${MAX_RECONNECT_ATTEMPTS})`);
+      console.log(
+        `[WS] disconnected, reconnecting in ${delay}ms (attempt ${retryCount.current}/${MAX_RECONNECT_ATTEMPTS})`
+      );
       setConnectionStatus('disconnected');
       reconnectTimer.current = setTimeout(connect, delay);
     };
@@ -217,40 +225,49 @@ export function useWebSocket() {
     }
   };
 
-  const sendMessage = useCallback((text: string, attachments?: Attachment[]) => {
-    const store = useChatStore.getState();
-    const displayAttachments = attachments?.map((a) => ({
-      name: a.name,
-      mime_type: a.mime_type,
-      url: `data:${a.mime_type};base64,${a.data}`,
-      size: a.size,
-    }));
-    store.addUserMessage(text || '(附件)', displayAttachments);
+  const sendMessage = useCallback(
+    (text: string, attachments?: Attachment[]) => {
+      const store = useChatStore.getState();
+      const displayAttachments = attachments?.map((a) => ({
+        name: a.name,
+        mime_type: a.mime_type,
+        url: `data:${a.mime_type};base64,${a.data}`,
+        size: a.size,
+      }));
+      store.addUserMessage(text || '(附件)', displayAttachments);
 
-    if (!send({ type: 'message', data: text, attachments })) {
-      store.markCancelled();
-    } else {
-      isCancelledRef.current = false;
-      assistantIdRef.current = store.startAssistantMessage();
-      // 60s streaming timeout: if no response, cancel to prevent stuck UI
-      clearStreamTimer();
-      streamTimer.current = setTimeout(() => {
-        if (useChatStore.getState().isStreaming) {
-          useChatStore.getState().markCancelled();
-        }
-      }, 60_000);
-    }
-  }, [send]);
+      if (!send({ type: 'message', data: text, attachments })) {
+        store.markCancelled();
+      } else {
+        isCancelledRef.current = false;
+        assistantIdRef.current = store.startAssistantMessage();
+        // 60s streaming timeout: if no response, cancel to prevent stuck UI
+        clearStreamTimer();
+        streamTimer.current = setTimeout(() => {
+          if (useChatStore.getState().isStreaming) {
+            useChatStore.getState().markCancelled();
+          }
+        }, 60_000);
+      }
+    },
+    [send]
+  );
 
-  const sendApproval = useCallback((requestId: string, approved: boolean, reason?: string) => {
-    send({ type: 'approval_response', request_id: requestId, approved, reason });
-    useChatStore.getState().setApprovalRequest(null);
-  }, [send]);
+  const sendApproval = useCallback(
+    (requestId: string, approved: boolean, reason?: string) => {
+      send({ type: 'approval_response', request_id: requestId, approved, reason });
+      useChatStore.getState().setApprovalRequest(null);
+    },
+    [send]
+  );
 
-  const sendInput = useCallback((requestId: string, text: string) => {
-    send({ type: 'input_response', request_id: requestId, text });
-    useChatStore.getState().setInputRequest(null);
-  }, [send]);
+  const sendInput = useCallback(
+    (requestId: string, text: string) => {
+      send({ type: 'input_response', request_id: requestId, text });
+      useChatStore.getState().setInputRequest(null);
+    },
+    [send]
+  );
 
   const cancel = useCallback(() => {
     useChatStore.getState().markCancelled();

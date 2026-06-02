@@ -9,10 +9,30 @@ const iconMap = {
 };
 
 const colorMap = {
-  success: { bg: 'var(--color-success-bg)', border: 'var(--color-success)', text: 'var(--color-success)', icon: 'var(--color-success)' },
-  error: { bg: 'var(--color-error-bg)', border: 'var(--color-error)', text: 'var(--color-error)', icon: 'var(--color-error)' },
-  warning: { bg: 'var(--color-warning-bg)', border: 'var(--color-warning)', text: 'var(--color-warning)', icon: 'var(--color-warning)' },
-  info: { bg: 'var(--color-info-bg)', border: 'var(--color-info)', text: 'var(--color-info)', icon: 'var(--color-info)' },
+  success: {
+    bg: 'var(--color-success-bg)',
+    border: 'var(--color-success)',
+    text: 'var(--color-success)',
+    icon: 'var(--color-success)',
+  },
+  error: {
+    bg: 'var(--color-error-bg)',
+    border: 'var(--color-error)',
+    text: 'var(--color-error)',
+    icon: 'var(--color-error)',
+  },
+  warning: {
+    bg: 'var(--color-warning-bg)',
+    border: 'var(--color-warning)',
+    text: 'var(--color-warning)',
+    icon: 'var(--color-warning)',
+  },
+  info: {
+    bg: 'var(--color-info-bg)',
+    border: 'var(--color-info)',
+    text: 'var(--color-info)',
+    icon: 'var(--color-info)',
+  },
 };
 
 export function ToastContainer() {
@@ -33,8 +53,13 @@ export function ToastContainer() {
             style={{ background: colors.bg, borderColor: colors.border }}
           >
             <Icon size={16} style={{ color: colors.icon, flexShrink: 0 }} />
-            <p className="flex-1 text-xs leading-relaxed" style={{ color: colors.text }}>{toast.message}</p>
-            <button onClick={() => removeToast(toast.id)} style={{ color: colors.text, flexShrink: 0 }}>
+            <p className="flex-1 text-xs leading-relaxed" style={{ color: colors.text }}>
+              {toast.message}
+            </p>
+            <button
+              onClick={() => removeToast(toast.id)}
+              style={{ color: colors.text, flexShrink: 0 }}
+            >
               <X size={14} />
             </button>
           </div>

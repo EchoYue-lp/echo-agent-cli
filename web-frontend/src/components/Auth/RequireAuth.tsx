@@ -33,9 +33,7 @@ export function RequireAuth({ children }: RequireAuthProps) {
   // 有认证错误（后端返回401） → 显示登录界面
   // 否则认证默认禁用，直接渲染应用
   if (error) {
-    return (
-      <LoginForm />
-    );
+    return <LoginForm />;
   }
 
   return <>{children}</>;

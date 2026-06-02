@@ -38,11 +38,7 @@ export function Terminal({ sessionId }: TerminalProps) {
 
     // Dynamic import xterm.js (avoids SSR issues)
     (async () => {
-      const [
-        { Terminal: XTerm },
-        { FitAddon },
-        { listen },
-      ] = await Promise.all([
+      const [{ Terminal: XTerm }, { FitAddon }, { listen }] = await Promise.all([
         import('@xterm/xterm'),
         import('@xterm/addon-fit'),
         import('@tauri-apps/api/event'),
@@ -103,15 +99,12 @@ export function Terminal({ sessionId }: TerminalProps) {
       );
 
       // ── Listen for process exit ──
-      const unlistenExit = await listen<{ id: string }>(
-        'terminal-exit',
-        (event) => {
-          if (event.payload.id === sessionId) {
-            term.write('\r\n\x1b[90m[Process exited]\x1b[0m\r\n');
-            setConnected(false);
-          }
+      const unlistenExit = await listen<{ id: string }>('terminal-exit', (event) => {
+        if (event.payload.id === sessionId) {
+          term.write('\r\n\x1b[90m[Process exited]\x1b[0m\r\n');
+          setConnected(false);
         }
-      );
+      });
 
       // ── Send user input to PTY ──
       term.onData((data: string) => {
@@ -188,10 +181,7 @@ export function Terminal({ sessionId }: TerminalProps) {
     let ws: WebSocket | null = null;
 
     (async () => {
-      const [
-        { Terminal: XTerm },
-        { FitAddon },
-      ] = await Promise.all([
+      const [{ Terminal: XTerm }, { FitAddon }] = await Promise.all([
         import('@xterm/xterm'),
         import('@xterm/addon-fit'),
       ]);
@@ -229,7 +219,9 @@ export function Terminal({ sessionId }: TerminalProps) {
         try {
           const msg = JSON.parse(event.data);
           if (msg.type === 'output') term.write(msg.data);
-        } catch { /* ignore */ }
+        } catch {
+          /* ignore */
+        }
       };
 
       term.onData((data: string) => {
@@ -261,7 +253,12 @@ export function Terminal({ sessionId }: TerminalProps) {
         </span>
       </div>
       {/* xterm.js container — tabIndex required for keyboard focus in Tauri WebView */}
-      <div ref={containerRef} className="flex-1 min-h-0 p-1" tabIndex={0} style={{ outline: 'none' }} />
+      <div
+        ref={containerRef}
+        className="flex-1 min-h-0 p-1"
+        tabIndex={0}
+        style={{ outline: 'none' }}
+      />
     </div>
   );
 }

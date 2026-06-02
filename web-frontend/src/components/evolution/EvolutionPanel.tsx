@@ -1,7 +1,24 @@
 import { useEffect, useState } from 'react';
-import { Sparkles, BarChart3, Search, RefreshCw, Pin, Play, CheckCircle, XCircle, Archive, Clock, Activity } from 'lucide-react';
+import {
+  Sparkles,
+  BarChart3,
+  Search,
+  RefreshCw,
+  Pin,
+  Play,
+  CheckCircle,
+  XCircle,
+  Archive,
+  Clock,
+  Activity,
+} from 'lucide-react';
 import { evolutionApi } from '../../api/endpoints';
-import type { TrajectoryEntry, TrajectoryStats, CuratorStatus, CuratorTransition } from '../../types/api';
+import type {
+  TrajectoryEntry,
+  TrajectoryStats,
+  CuratorStatus,
+  CuratorTransition,
+} from '../../types/api';
 
 export function EvolutionPanel() {
   // ── Trajectory state
@@ -114,7 +131,10 @@ export function EvolutionPanel() {
             </h3>
           </div>
           <button
-            onClick={() => { loadStats(); loadTrajectories(); }}
+            onClick={() => {
+              loadStats();
+              loadTrajectories();
+            }}
             disabled={loadingStats}
             className="flex items-center gap-1 text-[10px] font-medium transition-colors"
             style={{ color: 'var(--accent)' }}
@@ -138,13 +158,19 @@ export function EvolutionPanel() {
         {/* Recent trajectories */}
         {trajectories.length > 0 && (
           <div className="rounded-lg border" style={{ borderColor: 'var(--border-primary)' }}>
-            <div className="flex items-center gap-2 border-b px-3 py-2" style={{ borderColor: 'var(--border-primary)' }}>
+            <div
+              className="flex items-center gap-2 border-b px-3 py-2"
+              style={{ borderColor: 'var(--border-primary)' }}
+            >
               <Activity size={12} style={{ color: 'var(--text-tertiary)' }} />
               <span className="text-[11px] font-medium" style={{ color: 'var(--text-secondary)' }}>
                 最近轨迹 ({trajectories.length})
               </span>
             </div>
-            <div className="max-h-48 overflow-y-auto divide-y" style={{ borderColor: 'var(--border-primary)' }}>
+            <div
+              className="max-h-48 overflow-y-auto divide-y"
+              style={{ borderColor: 'var(--border-primary)' }}
+            >
               {trajectories.map((t) => (
                 <div
                   key={t.id}
@@ -152,14 +178,21 @@ export function EvolutionPanel() {
                   style={{ color: 'var(--text-secondary)' }}
                 >
                   <div className="flex items-center gap-2 min-w-0">
-                    {t.completed
-                      ? <CheckCircle size={11} style={{ color: 'var(--color-success)' }} />
-                      : <XCircle size={11} style={{ color: 'var(--color-error)' }} />
-                    }
-                    <span className="font-mono truncate" style={{ maxWidth: '80px', color: 'var(--text-tertiary)' }}>
+                    {t.completed ? (
+                      <CheckCircle size={11} style={{ color: 'var(--color-success)' }} />
+                    ) : (
+                      <XCircle size={11} style={{ color: 'var(--color-error)' }} />
+                    )}
+                    <span
+                      className="font-mono truncate"
+                      style={{ maxWidth: '80px', color: 'var(--text-tertiary)' }}
+                    >
                       {t.id.slice(0, 8)}
                     </span>
-                    <span className="rounded px-1.5 py-0.5 text-[10px]" style={{ background: 'var(--bg-hover)', color: 'var(--text-secondary)' }}>
+                    <span
+                      className="rounded px-1.5 py-0.5 text-[10px]"
+                      style={{ background: 'var(--bg-hover)', color: 'var(--text-secondary)' }}
+                    >
                       {t.model || 'unknown'}
                     </span>
                   </div>
@@ -212,35 +245,55 @@ export function EvolutionPanel() {
           }}
         >
           {reviewing ? (
-            <><RefreshCw size={12} className="animate-spin" /> 审查中...</>
+            <>
+              <RefreshCw size={12} className="animate-spin" /> 审查中...
+            </>
           ) : (
-            <><Search size={12} /> 立即审查</>
+            <>
+              <Search size={12} /> 立即审查
+            </>
           )}
         </button>
 
         {reviewError && (
-          <div className="mt-2 rounded-lg px-3 py-2 text-xs" style={{ background: 'var(--color-error-bg, rgba(239,68,68,0.1))', color: 'var(--color-error)' }}>
+          <div
+            className="mt-2 rounded-lg px-3 py-2 text-xs"
+            style={{
+              background: 'var(--color-error-bg, rgba(239,68,68,0.1))',
+              color: 'var(--color-error)',
+            }}
+          >
             {reviewError}
           </div>
         )}
 
         {reviewResult && (
-          <div className="mt-2 rounded-lg border p-3" style={{ borderColor: 'var(--border-primary)' }}>
+          <div
+            className="mt-2 rounded-lg border p-3"
+            style={{ borderColor: 'var(--border-primary)' }}
+          >
             <div className="flex items-center gap-2 mb-2">
-              {reviewResult.nothing_to_save
-                ? <Archive size={12} style={{ color: 'var(--text-tertiary)' }} />
-                : <CheckCircle size={12} style={{ color: 'var(--color-success)' }} />
-              }
+              {reviewResult.nothing_to_save ? (
+                <Archive size={12} style={{ color: 'var(--text-tertiary)' }} />
+              ) : (
+                <CheckCircle size={12} style={{ color: 'var(--color-success)' }} />
+              )}
               <span className="text-xs font-medium" style={{ color: 'var(--text-primary)' }}>
                 运行: <span className="font-mono">{reviewResult.run_id.slice(0, 12)}</span>
               </span>
             </div>
             {reviewResult.nothing_to_save ? (
-              <p className="text-xs" style={{ color: 'var(--text-tertiary)' }}>没有发现需要保存的内容。</p>
+              <p className="text-xs" style={{ color: 'var(--text-tertiary)' }}>
+                没有发现需要保存的内容。
+              </p>
             ) : (
               <ul className="space-y-1">
                 {reviewResult.actions.map((action, i) => (
-                  <li key={i} className="text-xs flex items-start gap-1.5" style={{ color: 'var(--text-secondary)' }}>
+                  <li
+                    key={i}
+                    className="text-xs flex items-start gap-1.5"
+                    style={{ color: 'var(--text-secondary)' }}
+                  >
                     <span style={{ color: 'var(--accent)' }}>-</span>
                     {action}
                   </li>
@@ -274,14 +327,21 @@ export function EvolutionPanel() {
           <div className="grid grid-cols-5 gap-2 mb-3">
             <StatCard label="总计" value={curatorStatus.total} />
             <StatCard label="活跃" value={curatorStatus.active} color="var(--color-success)" />
-            <StatCard label="过时" value={curatorStatus.stale} color="var(--color-warning, orange)" />
+            <StatCard
+              label="过时"
+              value={curatorStatus.stale}
+              color="var(--color-warning, orange)"
+            />
             <StatCard label="归档" value={curatorStatus.archived} color="var(--text-tertiary)" />
             <StatCard label="已固定" value={curatorStatus.pinned} icon={<Pin size={10} />} />
           </div>
         )}
 
         {curatorStatus?.last_run_at && (
-          <div className="flex items-center gap-1.5 mb-3 text-[10px]" style={{ color: 'var(--text-tertiary)' }}>
+          <div
+            className="flex items-center gap-1.5 mb-3 text-[10px]"
+            style={{ color: 'var(--text-tertiary)' }}
+          >
             <Clock size={10} />
             上次运行: {new Date(curatorStatus.last_run_at).toLocaleString()}
           </div>
@@ -297,17 +357,26 @@ export function EvolutionPanel() {
           }}
         >
           {curatorLoading ? (
-            <><RefreshCw size={12} className="animate-spin" /> 运行中...</>
+            <>
+              <RefreshCw size={12} className="animate-spin" /> 运行中...
+            </>
           ) : (
-            <><Play size={12} /> 运行策展</>
+            <>
+              <Play size={12} /> 运行策展
+            </>
           )}
         </button>
 
         {curatorMsg && (
-          <div className="mt-2 rounded-lg px-3 py-2 text-xs" style={{
-            background: curatorMsg.startsWith('Error') ? 'var(--color-error-bg, rgba(239,68,68,0.1))' : 'var(--accent-bg)',
-            color: curatorMsg.startsWith('Error') ? 'var(--color-error)' : 'var(--accent)',
-          }}>
+          <div
+            className="mt-2 rounded-lg px-3 py-2 text-xs"
+            style={{
+              background: curatorMsg.startsWith('Error')
+                ? 'var(--color-error-bg, rgba(239,68,68,0.1))'
+                : 'var(--accent-bg)',
+              color: curatorMsg.startsWith('Error') ? 'var(--color-error)' : 'var(--accent)',
+            }}
+          >
             {curatorMsg}
           </div>
         )}
@@ -321,8 +390,14 @@ export function EvolutionPanel() {
             </div>
             <div className="divide-y" style={{ borderColor: 'var(--border-primary)' }}>
               {transitions.map((t, i) => (
-                <div key={i} className="flex items-center justify-between px-3 py-2 text-xs" style={{ color: 'var(--text-secondary)' }}>
-                  <span className="font-medium" style={{ color: 'var(--text-primary)' }}>{t.skill}</span>
+                <div
+                  key={i}
+                  className="flex items-center justify-between px-3 py-2 text-xs"
+                  style={{ color: 'var(--text-secondary)' }}
+                >
+                  <span className="font-medium" style={{ color: 'var(--text-primary)' }}>
+                    {t.skill}
+                  </span>
                   <span className="font-mono text-[10px]">
                     {t.from} → {t.to}
                   </span>
@@ -345,7 +420,12 @@ export function EvolutionPanel() {
 
 // ── Helpers ──
 
-function StatCard({ label, value, color, icon }: {
+function StatCard({
+  label,
+  value,
+  color,
+  icon,
+}: {
   label: string;
   value: number | string;
   color?: string;
@@ -353,7 +433,10 @@ function StatCard({ label, value, color, icon }: {
 }) {
   return (
     <div className="rounded-lg p-2 text-center" style={{ background: 'var(--bg-hover)' }}>
-      <div className="flex items-center justify-center gap-1" style={{ color: 'var(--text-tertiary)' }}>
+      <div
+        className="flex items-center justify-center gap-1"
+        style={{ color: 'var(--text-tertiary)' }}
+      >
         {icon}
         <span className="text-[10px]">{label}</span>
       </div>

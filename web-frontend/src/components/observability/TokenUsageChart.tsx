@@ -72,11 +72,17 @@ export function TokenUsageChart({ events }: TokenUsageChartProps) {
       {/* Legend */}
       <div className="flex items-center gap-4 px-1">
         <span className="flex items-center gap-1 text-[10px]" style={{ color: s.textSec }}>
-          <span className="inline-block w-2.5 h-2.5 rounded-sm" style={{ background: inputColor }} />
+          <span
+            className="inline-block w-2.5 h-2.5 rounded-sm"
+            style={{ background: inputColor }}
+          />
           Input
         </span>
         <span className="flex items-center gap-1 text-[10px]" style={{ color: s.textSec }}>
-          <span className="inline-block w-2.5 h-2.5 rounded-sm" style={{ background: outputColor }} />
+          <span
+            className="inline-block w-2.5 h-2.5 rounded-sm"
+            style={{ background: outputColor }}
+          />
           Output
         </span>
       </div>
@@ -88,7 +94,11 @@ export function TokenUsageChart({ events }: TokenUsageChartProps) {
           const outputWidth = (call.output / maxTotal) * 100;
 
           return (
-            <div key={call.index} className="rounded-lg border px-3 py-2" style={{ borderColor: s.border, background: s.bg }}>
+            <div
+              key={call.index}
+              className="rounded-lg border px-3 py-2"
+              style={{ borderColor: s.border, background: s.bg }}
+            >
               <div className="flex items-center justify-between mb-1">
                 <span className="text-[10px] font-mono" style={{ color: s.textTer }}>
                   #{call.index} {call.model}
@@ -97,7 +107,10 @@ export function TokenUsageChart({ events }: TokenUsageChartProps) {
                   {call.total.toLocaleString()} tokens
                 </span>
               </div>
-              <div className="flex h-3 w-full rounded-full overflow-hidden" style={{ background: s.bgHover }}>
+              <div
+                className="flex h-3 w-full rounded-full overflow-hidden"
+                style={{ background: s.bgHover }}
+              >
                 <div
                   className="h-full"
                   style={{ width: `${inputWidth}%`, background: inputColor, opacity: 0.8 }}
@@ -129,7 +142,9 @@ function SummaryCard({ label, value, color }: { label: string; value: number; co
       <div className="text-sm font-semibold font-mono" style={{ color }}>
         {value.toLocaleString()}
       </div>
-      <div className="text-[10px]" style={{ color: 'var(--text-tertiary)' }}>{label}</div>
+      <div className="text-[10px]" style={{ color: 'var(--text-tertiary)' }}>
+        {label}
+      </div>
     </div>
   );
 }

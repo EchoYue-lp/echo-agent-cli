@@ -60,7 +60,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
   addUserMessage: (content, attachments) => {
     set((s) => ({
       isCancelled: false,
-      messages: [...s.messages, { id: nextId(), role: 'user', content, attachments, timestamp: Date.now() }],
+      messages: [
+        ...s.messages,
+        { id: nextId(), role: 'user', content, attachments, timestamp: Date.now() },
+      ],
     }));
     autoSave();
   },
@@ -68,7 +71,18 @@ export const useChatStore = create<ChatState>((set, get) => ({
   startAssistantMessage: () => {
     const id = nextId();
     set((s) => ({
-      messages: [...s.messages, { id, role: 'assistant', content: '', thinkingSegments: [], toolCalls: [], isStreaming: true, timestamp: Date.now() }],
+      messages: [
+        ...s.messages,
+        {
+          id,
+          role: 'assistant',
+          content: '',
+          thinkingSegments: [],
+          toolCalls: [],
+          isStreaming: true,
+          timestamp: Date.now(),
+        },
+      ],
       isStreaming: true,
     }));
     return id;
@@ -76,7 +90,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   appendToken: (id, token) => {
     set((s) => {
-      const idx = s.messages.findIndex(m => m.id === id);
+      const idx = s.messages.findIndex((m) => m.id === id);
       if (idx === -1) return { messages: s.messages };
       const updated = [...s.messages];
       updated[idx] = { ...updated[idx], content: updated[idx].content + token };
@@ -86,7 +100,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   appendThinking: (id, token) => {
     set((s) => {
-      const idx = s.messages.findIndex(m => m.id === id);
+      const idx = s.messages.findIndex((m) => m.id === id);
       if (idx === -1) return { messages: s.messages };
       const m = s.messages[idx];
       const segments = [...(m.thinkingSegments || [])];
@@ -138,9 +152,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   finalizeAssistantMessage: (id, content) => {
     set((s) => ({
       isStreaming: false,
-      messages: s.messages.map((m) =>
-        m.id === id ? { ...m, content, isStreaming: false } : m
-      ),
+      messages: s.messages.map((m) => (m.id === id ? { ...m, content, isStreaming: false } : m)),
     }));
     autoSave();
   },
@@ -170,9 +182,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }));
   },
 
-  clearMessages: () => set({ messages: [], isStreaming: false, isCancelled: false, isHistoryView: false }),
+  clearMessages: () =>
+    set({ messages: [], isStreaming: false, isCancelled: false, isHistoryView: false }),
 
-  replaceMessages: (messages) => set({ messages, isStreaming: false, isCancelled: false, isHistoryView: true }),
+  replaceMessages: (messages) =>
+    set({ messages, isStreaming: false, isCancelled: false, isHistoryView: true }),
 
   setHistoryView: (v) => set({ isHistoryView: v }),
 

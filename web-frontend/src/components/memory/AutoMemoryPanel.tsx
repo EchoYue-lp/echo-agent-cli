@@ -4,15 +4,7 @@ import {
   type AutoMemoryStatus,
   type AutoMemoryObservation,
 } from '../../api/endpoints';
-import {
-  Brain,
-  RefreshCw,
-  Zap,
-  ToggleLeft,
-  ToggleRight,
-  AlertCircle,
-  Tag,
-} from 'lucide-react';
+import { Brain, RefreshCw, Zap, ToggleLeft, ToggleRight, AlertCircle, Tag } from 'lucide-react';
 
 const CATEGORY_COLORS: Record<string, { bg: string; text: string }> = {
   Project: { bg: 'rgba(59,130,246,0.12)', text: 'var(--color-info, #3b82f6)' },
@@ -112,7 +104,9 @@ export function AutoMemoryPanel() {
   if (loading) {
     return (
       <div className="p-3">
-        <p className="text-xs" style={{ color: s.textTer }}>加载中...</p>
+        <p className="text-xs" style={{ color: s.textTer }}>
+          加载中...
+        </p>
       </div>
     );
   }
@@ -166,15 +160,14 @@ export function AutoMemoryPanel() {
           className="flex items-center gap-1.5 rounded-lg px-3 py-2 text-xs font-medium text-white transition-colors disabled:opacity-50"
           style={{ background: s.accent }}
         >
-          {extracting ? (
-            <RefreshCw size={12} className="animate-spin" />
-          ) : (
-            <Zap size={12} />
-          )}
+          {extracting ? <RefreshCw size={12} className="animate-spin" /> : <Zap size={12} />}
           {extracting ? '提取中...' : '立即提取'}
         </button>
         <button
-          onClick={() => { fetchStatus(); fetchObservations(); }}
+          onClick={() => {
+            fetchStatus();
+            fetchObservations();
+          }}
           className="rounded-lg p-2 transition-colors hover:opacity-80"
           style={{ color: s.textTer }}
           title="刷新"
@@ -187,7 +180,11 @@ export function AutoMemoryPanel() {
       {error && (
         <div
           className="flex items-start gap-2 rounded-lg border p-3 text-[11px]"
-          style={{ borderColor: 'rgba(239,68,68,0.3)', background: 'rgba(239,68,68,0.05)', color: 'var(--color-error, #ef4444)' }}
+          style={{
+            borderColor: 'rgba(239,68,68,0.3)',
+            background: 'rgba(239,68,68,0.05)',
+            color: 'var(--color-error, #ef4444)',
+          }}
         >
           <AlertCircle size={12} className="mt-0.5 flex-shrink-0" />
           <span>{error}</span>
@@ -243,7 +240,10 @@ export function AutoMemoryPanel() {
                       <p className="text-xs leading-relaxed" style={{ color: s.text }}>
                         {o.text}
                       </p>
-                      <div className="mt-1 flex items-center gap-2 text-[10px]" style={{ color: s.textTer }}>
+                      <div
+                        className="mt-1 flex items-center gap-2 text-[10px]"
+                        style={{ color: s.textTer }}
+                      >
                         <span>置信度: {Math.round(o.confidence * 100)}%</span>
                         <div
                           className="h-1 flex-1 max-w-[80px] rounded-full overflow-hidden"

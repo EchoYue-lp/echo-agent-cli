@@ -2,7 +2,21 @@ import { useState, useEffect, memo } from 'react';
 import type { ChatMessage } from '../../types/api';
 import { ToolCallCard } from './ToolCallCard';
 import { ChartCard } from './ChartCard';
-import { User, Bot, Copy, Check, RefreshCw, Pencil, X, ArrowUp, File, Download, ChevronDown, ChevronRight, Brain } from 'lucide-react';
+import {
+  User,
+  Bot,
+  Copy,
+  Check,
+  RefreshCw,
+  Pencil,
+  X,
+  ArrowUp,
+  File,
+  Download,
+  ChevronDown,
+  ChevronRight,
+  Brain,
+} from 'lucide-react';
 import { renderMarkdown } from '../../utils/markdown';
 
 interface MessageBubbleProps {
@@ -45,7 +59,11 @@ function isImageFile(mime: string): boolean {
   return mime.startsWith('image/');
 }
 
-export const MessageBubble = memo(function MessageBubble({ message, onRegenerate, onEditAndResend }: MessageBubbleProps) {
+export const MessageBubble = memo(function MessageBubble({
+  message,
+  onRegenerate,
+  onEditAndResend,
+}: MessageBubbleProps) {
   const isUser = message.role === 'user';
   const [editing, setEditing] = useState(false);
   const [editText, setEditText] = useState(message.content);
@@ -78,9 +96,11 @@ export const MessageBubble = memo(function MessageBubble({ message, onRegenerate
       {/* Avatar */}
       <div
         className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-xl text-xs font-semibold
-          ${isUser
-            ? 'bg-[var(--accent)] text-white'
-            : 'border border-[var(--border-primary)] bg-[var(--bg-primary)] text-[var(--text-secondary)]'}`}
+          ${
+            isUser
+              ? 'bg-[var(--accent)] text-white'
+              : 'border border-[var(--border-primary)] bg-[var(--bg-primary)] text-[var(--text-secondary)]'
+          }`}
       >
         {isUser ? <User size={14} /> : <Bot size={14} />}
       </div>
@@ -107,8 +127,7 @@ export const MessageBubble = memo(function MessageBubble({ message, onRegenerate
               : message.thinkingContent && (
                   // Legacy: old messages with single thinkingContent string
                   <ThinkingBlock index={1} total={1} content={message.thinkingContent} />
-                )
-            }
+                )}
           </>
         )}
 
@@ -185,12 +204,21 @@ export const MessageBubble = memo(function MessageBubble({ message, onRegenerate
                 className={`absolute -top-3 z-10 flex gap-0.5 rounded-lg border border-[var(--border-primary)] bg-[var(--bg-primary)] px-1 py-0.5 opacity-0 shadow-[var(--shadow-md)] transition-all duration-200 group-hover/msg:opacity-100 group-hover/msg:-translate-y-0.5
                   ${isUser ? 'left-0' : 'right-0'}`}
               >
-                <ActionButton icon={<Copy size={13} />} label="复制" onClick={() => copyToClipboard(message.content)} copyMode />
+                <ActionButton
+                  icon={<Copy size={13} />}
+                  label="复制"
+                  onClick={() => copyToClipboard(message.content)}
+                  copyMode
+                />
                 {isUser && (
                   <ActionButton icon={<Pencil size={13} />} label="编辑" onClick={startEdit} />
                 )}
                 {!isUser && onRegenerate && (
-                  <ActionButton icon={<RefreshCw size={13} />} label="重新生成" onClick={onRegenerate} />
+                  <ActionButton
+                    icon={<RefreshCw size={13} />}
+                    label="重新生成"
+                    onClick={onRegenerate}
+                  />
                 )}
               </div>
             )}
@@ -201,7 +229,10 @@ export const MessageBubble = memo(function MessageBubble({ message, onRegenerate
                   value={editText}
                   onChange={(e) => setEditText(e.target.value)}
                   onKeyDown={(e) => {
-                    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submitEdit(); }
+                    if (e.key === 'Enter' && !e.shiftKey) {
+                      e.preventDefault();
+                      submitEdit();
+                    }
                     if (e.key === 'Escape') cancelEdit();
                   }}
                   rows={3}
@@ -228,14 +259,19 @@ export const MessageBubble = memo(function MessageBubble({ message, onRegenerate
             ) : (
               <div
                 className={`rounded-2xl px-4 py-2.5 text-sm leading-relaxed
-                  ${isUser
-                    ? 'bg-[var(--accent)] text-white'
-                    : 'border border-[var(--border-primary)] bg-[var(--bg-primary)] text-[var(--text-assistant-msg)] md-content'}`}
+                  ${
+                    isUser
+                      ? 'bg-[var(--accent)] text-white'
+                      : 'border border-[var(--border-primary)] bg-[var(--bg-primary)] text-[var(--text-assistant-msg)] md-content'
+                  }`}
               >
                 {isUser ? (
                   <div className="whitespace-pre-wrap break-words">{message.content}</div>
                 ) : (
-                  <div className="break-words" dangerouslySetInnerHTML={{ __html: renderMarkdown(message.content) }} />
+                  <div
+                    className="break-words"
+                    dangerouslySetInnerHTML={{ __html: renderMarkdown(message.content) }}
+                  />
                 )}
                 {message.isStreaming && (
                   <span className="ml-0.5 inline-block h-[14px] w-[3px] animate-pulse rounded-full bg-[var(--accent)] align-text-bottom" />
@@ -249,7 +285,17 @@ export const MessageBubble = memo(function MessageBubble({ message, onRegenerate
   );
 });
 
-function ThinkingBlock({ content, index, total, isStreaming }: { content: string; index: number; total: number; isStreaming?: boolean }) {
+function ThinkingBlock({
+  content,
+  index,
+  total,
+  isStreaming,
+}: {
+  content: string;
+  index: number;
+  total: number;
+  isStreaming?: boolean;
+}) {
   const [expanded, setExpanded] = useState(isStreaming ?? false);
   const [manualToggle, setManualToggle] = useState(false);
 
@@ -269,24 +315,32 @@ function ThinkingBlock({ content, index, total, isStreaming }: { content: string
   const isActive = isStreaming && expanded;
 
   return (
-    <div className="my-1 overflow-hidden rounded-lg border-l-2 border-[var(--border-primary)] bg-[var(--bg-secondary)]"
-      style={{ borderLeftColor: isStreaming ? 'var(--color-purple)' : 'var(--border-primary)' }}>
+    <div
+      className="my-1 overflow-hidden rounded-lg border-l-2 border-[var(--border-primary)] bg-[var(--bg-secondary)]"
+      style={{ borderLeftColor: isStreaming ? 'var(--color-purple)' : 'var(--border-primary)' }}
+    >
       <button
         onClick={handleToggle}
         className="flex w-full items-center gap-2 px-3 py-2 text-left transition-colors hover:bg-[var(--bg-hover)]"
       >
-        <Brain size={13} className={`shrink-0 ${isStreaming ? 'text-[var(--color-purple)]' : 'text-[var(--text-tertiary)]'}`} />
-        <span className={`text-xs font-medium ${isStreaming ? 'text-[var(--color-purple)]' : 'text-[var(--text-secondary)]'}`}>
+        <Brain
+          size={13}
+          className={`shrink-0 ${isStreaming ? 'text-[var(--color-purple)]' : 'text-[var(--text-tertiary)]'}`}
+        />
+        <span
+          className={`text-xs font-medium ${isStreaming ? 'text-[var(--color-purple)]' : 'text-[var(--text-secondary)]'}`}
+        >
           {label}
         </span>
         {isStreaming && !expanded && (
           <span className="ml-1 inline-block h-2 w-2 animate-pulse rounded-full bg-[var(--color-purple)]" />
         )}
         <span className="ml-auto">
-          {expanded
-            ? <ChevronDown size={14} className="text-[var(--text-tertiary)]" />
-            : <ChevronRight size={14} className="text-[var(--text-tertiary)]" />
-          }
+          {expanded ? (
+            <ChevronDown size={14} className="text-[var(--text-tertiary)]" />
+          ) : (
+            <ChevronRight size={14} className="text-[var(--text-tertiary)]" />
+          )}
         </span>
       </button>
       {expanded && (
@@ -303,7 +357,12 @@ function ThinkingBlock({ content, index, total, isStreaming }: { content: string
   );
 }
 
-function ActionButton({ icon, label, onClick, copyMode }: {
+function ActionButton({
+  icon,
+  label,
+  onClick,
+  copyMode,
+}: {
   icon: React.ReactNode;
   label: string;
   onClick: () => void;

@@ -15,20 +15,38 @@ interface FileTreeProps {
 }
 
 const FILE_COLORS: Record<string, string> = {
-  rs: '#dea584', ts: '#3178c6', tsx: '#3178c6', js: '#f7df1e', jsx: '#61dafb',
-  py: '#3572A5', go: '#00ADD8', java: '#b07219', rb: '#701516',
-  json: '#292929', yaml: '#cb171e', yml: '#cb171e', toml: '#9c4221',
-  md: '#083fa1', css: '#563d7c', html: '#e34c26',
+  rs: '#dea584',
+  ts: '#3178c6',
+  tsx: '#3178c6',
+  js: '#f7df1e',
+  jsx: '#61dafb',
+  py: '#3572A5',
+  go: '#00ADD8',
+  java: '#b07219',
+  rb: '#701516',
+  json: '#292929',
+  yaml: '#cb171e',
+  yml: '#cb171e',
+  toml: '#9c4221',
+  md: '#083fa1',
+  css: '#563d7c',
+  html: '#e34c26',
 };
 
 function getIconColor(ext?: string): string {
-  return ext ? (FILE_COLORS[ext] || '#8b949e') : '#8b949e';
+  return ext ? FILE_COLORS[ext] || '#8b949e' : '#8b949e';
 }
 
 function TreeItem({
-  node, depth, selectedFile, onSelect,
+  node,
+  depth,
+  selectedFile,
+  onSelect,
 }: {
-  node: TreeNode; depth: number; selectedFile: string | null; onSelect: (path: string) => void;
+  node: TreeNode;
+  depth: number;
+  selectedFile: string | null;
+  onSelect: (path: string) => void;
 }) {
   const [expanded, setExpanded] = useState(depth === 0);
 
@@ -61,7 +79,11 @@ function TreeItem({
         }}
       >
         {node.is_dir ? (
-          expanded ? <ChevronDown size={14} style={{ color: 'var(--text-tertiary)' }} /> : <ChevronRight size={14} style={{ color: 'var(--text-tertiary)' }} />
+          expanded ? (
+            <ChevronDown size={14} style={{ color: 'var(--text-tertiary)' }} />
+          ) : (
+            <ChevronRight size={14} style={{ color: 'var(--text-tertiary)' }} />
+          )
         ) : (
           <span style={{ width: 14 }} />
         )}
@@ -75,7 +97,13 @@ function TreeItem({
       {node.is_dir && expanded && node.children && (
         <div>
           {node.children.map((child) => (
-            <TreeItem key={child.path} node={child} depth={depth + 1} selectedFile={selectedFile} onSelect={onSelect} />
+            <TreeItem
+              key={child.path}
+              node={child}
+              depth={depth + 1}
+              selectedFile={selectedFile}
+              onSelect={onSelect}
+            />
           ))}
         </div>
       )}
@@ -87,7 +115,13 @@ export function FileTree({ tree, selectedFile, onSelect }: FileTreeProps) {
   return (
     <div className="py-1">
       {tree.map((node) => (
-        <TreeItem key={node.path} node={node} depth={0} selectedFile={selectedFile} onSelect={onSelect} />
+        <TreeItem
+          key={node.path}
+          node={node}
+          depth={0}
+          selectedFile={selectedFile}
+          onSelect={onSelect}
+        />
       ))}
     </div>
   );

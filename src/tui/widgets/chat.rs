@@ -151,7 +151,7 @@ fn render_message(
             lines.push(Line::from(vec![
                 Span::styled(format!(" {} ", "\u{2139}"), Style::default().fg(t.subtext)),
                 Span::styled(
-                    format!(" {}", content.to_string()),
+                    format!(" {}", content),
                     Style::default()
                         .fg(t.subtext)
                         .add_modifier(Modifier::ITALIC),
@@ -164,10 +164,7 @@ fn render_message(
                     format!(" {} Tool ", "\u{1f527}"),
                     Style::default().fg(t.mauve).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    format!(" {}", content.to_string()),
-                    Style::default().fg(t.mauve),
-                ),
+                Span::styled(format!(" {}", content), Style::default().fg(t.mauve)),
             ]));
         }
     }
@@ -179,6 +176,6 @@ fn indent_line(line: Line<'static>, guide_color: Color) -> Line<'static> {
         "  \u{2502} ",
         Style::default().fg(guide_color),
     )];
-    spans.extend(line.spans.into_iter());
+    spans.extend(line.spans);
     Line::from(spans)
 }

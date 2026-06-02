@@ -278,11 +278,9 @@ pub async fn file_tree(
 ) -> Result<Vec<TreeNode>, IpcError> {
     let base = get_workspace_root(&state).await;
     let max_depth = depth.unwrap_or(3);
-    Ok(
-        tokio::task::spawn_blocking(move || build_tree(&base, &base, 0, max_depth))
-            .await
-            .map_err(|e| IpcError::Internal(format!("spawn_blocking failed: {e}")))?,
-    )
+    tokio::task::spawn_blocking(move || build_tree(&base, &base, 0, max_depth))
+        .await
+        .map_err(|e| IpcError::Internal(format!("spawn_blocking failed: {e}")))
 }
 
 #[tauri::command]

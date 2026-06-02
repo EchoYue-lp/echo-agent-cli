@@ -1,5 +1,22 @@
 import { useState, useRef } from 'react';
-import { Plus, Sun, Moon, Trash2, FolderOpen, Terminal, Settings, Code, BarChart3, GraduationCap, MessageSquare, Search, X, ChevronDown, ChevronRight, Loader2 } from 'lucide-react';
+import {
+  Plus,
+  Sun,
+  Moon,
+  Trash2,
+  FolderOpen,
+  Terminal,
+  Settings,
+  Code,
+  BarChart3,
+  GraduationCap,
+  MessageSquare,
+  Search,
+  X,
+  ChevronDown,
+  ChevronRight,
+  Loader2,
+} from 'lucide-react';
 import { BrandIcon } from '../common/BrandIcon';
 import { useUiStore } from '../../stores/uiStore';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
@@ -37,7 +54,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
   const searchInputRef = useRef<HTMLInputElement>(null);
 
   const filtered = searchQuery.trim()
-    ? workspaces.filter(w => w.name.toLowerCase().includes(searchQuery.toLowerCase()))
+    ? workspaces.filter((w) => w.name.toLowerCase().includes(searchQuery.toLowerCase()))
     : workspaces;
 
   const handleSwitch = async (ws: Workspace) => {
@@ -88,9 +105,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
 
   // Recent conversations for the currently expanded workspace
   // TODO: Filter by workspaceId once backend supports it
-  const recentConvs = current
-    ? conversations.slice(0, MAX_RECENT_CONVERSATIONS)
-    : [];
+  const recentConvs = current ? conversations.slice(0, MAX_RECENT_CONVERSATIONS) : [];
   const hasMoreConvs = current && conversations.length > MAX_RECENT_CONVERSATIONS;
 
   return (
@@ -153,7 +168,11 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
               className="flex-1 bg-transparent text-xs text-[var(--text-primary)] outline-none placeholder:text-[var(--text-tertiary)]"
             />
             {searchQuery && (
-              <button onClick={() => { setSearchQuery(''); searchInputRef.current?.focus(); }}
+              <button
+                onClick={() => {
+                  setSearchQuery('');
+                  searchInputRef.current?.focus();
+                }}
                 className="shrink-0 rounded p-0.5 text-[var(--text-tertiary)] hover:text-[var(--text-primary)]"
               >
                 <X size={12} />
@@ -189,23 +208,29 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
               {/* Workspace row */}
               <div
                 className={`group relative cursor-pointer rounded-lg transition-all
-                  ${isActive
-                    ? 'bg-[var(--bg-sidebar-active)] pl-[9px] border-l-[3px] border-l-[var(--accent)]'
-                    : 'border-l-[3px] border-l-transparent hover:bg-[var(--bg-sidebar-hover)]'}`}
+                  ${
+                    isActive
+                      ? 'bg-[var(--bg-sidebar-active)] pl-[9px] border-l-[3px] border-l-[var(--accent)]'
+                      : 'border-l-[3px] border-l-transparent hover:bg-[var(--bg-sidebar-hover)]'
+                  }`}
                 onClick={() => handleSwitch(ws)}
               >
                 <div className="flex items-center gap-2 py-2.5 pr-2">
                   {/* Expand arrow */}
                   {isActive ? (
-                    isExpanded
-                      ? <ChevronDown size={13} className="shrink-0 text-[var(--text-tertiary)]" />
-                      : <ChevronRight size={13} className="shrink-0 text-[var(--text-tertiary)]" />
+                    isExpanded ? (
+                      <ChevronDown size={13} className="shrink-0 text-[var(--text-tertiary)]" />
+                    ) : (
+                      <ChevronRight size={13} className="shrink-0 text-[var(--text-tertiary)]" />
+                    )
                   ) : (
                     getKindIcon(ws.kind)
                   )}
 
                   <div className="min-w-0 flex-1">
-                    <div className={`truncate text-[13px] ${isActive ? 'font-medium' : ''} text-[var(--text-primary)]`}>
+                    <div
+                      className={`truncate text-[13px] ${isActive ? 'font-medium' : ''} text-[var(--text-primary)]`}
+                    >
                       {ws.name}
                     </div>
                     <div className="truncate text-[11px] text-[var(--text-tertiary)]">
@@ -213,9 +238,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
                     </div>
                   </div>
 
-                  {isActive && (
-                    <div className="h-2 w-2 shrink-0 rounded-full bg-[var(--accent)]" />
-                  )}
+                  {isActive && <div className="h-2 w-2 shrink-0 rounded-full bg-[var(--accent)]" />}
 
                   <div className="flex shrink-0 items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
                     <button
@@ -256,10 +279,15 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
                     <div
                       key={conv.id}
                       className={`cursor-pointer rounded-md px-2 py-1.5 text-[12px] transition-colors
-                        ${activeConvId === conv.id
-                          ? 'bg-[var(--bg-sidebar-active)] text-[var(--text-primary)] font-medium'
-                          : 'text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'}`}
-                      onClick={(e) => { e.stopPropagation(); handleSelectConv(conv.id); }}
+                        ${
+                          activeConvId === conv.id
+                            ? 'bg-[var(--bg-sidebar-active)] text-[var(--text-primary)] font-medium'
+                            : 'text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
+                        }`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleSelectConv(conv.id);
+                      }}
                     >
                       <div className="flex items-center gap-1.5">
                         <MessageSquare size={11} className="shrink-0 text-[var(--text-tertiary)]" />

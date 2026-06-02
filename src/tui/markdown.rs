@@ -204,20 +204,18 @@ impl MarkdownRenderer {
             Event::Start(Tag::TableHead) => {
                 // Table head begins a new row
             }
-            Event::End(TagEnd::TableHead) => {
+            Event::End(TagEnd::TableHead)
                 // End of header row - add to rows
-                if !self.current_row.is_empty() {
+                if !self.current_row.is_empty() => {
                     self.table_rows.push(std::mem::take(&mut self.current_row));
                 }
-            }
             Event::Start(Tag::TableRow) => {
                 self.current_row.clear();
             }
-            Event::End(TagEnd::TableRow) => {
-                if !self.current_row.is_empty() {
+            Event::End(TagEnd::TableRow)
+                if !self.current_row.is_empty() => {
                     self.table_rows.push(std::mem::take(&mut self.current_row));
                 }
-            }
             Event::Start(Tag::TableCell { .. }) => {
                 self.current_cell.clear();
             }
@@ -392,10 +390,7 @@ impl MarkdownRenderer {
         let mut table_lines = Vec::new();
 
         // Separator line
-        let sep_parts: Vec<String> = col_widths
-            .iter()
-            .map(|w| "─".repeat(*w + 2))
-            .collect();
+        let sep_parts: Vec<String> = col_widths.iter().map(|w| "─".repeat(*w + 2)).collect();
         let sep = format!("┌{}┐", sep_parts.join("┬"));
         table_lines.push(sep);
 
@@ -408,8 +403,10 @@ impl MarkdownRenderer {
                 } else {
                     cell.to_string()
                 };
-                let style = if row_idx == 0 {
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                let _style = if row_idx == 0 {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 };
@@ -419,19 +416,14 @@ impl MarkdownRenderer {
 
             // Separator after header row
             if row_idx == 0 {
-                let sep_inner: Vec<String> = col_widths
-                    .iter()
-                    .map(|w| "─".repeat(*w + 2))
-                    .collect();
+                let sep_inner: Vec<String> =
+                    col_widths.iter().map(|w| "─".repeat(*w + 2)).collect();
                 table_lines.push(format!("├{}┤", sep_inner.join("┼")));
             }
         }
 
         // Bottom border
-        let bottom_parts: Vec<String> = col_widths
-            .iter()
-            .map(|w| "─".repeat(*w + 2))
-            .collect();
+        let bottom_parts: Vec<String> = col_widths.iter().map(|w| "─".repeat(*w + 2)).collect();
         table_lines.push(format!("└{}┘", bottom_parts.join("┴")));
 
         for line in table_lines {

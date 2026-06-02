@@ -117,7 +117,7 @@ pub async fn connect_mcp_server(
 
     let config = match transport {
         McpTransportConfig::Stdio { command, args, env } => {
-            let env_pairs: Vec<(String, String)> = env.into_iter().map(|(k, v)| (k, v)).collect();
+            let env_pairs: Vec<(String, String)> = env.into_iter().collect();
             McpServerConfig::stdio_with_env(&name, &command, args, env_pairs)
         }
         McpTransportConfig::Http { url, headers } => {
@@ -303,10 +303,10 @@ pub async fn update_mcp_config(
                 }
                 // Reconnect from config
                 for (name, entry) in &cfg.mcp_servers {
-                    if !entry.disabled {
-                        if let Ok(server_config) = entry.to_server_config(name) {
-                            agent.connect_mcp_from_config(server_config).await.ok();
-                        }
+                    if !entry.disabled
+                        && let Ok(server_config) = entry.to_server_config(name)
+                    {
+                        agent.connect_mcp_from_config(server_config).await.ok();
                     }
                 }
             })

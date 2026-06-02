@@ -10,7 +10,12 @@ export function ConfigPanel() {
   const [message, setMessage] = useState('');
 
   useEffect(() => {
-    configApi.getFull().then((c) => { setConfig(c); }).catch(console.error);
+    configApi
+      .getFull()
+      .then((c) => {
+        setConfig(c);
+      })
+      .catch(console.error);
   }, []);
 
   const markDirty = (update: Partial<FullConfigUpdateRequest>) => {
@@ -52,7 +57,11 @@ export function ConfigPanel() {
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           <h3 className="text-sm font-semibold text-[var(--text-primary)]">配置</h3>
-          {dirty && <span className="rounded-full bg-amber-500 px-2 py-0.5 text-[10px] font-medium text-white">未保存</span>}
+          {dirty && (
+            <span className="rounded-full bg-amber-500 px-2 py-0.5 text-[10px] font-medium text-white">
+              未保存
+            </span>
+          )}
         </div>
         <div className="flex items-center gap-2">
           {message && <span className="text-xs text-emerald-500">{message}</span>}
@@ -68,66 +77,154 @@ export function ConfigPanel() {
 
       {/* Agent */}
       <Section title="智能体">
-        <Field label="系统提示词" value={edit.agent?.system_prompt ?? config.agent.system_prompt}
-          onChange={(v) => markDirty({ agent: { ...edit.agent, system_prompt: v } })} multiline />
-        <Field label="最大迭代次数" value={String(edit.agent?.max_iterations ?? config.agent.max_iterations)}
-          onChange={(v) => markDirty({ agent: { ...edit.agent, max_iterations: Number(v) } })} type="number" />
-        <Toggle label="工具" value={edit.agent?.enable_tools ?? config.agent.enable_tools}
-          onChange={(v) => markDirty({ agent: { ...edit.agent, enable_tools: v } })} />
-        <Toggle label="记忆" value={edit.agent?.enable_memory ?? config.agent.enable_memory}
-          onChange={(v) => markDirty({ agent: { ...edit.agent, enable_memory: v } })} />
-        <Toggle label="人工介入" value={edit.agent?.enable_human_in_loop ?? config.agent.enable_human_loop}
-          onChange={(v) => markDirty({ agent: { ...edit.agent, enable_human_in_loop: v } })} />
+        <Field
+          label="系统提示词"
+          value={edit.agent?.system_prompt ?? config.agent.system_prompt}
+          onChange={(v) => markDirty({ agent: { ...edit.agent, system_prompt: v } })}
+          multiline
+        />
+        <Field
+          label="最大迭代次数"
+          value={String(edit.agent?.max_iterations ?? config.agent.max_iterations)}
+          onChange={(v) => markDirty({ agent: { ...edit.agent, max_iterations: Number(v) } })}
+          type="number"
+        />
+        <Toggle
+          label="工具"
+          value={edit.agent?.enable_tools ?? config.agent.enable_tools}
+          onChange={(v) => markDirty({ agent: { ...edit.agent, enable_tools: v } })}
+        />
+        <Toggle
+          label="记忆"
+          value={edit.agent?.enable_memory ?? config.agent.enable_memory}
+          onChange={(v) => markDirty({ agent: { ...edit.agent, enable_memory: v } })}
+        />
+        <Toggle
+          label="人工介入"
+          value={edit.agent?.enable_human_in_loop ?? config.agent.enable_human_loop}
+          onChange={(v) => markDirty({ agent: { ...edit.agent, enable_human_in_loop: v } })}
+        />
       </Section>
 
       {/* MCP */}
       <Section title="MCP">
-        <Field label="配置路径" value={edit.mcp?.config_path ?? config.mcp.config_path ?? ''}
-          onChange={(v) => markDirty({ mcp: { config_path: v } })} />
+        <Field
+          label="配置路径"
+          value={edit.mcp?.config_path ?? config.mcp.config_path ?? ''}
+          onChange={(v) => markDirty({ mcp: { config_path: v } })}
+        />
       </Section>
 
       {/* Channels - QQ */}
       <Section title="QQ 机器人">
-        <Toggle label="启用" value={edit.channels?.qq?.enabled ?? config.channels.qq.enabled}
-          onChange={(v) => markDirty({ channels: { ...edit.channels, qq: { ...edit.channels?.qq, enabled: v } } })} />
-        <Field label="应用 ID" value={edit.channels?.qq?.app_id ?? config.channels.qq.app_id}
-          onChange={(v) => markDirty({ channels: { ...edit.channels, qq: { ...edit.channels?.qq, app_id: v } } })} />
-        <Field label="客户端密钥" value={edit.channels?.qq?.client_secret ?? ''}
-          onChange={(v) => markDirty({ channels: { ...edit.channels, qq: { ...edit.channels?.qq, client_secret: v } } })}
-          type="password" />
+        <Toggle
+          label="启用"
+          value={edit.channels?.qq?.enabled ?? config.channels.qq.enabled}
+          onChange={(v) =>
+            markDirty({ channels: { ...edit.channels, qq: { ...edit.channels?.qq, enabled: v } } })
+          }
+        />
+        <Field
+          label="应用 ID"
+          value={edit.channels?.qq?.app_id ?? config.channels.qq.app_id}
+          onChange={(v) =>
+            markDirty({ channels: { ...edit.channels, qq: { ...edit.channels?.qq, app_id: v } } })
+          }
+        />
+        <Field
+          label="客户端密钥"
+          value={edit.channels?.qq?.client_secret ?? ''}
+          onChange={(v) =>
+            markDirty({
+              channels: { ...edit.channels, qq: { ...edit.channels?.qq, client_secret: v } },
+            })
+          }
+          type="password"
+        />
       </Section>
 
       {/* Channels - Feishu */}
       <Section title="飞书">
-        <Toggle label="启用" value={edit.channels?.feishu?.enabled ?? config.channels.feishu.enabled}
-          onChange={(v) => markDirty({ channels: { ...edit.channels, feishu: { ...edit.channels?.feishu, enabled: v } } })} />
-        <Field label="应用 ID" value={edit.channels?.feishu?.app_id ?? config.channels.feishu.app_id}
-          onChange={(v) => markDirty({ channels: { ...edit.channels, feishu: { ...edit.channels?.feishu, app_id: v } } })} />
-        <Field label="应用密钥" value={edit.channels?.feishu?.app_secret ?? ''}
-          onChange={(v) => markDirty({ channels: { ...edit.channels, feishu: { ...edit.channels?.feishu, app_secret: v } } })}
-          type="password" />
-        <Field label="模式" value={edit.channels?.feishu?.mode ?? config.channels.feishu.mode}
-          onChange={(v) => markDirty({ channels: { ...edit.channels, feishu: { ...edit.channels?.feishu, mode: v } } })} />
+        <Toggle
+          label="启用"
+          value={edit.channels?.feishu?.enabled ?? config.channels.feishu.enabled}
+          onChange={(v) =>
+            markDirty({
+              channels: { ...edit.channels, feishu: { ...edit.channels?.feishu, enabled: v } },
+            })
+          }
+        />
+        <Field
+          label="应用 ID"
+          value={edit.channels?.feishu?.app_id ?? config.channels.feishu.app_id}
+          onChange={(v) =>
+            markDirty({
+              channels: { ...edit.channels, feishu: { ...edit.channels?.feishu, app_id: v } },
+            })
+          }
+        />
+        <Field
+          label="应用密钥"
+          value={edit.channels?.feishu?.app_secret ?? ''}
+          onChange={(v) =>
+            markDirty({
+              channels: { ...edit.channels, feishu: { ...edit.channels?.feishu, app_secret: v } },
+            })
+          }
+          type="password"
+        />
+        <Field
+          label="模式"
+          value={edit.channels?.feishu?.mode ?? config.channels.feishu.mode}
+          onChange={(v) =>
+            markDirty({
+              channels: { ...edit.channels, feishu: { ...edit.channels?.feishu, mode: v } },
+            })
+          }
+        />
       </Section>
 
       {/* Session */}
       <Section title="会话">
-        <Field label="超时（分钟）" value={String(edit.channels?.session?.timeout_minutes ?? config.channels.session.timeout_minutes)}
-          onChange={(v) => markDirty({ channels: { ...edit.channels, session: { ...edit.channels?.session, timeout_minutes: Number(v) } } })} type="number" />
+        <Field
+          label="超时（分钟）"
+          value={String(
+            edit.channels?.session?.timeout_minutes ?? config.channels.session.timeout_minutes
+          )}
+          onChange={(v) =>
+            markDirty({
+              channels: {
+                ...edit.channels,
+                session: { ...edit.channels?.session, timeout_minutes: Number(v) },
+              },
+            })
+          }
+          type="number"
+        />
       </Section>
 
       {/* Server */}
       <Section title="服务端">
-        <Field label="主机" value={edit.server?.host ?? config.server.host}
-          onChange={(v) => markDirty({ server: { ...edit.server, host: v } })} />
-        <Field label="端口" value={String(edit.server?.port ?? config.server.port)}
-          onChange={(v) => markDirty({ server: { ...edit.server, port: Number(v) } })} type="number" />
+        <Field
+          label="主机"
+          value={edit.server?.host ?? config.server.host}
+          onChange={(v) => markDirty({ server: { ...edit.server, host: v } })}
+        />
+        <Field
+          label="端口"
+          value={String(edit.server?.port ?? config.server.port)}
+          onChange={(v) => markDirty({ server: { ...edit.server, port: Number(v) } })}
+          type="number"
+        />
       </Section>
 
       {/* Logging */}
       <Section title="日志">
-        <Field label="级别" value={edit.logging?.level ?? config.logging.level}
-          onChange={(v) => markDirty({ logging: { level: v } })} />
+        <Field
+          label="级别"
+          value={edit.logging?.level ?? config.logging.level}
+          onChange={(v) => markDirty({ logging: { level: v } })}
+        />
       </Section>
     </div>
   );
@@ -136,33 +233,60 @@ export function ConfigPanel() {
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <div className="rounded-lg border border-[var(--border-primary)] p-3">
-      <h4 className="mb-2 text-xs font-semibold uppercase tracking-wider text-[var(--text-tertiary)]">{title}</h4>
+      <h4 className="mb-2 text-xs font-semibold uppercase tracking-wider text-[var(--text-tertiary)]">
+        {title}
+      </h4>
       <div className="space-y-2">{children}</div>
     </div>
   );
 }
 
-function Field({ label, value, onChange, multiline, type }: {
+function Field({
+  label,
+  value,
+  onChange,
+  multiline,
+  type,
+}: {
   label: string;
   value: string;
   onChange: (v: string) => void;
   multiline?: boolean;
   type?: string;
 }) {
-  const cls = 'w-full rounded-lg border border-[var(--border-primary)] bg-[var(--bg-input)] px-2 py-1.5 text-sm text-[var(--text-primary)] outline-none focus:border-[var(--border-focus)]';
+  const cls =
+    'w-full rounded-lg border border-[var(--border-primary)] bg-[var(--bg-input)] px-2 py-1.5 text-sm text-[var(--text-primary)] outline-none focus:border-[var(--border-focus)]';
   return (
     <div>
       <label className="mb-1 block text-xs text-[var(--text-secondary)]">{label}</label>
       {multiline ? (
-        <textarea value={value} onChange={(e) => onChange(e.target.value)} className={cls} rows={3} />
+        <textarea
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          className={cls}
+          rows={3}
+        />
       ) : (
-        <input type={type} value={value} onChange={(e) => onChange(e.target.value)} className={cls} />
+        <input
+          type={type}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          className={cls}
+        />
       )}
     </div>
   );
 }
 
-function Toggle({ label, value, onChange }: { label: string; value: boolean; onChange: (v: boolean) => void }) {
+function Toggle({
+  label,
+  value,
+  onChange,
+}: {
+  label: string;
+  value: boolean;
+  onChange: (v: boolean) => void;
+}) {
   return (
     <div className="flex items-center justify-between">
       <span className="text-sm text-[var(--text-primary)]">{label}</span>
@@ -170,7 +294,9 @@ function Toggle({ label, value, onChange }: { label: string; value: boolean; onC
         onClick={() => onChange(!value)}
         className={`relative h-5 w-9 rounded-full transition ${value ? 'bg-[var(--accent)]' : 'bg-[var(--text-tertiary)]'}`}
       >
-        <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition ${value ? 'left-[18px]' : 'left-0.5'}`} />
+        <span
+          className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition ${value ? 'left-[18px]' : 'left-0.5'}`}
+        />
       </button>
     </div>
   );

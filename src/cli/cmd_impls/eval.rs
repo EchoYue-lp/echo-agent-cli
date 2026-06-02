@@ -94,16 +94,14 @@ cmd!(
 
 async fn cmd_self_review(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
     let store = ctx.agent.read(|a| a.run_store.clone()).await;
-    if let Some(ref s) = store {
-        if let Ok(runs) = s.list_all(1).await {
-            if let Some(r) = runs.first() {
-                if let Ok(Some(run)) = s.load(&r.run_id).await {
-                    let critique = echo_agent::improve::Analyzer::analyze(&run);
-                    println!("\n{}", critique.format_report());
-                    return CommandOutcome::Continue;
-                }
-            }
-        }
+    if let Some(ref s) = store
+        && let Ok(runs) = s.list_all(1).await
+        && let Some(r) = runs.first()
+        && let Ok(Some(run)) = s.load(&r.run_id).await
+    {
+        let critique = echo_agent::improve::Analyzer::analyze(&run);
+        println!("\n{}", critique.format_report());
+        return CommandOutcome::Continue;
     }
     println!("No runs to review.");
     CommandOutcome::Continue

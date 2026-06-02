@@ -318,9 +318,9 @@ pub async fn delete_workflow(
 
 #[tauri::command]
 pub async fn execute_workflow(
-    state: tauri::State<'_, TauriState>,
+    _state: tauri::State<'_, TauriState>,
     id: String,
-    input: Option<serde_json::Value>,
+    _input: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, IpcError> {
     // Workflow execution requires the agent; return stub for now
     Ok(serde_json::json!({
@@ -369,8 +369,8 @@ pub async fn update_sandbox_config(
 #[tauri::command]
 pub async fn execute_sandbox(
     _state: tauri::State<'_, TauriState>,
-    code: String,
-    language: Option<String>,
+    _code: String,
+    _language: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
     // Sandbox execution requires complex setup; return stub
     Ok(serde_json::json!({
@@ -385,7 +385,7 @@ pub async fn execute_sandbox(
 
 #[tauri::command]
 pub async fn compress_context(
-    state: tauri::State<'_, TauriState>,
+    _state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
     // Context compression is handled by the agent
     Ok(serde_json::json!({
@@ -417,9 +417,9 @@ pub async fn get_compression_stats(
 #[tauri::command]
 pub async fn extract_data(
     _state: tauri::State<'_, TauriState>,
-    input: String,
-    schema: serde_json::Value,
-    schema_name: String,
+    _input: String,
+    _schema: serde_json::Value,
+    _schema_name: String,
 ) -> Result<serde_json::Value, IpcError> {
     Ok(serde_json::json!({
         "success": false,
@@ -430,7 +430,7 @@ pub async fn extract_data(
 #[tauri::command]
 pub async fn validate_schema(
     _state: tauri::State<'_, TauriState>,
-    schema: serde_json::Value,
+    _schema: serde_json::Value,
 ) -> Result<serde_json::Value, IpcError> {
     Ok(serde_json::json!({
         "valid": true,
@@ -472,7 +472,7 @@ pub async fn get_context_stats(
 #[tauri::command]
 pub async fn get_history(
     _state: tauri::State<'_, TauriState>,
-    limit: Option<usize>,
+    _limit: Option<usize>,
 ) -> Result<serde_json::Value, IpcError> {
     // History is managed by conversation store
     Ok(serde_json::json!([]))
@@ -512,7 +512,7 @@ pub async fn list_trace_sessions(
 #[tauri::command]
 pub async fn get_trace_events(
     _state: tauri::State<'_, TauriState>,
-    session_id: String,
+    _session_id: String,
 ) -> Result<serde_json::Value, IpcError> {
     Ok(serde_json::json!([]))
 }
@@ -559,7 +559,7 @@ pub async fn get_paper(
 pub async fn create_paper(
     _state: tauri::State<'_, TauriState>,
     title: String,
-    authors: Option<Vec<String>>,
+    _authors: Option<Vec<String>>,
 ) -> Result<serde_json::Value, IpcError> {
     let id = uuid::Uuid::new_v4().to_string();
     Ok(serde_json::json!({
@@ -572,7 +572,7 @@ pub async fn create_paper(
 #[tauri::command]
 pub async fn delete_paper(
     _state: tauri::State<'_, TauriState>,
-    id: String,
+    _id: String,
 ) -> Result<serde_json::Value, IpcError> {
     Ok(serde_json::json!({"success": true}))
 }
@@ -580,8 +580,8 @@ pub async fn delete_paper(
 #[tauri::command]
 pub async fn update_paper_notes(
     _state: tauri::State<'_, TauriState>,
-    id: String,
-    notes: String,
+    _id: String,
+    _notes: String,
 ) -> Result<serde_json::Value, IpcError> {
     Ok(serde_json::json!({"success": true}))
 }
@@ -589,8 +589,8 @@ pub async fn update_paper_notes(
 #[tauri::command]
 pub async fn add_paper_tags(
     _state: tauri::State<'_, TauriState>,
-    id: String,
-    tags: Vec<String>,
+    _id: String,
+    _tags: Vec<String>,
 ) -> Result<serde_json::Value, IpcError> {
     Ok(serde_json::json!({"success": true}))
 }
@@ -612,7 +612,7 @@ pub async fn get_scratchpad(
 #[tauri::command]
 pub async fn update_scratchpad(
     _state: tauri::State<'_, TauriState>,
-    content: String,
+    _content: String,
 ) -> Result<serde_json::Value, IpcError> {
     Ok(serde_json::json!({"success": true}))
 }
@@ -631,8 +631,8 @@ pub async fn list_decisions(
 #[tauri::command]
 pub async fn create_decision(
     _state: tauri::State<'_, TauriState>,
-    title: String,
-    rationale: String,
+    _title: String,
+    _rationale: String,
 ) -> Result<serde_json::Value, IpcError> {
     let id = uuid::Uuid::new_v4().to_string();
     Ok(serde_json::json!({
@@ -655,7 +655,7 @@ pub async fn clear_decisions(
 #[tauri::command]
 pub async fn get_trajectories(
     _state: tauri::State<'_, TauriState>,
-    date: Option<String>,
+    _date: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
     Ok(serde_json::json!([]))
 }
@@ -686,7 +686,7 @@ pub async fn review_trajectory(
 pub async fn curator_action(
     _state: tauri::State<'_, TauriState>,
     action: String,
-    skill_name: Option<String>,
+    _skill_name: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
     Ok(serde_json::json!({
         "success": true,
@@ -752,7 +752,7 @@ pub async fn list_worktrees(
 pub async fn create_worktree(
     _state: tauri::State<'_, TauriState>,
     branch: String,
-    path: Option<String>,
+    _path: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
     Ok(serde_json::json!({
         "success": true,
@@ -763,7 +763,7 @@ pub async fn create_worktree(
 #[tauri::command]
 pub async fn remove_worktree(
     _state: tauri::State<'_, TauriState>,
-    path: String,
+    _path: String,
 ) -> Result<serde_json::Value, IpcError> {
     Ok(serde_json::json!({"success": true}))
 }

@@ -17,7 +17,7 @@
 //! /cron help
 //! ```
 
-use crate::cli::command::{CommandCategory, CommandContext, CommandOutcome, SubCommandDef, cmd};
+use crate::cli::command::{CommandCategory, CommandContext, CommandOutcome, SubCommandDef};
 use echo_agent_app_core::scheduler::{CronTask, CronTaskStatus};
 use std::sync::Arc;
 
@@ -190,8 +190,8 @@ async fn cmd_cron_list(ctx: &CommandContext, _args: &[&str]) -> CommandOutcome {
 
     println!("\n  Scheduled Tasks ({}):", tasks.len());
     println!(
-        "  {:<10} {:<20} {:<18} {:<8} {:<20} {}",
-        "ID", "Name", "Schedule", "Status", "Last Run", "Next Run"
+        "  {:<10} {:<20} {:<18} {:<8} {:<20} Next Run",
+        "ID", "Name", "Schedule", "Status", "Last Run"
     );
     println!("  {}", "-".repeat(96));
 
@@ -208,12 +208,12 @@ async fn cmd_cron_list(ctx: &CommandContext, _args: &[&str]) -> CommandOutcome {
         let last_run = task
             .last_run_at
             .as_deref()
-            .map(|s| format_relative_time(s))
+            .map(format_relative_time)
             .unwrap_or_else(|| "never".to_string());
         let next_run = if task.status == CronTaskStatus::Enabled {
             task.next_run()
                 .map(|dt| format_next_run(&dt))
-                .unwrap_or_else(|_| "error".to_string())
+                .unwrap_or_else(|| "error".to_string())
         } else {
             "-".to_string()
         };
@@ -399,7 +399,7 @@ async fn cmd_cron_run(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             let full_id = task.id.clone();
             let name = task.name.clone();
             println!("  Triggering '{}' [{}]...", name, &full_id[..8]);
-            match runner.run_task_once(&full_id).await {
+            match runner.run_once(&full_id).await {
                 Ok(result) => {
                     let preview: String = result.chars().take(500).collect();
                     println!("  Result:");
@@ -483,7 +483,7 @@ fn validate_cron_expr(expr: &str) -> Result<(), String> {
     // but our CronTask::next_run() already wraps with the cron crate.
     // We accept 5-field and try to parse via Schedule (which needs 7 fields),
     // so we pad with "0" prefix (seconds) and "*" suffix (year).
-    let fields: Vec<&str> = expr.trim().split_whitespace().collect();
+    let fields: Vec<&str> = expr.split_whitespace().collect();
     if fields.len() != 5 {
         return Err(format!("expected 5 fields, got {}", fields.len()));
     }

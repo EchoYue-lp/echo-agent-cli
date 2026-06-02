@@ -81,7 +81,7 @@ async fn cmd_tasks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 println!("Usage: /tasks status <id>");
                 return CommandOutcome::Continue;
             }
-            match service.get(id).await {
+            match service.get(id) {
                 Some((task, meta)) => {
                     println!("\nTask: {}", task.id);
                     println!("  Description: {}", task.description);
@@ -148,7 +148,7 @@ async fn cmd_tasks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 println!("{:-<80}", "");
                 for (task_id, req) in &pending {
                     println!("  Task: {}", task_id);
-                    println!("  Phase: {}", req.waiting_phase);
+                    println!("  Phase: {}", req.phase);
                     println!("  Prompt: {}", req.prompt);
                     println!("  Options: {}", req.options.join(", "));
                     println!();

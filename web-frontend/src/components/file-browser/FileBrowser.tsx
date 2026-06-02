@@ -102,19 +102,13 @@ export function FileBrowser() {
             ) : tree.length === 0 ? (
               <div className="px-4 py-8 text-center">
                 <FolderTree size={24} className="mx-auto mb-2 text-[var(--text-tertiary)]" />
-                <p className="text-xs text-[var(--text-tertiary)]">
-                  No workspace linked
-                </p>
+                <p className="text-xs text-[var(--text-tertiary)]">No workspace linked</p>
                 <p className="mt-1 text-[10px] text-[var(--text-tertiary)]">
                   Link a project to browse files
                 </p>
               </div>
             ) : (
-              <FileTree
-                tree={tree}
-                onSelect={handleSelectFile}
-                selectedFile={selectedFile}
-              />
+              <FileTree tree={tree} onSelect={handleSelectFile} selectedFile={selectedFile} />
             )}
           </div>
         </div>
@@ -147,9 +141,10 @@ export function FileBrowser() {
                 <button
                   onClick={handleViewContent}
                   className={`flex items-center gap-1 rounded-md px-2 py-1 text-[10px] font-medium transition-colors
-                    ${viewMode === 'content'
-                      ? 'bg-[var(--bg-sidebar-active)] text-[var(--text-primary)]'
-                      : 'text-[var(--text-tertiary)] hover:text-[var(--text-primary)]'
+                    ${
+                      viewMode === 'content'
+                        ? 'bg-[var(--bg-sidebar-active)] text-[var(--text-primary)]'
+                        : 'text-[var(--text-tertiary)] hover:text-[var(--text-primary)]'
                     }`}
                 >
                   <FileCode size={10} />
@@ -158,9 +153,10 @@ export function FileBrowser() {
                 <button
                   onClick={handleViewDiff}
                   className={`flex items-center gap-1 rounded-md px-2 py-1 text-[10px] font-medium transition-colors
-                    ${viewMode === 'diff'
-                      ? 'bg-[var(--bg-sidebar-active)] text-[var(--text-primary)]'
-                      : 'text-[var(--text-tertiary)] hover:text-[var(--text-primary)]'
+                    ${
+                      viewMode === 'diff'
+                        ? 'bg-[var(--bg-sidebar-active)] text-[var(--text-primary)]'
+                        : 'text-[var(--text-tertiary)] hover:text-[var(--text-primary)]'
                     }`}
                 >
                   <GitCompare size={10} />
@@ -248,9 +244,7 @@ function FileContentView({
             <span className="w-12 shrink-0 select-none px-2 text-right text-[var(--text-tertiary)]">
               {idx + 1}
             </span>
-            <span className="flex-1 whitespace-pre px-3 text-[var(--text-primary)]">
-              {line}
-            </span>
+            <span className="flex-1 whitespace-pre px-3 text-[var(--text-primary)]">{line}</span>
           </div>
         ))}
       </div>

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 pub fn run_onboard() -> anyhow::Result<()> {
     println!();
     println!("╭─────────────────────────────────────────────────────────────╮");
-    println!("│            🚀 Echo Agent CLI — 初始化向导                    │");
+    println!("│            🚀 EchoCoWork — 初始化向导                          │");
     println!("╰─────────────────────────────────────────────────────────────╯");
     println!();
     println!("  这个向导将帮你完成首次配置。按 Ctrl+C 可随时退出。");
@@ -81,29 +81,30 @@ pub fn run_onboard() -> anyhow::Result<()> {
         io::stdin().read_line(&mut input)?;
         let input = input.trim();
 
-        if let Ok(num) = input.parse::<usize>() {
-            if num >= 1 && num <= providers.len() {
-                let (key, name, _) = &providers[num - 1];
-                print!("  请输入 {} API Key: ", name);
-                io::stdout().flush()?;
-                let mut api_key = String::new();
-                io::stdin().read_line(&mut api_key)?;
-                let api_key = api_key.trim();
+        if let Ok(num) = input.parse::<usize>()
+            && num >= 1
+            && num <= providers.len()
+        {
+            let (key, name, _) = &providers[num - 1];
+            print!("  请输入 {} API Key: ", name);
+            io::stdout().flush()?;
+            let mut api_key = String::new();
+            io::stdin().read_line(&mut api_key)?;
+            let api_key = api_key.trim();
 
-                if !api_key.is_empty() {
-                    let env_path = echo_dir.join(".env");
-                    let content = format!("{}={}\n", key, api_key);
-                    if env_path.exists() {
-                        let existing = std::fs::read_to_string(&env_path)?;
-                        if !existing.contains(key) {
-                            std::fs::write(&env_path, format!("{}{}", existing, content))?;
-                        }
-                    } else {
-                        std::fs::write(&env_path, content)?;
+            if !api_key.is_empty() {
+                let env_path = echo_dir.join(".env");
+                let content = format!("{}={}\n", key, api_key);
+                if env_path.exists() {
+                    let existing = std::fs::read_to_string(&env_path)?;
+                    if !existing.contains(key) {
+                        std::fs::write(&env_path, format!("{}{}", existing, content))?;
                     }
-                    println!("  ✅ 已保存到 {}", env_path.display());
-                    has_any_key = true;
+                } else {
+                    std::fs::write(&env_path, content)?;
                 }
+                println!("  ✅ 已保存到 {}", env_path.display());
+                has_any_key = true;
             }
         }
     }
@@ -231,10 +232,10 @@ pub fn run_onboard() -> anyhow::Result<()> {
     println!("╰─────────────────────────────────────────────────────────────╯");
     println!();
     println!("  接下来，你可以:");
-    println!("    echo-agent-cli --cli          # 启动交互式 REPL");
-    println!("    echo-agent-cli --web          # 启动 Web 服务");
-    println!("    echo-agent-cli run '你好'     # 一次性对话");
-    println!("    echo-agent-cli doctor         # 运行诊断检查");
+    println!("    echo-agent-cli                  # 启动 TUI 交互界面");
+    println!("    echo-agent-cli --cli            # 启动交互式 REPL");
+    println!("    echo-agent-cli run '你好'       # 一次性对话");
+    println!("    echo-agent-cli doctor           # 运行诊断检查");
     println!();
 
     Ok(())

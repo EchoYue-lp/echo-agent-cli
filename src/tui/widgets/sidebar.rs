@@ -64,7 +64,9 @@ impl Widget for Sidebar {
 }
 
 fn render_file_tree(f: &mut Frame, area: Rect, t: &Theme) {
-    let hint = Style::default().fg(t.overlay0).add_modifier(Modifier::ITALIC);
+    let hint = Style::default()
+        .fg(t.overlay0)
+        .add_modifier(Modifier::ITALIC);
     let items = vec![ListItem::new(Line::from(vec![Span::styled(
         "  No project loaded\n  Press /workspace to open",
         hint,
@@ -90,7 +92,9 @@ fn render_tools_list(f: &mut Frame, app: &TuiApp, area: Rect, t: &Theme) {
             header,
             ListItem::new(Line::from(vec![Span::styled(
                 "    No tools registered",
-                Style::default().fg(t.overlay0).add_modifier(Modifier::ITALIC),
+                Style::default()
+                    .fg(t.overlay0)
+                    .add_modifier(Modifier::ITALIC),
             )])),
         ]
     } else {
@@ -98,7 +102,9 @@ fn render_tools_list(f: &mut Frame, app: &TuiApp, area: Rect, t: &Theme) {
             header,
             ListItem::new(Line::from(vec![Span::styled(
                 "    Tool list available via API",
-                Style::default().fg(t.overlay0).add_modifier(Modifier::ITALIC),
+                Style::default()
+                    .fg(t.overlay0)
+                    .add_modifier(Modifier::ITALIC),
             )])),
         ]
     };
