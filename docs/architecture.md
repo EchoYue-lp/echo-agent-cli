@@ -216,18 +216,18 @@ impl SchedulerRunner {
 ```
 workspaces/
 ├── {workspace-id}/
-│   ├── .echocowork/
-│   │   ├── sessions/         # 会话历史 (JSON)
-│   │   ├── conversations/    # 对话记录
-│   │   ├── memory/           # 记忆存储 (SQLite)
-│   │   ├── tasks/            # 任务状态
-│   │   ├── traces/           # 执行轨迹 (用于调试)
-│   │   ├── logs/             # 日志
-│   │   └── workspace.json    # 工作区清单
-│   ├── data/                 # 数据文件
-│   ├── papers/               # 论文文件
-│   ├── artifacts/            # 生成物
-│   └── scratchpad.md         # 共享草稿
+│   └── .echocowork/
+│       ├── sessions/         # 会话历史 (JSON)
+│       ├── conversations/    # 对话记录
+│       ├── memory/           # 记忆存储 (SQLite)
+│       ├── tasks/            # 任务状态
+│       ├── traces/           # 执行轨迹 (用于调试)
+│       ├── logs/             # 日志
+│       ├── data/             # 数据文件
+│       ├── papers/           # 论文文件
+│       ├── artifacts/        # 生成物
+│       ├── scratchpad.md     # 共享草稿
+│       └── workspace.json    # 工作区清单
 ```
 
 ## TUI 架构

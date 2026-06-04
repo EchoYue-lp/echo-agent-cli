@@ -153,11 +153,7 @@ fn render_suggestions(f: &mut Frame, app: &TuiApp, input_inner: Rect) {
 
         let mut spans = vec![Span::styled(
             format!("    {}", name),
-            if is_selected {
-                Style::default().fg(t.cyan).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(t.cyan).add_modifier(Modifier::BOLD)
-            },
+            Style::default().fg(t.cyan).add_modifier(Modifier::BOLD),
         )];
 
         if !usage.is_empty() {

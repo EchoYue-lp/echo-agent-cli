@@ -403,13 +403,6 @@ impl MarkdownRenderer {
                 } else {
                     cell.to_string()
                 };
-                let _style = if row_idx == 0 {
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                };
                 line.push_str(&format!(" {:<width$} │", truncated, width = width));
             }
             table_lines.push(line);

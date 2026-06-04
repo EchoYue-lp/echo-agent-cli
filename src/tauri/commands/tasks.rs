@@ -19,6 +19,22 @@ pub struct TaskInfo {
     pub kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub progress: Option<u8>,
+    /// Task priority (0-10, higher = more urgent).
+    pub priority: u8,
+    /// Task IDs this task depends on.
+    pub dependencies: Vec<String>,
+    /// Real-time progress percentage (0.0–100.0) from ProgressBridge.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress_pct: Option<f64>,
+    /// Current phase name (e.g., "thinking", "web_search", "completed").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress_phase: Option<String>,
+    /// Human-readable progress message (e.g., "Iteration 3", "Using: arxiv_search").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub progress_message: Option<String>,
+    /// Estimated seconds remaining.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eta_secs: Option<u64>,
 }
 
 #[tauri::command]
@@ -31,7 +47,13 @@ pub async fn list_tasks(state: tauri::State<'_, TauriState>) -> Result<Vec<TaskI
         .ok_or_else(|| IpcError::Internal("Task service not initialized".to_string()))?;
 
     let tasks = service.list(None);
-    Ok(tasks.into_iter().map(task_to_info).collect())
+    Ok(tasks
+        .into_iter()
+        .map(|task| {
+            let progress = service.get_progress(&task.id);
+            task_to_info(task, progress)
+        })
+        .collect())
 }
 
 #[tauri::command]
@@ -40,6 +62,8 @@ pub async fn submit_task(
     kind: String,
     description: String,
     params: Option<serde_json::Value>,
+    priority: Option<u8>,
+    depends_on: Option<Vec<String>>,
 ) -> Result<serde_json::Value, IpcError> {
     let service = state
         .app_state
@@ -103,7 +127,13 @@ pub async fn submit_task(
     };
 
     let task_id = service
-        .submit(task_kind, &description, Some("ipc".to_string()))
+        .submit_with_options(
+            task_kind,
+            &description,
+            Some("ipc".to_string()),
+            priority,
+            depends_on.unwrap_or_default(),
+        )
         .await
         .map_err(|e| IpcError::Internal(format!("Failed to submit task: {e}")))?;
 
@@ -129,7 +159,8 @@ pub async fn get_task(
         .get(&id)
         .ok_or_else(|| IpcError::NotFound(format!("Task '{}' not found", id)))?;
 
-    Ok(task_to_info(task))
+    let progress = service.get_progress(&id);
+    Ok(task_to_info(task, progress))
 }
 
 #[tauri::command]
@@ -151,7 +182,10 @@ pub async fn cancel_task(
     }))
 }
 
-fn task_to_info(task: echo_agent_app_core::tasks::Task) -> TaskInfo {
+fn task_to_info(
+    task: echo_agent_app_core::tasks::Task,
+    progress: Option<echo_agent_app_core::tasks::progress::TaskProgress>,
+) -> TaskInfo {
     let kind = task
         .tags
         .iter()
@@ -181,6 +215,17 @@ fn task_to_info(task: echo_agent_app_core::tasks::Task) -> TaskInfo {
         ),
     };
 
+    // Extract progress from the live progress cache (updated by ProgressBridge)
+    let (progress_pct, progress_phase, progress_message, eta_secs) = match progress {
+        Some(p) => (
+            Some(p.percentage),
+            Some(p.current_phase.clone()),
+            p.message.clone(),
+            p.eta_secs,
+        ),
+        None => (None, None, None, None),
+    };
+
     TaskInfo {
         id: task.id.clone(),
         description: task.description.clone(),
@@ -191,5 +236,72 @@ fn task_to_info(task: echo_agent_app_core::tasks::Task) -> TaskInfo {
         error,
         kind,
         progress: None,
+        priority: task.priority,
+        dependencies: task.dependencies.clone(),
+        progress_pct,
+        progress_phase,
+        progress_message,
+        eta_secs,
     }
+}
+
+/// Response for get_task_dag command
+#[derive(Debug, Serialize)]
+pub struct TaskDagInfo {
+    /// Mermaid format DAG visualization
+    pub mermaid: String,
+    /// Task details with dependencies
+    pub tasks: Vec<TaskDagNode>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TaskDagNode {
+    pub id: String,
+    pub description: String,
+    pub status: String,
+    pub priority: u8,
+    pub dependencies: Vec<String>,
+}
+
+#[tauri::command]
+pub async fn get_task_dag(state: tauri::State<'_, TauriState>) -> Result<TaskDagInfo, IpcError> {
+    let service = state
+        .app_state
+        .tasks
+        .service
+        .as_ref()
+        .ok_or_else(|| IpcError::Internal("Task service not initialized".to_string()))?;
+
+    let manager = service.manager();
+    let tasks = manager.get_all_tasks();
+
+    let mermaid = manager.visualize_dependencies();
+
+    let task_nodes: Vec<TaskDagNode> = tasks
+        .into_iter()
+        .map(|task| {
+            let status = match &task.status {
+                echo_agent_app_core::tasks::TaskStatus::Pending => "pending".to_string(),
+                echo_agent_app_core::tasks::TaskStatus::InProgress => "in_progress".to_string(),
+                echo_agent_app_core::tasks::TaskStatus::Completed => "completed".to_string(),
+                echo_agent_app_core::tasks::TaskStatus::Cancelled => "cancelled".to_string(),
+                echo_agent_app_core::tasks::TaskStatus::Failed(_) => "failed".to_string(),
+                echo_agent_app_core::tasks::TaskStatus::Blocked(_) => "blocked".to_string(),
+                echo_agent_app_core::tasks::TaskStatus::TimedOut { .. } => "timed_out".to_string(),
+                echo_agent_app_core::tasks::TaskStatus::Retrying { .. } => "retrying".to_string(),
+            };
+            TaskDagNode {
+                id: task.id,
+                description: task.description,
+                status,
+                priority: task.priority,
+                dependencies: task.dependencies,
+            }
+        })
+        .collect();
+
+    Ok(TaskDagInfo {
+        mermaid,
+        tasks: task_nodes,
+    })
 }

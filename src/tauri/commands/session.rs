@@ -3,7 +3,7 @@
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
 use echo_agent::agent::Agent;
-use echo_agent::memory::{ConversationFilter, ConversationStore};
+use echo_agent::memory::ConversationFilter;
 use echo_agent_app_core::types::SessionInfo;
 use serde::Serialize;
 

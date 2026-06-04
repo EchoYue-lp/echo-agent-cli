@@ -1,7 +1,6 @@
 //! Context management slash commands — mode, project, think, reasoning, model, system, compress, compact, context, refresh.
 
 use crate::cli::command::{CommandCategory, CommandContext, CommandOutcome, cmd};
-use crate::project::modes::ModeEngine;
 use echo_agent::agent::Agent;
 use std::sync::Arc;
 
@@ -9,10 +8,9 @@ use std::sync::Arc;
 
 async fn cmd_mode(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     if let Some(mode) = args.first() {
-        match crate::project::modes::from_str(mode) {
+        match crate::project::modes::parse_from_str(mode) {
             Some(agent_mode) => {
-                let overlay =
-                    crate::project::modes::chinese_mode_engine().system_prompt(&agent_mode);
+                let overlay = crate::project::modes::chinese_mode_prompt(&agent_mode);
 
                 // Use prompt stacking: preserve base, swap domain overlay
                 ctx.agent

@@ -1,5 +1,6 @@
 import { useRef, useCallback, useEffect, useState } from 'react';
 import { useChatStore } from '../stores/chatStore';
+import { isTauri } from '../lib/tauri-bridge';
 import type { ClientMessage, ServerMessage, Attachment } from '../types/api';
 
 export type ConnectionStatus = 'connected' | 'disconnected' | 'connecting';
@@ -277,6 +278,7 @@ export function useWebSocket() {
   }, [send]);
 
   useEffect(() => {
+    if (isTauri()) return; // In Tauri mode, chat uses IPC events, not WebSocket
     connect();
     return () => {
       clearTimeout(reconnectTimer.current);

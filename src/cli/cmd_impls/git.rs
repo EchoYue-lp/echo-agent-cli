@@ -332,7 +332,7 @@ async fn git_blame(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                         current_author = author.to_string();
                     } else if let Some(date) = line.strip_prefix("author-time ") {
                         if let Ok(ts) = date.parse::<i64>() {
-                            current_date = chrono::NaiveDateTime::from_timestamp_opt(ts, 0)
+                            current_date = chrono::DateTime::from_timestamp(ts, 0)
                                 .map(|d| d.format("%Y-%m-%d").to_string())
                                 .unwrap_or_else(|| date.to_string());
                         }

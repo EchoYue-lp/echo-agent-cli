@@ -309,7 +309,7 @@ impl WorkspaceRegistry {
             if legacy_manifest.exists() {
                 fs::remove_file(&legacy_manifest).ok();
             }
-            // 清理旧版本创建的系统子目录，不删除 data/papers/artifacts 等用户内容。
+            // 清理旧版本在 root 下直接创建的系统子目录（新版已移入 .echocowork/）。
             for subdir in [
                 "sessions",
                 "conversations",

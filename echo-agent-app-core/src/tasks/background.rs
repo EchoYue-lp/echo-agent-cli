@@ -197,6 +197,17 @@ pub struct BackgroundTaskMeta {
     /// Which interface submitted this (web, cli, tui, tauri).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub submitted_via: Option<String>,
+    /// Task priority (0-10, higher = more urgent). Default: 5.
+    #[serde(default = "default_priority")]
+    pub priority: u8,
+    /// List of task IDs this task depends on. Task will not start until
+    /// all dependencies reach `Completed` status.
+    #[serde(default)]
+    pub depends_on: Vec<String>,
+}
+
+fn default_priority() -> u8 {
+    5
 }
 
 impl BackgroundTaskKind {
@@ -233,6 +244,115 @@ impl BackgroundTaskKind {
             BackgroundTaskKind::Composite { .. } => "Composite Task",
         }
     }
+
+    /// Return the Agent mode name best suited for this task kind.
+    ///
+    /// Used by the unified dispatch to configure the task agent's system
+    /// prompt and available tools.
+    pub fn mode_name(&self) -> &str {
+        match self {
+            Self::AgentChat { .. } | Self::Cron { .. } | Self::Workflow { .. } => "general",
+            Self::Research { .. } | Self::ResearchToWriting { .. } => "research",
+            Self::DataPipeline { .. } => "data",
+            Self::WritingPipeline { .. } => "writing",
+            Self::Composite { .. } => "general",
+        }
+    }
+
+    /// Build a natural-language prompt from this task kind's parameters.
+    ///
+    /// Converts structured task parameters (topic, max_papers, etc.) into
+    /// a descriptive prompt that the Agent can execute autonomously.
+    pub fn to_prompt(&self) -> String {
+        match self {
+            Self::AgentChat { prompt, .. } | Self::Cron { prompt, .. } => prompt.clone(),
+
+            Self::Workflow { workflow_id, input } => {
+                if input.is_null() {
+                    format!("Execute workflow: {workflow_id}")
+                } else {
+                    format!("Execute workflow: {workflow_id}\nInput: {input}")
+                }
+            }
+
+            Self::Research {
+                topic, max_papers, ..
+            } => format!(
+                "Research the following topic thoroughly. Find up to {max_papers} relevant \
+                 academic papers using arxiv_search and semantic_scholar_search, fetch and \
+                 read the most important ones, then write a comprehensive literature review \
+                 with proper citations.\n\nTopic: {topic}"
+            ),
+
+            Self::ResearchToWriting {
+                topic,
+                max_papers,
+                audience,
+                format,
+                ..
+            } => format!(
+                "First, research the topic below by finding up to {max_papers} academic \
+                 papers. Then, write a {format} about it for {audience}. The final document \
+                 should be well-structured with proper citations and a reference list.\n\n\
+                 Topic: {topic}"
+            ),
+
+            Self::DataPipeline {
+                dataset_path,
+                objective,
+                max_charts,
+            } => {
+                let obj = objective.as_deref().unwrap_or(
+                    "Provide a comprehensive overview with key statistics, \
+                                trends, and insights",
+                );
+                format!(
+                    "Analyze the dataset at '{dataset_path}'. {obj}. Generate up to \
+                     {max_charts} charts to visualize the key findings. Use read_data to \
+                     load the dataset, profile_data for statistics, and generate_chart for \
+                     visualizations. End with an executive summary."
+                )
+            }
+
+            Self::WritingPipeline {
+                topic,
+                audience,
+                format,
+                max_revisions,
+                quality_threshold,
+            } => format!(
+                "Write a {format} about '{topic}' for {audience}. Follow this workflow:\n\
+                 1. Create a detailed outline\n2. Write a complete draft following the outline\n\
+                 3. Review the draft critically (score quality 1-{quality_threshold})\n\
+                 4. If quality < {quality_threshold}, revise and re-review (up to \
+                 {max_revisions} revisions)\n\
+                 5. Finalize the document"
+            ),
+
+            Self::Composite { steps, strategy } => {
+                let strat = match strategy {
+                    CompositeStrategy::Sequential => "in sequence",
+                    CompositeStrategy::Parallel => "in parallel",
+                };
+                let step_list = steps
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| {
+                        let desc = s
+                            .description
+                            .as_deref()
+                            .unwrap_or_else(|| s.kind.display_name());
+                        format!("  {}. {}", i + 1, desc)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!(
+                    "Execute the following {count} steps {strat}:\n{step_list}",
+                    count = steps.len()
+                )
+            }
+        }
+    }
 }
 
 impl BackgroundTaskMeta {
@@ -243,6 +363,18 @@ impl BackgroundTaskMeta {
             progress_message: None,
             submitted_at: chrono::Utc::now().to_rfc3339(),
             submitted_via,
+            priority: default_priority(),
+            depends_on: Vec::new(),
         }
+    }
+
+    pub fn with_priority(mut self, priority: u8) -> Self {
+        self.priority = priority.min(10);
+        self
+    }
+
+    pub fn with_dependencies(mut self, depends_on: Vec<String>) -> Self {
+        self.depends_on = depends_on;
+        self
     }
 }

@@ -1,41 +1,52 @@
-//! BackgroundTaskService — unified lifecycle manager for all background work.
+//! BackgroundTaskService — pure task lifecycle manager.
 //!
-//! Wraps the framework's `TaskManager` + `TaskExecutor` and provides a
-//! high-level submit/cancel/list/resume API. The `TaskExecuteFn` closure
-//! dispatches by `BackgroundTaskKind` tag to the appropriate handler.
+//! Manages task submission, scheduling, persistence, progress tracking, and
+//! cancellation. Does NOT hold any Agent reference — agent execution is
+//! delegated to a `TaskExecuteFn` closure provided at construction time.
 //!
-//! **No default timeout**: tasks run until they complete, are cancelled,
-//! or the process exits (in which case they are resumed on next start).
+//! ## Architecture
+//!
+//! The `TaskExecuteFn` closure is constructed in `AppState::start_task_service()`
+//! and captures: agent, subagent_executor. This keeps all
+//! Agent-related concerns outside the service itself.
+//!
+//! ## Concurrency
+//!
+//! All agent execution (foreground chat + background tasks) is serialized
+//! internally by `ReactAgent`'s `execution_mutex`. Only one caller can use
+//! the agent at a time.
 
 use super::background::*;
-use super::long_running::{HumanCheckpointGate, HumanCheckpointResponse};
 use super::*;
 use crate::agent_handle::AgentHandle;
-use echo_agent::agent::Agent; // Import Agent trait to call chat()
+use dashmap::DashMap;
+use echo_agent::agent::Agent;
 use echo_agent::memory::Store;
+use echo_agent::tasks::progress::TaskProgress;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing;
 
-/// Central service for managing background tasks.
+/// Pure task lifecycle manager.
 ///
 /// Created once per process and shared across all modes (web, cli, tui, tauri).
+/// Does NOT hold an AgentHandle — all agent operations are in the dispatch closure.
 pub struct BackgroundTaskService {
     manager: Arc<TaskManager>,
     executor: Arc<TaskExecutor>,
     store: Arc<SqliteTaskStore>,
-    agent: AgentHandle,
     event_bus: Arc<TaskEventBus>,
     cancel: echo_agent::agent::CancellationToken,
-    human_gate: Arc<HumanCheckpointGate>,
+    /// Latest progress for each task, updated by ProgressBridge via TaskEventBus.
+    /// Frontends (Tauri, CLI) can query this to get real-time progress.
+    latest_progress: Arc<DashMap<String, TaskProgress>>,
 }
 
 impl BackgroundTaskService {
     /// Create a new BackgroundTaskService.
     ///
-    /// `store_backend` is the SQLite (or in-memory) store used for task
-    /// persistence. Metadata is stored directly on the framework `Task`
-    /// via `metadata_json`.
+    /// `agent` is captured in the TaskExecuteFn closure.
+    /// The service itself does NOT hold any Agent reference.
     pub async fn new(
         agent: AgentHandle,
         store_backend: Arc<dyn Store>,
@@ -53,35 +64,72 @@ impl BackgroundTaskService {
             .expect("with_logging_and_events always creates an event bus");
         let event_bus = Arc::new(event_bus);
 
-        // Build the execute_fn that dispatches by kind — reads metadata_json
-        // from the Task in the manager instead of a separate meta_store
-        let agent_clone = agent.clone();
-        let manager_clone = manager.clone();
-        let execute_fn: TaskExecuteFn = Arc::new(move |ctx: TaskContext| {
-            let agent = agent_clone.clone();
-            let manager = manager_clone.clone();
-            Box::pin(async move { dispatch_task(ctx, agent, manager).await })
-        });
+        // Build the TaskExecuteFn closure — captures agent + manager + event_bus
+        let execute_fn: TaskExecuteFn = {
+            let agent = agent.clone();
+            let manager = manager.clone();
+            let event_bus = event_bus.clone();
+            Arc::new(move |ctx: TaskContext| {
+                let agent = agent.clone();
+                let manager = manager.clone();
+                let event_bus = event_bus.clone();
+                Box::pin(async move { dispatch_task(ctx, agent, manager, event_bus).await })
+            })
+        };
 
-        // Create executor — no default timeout (tasks run until done)
-        let config = TaskExecutorConfig {
-            max_concurrent: 5,
+        // Create executor — max_concurrent=1 since all tasks share one agent
+        let executor_config = TaskExecutorConfig {
+            max_concurrent: 1,
             default_timeout_secs: 0, // 0 = no timeout
             enable_hooks: true,
             ..Default::default()
         };
 
-        let executor =
-            Arc::new(TaskExecutor::new(manager.clone(), config).with_execute_fn(execute_fn));
+        let executor = Arc::new(
+            TaskExecutor::new(manager.clone(), executor_config).with_execute_fn(execute_fn),
+        );
+
+        // Progress cache — updated by a background subscriber of TaskEventBus.
+        let latest_progress = Arc::new(DashMap::new());
+        {
+            let mut rx = event_bus.subscribe();
+            let cache = latest_progress.clone();
+            tokio::spawn(async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(event) => {
+                            match event.as_ref() {
+                                TaskEvent::Progress { task_id, progress } => {
+                                    cache.insert(task_id.clone(), progress.clone());
+                                }
+                                // Clean up cache on terminal events
+                                TaskEvent::Completed { task_id, .. }
+                                | TaskEvent::Failed { task_id, .. } => {
+                                    let cache = cache.clone();
+                                    let tid = task_id.clone();
+                                    tokio::spawn(async move {
+                                        tokio::time::sleep(std::time::Duration::from_secs(60))
+                                            .await;
+                                        cache.remove(&tid);
+                                    });
+                                }
+                                _ => {}
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+        }
 
         Ok(Self {
             manager,
             executor,
             store,
-            agent,
             event_bus,
             cancel,
-            human_gate: Arc::new(HumanCheckpointGate::new()),
+            latest_progress,
         })
     }
 
@@ -90,18 +138,40 @@ impl BackgroundTaskService {
     /// Creates a framework `Task` with `BackgroundTaskMeta` stored as
     /// `metadata_json`, persists it to SQLite, and schedules it for execution.
     /// Returns the task ID.
+    ///
+    /// `priority` (0–10, default 5) controls scheduling order when multiple
+    /// tasks are ready. `depends_on` lists task IDs that must complete before
+    /// this task starts.
     pub async fn submit(
         &self,
         kind: BackgroundTaskKind,
         description: &str,
         submitted_via: Option<String>,
     ) -> anyhow::Result<String> {
-        let task_id = uuid::Uuid::new_v4().to_string();
-        let meta = BackgroundTaskMeta::new(kind.clone(), submitted_via);
+        self.submit_with_options(kind, description, submitted_via, None, Vec::new())
+            .await
+    }
 
-        // Create framework Task with metadata embedded directly
+    /// Submit with explicit priority and dependency list.
+    pub async fn submit_with_options(
+        &self,
+        kind: BackgroundTaskKind,
+        description: &str,
+        submitted_via: Option<String>,
+        priority: Option<u8>,
+        depends_on: Vec<String>,
+    ) -> anyhow::Result<String> {
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let prio = priority.unwrap_or(5).min(10);
+        let meta = BackgroundTaskMeta::new(kind.clone(), submitted_via)
+            .with_priority(prio)
+            .with_dependencies(depends_on.clone());
+
+        // Create framework Task with metadata, priority, and dependencies
         let task = Task::new(task_id.clone(), description.to_string())
             .with_tags(vec![kind.tag()])
+            .with_priority(prio)
+            .with_dependencies(depends_on)
             .with_metadata(meta);
 
         // Add to manager (also persists to store via event)
@@ -110,13 +180,17 @@ impl BackgroundTaskService {
         // Persist to SQLite
         self.persist_all().await?;
 
-        tracing::info!(task_id = %task_id, kind = %kind.display_name(), "Background task submitted");
+        tracing::info!(
+            task_id = %task_id,
+            kind = %kind.display_name(),
+            priority = prio,
+            "Background task submitted"
+        );
         Ok(task_id)
     }
 
     /// Cancel a running or pending task.
     pub async fn cancel(&self, task_id: &str) -> bool {
-        // Cancel in executor if running (sync)
         let executor_cancelled = self.executor.cancel_task(task_id);
         if executor_cancelled {
             let _ = self.persist_all().await;
@@ -201,7 +275,6 @@ impl BackgroundTaskService {
                     result = svc.executor.execute_all() => {
                         match result {
                             Ok(_) => {
-                                // All current tasks done, wait before checking for new ones
                                 tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                             }
                             Err(e) => {
@@ -220,47 +293,38 @@ impl BackgroundTaskService {
         self.event_bus.subscribe()
     }
 
+    /// Get the latest progress for a task (updated by ProgressBridge).
+    pub fn get_progress(&self, task_id: &str) -> Option<TaskProgress> {
+        self.latest_progress.get(task_id).map(|v| v.clone())
+    }
+
     /// Get the underlying TaskManager (for advanced use).
     pub fn manager(&self) -> &Arc<TaskManager> {
         &self.manager
     }
 
-    /// Get the underlying AgentHandle.
-    pub fn agent(&self) -> &AgentHandle {
-        &self.agent
-    }
+    // ── HITL checkpoint stubs ──
+    //
+    // These are stubs for the legacy HumanCheckpointGate interface from
+    // LongRunningTaskRunner. The HITL system is being redesigned to use
+    // the main Agent's HumanLoopProvider directly.
 
-    /// Get the human checkpoint gate (for responding to checkpoint requests).
-    pub fn human_gate(&self) -> &Arc<HumanCheckpointGate> {
-        &self.human_gate
-    }
-
-    /// Respond to a pending human checkpoint request.
-    pub async fn respond_to_checkpoint(
-        &self,
-        task_id: &str,
-        selection: &str,
-        instructions: Option<String>,
-    ) -> bool {
-        self.human_gate
-            .respond(
-                task_id,
-                HumanCheckpointResponse {
-                    selection: selection.to_string(),
-                    instructions,
-                },
-            )
-            .await
-    }
-
-    /// List pending human checkpoint requests.
+    /// List pending human checkpoint requests (currently always empty).
     pub async fn pending_checkpoints(
         &self,
     ) -> Vec<(String, super::long_running::HumanCheckpointRequest)> {
-        self.human_gate.pending().await
+        Vec::new()
     }
 
-    // ── Internal helpers ──
+    /// Respond to a pending human checkpoint request (currently always returns false).
+    pub async fn respond_to_checkpoint(
+        &self,
+        _task_id: &str,
+        _selection: &str,
+        _instructions: Option<String>,
+    ) -> bool {
+        false
+    }
 
     async fn persist_all(&self) -> anyhow::Result<()> {
         let tasks = self.manager.get_all_tasks();
@@ -271,13 +335,20 @@ impl BackgroundTaskService {
     }
 }
 
-// ── Task dispatch ──
+// ── Unified Task Dispatch ──
 
-/// Dispatch a task to the appropriate handler based on its kind (from Task.metadata_json).
+/// Dispatch a task using the **shared main Agent**.
+///
+/// Execution serialization is handled internally by ReactAgent's
+/// `execution_mutex` — no external mutex needed.
+///
+/// This function is captured in the TaskExecuteFn closure constructed in
+/// `AppState::start_task_service()`.
 async fn dispatch_task(
     ctx: TaskContext,
-    agent: AgentHandle,
+    agent: crate::agent_handle::AgentHandle,
     manager: Arc<TaskManager>,
+    event_bus: Arc<TaskEventBus>,
 ) -> Result<String, echo_agent::error::ReactError> {
     let task = manager.get_task(&ctx.task_id).ok_or_else(|| {
         echo_agent::error::ReactError::Other(format!(
@@ -300,129 +371,58 @@ async fn dispatch_task(
             ))
         })?;
 
-    match meta.kind {
-        BackgroundTaskKind::AgentChat { .. } => execute_agent_chat(ctx, agent).await,
-        BackgroundTaskKind::Cron { .. } => execute_cron(ctx, agent).await,
-        BackgroundTaskKind::Workflow { .. } => execute_workflow(ctx, agent).await,
-        BackgroundTaskKind::Research { .. } => execute_research(ctx, agent).await,
-        BackgroundTaskKind::ResearchToWriting { .. } => {
-            execute_research_to_writing(ctx, agent).await
-        }
-        BackgroundTaskKind::DataPipeline { .. } => execute_data_pipeline(ctx, agent).await,
-        BackgroundTaskKind::WritingPipeline { .. } => execute_writing_pipeline(ctx, agent).await,
-        BackgroundTaskKind::Composite { steps, strategy } => {
-            execute_composite(ctx, agent, steps, strategy).await
-        }
+    // Composite tasks need special handling — they orchestrate sub-tasks
+    if let BackgroundTaskKind::Composite { steps, strategy } = &meta.kind {
+        return execute_composite(ctx, agent, steps.clone(), strategy.clone()).await;
     }
-}
 
-/// Execute an AgentChat task: run the prompt through the agent.
-async fn execute_agent_chat(
-    ctx: TaskContext,
-    agent: AgentHandle,
-) -> Result<String, echo_agent::error::ReactError> {
-    // Description is the clean prompt (no kind prefix)
-    let prompt = ctx.description.clone();
+    let prompt = meta.kind.to_prompt();
 
-    let result = agent
-        .read_async(|guard| Box::pin(async move { guard.chat(&prompt).await }))
+    tracing::info!(
+        task_id = %ctx.task_id,
+        mode = %meta.kind.mode_name(),
+        prompt_len = prompt.len(),
+        "Executing task on shared Agent"
+    );
+
+    // Register ProgressBridge callback (brief write lock)
+    let bridge = Arc::new(super::progress_bridge::ProgressBridge::new(
+        ctx.task_id.clone(),
+        event_bus,
+        0, // unlimited; progress uses diminishing curve
+    ));
+    let bridge_clone = bridge.clone();
+    agent
+        .write(|a| {
+            a.add_callback(bridge_clone);
+        })
         .await;
 
-    result.map_err(|e| echo_agent::error::ReactError::Other(format!("Agent chat failed: {e}")))
-}
-
-/// Execute a Cron task: same as AgentChat for now.
-async fn execute_cron(
-    ctx: TaskContext,
-    agent: AgentHandle,
-) -> Result<String, echo_agent::error::ReactError> {
-    // Cron tasks execute the prompt like AgentChat
-    execute_agent_chat(ctx, agent).await
-}
-
-/// Execute a workflow task using the framework's Graph workflow engine.
-async fn execute_workflow(
-    ctx: TaskContext,
-    agent: AgentHandle,
-) -> Result<String, echo_agent::error::ReactError> {
-    // The description contains the workflow definition as JSON or a prompt to execute
-    let prompt = ctx.description.clone();
+    // Execute on the shared main agent — ReactAgent serializes internally
     let result = agent
-        .read_async(|guard| Box::pin(async move { guard.execute(&prompt).await }))
+        .read_async(|a| {
+            let prompt = prompt.clone();
+            Box::pin(async move { a.execute(&prompt).await })
+        })
         .await;
 
-    result.map_err(|e| {
-        echo_agent::error::ReactError::Other(format!("Workflow execution failed: {e}"))
-    })
-}
+    // Clean up callback
+    bridge.disable();
+    agent
+        .write(|a| {
+            a.remove_callbacks_by_type_name("ProgressBridge");
+        })
+        .await;
 
-/// Execute a research pipeline using the Graph workflow.
-async fn execute_research(
-    ctx: TaskContext,
-    agent: AgentHandle,
-) -> Result<String, echo_agent::error::ReactError> {
-    // Description is the research topic (clean, no kind prefix)
-    let topic = ctx.description.clone();
-
-    let result = super::pipelines::run_research(agent, &topic, 20).await;
-
-    result
-        .map_err(|e| echo_agent::error::ReactError::Other(format!("Research pipeline failed: {e}")))
-}
-
-/// Execute a research-to-writing continuous workflow using the Graph workflow.
-async fn execute_research_to_writing(
-    ctx: TaskContext,
-    agent: AgentHandle,
-) -> Result<String, echo_agent::error::ReactError> {
-    // Description is the research topic (clean, no kind prefix)
-    let topic = ctx.description.clone();
-
-    let config = super::pipelines::ResearchToWritingConfig::new(&topic);
-    let result = super::pipelines::run_research_to_writing(agent, config).await;
-
-    result.map_err(|e| {
-        echo_agent::error::ReactError::Other(format!("Research-to-writing pipeline failed: {e}"))
-    })
-}
-
-/// Execute a data analysis pipeline using the Graph workflow.
-async fn execute_data_pipeline(
-    ctx: TaskContext,
-    agent: AgentHandle,
-) -> Result<String, echo_agent::error::ReactError> {
-    // Description is the dataset path (clean, no kind prefix)
-    let dataset_path = ctx.description.clone();
-
-    let result = super::pipelines::run_data_pipeline(agent, &dataset_path, 3).await;
-
-    result.map_err(|e| {
-        echo_agent::error::ReactError::Other(format!("Data analysis pipeline failed: {e}"))
-    })
-}
-
-/// Execute a writing pipeline using the Graph workflow.
-async fn execute_writing_pipeline(
-    ctx: TaskContext,
-    agent: AgentHandle,
-) -> Result<String, echo_agent::error::ReactError> {
-    // Description is the writing topic (clean, no kind prefix)
-    let topic = ctx.description.clone();
-
-    let result = super::pipelines::run_writing_pipeline(agent, &topic).await;
-
-    result
-        .map_err(|e| echo_agent::error::ReactError::Other(format!("Writing pipeline failed: {e}")))
+    result.map_err(|e| echo_agent::error::ReactError::Other(format!("Agent execution failed: {e}")))
 }
 
 /// Execute a composite task by delegating to the framework's composite module.
 ///
-/// Converts CLI-domain `CompositeStep` / `CompositeStrategy` into their
-/// framework counterparts, then lets `echo_orchestration::tasks::composite`
-/// handle the sequential / parallel orchestration.
+/// Each sub-step runs on the shared main agent via `dispatch_sub_task`.
 async fn execute_composite(
     _ctx: TaskContext,
-    agent: AgentHandle,
+    agent: crate::agent_handle::AgentHandle,
     steps: Vec<super::background::CompositeStep>,
     strategy: super::background::CompositeStrategy,
 ) -> Result<String, echo_agent::error::ReactError> {
@@ -432,7 +432,6 @@ async fn execute_composite(
         execute_composite as framework_execute_composite,
     };
 
-    // Convert CLI CompositeStep → Framework CompositeStep
     let framework_steps: Vec<FrameworkCompositeStep> = steps
         .iter()
         .enumerate()
@@ -468,8 +467,6 @@ async fn execute_composite(
 
     let results = framework_execute_composite(plan).await?;
 
-    // Join results into a single string (backward compatible with the previous
-    // manual implementation).
     Ok(format!(
         "Composite task completed {} steps:\n{}",
         results.len(),
@@ -481,26 +478,33 @@ async fn execute_composite(
     ))
 }
 
-/// Dispatch a sub-task within a composite task.
+/// Dispatch a sub-task within a composite task using the shared main agent.
+///
+/// Execution serialization is handled internally by ReactAgent.
 async fn dispatch_sub_task(
-    ctx: TaskContext,
-    agent: AgentHandle,
+    _ctx: TaskContext,
+    agent: crate::agent_handle::AgentHandle,
     kind: &super::background::BackgroundTaskKind,
 ) -> Result<String, echo_agent::error::ReactError> {
     use super::background::BackgroundTaskKind;
 
-    match kind {
-        BackgroundTaskKind::AgentChat { .. } => execute_agent_chat(ctx, agent).await,
-        BackgroundTaskKind::Cron { .. } => execute_cron(ctx, agent).await,
-        BackgroundTaskKind::Workflow { .. } => execute_workflow(ctx, agent).await,
-        BackgroundTaskKind::Research { .. } => execute_research(ctx, agent).await,
-        BackgroundTaskKind::ResearchToWriting { .. } => {
-            execute_research_to_writing(ctx, agent).await
-        }
-        BackgroundTaskKind::DataPipeline { .. } => execute_data_pipeline(ctx, agent).await,
-        BackgroundTaskKind::WritingPipeline { .. } => execute_writing_pipeline(ctx, agent).await,
-        BackgroundTaskKind::Composite { .. } => Err(echo_agent::error::ReactError::Other(
+    if let BackgroundTaskKind::Composite { .. } = kind {
+        return Err(echo_agent::error::ReactError::Other(
             "Nested composite tasks are not supported".to_string(),
-        )),
+        ));
     }
+
+    let prompt = kind.to_prompt();
+
+    // Execute on the shared main agent — ReactAgent serializes internally
+    let result = agent
+        .read_async(|a| {
+            let prompt = prompt.clone();
+            Box::pin(async move { a.execute(&prompt).await })
+        })
+        .await;
+
+    result.map_err(|e| {
+        echo_agent::error::ReactError::Other(format!("Sub-task execution failed: {e}"))
+    })
 }

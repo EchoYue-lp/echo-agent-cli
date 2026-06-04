@@ -4,7 +4,7 @@
 //! 非破坏性迁移：先复制到工作区结构，验证后才清理原文件。
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};

@@ -2,9 +2,11 @@
 
 use super::{ChatMessage, MessageRole, TaskProgressEntry, TaskStripStatus, TuiApp};
 use crate::agent_handle::AgentHandle;
+use crate::tui::clipboard;
 use crate::tui::commands::SlashCommand;
 use crate::tui::ui;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
+use ratatui::layout::Rect;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::io;
 use std::sync::Arc;
@@ -18,7 +20,15 @@ use echo_agent_app_core::tasks::BackgroundTaskService;
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 enum AgentEvent {
-    Response(String),
+    /// A streaming token chunk from the LLM.
+    Token(String),
+    /// The final complete answer from the agent.
+    FinalAnswer(String),
+    /// A tool is about to be called.
+    ToolCall { name: String, args: String },
+    /// A tool execution completed.
+    ToolResult { name: String, output: String },
+    /// An error occurred.
     Error(String),
 }
 
@@ -43,20 +53,65 @@ pub async fn run_event_loop(
             }
         }
 
+        // Pre-compute chat area and wrapped lines for mouse selection.
+        let size = terminal.size()?;
+        let screen = Rect::new(0, 0, size.width, size.height);
+        app.chat_area = TuiApp::compute_chat_rect(screen, app.sidebar_visible);
+        app.update_wrapped_lines(app.chat_area.width);
+
+        // Flush buffered streaming tokens (throttled to ~2 updates/sec).
+        app.flush_pending_stream();
+
+        // Rebuild chat line cache if stale (avoids expensive markdown re-render).
+        app.prepare_chat_cache();
+
         // Draw UI.
         terminal.draw(|f| ui::draw(f, app))?;
 
         while let Ok(event) = agent_rx.try_recv() {
             match event {
-                AgentEvent::Response(response) => {
-                    app.append_stream(&response);
+                AgentEvent::Token(chunk) => {
+                    app.append_stream(&chunk);
+                }
+                AgentEvent::FinalAnswer(_answer) => {
                     app.finalize_stream();
+                }
+                AgentEvent::ToolCall { name, args } => {
+                    let display = if args.len() > 60 {
+                        format!("{} ({})", name, &args[..60])
+                    } else {
+                        format!("{} ({})", name, args)
+                    };
+                    app.messages.push(ChatMessage {
+                        role: MessageRole::System,
+                        content: format!("🔧 调用工具: {}", display),
+                    });
+                }
+                AgentEvent::ToolResult { name, output } => {
+                    // File-editing tools get a dedicated diff display
+                    if matches!(name.as_str(), "edit_file" | "create_file" | "write_file") {
+                        app.messages.push(ChatMessage {
+                            role: MessageRole::ToolResult {
+                                tool_name: name.clone(),
+                            },
+                            content: output,
+                        });
+                    } else {
+                        let display = if output.len() > 100 {
+                            format!("{} → {}...", name, &output[..100])
+                        } else {
+                            format!("{} → {}", name, output)
+                        };
+                        app.messages.push(ChatMessage {
+                            role: MessageRole::System,
+                            content: format!("✓ {}", display),
+                        });
+                    }
                 }
                 AgentEvent::Error(e) => {
                     app.messages.push(ChatMessage {
                         role: MessageRole::System,
                         content: format!("Error: {e}"),
-                        tool_calls: vec![],
                     });
                     app.is_processing = false;
                     app.status_msg = "Error".to_string();
@@ -68,15 +123,7 @@ pub async fn run_event_loop(
         if event::poll(POLL_INTERVAL)? {
             match event::read()? {
                 Event::Key(key) => handle_key(app, key, &agent, agent_tx.clone()).await,
-                Event::Mouse(mouse) => match mouse.kind {
-                    MouseEventKind::ScrollUp => {
-                        app.chat_scroll = app.chat_scroll.saturating_add(10)
-                    }
-                    MouseEventKind::ScrollDown => {
-                        app.chat_scroll = app.chat_scroll.saturating_sub(10)
-                    }
-                    _ => {}
-                },
+                Event::Mouse(mouse) => handle_mouse(app, &mouse),
                 Event::Resize(_, _) => {} // ratatui handles resize automatically
                 _ => {}
             }
@@ -90,6 +137,63 @@ pub async fn run_event_loop(
     Ok(())
 }
 
+// ── Mouse selection ────────────────────────────────────────────────────
+
+fn handle_mouse(app: &mut TuiApp, mouse: &crossterm::event::MouseEvent) {
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            // Start a new selection if clicking in the chat area.
+            if let Some(pos) = app.screen_to_text(mouse.column, mouse.row) {
+                app.clear_selection();
+                app.selection_start = Some(pos);
+                app.selection_end = Some(pos);
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            // Extend selection while dragging.
+            if app.selection_start.is_some()
+                && let Some(pos) = app.screen_to_text_clamped(mouse.column, mouse.row)
+            {
+                app.selection_end = Some(pos);
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            // Finalize selection and copy to clipboard.
+            if let Some(text) = app
+                .normalized_selection()
+                .map(|_| app.extract_selected_text())
+            {
+                if !text.is_empty() {
+                    match clipboard::copy_to_clipboard(&text) {
+                        Ok(lease) => {
+                            app.clipboard_lease = Some(lease);
+                            let bytes = text.len();
+                            app.status_msg = format!("✓ Copied {bytes} bytes to clipboard");
+                        }
+                        Err(e) => {
+                            app.status_msg = format!("✗ Copy failed: {e}");
+                        }
+                    }
+                } else {
+                    app.status_msg = "No text selected".to_string();
+                    app.clear_selection();
+                }
+            } else {
+                app.clear_selection();
+            }
+        }
+        MouseEventKind::ScrollUp => {
+            app.clear_selection();
+            app.chat_scroll = app.chat_scroll.saturating_add(10);
+        }
+        MouseEventKind::ScrollDown => {
+            app.clear_selection();
+            app.chat_scroll = app.chat_scroll.saturating_sub(10);
+        }
+        _ => {}
+    }
+}
+
 // ── State machine dispatch ────────────────────────────────────────────
 
 /// Determine which mode the app is in and dispatch to the appropriate handler.
@@ -99,91 +203,26 @@ async fn handle_key(
     agent: &AgentHandle,
     agent_tx: mpsc::UnboundedSender<AgentEvent>,
 ) {
-    // Determine active mode based on app state
-    let mode = if app.picker.is_some() {
-        AppMode::Picker
-    } else if app.diff_popup.is_some() {
-        AppMode::DiffPopup
-    } else if app.approval.is_some() {
-        AppMode::Approval
-    } else if !app.suggestions.is_empty() {
-        AppMode::CommandPalette
-    } else {
-        AppMode::Normal
-    };
-
-    match mode {
-        AppMode::Picker => handle_picker_key(app, &key),
-        AppMode::DiffPopup => handle_diff_popup_key(app, &key),
-        AppMode::Approval => handle_approval_key(app, &key),
-        AppMode::CommandPalette => handle_command_palette_key(app, &key),
-        AppMode::Normal => {
-            if let Some(result) = handle_global_shortcuts(app, &key)
-                && result
-            {
-                return;
-            }
-            handle_normal_key(app, &key, agent, agent_tx).await;
+    if !app.suggestions.is_empty() {
+        // Command palette mode: palette consumes Tab/Enter/Esc; everything
+        // else falls through to normal input handling.
+        if handle_command_palette_key(app, &key) {
+            return;
         }
     }
-}
 
-/// Application interaction modes for state-machine dispatch.
-enum AppMode {
-    Normal,
-    Picker,
-    DiffPopup,
-    Approval,
-    CommandPalette,
-}
-
-// ── Mode-specific handlers ──────────────────────────────────────────────
-
-fn handle_picker_key(app: &mut TuiApp, key: &KeyEvent) {
-    let picker = match app.picker.as_mut() {
-        Some(p) => p,
-        None => return,
-    };
-    match key.code {
-        KeyCode::Up => picker.move_up(),
-        KeyCode::Down => picker.move_down(),
-        KeyCode::Enter => {
-            let value = picker.selected_value().map(|s| s.to_string());
-            app.picker = None;
-            if let Some(val) = value {
-                app.status_msg = format!("Selected: {}", val);
-            }
-        }
-        KeyCode::Esc => {
-            app.picker = None;
-        }
-        _ => {}
+    if let Some(result) = handle_global_shortcuts(app, &key)
+        && result
+    {
+        return;
     }
+    handle_normal_key(app, &key, agent, agent_tx).await;
 }
 
-fn handle_diff_popup_key(app: &mut TuiApp, key: &KeyEvent) {
-    if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
-        app.diff_popup = None;
-    }
-}
-
-fn handle_approval_key(app: &mut TuiApp, key: &KeyEvent) {
-    match key.code {
-        KeyCode::Char('y') | KeyCode::Enter => {
-            if let Some(ref approval) = app.approval.take() {
-                app.status_msg = format!("Approved: {}", approval.tool_name);
-            }
-        }
-        KeyCode::Char('n') | KeyCode::Esc => {
-            if let Some(ref approval) = app.approval.take() {
-                app.status_msg = format!("Denied: {}", approval.tool_name);
-            }
-        }
-        _ => {}
-    }
-}
-
-fn handle_command_palette_key(app: &mut TuiApp, key: &KeyEvent) {
+// ── Command palette ────────────────────────────────────────────────────────
+/// Returns `true` if the key was consumed; `false` means the caller
+/// should fall through to normal text-editing handling.
+fn handle_command_palette_key(app: &mut TuiApp, key: &KeyEvent) -> bool {
     const MAX_VISIBLE: usize = 8;
     match key.code {
         KeyCode::Tab | KeyCode::Down => {
@@ -191,6 +230,7 @@ fn handle_command_palette_key(app: &mut TuiApp, key: &KeyEvent) {
             if app.selected_suggestion >= app.suggestion_scroll + MAX_VISIBLE {
                 app.suggestion_scroll = app.selected_suggestion - MAX_VISIBLE + 1;
             }
+            true
         }
         KeyCode::BackTab | KeyCode::Up => {
             if app.selected_suggestion > 0 {
@@ -202,18 +242,34 @@ fn handle_command_palette_key(app: &mut TuiApp, key: &KeyEvent) {
             if app.selected_suggestion < app.suggestion_scroll {
                 app.suggestion_scroll = app.selected_suggestion;
             }
+            true
         }
         KeyCode::Enter => {
+            // If the current input exactly matches a command name, clear
+            // suggestions so the Enter falls through to normal execution
+            // instead of requiring a second press.
+            let input_trimmed = app.input.trim().to_lowercase();
+            let exact_match = app
+                .suggestions
+                .iter()
+                .any(|c| c.slash_name() == input_trimmed);
+            if exact_match {
+                app.suggestions.clear();
+                return false; // fall through → Normal → handle_enter
+            }
+            // Otherwise, accept the selected suggestion into the input.
             if let Some(cmd) = app.suggestions.get(app.selected_suggestion) {
                 app.input = format!("{} ", cmd.slash_name());
                 app.cursor = app.input.len();
             }
             app.suggestions.clear();
+            true
         }
         KeyCode::Esc => {
             app.suggestions.clear();
+            true
         }
-        _ => {}
+        _ => false,
     }
 }
 
@@ -237,6 +293,29 @@ fn handle_global_shortcuts(app: &mut TuiApp, key: &KeyEvent) -> Option<bool> {
         KeyCode::Char('l') => {
             app.messages.clear();
             app.chat_scroll = 0;
+            app.clear_selection();
+            Some(true)
+        }
+        KeyCode::Char('y') => {
+            match app.last_assistant_response() {
+                Some(text) => {
+                    let text = text.to_string();
+                    match clipboard::copy_to_clipboard(&text) {
+                        Ok(lease) => {
+                            app.clipboard_lease = Some(lease);
+                            let len = text.len();
+                            app.status_msg =
+                                format!("✓ Copied response to clipboard ({len} bytes)");
+                        }
+                        Err(e) => {
+                            app.status_msg = format!("✗ Copy failed: {e}");
+                        }
+                    }
+                }
+                None => {
+                    app.status_msg = "No response to copy".to_string();
+                }
+            }
             Some(true)
         }
         _ => None,
@@ -369,35 +448,72 @@ fn handle_esc(app: &mut TuiApp) {
     if app.is_processing {
         app.is_processing = false;
         app.streaming_text.clear();
+        app.pending_stream.clear();
         app.status_msg = "Cancelled".to_string();
     }
 }
 
 // ── Agent communication ─────────────────────────────────────────────────
 
-/// Send a message to the agent and handle the response without blocking the UI loop.
+/// Send a message to the agent using streaming and forward events to the UI.
 async fn send_to_agent(
     agent: &AgentHandle,
     text: String,
     agent_tx: mpsc::UnboundedSender<AgentEvent>,
 ) {
-    let agent_clone = agent.clone();
-    tokio::spawn(async move {
-        let text_clone = text.clone();
-        let result: Result<String, String> = agent_clone
-            .read_async(|a| {
-                let task = text_clone.clone();
-                Box::pin(async move {
-                    use echo_agent::agent::Agent;
-                    a.execute(&task).await.map_err(|e| e.to_string())
-                })
-            })
-            .await;
+    use echo_agent::agent::Agent;
+    use futures::StreamExt;
 
-        let _ = match result {
-            Ok(response) => agent_tx.send(AgentEvent::Response(response)),
-            Err(e) => agent_tx.send(AgentEvent::Error(e)),
-        };
+    let inner = agent.inner().clone();
+    tokio::spawn(async move {
+        // Spawn task that owns the message string for the stream's lifetime
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let message = text;
+
+        tokio::spawn(async move {
+            let guard = inner.read().await;
+            match guard.chat_stream(&message).await {
+                Ok(mut stream) => {
+                    while let Some(event) = stream.next().await {
+                        if tx.send(event).is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                }
+            }
+        });
+
+        // Forward events from inner task to UI
+        while let Some(event) = rx.recv().await {
+            match event {
+                Ok(echo_agent::agent::AgentEvent::Token(t)) => {
+                    if agent_tx.send(AgentEvent::Token(t)).is_err() {
+                        break;
+                    }
+                }
+                Ok(echo_agent::agent::AgentEvent::FinalAnswer(answer)) => {
+                    let _ = agent_tx.send(AgentEvent::FinalAnswer(answer));
+                    break;
+                }
+                Ok(echo_agent::agent::AgentEvent::ToolCall { name, args }) => {
+                    let _ = agent_tx.send(AgentEvent::ToolCall {
+                        name,
+                        args: args.to_string(),
+                    });
+                }
+                Ok(echo_agent::agent::AgentEvent::ToolResult { name, output }) => {
+                    let _ = agent_tx.send(AgentEvent::ToolResult { name, output });
+                }
+                Ok(_) => {} // Ignore other event types
+                Err(e) => {
+                    let _ = agent_tx.send(AgentEvent::Error(e.to_string()));
+                    break;
+                }
+            }
+        }
     });
 }
 
@@ -448,7 +564,6 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &AgentHandle, cmd: &str) 
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
                 content: help,
-                tool_calls: vec![],
             });
         }
         Some(SlashCommand::Mode) => {
@@ -456,14 +571,12 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &AgentHandle, cmd: &str) 
                 app.messages.push(ChatMessage {
                     role: MessageRole::System,
                     content: format!("Current mode: {}", app.mode),
-                    tool_calls: vec![],
                 });
             } else {
                 app.mode = args.to_string();
                 app.messages.push(ChatMessage {
                     role: MessageRole::System,
                     content: format!("Mode switched to: {}", app.mode),
-                    tool_calls: vec![],
                 });
             }
         }
@@ -472,14 +585,12 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &AgentHandle, cmd: &str) 
                 app.messages.push(ChatMessage {
                     role: MessageRole::System,
                     content: format!("Current model: {}", app.model),
-                    tool_calls: vec![],
                 });
             } else {
                 app.model = args.to_string();
                 app.messages.push(ChatMessage {
                     role: MessageRole::System,
                     content: format!("Model switched to: {}", app.model),
-                    tool_calls: vec![],
                 });
             }
         }
@@ -497,7 +608,6 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &AgentHandle, cmd: &str) 
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
                 content: "Conversation reset.".to_string(),
-                tool_calls: vec![],
             });
         }
         Some(SlashCommand::Stats) => {
@@ -513,22 +623,38 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &AgentHandle, cmd: &str) 
                     app.tokens.2,
                     app.tool_count
                 ),
-                tool_calls: vec![],
+
             });
         }
         Some(SlashCommand::Compact) => {
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
                 content: "Context compression requested. (Will be wired to agent)".to_string(),
-                tool_calls: vec![],
             });
         }
+        Some(SlashCommand::Copy) => match app.last_assistant_response() {
+            Some(text) => {
+                let text = text.to_string();
+                match clipboard::copy_to_clipboard(&text) {
+                    Ok(lease) => {
+                        app.clipboard_lease = Some(lease);
+                        let len = text.len();
+                        app.status_msg = format!("✓ Copied response to clipboard ({len} bytes)");
+                    }
+                    Err(e) => {
+                        app.status_msg = format!("✗ Copy failed: {e}");
+                    }
+                }
+            }
+            None => {
+                app.status_msg = "No response to copy".to_string();
+            }
+        },
         Some(SlashCommand::Plan) => {
             app.mode = "plan".to_string();
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
                 content: "Entered plan mode. Write operations are disabled.".to_string(),
-                tool_calls: vec![],
             });
         }
         Some(SlashCommand::Permission) => {
@@ -536,14 +662,12 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &AgentHandle, cmd: &str) 
                 app.messages.push(ChatMessage {
                     role: MessageRole::System,
                     content: format!("Permission mode: {}", app.permission_mode),
-                    tool_calls: vec![],
                 });
             } else {
                 app.permission_mode = args.to_string();
                 app.messages.push(ChatMessage {
                     role: MessageRole::System,
                     content: format!("Permission mode set to: {}", app.permission_mode),
-                    tool_calls: vec![],
                 });
             }
         }
@@ -561,7 +685,6 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &AgentHandle, cmd: &str) 
                     app.messages.len(),
                     app.tool_count
                 ),
-                tool_calls: vec![],
             });
         }
         Some(SlashCommand::Cost) => {
@@ -571,21 +694,18 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &AgentHandle, cmd: &str) 
                     "Token usage: prompt={}, completion={}, total={}",
                     app.tokens.0, app.tokens.1, app.tokens.2
                 ),
-                tool_calls: vec![],
             });
         }
         Some(SlashCommand::Tools) => {
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
                 content: format!("Available tools: {} (see sidebar for list)", app.tool_count),
-                tool_calls: vec![],
             });
         }
         _ => {
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
                 content: format!("Command '{}' sent to agent for processing.", command),
-                tool_calls: vec![],
             });
         }
     }
@@ -627,7 +747,7 @@ fn update_parallel_tasks(app: &mut TuiApp, event: &TaskEvent) {
             };
             app.parallel_tasks.push(TaskProgressEntry {
                 task_id: task.id.clone(),
-                name: truncate_name(&name, 30),
+                name: crate::tui::widgets::task_strip::truncate_str(&name, 30),
                 status: TaskStripStatus::Pending,
                 progress_pct: 0.0,
                 phase: String::new(),
@@ -713,13 +833,4 @@ fn update_parallel_tasks(app: &mut TuiApp, event: &TaskEvent) {
         TaskStripStatus::Failed(_) => e.started_at.elapsed().as_secs() < 60,
         _ => true,
     });
-}
-
-/// Truncate a task name to fit the strip width.
-fn truncate_name(name: &str, max_len: usize) -> String {
-    if name.len() <= max_len {
-        name.to_string()
-    } else {
-        format!("{}…", &name[..max_len - 1])
-    }
 }

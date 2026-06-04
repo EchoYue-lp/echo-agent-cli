@@ -10,8 +10,40 @@ pub mod state;
 pub mod terminal;
 
 use echo_agent_app_core::AppState;
+use serde::Serialize;
 use state::TauriState;
 use std::sync::Arc;
+use tauri::Emitter;
+
+/// Task event payload emitted to the frontend via `app.emit("task://event", ...)`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TaskEventPayload {
+    /// Task created
+    Created {
+        task_id: String,
+        description: String,
+        kind: Option<String>,
+    },
+    /// Task status changed (includes cancellation as new_status: "cancelled")
+    Updated {
+        task_id: String,
+        old_status: String,
+        new_status: String,
+    },
+    /// Real-time progress update from ProgressBridge
+    Progress {
+        task_id: String,
+        percentage: f64,
+        phase: String,
+        message: Option<String>,
+        eta_secs: Option<u64>,
+    },
+    /// Task completed successfully
+    Completed { task_id: String, result: String },
+    /// Task failed
+    Failed { task_id: String, error: String },
+}
 
 pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
     tauri::Builder::default()
@@ -63,6 +95,7 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
             commands::tasks::submit_task,
             commands::tasks::get_task,
             commands::tasks::cancel_task,
+            commands::tasks::get_task_dag,
             // Memory
             commands::memory::list_memory,
             commands::memory::add_memory,
@@ -198,6 +231,81 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                     }
                 })
                 .ok();
+
+            // Spawn task event emitter — bridges TaskEventBus to Tauri events
+            let tauri_state = app.state::<TauriState>();
+            if let Some(service) = tauri_state.app_state.tasks.service.as_ref() {
+                let mut rx = service.subscribe_events();
+                let app_handle = app.handle().clone();
+                tokio::spawn(async move {
+                    loop {
+                        match rx.recv().await {
+                            Ok(event) => {
+                                let payload = match event.as_ref() {
+                                    echo_agent_app_core::tasks::TaskEvent::Created { task } => {
+                                        let kind = task
+                                            .tags
+                                            .iter()
+                                            .find(|t| t.starts_with("bg:kind:"))
+                                            .map(|t| {
+                                                t.strip_prefix("bg:kind:").unwrap_or(t).to_string()
+                                            });
+                                        TaskEventPayload::Created {
+                                            task_id: task.id.clone(),
+                                            description: task.description.clone(),
+                                            kind,
+                                        }
+                                    }
+                                    echo_agent_app_core::tasks::TaskEvent::Updated {
+                                        task_id,
+                                        old_status,
+                                        new_status,
+                                    } => TaskEventPayload::Updated {
+                                        task_id: task_id.clone(),
+                                        old_status: format!("{:?}", old_status),
+                                        new_status: format!("{:?}", new_status),
+                                    },
+                                    echo_agent_app_core::tasks::TaskEvent::Progress {
+                                        task_id,
+                                        progress,
+                                    } => TaskEventPayload::Progress {
+                                        task_id: task_id.clone(),
+                                        percentage: progress.percentage,
+                                        phase: progress.current_phase.clone(),
+                                        message: progress.message.clone(),
+                                        eta_secs: progress.eta_secs,
+                                    },
+                                    echo_agent_app_core::tasks::TaskEvent::Completed {
+                                        task_id,
+                                        result,
+                                    } => TaskEventPayload::Completed {
+                                        task_id: task_id.clone(),
+                                        result: result.clone(),
+                                    },
+                                    echo_agent_app_core::tasks::TaskEvent::Failed {
+                                        task_id,
+                                        error,
+                                        ..
+                                    } => TaskEventPayload::Failed {
+                                        task_id: task_id.clone(),
+                                        error: error.clone(),
+                                    },
+                                    // Skip other events (Assigned, Deleted)
+                                    _ => continue,
+                                };
+                                let _ = app_handle.emit("task://event", &payload);
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                tracing::warn!("Task event receiver lagged by {} events", n);
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                tracing::info!("Task event bus closed, stopping emitter");
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
 
             Ok(())
         })

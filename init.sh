@@ -4,11 +4,15 @@
 #
 # 功能:
 #   1. 检查并安装 Rust 工具链 (cargo + rustc)
-#   2. 检查并安装 Node.js (>= 18)
-#   3. 安装前端依赖
-#   4. 编译 TUI 版本 (echo-agent-cli)
+#   2. 检查并安装 Node.js (>= 18)（仅 GUI 模式）
+#   3. 安装前端依赖（仅 GUI 模式）
+#   4. 编译 TUI 或 GUI 版本
 #
-# 用法: ./init.sh [--release]
+# 用法:
+#   ./init.sh                  # 编译 TUI 版本（默认）
+#   ./init.sh --release        # 编译 TUI Release 版本
+#   ./init.sh --gui            # 编译 GUI 桌面应用版本
+#   ./init.sh --gui --release  # 编译 GUI Release 版本
 
 set -euo pipefail
 
@@ -202,62 +206,120 @@ build_tui() {
         log_info "项目依赖本地路径 ../echo-agent，请确保 echo-agent 框架已 clone"
     fi
 
-    # 检查前端构建产物
-    if [[ -d "$SCRIPT_DIR/web-frontend" ]]; then
-        log_step "构建前端资源..."
-        cd "$SCRIPT_DIR/web-frontend"
-        if [[ -f "package.json" ]]; then
-            npm run build 2>/dev/null || log_warn "前端构建失败，继续编译 Rust 部分"
-        fi
-        cd "$SCRIPT_DIR"
-    fi
-
-    # 编译 Rust TUI
+    # 编译 Rust TUI（显式指定 features，避免拉入 GUI 依赖）
     log_step "编译 Rust 项目..."
     if [[ "${1:-}" == "--release" ]]; then
-        cargo build --bin echo-agent-cli --release
+        cargo build --bin echo-agent-cli --no-default-features --features tui --release
         log_info "✅ TUI 编译完成 (Release)"
         log_info "可执行文件: $SCRIPT_DIR/target/release/echo-agent-cli"
     else
-        cargo build --bin echo-agent-cli
+        cargo build --bin echo-agent-cli --no-default-features --features tui
         log_info "✅ TUI 编译完成 (Debug)"
         log_info "可执行文件: $SCRIPT_DIR/target/debug/echo-agent-cli"
     fi
 }
 
+# ── 编译 GUI 版本 ─────────────────────────────────────────────
+build_gui() {
+    log_step "编译 GUI 版本 ($PROJECT_NAME — Tauri 桌面应用)..."
+
+    cd "$SCRIPT_DIR"
+
+    # 检查 echo-agent 框架
+    if [[ ! -d "$SCRIPT_DIR/../echo-agent" ]]; then
+        log_warn "echo-agent 框架未在同级目录中找到"
+        log_info "项目依赖本地路径 ../echo-agent，请确保 echo-agent 框架已 clone"
+    fi
+
+    # 构建前端资源
+    if [[ -d "$SCRIPT_DIR/web-frontend" ]]; then
+        log_step "构建前端资源..."
+        cd "$SCRIPT_DIR/web-frontend"
+        if [[ -f "package.json" ]]; then
+            npm run build 2>/dev/null || { log_error "前端构建失败"; exit 1; }
+        fi
+        cd "$SCRIPT_DIR"
+    else
+        log_error "web-frontend 目录不存在，GUI 构建需要前端资源"
+        exit 1
+    fi
+
+    # 编译 Rust GUI（显式指定 features）
+    log_step "编译 Rust Tauri 应用..."
+    if [[ "${1:-}" == "--release" ]]; then
+        cargo build --bin echo-agent-tauri --no-default-features --features gui --release
+        log_info "✅ GUI 编译完成 (Release)"
+        log_info "可执行文件: $SCRIPT_DIR/target/release/echo-agent-tauri"
+    else
+        cargo build --bin echo-agent-tauri --no-default-features --features gui
+        log_info "✅ GUI 编译完成 (Debug)"
+        log_info "可执行文件: $SCRIPT_DIR/target/debug/echo-agent-tauri"
+    fi
+}
+
 # ── 主入口 ────────────────────────────────────────────────────
 main() {
+    local build_mode="tui"  # 默认编译 TUI
+    local release_flag=""
+
+    # 解析参数
+    for arg in "$@"; do
+        case "$arg" in
+            --gui)    build_mode="gui" ;;
+            --release) release_flag="--release" ;;
+            *)        log_warn "未知参数: $arg" ;;
+        esac
+    done
+
     echo -e "${CYAN}"
     echo "╔══════════════════════════════════════════════════════════════╗"
-    echo "║         EchoCoWork — 初始化脚本                              ║"
+    if [[ "$build_mode" == "gui" ]]; then
+        echo "║    EchoCoWork — 初始化脚本 (GUI 桌面应用)                    ║"
+    else
+        echo "║    EchoCoWork — 初始化脚本 (TUI 终端界面)                     ║"
+    fi
     echo "╚══════════════════════════════════════════════════════════════╝"
     echo -e "${NC}"
 
     cd "$SCRIPT_DIR"
 
-    # 1. 安装 Rust
+    # 1. 安装 Rust（TUI 和 GUI 都需要）
     setup_rust
 
-    # 2. 安装 Node.js
-    setup_node
-
-    # 3. 安装前端依赖
-    setup_frontend
-
-    # 4. 编译 TUI
-    build_tui "${1:-}"
+    if [[ "$build_mode" == "gui" ]]; then
+        # GUI 需要 Node.js 和前端依赖
+        setup_node
+        setup_frontend
+        build_gui "$release_flag"
+    else
+        # TUI 不需要 Node.js
+        build_tui "$release_flag"
+    fi
 
     echo ""
     log_info "🎉 初始化完成！"
     echo ""
     echo -e "${GREEN}快速启动:${NC}"
-    if [[ "${1:-}" == "--release" ]]; then
-        echo -e "  ${CYAN}./target/release/echo-agent-cli${NC}"
+    if [[ "$build_mode" == "gui" ]]; then
+        if [[ "$release_flag" == "--release" ]]; then
+            echo -e "  ${CYAN}./target/release/echo-agent-tauri${NC}"
+        else
+            echo -e "  ${CYAN}./target/debug/echo-agent-tauri${NC}"
+        fi
     else
-        echo -e "  ${CYAN}./target/debug/echo-agent-cli${NC}"
+        if [[ "$release_flag" == "--release" ]]; then
+            echo -e "  ${CYAN}./target/release/echo-agent-cli${NC}"
+        else
+            echo -e "  ${CYAN}./target/debug/echo-agent-cli${NC}"
+        fi
     fi
     echo ""
-    echo -e "${YELLOW}提示: 使用 --release 参数编译生产版本${NC}"
+    if [[ "$build_mode" == "tui" ]]; then
+        echo -e "${YELLOW}提示: 使用 --gui 编译 GUI 桌面应用版本${NC}"
+        echo -e "${YELLOW}提示: 使用 --release 编译生产版本${NC}"
+    else
+        echo -e "${YELLOW}提示: 使用 --release 编译生产版本${NC}"
+    fi
 }
 
 # ── 执行 ───────────────────────────────────────────────────────

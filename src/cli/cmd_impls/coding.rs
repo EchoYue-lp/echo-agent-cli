@@ -65,12 +65,17 @@ async fn cmd_tasks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 println!("No background tasks.");
             } else {
                 println!("\nBackground Tasks:");
-                println!("{:-<80}", "");
+                println!("{:-<90}", "");
                 for t in &tasks {
                     let status = task_status_display(&t.status);
+                    let deps = if t.dependencies.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" deps:[{}]", t.dependencies.join(","))
+                    };
                     println!(
-                        "  [{:>12}] {} (id: {}, created_at: {})",
-                        status, t.description, t.id, t.created_at
+                        "  [{:>12}] P{:<2} {} (id: {}{})",
+                        status, t.priority, t.description, t.id, deps
                     );
                 }
             }
@@ -86,6 +91,10 @@ async fn cmd_tasks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                     println!("\nTask: {}", task.id);
                     println!("  Description: {}", task.description);
                     println!("  Status: {}", task_status_display(&task.status));
+                    println!("  Priority: {}", task.priority);
+                    if !task.dependencies.is_empty() {
+                        println!("  Dependencies: {}", task.dependencies.join(", "));
+                    }
                     println!("  Created At: {}", task.created_at);
                     if let Some(ref result) = task.result {
                         println!("  Result: {}", result);
@@ -95,6 +104,17 @@ async fn cmd_tasks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                         println!("  Progress: {}%", meta.progress);
                         if let Some(ref msg) = meta.progress_message {
                             println!("  Progress Message: {}", msg);
+                        }
+                    }
+                    // Show real-time progress from cache
+                    if let Some(p) = service.get_progress(id) {
+                        println!("  Live Progress: {:.1}%", p.percentage);
+                        println!("  Phase: {}", p.current_phase);
+                        if let Some(ref msg) = p.message {
+                            println!("  Message: {}", msg);
+                        }
+                        if let Some(eta) = p.eta_secs {
+                            println!("  ETA: {}s", eta);
                         }
                     }
                 }
@@ -148,9 +168,13 @@ async fn cmd_tasks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 println!("{:-<80}", "");
                 for (task_id, req) in &pending {
                     println!("  Task: {}", task_id);
-                    println!("  Phase: {}", req.phase);
+                    if let Some(ref phase) = req.phase {
+                        println!("  Phase: {}", phase);
+                    }
                     println!("  Prompt: {}", req.prompt);
-                    println!("  Options: {}", req.options.join(", "));
+                    if let Some(ref options) = req.options {
+                        println!("  Options: {}", options.join(", "));
+                    }
                     println!();
                 }
             }
@@ -176,9 +200,31 @@ async fn cmd_tasks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 );
             }
         }
+        "dag" => {
+            let manager = service.manager();
+            let tasks = manager.get_all_tasks();
+            if tasks.is_empty() {
+                println!("No tasks to visualize.");
+            } else {
+                println!("\nTask Dependency Graph (Mermaid format):");
+                println!("{}", manager.visualize_dependencies());
+                println!("\nTask Details:");
+                for task in &tasks {
+                    let deps = if task.dependencies.is_empty() {
+                        "none".to_string()
+                    } else {
+                        task.dependencies.join(", ")
+                    };
+                    println!(
+                        "  {} [P{}] - {} (deps: {})",
+                        task.id, task.priority, task.description, deps
+                    );
+                }
+            }
+        }
         _ => {
             println!(
-                "Usage: /tasks [list|status <id>|cancel <id>|research <topic>|checkpoints|respond <id> <selection>]"
+                "Usage: /tasks [list|status <id>|cancel <id>|research <topic>|checkpoints|respond <id> <selection>|dag]"
             );
         }
     }

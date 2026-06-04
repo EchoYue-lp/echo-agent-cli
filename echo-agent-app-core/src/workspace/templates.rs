@@ -20,7 +20,7 @@ pub enum WorkspaceTemplate {
 
 impl WorkspaceTemplate {
     /// 从字符串解析模板类型。
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse_from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "research" | "research-paper" | "paper" => Some(Self::ResearchPaper),
             "data" | "data-project" | "analysis" => Some(Self::DataProject),
@@ -57,8 +57,9 @@ impl WorkspaceTemplate {
         match self {
             Self::ResearchPaper => {
                 // Create research-specific structure
-                fs::create_dir_all(root.join("papers/pdf"))?;
-                fs::create_dir_all(root.join("papers/notes"))?;
+                let papers_dir = WorkspaceLayout::papers(root);
+                fs::create_dir_all(papers_dir.join("pdf"))?;
+                fs::create_dir_all(papers_dir.join("notes"))?;
                 fs::create_dir_all(root.join("references"))?;
                 fs::create_dir_all(root.join("drafts"))?;
 
@@ -104,14 +105,18 @@ Your abstract here.
 
                 // Create research notes template
                 let notes = "# Research Notes\n\n## Key Questions\n\n- \n\n## Reading Log\n\n| Paper | Key Finding | Relevance |\n|-------|-------------|----------|\n| | | |\n";
-                fs::write(root.join("papers/notes/reading-log.md"), notes)?;
+                fs::write(
+                    WorkspaceLayout::papers(root).join("notes/reading-log.md"),
+                    notes,
+                )?;
 
                 tracing::info!(workspace = %workspace.id, "Applied research paper template");
             }
 
             Self::DataProject => {
-                fs::create_dir_all(root.join("data/raw"))?;
-                fs::create_dir_all(root.join("data/processed"))?;
+                let data_dir = WorkspaceLayout::data(root);
+                fs::create_dir_all(data_dir.join("raw"))?;
+                fs::create_dir_all(data_dir.join("processed"))?;
                 fs::create_dir_all(root.join("notebooks"))?;
                 fs::create_dir_all(root.join("output/charts"))?;
                 fs::create_dir_all(root.join("output/reports"))?;

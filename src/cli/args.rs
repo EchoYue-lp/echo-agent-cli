@@ -1,6 +1,6 @@
 //! CLI 命令行参数定义
 //!
-//! 使用 clap derive 模式定义 TUI/GUI 产品入口和工具子命令。
+//! 使用 clap derive 模式定义 TUI/GUI 产品入口参数。
 
 use clap::Parser;
 
@@ -34,14 +34,6 @@ pub struct Args {
     #[arg(long, short = 'm', env = "MODEL_NAME")]
     pub model: Option<String>,
 
-    /// 系统提示词（不指定则使用配置文件中的值）
-    #[arg(long, short = 's', env = "SYSTEM_PROMPT")]
-    pub system_prompt: Option<String>,
-
-    /// Agent 模式 (general, coding, research, data, writing)
-    #[arg(long, default_value = "general")]
-    pub mode: String,
-
     /// 项目目录（自动加载 AGENTS.md 等项目指令）
     #[arg(long)]
     pub project: Option<String>,
@@ -54,17 +46,9 @@ pub struct Args {
     #[arg(long)]
     pub config: Option<String>,
 
-    /// 禁用彩色输出
-    #[arg(long)]
-    pub no_color: bool,
-
     /// 启用 IM 通道模式（内部/实验入口，默认隐藏）
     #[arg(long, hide = true)]
     pub channels: bool,
-
-    /// 输出格式 (text, json, markdown, table)
-    #[arg(long, short = 'o', default_value = "text")]
-    pub output: String,
 
     /// 继续最近一次会话 (resume latest session)
     #[arg(long, short = 'c', default_value_t = false)]
@@ -77,123 +61,4 @@ pub struct Args {
     /// 详细输出模式
     #[arg(long, short = 'v')]
     pub verbose: bool,
-
-    /// Headless mode: run a single prompt, print output, exit (for CI/CD).
-    /// Skips TUI/GUI initialization. Combine with --model and --mode.
-    #[arg(long, value_name = "PROMPT")]
-    pub headless: Option<String>,
-
-    /// Maximum iterations for headless mode (safety limit)
-    #[arg(long, value_name = "N")]
-    pub max_iterations: Option<usize>,
-
-    /// 子命令
-    #[command(subcommand)]
-    pub command: Option<Commands>,
-}
-
-/// CLI 子命令
-#[derive(Debug, clap::Subcommand)]
-pub enum Commands {
-    /// 一次性对话 (从参数或 stdin 读取)
-    Run {
-        /// 用户消息 (不指定则从 stdin 读取)
-        message: Vec<String>,
-        /// 从 stdin 读取 (管道模式)
-        #[arg(long)]
-        pipe: bool,
-        /// 模型名称（不指定则使用配置文件中的值）
-        #[arg(long, short = 'm')]
-        model: Option<String>,
-        /// 输出格式 (text, json, markdown)
-        #[arg(long, short = 'o', default_value = "text")]
-        output: String,
-    },
-    /// 管理配置档案
-    Profiles {
-        #[command(subcommand)]
-        action: ProfileAction,
-    },
-    /// 管理会话
-    Sessions {
-        #[command(subcommand)]
-        action: SessionAction,
-    },
-    /// 生成 Shell 补全脚本
-    Completions {
-        /// Shell 类型 (bash, zsh, fish, elvish, powershell)
-        shell: String,
-        /// 同时生成所有 Shell 的补全
-        #[arg(long)]
-        all: bool,
-    },
-    /// 交互式引导配置 (Onboarding Wizard)
-    Onboard,
-    /// 诊断配置问题
-    Doctor,
-    /// 运行 eval 测试用例
-    Eval {
-        /// eval 用例目录或文件路径
-        path: String,
-        /// 输出 JSON 格式报告
-        #[arg(long, short = 'j')]
-        json: bool,
-    },
-}
-
-/// 档案子命令
-#[derive(Debug, clap::Subcommand)]
-pub enum ProfileAction {
-    /// 列出所有档案
-    List,
-    /// 查看档案详情
-    Show { name: String },
-    /// 创建新档案
-    Create {
-        name: String,
-        #[arg(long, short = 'm')]
-        model: Option<String>,
-        #[arg(long, short = 's')]
-        system_prompt: Option<String>,
-    },
-    /// 更新档案
-    Update {
-        name: String,
-        #[arg(long, short = 'm')]
-        model: Option<String>,
-        #[arg(long, short = 's')]
-        system_prompt: Option<String>,
-        #[arg(long)]
-        theme: Option<String>,
-    },
-    /// 激活档案
-    Use { name: String },
-    /// 删除档案
-    Delete { name: String },
-}
-
-/// 会话子命令
-#[derive(Debug, clap::Subcommand)]
-pub enum SessionAction {
-    /// 列出所有会话
-    List,
-    /// 查看会话详情
-    Show { id: String },
-    /// 从现有会话创建分支
-    Branch {
-        parent_id: String,
-        branch_name: String,
-    },
-    /// 对比两个会话
-    Diff { id_a: String, id_b: String },
-    /// 导出会话
-    Export {
-        id: String,
-        #[arg(long, short = 'f', default_value = "json")]
-        format: String,
-        #[arg(long, short = 'o')]
-        output: Option<String>,
-    },
-    /// 删除会话
-    Delete { id: String },
 }

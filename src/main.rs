@@ -8,8 +8,8 @@
 //! # 启动 TUI（默认）
 //! echo-agent-cli
 //!
-//! # 指定模型和模式
-//! echo-agent-cli --model claude-sonnet-4-6 --mode coding
+//! # 指定模型
+//! echo-agent-cli --model claude-sonnet-4-6
 //! ```
 
 use echo_agent_cli::agent_handle::AgentHandle;
@@ -33,27 +33,35 @@ async fn main() -> anyhow::Result<()> {
     let mut app_config = config::load_config(args.config.as_deref());
     config::apply_env_overrides(&mut app_config);
 
-    // 处理其他子命令 (不需要创建 Agent 即可执行的命令)
-    if let Some(ref cmd) = args.command {
-        return cli::handle_subcommand(cmd).await;
-    }
-
     let is_tui_entry = !args.web && !args.cli && !args.channels;
 
     // 初始化日志。默认用户入口是 TUI，日志必须写入文件，避免污染全屏界面。
+    #[cfg(feature = "tui")]
     if is_tui_entry {
         infra::init_logging_for_tui(&app_config.logging.level);
     } else {
         infra::init_logging(&app_config.logging.level);
     }
 
+    #[cfg(not(feature = "tui"))]
+    {
+        infra::init_logging(&app_config.logging.level);
+    }
+
     // 创建 Agent + 加载 MCP 配置（统一路径，消除重复）
     let params = echo_agent_cli::infra::AgentCreateParams {
         model: args.model.clone(),
-        mode: args.mode.clone(),
-        system_prompt: args.system_prompt.clone(),
+        mode: "general".to_string(),
+        system_prompt: None,
         project: args.project.clone(),
+        session_id: None,
+        react_checkpoint_interval: None,
     };
+    // Resolve mode display string for TUI status bar.
+    let mode_display = echo_agent_app_core::project::modes::parse_from_str(&params.mode)
+        .map(|m| echo_agent_app_core::project::modes::format_display(&m))
+        .unwrap_or_else(|| "💬 通用".to_string());
+
     let mut agent = infra::create_agent(&params, &app_config);
     infra::load_mcp_config(&mut agent, args.mcp_config.as_deref(), &app_config).await;
 
@@ -573,23 +581,11 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // ── G13: Headless mode (--headless <prompt>) ─────────────────
-    if let Some(ref prompt) = args.headless {
-        let exit_code =
-            cli::run_headless_mode(&agent_handle, prompt, &args.output, args.max_iterations)
-                .await?;
-
-        // Keep hook bridges and unified memory alive until shutdown
-        drop(task_hook_bridge);
-        drop(subagent_hook_bridge);
-        drop(unified_memory);
-
-        std::process::exit(exit_code);
-    }
-
     // ── User-facing TUI mode (default) ─────────────────────────────────
+    #[cfg(feature = "tui")]
     if is_tui_entry {
         // Start BackgroundTaskService for parallel task progress display.
+        // ReactAgent serializes execution internally via execution_mutex.
         let tui_task_service = {
             let cancel = echo_agent::agent::CancellationToken::new();
             match echo_agent_app_core::tasks::BackgroundTaskService::new(
@@ -612,13 +608,25 @@ async fn main() -> anyhow::Result<()> {
             }
         };
 
-        echo_agent_cli::tui::run_tui(agent_handle.clone(), tui_task_service).await?;
+        echo_agent_cli::tui::run_tui(
+            agent_handle.clone(),
+            tui_task_service,
+            &app_config.tui,
+            &mode_display,
+        )
+        .await?;
 
         drop(task_hook_bridge);
         drop(subagent_hook_bridge);
         drop(unified_memory);
 
         return Ok(());
+    }
+
+    #[cfg(not(feature = "tui"))]
+    if is_tui_entry {
+        eprintln!("TUI 模式需要 tui feature。请使用: cargo build --features tui");
+        std::process::exit(1);
     }
 
     // ── Hidden legacy/internal modes ───────────────────────────────────
@@ -698,27 +706,22 @@ mod tests {
             port: 3000,
             host: "127.0.0.1".to_string(),
             model: Some("test-model".to_string()),
-            system_prompt: Some("test prompt".to_string()),
-            mode: "general".to_string(),
             project: None,
             mcp_config: None,
             config: None,
-            no_color: false,
             channels: false,
-            output: "text".to_string(),
             verbose: false,
             r#continue: false,
             resume: None,
-            headless: None,
-            max_iterations: None,
-            command: None,
         };
 
         let params = infra::AgentCreateParams {
             model: args.model.clone(),
-            mode: args.mode.clone(),
-            system_prompt: args.system_prompt.clone(),
+            mode: "general".to_string(),
+            system_prompt: None,
             project: args.project.clone(),
+            session_id: None,
+            react_checkpoint_interval: None,
         };
         let app_config = config::AppConfig::default();
         let agent = infra::create_agent(&params, &app_config);

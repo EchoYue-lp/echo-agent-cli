@@ -705,7 +705,24 @@ pub async fn list_human_gates(
     // Human gates are managed by BackgroundTaskService
     if let Some(ref service) = state.app_state.tasks.service {
         let gates = service.pending_checkpoints().await;
-        Ok(serde_json::to_value(gates).unwrap_or_default())
+        // HumanCheckpointRequest contains non-Serialize fields (Duration),
+        // so manually map to a serializable representation.
+        let items: Vec<serde_json::Value> = gates
+            .into_iter()
+            .map(|(id, req)| {
+                serde_json::json!({
+                    "id": id,
+                    "kind": format!("{:?}", req.kind),
+                    "prompt": req.prompt,
+                    "tool_name": req.tool_name,
+                    "risk_level": req.risk_level.as_ref().map(|r| format!("{:?}", r)),
+                    "task_id": req.task_id,
+                    "options": req.options,
+                    "phase": req.phase,
+                })
+            })
+            .collect();
+        Ok(serde_json::to_value(items).unwrap_or_default())
     } else {
         Ok(serde_json::json!([]))
     }

@@ -22,9 +22,11 @@ async fn main() -> anyhow::Result<()> {
     // ── Create agent + MCP ──
     let params = infra::AgentCreateParams {
         model: args.model.clone(),
-        mode: args.mode.clone(),
-        system_prompt: args.system_prompt.clone(),
+        mode: "general".to_string(),
+        system_prompt: None,
         project: args.project.clone(),
+        session_id: None,
+        react_checkpoint_interval: None,
     };
     let mut agent = infra::create_agent(&params, &app_config);
     infra::load_mcp_config(&mut agent, args.mcp_config.as_deref(), &app_config).await;

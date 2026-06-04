@@ -122,7 +122,7 @@ fn render_tasks_list(f: &mut Frame, app: &TuiApp, area: Rect, t: &Theme) {
     let task_item = if let Some(ref task) = app.active_task {
         ListItem::new(Line::from(vec![
             Span::styled(format!("    {} ", "\u{25b6}"), Style::default().fg(t.green)),
-            Span::styled(task.clone(), Style::default().fg(t.text)),
+            Span::styled(task.as_str(), Style::default().fg(t.text)),
         ]))
     } else {
         ListItem::new(Line::from(vec![Span::styled(

@@ -48,5 +48,8 @@ terminal_size = "0.3"
 [features]
 telemetry = ["echo-agent/telemetry"]
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("__ts_rs"))'] }
+
 [dev-dependencies]
 tempfile = "3"

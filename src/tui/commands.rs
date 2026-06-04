@@ -63,6 +63,7 @@ pub enum SlashCommand {
     Status,
     New,
     Compact,
+    Copy,
 
     // -- Context --
     Mode,
@@ -113,6 +114,7 @@ impl SlashCommand {
             Self::Status => "Show agent status",
             Self::New => "Start a new session",
             Self::Compact => "Compress context window",
+            Self::Copy => "Copy the last response to clipboard (or Ctrl+Y)",
 
             Self::Mode => "Switch agent mode (general/coding/research/data/writing)",
             Self::Model => "Switch or show current model",
@@ -154,7 +156,8 @@ impl SlashCommand {
             | Self::Stats
             | Self::Status
             | Self::New
-            | Self::Compact => Category::Session,
+            | Self::Compact
+            | Self::Copy => Category::Session,
             Self::Mode
             | Self::Model
             | Self::Think

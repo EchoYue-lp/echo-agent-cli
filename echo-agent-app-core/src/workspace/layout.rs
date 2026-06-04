@@ -52,19 +52,19 @@ impl WorkspaceLayout {
         Self::state_dir(root).join("memory")
     }
 
-    /// 数据集目录（数据分析工作区）：`{root}/data/`
+    /// 数据集目录（数据分析工作区）：`{root}/.echocowork/data/`
     pub fn data(root: &Path) -> PathBuf {
-        root.join("data")
+        Self::state_dir(root).join("data")
     }
 
-    /// 论文目录（学术研究工作区）：`{root}/papers/`
+    /// 论文目录（学术研究工作区）：`{root}/.echocowork/papers/`
     pub fn papers(root: &Path) -> PathBuf {
-        root.join("papers")
+        Self::state_dir(root).join("papers")
     }
 
-    /// 生成物目录（报告、论文、图表）：`{root}/artifacts/`
+    /// 生成物目录（报告、论文、图表）：`{root}/.echocowork/artifacts/`
     pub fn artifacts(root: &Path) -> PathBuf {
-        root.join("artifacts")
+        Self::state_dir(root).join("artifacts")
     }
 
     /// 任务状态目录（SQLite DB）：`{root}/.echocowork/tasks/`
@@ -104,9 +104,9 @@ impl WorkspaceLayout {
         }
     }
 
-    /// 共享草稿文件：`{root}/scratchpad.md`
+    /// 共享草稿文件：`{root}/.echocowork/scratchpad.md`
     pub fn scratchpad(root: &Path) -> PathBuf {
-        root.join("scratchpad.md")
+        Self::state_dir(root).join("scratchpad.md")
     }
 
     /// 决策日志文件：`{root}/.echocowork/decisions.jsonl`
@@ -176,7 +176,7 @@ mod tests {
         );
         assert_eq!(
             WorkspaceLayout::papers(root),
-            PathBuf::from("/tmp/test-workspace/papers")
+            PathBuf::from("/tmp/test-workspace/.echocowork/papers")
         );
         assert_eq!(
             WorkspaceLayout::manifest(root),

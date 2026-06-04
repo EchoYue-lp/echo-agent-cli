@@ -8,21 +8,13 @@ pub mod command;
 pub mod commands;
 pub mod completion;
 pub mod editor;
-pub mod eval;
-pub mod export;
 pub mod git_ops;
-pub mod handlers;
 pub mod keybindings;
 pub mod modes;
-pub mod onboard;
 pub mod repl;
 
-pub use args::{Args, Commands, ProfileAction, SessionAction};
-pub use handlers::{
-    handle_completions_command, handle_profile_action, handle_run_command, handle_session_action,
-    handle_subcommand,
-};
+pub use args::Args;
 #[cfg(feature = "channels")]
 pub use modes::run_channels_mode;
-pub use modes::{run_cli_mode, run_headless_mode};
+pub use modes::run_cli_mode;
 pub use repl::{ReplConfig, run_repl};

@@ -483,7 +483,7 @@ mod tests {
         .unwrap();
 
         let index = ProjectIndex::build(root);
-        let related = index.related_files(Path::new("src/lib.rs"));
+        let _related = index.related_files(Path::new("src/lib.rs"));
         // main.rs imports hello (though the simple parser won't resolve crate::hello)
         assert!(index.len() >= 2);
     }

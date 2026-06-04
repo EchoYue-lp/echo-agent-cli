@@ -123,7 +123,7 @@ impl Widget for TaskStrip {
 }
 
 /// Truncate a string to fit within max_len characters, adding "…" if needed.
-fn truncate_str(s: &str, max_len: usize) -> String {
+pub(crate) fn truncate_str(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
         s.to_string()
     } else {

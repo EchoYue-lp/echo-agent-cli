@@ -1,7 +1,10 @@
 pub mod cli;
 pub mod logging;
-pub mod shell;
+
+#[cfg(feature = "gui")]
 pub mod tauri;
+
+#[cfg(feature = "tui")]
 pub mod tui;
 
 // Re-export from app-core

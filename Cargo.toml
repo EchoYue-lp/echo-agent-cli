@@ -9,7 +9,7 @@ name = "echo-agent-cli"
 version = "1.0.0"
 edition = "2024"
 rust-version = "1.95"
-default-run = "echo-agent-tauri"
+default-run = "echo-agent-cli"
 license = "MIT"
 description = "EchoCoWork — Production-grade AI Agent CLI and Desktop App"
 repository = "https://github.com/EchoYue-lp/echo-agent-cli"
@@ -19,18 +19,31 @@ keywords = ["ai", "agent", "llm", "cli", "web"]
 categories = ["command-line-utilities", "web-programming", "development-tools"]
 
 [features]
-default = []
+default = ["tui"]
+tui = [
+    "dep:ratatui", "dep:crossterm", "dep:arboard",
+    "dep:unicode-width", "dep:textwrap", "dep:strum",
+    "dep:strum_macros", "dep:pulldown-cmark", "dep:syntect",
+]
+gui = [
+    "dep:tauri", "dep:tauri-plugin-shell", "dep:tauri-plugin-dialog",
+    "dep:tauri-plugin-notification", "dep:tauri-plugin-fs",
+    "dep:tauri-plugin-global-shortcut", "dep:portable-pty",
+    "dep:dashmap", "dep:similar",
+]
 channels = ["echo-agent/channels"]
 telemetry = ["echo-agent/telemetry"]
-devtools = ["tauri/devtools"]
+devtools = ["tauri?/devtools"]
 
 [[bin]]
 name = "echo-agent-cli"
 path = "src/main.rs"
+required-features = ["tui"]
 
 [[bin]]
 name = "echo-agent-tauri"
 path = "src-tauri/src/main.rs"
+required-features = ["gui"]
 
 [dependencies]
 echo-agent-app-core = { path = "./echo-agent-app-core" }
@@ -41,7 +54,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive", "env"] }
 reedline = "0.38"
 nu-ansi-term = "0.50"
-crossterm = "0.28"
+crossterm = { version = "0.28", optional = true }
 futures = "0.3"
 anyhow = "1.0"
 serde = { version = "1", features = ["derive"] }
@@ -50,9 +63,9 @@ serde_yaml = "0.9"
 serde_yaml_ng = "0.10"
 dotenvy = "0.15"
 indicatif = "0.17"
-pulldown-cmark = "0.11"
-syntect = { version = "5", default-features = false, features = ["parsing", "regex-onig", "default-syntaxes", "default-themes"] }
-similar = "2"
+pulldown-cmark = { version = "0.11", optional = true }
+syntect = { version = "5", default-features = false, features = ["parsing", "regex-onig", "default-syntaxes", "default-themes"], optional = true }
+similar = { version = "2", optional = true }
 terminal_size = "0.3"
 clap_complete = "4"
 shellexpand = "3"
@@ -62,20 +75,21 @@ tokio-util = "0.7"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 cron = "0.12"
-tauri = { version = "2", features = ["tray-icon"] }
-tauri-plugin-shell = "2"
-tauri-plugin-dialog = "2"
-tauri-plugin-notification = "2"
-tauri-plugin-fs = "2"
-tauri-plugin-global-shortcut = "2"
-ratatui = { version = "0.29", features = ["crossterm"] }
-unicode-width = "0.2"
-textwrap = "0.16"
-strum = "0.26"
-strum_macros = "0.26"
-portable-pty = "0.8"
-dashmap = "6"
+tauri = { version = "2", features = ["tray-icon"], optional = true }
+tauri-plugin-shell = { version = "2", optional = true }
+tauri-plugin-dialog = { version = "2", optional = true }
+tauri-plugin-notification = { version = "2", optional = true }
+tauri-plugin-fs = { version = "2", optional = true }
+tauri-plugin-global-shortcut = { version = "2", optional = true }
+ratatui = { version = "0.29", features = ["crossterm"], optional = true }
+unicode-width = { version = "0.2", optional = true }
+textwrap = { version = "0.16", optional = true }
+strum = { version = "0.26", optional = true }
+strum_macros = { version = "0.26", optional = true }
+portable-pty = { version = "0.8", optional = true }
+dashmap = { version = "6", optional = true }
 base64 = "0.22"
+arboard = { version = "3", optional = true }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

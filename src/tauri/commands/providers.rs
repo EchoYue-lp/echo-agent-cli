@@ -2,7 +2,6 @@
 
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
-use echo_agent::agent::Agent;
 use echo_agent::llm::LlmConfig;
 use echo_agent::prelude::Message;
 

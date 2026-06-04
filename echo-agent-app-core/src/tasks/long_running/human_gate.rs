@@ -1,10 +1,8 @@
-//! Human checkpoint gate — re-exported from the framework.
+//! Human checkpoint types — compatibility aliases for the unified HumanLoopProvider.
 //!
-//! The authoritative types live in `echo_orchestration::tasks::human_gate`
-//! (exposed via `echo_agent::tasks::human_gate`). This module re-exports
-//! them under the names used throughout this crate.
+//! The legacy `HumanGate` has been replaced by `HumanLoopProvider` with the
+//! `Selection` kind. These aliases preserve existing import paths.
 
-pub use echo_agent::tasks::human_gate::{
-    HumanGate as HumanCheckpointGate, HumanRequest as HumanCheckpointRequest,
-    HumanResponse as HumanCheckpointResponse,
+pub use echo_agent::human_loop::{
+    HumanLoopRequest as HumanCheckpointRequest, HumanLoopResponse as HumanCheckpointResponse,
 };

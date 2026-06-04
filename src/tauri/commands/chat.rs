@@ -154,6 +154,18 @@ impl HumanLoopProvider for TauriHumanLoopHandler {
                         }
                     }
                 }
+                echo_agent::human_loop::HumanLoopKind::Selection => {
+                    // For now, auto-approve with the first option
+                    // TODO: implement proper selection UI in frontend
+                    let selection = req
+                        .options
+                        .and_then(|opts| opts.into_iter().next())
+                        .unwrap_or_else(|| "approve".to_string());
+                    Ok(HumanLoopResponse::Selection {
+                        selection,
+                        instructions: None,
+                    })
+                }
             }
         })
     }
@@ -195,6 +207,8 @@ pub async fn send_chat_message(
 
     tokio::spawn(async move {
         let start = std::time::Instant::now();
+
+        // ReactAgent serializes execution internally via execution_mutex
 
         // Acquire read lock — must be held while stream is consumed
         let agent = agent_inner.read().await;

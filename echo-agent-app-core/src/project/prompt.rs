@@ -16,7 +16,7 @@ use echo_agent::prelude::PromptTemplateManager;
 use std::sync::Arc;
 
 use super::context::ProjectContext;
-use super::modes::{AgentMode, ModeEngine};
+use super::modes::AgentMode;
 
 /// A single module of the system prompt.
 #[derive(Debug, Clone)]
@@ -152,7 +152,7 @@ impl PromptAssembler {
         // P1: Mode-specific instructions (required)
         assembler.add_module(PromptModule {
             name: "mode".into(),
-            content: super::modes::chinese_mode_engine().system_prompt(mode),
+            content: super::modes::chinese_mode_prompt(mode),
             priority: 1,
             token_budget: 0,
             required: true,
@@ -242,21 +242,12 @@ impl PromptAssembler {
 
         // P1: Mode-specific instructions (required)
         // Use the template engine to look up the mode prompt template if available.
-        // The template name follows the pattern "mode_{kebab_case_name}"
-        // (e.g., "mode_general", "mode_coding", "mode_research", "mode_data", "mode_writing").
-        let mode_template_name = match mode {
-            AgentMode::General => "mode_general",
-            AgentMode::Coding => "mode_coding",
-            AgentMode::Research => "mode_research",
-            AgentMode::Data => "mode_data",
-            AgentMode::Writing => "mode_writing",
-            _ => "mode_general", // fallback for future modes
-        };
+        let mode_template_name = super::modes::template_key(mode);
         let mode_content = assembler
             .template_engine
             .as_ref()
-            .and_then(|engine| engine.get_template(&mode_template_name))
-            .unwrap_or_else(|| super::modes::chinese_mode_engine().system_prompt(mode));
+            .and_then(|engine| engine.get_template(mode_template_name))
+            .unwrap_or_else(|| super::modes::chinese_mode_prompt(mode));
 
         assembler.add_module(PromptModule {
             name: "mode".into(),

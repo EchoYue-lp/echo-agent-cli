@@ -6,7 +6,6 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
-use serde_json::json;
 use thiserror::Error;
 use ts_rs::TS;
 

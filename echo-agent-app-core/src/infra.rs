@@ -18,28 +18,32 @@ pub struct AgentCreateParams {
     pub mode: String,
     pub system_prompt: Option<String>,
     pub project: Option<String>,
+    /// Optional session ID for checkpoint isolation (used by background tasks).
+    pub session_id: Option<String>,
+    /// React loop checkpoint interval in iterations (0 = only at end).
+    /// Used by background tasks to enable crash recovery.
+    pub react_checkpoint_interval: Option<usize>,
 }
 
 /// 创建 Agent 实例
 ///
-/// Uses `ReactAgentBuilder` with `.mode()` and `.mode_engine()` to
-/// leverage the framework's mode auto-configuration (system prompt,
-/// recommended tools, display name) instead of manual prompt/tool wiring.
+/// Uses `ReactAgentBuilder` to construct the agent. Mode is resolved at the
+/// CLI layer (see `project::modes`); the framework is mode-agnostic.
 pub fn create_agent(params: &AgentCreateParams, app_config: &AppConfig) -> ReactAgent {
-    let model = params.model.as_deref().unwrap_or(&app_config.model.name);
+    // Use model from params if provided, otherwise check ECHOCOWORK_MODEL env var, then config
+    let config_model = app_config.model.get_model_name();
+    let model = params.model.as_deref().unwrap_or(&config_model);
 
-    // Parse mode with bilingual support via LocalizedModeEngine
-    let agent_mode = LocalizedModeEngine::from_str(&params.mode)
-        .or_else(|| AgentMode::from_name(&params.mode))
-        .unwrap_or_else(|| {
-            let valid = ["general", "coding", "research", "data", "writing"];
-            tracing::warn!(
-                "Unknown mode '{}', falling back to 'general'. Valid modes: {}",
-                params.mode,
-                valid.join(", ")
-            );
-            AgentMode::General
-        });
+    // Parse mode with bilingual support (Chinese aliases + English names)
+    let agent_mode = crate::project::modes::parse_from_str(&params.mode).unwrap_or_else(|| {
+        let valid = ["general", "coding", "research", "data", "writing"];
+        tracing::warn!(
+            "Unknown mode '{}', falling back to 'general'. Valid modes: {}",
+            params.mode,
+            valid.join(", ")
+        );
+        crate::project::modes::AgentMode::General
+    });
 
     let base_system_prompt = params
         .system_prompt
@@ -88,16 +92,12 @@ pub fn create_agent(params: &AgentCreateParams, app_config: &AppConfig) -> React
         usize::MAX
     };
 
-    let mode_engine = Arc::new(LocalizedModeEngine::with_chinese());
-
-    // Use ReactAgentBuilder with mode and mode_engine for framework-level
-    // auto-configuration (Chinese prompts, recommended tools, allowed_tools)
+    // Use ReactAgentBuilder — mode is resolved at the CLI layer,
+    // framework only receives model + system_prompt + tools.
     let mut builder = ReactAgentBuilder::new()
         .model(model)
         .name(&app_config.agent.name)
         .system_prompt(&system_prompt)
-        .mode(agent_mode)
-        .mode_engine(mode_engine)
         .enable_tools()
         .enable_memory()
         .enable_human_in_loop()
@@ -108,6 +108,19 @@ pub fn create_agent(params: &AgentCreateParams, app_config: &AppConfig) -> React
             timeout_ms: app_config.agent.tool_timeout_ms,
             ..Default::default()
         });
+
+    // Set session_id if provided (used by background tasks for checkpoint isolation)
+    if let Some(ref sid) = params.session_id {
+        builder = builder.session_id(sid.as_str());
+    }
+
+    // Set React loop checkpoint interval if provided (used by background tasks
+    // to enable crash recovery — saves conversation history every N iterations)
+    if let Some(interval) = params.react_checkpoint_interval {
+        if interval > 0 {
+            builder = builder.react_checkpoint_interval(interval);
+        }
+    }
 
     // Initialize JSONL run store for trace persistence (before build)
     if let Ok(home) = std::env::var("HOME") {
@@ -562,7 +575,7 @@ async fn probe_model_connectivity(model: &str) -> echo_agent::error::Result<()> 
 pub fn run_base_doctor() -> DoctorResult {
     let mut config = crate::config::load_config(None);
     crate::config::apply_env_overrides(&mut config);
-    run_base_doctor_for_model(&config.model.name)
+    run_base_doctor_for_model(&config.model.get_model_name())
 }
 
 /// 执行基础环境诊断（API Key、配置文件、数据目录等）

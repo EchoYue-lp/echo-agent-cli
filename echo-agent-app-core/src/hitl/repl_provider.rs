@@ -33,6 +33,7 @@ impl HumanLoopProvider for ReplHumanLoopProvider {
             match req.kind {
                 HumanLoopKind::Approval => handle_approval(&req),
                 HumanLoopKind::Input => handle_input(&req),
+                HumanLoopKind::Selection => handle_selection(&req),
             }
         })
     }
@@ -104,4 +105,48 @@ fn handle_input(
     } else {
         Ok(HumanLoopResponse::Text(text))
     }
+}
+
+fn handle_selection(
+    req: &HumanLoopRequest,
+) -> Result<HumanLoopResponse, echo_agent::error::ReactError> {
+    println!("\n╔══════════════════════════════════════════╗");
+    println!("║         SELECTION REQUIRED               ║");
+    println!("╚══════════════════════════════════════════╝");
+    println!("  {}", req.prompt);
+
+    if let Some(ref options) = req.options {
+        println!("\n  Options:");
+        for (i, opt) in options.iter().enumerate() {
+            println!("    [{}] {}", i + 1, opt);
+        }
+    }
+    println!("\n  Choice (number or text): ");
+
+    let mut input = String::new();
+    std::io::stdin()
+        .read_line(&mut input)
+        .map_err(|e| echo_agent::error::ReactError::Other(format!("stdin read error: {e}")))?;
+
+    let trimmed = input.trim();
+
+    // Try to parse as number, otherwise use as-is
+    let selection = if let Ok(idx) = trimmed.parse::<usize>() {
+        if let Some(ref options) = req.options {
+            if idx >= 1 && idx <= options.len() {
+                options[idx - 1].clone()
+            } else {
+                trimmed.to_string()
+            }
+        } else {
+            trimmed.to_string()
+        }
+    } else {
+        trimmed.to_string()
+    };
+
+    Ok(HumanLoopResponse::Selection {
+        selection,
+        instructions: None,
+    })
 }

@@ -1,9 +1,10 @@
 //! Long-running task runner -- executes pipelines with checkpoint/resume/progress/cancellation.
 
 use super::checkpoint::{LongRunningCheckpoint, LongRunningCheckpointStore};
-use super::human_gate::{HumanCheckpointGate, HumanCheckpointRequest, HumanCheckpointResponse};
+use super::human_gate::HumanCheckpointRequest;
 use super::phases::PhasePlan;
 use super::progress::ProgressReporter;
+use echo_agent::human_loop::{HumanLoopProvider, HumanLoopRequest, HumanLoopResponse};
 use futures::future::BoxFuture;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -47,7 +48,7 @@ pub struct LongRunningTaskRunner {
     checkpoint_store: LongRunningCheckpointStore,
     progress: ProgressReporter,
     cancel: CancellationToken,
-    human_gate: Option<Arc<HumanCheckpointGate>>,
+    human_loop_provider: Option<Arc<dyn HumanLoopProvider>>,
 }
 
 impl LongRunningTaskRunner {
@@ -64,13 +65,13 @@ impl LongRunningTaskRunner {
             checkpoint_store,
             progress,
             cancel,
-            human_gate: None,
+            human_loop_provider: None,
         }
     }
 
-    /// Set the human checkpoint gate for interactive pipelines.
-    pub fn with_human_gate(mut self, gate: Arc<HumanCheckpointGate>) -> Self {
-        self.human_gate = Some(gate);
+    /// Set the human loop provider for interactive pipelines.
+    pub fn with_human_loop_provider(mut self, provider: Arc<dyn HumanLoopProvider>) -> Self {
+        self.human_loop_provider = Some(provider);
         self
     }
 
@@ -178,51 +179,88 @@ impl LongRunningTaskRunner {
 
                     // Check for human checkpoint
                     if phase.human_checkpoint {
-                        if let Some(ref gate) = self.human_gate {
-                            let request = HumanCheckpointRequest {
-                                prompt: format!(
+                        if let Some(ref provider) = self.human_loop_provider {
+                            let request = HumanLoopRequest::selection(
+                                &self.task_id,
+                                format!(
                                     "Phase '{}' completed. Review and approve to continue.",
                                     phase.name
                                 ),
-                                context: phase_outputs
-                                    .get(&phase.id)
-                                    .cloned()
-                                    .unwrap_or(Value::Null),
-                                options: vec![
+                                vec![
                                     "approve".to_string(),
                                     "revise".to_string(),
                                     "cancel".to_string(),
                                 ],
-                                phase: phase.id.clone(),
+                            )
+                            .with_context(
+                                phase_outputs.get(&phase.id).cloned().unwrap_or(Value::Null),
+                            )
+                            .with_phase(&phase.id);
+
+                            let response = tokio::select! {
+                                result = provider.request(request) => result?,
+                                _ = self.cancel.cancelled() => {
+                                    return Err(anyhow::anyhow!("Task cancelled by user at checkpoint"));
+                                }
                             };
-                            let response =
-                                gate.request(&self.task_id, request, &self.cancel).await?;
-                            if response.selection == "cancel" {
-                                return Err(anyhow::anyhow!(
-                                    "Task cancelled by user at checkpoint"
-                                ));
-                            }
-                            if let Some(instructions) = response.instructions {
-                                phase_state.insert(
-                                    format!("{}_human_feedback", phase.id),
-                                    Value::String(instructions),
-                                );
+
+                            match response {
+                                HumanLoopResponse::Selection {
+                                    selection,
+                                    instructions,
+                                } => {
+                                    if selection == "cancel" {
+                                        return Err(anyhow::anyhow!(
+                                            "Task cancelled by user at checkpoint"
+                                        ));
+                                    }
+                                    if let Some(inst) = instructions {
+                                        phase_state.insert(
+                                            format!("{}_human_feedback", phase.id),
+                                            Value::String(inst),
+                                        );
+                                    }
+                                }
+                                _ => {
+                                    return Err(anyhow::anyhow!(
+                                        "Unexpected response type for checkpoint"
+                                    ));
+                                }
                             }
                         }
                     }
                 }
                 PhaseOutcome::NeedsHumanInput(request) => {
-                    if let Some(ref gate) = self.human_gate {
-                        let response = gate.request(&self.task_id, request, &self.cancel).await?;
-                        if response.selection == "cancel" {
-                            return Err(anyhow::anyhow!("Task cancelled by user"));
+                    if let Some(ref provider) = self.human_loop_provider {
+                        let response = tokio::select! {
+                            result = provider.request(request) => result?,
+                            _ = self.cancel.cancelled() => {
+                                return Err(anyhow::anyhow!("Task cancelled by user"));
+                            }
+                        };
+
+                        match response {
+                            HumanLoopResponse::Selection {
+                                selection,
+                                instructions,
+                            } => {
+                                if selection == "cancel" {
+                                    return Err(anyhow::anyhow!("Task cancelled by user"));
+                                }
+                                if let Some(inst) = instructions {
+                                    phase_state.insert(
+                                        format!("{}_human_feedback", phase.id),
+                                        Value::String(inst),
+                                    );
+                                }
+                            }
+                            _ => {
+                                return Err(anyhow::anyhow!(
+                                    "Unexpected response type for checkpoint"
+                                ));
+                            }
                         }
-                        if let Some(instructions) = response.instructions {
-                            phase_state.insert(
-                                format!("{}_human_feedback", phase.id),
-                                Value::String(instructions),
-                            );
-                        }
+
                         // Save checkpoint with human feedback
                         self.checkpoint_store
                             .save(&LongRunningCheckpoint {
@@ -236,7 +274,7 @@ impl LongRunningTaskRunner {
                             .await?;
                     } else {
                         return Err(anyhow::anyhow!(
-                            "Phase '{}' requires human input but no HumanCheckpointGate configured",
+                            "Phase '{}' requires human input but no HumanLoopProvider configured",
                             phase.name
                         ));
                     }

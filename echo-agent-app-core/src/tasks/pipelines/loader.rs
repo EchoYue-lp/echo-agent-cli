@@ -111,7 +111,7 @@ impl PipelineLoader {
 
         // 注册所有边
         for edge in &def.edges {
-            if let Some(condition) = &edge.condition {
+            if let Some(_condition) = &edge.condition {
                 // 有条件边（简化实现，实际应解析条件表达式）
                 builder = builder.add_edge(&edge.from, &edge.to);
             } else {

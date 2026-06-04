@@ -264,6 +264,7 @@ async fn chat_with_agent(agent: &AgentHandle, message: &str, output: &OutputRend
     // is in stream.next().await for the first SSE chunk.
     let mut spinner = output.start_spinner("Connecting to model...");
 
+    // ReactAgent serializes execution internally via execution_mutex
     let agent_guard = agent.inner().read().await;
     match agent_guard.chat_stream(message).await {
         Ok(mut stream) => {
@@ -314,15 +315,6 @@ async fn chat_with_agent(agent: &AgentHandle, message: &str, output: &OutputRend
                                     ("final_answer".into(), String::new())
                                 }
                                 AgentEvent::Cancelled => ("cancelled".into(), String::new()),
-                                AgentEvent::PlanGenerated { steps } => {
-                                    ("plan".into(), format!("{} steps", steps.len()))
-                                }
-                                AgentEvent::StepStart { description, .. } => {
-                                    ("step_start".into(), description.chars().take(60).collect())
-                                }
-                                AgentEvent::HandoffStart { from, to } => {
-                                    ("handoff".into(), format!("{from}->{to}"))
-                                }
                                 AgentEvent::ContextCompressed {
                                     before_tokens,
                                     after_tokens,
@@ -465,41 +457,9 @@ async fn chat_with_agent(agent: &AgentHandle, message: &str, output: &OutputRend
                                 clear_spinner!();
                                 output.print_warning("执行已取消");
                             }
-                            AgentEvent::PlanGenerated { steps } => {
-                                clear_spinner!();
-                                let plan_label = nu_ansi_term::Color::Cyan.paint("  📋 执行计划:");
-                                println!("\n{}", plan_label);
-                                for (i, step) in steps.iter().enumerate() {
-                                    let step_text = format!("    {}. {}", i + 1, step);
-                                    let styled = nu_ansi_term::Color::Fixed(12).paint(&step_text);
-                                    println!("{}", styled);
-                                }
-                                first_chunk = true;
-                            }
-                            AgentEvent::StepStart {
-                                step_index: _,
-                                description,
-                            } => {
-                                let desc_preview: String = description.chars().take(60).collect();
-                                let step_label = format!("  ▶ 执行: {}...", desc_preview);
-                                let styled = nu_ansi_term::Color::Fixed(8).paint(&step_label);
-                                println!("{}", styled);
-                            }
-                            AgentEvent::StepEnd { .. } => {}
-                            AgentEvent::HandoffStart { from, to } => {
-                                let handoff_label = format!("  🔀 交接: {} -> {}", from, to);
-                                let styled = nu_ansi_term::Color::Yellow.paint(&handoff_label);
-                                println!("\n{}", styled);
-                                first_chunk = true;
-                            }
-                            AgentEvent::HandoffEnd { .. } => {}
                             AgentEvent::MemoryRecalled { .. } => {}
                             AgentEvent::Chart { .. } => {}
                             AgentEvent::GuardTriggered { .. } => {}
-                            AgentEvent::ReflectionStart { .. } => {}
-                            AgentEvent::ReflectionEnd { .. } => {}
-                            AgentEvent::CritiqueGenerated { .. } => {}
-                            AgentEvent::Refining { .. } => {}
                             AgentEvent::Error { source, message } => {
                                 clear_spinner!();
                                 output.print_error(&format!("[{}] {}", source, message));
