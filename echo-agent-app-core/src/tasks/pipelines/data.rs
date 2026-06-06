@@ -264,3 +264,34 @@ pub async fn run_data_pipeline_with_config(
 
     Ok(final_output)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_data_pipeline_config_defaults() {
+        let config = DataPipelineConfig::default();
+        assert!(config.dataset_path.is_empty());
+        assert!(config.objective.is_none());
+        assert_eq!(config.max_charts, 3);
+    }
+
+    #[test]
+    fn test_data_pipeline_config_builder() {
+        let config = DataPipelineConfig::new("data.csv")
+            .with_objective("find trends")
+            .with_max_charts(5);
+        assert_eq!(config.dataset_path, "data.csv");
+        assert_eq!(config.objective, Some("find trends".to_string()));
+        assert_eq!(config.max_charts, 5);
+    }
+
+    #[test]
+    fn test_data_pipeline_config_clone() {
+        let config = DataPipelineConfig::new("test.json").with_objective("analysis");
+        let cloned = config.clone();
+        assert_eq!(cloned.dataset_path, "test.json");
+        assert_eq!(cloned.objective, Some("analysis".to_string()));
+    }
+}

@@ -18,7 +18,8 @@ use crate::agent_handle::AgentHandle;
 use echo_agent::workflow::{Graph, GraphBuilder, SharedAgent, SharedState};
 use futures::future::BoxFuture;
 
-// ── Configuration ──────────────────────────────────────────────────────────────
+// Re-export quality utilities from shared module
+use super::quality::extract_quality_score;
 
 /// Configuration for the research pipeline.
 #[derive(Debug, Clone)]
@@ -70,177 +71,6 @@ impl ResearchConfig {
         self.quality_threshold = threshold;
         self
     }
-}
-
-// ── Quality Score Extraction (Structured Output) ───────────────────────────────
-
-/// Structured quality assessment from the review stage.
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct QualityAssessment {
-    /// Overall quality score (0-100).
-    #[serde(default = "default_quality_score")]
-    pub quality_score: u32,
-    /// Confidence in the assessment (0.0-1.0).
-    #[serde(default = "default_confidence")]
-    pub confidence: f64,
-    /// Brief summary of the assessment.
-    #[serde(default)]
-    pub summary: String,
-    /// Specific suggestions for improvement.
-    #[serde(default)]
-    pub suggestions: Vec<String>,
-    /// Whether the output needs revision.
-    #[serde(default)]
-    pub needs_revision: bool,
-}
-
-fn default_quality_score() -> u32 {
-    60
-}
-fn default_confidence() -> f64 {
-    0.5
-}
-
-/// Extract structured quality assessment from review text.
-///
-/// Primary strategy: parse JSON code block from the review.
-/// Fallback: heuristic regex scanning (legacy behavior).
-pub fn extract_quality_assessment(review_text: &str) -> QualityAssessment {
-    // Strategy 1: Extract fenced JSON block
-    if let Some(json_str) = extract_json_block(review_text) {
-        if let Ok(assessment) = serde_json::from_str::<QualityAssessment>(&json_str) {
-            tracing::info!(
-                pipeline = "research",
-                quality_score = assessment.quality_score,
-                confidence = assessment.confidence,
-                "Parsed structured quality assessment"
-            );
-            return assessment;
-        }
-    }
-
-    // Strategy 2: Try parsing the entire text as JSON
-    if let Ok(assessment) = serde_json::from_str::<QualityAssessment>(review_text.trim()) {
-        return assessment;
-    }
-
-    // Strategy 3: Fallback to legacy regex extraction
-    let score = extract_quality_score_legacy(review_text);
-    QualityAssessment {
-        quality_score: score,
-        confidence: 0.3,
-        summary: "Extracted via legacy regex".to_string(),
-        suggestions: vec![],
-        needs_revision: score < 70,
-    }
-}
-
-/// Extract the quality score (backward-compatible wrapper).
-///
-/// Tries structured JSON first, falls back to regex.
-pub fn extract_quality_score(review_text: &str) -> u32 {
-    extract_quality_assessment(review_text).quality_score
-}
-
-/// Returns the prompt suffix for structured quality assessment.
-///
-/// Append this to the review prompt to get JSON output.
-pub fn quality_assessment_prompt() -> &'static str {
-    r#"
-
-IMPORTANT: After your review, output a JSON assessment block in this exact format:
-
-```json
-{
-  "quality_score": <0-100>,
-  "confidence": <0.0-1.0>,
-  "summary": "<brief summary>",
-  "suggestions": ["<suggestion 1>", "<suggestion 2>"],
-  "needs_revision": <true/false>
-}
-```"#
-}
-
-/// Extract a JSON code block from markdown text.
-fn extract_json_block(text: &str) -> Option<String> {
-    // Look for ```json ... ``` or ```JSON ... ```
-    let markers = ["```json", "```JSON"];
-    for marker in &markers {
-        if let Some(start_idx) = text.find(marker) {
-            let after_marker = &text[start_idx + marker.len()..];
-            if let Some(end_idx) = after_marker.find("```") {
-                let json_str = after_marker[..end_idx].trim();
-                return Some(json_str.to_string());
-            }
-        }
-    }
-    // Try bare ``` blocks
-    if let Some(start_idx) = text.find("```") {
-        let after = &text[start_idx + 3..];
-        // Skip optional language tag
-        let content_start = after.find('\n').map(|i| i + 1).unwrap_or(0);
-        let content = &after[content_start..];
-        if let Some(end_idx) = content.find("```") {
-            let json_str = content[..end_idx].trim();
-            // Only return if it looks like JSON
-            if json_str.starts_with('{') {
-                return Some(json_str.to_string());
-            }
-        }
-    }
-    None
-}
-
-/// Legacy regex-based quality score extraction (kept as fallback).
-fn extract_quality_score_legacy(review_text: &str) -> u32 {
-    // Primary: look for "QUALITY_SCORE: <number>" pattern
-    for line in review_text.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("QUALITY_SCORE:") {
-            let rest = rest.trim();
-            if let Ok(score) = rest.parse::<u32>() {
-                return score.min(100);
-            }
-            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-            if let Ok(score) = digits.parse::<u32>() {
-                return score.min(100);
-            }
-        }
-    }
-
-    // Fallback heuristic: look for "Score:" prefix
-    for line in review_text.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("Score:") {
-            if let Ok(score) = rest.trim().parse::<u32>() {
-                return score.min(100);
-            }
-        }
-    }
-
-    // Fallback heuristic: look for "Quality Score" or "quality score" phrases
-    for line in review_text.lines() {
-        let lower = line.to_lowercase();
-        if lower.contains("quality score") {
-            if let Some(pos) = lower.find("quality score") {
-                let rest = &line[pos..];
-                let digits: String = rest
-                    .chars()
-                    .skip_while(|c| !c.is_ascii_digit())
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect();
-                if let Ok(score) = digits.parse::<u32>() {
-                    return score.min(100);
-                }
-            }
-        }
-    }
-
-    tracing::warn!(
-        pipeline = "research",
-        "Could not extract quality score from review text; defaulting to 60"
-    );
-    60
 }
 
 // ── Build the Research Graph ───────────────────────────────────────────────────
@@ -298,12 +128,27 @@ pub fn build_research_graph(agent: SharedAgent) -> anyhow::Result<Graph> {
                 state.set(
                     "tpl_fetch",
                     format!(
-                        "Based on the following search results, identify the most relevant \
-                         and impactful papers (up to {max_papers}). For each selected paper:\n\
-                         1. Summarize the key findings and contributions\n\
-                         2. Note the methodology and approach\n\
-                         3. Identify how it relates to the research topic\n\
-                         4. Note any limitations or gaps identified by the authors"
+                        "You have the following merged search results about: {topic}\n\n\
+                         Your task: DOWNLOAD AND READ the actual papers, not just the abstracts.\n\n\
+                         Instructions:\n\
+                         1. From the search results below, identify the top {top_n} most relevant \
+                         and impactful papers based on citation count and relevance to the topic.\n\
+                         2. For each selected paper, use the pdf_fetch tool to download and read \
+                         the full text. Use the PDF URL provided in the search results \
+                         (for ArXiv papers, the URL format is typically https://arxiv.org/pdf/<arxiv_id>).\n\
+                         3. After reading each paper, extract:\n\
+                            - Key findings and main contributions\n\
+                            - Methodology and approach details\n\
+                            - Specific results, metrics, or evidence\n\
+                            - Limitations and gaps identified by the authors\n\
+                            - How it relates to the research topic: {topic}\n\
+                         4. If a PDF URL is not available or download fails, use the abstract \
+                         and note that full text was not accessible.\n\
+                         5. Prioritize depth over breadth: it is better to thoroughly analyze \
+                         {top_n} papers than superficially skim {max_papers}.\n\n\
+                         IMPORTANT: You MUST use pdf_fetch to download papers. Do NOT just \
+                         summarize the abstracts — read the actual papers.",
+                        top_n = (max_papers / 2).max(3).min(10),
                     ),
                 )?;
 
@@ -311,15 +156,18 @@ pub fn build_research_graph(agent: SharedAgent) -> anyhow::Result<Graph> {
                     "tpl_synthesize",
                     format!(
                         "You are writing a comprehensive literature review on: {topic}\n\n\
+                         IMPORTANT: The following paper analyses are based on FULL TEXT readings, not just abstracts. \
+                         Use the detailed findings, methodology descriptions, and specific evidence extracted from the papers.\n\n\
                          Based on the following analyzed papers, write a structured literature review \
                          that includes:\n\
                          1. Introduction and background context\n\
                          2. Key themes and approaches in the field\n\
-                         3. Comparison of methodologies across papers\n\
-                         4. Major findings and contributions\n\
+                         3. Comparison of methodologies across papers (use specific details from the full texts)\n\
+                         4. Major findings and contributions (cite specific results and metrics)\n\
                          5. Identified gaps, contradictions, and future directions\n\n\
                          Use proper academic citations [1], [2], etc.\n\
-                         Ensure each claim is grounded in the papers analyzed."
+                         Ensure each claim is grounded in evidence from the papers analyzed.\n\
+                         Reference specific experiments, datasets, or results mentioned in the full texts."
                     ),
                 )?;
 
@@ -662,4 +510,38 @@ pub async fn run_research_with_config(
     });
 
     Ok(final_output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_research_config_defaults() {
+        let config = ResearchConfig::default();
+        assert!(config.topic.is_empty());
+        assert_eq!(config.max_papers, 20);
+        assert_eq!(config.max_revisions, 3);
+        assert_eq!(config.quality_threshold, 70);
+    }
+
+    #[test]
+    fn test_research_config_builder() {
+        let config = ResearchConfig::new("LLM agents")
+            .with_max_papers(50)
+            .with_max_revisions(5)
+            .with_quality_threshold(80);
+        assert_eq!(config.topic, "LLM agents");
+        assert_eq!(config.max_papers, 50);
+        assert_eq!(config.max_revisions, 5);
+        assert_eq!(config.quality_threshold, 80);
+    }
+
+    #[test]
+    fn test_research_config_clone() {
+        let config = ResearchConfig::new("test topic");
+        let cloned = config.clone();
+        assert_eq!(cloned.topic, "test topic");
+        assert_eq!(cloned.max_papers, 20);
+    }
 }

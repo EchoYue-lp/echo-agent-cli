@@ -16,7 +16,8 @@ use crate::agent_handle::AgentHandle;
 use echo_agent::workflow::{Graph, GraphBuilder, SharedAgent, SharedState};
 use futures::future::BoxFuture;
 
-// ── Configuration ──────────────────────────────────────────────────────────────
+// Use shared quality extraction
+use super::quality::extract_quality_score;
 
 /// Configuration for the writing pipeline.
 #[derive(Debug, Clone)]
@@ -77,167 +78,6 @@ impl WritingPipelineConfig {
         self.quality_threshold = threshold;
         self
     }
-}
-
-// ── Quality Score Extraction (Structured Output) ───────────────────────────────
-
-/// Structured quality assessment from the writing review stage.
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct WritingQualityAssessment {
-    /// Overall quality score (0-100).
-    #[serde(default = "default_writing_quality_score")]
-    pub quality_score: u32,
-    /// Confidence in the assessment (0.0-1.0).
-    #[serde(default = "default_writing_confidence")]
-    pub confidence: f64,
-    /// Brief summary of the assessment.
-    #[serde(default)]
-    pub summary: String,
-    /// Specific suggestions for improvement.
-    #[serde(default)]
-    pub suggestions: Vec<String>,
-    /// Whether the output needs revision.
-    #[serde(default)]
-    pub needs_revision: bool,
-}
-
-fn default_writing_quality_score() -> u32 {
-    50
-}
-fn default_writing_confidence() -> f64 {
-    0.5
-}
-
-/// Extract structured quality assessment from writing review text.
-///
-/// Primary strategy: parse JSON code block from the review.
-/// Fallback: heuristic regex scanning (legacy behavior).
-pub fn extract_writing_quality_assessment(review_text: &str) -> WritingQualityAssessment {
-    // Strategy 1: Extract fenced JSON block
-    if let Some(json_str) = extract_json_block(review_text) {
-        if let Ok(assessment) = serde_json::from_str::<WritingQualityAssessment>(&json_str) {
-            tracing::info!(
-                pipeline = "writing",
-                quality_score = assessment.quality_score,
-                confidence = assessment.confidence,
-                "Parsed structured writing quality assessment"
-            );
-            return assessment;
-        }
-    }
-
-    // Strategy 2: Try parsing the entire text as JSON
-    if let Ok(assessment) = serde_json::from_str::<WritingQualityAssessment>(review_text.trim()) {
-        return assessment;
-    }
-
-    // Strategy 3: Fallback to legacy regex extraction
-    let score = extract_writing_quality_score_legacy(review_text);
-    WritingQualityAssessment {
-        quality_score: score,
-        confidence: 0.3,
-        summary: "Extracted via legacy regex".to_string(),
-        suggestions: vec![],
-        needs_revision: score < 70,
-    }
-}
-
-/// Extract the writing quality score (backward-compatible wrapper).
-///
-/// Tries structured JSON first, falls back to regex.
-pub fn extract_writing_quality_score(review_text: &str) -> u32 {
-    extract_writing_quality_assessment(review_text).quality_score
-}
-
-/// Returns the prompt suffix for structured writing quality assessment.
-///
-/// Append this to the review prompt to get JSON output.
-pub fn writing_quality_assessment_prompt() -> &'static str {
-    r#"
-
-IMPORTANT: After your review, output a JSON assessment block in this exact format:
-
-```json
-{
-  "quality_score": <0-100>,
-  "confidence": <0.0-1.0>,
-  "summary": "<brief summary>",
-  "suggestions": ["<suggestion 1>", "<suggestion 2>"],
-  "needs_revision": <true/false>
-}
-```"#
-}
-
-/// Extract a JSON code block from markdown text.
-fn extract_json_block(text: &str) -> Option<String> {
-    // Look for ```json ... ``` or ```JSON ... ```
-    let markers = ["```json", "```JSON"];
-    for marker in &markers {
-        if let Some(start_idx) = text.find(marker) {
-            let after_marker = &text[start_idx + marker.len()..];
-            if let Some(end_idx) = after_marker.find("```") {
-                let json_str = after_marker[..end_idx].trim();
-                return Some(json_str.to_string());
-            }
-        }
-    }
-    // Try bare ``` blocks
-    if let Some(start_idx) = text.find("```") {
-        let after = &text[start_idx + 3..];
-        // Skip optional language tag
-        let content_start = after.find('\n').map(|i| i + 1).unwrap_or(0);
-        let content = &after[content_start..];
-        if let Some(end_idx) = content.find("```") {
-            let json_str = content[..end_idx].trim();
-            // Only return if it looks like JSON
-            if json_str.starts_with('{') {
-                return Some(json_str.to_string());
-            }
-        }
-    }
-    None
-}
-
-/// Legacy regex-based quality score extraction (kept as fallback).
-fn extract_writing_quality_score_legacy(review_text: &str) -> u32 {
-    // Primary: look for "QUALITY_SCORE: <number>" pattern
-    for line in review_text.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("QUALITY_SCORE:") {
-            let rest = rest.trim();
-            if let Ok(score) = rest.parse::<u32>() {
-                return score.min(100);
-            }
-            let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-            if let Ok(score) = digits.parse::<u32>() {
-                return score.min(100);
-            }
-        }
-    }
-
-    // Fallback heuristic: look for "Quality Score" or "quality score" phrases
-    for line in review_text.lines() {
-        let lower = line.to_lowercase();
-        if lower.contains("quality score") {
-            if let Some(pos) = lower.find("quality score") {
-                let rest = &line[pos..];
-                let digits: String = rest
-                    .chars()
-                    .skip_while(|c| !c.is_ascii_digit())
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect();
-                if let Ok(score) = digits.parse::<u32>() {
-                    return score.min(100);
-                }
-            }
-        }
-    }
-
-    tracing::warn!(
-        pipeline = "writing",
-        "Could not extract quality score from review text; defaulting to 50"
-    );
-    50
 }
 
 // ── Build the Writing Graph ────────────────────────────────────────────────────
@@ -379,7 +219,7 @@ pub fn build_writing_graph(agent: &SharedAgent) -> anyhow::Result<Graph> {
         .add_function_node("evaluate_quality", |state: &SharedState| -> BoxFuture<'_, Result<(), echo_agent::error::ReactError>> {
             Box::pin(async move {
                 let review_text: String = state.get("review").unwrap_or_default();
-                let score = extract_writing_quality_score(&review_text);
+                let score = extract_quality_score(&review_text);
                 let _ = state.set("quality_score", score as i64);
 
                 let revision_count: i64 = state.get("revision_count").unwrap_or(0);
@@ -561,4 +401,41 @@ pub async fn run_writing_pipeline_with_config(
     });
 
     Ok(final_output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_writing_pipeline_config_defaults() {
+        let config = WritingPipelineConfig::default();
+        assert!(config.topic.is_empty());
+        assert_eq!(config.audience, "general audience");
+        assert_eq!(config.format, "markdown");
+        assert_eq!(config.max_revisions, 3);
+        assert_eq!(config.quality_threshold, 70);
+    }
+
+    #[test]
+    fn test_writing_pipeline_config_builder() {
+        let config = WritingPipelineConfig::new("Rust async")
+            .with_audience("developers")
+            .with_format("latex")
+            .with_max_revisions(5)
+            .with_quality_threshold(85);
+        assert_eq!(config.topic, "Rust async");
+        assert_eq!(config.audience, "developers");
+        assert_eq!(config.format, "latex");
+        assert_eq!(config.max_revisions, 5);
+        assert_eq!(config.quality_threshold, 85);
+    }
+
+    #[test]
+    fn test_writing_pipeline_config_clone() {
+        let config = WritingPipelineConfig::new("test");
+        let cloned = config.clone();
+        assert_eq!(cloned.topic, "test");
+        assert_eq!(cloned.format, "markdown");
+    }
 }
