@@ -6,6 +6,4 @@ pub mod gitignore;
 pub mod index;
 pub mod modes;
 pub mod prompt;
-pub mod prompt_stack;
 pub mod test_runner;
-pub mod tool_visibility;

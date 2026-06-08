@@ -152,10 +152,10 @@ pub fn load_builtin_pipelines() -> Vec<PipelineDefinition> {
     if let Ok(entries) = std::fs::read_dir(&builtin_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) == Some("yaml") {
-                if let Ok(def) = PipelineLoader::from_yaml(&path) {
-                    pipelines.push(def);
-                }
+            if path.extension().and_then(|s| s.to_str()) == Some("yaml")
+                && let Ok(def) = PipelineLoader::from_yaml(&path)
+            {
+                pipelines.push(def);
             }
         }
     }

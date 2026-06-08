@@ -514,77 +514,75 @@ cmd!(
 
 // ── FixCommand ───────────────────────────────────────────────────────
 
-async fn cmd_fix(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
+async fn cmd_fix(ctx: &CommandContext, _args: &[&str]) -> CommandOutcome {
     if let Some(ref cl) = ctx.coding_loop {
         let (cmd, root) = {
             let g = cl.lock().await;
             (g.test_command().to_string(), g.project_root.clone())
         };
 
-        let max_rounds: u32 = args.first().and_then(|s| s.parse().ok()).unwrap_or(3);
-
-        println!("Starting test-fix loop (max {} rounds)", max_rounds);
-
-        for round in 1..=max_rounds {
-            println!("\n--- Round {}/{} ---", round, max_rounds);
-            println!("Running: {}", cmd);
-
-            let parts: Vec<&str> = cmd.split_whitespace().collect();
-            let (program, cmd_args) = if parts.is_empty() {
-                ("echo", vec!["no test command"])
-            } else {
-                (parts[0], parts[1..].to_vec())
-            };
-
-            let result = tokio::process::Command::new(program)
-                .args(&cmd_args)
-                .current_dir(&root)
-                .output()
-                .await;
-
-            match result {
-                Ok(output) if output.status.success() => {
-                    println!("✅ Tests PASSED on round {}!", round);
-                    return CommandOutcome::Continue;
-                }
-                Ok(output) => {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    let combined = format!("{}\n{}", stdout, stderr);
-
-                    println!("❌ Tests FAILED on round {}", round);
-                    println!("\nError output:");
-                    println!("{}", combined);
-
-                    if round < max_rounds {
-                        println!("\nAsking agent to analyze and fix the errors...");
-
-                        let fix_prompt = format!(
-                            "The test command '{}' failed with the following output:\n\n{}\n\n\
-                             Please analyze the errors and fix the code. \
-                             Focus on the root cause, not just symptoms.",
-                            cmd, combined
-                        );
-
-                        // Return to REPL with the fix prompt - the agent will process it
-                        return CommandOutcome::Chat(fix_prompt);
-                    } else {
-                        println!("\n⚠️  Max rounds reached. Tests still failing.");
-                        println!("Consider reviewing the errors manually.");
-                    }
-                }
-                Err(e) => {
-                    println!("❌ Failed to run test command: {}", e);
-                    return CommandOutcome::Continue;
-                }
-            }
+        if cmd.is_empty() {
+            println!("No test command configured.");
+            return CommandOutcome::Continue;
         }
 
-        println!("\n⚠️  Test-fix loop completed after {} rounds", max_rounds);
+        println!("Running: {}", cmd);
+
+        let parts: Vec<&str> = cmd.split_whitespace().collect();
+        let (program, cmd_args) = if parts.is_empty() {
+            ("echo", vec!["no test command"])
+        } else {
+            (parts[0], parts[1..].to_vec())
+        };
+
+        let result = tokio::process::Command::new(program)
+            .args(&cmd_args)
+            .current_dir(&root)
+            .output()
+            .await;
+
+        match result {
+            Ok(output) if output.status.success() => {
+                println!("✅ All tests passed!");
+                CommandOutcome::Continue
+            }
+            Ok(output) => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let combined = format!("{}\n{}", stdout, stderr);
+
+                println!("❌ Tests FAILED");
+                println!("\nError output:");
+                // Truncate long output for display
+                let max_display = 2000;
+                if combined.len() > max_display {
+                    println!("{}...", &combined[..max_display]);
+                    println!("\n(truncated, {} more chars)", combined.len() - max_display);
+                } else {
+                    println!("{}", combined);
+                }
+
+                println!("\nAsking agent to analyze and fix the errors...");
+
+                let fix_prompt = format!(
+                    "The test command '{}' failed with the following output:\n\n{}\n\n\
+                     Please analyze the errors and fix the code. \
+                     Focus on the root cause, not just symptoms. \
+                     After fixing, the user can run /fix again to verify.",
+                    cmd, combined
+                );
+
+                CommandOutcome::Chat(fix_prompt)
+            }
+            Err(e) => {
+                println!("❌ Failed to run test command: {}", e);
+                CommandOutcome::Continue
+            }
+        }
     } else {
         println!("Coding mode not active.");
+        CommandOutcome::Continue
     }
-    CommandOutcome::Continue
 }
 cmd!(
     FixCommand,

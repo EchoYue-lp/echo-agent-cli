@@ -117,6 +117,7 @@ impl std::fmt::Display for WorkspaceId {
 /// 工作区类型。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Default)]
 pub enum WorkspaceKind {
     /// 代码项目工作区。
     Code {
@@ -134,13 +135,8 @@ pub enum WorkspaceKind {
         topics: Vec<String>,
     },
     /// 通用工作区。
+    #[default]
     General,
-}
-
-impl Default for WorkspaceKind {
-    fn default() -> Self {
-        Self::General
-    }
 }
 
 impl WorkspaceKind {

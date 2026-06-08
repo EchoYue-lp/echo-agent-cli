@@ -161,35 +161,35 @@ impl ProjectIndex {
 
             if path.is_dir() {
                 self.walk(root, &path, skip, allow_dot_dirs, include_dotfiles);
-            } else if path.is_file() {
-                if let Ok(meta) = path.metadata() {
-                    // Size cap: skip files larger than 1MB for indexing
-                    if meta.len() > 1_048_576 {
-                        continue;
-                    }
-                    let relative = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
-                    let language = detect_language(&relative);
-                    let (symbols, imports) = if language.is_some() {
-                        extract_symbols_and_imports(&path, language.as_deref())
-                    } else {
-                        (Vec::new(), Vec::new())
-                    };
-
-                    let info = FileInfo {
-                        relative_path: relative,
-                        size: meta.len(),
-                        modified: meta.modified().ok().and_then(|t| {
-                            t.duration_since(SystemTime::UNIX_EPOCH)
-                                .ok()
-                                .map(|d| d.as_secs())
-                        }),
-                        language,
-                        symbols,
-                        imports,
-                    };
-
-                    self.files.push(info);
+            } else if path.is_file()
+                && let Ok(meta) = path.metadata()
+            {
+                // Size cap: skip files larger than 1MB for indexing
+                if meta.len() > 1_048_576 {
+                    continue;
                 }
+                let relative = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
+                let language = detect_language(&relative);
+                let (symbols, imports) = if language.is_some() {
+                    extract_symbols_and_imports(&path, language.as_deref())
+                } else {
+                    (Vec::new(), Vec::new())
+                };
+
+                let info = FileInfo {
+                    relative_path: relative,
+                    size: meta.len(),
+                    modified: meta.modified().ok().and_then(|t| {
+                        t.duration_since(SystemTime::UNIX_EPOCH)
+                            .ok()
+                            .map(|d| d.as_secs())
+                    }),
+                    language,
+                    symbols,
+                    imports,
+                };
+
+                self.files.push(info);
             }
         }
     }
@@ -238,7 +238,7 @@ impl ProjectIndex {
 
         self.files
             .iter()
-            .filter(|f| f.modified.map_or(false, |m| m >= threshold))
+            .filter(|f| f.modified.is_some_and(|m| m >= threshold))
             .collect()
     }
 
@@ -255,7 +255,7 @@ impl ProjectIndex {
         };
 
         let mut related = Vec::new();
-        for (_, &idx) in &self.by_path {
+        for &idx in self.by_path.values() {
             if idx == target_idx {
                 continue;
             }
@@ -344,7 +344,7 @@ fn extract_symbols_and_imports(path: &Path, language: Option<&str>) -> (Vec<Stri
                 } else if trimmed.starts_with("pub struct ") {
                     if let Some(name) = trimmed
                         .strip_prefix("pub struct ")
-                        .and_then(|s| s.split(|c: char| c == '<' || c == '{' || c == '(').next())
+                        .and_then(|s| s.split(['<', '{', '(']).next())
                     {
                         symbols.push(name.trim().to_string());
                     }
@@ -357,13 +357,12 @@ fn extract_symbols_and_imports(path: &Path, language: Option<&str>) -> (Vec<Stri
                     }
                 } else if trimmed.starts_with("use ") {
                     imports.push(trimmed.to_string());
-                } else if trimmed.starts_with("mod ") {
-                    if let Some(name) = trimmed
+                } else if trimmed.starts_with("mod ")
+                    && let Some(name) = trimmed
                         .strip_prefix("mod ")
                         .and_then(|s| s.split(';').next())
-                    {
-                        symbols.push(format!("mod {name}").trim().to_string());
-                    }
+                {
+                    symbols.push(format!("mod {name}").trim().to_string());
                 }
             }
             Some("python") => {
@@ -377,7 +376,7 @@ fn extract_symbols_and_imports(path: &Path, language: Option<&str>) -> (Vec<Stri
                 } else if trimmed.starts_with("class ") {
                     if let Some(name) = trimmed
                         .strip_prefix("class ")
-                        .and_then(|s| s.split(|c: char| c == '(' || c == ':').next())
+                        .and_then(|s| s.split(['(', ':']).next())
                     {
                         symbols.push(name.trim().to_string());
                     }
@@ -410,12 +409,10 @@ fn extract_symbols_and_imports(path: &Path, language: Option<&str>) -> (Vec<Stri
                     || trimmed.starts_with("func ")
                     || trimmed.starts_with("def "))
                     && trimmed.contains('(')
+                    && let Some(name) = trimmed.split_whitespace().nth(1)
+                    && let Some(name) = name.split('(').next()
                 {
-                    if let Some(name) = trimmed.split_whitespace().nth(1) {
-                        if let Some(name) = name.split('(').next() {
-                            symbols.push(name.to_string());
-                        }
-                    }
+                    symbols.push(name.to_string());
                 }
             }
         }

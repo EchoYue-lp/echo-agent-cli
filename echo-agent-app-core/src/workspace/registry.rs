@@ -218,14 +218,13 @@ impl WorkspaceRegistry {
         for (id_str, root_str) in &index.entries {
             let root = PathBuf::from(root_str);
             let manifest = WorkspaceLayout::existing_manifest(&root);
-            if manifest.exists() {
-                if let Ok(data) = fs::read_to_string(&manifest) {
-                    if let Ok(ws) = serde_json::from_str::<Workspace>(&data) {
-                        seen_ids.insert(id_str.clone());
-                        workspaces.push(ws);
-                        continue;
-                    }
-                }
+            if manifest.exists()
+                && let Ok(data) = fs::read_to_string(&manifest)
+                && let Ok(ws) = serde_json::from_str::<Workspace>(&data)
+            {
+                seen_ids.insert(id_str.clone());
+                workspaces.push(ws);
+                continue;
             }
             // 索引条目无效（目录被手动删除了），忽略
             tracing::warn!(
@@ -246,12 +245,11 @@ impl WorkspaceRegistry {
                 if !manifest.exists() {
                     continue;
                 }
-                if let Ok(data) = fs::read_to_string(&manifest) {
-                    if let Ok(ws) = serde_json::from_str::<Workspace>(&data) {
-                        if !seen_ids.contains(ws.id.as_str()) {
-                            workspaces.push(ws);
-                        }
-                    }
+                if let Ok(data) = fs::read_to_string(&manifest)
+                    && let Ok(ws) = serde_json::from_str::<Workspace>(&data)
+                    && !seen_ids.contains(ws.id.as_str())
+                {
+                    workspaces.push(ws);
                 }
             }
         }
@@ -390,12 +388,11 @@ impl WorkspaceRegistry {
         let mut current = cwd.to_path_buf();
         loop {
             let manifest = WorkspaceLayout::existing_manifest(&current);
-            if manifest.exists() {
-                if let Ok(data) = fs::read_to_string(&manifest) {
-                    if let Ok(ws) = serde_json::from_str::<Workspace>(&data) {
-                        return Some(ws);
-                    }
-                }
+            if manifest.exists()
+                && let Ok(data) = fs::read_to_string(&manifest)
+                && let Ok(ws) = serde_json::from_str::<Workspace>(&data)
+            {
+                return Some(ws);
             }
             if !current.pop() {
                 break;

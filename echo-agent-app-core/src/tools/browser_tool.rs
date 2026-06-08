@@ -1,12 +1,19 @@
 //! Browser Tool - MCP Playwright Integration
 //!
 //! Provides browser automation capabilities through MCP Playwright server.
-//! Requires `@anthropic-ai/mcp-server-playwright` to be installed and configured.
+//! Requires `@anthropic-ai/mcp-server-playwright` to be installed and configured
+//! in your MCP config file (e.g., `~/.echo-agent/mcp.yaml`).
+//!
+//! ## Status
+//!
+//! This is a **stub tool** that returns an informative error directing users
+//! to configure the MCP Playwright server. It is registered by default so
+//! the agent knows browser capabilities exist, but actual browser operations
+//! require the MCP server to be running.
 
 use echo_agent::prelude::*;
-use std::collections::HashMap;
 
-/// Browser automation tool using MCP Playwright
+/// Browser automation tool stub — directs users to configure MCP Playwright.
 pub struct BrowserTool;
 
 impl BrowserTool {
@@ -21,13 +28,28 @@ impl Default for BrowserTool {
     }
 }
 
+const SETUP_MESSAGE: &str = "\
+BrowserTool requires the MCP Playwright server to be configured.
+
+To enable browser automation, add the following to your MCP config
+(~/.echo-agent/mcp.yaml or --mcp-config <path>):
+
+  servers:
+    playwright:
+      command: npx
+      args:
+        - \"@anthropic-ai/mcp-server-playwright\"
+
+Then restart echo-agent. Browser actions will be routed through the MCP server.";
+
 impl Tool for BrowserTool {
     fn name(&self) -> &str {
         "browser"
     }
 
     fn description(&self) -> &str {
-        "Browser automation tool: navigate, screenshot, click, fill forms, and extract content from web pages"
+        "Browser automation tool (navigate, screenshot, click, fill, extract, scroll). \
+         Requires MCP Playwright server to be configured."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -64,49 +86,17 @@ impl Tool for BrowserTool {
         Box::pin(async move {
             let action = parameters.get("action")
                 .and_then(|v| v.as_str())
-                .unwrap_or("navigate");
+                .unwrap_or("unknown");
 
-            match action {
-                "navigate" => {
-                    let url = parameters.get("url")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    if url.is_empty() {
-                        return Ok(ToolResult::error("URL is required for navigate action"));
-                    }
-                    // In actual implementation, this would call the MCP Playwright server
-                    Ok(ToolResult::success(format!("Navigated to {}", url)))
-                }
-                "screenshot" => {
-                    // In actual implementation, this would capture a screenshot via MCP
-                    Ok(ToolResult::success("Screenshot captured"))
-                }
-                "click" => {
-                    let selector = parameters.get("selector")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    Ok(ToolResult::success(format!("Clicked element: {}", selector)))
-                }
-                "fill" => {
-                    let selector = parameters.get("selector")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    let text = parameters.get("text")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
-                    Ok(ToolResult::success(format!("Filled {} with '{}'", selector, text)))
-                }
-                "extract" => {
-                    let max_length = parameters.get("max_length")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(5000) as usize;
-                    Ok(ToolResult::success(format!("Extracted page content (max {} chars)", max_length)))
-                }
-                "scroll" => {
-                    Ok(ToolResult::success("Scrolled page"))
-                }
-                _ => Ok(ToolResult::error(format!("Unknown browser action: {}", action))),
-            }
+            tracing::warn!(
+                action = action,
+                "BrowserTool stub called — MCP Playwright not configured"
+            );
+
+            Ok(ToolResult::error(format!(
+                "Browser action '{}' cannot be executed: {}",
+                action, SETUP_MESSAGE
+            )))
         })
     }
 
@@ -119,6 +109,6 @@ impl Tool for BrowserTool {
     }
 
     fn capability_description(&self) -> &str {
-        "Browser automation via Playwright MCP"
+        "Browser automation via Playwright MCP (requires MCP server configuration)"
     }
 }

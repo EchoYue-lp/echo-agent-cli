@@ -148,7 +148,7 @@ fn default_research_max_revisions() -> u32 {
 }
 
 fn default_research_quality_threshold() -> u32 {
-    7
+    70
 }
 
 fn default_rtw_writing_max_revisions() -> u32 {
@@ -164,7 +164,7 @@ fn default_wp_max_revisions() -> u32 {
 }
 
 fn default_wp_quality_threshold() -> u32 {
-    7
+    70
 }
 
 fn default_max_charts() -> usize {
@@ -323,7 +323,7 @@ impl BackgroundTaskKind {
             } => format!(
                 "Write a {format} about '{topic}' for {audience}. Follow this workflow:\n\
                  1. Create a detailed outline\n2. Write a complete draft following the outline\n\
-                 3. Review the draft critically (score quality 1-{quality_threshold})\n\
+                 3. Review the draft critically (score quality 0-100)\n\
                  4. If quality < {quality_threshold}, revise and re-review (up to \
                  {max_revisions} revisions)\n\
                  5. Finalize the document"

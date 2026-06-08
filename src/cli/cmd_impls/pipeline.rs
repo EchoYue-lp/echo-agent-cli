@@ -165,7 +165,7 @@ async fn pipeline_writing(ctx: &CommandContext, args: &[&str]) -> CommandOutcome
         audience: "general audience".to_string(),
         format: "markdown".to_string(),
         max_revisions: 3,
-        quality_threshold: 7,
+        quality_threshold: 70,
     };
 
     match service
@@ -245,8 +245,9 @@ async fn pipeline_list(ctx: &CommandContext, _args: &[&str]) -> CommandOutcome {
             .filter(|t| {
                 t.tags.iter().any(|tag| {
                     tag == "bg:kind:research"
-                        || tag == "bg:kind:data-pipeline"
-                        || tag == "bg:kind:writing-pipeline"
+                        || tag == "bg:kind:research_to_writing"
+                        || tag == "bg:kind:data_pipeline"
+                        || tag == "bg:kind:writing_pipeline"
                 })
             })
             .collect();

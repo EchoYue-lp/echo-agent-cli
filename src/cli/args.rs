@@ -34,6 +34,10 @@ pub struct Args {
     #[arg(long, short = 'm', env = "MODEL_NAME")]
     pub model: Option<String>,
 
+    /// Agent 工作模式 (general, coding, research, data, writing)
+    #[arg(long, short = 'M', env = "ECHOCOWORK_MODE", default_value = "coding")]
+    pub mode: String,
+
     /// 项目目录（自动加载 AGENTS.md 等项目指令）
     #[arg(long)]
     pub project: Option<String>,

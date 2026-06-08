@@ -12,6 +12,7 @@ EchoCoWork 是一个生产级的通用 Agent 产品，基于 Rust 生态构建�
 - **💻 Coding** — 代码生成、审查、重构、调试、测试
 - **📊 数据分析** — 结构化数据分析、统计、可视化、报告生成
 - **📚 学术研究** — arXiv/语义学者检索、论文阅读、学术写作辅助
+- **🏥 医学研究** — PubMed 文献检索、临床试验查询、循证医学分析
 
 ### 核心特性
 
@@ -273,7 +274,7 @@ sudo cp target/release/echo-agent-tauri /Applications/EchoCoWork.app/Contents/Ma
 
 | 命令 | 别名 | 描述 |
 |------|------|------|
-| `/mode <mode>` | | 切换模式（general/coding/research/data/writing） |
+| `/mode <mode>` | | 切换模式（general/coding/research/medical/data/writing） |
 | `/model <name>` | | 切换模型 |
 | `/think` | | 切换推理/思考显示 |
 | `/reasoning` | | 切换推理过程显示 |
@@ -315,6 +316,17 @@ sudo cp target/release/echo-agent-tauri /Applications/EchoCoWork.app/Contents/Ma
 | `/search-papers` | `sp` | 搜索学术论文 |
 | `/fetch-paper` | `fp` | 获取指定论文 |
 | `/papers` | | 列出已有论文 |
+
+#### Medical 医学研究
+
+医学模式通过 `/mode medical` 切换，Agent 可直接调用以下工具（无需 slash 命令）：
+
+- `pubmed_search` — 搜索 PubMed 医学文献（PMID、MeSH 词、摘要）
+- `clinical_trials_search` — 搜索 ClinicalTrials.gov 临床试验（NCT ID、状态、阶段、结局）
+- `pdf_fetch` — 下载并解析论文全文
+- `web_search` + `web_fetch` — 网络搜索补充信息
+
+所有医学工具**免费使用**，无需 API Key。详见 [配置指南](docs/configuration.md#学术研究与医学模式)。
 
 #### Pipeline 流水线
 

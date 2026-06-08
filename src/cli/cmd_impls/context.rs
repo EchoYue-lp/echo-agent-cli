@@ -106,7 +106,7 @@ cmd!(
     ReasoningCommand,
     "reasoning",
     CommandCategory::Context,
-    "Set reasoning effort (low/medium/high)",
+    "Set reasoning effort (low/medium/high) — alias of /think",
     cmd_reasoning
 );
 

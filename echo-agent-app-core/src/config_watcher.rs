@@ -26,12 +26,9 @@ pub fn resolve_config_path(explicit: Option<&str>) -> Option<PathBuf> {
             return Some(path);
         }
     }
-    for path in echo_agent::config::config_search_paths() {
-        if path.exists() {
-            return Some(path);
-        }
-    }
-    None
+    echo_agent::config::config_search_paths()
+        .into_iter()
+        .find(|path| path.exists())
 }
 
 /// Spawn a background task that watches the config file for changes.
@@ -118,7 +115,7 @@ pub fn spawn_config_watcher(
     })
 }
 
-async fn handle_config_change(config_path: &PathBuf, agent: &AgentHandle) {
+async fn handle_config_change(config_path: &std::path::Path, agent: &AgentHandle) {
     let path_str = config_path.to_str().unwrap_or("").to_string();
 
     // 1. Fire ConfigChange hook

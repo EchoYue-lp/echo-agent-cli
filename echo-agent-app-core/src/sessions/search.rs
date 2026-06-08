@@ -159,8 +159,7 @@ impl SessionSearchEngine {
         let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
 
         // FTS5 columns: session_id(0), session_name(1), model(2), content(3)
-        let sql = format!(
-            "SELECT
+        let sql = "SELECT
                 m.session_id,
                 m.session_name,
                 m.model,
@@ -171,7 +170,7 @@ impl SessionSearchEngine {
              WHERE sessions_fts MATCH ?1
              ORDER BY rank
              LIMIT ?2"
-        );
+            .to_string();
 
         let mut stmt = conn.prepare(&sql)?;
         let results = stmt
@@ -221,46 +220,46 @@ impl SessionSearchEngine {
         let mut count = 0;
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().map(|e| e == "json").unwrap_or(false) {
-                if let Ok(data) = std::fs::read_to_string(&path) {
-                    if is_v2 {
-                        if let Ok(session) = serde_json::from_str::<serde_json::Value>(&data) {
-                            let id = session["id"].as_str().unwrap_or("");
-                            let name = session["name"].as_str().unwrap_or("");
-                            let model = session["model"].as_str().unwrap_or("");
-                            let messages: Vec<String> = session["messages"]
-                                .as_array()
-                                .map(|arr| {
-                                    arr.iter()
-                                        .filter_map(|m| m["content"].as_str().map(String::from))
-                                        .collect()
-                                })
-                                .unwrap_or_default();
+            if path.extension().map(|e| e == "json").unwrap_or(false)
+                && let Ok(data) = std::fs::read_to_string(&path)
+            {
+                if is_v2 {
+                    if let Ok(session) = serde_json::from_str::<serde_json::Value>(&data) {
+                        let id = session["id"].as_str().unwrap_or("");
+                        let name = session["name"].as_str().unwrap_or("");
+                        let model = session["model"].as_str().unwrap_or("");
+                        let messages: Vec<String> = session["messages"]
+                            .as_array()
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|m| m["content"].as_str().map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
 
-                            if !id.is_empty() {
-                                self.index_session(id, name, model, &messages)?;
-                                count += 1;
-                            }
+                        if !id.is_empty() {
+                            self.index_session(id, name, model, &messages)?;
+                            count += 1;
                         }
-                    } else {
-                        // v1 format: { name, model, messages: [{ content }], ... }
-                        if let Ok(session) = serde_json::from_str::<serde_json::Value>(&data) {
-                            let name = session["name"].as_str().unwrap_or("");
-                            let model = session["model"].as_str().unwrap_or("");
-                            let messages: Vec<String> = session["messages"]
-                                .as_array()
-                                .map(|arr| {
-                                    arr.iter()
-                                        .filter_map(|m| m["content"].as_str().map(String::from))
-                                        .collect()
-                                })
-                                .unwrap_or_default();
+                    }
+                } else {
+                    // v1 format: { name, model, messages: [{ content }], ... }
+                    if let Ok(session) = serde_json::from_str::<serde_json::Value>(&data) {
+                        let name = session["name"].as_str().unwrap_or("");
+                        let model = session["model"].as_str().unwrap_or("");
+                        let messages: Vec<String> = session["messages"]
+                            .as_array()
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|m| m["content"].as_str().map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
 
-                            if !name.is_empty() {
-                                // v1 uses name as identifier
-                                self.index_session(name, name, model, &messages)?;
-                                count += 1;
-                            }
+                        if !name.is_empty() {
+                            // v1 uses name as identifier
+                            self.index_session(name, name, model, &messages)?;
+                            count += 1;
                         }
                     }
                 }

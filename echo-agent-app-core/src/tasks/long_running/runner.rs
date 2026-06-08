@@ -111,7 +111,7 @@ impl LongRunningTaskRunner {
             );
         }
 
-        for (idx, executor) in phase_executors.into_iter().enumerate().skip(start_idx) {
+        for idx in start_idx..phase_executors.len() {
             if self.cancel.is_cancelled() {
                 return Err(anyhow::anyhow!("Task cancelled before phase {}", idx));
             }
@@ -129,30 +129,72 @@ impl LongRunningTaskRunner {
                 self.plan.phases.len()
             );
 
-            let ctx = PhaseContext {
-                task_id: self.task_id.clone(),
-                phase_id: phase.id.clone(),
-                previous_outputs: phase_outputs.clone(),
-                phase_state: phase_state.clone(),
-                cancel: self.cancel.child_token(),
-                progress: Arc::new(ProgressReporter::new(
-                    self.task_id.clone(),
-                    self.plan.clone(),
-                )),
-            };
+            let max_attempts = phase.max_retries + 1; // retries + initial attempt
+            let mut last_error = String::new();
 
-            // Apply phase timeout if configured
-            let outcome = if phase.timeout_secs > 0 {
-                let timeout = std::time::Duration::from_secs(phase.timeout_secs);
-                match tokio::time::timeout(timeout, executor(ctx)).await {
-                    Ok(outcome) => outcome,
-                    Err(_) => PhaseOutcome::Failed(format!(
-                        "Phase '{}' timed out after {} seconds",
-                        phase.name, phase.timeout_secs
-                    )),
+            let outcome = 'retry: {
+                for attempt in 1..=max_attempts {
+                    if self.cancel.is_cancelled() {
+                        break 'retry PhaseOutcome::Cancelled;
+                    }
+
+                    if attempt > 1 {
+                        tracing::info!(
+                            "Task {} phase {} retry {}/{}",
+                            self.task_id,
+                            phase.name,
+                            attempt - 1,
+                            phase.max_retries
+                        );
+                        // Exponential backoff: 1s, 2s, 4s, ...
+                        let backoff = std::time::Duration::from_secs(1u64 << (attempt - 2).min(6));
+                        tokio::time::sleep(backoff).await;
+                    }
+
+                    let ctx = PhaseContext {
+                        task_id: self.task_id.clone(),
+                        phase_id: phase.id.clone(),
+                        previous_outputs: phase_outputs.clone(),
+                        phase_state: phase_state.clone(),
+                        cancel: self.cancel.child_token(),
+                        progress: Arc::new(ProgressReporter::new(
+                            self.task_id.clone(),
+                            self.plan.clone(),
+                        )),
+                    };
+
+                    // Apply phase timeout if configured
+                    let outcome = if phase.timeout_secs > 0 {
+                        let timeout = std::time::Duration::from_secs(phase.timeout_secs);
+                        match tokio::time::timeout(timeout, phase_executors[idx](ctx)).await {
+                            Ok(outcome) => outcome,
+                            Err(_) => PhaseOutcome::Failed(format!(
+                                "Phase '{}' timed out after {} seconds",
+                                phase.name, phase.timeout_secs
+                            )),
+                        }
+                    } else {
+                        phase_executors[idx](ctx).await
+                    };
+
+                    match &outcome {
+                        PhaseOutcome::Failed(err) => {
+                            last_error = err.clone();
+                            tracing::warn!(
+                                "Task {} phase {} attempt {}/{} failed: {}",
+                                self.task_id,
+                                phase.name,
+                                attempt,
+                                max_attempts,
+                                err
+                            );
+                            // Continue to next attempt
+                        }
+                        _ => break 'retry outcome,
+                    }
                 }
-            } else {
-                executor(ctx).await
+                // All attempts exhausted
+                PhaseOutcome::Failed(last_error)
             };
 
             match outcome {
@@ -178,54 +220,52 @@ impl LongRunningTaskRunner {
                         .await?;
 
                     // Check for human checkpoint
-                    if phase.human_checkpoint {
-                        if let Some(ref provider) = self.human_loop_provider {
-                            let request = HumanLoopRequest::selection(
-                                &self.task_id,
-                                format!(
-                                    "Phase '{}' completed. Review and approve to continue.",
-                                    phase.name
-                                ),
-                                vec![
-                                    "approve".to_string(),
-                                    "revise".to_string(),
-                                    "cancel".to_string(),
-                                ],
-                            )
-                            .with_context(
-                                phase_outputs.get(&phase.id).cloned().unwrap_or(Value::Null),
-                            )
-                            .with_phase(&phase.id);
+                    if phase.human_checkpoint
+                        && let Some(ref provider) = self.human_loop_provider
+                    {
+                        let request = HumanLoopRequest::selection(
+                            &self.task_id,
+                            format!(
+                                "Phase '{}' completed. Review and approve to continue.",
+                                phase.name
+                            ),
+                            vec![
+                                "approve".to_string(),
+                                "revise".to_string(),
+                                "cancel".to_string(),
+                            ],
+                        )
+                        .with_context(phase_outputs.get(&phase.id).cloned().unwrap_or(Value::Null))
+                        .with_phase(&phase.id);
 
-                            let response = tokio::select! {
-                                result = provider.request(request) => result?,
-                                _ = self.cancel.cancelled() => {
-                                    return Err(anyhow::anyhow!("Task cancelled by user at checkpoint"));
-                                }
-                            };
+                        let response = tokio::select! {
+                            result = provider.request(request) => result?,
+                            _ = self.cancel.cancelled() => {
+                                return Err(anyhow::anyhow!("Task cancelled by user at checkpoint"));
+                            }
+                        };
 
-                            match response {
-                                HumanLoopResponse::Selection {
-                                    selection,
-                                    instructions,
-                                } => {
-                                    if selection == "cancel" {
-                                        return Err(anyhow::anyhow!(
-                                            "Task cancelled by user at checkpoint"
-                                        ));
-                                    }
-                                    if let Some(inst) = instructions {
-                                        phase_state.insert(
-                                            format!("{}_human_feedback", phase.id),
-                                            Value::String(inst),
-                                        );
-                                    }
-                                }
-                                _ => {
+                        match response {
+                            HumanLoopResponse::Selection {
+                                selection,
+                                instructions,
+                            } => {
+                                if selection == "cancel" {
                                     return Err(anyhow::anyhow!(
-                                        "Unexpected response type for checkpoint"
+                                        "Task cancelled by user at checkpoint"
                                     ));
                                 }
+                                if let Some(inst) = instructions {
+                                    phase_state.insert(
+                                        format!("{}_human_feedback", phase.id),
+                                        Value::String(inst),
+                                    );
+                                }
+                            }
+                            _ => {
+                                return Err(anyhow::anyhow!(
+                                    "Unexpected response type for checkpoint"
+                                ));
                             }
                         }
                     }

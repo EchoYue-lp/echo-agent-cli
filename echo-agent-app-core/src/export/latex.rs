@@ -74,30 +74,28 @@ impl LatexExporter {
         let mut output = String::new();
         let mut chars = result.chars().peekable();
         while let Some(c) = chars.next() {
-            if c == '[' {
-                if chars.peek() == Some(&'[') {
-                    chars.next(); // consume second [
-                    let mut num = String::new();
-                    while let Some(&nc) = chars.peek() {
-                        if nc == ']' {
-                            break;
-                        }
-                        num.push(nc);
-                        chars.next();
+            if c == '[' && chars.peek() == Some(&'[') {
+                chars.next(); // consume second [
+                let mut num = String::new();
+                while let Some(&nc) = chars.peek() {
+                    if nc == ']' {
+                        break;
                     }
-                    chars.next(); // ]
-                    if chars.peek() == Some(&']') {
-                        chars.next(); // second ]
-                        output.push_str(&format!("\\cite{{ref{}}}", num));
-                        continue;
-                    }
-                    // Not a citation — put back the brackets
-                    output.push('[');
-                    output.push('[');
-                    output.push_str(&num);
-                    output.push(']');
+                    num.push(nc);
+                    chars.next();
+                }
+                chars.next(); // ]
+                if chars.peek() == Some(&']') {
+                    chars.next(); // second ]
+                    output.push_str(&format!("\\cite{{ref{}}}", num));
                     continue;
                 }
+                // Not a citation — put back the brackets
+                output.push('[');
+                output.push('[');
+                output.push_str(&num);
+                output.push(']');
+                continue;
             }
             output.push(c);
         }

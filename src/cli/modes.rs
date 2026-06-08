@@ -51,7 +51,9 @@ pub async fn run_cli_mode(
 
 /// 运行 IM 通道模式（QQ Bot、飞书等）
 #[cfg(feature = "channels")]
-pub async fn run_channels_mode(app_config: &AppConfig) -> Result<()> {
+pub async fn run_channels_mode(app_config: AppConfig) -> Result<()> {
+    use std::sync::Arc;
+
     use echo_agent::channels::{
         AgentChannelHandler, ChannelManager, FeishuChannel, FeishuConfig, MessageHandler,
         QqChannel, QqConfig, SessionConfig, SessionHandler,
@@ -82,6 +84,13 @@ pub async fn run_channels_mode(app_config: &AppConfig) -> Result<()> {
             "webhook" => FeishuConfig::new_webhook(
                 app_config.channels.feishu.app_id.clone(),
                 app_config.channels.feishu.app_secret.clone(),
+                app_config.channels.feishu.webhook_bind.clone(),
+                app_config.channels.feishu.webhook_path.clone(),
+                app_config
+                    .channels
+                    .feishu
+                    .webhook_verification_token
+                    .clone(),
             ),
             _ => FeishuConfig::new_long_poll(
                 app_config.channels.feishu.app_id.clone(),
@@ -128,7 +137,15 @@ pub async fn run_channels_mode(app_config: &AppConfig) -> Result<()> {
     };
 
     tracing::info!("启动 {} 个 IM 通道...", manager.len());
-    manager.start_all(handler_factory).await?;
+    let start_results = manager.start_all(handler_factory).await;
+    let failures: Vec<_> = start_results.iter().filter(|r| r.is_err()).collect();
+    if !failures.is_empty() {
+        tracing::warn!(
+            "{} 个通道启动失败（共 {} 个）",
+            failures.len(),
+            start_results.len()
+        );
+    }
     tracing::info!("所有 IM 通道已启动");
 
     crate::infra::shutdown_signal().await;

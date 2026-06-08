@@ -33,7 +33,12 @@ async fn main() -> anyhow::Result<()> {
     let mut app_config = config::load_config(args.config.as_deref());
     config::apply_env_overrides(&mut app_config);
 
-    let is_tui_entry = !args.web && !args.cli && !args.channels;
+    // --verbose 覆盖日志级别为 debug
+    if args.verbose {
+        app_config.logging.level = "debug".to_string();
+    }
+
+    let is_tui_entry = args.tui || (!args.web && !args.cli && !args.channels);
 
     // 初始化日志。默认用户入口是 TUI，日志必须写入文件，避免污染全屏界面。
     #[cfg(feature = "tui")]
@@ -51,11 +56,12 @@ async fn main() -> anyhow::Result<()> {
     // 创建 Agent + 加载 MCP 配置（统一路径，消除重复）
     let params = echo_agent_cli::infra::AgentCreateParams {
         model: args.model.clone(),
-        mode: "general".to_string(),
+        mode: args.mode.clone(),
         system_prompt: None,
         project: args.project.clone(),
         session_id: None,
         react_checkpoint_interval: None,
+        extra_tools: vec![],
     };
     // Resolve mode display string for TUI status bar.
     let mode_display = echo_agent_app_core::project::modes::parse_from_str(&params.mode)
@@ -619,6 +625,7 @@ async fn main() -> anyhow::Result<()> {
         drop(task_hook_bridge);
         drop(subagent_hook_bridge);
         drop(unified_memory);
+        cancel_token.cancel();
 
         return Ok(());
     }
@@ -641,7 +648,7 @@ async fn main() -> anyhow::Result<()> {
     if run_channels {
         #[cfg(feature = "channels")]
         {
-            let channels_handle = tokio::spawn(cli::run_channels_mode(&app_config));
+            let channels_handle = tokio::spawn(cli::run_channels_mode(app_config.clone()));
 
             if run_cli {
                 cli::run_cli_mode(
@@ -685,6 +692,7 @@ async fn main() -> anyhow::Result<()> {
     drop(task_hook_bridge);
     drop(subagent_hook_bridge);
     drop(unified_memory);
+    cancel_token.cancel();
 
     Ok(())
 }
@@ -706,6 +714,7 @@ mod tests {
             port: 3000,
             host: "127.0.0.1".to_string(),
             model: Some("test-model".to_string()),
+            mode: "general".to_string(),
             project: None,
             mcp_config: None,
             config: None,
@@ -722,6 +731,7 @@ mod tests {
             project: args.project.clone(),
             session_id: None,
             react_checkpoint_interval: None,
+            extra_tools: vec![],
         };
         let app_config = config::AppConfig::default();
         let agent = infra::create_agent(&params, &app_config);

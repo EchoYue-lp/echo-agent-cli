@@ -5,9 +5,9 @@
 
 pub mod data;
 pub mod loader;
+pub mod quality;
 pub mod research;
 pub mod research_to_writing;
-pub mod template_engine;
 pub mod writing;
 
 pub use data::{
@@ -16,17 +16,13 @@ pub use data::{
 pub use loader::{
     PipelineDefinition, PipelineLoader, default_pipeline_dir, load_builtin_pipelines,
 };
-pub use research::{
-    QualityAssessment, ResearchConfig, build_research_graph, extract_quality_assessment,
-    extract_quality_score, quality_assessment_prompt, run_research, run_research_with_config,
+pub use quality::{
+    QualityAssessment, extract_json_block, extract_quality_assessment, extract_quality_score,
+    extract_quality_score_legacy, quality_assessment_prompt,
 };
-pub use research_to_writing::{
-    R2WWritingQualityAssessment, ResearchToWritingConfig, extract_r2w_writing_quality_assessment,
-    run_research_to_writing,
-};
-pub use template_engine::{PromptTemplateEngine, paths as template_paths};
+pub use research::{ResearchConfig, build_research_graph, run_research, run_research_with_config};
+pub use research_to_writing::{ResearchToWritingConfig, run_research_to_writing};
 pub use writing::{
-    WritingPipelineConfig, WritingQualityAssessment, build_writing_graph,
-    extract_writing_quality_assessment, extract_writing_quality_score, run_writing_pipeline,
-    run_writing_pipeline_with_config, writing_quality_assessment_prompt,
+    WritingPipelineConfig, build_writing_graph, run_writing_pipeline,
+    run_writing_pipeline_with_config,
 };

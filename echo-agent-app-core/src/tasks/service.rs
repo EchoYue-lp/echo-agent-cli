@@ -1,8 +1,9 @@
 //! BackgroundTaskService — pure task lifecycle manager.
 //!
 //! Manages task submission, scheduling, persistence, progress tracking, and
-//! cancellation. Does NOT hold any Agent reference — agent execution is
-//! delegated to a `TaskExecuteFn` closure provided at construction time.
+//! cancellation. The service struct itself does not store an Agent reference;
+//! instead, agent execution is delegated to a `TaskExecuteFn` closure that
+//! captures the `AgentHandle` at construction time.
 //!
 //! ## Architecture
 //!
@@ -40,6 +41,8 @@ pub struct BackgroundTaskService {
     /// Latest progress for each task, updated by ProgressBridge via TaskEventBus.
     /// Frontends (Tauri, CLI) can query this to get real-time progress.
     latest_progress: Arc<DashMap<String, TaskProgress>>,
+    /// HITL provider for background tasks — routes approval/input requests to frontends.
+    hitl_provider: Arc<super::hitl_provider::BackgroundTaskHumanProvider>,
 }
 
 impl BackgroundTaskService {
@@ -123,6 +126,22 @@ impl BackgroundTaskService {
             });
         }
 
+        // Create HITL provider for background tasks
+        let (hitl_provider, _hitl_rx) = super::hitl_provider::BackgroundTaskHumanProvider::new();
+        let hitl_provider = Arc::new(hitl_provider);
+
+        // Wire HITL provider into the agent so background tasks can request human input
+        {
+            let hitl = hitl_provider.clone();
+            agent
+                .write(|a| {
+                    a.set_human_loop_provider(
+                        hitl as Arc<dyn echo_agent::human_loop::HumanLoopProvider>,
+                    )
+                })
+                .await;
+        }
+
         Ok(Self {
             manager,
             executor,
@@ -130,6 +149,7 @@ impl BackgroundTaskService {
             event_bus,
             cancel,
             latest_progress,
+            hitl_provider,
         })
     }
 
@@ -241,11 +261,11 @@ impl BackgroundTaskService {
         for task in tasks {
             if task.status.is_terminal() {
                 // Re-add terminal tasks for history but don't execute
-                let _ = self.manager.add_task(task);
+                self.manager.add_task(task);
                 continue;
             }
             // Re-add non-terminal tasks — they'll be picked up by execute_all
-            let _ = self.manager.add_task(task);
+            self.manager.add_task(task);
             resumed += 1;
         }
 
@@ -303,27 +323,51 @@ impl BackgroundTaskService {
         &self.manager
     }
 
-    // ── HITL checkpoint stubs ──
-    //
-    // These are stubs for the legacy HumanCheckpointGate interface from
-    // LongRunningTaskRunner. The HITL system is being redesigned to use
-    // the main Agent's HumanLoopProvider directly.
+    // ── HITL checkpoint integration ──
 
-    /// List pending human checkpoint requests (currently always empty).
+    /// List pending human checkpoint requests from background tasks.
     pub async fn pending_checkpoints(
         &self,
     ) -> Vec<(String, super::long_running::HumanCheckpointRequest)> {
-        Vec::new()
+        let request_ids = self.hitl_provider.pending_request_ids();
+        let mut result = Vec::new();
+        for id in request_ids {
+            if let Some(event) = self.hitl_provider.get_pending(&id) {
+                let request = echo_agent::human_loop::HumanLoopRequest {
+                    kind: echo_agent::human_loop::HumanLoopKind::Selection,
+                    prompt: event.prompt,
+                    tool_name: event.tool_name,
+                    args: event.args,
+                    risk_level: None,
+                    timeout: None,
+                    task_id: Some(event.task_id),
+                    options: event.options,
+                    context: event.context,
+                    phase: event.phase,
+                };
+                result.push((event.request_id, request));
+            }
+        }
+        result
     }
 
-    /// Respond to a pending human checkpoint request (currently always returns false).
+    /// Respond to a pending human checkpoint request.
     pub async fn respond_to_checkpoint(
         &self,
-        _task_id: &str,
-        _selection: &str,
-        _instructions: Option<String>,
+        request_id: &str,
+        selection: &str,
+        instructions: Option<String>,
     ) -> bool {
-        false
+        let response = echo_agent::human_loop::HumanLoopResponse::Selection {
+            selection: selection.to_string(),
+            instructions,
+        };
+        self.hitl_provider.respond(request_id, response)
+    }
+
+    /// Get the HITL provider (for subscribing to HITL events from frontends).
+    pub fn hitl_provider(&self) -> &Arc<super::hitl_provider::BackgroundTaskHumanProvider> {
+        &self.hitl_provider
     }
 
     async fn persist_all(&self) -> anyhow::Result<()> {
@@ -374,6 +418,128 @@ async fn dispatch_task(
     // Composite tasks need special handling — they orchestrate sub-tasks
     if let BackgroundTaskKind::Composite { steps, strategy } = &meta.kind {
         return execute_composite(ctx, agent, steps.clone(), strategy.clone()).await;
+    }
+
+    // Cron and Workflow are defined but not yet implemented — return clear error
+    match &meta.kind {
+        BackgroundTaskKind::Cron { .. } => {
+            return Err(echo_agent::error::ReactError::Other(
+                "Cron task kind is defined but not yet implemented. Use /cron command for scheduled tasks.".into(),
+            ));
+        }
+        BackgroundTaskKind::Workflow { .. } => {
+            return Err(echo_agent::error::ReactError::Other(
+                "Workflow task kind is defined but not yet implemented. Use /workflow command instead.".into(),
+            ));
+        }
+        _ => {}
+    }
+
+    // Pipeline tasks — route to structured graph pipelines instead of generic prompt
+    match &meta.kind {
+        BackgroundTaskKind::Research {
+            topic,
+            max_papers,
+            output_format: _,
+        } => {
+            tracing::info!(
+                task_id = %ctx.task_id,
+                pipeline = "research",
+                topic = %topic,
+                max_papers = max_papers,
+                "Executing research pipeline"
+            );
+            let config =
+                super::pipelines::ResearchConfig::new(topic.as_str()).with_max_papers(*max_papers);
+            let result = super::pipelines::run_research_with_config(agent.clone(), config).await;
+            return result.map_err(|e| {
+                echo_agent::error::ReactError::Other(format!("Research pipeline failed: {e}"))
+            });
+        }
+
+        BackgroundTaskKind::ResearchToWriting {
+            topic,
+            max_papers,
+            audience,
+            format,
+            research_max_revisions,
+            research_quality_threshold,
+            writing_max_revisions,
+            writing_quality_threshold,
+        } => {
+            tracing::info!(
+                task_id = %ctx.task_id,
+                pipeline = "research_to_writing",
+                topic = %topic,
+                max_papers = max_papers,
+                "Executing research-to-writing pipeline"
+            );
+            let config = super::pipelines::ResearchToWritingConfig::new(topic.as_str())
+                .with_max_papers(*max_papers)
+                .with_audience(audience.as_str())
+                .with_format(format.as_str())
+                .with_research_revisions(*research_max_revisions, *research_quality_threshold)
+                .with_writing_revisions(*writing_max_revisions, *writing_quality_threshold);
+            let result = super::pipelines::run_research_to_writing(agent.clone(), config).await;
+            return result.map_err(|e| {
+                echo_agent::error::ReactError::Other(format!(
+                    "Research-to-writing pipeline failed: {e}"
+                ))
+            });
+        }
+
+        BackgroundTaskKind::DataPipeline {
+            dataset_path,
+            objective,
+            max_charts,
+        } => {
+            tracing::info!(
+                task_id = %ctx.task_id,
+                pipeline = "data_analysis",
+                dataset_path = %dataset_path,
+                max_charts = max_charts,
+                "Executing data analysis pipeline"
+            );
+            let mut config = super::pipelines::DataPipelineConfig::new(dataset_path.as_str())
+                .with_max_charts(*max_charts);
+            if let Some(obj) = objective {
+                config = config.with_objective(obj.as_str());
+            }
+            let result =
+                super::pipelines::run_data_pipeline_with_config(agent.clone(), config).await;
+            return result.map_err(|e| {
+                echo_agent::error::ReactError::Other(format!("Data pipeline failed: {e}"))
+            });
+        }
+
+        BackgroundTaskKind::WritingPipeline {
+            topic,
+            audience,
+            format,
+            max_revisions,
+            quality_threshold,
+        } => {
+            tracing::info!(
+                task_id = %ctx.task_id,
+                pipeline = "writing",
+                topic = %topic,
+                audience = %audience,
+                "Executing writing pipeline"
+            );
+            let config = super::pipelines::WritingPipelineConfig::new(topic.as_str())
+                .with_audience(audience.as_str())
+                .with_format(format.as_str())
+                .with_max_revisions(*max_revisions)
+                .with_quality_threshold(*quality_threshold);
+            let result =
+                super::pipelines::run_writing_pipeline_with_config(agent.clone(), config).await;
+            return result.map_err(|e| {
+                echo_agent::error::ReactError::Other(format!("Writing pipeline failed: {e}"))
+            });
+        }
+
+        // Non-pipeline tasks fall through to generic prompt execution
+        _ => {}
     }
 
     let prompt = meta.kind.to_prompt();

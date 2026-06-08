@@ -12,6 +12,9 @@ use crate::agent_handle::AgentHandle;
 use crate::config::AppConfig;
 use crate::project::prompt::PromptAssembler;
 
+/// Default context window size in tokens (128K).
+const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
+
 /// Agent creation parameters (extracted from CLI args or config).
 pub struct AgentCreateParams {
     pub model: Option<String>,
@@ -23,6 +26,11 @@ pub struct AgentCreateParams {
     /// React loop checkpoint interval in iterations (0 = only at end).
     /// Used by background tasks to enable crash recovery.
     pub react_checkpoint_interval: Option<usize>,
+    /// Additional tools to enable beyond the mode's default set.
+    /// Mode determines which tools are enabled by default; this list
+    /// allows the user to extend beyond those defaults.
+    /// General mode enables all tools regardless.
+    pub extra_tools: Vec<String>,
 }
 
 /// 创建 Agent 实例
@@ -36,7 +44,10 @@ pub fn create_agent(params: &AgentCreateParams, app_config: &AppConfig) -> React
 
     // Parse mode with bilingual support (Chinese aliases + English names)
     let agent_mode = crate::project::modes::parse_from_str(&params.mode).unwrap_or_else(|| {
-        let valid = ["general", "coding", "research", "data", "writing"];
+        let valid: Vec<&str> = crate::project::modes::AgentMode::all()
+            .iter()
+            .map(|m| m.name())
+            .collect();
         tracing::warn!(
             "Unknown mode '{}', falling back to 'general'. Valid modes: {}",
             params.mode,
@@ -75,7 +86,7 @@ pub fn create_agent(params: &AgentCreateParams, app_config: &AppConfig) -> React
     let model_window = if app_config.agent.token_limit > 0 {
         app_config.agent.token_limit
     } else {
-        8000 // default context window estimate
+        DEFAULT_CONTEXT_WINDOW
     };
     let assembler = PromptAssembler::default_for_mode(
         &agent_mode,
@@ -83,13 +94,13 @@ pub fn create_agent(params: &AgentCreateParams, app_config: &AppConfig) -> React
         project_ctx.as_ref(),
         model_window,
     );
-    let system_prompt = assembler.assemble_no_vars();
+    let system_prompt = assembler.assemble();
 
     // Determine config values from AppConfig
     let token_limit = if app_config.agent.token_limit > 0 {
         app_config.agent.token_limit
     } else {
-        usize::MAX
+        DEFAULT_CONTEXT_WINDOW
     };
 
     // Use ReactAgentBuilder — mode is resolved at the CLI layer,
@@ -101,13 +112,18 @@ pub fn create_agent(params: &AgentCreateParams, app_config: &AppConfig) -> React
         .enable_tools()
         .enable_memory()
         .enable_human_in_loop()
-        .enable_cot()
         .max_iterations(app_config.agent.max_iterations)
         .token_limit(token_limit)
         .tool_execution(echo_agent::tools::ToolExecutionConfig {
             timeout_ms: app_config.agent.tool_timeout_ms,
             ..Default::default()
         });
+
+    // Enable COT (chain-of-thought) based on mode
+    // Coding and Writing modes don't need COT instruction
+    if should_enable_cot_for_mode(&agent_mode) {
+        builder = builder.enable_cot();
+    }
 
     // Set session_id if provided (used by background tasks for checkpoint isolation)
     if let Some(ref sid) = params.session_id {
@@ -116,10 +132,10 @@ pub fn create_agent(params: &AgentCreateParams, app_config: &AppConfig) -> React
 
     // Set React loop checkpoint interval if provided (used by background tasks
     // to enable crash recovery — saves conversation history every N iterations)
-    if let Some(interval) = params.react_checkpoint_interval {
-        if interval > 0 {
-            builder = builder.react_checkpoint_interval(interval);
-        }
+    if let Some(interval) = params.react_checkpoint_interval
+        && interval > 0
+    {
+        builder = builder.react_checkpoint_interval(interval);
     }
 
     // Initialize JSONL run store for trace persistence (before build)
@@ -146,6 +162,13 @@ pub fn create_agent(params: &AgentCreateParams, app_config: &AppConfig) -> React
             std::process::exit(1);
         }
     };
+
+    // Filter tools based on mode (unless General mode, which enables all tools).
+    // Mode determines the default tool set; extra_tools extends beyond those defaults.
+    // Core tools (final_answer, think, answer) are always kept.
+    if agent_mode != crate::project::modes::AgentMode::General {
+        filter_tools_by_mode_and_extras(&mut agent, &agent_mode, &params.extra_tools);
+    }
 
     // Register default hooks
     register_default_hooks(&mut agent);
@@ -305,75 +328,6 @@ pub async fn shutdown_signal() {
     }
 }
 
-/// Print a warning if the server binds to a non-localhost address.
-///
-/// EchoCoWork is designed as a single-user local application. Binding to
-/// 0.0.0.0 or a public IP exposes the agent to the network.
-pub fn warn_non_localhost_bind(host: &str, addr: &str, auth_enabled: bool) {
-    // Check if host is a non-localhost address
-    let is_localhost = host == "127.0.0.1" || host == "localhost" || host == "::1";
-    if !is_localhost {
-        tracing::warn!(
-            "⚠️  Server binding to non-localhost address: http://{}",
-            addr
-        );
-        tracing::warn!("   EchoCoWork is designed for single-user local use.");
-        if !auth_enabled {
-            tracing::warn!(
-                "   Authentication is DISABLED — anyone on the network can access the agent."
-            );
-            tracing::warn!("   Enable JWT auth in config or set ECHO_AUTH_ENABLED=true.");
-        }
-        tracing::warn!(
-            "   For remote access, use a reverse proxy with TLS and enable authentication."
-        );
-    }
-}
-
-/// Initialize TraceAnalyzer in AppState from the agent's RunStore.
-///
-/// Call this after the agent has been created (and its `run_store` set)
-/// and before the AppState is wrapped in `Arc`. This extracts the
-/// `Arc<dyn RunStore>` from the agent and creates a `TraceAnalyzer`
-/// that routes can use for observability queries.
-pub async fn init_trace_analyzer(state: &crate::state::AppState) {
-    let run_store = state
-        .connection
-        .agent
-        .read_async(|a| Box::pin(async move { a.run_store.clone() }))
-        .await;
-
-    if let Some(store) = run_store {
-        let analyzer = echo_agent::trace::TraceAnalyzer::new(store);
-        *state.trace.analyzer.write().await = Some(analyzer);
-        tracing::info!("TraceAnalyzer initialized from agent RunStore");
-    } else {
-        tracing::warn!("No RunStore available on agent — TraceAnalyzer disabled");
-    }
-}
-
-/// 打印 Web 模式启动信息
-pub fn print_web_startup_info(addr: &str) {
-    tracing::info!("🚀 EchoCoWork (Web 模式)");
-    tracing::info!("✅ 服务已启动: http://{}", addr);
-    tracing::info!("📖 API 端点:");
-    tracing::info!("   POST /api/chat          - 阻塞式对话");
-    tracing::info!("   GET  /api/history       - 获取对话历史");
-    tracing::info!("   POST /api/compress      - 触发上下文压缩");
-    tracing::info!("   POST /api/memory        - 添加记忆");
-    tracing::info!("   POST /api/memory/search - 搜索记忆");
-    tracing::info!("   POST /api/extract       - 结构化输出");
-    tracing::info!("   WS   /ws/chat           - WebSocket 流式对话");
-}
-
-/// 打印双模式启动信息
-pub fn print_both_startup_info(addr: &str) {
-    tracing::info!("🚀 EchoCoWork (Web + CLI 模式)");
-    tracing::info!("✅ Web 服务: http://{}", addr);
-    tracing::info!("✅ CLI 交互: 已启动");
-    tracing::info!("💡 输入 /help 查看命令帮助");
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogTarget {
     Stderr,
@@ -517,7 +471,7 @@ fn provider_from_model(model: &str) -> &str {
             } else if lower.starts_with("moonshot-") || lower.starts_with("kimi-") {
                 "moonshot"
             } else {
-                "qwen"
+                "unknown"
             }
         })
 }
@@ -758,4 +712,76 @@ pub fn print_doctor_result(result: &DoctorResult) {
         println!("\n  发现 {} 个问题需要关注", result.issues.len());
     }
     println!();
+}
+
+/// 根据模式决定是否启用 COT（chain-of-thought）指令
+///
+/// Coding 和 Writing 模式不需要 COT 指令，因为它们的工作流程已经在系统提示中明确定义。
+/// Research、Data 和 General 模式保持 COT 启用，以增强推理能力。
+fn should_enable_cot_for_mode(mode: &crate::project::modes::AgentMode) -> bool {
+    use crate::project::modes::AgentMode;
+    match mode {
+        AgentMode::Coding => false,
+        AgentMode::Writing => false,
+        AgentMode::Research => true,
+        AgentMode::Data => true,
+        AgentMode::Medical => true,
+        AgentMode::General => true,
+    }
+}
+
+/// 根据模式和用户指定的额外工具列表过滤工具。
+///
+/// - 模式决定默认启用的工具集（由 `recommended_tools()` 定义）
+/// - `extra_tools` 允许用户扩展到模式默认集之外的工具
+/// - 核心工具（final_answer、think、answer）始终保留
+/// - MCP 工具和用户通过 `extra_tools` 指定的工具不受过滤影响
+fn filter_tools_by_mode_and_extras(
+    agent: &mut ReactAgent,
+    mode: &crate::project::modes::AgentMode,
+    extra_tools: &[String],
+) {
+    use crate::project::modes::recommended_tools;
+
+    // Core tools that are always kept regardless of mode
+    const CORE_TOOLS: &[&str] = &[
+        "final_answer",
+        "think",
+        "answer",
+        "memory_write",
+        "todo_write",
+    ];
+
+    // Build the allowed tool set: mode defaults + extra_tools + core tools
+    let mode_tools = recommended_tools(mode);
+    let mut allowed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for t in &mode_tools {
+        allowed.insert(t.to_string());
+    }
+    for t in extra_tools {
+        allowed.insert(t.clone());
+    }
+    for t in CORE_TOOLS {
+        allowed.insert(t.to_string());
+    }
+
+    // Get all currently registered tools and remove those not in the allowed set
+    let registered = agent.tool_names();
+    let mut removed = Vec::new();
+    for name in &registered {
+        if !allowed.contains(name) {
+            agent.remove_tool(name);
+            removed.push(name.clone());
+        }
+    }
+
+    if !removed.is_empty() {
+        tracing::info!(
+            mode = %mode,
+            kept = allowed.len(),
+            removed = removed.len(),
+            removed_tools = ?removed,
+            "Filtered tools by mode"
+        );
+    }
 }

@@ -167,10 +167,10 @@ impl SkillsHub {
                 continue;
             }
             let skill_md = path.join("SKILL.md");
-            if skill_md.exists() {
-                if let Some(hub_entry) = Self::parse_skill_dir(&path, &skill_md) {
-                    self.entries.insert(hub_entry.name.clone(), hub_entry);
-                }
+            if skill_md.exists()
+                && let Some(hub_entry) = Self::parse_skill_dir(&path, &skill_md)
+            {
+                self.entries.insert(hub_entry.name.clone(), hub_entry);
             }
         }
     }

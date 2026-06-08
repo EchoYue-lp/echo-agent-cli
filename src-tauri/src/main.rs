@@ -27,6 +27,7 @@ async fn main() -> anyhow::Result<()> {
         project: args.project.clone(),
         session_id: None,
         react_checkpoint_interval: None,
+        extra_tools: vec![],
     };
     let mut agent = infra::create_agent(&params, &app_config);
     infra::load_mcp_config(&mut agent, args.mcp_config.as_deref(), &app_config).await;

@@ -58,6 +58,33 @@ mcp:
   #   ./mcp.json → ./.echo-agent/mcp.json → ~/.echo-agent/mcp.json
   # config_path: "mcp.json"
 
+# ── 研究与医学 API 配置 ─────────────────────────────────────────
+# 学术研究和医学模式使用的工具 — 全部免费，无需 API Key 即可使用
+#
+# 学术研究工具（Research 模式）:
+#   - arxiv_search            → 免费，搜索 ArXiv 预印本论文
+#   - semantic_scholar_search  → 免费，搜索 Semantic Scholar 学术数据库
+#   - pdf_fetch               → 免费，下载和解析 PDF 论文全文
+#   - web_search              → 免费（DuckDuckGo），可选 API Key 提升质量
+#   - web_fetch               → 免费，抓取网页内容
+#   - bibtex_generate         → 本地工具，生成 BibTeX 引用
+#
+# 医学研究工具（Medical 模式）:
+#   - pubmed_search           → 免费，搜索 PubMed 医学文献（NCBI）
+#   - clinical_trials_search  → 免费，搜索 ClinicalTrials.gov 临床试验
+#   - pdf_fetch               → 免费（部分论文需机构网络访问）
+#   - web_search              → 免费（DuckDuckGo）
+#   - web_fetch               → 免费
+#   - bibtex_generate         → 本地工具
+#
+# 可选 API Key（提升搜索质量，非必需）:
+#
+# web_search 可选升级（优先级：Tavily > Brave > DuckDuckGo）:
+#   export TAVILY_API_KEY="your-key"         # 推荐，AI 优化搜索，免费 1000 次/月
+#                                          # 申请：https://tavily.com/
+#   export BRAVE_SEARCH_API_KEY="your-key"   # 备选，免费 2000 次/月
+#                                          # 申请：https://brave.com/search/api/
+
 # ── IM 通道配置 ─────────────────────────────────────────────────────
 channels:
   # QQ Bot 通道
@@ -218,15 +245,94 @@ ollama serve
 ollama pull llama3.1
 ```
 
+## 学术研究与医学模式
+
+### 快速入门
+
+学术研究和医学模式的工具**全部免费**，无需任何 API Key 即可使用。启动后即可直接检索文献：
+
+```bash
+# 启动 TUI（默认 coding 模式）
+echo-agent-cli
+
+# 切换到研究模式
+/mode research
+
+# 或切换到医学模式
+/mode medical
+```
+
+### 工具一览
+
+| 工具 | 模式 | 数据来源 | API Key | 说明 |
+|------|------|---------|---------|------|
+| `arxiv_search` | Research | ArXiv.org | 不需要 | 搜索预印本论文，返回标题、作者、摘要、PDF 链接 |
+| `semantic_scholar_search` | Research | SemanticScholar.org | 不需要 | 搜索学术论文，返回引用数、研究领域、DOI |
+| `pubmed_search` | Medical | PubMed (NCBI) | 不需要 | 搜索医学文献，返回 PMID、MeSH 词、摘要 |
+| `clinical_trials_search` | Medical | ClinicalTrials.gov | 不需要 | 搜索临床试验，返回 NCT ID、状态、阶段、结局 |
+| `pdf_fetch` | 两者 | 各学术网站 | 不需要 | 下载并解析 PDF 全文（部分论文需机构网络） |
+| `web_search` | 两者 | DuckDuckGo | 不需要 | 网络搜索（可升级为 Tavily/Brave 提升质量） |
+| `web_fetch` | 两者 | 各网站 | 不需要 | 抓取网页内容并提取正文 |
+| `bibtex_generate` | 两者 | 本地生成 | 不需要 | 根据论文信息生成 BibTeX 引用格式 |
+
+### 可选：提升搜索质量
+
+`web_search` 默认使用 DuckDuckGo（免费、无需配置），可通过环境变量升级为更高质量的搜索引擎：
+
+```bash
+# 方式 1（推荐）：Tavily — AI 优化搜索，免费 1000 次/月
+# 申请：https://tavily.com/
+export TAVILY_API_KEY="tvly-your-key-here"
+
+# 方式 2：Brave Search — 免费 2000 次/月
+# 申请：https://brave.com/search/api/
+export BRAVE_SEARCH_API_KEY="BSAyour-key-here"
+```
+
+优先级：Tavily > Brave > DuckDuckGo（自动选择可用的最佳引擎）。
+
+### 使用示例
+
+**学术研究模式：**
+
+```
+> /mode research
+
+> 搜索 2024 年大语言模型在医学领域的最新研究
+Agent: 调用 arxiv_search + semantic_scholar_search 交叉检索...
+
+> 下载第一篇论文的全文
+Agent: 调用 pdf_fetch 下载并解析...
+
+> 生成这些论文的 BibTeX 引用
+Agent: 调用 bibtex_generate...
+```
+
+**医学研究模式：**
+
+```
+> /mode medical
+
+> 搜索 CRISPR 基因治疗在肿瘤免疫中的最新临床试验
+Agent: 调用 pubmed_search + clinical_trials_search 交叉检索...
+
+> 搜索 2023-2025 年发表的 PD-1 抑制剂 meta-analysis
+Agent: 调用 pubmed_search(query='PD-1 inhibitor meta-analysis', min_date='2023/01/01')...
+
+> 下载 PMID 为 38245678 的论文全文
+Agent: 调用 pdf_fetch...
+```
+
 ## 工作模式
 
 通过 TUI 内的 `/mode` 命令切换：
 
 | 模式 | 说明 |
 |------|------|
-| `general` | 通用助手（默认），适合日常问答和混合任务 |
+| `general` | 通用助手（TUI 默认），适合日常问答和混合任务 |
 | `coding` | 编程模式，专注代码阅读、生成、重构、调试 |
 | `research` | 研究模式，适合信息检索、文档阅读、报告生成 |
+| `medical` | 医学研究模式，PubMed 文献检索、临床试验、循证医学分析 |
 | `data` | 数据分析模式，处理数据读取、统计、可视化 |
 | `writing` | 写作模式，专注文章撰写、内容编辑、翻译 |
 
@@ -247,6 +353,8 @@ export DASHSCOPE_API_KEY="..."         # 阿里通义
 # ── 其他 ──
 export MCP_CONFIG_PATH="~/my-mcp-config.json"  # MCP 配置文件路径
 export MODEL_NAME="deepseek-v4-flash"          # 模型名称（覆盖配置文件）
+export TAVILY_API_KEY="..."                    # Web Search（可选，AI 优化搜索）
+export BRAVE_SEARCH_API_KEY="..."              # Web Search（可选，备选引擎）
 export HTTP_PROXY="http://proxy:8080"          # HTTP 代理
 export HTTPS_PROXY="http://proxy:8080"         # HTTPS 代理
 export RUST_LOG="info"                         # 日志级别

@@ -70,12 +70,10 @@ pub fn sensitive_match(path: &Path) -> Option<&'static str> {
     let path_str = path.to_string_lossy();
     let normalized = path_str.replace('\\', "/");
 
-    for pattern in SENSITIVE_PATTERNS {
-        if glob_match(pattern, &normalized) {
-            return Some(pattern);
-        }
-    }
-    None
+    SENSITIVE_PATTERNS
+        .iter()
+        .find(|&pattern| glob_match(pattern, &normalized))
+        .map(|v| v as _)
 }
 
 /// Simple glob match: `**` matches any depth, `*` matches within one segment.
@@ -137,9 +135,7 @@ fn segment_glob_match(pattern: &str, text: &str) -> bool {
     let mut star_ti: Option<usize> = None;
 
     while ti < txt.len() {
-        if pi < pat.len()
-            && (pat[pi] == '?' || pat[pi].to_ascii_lowercase() == txt[ti].to_ascii_lowercase())
-        {
+        if pi < pat.len() && (pat[pi] == '?' || pat[pi].eq_ignore_ascii_case(&txt[ti])) {
             pi += 1;
             ti += 1;
         } else if pi < pat.len() && pat[pi] == '*' {
