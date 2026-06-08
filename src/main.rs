@@ -12,11 +12,16 @@
 //! echo-agent-cli --model claude-sonnet-4-6
 //! ```
 
+#[cfg(feature = "tui")]
 use echo_agent_cli::agent_handle::AgentHandle;
+#[cfg(feature = "tui")]
 use echo_agent_cli::cli;
+#[cfg(feature = "tui")]
 use echo_agent_cli::config;
+#[cfg(feature = "tui")]
 use echo_agent_cli::infra;
 
+#[cfg(feature = "tui")]
 use clap::Parser;
 
 // ── 主入口 ─────────────────────────────────────────────────────
@@ -26,6 +31,25 @@ async fn main() -> anyhow::Result<()> {
     // 加载 .env 文件
     dotenvy::dotenv().ok();
 
+    // Tauri CLI builds the package-name binary (`echo-agent-cli`) and then
+    // bundles/renames it. In a GUI-only build, route this binary to the
+    // desktop runtime so the packaged app does not start the TUI path.
+    #[cfg(all(feature = "gui", not(feature = "tui")))]
+    return echo_agent_cli::tauri::desktop::run_desktop_entry().await;
+
+    #[cfg(feature = "tui")]
+    {
+        run_tui_or_cli_entry().await
+    }
+
+    #[cfg(all(not(feature = "tui"), not(feature = "gui")))]
+    {
+        compile_error!("Either the tui or gui feature must be enabled");
+    }
+}
+
+#[cfg(feature = "tui")]
+async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
     // 解析命令行参数
     let args = cli::Args::parse();
 

@@ -134,7 +134,12 @@ pub enum WorkspaceKind {
         #[serde(default)]
         topics: Vec<String>,
     },
-    /// 通用工作区。
+    /// 医学研究工作区。
+    Medical {
+        #[serde(default)]
+        topics: Vec<String>,
+    },
+    /// 通用/其他工作区。
     #[default]
     General,
 }
@@ -148,6 +153,9 @@ impl WorkspaceKind {
                 Self::DataAnalysis { datasets: vec![] }
             }
             "research" | "研究" | "论文" | "academic" => Self::Research { topics: vec![] },
+            "medical" | "medical_research" | "医学" | "医学研究" | "临床" => {
+                Self::Medical { topics: vec![] }
+            }
             _ => Self::General,
         }
     }
@@ -158,7 +166,8 @@ impl WorkspaceKind {
             Self::Code { .. } => "Code",
             Self::DataAnalysis { .. } => "Data Analysis",
             Self::Research { .. } => "Research",
-            Self::General => "General",
+            Self::Medical { .. } => "Medical Research",
+            Self::General => "Other",
         }
     }
 
@@ -168,7 +177,8 @@ impl WorkspaceKind {
             Self::Code { .. } => "💻",
             Self::DataAnalysis { .. } => "📊",
             Self::Research { .. } => "🔬",
-            Self::General => "💬",
+            Self::Medical { .. } => "🩺",
+            Self::General => "⋯",
         }
     }
 }

@@ -5,7 +5,8 @@ import {
   Code,
   BarChart3,
   GraduationCap,
-  MessageSquare,
+  HeartPulse,
+  MoreHorizontal,
   ArrowRight,
   Trash2,
   FolderOpen,
@@ -25,7 +26,7 @@ interface Props {
 const WORKSPACE_KIND = [
   { value: 'code', label: '代码项目', icon: Code, desc: '代码开发、调试、重构', color: '#6366f1' },
   {
-    value: 'data',
+    value: 'data_analysis',
     label: '数据分析',
     icon: BarChart3,
     desc: '数据清洗、分析、可视化',
@@ -39,10 +40,17 @@ const WORKSPACE_KIND = [
     color: '#10b981',
   },
   {
+    value: 'medical',
+    label: '医学研究',
+    icon: HeartPulse,
+    desc: '医学文献、临床证据、研究综述',
+    color: '#ef4444',
+  },
+  {
     value: 'general',
-    label: '通用',
-    icon: MessageSquare,
-    desc: '通用对话与任务',
+    label: '其他',
+    icon: MoreHorizontal,
+    desc: '其他通用任务',
     color: '#6b7280',
   },
 ];
@@ -57,7 +65,7 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
 
   const [view, setView] = useState<'list' | 'create'>('list');
   const [newName, setNewName] = useState('');
-  const [newKind, setNewKind] = useState('general');
+  const [newKind, setNewKind] = useState('code');
   const [customRoot, setCustomRoot] = useState('');
   const [defaultRoot, setDefaultRoot] = useState('');
   const [useCustomRoot, setUseCustomRoot] = useState(false);
@@ -70,7 +78,7 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
       init();
       setView('list');
       setNewName('');
-      setNewKind('general');
+      setNewKind('code');
       setCustomRoot('');
       setDefaultRoot('');
       setUseCustomRoot(false);
@@ -161,8 +169,9 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
   };
 
   const kindIcon = (kind: { type: string }) => {
-    const k = WORKSPACE_KIND.find((w) => w.value === kind.type);
-    if (!k) return <MessageSquare size={16} />;
+    const normalized = kind.type === 'data' ? 'data_analysis' : kind.type;
+    const k = WORKSPACE_KIND.find((w) => w.value === normalized);
+    if (!k) return <MoreHorizontal size={16} />;
     const Icon = k.icon;
     return <Icon size={16} style={{ color: k.color }} />;
   };

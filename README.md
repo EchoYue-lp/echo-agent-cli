@@ -71,21 +71,19 @@ echo-agent-cli/
 ### 前置条件
 
 - **Rust** >= 1.95（使用 `rustup` 安装）
-- **Node.js** >= 18（仅 GUI 桌面应用需要）
+- **Node.js** >= 18（仅 GUI 桌面应用需要，TUI 不需要）
+- **Tauri CLI**（仅打包桌面安装包时需要）：`npm install -g @tauri-apps/cli`
 
 ### 安装依赖
 
 ```bash
-# 进入项目目录
 cd echo-agent-cli
 
 # 安装 Rust 依赖
 cargo fetch
 
-# 安装前端依赖（仅 GUI 需要，TUI 不需要）
-cd web-frontend
-npm install
-cd ..
+# 安装前端依赖（仅 GUI 需要，TUI 可跳过）
+cd web-frontend && npm install && cd ..
 ```
 
 > **提示**：如果只使用 TUI 模式，可以跳过 Node.js 和前端依赖安装。使用 `./init.sh` 会自动处理。
@@ -117,52 +115,102 @@ MCP 配置搜索路径：`./mcp.json` → `./.echo-agent/mcp.json` → `~/.echo-
 
 ---
 
-## 📦 编译
+## 📦 构建与安装
 
 项目使用 Feature Flags 分离 TUI 和 GUI 构建。默认启用 `tui` feature。
 
-### 编译 TUI（终端全屏界面）
+> **入口区别**：`echo-agent-cli` 是 TUI（终端全屏界面）入口；`echo-agent-tauri` 是 GUI（Tauri 桌面应用）入口。若运行 `target/release/echo-agent-cli`，看到 TUI 是预期行为。要生成可双击打开且包含前端资源的桌面产物，请使用 Tauri 打包命令：`cargo tauri build -- --no-default-features --features gui`。GUI feature 会同时启用 `channels`，因此桌面应用会一并打包多通道能力。
+
+### TUI（终端全屏界面）
 
 ```bash
-# 编译 TUI（Debug）— 默认 feature，无需额外参数
-cargo build --bin echo-agent-cli
-
-# 编译 TUI（Release）
+# 编译（Release）
 cargo build --bin echo-agent-cli --release
 
-# 仅编译 TUI，排除 GUI 依赖（推荐，编译更快）
-cargo build --bin echo-agent-cli --no-default-features --features tui
+# 直接运行（不安装）
+cargo run --bin echo-agent-cli
 
-# 编译产物路径：
-#   Debug:   target/debug/echo-agent-cli
-#   Release: target/release/echo-agent-cli
+# 安装到 ~/.cargo/bin（推荐，可全局调用）
+cargo install --path . --bin echo-agent-cli --no-default-features --features tui
+
+# 确认安装成功
+which echo-agent-cli
+
+echo-agent-cli   # 安装后直接运行
 ```
 
-### 编译 GUI（桌面应用）
+编译产物路径：`target/debug/echo-agent-cli` 或 `target/release/echo-agent-cli`
+
+> **推荐**：确认 `which echo-agent-cli` 能找到 `~/.cargo/bin/echo-agent-cli` 后，再设置别名 `alias ecw='echo-agent-cli'`（添加到 `~/.bashrc` 或 `~/.zshrc`）。如果找不到，请先把 `~/.cargo/bin` 加入 `PATH`。
+
+### GUI（桌面应用）
+
+GUI 使用 Tauri 打包，包含两部分：
+
+- `web-frontend/`：React 前端，构建产物为 `web-frontend/dist`；
+- Rust GUI 运行时：由 `gui` feature 启用，并自动包含 `channels` 多通道能力，最终随 Tauri 一起打进桌面应用包。
+
+> **参数分隔符说明**：`cargo tauri dev/build` 的 feature 参数需要传给底层 Cargo，因此必须写在 `--` 后面。
+
+#### 开发运行
 
 ```bash
-# 编译 GUI（需要先构建前端）
+# 启动前端 Vite 服务并打开 Tauri 窗口
+cargo tauri dev -- --no-default-features --features gui
+```
+
+#### 生产打包
+
+```bash
+# 首次需要安装 Tauri CLI
+npm install -g @tauri-apps/cli
+
+# 自动构建前端 + 编译 Release + 生成平台原生安装包
+cargo tauri build -- --no-default-features --features gui
+```
+
+打包产物路径：
+
+| 平台 | 产物 |
+|------|------|
+| macOS | `target/release/bundle/macos/EchoCoWork.app` |
+|       | `target/release/bundle/dmg/EchoCoWork_*.dmg` |
+| Linux | `target/release/bundle/deb/echo-agent-tauri_*.deb` |
+|       | `target/release/bundle/appimage/echo-agent-tauri_*.AppImage` |
+| Windows | `target/release/bundle/msi/EchoCoWork_*.msi` |
+|         | `target/release/bundle/nsis/EchoCoWork_*.exe` |
+
+> **注意**：不要只把 `target/release/echo-agent-tauri` 复制进 `.app` 目录来当作安装包；那只是裸后端二进制，可能缺少前端资源、图标和平台元数据。
+
+#### 裸 Cargo 调试（非分发产物）
+
+如需单独调试 GUI 后端二进制，可手动构建前端后运行：
+
+```bash
 cd web-frontend && npm run build && cd ..
+
 cargo build --bin echo-agent-tauri --no-default-features --features gui --release
-
-# 编译产物路径：
-#   macOS:   target/release/echo-agent-tauri
-#   Linux:   target/release/echo-agent-tauri
-#   Windows: target/release/echo-agent-tauri.exe
+cargo run --bin echo-agent-tauri --no-default-features --features gui
 ```
 
-### 同时编译 TUI + GUI（开发调试用）
+裸可执行文件路径：`target/release/echo-agent-tauri`（Windows 为 `target/release/echo-agent-tauri.exe`）。
 
-```bash
-cargo build --features "tui,gui"
-```
+#### 为什么不会打成 TUI？
+
+Tauri CLI 打包时会构建包名二进制 `echo-agent-cli`，项目已在 `--no-default-features --features gui` 下把它路由到同一套 GUI/Tauri 运行时；因此打包产物不会启动 TUI。
+
+`gui` feature 已依赖 `channels` feature，所以 GUI 打包命令无需额外写 `--features "gui,channels"`，多通道能力会随 GUI 一起编译进桌面应用。
+
+当前 Tauri CLI 的 lifecycle command 工作目录是 `src-tauri/`，所以 `tauri.conf.json` 中的前端命令写作 `cd ../web-frontend && npm run build`。
+
+> **注意**：每个平台只能打包该平台原生的安装包。如需交叉编译请使用 CI/CD（如 GitHub Actions）。
 
 ### Feature Flags 说明
 
 | Feature | 描述 | 默认启用 |
 |---------|------|----------|
 | `tui` | 终端全屏界面（ratatui） | ✅ |
-| `gui` | 桌面应用（Tauri） | ❌ |
+| `gui` | 桌面应用（Tauri，自动包含 `channels`） | ❌ |
 | `channels` | 多通道支持（IM） | ❌ |
 | `telemetry` | 遥测数据收集 | ❌ |
 | `devtools` | Tauri 开发者工具 | ❌ |
@@ -181,57 +229,6 @@ echo-agent-cli 启用以下 echo-agent 框架 features：
 | `tasks` | 任务系统 |
 | `eval` | 评测框架 |
 | `improve` | 自我改进 |
-
----
-
-## 🖥️ 安装与运行
-
-### TUI — 命令行快捷进入
-
-```bash
-# 方式一：直接运行（不安装）
-cargo run --bin echo-agent-cli
-
-# 方式二：安装到 ~/.cargo/bin（推荐，可全局调用）
-cargo install --path . --bin echo-agent-cli --no-default-features --features tui
-# 安装后可直接运行：
-echo-agent-cli
-```
-
-#### 创建快捷命令
-
-安装后，建议创建一个短命令别名方便日常使用：
-
-```bash
-# Bash / Zsh（添加到 ~/.bashrc 或 ~/.zshrc）
-alias ecw='echo-agent-cli'
-alias echocowork='echo-agent-cli'
-
-# Fish（添加到 ~/.config/fish/config.fish）
-alias ecw='echo-agent-cli'
-alias echocowork='echo-agent-cli'
-
-# 重新加载配置
-source ~/.zshrc  # 或 source ~/.bashrc
-```
-
-现在可以像使用 `claude` 一样直接输入：
-
-```bash
-ecw          # 快捷进入 TUI
-echocowork   # 完整命令名
-```
-
-### GUI — 桌面应用
-
-```bash
-# 方式一：直接运行（不安装）
-cargo run --bin echo-agent-tauri --no-default-features --features gui
-
-# 方式二：编译后安装到系统（macOS 示例）
-cargo build --bin echo-agent-tauri --no-default-features --features gui --release
-sudo cp target/release/echo-agent-tauri /Applications/EchoCoWork.app/Contents/MacOS/echocowork
-```
 
 ---
 
@@ -428,15 +425,17 @@ sudo cp target/release/echo-agent-tauri /Applications/EchoCoWork.app/Contents/Ma
 # Rust 编译检查（TUI 模式，默认）
 cargo check --workspace
 
-# 检查所有功能
-cargo check --workspace --features "tui,gui"
+# GUI 入口编译检查
+cargo check --bin echo-agent-tauri --no-default-features --features gui
 
-# Clippy 检查
-cargo clippy --workspace --features "tui,gui"
+# TUI Clippy 检查
+cargo clippy --workspace
 
-# 运行测试
-cargo test --workspace --features "tui,gui"
+# TUI 测试
+cargo test --workspace
 ```
+
+> **说明**：为避免混淆，日常开发也建议分别检查 TUI 与 GUI 入口；不要把 TUI/GUI 当成同一个打包产物处理。
 
 ### GUI 前端开发
 

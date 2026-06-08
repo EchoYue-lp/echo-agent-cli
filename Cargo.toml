@@ -29,7 +29,7 @@ gui = [
     "dep:tauri", "dep:tauri-plugin-shell", "dep:tauri-plugin-dialog",
     "dep:tauri-plugin-notification", "dep:tauri-plugin-fs",
     "dep:tauri-plugin-global-shortcut", "dep:portable-pty",
-    "dep:dashmap", "dep:similar",
+    "dep:dashmap", "dep:similar", "channels",
 ]
 channels = ["echo-agent/channels"]
 telemetry = ["echo-agent/telemetry"]
@@ -38,7 +38,6 @@ devtools = ["tauri?/devtools"]
 [[bin]]
 name = "echo-agent-cli"
 path = "src/main.rs"
-required-features = ["tui"]
 
 [[bin]]
 name = "echo-agent-tauri"

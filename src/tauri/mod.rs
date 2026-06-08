@@ -4,6 +4,7 @@
 //! All business logic goes through Tauri IPC — no embedded Axum server needed.
 
 pub mod commands;
+pub mod desktop;
 pub mod error;
 pub mod ipc;
 pub mod state;

@@ -2,7 +2,7 @@
   "$schema": "https://raw.githubusercontent.com/nickel-lang/json-schema-store/main/tauri.v2.schema.json",
   "productName": "EchoCoWork",
   "version": "1.0.0",
-  "identifier": "com.echo-agent.app",
+  "identifier": "com.echocowork.desktop",
   "mainBinaryName": "echo-agent-tauri",
   "build": {
     "beforeDevCommand": "cd ../web-frontend && npm run dev",
