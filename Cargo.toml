@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "echo-agent-app-core",
+    "echo-agent-eval",
 ]
 
 [package]
@@ -33,6 +34,7 @@ gui = [
 ]
 channels = ["echo-agent/channels"]
 telemetry = ["echo-agent/telemetry"]
+eval = ["echo-agent/eval"]
 devtools = ["tauri?/devtools"]
 
 [[bin]]

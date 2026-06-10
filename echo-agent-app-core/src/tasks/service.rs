@@ -55,6 +55,16 @@ impl BackgroundTaskService {
         store_backend: Arc<dyn Store>,
         cancel: echo_agent::agent::CancellationToken,
     ) -> anyhow::Result<Self> {
+        Self::with_hooks(agent, store_backend, cancel, None).await
+    }
+
+    /// Create with optional task hook bridge for YAML hook integration.
+    pub async fn with_hooks(
+        agent: AgentHandle,
+        store_backend: Arc<dyn Store>,
+        cancel: echo_agent::agent::CancellationToken,
+        task_hooks: Option<Arc<dyn echo_agent::workspace::orchestration::tasks::TaskHooks>>,
+    ) -> anyhow::Result<Self> {
         let store = Arc::new(SqliteTaskStore::new(store_backend));
 
         // Create event bus with logging listener
@@ -88,9 +98,12 @@ impl BackgroundTaskService {
             ..Default::default()
         };
 
-        let executor = Arc::new(
-            TaskExecutor::new(manager.clone(), executor_config).with_execute_fn(execute_fn),
-        );
+        let mut executor =
+            TaskExecutor::new(manager.clone(), executor_config).with_execute_fn(execute_fn);
+        if let Some(hooks) = task_hooks {
+            executor = executor.with_task_hook(hooks);
+        }
+        let executor = Arc::new(executor);
 
         // Progress cache — updated by a background subscriber of TaskEventBus.
         let latest_progress = Arc::new(DashMap::new());

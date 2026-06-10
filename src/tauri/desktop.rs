@@ -114,7 +114,12 @@ pub async fn run_desktop_entry() -> anyhow::Result<()> {
 }
 
 async fn run_desktop() -> anyhow::Result<()> {
+    // Load project-local .env file (standard dotenvy behavior)
     dotenvy::dotenv().ok();
+
+    // On macOS, GUI apps launched from Dock/Finder don't inherit shell env vars.
+    // Spawn the user's login shell to pick up API keys from ~/.zshrc etc.
+    infra::load_shell_env();
 
     let args = cli::Args::parse_from(["echo-agent-tauri"]);
     let mut app_config = config::load_config(args.config.as_deref());
@@ -122,58 +127,18 @@ async fn run_desktop() -> anyhow::Result<()> {
 
     infra::init_logging(&app_config.logging.level);
 
-    // ── Create agent + MCP ──
+    // ── Bootstrap Agent Runtime (shared TUI/GUI initialization) ──
     let params = infra::AgentCreateParams {
         model: args.model.clone(),
-        mode: "general".to_string(),
         system_prompt: None,
         project: args.project.clone(),
         session_id: None,
         react_checkpoint_interval: None,
-        extra_tools: vec![],
-    };
-    let mut agent = infra::create_agent(&params, &app_config);
-    infra::load_mcp_config(&mut agent, args.mcp_config.as_deref(), &app_config).await;
-
-    // Configure auto-compression
-    if app_config.has_compressor() {
-        app_config.apply_compressor(&agent).await;
-    }
-
-    let agent_handle = AgentHandle::new(agent);
-
-    // ── HITL dispatcher ──
-    let hitl_dispatcher = {
-        use echo_agent_app_core::hitl::HitlDispatcher;
-        let dispatcher = Arc::new(HitlDispatcher::new());
-        let repl_provider = Arc::new(echo_agent_app_core::hitl::ReplHumanLoopProvider::new());
-        dispatcher.register("repl", repl_provider).await;
-        agent_handle
-            .write_async(|a| {
-                let d = dispatcher.clone();
-                Box::pin(async move { a.set_human_loop_provider(d) })
-            })
-            .await;
-        dispatcher // Keep dispatcher reference for AppState
     };
 
-    // ── Load hooks ──
-    infra::load_user_hooks(&agent_handle, &app_config).await;
-    let hooks_load = echo_agent_app_core::hooks_config::load_hooks_files();
-    if !hooks_load.definition.is_empty() {
-        let hooks_def = hooks_load.definition;
-        agent_handle
-            .write_async(|a| {
-                Box::pin(async move {
-                    let mut registry = a.hook_registry().write().await;
-                    registry.clear_user_hooks();
-                    registry.register_user_hooks(hooks_def);
-                })
-            })
-            .await;
-    }
-
-    infra::fire_startup_hook(&agent_handle).await;
+    let runtime =
+        echo_agent_app_core::runtime::AgentRuntime::bootstrap(&app_config, params).await?;
+    let agent_handle = runtime.agent_handle.clone();
 
     // ── Config watcher ──
     let cancel_token = tokio_util::sync::CancellationToken::new();
@@ -198,13 +163,32 @@ async fn run_desktop() -> anyhow::Result<()> {
     let conversation_store = infra::create_conversation_store();
     infra::inject_conversation_store(&agent_handle, &conversation_store);
 
+    // ── Initialize agent pool for multi-conversation parallel execution ──
+    // init_pool() also starts the cleanup monitor automatically.
+    let pool = runtime
+        .init_pool(echo_agent_app_core::agent_pool::PoolConfig::default())
+        .await;
+    tracing::info!(
+        pool_size = pool.pool_size().await,
+        "AgentPool initialized for GUI (cleanup monitor started)"
+    );
+
     let mut state_inner = AppState::from_shared(
         agent_handle.clone(),
-        hitl_dispatcher,
+        runtime.hitl_dispatcher,
         conversation_store,
         app_config.clone(),
     );
-    state_inner.start_task_service(task_store.clone()).await;
+    state_inner.set_pool(pool);
+
+    // Wire task hook bridge so YAML hooks see task lifecycle events
+    let task_hooks = runtime
+        .task_hook_bridge
+        .clone()
+        .map(|b| b as Arc<dyn echo_agent::workspace::orchestration::tasks::TaskHooks>);
+    state_inner
+        .start_task_service_with_hooks(task_store.clone(), task_hooks)
+        .await;
     state_inner.start_scheduler_with_store(Some(task_store));
     let state = Arc::new(state_inner);
 

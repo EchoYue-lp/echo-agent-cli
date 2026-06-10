@@ -1,0 +1,22 @@
+id: "data-vis-003"
+name: "散点图相关性"
+description: "Agent 应创建散点图并分析两个变量之间的相关关系"
+domain: data-visualization
+task: |
+  以下是 15 名学生的每日学习时长（小时）与考试成绩（分）数据：
+  学习时长: 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 9
+  考试成绩: 45, 52, 58, 62, 68, 71, 75, 78, 82, 85, 88, 90, 92, 95, 97
+
+  请用 Python matplotlib 创建一个散点图，要求：
+  1. x 轴为学习时长，y 轴为考试成绩
+  2. 添加标题"学习时长与考试成绩相关性分析"
+  3. 添加最佳拟合线和 R² 值标注
+  4. 计算并输出 Pearson 相关系数
+  5. 保存为 study_score_scatter.png
+success_criteria:
+  all_of:
+    - tool_used: "shell"
+    - output_contains: "study_score_scatter.png"
+    - output_contains: "散点图"
+    - output_contains: "相关"
+constraints: {}

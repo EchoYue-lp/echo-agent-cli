@@ -61,7 +61,6 @@ impl EnhancedCompleter {
                 "/prof",
                 "/debug",
                 "/dbg",
-                "/mode",
                 "/project",
                 "/proj",
                 "/cost",
@@ -77,12 +76,24 @@ impl EnhancedCompleter {
             tool_names: BTreeSet::new(),
             model_names: BTreeSet::from_iter(
                 [
-                    "qwen-max",
-                    "qwen-plus",
-                    "qwen-turbo",
-                    "gpt-4",
-                    "gpt-3.5-turbo",
-                    "claude-3-opus",
+                    // OpenAI
+                    "gpt-5.5",
+                    // Anthropic
+                    "claude-opus-4-8",
+                    "claude-opus-4-7",
+                    // DeepSeek
+                    "deepseek-v4-flash",
+                    "deepseek-v4-pro",
+                    // DashScope (Qwen)
+                    "qwen3.7-max",
+                    "qwen3.6-plus",
+                    "qwen3.7-plus",
+                    // Moonshot
+                    "kimi-k2.6",
+                    // Zhipu
+                    "glm-5.1",
+                    // Gemini
+                    "gemini-3.5-flash",
                 ]
                 .iter()
                 .map(|s| s.to_string()),
@@ -155,16 +166,6 @@ impl EnhancedCompleter {
             return ["text", "json", "markdown", "table"]
                 .iter()
                 .filter(|f| f.starts_with(prefix))
-                .map(|s| s.to_string())
-                .collect();
-        }
-
-        // /mode 后补全模式名
-        if input.starts_with("/mode ") {
-            let prefix = input.split_whitespace().last().unwrap_or("");
-            return ["general", "coding", "research", "data", "writing"]
-                .iter()
-                .filter(|m| m.starts_with(prefix))
                 .map(|s| s.to_string())
                 .collect();
         }

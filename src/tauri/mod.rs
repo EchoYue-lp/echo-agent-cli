@@ -211,6 +211,7 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
             terminal::write_terminal,
             terminal::resize_terminal,
             terminal::close_terminal,
+            terminal::list_terminal_sessions,
         ])
         .setup(|app| {
             // Register global shortcut: CmdOrCtrl+Shift+E toggles window visibility

@@ -1,0 +1,17 @@
+id: "web-search-003"
+name: "对比产品特性"
+description: "Agent 应搜索多个产品信息并进行结构化对比"
+domain: web-search
+task: |
+  搜索并对比 PostgreSQL 和 MySQL 在以下方面的差异：
+  - JSON 支持
+  - 复制机制
+  - 扩展性
+  以表格形式呈现。
+success_criteria:
+  all_of:
+    - tool_used: "web_search"
+    - output_contains:
+        substring: "PostgreSQL"
+    - output_contains:
+        substring: "MySQL"

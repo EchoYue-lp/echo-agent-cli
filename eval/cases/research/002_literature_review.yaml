@@ -1,0 +1,22 @@
+id: "research-002"
+name: "文献综述"
+description: "Agent 应基于检索结果撰写简要文献综述"
+domain: research
+task: |
+  搜索 "federated learning privacy" 相关论文，撰写一篇 500 字以内的简要文献综述。
+  要求：引用至少 3 篇真实论文，标注 DOI，按主题分组。
+success_criteria:
+  all_of:
+    - tool_used: "arxiv_search"
+    - citation_valid:
+        min_citations: 3
+        format: "any"
+    - llm_graded:
+        assertions:
+          - id: "structured"
+            check: "输出是否按主题分组，有清晰的引言和结论"
+            expected: "有分组结构"
+          - id: "no_fabrication"
+            check: "所有引用的论文标题和作者是否来自工具返回的真实结果"
+            expected: "全部来自工具结果"
+constraints: {}

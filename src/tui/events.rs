@@ -19,6 +19,191 @@ use echo_agent_app_core::tasks::BackgroundTaskService;
 /// Poll interval for non-blocking event check.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Handle keyboard input when an approval request is pending.
+/// Returns `true` if the key was consumed.
+async fn handle_approval_key(
+    _app: &mut TuiApp,
+    pending_handle: &Arc<tokio::sync::Mutex<Option<echo_agent_app_core::hitl::PendingApproval>>>,
+    key: &KeyEvent,
+) -> bool {
+    use echo_agent::human_loop::HumanLoopResponse;
+    use echo_agent_app_core::hitl::PendingApproval;
+
+    let mut guard = match pending_handle.try_lock() {
+        Ok(g) => g,
+        Err(_) => return false,
+    };
+    let approval = match guard.as_mut() {
+        Some(a) => a,
+        None => return false,
+    };
+
+    if approval.input_mode {
+        // ── Feedback input mode (for 拒绝/修改) ──
+        match key.code {
+            KeyCode::Esc => {
+                // Cancel input, go back to option selection
+                approval.input_mode = false;
+                approval.feedback_input.clear();
+                approval.feedback_cursor = 0;
+                true
+            }
+            KeyCode::Enter => {
+                // Submit feedback
+                let label = approval.input_label.clone();
+                let feedback = approval.feedback_input.clone();
+                let reason = if feedback.is_empty() {
+                    format!("用户{}", label)
+                } else {
+                    format!("用户{}: {}", label, feedback)
+                };
+                if let Some(tx) = approval.response_tx.take() {
+                    let _ = tx.send(HumanLoopResponse::Rejected {
+                        reason: Some(reason),
+                    });
+                }
+                true
+            }
+            KeyCode::Backspace => {
+                if approval.feedback_cursor > 0 {
+                    // Remove character before cursor
+                    let s = &mut approval.feedback_input;
+                    let byte_idx = approval.feedback_cursor;
+                    // Find the start of the previous character
+                    let prev = s[..byte_idx]
+                        .char_indices()
+                        .next_back()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                    s.drain(prev..byte_idx);
+                    approval.feedback_cursor = prev;
+                }
+                true
+            }
+            KeyCode::Char(c) => {
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    return false; // Let global shortcuts through
+                }
+                approval.feedback_input.insert(approval.feedback_cursor, c);
+                approval.feedback_cursor += c.len_utf8();
+                true
+            }
+            KeyCode::Left => {
+                if approval.feedback_cursor > 0 {
+                    let s = &approval.feedback_input;
+                    approval.feedback_cursor = s[..approval.feedback_cursor]
+                        .char_indices()
+                        .next_back()
+                        .map(|(i, _)| i)
+                        .unwrap_or(0);
+                }
+                true
+            }
+            KeyCode::Right => {
+                let s = &approval.feedback_input;
+                if approval.feedback_cursor < s.len() {
+                    approval.feedback_cursor += s[approval.feedback_cursor..]
+                        .chars()
+                        .next()
+                        .map(|c| c.len_utf8())
+                        .unwrap_or(0);
+                }
+                true
+            }
+            _ => true, // Consume all other keys in input mode
+        }
+    } else {
+        // ── Option selection mode ──
+        match key.code {
+            KeyCode::Left => {
+                if approval.selected_option > 0 {
+                    approval.selected_option -= 1;
+                }
+                true
+            }
+            KeyCode::Right | KeyCode::Tab => {
+                approval.selected_option =
+                    (approval.selected_option + 1) % PendingApproval::OPTION_COUNT;
+                true
+            }
+            KeyCode::Enter => {
+                // Confirm selected option
+                send_approval_response(approval);
+                true
+            }
+            KeyCode::Char('y') => {
+                approval.selected_option = 0;
+                send_approval_response(approval);
+                true
+            }
+            KeyCode::Char('n') => {
+                approval.selected_option = 1;
+                approval.input_mode = true;
+                approval.input_label = "拒绝原因".to_string();
+                approval.feedback_input.clear();
+                approval.feedback_cursor = 0;
+                true
+            }
+            KeyCode::Char('m') => {
+                approval.selected_option = 2;
+                approval.input_mode = true;
+                approval.input_label = "修改意见".to_string();
+                approval.feedback_input.clear();
+                approval.feedback_cursor = 0;
+                true
+            }
+            KeyCode::Char('a') => {
+                approval.selected_option = 3;
+                send_approval_response(approval);
+                true
+            }
+            KeyCode::Esc => {
+                // Esc = reject
+                if let Some(tx) = approval.response_tx.take() {
+                    let _ = tx.send(HumanLoopResponse::Rejected {
+                        reason: Some("User dismissed".to_string()),
+                    });
+                }
+                true
+            }
+            _ => false, // Let other keys through
+        }
+    }
+}
+
+/// Send the approval response based on the currently selected option.
+fn send_approval_response(approval: &mut echo_agent_app_core::hitl::PendingApproval) {
+    use echo_agent::human_loop::{ApprovalScope, HumanLoopResponse};
+
+    let response = match approval.selected_option {
+        0 => HumanLoopResponse::Approved,
+        1 => {
+            // Switch to input mode for rejection reason
+            approval.input_mode = true;
+            approval.input_label = "拒绝原因".to_string();
+            approval.feedback_input.clear();
+            approval.feedback_cursor = 0;
+            return; // Don't send yet
+        }
+        2 => {
+            // Switch to input mode for modification feedback
+            approval.input_mode = true;
+            approval.input_label = "修改意见".to_string();
+            approval.feedback_input.clear();
+            approval.feedback_cursor = 0;
+            return; // Don't send yet
+        }
+        3 => HumanLoopResponse::ApprovedWithScope {
+            scope: ApprovalScope::SessionAllTools,
+        },
+        _ => HumanLoopResponse::Approved,
+    };
+
+    if let Some(tx) = approval.response_tx.take() {
+        let _ = tx.send(response);
+    }
+}
+
 enum AgentEvent {
     /// A streaming token chunk from the LLM.
     Token(String),
@@ -77,8 +262,9 @@ pub async fn run_event_loop(
                     app.finalize_stream();
                 }
                 AgentEvent::ToolCall { name, args } => {
-                    let display = if args.len() > 60 {
-                        format!("{} ({})", name, &args[..60])
+                    let display = if args.chars().count() > 2000 {
+                        let truncated: String = args.chars().take(2000).collect();
+                        format!("{} ({}...)", name, truncated)
                     } else {
                         format!("{} ({})", name, args)
                     };
@@ -97,8 +283,9 @@ pub async fn run_event_loop(
                             content: output,
                         });
                     } else {
-                        let display = if output.len() > 100 {
-                            format!("{} → {}...", name, &output[..100])
+                        let display = if output.chars().count() > 100 {
+                            let truncated: String = output.chars().take(100).collect();
+                            format!("{} → {}...", name, truncated)
                         } else {
                             format!("{} → {}", name, output)
                         };
@@ -120,12 +307,33 @@ pub async fn run_event_loop(
         }
 
         // Handle events.
-        if event::poll(POLL_INTERVAL)? {
-            match event::read()? {
-                Event::Key(key) => handle_key(app, key, &agent, agent_tx.clone()).await,
-                Event::Mouse(mouse) => handle_mouse(app, &mouse),
-                Event::Resize(_, _) => {} // ratatui handles resize automatically
-                _ => {}
+        // ── Resilient event reading: tolerate transient I/O errors ──
+        // On macOS, terminal resize generates SIGWINCH which can interrupt
+        // crossterm's underlying read() syscall with EINTR. We must NOT
+        // propagate these as fatal errors — just skip the tick and retry.
+        match event::poll(POLL_INTERVAL) {
+            Ok(true) => match event::read() {
+                Ok(Event::Key(key)) => handle_key(app, key, &agent, agent_tx.clone()).await,
+                Ok(Event::Mouse(mouse)) => handle_mouse(app, &mouse),
+                Ok(Event::Resize(_, _)) => {} // ratatui handles resize automatically
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    tracing::warn!("crossterm event::read() error: {e}");
+                    // Non-fatal: skip this tick, will retry on next loop iteration.
+                    // Only propagate truly unexpected errors.
+                    if e.kind() != io::ErrorKind::WouldBlock {
+                        return Err(e.into());
+                    }
+                }
+            },
+            Ok(false) => {}
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => {
+                tracing::warn!("crossterm event::poll() error: {e}");
+                if e.kind() != io::ErrorKind::WouldBlock {
+                    return Err(e.into());
+                }
             }
         }
 
@@ -203,6 +411,20 @@ async fn handle_key(
     agent: &AgentHandle,
     agent_tx: mpsc::UnboundedSender<AgentEvent>,
 ) {
+    // ── Approval mode takes priority over everything ──
+    if let Some(pending_handle) = app.pending_approval.clone() {
+        // Check if there's a pending approval
+        let has_pending = {
+            let guard = pending_handle.try_lock();
+            guard.as_ref().map(|g| g.is_some()).unwrap_or(false)
+        };
+        if has_pending {
+            if handle_approval_key(app, &pending_handle, &key).await {
+                return;
+            }
+        }
+    }
+
     if !app.suggestions.is_empty() {
         // Command palette mode: palette consumes Tab/Enter/Esc; everything
         // else falls through to normal input handling.
@@ -471,6 +693,8 @@ async fn send_to_agent(
         let message = text;
 
         tokio::spawn(async move {
+            // The RwLock read guard must be held for the entire stream lifetime
+            // because chat_stream returns BoxStream<'a> that borrows from &'a self.
             let guard = inner.read().await;
             match guard.chat_stream(&message).await {
                 Ok(mut stream) => {
@@ -487,6 +711,7 @@ async fn send_to_agent(
         });
 
         // Forward events from inner task to UI
+        let mut got_final = false;
         while let Some(event) = rx.recv().await {
             match event {
                 Ok(echo_agent::agent::AgentEvent::Token(t)) => {
@@ -496,6 +721,7 @@ async fn send_to_agent(
                 }
                 Ok(echo_agent::agent::AgentEvent::FinalAnswer(answer)) => {
                     let _ = agent_tx.send(AgentEvent::FinalAnswer(answer));
+                    got_final = true;
                     break;
                 }
                 Ok(echo_agent::agent::AgentEvent::ToolCall { name, args }) => {
@@ -510,9 +736,19 @@ async fn send_to_agent(
                 Ok(_) => {} // Ignore other event types
                 Err(e) => {
                     let _ = agent_tx.send(AgentEvent::Error(e.to_string()));
+                    got_final = true; // Error also resets is_processing
                     break;
                 }
             }
+        }
+
+        // If the inner task ended without FinalAnswer or Error (e.g. channel
+        // dropped, LLM stream ended abnormally), send a fallback error so the
+        // UI resets is_processing and the user can send another message.
+        if !got_final {
+            let _ = agent_tx.send(AgentEvent::Error(
+                "Agent stream ended unexpectedly. Please try again.".to_string(),
+            ));
         }
     });
 }
@@ -565,20 +801,6 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &AgentHandle, cmd: &str) 
                 role: MessageRole::System,
                 content: help,
             });
-        }
-        Some(SlashCommand::Mode) => {
-            if args.is_empty() {
-                app.messages.push(ChatMessage {
-                    role: MessageRole::System,
-                    content: format!("Current mode: {}", app.mode),
-                });
-            } else {
-                app.mode = args.to_string();
-                app.messages.push(ChatMessage {
-                    role: MessageRole::System,
-                    content: format!("Mode switched to: {}", app.mode),
-                });
-            }
         }
         Some(SlashCommand::Model) => {
             if args.is_empty() {

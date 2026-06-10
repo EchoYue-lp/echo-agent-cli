@@ -37,6 +37,12 @@ pub struct SavedMessage {
     pub role: String,
     pub content: Option<String>,
     pub tool_calls: Option<Vec<SavedToolCall>>,
+    /// Thinking/reasoning segments from the LLM (e.g., DeepSeek thinking process)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_segments: Option<Vec<String>>,
+    /// Tool call result (for tool role messages)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_result: Option<String>,
 }
 
 /// 工具调用的序列化表示
@@ -266,6 +272,8 @@ impl Persistence {
                     })
                     .collect()
             }),
+            thinking_segments: None,
+            tool_result: None,
         }
     }
 }
@@ -290,6 +298,8 @@ mod tests {
             role: "user".to_string(),
             content: Some("hello".to_string()),
             tool_calls: None,
+            thinking_segments: None,
+            tool_result: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"role\":\"user\""));

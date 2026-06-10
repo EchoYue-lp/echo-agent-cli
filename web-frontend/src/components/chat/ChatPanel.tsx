@@ -178,6 +178,8 @@ export function ChatPanel() {
                     request={approvalRequest}
                     onApprove={() => sendApproval(approvalRequest.requestId, true)}
                     onReject={(reason) => sendApproval(approvalRequest.requestId, false, reason)}
+                    onModify={(feedback) => sendApproval(approvalRequest.requestId, false, `修改意见: ${feedback}`)}
+                    onApproveAll={() => sendApproval(approvalRequest.requestId, true, undefined, 'session_all_tools')}
                   />
                 </div>
               )}

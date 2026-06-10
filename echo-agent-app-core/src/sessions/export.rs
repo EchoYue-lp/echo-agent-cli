@@ -181,7 +181,7 @@ mod tests {
 
     #[test]
     fn test_export_markdown_string() {
-        let mut session = Session::new("test", "qwen-plus");
+        let mut session = Session::new("test", "qwen3.6-plus");
         session.messages.push(SessionMessage {
             role: "user".into(),
             content: Some("Hello".into()),
@@ -195,7 +195,7 @@ mod tests {
 
     #[test]
     fn test_export_html_string() {
-        let session = Session::new("test", "qwen-plus");
+        let session = Session::new("test", "qwen3.6-plus");
         let html = SessionExporter::to_html_string(&session);
         assert!(html.contains("<!DOCTYPE html>"));
         assert!(html.contains("test"));

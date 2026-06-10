@@ -1,0 +1,22 @@
+id: "data-vis-001"
+name: "柱状图对比"
+description: "Agent 应使用 Python 创建柱状图并保存为图片文件"
+domain: data-visualization
+task: |
+  以下是某公司 2025 年各季度销售额数据（万元）：
+  - Q1: 320
+  - Q2: 450
+  - Q3: 380
+  - Q4: 520
+
+  请用 Python matplotlib 创建一个柱状图，要求：
+  1. x 轴为季度，y 轴为销售额（万元）
+  2. 添加标题"2025 年季度销售额对比"
+  3. 每个柱子上方标注具体数值
+  4. 保存为 quarterly_sales.png
+success_criteria:
+  all_of:
+    - tool_used: "shell"
+    - output_contains: "quarterly_sales.png"
+    - output_contains: "柱状图"
+constraints: {}

@@ -88,15 +88,33 @@ function generateId(): string {
 }
 
 function chatMessagesToSaved(messages: ChatMessage[]) {
-  return messages.map((m) => ({
-    role: m.role,
-    content: m.content,
-    tool_calls: m.toolCalls?.map((tc) => ({
-      id: `${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-      name: tc.name,
-      arguments: JSON.stringify(tc.args),
-    })),
-  }));
+  const saved: { role: string; content: string; tool_calls?: { id: string; name: string; arguments: string }[]; thinking_segments?: string[]; tool_result?: string }[] = [];
+
+  for (const m of messages) {
+    // Save the main message
+    const entry: typeof saved[0] = {
+      role: m.role,
+      content: m.content,
+    };
+
+    // Save thinking segments
+    if (m.thinkingSegments && m.thinkingSegments.length > 0) {
+      entry.thinking_segments = m.thinkingSegments.map((s) => s.content);
+    }
+
+    // Save tool calls with stable IDs and results
+    if (m.toolCalls && m.toolCalls.length > 0) {
+      entry.tool_calls = m.toolCalls.map((tc, i) => ({
+        id: `tc-${m.id}-${i}`,
+        name: tc.name,
+        arguments: typeof tc.args === 'string' ? tc.args : JSON.stringify(tc.args || {}),
+      }));
+    }
+
+    saved.push(entry);
+  }
+
+  return saved;
 }
 
 // ── Store ──
@@ -201,16 +219,45 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
         console.error('Failed to restore agent context:', e);
       }
 
-      // Convert saved messages to chat messages for frontend display
-      const chatMessages: ChatMessage[] = record.messages
-        .filter((m) => m.role === 'user' || m.role === 'assistant')
-        .map((m) => ({
-          id: `loaded-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-          role: m.role as 'user' | 'assistant',
+      // Convert saved messages to chat messages for frontend display.
+      // Include tool messages to show the full thinking chain (tool calls + results).
+      const chatMessages: ChatMessage[] = record.messages.map((m, idx) => {
+        const base: ChatMessage = {
+          id: `loaded-${Date.now()}-${idx}`,
+          role: (m.role === 'tool' ? 'assistant' : m.role) as 'user' | 'assistant',
           content: m.content || '',
           isStreaming: false,
           timestamp: Date.now(),
-        }));
+        };
+
+        // Restore thinking segments
+        if (m.thinking_segments && m.thinking_segments.length > 0) {
+          base.thinkingSegments = m.thinking_segments.map((s) => ({ content: s }));
+        }
+
+        // Restore tool calls on assistant messages
+        if (m.role === 'assistant' && m.tool_calls && m.tool_calls.length > 0) {
+          base.toolCalls = m.tool_calls.map((tc) => ({
+            name: tc.name,
+            args: (() => { try { return JSON.parse(tc.arguments); } catch { return tc.arguments; } })(),
+            result: '',
+            success: true,
+          }));
+        }
+
+        // For tool result messages, show as assistant with tool result content
+        if (m.role === 'tool') {
+          base.content = m.tool_result || m.content || '';
+          base.toolCalls = [{
+            name: 'tool',
+            args: {},
+            result: m.tool_result || m.content || '',
+            success: true,
+          }];
+        }
+
+        return base;
+      });
 
       const chatStore = useChatStore.getState();
       chatStore.replaceMessages(chatMessages);

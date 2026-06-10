@@ -220,7 +220,19 @@ impl TerminalManager {
     }
 
     pub fn remove(&self, id: &str) -> Option<Arc<PtySession>> {
-        self.sessions.remove(id).map(|(_, s)| s)
+        self.sessions.remove(id).map(|(_, v)| v)
+    }
+
+    pub fn list(&self) -> Vec<serde_json::Value> {
+        self.sessions
+            .iter()
+            .map(|entry| {
+                serde_json::json!({
+                    "id": entry.key().clone(),
+                    "pid": entry.value().pid,
+                })
+            })
+            .collect()
     }
 
     pub fn close_all(&self) {
@@ -310,4 +322,11 @@ pub async fn close_terminal(
     session.kill().await.map_err(IpcError::Internal)?;
     info!("Terminal '{id}' closed");
     Ok(serde_json::json!({"success": true}))
+}
+
+#[tauri::command]
+pub async fn list_terminal_sessions(
+    state: tauri::State<'_, TauriState>,
+) -> Result<serde_json::Value, IpcError> {
+    Ok(serde_json::json!(state.terminal_manager.list()))
 }

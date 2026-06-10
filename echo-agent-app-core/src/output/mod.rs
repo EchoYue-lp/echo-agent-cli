@@ -204,8 +204,9 @@ impl OutputRenderer {
     pub fn print_tool_call(&self, name: &str, args: &serde_json::Value) {
         let label = self.paint(|t| t.tool_color, &format!("🔧 调用工具: {}", name));
         let args_str = serde_json::to_string(args).unwrap_or_default();
-        let args_display = if args_str.len() > 200 {
-            format!("{}...", &args_str[..200])
+        let args_display = if args_str.chars().count() > 200 {
+            let truncated: String = args_str.chars().take(200).collect();
+            format!("{truncated}...")
         } else {
             args_str
         };

@@ -1,0 +1,26 @@
+id: "data-wrangling-001"
+name: "CSV 缺失值处理"
+description: "Agent 应加载 CSV 文件，识别缺失值并采取填充、删除或插补策略处理"
+domain: data-wrangling
+task: |
+  加载 eval/fixtures/titanic-small.csv 文件，完成以下缺失值处理任务：
+  1. 统计每一列的缺失值数量和占比
+  2. 对 age 列的缺失值使用中位数进行填充（impute）
+  3. 对 cabin 列缺失值过多的情况，选择删除（drop）该列
+  4. 对 embarked 列的缺失值使用众数填充（fill）
+  5. 将处理后的数据保存到 no_missing.csv
+  报告处理前后各列的缺失值变化情况，说明每种处理策略的适用场景。
+project_fixture: "fixtures"
+success_criteria:
+  all_of:
+    - tool_used: "shell"
+    - output_contains: "缺失"
+    - any_of:
+        - output_contains: "填充"
+        - output_contains: "fill"
+        - output_contains: "drop"
+        - output_contains: "删除"
+        - output_contains: "impute"
+        - output_contains: "插补"
+    - output_contains: "no_missing.csv"
+constraints: {}

@@ -42,7 +42,7 @@ pub struct WebConfig {
 impl Default for WebConfig {
     fn default() -> Self {
         Self {
-            model: "qwen-plus".to_string(),
+            model: "qwen3.6-plus".to_string(),
             system_prompt: "你是一个智能助手。".to_string(),
             token_limit: 8000,
             max_upload_size_bytes: 10 * 1024 * 1024,
@@ -287,13 +287,45 @@ pub struct McpHealthStatus {
 
 // ── 子状态拆分 ──
 
-/// 连接管理状态：Agent 句柄 + HITL Dispatcher
+/// 连接管理状态：Agent 句柄 + HITL Dispatcher + 可选 Agent Pool
 pub struct ConnectionState {
     pub agent: AgentHandle,
     /// HITL dispatcher — 多 Provider 协作（repl, ws, webhook 等）
     /// WS handler 注册到 dispatcher 而非替换 agent 的 provider，
     /// 确保多模式下 HITL 请求能路由到正确的 Provider。
     pub hitl_dispatcher: Arc<crate::hitl::HitlDispatcher>,
+    /// Agent pool for multi-conversation parallel execution.
+    /// When `Some`, `agent_for()` routes to pool agents by conversation_id.
+    /// When `None`, all requests use the single `agent` (backward compatible).
+    pub pool: Option<Arc<crate::agent_pool::AgentPool>>,
+}
+
+impl ConnectionState {
+    /// Get the agent for a given conversation ID.
+    ///
+    /// If a pool is active, acquires (or reuses) a pool agent for the ID.
+    /// Falls back to the primary `agent` if pool is disabled or acquire fails.
+    pub async fn agent_for(&self, conversation_id: &str) -> AgentHandle {
+        if let Some(ref pool) = self.pool {
+            pool.acquire(conversation_id)
+                .await
+                .unwrap_or_else(|_| self.agent.clone())
+        } else {
+            self.agent.clone()
+        }
+    }
+
+    /// Get the primary agent (bypass pool routing).
+    ///
+    /// Used by commands that don't participate in multi-conversation routing.
+    pub fn primary_agent(&self) -> AgentHandle {
+        self.agent.clone()
+    }
+
+    /// Whether the agent pool is active.
+    pub fn has_pool(&self) -> bool {
+        self.pool.is_some()
+    }
 }
 
 /// 配置状态：应用 / Web / 沙箱 / 权限
@@ -427,6 +459,7 @@ impl AppState {
             connection: ConnectionState {
                 agent,
                 hitl_dispatcher,
+                pool: None,
             },
             config: ConfigState {
                 app_config: RwLock::new(app_config),
@@ -485,6 +518,13 @@ impl AppState {
         }
     }
 
+    /// Set the agent pool for multi-conversation parallel execution.
+    ///
+    /// Call this **before** wrapping in `Arc`.
+    pub fn set_pool(&mut self, pool: Arc<crate::agent_pool::AgentPool>) {
+        self.connection.pool = Some(pool);
+    }
+
     /// 启动定时任务调度器（仅在 Web 或双模式下调用）
     ///
     /// Call this **before** wrapping in `Arc`.
@@ -504,6 +544,9 @@ impl AppState {
             Some(b) => crate::scheduler::CronTaskStore::with_store(b),
             None => crate::scheduler::CronTaskStore::new(),
         };
+        // Cron tasks use the primary agent (scheduler fire_fn is sync).
+        // When a BackgroundTaskService is available, cron tasks are submitted
+        // to it (which uses the dedicated background agent from the pool).
         let runner = crate::scheduler::new_scheduler_runner(
             store,
             self.scheduler.cancel_token.clone(),
@@ -518,15 +561,40 @@ impl AppState {
 
     /// 启动后台任务服务（所有模式都应调用）
     ///
+    /// When an agent pool is active, background tasks run on a dedicated
+    /// pool agent instead of the primary agent, enabling parallel execution
+    /// with foreground conversations.
+    ///
     /// Call this **before** wrapping in `Arc`.
     pub async fn start_task_service(&mut self, store_backend: Arc<dyn echo_agent::memory::Store>) {
+        self.start_task_service_with_hooks(store_backend, None)
+            .await;
+    }
+
+    /// Start task service with optional hook bridge for YAML hook integration.
+    pub async fn start_task_service_with_hooks(
+        &mut self,
+        store_backend: Arc<dyn echo_agent::memory::Store>,
+        task_hooks: Option<Arc<dyn echo_agent::workspace::orchestration::tasks::TaskHooks>>,
+    ) {
         if self.tasks.service.is_some() {
             return;
         }
-        match crate::tasks::BackgroundTaskService::new(
-            self.connection.agent.clone(),
+
+        // Use dedicated background agent from pool if available
+        let bg_agent = if let Some(ref pool) = self.connection.pool {
+            pool.background_agent()
+                .await
+                .unwrap_or_else(|| self.connection.agent.clone())
+        } else {
+            self.connection.agent.clone()
+        };
+
+        match crate::tasks::BackgroundTaskService::with_hooks(
+            bg_agent,
             store_backend,
             self.tasks.cancel_token.clone(),
+            task_hooks,
         )
         .await
         {

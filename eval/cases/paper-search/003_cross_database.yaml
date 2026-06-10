@@ -1,0 +1,19 @@
+id: "paper-search-003"
+name: "跨数据库交叉检索"
+description: "Agent 应同时使用 arxiv_search 和 semantic_scholar_search 进行交叉检索并对比结果"
+domain: paper-search
+task: |
+  分别在 ArXiv 和 Semantic Scholar 两个数据库上搜索 "retrieval augmented generation" 相关论文，
+  对比两个平台返回的结果差异：
+  - 列出每个平台返回的前 3 篇论文标题和 DOI（如有）
+  - 标注哪些论文同时出现在两个平台，哪些只出现在其中一个平台
+  - 给出简要的对比分析
+success_criteria:
+  all_of:
+    - tool_used: "arxiv_search"
+    - tool_used: "semantic_scholar_search"
+    - output_contains:
+        substring: "DOI"
+    - output_contains:
+        substring: "retrieval augmented generation"
+constraints: {}

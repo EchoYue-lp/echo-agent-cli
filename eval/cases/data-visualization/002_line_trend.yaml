@@ -1,0 +1,20 @@
+id: "data-vis-002"
+name: "折线图趋势分析"
+description: "Agent 应生成折线图展示数据随时间的变化趋势"
+domain: data-visualization
+task: |
+  以下是某网站连续 12 个月的月活跃用户数（万人）：
+  1月: 12, 2月: 15, 3月: 18, 4月: 22, 5月: 28, 6月: 35,
+  7月: 42, 8月: 48, 9月: 45, 10月: 50, 11月: 55, 12月: 63
+
+  请用 Python matplotlib 创建一个折线图，要求：
+  1. x 轴为月份，y 轴为用户数（万人）
+  2. 添加标题"月活跃用户增长趋势"
+  3. 添加趋势线（线性回归拟合）
+  4. 保存为 user_trend.png
+success_criteria:
+  all_of:
+    - tool_used: "shell"
+    - output_contains: "user_trend.png"
+    - output_contains: "趋势"
+constraints: {}

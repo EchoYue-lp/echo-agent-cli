@@ -1,0 +1,13 @@
+id: "medical-002"
+name: "临床试验查询"
+description: "Agent 应查询正在招募的临床试验"
+domain: medical
+task: |
+  使用 clinical_trials_search 查找正在招募的阿尔茨海默病 III 期临床试验，
+  列出试验名称、NCT ID、招募状态、主要终点。
+success_criteria:
+  all_of:
+    - tool_used: "clinical_trials_search"
+    - output_contains: "RECRUITING"
+    - output_contains: "NCT"
+constraints: {}

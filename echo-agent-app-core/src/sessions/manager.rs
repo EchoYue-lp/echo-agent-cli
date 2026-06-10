@@ -287,7 +287,7 @@ mod tests {
     #[test]
     fn test_session_create_and_list() {
         let mut manager = SessionManager::new();
-        let session = manager.create("test-session", "qwen-plus").unwrap();
+        let session = manager.create("test-session", "qwen3.6-plus").unwrap();
         assert!(!session.id.is_empty());
         assert_eq!(session.name, "test-session");
 
@@ -300,7 +300,7 @@ mod tests {
     #[test]
     fn test_session_branch() {
         let mut manager = SessionManager::new();
-        let parent = manager.create("parent", "qwen-plus").unwrap();
+        let parent = manager.create("parent", "qwen3.6-plus").unwrap();
         let branch = manager.branch(&parent.id, "experiment").unwrap();
 
         assert_eq!(branch.parent_id, Some(parent.id.clone()));
@@ -313,7 +313,7 @@ mod tests {
     #[test]
     fn test_session_diff() {
         let mut manager = SessionManager::new();
-        let mut a = manager.create("diff-a", "qwen-plus").unwrap();
+        let mut a = manager.create("diff-a", "qwen3.6-plus").unwrap();
         a.messages.push(SessionMessage {
             role: "user".into(),
             content: Some("hello".into()),
@@ -321,7 +321,7 @@ mod tests {
         });
         manager.save(&a).unwrap();
 
-        let mut b = manager.create("diff-b", "qwen-plus").unwrap();
+        let mut b = manager.create("diff-b", "qwen3.6-plus").unwrap();
         b.messages.push(SessionMessage {
             role: "user".into(),
             content: Some("world".into()),

@@ -180,6 +180,9 @@ pub async fn run_repl(agent: AgentHandle, config: ReplConfig) -> anyhow::Result<
     // ── Auto-memory: extract observations on session end ────────────
     run_auto_memory_on_exit(&agent).await;
 
+    // ── Reflection: summarize session learnings ─────────────────────
+    run_reflection_on_exit(&agent).await;
+
     Ok(())
 }
 
@@ -251,6 +254,75 @@ async fn run_auto_memory_on_exit(agent: &AgentHandle) {
             // Silently report but don't block exit
             println!("  Auto-memory: failed to save ({})", e);
         }
+    }
+}
+
+/// Run lightweight reflection when the session ends.
+///
+/// Generates a brief summary of session learnings and appends to
+/// `.echo-agent/memory/PROJECT.md`. Non-blocking: errors are silently
+/// ignored to avoid disrupting exit flow.
+async fn run_reflection_on_exit(agent: &AgentHandle) {
+    // Get LLM client from agent
+    let llm_client = agent.read(|a| a.llm_client().cloned()).await;
+
+    let Some(llm) = llm_client else {
+        return;
+    };
+
+    // Get message count to ensure there's enough context for reflection
+    let message_count = agent
+        .read_async(|a| {
+            Box::pin(async move {
+                let ctx = a.context().lock().await;
+                ctx.messages().len()
+            })
+        })
+        .await;
+
+    // Need at least a few exchanges for meaningful reflection
+    if message_count < 4 {
+        return;
+    }
+
+    let prompt = "Reflect on the current session and summarize key learnings in 1-2 sentences.\n\
+                  Focus on reusable insights. Be specific. Max 200 tokens.\n\nReflection:";
+
+    let messages = vec![echo_agent::prelude::Message::user(prompt.to_string())];
+    let options = echo_agent::prelude::SimpleChatOptions::default().with_max_tokens(300);
+
+    let reflection = match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        llm.chat_simple_with_options(messages, options),
+    )
+    .await
+    {
+        Ok(Ok(text)) => text,
+        Ok(Err(_)) | Err(_) => return, // Silently skip on failure
+    };
+
+    // Write to .echo-agent/memory/PROJECT.md
+    let memory_dir = std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join(".echo-agent")
+        .join("memory");
+    let _ = std::fs::create_dir_all(&memory_dir);
+    let memory_file = memory_dir.join("PROJECT.md");
+
+    let entry = format!(
+        "\n## [session] Reflection ({})\n{}\n",
+        chrono::Local::now().format("%Y-%m-%d %H:%M"),
+        reflection.trim()
+    );
+
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&memory_file)
+    {
+        use std::io::Write;
+        let _ = file.write_all(entry.as_bytes());
+        println!("  🪞 Reflection saved to {}", memory_file.display());
     }
 }
 

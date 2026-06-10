@@ -1,0 +1,8 @@
+id: "general-001"
+name: "日常对话-不触发skill"
+description: "简单闲聊不应激活任何 skill"
+domain: general
+task: "今天天气怎么样？"
+success_criteria:
+  tool_not_used: "activate_skill"
+constraints: {}

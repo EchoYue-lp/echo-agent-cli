@@ -66,7 +66,6 @@ pub enum SlashCommand {
     Copy,
 
     // -- Context --
-    Mode,
     Model,
     Think,
     System,
@@ -116,7 +115,6 @@ impl SlashCommand {
             Self::Compact => "Compress context window",
             Self::Copy => "Copy the last response to clipboard (or Ctrl+Y)",
 
-            Self::Mode => "Switch agent mode (general/coding/research/data/writing)",
             Self::Model => "Switch or show current model",
             Self::Think => "Toggle reasoning/thinking display",
             Self::System => "Show or set system prompt",
@@ -158,8 +156,7 @@ impl SlashCommand {
             | Self::New
             | Self::Compact
             | Self::Copy => Category::Session,
-            Self::Mode
-            | Self::Model
+            Self::Model
             | Self::Think
             | Self::System
             | Self::Memory
@@ -180,7 +177,6 @@ impl SlashCommand {
     /// Example usage string (arguments portion).
     pub fn usage(self) -> &'static str {
         match self {
-            Self::Mode => "[general|coding|research|data|writing]",
             Self::Model => "[model-name]",
             Self::System => "[prompt text]",
             Self::Remember => "<fact>",

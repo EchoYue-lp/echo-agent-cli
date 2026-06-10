@@ -1,0 +1,16 @@
+id: "translation-003"
+name: "本地化 UI 字符串"
+description: "Agent 应将 UI 字符串翻译为目标语言，考虑本地化规范"
+domain: translation
+task: |
+  将以下 UI 字符串翻译为日语，注意敬语和简洁性：
+  - "Save changes"
+  - "Are you sure you want to delete this item?"
+  - "Loading..."
+  - "Settings"
+success_criteria:
+  all_of:
+    - output_contains:
+        substring: "保存"
+    - output_contains:
+        substring: "削除"

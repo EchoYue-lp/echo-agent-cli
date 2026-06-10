@@ -1,4 +1,6 @@
-//! Evaluation & trace slash commands — trace.
+//! Evaluation & trace slash commands — trace, runs, self-review.
+//!
+//! Note: The `/eval` commands have been moved to the standalone `echo-agent-eval` crate.
 
 use crate::cli::command::{CommandCategory, CommandContext, CommandOutcome, cmd};
 use std::sync::Arc;

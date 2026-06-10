@@ -1,4 +1,5 @@
 pub mod agent_handle;
+pub mod agent_pool;
 pub mod auto_memory;
 pub mod config;
 pub mod config_discovery;
@@ -27,5 +28,7 @@ pub mod types;
 pub mod unified_memory;
 pub mod webhook;
 pub mod workspace;
+
+pub mod runtime;
 
 pub use state::AppState;

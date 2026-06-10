@@ -1,0 +1,13 @@
+id: "research-005"
+name: "跨库交叉检索"
+description: "Agent 应在 ArXiv 和 Semantic Scholar 之间交叉验证"
+domain: research
+task: |
+  分别在 ArXiv 和 Semantic Scholar 上搜索 "large language model alignment"，
+  比较两个数据库的结果差异，列出只在其中一个数据库中出现的论文。
+success_criteria:
+  all_of:
+    - tool_used: "arxiv_search"
+    - tool_used: "semantic_scholar_search"
+    - output_contains: "差异"
+constraints: {}

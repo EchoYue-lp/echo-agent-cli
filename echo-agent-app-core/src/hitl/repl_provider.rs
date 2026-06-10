@@ -42,9 +42,9 @@ impl HumanLoopProvider for ReplHumanLoopProvider {
 fn handle_approval(
     req: &HumanLoopRequest,
 ) -> Result<HumanLoopResponse, echo_agent::error::ReactError> {
-    println!("\n╔══════════════════════════════════════════╗");
-    println!("║         TOOL APPROVAL REQUIRED           ║");
-    println!("╚══════════════════════════════════════════╝");
+    println!("\n╔══════════════════════════════════════════════════════╗");
+    println!("║              TOOL APPROVAL REQUIRED                ║");
+    println!("╚══════════════════════════════════════════════════════╝");
 
     if let Some(ref tool_name) = req.tool_name {
         println!("  Tool: {}", tool_name);
@@ -62,7 +62,7 @@ fn handle_approval(
         }
     }
 
-    println!("\n  [y] Approve  [n] Reject  [a] Approve for session");
+    println!("\n  [y] 同意  [n] 拒绝  [m] 修改意见  [a] 本次会话全部同意");
     println!("  Choice: ");
 
     // Read from stdin (blocking — acceptable for REPL mode)
@@ -74,9 +74,39 @@ fn handle_approval(
     let choice = input.trim().to_lowercase();
     match choice.as_str() {
         "y" | "yes" | "" => Ok(HumanLoopResponse::Approved),
-        "a" | "all" | "session" => Ok(HumanLoopResponse::ApprovedWithScope {
-            scope: ApprovalScope::Session,
+        "a" | "all" => Ok(HumanLoopResponse::ApprovedWithScope {
+            scope: ApprovalScope::SessionAllTools,
         }),
+        "n" | "no" => {
+            println!("  请输入拒绝原因（直接回车跳过）: ");
+            let mut reason = String::new();
+            std::io::stdin().read_line(&mut reason).map_err(|e| {
+                echo_agent::error::ReactError::Other(format!("stdin read error: {e}"))
+            })?;
+            let reason = reason.trim().to_string();
+            Ok(HumanLoopResponse::Rejected {
+                reason: if reason.is_empty() {
+                    Some("User rejected".to_string())
+                } else {
+                    Some(reason)
+                },
+            })
+        }
+        "m" | "modify" => {
+            println!("  请输入修改意见（Agent 将据此调整方案）: ");
+            let mut feedback = String::new();
+            std::io::stdin().read_line(&mut feedback).map_err(|e| {
+                echo_agent::error::ReactError::Other(format!("stdin read error: {e}"))
+            })?;
+            let feedback = feedback.trim().to_string();
+            Ok(HumanLoopResponse::Rejected {
+                reason: Some(if feedback.is_empty() {
+                    "用户要求修改".to_string()
+                } else {
+                    format!("用户修改意见: {}", feedback)
+                }),
+            })
+        }
         _ => Ok(HumanLoopResponse::Rejected {
             reason: Some("User rejected".to_string()),
         }),

@@ -9,7 +9,7 @@ pub async fn list_tools(
 ) -> Result<serde_json::Value, IpcError> {
     let infos = state
         .app_state
-        .get_tool_infos(&state.app_state.connection.agent)
+        .get_tool_infos(&state.app_state.connection.primary_agent())
         .await;
     serde_json::to_value(infos).map_err(|e| IpcError::Internal(e.to_string()))
 }
@@ -21,7 +21,7 @@ pub async fn get_tool(
 ) -> Result<serde_json::Value, IpcError> {
     let infos = state
         .app_state
-        .get_tool_infos(&state.app_state.connection.agent)
+        .get_tool_infos(&state.app_state.connection.primary_agent())
         .await;
     match infos.iter().find(|t| t.name == name) {
         Some(tool) => serde_json::to_value(tool).map_err(|e| IpcError::Internal(e.to_string())),
@@ -42,7 +42,7 @@ pub async fn enable_tool(
     }
     let infos = state
         .app_state
-        .get_tool_infos(&state.app_state.connection.agent)
+        .get_tool_infos(&state.app_state.connection.primary_agent())
         .await;
     match infos.iter().find(|t| t.name == name) {
         Some(tool) => serde_json::to_value(tool).map_err(|e| IpcError::Internal(e.to_string())),
@@ -63,7 +63,7 @@ pub async fn disable_tool(
     }
     let infos = state
         .app_state
-        .get_tool_infos(&state.app_state.connection.agent)
+        .get_tool_infos(&state.app_state.connection.primary_agent())
         .await;
     match infos.iter().find(|t| t.name == name) {
         Some(tool) => serde_json::to_value(tool).map_err(|e| IpcError::Internal(e.to_string())),

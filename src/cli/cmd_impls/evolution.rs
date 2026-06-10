@@ -3,6 +3,9 @@
 use crate::cli::command::{CommandCategory, CommandContext, CommandOutcome, cmd};
 use std::sync::Arc;
 
+use echo_agent::workspace::state::profiles::{AgentProfile, ProfileStore, UserProfile};
+use echo_agent::workspace::state::skill_telemetry::SkillTelemetryStore;
+
 // ── TrajectoriesCommand ─────────────────────────────────────────────
 
 async fn cmd_trajectories(_ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
@@ -280,6 +283,288 @@ cmd!(
     cmd_critiques
 );
 
+// ── SkillReviewCommand ───────────────────────────────────────────
+
+async fn cmd_skill_review(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
+    let skill_name = args.first().copied();
+
+    let store = ctx.agent.read(|a| a.store().cloned()).await;
+    let store = match store {
+        Some(s) => s,
+        None => {
+            println!("No memory store configured. Cannot load telemetry.");
+            return CommandOutcome::Continue;
+        }
+    };
+
+    let telemetry_store = SkillTelemetryStore::new(store);
+
+    match skill_name {
+        Some(name) => {
+            // Review a specific skill
+            match telemetry_store.get_telemetry(name).await {
+                Ok(Some(t)) => print_skill_review(&t),
+                Ok(None) => {
+                    println!("No telemetry data for skill '{}'.", name);
+                    println!("Use the skill a few times first, then review.");
+                }
+                Err(e) => println!("Error loading telemetry: {e}"),
+            }
+        }
+        None => {
+            // List all skills with telemetry
+            match telemetry_store.list_all().await {
+                Ok(telemetry) if !telemetry.is_empty() => {
+                    println!("\n=== Skill Telemetry Overview ===");
+                    println!(
+                        "{:<25} {:>8} {:>8} {:>10} {:>10}",
+                        "Skill", "Uses", "Success", "Avg(ms)", "Rate"
+                    );
+                    println!("{}", "-".repeat(65));
+                    for t in &telemetry {
+                        println!(
+                            "{:<25} {:>8} {:>8} {:>10} {:>9.0}%",
+                            t.skill_name,
+                            t.activation_count,
+                            t.success_count,
+                            t.avg_duration_ms(),
+                            t.success_rate() * 100.0,
+                        );
+                    }
+                    println!("\nRun /skill-review <name> for detailed analysis.");
+                }
+                Ok(_) => println!("No telemetry data yet. Use skills first, then review."),
+                Err(e) => println!("Error loading telemetry: {e}"),
+            }
+        }
+    }
+    CommandOutcome::Continue
+}
+
+fn print_skill_review(t: &echo_agent::workspace::state::skill_telemetry::SkillTelemetry) {
+    println!("\n=== Skill Review: {} ===", t.skill_name);
+    println!(
+        "Activations: {}  |  Success: {:.0}%  |  Avg Duration: {}ms",
+        t.activation_count,
+        t.success_rate() * 100.0,
+        t.avg_duration_ms(),
+    );
+
+    if !t.common_tools.is_empty() {
+        println!("\n🔧 Tools Used:");
+        let mut tools: Vec<_> = t.common_tools.iter().collect();
+        tools.sort_by(|a, b| b.1.cmp(a.1));
+        for (tool, count) in tools.iter().take(10) {
+            println!("  - {}: {} uses", tool, count);
+        }
+    }
+
+    if !t.common_failures.is_empty() {
+        println!("\n❌ Common Failures:");
+        for f in &t.common_failures {
+            let snippet = if f.error_snippet.len() > 80 {
+                format!("{}...", &f.error_snippet[..80])
+            } else {
+                f.error_snippet.clone()
+            };
+            println!("  - [{}x] {}", f.count, snippet);
+        }
+    }
+
+    if t.activation_count >= 3 {
+        println!("\n📝 Analysis:");
+        if t.success_rate() >= 0.9 {
+            println!("  ✓ High success rate — skill instructions are effective.");
+        } else if t.success_rate() >= 0.7 {
+            println!("  ⚠ Moderate success rate — review failure patterns above.");
+        } else {
+            println!("  ✗ Low success rate — skill needs significant improvement.");
+            println!("    Consider updating the SKILL.md instructions or sandbox policy.");
+        }
+        if t.common_tools.len() < 2 && t.activation_count > 5 {
+            println!("  💡 Skill uses few tools — consider expanding tool coverage.");
+        }
+    }
+}
+
+cmd!(
+    SkillReviewCommand,
+    "skill-review",
+    ["sr"],
+    CommandCategory::Advanced,
+    "Review skill telemetry and suggest improvements",
+    cmd_skill_review
+);
+
+// ── ProfileCommand ───────────────────────────────────────────────
+
+async fn cmd_profile(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
+    let sub = args.first().copied().unwrap_or("view");
+
+    let store = ctx.agent.read(|a| a.store().cloned()).await;
+    let store = match store {
+        Some(s) => s,
+        None => {
+            println!("No memory store configured.");
+            return CommandOutcome::Continue;
+        }
+    };
+
+    let profile_store = ProfileStore::new(store);
+
+    match sub {
+        "view" | "" => {
+            // Show agent profile
+            match profile_store.load_agent_profile().await {
+                Ok(Some(profile)) => {
+                    println!("\n=== Agent Profile ===");
+                    let caps = profile.top_capabilities(10);
+                    if !caps.is_empty() {
+                        println!("Capabilities (Top {}):", caps.len());
+                        for cap in &caps {
+                            println!(
+                                "  - {}: {:.0}% proficiency ({} uses, {:.0}% success)",
+                                cap.skill_name,
+                                cap.proficiency * 100.0,
+                                cap.usage_count,
+                                cap.success_rate * 100.0,
+                            );
+                        }
+                    } else {
+                        println!("  No capability data yet.");
+                    }
+
+                    let tools = profile.top_tools(10);
+                    if !tools.is_empty() {
+                        println!("\nTool Expertise (Top {}):", tools.len());
+                        for tool in &tools {
+                            let name = profile
+                                .tool_usage
+                                .iter()
+                                .find(|(_, v)| std::ptr::eq(*v, *tool))
+                                .map(|(k, _)| k.as_str())
+                                .unwrap_or("?");
+                            println!(
+                                "  - {}: {} uses ({})",
+                                name,
+                                tool.usage_count,
+                                if tool.common_skills.is_empty() {
+                                    "general".to_string()
+                                } else {
+                                    tool.common_skills.join(", ")
+                                },
+                            );
+                        }
+                    }
+                }
+                Ok(None) => println!("No agent profile yet. Use /profile refresh to generate."),
+                Err(e) => println!("Error loading agent profile: {e}"),
+            }
+
+            // Show user profile
+            match profile_store.load_user_profile().await {
+                Ok(Some(profile)) => {
+                    println!("\n=== User Profile ===");
+                    if !profile.preferences.is_empty() {
+                        println!("Preferences:");
+                        for (k, v) in &profile.preferences {
+                            println!("  - {}: {}", k, v);
+                        }
+                    }
+                    if !profile.expertise_areas.is_empty() {
+                        println!("Expertise: {}", profile.expertise_areas.join(", "));
+                    }
+                    let tasks = profile.top_tasks(10);
+                    if !tasks.is_empty() {
+                        println!("Common Tasks:");
+                        for t in &tasks {
+                            println!("  - {} ({}x)", t.task_type, t.frequency);
+                        }
+                    }
+                    if profile.preferences.is_empty()
+                        && profile.expertise_areas.is_empty()
+                        && profile.common_tasks.is_empty()
+                    {
+                        println!("  No user profile data yet.");
+                        println!("  Use /profile set <key> <value> to add preferences.");
+                    }
+                }
+                Ok(None) => println!("\nNo user profile yet."),
+                Err(e) => println!("Error loading user profile: {e}"),
+            }
+        }
+        "refresh" => {
+            // Refresh agent profile from telemetry
+            let telemetry_store = SkillTelemetryStore::new(
+                ctx.agent
+                    .read(|a| a.store().cloned())
+                    .await
+                    .expect("store should exist"),
+            );
+            match telemetry_store.list_all().await {
+                Ok(telemetry) if !telemetry.is_empty() => {
+                    let mut profile = profile_store
+                        .load_agent_profile()
+                        .await
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
+                    profile.update_from_telemetry(&telemetry);
+                    match profile_store.save_agent_profile(&profile).await {
+                        Ok(()) => {
+                            println!("Agent profile refreshed from {} skill(s).", telemetry.len())
+                        }
+                        Err(e) => println!("Error saving profile: {e}"),
+                    }
+                }
+                Ok(_) => println!("No telemetry data to build profile from."),
+                Err(e) => println!("Error loading telemetry: {e}"),
+            }
+        }
+        "set" => {
+            if args.len() < 4 {
+                println!("Usage: /profile set <key> <value>");
+                return CommandOutcome::Continue;
+            }
+            let key = args[1];
+            let value = args[2..].join(" ");
+            let mut profile = profile_store
+                .load_user_profile()
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            profile.set_preference(key, &value);
+            match profile_store.save_user_profile(&profile).await {
+                Ok(()) => println!("Set preference: {} = {}", key, value),
+                Err(e) => println!("Error saving preference: {e}"),
+            }
+        }
+        "reset" => {
+            match profile_store.save_agent_profile(&AgentProfile::new()).await {
+                Ok(()) => {}
+                Err(e) => println!("Error resetting agent profile: {e}"),
+            }
+            match profile_store.save_user_profile(&UserProfile::new()).await {
+                Ok(()) => println!("All profiles reset."),
+                Err(e) => println!("Error resetting user profile: {e}"),
+            }
+        }
+        _ => {
+            println!("Usage: /profile [view|refresh|set <key> <value>|reset]");
+        }
+    }
+    CommandOutcome::Continue
+}
+
+cmd!(
+    ProfileCommand,
+    "profile",
+    CommandCategory::Advanced,
+    "View or manage agent/user profiles",
+    cmd_profile
+);
+
 // ── Register ────────────────────────────────────────────────────────
 
 pub fn register_all(registry: &mut crate::cli::command::CommandRegistry) {
@@ -287,4 +572,6 @@ pub fn register_all(registry: &mut crate::cli::command::CommandRegistry) {
     registry.register(Arc::new(ReviewCommand));
     registry.register(Arc::new(CuratorCommand));
     registry.register(Arc::new(CritiquesCommand));
+    registry.register(Arc::new(SkillReviewCommand));
+    registry.register(Arc::new(ProfileCommand));
 }

@@ -1,0 +1,15 @@
+id: "git-workflow-002"
+name: "解决合并冲突"
+description: "Agent 应识别并解决 Git 合并冲突"
+domain: git-workflow
+task: |
+  当前分支 main 和 feature 分支有冲突。
+  请执行 git merge feature，查看冲突文件，
+  保留两个分支的修改内容，解决冲突后提交。
+success_criteria:
+  all_of:
+    - tool_used: "shell"
+    - output_contains:
+        substring: "merge"
+    - output_contains:
+        substring: "conflict"

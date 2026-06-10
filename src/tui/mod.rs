@@ -220,6 +220,10 @@ pub struct TuiApp {
     pub selection_start: Option<(usize, usize)>,
     /// Mouse selection end: (wrapped_line_index, visual_column).
     pub selection_end: Option<(usize, usize)>,
+    /// Pending approval request from the agent (TUI HITL provider).
+    pub pending_approval: Option<
+        std::sync::Arc<tokio::sync::Mutex<Option<echo_agent_app_core::hitl::PendingApproval>>>,
+    >,
 }
 
 #[derive(Clone, Debug)]
@@ -298,6 +302,7 @@ impl TuiApp {
             chat_area: Rect::new(0, 0, 0, 0),
             selection_start: None,
             selection_end: None,
+            pending_approval: None,
         }
     }
 
@@ -911,6 +916,9 @@ pub async fn run_tui(
     task_service: Option<std::sync::Arc<echo_agent_app_core::tasks::BackgroundTaskService>>,
     tui_config: &echo_agent_app_core::config::TuiConfig,
     mode_display: &str,
+    tui_pending: std::sync::Arc<
+        tokio::sync::Mutex<Option<echo_agent_app_core::hitl::PendingApproval>>,
+    >,
 ) -> anyhow::Result<()> {
     // Use ColorTheme to generate Theme, unifying both theme systems.
     let color_theme = echo_agent_app_core::output::theme::ColorTheme::dark();
@@ -936,6 +944,7 @@ pub async fn run_tui(
     let mut app = TuiApp::new(model, mode, theme);
     app.tool_count = 24; // Default estimate, updated dynamically.
     app.max_display_chars = tui_config.max_display_chars;
+    app.pending_approval = Some(tui_pending);
 
     // Main event loop.
     let result = events::run_event_loop(&mut terminal, &mut app, agent, task_service).await;

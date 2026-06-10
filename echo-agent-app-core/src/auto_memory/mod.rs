@@ -257,8 +257,14 @@ pub fn extract_observations(
 fn deduplicate_observations(observations: &mut Vec<Observation>) {
     observations.dedup_by(|a, b| {
         a.category == b.category
-            && ((a.text.len() > 20 && b.text.len() > 20 && b.text.contains(&a.text[..20]))
-                || (b.text.len() > 20 && a.text.len() > 20 && a.text.contains(&b.text[..20])))
+            && ((a.text.chars().count() > 20
+                && b.text.chars().count() > 20
+                && b.text
+                    .contains(&a.text.chars().take(20).collect::<String>()))
+                || (b.text.chars().count() > 20
+                    && a.text.chars().count() > 20
+                    && a.text
+                        .contains(&b.text.chars().take(20).collect::<String>())))
     });
 }
 

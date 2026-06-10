@@ -286,7 +286,7 @@ mod tests {
             .index_session(
                 "sess-1",
                 "rust help",
-                "qwen-plus",
+                "qwen3.6-plus",
                 &["How do I use tokio?", "You can use tokio::spawn"],
             )
             .unwrap();
@@ -295,7 +295,7 @@ mod tests {
             .index_session(
                 "sess-2",
                 "python help",
-                "gpt-4o",
+                "gpt-5.5",
                 &["How do I use asyncio?", "Use async/await syntax"],
             )
             .unwrap();
@@ -317,7 +317,7 @@ mod tests {
         engine.init_schema().unwrap();
 
         engine
-            .index_session("sess-rm", "test", "qwen-plus", &["hello world"])
+            .index_session("sess-rm", "test", "qwen3.6-plus", &["hello world"])
             .unwrap();
 
         let results = engine.search("hello", 10).unwrap();

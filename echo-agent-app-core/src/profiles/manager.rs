@@ -157,11 +157,11 @@ mod tests {
     #[test]
     fn test_profile_crud() {
         let manager = ProfileManager::new();
-        let profile = Profile::new("test-profile", "qwen-plus");
+        let profile = Profile::new("test-profile", "qwen3.6-plus");
         manager.save(&profile).unwrap();
 
         let loaded = manager.get("test-profile").unwrap();
-        assert_eq!(loaded.model, "qwen-plus");
+        assert_eq!(loaded.model, "qwen3.6-plus");
 
         let list = manager.list().unwrap();
         assert!(list.iter().any(|s| s.name == "test-profile"));

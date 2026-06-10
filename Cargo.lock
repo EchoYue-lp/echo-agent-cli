@@ -1408,6 +1408,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "echo-agent-eval"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "echo-agent-app-core",
+ "echo_agent",
+ "regex",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "echo_agent"
 version = "0.2.0"
 dependencies = [
@@ -1416,7 +1435,6 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "dotenvy",
- "echo_agents",
  "echo_core",
  "echo_execution",
  "echo_integration",
@@ -1446,13 +1464,6 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "uuid",
-]
-
-[[package]]
-name = "echo_agents"
-version = "0.2.0"
-dependencies = [
- "echo_core",
 ]
 
 [[package]]

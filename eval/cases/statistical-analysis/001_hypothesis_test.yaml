@@ -1,0 +1,21 @@
+id: "stats-001"
+name: "假设检验（t 检验）"
+description: "Agent 应对两组数据执行独立样本 t 检验，并报告 p 值及显著性结论"
+domain: statistical-analysis
+task: |
+  使用 Python（scipy 或 statsmodels）生成两组模拟数据并执行独立样本 t 检验：
+  - 组 A：均值 75，标准差 10，样本量 30
+  - 组 B：均值 82，标准差 12，样本量 30
+  请报告 t 统计量、p 值，并在显著性水平 α=0.05 下给出是否拒绝原假设的结论。
+success_criteria:
+  all_of:
+    - tool_used: "shell"
+    - output_contains: "p"
+    - any_of:
+        - output_contains: "显著"
+        - output_contains: "t 统计量"
+        - output_contains: "t-statistic"
+        - output_contains: "p-value"
+        - output_contains: "p 值"
+        - output_contains: "拒绝"
+constraints: {}

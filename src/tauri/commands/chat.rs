@@ -71,6 +71,7 @@ enum PendingResponse {
     Approval {
         approved: bool,
         reason: Option<String>,
+        scope: Option<String>,
     },
     Input {
         text: String,
@@ -120,9 +121,19 @@ impl HumanLoopProvider for TauriHumanLoopHandler {
                     tokio::select! {
                         response = rx_response => {
                             match response {
-                                Ok(PendingResponse::Approval { approved, reason }) => {
-                                    if approved { Ok(HumanLoopResponse::Approved) }
-                                    else { Ok(HumanLoopResponse::Rejected { reason }) }
+                                Ok(PendingResponse::Approval { approved, reason, scope }) => {
+                                    if approved {
+                                        match scope.as_deref() {
+                                            Some("session_all_tools") => {
+                                                Ok(HumanLoopResponse::ApprovedWithScope {
+                                                    scope: echo_agent::human_loop::ApprovalScope::SessionAllTools,
+                                                })
+                                            }
+                                            _ => Ok(HumanLoopResponse::Approved),
+                                        }
+                                    } else {
+                                        Ok(HumanLoopResponse::Rejected { reason })
+                                    }
                                 }
                                 _ => Ok(HumanLoopResponse::Timeout),
                             }
@@ -172,13 +183,24 @@ impl HumanLoopProvider for TauriHumanLoopHandler {
 }
 
 /// Send a chat message and stream agent events via Tauri events.
+///
+/// When `conversation_id` is provided and an agent pool is active,
+/// the message is routed to a pool agent dedicated to that conversation.
+/// This enables parallel multi-conversation execution.
 #[tauri::command]
 pub async fn send_chat_message(
     state: tauri::State<'_, TauriState>,
     app: tauri::AppHandle,
     message: String,
+    conversation_id: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    let agent_inner = state.app_state.connection.agent.inner().clone();
+    // Route to pool agent if conversation_id is provided and pool is active
+    let agent_handle = if let Some(ref conv_id) = conversation_id {
+        state.app_state.connection.agent_for(conv_id).await
+    } else {
+        state.app_state.connection.primary_agent()
+    };
+    let agent_inner = agent_handle.inner().clone();
     let cancel_token = CancellationToken::new();
     let message_key = Uuid::new_v4().to_string();
 
@@ -208,9 +230,13 @@ pub async fn send_chat_message(
     tokio::spawn(async move {
         let start = std::time::Instant::now();
 
-        // ReactAgent serializes execution internally via execution_mutex
-
-        // Acquire read lock — must be held while stream is consumed
+        // ReactAgent serializes execution internally via execution_mutex.
+        //
+        // The RwLock read guard is held for the stream's lifetime because
+        // `chat_stream_with_cancel` borrows from the agent. This is safe
+        // because: (1) with AgentPool, each conversation has its own agent
+        // so no cross-conversation contention; (2) writes only happen via
+        // `write_async` for config changes, which are rare during streaming.
         let agent = agent_inner.read().await;
         let stream_result = agent
             .chat_stream_with_cancel(&message, cancel_token_for_task)
@@ -316,10 +342,15 @@ pub async fn send_approval_response(
     request_id: String,
     approved: bool,
     reason: Option<String>,
+    scope: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
     let tx = PENDING_RESPONSES.lock().await.remove(&request_id);
     if let Some(tx) = tx {
-        let _ = tx.send(PendingResponse::Approval { approved, reason });
+        let _ = tx.send(PendingResponse::Approval {
+            approved,
+            reason,
+            scope,
+        });
         Ok(serde_json::json!({"success": true}))
     } else {
         Err(IpcError::NotFound(format!(

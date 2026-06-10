@@ -109,10 +109,15 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
 
   const handleBrowse = useCallback(async () => {
     if (isTauri()) {
-      const selected = await fileSystem.selectDirectory('选择工作区目录');
-      if (selected) {
-        setCustomRoot(selected);
-        setUseCustomRoot(true);
+      try {
+        const selected = await fileSystem.selectDirectory('选择工作区目录');
+        if (selected) {
+          setCustomRoot(selected);
+          setUseCustomRoot(true);
+        }
+      } catch (e) {
+        console.error('Browse directory failed:', e);
+        setError(`浏览目录失败: ${e instanceof Error ? e.message : String(e)}`);
       }
     } else {
       setShowPicker(true);

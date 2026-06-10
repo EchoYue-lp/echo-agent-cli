@@ -77,9 +77,11 @@ pub async fn save_conversation(
             conversation_id: conversation_id.clone(),
             role: m.role,
             content: m.content,
-            attachments_json: None,
+            attachments_json: m
+                .thinking_segments
+                .and_then(|ts| serde_json::to_string(&ts).ok()),
             tool_calls_json: m.tool_calls.and_then(|tc| serde_json::to_string(&tc).ok()),
-            tool_result_json: None,
+            tool_result_json: m.tool_result,
             created_at: chrono::Utc::now().to_rfc3339(),
         })
         .collect();
@@ -127,6 +129,10 @@ pub async fn get_conversation(
             tool_calls: m
                 .tool_calls_json
                 .and_then(|s| serde_json::from_str(&s).ok()),
+            thinking_segments: m
+                .attachments_json
+                .and_then(|s| serde_json::from_str(&s).ok()),
+            tool_result: m.tool_result_json,
         })
         .collect();
 
@@ -171,9 +177,11 @@ pub async fn update_conversation(
                 conversation_id: conv.conversation_id.clone(),
                 role: m.role,
                 content: m.content,
-                attachments_json: None,
+                attachments_json: m
+                    .thinking_segments
+                    .and_then(|ts| serde_json::to_string(&ts).ok()),
                 tool_calls_json: m.tool_calls.and_then(|tc| serde_json::to_string(&tc).ok()),
-                tool_result_json: None,
+                tool_result_json: m.tool_result,
                 created_at: chrono::Utc::now().to_rfc3339(),
             })
             .collect();
@@ -319,12 +327,39 @@ pub async fn restore_conversation(
                     tc_idx = 0;
                 }
                 "tool" => {
-                    let tool_id = pending_tc_ids
-                        .get(tc_idx)
-                        .cloned()
-                        .unwrap_or_else(|| format!("restored_unknown_{tc_idx}"));
+                    // Extract tool name and tool_call_id from tool_result_json
+                    // Format: {"tool_call_id": "...", "name": "..."}
+                    let (tool_id, tool_name) = if let Some(ref tr_json) = sm.tool_result_json {
+                        if let Ok(tr) = serde_json::from_str::<serde_json::Value>(tr_json) {
+                            let name = tr
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            // Prefer the stored tool_call_id over positional matching
+                            let id = tr
+                                .get("tool_call_id")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string())
+                                .or_else(|| pending_tc_ids.get(tc_idx).cloned())
+                                .unwrap_or_else(|| format!("restored_unknown_{tc_idx}"));
+                            (id, name)
+                        } else {
+                            let id = pending_tc_ids
+                                .get(tc_idx)
+                                .cloned()
+                                .unwrap_or_else(|| format!("restored_unknown_{tc_idx}"));
+                            (id, String::new())
+                        }
+                    } else {
+                        let id = pending_tc_ids
+                            .get(tc_idx)
+                            .cloned()
+                            .unwrap_or_else(|| format!("restored_unknown_{tc_idx}"));
+                        (id, String::new())
+                    };
                     tc_idx += 1;
-                    messages.push(Message::tool_result(tool_id, String::new(), text));
+                    messages.push(Message::tool_result(tool_id, tool_name, text));
                 }
                 _ => {
                     messages.push(Message::user(text));
@@ -333,10 +368,9 @@ pub async fn restore_conversation(
         }
 
         if !messages.is_empty() {
-            state
-                .app_state
-                .connection
-                .agent
+            // Route to pool agent for this conversation if pool is active
+            let agent = state.app_state.connection.agent_for(&id).await;
+            agent
                 .read_async(|a| {
                     Box::pin(async move {
                         a.load_messages(messages).await;

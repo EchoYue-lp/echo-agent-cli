@@ -5,6 +5,55 @@ use crate::tauri::state::TauriState;
 use echo_agent::llm::LlmConfig;
 use echo_agent::prelude::Message;
 
+/// All accepted environment variable names for each provider.
+///
+/// Priority order: first match wins. This mirrors
+/// `ProviderFactory::env_api_key()` in echo-integration/src/providers/config.rs
+/// but extends to cover alternative names users commonly set.
+fn provider_env_vars(provider: &str) -> &'static [&'static str] {
+    match provider {
+        "openai" => &["OPENAI_API_KEY"],
+        "anthropic" => &["ANTHROPIC_API_KEY"],
+        "deepseek" => &["DEEPSEEK_API_KEY"],
+        "dashscope" | "qwen" | "aliyun" => &["DASHSCOPE_API_KEY", "QWEN_API_KEY"],
+        "moonshot" | "kimi" => &["MOONSHOT_API_KEY", "KIMI_API_KEY"],
+        "zhipu" | "glm" => &["ZHIPU_API_KEY", "GLM_API_KEY"],
+        "gemini" | "google" => &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+        _ => &[],
+    }
+}
+
+/// Check if any accepted env var for a provider is set and non-empty.
+/// Returns the first match found.
+fn find_env_api_key(provider: &str) -> Option<String> {
+    for var in provider_env_vars(provider) {
+        if let Ok(val) = std::env::var(var)
+            && !val.is_empty()
+        {
+            return Some(val);
+        }
+    }
+    None
+}
+
+/// Resolve API key: user-filled key takes priority, then fall back to any
+/// accepted environment variable for the provider.
+fn resolve_api_key(user_key: &Option<String>, provider: &str) -> String {
+    // Priority 1: user explicitly filled in a key via GUI
+    if let Some(key) = user_key
+        && !key.is_empty()
+    {
+        return key.clone();
+    }
+    // Priority 2: any accepted env var
+    find_env_api_key(provider).unwrap_or_default()
+}
+
+/// Format accepted env var names for display (e.g. "DASHSCOPE_API_KEY / QWEN_API_KEY").
+fn env_vars_display(provider: &str) -> String {
+    provider_env_vars(provider).join(" / ")
+}
+
 #[tauri::command]
 pub async fn list_providers(
     state: tauri::State<'_, TauriState>,
@@ -22,71 +71,71 @@ pub async fn list_providers(
                 "id": "openai",
                 "name": "OpenAI",
                 "icon": "🟢",
-                "models": ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo", "o1", "o1-mini", "o3-mini"],
+                "models": ["gpt-5.5"],
                 "base_url": "https://api.openai.com/v1/chat/completions",
-                "api_key_env": "OPENAI_API_KEY",
+                "api_key_env": env_vars_display("openai"),
                 "requires_api_key": true,
-                "configured": std::env::var("OPENAI_API_KEY").is_ok(),
+                "configured": find_env_api_key("openai").is_some(),
             },
             {
                 "id": "anthropic",
                 "name": "Anthropic",
                 "icon": "🟠",
-                "models": ["claude-sonnet-4-20250514", "claude-3-5-haiku-20241022", "claude-3-opus-20240229"],
+                "models": ["claude-opus-4-8", "claude-opus-4-7"],
                 "base_url": "https://api.anthropic.com/v1/messages",
-                "api_key_env": "ANTHROPIC_API_KEY",
+                "api_key_env": env_vars_display("anthropic"),
                 "requires_api_key": true,
-                "configured": std::env::var("ANTHROPIC_API_KEY").is_ok(),
+                "configured": find_env_api_key("anthropic").is_some(),
             },
             {
                 "id": "deepseek",
                 "name": "DeepSeek",
                 "icon": "🔵",
-                "models": ["deepseek-chat", "deepseek-reasoner"],
+                "models": ["deepseek-v4-flash", "deepseek-v4-pro"],
                 "base_url": "https://api.deepseek.com/chat/completions",
-                "api_key_env": "DEEPSEEK_API_KEY",
+                "api_key_env": env_vars_display("deepseek"),
                 "requires_api_key": true,
-                "configured": std::env::var("DEEPSEEK_API_KEY").is_ok(),
+                "configured": find_env_api_key("deepseek").is_some(),
             },
             {
                 "id": "dashscope",
                 "name": "通义千问",
                 "icon": "🟣",
-                "models": ["qwen-max", "qwen-plus", "qwen-turbo", "qwen-long"],
+                "models": ["qwen3.7-max", "qwen3.6-plus"],
                 "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
-                "api_key_env": "DASHSCOPE_API_KEY",
+                "api_key_env": env_vars_display("dashscope"),
                 "requires_api_key": true,
-                "configured": std::env::var("DASHSCOPE_API_KEY").is_ok(),
+                "configured": find_env_api_key("dashscope").is_some(),
             },
             {
                 "id": "moonshot",
                 "name": "Moonshot",
                 "icon": "🌙",
-                "models": ["moonshot-v1-8k", "moonshot-v1-32k", "moonshot-v1-128k"],
+                "models": ["kimi-k2.6"],
                 "base_url": "https://api.moonshot.cn/v1/chat/completions",
-                "api_key_env": "MOONSHOT_API_KEY",
+                "api_key_env": env_vars_display("moonshot"),
                 "requires_api_key": true,
-                "configured": std::env::var("MOONSHOT_API_KEY").is_ok(),
+                "configured": find_env_api_key("moonshot").is_some(),
             },
             {
                 "id": "zhipu",
                 "name": "智谱",
                 "icon": "🔷",
-                "models": ["glm-4-plus", "glm-4", "glm-4-flash"],
+                "models": ["glm-5.1"],
                 "base_url": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
-                "api_key_env": "ZHIPU_API_KEY",
+                "api_key_env": env_vars_display("zhipu"),
                 "requires_api_key": true,
-                "configured": std::env::var("ZHIPU_API_KEY").is_ok(),
+                "configured": find_env_api_key("zhipu").is_some(),
             },
             {
                 "id": "gemini",
                 "name": "Gemini",
                 "icon": "💎",
-                "models": ["gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-1.5-pro"],
+                "models": ["gemini-3.5-flash"],
                 "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-                "api_key_env": "GEMINI_API_KEY",
+                "api_key_env": env_vars_display("gemini"),
                 "requires_api_key": true,
-                "configured": std::env::var("GEMINI_API_KEY").is_ok(),
+                "configured": find_env_api_key("gemini").is_some(),
             },
             {
                 "id": "ollama",
@@ -212,25 +261,6 @@ pub async fn switch_model(
         "model": model,
         "message": format!("Switched to model '{}'", model),
     }))
-}
-
-fn resolve_api_key(user_key: &Option<String>, provider: &str) -> String {
-    if let Some(key) = user_key
-        && !key.is_empty()
-    {
-        return key.clone();
-    }
-    let env_var = match provider {
-        "openai" => "OPENAI_API_KEY",
-        "anthropic" => "ANTHROPIC_API_KEY",
-        "deepseek" => "DEEPSEEK_API_KEY",
-        "dashscope" => "DASHSCOPE_API_KEY",
-        "moonshot" => "MOONSHOT_API_KEY",
-        "zhipu" => "ZHIPU_API_KEY",
-        "gemini" => "GEMINI_API_KEY",
-        _ => return String::new(),
-    };
-    std::env::var(env_var).unwrap_or_default()
 }
 
 fn default_base_url(provider: &str) -> String {

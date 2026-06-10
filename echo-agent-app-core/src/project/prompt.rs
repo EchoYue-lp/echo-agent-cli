@@ -16,7 +16,6 @@
 //! that OpenAI, DeepSeek, and Anthropic can cache automatically.
 
 use super::context::ProjectContext;
-use super::modes::AgentMode;
 
 /// A single module of the system prompt.
 #[derive(Debug, Clone)]
@@ -92,9 +91,8 @@ impl PromptAssembler {
         parts.join("\n\n")
     }
 
-    /// Build default modules for a coding session.
-    pub fn default_for_mode(
-        mode: &AgentMode,
+    /// Build default modules for a session.
+    pub fn default(
         base_prompt: &str,
         project_ctx: Option<&ProjectContext>,
         model_window: usize,
@@ -110,10 +108,41 @@ impl PromptAssembler {
             required: true,
         });
 
-        // P1: Mode-specific instructions (required)
+        // P1: Core assistant instructions (required)
         assembler.add_module(PromptModule {
-            name: "mode".into(),
-            content: super::modes::chinese_mode_prompt(mode),
+            name: "assistant".into(),
+            content: r#"你是 EchoCoWork，一个智能 AI 助手。你帮助用户完成各种任务：回答问题、编写和修改代码、分析信息、创意工作、通过工具执行操作。
+
+# 核心原则
+- 直接给出答案或采取行动，不要先描述你打算做什么
+- 使用工具执行操作，不要只描述你会做什么而不实际执行
+- 承认不确定性，优先考虑真正有用而非冗长
+- 高效且有目标地探索和调查
+
+# 信息准确性（极其重要）
+- 当用户要求查找文章、数据、研究、文献时，**必须使用搜索工具**（web_search、pubmed_search、arxiv_search 等），绝不能凭记忆编造
+- **严禁编造参考文献、引用、数据、统计数字**。每一条引用必须来自工具返回的真实搜索结果
+- 如果工具没有找到相关信息，如实告知用户"未找到相关结果"，而不是编造看似合理的内容
+- 区分你确定知道的信息和需要验证的信息；对于具体数据、日期、人名、引用，优先使用工具验证
+- 当提供医学、法律、金融等专业领域的信息时，必须标注信息来源
+
+# 工具使用
+- 当有可用工具能完成任务时，必须使用它们而不是描述你打算做什么
+- 每个响应要么包含推进任务的工具调用，要么向用户交付最终结果
+- 可以并行调用多个独立工具来提高效率
+- 工具失败时先诊断原因再切换策略，不要盲目重试相同操作
+
+# 行动准则
+- 仔细考虑行动的可逆性和影响范围
+- 可以自由执行本地、可逆的操作（编辑文件、运行测试）
+- 对于难以逆转、影响共享系统或有风险的操作，先与用户确认
+- 不要使用破坏性操作作为捷径来绕过问题
+
+# 输出风格
+- 简洁直接，先给答案/行动，再给推理
+- 不要重述用户说的话，直接执行
+- 只在需要用户输入、关键里程碑、或计划变更时输出文字
+- 引用代码时使用 file_path:line_number 格式"#.into(),
             priority: 1,
             token_budget: 0,
             required: true,
@@ -172,5 +201,22 @@ impl PromptAssembler {
         });
 
         assembler
+    }
+
+    /// Add memory + profile context as P6 module.
+    ///
+    /// Call this after `default_for_mode` with the pre-assembled memory context
+    /// string (from `UnifiedMemory::system_prompt_context()` and profiles).
+    pub fn add_memory_context(&mut self, context: &str) {
+        if context.is_empty() {
+            return;
+        }
+        self.add_module(PromptModule {
+            name: "memory_context".into(),
+            content: context.to_string(),
+            priority: 6,
+            token_budget: self.total_budget / 20, // 5% budget
+            required: false,
+        });
     }
 }

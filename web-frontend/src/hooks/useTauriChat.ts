@@ -1,5 +1,6 @@
 import { useRef, useCallback, useEffect } from 'react';
 import { useChatStore } from '../stores/chatStore';
+import { useConversationStore } from '../stores/conversationStore';
 import { isTauri, apiInvoke } from '../lib/tauri-bridge';
 import type { Attachment } from '../types/api';
 
@@ -174,7 +175,12 @@ export function useTauriChat() {
         }
       }, 60_000);
 
-      await apiInvoke('send_chat_message', { message: text });
+      // Pass conversation_id for pool-based parallel execution
+      const conversation_id = useConversationStore.getState().activeId;
+      await apiInvoke('send_chat_message', {
+        message: text,
+        conversation_id: conversation_id ?? undefined,
+      });
     } catch (e) {
       console.error('[TauriChat] Failed to send message:', e);
       if (assistantIdRef.current) {
@@ -185,9 +191,9 @@ export function useTauriChat() {
   }, []);
 
   const sendApproval = useCallback(
-    async (requestId: string, approved: boolean, reason?: string) => {
+    async (requestId: string, approved: boolean, reason?: string, scope?: string) => {
       try {
-        await apiInvoke('send_approval_response', { request_id: requestId, approved, reason });
+        await apiInvoke('send_approval_response', { request_id: requestId, approved, reason, scope });
         useChatStore.getState().setApprovalRequest(null);
       } catch (e) {
         console.error('[TauriChat] Failed to send approval:', e);

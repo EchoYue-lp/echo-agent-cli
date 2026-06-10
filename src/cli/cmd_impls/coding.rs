@@ -555,9 +555,13 @@ async fn cmd_fix(ctx: &CommandContext, _args: &[&str]) -> CommandOutcome {
                 println!("\nError output:");
                 // Truncate long output for display
                 let max_display = 2000;
-                if combined.len() > max_display {
-                    println!("{}...", &combined[..max_display]);
-                    println!("\n(truncated, {} more chars)", combined.len() - max_display);
+                if combined.chars().count() > max_display {
+                    let truncated: String = combined.chars().take(max_display).collect();
+                    println!("{truncated}...");
+                    println!(
+                        "\n(truncated, {} more chars)",
+                        combined.chars().count() - max_display
+                    );
                 } else {
                     println!("{}", combined);
                 }

@@ -1,0 +1,16 @@
+id: "data-003"
+name: "相关性分析"
+description: "Agent 应计算两列之间的相关系数"
+domain: data-analysis
+task: |
+  加载 titanic-small.csv，计算 age 和 fare 之间的 Pearson 相关系数。
+  使用 Python pandas 或 numpy 计算，并解释相关性的强度和方向。
+project_fixture: "fixtures"
+success_criteria:
+  all_of:
+    - tool_used: "shell"
+    - output_contains: "相关系数"
+    - citation_valid:
+        min_citations: 1
+        format: "any"
+constraints: {}

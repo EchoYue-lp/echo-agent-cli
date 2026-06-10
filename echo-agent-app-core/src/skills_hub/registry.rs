@@ -29,6 +29,12 @@ pub struct SkillHubEntry {
     pub tags: Vec<String>,
     /// 是否已加载到 agent
     pub loaded: bool,
+    /// 是否声明了沙箱策略
+    #[serde(default)]
+    pub has_sandbox: bool,
+    /// 依赖的其他技能
+    #[serde(default)]
+    pub depends_on: Vec<String>,
 }
 
 /// 本地技能注册表
@@ -178,7 +184,7 @@ impl SkillsHub {
     /// 解析技能目录
     fn parse_skill_dir(dir: &Path, skill_md: &Path) -> Option<SkillHubEntry> {
         let content = std::fs::read_to_string(skill_md).ok()?;
-        let (frontmatter, _body) = parse_frontmatter(&content);
+        let (frontmatter, _body, list_fields) = parse_frontmatter(&content);
 
         let dir_name = dir.file_name()?.to_str()?.to_string();
 
@@ -195,6 +201,8 @@ impl SkillsHub {
                 .map(|t| t.split(',').map(|s| s.trim().to_string()).collect())
                 .unwrap_or_default(),
             loaded: false,
+            has_sandbox: frontmatter.contains_key("sandbox"),
+            depends_on: list_fields.get("depends_on").cloned().unwrap_or_default(),
         })
     }
 }
@@ -202,10 +210,17 @@ impl SkillsHub {
 /// 简单 YAML frontmatter 解析器
 ///
 /// 支持 `---` 包围的键值对，格式: `key: value`
-fn parse_frontmatter(content: &str) -> (HashMap<String, String>, String) {
+/// Also extracts simple YAML lists (items starting with `  - value`) into `list_fields`.
+fn parse_frontmatter(
+    content: &str,
+) -> (
+    HashMap<String, String>,
+    String,
+    HashMap<String, Vec<String>>,
+) {
     let trimmed = content.trim_start();
     if !trimmed.starts_with("---") {
-        return (HashMap::new(), content.to_string());
+        return (HashMap::new(), content.to_string(), HashMap::new());
     }
 
     let after_delim = &trimmed[3..];
@@ -214,16 +229,43 @@ fn parse_frontmatter(content: &str) -> (HashMap<String, String>, String) {
     let body = after_delim.get(end + 3..).unwrap_or("").trim().to_string();
 
     let mut map = HashMap::new();
+    let mut lists: HashMap<String, Vec<String>> = HashMap::new();
+    let mut current_list_key: Option<String> = None;
+
     for line in fm_str.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
+        let trimmed_line = line.trim();
+        if trimmed_line.is_empty() || trimmed_line.starts_with('#') {
             continue;
         }
+
+        // Check if this is a list item (starts with `- `)
+        if let Some(stripped) = trimmed_line.strip_prefix("- ") {
+            if let Some(ref key) = current_list_key {
+                let val = stripped
+                    .trim()
+                    .trim_matches('"')
+                    .trim_matches('\'')
+                    .to_string();
+                if !val.is_empty() {
+                    lists.entry(key.clone()).or_default().push(val);
+                }
+            }
+            continue;
+        }
+
+        // Regular key: value line
+        current_list_key = None;
         if let Some((k, v)) = line.split_once(':') {
             let key = k.trim().to_string();
             let val = v.trim().trim_matches('"').trim_matches('\'').to_string();
-            map.insert(key, val);
+            if val.is_empty() {
+                // This might be a list key (value on subsequent lines)
+                current_list_key = Some(key.clone());
+                lists.insert(key.clone(), Vec::new());
+            } else {
+                map.insert(key, val);
+            }
         }
     }
-    (map, body)
+    (map, body, lists)
 }

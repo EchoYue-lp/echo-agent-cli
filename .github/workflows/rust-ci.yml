@@ -1,0 +1,50 @@
+name: Rust CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Cargo fmt check
+        run: cargo fmt --check
+
+      - name: Cargo clippy (tui feature)
+        run: cargo clippy --workspace --all-targets --features tui
+
+      - name: Cargo test (tui feature)
+        run: cargo test --workspace --features tui
+
+      - name: Cargo check all features
+        run: cargo check --workspace --all-features --all-targets
+
+      - name: Cargo check all targets
+        run: cargo check --workspace --all-targets
+
+      - name: Run eval suite (trigger test)
+        run: cargo run -p echo-agent-eval -- trigger-test --threshold 0.7
+
+      - name: Upload eval report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report
+          path: eval-report-*
+          if-no-files-found: ignore

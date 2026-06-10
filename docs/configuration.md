@@ -186,10 +186,13 @@ MCP 配置文件搜索路径（按优先级）：
 
 | 提供商 | 模型名称示例 | 环境变量 |
 |--------|-------------|---------|
-| DeepSeek | deepseek-v4-flash, deepseek-chat, deepseek-coder | DEEPSEEK_API_KEY |
-| OpenAI | gpt-4o, gpt-4, gpt-3.5-turbo | OPENAI_API_KEY |
-| Anthropic | claude-3.5-sonnet, claude-3-opus | ANTHROPIC_API_KEY |
-| 阿里通义 | qwen-plus, qwen-max, qwen-turbo | DASHSCOPE_API_KEY |
+| DeepSeek | deepseek-v4-flash, deepseek-v4-pro | DEEPSEEK_API_KEY |
+| OpenAI | gpt-5.5 | OPENAI_API_KEY |
+| Anthropic | claude-opus-4-8, claude-opus-4-7 | ANTHROPIC_API_KEY |
+| 阿里通义 | qwen3.7-max, qwen3.6-plus | DASHSCOPE_API_KEY |
+| Moonshot | kimi-k2.6 | MOONSHOT_API_KEY |
+| 智谱 | glm-5.1 | ZHIPU_API_KEY |
+| Gemini | gemini-3.5-flash | GEMINI_API_KEY |
 | Ollama (本地) | llama3.1, codellama, mistral | 无需 API Key |
 
 ### 切换模型示例
@@ -205,7 +208,7 @@ model:
 ```yaml
 model:
   provider: "openai"
-  name: "gpt-4o"
+  name: "gpt-5.5"
 ```
 
 **Anthropic Claude：**

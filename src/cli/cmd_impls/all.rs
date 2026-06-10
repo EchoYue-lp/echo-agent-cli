@@ -139,9 +139,79 @@ cmd!(
 
 // ── MemoryCommand ──────────────────────────────────────────────────────
 
-async fn cmd_memory(_: &CommandContext, _: &[&str]) -> CommandOutcome {
-    println!("\nMemory scopes: user, project, repo, task, session, run");
+async fn cmd_memory(_: &CommandContext, args: &[&str]) -> CommandOutcome {
+    let sub = args.first().copied().unwrap_or("show");
+
+    match sub {
+        "show" => {
+            println!("\n📝 Project Memory\n");
+
+            // User-level: ~/.echo-agent/user.md
+            let user_path = std::env::var("HOME")
+                .map(|h| {
+                    std::path::PathBuf::from(h)
+                        .join(".echo-agent")
+                        .join("user.md")
+                })
+                .unwrap_or_default();
+            print_memory_tier("User", &user_path);
+
+            // Project-level: <project-root>/.echo-agent/project.md
+            let project_path = find_project_root()
+                .map(|r| r.join(".echo-agent").join("project.md"))
+                .unwrap_or_default();
+            print_memory_tier("Project", &project_path);
+
+            // Reflection memory: .echo-agent/memory/PROJECT.md
+            let reflection_path = std::env::current_dir()
+                .unwrap_or_default()
+                .join(".echo-agent")
+                .join("memory")
+                .join("PROJECT.md");
+            print_memory_tier("Reflection", &reflection_path);
+        }
+        _ => {
+            println!("Usage: /memory [show]");
+        }
+    }
     CommandOutcome::Continue
+}
+
+fn print_memory_tier(label: &str, path: &std::path::Path) {
+    match std::fs::read_to_string(path) {
+        Ok(content) if !content.trim().is_empty() => {
+            println!("  ── {} ({}) ──", label, path.display());
+            // Show first 500 chars to avoid flooding the terminal
+            let preview = if content.len() > 500 {
+                format!("{}...", &content[..500])
+            } else {
+                content.clone()
+            };
+            for line in preview.lines() {
+                println!("    {}", line);
+            }
+            if content.len() > 500 {
+                println!("    ({} chars total, truncated)", content.len());
+            }
+            println!();
+        }
+        _ => {
+            println!("  ── {} ── (empty)", label);
+            println!();
+        }
+    }
+}
+
+fn find_project_root() -> Option<std::path::PathBuf> {
+    let mut dir = std::env::current_dir().ok()?;
+    loop {
+        if dir.join(".git").exists() || dir.join(".echo-agent").exists() {
+            return Some(dir);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
 }
 cmd!(
     MemoryCommand,
@@ -149,6 +219,81 @@ cmd!(
     CommandCategory::Context,
     "List memories",
     cmd_memory
+);
+
+// ── ReflectCommand ─────────────────────────────────────────────────────
+
+async fn cmd_reflect(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
+    println!("🪞 Generating reflection...");
+
+    // Get LLM client from agent
+    let llm_client = ctx.agent.read(|a| a.llm_client().cloned()).await;
+
+    let Some(llm) = llm_client else {
+        println!("⚠️  No LLM client available for reflection.");
+        return CommandOutcome::Continue;
+    };
+
+    let prompt = "Reflect on the current session and summarize key learnings in 1-2 sentences.\n\
+                  Focus on reusable insights. Be specific. Max 200 tokens.\n\nReflection:";
+
+    let messages = vec![echo_agent::prelude::Message::user(prompt.to_string())];
+    let options = echo_agent::prelude::SimpleChatOptions::default().with_max_tokens(300);
+
+    let reflection = match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        llm.chat_simple_with_options(messages, options),
+    )
+    .await
+    {
+        Ok(Ok(text)) => text,
+        Ok(Err(e)) => {
+            println!("⚠️  LLM reflection failed: {e}");
+            return CommandOutcome::Continue;
+        }
+        Err(_) => {
+            println!("⚠️  LLM reflection timed out (>2s).");
+            return CommandOutcome::Continue;
+        }
+    };
+
+    // Write to .echo-agent/memory/PROJECT.md
+    let memory_dir = std::env::current_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join(".echo-agent")
+        .join("memory");
+    let _ = std::fs::create_dir_all(&memory_dir);
+    let memory_file = memory_dir.join("PROJECT.md");
+
+    let entry = format!(
+        "\n## [session] Reflection ({})\n{}\n",
+        chrono::Local::now().format("%Y-%m-%d %H:%M"),
+        reflection.trim()
+    );
+
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&memory_file)
+    {
+        Ok(mut file) => {
+            use std::io::Write;
+            let _ = file.write_all(entry.as_bytes());
+            println!("✅ Reflection saved to {}", memory_file.display());
+        }
+        Err(e) => {
+            println!("⚠️  Failed to write reflection: {e}");
+        }
+    }
+
+    CommandOutcome::Continue
+}
+cmd!(
+    ReflectCommand,
+    "reflect",
+    CommandCategory::Context,
+    "Reflect on session learnings",
+    cmd_reflect
 );
 
 // ── AutoMemoryCommand ─────────────────────────────────────────────────
@@ -292,5 +437,6 @@ pub fn register_all(registry: &mut crate::cli::command::CommandRegistry) {
     registry.register(Arc::new(RememberCommand));
     registry.register(Arc::new(ForgetCommand));
     registry.register(Arc::new(MemoryCommand));
+    registry.register(Arc::new(ReflectCommand));
     registry.register(Arc::new(AutoMemoryCommand));
 }

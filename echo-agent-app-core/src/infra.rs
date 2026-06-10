@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use echo_agent::llm::LlmConfig;
 use echo_agent::memory::ConversationStore;
 use echo_agent::memory::SqliteConversationStore;
 use echo_agent::prelude::*;
@@ -15,10 +16,12 @@ use crate::project::prompt::PromptAssembler;
 /// Default context window size in tokens (128K).
 const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
 
+/// Default max output tokens when not configured (sensible for 128K context models).
+const DEFAULT_MAX_TOKENS: u32 = 8192;
+
 /// Agent creation parameters (extracted from CLI args or config).
 pub struct AgentCreateParams {
     pub model: Option<String>,
-    pub mode: String,
     pub system_prompt: Option<String>,
     pub project: Option<String>,
     /// Optional session ID for checkpoint isolation (used by background tasks).
@@ -26,35 +29,16 @@ pub struct AgentCreateParams {
     /// React loop checkpoint interval in iterations (0 = only at end).
     /// Used by background tasks to enable crash recovery.
     pub react_checkpoint_interval: Option<usize>,
-    /// Additional tools to enable beyond the mode's default set.
-    /// Mode determines which tools are enabled by default; this list
-    /// allows the user to extend beyond those defaults.
-    /// General mode enables all tools regardless.
-    pub extra_tools: Vec<String>,
 }
 
 /// 创建 Agent 实例
 ///
-/// Uses `ReactAgentBuilder` to construct the agent. Mode is resolved at the
-/// CLI layer (see `project::modes`); the framework is mode-agnostic.
+/// Uses `ReactAgentBuilder` to construct the agent. The framework is mode-agnostic;
+/// domain specialization is handled by the Skill system (SKILL.md files).
 pub fn create_agent(params: &AgentCreateParams, app_config: &AppConfig) -> ReactAgent {
     // Use model from params if provided, otherwise check ECHOCOWORK_MODEL env var, then config
     let config_model = app_config.model.get_model_name();
     let model = params.model.as_deref().unwrap_or(&config_model);
-
-    // Parse mode with bilingual support (Chinese aliases + English names)
-    let agent_mode = crate::project::modes::parse_from_str(&params.mode).unwrap_or_else(|| {
-        let valid: Vec<&str> = crate::project::modes::AgentMode::all()
-            .iter()
-            .map(|m| m.name())
-            .collect();
-        tracing::warn!(
-            "Unknown mode '{}', falling back to 'general'. Valid modes: {}",
-            params.mode,
-            valid.join(", ")
-        );
-        crate::project::modes::AgentMode::General
-    });
 
     let base_system_prompt = params
         .system_prompt
@@ -80,20 +64,14 @@ pub fn create_agent(params: &AgentCreateParams, app_config: &AppConfig) -> React
     } else {
         None
     };
-
     // Use PromptAssembler for modular, budget-aware prompt construction
-    // (project context, mode-specific prompt, etc.)
     let model_window = if app_config.agent.token_limit > 0 {
         app_config.agent.token_limit
     } else {
         DEFAULT_CONTEXT_WINDOW
     };
-    let assembler = PromptAssembler::default_for_mode(
-        &agent_mode,
-        base_system_prompt,
-        project_ctx.as_ref(),
-        model_window,
-    );
+    let assembler =
+        PromptAssembler::default(base_system_prompt, project_ctx.as_ref(), model_window);
     let system_prompt = assembler.assemble();
 
     // Determine config values from AppConfig
@@ -114,15 +92,31 @@ pub fn create_agent(params: &AgentCreateParams, app_config: &AppConfig) -> React
         .enable_human_in_loop()
         .max_iterations(app_config.agent.max_iterations)
         .token_limit(token_limit)
+        .max_tokens(Some(
+            app_config.model.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+        ))
+        .temperature(app_config.model.temperature)
         .tool_execution(echo_agent::tools::ToolExecutionConfig {
             timeout_ms: app_config.agent.tool_timeout_ms,
             ..Default::default()
-        });
+        })
+        .enable_cot();
 
-    // Enable COT (chain-of-thought) based on mode
-    // Coding and Writing modes don't need COT instruction
-    if should_enable_cot_for_mode(&agent_mode) {
-        builder = builder.enable_cot();
+    // ── Pass auth_token / base_url from AppConfig to LLM client ──
+    // Without this, the agent falls back to env vars + echo-agent-models.yaml,
+    // which may not exist (especially in GUI apps where shell env vars aren't inherited).
+    if let Some(auth_token) = app_config.model.get_auth_token() {
+        let provider = app_config.model.provider.as_str();
+        let base_url_override = app_config.model.get_base_url();
+        let llm_config =
+            build_llm_config(provider, &auth_token, model, base_url_override.as_deref());
+        tracing::info!(
+            provider = provider,
+            model = model,
+            has_base_url = base_url_override.is_some(),
+            "Injecting LlmConfig from AppConfig (auth_token + base_url)"
+        );
+        builder = builder.llm_config(llm_config);
     }
 
     // Set session_id if provided (used by background tasks for checkpoint isolation)
@@ -162,13 +156,6 @@ pub fn create_agent(params: &AgentCreateParams, app_config: &AppConfig) -> React
             std::process::exit(1);
         }
     };
-
-    // Filter tools based on mode (unless General mode, which enables all tools).
-    // Mode determines the default tool set; extra_tools extends beyond those defaults.
-    // Core tools (final_answer, think, answer) are always kept.
-    if agent_mode != crate::project::modes::AgentMode::General {
-        filter_tools_by_mode_and_extras(&mut agent, &agent_mode, &params.extra_tools);
-    }
 
     // Register default hooks
     register_default_hooks(&mut agent);
@@ -334,6 +321,91 @@ pub enum LogTarget {
     TuiFile,
 }
 
+/// Load shell environment variables by spawning the user's login shell.
+///
+/// On macOS, GUI apps launched from Dock/Finder/Spotlight do NOT inherit
+/// shell environment variables (from ~/.zshrc, ~/.bash_profile, etc.).
+/// This function bridges that gap — the same approach used by VS Code,
+/// JetBrains, and other macOS GUI apps.
+///
+/// Only sets variables that are NOT already present in the process environment,
+/// so explicit env vars always take precedence.
+///
+/// Only imports known API key variables to avoid polluting the environment
+/// with unrelated shell state.
+pub fn load_shell_env() {
+    // Only relevant on macOS where GUI apps miss shell env vars.
+    // On Linux, desktop environments generally inherit the shell env.
+    #[cfg(not(target_os = "macos"))]
+    {
+        return;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
+
+        // Spawn a login interactive shell and print its environment.
+        // -l = login shell (sources ~/.zprofile, ~/.bash_profile, etc.)
+        // -i = interactive (sources ~/.zshrc, ~/.bashrc, etc.)
+        // -c = run command then exit
+        let output = match std::process::Command::new(&shell)
+            .args(["-lic", "env"])
+            .output()
+        {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::warn!("Failed to spawn shell for env loading: {e}");
+                return;
+            }
+        };
+
+        if !output.status.success() {
+            tracing::warn!("Shell env command exited with status: {}", output.status);
+            return;
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        // Whitelist of env vars to import — known API keys and config paths
+        // that the agent framework needs.
+        const API_KEY_VARS: &[&str] = &[
+            "DEEPSEEK_API_KEY",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_BASE_URL",
+            "DASHSCOPE_API_KEY",
+            "QWEN_API_KEY",
+            "MOONSHOT_API_KEY",
+            "KIMI_API_KEY",
+            "ZHIPU_API_KEY",
+            "GLM_API_KEY",
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "ECHOCOWORK_AUTH_TOKEN",
+            "ECHOCOWORK_BASE_URL",
+            "ECHOCOWORK_MODEL",
+            "MCP_CONFIG_PATH",
+        ];
+
+        let mut loaded = Vec::new();
+        for line in stdout.lines() {
+            if let Some((key, value)) = line.split_once('=') {
+                if API_KEY_VARS.contains(&key) && std::env::var(key).is_err() && !value.is_empty() {
+                    // SAFETY: called once at startup before any threads
+                    unsafe { std::env::set_var(key, value) };
+                    loaded.push(key.to_string());
+                }
+            }
+        }
+
+        if !loaded.is_empty() {
+            tracing::info!(vars = loaded.join(", "), "Loaded shell env vars (GUI mode)");
+        }
+    }
+}
+
 pub fn init_logging_for_tui(level: &str) {
     init_logging_with_target(level, LogTarget::TuiFile);
 }
@@ -454,11 +526,7 @@ fn provider_from_model(model: &str) -> &str {
         .map(|(provider, _)| provider)
         .unwrap_or_else(|| {
             let lower = model.to_ascii_lowercase();
-            if lower.starts_with("gpt-")
-                || lower.starts_with("o1")
-                || lower.starts_with("o3")
-                || lower.starts_with("o4")
-            {
+            if lower.starts_with("gpt-") {
                 "openai"
             } else if lower.starts_with("claude-") {
                 "anthropic"
@@ -714,74 +782,35 @@ pub fn print_doctor_result(result: &DoctorResult) {
     println!();
 }
 
-/// 根据模式决定是否启用 COT（chain-of-thought）指令
+/// Build an [`LlmConfig`] from the AppConfig's model section.
 ///
-/// Coding 和 Writing 模式不需要 COT 指令，因为它们的工作流程已经在系统提示中明确定义。
-/// Research、Data 和 General 模式保持 COT 启用，以增强推理能力。
-fn should_enable_cot_for_mode(mode: &crate::project::modes::AgentMode) -> bool {
-    use crate::project::modes::AgentMode;
-    match mode {
-        AgentMode::Coding => false,
-        AgentMode::Writing => false,
-        AgentMode::Research => true,
-        AgentMode::Data => true,
-        AgentMode::Medical => true,
-        AgentMode::General => true,
-    }
-}
-
-/// 根据模式和用户指定的额外工具列表过滤工具。
-///
-/// - 模式决定默认启用的工具集（由 `recommended_tools()` 定义）
-/// - `extra_tools` 允许用户扩展到模式默认集之外的工具
-/// - 核心工具（final_answer、think、answer）始终保留
-/// - MCP 工具和用户通过 `extra_tools` 指定的工具不受过滤影响
-fn filter_tools_by_mode_and_extras(
-    agent: &mut ReactAgent,
-    mode: &crate::project::modes::AgentMode,
-    extra_tools: &[String],
-) {
-    use crate::project::modes::recommended_tools;
-
-    // Core tools that are always kept regardless of mode
-    const CORE_TOOLS: &[&str] = &[
-        "final_answer",
-        "think",
-        "answer",
-        "memory_write",
-        "todo_write",
-    ];
-
-    // Build the allowed tool set: mode defaults + extra_tools + core tools
-    let mode_tools = recommended_tools(mode);
-    let mut allowed: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for t in &mode_tools {
-        allowed.insert(t.to_string());
-    }
-    for t in extra_tools {
-        allowed.insert(t.clone());
-    }
-    for t in CORE_TOOLS {
-        allowed.insert(t.to_string());
-    }
-
-    // Get all currently registered tools and remove those not in the allowed set
-    let registered = agent.tool_names();
-    let mut removed = Vec::new();
-    for name in &registered {
-        if !allowed.contains(name) {
-            agent.remove_tool(name);
-            removed.push(name.clone());
+/// Maps the provider string to the appropriate factory method and optionally
+/// overrides the base URL. This enables auth_token / base_url from
+/// `echo-agent.yaml` to flow through to the agent's LLM client without
+/// requiring `echo-agent-models.yaml` or provider-specific env vars.
+fn build_llm_config(
+    provider: &str,
+    auth_token: &str,
+    model: &str,
+    base_url_override: Option<&str>,
+) -> LlmConfig {
+    let mut config = match provider.to_lowercase().as_str() {
+        "anthropic" => LlmConfig::anthropic(auth_token, model),
+        "deepseek" => LlmConfig::deepseek(auth_token, model),
+        "dashscope" | "qwen" | "aliyun" => LlmConfig::dashscope(auth_token, model),
+        "gemini" | "google" => LlmConfig::gemini(auth_token, model),
+        "ollama" => LlmConfig::ollama(model),
+        _ => {
+            // Default to OpenAI-compatible
+            let url = base_url_override.unwrap_or("https://api.openai.com/v1/chat/completions");
+            LlmConfig::new(url, auth_token, model)
         }
+    };
+    // Apply base_url override for non-default providers (except ollama which has its own URL)
+    if let Some(url) = base_url_override
+        && provider.to_lowercase() != "ollama"
+    {
+        config.base_url = url.to_string();
     }
-
-    if !removed.is_empty() {
-        tracing::info!(
-            mode = %mode,
-            kept = allowed.len(),
-            removed = removed.len(),
-            removed_tools = ?removed,
-            "Filtered tools by mode"
-        );
-    }
+    config
 }

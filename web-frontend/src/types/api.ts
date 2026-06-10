@@ -259,6 +259,8 @@ export interface SavedMessage {
   role: string;
   content: string | null;
   tool_calls?: { id: string; name: string; arguments: string }[];
+  thinking_segments?: string[];
+  tool_result?: string | null;
 }
 
 export interface ConversationRecord {

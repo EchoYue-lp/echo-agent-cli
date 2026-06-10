@@ -1,70 +1,8 @@
-//! Context management slash commands — mode, project, think, reasoning, model, system, compress, compact, context, refresh.
+//! Context management slash commands — project, think, reasoning, model, system, compress, compact, context, refresh.
 
 use crate::cli::command::{CommandCategory, CommandContext, CommandOutcome, cmd};
 use echo_agent::agent::Agent;
 use std::sync::Arc;
-
-// ── ModeCommand ───────────────────────────────────────────────────────
-
-async fn cmd_mode(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
-    if let Some(mode) = args.first() {
-        match crate::project::modes::parse_from_str(mode) {
-            Some(agent_mode) => {
-                let overlay = crate::project::modes::chinese_mode_prompt(&agent_mode);
-
-                // Use prompt stacking: preserve base, swap domain overlay
-                ctx.agent
-                    .write(|a| {
-                        let current = echo_agent::agent::Agent::system_prompt(a).to_string();
-
-                        let new_prompt = if current.contains("\n\n---\n\n") {
-                            // Already stacked — replace only the overlay section
-                            let parts: Vec<&str> = current.splitn(3, "\n\n---\n\n").collect();
-                            if parts.len() >= 2 {
-                                let base = parts[0];
-                                let context = if parts.len() > 2 { parts[2] } else { "" };
-                                if context.is_empty() {
-                                    format!("{}\n\n---\n\n{}", base, overlay)
-                                } else {
-                                    format!("{}\n\n---\n\n{}\n\n---\n\n{}", base, overlay, context)
-                                }
-                            } else {
-                                overlay
-                            }
-                        } else {
-                            // First mode switch: current prompt becomes base
-                            format!("{}\n\n---\n\n{}", current, overlay)
-                        };
-
-                        echo_agent::agent::Agent::set_system_prompt(a, &new_prompt);
-                    })
-                    .await;
-
-                println!(
-                    "Mode: {} {}",
-                    crate::project::modes::icon(&agent_mode),
-                    crate::project::modes::display_name(&agent_mode)
-                );
-                println!("System prompt updated (overlay applied).");
-            }
-            None => {
-                println!("Unknown mode: {mode}");
-                println!("Available: general, coding, research, data, writing");
-            }
-        }
-    } else {
-        println!("Current mode: {}", ctx.current_mode);
-        println!("Available: general, coding, research, data, writing");
-    }
-    CommandOutcome::Continue
-}
-cmd!(
-    ModeCommand,
-    "mode",
-    CommandCategory::Context,
-    "View or switch agent mode",
-    cmd_mode
-);
 
 // ── ThinkCommand ──────────────────────────────────────────────────────
 
@@ -254,6 +192,28 @@ cmd!(
     cmd_context
 );
 
+// ── CheckpointCommand ─────────────────────────────────────────────────
+
+async fn cmd_checkpoint(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
+    ctx.agent
+        .read_async(|a| {
+            Box::pin(async move {
+                a.force_checkpoint().await;
+            })
+        })
+        .await;
+    println!("Checkpoint saved.");
+    CommandOutcome::Continue
+}
+cmd!(
+    CheckpointCommand,
+    "checkpoint",
+    ["save"],
+    CommandCategory::Context,
+    "Force-save a runtime checkpoint (messages + plan + skills)",
+    cmd_checkpoint
+);
+
 // ── RefreshCommand ────────────────────────────────────────────────────
 
 async fn cmd_refresh(_ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
@@ -286,7 +246,6 @@ cmd!(
 // ── Register ─────────────────────────────────────────────────────────
 
 pub fn register_all(registry: &mut crate::cli::command::CommandRegistry) {
-    registry.register(Arc::new(ModeCommand));
     registry.register(Arc::new(ThinkCommand));
     registry.register(Arc::new(ReasoningCommand));
     registry.register(Arc::new(ModelCommand));
@@ -294,6 +253,7 @@ pub fn register_all(registry: &mut crate::cli::command::CommandRegistry) {
     registry.register(Arc::new(CompressCommand));
     registry.register(Arc::new(CompactCommand));
     registry.register(Arc::new(ContextCommand));
+    registry.register(Arc::new(CheckpointCommand));
     registry.register(Arc::new(RefreshCommand));
     registry.register(Arc::new(ProjectCommand));
 }

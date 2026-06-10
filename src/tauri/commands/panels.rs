@@ -25,16 +25,23 @@ pub async fn set_permissions_mode(
     state: tauri::State<'_, TauriState>,
     mode: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let valid_modes = ["default", "auto-approve", "strict"];
-    if !valid_modes.contains(&mode.as_str()) {
-        return Err(IpcError::Validation(format!(
-            "Invalid permission mode '{}', valid: {:?}",
-            mode, valid_modes
-        )));
-    }
+    let normalized = match mode.as_str() {
+        "default" => "default",
+        "plan" => "plan",
+        "auto-edit" | "autoedit" | "accept-edits" | "auto-approve" => "auto-edit",
+        "full-auto" | "fullauto" | "bypass" => "full-auto",
+        "auto" => "auto",
+        "dontask" | "dont-ask" | "strict" => "dontask",
+        _ => {
+            return Err(IpcError::Validation(format!(
+                "Invalid permission mode '{}'. Valid: default, plan, auto-edit, full-auto, auto, dontask",
+                mode
+            )));
+        }
+    };
     let mut mode_lock = state.app_state.config.permission_mode.write().await;
-    *mode_lock = mode.clone();
-    Ok(serde_json::json!({"success": true, "mode": mode}))
+    *mode_lock = normalized.to_string();
+    Ok(serde_json::json!({"success": true, "mode": normalized}))
 }
 
 #[tauri::command]
@@ -214,18 +221,38 @@ pub async fn get_auto_memory_observations(
 
 #[tauri::command]
 pub async fn list_skills(
-    _state: tauri::State<'_, TauriState>,
+    state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
-    // Skills are loaded from plugins; return empty for now
-    Ok(serde_json::json!([]))
+    let agent = state.app_state.connection.primary_agent();
+    let descriptors = agent.read(|a| a.skill_descriptors()).await;
+    let skills: Vec<serde_json::Value> = descriptors
+        .iter()
+        .map(|d| {
+            serde_json::json!({
+                "name": d.name,
+                "description": d.description,
+                "triggers": d.triggers,
+            })
+        })
+        .collect();
+    Ok(serde_json::json!(skills))
 }
 
 #[tauri::command]
 pub async fn get_skill(
-    _state: tauri::State<'_, TauriState>,
+    state: tauri::State<'_, TauriState>,
     name: String,
 ) -> Result<serde_json::Value, IpcError> {
-    Err(IpcError::NotFound(format!("Skill '{}' not found", name)))
+    let agent = state.app_state.connection.primary_agent();
+    let descriptors = agent.read(|a| a.skill_descriptors()).await;
+    match descriptors.iter().find(|d| d.name == name) {
+        Some(d) => Ok(serde_json::json!({
+            "name": d.name,
+            "description": d.description,
+            "triggers": d.triggers,
+        })),
+        None => Err(IpcError::NotFound(format!("Skill '{}' not found", name))),
+    }
 }
 
 #[tauri::command]
@@ -322,12 +349,10 @@ pub async fn execute_workflow(
     id: String,
     _input: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, IpcError> {
-    // Workflow execution requires the agent; return stub for now
-    Ok(serde_json::json!({
-        "success": true,
-        "message": "Workflow execution not yet implemented in IPC",
-        "workflow_id": id,
-    }))
+    Err(IpcError::NotImplemented(format!(
+        "Workflow execution '{}' is not available via IPC. Use the agent chat to run workflows.",
+        id
+    )))
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -372,11 +397,9 @@ pub async fn execute_sandbox(
     _code: String,
     _language: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    // Sandbox execution requires complex setup; return stub
-    Ok(serde_json::json!({
-        "success": false,
-        "error": "Sandbox execution not yet implemented in IPC",
-    }))
+    Err(IpcError::NotImplemented(
+        "Sandbox execution is not available via IPC. Use the agent chat to run code.".into(),
+    ))
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -421,10 +444,9 @@ pub async fn extract_data(
     _schema: serde_json::Value,
     _schema_name: String,
 ) -> Result<serde_json::Value, IpcError> {
-    Ok(serde_json::json!({
-        "success": false,
-        "error": "Data extraction not yet implemented in IPC",
-    }))
+    Err(IpcError::NotImplemented(
+        "Data extraction is not available via IPC. Use the data-wrangling skill in chat.".into(),
+    ))
 }
 
 #[tauri::command]
@@ -432,10 +454,9 @@ pub async fn validate_schema(
     _state: tauri::State<'_, TauriState>,
     _schema: serde_json::Value,
 ) -> Result<serde_json::Value, IpcError> {
-    Ok(serde_json::json!({
-        "valid": true,
-        "message": "Schema validation not yet implemented",
-    }))
+    Err(IpcError::NotImplemented(
+        "Schema validation is not available via IPC.".into(),
+    ))
 }
 
 #[tauri::command]
@@ -506,7 +527,9 @@ pub async fn export_history_json(
 pub async fn list_trace_sessions(
     _state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
-    Ok(serde_json::json!([]))
+    Err(IpcError::NotImplemented(
+        "Trace session listing is not available via IPC.".into(),
+    ))
 }
 
 #[tauri::command]
@@ -514,7 +537,9 @@ pub async fn get_trace_events(
     _state: tauri::State<'_, TauriState>,
     _session_id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    Ok(serde_json::json!([]))
+    Err(IpcError::NotImplemented(
+        "Trace event retrieval is not available via IPC.".into(),
+    ))
 }
 
 #[tauri::command]
@@ -544,7 +569,9 @@ pub async fn clear_trace_session(
 pub async fn list_papers(
     _state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
-    Ok(serde_json::json!([]))
+    Err(IpcError::NotImplemented(
+        "Paper listing is not available via IPC. Use the paper-search skill in chat.".into(),
+    ))
 }
 
 #[tauri::command]

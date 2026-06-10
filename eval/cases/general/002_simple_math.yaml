@@ -1,0 +1,10 @@
+id: "general-002"
+name: "简单计算-不触发skill"
+description: "简单数学计算不应激活任何 skill"
+domain: general
+task: "1+1等于几？"
+success_criteria:
+  all_of:
+    - output_contains: "2"
+    - tool_not_used: "activate_skill"
+constraints: {}

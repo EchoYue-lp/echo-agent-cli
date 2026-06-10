@@ -46,7 +46,7 @@ cargo run --bin echo-agent-cli -- onboard
 
 ```yaml
 model:
-  name: "qwen-plus"
+  name: "qwen3.6-plus"
   
 agent:
   name: "echo-assistant"
@@ -97,7 +97,7 @@ echo-agent-cli run "解释这段代码"
 echo-agent-cli --headless "写一个快速排序并测试"
 
 # 指定模型
-echo-agent-cli --model qwen-max run "写一个快速排序"
+echo-agent-cli --model qwen3.7-max run "写一个快速排序"
 
 # 使用指定配置
 echo-agent-cli --config ./my-config.yaml run "分析这段代码"
@@ -181,7 +181,7 @@ EchoCoWork 支持长期记忆：
 # ~/.echo-agent/config.yaml（或 ./echo-agent.yaml）
 
 model:
-  name: "qwen-plus"
+  name: "qwen3.6-plus"
   # max_tokens: 4096          # 可选
   # temperature: 0.7          # 可选
 
@@ -210,8 +210,8 @@ logging:
 ### Q: 如何选择模型？
 
 推荐使用：
-- **编程任务**: qwen-max, gpt-4, claude-3-5-sonnet
-- **通用对话**: qwen-plus, gpt-3.5-turbo
+- **编程任务**: qwen3.7-max, gpt-5.5, claude-opus-4-8
+- **通用对话**: qwen3.6-plus, gpt-5.5
 - **本地部署**: ollama/llama3.1
 
 ### Q: API Key 在哪里获取？

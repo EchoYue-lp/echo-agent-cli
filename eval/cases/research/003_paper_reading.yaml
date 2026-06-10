@@ -1,0 +1,13 @@
+id: "research-003"
+name: "论文深度阅读"
+description: "Agent 应下载并分析一篇论文"
+domain: research
+task: |
+  使用 semantic_scholar_search 搜索 "attention is all you need" 论文，
+  用 pdf_fetch 下载全文，分析其方法论、主要贡献和局限性。
+success_criteria:
+  all_of:
+    - tool_used: "semantic_scholar_search"
+    - tool_used: "pdf_fetch"
+    - output_contains: "方法论"
+constraints: {}

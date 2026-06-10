@@ -1,0 +1,14 @@
+id: "translation-002"
+name: "校对翻译质量"
+description: "Agent 应识别翻译中的错误和不自然表达并修正"
+domain: translation
+task: |
+  校对以下中英翻译，指出错误并给出改进版本：
+  原文: "The database supports ACID transactions."
+  翻译: "数据库支持酸交易。"
+success_criteria:
+  all_of:
+    - output_contains:
+        substring: "ACID"
+    - output_contains:
+        substring: "事务"

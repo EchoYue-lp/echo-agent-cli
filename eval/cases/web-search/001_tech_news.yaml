@@ -1,0 +1,12 @@
+id: "web-search-001"
+name: "搜索最新技术新闻"
+description: "Agent 应搜索并汇总最新的技术新闻"
+domain: web-search
+task: |
+  搜索 2026 年 6 月最新的 AI 模型发布信息，
+  列出至少 3 个新模型及其关键特性。
+success_criteria:
+  all_of:
+    - tool_used: "web_search"
+    - output_contains:
+        substring: "模型"

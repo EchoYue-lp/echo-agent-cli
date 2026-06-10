@@ -98,11 +98,30 @@ pub fn build_data_graph(shared: SharedAgent, max_charts: usize) -> anyhow::Resul
             Box::pin(async move {
                 let dataset_path: String = state.get("dataset_path").unwrap_or_default();
                 let objective: String = state.get("objective").unwrap_or_default();
+
+                // Detect file type to give correct tool guidance
+                let is_excel = dataset_path.ends_with(".xlsx") || dataset_path.ends_with(".xls")
+                    || dataset_path.ends_with(".xlsb") || dataset_path.ends_with(".ods");
+
+                let tool_guidance = if is_excel {
+                    format!(
+                        "The file is an Excel file. Use these tools:\n\
+                         1. excel_info to list sheets and dimensions\n\
+                         2. read_excel to preview the data\n\
+                         3. excel_profile to check column types and quality\n\
+                         4. excel_load to convert to Parquet for further analysis\n\
+                         Do NOT use read_file — it cannot read binary Excel files.")
+                } else {
+                    format!(
+                        "Use read_data to read the file and get a preview.\n\
+                         Then use profile_data to understand structure, types, and quality.")
+                };
+
                 let prompt = format!(
-                    "You are a data analyst. Describe the dataset at '{}'.\n\
-                     What are the columns, data types, shape, and any obvious issues?\n\
+                    "You are a data analyst. Describe the dataset at '{dataset_path}'.\n\
+                     {tool_guidance}\n\
+                     Report: columns, data types, shape, and any obvious issues.\n\
                      {objective_section}",
-                    dataset_path,
                     objective_section = if objective.is_empty() { String::new() } else {
                         format!("Focus especially on aspects relevant to: {}", objective)
                     }
@@ -116,13 +135,23 @@ pub fn build_data_graph(shared: SharedAgent, max_charts: usize) -> anyhow::Resul
         .add_function_node("profile_prompt", |state: &SharedState| -> BoxFuture<'_, Result<(), echo_agent::error::ReactError>> {
             Box::pin(async move {
                 let description: String = state.get("data_description").unwrap_or_default();
+                if description.is_empty() || description.contains("error") || description.contains("Error") {
+                    tracing::warn!(pipeline = "data_analysis", stage = "profile", "Previous stage produced empty or error output");
+                }
+                let prev_warning = if description.is_empty() {
+                    "\n\nWARNING: The data loading stage produced no output. Try to read the data file directly using read_data or excel_info/read_excel tools.\n"
+                } else if description.contains("error") || description.contains("Error") || description.contains("failed") {
+                    "\n\nWARNING: The data loading stage encountered issues. Try alternative tools (e.g., read_data for CSV/JSON, or read_excel/excel_info for Excel files).\n"
+                } else {
+                    ""
+                };
                 let prompt = format!(
-                    "Given this data description:\n{description}\n\n\
-                     Compute a statistical profile:\n\
-                     - Column distributions (mean, median, std dev for numeric; frequency counts for categorical)\n\
-                     - Missing value counts per column\n\
-                     - Correlations between numeric columns\n\
-                     - Data quality issues and anomalies\n\
+                    "Given this data description:\n{description}\n{prev_warning}\n\
+                     Compute a statistical profile using these tools:\n\
+                     - data_stats for per-column statistics (mean, median, std dev, percentiles)\n\
+                     - profile_data for dimension/metric classification and missing rates\n\
+                     - missing_value_analysis for detailed missing value patterns\n\
+                     - correlate_data for correlations between numeric columns\n\
                      Present the profile in a structured format."
                 );
                 state.set("profile_prompt", prompt)?;
@@ -136,11 +165,16 @@ pub fn build_data_graph(shared: SharedAgent, max_charts: usize) -> anyhow::Resul
                 let description: String = state.get("data_description").unwrap_or_default();
                 let profile: String = state.get("data_profile").unwrap_or_default();
                 let objective: String = state.get("objective").unwrap_or_default();
+                if profile.is_empty() {
+                    tracing::warn!(pipeline = "data_analysis", stage = "analyze", "Profile stage produced empty output");
+                }
                 let prompt = format!(
                     "Analyze this data and identify patterns, outliers, and insights:\n\n\
                      Data Description:\n{description}\n\n\
                      Statistical Profile:\n{profile}\n\
-                     {objective_section}",
+                     {objective_section}\n\
+                     Use tools like filter_data, aggregate_data, topn_data, contribution_data, \
+                     outlier_detection, and pivot_data as appropriate.",
                     objective_section = if objective.is_empty() { String::new() } else {
                         format!("\nFocus the analysis on: {}", objective)
                     }
@@ -155,12 +189,16 @@ pub fn build_data_graph(shared: SharedAgent, max_charts: usize) -> anyhow::Resul
             Box::pin(async move {
                 let analysis: String = state.get("analysis_result").unwrap_or_default();
                 let max_charts: i64 = state.get("max_charts").unwrap_or(3);
+                if analysis.is_empty() {
+                    tracing::warn!(pipeline = "data_analysis", stage = "visualize", "Analysis stage produced empty output");
+                }
                 let prompt = format!(
                     "Given this analysis:\n{analysis}\n\n\
                      Suggest {max_charts} visualizations that best illustrate these findings.\n\
+                     Use generate_chart tool to create actual charts.\n\
                      For each visualization, specify:\n\
-                     - Chart type (bar, line, scatter, heatmap, etc.)\n\
-                     - Which columns to use\n\
+                     - Chart type (bar, line, scatter, heatmap, boxplot, pie, area)\n\
+                     - Which columns to use (x_field, y_field, color_field)\n\
                      - What insight it reveals\n\
                      - Suggested title and axis labels"
                 );
@@ -174,6 +212,9 @@ pub fn build_data_graph(shared: SharedAgent, max_charts: usize) -> anyhow::Resul
             Box::pin(async move {
                 let analysis: String = state.get("analysis_result").unwrap_or_default();
                 let viz: String = state.get("visualization_suggestions").unwrap_or_default();
+                if analysis.is_empty() && viz.is_empty() {
+                    tracing::warn!(pipeline = "data_analysis", stage = "summarize", "Both analysis and visualization stages produced empty output");
+                }
                 let prompt = format!(
                     "Create a concise executive summary of these data findings:\n\n\
                      Analysis:\n{analysis}\n\n\

@@ -1,0 +1,26 @@
+id: "stats-002"
+name: "线性回归分析"
+description: "Agent 应使用 Python 执行线性回归并报告 R² 和回归系数"
+domain: statistical-analysis
+task: |
+  使用 Python（scikit-learn 或 statsmodels）对以下模拟数据执行简单线性回归分析：
+  - 自变量 x：10 到 50 之间的 20 个均匀分布随机数
+  - 因变量 y：y = 2.5x + 8 + 噪声（正态分布，均值 0，标准差 5）
+  请报告：
+  1. 回归系数（斜率和截距）
+  2. R² 决定系数
+  3. 对回归结果的简要解释
+success_criteria:
+  all_of:
+    - tool_used: "shell"
+    - any_of:
+        - output_contains: "R²"
+        - output_contains: "R-squared"
+        - output_contains: "R方"
+        - output_contains: "决定系数"
+    - any_of:
+        - output_contains: "系数"
+        - output_contains: "coefficient"
+        - output_contains: "斜率"
+        - output_contains: "截距"
+constraints: {}
