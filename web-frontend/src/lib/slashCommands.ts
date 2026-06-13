@@ -142,15 +142,6 @@ export const SLASH_COMMANDS: SlashCommand[] = [
     action: 'send',
   },
 
-  // Memory
-  {
-    name: '/auto-memory',
-    aliases: ['/am'],
-    description: 'Auto-memory (on/off/extract/show)',
-    category: 'Memory',
-    action: 'send',
-  },
-
   // Info
   {
     name: '/tools',

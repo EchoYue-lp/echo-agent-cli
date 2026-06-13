@@ -1,4 +1,4 @@
-import { useState, useRef } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import {
   Plus,
   Sun,
@@ -21,7 +21,9 @@ import { BrandIcon } from '../common/BrandIcon';
 import { useUiStore } from '../../stores/uiStore';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
 import { useConversationStore } from '../../stores/conversationStore';
+import { conversationApi } from '../../api/endpoints';
 import type { Workspace } from '../../api/endpoints';
+import type { ConversationListItem } from '../../types/api';
 
 const KIND_ICONS: Record<string, { icon: typeof Code; color: string }> = {
   code: { icon: Code, color: '#6366f1' },
@@ -51,11 +53,47 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
 
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
+  const [searchResults, setSearchResults] = useState<ConversationListItem[]>([]);
+  const [isSearching, setIsSearching] = useState(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
 
+  // Debounced search across all conversation content
+  useEffect(() => {
+    if (!searchQuery.trim()) {
+      setSearchResults([]);
+      return;
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(async () => {
+      if (controller.signal.aborted) return;
+      setIsSearching(true);
+      try {
+        const results = await conversationApi.search(searchQuery.trim());
+        if (!controller.signal.aborted) {
+          setSearchResults(results);
+        }
+      } catch (e) {
+        if (!controller.signal.aborted) {
+          console.error('Search failed:', e);
+          setSearchResults([]);
+        }
+      } finally {
+        if (!controller.signal.aborted) {
+          setIsSearching(false);
+        }
+      }
+    }, 300);
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [searchQuery]);
+
+  // Always filter workspace names; search results come from API when searching
   const filtered = searchQuery.trim()
     ? workspaces.filter((w) => w.name.toLowerCase().includes(searchQuery.toLowerCase()))
     : workspaces;
+  const isSearchingContent = searchQuery.trim().length > 0;
 
   const handleSwitch = async (ws: Workspace) => {
     if (current?.id === ws.id) {
@@ -181,6 +219,48 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
           </div>
         )}
       </div>
+
+      {/* Search Results — conversation content matches */}
+      {isSearchingContent && (
+        <div className="border-b border-[var(--border-primary)] px-2 pb-2">
+          <div className="px-1 py-1 text-[10px] font-semibold uppercase tracking-wider text-[var(--text-tertiary)]">
+            搜索结果 ({searchResults.length})
+          </div>
+          {isSearching && (
+            <div className="flex items-center gap-2 px-2 py-3">
+              <Loader2 size={12} className="animate-spin text-[var(--text-tertiary)]" />
+              <span className="text-[11px] text-[var(--text-tertiary)]">搜索中...</span>
+            </div>
+          )}
+          {!isSearching && searchResults.length === 0 && (
+            <div className="px-2 py-3 text-center">
+              <Search size={16} className="mx-auto mb-1 text-[var(--text-tertiary)]" />
+              <p className="text-[11px] text-[var(--text-tertiary)]">
+                未找到匹配的对话
+              </p>
+            </div>
+          )}
+          {!isSearching &&
+            searchResults.map((conv) => (
+              <div
+                key={conv.conversation_id}
+                className="cursor-pointer rounded-md px-2 py-2 text-[12px] transition-colors hover:bg-[var(--bg-hover)]"
+                onClick={() => handleSelectConv(conv.conversation_id)}
+              >
+                <div className="flex items-center gap-1.5">
+                  <MessageSquare size={11} className="shrink-0 text-[var(--accent)]" />
+                  <span className="truncate font-medium text-[var(--text-primary)]">
+                    {conv.title || '新对话'}
+                  </span>
+                </div>
+                <div className="mt-0.5 flex items-center gap-2 text-[10px] text-[var(--text-tertiary)] pl-[17px]">
+                  <span>{conv.message_count} 条消息</span>
+                  <span>{new Date(conv.updated_at).toLocaleDateString()}</span>
+                </div>
+              </div>
+            ))}
+        </div>
+      )}
 
       {/* Task (Workspace) List — expandable with conversations */}
       <div className="flex-1 overflow-y-auto px-2 pb-2">

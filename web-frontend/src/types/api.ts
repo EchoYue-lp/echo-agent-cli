@@ -146,6 +146,8 @@ export type ServerMessage =
   | { type: 'token'; data: string }
   | { type: 'tool_start'; name: string; args: unknown }
   | { type: 'tool_result'; name: string; result: string; success: boolean }
+  | { type: 'tool_batch_start'; tool_count: number }
+  | { type: 'tool_batch_end' }
   | { type: 'final_answer'; data: string }
   | {
       type: 'approval_request';
@@ -162,6 +164,14 @@ export type ServerMessage =
   | { type: 'thinking_end'; prompt_tokens: number; completion_tokens: number }
   | { type: 'pong' };
 
+// Execution round: one ReAct loop iteration (think → tools)
+export interface ExecutionRound {
+  /** Thinking that precedes this round's tools */
+  thinking?: { content: string };
+  /** Tools executed in this round (parallel if >1) */
+  tools: ToolCallInfo[];
+}
+
 // Chat store types
 export interface ChatMessage {
   id: string;
@@ -174,6 +184,10 @@ export interface ChatMessage {
   chartSpecs?: unknown[];
   isStreaming?: boolean;
   timestamp: number;
+  /** @deprecated Use executionRounds instead. Flat execution order tracking for backward compat. */
+  executionSteps?: { type: 'thinking' | 'tool'; index: number }[];
+  /** Execution rounds: each round = one ReAct iteration (thinking + tool batch) */
+  executionRounds?: ExecutionRound[];
 }
 
 export interface ApprovalRequest {
@@ -260,6 +274,8 @@ export interface SavedMessage {
   content: string | null;
   tool_calls?: { id: string; name: string; arguments: string }[];
   thinking_segments?: string[];
+  execution_steps?: { type: string; index: number }[];
+  execution_rounds?: { thinking?: { content: string }; tools: { name: string; args: unknown; result: string; success: boolean }[] }[];
   tool_result?: string | null;
 }
 
@@ -273,9 +289,9 @@ export interface ConversationRecord {
 }
 
 export interface ConversationListItem {
-  id: string;
+  id: number;
   conversation_id: string;
-  title: string;
+  title: string | null;
   message_count: number;
   created_at: string;
   updated_at: string;

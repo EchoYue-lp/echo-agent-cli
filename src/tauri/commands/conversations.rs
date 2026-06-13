@@ -3,7 +3,7 @@
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
 use echo_agent::memory::{NewConversation, StoredMessage};
-use echo_agent_app_core::persistence::SavedMessage;
+use echo_agent_app_core::persistence::{AttachmentsPayload, SavedExecutionStep, SavedMessage};
 
 #[tauri::command]
 pub async fn list_conversations(
@@ -72,17 +72,28 @@ pub async fn save_conversation(
     // Convert SavedMessage -> StoredMessage
     let stored: Vec<StoredMessage> = messages
         .into_iter()
-        .map(|m| StoredMessage {
-            id: None,
-            conversation_id: conversation_id.clone(),
-            role: m.role,
-            content: m.content,
-            attachments_json: m
-                .thinking_segments
-                .and_then(|ts| serde_json::to_string(&ts).ok()),
-            tool_calls_json: m.tool_calls.and_then(|tc| serde_json::to_string(&tc).ok()),
-            tool_result_json: m.tool_result,
-            created_at: chrono::Utc::now().to_rfc3339(),
+        .map(|m| {
+            // Pack thinking_segments + execution_steps into attachments_json (backward compatible)
+            let attachments_json = if m.thinking_segments.is_some() || m.execution_steps.is_some() {
+                let payload = AttachmentsPayload {
+                    thinking_segments: m.thinking_segments.unwrap_or_default(),
+                    execution_steps: m.execution_steps.unwrap_or_default(),
+                };
+                serde_json::to_string(&payload).ok()
+            } else {
+                None
+            };
+
+            StoredMessage {
+                id: None,
+                conversation_id: conversation_id.clone(),
+                role: m.role,
+                content: m.content,
+                attachments_json,
+                tool_calls_json: m.tool_calls.and_then(|tc| serde_json::to_string(&tc).ok()),
+                tool_result_json: m.tool_result,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            }
         })
         .collect();
 
@@ -123,16 +134,37 @@ pub async fn get_conversation(
     // Convert StoredMessage -> SavedMessage for frontend
     let messages: Vec<SavedMessage> = stored
         .into_iter()
-        .map(|m| SavedMessage {
-            role: m.role,
-            content: m.content,
-            tool_calls: m
-                .tool_calls_json
-                .and_then(|s| serde_json::from_str(&s).ok()),
-            thinking_segments: m
+        .map(|m| {
+            // Parse attachments_json which may contain thinking_segments + execution_steps
+            // or legacy plain array format
+            let (thinking_segments, execution_steps) = m
                 .attachments_json
-                .and_then(|s| serde_json::from_str(&s).ok()),
-            tool_result: m.tool_result_json,
+                .and_then(|s| AttachmentsPayload::parse(&s))
+                .map(|p| {
+                    let ts = if p.thinking_segments.is_empty() {
+                        None
+                    } else {
+                        Some(p.thinking_segments)
+                    };
+                    let es = if p.execution_steps.is_empty() {
+                        None
+                    } else {
+                        Some(p.execution_steps)
+                    };
+                    (ts, es)
+                })
+                .unwrap_or((None, None));
+
+            SavedMessage {
+                role: m.role,
+                content: m.content,
+                tool_calls: m
+                    .tool_calls_json
+                    .and_then(|s| serde_json::from_str(&s).ok()),
+                thinking_segments,
+                tool_result: m.tool_result_json,
+                execution_steps,
+            }
         })
         .collect();
 
@@ -172,17 +204,28 @@ pub async fn update_conversation(
     if let Some(msgs) = messages {
         let stored: Vec<StoredMessage> = msgs
             .into_iter()
-            .map(|m| StoredMessage {
-                id: None,
-                conversation_id: conv.conversation_id.clone(),
-                role: m.role,
-                content: m.content,
-                attachments_json: m
-                    .thinking_segments
-                    .and_then(|ts| serde_json::to_string(&ts).ok()),
-                tool_calls_json: m.tool_calls.and_then(|tc| serde_json::to_string(&tc).ok()),
-                tool_result_json: m.tool_result,
-                created_at: chrono::Utc::now().to_rfc3339(),
+            .map(|m| {
+                let attachments_json =
+                    if m.thinking_segments.is_some() || m.execution_steps.is_some() {
+                        let payload = AttachmentsPayload {
+                            thinking_segments: m.thinking_segments.unwrap_or_default(),
+                            execution_steps: m.execution_steps.unwrap_or_default(),
+                        };
+                        serde_json::to_string(&payload).ok()
+                    } else {
+                        None
+                    };
+
+                StoredMessage {
+                    id: None,
+                    conversation_id: conv.conversation_id.clone(),
+                    role: m.role,
+                    content: m.content,
+                    attachments_json,
+                    tool_calls_json: m.tool_calls.and_then(|tc| serde_json::to_string(&tc).ok()),
+                    tool_result_json: m.tool_result,
+                    created_at: chrono::Utc::now().to_rfc3339(),
+                }
             })
             .collect();
         if !stored.is_empty() {
@@ -385,4 +428,27 @@ pub async fn restore_conversation(
         "message_count": message_count,
         "conversation_id": conv.conversation_id,
     }))
+}
+
+#[tauri::command]
+pub async fn search_conversations(
+    state: tauri::State<'_, TauriState>,
+    query: String,
+    limit: Option<usize>,
+) -> Result<serde_json::Value, IpcError> {
+    if query.trim().is_empty() {
+        return Ok(serde_json::json!([]));
+    }
+
+    let store_guard = state.app_state.storage.conversation_store.read().await;
+    let store = store_guard
+        .as_ref()
+        .ok_or_else(|| IpcError::Internal("Conversation store not available".to_string()))?;
+
+    let results = store
+        .search_conversations(&query, limit.unwrap_or(20))
+        .await
+        .map_err(|e| IpcError::Internal(format!("search_conversations error: {e}")))?;
+
+    serde_json::to_value(&results).map_err(|e| IpcError::Internal(e.to_string()))
 }

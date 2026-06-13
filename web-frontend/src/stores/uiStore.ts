@@ -5,7 +5,6 @@ export type SettingsTabId =
   | 'mcp'
   | 'skills'
   | 'memory'
-  | 'auto-memory'
   | 'config'
   | 'providers'
   | 'sessions'

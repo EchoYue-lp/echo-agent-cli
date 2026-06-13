@@ -207,6 +207,17 @@ fn send_approval_response(approval: &mut echo_agent_app_core::hitl::PendingAppro
 enum AgentEvent {
     /// A streaming token chunk from the LLM.
     Token(String),
+    /// LLM thinking/reasoning started.
+    ThinkStart,
+    /// LLM thinking/reasoning ended.
+    ThinkEnd {
+        prompt_tokens: usize,
+        completion_tokens: usize,
+    },
+    /// A tool batch is starting (tools between start and end are concurrent).
+    ToolBatchStart { tool_count: usize },
+    /// A tool batch has ended.
+    ToolBatchEnd,
     /// The final complete answer from the agent.
     FinalAnswer(String),
     /// A tool is about to be called.
@@ -258,6 +269,23 @@ pub async fn run_event_loop(
                 AgentEvent::Token(chunk) => {
                     app.append_stream(&chunk);
                 }
+                AgentEvent::ThinkStart => {
+                    // Start a new thinking phase — insert a visible marker
+                    app.iteration_count += 1;
+                }
+                AgentEvent::ThinkEnd {
+                    prompt_tokens,
+                    completion_tokens: _,
+                } => {
+                    // Record token usage for the round summary
+                    let _ = prompt_tokens; // store if needed for stats
+                }
+                AgentEvent::ToolBatchStart { tool_count: _ } => {
+                    // Round boundary — current thinking phase is done, tools follow
+                }
+                AgentEvent::ToolBatchEnd => {
+                    // Tool batch complete — rebuild groups to reflect round structure
+                }
                 AgentEvent::FinalAnswer(_answer) => {
                     app.finalize_stream();
                 }
@@ -294,6 +322,7 @@ pub async fn run_event_loop(
                             content: format!("✓ {}", display),
                         });
                     }
+                    app.rebuild_message_groups();
                 }
                 AgentEvent::Error(e) => {
                     app.messages.push(ChatMessage {
@@ -719,6 +748,24 @@ async fn send_to_agent(
                         break;
                     }
                 }
+                Ok(echo_agent::agent::AgentEvent::ThinkStart) => {
+                    let _ = agent_tx.send(AgentEvent::ThinkStart);
+                }
+                Ok(echo_agent::agent::AgentEvent::ThinkEnd {
+                    prompt_tokens,
+                    completion_tokens,
+                }) => {
+                    let _ = agent_tx.send(AgentEvent::ThinkEnd {
+                        prompt_tokens,
+                        completion_tokens,
+                    });
+                }
+                Ok(echo_agent::agent::AgentEvent::ToolBatchStart { tool_count }) => {
+                    let _ = agent_tx.send(AgentEvent::ToolBatchStart { tool_count });
+                }
+                Ok(echo_agent::agent::AgentEvent::ToolBatchEnd) => {
+                    let _ = agent_tx.send(AgentEvent::ToolBatchEnd);
+                }
                 Ok(echo_agent::agent::AgentEvent::FinalAnswer(answer)) => {
                     let _ = agent_tx.send(AgentEvent::FinalAnswer(answer));
                     got_final = true;
@@ -733,7 +780,7 @@ async fn send_to_agent(
                 Ok(echo_agent::agent::AgentEvent::ToolResult { name, output }) => {
                     let _ = agent_tx.send(AgentEvent::ToolResult { name, output });
                 }
-                Ok(_) => {} // Ignore other event types
+                Ok(_) => {} // Ignore other event types (GuardTriggered, MemoryRecalled, etc.)
                 Err(e) => {
                     let _ = agent_tx.send(AgentEvent::Error(e.to_string()));
                     got_final = true; // Error also resets is_processing
@@ -849,10 +896,27 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &AgentHandle, cmd: &str) 
             });
         }
         Some(SlashCommand::Compact) => {
-            app.messages.push(ChatMessage {
-                role: MessageRole::System,
-                content: "Context compression requested. (Will be wired to agent)".to_string(),
-            });
+            let result = agent
+                .write_async(|a| Box::pin(async move { a.force_compress_context().await }))
+                .await;
+            match result {
+                Ok(stats) => {
+                    let saved = stats.before_tokens.saturating_sub(stats.after_tokens);
+                    app.messages.push(ChatMessage {
+                        role: MessageRole::System,
+                        content: format!(
+                            "上下文已压缩: {} → {} 条消息, 节省 ≈{} tokens",
+                            stats.before_count, stats.after_count, saved
+                        ),
+                    });
+                }
+                Err(e) => {
+                    app.messages.push(ChatMessage {
+                        role: MessageRole::System,
+                        content: format!("压缩失败: {e}"),
+                    });
+                }
+            }
         }
         Some(SlashCommand::Copy) => match app.last_assistant_response() {
             Some(text) => {

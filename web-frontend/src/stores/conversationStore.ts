@@ -88,7 +88,7 @@ function generateId(): string {
 }
 
 function chatMessagesToSaved(messages: ChatMessage[]) {
-  const saved: { role: string; content: string; tool_calls?: { id: string; name: string; arguments: string }[]; thinking_segments?: string[]; tool_result?: string }[] = [];
+  const saved: { role: string; content: string; tool_calls?: { id: string; name: string; arguments: string }[]; thinking_segments?: string[]; execution_steps?: { type: string; index: number }[]; execution_rounds?: { thinking?: { content: string }; tools: { name: string; args: unknown; result: string; success: boolean }[] }[]; tool_result?: string }[] = [];
 
   for (const m of messages) {
     // Save the main message
@@ -100,6 +100,27 @@ function chatMessagesToSaved(messages: ChatMessage[]) {
     // Save thinking segments
     if (m.thinkingSegments && m.thinkingSegments.length > 0) {
       entry.thinking_segments = m.thinkingSegments.map((s) => s.content);
+    }
+
+    // Save execution steps (chronological order of thinking/tool interleaving)
+    if (m.executionSteps && m.executionSteps.length > 0) {
+      entry.execution_steps = m.executionSteps.map((s) => ({
+        type: s.type,
+        index: s.index,
+      }));
+    }
+
+    // Save execution rounds (round-based model with thinking + parallel tools)
+    if (m.executionRounds && m.executionRounds.length > 0) {
+      entry.execution_rounds = m.executionRounds.map((r) => ({
+        thinking: r.thinking ? { content: r.thinking.content } : undefined,
+        tools: r.tools.map((t) => ({
+          name: t.name,
+          args: t.args,
+          result: t.result,
+          success: t.success,
+        })),
+      }));
     }
 
     // Save tool calls with stable IDs and results
@@ -132,13 +153,13 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
         items.length,
         'items:',
         JSON.stringify(
-          items.map((i) => ({ id: i.conversation_id, title: i.title, msgs: i.message_count }))
+          items.map((i) => ({ id: i.conversation_id, title: i.title ?? '', msgs: i.message_count }))
         )
       );
       const metas: ConversationMeta[] = items
         .map((item) => ({
           id: item.conversation_id,
-          title: item.title,
+          title: item.title ?? '',
           lastMessage: '',
           messageCount: item.message_count,
           createdAt: new Date(item.created_at).getTime(),
@@ -193,7 +214,7 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
       const metas: ConversationMeta[] = items
         .map((item) => ({
           id: item.conversation_id,
-          title: item.title,
+          title: item.title ?? '',
           lastMessage: '',
           messageCount: item.message_count,
           createdAt: new Date(item.created_at).getTime(),
@@ -233,6 +254,27 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
         // Restore thinking segments
         if (m.thinking_segments && m.thinking_segments.length > 0) {
           base.thinkingSegments = m.thinking_segments.map((s) => ({ content: s }));
+        }
+
+        // Restore execution steps (chronological order of thinking/tool interleaving)
+        if (m.execution_steps && m.execution_steps.length > 0) {
+          base.executionSteps = m.execution_steps.map((s) => ({
+            type: s.type as 'thinking' | 'tool',
+            index: s.index,
+          }));
+        }
+
+        // Restore execution rounds (round-based model)
+        if (m.execution_rounds && m.execution_rounds.length > 0) {
+          base.executionRounds = m.execution_rounds.map((r: any) => ({
+            thinking: r.thinking ? { content: r.thinking.content } : undefined,
+            tools: (r.tools || []).map((t: any) => ({
+              name: t.name,
+              args: t.args || {},
+              result: t.result || '',
+              success: t.success ?? true,
+            })),
+          }));
         }
 
         // Restore tool calls on assistant messages

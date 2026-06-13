@@ -361,6 +361,10 @@ export const conversationApi = {
       : post<{ success: boolean; message_count: number; conversation_id: string }>(
           `/conversations/${id}/restore`
         ),
+  search: (query: string, limit?: number) =>
+    isTauri()
+      ? apiInvoke<ConversationListItem[]>('search_conversations', { query, limit })
+      : get<ConversationListItem[]>(`/conversations/search?q=${encodeURIComponent(query)}`),
 };
 
 export const contextApi = {
@@ -916,38 +920,6 @@ export const schedulerApi = {
 };
 
 // ── Auto Memory API (自动记忆) ───────────────────────────────────
-
-export interface AutoMemoryStatus {
-  enabled: boolean;
-  observations_count: number;
-}
-
-export interface AutoMemoryObservation {
-  category: string;
-  text: string;
-  confidence: number;
-}
-
-export const autoMemoryApi = {
-  status: () =>
-    isTauri()
-      ? apiInvoke<AutoMemoryStatus>('get_auto_memory_status')
-      : get<AutoMemoryStatus>('/auto-memory/status'),
-  toggle: (enabled: boolean) =>
-    isTauri()
-      ? apiInvoke<{ enabled: boolean }>('toggle_auto_memory', { enabled })
-      : post<{ enabled: boolean }>('/auto-memory/toggle', { enabled }),
-  extract: () =>
-    isTauri()
-      ? apiInvoke<{ success: boolean; observations: AutoMemoryObservation[] }>(
-          'extract_auto_memory'
-        )
-      : post<{ success: boolean; observations: AutoMemoryObservation[] }>('/auto-memory/extract'),
-  observations: () =>
-    isTauri()
-      ? apiInvoke<AutoMemoryObservation[]>('get_auto_memory_observations')
-      : get<AutoMemoryObservation[]>('/auto-memory/observations'),
-};
 
 // ── Human Gate API (人工审批) ────────────────────────────────────
 

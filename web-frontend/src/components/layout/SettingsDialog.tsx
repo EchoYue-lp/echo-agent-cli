@@ -19,7 +19,6 @@ import {
   Sparkles,
   Package,
   Timer,
-  BrainCircuit,
   GitFork,
 } from 'lucide-react';
 import { useUiStore, type SettingsTabId } from '../../stores/uiStore';
@@ -39,7 +38,7 @@ import { EvolutionPanel } from '../evolution/EvolutionPanel';
 import { ProviderPanel } from '../providers/ProviderPanel';
 import { PluginPanel } from '../plugins/PluginPanel';
 import { SchedulerPanel } from '../scheduler/SchedulerPanel';
-import { AutoMemoryPanel } from '../memory/AutoMemoryPanel';
+
 import { WorktreePanel } from '../coding/WorktreePanel';
 
 interface SettingsItem {
@@ -98,7 +97,6 @@ const settingsGroups: { label: string; icon: typeof Settings; items: SettingsIte
     icon: Sparkles,
     items: [
       { id: 'evolution', label: '自进化', icon: Sparkles },
-      { id: 'auto-memory', label: '自动记忆', icon: BrainCircuit },
     ],
   },
 ];
@@ -108,7 +106,7 @@ const panels: Record<SettingsTabId, React.FC> = {
   mcp: McpPanel,
   skills: SkillsPanel,
   memory: MemoryPanel,
-  'auto-memory': AutoMemoryPanel,
+
   config: ConfigPanel,
   providers: ProviderPanel,
   sessions: SessionsPanel,

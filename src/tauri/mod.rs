@@ -141,6 +141,7 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
             commands::conversations::delete_conversation,
             commands::conversations::export_conversation,
             commands::conversations::restore_conversation,
+            commands::conversations::search_conversations,
             // Chat streaming
             commands::chat::send_chat_message,
             commands::chat::cancel_chat,

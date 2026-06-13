@@ -408,28 +408,79 @@ pub async fn execute_sandbox(
 
 #[tauri::command]
 pub async fn compress_context(
-    _state: tauri::State<'_, TauriState>,
+    state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
-    // Context compression is handled by the agent
-    Ok(serde_json::json!({
-        "success": true,
-        "message": "Context compression requested",
-    }))
+    let (messages_before, messages_after, tokens_before, tokens_after) = state
+        .app_state
+        .connection
+        .agent
+        .write_async(|agent| {
+            Box::pin(async move {
+                match agent.force_compress_context().await {
+                    Ok(stats) => (
+                        stats.before_count,
+                        stats.after_count,
+                        stats.before_tokens,
+                        stats.after_tokens,
+                    ),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Manual context compression failed");
+                        (0, 0, 0, 0)
+                    }
+                }
+            })
+        })
+        .await;
+
+    if messages_before == 0 && messages_after == 0 {
+        Ok(serde_json::json!({
+            "success": true,
+            "message": "No messages to compress",
+            "messages_before": 0,
+            "messages_after": 0,
+            "tokens_saved": 0,
+        }))
+    } else {
+        Ok(serde_json::json!({
+            "success": true,
+            "message": format!("Compressed: {messages_before} → {messages_after} messages"),
+            "messages_before": messages_before,
+            "messages_after": messages_after,
+            "tokens_saved": tokens_before.saturating_sub(tokens_after),
+        }))
+    }
 }
 
 #[tauri::command]
 pub async fn get_compression_stats(
     state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
-    let (message_count, token_count) = state
+    let (message_count, current_tokens, token_limit, compression_ratio) = state
         .app_state
         .connection
         .agent
-        .read_async(|agent| Box::pin(async move { agent.context_stats().await }))
+        .read_async(|agent| {
+            Box::pin(async move {
+                let token_limit = agent.config().get_token_limit();
+                let ctx = agent.context().lock().await;
+                let ratio = ctx.compression_metrics().compression_ratio();
+                (
+                    ctx.messages().len(),
+                    ctx.token_estimate(),
+                    token_limit,
+                    ratio,
+                )
+            })
+        })
         .await;
+    let needs_compression = token_limit > 0 && current_tokens > token_limit * 3 / 4;
+
     Ok(serde_json::json!({
         "message_count": message_count,
-        "token_count": token_count,
+        "current_tokens": current_tokens,
+        "token_limit": token_limit,
+        "compression_ratio": compression_ratio,
+        "needs_compression": needs_compression,
     }))
 }
 

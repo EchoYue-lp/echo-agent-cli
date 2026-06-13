@@ -1,19 +1,20 @@
 import { useEffect, useState } from 'react';
 import { configApi } from '../../api/endpoints';
-import type { FullConfigResponse, FullConfigUpdateRequest } from '../../types/api';
+import type { ConfigInfo, FullConfigResponse, FullConfigUpdateRequest } from '../../types/api';
 
 export function ConfigPanel() {
-  const [config, setConfig] = useState<FullConfigResponse | null>(null);
+  const [agentConfig, setAgentConfig] = useState<ConfigInfo | null>(null);
+  const [fullConfig, setFullConfig] = useState<FullConfigResponse | null>(null);
   const [edit, setEdit] = useState<FullConfigUpdateRequest>({});
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState('');
 
   useEffect(() => {
-    configApi
-      .getFull()
-      .then((c) => {
-        setConfig(c);
+    Promise.all([configApi.get(), configApi.getFull()])
+      .then(([agent, full]) => {
+        setAgentConfig(agent);
+        setFullConfig(full);
       })
       .catch(console.error);
   }, []);
@@ -28,12 +29,33 @@ export function ConfigPanel() {
     setSaving(true);
     setMessage('');
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15_000); // 15s timeout
+    const timeout = setTimeout(() => controller.abort(), 15_000);
+
     try {
-      const updated = await configApi.updateFull(edit, controller.signal);
-      setConfig(updated);
+      // Persist all changes to YAML config file (syncs model + system_prompt to agent)
+      const updatedFull = await configApi.updateFull(edit, controller.signal);
+      setFullConfig(updatedFull);
       setEdit({});
       setDirty(false);
+
+      // If max_iterations changed, also sync to the running agent
+      // (update_full_config only syncs model + system_prompt, not max_iterations)
+      if (edit.agent?.max_iterations != null || edit.agent?.system_prompt != null) {
+        try {
+          const agentUpdate: Partial<ConfigInfo> = {};
+          if (edit.agent?.system_prompt != null) {
+            agentUpdate.system_prompt = edit.agent.system_prompt;
+          }
+          if (edit.agent?.max_iterations != null) {
+            agentUpdate.max_iterations = edit.agent.max_iterations;
+          }
+          const updatedAgent = await configApi.update(agentUpdate);
+          setAgentConfig(updatedAgent);
+        } catch (e) {
+          console.error('Failed to sync to running agent:', e);
+        }
+      }
+
       setMessage('已保存');
       setTimeout(() => setMessage(''), 2000);
     } catch (e: any) {
@@ -49,7 +71,8 @@ export function ConfigPanel() {
     }
   };
 
-  if (!config) return <div className="p-3 text-sm text-[var(--text-tertiary)]">加载中...</div>;
+  if (!agentConfig || !fullConfig)
+    return <div className="p-3 text-sm text-[var(--text-tertiary)]">加载中...</div>;
 
   return (
     <div className="space-y-4 p-3">
@@ -75,34 +98,19 @@ export function ConfigPanel() {
         </div>
       </div>
 
-      {/* Agent */}
+      {/* Agent — reads from running agent (configApi.get), not YAML */}
       <Section title="智能体">
         <Field
           label="系统提示词"
-          value={edit.agent?.system_prompt ?? config.agent.system_prompt}
+          value={edit.agent?.system_prompt ?? agentConfig.system_prompt}
           onChange={(v) => markDirty({ agent: { ...edit.agent, system_prompt: v } })}
           multiline
         />
         <Field
           label="最大迭代次数"
-          value={String(edit.agent?.max_iterations ?? config.agent.max_iterations)}
+          value={String(edit.agent?.max_iterations ?? agentConfig.max_iterations)}
           onChange={(v) => markDirty({ agent: { ...edit.agent, max_iterations: Number(v) } })}
           type="number"
-        />
-        <Toggle
-          label="工具"
-          value={edit.agent?.enable_tools ?? config.agent.enable_tools}
-          onChange={(v) => markDirty({ agent: { ...edit.agent, enable_tools: v } })}
-        />
-        <Toggle
-          label="记忆"
-          value={edit.agent?.enable_memory ?? config.agent.enable_memory}
-          onChange={(v) => markDirty({ agent: { ...edit.agent, enable_memory: v } })}
-        />
-        <Toggle
-          label="人工介入"
-          value={edit.agent?.enable_human_in_loop ?? config.agent.enable_human_loop}
-          onChange={(v) => markDirty({ agent: { ...edit.agent, enable_human_in_loop: v } })}
         />
       </Section>
 
@@ -110,7 +118,7 @@ export function ConfigPanel() {
       <Section title="MCP">
         <Field
           label="配置路径"
-          value={edit.mcp?.config_path ?? config.mcp.config_path ?? ''}
+          value={edit.mcp?.config_path ?? fullConfig.mcp.config_path ?? ''}
           onChange={(v) => markDirty({ mcp: { config_path: v } })}
         />
       </Section>
@@ -119,16 +127,20 @@ export function ConfigPanel() {
       <Section title="QQ 机器人">
         <Toggle
           label="启用"
-          value={edit.channels?.qq?.enabled ?? config.channels.qq.enabled}
+          value={edit.channels?.qq?.enabled ?? fullConfig.channels.qq.enabled}
           onChange={(v) =>
-            markDirty({ channels: { ...edit.channels, qq: { ...edit.channels?.qq, enabled: v } } })
+            markDirty({
+              channels: { ...edit.channels, qq: { ...edit.channels?.qq, enabled: v } },
+            })
           }
         />
         <Field
           label="应用 ID"
-          value={edit.channels?.qq?.app_id ?? config.channels.qq.app_id}
+          value={edit.channels?.qq?.app_id ?? fullConfig.channels.qq.app_id}
           onChange={(v) =>
-            markDirty({ channels: { ...edit.channels, qq: { ...edit.channels?.qq, app_id: v } } })
+            markDirty({
+              channels: { ...edit.channels, qq: { ...edit.channels?.qq, app_id: v } },
+            })
           }
         />
         <Field
@@ -147,7 +159,7 @@ export function ConfigPanel() {
       <Section title="飞书">
         <Toggle
           label="启用"
-          value={edit.channels?.feishu?.enabled ?? config.channels.feishu.enabled}
+          value={edit.channels?.feishu?.enabled ?? fullConfig.channels.feishu.enabled}
           onChange={(v) =>
             markDirty({
               channels: { ...edit.channels, feishu: { ...edit.channels?.feishu, enabled: v } },
@@ -156,7 +168,7 @@ export function ConfigPanel() {
         />
         <Field
           label="应用 ID"
-          value={edit.channels?.feishu?.app_id ?? config.channels.feishu.app_id}
+          value={edit.channels?.feishu?.app_id ?? fullConfig.channels.feishu.app_id}
           onChange={(v) =>
             markDirty({
               channels: { ...edit.channels, feishu: { ...edit.channels?.feishu, app_id: v } },
@@ -175,7 +187,7 @@ export function ConfigPanel() {
         />
         <Field
           label="模式"
-          value={edit.channels?.feishu?.mode ?? config.channels.feishu.mode}
+          value={edit.channels?.feishu?.mode ?? fullConfig.channels.feishu.mode}
           onChange={(v) =>
             markDirty({
               channels: { ...edit.channels, feishu: { ...edit.channels?.feishu, mode: v } },
@@ -189,7 +201,8 @@ export function ConfigPanel() {
         <Field
           label="超时（分钟）"
           value={String(
-            edit.channels?.session?.timeout_minutes ?? config.channels.session.timeout_minutes
+            edit.channels?.session?.timeout_minutes ??
+              fullConfig.channels.session.timeout_minutes
           )}
           onChange={(v) =>
             markDirty({
@@ -203,26 +216,11 @@ export function ConfigPanel() {
         />
       </Section>
 
-      {/* Server */}
-      <Section title="服务端">
-        <Field
-          label="主机"
-          value={edit.server?.host ?? config.server.host}
-          onChange={(v) => markDirty({ server: { ...edit.server, host: v } })}
-        />
-        <Field
-          label="端口"
-          value={String(edit.server?.port ?? config.server.port)}
-          onChange={(v) => markDirty({ server: { ...edit.server, port: Number(v) } })}
-          type="number"
-        />
-      </Section>
-
       {/* Logging */}
       <Section title="日志">
         <Field
           label="级别"
-          value={edit.logging?.level ?? config.logging.level}
+          value={edit.logging?.level ?? fullConfig.logging.level}
           onChange={(v) => markDirty({ logging: { level: v } })}
         />
       </Section>
