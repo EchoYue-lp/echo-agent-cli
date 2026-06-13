@@ -22,6 +22,8 @@ type ChatEvent =
       prompt: string;
     }
   | { type: 'input_request'; request_id: string; prompt: string }
+  | { type: 'tool_batch_start'; tool_count: number }
+  | { type: 'tool_batch_end' }
   | { type: 'done' };
 
 export function useTauriChat() {
@@ -75,6 +77,14 @@ export function useTauriChat() {
       case 'tool_result':
         if (isCancelledRef.current) break;
         store.completeToolCall(event.name, event.result, event.success);
+        break;
+      case 'tool_batch_start':
+        if (isCancelledRef.current) break;
+        store.startToolBatch((event as any).tool_count || 0);
+        break;
+      case 'tool_batch_end':
+        if (isCancelledRef.current) break;
+        store.endToolBatch();
         break;
       case 'final_answer': {
         if (!isCancelledRef.current && assistantIdRef.current) {

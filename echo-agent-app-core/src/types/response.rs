@@ -291,6 +291,18 @@ pub enum ServerMessage {
         completion_tokens: usize,
     },
 
+    /// 工具批次开始
+    ToolBatchStart {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        tool_count: usize,
+    },
+    /// 工具批次结束
+    ToolBatchEnd {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
+
     /// 心跳响应
     Pong,
 }

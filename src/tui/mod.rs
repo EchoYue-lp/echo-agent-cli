@@ -27,8 +27,8 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::Color;
-use ratatui::text::Line;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::io;
 use std::time::Instant;
@@ -153,6 +153,8 @@ pub struct TuiApp {
     pub cursor: usize,
     /// Chat messages (role, content, tool_calls).
     pub messages: Vec<ChatMessage>,
+    /// Message groups (for collapsible display).
+    pub message_groups: Vec<MessageGroup>,
     /// Whether the agent is currently processing.
     pub is_processing: bool,
     /// Current streaming text being received.
@@ -177,6 +179,8 @@ pub struct TuiApp {
     pub tokens: (u32, u32, u32),
     /// Tool count.
     pub tool_count: usize,
+    /// Current ReAct iteration count (incremented on each ThinkStart).
+    pub iteration_count: usize,
     /// Active task name.
     pub active_task: Option<String>,
     /// Status message.
@@ -243,6 +247,34 @@ pub enum MessageRole {
     },
 }
 
+/// A group of related messages (thinking + tool calls + final answer).
+/// Represents one "turn" of the assistant's response.
+#[derive(Clone, Debug)]
+pub struct MessageGroup {
+    /// Index of the first message in this group (in TuiApp::messages).
+    pub start_idx: usize,
+    /// Index of the last message in this group (exclusive).
+    pub end_idx: usize,
+    /// Whether this group is collapsed (only show summary).
+    pub collapsed: bool,
+    /// Group type for display purposes.
+    pub group_type: MessageGroupType,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum MessageGroupType {
+    /// User message (always shown as-is).
+    UserMessage,
+    /// System message (always shown as-is).
+    SystemMessage,
+    /// Assistant turn with thinking, tool calls, and final answer.
+    AssistantTurn {
+        thinking_count: usize,
+        tool_call_count: usize,
+        has_final_answer: bool,
+    },
+}
+
 /// A single wrapped line of plain text for mouse selection coordinate mapping.
 ///
 /// The text includes display prefixes (indent, guide chars) so its visual width
@@ -268,6 +300,7 @@ impl TuiApp {
                     "EchoCoWork · {mode} · {model}\n输入消息开始协作，/ 查看命令，Ctrl+C 退出。"
                 ),
             }],
+            message_groups: vec![],
             is_processing: false,
             streaming_text: String::new(),
             suggestions: vec![],
@@ -280,6 +313,7 @@ impl TuiApp {
             mode,
             tokens: (0, 0, 0),
             tool_count: 0,
+            iteration_count: 0,
             active_task: None,
             status_msg: "Ready".to_string(),
             should_quit: false,
@@ -318,6 +352,154 @@ impl TuiApp {
         }
     }
 
+    /// Rebuild message groups from the messages array.
+    /// Groups consecutive Assistant messages (thinking + tool calls + final answer) together.
+    pub fn rebuild_message_groups(&mut self) {
+        self.message_groups.clear();
+
+        let mut i = 0;
+        while i < self.messages.len() {
+            let msg = &self.messages[i];
+
+            match msg.role {
+                MessageRole::User => {
+                    // User messages are their own group
+                    self.message_groups.push(MessageGroup {
+                        start_idx: i,
+                        end_idx: i + 1,
+                        collapsed: false,
+                        group_type: MessageGroupType::UserMessage,
+                    });
+                    i += 1;
+                }
+                MessageRole::System => {
+                    // System messages are their own group
+                    self.message_groups.push(MessageGroup {
+                        start_idx: i,
+                        end_idx: i + 1,
+                        collapsed: false,
+                        group_type: MessageGroupType::SystemMessage,
+                    });
+                    i += 1;
+                }
+                MessageRole::Assistant | MessageRole::ToolResult { .. } => {
+                    // Group consecutive Assistant and ToolResult messages
+                    let start = i;
+                    let mut thinking_count = 0;
+                    let mut tool_call_count = 0;
+                    let mut has_final_answer = false;
+
+                    while i < self.messages.len() {
+                        match &self.messages[i].role {
+                            MessageRole::Assistant => {
+                                // Check if this is a thinking message or final answer
+                                let content = &self.messages[i].content;
+                                if content.contains("🤔") || content.contains("Thinking:") {
+                                    thinking_count += 1;
+                                } else if !content.is_empty() {
+                                    has_final_answer = true;
+                                }
+                                i += 1;
+                            }
+                            MessageRole::ToolResult { .. } => {
+                                tool_call_count += 1;
+                                i += 1;
+                            }
+                            _ => break,
+                        }
+                    }
+
+                    self.message_groups.push(MessageGroup {
+                        start_idx: start,
+                        end_idx: i,
+                        collapsed: true, // Default to collapsed for assistant turns
+                        group_type: MessageGroupType::AssistantTurn {
+                            thinking_count,
+                            tool_call_count,
+                            has_final_answer,
+                        },
+                    });
+                }
+            }
+        }
+    }
+
+    /// Rebuild chat cache using message groups for collapsible display.
+    fn rebuild_chat_cache_with_groups(&mut self, theme: &Theme) {
+        self.chat_cached_messages_lines.clear();
+
+        for group in &self.message_groups {
+            match &group.group_type {
+                MessageGroupType::UserMessage | MessageGroupType::SystemMessage => {
+                    // Render user and system messages normally
+                    for idx in group.start_idx..group.end_idx {
+                        if let Some(msg) = self.messages.get(idx) {
+                            widgets::chat::build_chat_lines(
+                                &mut self.chat_cached_messages_lines,
+                                &msg.role,
+                                &msg.content,
+                                theme,
+                            );
+                        }
+                    }
+                }
+                MessageGroupType::AssistantTurn {
+                    thinking_count,
+                    tool_call_count,
+                    has_final_answer,
+                } => {
+                    if group.collapsed {
+                        // Render collapsed summary
+                        let mut summary_parts = vec![];
+                        if *thinking_count > 0 {
+                            summary_parts.push(format!("{} 思考", thinking_count));
+                        }
+                        if *tool_call_count > 0 {
+                            summary_parts.push(format!("{} 工具", tool_call_count));
+                        }
+                        if *has_final_answer {
+                            summary_parts.push("✅ 最终答案".to_string());
+                        }
+
+                        let summary = if summary_parts.is_empty() {
+                            "🤖 Assistant Turn [▶ 展开]".to_string()
+                        } else {
+                            format!("🤖 Assistant Turn: {} [▶ 展开]", summary_parts.join(", "))
+                        };
+
+                        self.chat_cached_messages_lines.push(Line::from(""));
+                        self.chat_cached_messages_lines
+                            .push(Line::from(vec![Span::styled(
+                                summary,
+                                Style::default().fg(theme.blue).add_modifier(Modifier::BOLD),
+                            )]));
+                    } else {
+                        // Render expanded (all messages in the group)
+                        for idx in group.start_idx..group.end_idx {
+                            if let Some(msg) = self.messages.get(idx) {
+                                widgets::chat::build_chat_lines(
+                                    &mut self.chat_cached_messages_lines,
+                                    &msg.role,
+                                    &msg.content,
+                                    theme,
+                                );
+                            }
+                        }
+
+                        // Add collapse hint
+                        self.chat_cached_messages_lines
+                            .push(Line::from(vec![Span::styled(
+                                "  [▼ 折叠]",
+                                Style::default()
+                                    .fg(theme.overlay0)
+                                    .add_modifier(Modifier::ITALIC),
+                            )]));
+                    }
+                }
+            }
+        }
+    }
+
     /// Submit the current input. Returns the text if non-empty.
     pub fn submit_input(&mut self) -> Option<String> {
         let text = self.input.trim().to_string();
@@ -333,6 +515,7 @@ impl TuiApp {
             content: text.clone(),
         });
         self.trim_old_messages();
+        self.rebuild_message_groups();
 
         self.input.clear();
         self.cursor = 0;
@@ -387,6 +570,7 @@ impl TuiApp {
         self.is_processing = false;
         self.status_msg = "Ready".to_string();
         self.trim_old_messages();
+        self.rebuild_message_groups();
     }
 
     /// Check whether the messages cache needs rebuilding.
@@ -418,7 +602,7 @@ impl TuiApp {
             return;
         }
 
-        let theme = &self.theme;
+        let theme = self.theme.clone();
 
         // Rebuild messages cache only when messages change.
         // Incremental: only render newly appended messages.
@@ -428,14 +612,9 @@ impl TuiApp {
                 // Messages were removed — full rebuild.
                 self.chat_cached_messages_lines.clear();
             }
-            for msg in self.messages.iter().skip(cached_count) {
-                widgets::chat::build_chat_lines(
-                    &mut self.chat_cached_messages_lines,
-                    &msg.role,
-                    &msg.content,
-                    theme,
-                );
-            }
+
+            // Rebuild cache using message groups for collapsible display
+            self.rebuild_chat_cache_with_groups(&theme);
         }
 
         // Rebuild stream cache when streaming text changes.

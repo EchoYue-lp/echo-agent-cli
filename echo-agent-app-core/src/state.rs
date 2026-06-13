@@ -809,7 +809,23 @@ impl AppState {
             "Switched to workspace"
         );
 
+        // 根据工作区类型配置 Agent（自动激活 Skills 和注入系统提示词）
+        self.apply_workspace_routing(&workspace).await;
+
         Ok(())
+    }
+
+    /// 应用工作区路由配置（根据 WorkspaceKind 激活 Skills 和注入系统提示词）
+    async fn apply_workspace_routing(&self, workspace: &Workspace) {
+        let kind = workspace.kind.clone();
+        self.connection
+            .agent
+            .write_async(|agent| {
+                Box::pin(async move {
+                    crate::workspace_routing::configure_agent_for_workspace(agent, &kind).await;
+                })
+            })
+            .await;
     }
 
     /// 退出工作区（回到全局默认路径）。

@@ -4,7 +4,7 @@ import { StatusBadge } from '../common/StatusBadge';
 import type { ToolCallInfo } from '../../types/api';
 import { ChartCard, extractVegaLiteSpec } from './ChartCard';
 
-export function ToolCallCard({ toolCall }: { toolCall: ToolCallInfo }) {
+export function ToolCallCard({ toolCall, compact = false }: { toolCall: ToolCallInfo; compact?: boolean }) {
   const [expanded, setExpanded] = useState(false);
   const [copied, setCopied] = useState<string | null>(null);
 
@@ -20,15 +20,15 @@ export function ToolCallCard({ toolCall }: { toolCall: ToolCallInfo }) {
 
   return (
     <div
-      className="my-1 overflow-hidden rounded-lg border border-[var(--border-primary)] bg-[var(--bg-secondary)] text-sm"
+      className={`overflow-hidden rounded-lg border border-[var(--border-primary)] bg-[var(--bg-secondary)] ${compact ? 'text-xs' : 'text-sm'}`}
       style={{ borderLeft: `3px solid ${statusColor}` }}
     >
       <button
         onClick={() => setExpanded(!expanded)}
-        className="flex w-full items-center gap-2 px-3 py-2 text-left transition-colors"
+        className={`flex w-full items-center gap-2 text-left transition-colors ${compact ? 'px-2 py-1' : 'px-3 py-2'}`}
       >
-        <Wrench size={12} className="shrink-0 text-amber-500" />
-        <span className="truncate font-mono text-xs font-medium text-[var(--text-primary)]">
+        <Wrench size={compact ? 10 : 12} className="shrink-0 text-amber-500" />
+        <span className={`truncate font-mono font-medium text-[var(--text-primary)] ${compact ? 'text-[10px]' : 'text-xs'}`}>
           {toolCall.name}
         </span>
         <span className="ml-auto">
@@ -39,17 +39,17 @@ export function ToolCallCard({ toolCall }: { toolCall: ToolCallInfo }) {
           />
         </span>
         {expanded ? (
-          <ChevronDown size={14} className="shrink-0 text-[var(--text-tertiary)]" />
+          <ChevronDown size={compact ? 10 : 14} className="shrink-0 text-[var(--text-tertiary)]" />
         ) : (
-          <ChevronRight size={14} className="shrink-0 text-[var(--text-tertiary)]" />
+          <ChevronRight size={compact ? 10 : 14} className="shrink-0 text-[var(--text-tertiary)]" />
         )}
       </button>
 
       {expanded && (
-        <div className="space-y-2 border-t border-[var(--border-primary)] px-3 pb-3 pt-2">
+        <div className={`space-y-2 border-t border-[var(--border-primary)] ${compact ? 'px-2 pb-2 pt-1.5' : 'px-3 pb-3 pt-2'}`}>
           <div>
             <div className="mb-1 flex items-center justify-between">
-              <span className="text-[11px] font-medium uppercase tracking-wider text-[var(--text-tertiary)]">
+              <span className={`font-medium uppercase tracking-wider text-[var(--text-tertiary)] ${compact ? 'text-[9px]' : 'text-[11px]'}`}>
                 参数
               </span>
               <CopyBtn
@@ -59,13 +59,13 @@ export function ToolCallCard({ toolCall }: { toolCall: ToolCallInfo }) {
                 onCopy={copyText}
               />
             </div>
-            <pre className="max-h-40 overflow-auto rounded-lg bg-[var(--bg-code)] p-3 text-xs leading-relaxed text-[var(--color-code-text)]">
+            <pre className={`overflow-auto rounded-lg bg-[var(--bg-code)] leading-relaxed text-[var(--color-code-text)] ${compact ? 'max-h-32 p-2 text-[10px]' : 'max-h-40 p-3 text-xs'}`}>
               {JSON.stringify(toolCall.args, null, 2)}
             </pre>
           </div>
           <div>
             <div className="mb-1 flex items-center justify-between">
-              <span className="text-[11px] font-medium uppercase tracking-wider text-[var(--text-tertiary)]">
+              <span className={`font-medium uppercase tracking-wider text-[var(--text-tertiary)] ${compact ? 'text-[9px]' : 'text-[11px]'}`}>
                 结果
               </span>
               <CopyBtn text={toolCall.result} label="result" copied={copied} onCopy={copyText} />
@@ -73,7 +73,7 @@ export function ToolCallCard({ toolCall }: { toolCall: ToolCallInfo }) {
             {chartSpec ? (
               <ChartCard spec={chartSpec} />
             ) : (
-              <pre className="max-h-40 overflow-auto rounded-lg bg-[var(--bg-code)] p-3 text-xs leading-relaxed text-[var(--color-code-text)]">
+              <pre className={`overflow-auto rounded-lg bg-[var(--bg-code)] leading-relaxed text-[var(--color-code-text)] ${compact ? 'max-h-32 p-2 text-[10px]' : 'max-h-40 p-3 text-xs'}`}>
                 {toolCall.result.length > 2000
                   ? toolCall.result.slice(0, 2000) + '\n...'
                   : toolCall.result}

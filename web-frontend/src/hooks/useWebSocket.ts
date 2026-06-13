@@ -123,6 +123,14 @@ export function useWebSocket() {
           if (isCancelledRef.current) break;
           store.completeToolCall(msg.name, msg.result, msg.success);
           break;
+        case 'tool_batch_start':
+          if (isCancelledRef.current) break;
+          store.startToolBatch(msg.tool_count);
+          break;
+        case 'tool_batch_end':
+          if (isCancelledRef.current) break;
+          store.endToolBatch();
+          break;
         case 'final_answer': {
           if (!isCancelledRef.current && assistantIdRef.current) {
             store.finalizeAssistantMessage(assistantIdRef.current, msg.data);

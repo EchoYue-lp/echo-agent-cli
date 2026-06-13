@@ -1,6 +1,12 @@
 import { create } from 'zustand';
-import type { ChatMessage, ApprovalRequest, ToolCallInfo } from '../types/api';
+import type { ChatMessage, ApprovalRequest, ToolCallInfo, ExecutionRound } from '../types/api';
 import { useConversationStore } from './conversationStore';
+
+/** In-progress round being built during streaming */
+interface CurrentRound {
+  thinking?: { content: string };
+  tools: { name: string; args: unknown; result?: string; success?: boolean }[];
+}
 
 interface ChatState {
   messages: ChatMessage[];
@@ -12,6 +18,8 @@ interface ChatState {
   pendingToolCalls: { name: string; args: unknown }[];
   /** True when viewing a loaded historical conversation (agent has no context) */
   isHistoryView: boolean;
+  /** Current round being built during streaming */
+  currentRound: CurrentRound | null;
 
   addUserMessage: (content: string, attachments?: ChatMessage['attachments']) => void;
   startAssistantMessage: () => string;
@@ -20,6 +28,8 @@ interface ChatState {
   startThinkingSegment: (id: string) => void;
   setToolCall: (name: string, args: unknown) => void;
   completeToolCall: (name: string, result: string, success: boolean) => void;
+  startToolBatch: (toolCount: number) => void;
+  endToolBatch: () => void;
   finalizeAssistantMessage: (id: string, content: string) => void;
   setStreaming: (v: boolean) => void;
   setThinking: (v: boolean) => void;
@@ -56,6 +66,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   inputRequest: null,
   pendingToolCalls: [],
   isHistoryView: false,
+  currentRound: null,
 
   addUserMessage: (content, attachments) => {
     set((s) => ({
@@ -79,6 +90,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
           content: '',
           thinkingSegments: [],
           toolCalls: [],
+          executionSteps: [],
+          executionRounds: [],
           isStreaming: true,
           timestamp: Date.now(),
         },
@@ -117,21 +130,42 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   startThinkingSegment: (id) => {
-    set((s) => ({
-      messages: s.messages.map((m) =>
-        m.id === id
-          ? { ...m, thinkingSegments: [...(m.thinkingSegments || []), { content: '' }] }
-          : m
-      ),
-    }));
+    set((s) => {
+      const messages = s.messages.map((m) => {
+        if (m.id !== id) return m;
+        const thinkingSegments = [...(m.thinkingSegments || []), { content: '' }];
+        const executionSteps = [...(m.executionSteps || []), { type: 'thinking' as const, index: thinkingSegments.length - 1 }];
+        return { ...m, thinkingSegments, executionSteps };
+      });
+      // If there's an in-progress round, it's now complete (thinking→tools→done),
+      // so start a fresh round for this new thinking phase.
+      return { messages };
+    });
   },
 
   setThinking: (v) => set({ isThinking: v }),
 
   setToolCall: (name, args) => {
-    set((s) => ({
-      pendingToolCalls: [...s.pendingToolCalls, { name, args }],
-    }));
+    set((s) => {
+      const pendingToolCalls = [...s.pendingToolCalls, { name, args }];
+      // Record execution step NOW (at tool_start), not at tool_result time.
+      // This ensures correct chronological interleaving with thinking segments.
+      const messages = s.messages.map((m) => {
+        if (!m.isStreaming) return m;
+        // Index = completed tool calls + currently pending (before this one)
+        const toolIndex = (m.toolCalls || []).length + s.pendingToolCalls.length;
+        const executionSteps = [
+          ...(m.executionSteps || []),
+          { type: 'tool' as const, index: toolIndex },
+        ];
+        return { ...m, executionSteps };
+      });
+      // Also add tool to current round for round-based rendering
+      const currentRound = s.currentRound
+        ? { ...s.currentRound, tools: [...s.currentRound.tools, { name, args }] }
+        : { tools: [{ name, args }] };
+      return { pendingToolCalls, messages, currentRound };
+    });
   },
 
   completeToolCall: (name, result, success) => {
@@ -141,11 +175,68 @@ export const useChatStore = create<ChatState>((set, get) => ({
     if (idx === -1) return;
     const matched = pendingToolCalls[idx];
     const tc: ToolCallInfo = { name, args: matched.args, result, success };
+    set((s) => {
+      // Update tool result in current round if exists
+      const currentRound = s.currentRound
+        ? {
+            ...s.currentRound,
+            tools: s.currentRound.tools.map((t) =>
+              t.name === name && t.result === undefined ? { ...t, result, success } : t
+            ),
+          }
+        : null;
+      return {
+        pendingToolCalls: s.pendingToolCalls.filter((_, i) => i !== idx),
+        messages: s.messages.map((m) => {
+          if (!m.isStreaming) return m;
+          const toolCalls = [...(m.toolCalls || []), tc];
+          // executionStep already recorded at setToolCall (tool_start) time — don't add again
+          return { ...m, toolCalls };
+        }),
+        currentRound,
+      };
+    });
+  },
+
+  /** Start a new tool batch (received tool_batch_start event from backend) */
+  startToolBatch: (_toolCount: number) => {
+    const state = get();
+    // Capture the last thinking segment from the streaming message.
+    // During streaming, thinking content is accumulated on message.thinkingSegments,
+    // not on currentRound. When a tool batch starts, we must explicitly associate
+    // the preceding thinking with the upcoming tools to form a complete ExecutionRound.
+    const streamingMsg = state.messages.find((m) => m.isStreaming);
+    const segments = streamingMsg?.thinkingSegments;
+    const lastSegment = segments && segments.length > 0 ? segments[segments.length - 1] : null;
+    set({
+      currentRound: {
+        thinking: lastSegment?.content ? { content: lastSegment.content } : undefined,
+        tools: [],
+      },
+    });
+  },
+
+  /** End current tool batch (received tool_batch_end event from backend).
+   *  Push the current round into the streaming message's executionRounds. */
+  endToolBatch: () => {
+    const { currentRound } = get();
+    if (!currentRound) return;
+    const round: ExecutionRound = {
+      thinking: currentRound.thinking,
+      tools: currentRound.tools.map((t) => ({
+        name: t.name,
+        args: t.args,
+        result: t.result || '',
+        success: t.success ?? true,
+      })),
+    };
     set((s) => ({
-      pendingToolCalls: s.pendingToolCalls.filter((_, i) => i !== idx),
-      messages: s.messages.map((m) =>
-        m.isStreaming ? { ...m, toolCalls: [...(m.toolCalls || []), tc] } : m
-      ),
+      currentRound: null,
+      messages: s.messages.map((m) => {
+        if (!m.isStreaming) return m;
+        const executionRounds = [...(m.executionRounds || []), round];
+        return { ...m, executionRounds };
+      }),
     }));
   },
 

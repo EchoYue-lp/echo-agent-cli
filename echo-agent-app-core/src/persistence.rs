@@ -43,6 +43,47 @@ pub struct SavedMessage {
     /// Tool call result (for tool role messages)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_result: Option<String>,
+    /// Execution order tracking: records the sequence of thinking and tool calls
+    /// for correct chronological interleaving when loading from history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_steps: Option<Vec<SavedExecutionStep>>,
+}
+
+/// Execution step for tracking thinking/tool interleaving order
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SavedExecutionStep {
+    #[serde(rename = "type")]
+    pub step_type: String, // "thinking" or "tool"
+    pub index: usize,
+}
+
+/// Combined payload stored in attachments_json (backward compatible).
+/// Old format: `["thinking1", "thinking2"]` (plain array)
+/// New format: `{"thinking_segments": [...], "execution_steps": [...]}`
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AttachmentsPayload {
+    #[serde(default)]
+    pub thinking_segments: Vec<String>,
+    #[serde(default)]
+    pub execution_steps: Vec<SavedExecutionStep>,
+}
+
+impl AttachmentsPayload {
+    /// Parse from JSON string, handling both old and new formats.
+    pub fn parse(s: &str) -> Option<Self> {
+        // Try new object format first
+        if let Ok(payload) = serde_json::from_str::<Self>(s) {
+            return Some(payload);
+        }
+        // Fall back to old array format: ["segment1", "segment2"]
+        if let Ok(segments) = serde_json::from_str::<Vec<String>>(s) {
+            return Some(Self {
+                thinking_segments: segments,
+                execution_steps: Vec::new(),
+            });
+        }
+        None
+    }
 }
 
 /// 工具调用的序列化表示
@@ -273,6 +314,7 @@ impl Persistence {
                     .collect()
             }),
             thinking_segments: None,
+            execution_steps: None,
             tool_result: None,
         }
     }
@@ -299,6 +341,7 @@ mod tests {
             content: Some("hello".to_string()),
             tool_calls: None,
             thinking_segments: None,
+            execution_steps: None,
             tool_result: None,
         };
         let json = serde_json::to_string(&msg).unwrap();

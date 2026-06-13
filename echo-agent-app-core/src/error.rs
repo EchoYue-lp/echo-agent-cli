@@ -69,6 +69,10 @@ pub enum StreamingEvent {
         prompt_tokens: usize,
         completion_tokens: usize,
     },
+    /// 工具批次开始
+    ToolBatchStart { tool_count: usize },
+    /// 工具批次结束
+    ToolBatchEnd,
     /// 流式结束标记
     Done,
 }

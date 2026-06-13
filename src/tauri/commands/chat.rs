@@ -41,6 +41,10 @@ pub enum ChatEvent {
         result: String,
         success: bool,
     },
+    #[serde(rename = "tool_batch_start")]
+    ToolBatchStart { tool_count: usize },
+    #[serde(rename = "tool_batch_end")]
+    ToolBatchEnd,
     #[serde(rename = "chart")]
     Chart { spec: serde_json::Value },
     #[serde(rename = "final_answer")]
@@ -270,6 +274,10 @@ pub async fn send_chat_message(
                                     result: error,
                                     success: false,
                                 },
+                                AgentEvent::ToolBatchStart { tool_count } => {
+                                    ChatEvent::ToolBatchStart { tool_count }
+                                }
+                                AgentEvent::ToolBatchEnd => ChatEvent::ToolBatchEnd,
                                 AgentEvent::Chart { spec } => ChatEvent::Chart { spec },
                                 AgentEvent::FinalAnswer(data) => ChatEvent::FinalAnswer { data },
                                 AgentEvent::Cancelled => ChatEvent::Cancelled,

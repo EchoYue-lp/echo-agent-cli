@@ -24,33 +24,33 @@ interface Props {
 }
 
 const WORKSPACE_KIND = [
-  { value: 'code', label: '代码项目', icon: Code, desc: '代码开发、调试、重构', color: '#6366f1' },
+  { value: 'code', label: '代码项目', icon: Code, desc: '自动激活 coding、git-workflow 技能', color: '#6366f1' },
   {
     value: 'data_analysis',
     label: '数据分析',
     icon: BarChart3,
-    desc: '数据清洗、分析、可视化',
+    desc: '自动激活 data-wrangling、statistical-analysis、data-visualization 技能',
     color: '#f59e0b',
   },
   {
     value: 'research',
     label: '学术研究',
     icon: GraduationCap,
-    desc: '文献检索、论文阅读与写作',
+    desc: '自动激活 paper-search、paper-reader、doc-writing 技能',
     color: '#10b981',
   },
   {
     value: 'medical',
     label: '医学研究',
     icon: HeartPulse,
-    desc: '医学文献、临床证据、研究综述',
+    desc: '自动激活 evidence-medicine、paper-search、paper-reader 技能',
     color: '#ef4444',
   },
   {
     value: 'general',
     label: '其他',
     icon: MoreHorizontal,
-    desc: '其他通用任务',
+    desc: '不自动激活特定技能，所有工具可用',
     color: '#6b7280',
   },
 ];

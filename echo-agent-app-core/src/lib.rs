@@ -28,6 +28,7 @@ pub mod types;
 pub mod unified_memory;
 pub mod webhook;
 pub mod workspace;
+pub mod workspace_routing;
 
 pub mod runtime;
 

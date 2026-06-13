@@ -1,4 +1,4 @@
-import { useState, useEffect, memo } from 'react';
+import { useState, memo } from 'react';
 import type { ChatMessage } from '../../types/api';
 import { ToolCallCard } from './ToolCallCard';
 import { ChartCard } from './ChartCard';
@@ -16,6 +16,7 @@ import {
   ChevronDown,
   ChevronRight,
   Brain,
+  Wrench,
 } from 'lucide-react';
 import { renderMarkdown } from '../../utils/markdown';
 
@@ -107,37 +108,16 @@ export const MessageBubble = memo(function MessageBubble({
 
       {/* Content */}
       <div className={`min-w-0 max-w-[80%] space-y-2 ${isUser ? 'items-end' : ''}`}>
-        {/* Thinking process — one block per ReAct iteration */}
+        {/* Execution process — grouped thinking + tool calls in chronological order */}
         {!isUser && (
-          <>
-            {message.thinkingSegments && message.thinkingSegments.length > 0
-              ? (() => {
-                  const nonEmpty = message.thinkingSegments.filter((seg) => seg.content.trim());
-                  if (nonEmpty.length === 0) return null;
-                  return nonEmpty.map((seg, i) => (
-                    <ThinkingBlock
-                      key={i}
-                      index={i + 1}
-                      total={nonEmpty.length}
-                      content={seg.content}
-                      isStreaming={message.isStreaming && i === nonEmpty.length - 1}
-                    />
-                  ));
-                })()
-              : message.thinkingContent && (
-                  // Legacy: old messages with single thinkingContent string
-                  <ThinkingBlock index={1} total={1} content={message.thinkingContent} />
-                )}
-          </>
-        )}
-
-        {/* Tool calls */}
-        {message.toolCalls && message.toolCalls.length > 0 && (
-          <div className="space-y-1.5">
-            {message.toolCalls.map((tc, i) => (
-              <ToolCallCard key={i} toolCall={tc} />
-            ))}
-          </div>
+          <ExecutionProcessBlock
+            thinkingSegments={message.thinkingSegments || []}
+            thinkingContent={message.thinkingContent}
+            toolCalls={message.toolCalls || []}
+            executionSteps={message.executionSteps || []}
+            executionRounds={message.executionRounds}
+            isStreaming={message.isStreaming}
+          />
         )}
 
         {/* Chart specs */}
@@ -285,72 +265,152 @@ export const MessageBubble = memo(function MessageBubble({
   );
 });
 
-function ThinkingBlock({
-  content,
-  index,
-  total,
+// ── Execution Process Block (groups thinking + tools chronologically) ─────────────
+
+interface ExecutionStep {
+  type: 'thinking' | 'tool';
+  index: number;
+  content?: string;
+  toolCall?: any;
+}
+
+function ExecutionProcessBlock({
+  thinkingSegments,
+  thinkingContent,
+  toolCalls,
+  executionSteps,
+  executionRounds,
   isStreaming,
 }: {
-  content: string;
-  index: number;
-  total: number;
+  thinkingSegments: Array<{ content: string }>;
+  thinkingContent?: string;
+  toolCalls: Array<any>;
+  executionSteps: Array<{ type: 'thinking' | 'tool'; index: number }>;
+  executionRounds?: Array<{ thinking?: { content: string }; tools: Array<any> }>;
   isStreaming?: boolean;
 }) {
-  const [expanded, setExpanded] = useState(isStreaming ?? false);
-  const [manualToggle, setManualToggle] = useState(false);
+  const [expanded, setExpanded] = useState(false);
 
-  // Auto-expand during streaming, auto-collapse when done (unless user manually toggled)
-  useEffect(() => {
-    if (!manualToggle) {
-      setExpanded(!!isStreaming);
+  // Build chronological execution steps using executionSteps order
+  const steps: ExecutionStep[] = [];
+  let totalThinking = 0;
+  let totalTools = 0;
+
+  if (executionRounds && executionRounds.length > 0) {
+    // New round-based model: each round has thinking + tools (parallel tools grouped)
+    executionRounds.forEach((round, ri) => {
+      if (round.thinking && round.thinking.content.trim()) {
+        steps.push({ type: 'thinking', index: ri, content: round.thinking.content });
+        totalThinking++;
+      }
+      round.tools.forEach((tc, ti) => {
+        steps.push({ type: 'tool', index: ri * 1000 + ti, toolCall: tc });
+        totalTools++;
+      });
+    });
+  } else if (executionSteps && executionSteps.length > 0) {
+    // Use the recorded execution order (legacy flat model)
+    executionSteps.forEach((step) => {
+      if (step.type === 'thinking') {
+        const segment = thinkingSegments[step.index];
+        if (segment && segment.content.trim()) {
+          steps.push({ type: 'thinking', index: step.index, content: segment.content });
+        }
+      } else if (step.type === 'tool') {
+        const toolCall = toolCalls[step.index];
+        if (toolCall) {
+          steps.push({ type: 'tool', index: step.index, toolCall });
+        }
+      }
+    });
+    totalThinking = steps.filter((s) => s.type === 'thinking').length;
+    totalTools = steps.filter((s) => s.type === 'tool').length;
+  } else {
+    // Fallback for legacy messages without executionSteps
+    const nonEmptyThinking = thinkingSegments.filter((seg) => seg.content.trim());
+    if (nonEmptyThinking.length > 0) {
+      nonEmptyThinking.forEach((seg, i) => {
+        steps.push({ type: 'thinking', index: i, content: seg.content });
+      });
+    } else if (thinkingContent) {
+      steps.push({ type: 'thinking', index: 0, content: thinkingContent });
     }
-  }, [isStreaming, manualToggle]);
+    toolCalls.forEach((tc, i) => {
+      steps.push({ type: 'tool', index: i, toolCall: tc });
+    });
+    totalThinking = nonEmptyThinking.length || (thinkingContent ? 1 : 0);
+    totalTools = toolCalls.length;
+  }
 
-  const handleToggle = () => {
-    setManualToggle(true);
-    setExpanded((prev) => !prev);
-  };
+  // If no steps, don't render anything
+  if (steps.length === 0) return null;
 
-  const label = total > 1 ? `思考过程 ${index}/${total}` : '思考过程';
-  const isActive = isStreaming && expanded;
+  const thinkingCount = totalThinking;
+  const toolCount = totalTools;
+
+  const summary = [];
+  if (thinkingCount > 0) summary.push(`${thinkingCount} 思考`);
+  if (toolCount > 0) summary.push(`${toolCount} 工具`);
+
+  const label = `执行过程 (${summary.join(', ')})`;
 
   return (
     <div
-      className="my-1 overflow-hidden rounded-lg border-l-2 border-[var(--border-primary)] bg-[var(--bg-secondary)]"
-      style={{ borderLeftColor: isStreaming ? 'var(--color-purple)' : 'var(--border-primary)' }}
+      className="my-1 overflow-hidden rounded-lg border border-[var(--border-primary)] bg-[var(--bg-secondary)]"
+      style={{ borderLeft: `2px solid ${isStreaming ? 'var(--color-purple)' : 'var(--border-primary)'}` }}
     >
       <button
-        onClick={handleToggle}
-        className="flex w-full items-center gap-2 px-3 py-2 text-left transition-colors hover:bg-[var(--bg-hover)]"
+        onClick={() => setExpanded(!expanded)}
+        className="flex w-full items-center gap-2 px-3 py-1.5 text-left transition-colors hover:bg-[var(--bg-hover)]"
       >
-        <Brain
-          size={13}
-          className={`shrink-0 ${isStreaming ? 'text-[var(--color-purple)]' : 'text-[var(--text-tertiary)]'}`}
+        <Wrench
+          size={12}
+          className={`shrink-0 ${isStreaming ? 'text-[var(--color-purple)] animate-pulse' : 'text-[var(--text-tertiary)]'}`}
         />
         <span
-          className={`text-xs font-medium ${isStreaming ? 'text-[var(--color-purple)]' : 'text-[var(--text-secondary)]'}`}
+          className={`text-xs ${isStreaming ? 'text-[var(--color-purple)] font-medium' : 'text-[var(--text-secondary)]'}`}
         >
           {label}
+          {isStreaming && !expanded && '...'}
         </span>
         {isStreaming && !expanded && (
-          <span className="ml-1 inline-block h-2 w-2 animate-pulse rounded-full bg-[var(--color-purple)]" />
+          <span className="ml-1 inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-[var(--color-purple)]" />
         )}
         <span className="ml-auto">
           {expanded ? (
-            <ChevronDown size={14} className="text-[var(--text-tertiary)]" />
+            <ChevronDown size={12} className="text-[var(--text-tertiary)]" />
           ) : (
-            <ChevronRight size={14} className="text-[var(--text-tertiary)]" />
+            <ChevronRight size={12} className="text-[var(--text-tertiary)]" />
           )}
         </span>
       </button>
+
       {expanded && (
-        <div className="border-t border-[var(--border-primary)] px-3 pb-3 pt-2">
-          <div className="max-h-72 overflow-y-auto rounded-lg bg-[var(--bg-primary)] p-3 text-xs leading-relaxed text-[var(--text-secondary)] whitespace-pre-wrap break-words">
-            {content}
-            {isActive && (
-              <span className="ml-0.5 inline-block h-3 w-[2px] animate-pulse rounded-full bg-[var(--color-purple)] align-text-bottom" />
-            )}
-          </div>
+        <div className="border-t border-[var(--border-primary)] px-3 pb-2 pt-2 space-y-1.5 max-h-80 overflow-y-auto">
+          {steps.map((step, i) => {
+            if (step.type === 'thinking') {
+              return (
+                <div
+                  key={`thinking-${step.index}`}
+                  className="rounded border-l-2 border-[var(--color-purple)] bg-[var(--bg-primary)] px-2 py-1.5"
+                >
+                  <div className="mb-1 flex items-center gap-1.5">
+                    <Brain size={10} className="text-[var(--color-purple)]" />
+                    <span className="text-[10px] font-medium text-[var(--color-purple)]">
+                      思考 {thinkingCount > 1 ? `${i + 1}/${thinkingCount}` : ''}
+                    </span>
+                  </div>
+                  <div className="max-h-48 overflow-y-auto text-xs leading-relaxed text-[var(--text-secondary)] whitespace-pre-wrap break-words">
+                    {step.content}
+                  </div>
+                </div>
+              );
+            } else {
+              return (
+                <ToolCallCard key={`tool-${step.index}`} toolCall={step.toolCall} compact />
+              );
+            }
+          })}
         </div>
       )}
     </div>
