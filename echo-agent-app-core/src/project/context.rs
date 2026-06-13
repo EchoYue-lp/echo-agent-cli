@@ -4,14 +4,11 @@ use tracing;
 use super::gitignore::GitIgnore;
 
 const PROJECT_CONTEXT_FILES: &[&str] = &[
+    // Cross-tool community standard (Codex / Aider / Cursor partial).
     "AGENTS.md",
+    // echo-agent's own private namespace, for users who want instructions
+    // that apply only to this product and not to other AI tools.
     "ECHO_AGENT.md",
-    ".echo-agent.md",
-    "CLAUDE.md",
-    ".cursorrules",
-    ".cursorrules.md",
-    "COPILOT.md",
-    ".github/copilot-instructions.md",
 ];
 
 const PROJECT_DIR_MARKERS: &[&str] = &[

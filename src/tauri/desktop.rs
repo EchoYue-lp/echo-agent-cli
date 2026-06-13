@@ -133,7 +133,10 @@ async fn run_desktop() -> anyhow::Result<()> {
         system_prompt: None,
         project: args.project.clone(),
         session_id: None,
+        conversation_id: None,
         react_checkpoint_interval: None,
+        state_store: None,
+        memory_context_suffix: None,
     };
 
     let runtime =

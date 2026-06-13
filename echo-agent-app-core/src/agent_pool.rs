@@ -388,14 +388,28 @@ impl AgentPool {
     }
 
     /// Internal: create a new agent with shared resources injected.
-    async fn create_agent(&self, session_id: &str) -> anyhow::Result<AgentHandle> {
-        // 1. Create a base agent
+    ///
+    /// `conversation_id` is used both as the pool key and as the
+    /// `AgentConfig.conversation_id` — the latter is required by
+    /// `save_runtime_checkpoint` and `ConversationStore` projection. We also
+    /// keep it as `session_id` so existing `session_id`-keyed paths (e.g.
+    /// background tasks) continue to work.
+    async fn create_agent(&self, conversation_id: &str) -> anyhow::Result<AgentHandle> {
+        // 1. Create a base agent — pass conversation_id + state_store at build
+        //    time so the agent boots with everything the framework's checkpoint
+        //    helpers need. (Previously the pool called `set_state_store` here,
+        //    but `self.shared.state_store` was always None because the primary
+        //    agent never had a store wired in — `extract_from` would only ever
+        //    see None and the runtime checkpoint loop silently no-op'd.)
         let params = infra::AgentCreateParams {
             model: None, // will use app_config default
             system_prompt: None,
             project: None,
-            session_id: Some(session_id.to_string()),
+            session_id: Some(conversation_id.to_string()),
+            conversation_id: Some(conversation_id.to_string()),
             react_checkpoint_interval: None,
+            state_store: self.shared.state_store.clone(),
+            memory_context_suffix: None,
         };
         let mut agent = infra::create_agent(&params, &self.app_config);
 
@@ -415,9 +429,7 @@ impl AgentPool {
         if let Some(ref tt) = self.shared.token_tracker {
             agent.set_token_tracker(tt.clone());
         }
-        if let Some(ref ss) = self.shared.state_store {
-            agent.set_state_store(ss.clone());
-        }
+        // state_store is now injected via the builder above; nothing to set here.
         if let Some(ref rs) = self.shared.run_store {
             agent.set_run_store(rs.clone());
         }
@@ -428,7 +440,7 @@ impl AgentPool {
             agent.set_conversation_store(cs.clone());
         }
         if let Some(ref st) = self.shared.store {
-            agent.set_store(st.clone());
+            agent.install_store(st.clone()).await;
         }
         #[cfg(feature = "human-loop")]
         if let Some(ref ps) = self.shared.permission_service {

@@ -8,6 +8,7 @@ use echo_agent::llm::LlmConfig;
 use echo_agent::memory::ConversationStore;
 use echo_agent::memory::SqliteConversationStore;
 use echo_agent::prelude::*;
+use echo_agent::state::{RuntimeStateStore, SqliteRuntimeStateStore};
 
 use crate::agent_handle::AgentHandle;
 use crate::config::AppConfig;
@@ -26,11 +27,47 @@ pub struct AgentCreateParams {
     pub project: Option<String>,
     /// Optional session ID for checkpoint isolation (used by background tasks).
     pub session_id: Option<String>,
+    /// Optional conversation ID — required for `RuntimeStateStore` checkpointing
+    /// and `ConversationStore` transcript projection. The pool sets this to the
+    /// pooled agent's conversation key so per-conversation state can survive
+    /// process restarts.
+    pub conversation_id: Option<String>,
     /// React loop checkpoint interval in iterations (0 = only at end).
     /// Used by background tasks to enable crash recovery.
     pub react_checkpoint_interval: Option<usize>,
+    /// Shared runtime state store (sqlite-backed). When supplied, the agent
+    /// will save `AgentCheckpoint`s + TaskNode DAG entries every iteration.
+    pub state_store: Option<Arc<dyn RuntimeStateStore>>,
+    /// Pre-computed instruction/profile context to inject into the system prompt
+    /// (for example, user/project/local EchoCoWork instruction files). Dynamic
+    /// long-term memories are recalled per turn through the agent memory store,
+    /// not baked into this boot-time suffix.
+    pub memory_context_suffix: Option<String>,
 }
 
+impl Default for AgentCreateParams {
+    fn default() -> Self {
+        Self {
+            model: None,
+            system_prompt: None,
+            project: None,
+            session_id: None,
+            conversation_id: None,
+            react_checkpoint_interval: None,
+            state_store: None,
+            memory_context_suffix: None,
+        }
+    }
+}
+
+/// Generate a fresh conversation id for the primary (non-pooled) agent.
+///
+/// Pooled GUI conversations use their frontend-provided conversation key. The
+/// primary TUI/CLI agent has no such key, so give each process/session its own
+/// id instead of writing every checkpoint to a shared "primary" row.
+pub fn default_primary_conversation_id() -> String {
+    format!("primary-{}", uuid::Uuid::new_v4())
+}
 /// 创建 Agent 实例
 ///
 /// Uses `ReactAgentBuilder` to construct the agent. The framework is mode-agnostic;
@@ -70,8 +107,14 @@ pub fn create_agent(params: &AgentCreateParams, app_config: &AppConfig) -> React
     } else {
         DEFAULT_CONTEXT_WINDOW
     };
-    let assembler =
+    let mut assembler =
         PromptAssembler::default(base_system_prompt, project_ctx.as_ref(), model_window);
+    // Inject the unified instruction/profile context so the agent's system prompt
+    // reflects EchoCoWork user/project/local instruction files. Dynamic long-term
+    // memories stay query-dependent and are recalled per turn through the Store.
+    if let Some(ref memory_suffix) = params.memory_context_suffix {
+        assembler.add_memory_context(memory_suffix);
+    }
     let system_prompt = assembler.assemble();
 
     // Determine config values from AppConfig
@@ -122,6 +165,20 @@ pub fn create_agent(params: &AgentCreateParams, app_config: &AppConfig) -> React
     // Set session_id if provided (used by background tasks for checkpoint isolation)
     if let Some(ref sid) = params.session_id {
         builder = builder.session_id(sid.as_str());
+    }
+
+    // Set conversation_id if provided. `conversation_id` (distinct from `session_id`)
+    // is what `save_runtime_checkpoint` and `ConversationStore` projection key on —
+    // without it the framework's checkpoint helpers silently no-op.
+    if let Some(ref cid) = params.conversation_id {
+        builder = builder.conversation_id(cid.as_str());
+    }
+
+    // Inject the shared runtime state store. When the product layer supplies a
+    // store and a conversation_id, every iteration of `run_core_loop` writes an
+    // `AgentCheckpoint` so the conversation can be resumed across restarts.
+    if let Some(ref store) = params.state_store {
+        builder = builder.state_store(store.clone());
     }
 
     // Set React loop checkpoint interval if provided (used by background tasks
@@ -278,6 +335,35 @@ pub fn create_conversation_store() -> Option<Arc<dyn ConversationStore>> {
 pub fn inject_conversation_store(agent: &AgentHandle, store: &Option<Arc<dyn ConversationStore>>) {
     if let Some(store) = store {
         agent.try_write(|a| a.set_conversation_store(store.clone()));
+    }
+}
+
+/// 创建运行时状态 Store（SQLite），失败时返回 None（禁用 checkpoint）
+///
+/// Persists `AgentCheckpoint`s (full messages + plan + active_skills + blocked_reason)
+/// and the TaskNode DAG so a conversation can be resumed across process restarts.
+/// Distinct from [`create_conversation_store`], which only stores user-visible
+/// transcript projections.
+pub fn create_runtime_state_store() -> Option<Arc<dyn RuntimeStateStore>> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    create_runtime_state_store_in(std::path::PathBuf::from(home).join(".echo-agent"))
+}
+
+/// 创建指定 base dir 下的运行时状态 Store（SQLite）。
+pub fn create_runtime_state_store_in(
+    base_dir: impl AsRef<std::path::Path>,
+) -> Option<Arc<dyn RuntimeStateStore>> {
+    let db_path = base_dir.as_ref().join("runtime_state.db");
+
+    match SqliteRuntimeStateStore::new(&db_path) {
+        Ok(store) => {
+            tracing::info!("RuntimeStateStore (SQLite) 初始化: {}", db_path.display());
+            Some(Arc::new(store))
+        }
+        Err(e) => {
+            tracing::warn!("RuntimeStateStore 初始化失败: {e}, 禁用运行时 checkpoint");
+            None
+        }
     }
 }
 

@@ -797,6 +797,21 @@ impl AppState {
                     db = %db_path.display(),
                     "Switched conversation store to workspace"
                 );
+
+                let runtime_dir =
+                    crate::workspace::layout::WorkspaceLayout::sessions(&workspace.root);
+                if let Some(runtime_store) =
+                    crate::infra::create_runtime_state_store_in(&runtime_dir)
+                {
+                    self.connection
+                        .agent
+                        .try_write(|a| a.set_state_store(runtime_store));
+                    tracing::info!(
+                        workspace = %workspace.id,
+                        db = %runtime_dir.join("runtime_state.db").display(),
+                        "Switched runtime state store to workspace"
+                    );
+                }
             }
             Err(e) => {
                 tracing::warn!("Failed to reinit conversation store for workspace: {e}");
@@ -850,6 +865,13 @@ impl AppState {
             Err(e) => {
                 tracing::warn!("Failed to reset conversation store to global: {e}");
             }
+        }
+
+        // 重置 runtime_state_store 到全局默认路径
+        if let Some(runtime_store) = crate::infra::create_runtime_state_store() {
+            self.connection
+                .agent
+                .try_write(|a| a.set_state_store(runtime_store));
         }
 
         tracing::info!("Exited workspace, using global default paths");

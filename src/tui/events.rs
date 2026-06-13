@@ -900,7 +900,7 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &AgentHandle, cmd: &str) 
                 .write_async(|a| Box::pin(async move { a.force_compress_context().await }))
                 .await;
             match result {
-                Ok(stats) => {
+                Ok((stats, _checkpoint)) => {
                     let saved = stats.before_tokens.saturating_sub(stats.after_tokens);
                     app.messages.push(ChatMessage {
                         role: MessageRole::System,

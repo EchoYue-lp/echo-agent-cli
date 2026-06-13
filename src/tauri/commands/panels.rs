@@ -417,7 +417,7 @@ pub async fn compress_context(
         .write_async(|agent| {
             Box::pin(async move {
                 match agent.force_compress_context().await {
-                    Ok(stats) => (
+                    Ok((stats, _checkpoint)) => (
                         stats.before_count,
                         stats.after_count,
                         stats.before_tokens,

@@ -36,6 +36,12 @@ pub struct AgentRuntime {
     pub task_hook_bridge: Option<Arc<echo_agent::hooks_bridge::BridgedTaskHooks>>,
     /// Hook bridge for forwarding subagent lifecycle events to the central HookRegistry.
     pub subagent_hook_bridge: Option<echo_agent::hooks_bridge::SubagentHookBridge>,
+    /// Shared `RuntimeStateStore` produced during bootstrap. Surfaced on the
+    /// runtime so `init_pool` (and any future product paths) can inject the
+    /// same instance into pooled agents — bypasses the previous `extract_from`
+    /// path which only saw a `None` value because the primary agent never had
+    /// a state store wired in.
+    pub state_store: Option<Arc<dyn echo_agent::state::RuntimeStateStore>>,
 }
 
 impl AgentRuntime {
@@ -59,8 +65,39 @@ impl AgentRuntime {
     /// 12. Fire startup hook
     pub async fn bootstrap(
         app_config: &AppConfig,
-        params: AgentCreateParams,
+        mut params: AgentCreateParams,
     ) -> anyhow::Result<Self> {
+        // ── 0a. Runtime state store (must be ready before agent is built so that
+        //       conversation_id + state_store land on the AgentConfig together;
+        //       otherwise `save_runtime_checkpoint` silently no-ops). ──
+        let state_store = infra::create_runtime_state_store();
+        if params.state_store.is_none() {
+            params.state_store = state_store.clone();
+        }
+
+        // Default conversation_id for the *primary* agent. Both
+        // `save_runtime_checkpoint` and `save_transcript_projection` early-return
+        // when `conversation_id` is None. Use a fresh id per primary session to
+        // avoid merging independent TUI/CLI runs into a shared "primary" row.
+        if params.conversation_id.is_none() {
+            params.conversation_id = Some(infra::default_primary_conversation_id());
+        }
+
+        // ── 0b. Unified memory — load instruction files (user.md / project.md /
+        //       local.md) BEFORE building the agent so we can hand the assembled
+        //       instruction suffix to `PromptAssembler::add_memory_context`.
+        //       Dynamic long-term memories remain query-dependent and are recalled
+        //       during each turn through the agent memory store. ──
+        let unified_memory = crate::unified_memory::UnifiedMemory::load();
+        let memory_suffix = unified_memory.system_prompt_context().to_prompt_suffix();
+        if params.memory_context_suffix.is_none() && !memory_suffix.is_empty() {
+            params.memory_context_suffix = Some(memory_suffix);
+        }
+        tracing::info!(
+            has_memory_context = params.memory_context_suffix.is_some(),
+            "Unified memory loaded"
+        );
+
         // ── 1. Create Agent ──
         let mut agent = infra::create_agent(&params, app_config);
 
@@ -137,11 +174,14 @@ impl AgentRuntime {
         let subagent_hook_bridge = agent_handle.read(|a| a.create_subagent_hook_bridge()).await;
         tracing::info!("Hook bridges created");
 
-        // ── 8. Unified memory ──
-        let unified_memory = {
-            let mem = crate::unified_memory::UnifiedMemory::load();
-            tracing::info!("Unified memory loaded");
-            mem
+        // ── 8. Unified memory — already loaded in step 0b. Attach the long-term
+        //       Store for runtime UnifiedMemory APIs. Boot-time prompt context
+        //       remains instruction-only; query-dependent dynamic memories are
+        //       recalled per turn by the agent. ──
+        let unified_memory = if let Some(store) = agent_handle.read(|a| a.store().cloned()).await {
+            unified_memory.with_store(store)
+        } else {
+            unified_memory
         };
 
         // ── 9. Plugins ──
@@ -222,6 +262,7 @@ impl AgentRuntime {
             keyword_classifier,
             task_hook_bridge: Some(Arc::new(task_hook_bridge)),
             subagent_hook_bridge: Some(subagent_hook_bridge),
+            state_store,
         })
     }
 

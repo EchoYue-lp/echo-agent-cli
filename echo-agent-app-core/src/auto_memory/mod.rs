@@ -24,7 +24,7 @@ pub struct Observation {
 }
 
 /// Categories of observations that auto-memory can extract.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ObservationCategory {
     /// Project structure, conventions, patterns
     Project,
@@ -254,7 +254,20 @@ pub fn extract_observations(
 }
 
 /// Remove near-duplicate observations.
+///
+/// Sorts by category, then by text length DESCENDING so longer/more-complete
+/// versions of the same observation come first. `dedup_by` keeps the first
+/// element of each adjacent pair, so this guarantees that when one snippet is
+/// a prefix-substring of another, the longer one wins.
 fn deduplicate_observations(observations: &mut Vec<Observation>) {
+    // Sort by category, then by text length DESC, then by text for stability
+    observations.sort_by(|a, b| {
+        a.category
+            .cmp(&b.category)
+            .then_with(|| b.text.chars().count().cmp(&a.text.chars().count()))
+            .then_with(|| a.text.cmp(&b.text))
+    });
+    // Now adjacent dedup keeps the longer snippet when one contains the other's prefix
     observations.dedup_by(|a, b| {
         a.category == b.category
             && ((a.text.chars().count() > 20

@@ -148,7 +148,10 @@ async fn cmd_run(
         system_prompt: None,
         project: None,
         session_id: Some(format!("eval-{}", uuid::Uuid::new_v4())),
+        conversation_id: None,
         react_checkpoint_interval: None,
+        state_store: None,
+        memory_context_suffix: None,
     };
     let runtime = AgentRuntime::bootstrap(&app_config, params).await?;
     let agent = runtime.agent_handle.as_shared_agent().await;

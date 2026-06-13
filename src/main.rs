@@ -81,7 +81,10 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
         system_prompt: None,
         project: args.project.clone(),
         session_id: None,
+        conversation_id: None,
         react_checkpoint_interval: None,
+        state_store: None,
+        memory_context_suffix: None,
     };
     // ── Bootstrap Agent Runtime (shared TUI/GUI initialization) ──
     let runtime =
@@ -432,7 +435,10 @@ mod tests {
             system_prompt: None,
             project: args.project.clone(),
             session_id: None,
+            conversation_id: None,
             react_checkpoint_interval: None,
+            state_store: None,
+            memory_context_suffix: None,
         };
         let app_config = config::AppConfig::default();
         let agent = infra::create_agent(&params, &app_config);

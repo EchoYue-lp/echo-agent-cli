@@ -106,16 +106,45 @@ cmd!(
 
 // ── CompressCommand ───────────────────────────────────────────────────
 
-async fn cmd_compress(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
+async fn cmd_compress(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
+    let focus = if args.is_empty() {
+        None
+    } else {
+        Some(args.join(" "))
+    };
     ctx.agent
         .read_async(|a| {
             Box::pin(async move {
-                let mut ctx = a.context().lock().await;
-                match ctx.force_compress(6).await {
-                    Ok(s) => println!(
-                        "Compressed: {} -> {} msgs ({} tokens -> {})",
-                        s.before_count, s.after_count, s.before_tokens, s.after_tokens
-                    ),
+                let window = 6;
+                let compressor =
+                    echo_agent::compression::compressor::SlidingWindowCompressor::new(window);
+                let result = if let Some(ref focus_instructions) = focus {
+                    a.force_compress_with_focus_and_hooks(focus_instructions, window, "manual")
+                        .await
+                } else {
+                    a.force_compress_with_hooks(&compressor, "manual").await
+                };
+                match result {
+                    Ok((s, checkpoint)) => {
+                        println!(
+                            "Compressed: {} -> {} msgs ({} tokens -> {})",
+                            s.before_count, s.after_count, s.before_tokens, s.after_tokens
+                        );
+                        if let Some(ref cp) = checkpoint {
+                            println!(
+                                "  Checkpoint: {} | Strategy: {} | Evicted: {} | Protected: {} | Tool fixes: {} | Duration: {}ms",
+                                cp.checkpoint_id,
+                                cp.strategy,
+                                cp.evicted_count,
+                                cp.protected_count,
+                                cp.tool_pair_fixes.len(),
+                                cp.compression_duration_ms
+                            );
+                            if let Some(ref f) = cp.focus_instructions {
+                                println!("  Focus: {}", f);
+                            }
+                        }
+                    }
                     Err(e) => println!("Compression failed: {e}"),
                 }
             })
@@ -134,17 +163,45 @@ cmd!(
 
 // ── CompactCommand ────────────────────────────────────────────────────
 
-async fn cmd_compact(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
+async fn cmd_compact(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
+    let focus = if args.is_empty() {
+        None
+    } else {
+        Some(args.join(" "))
+    };
     ctx.agent
         .read_async(|a| {
             Box::pin(async move {
-                let mut ctx = a.context().lock().await;
-                // Lightweight compaction: keep more recent messages than full compress
-                match ctx.force_compress(12).await {
-                    Ok(s) => println!(
-                        "Compact: {}->{} msgs ({} tokens -> {})",
-                        s.before_count, s.after_count, s.before_tokens, s.after_tokens
-                    ),
+                let window = 12;
+                let compressor =
+                    echo_agent::compression::compressor::SlidingWindowCompressor::new(window);
+                let result = if let Some(ref focus_instructions) = focus {
+                    a.force_compress_with_focus_and_hooks(focus_instructions, window, "manual")
+                        .await
+                } else {
+                    a.force_compress_with_hooks(&compressor, "manual").await
+                };
+                match result {
+                    Ok((s, checkpoint)) => {
+                        println!(
+                            "Compact: {}->{} msgs ({} tokens -> {})",
+                            s.before_count, s.after_count, s.before_tokens, s.after_tokens
+                        );
+                        if let Some(ref cp) = checkpoint {
+                            println!(
+                                "  Checkpoint: {} | Strategy: {} | Evicted: {} | Protected: {} | Tool fixes: {} | Duration: {}ms",
+                                cp.checkpoint_id,
+                                cp.strategy,
+                                cp.evicted_count,
+                                cp.protected_count,
+                                cp.tool_pair_fixes.len(),
+                                cp.compression_duration_ms
+                            );
+                            if let Some(ref f) = cp.focus_instructions {
+                                println!("  Focus: {}", f);
+                            }
+                        }
+                    }
                     Err(e) => println!("Compaction failed: {e}"),
                 }
             })
@@ -169,11 +226,9 @@ async fn cmd_context(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
             Box::pin(async move {
                 let ctx = a.context().lock().await;
                 println!("\n--- Context ---");
-                println!(
-                    "  Messages: {}  Tokens: {}",
-                    ctx.messages().len(),
-                    ctx.token_estimate()
-                );
+                // Show detailed token breakdown
+                let breakdown = ctx.token_breakdown(None);
+                println!("{}", breakdown.format_bar());
                 println!(
                     "  Plan mode: {}  Iterations: {}",
                     a.is_plan_mode(),
