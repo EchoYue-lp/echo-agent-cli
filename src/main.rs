@@ -406,7 +406,11 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
 
 // ── 单元测试 ─────────────────────────────────────────────────────
 
-#[cfg(test)]
+// The tests below reference `cli::Args` and `infra::AgentCreateParams`,
+// which are only declared with `#[cfg(feature = "tui")]` (see top of file).
+// Gate the whole test module on the same feature so a `gui`-only build
+// does not try to compile tests that reference missing modules.
+#[cfg(all(test, feature = "tui"))]
 mod tests {
     use super::*;
     use echo_agent::prelude::*;
