@@ -22,7 +22,7 @@
 |--------|--------|------|
 | **Tool Execution** | `ToolExecutionSubsystem` | ToolManager, SkillRegistry, HookRegistry, MCP, Sandbox, Intervention |
 | **Guard** | `GuardSubsystem` | GuardManager (安全检查), AuditLogger, CircuitBreaker |
-| **Memory** | `MemorySubsystem` | ContextManager, Store, Checkpointer, SnapshotManager, ConversationStore |
+| **Memory** | `MemorySubsystem` | ContextManager, Store, RuntimeStateStore, SnapshotManager, ConversationStore |
 | **Approval** | `ApprovalSubsystem` | HumanInLoop provider, PermissionService |
 
 ### 1.3 意图路由
@@ -38,12 +38,11 @@
 
 | 组件 | 文件 | 职责 |
 |------|------|------|
-| `RuntimeStateStore` | `echo-agent/src/state/mod.rs` | AgentCheckpoint (消息+计划+技能) + TaskNode DAG |
+| `RuntimeStateStore` | `echo-agent/src/state/mod.rs` | AgentCheckpoint (消息+计划+技能+阻塞原因) + TaskNode DAG |
 | `SqliteRuntimeStateStore` | `echo-agent/src/state/sqlite.rs` | SQLite 实现 |
-| `Checkpointer` | `echo-agent/src/memory/checkpointer.rs` | 轻量线程状态恢复（仅消息） |
 | `SqliteConversationStore` | `echo-agent/echo-state/src/memory/sqlite_conversation.rs` | 对话历史持久化 |
 
-**恢复策略**: `restore_thread_context` 优先使用 RuntimeStateStore（完整恢复），回退到 Checkpointer（消息恢复）。
+**恢复策略**: `restore_thread_context` 通过 `RuntimeStateStore` 完成完整运行时恢复（单一数据源）。
 
 ### 1.5 多 Agent 并行
 
@@ -92,7 +91,7 @@
 | AgentMode 空转 | ✅ 已删除 | modes.rs 删除，内容迁移到 SKILL.md |
 | SkillGateway 重复 | ✅ 已删除 | 改用框架 KeywordClassifier |
 | 工具执行双路径 | ⚠️ 部分统一 | execute_tool_feedback_raw 走 Pipeline，stream 路径仍内联 |
-| 双重持久化 | ✅ 已理清 | RuntimeStateStore 优先，Checkpointer 回退 |
+| 双重持久化 | ✅ 已理清 | RuntimeStateStore 单一数据源，Checkpointer 已移除 |
 | 4 套 Hook 碎片化 | ✅ 已桥接 | TaskHookBridge + SubagentHookBridge |
 | AgentRunner 死代码 | ✅ deprecated | 标记废弃，指向 ReactAgentBuilder |
 | CLI mode 残留 | ✅ 已清理 | args.rs + completion.rs |
