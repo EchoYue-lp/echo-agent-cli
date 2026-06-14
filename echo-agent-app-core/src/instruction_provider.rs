@@ -1,25 +1,30 @@
-//! 层级化项目记忆系统
+//! Layered instruction-file loader.
 //!
-//! 支持三级记忆文件：
-//! - project.md: 项目级（项目根目录 .echo-agent/）
-//! - user.md: 用户级（~/.echo-agent/）
-//! - local.md: 目录级（当前工作目录 .echo-agent/）
+//! Loads three tiers of user-curated instruction Markdown files and
+//! concatenates them as a system-prompt suffix:
+//! - `~/.echo-agent/user.md`              — user-level (cross-project)
+//! - `<project-root>/.echo-agent/project.md` — project-level
+//! - `<cwd>/.echo-agent/local.md`         — local directory
+//!
+//! Static, file-only loader: no DB, no embeddings, no recall. Agent-learned
+//! dynamic memories are handled separately by `UnifiedMemory.memories`
+//! (the `Store` backend).
 
 use std::path::PathBuf;
 
-/// 项目记忆管理器
-pub struct ProjectMemory {
+/// Layered instruction-file loader (user / project / local `.md`).
+pub struct InstructionProvider {
     pub project_level: Option<String>,
     pub user_level: Option<String>,
     pub local_level: Option<String>,
 }
 
-impl ProjectMemory {
-    /// 加载所有层级的记忆
+impl InstructionProvider {
+    /// Load every tier from disk.
     pub fn load() -> Self {
-        let project_level = Self::load_project_memory();
-        let user_level = Self::load_user_memory();
-        let local_level = Self::load_local_memory();
+        let project_level = Self::load_project_instructions();
+        let user_level = Self::load_user_instructions();
+        let local_level = Self::load_local_instructions();
 
         Self {
             project_level,
@@ -28,7 +33,7 @@ impl ProjectMemory {
         }
     }
 
-    /// 获取合并后的 system prompt 后缀
+    /// Concatenate the three tiers into a system-prompt suffix.
     pub fn get_system_prompt_suffix(&self) -> String {
         let mut parts = Vec::new();
 
@@ -49,8 +54,8 @@ impl ProjectMemory {
         }
     }
 
-    /// 加载项目级记忆
-    fn load_project_memory() -> Option<String> {
+    /// Load project-level instructions from `<project-root>/.echo-agent/project.md`.
+    fn load_project_instructions() -> Option<String> {
         std::env::current_dir()
             .ok()
             .and_then(|pwd| Self::find_project_root(&pwd))
@@ -59,16 +64,16 @@ impl ProjectMemory {
             .and_then(|path| std::fs::read_to_string(path).ok())
     }
 
-    /// 加载用户级记忆
-    fn load_user_memory() -> Option<String> {
+    /// Load user-level instructions from `~/.echo-agent/user.md`.
+    fn load_user_instructions() -> Option<String> {
         dirs::home_dir()
             .map(|home| home.join(".echo-agent").join("user.md"))
             .filter(|path| path.exists())
             .and_then(|path| std::fs::read_to_string(path).ok())
     }
 
-    /// 加载目录级记忆
-    fn load_local_memory() -> Option<String> {
+    /// Load local-directory instructions from `<cwd>/.echo-agent/local.md`.
+    fn load_local_instructions() -> Option<String> {
         std::env::current_dir()
             .ok()
             .map(|pwd| pwd.join(".echo-agent").join("local.md"))
@@ -76,7 +81,7 @@ impl ProjectMemory {
             .and_then(|path| std::fs::read_to_string(path).ok())
     }
 
-    /// 查找项目根目录（包含 .git 或 .echo-agent 的目录）
+    /// Find the project root (first ancestor containing `.git` or `.echo-agent`).
     fn find_project_root(start: &std::path::Path) -> Option<PathBuf> {
         let mut current = Some(start);
         while let Some(dir) = current {
@@ -88,34 +93,34 @@ impl ProjectMemory {
         None
     }
 
-    /// 保存项目级记忆
-    pub fn save_project_memory(content: &str) -> std::io::Result<()> {
-        let path = Self::project_memory_path();
+    /// Save project-level instructions to `<cwd>/.echo-agent/project.md`.
+    pub fn save_project_instructions(content: &str) -> std::io::Result<()> {
+        let path = Self::project_instructions_path();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(path, content)
     }
 
-    /// 保存用户级记忆
-    pub fn save_user_memory(content: &str) -> std::io::Result<()> {
-        let path = Self::user_memory_path();
+    /// Save user-level instructions to `~/.echo-agent/user.md`.
+    pub fn save_user_instructions(content: &str) -> std::io::Result<()> {
+        let path = Self::user_instructions_path();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(path, content)
     }
 
-    /// 项目记忆文件路径
-    fn project_memory_path() -> PathBuf {
+    /// Path to the project-level instructions file.
+    fn project_instructions_path() -> PathBuf {
         std::env::current_dir()
             .unwrap_or_else(|_| std::path::PathBuf::from("."))
             .join(".echo-agent")
             .join("project.md")
     }
 
-    /// 用户记忆文件路径
-    fn user_memory_path() -> PathBuf {
+    /// Path to the user-level instructions file.
+    fn user_instructions_path() -> PathBuf {
         dirs::home_dir()
             .unwrap_or_else(|| std::path::PathBuf::from("."))
             .join(".echo-agent")
@@ -123,7 +128,7 @@ impl ProjectMemory {
     }
 }
 
-impl Default for ProjectMemory {
+impl Default for InstructionProvider {
     fn default() -> Self {
         Self::load()
     }
@@ -134,13 +139,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_load_empty_memory() {
-        // This test assumes no memory files exist
-        let memory = ProjectMemory {
+    fn test_load_empty_instructions() {
+        // This test assumes no instruction files exist
+        let instructions = InstructionProvider {
             project_level: None,
             user_level: None,
             local_level: None,
         };
-        assert!(memory.get_system_prompt_suffix().is_empty());
+        assert!(instructions.get_system_prompt_suffix().is_empty());
     }
 }

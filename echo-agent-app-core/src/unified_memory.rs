@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use echo_agent::memory::{Store, StoreItem};
 use std::sync::Arc;
 
-use crate::project_memory::ProjectMemory;
+use crate::instruction_provider::InstructionProvider;
 
 // ── Instruction tiers ───────────────────────────────────────────────
 
@@ -117,7 +117,7 @@ impl MemoryContext {
 /// Unified memory manager bridging instructions and dynamic memories.
 pub struct UnifiedMemory {
     /// Static file-based instructions (user/project/local .md files).
-    instructions: ProjectMemory,
+    instructions: InstructionProvider,
     /// Dynamic KV store for agent-learned memories.
     memories: Option<Arc<dyn Store>>,
 }
@@ -126,7 +126,7 @@ impl UnifiedMemory {
     /// Create a new unified memory with just instructions loaded.
     pub fn load() -> Self {
         Self {
-            instructions: ProjectMemory::load(),
+            instructions: InstructionProvider::load(),
             memories: None,
         }
     }
