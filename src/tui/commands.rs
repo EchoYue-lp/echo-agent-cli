@@ -92,6 +92,8 @@ pub enum SlashCommand {
     // -- Scheduling --
     Cron,
     AutoMemory,
+    MemoryReview,
+    SkillCandidates,
 
     // -- Info --
     Tools,
@@ -136,6 +138,8 @@ impl SlashCommand {
 
             Self::Cron => "Manage scheduled tasks",
             Self::AutoMemory => "Toggle auto-memory",
+            Self::MemoryReview => "Review and clean up accumulated memories",
+            Self::SkillCandidates => "List skill candidates and drafts",
 
             Self::Tools => "List available tools",
             Self::Cost => "Show token cost summary",
@@ -168,7 +172,9 @@ impl SlashCommand {
             Self::Git => Category::Git,
             Self::Pipeline => Category::Pipeline,
             Self::Permission => Category::Security,
-            Self::Cron | Self::AutoMemory => Category::Scheduling,
+            Self::Cron | Self::AutoMemory | Self::MemoryReview | Self::SkillCandidates => {
+                Category::Scheduling
+            }
             Self::Tools | Self::Cost | Self::Help => Category::Info,
             Self::Quit | Self::Exit => Category::Exit,
         }

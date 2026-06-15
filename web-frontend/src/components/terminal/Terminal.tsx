@@ -35,6 +35,27 @@ export function Terminal({ sessionId }: TerminalProps) {
     if (!containerRef.current) return;
 
     let disposed = false;
+    let unlistenOutput: (() => void) | undefined;
+    let unlistenExit: (() => void) | undefined;
+    let observer: ResizeObserver | undefined;
+    let handleClick: (() => void) | undefined;
+    const cleanupResources = () => {
+      unlistenOutput?.();
+      unlistenOutput = undefined;
+      unlistenExit?.();
+      unlistenExit = undefined;
+      observer?.disconnect();
+      observer = undefined;
+      if (containerRef.current && handleClick) {
+        containerRef.current.removeEventListener('click', handleClick);
+      }
+      handleClick = undefined;
+      if (termRef.current) {
+        termRef.current.dispose();
+        termRef.current = null;
+      }
+      fitAddonRef.current = null;
+    };
 
     // Dynamic import xterm.js (avoids SSR issues)
     (async () => {
@@ -88,7 +109,7 @@ export function Terminal({ sessionId }: TerminalProps) {
       setConnected(true);
 
       // ── Listen for PTY output from Rust backend ──
-      const unlistenOutput = await listen<{ id: string; data: string }>(
+      unlistenOutput = await listen<{ id: string; data: string }>(
         'terminal-output',
         (event) => {
           if (event.payload.id === sessionId) {
@@ -99,7 +120,7 @@ export function Terminal({ sessionId }: TerminalProps) {
       );
 
       // ── Listen for process exit ──
-      const unlistenExit = await listen<{ id: string }>('terminal-exit', (event) => {
+      unlistenExit = await listen<{ id: string }>('terminal-exit', (event) => {
         if (event.payload.id === sessionId) {
           term.write('\r\n\x1b[90m[Process exited]\x1b[0m\r\n');
           setConnected(false);
@@ -133,7 +154,7 @@ export function Terminal({ sessionId }: TerminalProps) {
       term.resize(cols, rows);
 
       // ── ResizeObserver for container size changes ──
-      const observer = new ResizeObserver(() => {
+      observer = new ResizeObserver(() => {
         if (fitAddonRef.current) {
           try {
             fitAddonRef.current.fit();
@@ -145,29 +166,20 @@ export function Terminal({ sessionId }: TerminalProps) {
       observer.observe(containerRef.current);
 
       // Focus terminal on click
-      containerRef.current.addEventListener('click', () => term.focus());
+      handleClick = () => term.focus();
+      containerRef.current.addEventListener('click', handleClick);
       term.focus();
 
-      // ── Cleanup ──
-      return () => {
-        disposed = true;
-        observer.disconnect();
-        unlistenOutput();
-        unlistenExit();
-        term.dispose();
-        termRef.current = null;
-        fitAddonRef.current = null;
-      };
+      if (disposed) {
+        cleanupResources();
+      }
     })().catch((e: unknown) => {
       console.error('Failed to initialize terminal:', e);
     });
 
     return () => {
       disposed = true;
-      if (termRef.current) {
-        termRef.current.dispose();
-        termRef.current = null;
-      }
+      cleanupResources();
     };
   }, [sessionId, isTauriMode]);
 

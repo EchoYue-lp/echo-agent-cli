@@ -5,9 +5,32 @@
  * In Web environment, everything goes through HTTP.
  */
 
-// Detect Tauri environment
+declare global {
+  interface Window {
+    __TAURI__?: unknown;
+    __TAURI_INTERNALS__?: unknown;
+  }
+}
+
+// Detect Tauri environment. In dev mode the app is served from Vite over http,
+// so protocol-only checks are not enough.
 const isTauri = (): boolean => {
-  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+  if (typeof window === 'undefined') return false;
+
+  const hasTauriGlobals =
+    typeof window.__TAURI_INTERNALS__ !== 'undefined' || typeof window.__TAURI__ !== 'undefined';
+  const hasTauriProtocol = window.location.protocol === 'tauri:';
+  const hasTauriUserAgent = navigator.userAgent.toLowerCase().includes('tauri');
+  const hasTauriDevFlag = new URLSearchParams(window.location.search).has('tauri');
+  const hasTauriViteMode = import.meta.env.VITE_ECHOCOWORK_TAURI === '1';
+
+  return (
+    hasTauriGlobals ||
+    hasTauriProtocol ||
+    hasTauriUserAgent ||
+    hasTauriDevFlag ||
+    hasTauriViteMode
+  );
 };
 
 // Dynamic import for Tauri invoke

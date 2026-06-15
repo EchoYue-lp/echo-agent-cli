@@ -7,6 +7,7 @@ pub mod config_watcher;
 pub mod diff;
 pub mod embedded_server;
 pub mod error;
+pub mod evolution;
 pub mod export;
 pub mod hitl;
 pub mod hooks_config;

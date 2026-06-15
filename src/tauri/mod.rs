@@ -147,6 +147,7 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
             commands::chat::cancel_chat,
             commands::chat::send_approval_response,
             commands::chat::send_input_response,
+            commands::chat::send_selection_response,
             // Panels (migrated from HTTP server)
             commands::panels::get_permissions_mode,
             commands::panels::set_permissions_mode,

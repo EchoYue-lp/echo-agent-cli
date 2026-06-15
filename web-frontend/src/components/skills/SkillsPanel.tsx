@@ -3,6 +3,7 @@ import { skillsApi } from '../../api/endpoints';
 import type { SkillInfo } from '../../types/api';
 import { BookOpen, FolderOpen, Loader2 } from 'lucide-react';
 import { useToastStore } from '../../stores/toastStore';
+import { fileSystem, isTauri } from '../../lib/tauri-bridge';
 
 export function SkillsPanel() {
   const [skills, setSkills] = useState<SkillInfo[]>([]);
@@ -11,20 +12,28 @@ export function SkillsPanel() {
   const [uploading, setUploading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const addToast = useToastStore((s) => s.addToast);
+  const loadingAny = loading || uploading;
 
   useEffect(() => {
-    skillsApi.list().then(setSkills).catch(console.error);
+    refreshSkills().catch(console.error);
   }, []);
 
-  const load = async () => {
-    if (!dir.trim() || loading) return;
+  async function refreshSkills() {
+    const list = await skillsApi.list();
+    setSkills(list);
+    return list;
+  }
+
+  const loadPath = async (path: string) => {
+    if (!path || loading) return;
     setLoading(true);
     try {
-      await skillsApi.load(dir.trim());
-      setDir('');
-      const list = await skillsApi.list();
+      const result = await skillsApi.load(path);
+      const list = result.skills ?? (await refreshSkills());
       setSkills(list);
-      addToast('success', `成功加载 ${list.length} 个技能`);
+      setDir('');
+      const loadedCount = result.count ?? result.loaded?.length ?? list.length;
+      addToast('success', loadedCount > 0 ? `成功加载 ${loadedCount} 个技能` : '未发现新的技能');
     } catch (e: any) {
       const msg = e?.message || String(e);
       addToast('error', `加载技能失败: ${msg}`);
@@ -33,7 +42,29 @@ export function SkillsPanel() {
     }
   };
 
-  const handleBrowse = () => {
+  const load = async () => {
+    await loadPath(dir.trim());
+  };
+
+  const handleBrowse = async () => {
+    if (loadingAny) return;
+
+    if (isTauri()) {
+      setUploading(true);
+      try {
+        const selected = await fileSystem.selectDirectory('选择技能目录');
+        if (!selected) return;
+        setDir(selected);
+        await loadPath(selected);
+      } catch (e: any) {
+        const msg = e?.message || String(e);
+        addToast('error', `选择技能目录失败: ${msg}`);
+      } finally {
+        setUploading(false);
+      }
+      return;
+    }
+
     fileInputRef.current?.click();
   };
 
@@ -72,8 +103,6 @@ export function SkillsPanel() {
       if (fileInputRef.current) fileInputRef.current.value = '';
     }
   };
-
-  const loadingAny = loading || uploading;
 
   const s = {
     text: 'var(--text-primary)',

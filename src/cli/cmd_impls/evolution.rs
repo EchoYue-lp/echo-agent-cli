@@ -133,12 +133,26 @@ async fn cmd_review(ctx: &CommandContext, _args: &[&str]) -> CommandOutcome {
         &run.run_id[..12.min(run.run_id.len())]
     );
 
-    let reviewer = echo_agent::improve::BackgroundReviewer::new(
-        echo_agent::improve::BackgroundReviewConfig::default(),
+    let reviewer = echo_agent::evolution::BackgroundReviewer::new(
+        echo_agent::evolution::BackgroundReviewConfig::default(),
         llm_client,
-        memory_store,
+        memory_store.clone(),
         Some(run_store),
     );
+    let reviewer = if let Some(store) = memory_store {
+        let review_integration = Arc::new(echo_agent_app_core::evolution::ReviewIntegration::new(
+            echo_agent::evolution::ReviewConfig::default(),
+            echo_agent_app_core::evolution::discover_echo_agent_dir(),
+            store,
+        ));
+        reviewer.with_layer_manager(Arc::new(
+            review_integration
+                .create_layer_manager()
+                .with_write_observer(review_integration),
+        ))
+    } else {
+        reviewer
+    };
 
     match reviewer.review(&run) {
         Ok(handle) => match handle.await {
@@ -495,12 +509,15 @@ async fn cmd_profile(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         }
         "refresh" => {
             // Refresh agent profile from telemetry
-            let telemetry_store = SkillTelemetryStore::new(
-                ctx.agent
-                    .read(|a| a.store().cloned())
-                    .await
-                    .expect("store should exist"),
-            );
+            let store = ctx.agent.read(|a| a.store().cloned()).await;
+            let store = match store {
+                Some(s) => s,
+                None => {
+                    println!("No memory store configured. Cannot refresh profile.");
+                    return CommandOutcome::Continue;
+                }
+            };
+            let telemetry_store = SkillTelemetryStore::new(store);
             match telemetry_store.list_all().await {
                 Ok(telemetry) if !telemetry.is_empty() => {
                     let mut profile = profile_store
@@ -565,6 +582,829 @@ cmd!(
     cmd_profile
 );
 
+// ── MemoryReviewCommand ─────────────────────────────────────────────
+
+async fn cmd_memory_review(ctx: &CommandContext, _args: &[&str]) -> CommandOutcome {
+    // Get the store from the agent — needed to create ReviewIntegration
+    let store = ctx.agent.read(|a| a.store().cloned()).await;
+    let store = match store {
+        Some(s) => s,
+        None => {
+            println!("No memory store configured. Cannot run memory review.");
+            return CommandOutcome::Continue;
+        }
+    };
+
+    let echo_agent_dir = echo_agent_app_core::evolution::discover_echo_agent_dir();
+    let review_integration = echo_agent_app_core::evolution::ReviewIntegration::new(
+        echo_agent::evolution::ReviewConfig::default(),
+        echo_agent_dir,
+        store,
+    );
+
+    println!("\n📋 Running memory review...");
+
+    match review_integration.run_review().await {
+        Ok(report) => {
+            let formatted = echo_agent_app_core::evolution::format_review_report(&report);
+            println!("{formatted}");
+        }
+        Err(e) => {
+            println!("Memory review failed: {e}");
+        }
+    }
+
+    CommandOutcome::Continue
+}
+cmd!(
+    MemoryReviewCommand,
+    "memory-review",
+    ["mr"],
+    CommandCategory::Advanced,
+    "Review and clean up accumulated memories",
+    cmd_memory_review
+);
+
+// ── SkillCandidatesCommand ──────────────────────────────────────────
+
+async fn cmd_skill_candidates(_ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
+    let sub = args.first().copied().unwrap_or("list");
+
+    // Load curator state to find candidates and drafts.
+    let curator =
+        echo_agent::improve::Curator::default_path(echo_agent::improve::CuratorConfig::default());
+    let state = curator.load_state();
+
+    let candidates_and_drafts: Vec<_> = state
+        .skills
+        .iter()
+        .filter(|(_, meta)| {
+            matches!(
+                meta.lifecycle,
+                echo_agent::improve::SkillLifecycle::Candidate
+                    | echo_agent::improve::SkillLifecycle::Draft
+            )
+        })
+        .collect();
+
+    match sub {
+        "detail" | "d" => {
+            if candidates_and_drafts.is_empty() {
+                println!("No skill candidates or drafts found.");
+                println!(
+                    "Candidates are created automatically when repeated patterns are detected."
+                );
+                println!("Run /memory-review to trigger detection.");
+            } else {
+                println!("\n=== Skill Candidates & Drafts (Detail) ===");
+                for (name, meta) in &candidates_and_drafts {
+                    let lifecycle = format!("{:?}", meta.lifecycle);
+                    let created = meta.created_at.format("%Y-%m-%d %H:%M");
+                    let last_used = meta.last_used_at.format("%Y-%m-%d %H:%M");
+                    let auto = if meta.agent_created { "🤖" } else { "👤" };
+                    println!(
+                        "  {} {} [{}]  created: {}  last-used: {}",
+                        auto, name, lifecycle, created, last_used
+                    );
+                }
+            }
+        }
+        "list" | _ => {
+            if candidates_and_drafts.is_empty() {
+                println!("No skill candidates or drafts found.");
+                println!(
+                    "Candidates are created automatically when repeated patterns are detected."
+                );
+            } else {
+                println!("\n=== Skill Candidates & Drafts ===");
+                let candidate_count = candidates_and_drafts
+                    .iter()
+                    .filter(|(_, m)| {
+                        matches!(m.lifecycle, echo_agent::improve::SkillLifecycle::Candidate)
+                    })
+                    .count();
+                let draft_count = candidates_and_drafts
+                    .iter()
+                    .filter(|(_, m)| {
+                        matches!(m.lifecycle, echo_agent::improve::SkillLifecycle::Draft)
+                    })
+                    .count();
+                println!("  Candidates: {}  Drafts: {}", candidate_count, draft_count);
+                for (name, meta) in &candidates_and_drafts {
+                    let icon = match meta.lifecycle {
+                        echo_agent::improve::SkillLifecycle::Candidate => "🎯",
+                        echo_agent::improve::SkillLifecycle::Draft => "📝",
+                        _ => "  ",
+                    };
+                    println!("  {} {} [{:?}]", icon, name, meta.lifecycle);
+                }
+                println!("\n  Run /skill-candidates detail for more info.");
+                println!("  Run /skill-create <name> to generate a draft from a candidate.");
+                println!("  Run /skill-promote <name> to promote a draft to Active.");
+            }
+        }
+    }
+
+    CommandOutcome::Continue
+}
+cmd!(
+    SkillCandidatesCommand,
+    "skill-candidates",
+    ["sc"],
+    CommandCategory::Advanced,
+    "List skill candidates and drafts",
+    cmd_skill_candidates
+);
+
+// ── SkillPromoteCommand ────────────────────────────────────────────
+
+async fn cmd_skill_promote(_ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
+    let name = match args.first() {
+        Some(n) => *n,
+        None => {
+            println!("Usage: /skill-promote <name>");
+            println!("Promotes a Draft skill to Active status.");
+            return CommandOutcome::Continue;
+        }
+    };
+
+    let curator =
+        echo_agent::improve::Curator::default_path(echo_agent::improve::CuratorConfig::default());
+
+    // Check current lifecycle state.
+    let state = curator.load_state();
+    match state.skills.get(name) {
+        Some(meta) => match meta.lifecycle {
+            echo_agent::improve::SkillLifecycle::Draft => match curator.promote_to_active(name) {
+                Ok(true) => println!("✓ Skill '{}' promoted from Draft to Active.", name),
+                Ok(false) => println!("Skill '{}' was not in Draft state.", name),
+                Err(e) => println!("Error promoting skill: {e}"),
+            },
+            echo_agent::improve::SkillLifecycle::Candidate => {
+                println!("Skill '{}' is a Candidate, not a Draft.", name);
+                println!(
+                    "Run /skill-create {} first to generate a draft SKILL.md.",
+                    name
+                );
+            }
+            echo_agent::improve::SkillLifecycle::Active => {
+                println!("Skill '{}' is already Active.", name);
+            }
+            other => println!(
+                "Skill '{}' is in {:?} state and cannot be promoted.",
+                name, other
+            ),
+        },
+        None => {
+            println!("Skill '{}' not found in curator state.", name);
+            println!("Run /skill-candidates to see available candidates and drafts.");
+        }
+    }
+
+    CommandOutcome::Continue
+}
+cmd!(
+    SkillPromoteCommand,
+    "skill-promote",
+    CommandCategory::Advanced,
+    "Promote a Draft skill to Active",
+    cmd_skill_promote
+);
+
+// ── SkillCreateCommand ─────────────────────────────────────────────
+
+async fn cmd_skill_create(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
+    let name = args.first().copied();
+
+    let store = ctx.agent.read(|a| a.store().cloned()).await;
+    let store = match store {
+        Some(s) => s,
+        None => {
+            println!("No memory store configured. Cannot create skill drafts.");
+            return CommandOutcome::Continue;
+        }
+    };
+
+    let echo_agent_dir = echo_agent_app_core::evolution::discover_echo_agent_dir();
+
+    // If no name given, list candidates.
+    let name = match name {
+        Some(n) => n.to_string(),
+        None => {
+            // List available candidates.
+            let curator = echo_agent::improve::Curator::default_path(
+                echo_agent::improve::CuratorConfig::default(),
+            );
+            let state = curator.load_state();
+            let candidates: Vec<_> = state
+                .skills
+                .iter()
+                .filter(|(_, m)| {
+                    matches!(m.lifecycle, echo_agent::improve::SkillLifecycle::Candidate)
+                })
+                .collect();
+            if candidates.is_empty() {
+                println!("No candidates available. Run /memory-review to detect patterns.");
+            } else {
+                println!("\nAvailable candidates:");
+                for (name, _meta) in &candidates {
+                    println!("  🎯 {}", name);
+                }
+                println!("\nRun /skill-create <name> to generate a draft.");
+            }
+            return CommandOutcome::Continue;
+        }
+    };
+
+    // Generate draft from candidate.
+    let typed_store = echo_agent::memory::TypedMemoryStore::new(store);
+    let log_path = echo_agent_dir.join("evolution").join("change-log.jsonl");
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let change_log = echo_agent::evolution::JsonlChangeLog::new(log_path);
+    let generator = echo_agent::evolution::SkillDraftGenerator::new(
+        echo_agent_dir,
+        &change_log as &dyn echo_agent::evolution::ChangeLog,
+    );
+
+    match generator.generate(&name, &typed_store).await {
+        Ok(result) => {
+            if result.created {
+                println!("✓ Draft SKILL.md created for '{}' at:", result.name);
+            } else {
+                println!("✓ Draft SKILL.md updated for '{}' at:", result.name);
+            }
+            println!("  {}", result.skill_md_path.display());
+            println!(
+                "\nReview the draft, then run /skill-promote {} to activate it.",
+                result.name
+            );
+        }
+        Err(e) => {
+            println!("Error creating skill draft: {e}");
+            println!(
+                "Make sure '{}' is a valid candidate. Run /skill-candidates to check.",
+                name
+            );
+        }
+    }
+
+    CommandOutcome::Continue
+}
+cmd!(
+    SkillCreateCommand,
+    "skill-create",
+    CommandCategory::Advanced,
+    "Create a draft SKILL.md from a candidate",
+    cmd_skill_create
+);
+
+// ── SkillMergeCommand ─────────────────────────────────────────────
+
+async fn cmd_skill_merge(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
+    let store = ctx.agent.read(|a| a.store().cloned()).await;
+    let store = match store {
+        Some(s) => s,
+        None => {
+            println!("No memory store configured.");
+            return CommandOutcome::Continue;
+        }
+    };
+
+    // If no args, run similarity detection and show proposals
+    if args.is_empty() {
+        println!("Scanning skills for similarity...");
+        let detector = echo_agent::evolution::SkillSimilarityDetector::new(store.clone());
+
+        // Load all skill descriptors from registry
+        let descriptors: Vec<_> = ctx
+            .agent
+            .read(|a| {
+                a.skill_registry()
+                    .list_descriptors()
+                    .into_iter()
+                    .cloned()
+                    .collect()
+            })
+            .await;
+
+        let echo_agent_dir = echo_agent_app_core::evolution::discover_echo_agent_dir();
+        let log_path = echo_agent_dir.join("evolution").join("change-log.jsonl");
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let change_log = echo_agent::evolution::JsonlChangeLog::new(log_path);
+
+        match detector.scan_and_propose(&descriptors, &change_log).await {
+            Ok(proposals) if !proposals.is_empty() => {
+                println!("\n=== Skill Merge Proposals ===");
+                for (i, proposal) in proposals.iter().enumerate() {
+                    println!(
+                        "{}. {} ↔ {} (similarity: {:.2})",
+                        i + 1,
+                        proposal.skill_a,
+                        proposal.skill_b,
+                        proposal.similarity_score
+                    );
+                    println!(
+                        "   Primary: {} | Deprecate: {}",
+                        proposal.primary_skill, proposal.deprecated_skill
+                    );
+                    println!(
+                        "   Trigger overlap: {:.2} | Path overlap: {:.2}",
+                        proposal.breakdown.trigger_overlap, proposal.breakdown.path_overlap
+                    );
+                    println!(
+                        "   Tool overlap: {:.2} | Description similarity: {:.2}",
+                        proposal.breakdown.tool_overlap, proposal.breakdown.description_similarity
+                    );
+                    println!();
+                }
+                println!("Run /skill-merge <skill-a> <skill-b> to execute a merge.");
+            }
+            Ok(_) => {
+                println!("No similar skill pairs found.");
+            }
+            Err(e) => {
+                println!("Error scanning skills: {e}");
+            }
+        }
+
+        return CommandOutcome::Continue;
+    }
+
+    // Execute merge if two skill names provided
+    if args.len() == 2 {
+        let skill_a = args[0];
+        let skill_b = args[1];
+
+        println!("Executing merge: {} ↔ {}...", skill_a, skill_b);
+
+        // Load proposals from storage
+        let proposal_key = format!("merge:{}:{}", skill_a, skill_b);
+
+        match store
+            .get(&["evolution", "merge_proposals"], &proposal_key)
+            .await
+        {
+            Ok(Some(proposal_item)) => {
+                let proposal: echo_agent::evolution::SkillMergeProposal =
+                    match serde_json::from_value(proposal_item.value) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            println!("Error parsing proposal: {e}");
+                            return CommandOutcome::Continue;
+                        }
+                    };
+
+                // Get primary descriptor
+                let primary_desc = ctx
+                    .agent
+                    .read(|a| {
+                        a.skill_registry()
+                            .get_descriptor(&proposal.primary_skill)
+                            .cloned()
+                    })
+                    .await;
+
+                let primary_desc = match primary_desc {
+                    Some(d) => d,
+                    None => {
+                        println!(
+                            "Primary skill '{}' not found in registry.",
+                            proposal.primary_skill
+                        );
+                        return CommandOutcome::Continue;
+                    }
+                };
+
+                // Get deprecated descriptor
+                let deprecated_desc = ctx
+                    .agent
+                    .read(|a| {
+                        a.skill_registry()
+                            .get_descriptor(&proposal.deprecated_skill)
+                            .cloned()
+                    })
+                    .await;
+
+                let echo_agent_dir = echo_agent_app_core::evolution::discover_echo_agent_dir();
+                let log_path = echo_agent_dir.join("evolution").join("change-log.jsonl");
+                if let Some(parent) = log_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let change_log = echo_agent::evolution::JsonlChangeLog::new(log_path);
+
+                let curator_config = echo_agent::improve::CuratorConfig::default();
+                let curator = echo_agent::improve::Curator::default_path(curator_config);
+                let merger = echo_agent::evolution::SkillMerger::new(store.clone(), curator);
+
+                let mut primary_desc_mut = primary_desc;
+                match merger
+                    .execute_merge(
+                        &proposal,
+                        &mut primary_desc_mut,
+                        deprecated_desc.as_ref(),
+                        &change_log,
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        println!("✓ Merge completed successfully.");
+                        println!(
+                            "  Primary skill '{}' has been updated.",
+                            proposal.primary_skill
+                        );
+                        println!(
+                            "  Secondary skill '{}' has been deprecated.",
+                            proposal.deprecated_skill
+                        );
+                        println!(
+                            "\nNote: The updated skill descriptor needs to be written back to the registry."
+                        );
+                        println!(
+                            "This is a manual step - update the SKILL.md file for '{}' with the merged content.",
+                            proposal.primary_skill
+                        );
+                    }
+                    Err(e) => {
+                        println!("Error executing merge: {e}");
+                    }
+                }
+            }
+            Ok(None) => {
+                println!("No merge proposal found for {} ↔ {}.", skill_a, skill_b);
+                println!("Run /skill-merge without arguments to scan for similar skills.");
+            }
+            Err(e) => {
+                println!("Error loading proposal: {e}");
+            }
+        }
+
+        return CommandOutcome::Continue;
+    }
+
+    println!("Usage:");
+    println!("  /skill-merge              Scan skills and show merge proposals");
+    println!("  /skill-merge <a> <b>      Execute merge of two skills");
+
+    CommandOutcome::Continue
+}
+cmd!(
+    SkillMergeCommand,
+    "skill-merge",
+    CommandCategory::Advanced,
+    "Detect similar skills and propose/execute merges",
+    cmd_skill_merge
+);
+
+// ── SkillHealthCommand ─────────────────────────────────────────────
+
+async fn cmd_skill_health(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
+    let store = ctx.agent.read(|a| a.store().cloned()).await;
+    let store = match store {
+        Some(s) => s,
+        None => {
+            println!("No memory store configured.");
+            return CommandOutcome::Continue;
+        }
+    };
+
+    let monitor = echo_agent::evolution::SkillHealthMonitor::new(store);
+
+    if args.is_empty() {
+        // Show health overview for all skills
+        println!("Analyzing skill health...");
+        match monitor.analyze_all_skills().await {
+            Ok(reports) if !reports.is_empty() => {
+                println!("\n=== Skill Health Overview ===");
+
+                let healthy: Vec<_> = reports
+                    .iter()
+                    .filter(|r| r.status == echo_agent::evolution::HealthStatus::Healthy)
+                    .collect();
+                let needs_attention: Vec<_> = reports
+                    .iter()
+                    .filter(|r| r.status == echo_agent::evolution::HealthStatus::NeedsAttention)
+                    .collect();
+                let unhealthy: Vec<_> = reports
+                    .iter()
+                    .filter(|r| r.status == echo_agent::evolution::HealthStatus::Unhealthy)
+                    .collect();
+
+                println!("  ✓ Healthy: {} skills", healthy.len());
+                println!("  ⚠ Needs attention: {} skills", needs_attention.len());
+                println!("  ✗ Unhealthy: {} skills", unhealthy.len());
+                println!();
+
+                if !unhealthy.is_empty() {
+                    println!("Unhealthy skills:");
+                    for report in unhealthy.iter().take(5) {
+                        println!(
+                            "  • {} (score: {:.2})",
+                            report.skill_name, report.health_score
+                        );
+                    }
+                    if unhealthy.len() > 5 {
+                        println!("  ... and {} more", unhealthy.len() - 5);
+                    }
+                    println!();
+                }
+
+                if !needs_attention.is_empty() {
+                    println!("Skills needing attention:");
+                    for report in needs_attention.iter().take(5) {
+                        println!(
+                            "  • {} (score: {:.2})",
+                            report.skill_name, report.health_score
+                        );
+                    }
+                    if needs_attention.len() > 5 {
+                        println!("  ... and {} more", needs_attention.len() - 5);
+                    }
+                }
+
+                println!("\nRun /skill-health <name> for detailed analysis of a specific skill.");
+            }
+            Ok(_) => {
+                println!("No skills with telemetry data found.");
+            }
+            Err(e) => {
+                println!("Error analyzing skills: {e}");
+            }
+        }
+    } else {
+        // Show detailed health for specific skill
+        let skill_name = args[0];
+        println!("Analyzing health of '{}'...", skill_name);
+
+        match monitor.analyze_skill(skill_name).await {
+            Ok(Some(report)) => {
+                println!("\n=== Skill Health: {} ===", report.skill_name);
+                println!(
+                    "Status: {} (score: {:.2})",
+                    match report.status {
+                        echo_agent::evolution::HealthStatus::Healthy => "✓ Healthy",
+                        echo_agent::evolution::HealthStatus::NeedsAttention => "⚠ Needs attention",
+                        echo_agent::evolution::HealthStatus::Unhealthy => "✗ Unhealthy",
+                    },
+                    report.health_score
+                );
+                println!("\nBreakdown:");
+                println!("  Success rate: {:.2}", report.breakdown.success_rate);
+                println!(
+                    "  Recent success: {:.2}",
+                    report.breakdown.recent_success_rate
+                );
+                println!("  Usage frequency: {:.2}", report.breakdown.usage_frequency);
+                println!("  Freshness: {:.2}", report.breakdown.freshness);
+                println!("  User approval: {:.2}", report.breakdown.user_approval);
+                println!(
+                    "  Command validity: {:.2}",
+                    report.breakdown.command_validity
+                );
+
+                if !report.recommendations.is_empty() {
+                    println!("\nRecommendations:");
+                    for (i, rec) in report.recommendations.iter().enumerate() {
+                        println!("  {}. {}", i + 1, rec);
+                    }
+                }
+            }
+            Ok(None) => {
+                println!("No telemetry data found for skill '{}'.", skill_name);
+            }
+            Err(e) => {
+                println!("Error analyzing skill: {e}");
+            }
+        }
+    }
+
+    CommandOutcome::Continue
+}
+cmd!(
+    SkillHealthCommand,
+    "skill-health",
+    CommandCategory::Advanced,
+    "Monitor skill health and get recommendations",
+    cmd_skill_health
+);
+
+// ── SkillPatchCommand ─────────────────────────────────────────────
+
+async fn cmd_skill_patch(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
+    let store = ctx.agent.read(|a| a.store().cloned()).await;
+    let store = match store {
+        Some(s) => s,
+        None => {
+            println!("No memory store configured.");
+            return CommandOutcome::Continue;
+        }
+    };
+
+    let patcher = echo_agent::evolution::SkillPatcher::new(store);
+
+    if args.is_empty() {
+        // Show all patch proposals
+        println!("Analyzing skills for patch opportunities...");
+        match patcher.analyze_all_skills().await {
+            Ok(patches) if !patches.is_empty() => {
+                println!("\n=== Skill Patch Proposals ===");
+                for (i, patch) in patches.iter().enumerate() {
+                    println!(
+                        "{}. {} ({})",
+                        i + 1,
+                        patch.skill_name,
+                        match &patch.patch_type {
+                            echo_agent::evolution::PatchType::ErrorHandling { .. } =>
+                                "Error handling",
+                            echo_agent::evolution::PatchType::PrerequisiteCheck { .. } =>
+                                "Prerequisite check",
+                            echo_agent::evolution::PatchType::FallbackStrategy { .. } =>
+                                "Fallback strategy",
+                            echo_agent::evolution::PatchType::InstructionEnhancement { .. } =>
+                                "Instruction enhancement",
+                        }
+                    );
+                    println!(
+                        "   Confidence: {:.2} | Priority: {}",
+                        patch.confidence, patch.priority
+                    );
+                    println!("   {}\n", patch.rationale);
+                }
+                println!("Run /skill-patch <name> to see patches for a specific skill.");
+            }
+            Ok(_) => {
+                println!("No patch opportunities found. All skills are performing well.");
+            }
+            Err(e) => {
+                println!("Error analyzing skills: {e}");
+            }
+        }
+    } else {
+        // Show patches for specific skill
+        let skill_name = args[0];
+        println!("Analyzing '{}' for patch opportunities...", skill_name);
+
+        match patcher.analyze_and_propose(skill_name).await {
+            Ok(patches) if !patches.is_empty() => {
+                println!("\n=== Patches for {} ===", skill_name);
+                for (i, patch) in patches.iter().enumerate() {
+                    println!("\n{}. {}", i + 1, patch.summary());
+                }
+                println!(
+                    "\nNote: These are proposals. To apply them, manually update the SKILL.md file."
+                );
+                println!("Future versions may support automatic patch application.");
+            }
+            Ok(_) => {
+                println!("No patch opportunities found for '{}'.", skill_name);
+            }
+            Err(e) => {
+                println!("Error analyzing skill: {e}");
+            }
+        }
+    }
+
+    CommandOutcome::Continue
+}
+cmd!(
+    SkillPatchCommand,
+    "skill-patch",
+    CommandCategory::Advanced,
+    "Generate patch proposals to improve skills",
+    cmd_skill_patch
+);
+
+// ── RulePromoteCommand ────────────────────────────────────────────
+
+async fn cmd_rule_promote(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
+    let store = ctx.agent.read(|a| a.store().cloned()).await;
+    let store = match store {
+        Some(s) => s,
+        None => {
+            println!("No memory store configured.");
+            return CommandOutcome::Continue;
+        }
+    };
+
+    let promoter = echo_agent_app_core::evolution::RulePromoter::new(store);
+
+    match args.first().copied() {
+        Some("scan") | None => {
+            println!("Scanning memories for rule promotion candidates...");
+            let proposals = promoter.scan_for_proposals().await;
+
+            if proposals.is_empty() {
+                println!("\nNo memories meet the promotion criteria.");
+                println!(
+                    "Criteria: confidence >= {:.2}, age >= {} days",
+                    promoter.criteria().min_confidence,
+                    promoter.criteria().min_age_days
+                );
+            } else {
+                println!("\n=== Rule Promotion Candidates ===\n");
+                for (i, proposal) in proposals.iter().enumerate() {
+                    println!(
+                        "{}. [{}] (confidence: {:.2})",
+                        i + 1,
+                        proposal.memory_key,
+                        proposal.confidence
+                    );
+                    println!("   Type: {:?}", proposal.memory_type);
+                    println!("   Reason: {}", proposal.reason);
+                    println!("   Rule: {}", proposal.rule_text);
+                    println!();
+                }
+
+                println!("To promote a specific rule, use: /rule-promote <memory_key>");
+            }
+        }
+        Some(memory_key) => {
+            println!("Promoting memory '{}' to rule...", memory_key);
+
+            let proposals = promoter.scan_for_proposals().await;
+            let proposal = proposals.iter().find(|p| p.memory_key == memory_key);
+
+            match proposal {
+                Some(prop) => {
+                    let change_log = echo_agent::evolution::JsonlChangeLog::new(
+                        echo_agent_app_core::evolution::discover_echo_agent_dir()
+                            .join("evolution")
+                            .join("changelog.jsonl"),
+                    );
+
+                    match promoter.promote_rule(prop, &change_log).await {
+                        Ok(()) => {
+                            println!(
+                                "✓ Successfully promoted memory '{}' to AGENTS.md",
+                                memory_key
+                            );
+                        }
+                        Err(e) => {
+                            println!("✗ Failed to promote rule: {}", e);
+                        }
+                    }
+                }
+                None => {
+                    println!(
+                        "Memory '{}' not found or does not meet promotion criteria.",
+                        memory_key
+                    );
+                    println!("Run /rule-promote scan to see available candidates.");
+                }
+            }
+        }
+    }
+
+    CommandOutcome::Continue
+}
+cmd!(
+    RulePromoteCommand,
+    "rule-promote",
+    CommandCategory::Advanced,
+    "Promote high-confidence memories to agent rules in AGENTS.md",
+    cmd_rule_promote
+);
+
+// ── EvolutionDashboardCommand ─────────────────────────────────────
+
+async fn cmd_evolution_dashboard(ctx: &CommandContext, _args: &[&str]) -> CommandOutcome {
+    let store = ctx.agent.read(|a| a.store().cloned()).await;
+    let store = match store {
+        Some(s) => s,
+        None => {
+            println!("No memory store configured.");
+            return CommandOutcome::Continue;
+        }
+    };
+
+    let change_log = echo_agent::evolution::JsonlChangeLog::new(
+        echo_agent_app_core::evolution::discover_echo_agent_dir()
+            .join("evolution")
+            .join("changelog.jsonl"),
+    );
+
+    let dashboard = echo_agent_app_core::evolution::Dashboard::new(store, change_log);
+
+    println!("Generating evolution dashboard...\n");
+
+    let metrics = dashboard.generate_metrics().await;
+    let output = echo_agent_app_core::evolution::Dashboard::format_metrics(&metrics);
+
+    println!("{}", output);
+
+    CommandOutcome::Continue
+}
+cmd!(
+    EvolutionDashboardCommand,
+    "evolution-dashboard",
+    CommandCategory::Advanced,
+    "Display evolution system metrics and status overview",
+    cmd_evolution_dashboard
+);
+
 // ── Register ────────────────────────────────────────────────────────
 
 pub fn register_all(registry: &mut crate::cli::command::CommandRegistry) {
@@ -574,4 +1414,13 @@ pub fn register_all(registry: &mut crate::cli::command::CommandRegistry) {
     registry.register(Arc::new(CritiquesCommand));
     registry.register(Arc::new(SkillReviewCommand));
     registry.register(Arc::new(ProfileCommand));
+    registry.register(Arc::new(MemoryReviewCommand));
+    registry.register(Arc::new(SkillCandidatesCommand));
+    registry.register(Arc::new(SkillPromoteCommand));
+    registry.register(Arc::new(SkillCreateCommand));
+    registry.register(Arc::new(SkillMergeCommand));
+    registry.register(Arc::new(SkillHealthCommand));
+    registry.register(Arc::new(SkillPatchCommand));
+    registry.register(Arc::new(RulePromoteCommand));
+    registry.register(Arc::new(EvolutionDashboardCommand));
 }

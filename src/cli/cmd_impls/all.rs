@@ -304,8 +304,8 @@ pub static AUTO_MEMORY_ENABLED: std::sync::atomic::AtomicBool =
 
 async fn cmd_auto_memory(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     use echo_agent_app_core::auto_memory::{
-        AutoMemoryConfig, extract_observations, format_observations_for_memory,
-        run_auto_memory_extraction,
+        AutoMemoryConfig, append_to_project_memory, extract_observations,
+        format_observations_for_memory, write_observations_to_memory_layer,
     };
 
     let sub = args.first().copied().unwrap_or("");
@@ -339,16 +339,32 @@ async fn cmd_auto_memory(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
                 .await;
 
             let config = AutoMemoryConfig::default();
-            match run_auto_memory_extraction(&messages, &config) {
-                Ok(count) => {
-                    if count > 0 {
-                        println!(
-                            "Extracted {} observation(s) and saved to project memory.",
-                            count
-                        );
-                    } else {
-                        println!("No observations extracted from this session.");
+            let observations = extract_observations(&messages, &config);
+            let count = observations.len();
+            if count == 0 {
+                println!("No observations extracted from this session.");
+                return CommandOutcome::Continue;
+            }
+
+            let typed_written = match handle.read(|a| a.store().cloned()).await {
+                Some(store) => {
+                    match write_observations_to_memory_layer(&observations, store, None).await {
+                        Ok(count) => count,
+                        Err(e) => {
+                            println!("Typed auto-memory write failed: {e}");
+                            0
+                        }
                     }
+                }
+                None => 0,
+            };
+
+            match append_to_project_memory(&observations) {
+                Ok(()) => {
+                    println!(
+                        "Extracted {} observation(s), saved {} to typed memory and project memory.",
+                        count, typed_written
+                    );
                 }
                 Err(e) => println!("Auto-memory extraction failed: {e}"),
             }

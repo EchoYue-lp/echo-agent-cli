@@ -139,6 +139,12 @@ export type ClientMessage =
   | { type: 'message'; data: string; attachments?: Attachment[] }
   | { type: 'approval_response'; request_id: string; approved: boolean; reason?: string }
   | { type: 'input_response'; request_id: string; text: string }
+  | {
+      type: 'selection_response';
+      request_id: string;
+      selection: string;
+      instructions?: string;
+    }
   | { type: 'cancel' }
   | { type: 'ping' };
 
@@ -157,6 +163,15 @@ export type ServerMessage =
       prompt?: string;
     }
   | { type: 'input_request'; request_id: string; prompt?: string }
+  | {
+      type: 'selection_request';
+      request_id: string;
+      prompt: string;
+      options: string[];
+      task_id?: string | null;
+      context?: unknown;
+      phase?: string | null;
+    }
   | { type: 'chart'; spec: unknown }
   | { type: 'error'; message: string }
   | { type: 'cancelled' }

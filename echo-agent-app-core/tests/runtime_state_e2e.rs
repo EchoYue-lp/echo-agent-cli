@@ -76,7 +76,8 @@ async fn create_agent_threads_state_store_and_conversation_id() {
         memory_context_suffix: None,
     };
     let app_config = make_app_config();
-    let agent = infra::create_agent(&params, &app_config);
+    let agent = infra::create_agent(&params, &app_config)
+        .expect("create_agent should succeed in e2e test — check model/provider config");
 
     assert!(
         agent.state_store().is_some(),
@@ -102,7 +103,8 @@ async fn create_agent_without_state_store_leaves_it_none() {
         memory_context_suffix: None,
     };
     let app_config = make_app_config();
-    let agent = infra::create_agent(&params, &app_config);
+    let agent = infra::create_agent(&params, &app_config)
+        .expect("create_agent should succeed in e2e test — check model/provider config");
 
     assert!(
         agent.state_store().is_none(),
@@ -130,7 +132,8 @@ async fn memory_context_suffix_lands_in_system_prompt() {
         memory_context_suffix: Some(suffix.clone()),
     };
     let app_config = make_app_config();
-    let agent = infra::create_agent(&params, &app_config);
+    let agent = infra::create_agent(&params, &app_config)
+        .expect("create_agent should succeed in e2e test — check model/provider config");
 
     let prompt = agent.system_prompt();
     assert!(

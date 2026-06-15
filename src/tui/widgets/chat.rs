@@ -36,8 +36,10 @@ impl Widget for Chat {
         // chat_scroll is measured from the bottom: 0 = auto-scroll/latest.
         let total_lines = lines.len();
         let visible = inner_height(area);
-        let max_scroll = total_lines.saturating_sub(visible) as u16;
-        let scroll = max_scroll.saturating_sub(app.chat_scroll.min(max_scroll));
+        let max_scroll = total_lines.saturating_sub(visible);
+        let scroll_u16 = max_scroll.saturating_sub(app.chat_scroll.min(max_scroll));
+        // ratatui scroll API uses u16; cap at u16::MAX for extremely long conversations.
+        let scroll = (scroll_u16.min(u16::MAX as usize)) as u16;
 
         // Apply selection highlighting to visible lines.
         if let Some((sel_start, sel_end)) = app.normalized_selection().map(|(s, e)| (s, e)) {

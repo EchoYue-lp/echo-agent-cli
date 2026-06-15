@@ -3,7 +3,7 @@
 //! Shared by the dedicated `echo-agent-tauri` binary and by the package-name
 //! binary when Tauri CLI builds the app with `--no-default-features --features gui`.
 
-use crate::{agent_handle::AgentHandle, cli, config, config_watcher, infra, state::AppState};
+use crate::{cli, config, config_watcher, infra, state::AppState};
 use clap::Parser;
 use std::sync::Arc;
 
@@ -178,10 +178,11 @@ async fn run_desktop() -> anyhow::Result<()> {
 
     let mut state_inner = AppState::from_shared(
         agent_handle.clone(),
-        runtime.hitl_dispatcher,
+        runtime.hitl_dispatcher.clone(),
         conversation_store,
         app_config.clone(),
-    );
+    )
+    .with_review_integration(runtime.review_integration.clone());
     state_inner.set_pool(pool);
 
     // Wire task hook bridge so YAML hooks see task lifecycle events

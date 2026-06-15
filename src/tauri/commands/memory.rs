@@ -1,4 +1,9 @@
-//! Tauri IPC commands for memory management.
+//! Tauri IPC commands for raw Store memory management.
+//!
+//! These commands are a legacy/admin surface for arbitrary Store namespaces.
+//! Runtime-recallable agent memories should be written through
+//! `MemoryLayerManager::write_memory` via AutoMemory, TriggerDetector,
+//! BackgroundReviewer, or the layered `remember` tool.
 
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;

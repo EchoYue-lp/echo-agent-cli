@@ -37,9 +37,8 @@ use std::time::{Duration, Instant};
 use echo_agent::agent::AgentHandle;
 use echo_agent::agent::CancellationToken;
 use echo_agent::llm::LlmClient;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::RwLock;
 
-use crate::agent_handle;
 use crate::config::AppConfig;
 use crate::infra;
 
@@ -99,7 +98,6 @@ pub struct SharedResources {
     pub conversation_store: Option<Arc<dyn echo_agent::memory::ConversationStore>>,
     pub run_store: Option<Arc<dyn echo_agent::trace::RunStore>>,
     pub token_tracker: Option<Arc<echo_agent::tokenizer::TokenUsageTracker>>,
-    #[cfg(feature = "human-loop")]
     pub permission_service: Option<Arc<echo_agent::human_loop::service::PermissionService>>,
     pub state_store: Option<Arc<dyn echo_agent::state::RuntimeStateStore>>,
     pub tool_execution_pipeline:
@@ -124,7 +122,6 @@ impl SharedResources {
                 let state_store = a.state_store().clone();
                 let run_store = a.run_store().cloned();
                 let tool_execution_pipeline = a.tool_execution_pipeline().clone();
-                #[cfg(feature = "human-loop")]
                 let permission_service = a.permission_service().cloned();
 
                 SharedResources {
@@ -136,7 +133,6 @@ impl SharedResources {
                     conversation_store,
                     run_store,
                     token_tracker,
-                    #[cfg(feature = "human-loop")]
                     permission_service,
                     state_store,
                     tool_execution_pipeline,
@@ -411,7 +407,8 @@ impl AgentPool {
             state_store: self.shared.state_store.clone(),
             memory_context_suffix: None,
         };
-        let mut agent = infra::create_agent(&params, &self.app_config);
+        let mut agent =
+            infra::create_agent(&params, &self.app_config).map_err(|e| anyhow::anyhow!("{e}"))?;
 
         // 2. Inject shared resources (replace independently-created ones)
         if let Some(ref llm) = self.shared.llm_client {
@@ -442,7 +439,6 @@ impl AgentPool {
         if let Some(ref st) = self.shared.store {
             agent.install_store(st.clone()).await;
         }
-        #[cfg(feature = "human-loop")]
         if let Some(ref ps) = self.shared.permission_service {
             agent.set_permission_service(ps.clone());
         }

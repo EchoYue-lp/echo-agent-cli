@@ -333,6 +333,29 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
         )
         .await?;
 
+        // ── Memory review on session end (TUI) ──────────────────────
+        if let Some(ref review_integration) = runtime.review_integration {
+            if let Some(review_result) = review_integration.on_session_end().await {
+                match review_result {
+                    Ok(report) => {
+                        if report.total_scanned > 0 {
+                            println!(
+                                "  📋 Memory review: {} scanned, {} stale, {} conflicts, {} merged, {} archived",
+                                report.total_scanned,
+                                report.stale_count,
+                                report.conflict_groups,
+                                report.merges_applied,
+                                report.archives_applied
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("  ⚠ Memory review failed: {e}");
+                    }
+                }
+            }
+        }
+
         drop(runtime);
         cancel_token.cancel();
 
@@ -445,7 +468,13 @@ mod tests {
             memory_context_suffix: None,
         };
         let app_config = config::AppConfig::default();
-        let agent = infra::create_agent(&params, &app_config);
+        let agent = match infra::create_agent(&params, &app_config) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("test setup failed: create_agent: {e}");
+                return;
+            }
+        };
         assert_eq!(agent.model_name(), "test-model");
     }
 

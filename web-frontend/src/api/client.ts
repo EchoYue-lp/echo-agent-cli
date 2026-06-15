@@ -1,5 +1,6 @@
 import type { LoginResponse, HealthResponse } from '../types/api';
 import { useToastStore } from '../stores/toastStore';
+import { isTauri } from '../lib/tauri-bridge';
 
 const BASE = '/api';
 
@@ -53,6 +54,10 @@ export function isAuthenticated(): boolean {
 
 // 带认证的请求函数
 async function request<T>(path: string, opts?: RequestInit): Promise<T> {
+  if (isTauri()) {
+    throw new Error(`HTTP API fallback is disabled in Tauri mode: ${path}`);
+  }
+
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
   };

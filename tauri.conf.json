@@ -5,9 +5,14 @@
   "identifier": "com.echocowork.desktop",
   "mainBinaryName": "echo-agent-tauri",
   "build": {
-    "beforeDevCommand": "cd ../web-frontend && npm run dev",
-    "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "cd ../web-frontend && npm run build",
+    "runner": {
+      "cmd": "cargo",
+      "args": ["--bin", "echo-agent-tauri"]
+    },
+    "features": ["gui"],
+    "beforeDevCommand": "cd ../web-frontend && npm run dev:tauri",
+    "devUrl": "http://localhost:1420/?tauri=1",
+    "beforeBuildCommand": "cd ../web-frontend && npm run build:tauri",
     "frontendDist": "web-frontend/dist"
   },
   "app": {

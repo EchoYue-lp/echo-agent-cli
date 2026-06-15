@@ -170,7 +170,7 @@ pub struct TuiApp {
     /// Sidebar active tab (0=files, 1=tools, 2=tasks).
     pub sidebar_tab: usize,
     /// Scroll offset for chat area (0 = auto-scroll to bottom).
-    pub chat_scroll: u16,
+    pub chat_scroll: usize,
     /// Model name.
     pub model: String,
     /// Agent mode label.
@@ -905,8 +905,8 @@ impl TuiApp {
         // Compute scroll offset (same algorithm as Chat widget).
         let total_lines = self.wrapped_lines.len();
         let visible = ca.height as usize;
-        let max_scroll = total_lines.saturating_sub(visible) as u16;
-        let scroll = max_scroll.saturating_sub(self.chat_scroll.min(max_scroll)) as usize;
+        let max_scroll = total_lines.saturating_sub(visible);
+        let scroll = max_scroll.saturating_sub(self.chat_scroll.min(max_scroll));
 
         let line_idx = (rel_row + scroll).min(self.wrapped_lines.len().saturating_sub(1));
         Some((line_idx, rel_col))
@@ -932,8 +932,8 @@ impl TuiApp {
 
         let total_lines = self.wrapped_lines.len();
         let visible = ca.height as usize;
-        let max_scroll = total_lines.saturating_sub(visible) as u16;
-        let scroll = max_scroll.saturating_sub(self.chat_scroll.min(max_scroll)) as usize;
+        let max_scroll = total_lines.saturating_sub(visible);
+        let scroll = max_scroll.saturating_sub(self.chat_scroll.min(max_scroll));
 
         let line_idx = (rel_row + scroll).min(self.wrapped_lines.len().saturating_sub(1));
         Some((line_idx, rel_col))

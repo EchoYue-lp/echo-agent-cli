@@ -7,6 +7,12 @@
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
 use echo_agent_app_core::state::{AuditDecision, PermissionBehavior, PermissionRuleConfig};
+use echo_agent_app_core::workspace::layout::WorkspaceLayout;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 // ════════════════════════════════════════════════════════════════════════════
 // Permissions
@@ -178,46 +184,191 @@ pub async fn clear_audit_logs(
 // Auto Memory
 // ════════════════════════════════════════════════════════════════════════════
 
+async fn current_agent_messages(state: &TauriState) -> Vec<(String, String)> {
+    let agent = state.app_state.connection.primary_agent();
+    agent
+        .read_async(|agent| {
+            Box::pin(async move {
+                let ctx = agent.context().lock().await;
+                ctx.messages()
+                    .iter()
+                    .map(|m| {
+                        (
+                            m.role.as_str().to_string(),
+                            m.content.as_text().unwrap_or_default().to_string(),
+                        )
+                    })
+                    .collect()
+            })
+        })
+        .await
+}
+
+async fn auto_memory_config_status(
+    state: &TauriState,
+) -> Result<
+    (
+        echo_agent_app_core::auto_memory::AutoMemoryConfig,
+        usize,
+        PathBuf,
+    ),
+    IpcError,
+> {
+    let mut config = echo_agent_app_core::auto_memory::AutoMemoryConfig::default();
+    config.enabled =
+        crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
+    let messages = current_agent_messages(state).await;
+    let observations = echo_agent_app_core::auto_memory::extract_observations(&messages, &config);
+    let root = workspace_project_root(state).await?;
+    let memory_path = root.join(".echo-agent").join("project.md");
+    Ok((config, observations.len(), memory_path))
+}
+
+fn persist_auto_memory_observations(
+    memory_path: &Path,
+    observations: &[echo_agent_app_core::auto_memory::Observation],
+) -> Result<(), IpcError> {
+    if observations.is_empty() {
+        return Ok(());
+    }
+
+    let formatted = echo_agent_app_core::auto_memory::format_observations_for_memory(observations);
+    if let Some(parent) = memory_path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| IpcError::Internal(format!("Failed to create memory directory: {e}")))?;
+    }
+
+    let existing = std::fs::read_to_string(memory_path).unwrap_or_default();
+    let new_content = if let Some(marker_pos) = existing.find("## Auto-extracted observations") {
+        let before = &existing[..marker_pos];
+        format!("{}{}", before.trim_end(), formatted)
+    } else if existing.is_empty() {
+        formatted
+    } else {
+        format!("{}\n{}", existing.trim_end(), formatted)
+    };
+
+    std::fs::write(memory_path, new_content)
+        .map_err(|e| IpcError::Internal(format!("Failed to write project memory: {e}")))?;
+    Ok(())
+}
+
+async fn write_auto_memory_observations(
+    state: &TauriState,
+    observations: &[echo_agent_app_core::auto_memory::Observation],
+) -> Result<usize, IpcError> {
+    if observations.is_empty() {
+        return Ok(0);
+    }
+
+    let Some(store) = state
+        .app_state
+        .connection
+        .primary_agent()
+        .read(|agent| agent.store().cloned())
+        .await
+    else {
+        return Ok(0);
+    };
+
+    echo_agent_app_core::auto_memory::write_observations_to_memory_layer(
+        observations,
+        store,
+        state.app_state.review_integration.clone(),
+    )
+    .await
+    .map_err(IpcError::Internal)
+}
+
 #[tauri::command]
 pub async fn get_auto_memory_status(
-    _state: tauri::State<'_, TauriState>,
+    state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
-    // Auto-memory is managed by the agent; return default status
-    Ok(serde_json::json!({
-        "enabled": true,
-        "observation_count": 0,
+    let (config, observation_count, memory_path) = auto_memory_config_status(&state).await?;
+    Ok(json!({
+        "enabled": config.enabled,
+        "observation_count": observation_count,
+        "config": config,
+        "memory_path": memory_path.display().to_string(),
     }))
 }
 
 #[tauri::command]
 pub async fn toggle_auto_memory(
-    _state: tauri::State<'_, TauriState>,
+    state: tauri::State<'_, TauriState>,
     enabled: bool,
 ) -> Result<serde_json::Value, IpcError> {
-    Ok(serde_json::json!({"enabled": enabled}))
+    crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED
+        .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    get_auto_memory_status(state).await
 }
 
 #[tauri::command]
 pub async fn extract_auto_memory(
-    _state: tauri::State<'_, TauriState>,
+    state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
-    // Extraction is handled by the agent's auto-memory module
-    Ok(serde_json::json!({
+    let mut config = echo_agent_app_core::auto_memory::AutoMemoryConfig::default();
+    config.enabled =
+        crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
+    if !config.enabled {
+        return Ok(json!({
+            "success": false,
+            "count": 0,
+            "observations": [],
+            "formatted": "",
+            "message": "Auto Memory is disabled",
+        }));
+    }
+
+    let messages = current_agent_messages(&state).await;
+    let observations = echo_agent_app_core::auto_memory::extract_observations(&messages, &config);
+    let root = workspace_project_root(&state).await?;
+    let memory_path = root.join(".echo-agent").join("project.md");
+    persist_auto_memory_observations(&memory_path, &observations)?;
+    let typed_written = write_auto_memory_observations(&state, &observations).await?;
+    let count = observations.len();
+    let formatted = echo_agent_app_core::auto_memory::format_observations_for_memory(&observations);
+
+    Ok(json!({
         "success": true,
-        "observations": [],
+        "count": count,
+        "typed_written": typed_written,
+        "observations": observations,
+        "formatted": formatted,
+        "memory_path": memory_path.display().to_string(),
     }))
 }
 
 #[tauri::command]
 pub async fn get_auto_memory_observations(
-    _state: tauri::State<'_, TauriState>,
+    state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
-    Ok(serde_json::json!([]))
+    let mut config = echo_agent_app_core::auto_memory::AutoMemoryConfig::default();
+    config.enabled =
+        crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
+    let messages = current_agent_messages(&state).await;
+    let observations = echo_agent_app_core::auto_memory::extract_observations(&messages, &config);
+    let count = observations.len();
+    let formatted = echo_agent_app_core::auto_memory::format_observations_for_memory(&observations);
+    Ok(json!({
+        "observations": observations,
+        "count": count,
+        "formatted": formatted,
+    }))
 }
 
 // ════════════════════════════════════════════════════════════════════════════
 // Skills
 // ════════════════════════════════════════════════════════════════════════════
+
+fn skill_descriptor_json(d: &echo_agent::skills::external::SkillDescriptor) -> serde_json::Value {
+    json!({
+        "name": d.name,
+        "description": d.description,
+        "triggers": d.triggers,
+        "file": d.location.display().to_string(),
+    })
+}
 
 #[tauri::command]
 pub async fn list_skills(
@@ -225,17 +376,8 @@ pub async fn list_skills(
 ) -> Result<serde_json::Value, IpcError> {
     let agent = state.app_state.connection.primary_agent();
     let descriptors = agent.read(|a| a.skill_descriptors()).await;
-    let skills: Vec<serde_json::Value> = descriptors
-        .iter()
-        .map(|d| {
-            serde_json::json!({
-                "name": d.name,
-                "description": d.description,
-                "triggers": d.triggers,
-            })
-        })
-        .collect();
-    Ok(serde_json::json!(skills))
+    let skills: Vec<serde_json::Value> = descriptors.iter().map(skill_descriptor_json).collect();
+    Ok(json!(skills))
 }
 
 #[tauri::command]
@@ -246,28 +388,69 @@ pub async fn get_skill(
     let agent = state.app_state.connection.primary_agent();
     let descriptors = agent.read(|a| a.skill_descriptors()).await;
     match descriptors.iter().find(|d| d.name == name) {
-        Some(d) => Ok(serde_json::json!({
-            "name": d.name,
-            "description": d.description,
-            "triggers": d.triggers,
-        })),
+        Some(d) => Ok(skill_descriptor_json(d)),
         None => Err(IpcError::NotFound(format!("Skill '{}' not found", name))),
     }
 }
 
 #[tauri::command]
 pub async fn load_skill(
-    _state: tauri::State<'_, TauriState>,
+    state: tauri::State<'_, TauriState>,
     name: String,
 ) -> Result<serde_json::Value, IpcError> {
-    Ok(serde_json::json!({"success": true, "loaded": name}))
+    let raw = name.trim();
+    if raw.is_empty() {
+        return Err(IpcError::Validation("技能目录路径不能为空".into()));
+    }
+
+    let path = std::path::PathBuf::from(raw);
+    if !path.exists() {
+        return Err(IpcError::NotFound(format!(
+            "技能目录不存在: {}",
+            path.display()
+        )));
+    }
+    if !path.is_dir() {
+        return Err(IpcError::Validation(format!(
+            "技能路径不是目录: {}",
+            path.display()
+        )));
+    }
+
+    let agent = state.app_state.connection.primary_agent();
+    let loaded = agent
+        .write_async(|agent| {
+            let path = path.clone();
+            Box::pin(async move { agent.load_skills_from_dir(path).await })
+        })
+        .await
+        .map_err(|e| IpcError::Internal(e.to_string()))?;
+    let count = loaded.len();
+
+    let skills: Vec<serde_json::Value> = agent
+        .read(|a| {
+            a.skill_descriptors()
+                .iter()
+                .map(skill_descriptor_json)
+                .collect()
+        })
+        .await;
+
+    Ok(json!({
+        "success": true,
+        "loaded": loaded,
+        "count": count,
+        "skills": skills,
+    }))
 }
 
 #[tauri::command]
 pub async fn upload_skill(
     _state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
-    Ok(serde_json::json!({"success": true, "message": "Use file dialog to upload"}))
+    Err(IpcError::Validation(
+        "Tauri 桌面端不支持浏览器式技能上传；请使用“浏览”选择本地技能目录加载".into(),
+    ))
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -345,14 +528,44 @@ pub async fn delete_workflow(
 
 #[tauri::command]
 pub async fn execute_workflow(
-    _state: tauri::State<'_, TauriState>,
+    state: tauri::State<'_, TauriState>,
     id: String,
-    _input: Option<serde_json::Value>,
+    input: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, IpcError> {
-    Err(IpcError::NotImplemented(format!(
-        "Workflow execution '{}' is not available via IPC. Use the agent chat to run workflows.",
-        id
-    )))
+    let workflow = {
+        let workflows = state.app_state.history.workflows.read().await;
+        workflows
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| IpcError::NotFound(format!("Workflow '{}' not found", id)))?
+    };
+
+    let definition = workflow.definition.trim();
+    let graph = echo_agent::workflow::loader::load_graph_from_yaml_str(definition)
+        .or_else(|_| echo_agent::workflow::loader::load_graph_from_json_str(definition))
+        .map_err(|e| {
+            IpcError::Validation(format!(
+                "Workflow '{}' is not a framework Graph workflow definition: {e}",
+                workflow.name
+            ))
+        })?;
+
+    let shared_state = echo_agent::workflow::SharedState::new();
+    shared_state
+        .set("input", input.unwrap_or_else(|| json!({})))
+        .map_err(|e| IpcError::Internal(format!("Failed to initialize workflow state: {e}")))?;
+    let result = graph
+        .run(shared_state)
+        .await
+        .map_err(|e| IpcError::Internal(format!("Workflow execution failed: {e}")))?;
+
+    Ok(json!({
+        "success": true,
+        "workflow_id": workflow.id,
+        "path": result.path,
+        "steps": result.steps,
+        "state": result.state.to_json_value().map_err(|e| IpcError::Internal(format!("Failed to serialize workflow state: {e}")))?,
+    }))
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -393,13 +606,37 @@ pub async fn update_sandbox_config(
 
 #[tauri::command]
 pub async fn execute_sandbox(
-    _state: tauri::State<'_, TauriState>,
-    _code: String,
-    _language: Option<String>,
+    state: tauri::State<'_, TauriState>,
+    code: String,
+    language: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    Err(IpcError::NotImplemented(
-        "Sandbox execution is not available via IPC. Use the agent chat to run code.".into(),
-    ))
+    let manager = state
+        .app_state
+        .connection
+        .primary_agent()
+        .read(|agent| agent.sandbox_manager().cloned())
+        .await
+        .unwrap_or_else(|| std::sync::Arc::new(echo_agent::sandbox::SandboxManager::local_only()));
+    let command = match language.as_deref().filter(|s| !s.trim().is_empty()) {
+        Some("shell") | Some("sh") | Some("bash") => {
+            echo_agent::sandbox::SandboxCommand::shell(code)
+        }
+        Some(lang) => echo_agent::sandbox::SandboxCommand::code(lang.to_string(), code),
+        None => echo_agent::sandbox::SandboxCommand::shell(code),
+    };
+    let result = manager
+        .execute(command)
+        .await
+        .map_err(|e| IpcError::Internal(format!("Sandbox execution failed: {e}")))?;
+    Ok(json!({
+        "success": result.success(),
+        "exit_code": result.exit_code,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "duration_ms": result.duration.as_millis(),
+        "sandbox_type": result.sandbox_type,
+        "timed_out": result.timed_out,
+    }))
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -490,31 +727,64 @@ pub async fn get_compression_stats(
 
 #[tauri::command]
 pub async fn extract_data(
-    _state: tauri::State<'_, TauriState>,
-    _input: String,
-    _schema: serde_json::Value,
-    _schema_name: String,
+    state: tauri::State<'_, TauriState>,
+    input: String,
+    schema: serde_json::Value,
+    schema_name: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    Err(IpcError::NotImplemented(
-        "Data extraction is not available via IPC. Use the data-wrangling skill in chat.".into(),
-    ))
+    if !schema.is_object() {
+        return Err(IpcError::Validation("Schema must be a JSON object".into()));
+    }
+    let name = schema_name.unwrap_or_else(|| "extraction".to_string());
+    let format = echo_agent::llm::ResponseFormat::json_schema(name, schema);
+    let value = state
+        .app_state
+        .connection
+        .primary_agent()
+        .read_async(|agent| Box::pin(async move { agent.extract_json(&input, format).await }))
+        .await
+        .map_err(|e| IpcError::Internal(format!("Extraction failed: {e}")))?;
+    Ok(json!({
+        "success": true,
+        "data": value,
+    }))
 }
 
 #[tauri::command]
 pub async fn validate_schema(
     _state: tauri::State<'_, TauriState>,
-    _schema: serde_json::Value,
+    schema: serde_json::Value,
 ) -> Result<serde_json::Value, IpcError> {
-    Err(IpcError::NotImplemented(
-        "Schema validation is not available via IPC.".into(),
-    ))
+    let mut errors = Vec::new();
+    if !schema.is_object() {
+        errors.push("Schema must be a JSON object".to_string());
+    }
+    Ok(json!({
+        "valid": errors.is_empty(),
+        "errors": errors,
+    }))
 }
 
 #[tauri::command]
 pub async fn get_extract_examples(
     _state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
-    Ok(serde_json::json!([]))
+    Ok(json!([
+        {
+            "name": "person",
+            "input": "Zhang San, 28 years old, works as an engineer.",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "age": {"type": "integer"},
+                    "job": {"type": "string"}
+                },
+                "required": ["name", "age"],
+                "additionalProperties": false
+            }
+        }
+    ]))
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -546,28 +816,25 @@ pub async fn get_history(
     _state: tauri::State<'_, TauriState>,
     _limit: Option<usize>,
 ) -> Result<serde_json::Value, IpcError> {
-    // History is managed by conversation store
-    Ok(serde_json::json!([]))
+    Err(IpcError::NotImplemented("对话历史查询功能尚未实现".into()))
 }
 
 #[tauri::command]
 pub async fn export_history_markdown(
     _state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
-    Ok(serde_json::json!({
-        "success": true,
-        "content": "# History Export\n\nNot yet implemented.",
-    }))
+    Err(IpcError::NotImplemented(
+        "对话历史 Markdown 导出功能尚未实现".into(),
+    ))
 }
 
 #[tauri::command]
 pub async fn export_history_json(
     _state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
-    Ok(serde_json::json!({
-        "success": true,
-        "content": "[]",
-    }))
+    Err(IpcError::NotImplemented(
+        "对话历史 JSON 导出功能尚未实现".into(),
+    ))
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -576,40 +843,66 @@ pub async fn export_history_json(
 
 #[tauri::command]
 pub async fn list_trace_sessions(
-    _state: tauri::State<'_, TauriState>,
+    state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
-    Err(IpcError::NotImplemented(
-        "Trace session listing is not available via IPC.".into(),
-    ))
+    let sessions = state.app_state.trace.collector.list_sessions().await;
+    Ok(json!(sessions))
 }
 
 #[tauri::command]
 pub async fn get_trace_events(
-    _state: tauri::State<'_, TauriState>,
-    _session_id: String,
+    state: tauri::State<'_, TauriState>,
+    session_id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    Err(IpcError::NotImplemented(
-        "Trace event retrieval is not available via IPC.".into(),
-    ))
+    let events = state
+        .app_state
+        .trace
+        .collector
+        .get_events(&session_id)
+        .await;
+    Ok(json!(events))
 }
 
 #[tauri::command]
 pub async fn get_trace_summary(
-    _state: tauri::State<'_, TauriState>,
+    state: tauri::State<'_, TauriState>,
     session_id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    Ok(serde_json::json!({
-        "session_id": session_id,
-        "event_count": 0,
-    }))
+    if let Some(summary) = state
+        .app_state
+        .trace
+        .collector
+        .get_summary(&session_id)
+        .await
+    {
+        Ok(json!(summary))
+    } else {
+        Ok(json!({
+            "session_id": session_id,
+            "total_duration_ms": 0,
+            "llm_calls": 0,
+            "total_input_tokens": 0,
+            "total_output_tokens": 0,
+            "tool_calls": 0,
+            "tool_success_rate": 1.0,
+            "agent_steps": 0,
+            "events": [],
+        }))
+    }
 }
 
 #[tauri::command]
 pub async fn clear_trace_session(
-    _state: tauri::State<'_, TauriState>,
+    state: tauri::State<'_, TauriState>,
     session_id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    Ok(serde_json::json!({"success": true, "cleared": session_id}))
+    state
+        .app_state
+        .trace
+        .collector
+        .clear_session(&session_id)
+        .await;
+    Ok(json!({"success": true, "cleared": session_id}))
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -620,31 +913,24 @@ pub async fn clear_trace_session(
 pub async fn list_papers(
     _state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
-    Err(IpcError::NotImplemented(
-        "Paper listing is not available via IPC. Use the paper-search skill in chat.".into(),
-    ))
+    Err(IpcError::NotImplemented("论文列表功能尚未实现".into()))
 }
 
 #[tauri::command]
 pub async fn get_paper(
     _state: tauri::State<'_, TauriState>,
-    id: String,
+    _id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    Err(IpcError::NotFound(format!("Paper '{}' not found", id)))
+    Err(IpcError::NotImplemented("论文查询功能尚未实现".into()))
 }
 
 #[tauri::command]
 pub async fn create_paper(
     _state: tauri::State<'_, TauriState>,
-    title: String,
+    _title: String,
     _authors: Option<Vec<String>>,
 ) -> Result<serde_json::Value, IpcError> {
-    let id = uuid::Uuid::new_v4().to_string();
-    Ok(serde_json::json!({
-        "success": true,
-        "id": id,
-        "title": title,
-    }))
+    Err(IpcError::NotImplemented("论文创建功能尚未实现".into()))
 }
 
 #[tauri::command]
@@ -652,7 +938,7 @@ pub async fn delete_paper(
     _state: tauri::State<'_, TauriState>,
     _id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    Ok(serde_json::json!({"success": true}))
+    Err(IpcError::NotImplemented("论文删除功能尚未实现".into()))
 }
 
 #[tauri::command]
@@ -661,7 +947,7 @@ pub async fn update_paper_notes(
     _id: String,
     _notes: String,
 ) -> Result<serde_json::Value, IpcError> {
-    Ok(serde_json::json!({"success": true}))
+    Err(IpcError::NotImplemented("论文笔记更新功能尚未实现".into()))
 }
 
 #[tauri::command]
@@ -670,93 +956,288 @@ pub async fn add_paper_tags(
     _id: String,
     _tags: Vec<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    Ok(serde_json::json!({"success": true}))
+    Err(IpcError::NotImplemented("论文标签添加功能尚未实现".into()))
 }
 
 // ════════════════════════════════════════════════════════════════════════════
 // Scratchpad
 // ════════════════════════════════════════════════════════════════════════════
 
+async fn workspace_state_root(state: &TauriState) -> Result<PathBuf, IpcError> {
+    if let Some(ws) = state.app_state.current_workspace().await {
+        Ok(ws.root)
+    } else {
+        std::env::current_dir()
+            .map_err(|e| IpcError::Internal(format!("Failed to resolve current directory: {e}")))
+    }
+}
+
+fn modified_at(path: &Path) -> String {
+    path.metadata()
+        .and_then(|m| m.modified())
+        .map(|t| {
+            let dt: chrono::DateTime<chrono::Utc> = t.into();
+            dt.to_rfc3339()
+        })
+        .unwrap_or_else(|_| chrono::Utc::now().to_rfc3339())
+}
+
 #[tauri::command]
 pub async fn get_scratchpad(
-    _state: tauri::State<'_, TauriState>,
+    state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
-    Ok(serde_json::json!({
-        "content": "",
-        "updated_at": null,
+    let root = workspace_state_root(&state).await?;
+    WorkspaceLayout::ensure_dirs(&root).map_err(|e| IpcError::Internal(e.to_string()))?;
+    let path = WorkspaceLayout::scratchpad(&root);
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| IpcError::Internal(format!("Failed to read scratchpad: {e}")))?;
+
+    Ok(json!({
+        "content": content,
+        "modified_at": modified_at(&path),
     }))
 }
 
 #[tauri::command]
 pub async fn update_scratchpad(
-    _state: tauri::State<'_, TauriState>,
-    _content: String,
+    state: tauri::State<'_, TauriState>,
+    content: String,
 ) -> Result<serde_json::Value, IpcError> {
-    Ok(serde_json::json!({"success": true}))
+    let root = workspace_state_root(&state).await?;
+    WorkspaceLayout::ensure_dirs(&root).map_err(|e| IpcError::Internal(e.to_string()))?;
+    let path = WorkspaceLayout::scratchpad(&root);
+    std::fs::write(&path, content)
+        .map_err(|e| IpcError::Internal(format!("Failed to write scratchpad: {e}")))?;
+
+    Ok(json!({
+        "content": std::fs::read_to_string(&path).unwrap_or_default(),
+        "modified_at": modified_at(&path),
+    }))
 }
 
 // ════════════════════════════════════════════════════════════════════════════
 // Decisions
 // ════════════════════════════════════════════════════════════════════════════
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DecisionRecord {
+    id: String,
+    decision: String,
+    rationale: String,
+    #[serde(default)]
+    alternatives: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context: Option<String>,
+    timestamp: String,
+}
+
 #[tauri::command]
 pub async fn list_decisions(
-    _state: tauri::State<'_, TauriState>,
+    state: tauri::State<'_, TauriState>,
+    limit: Option<usize>,
 ) -> Result<serde_json::Value, IpcError> {
-    Ok(serde_json::json!([]))
+    let root = workspace_state_root(&state).await?;
+    WorkspaceLayout::ensure_dirs(&root).map_err(|e| IpcError::Internal(e.to_string()))?;
+    let path = WorkspaceLayout::decisions(&root);
+    if !path.exists() {
+        return Ok(json!([]));
+    }
+
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| IpcError::Internal(format!("Failed to read decisions: {e}")))?;
+    let mut records: Vec<DecisionRecord> = content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<DecisionRecord>(line).ok())
+        .collect();
+    records.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    if let Some(limit) = limit {
+        records.truncate(limit);
+    }
+    Ok(json!(records))
 }
 
 #[tauri::command]
 pub async fn create_decision(
-    _state: tauri::State<'_, TauriState>,
-    _title: String,
-    _rationale: String,
+    state: tauri::State<'_, TauriState>,
+    title: String,
+    rationale: String,
+    alternatives: Option<Vec<String>>,
+    context: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    let id = uuid::Uuid::new_v4().to_string();
-    Ok(serde_json::json!({
-        "success": true,
-        "id": id,
-    }))
+    let decision = title.trim();
+    let rationale = rationale.trim();
+    if decision.is_empty() {
+        return Err(IpcError::Validation("Decision cannot be empty".into()));
+    }
+    if rationale.is_empty() {
+        return Err(IpcError::Validation("Rationale cannot be empty".into()));
+    }
+
+    let root = workspace_state_root(&state).await?;
+    WorkspaceLayout::ensure_dirs(&root).map_err(|e| IpcError::Internal(e.to_string()))?;
+    let path = WorkspaceLayout::decisions(&root);
+    let record = DecisionRecord {
+        id: uuid::Uuid::new_v4().to_string(),
+        decision: decision.to_string(),
+        rationale: rationale.to_string(),
+        alternatives: alternatives
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        context: context.and_then(|s| {
+            let trimmed = s.trim().to_string();
+            (!trimmed.is_empty()).then_some(trimmed)
+        }),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+    };
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|e| IpcError::Internal(format!("Failed to open decisions log: {e}")))?;
+    let line = serde_json::to_string(&record)
+        .map_err(|e| IpcError::Internal(format!("Failed to encode decision: {e}")))?;
+    writeln!(file, "{line}")
+        .map_err(|e| IpcError::Internal(format!("Failed to write decision: {e}")))?;
+
+    Ok(json!(record))
 }
 
 #[tauri::command]
 pub async fn clear_decisions(
-    _state: tauri::State<'_, TauriState>,
+    state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
-    Ok(serde_json::json!({"success": true, "cleared": 0}))
+    let root = workspace_state_root(&state).await?;
+    WorkspaceLayout::ensure_dirs(&root).map_err(|e| IpcError::Internal(e.to_string()))?;
+    let path = WorkspaceLayout::decisions(&root);
+    std::fs::write(&path, "")
+        .map_err(|e| IpcError::Internal(format!("Failed to clear decisions: {e}")))?;
+    Ok(json!({"cleared": true}))
 }
 
 // ════════════════════════════════════════════════════════════════════════════
 // Evolution
 // ════════════════════════════════════════════════════════════════════════════
 
+fn curator_status_json(status: echo_agent::improve::CuratorStatus) -> serde_json::Value {
+    json!({
+        "total": status.total,
+        "candidate": status.candidate,
+        "draft": status.draft,
+        "active": status.active,
+        "stale": status.stale,
+        "deprecated": status.deprecated,
+        "archived": status.archived,
+        "pinned": status.pinned,
+        "last_run_at": status.last_run_at,
+    })
+}
+
 #[tauri::command]
 pub async fn get_trajectories(
     _state: tauri::State<'_, TauriState>,
-    _date: Option<String>,
+    date: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    Ok(serde_json::json!([]))
+    let saver = echo_agent::improve::TrajectorySaver::default_dir()
+        .map_err(|e| IpcError::Internal(e.to_string()))?;
+    let trajectories = saver
+        .list(date.as_deref())
+        .await
+        .map_err(|e| IpcError::Internal(e.to_string()))?;
+    Ok(json!({
+        "count": trajectories.len(),
+        "trajectories": trajectories,
+    }))
 }
 
 #[tauri::command]
 pub async fn get_trajectory_stats(
     _state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
-    Ok(serde_json::json!({
-        "total_trajectories": 0,
-        "approved": 0,
-        "pending": 0,
-    }))
+    let saver = echo_agent::improve::TrajectorySaver::default_dir()
+        .map_err(|e| IpcError::Internal(e.to_string()))?;
+    let stats = saver
+        .stats()
+        .await
+        .map_err(|e| IpcError::Internal(e.to_string()))?;
+    Ok(json!({ "stats": stats }))
 }
 
 #[tauri::command]
 pub async fn review_trajectory(
-    _state: tauri::State<'_, TauriState>,
-    trajectory_id: String,
+    state: tauri::State<'_, TauriState>,
+    trajectory_id: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    Ok(serde_json::json!({
-        "trajectory_id": trajectory_id,
-        "status": "not_found",
+    let agent = state.app_state.connection.primary_agent();
+    let (llm_client, memory_store, run_store) = agent
+        .read(|a| {
+            (
+                a.llm_client().cloned(),
+                a.store().cloned(),
+                a.run_store().cloned(),
+            )
+        })
+        .await;
+
+    let llm_client = llm_client
+        .ok_or_else(|| IpcError::Internal("No LLM client available for review".into()))?;
+    let run_store =
+        run_store.ok_or_else(|| IpcError::Internal("No run store configured".into()))?;
+
+    let run_id = match trajectory_id {
+        Some(id) if !id.trim().is_empty() => id,
+        _ => {
+            let runs = run_store
+                .list_all(1)
+                .await
+                .map_err(|e| IpcError::Internal(e.to_string()))?;
+            runs.first()
+                .map(|r| r.run_id.clone())
+                .ok_or_else(|| IpcError::NotFound("No runs to review".into()))?
+        }
+    };
+
+    let reviewer = echo_agent::evolution::BackgroundReviewer::new(
+        echo_agent::evolution::BackgroundReviewConfig::default(),
+        llm_client,
+        memory_store.clone(),
+        Some(run_store),
+    );
+    let reviewer = if let Some(store) = memory_store {
+        let review_integration = state
+            .app_state
+            .review_integration
+            .clone()
+            .unwrap_or_else(|| {
+                std::sync::Arc::new(echo_agent_app_core::evolution::ReviewIntegration::new(
+                    echo_agent::evolution::ReviewConfig::default(),
+                    echo_agent_app_core::evolution::discover_echo_agent_dir(),
+                    store,
+                ))
+            });
+        reviewer.with_layer_manager(std::sync::Arc::new(
+            review_integration
+                .create_layer_manager()
+                .with_write_observer(review_integration.clone()),
+        ))
+    } else {
+        reviewer
+    };
+    let handle = reviewer
+        .review_by_run_id(&run_id)
+        .map_err(|e| IpcError::Internal(e.to_string()))?;
+    let outcome = handle
+        .await
+        .map_err(|e| IpcError::Internal(format!("Background review task failed to join: {e}")))?;
+    Ok(json!({
+        "success": outcome.error.is_none(),
+        "run_id": outcome.run_id,
+        "actions": outcome.actions,
+        "nothing_to_save": outcome.nothing_to_save,
+        "error": outcome.error,
     }))
 }
 
@@ -764,12 +1245,63 @@ pub async fn review_trajectory(
 pub async fn curator_action(
     _state: tauri::State<'_, TauriState>,
     action: String,
-    _skill_name: Option<String>,
+    skill_name: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    Ok(serde_json::json!({
-        "success": true,
-        "action": action,
-    }))
+    let curator =
+        echo_agent::improve::Curator::default_path(echo_agent::improve::CuratorConfig::default());
+
+    match action.as_str() {
+        "status" => Ok(json!({
+            "success": true,
+            "status": curator_status_json(curator.status()),
+        })),
+        "run" => {
+            let transitions = curator
+                .apply_transitions()
+                .map_err(|e| IpcError::Internal(e.to_string()))?;
+            let transition_values: Vec<serde_json::Value> = transitions
+                .iter()
+                .map(|(skill, from, to)| {
+                    json!({
+                        "skill": skill,
+                        "from": format!("{from:?}"),
+                        "to": format!("{to:?}"),
+                    })
+                })
+                .collect();
+            Ok(json!({
+                "success": true,
+                "transitions": transition_values,
+                "count": transitions.len(),
+                "status": curator_status_json(curator.status()),
+            }))
+        }
+        "pin" => {
+            let name = skill_name
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| IpcError::Validation("skill_name is required for pin".into()))?;
+            curator
+                .pin_skill(&name)
+                .map_err(|e| IpcError::Internal(e.to_string()))?;
+            Ok(
+                json!({"success": true, "pinned": name, "status": curator_status_json(curator.status())}),
+            )
+        }
+        "unpin" => {
+            let name = skill_name
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| IpcError::Validation("skill_name is required for unpin".into()))?;
+            curator
+                .unpin_skill(&name)
+                .map_err(|e| IpcError::Internal(e.to_string()))?;
+            Ok(
+                json!({"success": true, "unpinned": name, "status": curator_status_json(curator.status())}),
+            )
+        }
+        _ => Err(IpcError::Validation(format!(
+            "Unknown curator action '{action}'. Valid: status, run, pin, unpin"
+        ))),
+    }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -836,31 +1368,265 @@ pub async fn respond_human_gate(
 // Worktree
 // ════════════════════════════════════════════════════════════════════════════
 
+#[derive(Debug, Clone, Serialize)]
+struct WorktreeInfo {
+    path: String,
+    branch: String,
+    managed: bool,
+    head: String,
+}
+
+async fn workspace_project_root(state: &TauriState) -> Result<PathBuf, IpcError> {
+    if let Some(ws) = state.app_state.current_workspace().await {
+        Ok(ws.project_root.unwrap_or(ws.root))
+    } else {
+        std::env::current_dir()
+            .map_err(|e| IpcError::Internal(format!("Failed to resolve current directory: {e}")))
+    }
+}
+
+fn run_git(repo: &Path, args: &[&str]) -> Result<String, IpcError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .map_err(|e| IpcError::Internal(format!("Failed to run git: {e}")))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(IpcError::Validation(if stderr.is_empty() {
+            format!("git {:?} failed", args)
+        } else {
+            stderr
+        }))
+    }
+}
+
+fn git_repo_root(start: &Path) -> Result<PathBuf, IpcError> {
+    let root = run_git(start, &["rev-parse", "--show-toplevel"])?;
+    Ok(PathBuf::from(root))
+}
+
+fn parse_worktree_list(output: &str, repo_root: &Path) -> Vec<WorktreeInfo> {
+    let canonical_repo = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.to_path_buf());
+    let mut items = Vec::new();
+    let mut current_path: Option<PathBuf> = None;
+    let mut current_head = String::new();
+    let mut current_branch = String::new();
+
+    let flush = |items: &mut Vec<WorktreeInfo>,
+                 path: &mut Option<PathBuf>,
+                 head: &mut String,
+                 branch: &mut String| {
+        let Some(path_buf) = path.take() else {
+            return;
+        };
+        let canonical = path_buf.canonicalize().unwrap_or_else(|_| path_buf.clone());
+        let display_branch = if branch.is_empty() {
+            "(detached)".to_string()
+        } else {
+            branch
+                .strip_prefix("refs/heads/")
+                .unwrap_or(branch.as_str())
+                .to_string()
+        };
+        items.push(WorktreeInfo {
+            path: path_buf.to_string_lossy().to_string(),
+            branch: display_branch,
+            managed: canonical != canonical_repo,
+            head: head.chars().take(12).collect(),
+        });
+        head.clear();
+        branch.clear();
+    };
+
+    for line in output.lines() {
+        if line.trim().is_empty() {
+            flush(
+                &mut items,
+                &mut current_path,
+                &mut current_head,
+                &mut current_branch,
+            );
+            continue;
+        }
+        if let Some(path) = line.strip_prefix("worktree ") {
+            flush(
+                &mut items,
+                &mut current_path,
+                &mut current_head,
+                &mut current_branch,
+            );
+            current_path = Some(PathBuf::from(path));
+        } else if let Some(head) = line.strip_prefix("HEAD ") {
+            current_head = head.to_string();
+        } else if let Some(branch) = line.strip_prefix("branch ") {
+            current_branch = branch.to_string();
+        }
+    }
+    flush(
+        &mut items,
+        &mut current_path,
+        &mut current_head,
+        &mut current_branch,
+    );
+    items
+}
+
+fn validate_branch_name(repo: &Path, branch: &str) -> Result<(), IpcError> {
+    if branch.trim().is_empty() {
+        return Err(IpcError::Validation("Branch name cannot be empty".into()));
+    }
+    if branch.starts_with('-') || branch.chars().any(char::is_whitespace) {
+        return Err(IpcError::Validation(
+            "Branch name cannot start with '-' or contain whitespace".into(),
+        ));
+    }
+    run_git(repo, &["check-ref-format", "--branch", branch]).map(|_| ())
+}
+
+fn default_worktree_path(repo_root: &Path, branch: &str) -> Result<PathBuf, IpcError> {
+    let parent = repo_root
+        .parent()
+        .ok_or_else(|| IpcError::Validation("Repository root has no parent directory".into()))?;
+    let repo_name = repo_root
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "worktree".to_string());
+    let safe_branch: String = branch
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    Ok(parent.join(format!("{repo_name}-{safe_branch}")))
+}
+
+fn validate_worktree_target(repo_root: &Path, target: &Path) -> Result<(), IpcError> {
+    let repo_parent = repo_root
+        .parent()
+        .ok_or_else(|| IpcError::Validation("Repository root has no parent directory".into()))?
+        .canonicalize()
+        .map_err(|e| IpcError::Validation(format!("Cannot resolve repository parent: {e}")))?;
+    let target_parent = target
+        .parent()
+        .ok_or_else(|| IpcError::Validation("Worktree path has no parent directory".into()))?;
+    let canonical_parent = target_parent
+        .canonicalize()
+        .map_err(|e| IpcError::Validation(format!("Cannot resolve worktree parent: {e}")))?;
+    if !canonical_parent.starts_with(&repo_parent) {
+        return Err(IpcError::Validation(format!(
+            "Worktree path must stay under repository parent: {}",
+            repo_parent.display()
+        )));
+    }
+    if target.exists() {
+        return Err(IpcError::Validation(format!(
+            "Worktree path already exists: {}",
+            target.display()
+        )));
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn list_worktrees(
-    _state: tauri::State<'_, TauriState>,
+    state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
-    Ok(serde_json::json!([]))
+    let start = workspace_project_root(&state).await?;
+    let repo_root = git_repo_root(&start)?;
+    let output = run_git(&repo_root, &["worktree", "list", "--porcelain"])?;
+    Ok(json!(parse_worktree_list(&output, &repo_root)))
 }
 
 #[tauri::command]
 pub async fn create_worktree(
-    _state: tauri::State<'_, TauriState>,
+    state: tauri::State<'_, TauriState>,
     branch: String,
-    _path: Option<String>,
+    base: Option<String>,
+    path: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    Ok(serde_json::json!({
-        "success": true,
-        "branch": branch,
-    }))
+    let start = workspace_project_root(&state).await?;
+    let repo_root = git_repo_root(&start)?;
+    let branch = branch.trim().to_string();
+    validate_branch_name(&repo_root, &branch)?;
+
+    let target = path
+        .filter(|p| !p.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or(default_worktree_path(&repo_root, &branch)?);
+    validate_worktree_target(&repo_root, &target)?;
+
+    let base_ref = base
+        .and_then(|s| {
+            let trimmed = s.trim().to_string();
+            (!trimmed.is_empty()).then_some(trimmed)
+        })
+        .unwrap_or_else(|| "HEAD".to_string());
+    let target_str = target.to_string_lossy().to_string();
+    run_git(
+        &repo_root,
+        &["worktree", "add", "-b", &branch, &target_str, &base_ref],
+    )?;
+
+    let output = run_git(&repo_root, &["worktree", "list", "--porcelain"])?;
+    parse_worktree_list(&output, &repo_root)
+        .into_iter()
+        .find(|wt| wt.path == target_str)
+        .map(|wt| json!(wt))
+        .ok_or_else(|| IpcError::Internal("Created worktree was not found in git output".into()))
 }
 
 #[tauri::command]
 pub async fn remove_worktree(
-    _state: tauri::State<'_, TauriState>,
-    _path: String,
+    state: tauri::State<'_, TauriState>,
+    path: String,
 ) -> Result<serde_json::Value, IpcError> {
-    Ok(serde_json::json!({"success": true}))
+    let start = workspace_project_root(&state).await?;
+    let repo_root = git_repo_root(&start)?;
+    let target = PathBuf::from(path.trim());
+    if target.as_os_str().is_empty() {
+        return Err(IpcError::Validation("Worktree path cannot be empty".into()));
+    }
+
+    let canonical_repo = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.clone());
+    let canonical_target = target
+        .canonicalize()
+        .map_err(|e| IpcError::Validation(format!("Cannot resolve worktree path: {e}")))?;
+    if canonical_target == canonical_repo {
+        return Err(IpcError::Validation(
+            "Refusing to remove the primary repository worktree".into(),
+        ));
+    }
+
+    let output = run_git(&repo_root, &["worktree", "list", "--porcelain"])?;
+    let known = parse_worktree_list(&output, &repo_root)
+        .into_iter()
+        .any(|wt| {
+            PathBuf::from(wt.path)
+                .canonicalize()
+                .map(|p| p == canonical_target)
+                .unwrap_or(false)
+        });
+    if !known {
+        return Err(IpcError::Validation(
+            "Path is not a registered git worktree".into(),
+        ));
+    }
+
+    let target_str = target.to_string_lossy().to_string();
+    run_git(&repo_root, &["worktree", "remove", &target_str])?;
+    Ok(json!({"success": true}))
 }
 
 // ════════════════════════════════════════════════════════════════════════════

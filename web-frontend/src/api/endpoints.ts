@@ -38,6 +38,44 @@ import type {
   SwitchModelResponse,
 } from '../types/api';
 
+type LoadSkillsResponse = {
+  success: boolean;
+  loaded?: string[];
+  count?: number;
+  skills?: SkillInfo[];
+};
+
+export interface AutoMemoryObservation {
+  category: 'Project' | 'User' | 'Bug' | 'Decision' | 'FilePath';
+  text: string;
+  confidence: number;
+  source_turn?: number;
+}
+
+export interface AutoMemoryStatus {
+  enabled: boolean;
+  observation_count: number;
+  config: {
+    enabled: boolean;
+    min_confidence: number;
+    max_per_session: number;
+    categories: string[];
+  };
+  memory_path?: string;
+}
+
+export interface AutoMemoryPreview {
+  observations: AutoMemoryObservation[];
+  count: number;
+  formatted: string;
+}
+
+export interface AutoMemoryExtractResult extends AutoMemoryPreview {
+  success: boolean;
+  memory_path?: string;
+  message?: string;
+}
+
 export const sessionApi = {
   get: () => (isTauri() ? apiInvoke<SessionInfo>('get_session') : get<SessionInfo>('/session')),
   reset: () =>
@@ -116,11 +154,11 @@ export const skillsApi = {
     isTauri() ? apiInvoke<SkillInfo>('get_skill', { name }) : get<SkillInfo>(`/skills/${name}`),
   load: (dir: string) =>
     isTauri()
-      ? apiInvoke<{ success: boolean }>('load_skill', { name: dir })
-      : post<{ success: boolean }>('/skills/load', { dir }),
+      ? apiInvoke<LoadSkillsResponse>('load_skill', { name: dir })
+      : post<LoadSkillsResponse>('/skills/load', { dir }),
   upload: (rootDir: string, files: { path: string; content: string }[]) =>
     isTauri()
-      ? apiInvoke<{ message: string; loaded: string[]; skills: SkillInfo[] }>('upload_skill')
+      ? Promise.reject(new Error('Tauri 模式请使用“浏览”选择本地技能目录加载'))
       : post<{ message: string; loaded: string[]; skills: SkillInfo[] }>('/skills/upload', {
           root_dir: rootDir,
           files,
@@ -183,6 +221,25 @@ export const memoryApi = {
     isTauri()
       ? apiInvoke<NamespacesResponse>('list_namespaces')
       : get<NamespacesResponse>('/memory/namespaces'),
+};
+
+export const autoMemoryApi = {
+  status: () =>
+    isTauri()
+      ? apiInvoke<AutoMemoryStatus>('get_auto_memory_status')
+      : get<AutoMemoryStatus>('/auto-memory/status'),
+  toggle: (enabled: boolean) =>
+    isTauri()
+      ? apiInvoke<AutoMemoryStatus>('toggle_auto_memory', { enabled })
+      : post<AutoMemoryStatus>('/auto-memory/toggle', { enabled }),
+  preview: () =>
+    isTauri()
+      ? apiInvoke<AutoMemoryPreview>('get_auto_memory_observations')
+      : get<AutoMemoryPreview>('/auto-memory/observations'),
+  extract: () =>
+    isTauri()
+      ? apiInvoke<AutoMemoryExtractResult>('extract_auto_memory')
+      : post<AutoMemoryExtractResult>('/auto-memory/extract'),
 };
 
 export const configApi = {
@@ -659,7 +716,12 @@ export const decisionsApi = {
       : get<Decision[]>(`/decisions${limit ? `?limit=${limit}` : ''}`),
   create: (req: CreateDecisionRequest) =>
     isTauri()
-      ? apiInvoke<Decision>('create_decision', { title: req.decision, rationale: req.rationale })
+      ? apiInvoke<Decision>('create_decision', {
+          title: req.decision,
+          rationale: req.rationale,
+          alternatives: req.alternatives,
+          context: req.context,
+        })
       : post<Decision>('/decisions', req),
   clear: () =>
     isTauri()
@@ -959,12 +1021,16 @@ export interface WorktreeInfo {
 export const worktreeApi = {
   list: () =>
     isTauri() ? apiInvoke<WorktreeInfo[]>('list_worktrees') : get<WorktreeInfo[]>('/worktrees'),
-  create: (req: { branch: string; base?: string }) =>
+  create: (req: { branch: string; base?: string; path?: string }) =>
     isTauri()
-      ? apiInvoke<WorktreeInfo>('create_worktree', { branch: req.branch, path: req.base })
+      ? apiInvoke<WorktreeInfo>('create_worktree', {
+          branch: req.branch,
+          base: req.base,
+          path: req.path,
+        })
       : post<WorktreeInfo>('/worktrees', req),
-  remove: (branch: string) =>
+  remove: (path: string) =>
     isTauri()
-      ? apiInvoke<{ success: boolean }>('remove_worktree', { path: branch })
-      : del<{ success: boolean }>(`/worktrees?branch=${encodeURIComponent(branch)}`),
+      ? apiInvoke<{ success: boolean }>('remove_worktree', { path })
+      : del<{ success: boolean }>(`/worktrees?path=${encodeURIComponent(path)}`),
 };

@@ -25,7 +25,7 @@ interface ConversationState {
   isLoading: boolean;
 
   /** Initialize: load from backend */
-  init: () => void;
+  init: () => Promise<void>;
   /** Save current chat messages as a conversation (upsert) */
   saveCurrent: (messages: ChatMessage[]) => void;
   /** Load a conversation and display it */

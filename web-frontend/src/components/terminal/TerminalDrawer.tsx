@@ -4,6 +4,7 @@ import { useUiStore } from '../../stores/uiStore';
 import { Terminal } from '../terminal/Terminal';
 import { terminalApi } from '../../api/endpoints';
 import { isTauri, apiInvoke } from '../../lib/tauri-bridge';
+import { useToastStore } from '../../stores/toastStore';
 
 interface TerminalTab {
   id: string;
@@ -18,6 +19,7 @@ export function TerminalDrawer() {
   const [activeTabId, setActiveTabId] = useState<string | null>(null);
   const [height, setHeight] = useState(300);
   const [dragging, setDragging] = useState(false);
+  const addToast = useToastStore((s) => s.addToast);
 
   // Create initial terminal session on first open
   useEffect(() => {
@@ -33,8 +35,13 @@ export function TerminalDrawer() {
     if (isTauri()) {
       try {
         await apiInvoke('create_terminal', { id: newId, rows: 24, cols: 80 });
-      } catch (e) {
+      } catch (e: unknown) {
         console.error('Failed to create terminal via IPC:', e);
+        addToast(
+          'error',
+          `创建终端失败: ${e instanceof Error ? e.message : 'Unknown error'}`
+        );
+        return;
       }
     } else {
       try {
@@ -42,8 +49,13 @@ export function TerminalDrawer() {
         setTabs((prev) => [...prev, { id: session.id, label: newLabel }]);
         setActiveTabId(session.id);
         return;
-      } catch (e) {
+      } catch (e: unknown) {
         console.error('Failed to create terminal session:', e);
+        addToast(
+          'error',
+          `创建终端失败: ${e instanceof Error ? e.message : 'Unknown error'}`
+        );
+        return;
       }
     }
 

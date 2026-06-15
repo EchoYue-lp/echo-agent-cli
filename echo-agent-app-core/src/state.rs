@@ -424,6 +424,8 @@ pub struct AppState {
     pub workspace: WorkspaceState,
     /// Skills Hub（本地技能市场）
     pub skills_hub: Arc<RwLock<crate::skills_hub::SkillsHub>>,
+    /// Shared memory review integration for GUI/IPC paths that write real memory.
+    pub review_integration: Option<Arc<crate::evolution::ReviewIntegration>>,
 }
 
 impl AppState {
@@ -481,9 +483,12 @@ impl AppState {
                 persistence: RwLock::new(Persistence::new()),
                 search_engine: crate::sessions::SessionSearchEngine::new().unwrap_or_else(|e| {
                     tracing::warn!("Failed to init search engine: {e}, creating empty");
-                    // Fallback: create an in-memory engine that won't persist
+                    // Fallback: create an in-memory engine that won't persist.
+                    // SAFETY: new_in_memory constructs a pure in-memory SQLite FTS5 table;
+                    // it can only fail under extreme conditions (OOM), at which point the
+                    // process is already in an unrecoverable state.
                     crate::sessions::SessionSearchEngine::new_in_memory()
-                        .expect("in-memory FTS5 engine should always init")
+                        .expect("in-memory FTS5 engine should always init — OOM?")
                 }),
             },
             history: HistoryState {
@@ -515,7 +520,17 @@ impl AppState {
                 })),
             },
             skills_hub: Arc::new(RwLock::new(crate::skills_hub::SkillsHub::new())),
+            review_integration: None,
         }
+    }
+
+    /// Attach the shared review integration created during runtime bootstrap.
+    pub fn with_review_integration(
+        mut self,
+        review_integration: Option<Arc<crate::evolution::ReviewIntegration>>,
+    ) -> Self {
+        self.review_integration = review_integration;
+        self
     }
 
     /// Set the agent pool for multi-conversation parallel execution.

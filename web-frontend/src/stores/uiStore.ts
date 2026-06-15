@@ -10,6 +10,8 @@ export type SettingsTabId =
   | 'sessions'
   | 'permissions'
   | 'audit'
+  | 'scratchpad'
+  | 'decisions'
   | 'workflow'
   | 'sandbox'
   | 'compress'

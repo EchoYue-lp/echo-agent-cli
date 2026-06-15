@@ -1,7 +1,12 @@
 import { useEffect, useState } from 'react';
-import { memoryApi } from '../../api/endpoints';
+import {
+  autoMemoryApi,
+  memoryApi,
+  type AutoMemoryObservation,
+  type AutoMemoryStatus,
+} from '../../api/endpoints';
 import type { MemoryEntry } from '../../types/api';
-import { Brain, Plus, Search, Trash2 } from 'lucide-react';
+import { Brain, Loader2, Plus, Search, Sparkles, Trash2 } from 'lucide-react';
 
 export function MemoryPanel() {
   const [entries, setEntries] = useState<MemoryEntry[]>([]);
@@ -10,6 +15,10 @@ export function MemoryPanel() {
   const [searchQuery, setSearchQuery] = useState('');
   const [showAdd, setShowAdd] = useState(false);
   const [addForm, setAddForm] = useState({ namespace: 'default', key: '', value: '' });
+  const [autoStatus, setAutoStatus] = useState<AutoMemoryStatus | null>(null);
+  const [autoPreview, setAutoPreview] = useState<AutoMemoryObservation[]>([]);
+  const [autoBusy, setAutoBusy] = useState(false);
+  const [autoMessage, setAutoMessage] = useState<string | null>(null);
 
   useEffect(() => {
     memoryApi
@@ -17,7 +26,67 @@ export function MemoryPanel() {
       .then((data) => setNamespaces(data.namespaces.map((ns) => ns.join('/'))))
       .catch(console.error);
     loadEntries();
+    loadAutoMemoryStatus();
   }, []);
+
+  const loadAutoMemoryStatus = async () => {
+    try {
+      const status = await autoMemoryApi.status();
+      setAutoStatus(status);
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const toggleAutoMemory = async () => {
+    if (!autoStatus || autoBusy) return;
+    setAutoBusy(true);
+    setAutoMessage(null);
+    try {
+      const status = await autoMemoryApi.toggle(!autoStatus.enabled);
+      setAutoStatus(status);
+      if (!status.enabled) setAutoPreview([]);
+    } catch (e) {
+      setAutoMessage(e instanceof Error ? e.message : 'Auto Memory 更新失败');
+    } finally {
+      setAutoBusy(false);
+    }
+  };
+
+  const previewAutoMemory = async () => {
+    setAutoBusy(true);
+    setAutoMessage(null);
+    try {
+      const preview = await autoMemoryApi.preview();
+      setAutoPreview(preview.observations);
+      setAutoMessage(preview.count === 0 ? '当前会话没有可提取观察' : null);
+      await loadAutoMemoryStatus();
+    } catch (e) {
+      setAutoMessage(e instanceof Error ? e.message : 'Auto Memory 预览失败');
+    } finally {
+      setAutoBusy(false);
+    }
+  };
+
+  const extractAutoMemory = async () => {
+    setAutoBusy(true);
+    setAutoMessage(null);
+    try {
+      const result = await autoMemoryApi.extract();
+      setAutoPreview(result.observations);
+      setAutoMessage(
+        result.success
+          ? `已保存 ${result.count} 条观察`
+          : result.message || 'Auto Memory 未保存'
+      );
+      await loadAutoMemoryStatus();
+      await loadEntries(selectedNs || undefined);
+    } catch (e) {
+      setAutoMessage(e instanceof Error ? e.message : 'Auto Memory 提取失败');
+    } finally {
+      setAutoBusy(false);
+    }
+  };
 
   const loadEntries = async (ns?: string) => {
     try {
@@ -100,6 +169,85 @@ export function MemoryPanel() {
         >
           <Plus size={16} />
         </button>
+      </div>
+
+      <div className="rounded-lg border p-3" style={{ borderColor: s.border, background: s.bg }}>
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex min-w-0 items-center gap-2">
+            <Sparkles size={14} style={{ color: s.accent }} />
+            <div className="min-w-0">
+              <div className="text-xs font-medium" style={{ color: s.text }}>
+                Auto Memory
+              </div>
+              <div className="truncate text-[11px]" style={{ color: s.textTer }}>
+                候选 {autoStatus?.observation_count ?? 0} · 阈值{' '}
+                {Math.round((autoStatus?.config.min_confidence ?? 0.7) * 100)}%
+              </div>
+            </div>
+          </div>
+          <button
+            onClick={toggleAutoMemory}
+            disabled={!autoStatus || autoBusy}
+            className="rounded-full px-2 py-1 text-[11px] font-medium transition-colors disabled:opacity-50"
+            style={{
+              background: autoStatus?.enabled ? 'var(--color-success-bg)' : s.bgHover,
+              color: autoStatus?.enabled ? 'var(--color-success)' : s.textSec,
+            }}
+          >
+            {autoStatus?.enabled ? 'ON' : 'OFF'}
+          </button>
+        </div>
+
+        <div className="mt-3 flex items-center gap-2">
+          <button
+            onClick={previewAutoMemory}
+            disabled={autoBusy}
+            className="flex items-center gap-1 rounded-lg px-2 py-1 text-xs transition-colors disabled:opacity-50"
+            style={{ background: s.bgHover, color: s.textSec }}
+          >
+            {autoBusy ? <Loader2 size={12} className="animate-spin" /> : <Search size={12} />}
+            预览
+          </button>
+          <button
+            onClick={extractAutoMemory}
+            disabled={autoBusy || autoStatus?.enabled === false}
+            className="flex items-center gap-1 rounded-lg px-2 py-1 text-xs font-medium text-white transition-colors disabled:opacity-50"
+            style={{ background: s.accent }}
+          >
+            {autoBusy ? <Loader2 size={12} className="animate-spin" /> : <Sparkles size={12} />}
+            提取
+          </button>
+        </div>
+
+        {autoMessage && (
+          <div className="mt-2 text-[11px]" style={{ color: s.textTer }}>
+            {autoMessage}
+          </div>
+        )}
+
+        {autoPreview.length > 0 && (
+          <div className="mt-3 max-h-40 space-y-2 overflow-auto">
+            {autoPreview.map((obs, idx) => (
+              <div
+                key={`${obs.category}-${obs.source_turn ?? idx}-${idx}`}
+                className="rounded-md border px-2 py-1.5"
+                style={{ borderColor: s.border, background: s.bgHover }}
+              >
+                <div className="mb-1 flex items-center justify-between gap-2">
+                  <span className="text-[10px] font-medium" style={{ color: s.accent }}>
+                    {obs.category}
+                  </span>
+                  <span className="text-[10px]" style={{ color: s.textTer }}>
+                    {Math.round(obs.confidence * 100)}%
+                  </span>
+                </div>
+                <div className="text-[11px]" style={{ color: s.textSec }}>
+                  {obs.text}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
       <select

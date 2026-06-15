@@ -275,12 +275,15 @@ pub async fn run_event_loop(
                 }
                 AgentEvent::ThinkEnd {
                     prompt_tokens,
-                    completion_tokens: _,
+                    completion_tokens,
                 } => {
-                    // Record token usage for the round summary
-                    let _ = prompt_tokens; // store if needed for stats
+                    // Accumulate token usage for stats display
+                    app.tokens.0 = app.tokens.0.saturating_add(prompt_tokens as u32);
+                    app.tokens.1 = app.tokens.1.saturating_add(completion_tokens as u32);
+                    app.tokens.2 += 1; // request count
                 }
-                AgentEvent::ToolBatchStart { tool_count: _ } => {
+                AgentEvent::ToolBatchStart { tool_count } => {
+                    tracing::debug!(tool_count, "TUI tool batch started");
                     // Round boundary — current thinking phase is done, tools follow
                 }
                 AgentEvent::ToolBatchEnd => {
@@ -714,22 +717,41 @@ async fn send_to_agent(
 ) {
     use echo_agent::agent::Agent;
     use futures::StreamExt;
+    use tokio::sync::oneshot;
 
     let inner = agent.inner().clone();
+    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+
     tokio::spawn(async move {
-        // Spawn task that owns the message string for the stream's lifetime
         let (tx, mut rx) = mpsc::unbounded_channel();
         let message = text;
 
+        // Inner task: runs the LLM stream with a cancellation signal so that
+        // when the outer forwarding loop exits (UI quit, channel error), the
+        // RwLock read guard is released promptly instead of being held until
+        // the LLM produces its next token.
         tokio::spawn(async move {
-            // The RwLock read guard must be held for the entire stream lifetime
-            // because chat_stream returns BoxStream<'a> that borrows from &'a self.
             let guard = inner.read().await;
             match guard.chat_stream(&message).await {
                 Ok(mut stream) => {
-                    while let Some(event) = stream.next().await {
-                        if tx.send(event).is_err() {
-                            break;
+                    tokio::pin!(let cancel_rx = cancel_rx;);
+                    loop {
+                        tokio::select! {
+                            _ = &mut cancel_rx => {
+                                // Outer task dropped the oneshot sender —
+                                // UI is gone, release the lock immediately.
+                                break;
+                            }
+                            next = stream.next() => {
+                                match next {
+                                    Some(event) => {
+                                        if tx.send(event).is_err() {
+                                            break;
+                                        }
+                                    }
+                                    None => break,
+                                }
+                            }
                         }
                     }
                 }
@@ -737,6 +759,7 @@ async fn send_to_agent(
                     let _ = tx.send(Err(e));
                 }
             }
+            // guard dropped here — RwLock released
         });
 
         // Forward events from inner task to UI
@@ -783,15 +806,18 @@ async fn send_to_agent(
                 Ok(_) => {} // Ignore other event types (GuardTriggered, MemoryRecalled, etc.)
                 Err(e) => {
                     let _ = agent_tx.send(AgentEvent::Error(e.to_string()));
-                    got_final = true; // Error also resets is_processing
+                    got_final = true;
                     break;
                 }
             }
         }
 
-        // If the inner task ended without FinalAnswer or Error (e.g. channel
-        // dropped, LLM stream ended abnormally), send a fallback error so the
-        // UI resets is_processing and the user can send another message.
+        // Signal the inner task to stop (drop the oneshot sender).
+        // If rx.recv() returned None (tx dropped), or agent_tx.send() failed,
+        // or we got a FinalAnswer/Error, the inner task should stop holding
+        // the agent lock.
+        drop(cancel_tx);
+
         if !got_final {
             let _ = agent_tx.send(AgentEvent::Error(
                 "Agent stream ended unexpectedly. Please try again.".to_string(),
@@ -959,6 +985,89 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &AgentHandle, cmd: &str) 
         }
         Some(SlashCommand::Quit) | Some(SlashCommand::Exit) => {
             app.should_quit = true;
+        }
+        Some(SlashCommand::MemoryReview) => {
+            // Create ReviewIntegration on-the-fly from the agent's store
+            let store = agent.read(|a| a.store().cloned()).await;
+            match store {
+                Some(store) => {
+                    let echo_agent_dir = echo_agent_app_core::evolution::discover_echo_agent_dir();
+                    let review_integration = echo_agent_app_core::evolution::ReviewIntegration::new(
+                        echo_agent::evolution::ReviewConfig::default(),
+                        echo_agent_dir,
+                        store,
+                    );
+
+                    app.messages.push(ChatMessage {
+                        role: MessageRole::System,
+                        content: "📋 Running memory review...".to_string(),
+                    });
+
+                    match review_integration.run_review().await {
+                        Ok(report) => {
+                            let formatted =
+                                echo_agent_app_core::evolution::format_review_report(&report);
+                            app.messages.push(ChatMessage {
+                                role: MessageRole::System,
+                                content: formatted,
+                            });
+                        }
+                        Err(e) => {
+                            app.messages.push(ChatMessage {
+                                role: MessageRole::System,
+                                content: format!("Memory review failed: {e}"),
+                            });
+                        }
+                    }
+                }
+                None => {
+                    app.messages.push(ChatMessage {
+                        role: MessageRole::System,
+                        content: "No memory store configured. Cannot run memory review."
+                            .to_string(),
+                    });
+                }
+            }
+        }
+        Some(SlashCommand::SkillCandidates) => {
+            // List candidates and drafts from Curator state
+            let curator = echo_agent::improve::Curator::default_path(
+                echo_agent::improve::CuratorConfig::default(),
+            );
+            let state = curator.load_state();
+            let items: Vec<_> = state
+                .skills
+                .iter()
+                .filter(|(_, m)| {
+                    matches!(
+                        m.lifecycle,
+                        echo_agent::improve::SkillLifecycle::Candidate
+                            | echo_agent::improve::SkillLifecycle::Draft
+                    )
+                })
+                .collect();
+
+            if items.is_empty() {
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: "No skill candidates or drafts found. Run /memory-review to detect patterns.".to_string(),
+                });
+            } else {
+                let mut content = String::from("🎯 Skill Candidates & Drafts:\n");
+                for (name, meta) in &items {
+                    let icon = match meta.lifecycle {
+                        echo_agent::improve::SkillLifecycle::Candidate => "🎯",
+                        echo_agent::improve::SkillLifecycle::Draft => "📝",
+                        _ => "  ",
+                    };
+                    content.push_str(&format!("  {} {} [{:?}]\n", icon, name, meta.lifecycle));
+                }
+                content.push_str("\nUse /skill-create <name> to generate a draft, /skill-promote <name> to activate.");
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content,
+                });
+            }
         }
         Some(SlashCommand::Status) => {
             app.messages.push(ChatMessage {

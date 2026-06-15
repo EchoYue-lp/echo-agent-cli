@@ -183,6 +183,9 @@ pub async fn run_repl(agent: AgentHandle, config: ReplConfig) -> anyhow::Result<
     // ── Reflection: summarize session learnings ─────────────────────
     run_reflection_on_exit(&agent).await;
 
+    // ── Memory review: staleness scoring, conflict detection, GC ────
+    run_memory_review_on_exit(&agent).await;
+
     Ok(())
 }
 
@@ -192,7 +195,7 @@ pub async fn run_repl(agent: AgentHandle, config: ReplConfig) -> anyhow::Result<
 async fn run_auto_memory_on_exit(agent: &AgentHandle) {
     use echo_agent_app_core::auto_memory::{
         AutoMemoryConfig, append_to_project_memory, extract_observations,
-        format_observations_for_memory,
+        format_observations_for_memory, write_observations_to_memory_layer,
     };
 
     // Check if auto-memory is enabled (shared with /auto-memory command)
@@ -236,11 +239,22 @@ async fn run_auto_memory_on_exit(agent: &AgentHandle) {
     let count = observations.len();
     let formatted = format_observations_for_memory(&observations);
 
+    let typed_written = match agent.read(|a| a.store().cloned()).await {
+        Some(store) => match write_observations_to_memory_layer(&observations, store, None).await {
+            Ok(count) => count,
+            Err(e) => {
+                println!("  Auto-memory: failed to save typed memory ({})", e);
+                0
+            }
+        },
+        None => 0,
+    };
+
     match append_to_project_memory(&observations) {
         Ok(()) => {
             println!(
-                "  💾 Auto-memory: saved {} observation(s) to project memory.",
-                count
+                "  💾 Auto-memory: saved {} observation(s) to project memory, {} to typed memory.",
+                count, typed_written
             );
             // Print a brief summary of what was saved
             for line in formatted.lines().take(8) {
@@ -323,6 +337,46 @@ async fn run_reflection_on_exit(agent: &AgentHandle) {
         use std::io::Write;
         let _ = file.write_all(entry.as_bytes());
         println!("  🪞 Reflection saved to {}", memory_file.display());
+    }
+}
+
+/// Run memory review when the session ends.
+///
+/// Performs staleness scoring, conflict detection, merge, and archival
+/// on typed memories. Non-blocking: errors are silently ignored to avoid
+/// disrupting exit flow.
+async fn run_memory_review_on_exit(agent: &AgentHandle) {
+    let store = agent.read(|a| a.store().cloned()).await;
+    let Some(store) = store else {
+        return;
+    };
+
+    let echo_agent_dir = echo_agent_app_core::evolution::discover_echo_agent_dir();
+    let review_integration = echo_agent_app_core::evolution::ReviewIntegration::new(
+        echo_agent::evolution::ReviewConfig::default(),
+        echo_agent_dir,
+        store,
+    );
+
+    if let Some(review_result) = review_integration.on_session_end().await {
+        match review_result {
+            Ok(report) => {
+                let count = report.total_scanned;
+                if count > 0 {
+                    println!(
+                        "  📋 Memory review: {} scanned, {} stale, {} conflicts, {} merged, {} archived",
+                        count,
+                        report.stale_count,
+                        report.conflict_groups,
+                        report.merges_applied,
+                        report.archives_applied
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!("  ⚠ Memory review failed: {e}");
+            }
+        }
     }
 }
 

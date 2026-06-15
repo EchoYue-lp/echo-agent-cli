@@ -63,16 +63,17 @@ impl Widget for Sidebar {
     }
 }
 
-fn render_file_tree(f: &mut Frame, area: Rect, t: &Theme) {
+fn render_file_tree(_f: &mut Frame, area: Rect, t: &Theme) {
     let hint = Style::default()
         .fg(t.overlay0)
         .add_modifier(Modifier::ITALIC);
     let items = vec![ListItem::new(Line::from(vec![Span::styled(
-        "  No project loaded\n  Press /workspace to open",
+        "  Project files will appear\n  here once a workspace\n  is loaded via /project",
         hint,
     )]))];
     let list = List::new(items);
-    f.render_widget(list, area);
+    // safe: ratatui requires a mutable Frame ref
+    _f.render_widget(list, area);
 }
 
 fn render_tools_list(f: &mut Frame, app: &TuiApp, area: Rect, t: &Theme) {
@@ -101,7 +102,7 @@ fn render_tools_list(f: &mut Frame, app: &TuiApp, area: Rect, t: &Theme) {
         vec![
             header,
             ListItem::new(Line::from(vec![Span::styled(
-                "    Tool list available via API",
+                format!("    {} tools available. Use /tools", app.tool_count),
                 Style::default()
                     .fg(t.overlay0)
                     .add_modifier(Modifier::ITALIC),
@@ -113,7 +114,7 @@ fn render_tools_list(f: &mut Frame, app: &TuiApp, area: Rect, t: &Theme) {
     f.render_widget(list, area);
 }
 
-fn render_tasks_list(f: &mut Frame, app: &TuiApp, area: Rect, t: &Theme) {
+fn render_tasks_list(_f: &mut Frame, app: &TuiApp, area: Rect, t: &Theme) {
     let header = ListItem::new(Line::from(vec![Span::styled(
         format!("  {} Active Tasks", "\u{1f4cb}"),
         Style::default().fg(t.cyan).add_modifier(Modifier::BOLD),
@@ -126,7 +127,7 @@ fn render_tasks_list(f: &mut Frame, app: &TuiApp, area: Rect, t: &Theme) {
         ]))
     } else {
         ListItem::new(Line::from(vec![Span::styled(
-            format!("    {} No active tasks", "\u{25cb}"),
+            format!("    {} No active background tasks", "\u{25cb}"),
             Style::default()
                 .fg(t.overlay0)
                 .add_modifier(Modifier::ITALIC),
@@ -134,5 +135,5 @@ fn render_tasks_list(f: &mut Frame, app: &TuiApp, area: Rect, t: &Theme) {
     };
 
     let list = List::new(vec![header, task_item]);
-    f.render_widget(list, area);
+    _f.render_widget(list, area);
 }

@@ -3,7 +3,7 @@
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
 use echo_agent::memory::{NewConversation, StoredMessage};
-use echo_agent_app_core::persistence::{AttachmentsPayload, SavedExecutionStep, SavedMessage};
+use echo_agent_app_core::persistence::{AttachmentsPayload, SavedMessage};
 
 #[tauri::command]
 pub async fn list_conversations(

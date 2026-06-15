@@ -150,13 +150,19 @@ GUI 使用 Tauri 打包，包含两部分：
 - `web-frontend/`：React 前端，构建产物为 `web-frontend/dist`；
 - Rust GUI 运行时：由 `gui` feature 启用，并自动包含 `channels` 多通道能力，最终随 Tauri 一起打进桌面应用包。
 
-> **参数分隔符说明**：`cargo tauri dev/build` 的 feature 参数需要传给底层 Cargo，因此必须写在 `--` 后面。
+> `tauri.conf.json` 已配置 GUI runner；直接运行 `cargo tauri dev/build` 会使用 `echo-agent-tauri` 和 `gui` feature，不会落到默认 TUI binary。Tauri CLI 目前会把 Cargo 默认 feature 展开进日志，因此你可能看到 `--features gui,tui`；这是 Tauri CLI 的参数展开行为，不代表启动了 TUI 入口。日常 GUI 开发推荐使用 `.cargo/config.toml` 中的 `cargo gui-dev` alias。
 
 #### 开发运行
 
 ```bash
-# 启动前端 Vite 服务并打开 Tauri 窗口
-cargo tauri dev -- --no-default-features --features gui
+# 推荐：启动前端 Vite 服务并打开 Tauri 窗口，且显式禁用默认 tui feature
+cargo gui-dev
+
+# 等价的完整命令
+cargo tauri dev -- --no-default-features --features gui --bin echo-agent-tauri
+
+# 兼容入口：也会启动 GUI，但日志中可能出现 --features gui,tui
+cargo tauri dev
 ```
 
 #### 生产打包
@@ -165,8 +171,11 @@ cargo tauri dev -- --no-default-features --features gui
 # 首次需要安装 Tauri CLI
 npm install -g @tauri-apps/cli
 
-# 自动构建前端 + 编译 Release + 生成平台原生安装包
-cargo tauri build -- --no-default-features --features gui
+# 推荐：自动构建前端 + 编译 Release + 生成平台原生安装包
+cargo gui-bundle
+
+# 兼容入口：也会打包 GUI，但日志中可能出现 --features gui,tui
+cargo tauri build
 ```
 
 打包产物路径：
@@ -187,10 +196,14 @@ cargo tauri build -- --no-default-features --features gui
 如需单独调试 GUI 后端二进制，可手动构建前端后运行：
 
 ```bash
-cd web-frontend && npm run build && cd ..
+cd web-frontend && npm run build:tauri && cd ..
 
 cargo build --bin echo-agent-tauri --no-default-features --features gui --release
 cargo run --bin echo-agent-tauri --no-default-features --features gui
+
+# 或使用项目 alias
+cargo gui-build
+cargo gui-run
 ```
 
 裸可执行文件路径：`target/release/echo-agent-tauri`（Windows 为 `target/release/echo-agent-tauri.exe`）。
@@ -201,7 +214,15 @@ Tauri CLI 打包时会构建包名二进制 `echo-agent-cli`，项目已在 `--n
 
 `gui` feature 已依赖 `channels` feature，所以 GUI 打包命令无需额外写 `--features "gui,channels"`，多通道能力会随 GUI 一起编译进桌面应用。
 
-当前 Tauri CLI 的 lifecycle command 工作目录是 `src-tauri/`，所以 `tauri.conf.json` 中的前端命令写作 `cd ../web-frontend && npm run build`。
+当前 Tauri CLI 的 lifecycle command 工作目录是 `src-tauri/`，所以 `tauri.conf.json` 中的前端命令写作 `cd ../web-frontend && npm run dev:tauri` / `cd ../web-frontend && npm run build:tauri`。
+
+#### GUI 功能状态
+
+当前 GUI 已接真实 Tauri 后端的核心面板包括：聊天/会话、记忆、Auto Memory、工具、MCP、技能、模型供应商、权限/审计、压缩、定时任务、自进化、Trace、Terminal、Scratchpad、Decisions、Worktree。
+
+仍隐藏或不作为完整 GUI 功能暴露的面板包括：`workflow`（仅保存/删除，执行未接 IPC）、`sandbox`（仅配置可读写，执行未开放）、`extract`（仅 schema 校验，抽取逻辑建议通过 chat skill 使用）、`papers`（论文库 IPC 尚未实现）。
+
+更完整的 GUI 状态矩阵见 [docs/gui-status.md](docs/gui-status.md)。
 
 > **注意**：每个平台只能打包该平台原生的安装包。如需交叉编译请使用 CI/CD（如 GitHub Actions）。
 
@@ -550,6 +571,7 @@ workspaces/
 │       ├── papers/            # 论文文件
 │       ├── artifacts/         # 生成物
 │       ├── scratchpad.md      # 共享草稿
+│       ├── decisions.jsonl    # 决策日志
 │       └── workspace.json     # 工作区清单
 ```
 

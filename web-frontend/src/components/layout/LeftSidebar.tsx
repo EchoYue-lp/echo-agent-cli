@@ -55,6 +55,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<ConversationListItem[]>([]);
   const [isSearching, setIsSearching] = useState(false);
+  const [showAllConvs, setShowAllConvs] = useState(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
 
   // Debounced search across all conversation content
@@ -88,6 +89,10 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
       controller.abort();
     };
   }, [searchQuery]);
+
+  useEffect(() => {
+    setShowAllConvs(false);
+  }, [current?.id]);
 
   // Always filter workspace names; search results come from API when searching
   const filtered = searchQuery.trim()
@@ -141,10 +146,11 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
     return <Icon size={14} style={{ color: k.color }} />;
   };
 
-  // Recent conversations for the currently expanded workspace
-  // TODO: Filter by workspaceId once backend supports it
-  const recentConvs = current ? conversations.slice(0, MAX_RECENT_CONVERSATIONS) : [];
-  const hasMoreConvs = current && conversations.length > MAX_RECENT_CONVERSATIONS;
+  // Conversations are loaded from the active workspace-scoped store after switchWorkspace.
+  const visibleConvs = current
+    ? conversations.slice(0, showAllConvs ? conversations.length : MAX_RECENT_CONVERSATIONS)
+    : [];
+  const hasMoreConvs = current && !showAllConvs && conversations.length > MAX_RECENT_CONVERSATIONS;
 
   return (
     <div className="flex h-full flex-col bg-[var(--bg-sidebar)]">
@@ -342,20 +348,20 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
               {/* Expanded conversations */}
               {isExpanded && (
                 <div className="ml-7 border-l border-[var(--border-primary)] pl-2 pb-1">
-                  {isConvLoading && recentConvs.length === 0 && (
+                  {isConvLoading && visibleConvs.length === 0 && (
                     <div className="flex items-center gap-2 py-2 px-1">
                       <Loader2 size={12} className="animate-spin text-[var(--text-tertiary)]" />
                       <span className="text-[11px] text-[var(--text-tertiary)]">加载中...</span>
                     </div>
                   )}
 
-                  {!isConvLoading && recentConvs.length === 0 && (
+                  {!isConvLoading && visibleConvs.length === 0 && (
                     <div className="py-2 px-1 text-[11px] text-[var(--text-tertiary)]">
                       暂无对话，开始聊天吧
                     </div>
                   )}
 
-                  {recentConvs.map((conv) => (
+                  {visibleConvs.map((conv) => (
                     <div
                       key={conv.id}
                       className={`cursor-pointer rounded-md px-2 py-1.5 text-[12px] transition-colors
@@ -383,9 +389,16 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
 
                   {hasMoreConvs && (
                     <div className="mt-1 text-center">
-                      <span className="text-[11px] text-[var(--accent)] cursor-pointer hover:underline">
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setShowAllConvs(true);
+                        }}
+                        className="text-[11px] text-[var(--accent)] cursor-pointer hover:underline"
+                      >
                         查看更多 ({conversations.length - MAX_RECENT_CONVERSATIONS})...
-                      </span>
+                      </button>
                     </div>
                   )}
                 </div>

@@ -16,9 +16,11 @@ use std::sync::Arc;
 
 use crate::agent_handle::AgentHandle;
 use crate::config::AppConfig;
+use crate::evolution::ReviewIntegration;
 use crate::hitl::HitlDispatcher;
 use crate::infra::{self, AgentCreateParams};
 use crate::state::AppState;
+use echo_agent::evolution::ReviewConfig;
 use echo_agent::intent::{
     ChainedClassifier, KeywordClassifier, LlmIntentClassifier, SkillDescription,
 };
@@ -42,6 +44,10 @@ pub struct AgentRuntime {
     /// path which only saw a `None` value because the primary agent never had
     /// a state store wired in.
     pub state_store: Option<Arc<dyn echo_agent::state::RuntimeStateStore>>,
+    /// Memory review integration for staleness scoring, conflict detection,
+    /// and garbage collection. Created in bootstrap when a `Store` is available.
+    /// Used by `/memory-review` command and session-end review hooks.
+    pub review_integration: Option<Arc<ReviewIntegration>>,
 }
 
 impl AgentRuntime {
@@ -99,7 +105,8 @@ impl AgentRuntime {
         );
 
         // ── 1. Create Agent ──
-        let mut agent = infra::create_agent(&params, app_config);
+        let mut agent =
+            infra::create_agent(&params, app_config).map_err(|e| anyhow::anyhow!("{e}"))?;
 
         // ── 2. Load MCP ──
         infra::load_mcp_config(&mut agent, None, app_config).await;
@@ -184,6 +191,39 @@ impl AgentRuntime {
             unified_memory
         };
 
+        // ── 8b. Review integration — create when Store is available so
+        //       /memory-review and session-end hooks can access it. ──
+        let review_integration = agent_handle
+            .read(|a| a.store().cloned())
+            .await
+            .map(|store| {
+                let echo_agent_dir =
+                    crate::evolution::review_integration::discover_echo_agent_dir();
+                Arc::new(ReviewIntegration::new(
+                    ReviewConfig::default(),
+                    echo_agent_dir,
+                    store,
+                ))
+            });
+        if review_integration.is_some() {
+            tracing::info!("ReviewIntegration created for session");
+        }
+        if let Some(review_integration) = &review_integration {
+            let layer_manager = Arc::new(
+                review_integration
+                    .create_layer_manager()
+                    .with_write_observer(review_integration.clone()),
+            );
+            agent_handle
+                .write_async(|a| {
+                    Box::pin(async move {
+                        a.install_memory_layer_manager(layer_manager);
+                    })
+                })
+                .await;
+            tracing::info!("Layered memory tools installed on primary agent");
+        }
+
         // ── 9. Plugins ──
         load_plugins(&agent_handle).await;
 
@@ -263,6 +303,7 @@ impl AgentRuntime {
             task_hook_bridge: Some(Arc::new(task_hook_bridge)),
             subagent_hook_bridge: Some(subagent_hook_bridge),
             state_store,
+            review_integration,
         })
     }
 
@@ -278,7 +319,8 @@ impl AgentRuntime {
             self.hitl_dispatcher.clone(),
             conversation_store,
             self.app_config.clone(),
-        );
+        )
+        .with_review_integration(self.review_integration.clone());
         // Note: task_service and scheduler are started separately by the caller
         // because they need a Store which may be created differently per entry.
         state

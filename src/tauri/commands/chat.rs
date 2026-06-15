@@ -62,6 +62,15 @@ pub enum ChatEvent {
     },
     #[serde(rename = "input_request")]
     InputRequest { request_id: String, prompt: String },
+    #[serde(rename = "selection_request")]
+    SelectionRequest {
+        request_id: String,
+        prompt: String,
+        options: Vec<String>,
+        task_id: Option<String>,
+        context: Option<serde_json::Value>,
+        phase: Option<String>,
+    },
     #[serde(rename = "done")]
     Done,
 }
@@ -80,6 +89,10 @@ enum PendingResponse {
     Input {
         text: String,
     },
+    Selection {
+        selection: String,
+        instructions: Option<String>,
+    },
 }
 
 /// Tauri-based HumanLoopProvider — emits approval/input requests via Tauri events
@@ -87,13 +100,21 @@ enum PendingResponse {
 struct TauriHumanLoopHandler {
     app_handle: tauri::AppHandle,
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<PendingResponse>>>>,
+    conversation_id: Option<String>,
+    message_key: String,
 }
 
 impl TauriHumanLoopHandler {
-    fn new(app_handle: tauri::AppHandle) -> Self {
+    fn new(
+        app_handle: tauri::AppHandle,
+        conversation_id: Option<String>,
+        message_key: String,
+    ) -> Self {
         Self {
             app_handle,
             pending: PENDING_RESPONSES.clone(),
+            conversation_id,
+            message_key,
         }
     }
 }
@@ -107,8 +128,17 @@ impl HumanLoopProvider for TauriHumanLoopHandler {
         let (tx_response, rx_response) = oneshot::channel();
         let app_handle = self.app_handle.clone();
         let pending = self.pending.clone();
+        let conversation_id = self.conversation_id.clone();
+        let message_key = self.message_key.clone();
 
         Box::pin(async move {
+            tracing::debug!(
+                request_id = %request_id,
+                conversation_id = ?conversation_id,
+                message_key = %message_key,
+                "Tauri HITL request created"
+            );
+
             match req.kind {
                 echo_agent::human_loop::HumanLoopKind::Approval => {
                     let tool_name = req.tool_name.clone().unwrap_or_default();
@@ -119,8 +149,8 @@ impl HumanLoopProvider for TauriHumanLoopHandler {
                         args,
                         prompt: req.prompt.clone(),
                     };
-                    let _ = app_handle.emit("chat://event", &event);
                     pending.lock().await.insert(request_id.clone(), tx_response);
+                    let _ = app_handle.emit("chat://event", &event);
 
                     tokio::select! {
                         response = rx_response => {
@@ -153,8 +183,8 @@ impl HumanLoopProvider for TauriHumanLoopHandler {
                         request_id: request_id.clone(),
                         prompt: req.prompt.clone(),
                     };
-                    let _ = app_handle.emit("chat://event", &event);
                     pending.lock().await.insert(request_id.clone(), tx_response);
+                    let _ = app_handle.emit("chat://event", &event);
 
                     tokio::select! {
                         response = rx_response => {
@@ -170,16 +200,31 @@ impl HumanLoopProvider for TauriHumanLoopHandler {
                     }
                 }
                 echo_agent::human_loop::HumanLoopKind::Selection => {
-                    // For now, auto-approve with the first option
-                    // TODO: implement proper selection UI in frontend
-                    let selection = req
-                        .options
-                        .and_then(|opts| opts.into_iter().next())
-                        .unwrap_or_else(|| "approve".to_string());
-                    Ok(HumanLoopResponse::Selection {
-                        selection,
-                        instructions: None,
-                    })
+                    let event = ChatEvent::SelectionRequest {
+                        request_id: request_id.clone(),
+                        prompt: req.prompt.clone(),
+                        options: req.options.clone().unwrap_or_default(),
+                        task_id: req.task_id.clone(),
+                        context: req.context.clone(),
+                        phase: req.phase.clone(),
+                    };
+                    pending.lock().await.insert(request_id.clone(), tx_response);
+                    let _ = app_handle.emit("chat://event", &event);
+
+                    tokio::select! {
+                        response = rx_response => {
+                            match response {
+                                Ok(PendingResponse::Selection { selection, instructions }) => {
+                                    Ok(HumanLoopResponse::Selection { selection, instructions })
+                                }
+                                _ => Ok(HumanLoopResponse::Timeout),
+                            }
+                        }
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
+                            pending.lock().await.remove(&request_id);
+                            Ok(HumanLoopResponse::Timeout)
+                        }
+                    }
                 }
             }
         })
@@ -215,14 +260,20 @@ pub async fn send_chat_message(
         .cancel_token
         .insert(message_key.clone(), cancel_token.clone());
 
-    // Register Tauri HITL handler with the dispatcher (before spawning)
-    let hitl_handler: Arc<dyn HumanLoopProvider> =
-        Arc::new(TauriHumanLoopHandler::new(app.clone()));
-    state
-        .app_state
-        .connection
-        .hitl_dispatcher
-        .register("tauri", hitl_handler)
+    // Attach a Tauri HITL handler to this specific agent. This keeps concurrent
+    // GUI conversations isolated instead of racing through the global dispatcher.
+    let hitl_handler: Arc<dyn HumanLoopProvider> = Arc::new(TauriHumanLoopHandler::new(
+        app.clone(),
+        conversation_id.clone(),
+        message_key.clone(),
+    ));
+    agent_handle
+        .write_async(|agent| {
+            let handler = hitl_handler.clone();
+            Box::pin(async move {
+                agent.set_human_loop_provider(handler);
+            })
+        })
         .await;
 
     let app_handle = app.clone();
@@ -230,6 +281,7 @@ pub async fn send_chat_message(
     let hitl_dispatcher = state.app_state.connection.hitl_dispatcher.clone();
     let cancel_tokens = state.app_state.session.cancel_token.clone();
     let cleanup_key = message_key.clone();
+    let cleanup_agent = agent_handle.clone();
 
     tokio::spawn(async move {
         let start = std::time::Instant::now();
@@ -318,7 +370,14 @@ pub async fn send_chat_message(
 
         // Cleanup
         cancel_tokens.remove(&cleanup_key);
-        hitl_dispatcher.unregister("tauri").await;
+        cleanup_agent
+            .write_async(|agent| {
+                let dispatcher = hitl_dispatcher.clone();
+                Box::pin(async move {
+                    agent.set_human_loop_provider(dispatcher);
+                })
+            })
+            .await;
 
         tracing::info!(
             elapsed_ms = start.elapsed().as_millis() as u64,
@@ -381,6 +440,28 @@ pub async fn send_input_response(
     } else {
         Err(IpcError::NotFound(format!(
             "Input request '{}' not found or expired",
+            request_id
+        )))
+    }
+}
+
+/// Respond to a selection request.
+#[tauri::command]
+pub async fn send_selection_response(
+    request_id: String,
+    selection: String,
+    instructions: Option<String>,
+) -> Result<serde_json::Value, IpcError> {
+    let tx = PENDING_RESPONSES.lock().await.remove(&request_id);
+    if let Some(tx) = tx {
+        let _ = tx.send(PendingResponse::Selection {
+            selection,
+            instructions,
+        });
+        Ok(serde_json::json!({"success": true}))
+    } else {
+        Err(IpcError::NotFound(format!(
+            "Selection request '{}' not found or expired",
             request_id
         )))
     }

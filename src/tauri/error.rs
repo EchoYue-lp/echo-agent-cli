@@ -11,6 +11,18 @@ pub enum IpcError {
     NotImplemented(String),
 }
 
+impl IpcError {
+    /// Machine-readable error kind for frontend matching.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            IpcError::NotFound(_) => "not_found",
+            IpcError::Validation(_) => "validation",
+            IpcError::Internal(_) => "internal",
+            IpcError::NotImplemented(_) => "not_implemented",
+        }
+    }
+}
+
 impl fmt::Display for IpcError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -22,9 +34,16 @@ impl fmt::Display for IpcError {
     }
 }
 
+impl std::error::Error for IpcError {}
+
 impl Serialize for IpcError {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&self.to_string())
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("IpcError", 3)?;
+        s.serialize_field("kind", self.kind())?;
+        s.serialize_field("message", &self.to_string())?;
+        s.serialize_field("error", self.kind())?; // legacy compat
+        s.end()
     }
 }
 

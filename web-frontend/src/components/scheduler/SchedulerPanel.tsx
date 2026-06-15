@@ -13,6 +13,7 @@ import {
   AlertCircle,
   HelpCircle,
 } from 'lucide-react';
+import { useToastStore } from '../../stores/toastStore';
 
 // ── Cron helpers ───────────────────────────────────────────────────
 
@@ -54,11 +55,26 @@ function describeCron(expr: string): string {
   return expr;
 }
 
+function validateCron(expr: string): string | null {
+  const parts = expr.trim().split(/\s+/);
+  if (parts.length !== 5) {
+    return 'Cron 表达式需要 5 段：分 时 日 月 周';
+  }
+
+  const token = /^(\*|\d+|\d+-\d+|\*\/\d+|\d+(,\d+)*|\d+-\d+\/\d+)$/;
+  if (!parts.every((part) => token.test(part))) {
+    return 'Cron 表达式包含暂不支持的字段格式';
+  }
+
+  return null;
+}
+
 // ── Component ──────────────────────────────────────────────────────
 
 export function SchedulerPanel() {
   const [tasks, setTasks] = useState<SchedulerTask[]>([]);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const [showAdd, setShowAdd] = useState(false);
   const [form, setForm] = useState({ name: '', cron_expr: '', prompt: '' });
   const [runResult, setRunResult] = useState<{
@@ -68,6 +84,8 @@ export function SchedulerPanel() {
   } | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [busyTaskId, setBusyTaskId] = useState<string | null>(null);
+  const addToast = useToastStore((s) => s.addToast);
 
   const s = {
     text: 'var(--text-primary)',
@@ -80,17 +98,21 @@ export function SchedulerPanel() {
     bgInput: 'var(--bg-input)',
     accent: 'var(--accent)',
   };
+  const cronError = form.cron_expr.trim() ? validateCron(form.cron_expr) : null;
 
   const fetchTasks = useCallback(async () => {
+    setRefreshing(true);
     try {
       const data = await schedulerApi.list();
       setTasks(data);
     } catch (e) {
       console.error('Failed to fetch scheduler tasks:', e);
+      addToast('error', `加载定时任务失败: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setLoading(false);
+      setRefreshing(false);
     }
-  }, []);
+  }, [addToast]);
 
   useEffect(() => {
     fetchTasks();
@@ -98,14 +120,21 @@ export function SchedulerPanel() {
 
   const handleCreate = async () => {
     if (!form.name.trim() || !form.cron_expr.trim() || !form.prompt.trim()) return;
+    const cronError = validateCron(form.cron_expr);
+    if (cronError) {
+      addToast('warning', cronError);
+      return;
+    }
     setSubmitting(true);
     try {
       await schedulerApi.create(form);
+      addToast('success', '定时任务已创建');
       setForm({ name: '', cron_expr: '', prompt: '' });
       setShowAdd(false);
-      fetchTasks();
+      await fetchTasks();
     } catch (e) {
       console.error('Failed to create task:', e);
+      addToast('error', `创建定时任务失败: ${e instanceof Error ? e.message : String(e)}`);
     } finally {
       setSubmitting(false);
     }
@@ -113,32 +142,52 @@ export function SchedulerPanel() {
 
   const handleToggle = async (task: SchedulerTask) => {
     const nextEnabled = task.status !== 'enabled';
+    setBusyTaskId(task.id);
     try {
       await schedulerApi.updateStatus(task.id, nextEnabled);
-      fetchTasks();
+      addToast('success', nextEnabled ? '定时任务已启用' : '定时任务已禁用');
+      await fetchTasks();
     } catch (e) {
       console.error('Failed to toggle task:', e);
+      addToast('error', `更新定时任务状态失败: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setBusyTaskId(null);
     }
   };
 
   const handleRun = async (id: string) => {
     setRunResult({ id });
+    setBusyTaskId(id);
     try {
       const res = await schedulerApi.run(id);
       setRunResult({ id, result: res.result, error: res.error });
-      fetchTasks();
+      if (res.error) {
+        addToast('error', `手动运行失败: ${res.error}`);
+      } else {
+        addToast('success', '定时任务运行完成');
+      }
+      await fetchTasks();
     } catch (e) {
-      setRunResult({ id, error: String(e) });
+      const message = e instanceof Error ? e.message : String(e);
+      setRunResult({ id, error: message });
+      addToast('error', `手动运行失败: ${message}`);
+    } finally {
+      setBusyTaskId(null);
     }
   };
 
   const handleDelete = async (id: string) => {
+    setBusyTaskId(id);
     try {
       await schedulerApi.delete(id);
+      addToast('success', '定时任务已删除');
       setConfirmDelete(null);
-      fetchTasks();
+      await fetchTasks();
     } catch (e) {
       console.error('Failed to delete task:', e);
+      addToast('error', `删除定时任务失败: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      setBusyTaskId(null);
     }
   };
 
@@ -162,11 +211,12 @@ export function SchedulerPanel() {
         <div className="flex gap-1">
           <button
             onClick={fetchTasks}
+            disabled={refreshing}
             className="rounded p-1.5 transition-colors hover:opacity-80"
             style={{ color: s.textTer }}
             title="刷新"
           >
-            <RefreshCw size={14} />
+            <RefreshCw size={14} className={refreshing ? 'animate-spin' : ''} />
           </button>
           <button
             onClick={() => setShowAdd(!showAdd)}
@@ -219,10 +269,13 @@ export function SchedulerPanel() {
             {form.cron_expr.trim() && (
               <div
                 className="flex items-center gap-1.5 rounded px-2 py-1 text-[11px]"
-                style={{ background: s.bgHover, color: s.textSec }}
+                style={{
+                  background: cronError ? 'rgba(239,68,68,0.08)' : s.bgHover,
+                  color: cronError ? 'var(--color-error, #ef4444)' : s.textSec,
+                }}
               >
-                <HelpCircle size={11} />
-                <span>{describeCron(form.cron_expr)}</span>
+                {cronError ? <AlertCircle size={11} /> : <HelpCircle size={11} />}
+                <span>{cronError ?? describeCron(form.cron_expr)}</span>
               </div>
             )}
           </div>
@@ -239,7 +292,11 @@ export function SchedulerPanel() {
           <button
             onClick={handleCreate}
             disabled={
-              submitting || !form.name.trim() || !form.cron_expr.trim() || !form.prompt.trim()
+              submitting ||
+              Boolean(cronError) ||
+              !form.name.trim() ||
+              !form.cron_expr.trim() ||
+              !form.prompt.trim()
             }
             className="flex items-center gap-1.5 rounded-lg px-3 py-2 text-xs font-medium text-white transition-colors disabled:opacity-50"
             style={{ background: s.accent }}
@@ -280,6 +337,7 @@ export function SchedulerPanel() {
                   </span>
                   <button
                     onClick={() => handleToggle(task)}
+                    disabled={busyTaskId === task.id}
                     className="transition-colors"
                     style={{ color: enabled ? 'var(--color-success, #22c55e)' : s.textTer }}
                     title={enabled ? '禁用' : '启用'}
@@ -331,13 +389,19 @@ export function SchedulerPanel() {
                 <div className="flex items-center gap-2 pt-1">
                   <button
                     onClick={() => handleRun(task.id)}
+                    disabled={busyTaskId === task.id}
                     className="flex items-center gap-1 rounded px-2 py-1 text-[11px] font-medium transition-colors"
                     style={{
                       background: 'rgba(59,130,246,0.1)',
                       color: 'var(--color-info, #3b82f6)',
                     }}
                   >
-                    <Play size={11} /> 手动运行
+                    {busyTaskId === task.id && runResult?.id === task.id && !runResult.result && !runResult.error ? (
+                      <RefreshCw size={11} className="animate-spin" />
+                    ) : (
+                      <Play size={11} />
+                    )}{' '}
+                    手动运行
                   </button>
                   {confirmDelete === task.id ? (
                     <div className="flex items-center gap-1">
@@ -349,6 +413,7 @@ export function SchedulerPanel() {
                       </span>
                       <button
                         onClick={() => handleDelete(task.id)}
+                        disabled={busyTaskId === task.id}
                         className="rounded p-1 transition-colors"
                         style={{ color: 'var(--color-error, #ef4444)' }}
                       >
@@ -365,6 +430,7 @@ export function SchedulerPanel() {
                   ) : (
                     <button
                       onClick={() => setConfirmDelete(task.id)}
+                      disabled={busyTaskId === task.id}
                       className="flex items-center gap-1 rounded px-2 py-1 text-[11px] transition-colors"
                       style={{ color: 'var(--color-error, #ef4444)' }}
                     >

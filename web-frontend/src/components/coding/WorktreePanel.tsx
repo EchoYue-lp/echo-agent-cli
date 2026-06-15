@@ -51,10 +51,10 @@ export function WorktreePanel() {
     }
   };
 
-  const handleRemove = async (branch: string) => {
-    setRemoving(branch);
+  const handleRemove = async (path: string) => {
+    setRemoving(path);
     try {
-      await worktreeApi.remove(branch);
+      await worktreeApi.remove(path);
       setConfirmDelete(null);
       await fetchWorktrees();
     } catch (e) {
@@ -232,14 +232,14 @@ export function WorktreePanel() {
                 {/* Actions */}
                 {!isMain && (
                   <div className="flex shrink-0 items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100">
-                    {confirmDelete === wt.branch ? (
+                    {confirmDelete === wt.path ? (
                       <div className="flex items-center gap-1">
                         <button
-                          onClick={() => handleRemove(wt.branch)}
-                          disabled={removing === wt.branch}
+                          onClick={() => handleRemove(wt.path)}
+                          disabled={removing === wt.path}
                           className="rounded bg-[var(--color-error)] px-2 py-1 text-[11px] font-medium text-white hover:opacity-90 disabled:opacity-50"
                         >
-                          {removing === wt.branch ? (
+                          {removing === wt.path ? (
                             <Loader2 size={11} className="animate-spin" />
                           ) : (
                             'Confirm'
@@ -254,7 +254,7 @@ export function WorktreePanel() {
                       </div>
                     ) : (
                       <button
-                        onClick={() => setConfirmDelete(wt.branch)}
+                        onClick={() => setConfirmDelete(wt.path)}
                         className="rounded p-1.5 text-[var(--text-tertiary)] transition-colors hover:bg-[var(--color-error)]/10 hover:text-[var(--color-error)]"
                         title="Remove worktree"
                       >

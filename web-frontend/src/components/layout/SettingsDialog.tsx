@@ -5,10 +5,7 @@ import {
   Save,
   Lock,
   ShieldCheck,
-  GitBranch,
-  Terminal,
   Minimize2,
-  FileJson,
   Wrench,
   Globe,
   BookOpen,
@@ -19,17 +16,16 @@ import {
   Sparkles,
   Package,
   Timer,
-  GitFork,
+  FileEdit,
+  GitBranch,
+  Scale,
 } from 'lucide-react';
 import { useUiStore, type SettingsTabId } from '../../stores/uiStore';
 import { ConfigPanel } from '../config/ConfigPanel';
 import { SessionsPanel } from '../sessions/SessionsPanel';
 import { PermissionsPanel } from '../permissions/PermissionsPanel';
 import { AuditPanel } from '../audit/AuditPanel';
-import { WorkflowPanel } from '../workflow/WorkflowPanel';
-import { SandboxPanel } from '../sandbox/SandboxPanel';
 import { CompressPanel } from '../compress/CompressPanel';
-import { ExtractPanel } from '../extract/ExtractPanel';
 import { ToolsPanel } from '../tools/ToolsPanel';
 import { McpPanel } from '../mcp/McpPanel';
 import { SkillsPanel } from '../skills/SkillsPanel';
@@ -38,7 +34,8 @@ import { EvolutionPanel } from '../evolution/EvolutionPanel';
 import { ProviderPanel } from '../providers/ProviderPanel';
 import { PluginPanel } from '../plugins/PluginPanel';
 import { SchedulerPanel } from '../scheduler/SchedulerPanel';
-
+import { ScratchpadPanel } from '../scratchpad/ScratchpadPanel';
+import { DecisionLogPanel } from '../decisions/DecisionLogPanel';
 import { WorktreePanel } from '../coding/WorktreePanel';
 
 interface SettingsItem {
@@ -66,8 +63,9 @@ const settingsGroups: { label: string; icon: typeof Settings; items: SettingsIte
     icon: Database,
     items: [
       { id: 'sessions', label: '会话', icon: Save },
+      { id: 'scratchpad', label: '草稿', icon: FileEdit },
+      { id: 'decisions', label: '决策', icon: Scale },
       { id: 'compress', label: '压缩', icon: Minimize2 },
-      { id: 'extract', label: '提取', icon: FileJson },
     ],
   },
   {
@@ -82,15 +80,9 @@ const settingsGroups: { label: string; icon: typeof Settings; items: SettingsIte
     label: '运行时',
     icon: Activity,
     items: [
-      { id: 'workflow', label: '工作流', icon: GitBranch },
-      { id: 'sandbox', label: '沙箱', icon: Terminal },
       { id: 'scheduler', label: '定时任务', icon: Timer },
+      { id: 'worktree', label: 'Worktree', icon: GitBranch },
     ],
-  },
-  {
-    label: '开发',
-    icon: GitFork,
-    items: [{ id: 'worktree', label: '工作树', icon: GitFork }],
   },
   {
     label: '智能',
@@ -112,19 +104,25 @@ const panels: Record<SettingsTabId, React.FC> = {
   sessions: SessionsPanel,
   permissions: PermissionsPanel,
   audit: AuditPanel,
-  workflow: WorkflowPanel,
-  sandbox: SandboxPanel,
+  scratchpad: ScratchpadPanel,
+  decisions: DecisionLogPanel,
   compress: CompressPanel,
-  extract: ExtractPanel,
   evolution: EvolutionPanel,
   plugins: PluginPanel,
   scheduler: SchedulerPanel,
+  workflow: () => null,
+  sandbox: () => null,
+  extract: () => null,
   worktree: WorktreePanel,
 };
 
 export function SettingsDialog() {
   const { settingsOpen, closeSettings, activeSettingsTab, setActiveSettingsTab } = useUiStore();
-  const Panel = panels[activeSettingsTab];
+  const visibleItems = settingsGroups.flatMap((g) => g.items);
+  const activeItem = visibleItems.find((i) => i.id === activeSettingsTab);
+  const effectiveSettingsTab = activeItem ? activeSettingsTab : 'tools';
+  const effectiveItem = activeItem ?? visibleItems.find((i) => i.id === effectiveSettingsTab);
+  const Panel = panels[effectiveSettingsTab];
 
   // Close on Escape key
   useEffect(() => {
@@ -137,8 +135,6 @@ export function SettingsDialog() {
   }, [settingsOpen, closeSettings]);
 
   if (!settingsOpen) return null;
-
-  const activeItem = settingsGroups.flatMap((g) => g.items).find((i) => i.id === activeSettingsTab);
 
   return (
     <>
@@ -180,7 +176,7 @@ export function SettingsDialog() {
                     onClick={() => setActiveSettingsTab(id)}
                     className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-[13px] font-medium transition-all duration-150
                       ${
-                        activeSettingsTab === id
+                        effectiveSettingsTab === id
                           ? 'bg-[var(--accent)]/10 text-[var(--accent)] shadow-sm'
                           : 'text-[var(--text-secondary)] hover:bg-[var(--bg-sidebar-hover)] hover:text-[var(--text-primary)]'
                       }`}
@@ -198,7 +194,7 @@ export function SettingsDialog() {
         <div className="flex flex-1 flex-col min-w-0">
           <div className="flex items-center justify-between border-b border-[var(--border-primary)] px-6 py-3.5">
             <span className="text-sm font-semibold text-[var(--text-primary)]">
-              {activeItem?.label}
+              {effectiveItem?.label}
             </span>
           </div>
           <div className="flex-1 overflow-y-auto">

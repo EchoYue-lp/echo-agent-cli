@@ -22,6 +22,15 @@ type ChatEvent =
       prompt: string;
     }
   | { type: 'input_request'; request_id: string; prompt: string }
+  | {
+      type: 'selection_request';
+      request_id: string;
+      prompt: string;
+      options: string[];
+      task_id?: string | null;
+      context?: unknown;
+      phase?: string | null;
+    }
   | { type: 'tool_batch_start'; tool_count: number }
   | { type: 'tool_batch_end' }
   | { type: 'done' };
@@ -106,6 +115,17 @@ export function useTauriChat() {
       case 'input_request':
         if (isCancelledRef.current) break;
         store.setInputRequest({ requestId: event.request_id, prompt: event.prompt });
+        break;
+      case 'selection_request':
+        if (isCancelledRef.current) break;
+        store.setSelectionRequest({
+          requestId: event.request_id,
+          prompt: event.prompt,
+          options: event.options,
+          taskId: event.task_id ?? undefined,
+          context: event.context,
+          phase: event.phase ?? undefined,
+        });
         break;
       case 'chart':
         if (isCancelledRef.current) break;
@@ -221,6 +241,22 @@ export function useTauriChat() {
     }
   }, []);
 
+  const sendSelection = useCallback(
+    async (requestId: string, selection: string, instructions?: string) => {
+      try {
+        await apiInvoke('send_selection_response', {
+          request_id: requestId,
+          selection,
+          instructions,
+        });
+        useChatStore.getState().setSelectionRequest(null);
+      } catch (e) {
+        console.error('[TauriChat] Failed to send selection:', e);
+      }
+    },
+    []
+  );
+
   const cancel = useCallback(async () => {
     useChatStore.getState().markCancelled();
     assistantIdRef.current = null;
@@ -232,5 +268,12 @@ export function useTauriChat() {
     }
   }, []);
 
-  return { sendMessage, sendApproval, sendInput, cancel, connectionStatus: 'connected' as const };
+  return {
+    sendMessage,
+    sendApproval,
+    sendInput,
+    sendSelection,
+    cancel,
+    connectionStatus: 'connected' as const,
+  };
 }

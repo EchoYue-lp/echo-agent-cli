@@ -120,14 +120,19 @@ pub struct UnifiedMemory {
     instructions: InstructionProvider,
     /// Dynamic KV store for agent-learned memories.
     memories: Option<Arc<dyn Store>>,
+    /// Hot layer content cached at load time (MEMORY.md body, frontmatter stripped).
+    hot_content: Option<String>,
 }
 
 impl UnifiedMemory {
     /// Create a new unified memory with just instructions loaded.
     pub fn load() -> Self {
+        let instructions = InstructionProvider::load();
+        let hot_content = load_hot_content();
         Self {
-            instructions: InstructionProvider::load(),
+            instructions,
             memories: None,
+            hot_content,
         }
     }
 
@@ -183,7 +188,10 @@ impl UnifiedMemory {
 
     // ── Memories (async) ─────────────────────────────────────────────
 
-    /// Store a memory (agent-learned knowledge).
+    /// Store a legacy app-level memory in the raw Store namespace.
+    ///
+    /// Runtime-recallable agent memories should use the layered memory path
+    /// (`MemoryLayerManager::write_memory`) rather than this product API.
     pub async fn remember(&self, content: &str, importance: f32) -> Result<String, String> {
         let store = self.memories.as_ref().ok_or("No memory store configured")?;
 
@@ -266,11 +274,32 @@ impl UnifiedMemory {
     // ── Aggregated context ───────────────────────────────────────────
 
     /// Get all context needed for system prompt injection.
+    ///
+    /// Re-reads the hot layer MEMORY.md each call so that session mutations
+    /// (auto-promotion, demotion during review) are reflected immediately
+    /// without requiring a restart.
     pub fn system_prompt_context(&self) -> MemoryContext {
+        let mut memories = Vec::new();
+
+        // Re-read hot layer on each call so review/auto-promotion updates
+        // take effect in the same session.
+        let hot = load_hot_content();
+        if let Some(ref content) = hot {
+            if !content.is_empty() {
+                memories.push(content.clone());
+            }
+        }
+
         MemoryContext {
             instructions: self.instructions.get_system_prompt_suffix(),
-            memories: Vec::new(),
+            memories,
         }
+    }
+
+    /// Refresh cached hot layer content (call after a review cycle or
+    /// explicit promotion/demotion).
+    pub fn refresh_hot(&mut self) {
+        self.hot_content = load_hot_content();
     }
 }
 
@@ -285,6 +314,54 @@ fn find_project_root(start: &Path) -> Option<PathBuf> {
         }
         dir = dir.parent()?;
     }
+}
+
+/// Load the hot layer content from MEMORY.md (body only, frontmatter stripped).
+///
+/// Tries project-level `.echo-agent/MEMORY.md` first, then user-level `~/.echo-agent/MEMORY.md`.
+fn load_hot_content() -> Option<String> {
+    // Project-level
+    if let Ok(pwd) = std::env::current_dir() {
+        if let Some(root) = find_project_root(&pwd) {
+            let path = root.join(".echo-agent").join("MEMORY.md");
+            if path.exists() {
+                if let Ok(raw) = std::fs::read_to_string(&path) {
+                    return Some(strip_yaml_frontmatter(&raw));
+                }
+            }
+        }
+    }
+
+    // User-level
+    if let Some(home) = dirs::home_dir() {
+        let path = home.join(".echo-agent").join("MEMORY.md");
+        if path.exists() {
+            if let Ok(raw) = std::fs::read_to_string(&path) {
+                return Some(strip_yaml_frontmatter(&raw));
+            }
+        }
+    }
+
+    None
+}
+
+/// Strip YAML frontmatter (between --- markers) from a MEMORY.md file.
+fn strip_yaml_frontmatter(raw: &str) -> String {
+    let trimmed = raw.trim_start();
+    if !trimmed.starts_with("---") {
+        return raw.to_string();
+    }
+
+    let rest = &trimmed[3..]; // skip opening ---
+    if let Some(pos) = rest.find("\n---") {
+        let body = rest[pos + 4..]
+            .trim_start_matches('\n')
+            .trim_start_matches('\r');
+        return body.to_string();
+    }
+
+    // No closing marker — return as-is
+    raw.to_string()
 }
 
 #[cfg(test)]

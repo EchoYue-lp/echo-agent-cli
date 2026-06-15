@@ -15,6 +15,14 @@ interface ChatState {
   isThinking: boolean;
   approvalRequest: ApprovalRequest | null;
   inputRequest: { requestId: string; prompt?: string } | null;
+  selectionRequest: {
+    requestId: string;
+    prompt: string;
+    options: string[];
+    taskId?: string;
+    context?: unknown;
+    phase?: string;
+  } | null;
   pendingToolCalls: { name: string; args: unknown }[];
   /** True when viewing a loaded historical conversation (agent has no context) */
   isHistoryView: boolean;
@@ -36,6 +44,7 @@ interface ChatState {
   markCancelled: () => void;
   setApprovalRequest: (r: ApprovalRequest | null) => void;
   setInputRequest: (r: { requestId: string; prompt?: string } | null) => void;
+  setSelectionRequest: (r: ChatState['selectionRequest']) => void;
   addChartMessage: (spec: unknown) => void;
   clearMessages: () => void;
   replaceMessages: (messages: ChatMessage[]) => void;
@@ -64,6 +73,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   isThinking: false,
   approvalRequest: null,
   inputRequest: null,
+  selectionRequest: null,
   pendingToolCalls: [],
   isHistoryView: false,
   currentRound: null,
@@ -264,6 +274,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   setApprovalRequest: (r) => set({ approvalRequest: r }),
   setInputRequest: (r) => set({ inputRequest: r }),
+  setSelectionRequest: (r) => set({ selectionRequest: r }),
 
   addChartMessage: (spec) => {
     set((s) => ({
@@ -274,10 +285,26 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   clearMessages: () =>
-    set({ messages: [], isStreaming: false, isCancelled: false, isHistoryView: false }),
+    set({
+      messages: [],
+      isStreaming: false,
+      isCancelled: false,
+      isHistoryView: false,
+      approvalRequest: null,
+      inputRequest: null,
+      selectionRequest: null,
+    }),
 
   replaceMessages: (messages) =>
-    set({ messages, isStreaming: false, isCancelled: false, isHistoryView: true }),
+    set({
+      messages,
+      isStreaming: false,
+      isCancelled: false,
+      isHistoryView: true,
+      approvalRequest: null,
+      inputRequest: null,
+      selectionRequest: null,
+    }),
 
   setHistoryView: (v) => set({ isHistoryView: v }),
 

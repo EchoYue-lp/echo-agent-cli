@@ -183,8 +183,129 @@ fn check_criteria(criteria: &SuccessCriteria, output: &str, result: &mut EvalRes
                 ));
             }
         }
-        // ToolUsed/ToolNotUsed/TestPass/ValueMatch/LlmGraded/SweBench —
-        // require trace analysis or shell execution, skip in simplified mode
-        _ => {}
+        SuccessCriteria::TestPass { command } => {
+            // Run the test command and check exit status
+            let status = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(command)
+                .status();
+
+            match status {
+                Ok(s) if s.success() => {
+                    // Test passed
+                }
+                Ok(s) => {
+                    result.success = false;
+                    result.violations.push(format!(
+                        "Test command failed with exit code: {:?}",
+                        s.code()
+                    ));
+                }
+                Err(e) => {
+                    result.success = false;
+                    result
+                        .violations
+                        .push(format!("Failed to execute test command: {}", e));
+                }
+            }
+        }
+        SuccessCriteria::ToolUsed { tool_name } => {
+            // Check if the tool appears in the output (as a tool call indicator)
+            // This is a simplified check - ideally we'd parse the trace
+            let tool_markers = [
+                format!("🔧 调用工具: {}", tool_name),
+                format!("Tool call: {}", tool_name),
+                format!("tool_name: {}", tool_name),
+            ];
+
+            let tool_used = tool_markers.iter().any(|marker| output.contains(marker));
+
+            if !tool_used {
+                result.success = false;
+                result
+                    .violations
+                    .push(format!("Required tool '{}' was not used", tool_name));
+            }
+        }
+        SuccessCriteria::ToolNotUsed { tool_name } => {
+            // Check if the tool does NOT appear in the output
+            let tool_markers = [
+                format!("🔧 调用工具: {}", tool_name),
+                format!("Tool call: {}", tool_name),
+                format!("tool_name: {}", tool_name),
+            ];
+
+            let tool_used = tool_markers.iter().any(|marker| output.contains(marker));
+
+            if tool_used {
+                result.success = false;
+                result
+                    .violations
+                    .push(format!("Forbidden tool '{}' was used", tool_name));
+            }
+        }
+        SuccessCriteria::ValueMatch {
+            expected,
+            tolerance,
+        } => {
+            // Try to extract numeric values from output and compare
+            // This is a simplified implementation
+            for (key, expected_value) in expected {
+                // Look for patterns like "key: value" or "key = value"
+                let patterns = [
+                    format!(r"{}:\s*([0-9]+\.?[0-9]*)", regex::escape(key)),
+                    format!(r"{}\s*=\s*([0-9]+\.?[0-9]*)", regex::escape(key)),
+                ];
+
+                let mut found = false;
+                for pattern in &patterns {
+                    if let Ok(re) = regex::Regex::new(pattern) {
+                        if let Some(captures) = re.captures(output) {
+                            if let Some(value_str) = captures.get(1) {
+                                if let Ok(actual_value) = value_str.as_str().parse::<f64>() {
+                                    let diff = (actual_value - expected_value).abs();
+                                    if diff > *tolerance {
+                                        result.success = false;
+                                        result.violations.push(format!(
+                                            "Value mismatch for '{}': expected {}, got {} (tolerance: {})",
+                                            key, expected_value, actual_value, tolerance
+                                        ));
+                                    }
+                                    found = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !found {
+                    result.success = false;
+                    result
+                        .violations
+                        .push(format!("Could not find value for '{}' in output", key));
+                }
+            }
+        }
+        SuccessCriteria::LlmGraded { .. } => {
+            tracing::warn!(
+                "LlmGraded criteria not implemented in simplified eval runner. \
+                 Use the full eval runner for LLM-as-Judge evaluation."
+            );
+            result.violations.push(
+                "LlmGraded criteria requires full eval runner (not implemented in simplified mode)"
+                    .to_string(),
+            );
+        }
+        SuccessCriteria::SweBench { .. } => {
+            tracing::warn!(
+                "SweBench criteria not implemented in simplified eval runner. \
+                 Use the full eval runner for SWE-bench evaluation."
+            );
+            result.violations.push(
+                "SweBench criteria requires full eval runner (not implemented in simplified mode)"
+                    .to_string(),
+            );
+        }
     }
 }

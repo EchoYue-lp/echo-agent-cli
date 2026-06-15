@@ -72,7 +72,16 @@ pub fn default_primary_conversation_id() -> String {
 ///
 /// Uses `ReactAgentBuilder` to construct the agent. The framework is mode-agnostic;
 /// domain specialization is handled by the Skill system (SKILL.md files).
-pub fn create_agent(params: &AgentCreateParams, app_config: &AppConfig) -> ReactAgent {
+///
+/// # Errors
+///
+/// Returns `Err` if the agent builder fails (e.g. missing required config like
+/// an API key or an invalid model name). Callers should surface this to the user
+/// rather than crashing.
+pub fn create_agent(
+    params: &AgentCreateParams,
+    app_config: &AppConfig,
+) -> std::result::Result<ReactAgent, String> {
     // Use model from params if provided, otherwise check ECHOCOWORK_MODEL env var, then config
     let config_model = app_config.model.get_model_name();
     let model = params.model.as_deref().unwrap_or(&config_model);
@@ -204,20 +213,15 @@ pub fn create_agent(params: &AgentCreateParams, app_config: &AppConfig) -> React
         }
     }
 
-    let mut agent = match builder.build() {
-        Ok(a) => a,
-        Err(e) => {
-            tracing::error!("Failed to build agent: {e}");
-            eprintln!("Error: Failed to initialize agent: {e}");
-            eprintln!("Please check your configuration and try again.");
-            std::process::exit(1);
-        }
-    };
+    let mut agent = builder.build().map_err(|e| {
+        tracing::error!("Failed to build agent: {e}");
+        format!("Failed to initialize agent: {e}. Please check your configuration and try again.")
+    })?;
 
     // Register default hooks
     register_default_hooks(&mut agent);
 
-    agent
+    Ok(agent)
 }
 
 /// Register sensible default hooks for the CLI agent.
@@ -475,16 +479,25 @@ pub fn load_shell_env() {
             "MCP_CONFIG_PATH",
         ];
 
+        // SAFETY: `std::env::set_var` is not thread-safe in Rust. We use a
+        // `std::sync::Once` to guarantee this block runs at most once per
+        // process lifetime, and it must be called early in `main()` / app
+        // startup before any worker threads are spawned.
+        static SHELL_ENV_LOADED: std::sync::Once = std::sync::Once::new();
         let mut loaded = Vec::new();
-        for line in stdout.lines() {
-            if let Some((key, value)) = line.split_once('=') {
-                if API_KEY_VARS.contains(&key) && std::env::var(key).is_err() && !value.is_empty() {
-                    // SAFETY: called once at startup before any threads
-                    unsafe { std::env::set_var(key, value) };
-                    loaded.push(key.to_string());
+        SHELL_ENV_LOADED.call_once(|| {
+            for line in stdout.lines() {
+                if let Some((key, value)) = line.split_once('=') {
+                    if API_KEY_VARS.contains(&key)
+                        && std::env::var(key).is_err()
+                        && !value.is_empty()
+                    {
+                        unsafe { std::env::set_var(key, value) };
+                        loaded.push(key.to_string());
+                    }
                 }
             }
-        }
+        });
 
         if !loaded.is_empty() {
             tracing::info!(vars = loaded.join(", "), "Loaded shell env vars (GUI mode)");
@@ -744,8 +757,12 @@ pub fn run_base_doctor_for_model_with_connectivity(
     }
 
     if connectivity == DoctorConnectivity::Probe {
+        // block_in_place is required when called from within a tokio task
+        // context (e.g. from a Tauri command handler).
         let probe_result = match tokio::runtime::Handle::try_current() {
-            Ok(handle) => handle.block_on(probe_model_connectivity(model)),
+            Ok(handle) => {
+                tokio::task::block_in_place(|| handle.block_on(probe_model_connectivity(model)))
+            }
             Err(_) => Err(echo_agent::error::ReactError::Other(
                 "Not running in a tokio runtime".to_string(),
             )),

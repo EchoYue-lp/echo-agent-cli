@@ -152,6 +152,17 @@ export function useWebSocket() {
           if (isCancelledRef.current) break;
           store.setInputRequest({ requestId: msg.request_id, prompt: msg.prompt });
           break;
+        case 'selection_request':
+          if (isCancelledRef.current) break;
+          store.setSelectionRequest({
+            requestId: msg.request_id,
+            prompt: msg.prompt,
+            options: msg.options,
+            taskId: msg.task_id ?? undefined,
+            context: msg.context,
+            phase: msg.phase ?? undefined,
+          });
+          break;
         case 'pong':
           // Heartbeat response received, clear timeout
           if (heartbeatTimeout.current) {
@@ -278,6 +289,14 @@ export function useWebSocket() {
     [send]
   );
 
+  const sendSelection = useCallback(
+    (requestId: string, selection: string, instructions?: string) => {
+      send({ type: 'selection_response', request_id: requestId, selection, instructions });
+      useChatStore.getState().setSelectionRequest(null);
+    },
+    [send]
+  );
+
   const cancel = useCallback(() => {
     useChatStore.getState().markCancelled();
     assistantIdRef.current = null;
@@ -296,5 +315,5 @@ export function useWebSocket() {
     };
   }, [connect]);
 
-  return { sendMessage, sendApproval, sendInput, cancel, connectionStatus };
+  return { sendMessage, sendApproval, sendInput, sendSelection, cancel, connectionStatus };
 }
