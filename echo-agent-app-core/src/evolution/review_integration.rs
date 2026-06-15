@@ -13,7 +13,7 @@
 //! framework internals.
 
 use echo_agent::evolution::{
-    ChangeLog, JsonlChangeLog, MemoryLayerManager, MemoryReviewer, MemoryWriteObserver,
+    MemoryLayerManager, MemoryReviewer, MemoryRuntimeIntegrationBuilder, MemoryWriteObserver,
     ReviewChange, ReviewConfig, ReviewReport, SkillCandidateDetector, SkillDraftGenerator,
 };
 use echo_agent::memory::Store;
@@ -101,12 +101,13 @@ impl ReviewIntegration {
 
     /// Internal: run the review and return the report.
     ///
-    /// Creates all framework plumbing (`TypedMemoryStore`, `MemoryLayerManager`,
-    /// `ChangeLog`) on each call. Reviews are infrequent enough (session end,
-    /// every 50 writes, or manual) that this overhead is negligible.
+    /// Creates framework plumbing through `MemoryRuntimeIntegrationBuilder` on
+    /// each call. Reviews are infrequent enough (session end, every 50 writes,
+    /// or manual) that this overhead is negligible.
     async fn run_review_inner(&self) -> Result<ReviewReport, String> {
         let typed_store = TypedMemoryStore::new(self.store.clone());
-        let change_log = self.create_change_log();
+        let runtime_builder = self.runtime_builder();
+        let change_log = runtime_builder.create_change_log();
         let layer_manager = self.create_layer_manager();
         let reviewer = MemoryReviewer::new();
         let mut report = reviewer
@@ -178,25 +179,14 @@ impl ReviewIntegration {
     /// layer manager increments the counter, and `on_memory_write()` can trigger
     /// periodic reviews without an explicit caller.
     pub fn create_layer_manager(&self) -> MemoryLayerManager {
-        let change_log = self.create_change_log();
-        MemoryLayerManager::new(self.echo_agent_dir.clone(), self.store.clone(), change_log)
-            .with_review_trigger(
-                self.write_counter.clone(),
-                self.config.review_every_n_writes,
-            )
+        self.runtime_builder().build_layer_manager()
     }
 
-    /// Create a `JsonlChangeLog` for the audit trail.
-    fn create_change_log(&self) -> Box<dyn ChangeLog> {
-        let log_path = self
-            .echo_agent_dir
-            .join("evolution")
-            .join("change-log.jsonl");
-        // Ensure the evolution directory exists.
-        if let Some(parent) = log_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        Box::new(JsonlChangeLog::new(log_path))
+    /// Create framework runtime wiring without owning product lifecycle policy.
+    fn runtime_builder(&self) -> MemoryRuntimeIntegrationBuilder {
+        MemoryRuntimeIntegrationBuilder::new(self.echo_agent_dir.clone(), self.store.clone())
+            .write_counter(self.write_counter.clone())
+            .review_every_n_writes(self.config.review_every_n_writes)
     }
 }
 
