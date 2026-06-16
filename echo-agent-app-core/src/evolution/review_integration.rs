@@ -70,7 +70,7 @@ impl ReviewIntegration {
         if count == 0 {
             return None;
         }
-        if count % self.config.review_every_n_writes != 0 {
+        if !count.is_multiple_of(self.config.review_every_n_writes) {
             return None;
         }
 

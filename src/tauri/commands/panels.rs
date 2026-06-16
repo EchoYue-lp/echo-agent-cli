@@ -214,9 +214,11 @@ async fn auto_memory_config_status(
     ),
     IpcError,
 > {
-    let mut config = echo_agent_app_core::auto_memory::AutoMemoryConfig::default();
-    config.enabled =
-        crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
+    let config = echo_agent_app_core::auto_memory::AutoMemoryConfig {
+        enabled: crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED
+            .load(std::sync::atomic::Ordering::Relaxed),
+        ..Default::default()
+    };
     let messages = current_agent_messages(state).await;
     let observations = echo_agent_app_core::auto_memory::extract_observations(&messages, &config);
     let root = workspace_project_root(state).await?;
@@ -307,9 +309,11 @@ pub async fn toggle_auto_memory(
 pub async fn extract_auto_memory(
     state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
-    let mut config = echo_agent_app_core::auto_memory::AutoMemoryConfig::default();
-    config.enabled =
-        crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
+    let config = echo_agent_app_core::auto_memory::AutoMemoryConfig {
+        enabled: crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED
+            .load(std::sync::atomic::Ordering::Relaxed),
+        ..Default::default()
+    };
     if !config.enabled {
         return Ok(json!({
             "success": false,
@@ -343,9 +347,11 @@ pub async fn extract_auto_memory(
 pub async fn get_auto_memory_observations(
     state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
-    let mut config = echo_agent_app_core::auto_memory::AutoMemoryConfig::default();
-    config.enabled =
-        crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED.load(std::sync::atomic::Ordering::Relaxed);
+    let config = echo_agent_app_core::auto_memory::AutoMemoryConfig {
+        enabled: crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED
+            .load(std::sync::atomic::Ordering::Relaxed),
+        ..Default::default()
+    };
     let messages = current_agent_messages(&state).await;
     let observations = echo_agent_app_core::auto_memory::extract_observations(&messages, &config);
     let count = observations.len();

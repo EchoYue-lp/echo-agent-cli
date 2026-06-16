@@ -111,6 +111,8 @@ impl LongRunningTaskRunner {
             );
         }
 
+        #[allow(clippy::needless_range_loop)]
+        // `idx` indexes multiple slices and is used arithmetically
         for idx in start_idx..phase_executors.len() {
             if self.cancel.is_cancelled() {
                 return Err(anyhow::anyhow!("Task cancelled before phase {}", idx));

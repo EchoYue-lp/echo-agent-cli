@@ -284,10 +284,10 @@ impl UnifiedMemory {
         // Re-read hot layer on each call so review/auto-promotion updates
         // take effect in the same session.
         let hot = load_hot_content();
-        if let Some(ref content) = hot {
-            if !content.is_empty() {
-                memories.push(content.clone());
-            }
+        if let Some(ref content) = hot
+            && !content.is_empty()
+        {
+            memories.push(content.clone());
         }
 
         MemoryContext {
@@ -321,24 +321,24 @@ fn find_project_root(start: &Path) -> Option<PathBuf> {
 /// Tries project-level `.echo-agent/MEMORY.md` first, then user-level `~/.echo-agent/MEMORY.md`.
 fn load_hot_content() -> Option<String> {
     // Project-level
-    if let Ok(pwd) = std::env::current_dir() {
-        if let Some(root) = find_project_root(&pwd) {
-            let path = root.join(".echo-agent").join("MEMORY.md");
-            if path.exists() {
-                if let Ok(raw) = std::fs::read_to_string(&path) {
-                    return Some(strip_yaml_frontmatter(&raw));
-                }
-            }
+    if let Ok(pwd) = std::env::current_dir()
+        && let Some(root) = find_project_root(&pwd)
+    {
+        let path = root.join(".echo-agent").join("MEMORY.md");
+        if path.exists()
+            && let Ok(raw) = std::fs::read_to_string(&path)
+        {
+            return Some(strip_yaml_frontmatter(&raw));
         }
     }
 
     // User-level
     if let Some(home) = dirs::home_dir() {
         let path = home.join(".echo-agent").join("MEMORY.md");
-        if path.exists() {
-            if let Ok(raw) = std::fs::read_to_string(&path) {
-                return Some(strip_yaml_frontmatter(&raw));
-            }
+        if path.exists()
+            && let Ok(raw) = std::fs::read_to_string(&path)
+        {
+            return Some(strip_yaml_frontmatter(&raw));
         }
     }
 

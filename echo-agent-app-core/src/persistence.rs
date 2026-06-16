@@ -364,7 +364,7 @@ mod tests {
             created_at: "2024-01-02".into(),
             updated_at: "2024-01-02".into(),
         };
-        let mut list = vec![a, b];
+        let mut list = [a, b];
         list.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         assert_eq!(list[0].name, "b");
     }

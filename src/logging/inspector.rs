@@ -140,6 +140,7 @@ pub struct InspectorStats {
 }
 
 /// 便捷函数：创建调用记录
+#[allow(clippy::too_many_arguments)]
 pub fn create_record(
     model: &str,
     request: &str,

@@ -164,8 +164,8 @@ impl PermissionRuleConfig {
     /// Supported matcher patterns:
     /// - `tool:<name>` — exact tool name match
     /// - `perm:<flag>` — matches if the tool declares the given permission
-    ///   (checked via the caller, not here — this method returns `true`
-    ///    for all `perm:` matchers, leaving permission-checking to the caller)
+    ///   (this method returns `true` for all `perm:` matchers; the caller
+    ///   performs the actual permission check)
     /// - `*` — catch-all, matches every tool
     pub fn matches_tool(&self, tool_name: &str) -> bool {
         if self.matcher == "*" {

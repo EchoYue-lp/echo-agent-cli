@@ -104,17 +104,15 @@ pub fn build_data_graph(shared: SharedAgent, max_charts: usize) -> anyhow::Resul
                     || dataset_path.ends_with(".xlsb") || dataset_path.ends_with(".ods");
 
                 let tool_guidance = if is_excel {
-                    format!(
-                        "The file is an Excel file. Use these tools:\n\
+                    "The file is an Excel file. Use these tools:\n\
                          1. excel_info to list sheets and dimensions\n\
                          2. read_excel to preview the data\n\
                          3. excel_profile to check column types and quality\n\
                          4. excel_load to convert to Parquet for further analysis\n\
-                         Do NOT use read_file — it cannot read binary Excel files.")
+                         Do NOT use read_file — it cannot read binary Excel files.".to_string()
                 } else {
-                    format!(
-                        "Use read_data to read the file and get a preview.\n\
-                         Then use profile_data to understand structure, types, and quality.")
+                    "Use read_data to read the file and get a preview.\n\
+                         Then use profile_data to understand structure, types, and quality.".to_string()
                 };
 
                 let prompt = format!(

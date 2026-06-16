@@ -272,19 +272,19 @@ fn load_skill_triggers(skills_dir: &std::path::Path) -> std::collections::HashMa
             .and_then(|rest| rest.split_once("---"))
             .map(|(fm, _)| fm);
 
-        if let Some(fm) = frontmatter {
-            if let Ok(yaml) = serde_yaml::from_str::<serde_yaml::Value>(fm) {
-                let skill_name = yaml
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
+        if let Some(fm) = frontmatter
+            && let Ok(yaml) = serde_yaml::from_str::<serde_yaml::Value>(fm)
+        {
+            let skill_name = yaml
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
 
-                if let Some(triggers) = yaml.get("triggers").and_then(|v| v.as_sequence()) {
-                    for t in triggers {
-                        if let Some(trigger) = t.as_str() {
-                            map.insert(trigger.to_lowercase(), skill_name.clone());
-                        }
+            if let Some(triggers) = yaml.get("triggers").and_then(|v| v.as_sequence()) {
+                for t in triggers {
+                    if let Some(trigger) = t.as_str() {
+                        map.insert(trigger.to_lowercase(), skill_name.clone());
                     }
                 }
             }

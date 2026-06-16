@@ -255,7 +255,7 @@ impl WorkspaceRegistry {
         }
 
         // 按最后活跃时间降序
-        workspaces.sort_by(|a, b| b.last_active.cmp(&a.last_active));
+        workspaces.sort_by_key(|w| std::cmp::Reverse(w.last_active));
         Ok(workspaces)
     }
 

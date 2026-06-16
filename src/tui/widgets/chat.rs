@@ -42,7 +42,7 @@ impl Widget for Chat {
         let scroll = (scroll_u16.min(u16::MAX as usize)) as u16;
 
         // Apply selection highlighting to visible lines.
-        if let Some((sel_start, sel_end)) = app.normalized_selection().map(|(s, e)| (s, e)) {
+        if let Some((sel_start, sel_end)) = app.normalized_selection() {
             let vis_start = scroll as usize;
             let vis_end = (scroll as usize + visible).min(total_lines);
             for vis_idx in vis_start..vis_end {

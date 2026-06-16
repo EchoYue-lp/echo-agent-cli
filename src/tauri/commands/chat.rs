@@ -76,6 +76,7 @@ pub enum ChatEvent {
 }
 
 /// Global pending map for approval/input responses.
+#[allow(clippy::type_complexity)]
 static PENDING_RESPONSES: LazyLock<Arc<Mutex<HashMap<String, oneshot::Sender<PendingResponse>>>>> =
     LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
 

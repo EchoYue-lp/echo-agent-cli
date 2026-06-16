@@ -27,7 +27,7 @@ async fn cmd_trajectories(_ctx: &CommandContext, args: &[&str]) -> CommandOutcom
             },
             Err(e) => println!("Error initializing trajectory saver: {e}"),
         },
-        "list" | _ => {
+        _ => {
             let date_filter = args.get(1).copied();
             match echo_agent::improve::TrajectorySaver::default_dir() {
                 Ok(saver) => match saver.list(date_filter).await {
@@ -669,7 +669,7 @@ async fn cmd_skill_candidates(_ctx: &CommandContext, args: &[&str]) -> CommandOu
                 }
             }
         }
-        "list" | _ => {
+        _ => {
             if candidates_and_drafts.is_empty() {
                 println!("No skill candidates or drafts found.");
                 println!(

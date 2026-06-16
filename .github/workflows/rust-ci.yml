@@ -24,27 +24,26 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Cargo fmt check
-        run: cargo fmt --check
+        run: cargo fmt --all --check
 
-      - name: Cargo clippy (tui feature)
-        run: cargo clippy --workspace --all-targets --features tui
+      # Clippy must be as strict as the framework: -D warnings + all features,
+      # so telemetry/eval/gui-gated code paths are actually linted. Previously
+      # this only checked the `tui` feature (which is in `default`) and did not
+      # fail on warnings — letting regressions slip through.
+      - name: Cargo clippy (all features, deny warnings)
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
-      - name: Cargo test (tui feature)
-        run: cargo test --workspace --features tui
+      - name: Cargo test (all features)
+        run: cargo test --workspace --all-features --locked
 
-      - name: Cargo check all features
-        run: cargo check --workspace --all-features --all-targets
+      # Verify the core library compiles without any optional features (the CLI
+      # binary itself requires `tui` or `gui`, so we scope this to app-core).
+      - name: Cargo check app-core (no-default-features)
+        run: cargo check -p echo-agent-app-core --no-default-features --locked
 
-      - name: Cargo check all targets
-        run: cargo check --workspace --all-targets
-
-      - name: Run eval suite (trigger test)
+      # Skill trigger-accuracy gate: FAILS the build when F1 drops below the
+      # threshold, so a regression in trigger detection is caught here rather
+      # than at runtime. Previously this step always passed (Ok(()) regardless
+      # of F1), making it a no-op.
+      - name: Skill trigger accuracy gate (F1 ≥ 0.7)
         run: cargo run -p echo-agent-eval -- trigger-test --threshold 0.7
-
-      - name: Upload eval report
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: eval-report
-          path: eval-report-*
-          if-no-files-found: ignore

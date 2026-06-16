@@ -194,7 +194,7 @@ pub fn build_research_to_writing_graph(agent: SharedAgent) -> anyhow::Result<Gra
                          {top_n} papers than superficially skim {max_papers}.\n\n\
                          IMPORTANT: You MUST use pdf_fetch to download papers. Do NOT just \
                          summarize the abstracts — read the actual papers.",
-                        top_n = (max_papers / 2).max(3).min(10),
+                        top_n = (max_papers / 2).clamp(3, 10),
                     ),
                 )?;
 

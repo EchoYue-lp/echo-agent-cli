@@ -480,13 +480,11 @@ async fn load_plugins(agent_handle: &AgentHandle) {
 
                     if let Some(ref hooks_file) = resolved.hooks_file
                         && let Ok(content) = std::fs::read_to_string(hooks_file)
-                    {
-                        if let Ok(def) = serde_yaml::from_str::<
+                        && let Ok(def) = serde_yaml::from_str::<
                             echo_agent::skills::hooks::HooksDefinition,
                         >(&content)
-                        {
-                            hooks_to_register.push((plugin_id.clone(), source_dir.clone(), def));
-                        }
+                    {
+                        hooks_to_register.push((plugin_id.clone(), source_dir.clone(), def));
                     }
 
                     if let Some(ref mcp_file) = resolved.mcp_config_file {
@@ -568,24 +566,24 @@ async fn register_lsp_tools(agent_handle: &AgentHandle) {
         }
     });
 
-    if let Some(ref lsp_path) = project_lsp {
-        if let Ok(config) = LspConfig::from_file(lsp_path) {
-            lsp_manager.load_config(&config);
-            lsp_configured = true;
-            tracing::info!(path = %lsp_path.display(), languages = config.servers.len(), "LSP config loaded (project)");
-        }
+    if let Some(ref lsp_path) = project_lsp
+        && let Ok(config) = LspConfig::from_file(lsp_path)
+    {
+        lsp_manager.load_config(&config);
+        lsp_configured = true;
+        tracing::info!(path = %lsp_path.display(), languages = config.servers.len(), "LSP config loaded (project)");
     }
 
     // Try loading global ~/.echo-agent/.lsp.yaml
     let home = std::env::var("HOME").ok().map(std::path::PathBuf::from);
     if let Some(ref home_dir) = home {
         let global_lsp = home_dir.join(".echo-agent").join(".lsp.yaml");
-        if global_lsp.exists() {
-            if let Ok(config) = LspConfig::from_file(&global_lsp) {
-                lsp_manager.load_config(&config);
-                lsp_configured = true;
-                tracing::info!(path = %global_lsp.display(), languages = config.servers.len(), "LSP config loaded (global)");
-            }
+        if global_lsp.exists()
+            && let Ok(config) = LspConfig::from_file(&global_lsp)
+        {
+            lsp_manager.load_config(&config);
+            lsp_configured = true;
+            tracing::info!(path = %global_lsp.display(), languages = config.servers.len(), "LSP config loaded (global)");
         }
     }
 

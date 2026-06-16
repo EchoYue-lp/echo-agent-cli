@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 /// Result of a single trigger test case.
+#[allow(dead_code)] // `query` retained for debugging/diagnostics; reported inline above.
 struct TestCaseResult {
     query: String,
     expected: String,
@@ -132,11 +133,17 @@ where
 
     if f1 >= threshold {
         println!("\n   ✅ PASS: F1 {f1:.3} ≥ {threshold}\n");
+        Ok(())
     } else {
-        println!("\n   ❌ FAIL: F1 {f1:.3} < {threshold}\n");
+        // Return an error so CI fails on a trigger-accuracy regression.
+        // Previously this returned Ok(()), making the gate a no-op.
+        let msg = format!(
+            "Skill trigger accuracy gate FAILED: F1 {f1:.3} < threshold {threshold}. \
+             Improve trigger keywords in the relevant SKILL.md files (in the `skills/` dir).",
+        );
+        println!("\n   ❌ FAIL: {msg}\n");
+        Err(msg)
     }
-
-    Ok(())
 }
 
 /// Compute precision, recall, F1 overall and per-skill.
@@ -145,6 +152,7 @@ where
 /// - **True Positive (TP)**: expected=skill_X, actual=skill_X
 /// - **False Positive (FP)**: expected=none, actual=skill_X
 /// - **False Negative (FN)**: expected=skill_X, actual=none or wrong skill
+#[allow(clippy::type_complexity)] // (precision, recall, f1, per_skill) — clear enough inline
 fn compute_metrics(results: &[TestCaseResult]) -> (f64, f64, f64, Vec<(String, (f64, f64, f64))>) {
     // Overall metrics (excluding boundary cases)
     let non_boundary: Vec<&TestCaseResult> = results.iter().filter(|r| !r.is_boundary).collect();

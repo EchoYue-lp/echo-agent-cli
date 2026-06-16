@@ -48,6 +48,12 @@ pub struct SkillsHub {
     loaded_skills: Vec<String>,
 }
 
+impl Default for SkillsHub {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SkillsHub {
     /// 创建新的 SkillsHub，指向 `~/.echo-agent/skills/`
     pub fn new() -> Self {

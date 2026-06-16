@@ -259,23 +259,21 @@ fn check_criteria(criteria: &SuccessCriteria, output: &str, result: &mut EvalRes
 
                 let mut found = false;
                 for pattern in &patterns {
-                    if let Ok(re) = regex::Regex::new(pattern) {
-                        if let Some(captures) = re.captures(output) {
-                            if let Some(value_str) = captures.get(1) {
-                                if let Ok(actual_value) = value_str.as_str().parse::<f64>() {
-                                    let diff = (actual_value - expected_value).abs();
-                                    if diff > *tolerance {
-                                        result.success = false;
-                                        result.violations.push(format!(
-                                            "Value mismatch for '{}': expected {}, got {} (tolerance: {})",
-                                            key, expected_value, actual_value, tolerance
-                                        ));
-                                    }
-                                    found = true;
-                                    break;
-                                }
-                            }
+                    if let Ok(re) = regex::Regex::new(pattern)
+                        && let Some(captures) = re.captures(output)
+                        && let Some(value_str) = captures.get(1)
+                        && let Ok(actual_value) = value_str.as_str().parse::<f64>()
+                    {
+                        let diff = (actual_value - expected_value).abs();
+                        if diff > *tolerance {
+                            result.success = false;
+                            result.violations.push(format!(
+                                "Value mismatch for '{}': expected {}, got {} (tolerance: {})",
+                                key, expected_value, actual_value, tolerance
+                            ));
                         }
+                        found = true;
+                        break;
                     }
                 }
 

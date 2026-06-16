@@ -332,24 +332,24 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
         .await?;
 
         // ── Memory review on session end (TUI) ──────────────────────
-        if let Some(ref review_integration) = runtime.review_integration {
-            if let Some(review_result) = review_integration.on_session_end().await {
-                match review_result {
-                    Ok(report) => {
-                        if report.total_scanned > 0 {
-                            println!(
-                                "  📋 Memory review: {} scanned, {} stale, {} conflicts, {} merged, {} archived",
-                                report.total_scanned,
-                                report.stale_count,
-                                report.conflict_groups,
-                                report.merges_applied,
-                                report.archives_applied
-                            );
-                        }
+        if let Some(ref review_integration) = runtime.review_integration
+            && let Some(review_result) = review_integration.on_session_end().await
+        {
+            match review_result {
+                Ok(report) => {
+                    if report.total_scanned > 0 {
+                        println!(
+                            "  📋 Memory review: {} scanned, {} stale, {} conflicts, {} merged, {} archived",
+                            report.total_scanned,
+                            report.stale_count,
+                            report.conflict_groups,
+                            report.merges_applied,
+                            report.archives_applied
+                        );
                     }
-                    Err(e) => {
-                        eprintln!("  ⚠ Memory review failed: {e}");
-                    }
+                }
+                Err(e) => {
+                    eprintln!("  ⚠ Memory review failed: {e}");
                 }
             }
         }

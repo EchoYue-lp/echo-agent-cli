@@ -202,7 +202,7 @@ fn render_approval_card(f: &mut Frame, app: &TuiApp, chat_area: Rect) {
                 } else {
                     Style::default().fg(theme.text)
                 };
-                let prefix = if i > 0 { "  " } else { "  " };
+                let prefix = "  ";
                 vec![
                     Span::styled(prefix.to_string(), Style::default()),
                     Span::styled(label.to_string(), style),

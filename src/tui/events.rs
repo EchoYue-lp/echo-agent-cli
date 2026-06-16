@@ -450,10 +450,8 @@ async fn handle_key(
             let guard = pending_handle.try_lock();
             guard.as_ref().map(|g| g.is_some()).unwrap_or(false)
         };
-        if has_pending {
-            if handle_approval_key(app, &pending_handle, &key).await {
-                return;
-            }
+        if has_pending && handle_approval_key(app, &pending_handle, &key).await {
+            return;
         }
     }
 

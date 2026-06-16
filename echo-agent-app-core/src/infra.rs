@@ -21,6 +21,7 @@ const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
 const DEFAULT_MAX_TOKENS: u32 = 8192;
 
 /// Agent creation parameters (extracted from CLI args or config).
+#[derive(Default)]
 pub struct AgentCreateParams {
     pub model: Option<String>,
     pub system_prompt: Option<String>,
@@ -43,21 +44,6 @@ pub struct AgentCreateParams {
     /// long-term memories are recalled per turn through the agent memory store,
     /// not baked into this boot-time suffix.
     pub memory_context_suffix: Option<String>,
-}
-
-impl Default for AgentCreateParams {
-    fn default() -> Self {
-        Self {
-            model: None,
-            system_prompt: None,
-            project: None,
-            session_id: None,
-            conversation_id: None,
-            react_checkpoint_interval: None,
-            state_store: None,
-            memory_context_suffix: None,
-        }
-    }
 }
 
 /// Generate a fresh conversation id for the primary (non-pooled) agent.
@@ -487,14 +473,13 @@ pub fn load_shell_env() {
         let mut loaded = Vec::new();
         SHELL_ENV_LOADED.call_once(|| {
             for line in stdout.lines() {
-                if let Some((key, value)) = line.split_once('=') {
-                    if API_KEY_VARS.contains(&key)
-                        && std::env::var(key).is_err()
-                        && !value.is_empty()
-                    {
-                        unsafe { std::env::set_var(key, value) };
-                        loaded.push(key.to_string());
-                    }
+                if let Some((key, value)) = line.split_once('=')
+                    && API_KEY_VARS.contains(&key)
+                    && std::env::var(key).is_err()
+                    && !value.is_empty()
+                {
+                    unsafe { std::env::set_var(key, value) };
+                    loaded.push(key.to_string());
                 }
             }
         });
@@ -519,6 +504,10 @@ pub fn init_logging(level: &str) {
 /// [`echo_agent::telemetry::init_telemetry`] which sets up OTLP tracing + metrics
 /// configured via `OTEL_EXPORTER_OTLP_ENDPOINT` (defaults to `http://localhost:4317`).
 pub fn init_logging_with_target(level: &str, target: LogTarget) {
+    // `level` is consumed by the EnvFilter below when `telemetry` is off;
+    // reference it here so the param is considered used under all feature combos.
+    #[cfg(feature = "telemetry")]
+    let _ = level;
     use std::sync::OnceLock;
     static INIT: OnceLock<()> = OnceLock::new();
 
@@ -539,7 +528,6 @@ pub fn init_logging_with_target(level: &str, target: LogTarget) {
             // Note: We don't set RUST_LOG env var to avoid thread-safety issues
             // Instead, we rely on tracing_subscriber's EnvFilter::new() to parse the filter
             let _ = echo_agent::telemetry::init_telemetry(config);
-            return;
         }
 
         #[cfg(not(feature = "telemetry"))]
@@ -576,6 +564,7 @@ pub fn init_logging_with_target(level: &str, target: LogTarget) {
     });
 }
 
+#[cfg_attr(feature = "telemetry", allow(dead_code))]
 fn tui_log_path() -> std::path::PathBuf {
     if let Ok(cwd) = std::env::current_dir() {
         let mut current = cwd.as_path();

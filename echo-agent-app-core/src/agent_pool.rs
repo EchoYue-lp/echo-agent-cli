@@ -365,7 +365,7 @@ impl AgentPool {
 
     /// Conservative default fan-out for a single composite parallel task.
     pub fn composite_parallelism(&self) -> usize {
-        self.background_task_concurrency().min(3).max(1)
+        self.background_task_concurrency().clamp(1, 3)
     }
 
     /// Start a periodic cleanup task that evicts idle agents.
