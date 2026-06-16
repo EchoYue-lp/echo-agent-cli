@@ -3,7 +3,15 @@ import { PanelLeftClose, PanelLeftOpen } from 'lucide-react';
 import { useUiStore } from '../../stores/uiStore';
 import { TerminalDrawer } from '../terminal/TerminalDrawer';
 
-export function AppLayout({ left, center }: { left: ReactNode; center: ReactNode }) {
+export function AppLayout({
+  left,
+  center,
+  right,
+}: {
+  left: ReactNode;
+  center: ReactNode;
+  right?: ReactNode;
+}) {
   const { leftSidebarOpen, toggleLeftSidebar } = useUiStore();
 
   const closeSidebarMobile = () => {
@@ -26,9 +34,9 @@ export function AppLayout({ left, center }: { left: ReactNode; center: ReactNode
         className={`shrink-0 overflow-hidden transition-all duration-300 ease-in-out
           max-md:fixed max-md:inset-y-0 max-md:left-0 max-md:z-50
           ${leftSidebarOpen ? 'border-r border-[var(--border-primary)] bg-[var(--bg-sidebar)]' : ''}`}
-        style={{ width: leftSidebarOpen ? '280px' : '0px' }}
+        style={{ width: leftSidebarOpen ? '300px' : '0px' }}
       >
-        <div className="h-full w-[280px]">{left}</div>
+        <div className="h-full w-[300px]">{left}</div>
       </div>
 
       {/* Center + Terminal drawer */}
@@ -41,8 +49,9 @@ export function AppLayout({ left, center }: { left: ReactNode; center: ReactNode
         >
           {leftSidebarOpen ? <PanelLeftClose size={14} /> : <PanelLeftOpen size={14} />}
         </button>
-        <div onClick={closeSidebarMobile} className="flex flex-1 flex-col min-h-0">
-          {center}
+        <div onClick={closeSidebarMobile} className="flex flex-1 min-h-0">
+          <div className="flex min-w-0 flex-1 flex-col">{center}</div>
+          {right}
         </div>
         {/* Terminal drawer at bottom */}
         <TerminalDrawer />

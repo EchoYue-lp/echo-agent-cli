@@ -19,19 +19,7 @@ export function LoginForm() {
   };
 
   return (
-    <div className="noise relative flex min-h-screen items-center justify-center overflow-hidden px-4">
-      {/* Animated gradient orbs */}
-      <div className="pointer-events-none fixed -inset-40">
-        <div
-          className="animate-float absolute left-1/4 top-1/4 h-[400px] w-[400px] rounded-full opacity-20 blur-[120px]"
-          style={{ background: 'var(--accent)' }}
-        />
-        <div
-          className="animate-float absolute bottom-1/4 right-1/4 h-[350px] w-[350px] rounded-full opacity-15 blur-[100px]"
-          style={{ animationDelay: '-2s', background: 'var(--color-purple)' }}
-        />
-      </div>
-
+    <div className="relative flex min-h-screen items-center justify-center overflow-hidden px-4">
       {/* Backdrop */}
       <div className="pointer-events-none fixed inset-0 bg-[var(--bg-chat)]/60" />
 

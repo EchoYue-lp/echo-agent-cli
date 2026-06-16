@@ -90,15 +90,9 @@ cd web-frontend && npm install && cd ..
 
 ### 配置
 
-设置以下三个环境变量即可使用（写入 `~/.bashrc` 或 `.env` 文件）：
+GUI 用户推荐在 **设置 → 模型供应商** 中添加模型。每个厂商可以添加多个模型，保存后可在聊天输入框底部的“默认模型”下拉框中切换。用户填写的 API Key 优先级高于系统环境变量，CLI/TUI 也会读取同一份默认已配置模型。
 
-```bash
-export ECHOCOWORK_AUTH_TOKEN="your-api-key"
-export ECHOCOWORK_BASE_URL="https://api.deepseek.com/v1"
-export ECHOCOWORK_MODEL="deepseek-v4-flash"
-```
-
-也可以通过 `echo-agent.yaml` 配置文件设置。完整配置参考（含 echo-agent.yaml 和 mcp.json 完整示例，可直接复制）：
+自动化部署也可以通过 `echo-agent.yaml` 设置 `model_providers` 和 `configured_models`。完整配置参考：
 
 - [配置指南](docs/configuration.md)
 

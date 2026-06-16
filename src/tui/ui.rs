@@ -42,14 +42,14 @@ pub fn draw(f: &mut Frame, app: &TuiApp) {
         vec![
             Constraint::Length(1),               // StatusBar
             Constraint::Min(8),                  // Chat (+ sidebar)
-            Constraint::Length(2),               // Input
+            Constraint::Length(3),               // Input
             Constraint::Length(task_strip_rows), // TaskStrip (dynamic, bottom)
         ]
     } else {
         vec![
             Constraint::Length(1), // StatusBar
             Constraint::Min(8),    // Chat (+ sidebar)
-            Constraint::Length(2), // Input
+            Constraint::Length(3), // Input
         ]
     };
 

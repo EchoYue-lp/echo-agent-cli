@@ -93,21 +93,21 @@ export const MessageBubble = memo(function MessageBubble({
   const files = message.attachments?.filter((a) => !isImageFile(a.mime_type)) ?? [];
 
   return (
-    <div className={`flex gap-3 py-3 ${isUser ? 'flex-row-reverse' : ''}`}>
+    <div className={`flex gap-3 py-3.5 ${isUser ? 'flex-row-reverse' : ''}`}>
       {/* Avatar */}
       <div
-        className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-xl text-xs font-semibold
+        className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-xs font-semibold
           ${
             isUser
-              ? 'bg-[var(--accent)] text-white'
-              : 'border border-[var(--border-primary)] bg-[var(--bg-primary)] text-[var(--text-secondary)]'
+              ? 'bg-[var(--bg-user-msg)] text-[var(--text-user-msg)]'
+              : 'border border-[var(--border-primary)] bg-[var(--bg-secondary)] text-[var(--text-secondary)]'
           }`}
       >
         {isUser ? <User size={14} /> : <Bot size={14} />}
       </div>
 
       {/* Content */}
-      <div className={`min-w-0 max-w-[80%] space-y-2 ${isUser ? 'items-end' : ''}`}>
+      <div className={`min-w-0 space-y-2 ${isUser ? 'max-w-[72%] items-end' : 'max-w-[92%]'}`}>
         {/* Execution process — grouped thinking + tool calls in chronological order */}
         {!isUser && (
           <ExecutionProcessBlock
@@ -229,7 +229,7 @@ export const MessageBubble = memo(function MessageBubble({
                   <button
                     onClick={submitEdit}
                     disabled={!editText.trim()}
-                    className="flex items-center gap-1 rounded-md px-2.5 py-1 text-xs text-white"
+                    className="flex items-center gap-1 rounded-md px-2.5 py-1 text-xs text-[var(--text-on-accent)]"
                     style={{ background: 'var(--accent)' }}
                   >
                     <ArrowUp size={12} /> 发送
@@ -238,11 +238,11 @@ export const MessageBubble = memo(function MessageBubble({
               </div>
             ) : (
               <div
-                className={`rounded-2xl px-4 py-2.5 text-sm leading-relaxed
+                className={`text-sm leading-relaxed
                   ${
                     isUser
-                      ? 'bg-[var(--accent)] text-white'
-                      : 'border border-[var(--border-primary)] bg-[var(--bg-primary)] text-[var(--text-assistant-msg)] md-content'
+                      ? 'rounded-2xl bg-[var(--bg-user-msg)] px-4 py-2.5 text-[var(--text-user-msg)]'
+                      : 'border-l-2 border-[var(--border-primary)] px-4 py-1 text-[var(--text-assistant-msg)] md-content'
                   }`}
               >
                 {isUser ? (
@@ -357,7 +357,9 @@ function ExecutionProcessBlock({
   return (
     <div
       className="my-1 overflow-hidden rounded-lg border border-[var(--border-primary)] bg-[var(--bg-secondary)]"
-      style={{ borderLeft: `2px solid ${isStreaming ? 'var(--color-purple)' : 'var(--border-primary)'}` }}
+      style={{
+        borderLeft: `2px solid ${isStreaming ? 'var(--color-purple)' : 'var(--border-primary)'}`,
+      }}
     >
       <button
         onClick={() => setExpanded(!expanded)}
@@ -406,9 +408,7 @@ function ExecutionProcessBlock({
                 </div>
               );
             } else {
-              return (
-                <ToolCallCard key={`tool-${step.index}`} toolCall={step.toolCall} compact />
-              );
+              return <ToolCallCard key={`tool-${step.index}`} toolCall={step.toolCall} compact />;
             }
           })}
         </div>

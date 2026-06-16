@@ -43,6 +43,12 @@ impl Widget for Input {
             width: area.width,
             height: 1,
         };
+        let footer = Rect {
+            x: area.x,
+            y: area.y + 2,
+            width: area.width,
+            height: area.height.saturating_sub(2).min(1),
+        };
 
         // Draw suggestions popup above the input if any.
         if !app.suggestions.is_empty() {
@@ -79,6 +85,15 @@ impl Widget for Input {
 
         let input = Paragraph::new(Line::from(vec![prompt_icon, text_span])).style(style);
         f.render_widget(input, inner);
+
+        if footer.height > 0 {
+            let footer_line = Line::from(vec![
+                Span::styled("  Enter 发送", Style::default().fg(t.overlay0)),
+                Span::styled("  Shift+Enter 换行", Style::default().fg(t.overlay0)),
+                Span::styled("  / 命令", Style::default().fg(t.overlay0)),
+            ]);
+            f.render_widget(Paragraph::new(footer_line), footer);
+        }
 
         // Show cursor (offset by prompt display width).
         if !app.is_processing {

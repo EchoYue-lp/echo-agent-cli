@@ -223,7 +223,12 @@ export function useTauriChat() {
   const sendApproval = useCallback(
     async (requestId: string, approved: boolean, reason?: string, scope?: string) => {
       try {
-        await apiInvoke('send_approval_response', { request_id: requestId, approved, reason, scope });
+        await apiInvoke('send_approval_response', {
+          request_id: requestId,
+          approved,
+          reason,
+          scope,
+        });
         useChatStore.getState().setApprovalRequest(null);
       } catch (e) {
         console.error('[TauriChat] Failed to send approval:', e);

@@ -75,9 +75,7 @@ export function MemoryPanel() {
       const result = await autoMemoryApi.extract();
       setAutoPreview(result.observations);
       setAutoMessage(
-        result.success
-          ? `已保存 ${result.count} 条观察`
-          : result.message || 'Auto Memory 未保存'
+        result.success ? `已保存 ${result.count} 条观察` : result.message || 'Auto Memory 未保存'
       );
       await loadAutoMemoryStatus();
       await loadEntries(selectedNs || undefined);

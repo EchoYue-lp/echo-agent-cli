@@ -25,11 +25,7 @@ const isTauri = (): boolean => {
   const hasTauriViteMode = import.meta.env.VITE_ECHOCOWORK_TAURI === '1';
 
   return (
-    hasTauriGlobals ||
-    hasTauriProtocol ||
-    hasTauriUserAgent ||
-    hasTauriDevFlag ||
-    hasTauriViteMode
+    hasTauriGlobals || hasTauriProtocol || hasTauriUserAgent || hasTauriDevFlag || hasTauriViteMode
   );
 };
 

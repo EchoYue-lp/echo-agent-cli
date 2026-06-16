@@ -209,8 +209,8 @@ export function SandboxPanel() {
           disabled={running || !code.trim()}
           className="flex w-full items-center justify-center gap-2 rounded-lg py-2 text-xs font-medium transition-colors"
           style={{
-            background: running ? 'var(--border-primary)' : 'var(--accent)',
-            color: running ? 'var(--text-tertiary)' : 'white',
+            background: running ? 'var(--border-primary)' : 'var(--action-run)',
+            color: running ? 'var(--text-tertiary)' : 'var(--text-on-run)',
           }}
         >
           {running ? (

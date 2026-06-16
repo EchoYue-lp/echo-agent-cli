@@ -43,7 +43,7 @@ impl Default for WebConfig {
     fn default() -> Self {
         Self {
             model: "qwen3.6-plus".to_string(),
-            system_prompt: "你是一个智能助手。".to_string(),
+            system_prompt: "你是 EchoCoWork，一个面向真实项目协作的 AI 编程与研究代理。你帮助用户理解需求、检查项目、修改代码、运行验证、整理结论，并在需要时使用记忆和自进化能力沉淀长期经验。".to_string(),
             token_limit: 8000,
             max_upload_size_bytes: 10 * 1024 * 1024,
         }

@@ -144,7 +144,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const messages = s.messages.map((m) => {
         if (m.id !== id) return m;
         const thinkingSegments = [...(m.thinkingSegments || []), { content: '' }];
-        const executionSteps = [...(m.executionSteps || []), { type: 'thinking' as const, index: thinkingSegments.length - 1 }];
+        const executionSteps = [
+          ...(m.executionSteps || []),
+          { type: 'thinking' as const, index: thinkingSegments.length - 1 },
+        ];
         return { ...m, thinkingSegments, executionSteps };
       });
       // If there's an in-progress round, it's now complete (thinking→tools→done),

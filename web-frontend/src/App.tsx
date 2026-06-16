@@ -1,6 +1,7 @@
 import { useCallback, useState, useMemo, useEffect } from 'react';
 import { AppLayout } from './components/layout/AppLayout';
 import { LeftSidebar } from './components/layout/LeftSidebar';
+import { RightRail } from './components/layout/RightRail';
 import { ChatPanel } from './components/chat/ChatPanel';
 import { SettingsDialog } from './components/layout/SettingsDialog';
 import { ToastContainer } from './components/common/Toast';
@@ -112,15 +113,6 @@ function App() {
         category: 'Settings',
       },
       {
-        id: 'settings-permissions',
-        label: 'Settings: Permissions',
-        description: 'Configure tool permissions',
-        action: () => {
-          setActiveSettingsTab('permissions');
-        },
-        category: 'Settings',
-      },
-      {
         id: 'toggle-theme',
         label: 'Toggle Theme',
         description: 'Switch between light and dark mode',
@@ -154,7 +146,11 @@ function App() {
   return (
     <ErrorBoundary>
       <RequireAuth>
-        <AppLayout left={<LeftSidebar onNewTask={handleNewTask} />} center={<ChatPanel />} />
+        <AppLayout
+          left={<LeftSidebar onNewTask={handleNewTask} />}
+          center={<ChatPanel />}
+          right={<RightRail />}
+        />
         <SettingsDialog />
         <NewTaskDialog isOpen={newTaskOpen} onClose={() => setNewTaskOpen(false)} />
         <CommandPalette

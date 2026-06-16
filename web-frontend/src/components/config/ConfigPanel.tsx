@@ -9,6 +9,7 @@ export function ConfigPanel() {
   const [dirty, setDirty] = useState(false);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState('');
+  const [advancedOpen, setAdvancedOpen] = useState(false);
 
   useEffect(() => {
     Promise.all([configApi.get(), configApi.getFull()])
@@ -91,7 +92,7 @@ export function ConfigPanel() {
           <button
             onClick={save}
             disabled={saving || !dirty}
-            className="rounded-lg bg-[var(--accent)] px-3 py-1 text-xs font-medium text-white transition-colors hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-30"
+            className="rounded-lg bg-[var(--accent)] px-3 py-1 text-xs font-medium text-[var(--text-on-accent)] transition-colors hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-30"
           >
             {saving ? '保存中...' : '保存'}
           </button>
@@ -105,13 +106,32 @@ export function ConfigPanel() {
           value={edit.agent?.system_prompt ?? agentConfig.system_prompt}
           onChange={(v) => markDirty({ agent: { ...edit.agent, system_prompt: v } })}
           multiline
+          rows={16}
+          className="min-h-[320px] resize-y font-mono leading-relaxed"
         />
-        <Field
-          label="最大迭代次数"
-          value={String(edit.agent?.max_iterations ?? agentConfig.max_iterations)}
-          onChange={(v) => markDirty({ agent: { ...edit.agent, max_iterations: Number(v) } })}
-          type="number"
-        />
+      </Section>
+
+      <Section title="高级/调试">
+        <button
+          type="button"
+          onClick={() => setAdvancedOpen((open) => !open)}
+          className="w-full rounded-lg border border-[var(--border-primary)] bg-[var(--bg-primary)] px-3 py-2 text-left text-xs font-medium text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)]"
+        >
+          {advancedOpen ? '收起高级运行参数' : '展开高级运行参数'}
+        </button>
+        {advancedOpen && (
+          <div className="space-y-2 rounded-lg border border-[var(--border-secondary)] bg-[var(--bg-secondary)] p-3">
+            <Field
+              label="单轮推理安全上限"
+              value={String(edit.agent?.max_iterations ?? agentConfig.max_iterations)}
+              onChange={(v) => markDirty({ agent: { ...edit.agent, max_iterations: Number(v) } })}
+              type="number"
+            />
+            <p className="text-[11px] leading-relaxed text-[var(--text-tertiary)]">
+              仅用于调试或防止异常循环。0 表示不限制，长程 CoWork 任务建议保持 0。
+            </p>
+          </div>
+        )}
       </Section>
 
       {/* MCP */}
@@ -201,8 +221,7 @@ export function ConfigPanel() {
         <Field
           label="超时（分钟）"
           value={String(
-            edit.channels?.session?.timeout_minutes ??
-              fullConfig.channels.session.timeout_minutes
+            edit.channels?.session?.timeout_minutes ?? fullConfig.channels.session.timeout_minutes
           )}
           onChange={(v) =>
             markDirty({
@@ -245,15 +264,20 @@ function Field({
   onChange,
   multiline,
   type,
+  rows,
+  className,
 }: {
   label: string;
   value: string;
   onChange: (v: string) => void;
   multiline?: boolean;
   type?: string;
+  rows?: number;
+  className?: string;
 }) {
   const cls =
     'w-full rounded-lg border border-[var(--border-primary)] bg-[var(--bg-input)] px-2 py-1.5 text-sm text-[var(--text-primary)] outline-none focus:border-[var(--border-focus)]';
+  const controlClassName = `${cls} ${className ?? ''}`;
   return (
     <div>
       <label className="mb-1 block text-xs text-[var(--text-secondary)]">{label}</label>
@@ -261,15 +285,16 @@ function Field({
         <textarea
           value={value}
           onChange={(e) => onChange(e.target.value)}
-          className={cls}
-          rows={3}
+          className={controlClassName}
+          rows={rows ?? 3}
+          spellCheck={false}
         />
       ) : (
         <input
           type={type}
           value={value}
           onChange={(e) => onChange(e.target.value)}
-          className={cls}
+          className={controlClassName}
         />
       )}
     </div>

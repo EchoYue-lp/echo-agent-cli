@@ -134,7 +134,10 @@ pub struct FullConfigResponse {
 #[derive(Debug, Serialize, TS)]
 #[ts(export, rename = "ModelConfigResponse")]
 pub struct ModelConfigResponse {
+    pub provider: String,
     pub name: String,
+    pub has_auth_token: bool,
+    pub base_url: Option<String>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
 }

@@ -1,10 +1,5 @@
 import { useEffect, useState } from 'react';
-import {
-  Sparkles,
-  Play,
-  Clock,
-  Loader2,
-} from 'lucide-react';
+import { Sparkles, Play, Clock, Loader2 } from 'lucide-react';
 import { sessionApi } from '../../api/endpoints';
 import { useConversationStore } from '../../stores/conversationStore';
 
@@ -94,18 +89,12 @@ export function WelcomeScreen({
 
   return (
     <div className="flex h-full flex-col items-center justify-center px-4">
-      <div className="mb-12 flex flex-col items-center">
-        <div
-          className="animate-slide-up mb-6 flex h-[80px] w-[80px] items-center justify-center rounded-2xl"
-          style={{
-            background: 'linear-gradient(135deg, var(--accent) 0%, var(--color-purple) 100%)',
-            boxShadow: '0 12px 40px -8px rgba(99, 102, 241, 0.35)',
-          }}
-        >
-          <Sparkles size={36} color="white" />
+      <div className="mb-10 flex flex-col items-center">
+        <div className="animate-slide-up mb-5 flex h-12 w-12 items-center justify-center rounded-xl border border-[var(--border-primary)] bg-[var(--bg-primary)] text-[var(--accent)] shadow-[var(--shadow-sm)]">
+          <Sparkles size={22} />
         </div>
         <h1
-          className="animate-slide-up text-2xl font-semibold tracking-tight text-[var(--text-primary)]"
+          className="animate-slide-up text-xl font-semibold tracking-tight text-[var(--text-primary)]"
           style={{ animationDelay: '0.05s' }}
         >
           今天有什么可以帮你的？

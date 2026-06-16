@@ -80,10 +80,11 @@ export function WorkflowPanel() {
             <div className="ml-auto flex gap-1">
               <button
                 onClick={() => execute(wf.id)}
-                className="rounded p-1 transition-colors hover:bg-[var(--bg-hover)]"
+                className="rounded p-1 transition-colors"
+                style={{ background: 'var(--action-run-bg)' }}
                 title="执行"
               >
-                <Play size={12} style={{ color: 'var(--accent)' }} />
+                <Play size={12} style={{ color: 'var(--action-run)' }} />
               </button>
               <button
                 onClick={() => remove(wf.id)}

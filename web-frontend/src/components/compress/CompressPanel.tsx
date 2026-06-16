@@ -128,8 +128,8 @@ export function CompressPanel() {
         disabled={compressing}
         className="flex w-full items-center justify-center gap-2 rounded-lg py-2.5 text-xs font-medium transition-colors"
         style={{
-          background: compressing ? 'var(--border-primary)' : 'var(--accent)',
-          color: compressing ? 'var(--text-tertiary)' : 'white',
+          background: compressing ? 'var(--border-primary)' : 'var(--action-run)',
+          color: compressing ? 'var(--text-tertiary)' : 'var(--text-on-run)',
         }}
       >
         {compressing ? (

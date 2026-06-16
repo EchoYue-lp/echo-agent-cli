@@ -8,7 +8,6 @@ export type SettingsTabId =
   | 'config'
   | 'providers'
   | 'sessions'
-  | 'permissions'
   | 'audit'
   | 'scratchpad'
   | 'decisions'

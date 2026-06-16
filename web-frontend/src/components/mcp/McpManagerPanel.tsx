@@ -83,7 +83,7 @@ export function McpManagerPanel({
         <button
           onClick={() => setEditingServer('new')}
           className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium
-            bg-[var(--accent)] text-white hover:opacity-90 transition-opacity"
+            bg-[var(--accent)] text-[var(--text-on-accent)] hover:opacity-90 transition-opacity"
         >
           <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
@@ -150,7 +150,7 @@ export function McpManagerPanel({
           <div className="flex items-center gap-2 mt-3">
             <button
               onClick={handleAdd}
-              className="px-4 py-2 rounded-lg text-sm font-medium bg-[var(--accent)] text-white hover:opacity-90 transition-opacity"
+              className="px-4 py-2 rounded-lg text-sm font-medium bg-[var(--accent)] text-[var(--text-on-accent)] hover:opacity-90 transition-opacity"
             >
               Add Server
             </button>

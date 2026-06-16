@@ -188,7 +188,7 @@ export default function DirectoryPicker({
             </button>
             <button
               onClick={handleConfirm}
-              className="rounded-lg px-4 py-1.5 text-xs font-medium text-white transition-colors hover:opacity-90"
+              className="rounded-lg px-4 py-1.5 text-xs font-medium text-[var(--text-on-accent)] transition-colors hover:opacity-90"
               style={{ background: 'var(--accent)' }}
             >
               选择此目录

@@ -1,9 +1,9 @@
 import { useEffect } from 'react';
+import type { CSSProperties } from 'react';
 import {
   X,
   Settings,
   Save,
-  Lock,
   ShieldCheck,
   Minimize2,
   Wrench,
@@ -23,7 +23,6 @@ import {
 import { useUiStore, type SettingsTabId } from '../../stores/uiStore';
 import { ConfigPanel } from '../config/ConfigPanel';
 import { SessionsPanel } from '../sessions/SessionsPanel';
-import { PermissionsPanel } from '../permissions/PermissionsPanel';
 import { AuditPanel } from '../audit/AuditPanel';
 import { CompressPanel } from '../compress/CompressPanel';
 import { ToolsPanel } from '../tools/ToolsPanel';
@@ -71,10 +70,7 @@ const settingsGroups: { label: string; icon: typeof Settings; items: SettingsIte
   {
     label: '安全',
     icon: ShieldCheck,
-    items: [
-      { id: 'permissions', label: '权限', icon: Lock },
-      { id: 'audit', label: '审计', icon: ShieldCheck },
-    ],
+    items: [{ id: 'audit', label: '审计', icon: ShieldCheck }],
   },
   {
     label: '运行时',
@@ -87,9 +83,7 @@ const settingsGroups: { label: string; icon: typeof Settings; items: SettingsIte
   {
     label: '智能',
     icon: Sparkles,
-    items: [
-      { id: 'evolution', label: '自进化', icon: Sparkles },
-    ],
+    items: [{ id: 'evolution', label: '自进化', icon: Sparkles }],
   },
 ];
 
@@ -102,7 +96,6 @@ const panels: Record<SettingsTabId, React.FC> = {
   config: ConfigPanel,
   providers: ProviderPanel,
   sessions: SessionsPanel,
-  permissions: PermissionsPanel,
   audit: AuditPanel,
   scratchpad: ScratchpadPanel,
   decisions: DecisionLogPanel,
@@ -146,10 +139,20 @@ export function SettingsDialog() {
       />
 
       {/* Dialog */}
-      <div className="animate-scale-in fixed left-1/2 top-1/2 z-50 flex h-[85vh] w-[92vw] max-w-6xl -translate-x-1/2 -translate-y-1/2 overflow-hidden rounded-2xl border border-[var(--border-primary)] bg-[var(--bg-primary)] shadow-2xl max-sm:h-screen max-sm:w-screen max-sm:max-w-none max-sm:rounded-none">
+      <div
+        className="settings-dialog animate-scale-in fixed left-1/2 top-1/2 z-50 flex h-[85vh] w-[92vw] max-w-6xl -translate-x-1/2 -translate-y-1/2 overflow-hidden rounded-2xl border border-[var(--border-primary)] bg-[var(--settings-dialog-bg)] shadow-[var(--shadow-xl)] max-sm:h-screen max-sm:w-screen max-sm:max-w-none max-sm:rounded-none"
+        style={
+          {
+            '--accent': 'var(--settings-accent)',
+            '--accent-bg': 'var(--settings-accent-bg)',
+            '--border-focus': 'var(--settings-accent)',
+            '--text-on-accent': 'var(--settings-text-on-accent)',
+          } as CSSProperties
+        }
+      >
         {/* Left sidebar — settings nav */}
-        <div className="flex w-[220px] shrink-0 flex-col border-r border-[var(--border-primary)] bg-[var(--bg-sidebar)]">
-          <div className="flex items-center justify-between border-b border-[var(--border-primary)] px-5 py-4">
+        <div className="flex w-[220px] shrink-0 flex-col border-r border-[var(--border-primary)] bg-[var(--settings-sidebar-bg)]">
+          <div className="flex items-center justify-between border-b border-[var(--border-secondary)] px-5 py-4">
             <h2 className="text-sm font-semibold tracking-tight text-[var(--text-primary)]">
               设置
             </h2>
@@ -177,7 +180,7 @@ export function SettingsDialog() {
                     className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-[13px] font-medium transition-all duration-150
                       ${
                         effectiveSettingsTab === id
-                          ? 'bg-[var(--accent)]/10 text-[var(--accent)] shadow-sm'
+                          ? 'bg-[var(--settings-active-bg)] text-[var(--text-primary)]'
                           : 'text-[var(--text-secondary)] hover:bg-[var(--bg-sidebar-hover)] hover:text-[var(--text-primary)]'
                       }`}
                   >
@@ -191,8 +194,8 @@ export function SettingsDialog() {
         </div>
 
         {/* Content area */}
-        <div className="flex flex-1 flex-col min-w-0">
-          <div className="flex items-center justify-between border-b border-[var(--border-primary)] px-6 py-3.5">
+        <div className="flex flex-1 flex-col min-w-0 bg-[var(--settings-content-bg)]">
+          <div className="flex items-center justify-between border-b border-[var(--border-secondary)] bg-[var(--settings-panel-bg)] px-6 py-3.5">
             <span className="text-sm font-semibold text-[var(--text-primary)]">
               {effectiveItem?.label}
             </span>

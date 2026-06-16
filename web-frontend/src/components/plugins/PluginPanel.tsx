@@ -156,7 +156,7 @@ export function PluginPanel() {
           </button>
           <button
             onClick={() => setShowInstall(!showInstall)}
-            className="flex items-center gap-1 px-3 py-2 rounded-lg text-white text-sm transition-colors hover:opacity-90"
+            className="flex items-center gap-1 px-3 py-2 rounded-lg text-[var(--text-on-accent)] text-sm transition-colors hover:opacity-90"
             style={{ background: 'var(--accent)' }}
           >
             <Plus className="w-4 h-4" />
@@ -231,7 +231,7 @@ export function PluginPanel() {
             <button
               onClick={handleInstall}
               disabled={installing || !installSource.trim()}
-              className="flex items-center gap-1 px-4 py-2 text-white rounded text-sm transition-colors disabled:opacity-50 hover:opacity-90"
+              className="flex items-center gap-1 px-4 py-2 text-[var(--text-on-accent)] rounded text-sm transition-colors disabled:opacity-50 hover:opacity-90"
               style={{ background: 'var(--accent)' }}
             >
               {installing ? (

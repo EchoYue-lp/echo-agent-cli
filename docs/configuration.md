@@ -11,13 +11,14 @@ EchoCoWork 按以下优先级查找配置文件：
 
 ## 快速配置
 
-只需设置三个环境变量即可使用：
+GUI 用户不需要手写 YAML。打开 **设置 → 模型供应商**：
 
-```bash
-export ECHOCOWORK_AUTH_TOKEN="your-api-key"
-export ECHOCOWORK_BASE_URL="https://api.deepseek.com/v1"
-export ECHOCOWORK_MODEL="deepseek-v4-flash"
-```
+1. 选择厂商。
+2. 填写 API Key、模型名和可选 API 地址。
+3. 点击“保存并使用”。
+4. 在聊天输入框底部的“默认模型”下拉框中切换已配置模型。
+
+用户填写的 API Key 优先级高于系统环境变量。CLI/TUI 会读取同一份已配置默认模型。
 
 ## 完整配置文件（echo-agent.yaml）
 
@@ -25,22 +26,32 @@ export ECHOCOWORK_MODEL="deepseek-v4-flash"
 
 ```yaml
 # ── 模型配置 ─────────────────────────────────────────────────────
-# 也可以通过环境变量设置（优先级更高）：
-# - ECHOCOWORK_AUTH_TOKEN: API 密钥
-# - ECHOCOWORK_BASE_URL: API 基础 URL
-# - ECHOCOWORK_MODEL: 模型名称
+# 推荐通过 GUI 的“模型供应商”页面维护。YAML 适合自动化部署。
 model:
-  provider: "deepseek"        # 模型 Provider（deepseek/openai/anthropic/qwen）
-  name: "deepseek-v4-flash"   # 模型名称
-  auth_token: ""              # API 密钥（可选，优先从环境变量 ECHOCOWORK_AUTH_TOKEN 读取）
-  base_url: ""                # API 基础 URL（可选，优先从环境变量 ECHOCOWORK_BASE_URL 读取）
-  # max_tokens: 4096          # 最大输出 token 数（可选）
-  # temperature: 0.7          # 温度参数（可选）
+  default_model_id: "deepseek:deepseek-v4-flash"
+  provider: "deepseek"        # 运行时镜像字段，由“模型供应商”保存默认模型时同步
+  name: "deepseek-v4-flash"   # 运行时镜像字段，不建议手动编辑
+  max_tokens: 8192
+  temperature: 0.7
+
+model_providers:
+  deepseek:
+    auth_token: "your-api-key"
+    base_url: "https://api.deepseek.com/chat/completions"
+
+configured_models:
+  - id: "deepseek:deepseek-v4-flash"
+    display_name: "Deepseek V4 Flash"
+    provider: "deepseek"
+    model: "deepseek-v4-flash"
+    enabled: true
+    max_tokens: 8192
+    temperature: 0.7
 
 # ── Agent 配置 ─────────────────────────────────────────────────────
 agent:
   name: "echo-assistant"                              # Agent 名称
-  system_prompt: "你是一个智能助手，可以帮助用户回答问题、执行任务。"  # 系统提示词
+  system_prompt: "你是 EchoCoWork，一个面向真实项目协作的 AI 编程与研究代理。你帮助用户理解需求、检查项目、修改代码、运行验证、整理结论，并在需要时使用记忆和自进化能力沉淀长期经验。"  # 系统提示词
   max_iterations: 0            # ReAct 最大迭代次数（0 = 无限制，直到任务完成或用户取消）
   enable_tools: true          # 启用工具调用
   enable_memory: true         # 启用记忆
@@ -197,49 +208,97 @@ MCP 配置文件搜索路径（按优先级）：
 
 ### 切换模型示例
 
-**DeepSeek（默认）：**
+### 模型供应商配置
+
+推荐在 GUI 中配置。需要手写 YAML 时，按下面结构添加到 `model_providers` 和 `configured_models`。
+
+**DeepSeek：**
 ```yaml
 model:
-  provider: "deepseek"
-  name: "deepseek-v4-flash"
+  default_model_id: "deepseek:deepseek-v4-flash"
+
+model_providers:
+  deepseek:
+    auth_token: "your-api-key"
+    base_url: "https://api.deepseek.com/chat/completions"
+
+configured_models:
+  - id: "deepseek:deepseek-v4-flash"
+    display_name: "Deepseek V4 Flash"
+    provider: "deepseek"
+    model: "deepseek-v4-flash"
+    enabled: true
 ```
 
-**OpenAI GPT-4o：**
+**OpenAI：**
 ```yaml
 model:
-  provider: "openai"
-  name: "gpt-5.5"
+  default_model_id: "openai:gpt-5.5"
+
+model_providers:
+  openai:
+    auth_token: "your-api-key"
+    base_url: "https://api.openai.com/v1/chat/completions"
+
+configured_models:
+  - id: "openai:gpt-5.5"
+    display_name: "Gpt 5.5"
+    provider: "openai"
+    model: "gpt-5.5"
+    enabled: true
 ```
 
 **Anthropic Claude：**
 ```yaml
 model:
-  provider: "anthropic"
-  name: "claude-3.5-sonnet"
+  default_model_id: "anthropic:claude-opus-4-8"
+
+model_providers:
+  anthropic:
+    auth_token: "your-api-key"
+    base_url: "https://api.anthropic.com/v1/messages"
+
+configured_models:
+  - id: "anthropic:claude-opus-4-8"
+    display_name: "Claude Opus 4 8"
+    provider: "anthropic"
+    model: "claude-opus-4-8"
+    enabled: true
 ```
 
 **自定义 Provider：**
 ```yaml
 model:
-  provider: "custom"
-  name: "your-model-name"
-  auth_token: "your-api-key"
-  base_url: "https://your-api-endpoint.com/v1"
+  default_model_id: "custom:your-model-name"
+
+model_providers:
+  custom:
+    auth_token: "your-api-key"
+    base_url: "https://your-api-endpoint.com/v1/chat/completions"
+
+configured_models:
+  - id: "custom:your-model-name"
+    display_name: "Your Model Name"
+    provider: "custom"
+    model: "your-model-name"
+    enabled: true
 ```
 
 ### Ollama 本地部署
 
 ```yaml
 model:
-  provider: "ollama"
-  name: "llama3.1"
+  default_model_id: "ollama:llama3.1"
+
+configured_models:
+  - id: "ollama:llama3.1"
+    display_name: "Llama3.1"
+    provider: "ollama"
+    model: "llama3.1"
+    enabled: true
 ```
 
-Ollama 使用默认地址 `http://localhost:11434/v1`，无需 API Key。如需自定义地址：
-
-```bash
-export OLLAMA_BASE_URL="http://localhost:11434/v1"
-```
+Ollama 使用默认地址 `http://localhost:11434/api/chat`，无需 API Key。
 
 确保 Ollama 已启动：
 
@@ -342,16 +401,14 @@ Agent: 调用 pdf_fetch...
 ## 环境变量汇总
 
 ```bash
-# ── 核心配置（优先级最高） ──
-export ECHOCOWORK_AUTH_TOKEN="..."     # API 密钥
-export ECHOCOWORK_BASE_URL="..."       # API 基础 URL
-export ECHOCOWORK_MODEL="..."          # 模型名称
-
-# ── Provider 专属 API Key ──
+# ── Provider 专属 API Key（兜底） ──
+# GUI/YAML 中保存的 API Key 优先级更高；环境变量适合 CI 或无 GUI 环境。
 export DEEPSEEK_API_KEY="..."          # DeepSeek
 export OPENAI_API_KEY="..."            # OpenAI
 export ANTHROPIC_API_KEY="..."         # Anthropic
 export DASHSCOPE_API_KEY="..."         # 阿里通义
+export QWEN_API_KEY="..."              # 阿里通义别名
+export GEMINI_API_KEY="..."            # Gemini
 
 # ── 其他 ──
 export MCP_CONFIG_PATH="~/my-mcp-config.json"  # MCP 配置文件路径

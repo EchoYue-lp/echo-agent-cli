@@ -2,192 +2,262 @@
 
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
-use echo_agent::llm::LlmConfig;
+use echo_agent::config::{ConfiguredModel, ModelProviderConfig};
 use echo_agent::prelude::Message;
+use echo_agent_app_core::infra::build_llm_config;
+use echo_agent_app_core::model_config;
+use serde::Deserialize;
 
-/// All accepted environment variable names for each provider.
-///
-/// Priority order: first match wins. This mirrors
-/// `ProviderFactory::env_api_key()` in echo-integration/src/providers/config.rs
-/// but extends to cover alternative names users commonly set.
-fn provider_env_vars(provider: &str) -> &'static [&'static str] {
-    match provider {
-        "openai" => &["OPENAI_API_KEY"],
-        "anthropic" => &["ANTHROPIC_API_KEY"],
-        "deepseek" => &["DEEPSEEK_API_KEY"],
-        "dashscope" | "qwen" | "aliyun" => &["DASHSCOPE_API_KEY", "QWEN_API_KEY"],
-        "moonshot" | "kimi" => &["MOONSHOT_API_KEY", "KIMI_API_KEY"],
-        "zhipu" | "glm" => &["ZHIPU_API_KEY", "GLM_API_KEY"],
-        "gemini" | "google" => &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
-        _ => &[],
-    }
+#[derive(Debug, Deserialize)]
+pub struct UpsertConfiguredModelRequest {
+    pub id: Option<String>,
+    pub display_name: Option<String>,
+    pub provider: String,
+    pub model: String,
+    pub api_key: Option<String>,
+    pub base_url: Option<String>,
+    pub temperature: Option<f32>,
+    pub max_tokens: Option<u32>,
+    pub enabled: Option<bool>,
+    pub set_default: Option<bool>,
 }
 
-/// Check if any accepted env var for a provider is set and non-empty.
-/// Returns the first match found.
-fn find_env_api_key(provider: &str) -> Option<String> {
-    for var in provider_env_vars(provider) {
-        if let Ok(val) = std::env::var(var)
-            && !val.is_empty()
-        {
-            return Some(val);
-        }
-    }
-    None
+#[derive(Debug, Clone)]
+struct ResolvedAuth {
+    token: String,
+    source: &'static str,
 }
 
-/// Resolve API key: user-filled key takes priority, then fall back to any
-/// accepted environment variable for the provider.
-fn resolve_api_key(user_key: &Option<String>, provider: &str) -> String {
-    // Priority 1: user explicitly filled in a key via GUI
-    if let Some(key) = user_key
-        && !key.is_empty()
+fn resolve_auth_token(
+    user_key: Option<&str>,
+    provider_config: Option<&ModelProviderConfig>,
+    provider: &str,
+) -> ResolvedAuth {
+    if let Some(token) = user_key.map(str::trim).filter(|token| !token.is_empty()) {
+        return ResolvedAuth {
+            token: token.to_string(),
+            source: "input",
+        };
+    }
+
+    if let Some(token) = provider_config
+        .and_then(|config| config.auth_token.as_deref())
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
     {
-        return key.clone();
+        return ResolvedAuth {
+            token: token.to_string(),
+            source: "config",
+        };
     }
-    // Priority 2: any accepted env var
-    find_env_api_key(provider).unwrap_or_default()
+
+    if let Some(token) = model_config::find_env_api_key(provider) {
+        return ResolvedAuth {
+            token,
+            source: "env",
+        };
+    }
+
+    ResolvedAuth {
+        token: String::new(),
+        source: "none",
+    }
 }
 
-/// Format accepted env var names for display (e.g. "DASHSCOPE_API_KEY / QWEN_API_KEY").
-fn env_vars_display(provider: &str) -> String {
-    provider_env_vars(provider).join(" / ")
-}
-
-#[tauri::command]
-pub async fn list_providers(
-    state: tauri::State<'_, TauriState>,
-) -> Result<serde_json::Value, IpcError> {
-    let current_model = state
+async fn apply_runtime_model(
+    state: &tauri::State<'_, TauriState>,
+    runtime: echo_agent_app_core::model_config::ModelRuntimeConfig,
+) {
+    state
         .app_state
         .connection
         .agent
-        .read(|agent| agent.config().get_model_name().to_string())
+        .write_async(|agent| {
+            let runtime = runtime.clone();
+            Box::pin(async move {
+                if let Some(ref token) = runtime.auth_token {
+                    let config = build_llm_config(
+                        &runtime.provider,
+                        token,
+                        &runtime.model,
+                        runtime.base_url.as_deref(),
+                    );
+                    agent.set_llm_config(config);
+                } else {
+                    agent.set_model(&runtime.model);
+                }
+                agent.set_temperature(runtime.temperature);
+                agent.set_max_tokens(runtime.max_tokens);
+                tracing::info!(
+                    provider = %runtime.provider,
+                    model = %runtime.model,
+                    display_name = %runtime.display_name,
+                    auth_source = %runtime.auth_source,
+                    "模型配置已应用到当前 Agent"
+                );
+            })
+        })
         .await;
 
+    if let Some(pool) = state.app_state.connection.pool.as_ref() {
+        let app_config = state.app_state.config.app_config.read().await.clone();
+        pool.update_app_config(app_config).await;
+        pool.apply_runtime_model(runtime).await;
+    }
+}
+
+#[tauri::command]
+pub async fn list_model_templates() -> Result<serde_json::Value, IpcError> {
     Ok(serde_json::json!({
-        "providers": [
-            {
-                "id": "openai",
-                "name": "OpenAI",
-                "icon": "🟢",
-                "models": ["gpt-5.5"],
-                "base_url": "https://api.openai.com/v1/chat/completions",
-                "api_key_env": env_vars_display("openai"),
-                "requires_api_key": true,
-                "configured": find_env_api_key("openai").is_some(),
-            },
-            {
-                "id": "anthropic",
-                "name": "Anthropic",
-                "icon": "🟠",
-                "models": ["claude-opus-4-8", "claude-opus-4-7"],
-                "base_url": "https://api.anthropic.com/v1/messages",
-                "api_key_env": env_vars_display("anthropic"),
-                "requires_api_key": true,
-                "configured": find_env_api_key("anthropic").is_some(),
-            },
-            {
-                "id": "deepseek",
-                "name": "DeepSeek",
-                "icon": "🔵",
-                "models": ["deepseek-v4-flash", "deepseek-v4-pro"],
-                "base_url": "https://api.deepseek.com/chat/completions",
-                "api_key_env": env_vars_display("deepseek"),
-                "requires_api_key": true,
-                "configured": find_env_api_key("deepseek").is_some(),
-            },
-            {
-                "id": "dashscope",
-                "name": "通义千问",
-                "icon": "🟣",
-                "models": ["qwen3.7-max", "qwen3.6-plus"],
-                "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
-                "api_key_env": env_vars_display("dashscope"),
-                "requires_api_key": true,
-                "configured": find_env_api_key("dashscope").is_some(),
-            },
-            {
-                "id": "moonshot",
-                "name": "Moonshot",
-                "icon": "🌙",
-                "models": ["kimi-k2.6"],
-                "base_url": "https://api.moonshot.cn/v1/chat/completions",
-                "api_key_env": env_vars_display("moonshot"),
-                "requires_api_key": true,
-                "configured": find_env_api_key("moonshot").is_some(),
-            },
-            {
-                "id": "zhipu",
-                "name": "智谱",
-                "icon": "🔷",
-                "models": ["glm-5.1"],
-                "base_url": "https://open.bigmodel.cn/api/paas/v4/chat/completions",
-                "api_key_env": env_vars_display("zhipu"),
-                "requires_api_key": true,
-                "configured": find_env_api_key("zhipu").is_some(),
-            },
-            {
-                "id": "gemini",
-                "name": "Gemini",
-                "icon": "💎",
-                "models": ["gemini-3.5-flash"],
-                "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-                "api_key_env": env_vars_display("gemini"),
-                "requires_api_key": true,
-                "configured": find_env_api_key("gemini").is_some(),
-            },
-            {
-                "id": "ollama",
-                "name": "Ollama",
-                "icon": "🦙",
-                "models": ["llama3.1", "qwen2.5", "deepseek-r1", "codellama", "mistral"],
-                "base_url": "http://localhost:11434/api/chat",
-                "api_key_env": "",
-                "requires_api_key": false,
-                "configured": true,
-            },
-        ],
-        "current_model": current_model,
+        "providers": model_config::provider_templates(),
+    }))
+}
+
+#[tauri::command]
+pub async fn list_configured_models(
+    state: tauri::State<'_, TauriState>,
+) -> Result<serde_json::Value, IpcError> {
+    let mut cfg = state.app_state.config.app_config.write().await;
+    let models = model_config::configured_model_views(&mut cfg);
+    let default_model_id = cfg.model.default_model_id.clone();
+    Ok(serde_json::json!({
+        "models": models,
+        "default_model_id": default_model_id,
+    }))
+}
+
+#[tauri::command]
+pub async fn upsert_configured_model(
+    state: tauri::State<'_, TauriState>,
+    req: UpsertConfiguredModelRequest,
+) -> Result<serde_json::Value, IpcError> {
+    let model_id;
+    let runtime;
+    {
+        let mut cfg = state.app_state.config.app_config.write().await;
+        let provider_config = cfg
+            .model_providers
+            .entry(req.provider.clone())
+            .or_insert_with(ModelProviderConfig::default);
+        if let Some(key) = req
+            .api_key
+            .as_ref()
+            .map(|key| key.trim().to_string())
+            .filter(|key| !key.is_empty())
+        {
+            provider_config.auth_token = Some(key);
+        }
+        if let Some(url) = req
+            .base_url
+            .as_ref()
+            .map(|url| url.trim().to_string())
+            .filter(|url| !url.is_empty())
+        {
+            provider_config.base_url = Some(url);
+        }
+
+        let configured = ConfiguredModel {
+            id: req.id.unwrap_or_default(),
+            display_name: req.display_name.unwrap_or_default(),
+            provider: req.provider,
+            model: req.model,
+            enabled: req.enabled.unwrap_or(true),
+            max_tokens: req.max_tokens,
+            temperature: req.temperature,
+        };
+        model_id = model_config::upsert_configured_model(&mut cfg, configured);
+        if req.set_default.unwrap_or(false) {
+            runtime = model_config::set_default_model(&mut cfg, &model_id)
+                .map_err(IpcError::Validation)?;
+        } else {
+            runtime = model_config::resolve_runtime_model(&cfg, Some(&model_id));
+        }
+        if let Err(e) = echo_agent::config::save_config(&cfg) {
+            tracing::warn!("Failed to persist configured model: {e}");
+        }
+    }
+
+    if req.set_default.unwrap_or(false) {
+        apply_runtime_model(&state, runtime.clone()).await;
+    }
+
+    Ok(serde_json::json!({
+        "success": true,
+        "model_id": model_id,
+        "auth_source": runtime.auth_source,
+    }))
+}
+
+#[tauri::command]
+pub async fn delete_configured_model(
+    state: tauri::State<'_, TauriState>,
+    model_id: String,
+) -> Result<serde_json::Value, IpcError> {
+    {
+        let mut cfg = state.app_state.config.app_config.write().await;
+        model_config::delete_configured_model(&mut cfg, &model_id).map_err(IpcError::Validation)?;
+        if let Err(e) = echo_agent::config::save_config(&cfg) {
+            tracing::warn!("Failed to persist configured model deletion: {e}");
+        }
+    }
+    Ok(serde_json::json!({ "success": true }))
+}
+
+#[tauri::command]
+pub async fn set_default_model(
+    state: tauri::State<'_, TauriState>,
+    model_id: String,
+) -> Result<serde_json::Value, IpcError> {
+    let runtime;
+    {
+        let mut cfg = state.app_state.config.app_config.write().await;
+        runtime =
+            model_config::set_default_model(&mut cfg, &model_id).map_err(IpcError::Validation)?;
+        if let Err(e) = echo_agent::config::save_config(&cfg) {
+            tracing::warn!("Failed to persist default model: {e}");
+        }
+    }
+
+    apply_runtime_model(&state, runtime.clone()).await;
+    Ok(serde_json::json!({
+        "success": true,
+        "model_id": runtime.id,
+        "display_name": runtime.display_name,
+        "model": runtime.model,
+        "provider": runtime.provider,
     }))
 }
 
 #[tauri::command]
 pub async fn test_connection(
+    state: tauri::State<'_, TauriState>,
     provider: String,
     model: String,
     api_key: Option<String>,
     base_url: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    let key = resolve_api_key(&api_key, &provider);
+    let app_config = state.app_state.config.app_config.read().await;
+    let provider_config = app_config.model_providers.get(&provider);
+    let auth = resolve_auth_token(api_key.as_deref(), provider_config, &provider);
+    let base_url = base_url
+        .filter(|url| !url.trim().is_empty())
+        .or_else(|| provider_config.and_then(|config| config.base_url.clone()))
+        .or_else(|| model_config::default_base_url(&provider));
+    let requires_api_key = model_config::provider_templates()
+        .iter()
+        .find(|template| template.id == provider)
+        .map(|template| template.requires_api_key)
+        .unwrap_or(true);
+    if requires_api_key && auth.token.is_empty() {
+        return Ok(serde_json::json!({
+            "success": false,
+            "error": "没有可用的 API Key。请填写 API Key，或设置对应环境变量后重试。",
+            "auth_source": auth.source,
+            "has_auth_token": false,
+        }));
+    }
 
-    let config = match provider.as_str() {
-        "openai" => LlmConfig::openai(key, model.clone()),
-        "anthropic" => LlmConfig::anthropic(key, model.clone()),
-        "deepseek" => LlmConfig::deepseek(key, model.clone()),
-        "dashscope" => LlmConfig::dashscope(key, model.clone()),
-        "gemini" => LlmConfig::gemini(key, model.clone()),
-        "ollama" => LlmConfig::ollama(model.clone()),
-        _ => {
-            let url = base_url
-                .clone()
-                .unwrap_or_else(|| "https://api.openai.com/v1/chat/completions".into());
-            LlmConfig::new(url, key, model.clone())
-        }
-    };
-
-    let config = if let Some(ref url) = base_url {
-        if provider != "ollama" {
-            LlmConfig {
-                base_url: url.clone(),
-                ..config
-            }
-        } else {
-            config
-        }
-    } else {
-        config
-    };
+    let config = build_llm_config(&provider, &auth.token, &model, base_url.as_deref());
 
     match config.build_client() {
         Ok(client) => {
@@ -197,82 +267,22 @@ pub async fn test_connection(
                     "success": true,
                     "response": response,
                     "model": client.model_name(),
+                    "auth_source": auth.source,
+                    "has_auth_token": !auth.token.is_empty(),
                 })),
                 Err(e) => Ok(serde_json::json!({
                     "success": false,
                     "error": format!("API call failed: {e}"),
+                    "auth_source": auth.source,
+                    "has_auth_token": !auth.token.is_empty(),
                 })),
             }
         }
         Err(e) => Ok(serde_json::json!({
             "success": false,
             "error": format!("Failed to create client: {e}"),
+            "auth_source": auth.source,
+            "has_auth_token": !auth.token.is_empty(),
         })),
-    }
-}
-
-#[tauri::command]
-pub async fn switch_model(
-    state: tauri::State<'_, TauriState>,
-    model: String,
-    api_key: Option<String>,
-    base_url: Option<String>,
-    provider: Option<String>,
-    temperature: Option<f32>,
-    max_tokens: Option<u32>,
-) -> Result<serde_json::Value, IpcError> {
-    let prov = provider.as_deref().unwrap_or("openai");
-    let key = resolve_api_key(&api_key, prov);
-    let url = base_url.clone().unwrap_or_else(|| default_base_url(prov));
-
-    let has_credentials = !key.is_empty() || prov == "ollama";
-
-    state
-        .app_state
-        .connection
-        .agent
-        .write_async(|agent| {
-            let model = model.clone();
-            let key = key.clone();
-            let url = url.clone();
-            let prov = prov.to_string();
-            Box::pin(async move {
-                if has_credentials {
-                    let config = match prov.as_str() {
-                        "anthropic" => LlmConfig::anthropic(key, model.clone()),
-                        "deepseek" => LlmConfig::deepseek(key, model.clone()),
-                        "dashscope" => LlmConfig::dashscope(key, model.clone()),
-                        "gemini" => LlmConfig::gemini(key, model.clone()),
-                        "ollama" => LlmConfig::ollama(model.clone()),
-                        _ => LlmConfig::new(url, key, model.clone()),
-                    };
-                    agent.set_llm_config(config);
-                } else {
-                    agent.set_model(&model);
-                }
-                agent.set_temperature(temperature);
-                agent.set_max_tokens(max_tokens);
-            })
-        })
-        .await;
-
-    Ok(serde_json::json!({
-        "success": true,
-        "model": model,
-        "message": format!("Switched to model '{}'", model),
-    }))
-}
-
-fn default_base_url(provider: &str) -> String {
-    match provider {
-        "openai" => "https://api.openai.com/v1/chat/completions".into(),
-        "anthropic" => "https://api.anthropic.com/v1/messages".into(),
-        "deepseek" => "https://api.deepseek.com/chat/completions".into(),
-        "dashscope" => "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions".into(),
-        "moonshot" => "https://api.moonshot.cn/v1/chat/completions".into(),
-        "zhipu" => "https://open.bigmodel.cn/api/paas/v4/chat/completions".into(),
-        "gemini" => "https://generativelanguage.googleapis.com/v1beta/openai/".into(),
-        "ollama" => "http://localhost:11434/api/chat".into(),
-        _ => "https://api.openai.com/v1/chat/completions".into(),
     }
 }

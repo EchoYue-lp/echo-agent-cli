@@ -63,7 +63,7 @@ export function SessionsPanel() {
           onClick={create}
           disabled={loading}
           className="flex items-center gap-1 rounded-lg px-2.5 py-1 text-xs font-medium transition-colors"
-          style={{ background: 'var(--accent)', color: 'white' }}
+          style={{ background: 'var(--accent)', color: 'var(--text-on-accent)' }}
         >
           <Plus size={12} />
           创建

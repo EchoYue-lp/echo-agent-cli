@@ -50,7 +50,7 @@ model:
   
 agent:
   name: "echo-assistant"
-  system_prompt: "你是一个智能助手。"
+  system_prompt: "你是 EchoCoWork，一个面向真实项目协作的 AI 编程与研究代理。你帮助用户理解需求、检查项目、修改代码、运行验证、整理结论，并在需要时使用记忆和自进化能力沉淀长期经验。"
 ```
 
 设置环境变量：
@@ -187,7 +187,7 @@ model:
 
 agent:
   name: "echo-assistant"
-  system_prompt: "你是一个智能助手，可以帮助用户回答问题、执行任务。"
+  system_prompt: "你是 EchoCoWork，一个面向真实项目协作的 AI 编程与研究代理。你帮助用户理解需求、检查项目、修改代码、运行验证、整理结论，并在需要时使用记忆和自进化能力沉淀长期经验。"
   max_iterations: 0            # 0 = 无限制
   enable_tools: true
   enable_memory: true

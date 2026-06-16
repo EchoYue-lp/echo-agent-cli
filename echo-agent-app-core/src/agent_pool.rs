@@ -41,6 +41,7 @@ use tokio::sync::RwLock;
 
 use crate::config::AppConfig;
 use crate::infra;
+use crate::model_config::ModelRuntimeConfig;
 
 /// Configuration for the agent pool.
 #[derive(Debug, Clone)]
@@ -176,7 +177,8 @@ pub struct AgentPool {
     shared: SharedResources,
     agents: RwLock<HashMap<String, PooledAgent>>,
     config: PoolConfig,
-    app_config: AppConfig,
+    app_config: RwLock<AppConfig>,
+    runtime_llm_config: RwLock<Option<echo_agent::llm::LlmConfig>>,
     /// Skill descriptors extracted from the primary agent.
     /// Pool agents register these instead of re-reading from disk.
     skill_descriptors: Vec<echo_agent::skills::external::SkillDescriptor>,
@@ -203,7 +205,8 @@ impl AgentPool {
             shared,
             agents: RwLock::new(HashMap::new()),
             config,
-            app_config: runtime.app_config.clone(),
+            app_config: RwLock::new(runtime.app_config.clone()),
+            runtime_llm_config: RwLock::new(None),
             skill_descriptors,
             cleanup_cancel: CancellationToken::new(),
         };
@@ -336,6 +339,60 @@ impl AgentPool {
         agents.get("__background__").map(|pa| pa.handle.clone())
     }
 
+    /// Update the pool's app config snapshot used for future agents.
+    pub async fn update_app_config(&self, app_config: AppConfig) {
+        *self.app_config.write().await = app_config;
+    }
+
+    /// Apply a runtime model to all existing pooled agents and remember it for
+    /// future agents. This prevents pooled GUI conversations from continuing to
+    /// use stale env-derived credentials after the user saves a GUI API key.
+    pub async fn apply_runtime_model(&self, runtime: ModelRuntimeConfig) {
+        let llm_config = runtime.auth_token.as_ref().map(|token| {
+            infra::build_llm_config(
+                &runtime.provider,
+                token,
+                &runtime.model,
+                runtime.base_url.as_deref(),
+            )
+        });
+        *self.runtime_llm_config.write().await = llm_config.clone();
+
+        let agents: Vec<AgentHandle> = self
+            .agents
+            .read()
+            .await
+            .values()
+            .map(|pa| pa.handle.clone())
+            .collect();
+        for handle in agents {
+            let runtime = runtime.clone();
+            let llm_config = llm_config.clone();
+            handle
+                .write_async(|agent| {
+                    Box::pin(async move {
+                        if let Some(config) = llm_config {
+                            agent.set_llm_config(config);
+                        } else {
+                            agent.set_model(&runtime.model);
+                        }
+                        agent.set_temperature(runtime.temperature);
+                        agent.set_max_tokens(runtime.max_tokens);
+                    })
+                })
+                .await;
+        }
+
+        let pooled_agents = self.agents.read().await.len();
+        tracing::info!(
+            provider = %runtime.provider,
+            model = %runtime.model,
+            auth_source = %runtime.auth_source,
+            pooled_agents = pooled_agents,
+            "AgentPool: runtime model applied"
+        );
+    }
+
     /// Current number of agents in the pool (including background).
     pub async fn pool_size(&self) -> usize {
         self.agents.read().await.len()
@@ -433,6 +490,7 @@ impl AgentPool {
         //    but `self.shared.state_store` was always None because the primary
         //    agent never had a store wired in — `extract_from` would only ever
         //    see None and the runtime checkpoint loop silently no-op'd.)
+        let app_config = self.app_config.read().await.clone();
         let params = infra::AgentCreateParams {
             model: None, // will use app_config default
             system_prompt: None,
@@ -444,11 +502,14 @@ impl AgentPool {
             memory_context_suffix: None,
         };
         let mut agent =
-            infra::create_agent(&params, &self.app_config).map_err(|e| anyhow::anyhow!("{e}"))?;
+            infra::create_agent(&params, &app_config).map_err(|e| anyhow::anyhow!("{e}"))?;
 
         // 2. Inject shared resources (replace independently-created ones)
         if let Some(ref llm) = self.shared.llm_client {
             agent.set_llm_client(llm.clone());
+        }
+        if let Some(llm_config) = self.runtime_llm_config.read().await.clone() {
+            agent.set_llm_config(llm_config);
         }
         if let Some(ref tm) = self.shared.tool_manager {
             agent.set_tool_manager(tm.clone());
@@ -762,7 +823,8 @@ mod tests {
                 idle_timeout: Duration::from_secs(1800),
                 enable_background_agent: enable_bg,
             },
-            app_config: AppConfig::default(),
+            app_config: RwLock::new(AppConfig::default()),
+            runtime_llm_config: RwLock::new(None),
             skill_descriptors: vec![],
             cleanup_cancel: CancellationToken::new(),
         }
@@ -792,7 +854,8 @@ mod tests {
                 idle_timeout: Duration::from_secs(1800),
                 enable_background_agent: false,
             },
-            app_config: AppConfig::default(),
+            app_config: RwLock::new(AppConfig::default()),
+            runtime_llm_config: RwLock::new(None),
             skill_descriptors: vec![],
             cleanup_cancel: CancellationToken::new(),
         }

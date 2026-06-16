@@ -33,9 +33,9 @@ import type {
   TrajectoryStats,
   CuratorStatus,
   CuratorTransition,
-  ProviderListResponse,
+  ConfiguredModelListResponse,
+  ProviderTemplate,
   TestConnectionResponse,
-  SwitchModelResponse,
 } from '../types/api';
 
 type LoadSkillsResponse = {
@@ -439,6 +439,10 @@ export interface BackgroundTask {
   error?: string;
   kind?: string;
   progress?: number;
+  progress_pct?: number;
+  progress_phase?: string;
+  progress_message?: string;
+  eta_secs?: number;
 }
 
 export interface SubmitTaskRequest {
@@ -843,25 +847,66 @@ export const evolutionApi = {
 // ── Provider API ──────────────────────────────────────────────────────────
 
 export const providerApi = {
-  list: () =>
+  listTemplates: () =>
     isTauri()
-      ? apiInvoke<ProviderListResponse>('list_providers')
-      : get<ProviderListResponse>('/providers'),
-  test: (req: { provider: string; model: string; api_key?: string; base_url?: string }) =>
+      ? apiInvoke<{ providers: ProviderTemplate[] }>('list_model_templates')
+      : get<{ providers: ProviderTemplate[] }>('/models/templates'),
+  listConfigured: () =>
     isTauri()
-      ? apiInvoke<TestConnectionResponse>('test_connection', req)
-      : post<TestConnectionResponse>('/providers/test', req),
-  switch: (req: {
+      ? apiInvoke<ConfiguredModelListResponse>('list_configured_models')
+      : get<ConfiguredModelListResponse>('/models/configured'),
+  setDefault: (modelId: string) =>
+    isTauri()
+      ? apiInvoke<{
+          success: boolean;
+          model_id: string;
+          display_name: string;
+          model: string;
+          provider: string;
+        }>('set_default_model', { modelId })
+      : post<{
+          success: boolean;
+          model_id: string;
+          display_name: string;
+          model: string;
+          provider: string;
+        }>('/models/default', { model_id: modelId }),
+  upsertConfigured: (req: {
+    id?: string;
+    display_name?: string;
+    provider: string;
     model: string;
     api_key?: string;
     base_url?: string;
-    provider?: string;
     temperature?: number;
     max_tokens?: number;
+    enabled?: boolean;
+    set_default?: boolean;
   }) =>
     isTauri()
-      ? apiInvoke<SwitchModelResponse>('switch_model', req)
-      : post<SwitchModelResponse>('/providers/switch', req),
+      ? apiInvoke<{
+          success: boolean;
+          model_id: string;
+          auth_source?: string;
+        }>('upsert_configured_model', { req })
+      : post<{
+          success: boolean;
+          model_id: string;
+          auth_source?: string;
+        }>('/models/configured', req),
+  deleteConfigured: (modelId: string) =>
+    isTauri()
+      ? apiInvoke<{ success: boolean }>('delete_configured_model', { modelId })
+      : del<{ success: boolean }>(`/models/configured/${encodeURIComponent(modelId)}`),
+  test: (req: { provider: string; model: string; api_key?: string; base_url?: string }) =>
+    isTauri()
+      ? apiInvoke<TestConnectionResponse>('test_connection', {
+          provider: req.provider,
+          model: req.model,
+          apiKey: req.api_key,
+          baseUrl: req.base_url,
+        })
+      : post<TestConnectionResponse>('/providers/test', req),
 };
 
 // ── Plugin API ──────────────────────────────────────────────────────────
@@ -986,12 +1031,17 @@ export const schedulerApi = {
 // ── Human Gate API (人工审批) ────────────────────────────────────
 
 export interface HumanGateCheckpoint {
+  id?: string;
   task_id: string;
+  kind?: string;
   prompt: string;
   context?: Record<string, unknown>;
   options?: string[];
-  status: string;
-  created_at: string;
+  phase?: string;
+  tool_name?: string;
+  risk_level?: string;
+  status?: string;
+  created_at?: string;
 }
 
 export const humanGateApi = {

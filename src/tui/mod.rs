@@ -65,44 +65,46 @@ pub struct Theme {
 impl Theme {
     /// Create a Theme from a CLI ColorTheme, unifying both theme systems.
     pub fn from_color_theme(ct: &echo_agent_app_core::output::theme::ColorTheme) -> Self {
-        use nu_ansi_term::Color as AnsiColor;
         use ratatui::style::Color as RatatuiColor;
 
-        fn ansi_to_ratatui(c: &AnsiColor) -> RatatuiColor {
-            match c {
-                AnsiColor::Black => RatatuiColor::Black,
-                AnsiColor::Red => RatatuiColor::Red,
-                AnsiColor::Green => RatatuiColor::Green,
-                AnsiColor::Yellow => RatatuiColor::Yellow,
-                AnsiColor::Blue => RatatuiColor::Blue,
-                AnsiColor::Magenta => RatatuiColor::Magenta,
-                AnsiColor::Cyan => RatatuiColor::Cyan,
-                AnsiColor::White => RatatuiColor::White,
-                AnsiColor::Fixed(n) => RatatuiColor::Indexed(*n),
-                AnsiColor::Rgb(r, g, b) => RatatuiColor::Rgb(*r, *g, *b),
-                AnsiColor::DarkGray => RatatuiColor::DarkGray,
-                AnsiColor::LightGray => RatatuiColor::Gray,
-                _ => RatatuiColor::Reset,
-            }
+        if ct.name == "light" {
+            return Self {
+                is_dark: false,
+                bg: RatatuiColor::Rgb(250, 250, 249),
+                surface0: RatatuiColor::Rgb(231, 229, 228),
+                surface1: RatatuiColor::Rgb(245, 245, 244),
+                overlay0: RatatuiColor::Rgb(161, 161, 170),
+                text: RatatuiColor::Rgb(24, 24, 27),
+                subtext: RatatuiColor::Rgb(82, 82, 91),
+                blue: RatatuiColor::Rgb(82, 82, 91),
+                green: RatatuiColor::Rgb(82, 82, 91),
+                yellow: RatatuiColor::Rgb(202, 138, 4),
+                peach: RatatuiColor::Rgb(82, 82, 91),
+                mauve: RatatuiColor::Rgb(82, 82, 91),
+                teal: RatatuiColor::Rgb(82, 82, 91),
+                red: RatatuiColor::Rgb(220, 38, 38),
+                cyan: RatatuiColor::Rgb(82, 82, 91),
+                lavender: RatatuiColor::Rgb(82, 82, 91),
+            };
         }
 
         Self {
-            is_dark: ct.name != "light",
-            bg: RatatuiColor::Reset,
-            surface0: ansi_to_ratatui(&ct.border_color),
-            surface1: ansi_to_ratatui(&ct.border_color),
-            overlay0: ansi_to_ratatui(&ct.muted_color),
-            text: RatatuiColor::Reset,
-            subtext: ansi_to_ratatui(&ct.muted_color),
-            blue: ansi_to_ratatui(&ct.info_color),
-            green: ansi_to_ratatui(&ct.success_color),
-            yellow: ansi_to_ratatui(&ct.tool_color),
-            peach: ansi_to_ratatui(&ct.heading_color),
-            mauve: ansi_to_ratatui(&ct.assistant_color),
-            teal: ansi_to_ratatui(&ct.user_color),
-            red: ansi_to_ratatui(&ct.error_color),
-            cyan: ansi_to_ratatui(&ct.user_color),
-            lavender: ansi_to_ratatui(&ct.assistant_color),
+            is_dark: true,
+            bg: RatatuiColor::Rgb(16, 16, 16),
+            surface0: RatatuiColor::Rgb(48, 48, 48),
+            surface1: RatatuiColor::Rgb(36, 36, 36),
+            overlay0: RatatuiColor::Rgb(113, 113, 122),
+            text: RatatuiColor::Rgb(231, 229, 228),
+            subtext: RatatuiColor::Rgb(161, 161, 170),
+            blue: RatatuiColor::Rgb(161, 161, 170),
+            green: RatatuiColor::Rgb(161, 161, 170),
+            yellow: RatatuiColor::Rgb(250, 204, 21),
+            peach: RatatuiColor::Rgb(161, 161, 170),
+            mauve: RatatuiColor::Rgb(161, 161, 170),
+            teal: RatatuiColor::Rgb(161, 161, 170),
+            red: RatatuiColor::Rgb(248, 113, 113),
+            cyan: RatatuiColor::Rgb(161, 161, 170),
+            lavender: RatatuiColor::Rgb(161, 161, 170),
         }
     }
 }

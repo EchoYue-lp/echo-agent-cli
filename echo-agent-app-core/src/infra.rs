@@ -12,6 +12,7 @@ use echo_agent::state::{RuntimeStateStore, SqliteRuntimeStateStore};
 
 use crate::agent_handle::AgentHandle;
 use crate::config::AppConfig;
+use crate::model_config;
 use crate::project::prompt::PromptAssembler;
 
 /// Default context window size in tokens (128K).
@@ -68,9 +69,16 @@ pub fn create_agent(
     params: &AgentCreateParams,
     app_config: &AppConfig,
 ) -> std::result::Result<ReactAgent, String> {
-    // Use model from params if provided, otherwise check ECHOCOWORK_MODEL env var, then config
-    let config_model = app_config.model.get_model_name();
-    let model = params.model.as_deref().unwrap_or(&config_model);
+    // Resolve the product-level configured model first. The legacy `model`
+    // section is only a persisted mirror/fallback; GUI/CLI/TUI should all
+    // converge on configured_models for actual runtime wiring.
+    let runtime_model = model_config::resolve_runtime_model(
+        app_config,
+        app_config.model.default_model_id.as_deref(),
+    );
+    let model = params.model.as_deref().unwrap_or(&runtime_model.model);
+    let temperature = runtime_model.temperature.or(app_config.model.temperature);
+    let max_tokens = runtime_model.max_tokens.or(app_config.model.max_tokens);
 
     let base_system_prompt = params
         .system_prompt
@@ -130,29 +138,27 @@ pub fn create_agent(
         .enable_human_in_loop()
         .max_iterations(app_config.agent.max_iterations)
         .token_limit(token_limit)
-        .max_tokens(Some(
-            app_config.model.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
-        ))
-        .temperature(app_config.model.temperature)
+        .max_tokens(Some(max_tokens.unwrap_or(DEFAULT_MAX_TOKENS)))
+        .temperature(temperature)
         .tool_execution(echo_agent::tools::ToolExecutionConfig {
             timeout_ms: app_config.agent.tool_timeout_ms,
             ..Default::default()
         })
         .enable_cot();
 
-    // ── Pass auth_token / base_url from AppConfig to LLM client ──
+    // ── Pass the resolved configured model to the LLM client ──
     // Without this, the agent falls back to env vars + echo-agent-models.yaml,
     // which may not exist (especially in GUI apps where shell env vars aren't inherited).
-    if let Some(auth_token) = app_config.model.get_auth_token() {
-        let provider = app_config.model.provider.as_str();
-        let base_url_override = app_config.model.get_base_url();
-        let llm_config =
-            build_llm_config(provider, &auth_token, model, base_url_override.as_deref());
+    if let Some(auth_token) = runtime_model.auth_token.as_deref() {
+        let provider = runtime_model.provider.as_str();
+        let base_url_override = runtime_model.base_url.as_deref();
+        let llm_config = build_llm_config(provider, auth_token, model, base_url_override);
         tracing::info!(
             provider = provider,
             model = model,
+            auth_source = %runtime_model.auth_source,
             has_base_url = base_url_override.is_some(),
-            "Injecting LlmConfig from AppConfig (auth_token + base_url)"
+            "Injecting LlmConfig from configured model"
         );
         builder = builder.llm_config(llm_config);
     }
@@ -880,12 +886,14 @@ pub fn print_doctor_result(result: &DoctorResult) {
 /// overrides the base URL. This enables auth_token / base_url from
 /// `echo-agent.yaml` to flow through to the agent's LLM client without
 /// requiring `echo-agent-models.yaml` or provider-specific env vars.
-fn build_llm_config(
+pub fn build_llm_config(
     provider: &str,
     auth_token: &str,
     model: &str,
     base_url_override: Option<&str>,
 ) -> LlmConfig {
+    let default_base_url = echo_agent::llm::config::provider_base_url(provider)
+        .unwrap_or("https://api.openai.com/v1/chat/completions");
     let mut config = match provider.to_lowercase().as_str() {
         "anthropic" => LlmConfig::anthropic(auth_token, model),
         "deepseek" => LlmConfig::deepseek(auth_token, model),
@@ -894,7 +902,7 @@ fn build_llm_config(
         "ollama" => LlmConfig::ollama(model),
         _ => {
             // Default to OpenAI-compatible
-            let url = base_url_override.unwrap_or("https://api.openai.com/v1/chat/completions");
+            let url = base_url_override.unwrap_or(default_base_url);
             LlmConfig::new(url, auth_token, model)
         }
     };

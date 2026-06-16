@@ -35,24 +35,27 @@ impl Widget for StatusBar {
             String::new()
         };
         let sidebar_hint = if app.sidebar_visible {
-            " · sidebar"
+            "side"
         } else {
-            " · Ctrl+B sidebar"
+            "Ctrl+B side"
         };
 
         let line = Line::from(vec![
             Span::styled(
-                " EchoCoWork ",
+                " EchoCoWork",
                 Style::default().fg(mode_color).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!(" {}", app.mode), Style::default().fg(t.text)),
-            Span::styled(format!(" · {}", app.model), Style::default().fg(t.subtext)),
-            Span::styled(format!(" · {}", state), Style::default().fg(state_color)),
+            Span::styled(format!("  {}", app.mode), Style::default().fg(t.text)),
+            Span::styled(format!("  {}", app.model), Style::default().fg(t.subtext)),
+            Span::styled(format!("  {}", state), Style::default().fg(state_color)),
             Span::styled(tokens, Style::default().fg(t.subtext)),
-            Span::styled(sidebar_hint, Style::default().fg(t.overlay0)),
+            Span::styled(
+                format!("  {}", sidebar_hint),
+                Style::default().fg(t.overlay0),
+            ),
         ]);
 
-        let paragraph = Paragraph::new(line);
+        let paragraph = Paragraph::new(line).style(Style::default().bg(t.bg));
         f.render_widget(paragraph, area);
     }
 }

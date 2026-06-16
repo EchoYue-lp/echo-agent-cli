@@ -1,120 +1,156 @@
 @import 'tailwindcss';
 
 @theme {
-  --color-primary: #6366f1;
-  --color-primary-light: #818cf8;
-  --color-primary-dark: #4f46e5;
+  --color-primary: #18181b;
+  --color-primary-light: #3f3f46;
+  --color-primary-dark: #09090b;
   --color-surface: #ffffff;
-  --color-surface-dark: #0f172a;
-  --color-border: #e2e8f0;
-  --color-border-dark: #334155;
+  --color-surface-dark: #141414;
+  --color-border: #e7e5e4;
+  --color-border-dark: #303030;
 }
 
 :root {
   --bg-primary: #ffffff;
-  --bg-secondary: #f8fafc;
-  --bg-chat: #f1f5f9;
-  --bg-hover: #f1f5f9;
+  --bg-secondary: #fafafa;
+  --bg-chat: #f7f7f5;
+  --bg-hover: #f0f0ee;
   --bg-input: #ffffff;
-  --bg-user-msg: linear-gradient(135deg, #6366f1, #8b5cf6);
+  --bg-user-msg: #18181b;
   --bg-assistant-msg: #ffffff;
-  --bg-code: #0f172a;
-  --bg-code-header: #1e293b;
-  --bg-sidebar: #ffffff;
-  --bg-sidebar-hover: #f8fafc;
-  --bg-sidebar-active: #eef2ff;
+  --bg-code: #151515;
+  --bg-code-header: #202020;
+  --bg-sidebar: #fbfbfa;
+  --bg-sidebar-hover: #efefed;
+  --bg-sidebar-active: #ececea;
+  --bg-rail: #ffffff;
   --bg-overlay: rgba(0, 0, 0, 0.5);
 
-  --text-primary: #0f172a;
-  --text-secondary: #475569;
-  --text-tertiary: #94a3b8;
+  --text-primary: #18181b;
+  --text-secondary: #52525b;
+  --text-tertiary: #a1a1aa;
   --text-inverse: #ffffff;
+  --text-on-accent: #ffffff;
+  --text-on-soft-action: #18181b;
   --text-user-msg: #ffffff;
-  --text-assistant-msg: #0f172a;
-  --text-link: #6366f1;
+  --text-assistant-msg: #18181b;
+  --text-link: #18181b;
 
-  --border-primary: #e2e8f0;
-  --border-secondary: #f1f5f9;
-  --border-focus: #6366f1;
+  --border-primary: #e7e5e4;
+  --border-secondary: #f0eeeb;
+  --border-focus: #18181b;
 
-  --accent: #6366f1;
-  --accent-light: #818cf8;
-  --accent-bg: #eef2ff;
+  --accent: #18181b;
+  --accent-light: #3f3f46;
+  --accent-bg: #efefed;
+  --action-soft: #f0f0ee;
+  --action-soft-hover: #e7e5e4;
+  --action-run: #16a34a;
+  --action-run-hover: #15803d;
+  --action-run-bg: #dcfce7;
+  --text-on-run: #ffffff;
+
+  --settings-dialog-bg: #f5f5f4;
+  --settings-sidebar-bg: #f8f7f5;
+  --settings-content-bg: #fafafa;
+  --settings-panel-bg: #ffffff;
+  --settings-active-bg: #e7e5e4;
+  --settings-accent: #78716c;
+  --settings-accent-bg: #eeeae6;
+  --settings-text-on-accent: #ffffff;
 
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.03);
-  --shadow-md: 0 2px 8px rgba(0, 0, 0, 0.05);
-  --shadow-lg: 0 4px 16px rgba(0, 0, 0, 0.06);
-  --shadow-xl: 0 8px 24px rgba(0, 0, 0, 0.08);
-  --shadow-glow: 0 0 20px rgba(99, 102, 241, 0.15);
+  --shadow-md: 0 8px 24px rgba(24, 24, 27, 0.06);
+  --shadow-lg: 0 16px 40px rgba(24, 24, 27, 0.08);
+  --shadow-xl: 0 20px 60px rgba(24, 24, 27, 0.1);
+  --shadow-glow: 0 0 18px rgba(24, 24, 27, 0.14);
 
-  --color-success: #10b981;
-  --color-success-bg: #d1fae5;
-  --color-success-text: #065f46;
+  --color-success: #52525b;
+  --color-success-bg: #f4f4f5;
+  --color-success-text: #27272a;
   --color-error: #ef4444;
   --color-error-bg: #fee2e2;
   --color-error-text: #991b1b;
   --color-warning: #f59e0b;
   --color-warning-bg: #fef3c7;
   --color-warning-text: #92400e;
-  --color-info: #3b82f6;
-  --color-info-bg: #dbeafe;
-  --color-info-text: #1e40af;
-  --color-purple: #a78bfa;
-  --color-purple-bg: #ede9fe;
+  --color-info: #52525b;
+  --color-info-bg: #f4f4f5;
+  --color-info-text: #27272a;
+  --color-purple: #71717a;
+  --color-purple-bg: #f4f4f5;
   --color-code-text: #e2e8f0;
 }
 
 .dark {
-  --bg-primary: #0f172a;
-  --bg-secondary: #1e293b;
-  --bg-chat: #0a0f1e;
-  --bg-hover: #1e293b;
-  --bg-input: #1e293b;
-  --bg-user-msg: linear-gradient(135deg, #4f46e5, #6d28d9);
-  --bg-assistant-msg: #1e293b;
-  --bg-code: #020617;
-  --bg-code-header: #0f172a;
-  --bg-sidebar: #0b1121;
-  --bg-sidebar-hover: #1e293b;
-  --bg-sidebar-active: #1e1b4b;
+  --bg-primary: #18181b;
+  --bg-secondary: #141414;
+  --bg-chat: #101010;
+  --bg-hover: #242424;
+  --bg-input: #18181b;
+  --bg-user-msg: #e5e7eb;
+  --bg-assistant-msg: #18181b;
+  --bg-code: #0a0a0a;
+  --bg-code-header: #18181b;
+  --bg-sidebar: #222222;
+  --bg-sidebar-hover: #303030;
+  --bg-sidebar-active: #303030;
+  --bg-rail: #1c1c1f;
   --bg-overlay: rgba(0, 0, 0, 0.75);
 
-  --text-primary: #f1f5f9;
-  --text-secondary: #94a3b8;
-  --text-tertiary: #64748b;
-  --text-inverse: #ffffff;
-  --text-user-msg: #ffffff;
-  --text-assistant-msg: #f1f5f9;
-  --text-link: #818cf8;
+  --text-primary: #e7e5e4;
+  --text-secondary: #a1a1aa;
+  --text-tertiary: #71717a;
+  --text-inverse: #18181b;
+  --text-on-accent: #18181b;
+  --text-on-soft-action: #e4e4e7;
+  --text-user-msg: #18181b;
+  --text-assistant-msg: #e7e5e4;
+  --text-link: #e4e4e7;
 
-  --border-primary: #1e293b;
-  --border-secondary: #0f172a;
-  --border-focus: #818cf8;
+  --border-primary: #303030;
+  --border-secondary: #242424;
+  --border-focus: #e4e4e7;
 
-  --accent: #818cf8;
-  --accent-light: #a5b4fc;
-  --accent-bg: #1e1b4b;
+  --accent: #e4e4e7;
+  --accent-light: #fafafa;
+  --accent-bg: #27272a;
+  --action-soft: #27272a;
+  --action-soft-hover: #303030;
+  --action-run: #22c55e;
+  --action-run-hover: #4ade80;
+  --action-run-bg: #052e16;
+  --text-on-run: #052e16;
+
+  --settings-dialog-bg: #18181b;
+  --settings-sidebar-bg: #202020;
+  --settings-content-bg: #141414;
+  --settings-panel-bg: #1f1f22;
+  --settings-active-bg: #303030;
+  --settings-accent: #a8a29e;
+  --settings-accent-bg: #303030;
+  --settings-text-on-accent: #18181b;
 
   --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.2);
   --shadow-md: 0 2px 8px rgba(0, 0, 0, 0.3);
   --shadow-lg: 0 4px 16px rgba(0, 0, 0, 0.35);
   --shadow-xl: 0 8px 24px rgba(0, 0, 0, 0.45);
-  --shadow-glow: 0 0 20px rgba(129, 140, 248, 0.12);
+  --shadow-glow: 0 0 20px rgba(228, 228, 231, 0.1);
 
-  --color-success: #34d399;
-  --color-success-bg: #064e3b30;
-  --color-success-text: #a7f3d0;
+  --color-success: #a1a1aa;
+  --color-success-bg: #27272a;
+  --color-success-text: #e4e4e7;
   --color-error: #f87171;
   --color-error-bg: #7f1d1d30;
   --color-error-text: #fecaca;
   --color-warning: #fbbf24;
   --color-warning-bg: #78350f30;
   --color-warning-text: #fde68a;
-  --color-info: #60a5fa;
-  --color-info-bg: #1e3a5f30;
-  --color-info-text: #bfdbfe;
-  --color-purple: #a78bfa;
-  --color-purple-bg: #4c1d9530;
+  --color-info: #a1a1aa;
+  --color-info-bg: #27272a;
+  --color-info-text: #e4e4e7;
+  --color-purple: #a1a1aa;
+  --color-purple-bg: #27272a;
   --color-code-text: #e2e8f0;
 }
 

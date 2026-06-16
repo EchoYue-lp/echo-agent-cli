@@ -7,6 +7,7 @@ import { WelcomeScreen } from './WelcomeScreen';
 import { useWebSocket } from '../../hooks/useWebSocket';
 import { useTauriChat } from '../../hooks/useTauriChat';
 import { isTauri } from '../../lib/tauri-bridge';
+import { useWorkspaceStore } from '../../stores/workspaceStore';
 import type { Attachment } from '../../types/api';
 
 function useChatTransport() {
@@ -22,6 +23,7 @@ export function ChatPanel() {
   const selectionRequest = useChatStore((s) => s.selectionRequest);
   const isStreaming = useChatStore((s) => s.isStreaming);
   const isCancelled = useChatStore((s) => s.isCancelled);
+  const currentWorkspace = useWorkspaceStore((s) => s.current);
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const isNearBottomRef = useRef(true);
@@ -63,6 +65,20 @@ export function ChatPanel() {
 
   return (
     <div className="flex h-full flex-col min-h-0" role="main" aria-label="聊天面板">
+      <div className="flex h-12 shrink-0 items-center justify-between border-b border-[var(--border-primary)] bg-[var(--bg-primary)] px-12">
+        <div className="min-w-0">
+          <div className="truncate text-sm font-semibold text-[var(--text-primary)]">
+            {currentWorkspace?.name || 'EchoCoWork'}
+          </div>
+          <div className="truncate text-[11px] text-[var(--text-tertiary)]">
+            {currentWorkspace?.root || '选择或创建一个任务开始工作'}
+          </div>
+        </div>
+        <div className="hidden items-center gap-2 text-xs text-[var(--text-tertiary)] sm:flex">
+          <span className="h-2 w-2 rounded-full bg-[var(--accent)]" />
+          <span>{isStreaming ? '执行中' : '就绪'}</span>
+        </div>
+      </div>
       {/* Messages area */}
       <div
         ref={scrollRef}
@@ -75,8 +91,8 @@ export function ChatPanel() {
         {messages.length === 0 ? (
           <WelcomeScreen onSuggestionClick={handleSuggestionClick} />
         ) : (
-          <div className="mx-auto max-w-3xl px-4 sm:px-6">
-            <div className="space-y-2 pb-4 pt-2">
+          <div className="mx-auto w-full max-w-[920px] px-5 sm:px-8">
+            <div className="space-y-1 pb-4 pt-4">
               {messages.map((msg, idx) => {
                 const prevMsg = idx > 0 ? messages[idx - 1] : null;
                 const showSeparator =
@@ -180,8 +196,12 @@ export function ChatPanel() {
                     request={approvalRequest}
                     onApprove={() => sendApproval(approvalRequest.requestId, true)}
                     onReject={(reason) => sendApproval(approvalRequest.requestId, false, reason)}
-                    onModify={(feedback) => sendApproval(approvalRequest.requestId, false, `修改意见: ${feedback}`)}
-                    onApproveAll={() => sendApproval(approvalRequest.requestId, true, undefined, 'session_all_tools')}
+                    onModify={(feedback) =>
+                      sendApproval(approvalRequest.requestId, false, `修改意见: ${feedback}`)
+                    }
+                    onApproveAll={() =>
+                      sendApproval(approvalRequest.requestId, true, undefined, 'session_all_tools')
+                    }
                   />
                 </div>
               )}
@@ -334,7 +354,7 @@ function SelectionCard({
                 key={option}
                 type="button"
                 onClick={() => submitSelection(option)}
-                className="rounded-lg bg-[var(--accent)] px-4 py-2 text-sm font-medium text-white transition-opacity hover:opacity-90"
+                className="rounded-lg bg-[var(--accent)] px-4 py-2 text-sm font-medium text-[var(--text-on-accent)] transition-opacity hover:opacity-90"
               >
                 {option}
               </button>
@@ -343,7 +363,7 @@ function SelectionCard({
             <button
               type="button"
               onClick={() => submitSelection('approve')}
-              className="rounded-lg bg-[var(--accent)] px-4 py-2 text-sm font-medium text-white transition-opacity hover:opacity-90"
+              className="rounded-lg bg-[var(--accent)] px-4 py-2 text-sm font-medium text-[var(--text-on-accent)] transition-opacity hover:opacity-90"
             >
               继续
             </button>

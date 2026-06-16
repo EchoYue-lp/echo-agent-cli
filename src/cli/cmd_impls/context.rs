@@ -52,12 +52,13 @@ cmd!(
 
 async fn cmd_model(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     if let Some(m) = args.first() {
-        ctx.agent.write(|a| a.set_model(m)).await;
-        println!("Model set to: {m}");
+        println!(
+            "Model switching now uses configured models. '{m}' was not applied; configure and select models from the provider settings."
+        );
     } else {
         let model = ctx.agent.read(|a| a.model_name().to_string()).await;
         println!("Current model: {model}");
-        println!("Use /model <name> to switch models");
+        println!("Configure/select models from the provider settings.");
     }
     CommandOutcome::Continue
 }
@@ -65,7 +66,7 @@ cmd!(
     ModelCommand,
     "model",
     CommandCategory::Config,
-    "View or switch model",
+    "View current model",
     cmd_model
 );
 

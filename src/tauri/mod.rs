@@ -124,9 +124,12 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
             commands::plugins::disable_plugin,
             commands::plugins::reload_plugins,
             // Providers
-            commands::providers::list_providers,
+            commands::providers::list_model_templates,
+            commands::providers::list_configured_models,
+            commands::providers::upsert_configured_model,
+            commands::providers::delete_configured_model,
+            commands::providers::set_default_model,
             commands::providers::test_connection,
-            commands::providers::switch_model,
             // Scheduler
             commands::scheduler::list_scheduler_tasks,
             commands::scheduler::add_scheduler_task,

@@ -24,7 +24,13 @@ interface Props {
 }
 
 const WORKSPACE_KIND = [
-  { value: 'code', label: '代码项目', icon: Code, desc: '自动激活 coding、git-workflow 技能', color: '#6366f1' },
+  {
+    value: 'code',
+    label: '代码项目',
+    icon: Code,
+    desc: '自动激活 coding、git-workflow 技能',
+    color: '#6366f1',
+  },
   {
     value: 'data_analysis',
     label: '数据分析',
@@ -518,7 +524,7 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
             <button
               onClick={handleCreate}
               disabled={creating || !newName.trim()}
-              className="rounded-lg px-5 py-2 text-sm font-medium text-white transition-colors disabled:opacity-50"
+              className="rounded-lg px-5 py-2 text-sm font-medium text-[var(--text-on-accent)] transition-colors disabled:opacity-50"
               style={{ background: 'var(--accent)' }}
             >
               {creating ? '创建中...' : '创建并进入'}

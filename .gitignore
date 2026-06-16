@@ -9,3 +9,4 @@ web-frontend/dist/
 .vite/
 gen/
 echo-agent.yaml
+.echocowork/

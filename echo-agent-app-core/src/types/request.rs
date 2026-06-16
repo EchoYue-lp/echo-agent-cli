@@ -78,7 +78,6 @@ pub struct UpdateFullConfigRequest {
 #[derive(Debug, Deserialize, TS)]
 #[ts(export, rename = "ModelUpdate")]
 pub struct ModelUpdate {
-    pub name: Option<String>,
     pub max_tokens: Option<u32>,
     pub temperature: Option<f32>,
 }

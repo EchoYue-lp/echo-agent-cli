@@ -2,17 +2,28 @@
 # 复制为 echo-agent.yaml 并根据实际情况修改
 
 # ── 模型配置 ─────────────────────────────────────────────────────
-# 也可以通过环境变量设置（优先级更高）：
-# - ECHOCOWORK_AUTH_TOKEN: API 密钥
-# - ECHOCOWORK_BASE_URL: API 基础 URL
-# - ECHOCOWORK_MODEL: 模型名称
+# GUI 用户推荐在“设置 → 模型供应商”里维护。
+# YAML 适合自动化部署；CLI/TUI/GUI 会读取同一份 default_model_id。
 model:
-  provider: "deepseek"        # 模型 Provider（deepseek/openai/anthropic/qwen/custom）
-  name: "deepseek-v4-flash"   # 模型名称
-  auth_token: ""              # API 密钥（可选，优先从环境变量 ECHOCOWORK_AUTH_TOKEN 读取）
-  base_url: ""                # API 基础 URL（可选，优先从环境变量 ECHOCOWORK_BASE_URL 读取）
-  # max_tokens: 4096          # 最大输出 token 数（可选）
-  # temperature: 0.7          # 温度参数（可选）
+  default_model_id: "deepseek:deepseek-v4-flash"
+  provider: "deepseek"        # 运行时镜像字段，由模型供应商配置同步
+  name: "deepseek-v4-flash"   # 运行时镜像字段，不建议手动编辑
+  max_tokens: 8192
+  temperature: 0.7
+
+model_providers:
+  deepseek:
+    auth_token: "your-api-key"
+    base_url: "https://api.deepseek.com/chat/completions"
+
+configured_models:
+  - id: "deepseek:deepseek-v4-flash"
+    display_name: "Deepseek V4 Flash"
+    provider: "deepseek"
+    model: "deepseek-v4-flash"
+    enabled: true
+    max_tokens: 8192
+    temperature: 0.7
 
 # ── Agent 配置 ─────────────────────────────────────────────────────
 agent:

@@ -3,121 +3,42 @@
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
 use echo_agent::agent::Agent;
-use echo_agent::llm::config::Config;
+use echo_agent_app_core::model_config;
 use echo_agent_app_core::types::{
     AgentConfigResponse, ChannelsConfigResponse, FeishuConfigResponse, FullConfigResponse,
     LoggingConfigResponse, McpConfigResponse, ModelConfigResponse, QqConfigResponse,
     ServerConfigResponse, SessionConfigResponse, UpdateConfigRequest, UpdateFullConfigRequest,
 };
 
-#[tauri::command]
-pub async fn get_config(
-    state: tauri::State<'_, TauriState>,
-) -> Result<AgentConfigResponse, IpcError> {
-    let available_models = Config::list_models();
-    Ok(state
-        .app_state
-        .connection
-        .agent
-        .read(|agent| AgentConfigResponse {
-            model: agent.model_name().to_string(),
-            system_prompt: agent.system_prompt().to_string(),
-            max_iterations: agent.config().get_max_iterations(),
-            token_limit: agent.config().get_token_limit(),
-            enable_memory: agent.config().is_memory_enabled(),
-            enable_human_loop: agent.config().is_human_in_loop_enabled(),
-            session_id: agent.config().get_session_id().map(|s| s.to_string()),
-            available_models,
-        })
-        .await)
+fn configured_model_names(cfg: &echo_agent::config::AppConfig) -> Vec<String> {
+    cfg.configured_models
+        .iter()
+        .filter(|model| model.enabled)
+        .map(|model| model.display_name.clone())
+        .collect()
 }
 
-#[tauri::command]
-pub async fn update_config(
-    state: tauri::State<'_, TauriState>,
-    req: UpdateConfigRequest,
-) -> Result<AgentConfigResponse, IpcError> {
-    if let Some(ref model) = req.model
-        && !Config::has_model(model)
-    {
-        let available = Config::list_models();
-        return Err(IpcError::Validation(format!(
-            "模型 '{}' 未配置，可用模型: {:?}",
-            model, available
-        )));
-    }
-
-    {
-        let mut config = state.app_state.config.web_config.write().await;
-        if let Some(ref model) = req.model {
-            config.model = model.clone();
-        }
-        if let Some(ref system_prompt) = req.system_prompt {
-            config.system_prompt = system_prompt.clone();
-        }
-        if let Some(token_limit) = req.token_limit {
-            config.token_limit = token_limit;
-        }
-    }
-
-    {
-        state
-            .app_state
-            .connection
-            .agent
-            .write_async(|agent| {
-                Box::pin(async move {
-                    if let Some(ref model) = req.model {
-                        agent.set_model(model);
-                        tracing::info!("模型已切换为: {}", model);
-                    }
-                    if let Some(ref system_prompt) = req.system_prompt {
-                        agent.set_system_prompt(system_prompt.clone()).await;
-                        tracing::info!("系统提示词已更新");
-                    }
-                })
-            })
-            .await;
-    }
-
-    let available_models = Config::list_models();
-    Ok(state
-        .app_state
-        .connection
-        .agent
-        .read(|agent| AgentConfigResponse {
-            model: agent.model_name().to_string(),
-            system_prompt: agent.system_prompt().to_string(),
-            max_iterations: agent.config().get_max_iterations(),
-            token_limit: agent.config().get_token_limit(),
-            enable_memory: agent.config().is_memory_enabled(),
-            enable_human_loop: agent.config().is_human_in_loop_enabled(),
-            session_id: agent.config().get_session_id().map(|s| s.to_string()),
-            available_models,
-        })
-        .await)
-}
-
-#[tauri::command]
-pub async fn get_full_config(
-    state: tauri::State<'_, TauriState>,
-) -> Result<FullConfigResponse, IpcError> {
-    let cfg = state.app_state.config.app_config.read().await;
-    Ok(FullConfigResponse {
+fn full_config_response(cfg: &echo_agent::config::AppConfig) -> FullConfigResponse {
+    let runtime = model_config::resolve_runtime_model(cfg, cfg.model.default_model_id.as_deref());
+    let available_models = configured_model_names(cfg);
+    FullConfigResponse {
         model: ModelConfigResponse {
-            name: cfg.model.name.clone(),
-            max_tokens: cfg.model.max_tokens,
-            temperature: cfg.model.temperature,
+            provider: runtime.provider.clone(),
+            name: runtime.model.clone(),
+            has_auth_token: runtime.auth_token.is_some(),
+            base_url: runtime.base_url.clone(),
+            max_tokens: runtime.max_tokens,
+            temperature: runtime.temperature,
         },
         agent: AgentConfigResponse {
-            model: cfg.model.name.clone(),
+            model: runtime.model,
             system_prompt: cfg.agent.system_prompt.clone(),
             max_iterations: cfg.agent.max_iterations,
-            token_limit: cfg.model.max_tokens.unwrap_or(8000) as usize,
+            token_limit: runtime.max_tokens.unwrap_or(8000) as usize,
             enable_memory: cfg.agent.enable_memory,
             enable_human_loop: cfg.agent.enable_human_in_loop,
             session_id: None,
-            available_models: Config::list_models(),
+            available_models,
         },
         mcp: McpConfigResponse {
             config_path: cfg.mcp.config_path.clone(),
@@ -145,7 +66,98 @@ pub async fn get_full_config(
         logging: LoggingConfigResponse {
             level: cfg.logging.level.clone(),
         },
-    })
+    }
+}
+
+#[tauri::command]
+pub async fn get_config(
+    state: tauri::State<'_, TauriState>,
+) -> Result<AgentConfigResponse, IpcError> {
+    let available_models = {
+        let cfg = state.app_state.config.app_config.read().await;
+        configured_model_names(&cfg)
+    };
+    Ok(state
+        .app_state
+        .connection
+        .agent
+        .read(|agent| AgentConfigResponse {
+            model: agent.model_name().to_string(),
+            system_prompt: agent.system_prompt().to_string(),
+            max_iterations: agent.config().get_max_iterations(),
+            token_limit: agent.config().get_token_limit(),
+            enable_memory: agent.config().is_memory_enabled(),
+            enable_human_loop: agent.config().is_human_in_loop_enabled(),
+            session_id: agent.config().get_session_id().map(|s| s.to_string()),
+            available_models,
+        })
+        .await)
+}
+
+#[tauri::command]
+pub async fn update_config(
+    state: tauri::State<'_, TauriState>,
+    req: UpdateConfigRequest,
+) -> Result<AgentConfigResponse, IpcError> {
+    if req.model.is_some() {
+        return Err(IpcError::Validation(
+            "模型切换请使用“模型供应商”里的已配置模型，不再支持 config 旧入口".to_string(),
+        ));
+    }
+
+    {
+        let mut config = state.app_state.config.web_config.write().await;
+        if let Some(ref system_prompt) = req.system_prompt {
+            config.system_prompt = system_prompt.clone();
+        }
+        if let Some(token_limit) = req.token_limit {
+            config.token_limit = token_limit;
+        }
+    }
+
+    {
+        state
+            .app_state
+            .connection
+            .agent
+            .write_async(|agent| {
+                Box::pin(async move {
+                    if let Some(ref system_prompt) = req.system_prompt {
+                        agent.set_system_prompt(system_prompt.clone()).await;
+                        tracing::info!("系统提示词已更新");
+                    }
+                })
+            })
+            .await;
+    }
+
+    let available_models = {
+        let cfg = state.app_state.config.app_config.read().await;
+        configured_model_names(&cfg)
+    };
+    Ok(state
+        .app_state
+        .connection
+        .agent
+        .read(|agent| AgentConfigResponse {
+            model: agent.model_name().to_string(),
+            system_prompt: agent.system_prompt().to_string(),
+            max_iterations: agent.config().get_max_iterations(),
+            token_limit: agent.config().get_token_limit(),
+            enable_memory: agent.config().is_memory_enabled(),
+            enable_human_loop: agent.config().is_human_in_loop_enabled(),
+            session_id: agent.config().get_session_id().map(|s| s.to_string()),
+            available_models,
+        })
+        .await)
+}
+
+#[tauri::command]
+pub async fn get_full_config(
+    state: tauri::State<'_, TauriState>,
+) -> Result<FullConfigResponse, IpcError> {
+    let cfg = state.app_state.config.app_config.read().await;
+    Ok(full_config_response(&cfg))
 }
 
 #[tauri::command]
@@ -157,11 +169,19 @@ pub async fn update_full_config(
         let mut cfg = state.app_state.config.app_config.write().await;
 
         if let Some(m) = req.model {
-            if let Some(v) = m.name {
-                cfg.model.name = v;
-            }
             cfg.model.max_tokens = m.max_tokens.or(cfg.model.max_tokens);
             cfg.model.temperature = m.temperature.or(cfg.model.temperature);
+            let max_tokens = cfg.model.max_tokens;
+            let temperature = cfg.model.temperature;
+            if let Some(default_id) = cfg.model.default_model_id.clone()
+                && let Some(default_model) = cfg
+                    .configured_models
+                    .iter_mut()
+                    .find(|model| model.id == default_id)
+            {
+                default_model.max_tokens = max_tokens;
+                default_model.temperature = temperature;
+            }
         }
 
         if let Some(a) = req.agent {
@@ -255,12 +275,16 @@ pub async fn update_full_config(
         }
     }
 
-    // Sync model + system_prompt to agent (await completion before responding)
-    let model_name;
+    // Sync model runtime settings + system_prompt to agent (await completion before responding)
+    let temperature;
+    let max_tokens;
     let system_prompt;
     {
         let cfg = state.app_state.config.app_config.read().await;
-        model_name = cfg.model.name.clone();
+        let runtime =
+            model_config::resolve_runtime_model(&cfg, cfg.model.default_model_id.as_deref());
+        temperature = runtime.temperature;
+        max_tokens = runtime.max_tokens;
         system_prompt = cfg.agent.system_prompt.clone();
     }
     state
@@ -268,61 +292,19 @@ pub async fn update_full_config(
         .connection
         .agent
         .write_async(|agent| {
-            let model_name = model_name.clone();
             let system_prompt = system_prompt.clone();
             Box::pin(async move {
-                agent.set_model(&model_name);
+                agent.set_temperature(temperature);
+                agent.set_max_tokens(max_tokens);
                 agent.set_system_prompt(system_prompt.clone()).await;
-                tracing::info!(model = %model_name, "配置已同步到 Agent");
+                tracing::info!("配置已同步到 Agent");
             })
         })
         .await;
 
     // Return updated config
     let cfg = state.app_state.config.app_config.read().await;
-    Ok(FullConfigResponse {
-        model: ModelConfigResponse {
-            name: cfg.model.name.clone(),
-            max_tokens: cfg.model.max_tokens,
-            temperature: cfg.model.temperature,
-        },
-        agent: AgentConfigResponse {
-            model: cfg.model.name.clone(),
-            system_prompt: cfg.agent.system_prompt.clone(),
-            max_iterations: cfg.agent.max_iterations,
-            token_limit: cfg.model.max_tokens.unwrap_or(8000) as usize,
-            enable_memory: cfg.agent.enable_memory,
-            enable_human_loop: cfg.agent.enable_human_in_loop,
-            session_id: None,
-            available_models: Config::list_models(),
-        },
-        mcp: McpConfigResponse {
-            config_path: cfg.mcp.config_path.clone(),
-        },
-        channels: ChannelsConfigResponse {
-            qq: QqConfigResponse {
-                enabled: cfg.channels.qq.enabled,
-                app_id: cfg.channels.qq.app_id.clone(),
-            },
-            feishu: FeishuConfigResponse {
-                enabled: cfg.channels.feishu.enabled,
-                app_id: cfg.channels.feishu.app_id.clone(),
-                mode: cfg.channels.feishu.mode.clone(),
-            },
-            session: SessionConfigResponse {
-                timeout_minutes: cfg.channels.session.timeout_minutes,
-                reset_keywords: cfg.channels.session.reset_keywords.clone(),
-                reset_commands: cfg.channels.session.reset_commands.clone(),
-            },
-        },
-        server: ServerConfigResponse {
-            host: cfg.server.host.clone(),
-            port: cfg.server.port,
-        },
-        logging: LoggingConfigResponse {
-            level: cfg.logging.level.clone(),
-        },
-    })
+    Ok(full_config_response(&cfg))
 }
 
 #[tauri::command]

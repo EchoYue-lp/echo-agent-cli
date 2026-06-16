@@ -392,11 +392,14 @@ export function SchedulerPanel() {
                     disabled={busyTaskId === task.id}
                     className="flex items-center gap-1 rounded px-2 py-1 text-[11px] font-medium transition-colors"
                     style={{
-                      background: 'rgba(59,130,246,0.1)',
-                      color: 'var(--color-info, #3b82f6)',
+                      background: 'var(--action-run-bg)',
+                      color: 'var(--action-run)',
                     }}
                   >
-                    {busyTaskId === task.id && runResult?.id === task.id && !runResult.result && !runResult.error ? (
+                    {busyTaskId === task.id &&
+                    runResult?.id === task.id &&
+                    !runResult.result &&
+                    !runResult.error ? (
                       <RefreshCw size={11} className="animate-spin" />
                     ) : (
                       <Play size={11} />

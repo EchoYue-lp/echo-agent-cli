@@ -126,7 +126,8 @@ export default function NotebookPanel() {
               {cell.type === 'code' && (
                 <button
                   onClick={() => runCell(cell.id)}
-                  className="p-1 rounded bg-green-600 text-white hover:bg-green-700"
+                  className="p-1 rounded"
+                  style={{ background: 'var(--action-run)', color: 'var(--text-on-run)' }}
                   title="Run"
                 >
                   <Play size={12} />

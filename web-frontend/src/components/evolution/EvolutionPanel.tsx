@@ -240,8 +240,8 @@ export function EvolutionPanel() {
           disabled={reviewing}
           className="flex w-full items-center justify-center gap-2 rounded-lg py-2.5 text-xs font-medium transition-colors"
           style={{
-            background: reviewing ? 'var(--border-primary)' : 'var(--accent)',
-            color: reviewing ? 'var(--text-tertiary)' : 'white',
+            background: reviewing ? 'var(--border-primary)' : 'var(--action-run)',
+            color: reviewing ? 'var(--text-tertiary)' : 'var(--text-on-run)',
           }}
         >
           {reviewing ? (
@@ -352,8 +352,8 @@ export function EvolutionPanel() {
           disabled={curatorLoading}
           className="flex w-full items-center justify-center gap-2 rounded-lg py-2.5 text-xs font-medium transition-colors"
           style={{
-            background: curatorLoading ? 'var(--border-primary)' : 'var(--accent)',
-            color: curatorLoading ? 'var(--text-tertiary)' : 'white',
+            background: curatorLoading ? 'var(--border-primary)' : 'var(--action-run)',
+            color: curatorLoading ? 'var(--text-tertiary)' : 'var(--text-on-run)',
           }}
         >
           {curatorLoading ? (

@@ -94,7 +94,9 @@ export function ApprovalCard({
                 }}
                 className="flex-1 rounded-lg border border-red-300 px-3 py-1.5 text-sm outline-none dark:border-red-700 dark:bg-[var(--bg-input)] dark:text-[var(--text-primary)]"
                 placeholder={
-                  inputMode === 'reject' ? '请输入拒绝原因...' : '请输入修改意见（Agent 将据此调整方案）...'
+                  inputMode === 'reject'
+                    ? '请输入拒绝原因...'
+                    : '请输入修改意见（Agent 将据此调整方案）...'
                 }
                 autoFocus
               />

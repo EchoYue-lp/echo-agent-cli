@@ -13,6 +13,7 @@ pub mod hitl;
 pub mod hooks_config;
 pub mod infra;
 pub mod instruction_provider;
+pub mod model_config;
 pub mod observability;
 pub mod output;
 pub mod persistence;

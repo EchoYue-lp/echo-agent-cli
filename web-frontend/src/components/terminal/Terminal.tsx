@@ -109,15 +109,12 @@ export function Terminal({ sessionId }: TerminalProps) {
       setConnected(true);
 
       // ── Listen for PTY output from Rust backend ──
-      unlistenOutput = await listen<{ id: string; data: string }>(
-        'terminal-output',
-        (event) => {
-          if (event.payload.id === sessionId) {
-            const text = b64Decode(event.payload.data);
-            term.write(text);
-          }
+      unlistenOutput = await listen<{ id: string; data: string }>('terminal-output', (event) => {
+        if (event.payload.id === sessionId) {
+          const text = b64Decode(event.payload.data);
+          term.write(text);
         }
-      );
+      });
 
       // ── Listen for process exit ──
       unlistenExit = await listen<{ id: string }>('terminal-exit', (event) => {

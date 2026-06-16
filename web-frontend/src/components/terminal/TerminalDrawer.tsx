@@ -37,10 +37,7 @@ export function TerminalDrawer() {
         await apiInvoke('create_terminal', { id: newId, rows: 24, cols: 80 });
       } catch (e: unknown) {
         console.error('Failed to create terminal via IPC:', e);
-        addToast(
-          'error',
-          `创建终端失败: ${e instanceof Error ? e.message : 'Unknown error'}`
-        );
+        addToast('error', `创建终端失败: ${e instanceof Error ? e.message : 'Unknown error'}`);
         return;
       }
     } else {
@@ -51,10 +48,7 @@ export function TerminalDrawer() {
         return;
       } catch (e: unknown) {
         console.error('Failed to create terminal session:', e);
-        addToast(
-          'error',
-          `创建终端失败: ${e instanceof Error ? e.message : 'Unknown error'}`
-        );
+        addToast('error', `创建终端失败: ${e instanceof Error ? e.message : 'Unknown error'}`);
         return;
       }
     }

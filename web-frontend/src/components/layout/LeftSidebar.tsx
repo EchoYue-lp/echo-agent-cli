@@ -155,7 +155,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
   return (
     <div className="flex h-full flex-col bg-[var(--bg-sidebar)]">
       {/* Brand Header */}
-      <div className="flex items-center justify-between border-b border-[var(--border-primary)] px-3 py-2.5">
+      <div className="flex items-center justify-between px-3 py-3">
         <div className="flex items-center gap-2">
           <BrandIcon size="md" />
           <span className="text-sm font-semibold tracking-tight text-[var(--text-primary)]">
@@ -165,8 +165,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
             <div className="flex items-center gap-1">
               <button
                 onClick={onNewTask}
-                className="flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] font-medium transition-colors hover:opacity-80"
-                style={{ background: 'var(--accent)', color: 'white' }}
+                className="flex max-w-[118px] items-center gap-1 rounded-md bg-[var(--bg-hover)] px-1.5 py-0.5 text-[11px] font-medium text-[var(--text-secondary)] transition-colors hover:text-[var(--text-primary)]"
                 title={`当前: ${current.name}\n${current.root}`}
               >
                 <FolderOpen size={11} />
@@ -192,17 +191,17 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
       </div>
 
       {/* New Task + Search */}
-      <div className="space-y-2 px-3 pt-3 pb-2">
+      <div className="space-y-2 px-3 pb-3">
         <button
           onClick={onNewTask}
-          className="flex w-full items-center gap-2 rounded-lg border border-[var(--border-primary)] px-3 py-2 text-sm font-medium text-[var(--text-primary)] transition-all hover:bg-[var(--bg-sidebar-hover)]"
+          className="flex w-full items-center gap-2 rounded-lg bg-[var(--action-soft)] px-3 py-2 text-sm font-medium text-[var(--text-on-soft-action)] transition-colors hover:bg-[var(--action-soft-hover)]"
         >
           <Plus size={15} />
           新建任务
         </button>
 
         {workspaces.length > 0 && (
-          <div className="flex items-center gap-2 rounded-lg border border-[var(--border-primary)] bg-[var(--bg-hover)] px-3 py-1.5 transition-colors focus-within:border-[var(--border-focus)]">
+          <div className="flex items-center gap-2 rounded-lg bg-[var(--bg-hover)] px-3 py-1.5 transition-colors focus-within:ring-1 focus-within:ring-[var(--border-focus)]">
             <Search size={13} className="shrink-0 text-[var(--text-tertiary)]" />
             <input
               ref={searchInputRef}
@@ -241,9 +240,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
           {!isSearching && searchResults.length === 0 && (
             <div className="px-2 py-3 text-center">
               <Search size={16} className="mx-auto mb-1 text-[var(--text-tertiary)]" />
-              <p className="text-[11px] text-[var(--text-tertiary)]">
-                未找到匹配的对话
-              </p>
+              <p className="text-[11px] text-[var(--text-tertiary)]">未找到匹配的对话</p>
             </div>
           )}
           {!isSearching &&
@@ -296,12 +293,12 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
                 className={`group relative cursor-pointer rounded-lg transition-all
                   ${
                     isActive
-                      ? 'bg-[var(--bg-sidebar-active)] pl-[9px] border-l-[3px] border-l-[var(--accent)]'
-                      : 'border-l-[3px] border-l-transparent hover:bg-[var(--bg-sidebar-hover)]'
+                      ? 'bg-[var(--bg-sidebar-active)]'
+                      : 'hover:bg-[var(--bg-sidebar-hover)]'
                   }`}
                 onClick={() => handleSwitch(ws)}
               >
-                <div className="flex items-center gap-2 py-2.5 pr-2">
+                <div className="flex items-center gap-2 px-2 py-2.5">
                   {/* Expand arrow */}
                   {isActive ? (
                     isExpanded ? (
@@ -324,7 +321,9 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
                     </div>
                   </div>
 
-                  {isActive && <div className="h-2 w-2 shrink-0 rounded-full bg-[var(--accent)]" />}
+                  {isActive && (
+                    <div className="h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--accent)]" />
+                  )}
 
                   <div className="flex shrink-0 items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
                     <button

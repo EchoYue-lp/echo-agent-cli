@@ -290,7 +290,10 @@ export interface SavedMessage {
   tool_calls?: { id: string; name: string; arguments: string }[];
   thinking_segments?: string[];
   execution_steps?: { type: string; index: number }[];
-  execution_rounds?: { thinking?: { content: string }; tools: { name: string; args: unknown; result: string; success: boolean }[] }[];
+  execution_rounds?: {
+    thinking?: { content: string };
+    tools: { name: string; args: unknown; result: string; success: boolean }[];
+  }[];
   tool_result?: string | null;
 }
 
@@ -346,7 +349,14 @@ export interface SandboxExecuteResult {
 // ── Full Config types ──
 
 export interface FullConfigResponse {
-  model: { name: string; max_tokens: number | null; temperature: number | null };
+  model: {
+    provider: string;
+    name: string;
+    has_auth_token: boolean;
+    base_url: string | null;
+    max_tokens: number | null;
+    temperature: number | null;
+  };
   agent: {
     model: string;
     system_prompt: string;
@@ -373,7 +383,10 @@ export interface FullConfigResponse {
 }
 
 export interface FullConfigUpdateRequest {
-  model?: { name?: string; max_tokens?: number; temperature?: number };
+  model?: {
+    max_tokens?: number;
+    temperature?: number;
+  };
   agent?: {
     name?: string;
     system_prompt?: string;
@@ -492,20 +505,32 @@ export interface CuratorTransition {
 
 // ── Provider types ──────────────────────────────────────────────────────────
 
-export interface ProviderInfo {
+export interface ProviderTemplate {
   id: string;
   name: string;
-  icon: string;
-  models?: string[];
-  api_key_env: string;
   base_url: string;
+  api_key_env: string;
+  default_models: string[];
   requires_api_key: boolean;
-  configured: boolean;
 }
 
-export interface ProviderListResponse {
-  providers: ProviderInfo[];
-  current_model: string;
+export interface ConfiguredModel {
+  id: string;
+  display_name: string;
+  provider: string;
+  model: string;
+  enabled: boolean;
+  is_default: boolean;
+  has_auth_token: boolean;
+  auth_source: 'config' | 'env' | 'none' | string;
+  base_url: string | null;
+  temperature: number | null;
+  max_tokens: number | null;
+}
+
+export interface ConfiguredModelListResponse {
+  models: ConfiguredModel[];
+  default_model_id: string | null;
 }
 
 export interface TestConnectionResponse {
@@ -513,10 +538,6 @@ export interface TestConnectionResponse {
   response?: string;
   error?: string;
   model?: string;
-}
-
-export interface SwitchModelResponse {
-  success: boolean;
-  model: string;
-  message: string;
+  auth_source?: 'input' | 'config' | 'env' | 'none' | string;
+  has_auth_token?: boolean;
 }

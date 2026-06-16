@@ -116,22 +116,54 @@ pub async fn run_channels_mode(app_config: AppConfig) -> Result<()> {
     let session_config =
         SessionConfig::default().with_timeout_minutes(app_config.channels.session.timeout_minutes);
 
-    let model = app_config.model.name.clone();
+    let runtime_model = echo_agent_app_core::model_config::resolve_runtime_model(
+        &app_config,
+        app_config.model.default_model_id.as_deref(),
+    );
+    let model = runtime_model.model;
+    let llm_config = runtime_model.auth_token.as_ref().map(|token| {
+        echo_agent_app_core::infra::build_llm_config(
+            &runtime_model.provider,
+            token,
+            &model,
+            runtime_model.base_url.as_deref(),
+        )
+    });
     let system_prompt = app_config.agent.system_prompt.clone();
     let agent_name = app_config.agent.name.clone();
     let handler_factory = move |_channel_id: &str| -> Arc<dyn MessageHandler> {
         let model = model.clone();
+        let llm_config = llm_config.clone();
         let system_prompt = system_prompt.clone();
         let agent_name = agent_name.clone();
         let session_config = session_config.clone();
         Arc::new(SessionHandler::new(
             session_config,
             move || -> Box<dyn MessageHandler> {
-                Box::new(AgentChannelHandler::standard(
-                    &model,
-                    &agent_name,
-                    &system_prompt,
-                ))
+                if let Some(llm_config) = llm_config.clone() {
+                    match AgentChannelHandler::standard_with_llm_config(
+                        &model,
+                        &agent_name,
+                        &system_prompt,
+                        llm_config,
+                    ) {
+                        Ok(handler) => Box::new(handler),
+                        Err(e) => {
+                            tracing::warn!("IM channel agent LLM config failed: {e}");
+                            Box::new(AgentChannelHandler::standard(
+                                &model,
+                                &agent_name,
+                                &system_prompt,
+                            ))
+                        }
+                    }
+                } else {
+                    Box::new(AgentChannelHandler::standard(
+                        &model,
+                        &agent_name,
+                        &system_prompt,
+                    ))
+                }
             },
         ))
     };

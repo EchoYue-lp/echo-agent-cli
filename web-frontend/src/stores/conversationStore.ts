@@ -88,11 +88,22 @@ function generateId(): string {
 }
 
 function chatMessagesToSaved(messages: ChatMessage[]) {
-  const saved: { role: string; content: string; tool_calls?: { id: string; name: string; arguments: string }[]; thinking_segments?: string[]; execution_steps?: { type: string; index: number }[]; execution_rounds?: { thinking?: { content: string }; tools: { name: string; args: unknown; result: string; success: boolean }[] }[]; tool_result?: string }[] = [];
+  const saved: {
+    role: string;
+    content: string;
+    tool_calls?: { id: string; name: string; arguments: string }[];
+    thinking_segments?: string[];
+    execution_steps?: { type: string; index: number }[];
+    execution_rounds?: {
+      thinking?: { content: string };
+      tools: { name: string; args: unknown; result: string; success: boolean }[];
+    }[];
+    tool_result?: string;
+  }[] = [];
 
   for (const m of messages) {
     // Save the main message
-    const entry: typeof saved[0] = {
+    const entry: (typeof saved)[0] = {
       role: m.role,
       content: m.content,
     };
@@ -281,7 +292,13 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
         if (m.role === 'assistant' && m.tool_calls && m.tool_calls.length > 0) {
           base.toolCalls = m.tool_calls.map((tc) => ({
             name: tc.name,
-            args: (() => { try { return JSON.parse(tc.arguments); } catch { return tc.arguments; } })(),
+            args: (() => {
+              try {
+                return JSON.parse(tc.arguments);
+              } catch {
+                return tc.arguments;
+              }
+            })(),
             result: '',
             success: true,
           }));
@@ -290,12 +307,14 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
         // For tool result messages, show as assistant with tool result content
         if (m.role === 'tool') {
           base.content = m.tool_result || m.content || '';
-          base.toolCalls = [{
-            name: 'tool',
-            args: {},
-            result: m.tool_result || m.content || '',
-            success: true,
-          }];
+          base.toolCalls = [
+            {
+              name: 'tool',
+              args: {},
+              result: m.tool_result || m.content || '',
+              success: true,
+            },
+          ];
         }
 
         return base;

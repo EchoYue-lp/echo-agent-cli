@@ -61,11 +61,16 @@ trait TaskAgentProvider: Send + Sync {
 struct TaskAgentLease {
     agent: AgentHandle,
     release: Option<TaskAgentRelease>,
+    provider: &'static str,
 }
 
 impl TaskAgentLease {
     fn agent(&self) -> AgentHandle {
         self.agent.clone()
+    }
+
+    fn provider(&self) -> &'static str {
+        self.provider
     }
 
     async fn release(mut self) {
@@ -123,6 +128,7 @@ impl TaskAgentProvider for SingleAgentTaskProvider {
         Ok(TaskAgentLease {
             agent: self.agent.clone(),
             release: None,
+            provider: "single",
         })
     }
 }
@@ -147,6 +153,7 @@ impl TaskAgentProvider for PoolTaskAgentProvider {
                 pool: self.pool.clone(),
                 key,
             }),
+            provider: "pool",
         })
     }
 }
@@ -636,6 +643,7 @@ async fn dispatch_task(
     let lease = agent_provider.acquire_for_task(&ctx.task_id).await?;
     let agent = lease.agent();
     install_background_hitl_provider(&agent, hitl_provider.clone()).await;
+    log_task_runtime_model(&ctx.task_id, &agent, lease.provider()).await;
     tracing::debug!(
         task_id = %ctx.task_id,
         workspace_write_policy = ?meta.workspace_write_policy,
@@ -752,6 +760,30 @@ async fn dispatch_task(
 
     lease.release().await;
     result
+}
+
+async fn log_task_runtime_model(task_id: &str, agent: &AgentHandle, agent_provider: &'static str) {
+    agent
+        .read(|agent| {
+            let llm_config = agent.llm_config();
+            let auth_source = if llm_config.is_some() {
+                "configured"
+            } else {
+                "fallback_env_or_models"
+            };
+            tracing::info!(
+                task_id = %task_id,
+                agent_provider = agent_provider,
+                model = %agent.model_name(),
+                llm_provider = ?llm_config.map(|config| &config.provider),
+                has_base_url = llm_config
+                    .map(|config| !config.base_url.is_empty())
+                    .unwrap_or(false),
+                auth_source = auth_source,
+                "Background task runtime model"
+            );
+        })
+        .await;
 }
 
 async fn install_background_hitl_provider(
@@ -994,6 +1026,7 @@ mod tests {
             release: Some(TaskAgentRelease::Test {
                 released: released.clone(),
             }),
+            provider: "test",
         };
 
         drop(lease);

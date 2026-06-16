@@ -1,12 +1,31 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from 'react';
-import { ArrowUp, Square, Paperclip, X, File, Terminal } from 'lucide-react';
-import type { Attachment } from '../../types/api';
+import {
+  ArrowUp,
+  Square,
+  Paperclip,
+  X,
+  File,
+  Terminal,
+  ShieldCheck,
+  Cpu,
+  ChevronDown,
+  Check,
+} from 'lucide-react';
+import { permissionsApi, providerApi } from '../../api/endpoints';
+import { useUiStore } from '../../stores/uiStore';
+import type { Attachment, ConfiguredModel } from '../../types/api';
 import {
   filterCommands,
   groupByCategory,
   CATEGORY_META,
   type SlashCommand,
 } from '../../lib/slashCommands';
+import {
+  PERMISSION_MODES,
+  PERMISSIONS_CHANGED_EVENT,
+  normalizePermissionMode,
+  notifyPermissionsChanged,
+} from '../../lib/permissionModes';
 
 interface PendingFile {
   id: string;
@@ -156,12 +175,121 @@ function CommandPalette({ commands, selectedIndex, onSelect }: CommandPalettePro
 
 // ─── Main ChatInput ──────────────────────────────────────────────────────────
 
+const MODELS_CHANGED_EVENT = 'echocowork:models-changed';
+
+function notifyModelsChanged() {
+  window.dispatchEvent(new Event(MODELS_CHANGED_EVENT));
+}
+
 export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
   const [text, setText] = useState('');
   const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
   const [paletteSelectedIndex, setPaletteSelectedIndex] = useState(0);
+  const [configuredModels, setConfiguredModels] = useState<ConfiguredModel[]>([]);
+  const [modelMenuOpen, setModelMenuOpen] = useState(false);
+  const [switchingModelId, setSwitchingModelId] = useState<string | null>(null);
+  const [permissionMode, setPermissionMode] = useState('default');
+  const [permissionMenuOpen, setPermissionMenuOpen] = useState(false);
+  const [switchingPermissionMode, setSwitchingPermissionMode] = useState<string | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const setActiveSettingsTab = useUiStore((s) => s.setActiveSettingsTab);
+  const activeModel = configuredModels.find((model) => model.is_default);
+  const visibleModels = configuredModels.filter((model) => model.enabled);
+  const displayModel = activeModel ?? visibleModels[0] ?? null;
+  const activePermissionMode =
+    PERMISSION_MODES.find((mode) => mode.id === permissionMode) ?? PERMISSION_MODES[0];
+
+  const loadConfiguredModels = useCallback(async () => {
+    try {
+      const res = await providerApi.listConfigured();
+      setConfiguredModels(res.models);
+    } catch (e) {
+      console.error('[ChatInput] Failed to load configured models:', e);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadConfiguredModels();
+  }, [loadConfiguredModels]);
+
+  const loadPermissionMode = useCallback(async () => {
+    try {
+      const res = await permissionsApi.getMode();
+      setPermissionMode(normalizePermissionMode(res.mode));
+    } catch (e) {
+      console.error('[ChatInput] Failed to load permission mode:', e);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadPermissionMode();
+  }, [loadPermissionMode]);
+
+  useEffect(() => {
+    const refreshPermissionMode = () => {
+      void loadPermissionMode();
+    };
+    window.addEventListener(PERMISSIONS_CHANGED_EVENT, refreshPermissionMode);
+    window.addEventListener('focus', refreshPermissionMode);
+    return () => {
+      window.removeEventListener(PERMISSIONS_CHANGED_EVENT, refreshPermissionMode);
+      window.removeEventListener('focus', refreshPermissionMode);
+    };
+  }, [loadPermissionMode]);
+
+  useEffect(() => {
+    const refreshModels = () => {
+      void loadConfiguredModels();
+    };
+    window.addEventListener(MODELS_CHANGED_EVENT, refreshModels);
+    window.addEventListener('focus', refreshModels);
+    return () => {
+      window.removeEventListener(MODELS_CHANGED_EVENT, refreshModels);
+      window.removeEventListener('focus', refreshModels);
+    };
+  }, [loadConfiguredModels]);
+
+  const openModelSettings = useCallback(() => {
+    setModelMenuOpen(false);
+    setActiveSettingsTab('providers');
+  }, [setActiveSettingsTab]);
+
+  const switchModel = useCallback(
+    async (model: ConfiguredModel) => {
+      if (model.is_default || switchingModelId) return;
+      setSwitchingModelId(model.id);
+      try {
+        await providerApi.setDefault(model.id);
+        await loadConfiguredModels();
+        notifyModelsChanged();
+        setModelMenuOpen(false);
+      } catch (e) {
+        console.error('[ChatInput] Failed to switch model:', e);
+      } finally {
+        setSwitchingModelId(null);
+      }
+    },
+    [loadConfiguredModels, switchingModelId]
+  );
+
+  const switchPermissionMode = useCallback(
+    async (mode: string) => {
+      if (mode === permissionMode || switchingPermissionMode) return;
+      setSwitchingPermissionMode(mode);
+      try {
+        await permissionsApi.setMode(mode);
+        setPermissionMode(mode);
+        notifyPermissionsChanged();
+        setPermissionMenuOpen(false);
+      } catch (e) {
+        console.error('[ChatInput] Failed to switch permission mode:', e);
+      } finally {
+        setSwitchingPermissionMode(null);
+      }
+    },
+    [permissionMode, switchingPermissionMode]
+  );
 
   // Auto-resize textarea
   useEffect(() => {
@@ -386,13 +514,13 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
 
   return (
     <div
-      className="px-4 pb-4 pt-2"
+      className="px-5 pb-5 pt-2"
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
     >
       {/* Relative container so the absolute-positioned palette anchors here */}
-      <div className="relative mx-auto max-w-3xl">
+      <div className="relative mx-auto max-w-[920px]">
         {/* ── Slash Command Palette ── */}
         {showPalette && (
           <CommandPalette
@@ -402,7 +530,7 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
           />
         )}
 
-        <div className="glass flex flex-col rounded-2xl shadow-[var(--shadow-sm)] transition-shadow focus-within:shadow-[var(--shadow-md)] relative">
+        <div className="relative flex flex-col rounded-[20px] border border-[var(--border-primary)] bg-[var(--bg-input)] shadow-[var(--shadow-md)] transition-shadow focus-within:shadow-[var(--shadow-lg)]">
           {/* Drag overlay */}
           {isDragging && (
             <div className="absolute inset-0 z-10 flex items-center justify-center rounded-2xl border-2 border-dashed border-[var(--accent)] bg-[var(--accent)]/5">
@@ -452,7 +580,7 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
           )}
 
           {/* Input row */}
-          <div className="flex items-end px-4 py-3">
+          <div className="flex items-end px-4 pt-3 pb-2">
             {/* Attachment button */}
             <button
               onClick={() => fileInputRef.current?.click()}
@@ -477,7 +605,7 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
               onKeyDown={handleKeyDown}
               onPaste={handlePaste}
               rows={1}
-              placeholder="Send a message, or type / for commands..."
+              placeholder="继续输入以排队后续修改，或输入 / 查看命令"
               className="max-h-[200px] min-h-[24px] flex-1 resize-none bg-transparent text-sm leading-relaxed text-[var(--text-primary)] outline-none placeholder:text-[var(--text-tertiary)]"
             />
             {isStreaming ? (
@@ -492,17 +620,119 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
               <button
                 onClick={handleSend}
                 disabled={!hasContent}
-                className="ml-2 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-[var(--accent)] text-white transition-all hover:shadow-[var(--shadow-glow)] disabled:opacity-20 disabled:hover:shadow-none"
+                className="ml-2 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-[var(--accent)] text-[var(--text-on-accent)] transition-all hover:shadow-[var(--shadow-glow)] disabled:opacity-20 disabled:hover:shadow-none"
               >
                 <ArrowUp size={16} strokeWidth={2.5} />
               </button>
             )}
           </div>
+          <div className="flex items-center justify-between border-t border-[var(--border-secondary)] px-4 py-2 text-[11px] text-[var(--text-tertiary)]">
+            <div className="flex min-w-0 items-center gap-3">
+              <div className="relative">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPermissionMenuOpen((open) => !open);
+                    setModelMenuOpen(false);
+                  }}
+                  className="flex max-w-[180px] items-center gap-1.5 rounded-md px-1.5 py-1 text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                  title="切换审批模式"
+                >
+                  <ShieldCheck size={13} />
+                  <span className="truncate">{activePermissionMode.label}</span>
+                  <ChevronDown size={12} />
+                </button>
+                {permissionMenuOpen && (
+                  <div className="absolute bottom-full left-0 z-50 mb-2 w-64 overflow-hidden rounded-lg border border-[var(--border-primary)] bg-[var(--bg-primary)] shadow-[var(--shadow-md)]">
+                    <div className="border-b border-[var(--border-secondary)] px-3 py-2 text-[10px] font-medium text-[var(--text-tertiary)]">
+                      审批模式
+                    </div>
+                    <div className="p-1">
+                      {PERMISSION_MODES.map((mode) => (
+                        <button
+                          key={mode.id}
+                          type="button"
+                          onClick={() => switchPermissionMode(mode.id)}
+                          disabled={switchingPermissionMode !== null}
+                          className="flex w-full items-start gap-2 rounded-md px-2 py-2 text-left transition-colors hover:bg-[var(--bg-hover)] disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center text-[var(--accent)]">
+                            {mode.id === permissionMode && <Check size={13} />}
+                          </span>
+                          <span className="min-w-0 flex-1">
+                            <span className="block text-xs text-[var(--text-primary)]">
+                              {mode.label}
+                            </span>
+                            <span className="block text-[10px] text-[var(--text-tertiary)]">
+                              {mode.description}
+                            </span>
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+              <div className="relative hidden sm:block">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPermissionMenuOpen(false);
+                    if (visibleModels.length === 0) {
+                      openModelSettings();
+                    } else {
+                      setModelMenuOpen((open) => !open);
+                    }
+                  }}
+                  className="flex max-w-[220px] items-center gap-1.5 rounded-md px-1.5 py-1 text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                  title="切换默认模型"
+                >
+                  <Cpu size={13} />
+                  <span className="truncate">
+                    {displayModel?.display_name || displayModel?.model || '配置模型'}
+                  </span>
+                  {visibleModels.length > 0 && <ChevronDown size={12} />}
+                </button>
+                {modelMenuOpen && visibleModels.length > 0 && (
+                  <div className="absolute bottom-full left-0 z-50 mb-2 w-64 overflow-hidden rounded-lg border border-[var(--border-primary)] bg-[var(--bg-primary)] shadow-[var(--shadow-md)]">
+                    <div className="border-b border-[var(--border-secondary)] px-3 py-2 text-[10px] font-medium text-[var(--text-tertiary)]">
+                      默认模型
+                    </div>
+                    <div className="max-h-64 overflow-y-auto p-1">
+                      {visibleModels.map((model) => (
+                        <button
+                          key={model.id}
+                          type="button"
+                          onClick={() => switchModel(model)}
+                          disabled={switchingModelId !== null}
+                          className="flex w-full items-center gap-2 rounded-md px-2 py-2 text-left text-xs text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-hover)] disabled:cursor-not-allowed disabled:opacity-50"
+                        >
+                          <span className="flex h-4 w-4 shrink-0 items-center justify-center text-[var(--accent)]">
+                            {model.is_default && <Check size={13} />}
+                          </span>
+                          <span className="min-w-0 flex-1 truncate">
+                            {model.display_name || model.model}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={openModelSettings}
+                      className="w-full border-t border-[var(--border-secondary)] px-3 py-2 text-left text-xs text-[var(--accent)] transition-colors hover:bg-[var(--bg-hover)]"
+                    >
+                      管理模型
+                    </button>
+                  </div>
+                )}
+              </div>
+            </div>
+            <div className="flex items-center gap-3">
+              <span>Enter 发送</span>
+              {text.length > 0 && <span>{text.length} 字</span>}
+            </div>
+          </div>
         </div>
-      </div>
-      <div className="mx-auto mt-2 flex max-w-3xl items-center justify-between text-[11px] text-[var(--text-tertiary)]">
-        <span>EchoCoWork may make mistakes; verify important information</span>
-        {text.length > 0 && <span>{text.length} chars</span>}
       </div>
     </div>
   );
