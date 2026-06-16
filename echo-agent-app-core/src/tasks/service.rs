@@ -3,23 +3,24 @@
 //! Manages task submission, scheduling, persistence, progress tracking, and
 //! cancellation. The service struct itself does not store an Agent reference;
 //! instead, agent execution is delegated to a `TaskExecuteFn` closure that
-//! captures the `AgentHandle` at construction time.
+//! acquires an agent from a task-scoped provider at execution time.
 //!
 //! ## Architecture
 //!
 //! The `TaskExecuteFn` closure is constructed in `AppState::start_task_service()`
-//! and captures: agent, subagent_executor. This keeps all
+//! and captures: an agent provider, manager, and event bus. This keeps all
 //! Agent-related concerns outside the service itself.
 //!
 //! ## Concurrency
 //!
-//! All agent execution (foreground chat + background tasks) is serialized
-//! internally by `ReactAgent`'s `execution_mutex`. Only one caller can use
-//! the agent at a time.
+//! When an `AgentPool` is available, each background task gets a distinct
+//! pooled worker agent so ready tasks can run concurrently. Without a pool,
+//! the service falls back to the legacy single-agent serialized path.
 
 use super::background::*;
 use super::*;
 use crate::agent_handle::AgentHandle;
+use async_trait::async_trait;
 use dashmap::DashMap;
 use echo_agent::agent::Agent;
 use echo_agent::memory::Store;
@@ -27,6 +28,128 @@ use echo_agent::tasks::progress::TaskProgress;
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing;
+
+/// Runtime execution settings for background tasks.
+#[derive(Debug, Clone)]
+pub struct BackgroundTaskServiceConfig {
+    /// Maximum top-level background tasks that may execute at once.
+    pub max_concurrent: usize,
+    /// Number of agent slots reserved for foreground/multi-session work.
+    pub reserve_foreground_agents: usize,
+    /// Maximum parallel steps inside a single composite task.
+    pub composite_parallelism: usize,
+}
+
+impl Default for BackgroundTaskServiceConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent: 1,
+            reserve_foreground_agents: 0,
+            composite_parallelism: 1,
+        }
+    }
+}
+
+#[async_trait]
+trait TaskAgentProvider: Send + Sync {
+    async fn acquire_for_task(
+        &self,
+        task_key: &str,
+    ) -> Result<TaskAgentLease, echo_agent::error::ReactError>;
+}
+
+struct TaskAgentLease {
+    agent: AgentHandle,
+    release: Option<TaskAgentRelease>,
+}
+
+impl TaskAgentLease {
+    fn agent(&self) -> AgentHandle {
+        self.agent.clone()
+    }
+
+    async fn release(mut self) {
+        if let Some(release) = self.release.take() {
+            release.release().await;
+        }
+    }
+}
+
+impl Drop for TaskAgentLease {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            tokio::spawn(async move {
+                release.release().await;
+            });
+        }
+    }
+}
+
+enum TaskAgentRelease {
+    Pool {
+        pool: Arc<crate::agent_pool::AgentPool>,
+        key: String,
+    },
+    #[cfg(test)]
+    Test {
+        released: Arc<std::sync::atomic::AtomicUsize>,
+    },
+}
+
+impl TaskAgentRelease {
+    async fn release(self) {
+        match self {
+            TaskAgentRelease::Pool { pool, key } => {
+                pool.release(&key).await;
+            }
+            #[cfg(test)]
+            TaskAgentRelease::Test { released } => {
+                released.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+}
+
+struct SingleAgentTaskProvider {
+    agent: AgentHandle,
+}
+
+#[async_trait]
+impl TaskAgentProvider for SingleAgentTaskProvider {
+    async fn acquire_for_task(
+        &self,
+        _task_key: &str,
+    ) -> Result<TaskAgentLease, echo_agent::error::ReactError> {
+        Ok(TaskAgentLease {
+            agent: self.agent.clone(),
+            release: None,
+        })
+    }
+}
+
+struct PoolTaskAgentProvider {
+    pool: Arc<crate::agent_pool::AgentPool>,
+}
+
+#[async_trait]
+impl TaskAgentProvider for PoolTaskAgentProvider {
+    async fn acquire_for_task(
+        &self,
+        task_key: &str,
+    ) -> Result<TaskAgentLease, echo_agent::error::ReactError> {
+        let key = format!("__task__:{task_key}");
+        let agent = self.pool.acquire(&key).await.map_err(|e| {
+            echo_agent::error::ReactError::Other(format!("Failed to acquire task agent: {e}"))
+        })?;
+        Ok(TaskAgentLease {
+            agent,
+            release: Some(TaskAgentRelease::Pool {
+                pool: self.pool.clone(),
+                key,
+            }),
+        })
+    }
+}
 
 /// Pure task lifecycle manager.
 ///
@@ -38,6 +161,7 @@ pub struct BackgroundTaskService {
     store: Arc<SqliteTaskStore>,
     event_bus: Arc<TaskEventBus>,
     cancel: echo_agent::agent::CancellationToken,
+    config: BackgroundTaskServiceConfig,
     /// Latest progress for each task, updated by ProgressBridge via TaskEventBus.
     /// Frontends (Tauri, CLI) can query this to get real-time progress.
     latest_progress: Arc<DashMap<String, TaskProgress>>,
@@ -65,6 +189,47 @@ impl BackgroundTaskService {
         cancel: echo_agent::agent::CancellationToken,
         task_hooks: Option<Arc<dyn echo_agent::workspace::orchestration::tasks::TaskHooks>>,
     ) -> anyhow::Result<Self> {
+        Self::with_agent_provider(
+            Arc::new(SingleAgentTaskProvider { agent }),
+            BackgroundTaskServiceConfig::default(),
+            store_backend,
+            cancel,
+            task_hooks,
+        )
+        .await
+    }
+
+    /// Create with an AgentPool so top-level background tasks can execute in parallel.
+    pub async fn with_pool(
+        pool: Arc<crate::agent_pool::AgentPool>,
+        store_backend: Arc<dyn Store>,
+        cancel: echo_agent::agent::CancellationToken,
+        task_hooks: Option<Arc<dyn echo_agent::workspace::orchestration::tasks::TaskHooks>>,
+    ) -> anyhow::Result<Self> {
+        let max_concurrent = pool.background_task_concurrency();
+        let reserve_foreground_agents = pool.foreground_agent_reserve();
+        let composite_parallelism = pool.composite_parallelism();
+        Self::with_agent_provider(
+            Arc::new(PoolTaskAgentProvider { pool }),
+            BackgroundTaskServiceConfig {
+                max_concurrent,
+                reserve_foreground_agents,
+                composite_parallelism,
+            },
+            store_backend,
+            cancel,
+            task_hooks,
+        )
+        .await
+    }
+
+    async fn with_agent_provider(
+        agent_provider: Arc<dyn TaskAgentProvider>,
+        service_config: BackgroundTaskServiceConfig,
+        store_backend: Arc<dyn Store>,
+        cancel: echo_agent::agent::CancellationToken,
+        task_hooks: Option<Arc<dyn echo_agent::workspace::orchestration::tasks::TaskHooks>>,
+    ) -> anyhow::Result<Self> {
         let store = Arc::new(SqliteTaskStore::new(store_backend));
 
         // Create event bus with logging listener
@@ -77,22 +242,41 @@ impl BackgroundTaskService {
             .expect("with_logging_and_events always creates an event bus");
         let event_bus = Arc::new(event_bus);
 
-        // Build the TaskExecuteFn closure — captures agent + manager + event_bus
+        // Create HITL provider for background tasks.
+        let (hitl_provider, _hitl_rx) = super::hitl_provider::BackgroundTaskHumanProvider::new();
+        let hitl_provider = Arc::new(hitl_provider);
+
+        // Build the TaskExecuteFn closure — captures provider + manager + event_bus
         let execute_fn: TaskExecuteFn = {
-            let agent = agent.clone();
+            let agent_provider = agent_provider.clone();
             let manager = manager.clone();
             let event_bus = event_bus.clone();
+            let hitl_provider = hitl_provider.clone();
+            let service_config = service_config.clone();
             Arc::new(move |ctx: TaskContext| {
-                let agent = agent.clone();
+                let agent_provider = agent_provider.clone();
                 let manager = manager.clone();
                 let event_bus = event_bus.clone();
-                Box::pin(async move { dispatch_task(ctx, agent, manager, event_bus).await })
+                let hitl_provider = hitl_provider.clone();
+                let service_config = service_config.clone();
+                Box::pin(async move {
+                    dispatch_task(
+                        ctx,
+                        agent_provider,
+                        manager,
+                        event_bus,
+                        hitl_provider,
+                        service_config,
+                    )
+                    .await
+                })
             })
         };
 
-        // Create executor — max_concurrent=1 since all tasks share one agent
+        // Create executor. Pool-backed services can run multiple tasks concurrently;
+        // single-agent services keep the legacy serialized behavior.
         let executor_config = TaskExecutorConfig {
-            max_concurrent: 1,
+            max_concurrent: service_config.max_concurrent.max(1),
             default_timeout_secs: 0, // 0 = no timeout
             enable_hooks: true,
             ..Default::default()
@@ -139,28 +323,13 @@ impl BackgroundTaskService {
             });
         }
 
-        // Create HITL provider for background tasks
-        let (hitl_provider, _hitl_rx) = super::hitl_provider::BackgroundTaskHumanProvider::new();
-        let hitl_provider = Arc::new(hitl_provider);
-
-        // Wire HITL provider into the agent so background tasks can request human input
-        {
-            let hitl = hitl_provider.clone();
-            agent
-                .write(|a| {
-                    a.set_human_loop_provider(
-                        hitl as Arc<dyn echo_agent::human_loop::HumanLoopProvider>,
-                    )
-                })
-                .await;
-        }
-
         Ok(Self {
             manager,
             executor,
             store,
             event_bus,
             cancel,
+            config: service_config,
             latest_progress,
             hitl_provider,
         })
@@ -331,6 +500,11 @@ impl BackgroundTaskService {
         self.latest_progress.get(task_id).map(|v| v.clone())
     }
 
+    /// Runtime execution settings for this service.
+    pub fn config(&self) -> &BackgroundTaskServiceConfig {
+        &self.config
+    }
+
     /// Get the underlying TaskManager (for advanced use).
     pub fn manager(&self) -> &Arc<TaskManager> {
         &self.manager
@@ -394,18 +568,21 @@ impl BackgroundTaskService {
 
 // ── Unified Task Dispatch ──
 
-/// Dispatch a task using the **shared main Agent**.
+/// Dispatch a task using a task-scoped agent from the provider.
 ///
-/// Execution serialization is handled internally by ReactAgent's
-/// `execution_mutex` — no external mutex needed.
+/// Pool-backed providers return a distinct worker per task, allowing ready
+/// tasks to execute concurrently. Single-agent providers preserve the legacy
+/// serialized behavior.
 ///
 /// This function is captured in the TaskExecuteFn closure constructed in
 /// `AppState::start_task_service()`.
 async fn dispatch_task(
     ctx: TaskContext,
-    agent: crate::agent_handle::AgentHandle,
+    agent_provider: Arc<dyn TaskAgentProvider>,
     manager: Arc<TaskManager>,
     event_bus: Arc<TaskEventBus>,
+    hitl_provider: Arc<super::hitl_provider::BackgroundTaskHumanProvider>,
+    service_config: BackgroundTaskServiceConfig,
 ) -> Result<String, echo_agent::error::ReactError> {
     let task = manager.get_task(&ctx.task_id).ok_or_else(|| {
         echo_agent::error::ReactError::Other(format!(
@@ -430,7 +607,15 @@ async fn dispatch_task(
 
     // Composite tasks need special handling — they orchestrate sub-tasks
     if let BackgroundTaskKind::Composite { steps, strategy } = &meta.kind {
-        return execute_composite(ctx, agent, steps.clone(), strategy.clone()).await;
+        return execute_composite(
+            ctx,
+            agent_provider,
+            hitl_provider,
+            service_config.composite_parallelism,
+            steps.clone(),
+            strategy.clone(),
+        )
+        .await;
     }
 
     // Cron and Workflow are defined but not yet implemented — return clear error
@@ -448,8 +633,18 @@ async fn dispatch_task(
         _ => {}
     }
 
+    let lease = agent_provider.acquire_for_task(&ctx.task_id).await?;
+    let agent = lease.agent();
+    install_background_hitl_provider(&agent, hitl_provider.clone()).await;
+    tracing::debug!(
+        task_id = %ctx.task_id,
+        workspace_write_policy = ?meta.workspace_write_policy,
+        sandbox_execution_policy = ?meta.sandbox_execution_policy,
+        "Background task resource policy"
+    );
+
     // Pipeline tasks — route to structured graph pipelines instead of generic prompt
-    match &meta.kind {
+    let result = match &meta.kind {
         BackgroundTaskKind::Research {
             topic,
             max_papers,
@@ -465,9 +660,9 @@ async fn dispatch_task(
             let config =
                 super::pipelines::ResearchConfig::new(topic.as_str()).with_max_papers(*max_papers);
             let result = super::pipelines::run_research_with_config(agent.clone(), config).await;
-            return result.map_err(|e| {
+            result.map_err(|e| {
                 echo_agent::error::ReactError::Other(format!("Research pipeline failed: {e}"))
-            });
+            })
         }
 
         BackgroundTaskKind::ResearchToWriting {
@@ -494,11 +689,11 @@ async fn dispatch_task(
                 .with_research_revisions(*research_max_revisions, *research_quality_threshold)
                 .with_writing_revisions(*writing_max_revisions, *writing_quality_threshold);
             let result = super::pipelines::run_research_to_writing(agent.clone(), config).await;
-            return result.map_err(|e| {
+            result.map_err(|e| {
                 echo_agent::error::ReactError::Other(format!(
                     "Research-to-writing pipeline failed: {e}"
                 ))
-            });
+            })
         }
 
         BackgroundTaskKind::DataPipeline {
@@ -520,9 +715,9 @@ async fn dispatch_task(
             }
             let result =
                 super::pipelines::run_data_pipeline_with_config(agent.clone(), config).await;
-            return result.map_err(|e| {
+            result.map_err(|e| {
                 echo_agent::error::ReactError::Other(format!("Data pipeline failed: {e}"))
-            });
+            })
         }
 
         BackgroundTaskKind::WritingPipeline {
@@ -546,22 +741,45 @@ async fn dispatch_task(
                 .with_quality_threshold(*quality_threshold);
             let result =
                 super::pipelines::run_writing_pipeline_with_config(agent.clone(), config).await;
-            return result.map_err(|e| {
+            result.map_err(|e| {
                 echo_agent::error::ReactError::Other(format!("Writing pipeline failed: {e}"))
-            });
+            })
         }
 
         // Non-pipeline tasks fall through to generic prompt execution
-        _ => {}
-    }
+        _ => execute_prompt_task(ctx, agent, event_bus, &meta.kind).await,
+    };
 
-    let prompt = meta.kind.to_prompt();
+    lease.release().await;
+    result
+}
+
+async fn install_background_hitl_provider(
+    agent: &AgentHandle,
+    hitl_provider: Arc<super::hitl_provider::BackgroundTaskHumanProvider>,
+) {
+    agent
+        .write(|a| {
+            a.set_human_loop_provider(
+                hitl_provider as Arc<dyn echo_agent::human_loop::HumanLoopProvider>,
+            )
+        })
+        .await;
+}
+
+async fn execute_prompt_task(
+    ctx: TaskContext,
+    agent: AgentHandle,
+    event_bus: Arc<TaskEventBus>,
+    kind: &BackgroundTaskKind,
+) -> Result<String, echo_agent::error::ReactError> {
+    let prompt = kind.to_prompt();
 
     tracing::info!(
         task_id = %ctx.task_id,
-        mode = %meta.kind.mode_name(),
+        mode = %kind.mode_name(),
         prompt_len = prompt.len(),
-        "Executing task on shared Agent"
+        "Executing task on background worker agent"
     );
 
     // Register ProgressBridge callback (brief write lock)
@@ -577,7 +795,6 @@ async fn dispatch_task(
         })
         .await;
 
-    // Execute on the shared main agent — ReactAgent serializes internally
     let result = agent
         .read_async(|a| {
             let prompt = prompt.clone();
@@ -585,11 +802,12 @@ async fn dispatch_task(
         })
         .await;
 
-    // Clean up callback
+    // Clean up callback. Pool workers execute one task at a time; this remains
+    // task-local for pooled execution and preserves legacy single-agent behavior.
     bridge.disable();
     agent
         .write(|a| {
-            a.remove_callbacks_by_type_name("ProgressBridge");
+            a.remove_callbacks_by_type_name_and_id("ProgressBridge", &ctx.task_id);
         })
         .await;
 
@@ -600,8 +818,10 @@ async fn dispatch_task(
 ///
 /// Each sub-step runs on the shared main agent via `dispatch_sub_task`.
 async fn execute_composite(
-    _ctx: TaskContext,
-    agent: crate::agent_handle::AgentHandle,
+    ctx: TaskContext,
+    agent_provider: Arc<dyn TaskAgentProvider>,
+    hitl_provider: Arc<super::hitl_provider::BackgroundTaskHumanProvider>,
+    composite_parallelism: usize,
     steps: Vec<super::background::CompositeStep>,
     strategy: super::background::CompositeStrategy,
 ) -> Result<String, echo_agent::error::ReactError> {
@@ -611,11 +831,15 @@ async fn execute_composite(
         execute_composite as framework_execute_composite,
     };
 
+    let composite_limiter = Arc::new(tokio::sync::Semaphore::new(composite_parallelism.max(1)));
     let framework_steps: Vec<FrameworkCompositeStep> = steps
         .iter()
         .enumerate()
         .map(|(i, step)| {
-            let agent = agent.clone();
+            let agent_provider = agent_provider.clone();
+            let hitl_provider = hitl_provider.clone();
+            let parent_task_id = ctx.task_id.clone();
+            let composite_limiter = composite_limiter.clone();
             let kind = step.kind.clone();
             let step_id = step
                 .description
@@ -625,9 +849,26 @@ async fn execute_composite(
                 id: step_id.clone(),
                 name: step_id,
                 execute_fn: Arc::new(move |ctx| {
-                    let agent = agent.clone();
+                    let agent_provider = agent_provider.clone();
+                    let hitl_provider = hitl_provider.clone();
+                    let parent_task_id = parent_task_id.clone();
+                    let composite_limiter = composite_limiter.clone();
                     let kind = kind.clone();
-                    Box::pin(async move { dispatch_sub_task(ctx, agent, &kind).await })
+                    Box::pin(async move {
+                        let _permit = composite_limiter.acquire_owned().await.map_err(|e| {
+                            echo_agent::error::ReactError::Other(format!(
+                                "Composite parallelism limiter closed: {e}"
+                            ))
+                        })?;
+                        dispatch_sub_task(
+                            ctx,
+                            agent_provider,
+                            hitl_provider,
+                            &parent_task_id,
+                            &kind,
+                        )
+                        .await
+                    })
                 }),
                 input_from: step.input_from.clone(),
             }
@@ -657,12 +898,16 @@ async fn execute_composite(
     ))
 }
 
-/// Dispatch a sub-task within a composite task using the shared main agent.
-///
-/// Execution serialization is handled internally by ReactAgent.
+fn composite_step_task_key(parent_task_id: &str, step_id: &str) -> String {
+    format!("{parent_task_id}:step:{step_id}")
+}
+
+/// Dispatch a sub-task within a composite task using a task-scoped worker agent.
 async fn dispatch_sub_task(
-    _ctx: TaskContext,
-    agent: crate::agent_handle::AgentHandle,
+    ctx: TaskContext,
+    agent_provider: Arc<dyn TaskAgentProvider>,
+    hitl_provider: Arc<super::hitl_provider::BackgroundTaskHumanProvider>,
+    parent_task_id: &str,
     kind: &super::background::BackgroundTaskKind,
 ) -> Result<String, echo_agent::error::ReactError> {
     use super::background::BackgroundTaskKind;
@@ -674,8 +919,11 @@ async fn dispatch_sub_task(
     }
 
     let prompt = kind.to_prompt();
+    let task_key = composite_step_task_key(parent_task_id, &ctx.task_id);
+    let lease = agent_provider.acquire_for_task(&task_key).await?;
+    let agent = lease.agent();
+    install_background_hitl_provider(&agent, hitl_provider).await;
 
-    // Execute on the shared main agent — ReactAgent serializes internally
     let result = agent
         .read_async(|a| {
             let prompt = prompt.clone();
@@ -683,7 +931,122 @@ async fn dispatch_sub_task(
         })
         .await;
 
+    lease.release().await;
+
     result.map_err(|e| {
         echo_agent::error::ReactError::Other(format!("Sub-task execution failed: {e}"))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::time::{Duration, Instant};
+
+    fn create_test_agent_handle() -> AgentHandle {
+        create_test_agent_handle_with_response("ok")
+    }
+
+    fn create_test_agent_handle_with_response(response: &str) -> AgentHandle {
+        use echo_agent::agent::ReactAgentBuilder;
+        use echo_agent::testing::MockLlmClient;
+
+        let mock_llm = Arc::new(
+            MockLlmClient::new()
+                .with_model_name("test-model")
+                .with_response(response),
+        );
+        let agent = ReactAgentBuilder::new()
+            .model("test-model")
+            .llm_client(mock_llm)
+            .build()
+            .expect("test agent should build");
+        AgentHandle::new(agent)
+    }
+
+    #[test]
+    fn default_background_task_service_config_is_serial() {
+        let config = BackgroundTaskServiceConfig::default();
+        assert_eq!(config.max_concurrent, 1);
+        assert_eq!(config.reserve_foreground_agents, 0);
+        assert_eq!(config.composite_parallelism, 1);
+    }
+
+    #[tokio::test]
+    async fn single_agent_provider_reuses_the_same_agent_without_release() {
+        let handle = create_test_agent_handle();
+        let provider = SingleAgentTaskProvider {
+            agent: handle.clone(),
+        };
+
+        let lease = provider.acquire_for_task("task-1").await.unwrap();
+
+        assert!(Arc::ptr_eq(handle.inner(), lease.agent().inner()));
+        assert!(lease.release.is_none());
+    }
+
+    #[tokio::test]
+    async fn task_agent_lease_drop_releases_worker_as_fallback() {
+        let released = Arc::new(AtomicUsize::new(0));
+        let lease = TaskAgentLease {
+            agent: create_test_agent_handle(),
+            release: Some(TaskAgentRelease::Test {
+                released: released.clone(),
+            }),
+        };
+
+        drop(lease);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert_eq!(released.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn task_executor_runs_ready_tasks_concurrently() {
+        let manager = Arc::new(TaskManager::with_logging_and_events());
+        manager.add_task(Task::new("task-a".to_string(), "A".to_string()));
+        manager.add_task(Task::new("task-b".to_string(), "B".to_string()));
+
+        let execute_fn: TaskExecuteFn = Arc::new(|_ctx| {
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                Ok("done".to_string())
+            })
+        });
+
+        let executor = TaskExecutor::new(
+            manager,
+            TaskExecutorConfig {
+                max_concurrent: 2,
+                retry_delay_secs: 0,
+                retry_jitter: false,
+                default_timeout_secs: 0,
+                ..Default::default()
+            },
+        )
+        .with_execute_fn(execute_fn);
+
+        let started = Instant::now();
+        let results = executor.execute_ready_tasks().await.unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert!(
+            started.elapsed() < Duration::from_millis(260),
+            "two 150ms tasks should run concurrently, elapsed={:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn composite_parallel_step_keys_are_parent_scoped() {
+        assert_eq!(
+            composite_step_task_key("parent-task", "a"),
+            "parent-task:step:a"
+        );
+        assert_eq!(
+            composite_step_task_key("parent-task", "b"),
+            "parent-task:step:b"
+        );
+    }
 }

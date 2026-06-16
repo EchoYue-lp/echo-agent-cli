@@ -11,7 +11,7 @@
 //! ├── SharedResources (Arc-shared across all pool agents)
 //! │   ├── LlmClient, ToolManager, HookRegistry, SandboxManager
 //! │   ├── Store, ConversationStore, RunStore, RuntimeStateStore
-//! │   └── TokenUsageTracker, PermissionService, ToolExecutionPipeline
+//! │   └── TokenUsageTracker, PermissionService, ToolExecutionPipeline, ReviewIntegration
 //! │
 //! └── agents: RwLock<HashMap<String, PooledAgent>>
 //!     ├── "conv-001" → Agent (independent execution_mutex + ContextManager)
@@ -102,6 +102,7 @@ pub struct SharedResources {
     pub state_store: Option<Arc<dyn echo_agent::state::RuntimeStateStore>>,
     pub tool_execution_pipeline:
         Option<Arc<echo_agent::agent::react::run::pipeline::ToolExecutionPipeline>>,
+    pub review_integration: Option<Arc<crate::evolution::ReviewIntegration>>,
 }
 
 impl SharedResources {
@@ -109,7 +110,10 @@ impl SharedResources {
     ///
     /// This reads through the agent's subsystems and clones the `Arc` handles
     /// without duplicating the underlying data.
-    pub async fn extract_from(agent: &AgentHandle) -> Self {
+    pub async fn extract_from(
+        agent: &AgentHandle,
+        review_integration: Option<Arc<crate::evolution::ReviewIntegration>>,
+    ) -> Self {
         agent
             .read(|a| {
                 let llm_client = a.llm_client().cloned();
@@ -136,6 +140,7 @@ impl SharedResources {
                     permission_service,
                     state_store,
                     tool_execution_pipeline,
+                    review_integration,
                 }
             })
             .await
@@ -185,7 +190,11 @@ impl AgentPool {
     /// Extracts shared resources from the runtime's primary agent and
     /// optionally pre-creates a background task agent.
     pub async fn from_runtime(runtime: &crate::runtime::AgentRuntime, config: PoolConfig) -> Self {
-        let shared = SharedResources::extract_from(&runtime.agent_handle).await;
+        let shared = SharedResources::extract_from(
+            &runtime.agent_handle,
+            runtime.review_integration.clone(),
+        )
+        .await;
 
         // Extract skill descriptors from primary agent (avoids re-reading from disk)
         let skill_descriptors = runtime.agent_handle.read(|a| a.skill_descriptors()).await;
@@ -332,6 +341,33 @@ impl AgentPool {
         self.agents.read().await.len()
     }
 
+    /// Maximum number of non-background agents this pool may create.
+    pub fn max_agents(&self) -> usize {
+        self.config.max_agents
+    }
+
+    /// Conservative default parallelism for background tasks backed by this pool.
+    ///
+    /// Keep one slot notionally reserved for foreground/multi-session work and
+    /// cap the initial task fan-out to avoid overwhelming tools, LLM calls, and
+    /// workspace writes.
+    pub fn background_task_concurrency(&self) -> usize {
+        self.config
+            .max_agents
+            .saturating_sub(self.foreground_agent_reserve())
+            .clamp(1, 4)
+    }
+
+    /// Number of pool slots reserved for foreground/multi-session work.
+    pub fn foreground_agent_reserve(&self) -> usize {
+        1
+    }
+
+    /// Conservative default fan-out for a single composite parallel task.
+    pub fn composite_parallelism(&self) -> usize {
+        self.background_task_concurrency().min(3).max(1)
+    }
+
     /// Start a periodic cleanup task that evicts idle agents.
     ///
     /// The cleanup runs every 5 minutes, removing agents that have been
@@ -439,6 +475,14 @@ impl AgentPool {
         if let Some(ref st) = self.shared.store {
             agent.install_store(st.clone()).await;
         }
+        if let Some(ref review_integration) = self.shared.review_integration {
+            let layer_manager = Arc::new(
+                review_integration
+                    .create_layer_manager()
+                    .with_write_observer(review_integration.clone()),
+            );
+            agent.install_memory_layer_manager(layer_manager);
+        }
         if let Some(ref ps) = self.shared.permission_service {
             agent.set_permission_service(ps.clone());
         }
@@ -495,6 +539,26 @@ mod tests {
         };
         assert_eq!(config.max_agents, 5);
         assert!(!config.enable_background_agent);
+    }
+
+    #[tokio::test]
+    async fn test_pool_exposes_max_agents() {
+        let pool = create_test_pool(4, false).await;
+        assert_eq!(pool.max_agents(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_pool_background_task_concurrency_is_conservative() {
+        let small = create_test_pool(1, false).await;
+        assert_eq!(small.background_task_concurrency(), 1);
+
+        let medium = create_test_pool(3, false).await;
+        assert_eq!(medium.background_task_concurrency(), 2);
+
+        let large = create_test_pool(10, false).await;
+        assert_eq!(large.background_task_concurrency(), 4);
+        assert_eq!(large.foreground_agent_reserve(), 1);
+        assert_eq!(large.composite_parallelism(), 3);
     }
 
     #[test]
@@ -631,7 +695,7 @@ mod tests {
     async fn test_shared_resources_extraction() {
         let agent = create_test_agent();
         let handle = AgentHandle::new(agent);
-        let shared = SharedResources::extract_from(&handle).await;
+        let shared = SharedResources::extract_from(&handle, None).await;
 
         // LlmClient should be extracted
         assert!(shared.llm_client.is_some());
@@ -647,7 +711,7 @@ mod tests {
     async fn test_shared_resources_arc_sharing() {
         let agent = create_test_agent();
         let handle = AgentHandle::new(agent);
-        let shared = SharedResources::extract_from(&handle).await;
+        let shared = SharedResources::extract_from(&handle, None).await;
 
         // Verify Arc reference counts indicate sharing
         let tm = shared.tool_manager.as_ref().unwrap();
@@ -688,7 +752,7 @@ mod tests {
     async fn create_test_pool(max_agents: usize, enable_bg: bool) -> AgentPool {
         let agent = create_test_agent();
         let handle = AgentHandle::new(agent);
-        let shared = SharedResources::extract_from(&handle).await;
+        let shared = SharedResources::extract_from(&handle, None).await;
 
         AgentPool {
             shared,
@@ -702,5 +766,83 @@ mod tests {
             skill_descriptors: vec![],
             cleanup_cancel: CancellationToken::new(),
         }
+    }
+
+    async fn create_test_pool_with_review_integration() -> AgentPool {
+        let agent = create_test_agent();
+        let handle = AgentHandle::new(agent);
+        let store = Arc::new(echo_agent::memory::InMemoryStore::new())
+            as Arc<dyn echo_agent::memory::Store>;
+        let echo_agent_dir = std::env::temp_dir()
+            .join(format!("echo-agent-pool-test-{}", uuid::Uuid::new_v4()))
+            .join(".echo-agent");
+        let review_integration = Arc::new(crate::evolution::ReviewIntegration::new(
+            echo_agent::evolution::ReviewConfig::default(),
+            echo_agent_dir,
+            store.clone(),
+        ));
+        let mut shared = SharedResources::extract_from(&handle, Some(review_integration)).await;
+        shared.store = Some(store);
+
+        AgentPool {
+            shared,
+            agents: RwLock::new(HashMap::new()),
+            config: PoolConfig {
+                max_agents: 3,
+                idle_timeout: Duration::from_secs(1800),
+                enable_background_agent: false,
+            },
+            app_config: AppConfig::default(),
+            skill_descriptors: vec![],
+            cleanup_cancel: CancellationToken::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pool_agent_installs_layered_memory_runtime() {
+        let pool = create_test_pool_with_review_integration().await;
+        let handle = pool.acquire("conv-memory").await.unwrap();
+
+        let has_layer_manager = handle.read(|agent| agent.has_memory_layer_manager()).await;
+        assert!(
+            has_layer_manager,
+            "pooled agents must install MemoryLayerManager so TriggerDetector writes real memory"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_task_workers_are_isolated_and_have_memory_runtime() {
+        let pool = create_test_pool_with_review_integration().await;
+
+        let task_a = pool.acquire("__task__:task-a").await.unwrap();
+        let task_b = pool.acquire("__task__:task-b").await.unwrap();
+
+        assert!(
+            !Arc::ptr_eq(task_a.inner(), task_b.inner()),
+            "parallel background tasks must use distinct worker agents"
+        );
+
+        let task_a_has_memory = task_a.read(|agent| agent.has_memory_layer_manager()).await;
+        let task_b_has_memory = task_b.read(|agent| agent.has_memory_layer_manager()).await;
+        assert!(task_a_has_memory);
+        assert!(task_b_has_memory);
+    }
+
+    #[tokio::test]
+    async fn test_released_task_worker_frees_pool_capacity() {
+        let pool = create_test_pool(1, false).await;
+
+        let _task_a = pool.acquire("__task__:task-a").await.unwrap();
+        assert_eq!(pool.pool_size().await, 1);
+
+        pool.release("__task__:task-a").await;
+        assert_eq!(pool.pool_size().await, 0);
+
+        let task_b = pool.acquire("__task__:task-b").await;
+        assert!(
+            task_b.is_ok(),
+            "released task worker should free capacity for a later task"
+        );
+        assert_eq!(pool.pool_size().await, 1);
     }
 }

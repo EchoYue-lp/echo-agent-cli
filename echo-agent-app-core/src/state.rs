@@ -596,23 +596,25 @@ impl AppState {
             return;
         }
 
-        // Use dedicated background agent from pool if available
-        let bg_agent = if let Some(ref pool) = self.connection.pool {
-            pool.background_agent()
-                .await
-                .unwrap_or_else(|| self.connection.agent.clone())
+        let service_result = if let Some(ref pool) = self.connection.pool {
+            crate::tasks::BackgroundTaskService::with_pool(
+                pool.clone(),
+                store_backend,
+                self.tasks.cancel_token.clone(),
+                task_hooks,
+            )
+            .await
         } else {
-            self.connection.agent.clone()
+            crate::tasks::BackgroundTaskService::with_hooks(
+                self.connection.agent.clone(),
+                store_backend,
+                self.tasks.cancel_token.clone(),
+                task_hooks,
+            )
+            .await
         };
 
-        match crate::tasks::BackgroundTaskService::with_hooks(
-            bg_agent,
-            store_backend,
-            self.tasks.cancel_token.clone(),
-            task_hooks,
-        )
-        .await
-        {
+        match service_result {
             Ok(service) => {
                 let service = Arc::new(service);
                 service.clone().spawn();

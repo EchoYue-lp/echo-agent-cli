@@ -83,7 +83,7 @@ impl BackgroundTaskHumanProvider {
         self.pending.get(request_id).map(|entry| {
             let req = &entry.request;
             HitlEvent {
-                task_id: String::new(), // will be filled by caller
+                task_id: req.task_id.clone().unwrap_or_default(),
                 request_id: request_id.to_string(),
                 kind: match req.kind {
                     HumanLoopKind::Approval => "approval".to_string(),
@@ -109,7 +109,7 @@ impl HumanLoopProvider for BackgroundTaskHumanProvider {
 
         // Build the event
         let event = HitlEvent {
-            task_id: String::new(), // caller should fill
+            task_id: req.task_id.clone().unwrap_or_default(),
             request_id: request_id.clone(),
             kind: match req.kind {
                 HumanLoopKind::Approval => "approval".to_string(),
@@ -150,5 +150,80 @@ impl HumanLoopProvider for BackgroundTaskHumanProvider {
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use echo_agent::human_loop::{HumanLoopProvider, HumanLoopRequest, HumanLoopResponse};
+
+    #[tokio::test]
+    async fn hitl_events_preserve_task_id_for_concurrent_requests() {
+        let (provider, mut rx) = BackgroundTaskHumanProvider::new();
+
+        let fut_a = provider.request(HumanLoopRequest::selection(
+            "task-a",
+            "Approve A?",
+            vec!["Approve".to_string(), "Cancel".to_string()],
+        ));
+        let event_a = rx.recv().await.expect("event a");
+
+        let fut_b = provider.request(HumanLoopRequest::selection(
+            "task-b",
+            "Approve B?",
+            vec!["Approve".to_string(), "Cancel".to_string()],
+        ));
+        let event_b = rx.recv().await.expect("event b");
+
+        assert_eq!(event_a.task_id, "task-a");
+        assert_eq!(event_b.task_id, "task-b");
+        assert_ne!(event_a.request_id, event_b.request_id);
+
+        let pending_a = provider
+            .get_pending(&event_a.request_id)
+            .expect("pending a");
+        let pending_b = provider
+            .get_pending(&event_b.request_id)
+            .expect("pending b");
+        assert_eq!(pending_a.task_id, "task-a");
+        assert_eq!(pending_b.task_id, "task-b");
+
+        assert!(provider.respond(
+            &event_b.request_id,
+            HumanLoopResponse::Selection {
+                selection: "Cancel".to_string(),
+                instructions: None,
+            },
+        ));
+        assert!(provider.respond(
+            &event_a.request_id,
+            HumanLoopResponse::Selection {
+                selection: "Approve".to_string(),
+                instructions: Some("ok".to_string()),
+            },
+        ));
+
+        match fut_a.await.expect("response a") {
+            HumanLoopResponse::Selection {
+                selection,
+                instructions,
+            } => {
+                assert_eq!(selection, "Approve");
+                assert_eq!(instructions.as_deref(), Some("ok"));
+            }
+            other => panic!("unexpected response a: {other:?}"),
+        }
+
+        match fut_b.await.expect("response b") {
+            HumanLoopResponse::Selection {
+                selection,
+                instructions,
+            } => {
+                assert_eq!(selection, "Cancel");
+                assert!(instructions.is_none());
+            }
+            other => panic!("unexpected response b: {other:?}"),
+        }
     }
 }

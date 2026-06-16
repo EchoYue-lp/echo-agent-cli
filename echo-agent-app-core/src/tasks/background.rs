@@ -127,6 +127,30 @@ pub enum CompositeStrategy {
     Parallel,
 }
 
+/// Workspace write policy for parallel background tasks.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceWritePolicy {
+    /// Rely on existing tool permission, sandbox, and read-before-edit guards.
+    #[default]
+    Guarded,
+    /// Task should avoid writing workspace files.
+    ReadOnly,
+    /// Caller explicitly allows workspace writes.
+    AllowWrites,
+}
+
+/// Shell/sandbox execution policy for parallel background tasks.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxExecutionPolicy {
+    /// Use existing shared sandbox/tool execution limits and permissions.
+    #[default]
+    SharedLimited,
+    /// Task should avoid shell/sandbox execution.
+    Disabled,
+}
+
 fn default_strategy() -> CompositeStrategy {
     CompositeStrategy::Sequential
 }
@@ -204,6 +228,12 @@ pub struct BackgroundTaskMeta {
     /// all dependencies reach `Completed` status.
     #[serde(default)]
     pub depends_on: Vec<String>,
+    /// Workspace write policy for parallel execution safety.
+    #[serde(default)]
+    pub workspace_write_policy: WorkspaceWritePolicy,
+    /// Shell/sandbox policy for parallel execution safety.
+    #[serde(default)]
+    pub sandbox_execution_policy: SandboxExecutionPolicy,
 }
 
 fn default_priority() -> u8 {
@@ -365,6 +395,8 @@ impl BackgroundTaskMeta {
             submitted_via,
             priority: default_priority(),
             depends_on: Vec::new(),
+            workspace_write_policy: WorkspaceWritePolicy::default(),
+            sandbox_execution_policy: SandboxExecutionPolicy::default(),
         }
     }
 
@@ -376,5 +408,37 @@ impl BackgroundTaskMeta {
     pub fn with_dependencies(mut self, depends_on: Vec<String>) -> Self {
         self.depends_on = depends_on;
         self
+    }
+
+    pub fn with_workspace_write_policy(mut self, policy: WorkspaceWritePolicy) -> Self {
+        self.workspace_write_policy = policy;
+        self
+    }
+
+    pub fn with_sandbox_execution_policy(mut self, policy: SandboxExecutionPolicy) -> Self {
+        self.sandbox_execution_policy = policy;
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn background_task_meta_defaults_to_guarded_parallel_resource_policies() {
+        let meta = BackgroundTaskMeta::new(
+            BackgroundTaskKind::AgentChat {
+                prompt: "hello".to_string(),
+                session_id: None,
+            },
+            Some("test".to_string()),
+        );
+
+        assert_eq!(meta.workspace_write_policy, WorkspaceWritePolicy::Guarded);
+        assert_eq!(
+            meta.sandbox_execution_policy,
+            SandboxExecutionPolicy::SharedLimited
+        );
     }
 }

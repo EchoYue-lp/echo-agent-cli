@@ -285,17 +285,15 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             "AgentPool initialized for TUI (background task isolation)"
         );
 
-        // Start BackgroundTaskService with a dedicated pool agent.
-        let bg_agent = pool
-            .background_agent()
-            .await
-            .unwrap_or_else(|| agent_handle.clone());
+        // Start BackgroundTaskService with the pool so independent
+        // background tasks can use distinct worker agents.
         let tui_task_service = {
             let cancel = echo_agent::agent::CancellationToken::new();
-            match echo_agent_app_core::tasks::BackgroundTaskService::new(
-                bg_agent,
+            match echo_agent_app_core::tasks::BackgroundTaskService::with_pool(
+                pool.clone(),
                 task_store.clone(),
                 cancel,
+                None,
             )
             .await
             {
