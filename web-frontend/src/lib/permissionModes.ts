@@ -5,7 +5,7 @@ export const PERMISSION_MODES = [
   { id: 'plan', label: '计划模式', description: '先规划，再确认执行' },
   { id: 'auto-edit', label: '自动编辑', description: '编辑类操作自动通过' },
   { id: 'full-auto', label: '全自动', description: '尽量不打断执行' },
-  { id: 'dontask', label: '严格确认', description: '敏感操作都询问' },
+  { id: 'strict', label: '严格确认', description: '写入、命令、网络都询问' },
 ] as const;
 
 export function notifyPermissionsChanged() {
@@ -20,9 +20,8 @@ export function normalizePermissionMode(mode?: string) {
     case 'fullauto':
     case 'bypass':
       return 'full-auto';
-    case 'dont-ask':
     case 'strict':
-      return 'dontask';
+      return 'strict';
     case 'ask':
       return 'default';
     default:

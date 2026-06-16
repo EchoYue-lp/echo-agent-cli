@@ -159,47 +159,6 @@ async fn cmd_tasks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 Err(e) => println!("Failed to submit research task: {}", e),
             }
         }
-        "checkpoints" => {
-            let pending = service.pending_checkpoints().await;
-            if pending.is_empty() {
-                println!("No pending human checkpoints.");
-            } else {
-                println!("\nPending Human Checkpoints:");
-                println!("{:-<80}", "");
-                for (task_id, req) in &pending {
-                    println!("  Task: {}", task_id);
-                    if let Some(ref phase) = req.phase {
-                        println!("  Phase: {}", phase);
-                    }
-                    println!("  Prompt: {}", req.prompt);
-                    if let Some(ref options) = req.options {
-                        println!("  Options: {}", options.join(", "));
-                    }
-                    println!();
-                }
-            }
-        }
-        "respond" => {
-            let task_id = args.get(1).copied().unwrap_or("");
-            let selection = args.get(2).copied().unwrap_or("");
-            if task_id.is_empty() || selection.is_empty() {
-                println!("Usage: /tasks respond <task_id> <selection> [instructions]");
-                println!("  Use '/tasks checkpoints' to see pending requests.");
-                return CommandOutcome::Continue;
-            }
-            let instructions = args.get(3..).map(|s| s.join(" "));
-            if service
-                .respond_to_checkpoint(task_id, selection, instructions)
-                .await
-            {
-                println!("Checkpoint response sent for task {}.", task_id);
-            } else {
-                println!(
-                    "No pending checkpoint found for task {}. Use '/tasks checkpoints' to list pending requests.",
-                    task_id
-                );
-            }
-        }
         "dag" => {
             let manager = service.manager();
             let tasks = manager.get_all_tasks();
@@ -223,9 +182,7 @@ async fn cmd_tasks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             }
         }
         _ => {
-            println!(
-                "Usage: /tasks [list|status <id>|cancel <id>|research <topic>|checkpoints|respond <id> <selection>|dag]"
-            );
+            println!("Usage: /tasks [list|status <id>|cancel <id>|research <topic>|dag]");
         }
     }
     CommandOutcome::Continue
@@ -615,7 +572,7 @@ async fn cmd_permission(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         println!("  auto-edit  — File edits are auto-approved; shell still requires confirmation");
         println!("  full-auto  — All operations auto-approved (bypass permissions)");
         println!("  auto       — AI classifier decides (when available)");
-        println!("  dontask    — Silently reject operations not matching an allow rule");
+        println!("  strict     — Ask before writes, shell, network, and sensitive operations");
         println!();
         println!("Usage: /permission <mode>");
         return CommandOutcome::Continue;
@@ -628,10 +585,10 @@ async fn cmd_permission(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         "auto-edit" | "autoedit" | "accept-edits" => "auto-edit",
         "full-auto" | "fullauto" | "bypass" => "full-auto",
         "auto" => "auto",
-        "dontask" | "dont-ask" => "dontask",
+        "strict" | "strict-confirm" | "strict-confirmation" => "strict",
         _ => {
             println!("Unknown permission mode: '{}'", mode);
-            println!("Valid modes: default, plan, auto-edit, full-auto, auto, dontask");
+            println!("Valid modes: default, plan, auto-edit, full-auto, auto, strict");
             return CommandOutcome::Continue;
         }
     };
@@ -644,9 +601,9 @@ async fn cmd_permission(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         "full-auto" => {
             println!("Permission mode: full-auto — all operations auto-approved. Use with caution.")
         }
-        "dontask" => {
-            println!("Permission mode: dontask — silent rejection for disallowed operations.")
-        }
+        "strict" => println!(
+            "Permission mode: strict — writes, shell, network, and sensitive operations require confirmation."
+        ),
         "auto" => println!("Permission mode: auto — AI classifier decides."),
         _ => println!("Permission mode: default — standard approval flow."),
     }

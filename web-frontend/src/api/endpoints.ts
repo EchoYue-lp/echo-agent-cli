@@ -1028,37 +1028,6 @@ export const schedulerApi = {
 
 // ── Auto Memory API (自动记忆) ───────────────────────────────────
 
-// ── Human Gate API (人工审批) ────────────────────────────────────
-
-export interface HumanGateCheckpoint {
-  id?: string;
-  task_id: string;
-  kind?: string;
-  prompt: string;
-  context?: Record<string, unknown>;
-  options?: string[];
-  phase?: string;
-  tool_name?: string;
-  risk_level?: string;
-  status?: string;
-  created_at?: string;
-}
-
-export const humanGateApi = {
-  list: () =>
-    isTauri()
-      ? apiInvoke<HumanGateCheckpoint[]>('list_human_gates')
-      : get<HumanGateCheckpoint[]>('/tasks/checkpoints'),
-  respond: (taskId: string, selection: string, instructions?: string) =>
-    isTauri()
-      ? apiInvoke<{ success: boolean }>('respond_human_gate', {
-          gate_id: taskId,
-          response: selection,
-          instructions,
-        })
-      : post<{ success: boolean }>(`/tasks/${taskId}/respond`, { selection, instructions }),
-};
-
 // ── Worktree API (Git 工作树) ─────────────────────────────────────
 
 export interface WorktreeInfo {

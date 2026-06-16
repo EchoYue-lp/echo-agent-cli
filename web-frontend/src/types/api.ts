@@ -11,6 +11,17 @@ export interface ChatResponse {
   context_stats: ContextStats;
 }
 
+export type ChatRunStatus =
+  | 'idle'
+  | 'running'
+  | 'thinking'
+  | 'using_tool'
+  | 'waiting_approval'
+  | 'waiting_input'
+  | 'completed'
+  | 'failed'
+  | 'cancelled';
+
 export interface ToolCallInfo {
   name: string;
   args: unknown;
@@ -136,35 +147,44 @@ export interface Attachment {
 
 // WebSocket 消息类型
 export type ClientMessage =
-  | { type: 'message'; data: string; attachments?: Attachment[] }
-  | { type: 'approval_response'; request_id: string; approved: boolean; reason?: string }
-  | { type: 'input_response'; request_id: string; text: string }
+  | { type: 'message'; id?: string; data: string; attachments?: Attachment[] }
+  | {
+      type: 'approval_response';
+      id?: string;
+      request_id: string;
+      approved: boolean;
+      reason?: string;
+    }
+  | { type: 'input_response'; id?: string; request_id: string; text: string }
   | {
       type: 'selection_response';
+      id?: string;
       request_id: string;
       selection: string;
       instructions?: string;
     }
-  | { type: 'cancel' }
+  | { type: 'cancel'; id?: string }
   | { type: 'ping' };
 
 export type ServerMessage =
-  | { type: 'token'; data: string }
-  | { type: 'tool_start'; name: string; args: unknown }
-  | { type: 'tool_result'; name: string; result: string; success: boolean }
-  | { type: 'tool_batch_start'; tool_count: number }
-  | { type: 'tool_batch_end' }
-  | { type: 'final_answer'; data: string }
+  | { type: 'token'; id?: string; data: string }
+  | { type: 'tool_start'; id?: string; name: string; args: unknown }
+  | { type: 'tool_result'; id?: string; name: string; result: string; success: boolean }
+  | { type: 'tool_batch_start'; id?: string; tool_count: number }
+  | { type: 'tool_batch_end'; id?: string }
+  | { type: 'final_answer'; id?: string; data: string }
   | {
       type: 'approval_request';
+      id?: string;
       request_id: string;
       tool_name: string;
       args: unknown;
       prompt?: string;
     }
-  | { type: 'input_request'; request_id: string; prompt?: string }
+  | { type: 'input_request'; id?: string; request_id: string; prompt?: string }
   | {
       type: 'selection_request';
+      id?: string;
       request_id: string;
       prompt: string;
       options: string[];
@@ -172,11 +192,11 @@ export type ServerMessage =
       context?: unknown;
       phase?: string | null;
     }
-  | { type: 'chart'; spec: unknown }
-  | { type: 'error'; message: string }
-  | { type: 'cancelled' }
-  | { type: 'thinking_start' }
-  | { type: 'thinking_end'; prompt_tokens: number; completion_tokens: number }
+  | { type: 'chart'; id?: string; spec: unknown }
+  | { type: 'error'; id?: string; message: string }
+  | { type: 'cancelled'; id?: string }
+  | { type: 'thinking_start'; id?: string }
+  | { type: 'thinking_end'; id?: string; prompt_tokens: number; completion_tokens: number }
   | { type: 'pong' };
 
 // Execution round: one ReAct loop iteration (think → tools)

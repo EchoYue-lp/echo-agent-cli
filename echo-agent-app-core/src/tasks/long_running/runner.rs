@@ -1,7 +1,6 @@
 //! Long-running task runner -- executes pipelines with checkpoint/resume/progress/cancellation.
 
 use super::checkpoint::{LongRunningCheckpoint, LongRunningCheckpointStore};
-use super::human_gate::HumanCheckpointRequest;
 use super::phases::PhasePlan;
 use super::progress::ProgressReporter;
 use echo_agent::human_loop::{HumanLoopProvider, HumanLoopRequest, HumanLoopResponse};
@@ -16,7 +15,7 @@ pub enum PhaseOutcome {
     /// Phase completed successfully with output data.
     Completed(Value),
     /// Phase needs human input -- pipeline will pause.
-    NeedsHumanInput(HumanCheckpointRequest),
+    NeedsHumanInput(HumanLoopRequest),
     /// Phase was cancelled.
     Cancelled,
     /// Phase failed with an error message.

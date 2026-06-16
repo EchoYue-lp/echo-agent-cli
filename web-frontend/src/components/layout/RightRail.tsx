@@ -9,10 +9,8 @@ import {
   XCircle,
 } from 'lucide-react';
 import {
-  humanGateApi,
   tasksApi,
   type BackgroundTask,
-  type HumanGateCheckpoint,
 } from '../../api/endpoints';
 import { useChatStore } from '../../stores/chatStore';
 
@@ -41,7 +39,6 @@ function shortTime(value?: string) {
 
 export function RightRail() {
   const [tasks, setTasks] = useState<BackgroundTask[]>([]);
-  const [humanGates, setHumanGates] = useState<HumanGateCheckpoint[]>([]);
   const [taskError, setTaskError] = useState<string | null>(null);
   const messages = useChatStore((s) => s.messages);
   const isStreaming = useChatStore((s) => s.isStreaming);
@@ -54,10 +51,9 @@ export function RightRail() {
     let cancelled = false;
     const load = async () => {
       try {
-        const [taskList, gateList] = await Promise.all([tasksApi.list(), humanGateApi.list()]);
+        const taskList = await tasksApi.list();
         if (!cancelled) {
           setTasks(taskList);
-          setHumanGates(gateList);
           setTaskError(null);
         }
       } catch (e) {
@@ -85,7 +81,7 @@ export function RightRail() {
   );
   const foregroundHumanRequests =
     (approvalRequest ? 1 : 0) + (inputRequest ? 1 : 0) + (selectionRequest ? 1 : 0);
-  const totalHumanRequests = foregroundHumanRequests + humanGates.length;
+  const totalHumanRequests = foregroundHumanRequests;
   const isRuntimeBusy = isStreaming || activeTasks.length > 0;
   const displayedTasks = tasks.slice(0, 6);
 

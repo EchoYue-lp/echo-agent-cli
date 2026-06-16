@@ -14,10 +14,10 @@ const HEARTBEAT_TIMEOUT_MS = 10000;
 export function useWebSocket() {
   const wsRef = useRef<WebSocket | null>(null);
   const assistantIdRef = useRef<string | null>(null);
+  const currentMessageIdRef = useRef<string | null>(null);
   const inThinkingRef = useRef(false);
   const isCancelledRef = useRef(false);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
-  const streamTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
   const heartbeatTimer = useRef<ReturnType<typeof setInterval>>(undefined);
   const heartbeatTimeout = useRef<ReturnType<typeof setTimeout>>(undefined);
   const messageQueue = useRef<ClientMessage[]>([]);
@@ -87,19 +87,22 @@ export function useWebSocket() {
         return;
       }
       const store = useChatStore.getState();
+      if (msg.type !== 'pong' && 'id' in msg && msg.id && currentMessageIdRef.current !== msg.id) {
+        return;
+      }
 
       switch (msg.type) {
         case 'token': {
-          clearStreamTimer();
           if (isCancelledRef.current) break;
           if (!assistantIdRef.current) {
             assistantIdRef.current = store.startAssistantMessage();
           }
-          if (inThinkingRef.current) {
-            store.appendThinking(assistantIdRef.current, msg.data);
-          } else {
-            store.appendToken(assistantIdRef.current, msg.data);
+          if (!inThinkingRef.current) {
+            inThinkingRef.current = true;
+            store.setThinking(true);
+            store.startThinkingSegment(assistantIdRef.current);
           }
+          store.appendThinking(assistantIdRef.current, msg.data);
           break;
         }
         case 'thinking_start':
@@ -117,11 +120,15 @@ export function useWebSocket() {
           break;
         case 'tool_start':
           if (isCancelledRef.current) break;
+          inThinkingRef.current = false;
+          store.setThinking(false);
+          store.setRunStatus('using_tool');
           store.setToolCall(msg.name, msg.args);
           break;
         case 'tool_result':
           if (isCancelledRef.current) break;
           store.completeToolCall(msg.name, msg.result, msg.success);
+          store.setRunStatus('running');
           break;
         case 'tool_batch_start':
           if (isCancelledRef.current) break;
@@ -135,7 +142,9 @@ export function useWebSocket() {
           if (!isCancelledRef.current && assistantIdRef.current) {
             store.finalizeAssistantMessage(assistantIdRef.current, msg.data);
           }
+          inThinkingRef.current = false;
           assistantIdRef.current = null;
+          currentMessageIdRef.current = null;
           isCancelledRef.current = false;
           break;
         }
@@ -175,17 +184,19 @@ export function useWebSocket() {
           store.addChartMessage(msg.spec);
           break;
         case 'error': {
-          clearStreamTimer();
           if (!isCancelledRef.current && assistantIdRef.current) {
             store.finalizeAssistantMessage(assistantIdRef.current, `[Error] ${msg.message}`);
           }
+          store.setRunStatus('failed');
           assistantIdRef.current = null;
+          currentMessageIdRef.current = null;
           isCancelledRef.current = false;
           break;
         }
         case 'cancelled':
-          clearStreamTimer();
+          store.setRunStatus('cancelled');
           assistantIdRef.current = null;
+          currentMessageIdRef.current = null;
           isCancelledRef.current = false;
           break;
       }
@@ -238,13 +249,6 @@ export function useWebSocket() {
     return false;
   }, []);
 
-  const clearStreamTimer = () => {
-    if (streamTimer.current) {
-      clearTimeout(streamTimer.current);
-      streamTimer.current = undefined;
-    }
-  };
-
   const sendMessage = useCallback(
     (text: string, attachments?: Attachment[]) => {
       const store = useChatStore.getState();
@@ -255,19 +259,19 @@ export function useWebSocket() {
         size: a.size,
       }));
       store.addUserMessage(text || '(附件)', displayAttachments);
+      const messageId =
+        typeof crypto !== 'undefined' && 'randomUUID' in crypto
+          ? crypto.randomUUID()
+          : `chat-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      currentMessageIdRef.current = messageId;
 
-      if (!send({ type: 'message', data: text, attachments })) {
+      if (!send({ type: 'message', id: messageId, data: text, attachments })) {
+        currentMessageIdRef.current = null;
         store.markCancelled();
       } else {
         isCancelledRef.current = false;
         assistantIdRef.current = store.startAssistantMessage();
-        // 60s streaming timeout: if no response, cancel to prevent stuck UI
-        clearStreamTimer();
-        streamTimer.current = setTimeout(() => {
-          if (useChatStore.getState().isStreaming) {
-            useChatStore.getState().markCancelled();
-          }
-        }, 60_000);
+        store.setRunStatus('running');
       }
     },
     [send]
@@ -275,24 +279,44 @@ export function useWebSocket() {
 
   const sendApproval = useCallback(
     (requestId: string, approved: boolean, reason?: string) => {
-      send({ type: 'approval_response', request_id: requestId, approved, reason });
+      send({
+        type: 'approval_response',
+        id: currentMessageIdRef.current ?? undefined,
+        request_id: requestId,
+        approved,
+        reason,
+      });
       useChatStore.getState().setApprovalRequest(null);
+      useChatStore.getState().setRunStatus('running');
     },
     [send]
   );
 
   const sendInput = useCallback(
     (requestId: string, text: string) => {
-      send({ type: 'input_response', request_id: requestId, text });
+      send({
+        type: 'input_response',
+        id: currentMessageIdRef.current ?? undefined,
+        request_id: requestId,
+        text,
+      });
       useChatStore.getState().setInputRequest(null);
+      useChatStore.getState().setRunStatus('running');
     },
     [send]
   );
 
   const sendSelection = useCallback(
     (requestId: string, selection: string, instructions?: string) => {
-      send({ type: 'selection_response', request_id: requestId, selection, instructions });
+      send({
+        type: 'selection_response',
+        id: currentMessageIdRef.current ?? undefined,
+        request_id: requestId,
+        selection,
+        instructions,
+      });
       useChatStore.getState().setSelectionRequest(null);
+      useChatStore.getState().setRunStatus('running');
     },
     [send]
   );
@@ -300,8 +324,10 @@ export function useWebSocket() {
   const cancel = useCallback(() => {
     useChatStore.getState().markCancelled();
     assistantIdRef.current = null;
+    const messageId = currentMessageIdRef.current;
+    currentMessageIdRef.current = null;
     isCancelledRef.current = true;
-    send({ type: 'cancel' });
+    send({ type: 'cancel', id: messageId ?? undefined });
   }, [send]);
 
   useEffect(() => {
@@ -309,7 +335,6 @@ export function useWebSocket() {
     connect();
     return () => {
       clearTimeout(reconnectTimer.current);
-      clearStreamTimer();
       clearHeartbeat();
       wsRef.current?.close();
     };

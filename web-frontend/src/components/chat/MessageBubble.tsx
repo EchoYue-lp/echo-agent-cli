@@ -16,7 +16,6 @@ import {
   ChevronDown,
   ChevronRight,
   Brain,
-  Wrench,
 } from 'lucide-react';
 import { renderMarkdown } from '../../utils/markdown';
 
@@ -289,7 +288,7 @@ function ExecutionProcessBlock({
   executionRounds?: Array<{ thinking?: { content: string }; tools: Array<any> }>;
   isStreaming?: boolean;
 }) {
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useState(true);
 
   // Build chronological execution steps using executionSteps order
   const steps: ExecutionStep[] = [];
@@ -352,7 +351,7 @@ function ExecutionProcessBlock({
   if (thinkingCount > 0) summary.push(`${thinkingCount} 思考`);
   if (toolCount > 0) summary.push(`${toolCount} 工具`);
 
-  const label = `执行过程 (${summary.join(', ')})`;
+  const label = `思考与执行 (${summary.join(', ')})`;
 
   return (
     <div
@@ -365,7 +364,7 @@ function ExecutionProcessBlock({
         onClick={() => setExpanded(!expanded)}
         className="flex w-full items-center gap-2 px-3 py-1.5 text-left transition-colors hover:bg-[var(--bg-hover)]"
       >
-        <Wrench
+        <Brain
           size={12}
           className={`shrink-0 ${isStreaming ? 'text-[var(--color-purple)] animate-pulse' : 'text-[var(--text-tertiary)]'}`}
         />

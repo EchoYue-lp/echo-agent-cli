@@ -653,15 +653,15 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
                           key={mode.id}
                           type="button"
                           onClick={() => switchPermissionMode(mode.id)}
-                          disabled={switchingPermissionMode !== null}
-                          className="flex w-full items-start gap-2 rounded-md px-2 py-2 text-left transition-colors hover:bg-[var(--bg-hover)] disabled:cursor-not-allowed disabled:opacity-50"
+                          disabled={switchingPermissionMode === mode.id}
+                          className="flex w-full items-start gap-2 rounded-md px-2 py-2 text-left transition-colors hover:bg-[var(--bg-hover)] disabled:cursor-wait disabled:opacity-70"
                         >
                           <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center text-[var(--accent)]">
                             {mode.id === permissionMode && <Check size={13} />}
                           </span>
                           <span className="min-w-0 flex-1">
                             <span className="block text-xs text-[var(--text-primary)]">
-                              {mode.label}
+                              {switchingPermissionMode === mode.id ? '切换中...' : mode.label}
                             </span>
                             <span className="block text-[10px] text-[var(--text-tertiary)]">
                               {mode.description}

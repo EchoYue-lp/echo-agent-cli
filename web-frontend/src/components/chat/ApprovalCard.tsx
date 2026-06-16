@@ -1,8 +1,9 @@
 import { useState } from 'react';
 import type { ApprovalRequest } from '../../types/api';
-import { ShieldAlert, Check, X, Pencil, Unlock } from 'lucide-react';
+import { ShieldCheck, Check, X, Pencil, Unlock, ChevronDown } from 'lucide-react';
 
 type InputMode = 'none' | 'reject' | 'modify';
+type MaybePromise<T> = T | Promise<T>;
 
 export function ApprovalCard({
   request,
@@ -12,19 +13,31 @@ export function ApprovalCard({
   onApproveAll,
 }: {
   request: ApprovalRequest;
-  onApprove: () => void;
-  onReject: (reason?: string) => void;
-  onModify: (feedback: string) => void;
-  onApproveAll: () => void;
+  onApprove: () => MaybePromise<void>;
+  onReject: (reason?: string) => MaybePromise<void>;
+  onModify: (feedback: string) => MaybePromise<void>;
+  onApproveAll: () => MaybePromise<void>;
 }) {
   const [feedback, setFeedback] = useState('');
   const [inputMode, setInputMode] = useState<InputMode>('none');
+  const [isSubmitting, setIsSubmitting] = useState(false);
 
-  const handleSubmitFeedback = () => {
+  const runAction = async (action: () => MaybePromise<void>) => {
+    if (isSubmitting) return;
+    setIsSubmitting(true);
+    try {
+      await action();
+    } catch (e) {
+      setIsSubmitting(false);
+      throw e;
+    }
+  };
+
+  const handleSubmitFeedback = async () => {
     if (inputMode === 'reject') {
-      onReject(feedback || undefined);
+      await runAction(() => onReject(feedback || undefined));
     } else if (inputMode === 'modify') {
-      onModify(feedback);
+      await runAction(() => onModify(feedback));
     }
     setFeedback('');
     setInputMode('none');
@@ -36,55 +49,70 @@ export function ApprovalCard({
   };
 
   return (
-    <div className="animate-pulse-border rounded-xl border-2 border-red-300 bg-red-50 p-4 dark:border-red-800 dark:bg-red-950/30">
-      <div className="flex items-start gap-3">
-        <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-red-100 dark:bg-red-900/40">
-          <ShieldAlert size={16} className="text-red-600 dark:text-red-400" />
+    <div className="rounded-lg border border-[var(--border-primary)] bg-[var(--bg-primary)] px-3 py-2 shadow-[var(--shadow-sm)]">
+      <div className="flex items-start gap-2.5">
+        <div className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-[var(--bg-secondary)] text-[var(--accent)]">
+          <ShieldCheck size={15} />
         </div>
-        <div className="flex-1">
-          <p className="text-sm font-semibold text-red-800 dark:text-red-300">需要批准</p>
-          <p className="mt-1 text-sm text-red-700 dark:text-red-400">
-            工具：
-            <code className="rounded bg-red-100 px-1.5 py-0.5 font-mono text-xs dark:bg-red-900/40">
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <p className="text-xs font-semibold text-[var(--text-primary)]">需要审批</p>
+            <code className="rounded bg-[var(--bg-secondary)] px-1.5 py-0.5 font-mono text-[11px] text-[var(--text-secondary)]">
               {request.toolName}
             </code>
-          </p>
-          <pre className="mt-2 max-h-32 overflow-auto rounded-lg bg-[var(--bg-code)] p-3 text-xs text-[var(--color-code-text)]">
-            {JSON.stringify(request.args, null, 2)}
-          </pre>
-          {request.prompt && (
-            <p className="mt-2 text-sm text-red-700 dark:text-red-400">{request.prompt}</p>
-          )}
+            {request.prompt && (
+              <span className="min-w-0 flex-1 truncate text-[11px] text-[var(--text-tertiary)]">
+                {request.prompt}
+              </span>
+            )}
+          </div>
+          <details className="mt-1 group">
+            <summary className="inline-flex cursor-pointer list-none items-center gap-1 text-[11px] text-[var(--text-tertiary)] transition-colors hover:text-[var(--text-secondary)]">
+              查看参数
+              <ChevronDown size={12} className="transition-transform group-open:rotate-180" />
+            </summary>
+            <pre className="mt-1 max-h-28 overflow-auto rounded-md bg-[var(--bg-code)] p-2 text-[11px] text-[var(--color-code-text)]">
+              {JSON.stringify(request.args, null, 2)}
+            </pre>
+          </details>
 
           {inputMode === 'none' ? (
-            <div className="mt-3 flex flex-wrap items-center gap-2">
+            <div className="mt-2 flex flex-wrap items-center gap-1.5">
               <button
-                onClick={onApprove}
-                className="flex items-center gap-1.5 rounded-lg bg-green-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-green-700"
+                type="button"
+                onClick={() => runAction(onApprove)}
+                disabled={isSubmitting}
+                className="flex items-center gap-1 rounded-md bg-[var(--accent)] px-2.5 py-1.5 text-xs font-medium text-[var(--text-on-accent)] transition-opacity hover:opacity-90"
               >
-                <Check size={14} /> 同意
+                <Check size={13} /> {isSubmitting ? '处理中' : '同意'}
               </button>
               <button
+                type="button"
                 onClick={() => setInputMode('reject')}
-                className="flex items-center gap-1.5 rounded-lg bg-red-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-red-700"
+                disabled={isSubmitting}
+                className="flex items-center gap-1 rounded-md border border-[var(--border-primary)] px-2.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
               >
-                <X size={14} /> 拒绝
+                <X size={13} /> 拒绝
               </button>
               <button
+                type="button"
                 onClick={() => setInputMode('modify')}
-                className="flex items-center gap-1.5 rounded-lg bg-amber-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-amber-700"
+                disabled={isSubmitting}
+                className="flex items-center gap-1 rounded-md border border-[var(--border-primary)] px-2.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
               >
-                <Pencil size={14} /> 修改意见
+                <Pencil size={13} /> 修改
               </button>
               <button
-                onClick={onApproveAll}
-                className="flex items-center gap-1.5 rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-blue-700"
+                type="button"
+                onClick={() => runAction(onApproveAll)}
+                disabled={isSubmitting}
+                className="flex items-center gap-1 rounded-md border border-[var(--border-primary)] px-2.5 py-1.5 text-xs font-medium text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
               >
-                <Unlock size={14} /> 全部同意
+                <Unlock size={13} /> 本会话同意
               </button>
             </div>
           ) : (
-            <div className="mt-3 flex flex-1 gap-2">
+            <div className="mt-2 flex flex-1 gap-2">
               <input
                 value={feedback}
                 onChange={(e) => setFeedback(e.target.value)}
@@ -92,7 +120,7 @@ export function ApprovalCard({
                   if (e.key === 'Enter') handleSubmitFeedback();
                   if (e.key === 'Escape') handleCancel();
                 }}
-                className="flex-1 rounded-lg border border-red-300 px-3 py-1.5 text-sm outline-none dark:border-red-700 dark:bg-[var(--bg-input)] dark:text-[var(--text-primary)]"
+                className="flex-1 rounded-md border border-[var(--border-primary)] bg-[var(--bg-input)] px-2.5 py-1.5 text-xs text-[var(--text-primary)] outline-none focus:border-[var(--border-focus)]"
                 placeholder={
                   inputMode === 'reject'
                     ? '请输入拒绝原因...'
@@ -101,18 +129,18 @@ export function ApprovalCard({
                 autoFocus
               />
               <button
+                type="button"
                 onClick={handleSubmitFeedback}
-                className={`rounded-lg px-3 py-1.5 text-sm font-medium text-white ${
-                  inputMode === 'reject'
-                    ? 'bg-red-600 hover:bg-red-700'
-                    : 'bg-amber-600 hover:bg-amber-700'
-                }`}
+                disabled={isSubmitting}
+                className="rounded-md bg-[var(--accent)] px-2.5 py-1.5 text-xs font-medium text-[var(--text-on-accent)] transition-opacity hover:opacity-90"
               >
-                提交
+                {isSubmitting ? '提交中' : '提交'}
               </button>
               <button
+                type="button"
                 onClick={handleCancel}
-                className="rounded-lg bg-gray-100 px-3 py-1.5 text-sm text-gray-700 dark:bg-gray-700 dark:text-gray-200"
+                disabled={isSubmitting}
+                className="rounded-md border border-[var(--border-primary)] px-2.5 py-1.5 text-xs text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-hover)]"
               >
                 取消
               </button>

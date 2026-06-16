@@ -23,6 +23,7 @@ export function ChatPanel() {
   const selectionRequest = useChatStore((s) => s.selectionRequest);
   const isStreaming = useChatStore((s) => s.isStreaming);
   const isCancelled = useChatStore((s) => s.isCancelled);
+  const runStatus = useChatStore((s) => s.runStatus);
   const currentWorkspace = useWorkspaceStore((s) => s.current);
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -76,7 +77,7 @@ export function ChatPanel() {
         </div>
         <div className="hidden items-center gap-2 text-xs text-[var(--text-tertiary)] sm:flex">
           <span className="h-2 w-2 rounded-full bg-[var(--accent)]" />
-          <span>{isStreaming ? '执行中' : '就绪'}</span>
+          <span>{runStatusLabel(runStatus, isStreaming)}</span>
         </div>
       </div>
       {/* Messages area */}
@@ -150,7 +151,7 @@ export function ChatPanel() {
                     <div className="spinner" />
                     <div className="flex items-center gap-1.5">
                       <span className="text-xs text-[var(--text-tertiary)] animate-breathe">
-                        思考中
+                        {runStatusLabel(runStatus, true)}
                       </span>
                       <span className="flex gap-0.5">
                         <span
@@ -186,22 +187,6 @@ export function ChatPanel() {
                       background:
                         'linear-gradient(to right, transparent, var(--border-primary), transparent)',
                     }}
-                  />
-                </div>
-              )}
-
-              {approvalRequest && (
-                <div className="py-2">
-                  <ApprovalCard
-                    request={approvalRequest}
-                    onApprove={() => sendApproval(approvalRequest.requestId, true)}
-                    onReject={(reason) => sendApproval(approvalRequest.requestId, false, reason)}
-                    onModify={(feedback) =>
-                      sendApproval(approvalRequest.requestId, false, `修改意见: ${feedback}`)
-                    }
-                    onApproveAll={() =>
-                      sendApproval(approvalRequest.requestId, true, undefined, 'session_all_tools')
-                    }
                   />
                 </div>
               )}
@@ -254,6 +239,21 @@ export function ChatPanel() {
       )}
 
       <div>
+        {approvalRequest && (
+          <div className="mx-auto w-full max-w-[920px] px-5 pb-2 sm:px-8">
+            <ApprovalCard
+              request={approvalRequest}
+              onApprove={() => sendApproval(approvalRequest.requestId, true)}
+              onReject={(reason) => sendApproval(approvalRequest.requestId, false, reason)}
+              onModify={(feedback) =>
+                sendApproval(approvalRequest.requestId, false, `修改意见: ${feedback}`)
+              }
+              onApproveAll={() =>
+                sendApproval(approvalRequest.requestId, true, undefined, 'session_all_tools')
+              }
+            />
+          </div>
+        )}
         {isStreaming && messages.length > 0 && (
           <div className="flex justify-center pb-2">
             <button
@@ -273,6 +273,27 @@ export function ChatPanel() {
       </div>
     </div>
   );
+}
+
+function runStatusLabel(status: string, isStreaming: boolean) {
+  switch (status) {
+    case 'thinking':
+      return '思考中';
+    case 'using_tool':
+      return '调用工具中';
+    case 'waiting_approval':
+      return '等待审批';
+    case 'waiting_input':
+      return '等待输入';
+    case 'failed':
+      return '执行失败';
+    case 'cancelled':
+      return '已停止';
+    case 'running':
+      return '执行中';
+    default:
+      return isStreaming ? '执行中' : '就绪';
+  }
 }
 
 function InputCard({ prompt, onSubmit }: { prompt?: string; onSubmit: (text: string) => void }) {

@@ -179,6 +179,7 @@ pub struct AgentPool {
     config: PoolConfig,
     app_config: RwLock<AppConfig>,
     runtime_llm_config: RwLock<Option<echo_agent::llm::LlmConfig>>,
+    permission_mode: RwLock<String>,
     /// Skill descriptors extracted from the primary agent.
     /// Pool agents register these instead of re-reading from disk.
     skill_descriptors: Vec<echo_agent::skills::external::SkillDescriptor>,
@@ -207,6 +208,7 @@ impl AgentPool {
             config,
             app_config: RwLock::new(runtime.app_config.clone()),
             runtime_llm_config: RwLock::new(None),
+            permission_mode: RwLock::new("default".to_string()),
             skill_descriptors,
             cleanup_cancel: CancellationToken::new(),
         };
@@ -393,6 +395,34 @@ impl AgentPool {
         );
     }
 
+    /// Apply the current permission mode to all existing pooled agents and
+    /// remember it for future agents.
+    pub async fn apply_permission_mode(&self, mode: String) {
+        *self.permission_mode.write().await = mode.clone();
+
+        let agents: Vec<AgentHandle> = self
+            .agents
+            .read()
+            .await
+            .values()
+            .map(|pa| pa.handle.clone())
+            .collect();
+
+        for handle in agents {
+            let mode = mode.clone();
+            handle
+                .write_async(|agent| {
+                    Box::pin(async move {
+                        agent.set_permission_mode(&mode);
+                    })
+                })
+                .await;
+        }
+
+        let pooled_agents = self.agents.read().await.len();
+        tracing::info!(mode = %mode, pooled_agents, "AgentPool: permission mode applied");
+    }
+
     /// Current number of agents in the pool (including background).
     pub async fn pool_size(&self) -> usize {
         self.agents.read().await.len()
@@ -547,6 +577,8 @@ impl AgentPool {
         if let Some(ref ps) = self.shared.permission_service {
             agent.set_permission_service(ps.clone());
         }
+        let permission_mode = self.permission_mode.read().await.clone();
+        agent.set_permission_mode(&permission_mode);
 
         // 3. Register skill descriptors extracted from primary agent
         //    (avoids re-reading SKILL.md files from disk for each pool agent)
@@ -557,17 +589,19 @@ impl AgentPool {
         // 4. Wrap in AgentHandle
         let handle = AgentHandle::new(agent);
 
-        // 5. Configure HITL dispatcher for this agent
+        // 5. Configure HITL for this agent.
+        // Use an empty HitlDispatcher (no REPL provider!) so that if the caller
+        // hasn't yet called set_human_loop_provider, approval requests
+        // auto-reject instead of blocking on terminal stdin (which hangs GUI).
+        // The real provider (Tauri/TUI/REPL) is injected per-use via
+        // set_human_loop_provider, which now does an in-place replace.
         {
             let dispatcher = Arc::new(crate::hitl::HitlDispatcher::new());
-            let repl_provider = Arc::new(crate::hitl::ReplHumanLoopProvider::new());
-            dispatcher.register("repl", repl_provider).await;
             handle
                 .write_async(|a| {
                     let d = dispatcher.clone();
                     Box::pin(async move {
                         a.set_human_loop_provider(d);
-                        a.build_permission_service();
                     })
                 })
                 .await;
@@ -825,6 +859,7 @@ mod tests {
             },
             app_config: RwLock::new(AppConfig::default()),
             runtime_llm_config: RwLock::new(None),
+            permission_mode: RwLock::new("default".to_string()),
             skill_descriptors: vec![],
             cleanup_cancel: CancellationToken::new(),
         }
@@ -856,6 +891,7 @@ mod tests {
             },
             app_config: RwLock::new(AppConfig::default()),
             runtime_llm_config: RwLock::new(None),
+            permission_mode: RwLock::new("default".to_string()),
             skill_descriptors: vec![],
             cleanup_cancel: CancellationToken::new(),
         }
@@ -907,5 +943,24 @@ mod tests {
             "released task worker should free capacity for a later task"
         );
         assert_eq!(pool.pool_size().await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_permission_mode_applies_to_existing_and_future_pool_agents() {
+        let pool = create_test_pool(3, false).await;
+        let first = pool.acquire("conv-a").await.unwrap();
+
+        pool.apply_permission_mode("full-auto".to_string()).await;
+
+        let first_mode = first
+            .read(|agent| agent.get_permission_mode().to_string())
+            .await;
+        assert_eq!(first_mode, "full-auto");
+
+        let second = pool.acquire("conv-b").await.unwrap();
+        let second_mode = second
+            .read(|agent| agent.get_permission_mode().to_string())
+            .await;
+        assert_eq!(second_mode, "full-auto");
     }
 }

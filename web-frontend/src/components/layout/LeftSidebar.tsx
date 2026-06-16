@@ -50,6 +50,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
   const activeConvId = useConversationStore((s) => s.activeId);
   const isConvLoading = useConversationStore((s) => s.isLoading);
   const loadConversation = useConversationStore((s) => s.loadConversation);
+  const startNewConversation = useConversationStore((s) => s.startNew);
 
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
@@ -135,6 +136,22 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
     }
   };
 
+  const handleNewConversation = async (e: React.MouseEvent, ws: Workspace) => {
+    e.stopPropagation();
+    try {
+      if (current?.id === ws.id) {
+        await startNewConversation();
+      } else {
+        await startNewConversation();
+        await switchTo(ws.id);
+      }
+      setExpandedId(ws.id);
+      setShowAllConvs(false);
+    } catch (err) {
+      console.error('Start new conversation failed:', err);
+    }
+  };
+
   const handleSelectConv = async (convId: string) => {
     if (convId === activeConvId) return;
     await loadConversation(convId);
@@ -164,7 +181,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
           {current && (
             <div className="flex items-center gap-1">
               <button
-                onClick={onNewTask}
+                onClick={() => onNewTask()}
                 className="flex max-w-[118px] items-center gap-1 rounded-md bg-[var(--bg-hover)] px-1.5 py-0.5 text-[11px] font-medium text-[var(--text-secondary)] transition-colors hover:text-[var(--text-primary)]"
                 title={`当前: ${current.name}\n${current.root}`}
               >
@@ -193,7 +210,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
       {/* New Task + Search */}
       <div className="space-y-2 px-3 pb-3">
         <button
-          onClick={onNewTask}
+          onClick={() => onNewTask()}
           className="flex w-full items-center gap-2 rounded-lg bg-[var(--action-soft)] px-3 py-2 text-sm font-medium text-[var(--text-on-soft-action)] transition-colors hover:bg-[var(--action-soft-hover)]"
         >
           <Plus size={15} />
@@ -326,6 +343,13 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
                   )}
 
                   <div className="flex shrink-0 items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+                    <button
+                      onClick={(e) => handleNewConversation(e, ws)}
+                      className="rounded p-1 text-[var(--text-tertiary)] transition-colors hover:text-[var(--accent)]"
+                      title="新建会话"
+                    >
+                      <Plus size={12} />
+                    </button>
                     <button
                       onClick={(e) => handleOpenFolder(e, ws)}
                       className="rounded p-1 text-[var(--text-tertiary)] transition-colors hover:text-[var(--text-primary)]"

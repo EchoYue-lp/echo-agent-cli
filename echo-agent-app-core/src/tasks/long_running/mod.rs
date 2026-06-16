@@ -8,13 +8,11 @@
 //! - Persistence: survives process restart via SQLite
 
 pub mod checkpoint;
-pub mod human_gate;
 pub mod phases;
 pub mod progress;
 pub mod runner;
 
 pub use checkpoint::*;
-pub use human_gate::*;
 pub use phases::*;
 pub use progress::*;
 pub use runner::*;

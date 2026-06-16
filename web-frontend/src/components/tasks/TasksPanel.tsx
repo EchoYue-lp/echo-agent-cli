@@ -1,10 +1,8 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import {
   tasksApi,
-  humanGateApi,
   type BackgroundTask,
   type SubmitTaskRequest,
-  type HumanGateCheckpoint,
 } from '../../api/endpoints';
 import {
   Play,
@@ -13,9 +11,6 @@ import {
   Plus,
   ChevronDown,
   ChevronUp,
-  CheckCircle2,
-  Edit3,
-  AlertTriangle,
   HandMetal,
 } from 'lucide-react';
 
@@ -71,12 +66,6 @@ export function TasksPanel() {
   // Progress data keyed by task ID
   const [progressMap, setProgressMap] = useState<Record<string, TaskProgress>>({});
 
-  // Human gate checkpoints
-  const [gates, setGates] = useState<HumanGateCheckpoint[]>([]);
-  const [gateResponse, setGateResponse] = useState<
-    Record<string, { selection: string; instructions: string }>
-  >({});
-
   // SSE event sources keyed by task ID
   const eventSourcesRef = useRef<Record<string, EventSource>>({});
 
@@ -91,25 +80,13 @@ export function TasksPanel() {
     }
   }, []);
 
-  const fetchGates = useCallback(async () => {
-    try {
-      const data = await humanGateApi.list();
-      setGates(data);
-    } catch (e) {
-      // Checkpoints endpoint might not exist yet, that's fine
-      console.debug('Failed to fetch gates:', e);
-    }
-  }, []);
-
   useEffect(() => {
     fetchTasks();
-    fetchGates();
     const interval = setInterval(() => {
       fetchTasks();
-      fetchGates();
     }, 5000);
     return () => clearInterval(interval);
-  }, [fetchTasks, fetchGates]);
+  }, [fetchTasks]);
 
   // Subscribe to SSE for active tasks
   useEffect(() => {
@@ -229,17 +206,6 @@ export function TasksPanel() {
     }
   };
 
-  const handleGateRespond = async (taskId: string, selection: string) => {
-    const instructions = gateResponse[taskId]?.instructions || '';
-    try {
-      await humanGateApi.respond(taskId, selection, instructions || undefined);
-      setGates((prev) => prev.filter((g) => g.task_id !== taskId));
-      fetchTasks();
-    } catch (e) {
-      console.error('Failed to respond to gate:', e);
-    }
-  };
-
   const s = {
     text: 'var(--text-primary)',
     textSec: 'var(--text-secondary)',
@@ -270,7 +236,6 @@ export function TasksPanel() {
           <button
             onClick={() => {
               fetchTasks();
-              fetchGates();
             }}
             className="rounded p-1 transition-colors"
             style={{ color: s.textTer }}
@@ -331,20 +296,6 @@ export function TasksPanel() {
           </button>
         </div>
       )}
-
-      {/* Human Gate Alerts */}
-      {gates
-        .filter((g) => g.status === 'pending')
-        .map((gate) => (
-          <HumanGateCard
-            key={gate.task_id}
-            gate={gate}
-            response={gateResponse[gate.task_id] || { selection: '', instructions: '' }}
-            onResponseChange={(r) => setGateResponse((prev) => ({ ...prev, [gate.task_id]: r }))}
-            onSubmit={(selection) => handleGateRespond(gate.task_id, selection)}
-            styles={s}
-          />
-        ))}
 
       {tasks.length === 0 ? (
         <p className="text-xs py-4 text-center" style={{ color: s.textTer }}>
@@ -521,112 +472,6 @@ export function TasksPanel() {
           })}
         </div>
       )}
-    </div>
-  );
-}
-
-// ── Human Gate Card ──────────────────────────────────────────────────
-
-interface HumanGateCardProps {
-  gate: HumanGateCheckpoint;
-  response: { selection: string; instructions: string };
-  onResponseChange: (r: { selection: string; instructions: string }) => void;
-  onSubmit: (selection: string) => void;
-  styles: Record<string, string>;
-}
-
-function HumanGateCard({
-  gate,
-  response,
-  onResponseChange,
-  onSubmit,
-  styles: s,
-}: HumanGateCardProps) {
-  const [contextOpen, setContextOpen] = useState(false);
-  const options = gate.options || ['approve', 'revise', 'cancel'];
-  const optionLabels: Record<string, { label: string; color: string; icon: typeof CheckCircle2 }> =
-    {
-      approve: { label: '批准', color: 'var(--color-success, #22c55e)', icon: CheckCircle2 },
-      revise: { label: '修改', color: 'var(--color-warning, #eab308)', icon: Edit3 },
-      cancel: { label: '取消', color: 'var(--color-error, #ef4444)', icon: XCircle },
-    };
-
-  return (
-    <div
-      className="rounded-lg border-2 p-3 space-y-2"
-      style={{ borderColor: 'var(--color-purple, #a855f7)', background: 'rgba(168,85,247,0.04)' }}
-    >
-      <div className="flex items-center gap-2">
-        <HandMetal size={14} style={{ color: 'var(--color-purple, #a855f7)' }} />
-        <span className="text-xs font-semibold" style={{ color: 'var(--color-purple, #a855f7)' }}>
-          等待人工审批
-        </span>
-        <span className="text-[10px]" style={{ color: s.textTer }}>
-          任务: {gate.task_id.slice(0, 8)}
-        </span>
-      </div>
-
-      {/* Prompt */}
-      <div
-        className="rounded-lg p-2.5 text-xs leading-relaxed"
-        style={{ background: s.bgCard, color: s.text }}
-      >
-        {gate.prompt}
-      </div>
-
-      {/* Context (collapsible) */}
-      {gate.context && Object.keys(gate.context).length > 0 && (
-        <div>
-          <button
-            onClick={() => setContextOpen(!contextOpen)}
-            className="flex items-center gap-1 text-[10px]"
-            style={{ color: s.textTer }}
-          >
-            {contextOpen ? <ChevronUp size={10} /> : <ChevronDown size={10} />}
-            上下文数据
-          </button>
-          {contextOpen && (
-            <pre
-              className="mt-1 rounded p-2 text-[10px] overflow-x-auto"
-              style={{ background: s.bgCard, color: s.textSec }}
-            >
-              {JSON.stringify(gate.context, null, 2)}
-            </pre>
-          )}
-        </div>
-      )}
-
-      {/* Revision instructions (shown when revise is selected or always) */}
-      <input
-        type="text"
-        value={response.instructions}
-        onChange={(e) => onResponseChange({ ...response, instructions: e.target.value })}
-        placeholder="修改说明（可选）..."
-        className="w-full rounded-lg border px-2 py-1.5 text-xs"
-        style={{ borderColor: s.border, background: s.bg, color: s.text }}
-      />
-
-      {/* Option buttons */}
-      <div className="flex gap-2">
-        {options.map((opt) => {
-          const cfg = optionLabels[opt] || { label: opt, color: s.textSec, icon: AlertTriangle };
-          const Icon = cfg.icon;
-          return (
-            <button
-              key={opt}
-              onClick={() => onSubmit(opt)}
-              className="flex items-center gap-1 rounded-lg px-3 py-1.5 text-[11px] font-medium transition-colors"
-              style={{
-                background: `${cfg.color}18`,
-                color: cfg.color,
-              }}
-            >
-              <Icon size={12} />
-              {cfg.label}
-            </button>
-          );
-        })}
-      </div>
     </div>
   );
 }

@@ -2,9 +2,15 @@ import { useRef, useCallback, useEffect } from 'react';
 import { useChatStore } from '../stores/chatStore';
 import { useConversationStore } from '../stores/conversationStore';
 import { isTauri, apiInvoke } from '../lib/tauri-bridge';
-import type { Attachment } from '../types/api';
+import type { Attachment, ChatRunStatus } from '../types/api';
 
-type ChatEvent =
+type ChatEventBase = {
+  message_key?: string;
+  conversation_id?: string | null;
+};
+
+type ChatEvent = ChatEventBase &
+  (
   | { type: 'token'; data: string }
   | { type: 'thinking_start' }
   | { type: 'thinking_end'; prompt_tokens: number; completion_tokens: number }
@@ -14,6 +20,7 @@ type ChatEvent =
   | { type: 'final_answer'; data: string }
   | { type: 'cancelled' }
   | { type: 'error'; message: string }
+  | { type: 'run_status'; status: ChatRunStatus }
   | {
       type: 'approval_request';
       request_id: string;
@@ -33,37 +40,43 @@ type ChatEvent =
     }
   | { type: 'tool_batch_start'; tool_count: number }
   | { type: 'tool_batch_end' }
-  | { type: 'done' };
+  | { type: 'done' }
+  );
 
 export function useTauriChat() {
   const assistantIdRef = useRef<string | null>(null);
   const inThinkingRef = useRef(false);
   const isCancelledRef = useRef(false);
   const unlistenRef = useRef<(() => void) | null>(null);
-  const streamTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const currentMessageKeyRef = useRef<string | null>(null);
+  const currentConversationIdRef = useRef<string | null>(null);
 
-  const clearStreamTimer = () => {
-    if (streamTimer.current) {
-      clearTimeout(streamTimer.current);
-      streamTimer.current = undefined;
+  const isCurrentRunEvent = (event: ChatEvent) => {
+    if (event.message_key) {
+      return currentMessageKeyRef.current === event.message_key;
     }
+    if (event.conversation_id) {
+      return currentConversationIdRef.current === event.conversation_id;
+    }
+    return true;
   };
 
   const handleEvent = useCallback((event: ChatEvent) => {
+    if (!isCurrentRunEvent(event)) return;
     const store = useChatStore.getState();
 
     switch (event.type) {
       case 'token': {
-        clearStreamTimer();
         if (isCancelledRef.current) break;
         if (!assistantIdRef.current) {
           assistantIdRef.current = store.startAssistantMessage();
         }
-        if (inThinkingRef.current) {
-          store.appendThinking(assistantIdRef.current, event.data);
-        } else {
-          store.appendToken(assistantIdRef.current, event.data);
+        if (!inThinkingRef.current) {
+          inThinkingRef.current = true;
+          store.setThinking(true);
+          store.startThinkingSegment(assistantIdRef.current);
         }
+        store.appendThinking(assistantIdRef.current, event.data);
         break;
       }
       case 'thinking_start':
@@ -81,11 +94,15 @@ export function useTauriChat() {
         break;
       case 'tool_start':
         if (isCancelledRef.current) break;
+        inThinkingRef.current = false;
+        store.setThinking(false);
+        store.setRunStatus('using_tool');
         store.setToolCall(event.name, event.args);
         break;
       case 'tool_result':
         if (isCancelledRef.current) break;
         store.completeToolCall(event.name, event.result, event.success);
+        store.setRunStatus('running');
         break;
       case 'tool_batch_start':
         if (isCancelledRef.current) break;
@@ -99,7 +116,9 @@ export function useTauriChat() {
         if (!isCancelledRef.current && assistantIdRef.current) {
           store.finalizeAssistantMessage(assistantIdRef.current, event.data);
         }
+        inThinkingRef.current = false;
         assistantIdRef.current = null;
+        currentMessageKeyRef.current = null;
         isCancelledRef.current = false;
         break;
       }
@@ -132,26 +151,31 @@ export function useTauriChat() {
         store.addChartMessage(event.spec);
         break;
       case 'error': {
-        clearStreamTimer();
         if (!isCancelledRef.current && assistantIdRef.current) {
           store.finalizeAssistantMessage(assistantIdRef.current, `[Error] ${event.message}`);
         }
+        store.setRunStatus('failed');
         assistantIdRef.current = null;
+        currentMessageKeyRef.current = null;
         isCancelledRef.current = false;
         break;
       }
+      case 'run_status':
+        store.setRunStatus(event.status);
+        break;
       case 'cancelled':
-        clearStreamTimer();
+        store.setRunStatus('cancelled');
         assistantIdRef.current = null;
+        currentMessageKeyRef.current = null;
         isCancelledRef.current = false;
         break;
       case 'done':
-        clearStreamTimer();
         // If no final_answer was received, finalize with empty content
         if (assistantIdRef.current && !isCancelledRef.current) {
           store.finalizeAssistantMessage(assistantIdRef.current, '');
         }
         assistantIdRef.current = null;
+        currentMessageKeyRef.current = null;
         isCancelledRef.current = false;
         break;
     }
@@ -177,7 +201,6 @@ export function useTauriChat() {
 
     return () => {
       mounted = false;
-      clearStreamTimer();
       unlistenRef.current?.();
       unlistenRef.current = null;
     };
@@ -197,26 +220,29 @@ export function useTauriChat() {
       isCancelledRef.current = false;
       assistantIdRef.current = store.startAssistantMessage();
 
-      // 60s streaming timeout
-      clearStreamTimer();
-      streamTimer.current = setTimeout(() => {
-        if (useChatStore.getState().isStreaming) {
-          useChatStore.getState().markCancelled();
-        }
-      }, 60_000);
-
       // Pass conversation_id for pool-based parallel execution
       const conversation_id = useConversationStore.getState().activeId;
+      const message_key =
+        typeof crypto !== 'undefined' && 'randomUUID' in crypto
+          ? crypto.randomUUID()
+          : `chat-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      currentMessageKeyRef.current = message_key;
+      currentConversationIdRef.current = conversation_id ?? null;
       await apiInvoke('send_chat_message', {
         message: text,
+        conversationId: conversation_id ?? undefined,
         conversation_id: conversation_id ?? undefined,
+        messageKey: message_key,
+        message_key,
       });
     } catch (e) {
       console.error('[TauriChat] Failed to send message:', e);
       if (assistantIdRef.current) {
         store.finalizeAssistantMessage(assistantIdRef.current, `[Error] ${e}`);
       }
+      store.setRunStatus('failed');
       assistantIdRef.current = null;
+      currentMessageKeyRef.current = null;
     }
   }, []);
 
@@ -224,14 +250,17 @@ export function useTauriChat() {
     async (requestId: string, approved: boolean, reason?: string, scope?: string) => {
       try {
         await apiInvoke('send_approval_response', {
+          requestId,
           request_id: requestId,
           approved,
           reason,
           scope,
         });
         useChatStore.getState().setApprovalRequest(null);
+        useChatStore.getState().setRunStatus('running');
       } catch (e) {
         console.error('[TauriChat] Failed to send approval:', e);
+        throw e;
       }
     },
     []
@@ -239,8 +268,9 @@ export function useTauriChat() {
 
   const sendInput = useCallback(async (requestId: string, text: string) => {
     try {
-      await apiInvoke('send_input_response', { request_id: requestId, text });
+      await apiInvoke('send_input_response', { requestId, request_id: requestId, text });
       useChatStore.getState().setInputRequest(null);
+      useChatStore.getState().setRunStatus('running');
     } catch (e) {
       console.error('[TauriChat] Failed to send input:', e);
     }
@@ -250,11 +280,13 @@ export function useTauriChat() {
     async (requestId: string, selection: string, instructions?: string) => {
       try {
         await apiInvoke('send_selection_response', {
+          requestId,
           request_id: requestId,
           selection,
           instructions,
         });
         useChatStore.getState().setSelectionRequest(null);
+        useChatStore.getState().setRunStatus('running');
       } catch (e) {
         console.error('[TauriChat] Failed to send selection:', e);
       }
@@ -263,13 +295,19 @@ export function useTauriChat() {
   );
 
   const cancel = useCallback(async () => {
+    const messageKey = currentMessageKeyRef.current;
     useChatStore.getState().markCancelled();
     assistantIdRef.current = null;
     isCancelledRef.current = true;
     try {
-      await apiInvoke('cancel_chat');
+      await apiInvoke('cancel_chat', {
+        messageKey: messageKey ?? undefined,
+        message_key: messageKey ?? undefined,
+      });
     } catch (e) {
       console.error('[TauriChat] Failed to cancel:', e);
+    } finally {
+      currentMessageKeyRef.current = null;
     }
   }, []);
 

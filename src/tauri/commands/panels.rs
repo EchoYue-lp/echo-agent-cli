@@ -37,16 +37,34 @@ pub async fn set_permissions_mode(
         "auto-edit" | "autoedit" | "accept-edits" | "auto-approve" => "auto-edit",
         "full-auto" | "fullauto" | "bypass" => "full-auto",
         "auto" => "auto",
-        "dontask" | "dont-ask" | "strict" => "dontask",
+        "strict" | "strict-confirm" | "strict-confirmation" => "strict",
         _ => {
             return Err(IpcError::Validation(format!(
-                "Invalid permission mode '{}'. Valid: default, plan, auto-edit, full-auto, auto, dontask",
+                "Invalid permission mode '{}'. Valid: default, plan, auto-edit, full-auto, auto, strict",
                 mode
             )));
         }
     };
     let mut mode_lock = state.app_state.config.permission_mode.write().await;
     *mode_lock = normalized.to_string();
+    drop(mode_lock);
+
+    state
+        .app_state
+        .connection
+        .primary_agent()
+        .write_async(|agent| {
+            let mode = normalized.to_string();
+            Box::pin(async move {
+                agent.set_permission_mode(&mode);
+            })
+        })
+        .await;
+
+    if let Some(pool) = &state.app_state.connection.pool {
+        pool.apply_permission_mode(normalized.to_string()).await;
+    }
+
     Ok(serde_json::json!({"success": true, "mode": normalized}))
 }
 
@@ -1307,66 +1325,6 @@ pub async fn curator_action(
         _ => Err(IpcError::Validation(format!(
             "Unknown curator action '{action}'. Valid: status, run, pin, unpin"
         ))),
-    }
-}
-
-// ════════════════════════════════════════════════════════════════════════════
-// Human Gate
-// ════════════════════════════════════════════════════════════════════════════
-
-#[tauri::command]
-pub async fn list_human_gates(
-    state: tauri::State<'_, TauriState>,
-) -> Result<serde_json::Value, IpcError> {
-    // Human gates are managed by BackgroundTaskService
-    if let Some(ref service) = state.app_state.tasks.service {
-        let gates = service.pending_checkpoints().await;
-        // HumanCheckpointRequest contains non-Serialize fields (Duration),
-        // so manually map to a serializable representation.
-        let items: Vec<serde_json::Value> = gates
-            .into_iter()
-            .map(|(id, req)| {
-                serde_json::json!({
-                    "id": id,
-                    "kind": format!("{:?}", req.kind),
-                    "prompt": req.prompt,
-                    "tool_name": req.tool_name,
-                    "risk_level": req.risk_level.as_ref().map(|r| format!("{:?}", r)),
-                    "task_id": req.task_id,
-                    "options": req.options,
-                    "phase": req.phase,
-                })
-            })
-            .collect();
-        Ok(serde_json::to_value(items).unwrap_or_default())
-    } else {
-        Ok(serde_json::json!([]))
-    }
-}
-
-#[tauri::command]
-pub async fn respond_human_gate(
-    state: tauri::State<'_, TauriState>,
-    gate_id: String,
-    response: String,
-    instructions: Option<String>,
-) -> Result<serde_json::Value, IpcError> {
-    if let Some(ref service) = state.app_state.tasks.service {
-        let ok = service
-            .respond_to_checkpoint(&gate_id, &response, instructions)
-            .await;
-        if ok {
-            Ok(serde_json::json!({"success": true}))
-        } else {
-            Err(IpcError::NotFound(format!(
-                "Gate '{}' not found or expired",
-                gate_id
-            )))
-        }
-    } else {
-        Err(IpcError::Internal(
-            "BackgroundTaskService not available".into(),
-        ))
     }
 }
 

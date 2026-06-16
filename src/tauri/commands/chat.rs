@@ -53,6 +53,8 @@ pub enum ChatEvent {
     Cancelled,
     #[serde(rename = "error")]
     Error { message: String },
+    #[serde(rename = "run_status")]
+    RunStatus { status: String },
     #[serde(rename = "approval_request")]
     ApprovalRequest {
         request_id: String,
@@ -75,10 +77,46 @@ pub enum ChatEvent {
     Done,
 }
 
+fn emit_chat_event(
+    app: &tauri::AppHandle,
+    event: &ChatEvent,
+    message_key: &str,
+    conversation_id: &Option<String>,
+) -> bool {
+    let mut payload = match serde_json::to_value(event) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(%error, "failed to serialize chat event");
+            return false;
+        }
+    };
+
+    if let serde_json::Value::Object(ref mut map) = payload {
+        map.insert(
+            "message_key".to_string(),
+            serde_json::Value::String(message_key.to_string()),
+        );
+        map.insert(
+            "conversation_id".to_string(),
+            conversation_id
+                .as_ref()
+                .map(|id| serde_json::Value::String(id.clone()))
+                .unwrap_or(serde_json::Value::Null),
+        );
+    }
+
+    app.emit("chat://event", payload).is_ok()
+}
+
 /// Global pending map for approval/input responses.
 #[allow(clippy::type_complexity)]
-static PENDING_RESPONSES: LazyLock<Arc<Mutex<HashMap<String, oneshot::Sender<PendingResponse>>>>> =
+static PENDING_RESPONSES: LazyLock<Arc<Mutex<HashMap<String, PendingRequest>>>> =
     LazyLock::new(|| Arc::new(Mutex::new(HashMap::new())));
+
+struct PendingRequest {
+    message_key: String,
+    tx: oneshot::Sender<PendingResponse>,
+}
 
 #[derive(Debug)]
 enum PendingResponse {
@@ -100,7 +138,7 @@ enum PendingResponse {
 /// and awaits responses through the shared PENDING_RESPONSES map.
 struct TauriHumanLoopHandler {
     app_handle: tauri::AppHandle,
-    pending: Arc<Mutex<HashMap<String, oneshot::Sender<PendingResponse>>>>,
+    pending: Arc<Mutex<HashMap<String, PendingRequest>>>,
     conversation_id: Option<String>,
     message_key: String,
 }
@@ -150,8 +188,22 @@ impl HumanLoopProvider for TauriHumanLoopHandler {
                         args,
                         prompt: req.prompt.clone(),
                     };
-                    pending.lock().await.insert(request_id.clone(), tx_response);
-                    let _ = app_handle.emit("chat://event", &event);
+                    pending.lock().await.insert(
+                        request_id.clone(),
+                        PendingRequest {
+                            message_key: message_key.clone(),
+                            tx: tx_response,
+                        },
+                    );
+                    emit_chat_event(
+                        &app_handle,
+                        &ChatEvent::RunStatus {
+                            status: "waiting_approval".to_string(),
+                        },
+                        &message_key,
+                        &conversation_id,
+                    );
+                    let _ = emit_chat_event(&app_handle, &event, &message_key, &conversation_id);
 
                     tokio::select! {
                         response = rx_response => {
@@ -174,7 +226,7 @@ impl HumanLoopProvider for TauriHumanLoopHandler {
                             }
                         }
                         _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
-                            pending.lock().await.remove(&request_id);
+                    pending.lock().await.remove(&request_id);
                             Ok(HumanLoopResponse::Timeout)
                         }
                     }
@@ -184,8 +236,22 @@ impl HumanLoopProvider for TauriHumanLoopHandler {
                         request_id: request_id.clone(),
                         prompt: req.prompt.clone(),
                     };
-                    pending.lock().await.insert(request_id.clone(), tx_response);
-                    let _ = app_handle.emit("chat://event", &event);
+                    pending.lock().await.insert(
+                        request_id.clone(),
+                        PendingRequest {
+                            message_key: message_key.clone(),
+                            tx: tx_response,
+                        },
+                    );
+                    emit_chat_event(
+                        &app_handle,
+                        &ChatEvent::RunStatus {
+                            status: "waiting_input".to_string(),
+                        },
+                        &message_key,
+                        &conversation_id,
+                    );
+                    let _ = emit_chat_event(&app_handle, &event, &message_key, &conversation_id);
 
                     tokio::select! {
                         response = rx_response => {
@@ -209,8 +275,22 @@ impl HumanLoopProvider for TauriHumanLoopHandler {
                         context: req.context.clone(),
                         phase: req.phase.clone(),
                     };
-                    pending.lock().await.insert(request_id.clone(), tx_response);
-                    let _ = app_handle.emit("chat://event", &event);
+                    pending.lock().await.insert(
+                        request_id.clone(),
+                        PendingRequest {
+                            message_key: message_key.clone(),
+                            tx: tx_response,
+                        },
+                    );
+                    emit_chat_event(
+                        &app_handle,
+                        &ChatEvent::RunStatus {
+                            status: "waiting_input".to_string(),
+                        },
+                        &message_key,
+                        &conversation_id,
+                    );
+                    let _ = emit_chat_event(&app_handle, &event, &message_key, &conversation_id);
 
                     tokio::select! {
                         response = rx_response => {
@@ -243,6 +323,7 @@ pub async fn send_chat_message(
     app: tauri::AppHandle,
     message: String,
     conversation_id: Option<String>,
+    message_key: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
     // Route to pool agent if conversation_id is provided and pool is active
     let agent_handle = if let Some(ref conv_id) = conversation_id {
@@ -252,7 +333,7 @@ pub async fn send_chat_message(
     };
     let agent_inner = agent_handle.inner().clone();
     let cancel_token = CancellationToken::new();
-    let message_key = Uuid::new_v4().to_string();
+    let message_key = message_key.unwrap_or_else(|| Uuid::new_v4().to_string());
 
     // Register cancel token
     state
@@ -272,20 +353,31 @@ pub async fn send_chat_message(
         .write_async(|agent| {
             let handler = hitl_handler.clone();
             Box::pin(async move {
-                agent.set_human_loop_provider(handler);
+                agent.set_human_loop_provider_preserving_approvals(handler);
             })
         })
         .await;
 
     let app_handle = app.clone();
     let cancel_token_for_task = cancel_token.clone();
-    let hitl_dispatcher = state.app_state.connection.hitl_dispatcher.clone();
     let cancel_tokens = state.app_state.session.cancel_token.clone();
     let cleanup_key = message_key.clone();
     let cleanup_agent = agent_handle.clone();
+    let event_message_key = message_key.clone();
+    let event_conversation_id = conversation_id.clone();
 
     tokio::spawn(async move {
         let start = std::time::Instant::now();
+        let mut terminal_status = "completed".to_string();
+
+        emit_chat_event(
+            &app_handle,
+            &ChatEvent::RunStatus {
+                status: "running".to_string(),
+            },
+            &event_message_key,
+            &event_conversation_id,
+        );
 
         // ReactAgent serializes execution internally via execution_mutex.
         //
@@ -306,7 +398,17 @@ pub async fn send_chat_message(
                         Ok(event) => {
                             let chat_event = match event {
                                 AgentEvent::Token(data) => ChatEvent::Token { data },
-                                AgentEvent::ThinkStart => ChatEvent::ThinkingStart,
+                                AgentEvent::ThinkStart => {
+                                    emit_chat_event(
+                                        &app_handle,
+                                        &ChatEvent::RunStatus {
+                                            status: "thinking".to_string(),
+                                        },
+                                        &event_message_key,
+                                        &event_conversation_id,
+                                    );
+                                    ChatEvent::ThinkingStart
+                                }
                                 AgentEvent::ThinkEnd {
                                     prompt_tokens,
                                     completion_tokens,
@@ -315,6 +417,14 @@ pub async fn send_chat_message(
                                     completion_tokens,
                                 },
                                 AgentEvent::ToolCall { name, args } => {
+                                    emit_chat_event(
+                                        &app_handle,
+                                        &ChatEvent::RunStatus {
+                                            status: "using_tool".to_string(),
+                                        },
+                                        &event_message_key,
+                                        &event_conversation_id,
+                                    );
                                     ChatEvent::ToolStart { name, args }
                                 }
                                 AgentEvent::ToolResult { name, output } => ChatEvent::ToolResult {
@@ -332,24 +442,41 @@ pub async fn send_chat_message(
                                 }
                                 AgentEvent::ToolBatchEnd => ChatEvent::ToolBatchEnd,
                                 AgentEvent::Chart { spec } => ChatEvent::Chart { spec },
-                                AgentEvent::FinalAnswer(data) => ChatEvent::FinalAnswer { data },
-                                AgentEvent::Cancelled => ChatEvent::Cancelled,
-                                AgentEvent::Error { source, message } => ChatEvent::Error {
-                                    message: format!("{source}: {message}"),
-                                },
+                                AgentEvent::FinalAnswer(data) => {
+                                    terminal_status = "completed".to_string();
+                                    ChatEvent::FinalAnswer { data }
+                                }
+                                AgentEvent::Cancelled => {
+                                    terminal_status = "cancelled".to_string();
+                                    ChatEvent::Cancelled
+                                }
+                                AgentEvent::Error { source, message } => {
+                                    terminal_status = "failed".to_string();
+                                    ChatEvent::Error {
+                                        message: format!("{source}: {message}"),
+                                    }
+                                }
                                 _ => continue,
                             };
 
-                            if app_handle.emit("chat://event", &chat_event).is_err() {
+                            if !emit_chat_event(
+                                &app_handle,
+                                &chat_event,
+                                &event_message_key,
+                                &event_conversation_id,
+                            ) {
                                 break;
                             }
                         }
                         Err(e) => {
-                            let _ = app_handle.emit(
-                                "chat://event",
+                            terminal_status = "failed".to_string();
+                            let _ = emit_chat_event(
+                                &app_handle,
                                 &ChatEvent::Error {
                                     message: e.to_string(),
                                 },
+                                &event_message_key,
+                                &event_conversation_id,
                             );
                             break;
                         }
@@ -357,25 +484,43 @@ pub async fn send_chat_message(
                 }
             }
             Err(e) => {
-                let _ = app_handle.emit(
-                    "chat://event",
+                terminal_status = "failed".to_string();
+                let _ = emit_chat_event(
+                    &app_handle,
                     &ChatEvent::Error {
                         message: e.to_string(),
                     },
+                    &event_message_key,
+                    &event_conversation_id,
                 );
             }
         }
 
         // Emit done event
-        let _ = app_handle.emit("chat://event", &ChatEvent::Done);
+        let _ = emit_chat_event(
+            &app_handle,
+            &ChatEvent::RunStatus {
+                status: terminal_status,
+            },
+            &event_message_key,
+            &event_conversation_id,
+        );
+        let _ = emit_chat_event(
+            &app_handle,
+            &ChatEvent::Done,
+            &event_message_key,
+            &event_conversation_id,
+        );
 
-        // Cleanup
+        // Cleanup: restore an empty dispatcher (NOT the REPL-laden runtime
+        // dispatcher) so the agent doesn't fall back to terminal-blocking
+        // approval between messages.
         cancel_tokens.remove(&cleanup_key);
         cleanup_agent
             .write_async(|agent| {
-                let dispatcher = hitl_dispatcher.clone();
                 Box::pin(async move {
-                    agent.set_human_loop_provider(dispatcher);
+                    let empty = Arc::new(echo_agent_app_core::hitl::HitlDispatcher::new());
+                    agent.set_human_loop_provider_preserving_approvals(empty);
                 })
             })
             .await;
@@ -396,11 +541,50 @@ pub async fn send_chat_message(
 #[tauri::command]
 pub async fn cancel_chat(
     state: tauri::State<'_, TauriState>,
+    message_key: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    for entry in state.app_state.session.cancel_token.iter() {
-        entry.value().cancel();
+    if let Some(ref key) = message_key {
+        if let Some((_, token)) = state.app_state.session.cancel_token.remove(key) {
+            token.cancel();
+        }
+    } else {
+        // Fallback for non-isolated callers.
+        for entry in state.app_state.session.cancel_token.iter() {
+            entry.value().cancel();
+        }
+        state.app_state.session.cancel_token.clear();
     }
-    state.app_state.session.cancel_token.clear();
+
+    // Reject all pending approval requests so parked HITL futures unblock
+    // immediately instead of waiting up to 300s for a timeout.
+    let mut pending = PENDING_RESPONSES.lock().await;
+    let request_ids: Vec<String> = pending
+        .iter()
+        .filter_map(|(request_id, req)| {
+            if message_key
+                .as_ref()
+                .map(|key| &req.message_key == key)
+                .unwrap_or(true)
+            {
+                Some(request_id.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    for request_id in request_ids {
+        let Some(req) = pending.remove(&request_id) else {
+            continue;
+        };
+        let _ = req.tx.send(PendingResponse::Approval {
+            approved: false,
+            reason: Some("cancelled by user".to_string()),
+            scope: None,
+        });
+        tracing::debug!(%request_id, "cancelled pending approval on cancel_chat");
+    }
+
     Ok(serde_json::json!({"success": true}))
 }
 
@@ -412,9 +596,9 @@ pub async fn send_approval_response(
     reason: Option<String>,
     scope: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    let tx = PENDING_RESPONSES.lock().await.remove(&request_id);
-    if let Some(tx) = tx {
-        let _ = tx.send(PendingResponse::Approval {
+    let req = PENDING_RESPONSES.lock().await.remove(&request_id);
+    if let Some(req) = req {
+        let _ = req.tx.send(PendingResponse::Approval {
             approved,
             reason,
             scope,
@@ -434,9 +618,9 @@ pub async fn send_input_response(
     request_id: String,
     text: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let tx = PENDING_RESPONSES.lock().await.remove(&request_id);
-    if let Some(tx) = tx {
-        let _ = tx.send(PendingResponse::Input { text });
+    let req = PENDING_RESPONSES.lock().await.remove(&request_id);
+    if let Some(req) = req {
+        let _ = req.tx.send(PendingResponse::Input { text });
         Ok(serde_json::json!({"success": true}))
     } else {
         Err(IpcError::NotFound(format!(
@@ -453,9 +637,9 @@ pub async fn send_selection_response(
     selection: String,
     instructions: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    let tx = PENDING_RESPONSES.lock().await.remove(&request_id);
-    if let Some(tx) = tx {
-        let _ = tx.send(PendingResponse::Selection {
+    let req = PENDING_RESPONSES.lock().await.remove(&request_id);
+    if let Some(req) = req {
+        let _ = req.tx.send(PendingResponse::Selection {
             selection,
             instructions,
         });

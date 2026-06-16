@@ -1,5 +1,11 @@
 import { create } from 'zustand';
-import type { ChatMessage, ApprovalRequest, ToolCallInfo, ExecutionRound } from '../types/api';
+import type {
+  ChatMessage,
+  ApprovalRequest,
+  ToolCallInfo,
+  ExecutionRound,
+  ChatRunStatus,
+} from '../types/api';
 import { useConversationStore } from './conversationStore';
 
 /** In-progress round being built during streaming */
@@ -13,6 +19,7 @@ interface ChatState {
   isStreaming: boolean;
   isCancelled: boolean;
   isThinking: boolean;
+  runStatus: ChatRunStatus;
   approvalRequest: ApprovalRequest | null;
   inputRequest: { requestId: string; prompt?: string } | null;
   selectionRequest: {
@@ -41,6 +48,7 @@ interface ChatState {
   finalizeAssistantMessage: (id: string, content: string) => void;
   setStreaming: (v: boolean) => void;
   setThinking: (v: boolean) => void;
+  setRunStatus: (status: ChatRunStatus) => void;
   markCancelled: () => void;
   setApprovalRequest: (r: ApprovalRequest | null) => void;
   setInputRequest: (r: { requestId: string; prompt?: string } | null) => void;
@@ -71,6 +79,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   isStreaming: false,
   isCancelled: false,
   isThinking: false,
+  runStatus: 'idle',
   approvalRequest: null,
   inputRequest: null,
   selectionRequest: null,
@@ -81,6 +90,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   addUserMessage: (content, attachments) => {
     set((s) => ({
       isCancelled: false,
+      runStatus: 'running',
       messages: [
         ...s.messages,
         { id: nextId(), role: 'user', content, attachments, timestamp: Date.now() },
@@ -107,6 +117,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
         },
       ],
       isStreaming: true,
+      isCancelled: false,
+      runStatus: 'running',
     }));
     return id;
   },
@@ -156,7 +168,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     });
   },
 
-  setThinking: (v) => set({ isThinking: v }),
+  setThinking: (v) => set({ isThinking: v, runStatus: v ? 'thinking' : get().runStatus }),
 
   setToolCall: (name, args) => {
     set((s) => {
@@ -177,7 +189,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const currentRound = s.currentRound
         ? { ...s.currentRound, tools: [...s.currentRound.tools, { name, args }] }
         : { tools: [{ name, args }] };
-      return { pendingToolCalls, messages, currentRound };
+      return { pendingToolCalls, messages, currentRound, runStatus: 'using_tool' };
     });
   },
 
@@ -256,17 +268,28 @@ export const useChatStore = create<ChatState>((set, get) => ({
   finalizeAssistantMessage: (id, content) => {
     set((s) => ({
       isStreaming: false,
+      isThinking: false,
+      runStatus: 'completed',
       messages: s.messages.map((m) => (m.id === id ? { ...m, content, isStreaming: false } : m)),
     }));
     autoSave();
   },
 
   setStreaming: (v) => set({ isStreaming: v }),
+  setRunStatus: (status) =>
+    set({
+      runStatus: status,
+      isStreaming: !['idle', 'completed', 'failed', 'cancelled'].includes(status),
+      isCancelled: status === 'cancelled',
+      isThinking: status === 'thinking',
+    }),
 
   markCancelled: () => {
     set((s) => ({
       isStreaming: false,
       isCancelled: true,
+      isThinking: false,
+      runStatus: 'cancelled',
       pendingToolCalls: [],
       messages: s.messages.map((m) =>
         m.isStreaming ? { ...m, isStreaming: false, content: m.content || '' } : m
@@ -275,9 +298,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
     autoSave();
   },
 
-  setApprovalRequest: (r) => set({ approvalRequest: r }),
-  setInputRequest: (r) => set({ inputRequest: r }),
-  setSelectionRequest: (r) => set({ selectionRequest: r }),
+  setApprovalRequest: (r) =>
+    set({ approvalRequest: r, runStatus: r ? 'waiting_approval' : get().runStatus }),
+  setInputRequest: (r) => set({ inputRequest: r, runStatus: r ? 'waiting_input' : get().runStatus }),
+  setSelectionRequest: (r) =>
+    set({ selectionRequest: r, runStatus: r ? 'waiting_input' : get().runStatus }),
 
   addChartMessage: (spec) => {
     set((s) => ({
@@ -296,6 +321,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       approvalRequest: null,
       inputRequest: null,
       selectionRequest: null,
+      runStatus: 'idle',
     }),
 
   replaceMessages: (messages) =>
@@ -307,6 +333,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       approvalRequest: null,
       inputRequest: null,
       selectionRequest: null,
+      runStatus: 'idle',
     }),
 
   setHistoryView: (v) => set({ isHistoryView: v }),

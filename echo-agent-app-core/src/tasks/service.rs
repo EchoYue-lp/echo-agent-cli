@@ -517,48 +517,6 @@ impl BackgroundTaskService {
         &self.manager
     }
 
-    // ── HITL checkpoint integration ──
-
-    /// List pending human checkpoint requests from background tasks.
-    pub async fn pending_checkpoints(
-        &self,
-    ) -> Vec<(String, super::long_running::HumanCheckpointRequest)> {
-        let request_ids = self.hitl_provider.pending_request_ids();
-        let mut result = Vec::new();
-        for id in request_ids {
-            if let Some(event) = self.hitl_provider.get_pending(&id) {
-                let request = echo_agent::human_loop::HumanLoopRequest {
-                    kind: echo_agent::human_loop::HumanLoopKind::Selection,
-                    prompt: event.prompt,
-                    tool_name: event.tool_name,
-                    args: event.args,
-                    risk_level: None,
-                    timeout: None,
-                    task_id: Some(event.task_id),
-                    options: event.options,
-                    context: event.context,
-                    phase: event.phase,
-                };
-                result.push((event.request_id, request));
-            }
-        }
-        result
-    }
-
-    /// Respond to a pending human checkpoint request.
-    pub async fn respond_to_checkpoint(
-        &self,
-        request_id: &str,
-        selection: &str,
-        instructions: Option<String>,
-    ) -> bool {
-        let response = echo_agent::human_loop::HumanLoopResponse::Selection {
-            selection: selection.to_string(),
-            instructions,
-        };
-        self.hitl_provider.respond(request_id, response)
-    }
-
     /// Get the HITL provider (for subscribing to HITL events from frontends).
     pub fn hitl_provider(&self) -> &Arc<super::hitl_provider::BackgroundTaskHumanProvider> {
         &self.hitl_provider
