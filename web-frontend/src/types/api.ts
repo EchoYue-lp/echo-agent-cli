@@ -546,6 +546,7 @@ export interface ConfiguredModel {
   base_url: string | null;
   temperature: number | null;
   max_tokens: number | null;
+  context_window: number | null;
 }
 
 export interface ConfiguredModelListResponse {

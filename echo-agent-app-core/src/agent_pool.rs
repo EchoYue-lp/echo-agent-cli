@@ -380,6 +380,10 @@ impl AgentPool {
                         }
                         agent.set_temperature(runtime.temperature);
                         agent.set_max_tokens(runtime.max_tokens);
+                        // Apply context_window as token_limit when set.
+                        if let Some(cw) = runtime.context_window {
+                            agent.set_token_limit(cw as usize);
+                        }
                     })
                 })
                 .await;

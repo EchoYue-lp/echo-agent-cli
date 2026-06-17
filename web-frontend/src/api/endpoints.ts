@@ -995,6 +995,7 @@ export const providerApi = {
     base_url?: string;
     temperature?: number;
     max_tokens?: number;
+    context_window?: number | null;
     enabled?: boolean;
     set_default?: boolean;
   }) =>

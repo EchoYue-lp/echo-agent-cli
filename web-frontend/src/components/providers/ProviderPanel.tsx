@@ -19,6 +19,8 @@ export function ProviderPanel() {
   const [customModel, setCustomModel] = useState('');
   const [temperature, setTemperature] = useState('');
   const [maxTokens, setMaxTokens] = useState('');
+  const [contextWindow, setContextWindow] = useState('');
+  const [contextWindowPreset, setContextWindowPreset] = useState('auto');
   const [loading, setLoading] = useState(true);
   const [testing, setTesting] = useState(false);
   const [switching, setSwitching] = useState(false);
@@ -83,6 +85,8 @@ export function ProviderPanel() {
     setApiKey('');
     setTemperature('');
     setMaxTokens('');
+    setContextWindow('');
+    setContextWindowPreset('auto');
     setTestResult(null);
     setSwitchResult(null);
   };
@@ -129,6 +133,7 @@ export function ProviderPanel() {
         base_url: hasCustomBaseUrl || isCustom ? trimmedBaseUrl : undefined,
         temperature: temperature ? Number(temperature) : undefined,
         max_tokens: maxTokens ? Number(maxTokens) : undefined,
+        context_window: contextWindow ? Number(contextWindow) : null,
         set_default: true,
       });
       setSwitchResult({
@@ -401,7 +406,7 @@ export function ProviderPanel() {
             </div>
             <div>
               <label className="mb-1 block text-xs text-[var(--text-secondary)]">
-                最大上下文
+                最大输出 Token
                 <span className="ml-1 text-[var(--text-tertiary)]">(可选)</span>
               </label>
               <input
@@ -409,10 +414,60 @@ export function ProviderPanel() {
                 min="1"
                 value={maxTokens}
                 onChange={(e) => setMaxTokens(e.target.value)}
-                placeholder="默认"
+                placeholder="默认（由模型决定）"
                 className="w-full rounded-lg border border-[var(--border-primary)] bg-[var(--bg-input)] px-3 py-2 text-sm text-[var(--text-primary)] outline-none placeholder:text-[var(--text-tertiary)] focus:border-[var(--border-focus)]"
               />
             </div>
+          </div>
+
+          {/* Context Window */}
+          <div>
+            <label className="mb-1 block text-xs text-[var(--text-secondary)]">
+              模型上下文窗口
+              <span className="ml-1 text-[var(--text-tertiary)]">(可选，留空自动推断)</span>
+            </label>
+            <div className="flex gap-2">
+              <select
+                value={contextWindowPreset}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  setContextWindowPreset(val);
+                  if (val === 'auto') {
+                    setContextWindow('');
+                  } else if (val !== 'custom') {
+                    setContextWindow(val);
+                  }
+                }}
+                className="rounded-lg border border-[var(--border-primary)] bg-[var(--bg-input)] px-2 py-2 text-sm text-[var(--text-primary)] outline-none focus:border-[var(--border-focus)]"
+              >
+                <option value="auto">自动</option>
+                <option value="4096">4K</option>
+                <option value="8192">8K</option>
+                <option value="16384">16K</option>
+                <option value="32768">32K</option>
+                <option value="65536">64K</option>
+                <option value="131072">128K</option>
+                <option value="200000">200K</option>
+                <option value="500000">500K</option>
+                <option value="1000000">1M</option>
+                <option value="2000000">2M</option>
+                <option value="custom">自定义</option>
+              </select>
+              {contextWindowPreset === 'custom' && (
+                <input
+                  type="number"
+                  min="1"
+                  step="1000"
+                  value={contextWindow}
+                  onChange={(e) => setContextWindow(e.target.value)}
+                  placeholder="输入 token 数"
+                  className="flex-1 rounded-lg border border-[var(--border-primary)] bg-[var(--bg-input)] px-3 py-2 text-sm text-[var(--text-primary)] outline-none placeholder:text-[var(--text-tertiary)] focus:border-[var(--border-focus)]"
+                />
+              )}
+            </div>
+            <p className="mt-1 text-[10px] text-[var(--text-tertiary)]">
+              用于压缩触发、TokenBudget 分配和自适应压缩调优。自动模式下根据模型名称推断。
+            </p>
           </div>
 
           {/* Action buttons */}

@@ -25,6 +25,7 @@ pub struct ConfiguredModelView {
     pub base_url: Option<String>,
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
+    pub context_window: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -38,6 +39,7 @@ pub struct ModelRuntimeConfig {
     pub base_url: Option<String>,
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
+    pub context_window: Option<u32>,
 }
 
 pub fn provider_env_vars(provider: &str) -> &'static [&'static str] {
@@ -106,6 +108,7 @@ pub fn configured_model_views(config: &mut AppConfig) -> Vec<ConfiguredModelView
                 base_url: runtime.base_url,
                 temperature: model.temperature,
                 max_tokens: model.max_tokens,
+                context_window: model.context_window,
             }
         })
         .collect()
@@ -153,6 +156,7 @@ pub fn set_default_model(
     config.model.name = model.model.clone();
     config.model.temperature = model.temperature;
     config.model.max_tokens = model.max_tokens;
+    config.model.context_window = model.context_window;
 
     if let Some(provider_config) = config.model_providers.get(&model.provider) {
         config.model.auth_token = provider_config.auth_token.clone();
@@ -203,7 +207,7 @@ pub fn resolve_runtime_model(config: &AppConfig, model_id: Option<&str>) -> Mode
         .clone()
         .unwrap_or_else(|| stable_model_id(&config.model.provider, &config.model.name));
 
-    let (id, display_name, provider, model, temperature, max_tokens) =
+    let (id, display_name, provider, model, temperature, max_tokens, context_window) =
         if let Some(selected) = selected {
             (
                 selected.id.clone(),
@@ -212,6 +216,7 @@ pub fn resolve_runtime_model(config: &AppConfig, model_id: Option<&str>) -> Mode
                 selected.model.clone(),
                 selected.temperature,
                 selected.max_tokens,
+                selected.context_window,
             )
         } else {
             (
@@ -221,6 +226,7 @@ pub fn resolve_runtime_model(config: &AppConfig, model_id: Option<&str>) -> Mode
                 config.model.name.clone(),
                 config.model.temperature,
                 config.model.max_tokens,
+                config.model.context_window,
             )
         };
 
@@ -260,6 +266,7 @@ pub fn resolve_runtime_model(config: &AppConfig, model_id: Option<&str>) -> Mode
         base_url,
         temperature,
         max_tokens,
+        context_window,
     }
 }
 

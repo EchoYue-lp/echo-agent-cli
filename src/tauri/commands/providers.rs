@@ -18,6 +18,7 @@ pub struct UpsertConfiguredModelRequest {
     pub base_url: Option<String>,
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
+    pub context_window: Option<u32>,
     pub enabled: Option<bool>,
     pub set_default: Option<bool>,
 }
@@ -88,6 +89,12 @@ async fn apply_runtime_model(
                 }
                 agent.set_temperature(runtime.temperature);
                 agent.set_max_tokens(runtime.max_tokens);
+                // Apply context_window: if set, use it as token_limit so the
+                // agent gets the right budget/compression behavior. If not
+                // set, leave token_limit unchanged (framework infers).
+                if let Some(cw) = runtime.context_window {
+                    agent.set_token_limit(cw as usize);
+                }
                 tracing::info!(
                     provider = %runtime.provider,
                     model = %runtime.model,
@@ -164,6 +171,7 @@ pub async fn upsert_configured_model(
             enabled: req.enabled.unwrap_or(true),
             max_tokens: req.max_tokens,
             temperature: req.temperature,
+            context_window: req.context_window,
         };
         model_id = model_config::upsert_configured_model(&mut cfg, configured);
         if req.set_default.unwrap_or(false) {
