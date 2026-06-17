@@ -137,6 +137,7 @@ async fn run_desktop() -> anyhow::Result<()> {
         react_checkpoint_interval: None,
         state_store: None,
         memory_context_suffix: None,
+        working_dir: None,
     };
 
     let runtime =

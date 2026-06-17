@@ -13,3 +13,6 @@ echo-agent.yaml
 
 # Worktree directories
 .worktrees/
+
+# Worktree directories
+.worktrees/

@@ -534,6 +534,9 @@ impl AgentPool {
             react_checkpoint_interval: None,
             state_store: self.shared.state_store.clone(),
             memory_context_suffix: None,
+            // Stage 2 will bind a per-conversation worktree here; for now the
+            // pooled agent runs in the process cwd.
+            working_dir: None,
         };
         let mut agent =
             infra::create_agent(&params, &app_config).map_err(|e| anyhow::anyhow!("{e}"))?;

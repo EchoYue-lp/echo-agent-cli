@@ -85,6 +85,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
         react_checkpoint_interval: None,
         state_store: None,
         memory_context_suffix: None,
+        working_dir: None,
     };
     // ── Bootstrap Agent Runtime (shared TUI/GUI initialization) ──
     let runtime =
@@ -464,6 +465,7 @@ mod tests {
             react_checkpoint_interval: None,
             state_store: None,
             memory_context_suffix: None,
+            working_dir: None,
         };
         let app_config = config::AppConfig::default();
         let agent = match infra::create_agent(&params, &app_config) {

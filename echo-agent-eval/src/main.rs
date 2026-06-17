@@ -152,6 +152,7 @@ async fn cmd_run(
         react_checkpoint_interval: None,
         state_store: None,
         memory_context_suffix: None,
+        working_dir: None,
     };
     let runtime = AgentRuntime::bootstrap(&app_config, params).await?;
     let agent = runtime.agent_handle.as_shared_agent().await;

@@ -45,6 +45,11 @@ pub struct AgentCreateParams {
     /// long-term memories are recalled per turn through the agent memory store,
     /// not baked into this boot-time suffix.
     pub memory_context_suffix: Option<String>,
+    /// Session-bound working directory (worktree path). Propagated to
+    /// `ReactAgent.config.working_dir`, which `ExecuteStage` injects into every
+    /// tool call's `ToolContext` — so shell/file/git tools run inside the
+    /// isolated checkout. None = use process cwd (backward compatible).
+    pub working_dir: Option<std::path::PathBuf>,
 }
 
 /// Generate a fresh conversation id for the primary (non-pooled) agent.
@@ -177,6 +182,13 @@ pub fn create_agent(
     // without it the framework's checkpoint helpers silently no-op.
     if let Some(ref cid) = params.conversation_id {
         builder = builder.conversation_id(cid.as_str());
+    }
+
+    // Bind the session working directory (worktree isolation). Propagated to
+    // ReactAgent.config.working_dir, then into every tool's ToolContext via
+    // ExecuteStage, so shell/file/git tools run inside the worktree.
+    if let Some(ref wd) = params.working_dir {
+        builder = builder.working_dir(wd.clone());
     }
 
     // Inject the shared runtime state store. When the product layer supplies a
