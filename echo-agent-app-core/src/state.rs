@@ -13,6 +13,7 @@ use echo_agent::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 pub use crate::hitl::HitlDispatcher;
 use tokio::sync::RwLock;
@@ -372,6 +373,27 @@ pub struct SchedulerState {
 pub struct TaskState {
     pub service: Option<Arc<crate::tasks::BackgroundTaskService>>,
     pub cancel_token: CancellationToken,
+    /// TaskRuntime canonical SQLite store for complex-task runs, plans,
+    /// todos, events, artifacts, reviews, and execution summaries.
+    /// Backs the `task://event` query commands. `None` only if both the
+    /// on-disk open and the in-memory fallback failed (extreme OOM).
+    pub runtime: Option<Arc<crate::tasks::task_runtime::TaskRuntimeStore>>,
+    /// Run-scoped cancellation tokens for executing TaskRuntime runs, keyed
+    /// `__run__:{run_id}`. Distinct from `cancel_token` (a single token for
+    /// the legacy background-task service) and from
+    /// `SessionState.cancel_token` (per-message chat tokens). cancel_task_run
+    /// looks up a run here and triggers it; execute_task_run inserts one
+    /// when it spawns the executor.
+    pub run_cancel_tokens: DashMap<String, CancellationToken>,
+    /// Whether `send_chat_message` should auto-route complex input to the
+    /// TaskRuntime (create a run + generate a plan). Default OFF — every
+    /// message takes the normal chat path until the GUI opts in via
+    /// `set_taskruntime_auto_route`. Toggleable at runtime; no restart needed.
+    pub auto_route: AtomicBool,
+    /// Manual interaction mode override (Chat/Plan/Auto). `Auto` defers to
+    /// auto_route + classifier; `Chat` forces normal chat; `Plan` forces plan
+    /// generation without execution. Toggleable at runtime via Tauri command.
+    pub interaction_mode: std::sync::atomic::AtomicU8,
 }
 
 /// Webhook 状态
@@ -502,6 +524,18 @@ impl AppState {
             tasks: TaskState {
                 service: None,
                 cancel_token: CancellationToken::new(),
+                runtime: Some(Arc::new(
+                    crate::tasks::task_runtime::TaskRuntimeStore::new().unwrap_or_else(|e| {
+                        tracing::warn!(
+                            "Failed to open task_runtime.db: {e}; falling back to in-memory store"
+                        );
+                        crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
+                            .expect("in-memory task_runtime store should always init — OOM?")
+                    }),
+                )),
+                auto_route: AtomicBool::new(false),
+                interaction_mode: std::sync::atomic::AtomicU8::new(0), // 0 = Auto
+                run_cancel_tokens: DashMap::new(),
             },
             webhook: WebhookState {
                 emitter: crate::webhook::WebhookEmitter::with_endpoints(webhook_endpoints),

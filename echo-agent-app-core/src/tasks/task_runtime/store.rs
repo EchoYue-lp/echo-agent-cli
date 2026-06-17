@@ -1,0 +1,1293 @@
+//! SQLite-backed canonical store for the TaskRuntime.
+//!
+//! Design constraints (from the plan):
+//!
+//! - SQLite is the **single source of truth**. JSON/Markdown exports under
+//!   `.eko/runtime/{run_id}/` are derived from these tables, never the
+//!   canonical state.
+//! - Every state mutation must append a [`RuntimeTaskEvent`] **inside the
+//!   same transaction** as the state update. This module enforces that by
+//!   routing all writes through transaction-scoped helpers.
+//!
+//! This mirrors the `SessionSearchEngine` pattern (`Mutex<Connection>` +
+//! `init_schema` + `new_in_memory`) so it composes with the rest of the
+//! app's rusqlite usage.
+
+use std::path::PathBuf;
+use std::sync::Mutex;
+
+use anyhow::Context;
+use chrono::{DateTime, Utc};
+use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, Row};
+
+use super::types::*;
+
+/// Error returned by store operations. Kept separate from `anyhow::Error`
+/// so callers can distinguish invariant violations (e.g. illegal status
+/// transition) from infrastructure failures.
+#[derive(Debug, thiserror::Error)]
+pub enum StoreError {
+    #[error("run not found: {0}")]
+    RunNotFound(String),
+    #[error("plan not found for run: {0}")]
+    PlanNotFound(String),
+    #[error("task not found: {0}")]
+    TaskNotFound(String),
+    #[error("illegal transition {from} -> {to} for run {run_id}")]
+    IllegalTransition {
+        run_id: String,
+        from: String,
+        to: String,
+    },
+    #[error("sqlite: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+    #[error("lock poisoned")]
+    LockPoisoned,
+    #[error("json: {0}")]
+    Json(#[from] serde_json::Error),
+}
+
+/// Canonical TaskRuntime store. One instance per process; cheap to clone
+/// behind `Arc`. The connection is single-writer (`Mutex`), which is fine
+/// because TaskRuntime writes are low-frequency state transitions, not
+/// hot-path tool calls.
+pub struct TaskRuntimeStore {
+    conn: Mutex<Connection>,
+}
+
+impl TaskRuntimeStore {
+    /// Open (or create) the store at the default location:
+    /// `~/.echo-agent/task_runtime.db`.
+    pub fn new() -> anyhow::Result<Self> {
+        Self::open(&default_db_path())
+    }
+
+    /// Open (or create) the store at an explicit path. Used for
+    /// workspace-scoped databases and tests.
+    pub fn open(path: &PathBuf) -> anyhow::Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating db parent dir {}", parent.display()))?;
+        }
+        let conn = Connection::open(path)
+            .with_context(|| format!("opening task_runtime db at {}", path.display()))?;
+        let store = Self {
+            conn: Mutex::new(conn),
+        };
+        store.init_schema()?;
+        Ok(store)
+    }
+
+    /// In-memory store for tests / fallback. Schema is identical.
+    pub fn new_in_memory() -> anyhow::Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        let store = Self {
+            conn: Mutex::new(conn),
+        };
+        store.init_schema()?;
+        Ok(store)
+    }
+
+    // ── Schema ──────────────────────────────────────────────────────────
+
+    fn init_schema(&self) -> anyhow::Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
+        conn.execute_batch(
+            // NOTE: every table uses TEXT PRIMARY KEY ids (UUIDs from the
+            // caller). Status / kind columns store the `as_str()` discriminator
+            // for human-readable SQL and stable cross-version decoding.
+            "
+            CREATE TABLE IF NOT EXISTS tr_runs (
+                run_id            TEXT PRIMARY KEY,
+                workspace_id      TEXT NOT NULL,
+                conversation_id   TEXT NOT NULL,
+                root_message_id   TEXT NOT NULL DEFAULT '',
+                domain_profile    TEXT NOT NULL DEFAULT 'general',
+                status            TEXT NOT NULL DEFAULT 'pending',
+                goal              TEXT NOT NULL DEFAULT '',
+                plan_id           TEXT,
+                created_at        TEXT NOT NULL,
+                updated_at        TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS ix_runs_conv ON tr_runs(conversation_id);
+            CREATE INDEX IF NOT EXISTS ix_runs_workspace ON tr_runs(workspace_id);
+            CREATE INDEX IF NOT EXISTS ix_runs_status ON tr_runs(status);
+
+            CREATE TABLE IF NOT EXISTS tr_plans (
+                plan_id           TEXT PRIMARY KEY,
+                run_id            TEXT NOT NULL,
+                domain_profile    TEXT NOT NULL DEFAULT 'general',
+                goal              TEXT NOT NULL DEFAULT '',
+                assumptions       TEXT NOT NULL DEFAULT '[]',
+                risks             TEXT NOT NULL DEFAULT '[]',
+                execution_mode    TEXT NOT NULL DEFAULT 'parallel',
+                created_at        TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS ix_plans_run ON tr_plans(run_id);
+
+            CREATE TABLE IF NOT EXISTS tr_plan_tasks (
+                id                TEXT PRIMARY KEY,
+                plan_id           TEXT NOT NULL,
+                run_id            TEXT NOT NULL,
+                title             TEXT NOT NULL DEFAULT '',
+                description       TEXT NOT NULL DEFAULT '',
+                kind              TEXT NOT NULL DEFAULT 'read_only_review',
+                agent_role        TEXT NOT NULL DEFAULT 'general',
+                domain_profile    TEXT NOT NULL DEFAULT 'general',
+                depends_on        TEXT NOT NULL DEFAULT '[]',
+                parallel_group    TEXT,
+                files             TEXT NOT NULL DEFAULT '[]',
+                allowed_tools     TEXT NOT NULL DEFAULT '[]',
+                verification      TEXT NOT NULL DEFAULT '[]',
+                retry_count       INTEGER NOT NULL DEFAULT 0,
+                max_retries       INTEGER NOT NULL DEFAULT 3,
+                failure_fingerprint TEXT,
+                status            TEXT NOT NULL DEFAULT 'pending'
+            );
+            CREATE INDEX IF NOT EXISTS ix_tasks_plan ON tr_plan_tasks(plan_id);
+            CREATE INDEX IF NOT EXISTS ix_tasks_run  ON tr_plan_tasks(run_id);
+            CREATE INDEX IF NOT EXISTS ix_tasks_status ON tr_plan_tasks(status);
+
+            CREATE TABLE IF NOT EXISTS tr_todos (
+                id                TEXT PRIMARY KEY,
+                run_id            TEXT NOT NULL,
+                task_id           TEXT NOT NULL,
+                title             TEXT NOT NULL DEFAULT '',
+                status            TEXT NOT NULL DEFAULT 'pending',
+                owner_agent       TEXT,
+                started_at        TEXT,
+                completed_at      TEXT,
+                summary           TEXT
+            );
+            CREATE INDEX IF NOT EXISTS ix_todos_run ON tr_todos(run_id);
+
+            CREATE TABLE IF NOT EXISTS tr_events (
+                seq               INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_id            TEXT NOT NULL,
+                task_id           TEXT,
+                step_id           TEXT,
+                event_type        TEXT NOT NULL,
+                payload           TEXT NOT NULL DEFAULT '{}',
+                timestamp         TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS ix_events_run ON tr_events(run_id, seq);
+
+            CREATE TABLE IF NOT EXISTS tr_artifacts (
+                id                TEXT PRIMARY KEY,
+                run_id            TEXT NOT NULL,
+                task_id           TEXT,
+                kind              TEXT NOT NULL DEFAULT 'other',
+                title             TEXT NOT NULL DEFAULT '',
+                path              TEXT,
+                metadata          TEXT NOT NULL DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS ix_artifacts_run ON tr_artifacts(run_id);
+            CREATE INDEX IF NOT EXISTS ix_artifacts_task ON tr_artifacts(task_id);
+
+            CREATE TABLE IF NOT EXISTS tr_reviews (
+                id                TEXT PRIMARY KEY,
+                run_id            TEXT NOT NULL,
+                task_id           TEXT NOT NULL,
+                reviewer_agent    TEXT NOT NULL DEFAULT '',
+                outcome           TEXT NOT NULL DEFAULT 'pass',
+                issues            TEXT NOT NULL DEFAULT '[]',
+                failure_fingerprint TEXT,
+                created_fix_task_id TEXT,
+                created_at        TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS ix_reviews_task ON tr_reviews(task_id);
+
+            CREATE TABLE IF NOT EXISTS tr_summaries (
+                run_id            TEXT NOT NULL,
+                task_id           TEXT NOT NULL,
+                worker_agent      TEXT NOT NULL DEFAULT '',
+                completed_work    TEXT NOT NULL DEFAULT '[]',
+                files_read        TEXT NOT NULL DEFAULT '[]',
+                files_changed     TEXT NOT NULL DEFAULT '[]',
+                decisions         TEXT NOT NULL DEFAULT '[]',
+                failures          TEXT NOT NULL DEFAULT '[]',
+                verification      TEXT NOT NULL DEFAULT '[]',
+                next_implications TEXT NOT NULL DEFAULT '[]',
+                created_at        TEXT NOT NULL,
+                PRIMARY KEY (run_id, task_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS tr_approvals (
+                run_id            TEXT NOT NULL,
+                tool_name         TEXT NOT NULL,
+                scope_level       TEXT NOT NULL DEFAULT 'conversation',
+                conversation_id   TEXT NOT NULL,
+                created_at        TEXT NOT NULL,
+                PRIMARY KEY (run_id, tool_name, conversation_id)
+            );
+            CREATE INDEX IF NOT EXISTS ix_approvals_lookup
+                ON tr_approvals(run_id, conversation_id, tool_name);
+            ",
+        )?;
+        Ok(())
+    }
+
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>, StoreError> {
+        self.conn.lock().map_err(|_| StoreError::LockPoisoned)
+    }
+
+    // ── Runs ────────────────────────────────────────────────────────────
+
+    /// Create a new run in `Pending` and emit `RunCreated`. Returns the
+    /// created run.
+    pub fn create_run(
+        &self,
+        run_id: &str,
+        workspace_id: &str,
+        conversation_id: &str,
+        root_message_id: &str,
+        domain_profile: DomainProfile,
+        goal: &str,
+    ) -> Result<TaskRun, StoreError> {
+        let now = Utc::now();
+        let run = TaskRun {
+            run_id: run_id.to_string(),
+            workspace_id: workspace_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            root_message_id: root_message_id.to_string(),
+            domain_profile,
+            status: TaskRunStatus::Pending,
+            goal: goal.to_string(),
+            plan_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO tr_runs
+                (run_id, workspace_id, conversation_id, root_message_id, domain_profile,
+                 status, goal, plan_id, created_at, updated_at)
+             VALUES (?,?,?,?,?, 'pending', ?, NULL, ?, ?)",
+            params![
+                run.run_id,
+                run.workspace_id,
+                run.conversation_id,
+                run.root_message_id,
+                domain_profile.as_str(),
+                run.goal,
+                run.created_at.to_rfc3339(),
+                run.updated_at.to_rfc3339(),
+            ],
+        )?;
+        append_event_tx(
+            &tx,
+            run.run_id.as_str(),
+            None,
+            None,
+            RuntimeEventKind::RunCreated,
+            serde_json::json!({ "goal": goal, "domain_profile": domain_profile.as_str() }),
+        )?;
+        tx.commit()?;
+        Ok(run)
+    }
+
+    /// Atomically transition a run to `next` and append `RunStatusChanged`.
+    /// Rejects illegal transitions (see [`TaskRunStatus::can_transition_to`]).
+    pub fn transition_run(
+        &self,
+        run_id: &str,
+        next: TaskRunStatus,
+    ) -> Result<TaskRun, StoreError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+
+        let (current_str, mut run) = load_run_for_update(&tx, run_id)?;
+        let current =
+            TaskRunStatus::from_str(&current_str).unwrap_or(TaskRunStatus::Pending);
+        if !current.can_transition_to(next) {
+            return Err(StoreError::IllegalTransition {
+                run_id: run_id.to_string(),
+                from: current.as_str().to_string(),
+                to: next.as_str().to_string(),
+            });
+        }
+
+        let now = Utc::now().to_rfc3339();
+        run.status = next;
+        run.updated_at = Utc::now();
+        tx.execute(
+            "UPDATE tr_runs SET status = ?, updated_at = ? WHERE run_id = ?",
+            params![next.as_str(), now, run_id],
+        )?;
+        append_event_tx(
+            &tx,
+            run_id,
+            None,
+            None,
+            RuntimeEventKind::RunStatusChanged,
+            serde_json::json!({ "from": current.as_str(), "to": next.as_str() }),
+        )?;
+        // A run moving to Cancelled is significant enough to deserve its own
+        // event kind for consumers that filter on it.
+        if next == TaskRunStatus::Cancelled {
+            append_event_tx(
+                &tx,
+                run_id,
+                None,
+                None,
+                RuntimeEventKind::RunCancelled,
+                serde_json::json!({}),
+            )?;
+        }
+        tx.commit()?;
+        Ok(run)
+    }
+
+    /// Attach a generated plan to a run, replacing any prior plan, and
+    /// transition the run to `AwaitingPlanApproval` (from `Planning`).
+    /// All plan tasks and their todo rows are inserted in the same tx.
+    pub fn attach_plan(&self, plan: &TaskPlan) -> Result<(), StoreError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+
+        // Upsert the plan row.
+        tx.execute(
+            "INSERT INTO tr_plans
+                (plan_id, run_id, domain_profile, goal, assumptions, risks,
+                 execution_mode, created_at)
+             VALUES (?,?,?,?,?,?,?,?)
+             ON CONFLICT(plan_id) DO UPDATE SET
+                goal=excluded.goal,
+                assumptions=excluded.assumptions,
+                risks=excluded.risks,
+                execution_mode=excluded.execution_mode",
+            params![
+                plan.plan_id,
+                plan.run_id,
+                plan.domain_profile.as_str(),
+                plan.goal,
+                serde_json::to_string(&plan.assumptions)?,
+                serde_json::to_string(&plan.risks)?,
+                match plan.execution_mode {
+                    ExecutionMode::Sequential => "sequential",
+                    ExecutionMode::Parallel => "parallel",
+                    ExecutionMode::PlanOnly => "plan_only",
+                },
+                Utc::now().to_rfc3339(),
+            ],
+        )?;
+
+        // Replace all plan-task rows for this plan atomically.
+        tx.execute(
+            "DELETE FROM tr_plan_tasks WHERE plan_id = ?",
+            params![plan.plan_id],
+        )?;
+        tx.execute(
+            "DELETE FROM tr_todos WHERE run_id = ?",
+            params![plan.run_id],
+        )?;
+
+        for t in &plan.tasks {
+            insert_plan_task_tx(&tx, &plan.plan_id, &plan.run_id, t)?;
+            // Mirror each task into the todo projection.
+            tx.execute(
+                "INSERT INTO tr_todos
+                    (id, run_id, task_id, title, status, owner_agent,
+                     started_at, completed_at, summary)
+                 VALUES (?,?,?,?,'pending',NULL,NULL,NULL,NULL)",
+                params![t.id, plan.run_id, t.id, t.title],
+            )?;
+        }
+
+        // Link run -> plan and advance to AwaitingPlanApproval. This goes
+        // through the state-machine path: read current status, validate the
+        // transition is legal (Planning → AwaitingPlanApproval, or
+        // AwaitingPlanApproval → AwaitingPlanApproval when re-editing a plan),
+        // and emit RunStatusChanged so the event log stays consistent with the
+        // "SQLite state machine is the single source of truth" invariant.
+        let (current_status_str, _run) = load_run_for_update(&tx, &plan.run_id)?;
+        let current = TaskRunStatus::from_str(&current_status_str).unwrap_or(TaskRunStatus::Pending);
+        // Allowed entry states for attach_plan: Planning (first generation)
+        // and AwaitingPlanApproval (re-edit of an existing plan before
+        // approval). Anything else (e.g. Running) is a bug — refuse rather
+        // than silently stamp a status.
+        if !matches!(current, TaskRunStatus::Planning | TaskRunStatus::AwaitingPlanApproval) {
+            return Err(StoreError::IllegalTransition {
+                run_id: plan.run_id.clone(),
+                from: current.as_str().to_string(),
+                to: TaskRunStatus::AwaitingPlanApproval.as_str().to_string(),
+            });
+        }
+        let now = Utc::now().to_rfc3339();
+        tx.execute(
+            "UPDATE tr_runs SET plan_id = ?, updated_at = ?, status = 'awaiting_plan_approval'
+             WHERE run_id = ?",
+            params![plan.plan_id, now, plan.run_id],
+        )?;
+        // Only emit RunStatusChanged when the status actually changes —
+        // re-editing a plan (Already AwaitingPlanApproval) shouldn't log a
+        // no-op transition, but PlanEdited captures the edit.
+        if current != TaskRunStatus::AwaitingPlanApproval {
+            append_event_tx(
+                &tx,
+                plan.run_id.as_str(),
+                None,
+                None,
+                RuntimeEventKind::RunStatusChanged,
+                serde_json::json!({
+                    "from": current.as_str(),
+                    "to": TaskRunStatus::AwaitingPlanApproval.as_str(),
+                }),
+            )?;
+        }
+        append_event_tx(
+            &tx,
+            plan.run_id.as_str(),
+            None,
+            None,
+            RuntimeEventKind::PlanGenerated,
+            serde_json::json!({ "plan_id": plan.plan_id, "task_count": plan.tasks.len() }),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Record that the user approved/rejected/edited the plan.
+    pub fn resolve_plan(
+        &self,
+        run_id: &str,
+        approved: bool,
+        note: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        append_event_tx(
+            &tx,
+            run_id,
+            None,
+            None,
+            if approved {
+                RuntimeEventKind::PlanApproved
+            } else {
+                RuntimeEventKind::PlanRejected
+            },
+            serde_json::json!({ "note": note.unwrap_or("") }),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    // ── Task / todo mutations ───────────────────────────────────────────
+
+    /// Update a plan task's status and its mirrored todo row, emitting a
+    /// kind-appropriate event. Used by the scheduler (PR 3) and review
+    /// gates (PR 4).
+    pub fn set_task_status(
+        &self,
+        run_id: &str,
+        task_id: &str,
+        status: TodoStatus,
+        owner_agent: Option<&str>,
+        summary: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let now = Utc::now().to_rfc3339();
+
+        tx.execute(
+            "UPDATE tr_plan_tasks SET status = ? WHERE id = ?",
+            params![status.as_str(), task_id],
+        )?;
+        if tx.changes() == 0 {
+            return Err(StoreError::TaskNotFound(task_id.to_string()));
+        }
+
+        // Keep the todo projection in lock-step.
+        let started = matches!(status, TodoStatus::Running);
+        let finished = matches!(
+            status,
+            TodoStatus::Completed | TodoStatus::Failed | TodoStatus::Skipped
+        );
+        tx.execute(
+            "UPDATE tr_todos SET status = ?, owner_agent = ?,
+                started_at = CASE WHEN ? THEN ? ELSE started_at END,
+                completed_at = CASE WHEN ? THEN ? ELSE completed_at END,
+                summary = ?
+             WHERE run_id = ? AND task_id = ?",
+            params![
+                status.as_str(),
+                owner_agent,
+                started,
+                if started { Some(&now) } else { None },
+                finished,
+                if finished { Some(&now) } else { None },
+                summary,
+                run_id,
+                task_id
+            ],
+        )?;
+
+        let kind = match status {
+            TodoStatus::Running => RuntimeEventKind::TaskStarted,
+            TodoStatus::Completed => RuntimeEventKind::TaskCompleted,
+            TodoStatus::Failed => RuntimeEventKind::TaskFailed,
+            TodoStatus::Skipped => RuntimeEventKind::TaskSkipped,
+            TodoStatus::Blocked => RuntimeEventKind::TaskBlocked,
+            TodoStatus::Pending => RuntimeEventKind::TodoUpdated,
+        };
+        append_event_tx(
+            &tx,
+            run_id,
+            Some(task_id),
+            None,
+            kind,
+            serde_json::json!({
+                "status": status.as_str(),
+                "owner_agent": owner_agent,
+                "summary": summary,
+            }),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Update a plan task's mutable fields (title, description, retry_count,
+    /// failure_fingerprint, status) in place. Used by the review gate when a
+    /// NeedsFix outcome produces a fix variant of a task — the fix shape must
+    /// be persisted so a process restart doesn't lose retry progress or the
+    /// review-informed brief. The task id is unchanged so downstream
+    /// depends_on keeps resolving. Emits a `Note` event for traceability.
+    pub fn update_plan_task(&self, run_id: &str, task: &PlanTask) -> Result<(), StoreError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE tr_plan_tasks SET
+                title = ?, description = ?, retry_count = ?,
+                failure_fingerprint = ?, status = ?
+             WHERE run_id = ? AND id = ?",
+            params![
+                task.title,
+                task.description,
+                task.retry_count,
+                task.failure_fingerprint,
+                task.status.as_str(),
+                run_id,
+                task.id,
+            ],
+        )?;
+        if tx.changes() == 0 {
+            return Err(StoreError::TaskNotFound(task.id.clone()));
+        }
+        // Keep the todo title in sync (it shows in the GUI).
+        tx.execute(
+            "UPDATE tr_todos SET title = ?, status = ? WHERE run_id = ? AND task_id = ?",
+            params![task.title, task.status.as_str(), run_id, task.id],
+        )?;
+        append_event_tx(
+            &tx,
+            run_id,
+            Some(task.id.as_str()),
+            None,
+            RuntimeEventKind::Note,
+            serde_json::json!({
+                "kind": "fix_task_persisted",
+                "retry_count": task.retry_count,
+                "failure_fingerprint": task.failure_fingerprint,
+            }),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    // ── Reviews, artifacts, summaries ───────────────────────────────────
+
+    pub fn add_review(&self, r: &ReviewResult) -> Result<(), StoreError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO tr_reviews
+                (id, run_id, task_id, reviewer_agent, outcome, issues,
+                 failure_fingerprint, created_fix_task_id, created_at)
+             VALUES (?,?,?,?,?,?,?,?,?)",
+            params![
+                r.id,
+                r.run_id,
+                r.task_id,
+                r.reviewer_agent,
+                r.outcome.as_str(),
+                serde_json::to_string(&r.issues)?,
+                r.failure_fingerprint,
+                r.created_fix_task_id,
+                r.created_at.to_rfc3339(),
+            ],
+        )?;
+        let kind = match r.outcome {
+            ReviewOutcome::Pass => RuntimeEventKind::ReviewPassed,
+            ReviewOutcome::NeedsFix => RuntimeEventKind::ReviewNeedsFix,
+            ReviewOutcome::Blocked => RuntimeEventKind::ReviewBlocked,
+        };
+        append_event_tx(
+            &tx,
+            r.run_id.as_str(),
+            Some(r.task_id.as_str()),
+            None,
+            kind,
+            serde_json::json!({ "review_id": r.id, "reviewer": r.reviewer_agent }),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn add_artifact(&self, a: &Artifact) -> Result<(), StoreError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO tr_artifacts
+                (id, run_id, task_id, kind, title, path, metadata)
+             VALUES (?,?,?,?,?,?,?)",
+            params![
+                a.id,
+                a.run_id,
+                a.task_id,
+                a.kind.as_str(),
+                a.title,
+                a.path,
+                a.metadata.to_string(),
+            ],
+        )?;
+        append_event_tx(
+            &tx,
+            a.run_id.as_str(),
+            a.task_id.as_deref(),
+            None,
+            RuntimeEventKind::ArtifactProduced,
+            serde_json::json!({ "artifact_id": a.id, "kind": a.kind.as_str(), "title": a.title }),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Persist or overwrite the per-task execution summary. Primary key is
+    /// `(run_id, task_id)` so a re-execution replaces the prior summary. The
+    /// write is transactional and appends a `Note` event so the GUI and the
+    /// recovery path can tell when a summary was updated (consistent with the
+    /// "every state-relevant change writes a TaskEvent" invariant).
+    pub fn put_summary(&self, s: &TaskExecutionSummary) -> Result<(), StoreError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO tr_summaries
+                (run_id, task_id, worker_agent, completed_work, files_read,
+                 files_changed, decisions, failures, verification,
+                 next_implications, created_at)
+             VALUES (?,?,?,?,?,?,?,?,?,?,?)
+             ON CONFLICT(run_id, task_id) DO UPDATE SET
+                worker_agent=excluded.worker_agent,
+                completed_work=excluded.completed_work,
+                files_read=excluded.files_read,
+                files_changed=excluded.files_changed,
+                decisions=excluded.decisions,
+                failures=excluded.failures,
+                verification=excluded.verification,
+                next_implications=excluded.next_implications,
+                created_at=excluded.created_at",
+            params![
+                s.run_id,
+                s.task_id,
+                s.worker_agent,
+                serde_json::to_string(&s.completed_work)?,
+                serde_json::to_string(&s.files_read)?,
+                serde_json::to_string(&s.files_changed)?,
+                serde_json::to_string(&s.decisions)?,
+                serde_json::to_string(&s.failures)?,
+                serde_json::to_string(&s.verification)?,
+                serde_json::to_string(&s.next_implications)?,
+                s.created_at.to_rfc3339(),
+            ],
+        )?;
+        append_event_tx(
+            &tx,
+            s.run_id.as_str(),
+            Some(s.task_id.as_str()),
+            None,
+            RuntimeEventKind::Note,
+            serde_json::json!({
+                "kind": "summary_persisted",
+                "worker_agent": s.worker_agent,
+                "files_changed": s.files_changed.len(),
+            }),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    // ── Read paths (used by Tauri query commands + recovery) ────────────
+
+    pub fn get_run(&self, run_id: &str) -> Result<Option<TaskRun>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT run_id, workspace_id, conversation_id, root_message_id,
+                    domain_profile, status, goal, plan_id, created_at, updated_at
+             FROM tr_runs WHERE run_id = ?",
+        )?;
+        let mut rows = stmt.query(params![run_id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(decode_run(&row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Latest run for a conversation (used by GUI to bind a chat to its run).
+    pub fn latest_run_for_conversation(&self, conversation_id: &str) -> Result<Option<TaskRun>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT run_id, workspace_id, conversation_id, root_message_id,
+                    domain_profile, status, goal, plan_id, created_at, updated_at
+             FROM tr_runs WHERE conversation_id = ?
+             ORDER BY created_at DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![conversation_id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(decode_run(&row)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn list_runs_in(&self, statuses: &[TaskRunStatus]) -> Result<Vec<TaskRun>, StoreError> {
+        let conn = self.lock()?;
+        if statuses.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders: Vec<String> = (0..statuses.len()).map(|_| "?".to_string()).collect();
+        let sql = format!(
+            "SELECT run_id, workspace_id, conversation_id, root_message_id,
+                    domain_profile, status, goal, plan_id, created_at, updated_at
+             FROM tr_runs WHERE status IN ({})
+             ORDER BY created_at DESC",
+            placeholders.join(", ")
+        );
+        let vals: Vec<SqlValue> = statuses
+            .iter()
+            .map(|s| SqlValue::Text(s.as_str().to_string()))
+            .collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(vals.iter()), decode_run)?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
+    pub fn get_plan(&self, run_id: &str) -> Result<Option<TaskPlan>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT plan_id, run_id, domain_profile, goal, assumptions, risks, execution_mode
+             FROM tr_plans WHERE run_id = ? ORDER BY rowid DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![run_id])?;
+        let Some(row) = rows.next()? else {
+            return Ok(None);
+        };
+        let plan_id: String = row.get(0)?;
+        let domain_profile = DomainProfile::from_str(&row.get::<_, String>(2)?).unwrap_or_default();
+        let goal: String = row.get(3)?;
+        let assumptions: Vec<String> = serde_json::from_str(&row.get::<_, String>(4)?)?;
+        let risks: Vec<String> = serde_json::from_str(&row.get::<_, String>(5)?)?;
+        let execution_mode = match row.get::<_, String>(6)?.as_str() {
+            "sequential" => ExecutionMode::Sequential,
+            "plan_only" => ExecutionMode::PlanOnly,
+            _ => ExecutionMode::Parallel,
+        };
+
+        let tasks = load_plan_tasks(&conn, &plan_id)?;
+        Ok(Some(TaskPlan {
+            plan_id,
+            run_id: run_id.to_string(),
+            domain_profile,
+            goal,
+            assumptions,
+            risks,
+            execution_mode,
+            tasks,
+        }))
+    }
+
+    pub fn list_todos(&self, run_id: &str) -> Result<Vec<TodoItem>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, run_id, task_id, title, status, owner_agent,
+                    started_at, completed_at, summary
+             FROM tr_todos WHERE run_id = ? ORDER BY rowid ASC",
+        )?;
+        let rows = stmt.query_map(params![run_id], |row| {
+            Ok(TodoItem {
+                id: row.get(0)?,
+                run_id: row.get(1)?,
+                task_id: row.get(2)?,
+                title: row.get(3)?,
+                status: TodoStatus::from_str(&row.get::<_, String>(4)?).unwrap_or_default(),
+                owner_agent: row.get(5)?,
+                started_at: parse_opt_dt(row.get(6)?),
+                completed_at: parse_opt_dt(row.get(7)?),
+                summary: row.get(8)?,
+            })
+        })?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
+    pub fn list_events(&self, run_id: &str, since_seq: i64) -> Result<Vec<RuntimeTaskEvent>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT seq, run_id, task_id, step_id, event_type, payload, timestamp
+             FROM tr_events WHERE run_id = ? AND seq > ? ORDER BY seq ASC",
+        )?;
+        let rows = stmt.query_map(params![run_id, since_seq], |row| {
+            Ok(RuntimeTaskEvent {
+                seq: row.get(0)?,
+                run_id: row.get(1)?,
+                task_id: row.get(2)?,
+                step_id: row.get(3)?,
+                event_type: RuntimeEventKind::from_str(&row.get::<_, String>(4)?)
+                    .unwrap_or(RuntimeEventKind::Note),
+                payload: serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
+                timestamp: parse_dt(row.get(6)?),
+            })
+        })?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
+    pub fn list_artifacts(&self, run_id: &str) -> Result<Vec<Artifact>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, run_id, task_id, kind, title, path, metadata
+             FROM tr_artifacts WHERE run_id = ? ORDER BY rowid ASC",
+        )?;
+        let rows = stmt.query_map(params![run_id], |row| {
+            Ok(Artifact {
+                id: row.get(0)?,
+                run_id: row.get(1)?,
+                task_id: row.get(2)?,
+                kind: ArtifactKind::from_str(&row.get::<_, String>(3)?).unwrap_or(ArtifactKind::Other),
+                title: row.get(4)?,
+                path: row.get(5)?,
+                metadata: serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or_default(),
+            })
+        })?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
+    pub fn list_reviews(&self, run_id: &str, task_id: &str) -> Result<Vec<ReviewResult>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, run_id, task_id, reviewer_agent, outcome, issues,
+                    failure_fingerprint, created_fix_task_id, created_at
+             FROM tr_reviews WHERE run_id = ? AND task_id = ? ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map(params![run_id, task_id], |row| {
+            Ok(ReviewResult {
+                id: row.get(0)?,
+                run_id: row.get(1)?,
+                task_id: row.get(2)?,
+                reviewer_agent: row.get(3)?,
+                outcome: ReviewOutcome::from_str(&row.get::<_, String>(4)?).unwrap_or(ReviewOutcome::Blocked),
+                issues: serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
+                failure_fingerprint: row.get(6)?,
+                created_fix_task_id: row.get(7)?,
+                created_at: parse_dt(row.get(8)?),
+            })
+        })?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
+    pub fn get_summary(&self, run_id: &str, task_id: &str) -> Result<Option<TaskExecutionSummary>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT run_id, task_id, worker_agent, completed_work, files_read,
+                    files_changed, decisions, failures, verification,
+                    next_implications, created_at
+             FROM tr_summaries WHERE run_id = ? AND task_id = ?",
+        )?;
+        let mut rows = stmt.query(params![run_id, task_id])?;
+        match rows.next()? {
+            Some(row) => {
+                let completed_work: String = row.get(3)?;
+                let files_read: String = row.get(4)?;
+                let files_changed: String = row.get(5)?;
+                let decisions: String = row.get(6)?;
+                let failures: String = row.get(7)?;
+                let verification: String = row.get(8)?;
+                let next_implications: String = row.get(9)?;
+                let created_at: String = row.get(10)?;
+                Ok(Some(TaskExecutionSummary {
+                    run_id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    worker_agent: row.get(2)?,
+                    completed_work: serde_json::from_str(&completed_work).unwrap_or_default(),
+                    files_read: serde_json::from_str(&files_read).unwrap_or_default(),
+                    files_changed: serde_json::from_str(&files_changed).unwrap_or_default(),
+                    decisions: serde_json::from_str(&decisions).unwrap_or_default(),
+                    failures: serde_json::from_str(&failures).unwrap_or_default(),
+                    verification: serde_json::from_str(&verification).unwrap_or_default(),
+                    next_implications: serde_json::from_str(&next_implications).unwrap_or_default(),
+                    created_at: parse_dt(created_at),
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Append a free-form `Note` event for diagnostics / trace breadcrumbs.
+    pub fn note(&self, run_id: &str, task_id: Option<&str>, message: &str) -> Result<(), StoreError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        append_event_tx(
+            &tx,
+            run_id,
+            task_id,
+            None,
+            RuntimeEventKind::Note,
+            serde_json::json!({ "message": message }),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    // ── Approval scope tracking ─────────────────────────────────────────
+
+    /// Grant a scoped approval for a tool call. Returns true if newly recorded.
+    /// `scope_level` is one of: once | task | conversation | workspace | tool | all_tools.
+    pub fn grant_approval(
+        &self,
+        run_id: &str,
+        tool_name: &str,
+        scope_level: &str,
+        conversation_id: &str,
+    ) -> Result<bool, StoreError> {
+        let conn = self.lock()?;
+        let created = conn.execute(
+            "INSERT OR IGNORE INTO tr_approvals (run_id, tool_name, scope_level, conversation_id, created_at)
+             VALUES (?,?,?,?,?)",
+            params![run_id, tool_name, scope_level, conversation_id, chrono::Utc::now().to_rfc3339()],
+        )?;
+        Ok(created > 0)
+    }
+
+    /// Check whether a tool call is covered by a prior scope grant
+    /// (conversation-level, all-tools wildcard, or per-tool).
+    pub fn is_approved(
+        &self,
+        run_id: &str,
+        conversation_id: &str,
+        tool_name: &str,
+    ) -> Result<bool, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT 1 FROM tr_approvals
+             WHERE run_id = ? AND (tool_name = ? OR tool_name = '*') AND conversation_id = ?
+             LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![run_id, tool_name, conversation_id])?;
+        Ok(rows.next()?.is_some())
+    }
+
+    /// Revoke all approvals for a run.
+    pub fn revoke_run_approvals(&self, run_id: &str) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute("DELETE FROM tr_approvals WHERE run_id = ?", params![run_id])?;
+        Ok(())
+    }
+}
+
+// ── transaction-scoped helpers (private) ─────────────────────────────────
+
+fn append_event_tx(
+    tx: &rusqlite::Transaction<'_>,
+    run_id: &str,
+    task_id: Option<&str>,
+    step_id: Option<&str>,
+    event_type: RuntimeEventKind,
+    payload: serde_json::Value,
+) -> Result<(), StoreError> {
+    tx.execute(
+        "INSERT INTO tr_events (run_id, task_id, step_id, event_type, payload, timestamp)
+         VALUES (?,?,?,?,?,?)",
+        params![
+            run_id,
+            task_id,
+            step_id,
+            event_type.as_str(),
+            payload.to_string(),
+            Utc::now().to_rfc3339(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_plan_task_tx(
+    tx: &rusqlite::Transaction<'_>,
+    plan_id: &str,
+    run_id: &str,
+    t: &PlanTask,
+) -> Result<(), StoreError> {
+    tx.execute(
+        "INSERT INTO tr_plan_tasks
+            (id, plan_id, run_id, title, description, kind, agent_role, domain_profile,
+             depends_on, parallel_group, files, allowed_tools, verification,
+             retry_count, max_retries, failure_fingerprint, status)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        params![
+            t.id,
+            plan_id,
+            run_id,
+            t.title,
+            t.description,
+            t.kind.as_str(),
+            t.agent_role,
+            t.domain_profile.as_str(),
+            serde_json::to_string(&t.depends_on)?,
+            t.parallel_group,
+            serde_json::to_string(&t.files)?,
+            serde_json::to_string(&t.allowed_tools)?,
+            serde_json::to_string(&t.verification)?,
+            t.retry_count,
+            t.max_retries,
+            t.failure_fingerprint,
+            t.status.as_str(),
+        ],
+    )?;
+    Ok(())
+}
+
+fn load_plan_tasks(conn: &Connection, plan_id: &str) -> Result<Vec<PlanTask>, StoreError> {
+    let mut stmt = conn.prepare(
+        "SELECT id, title, description, kind, agent_role, domain_profile,
+                depends_on, parallel_group, files, allowed_tools, verification,
+                retry_count, max_retries, failure_fingerprint, status
+         FROM tr_plan_tasks WHERE plan_id = ? ORDER BY rowid ASC",
+    )?;
+    let rows = stmt.query_map(params![plan_id], |row| {
+        Ok(PlanTask {
+            id: row.get(0)?,
+            title: row.get(1)?,
+            description: row.get(2)?,
+            kind: PlanTaskKind::from_str(&row.get::<_, String>(3)?).unwrap_or(PlanTaskKind::ReadOnlyReview),
+            agent_role: row.get(4)?,
+            domain_profile: DomainProfile::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
+            depends_on: serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or_default(),
+            parallel_group: row.get(7)?,
+            files: serde_json::from_str(&row.get::<_, String>(8)?).unwrap_or_default(),
+            allowed_tools: serde_json::from_str(&row.get::<_, String>(9)?).unwrap_or_default(),
+            verification: serde_json::from_str(&row.get::<_, String>(10)?).unwrap_or_default(),
+            retry_count: row.get(11)?,
+            max_retries: row.get(12)?,
+            failure_fingerprint: row.get(13)?,
+            status: TodoStatus::from_str(&row.get::<_, String>(14)?).unwrap_or_default(),
+        })
+    })?;
+    Ok(rows.filter_map(Result::ok).collect())
+}
+
+/// Read a run AND take a write lock on its row (via `SELECT ... ` within the
+/// open tx). Returns (current_status_str, run). Caller is inside a tx so the
+/// subsequent UPDATE + event append are atomic with this read.
+fn load_run_for_update(
+    tx: &rusqlite::Transaction<'_>,
+    run_id: &str,
+) -> Result<(String, TaskRun), StoreError> {
+    let mut stmt = tx.prepare(
+        "SELECT run_id, workspace_id, conversation_id, root_message_id,
+                domain_profile, status, goal, plan_id, created_at, updated_at
+         FROM tr_runs WHERE run_id = ?",
+    )?;
+    let mut rows = stmt.query(params![run_id])?;
+    let row = rows
+        .next()?
+        .ok_or(StoreError::RunNotFound(run_id.to_string()))?;
+    let run = decode_run(&row)?;
+    Ok((run.status.as_str().to_string(), run))
+}
+
+fn decode_run(row: &Row<'_>) -> rusqlite::Result<TaskRun> {
+    let domain_str: String = row.get(4)?;
+    let status_str: String = row.get(5)?;
+    let created: String = row.get(8)?;
+    let updated: String = row.get(9)?;
+    Ok(TaskRun {
+        run_id: row.get(0)?,
+        workspace_id: row.get(1)?,
+        conversation_id: row.get(2)?,
+        root_message_id: row.get(3)?,
+        domain_profile: DomainProfile::from_str(&domain_str).unwrap_or_default(),
+        status: TaskRunStatus::from_str(&status_str).unwrap_or_default(),
+        goal: row.get(6)?,
+        plan_id: row.get(7)?,
+        created_at: parse_dt(created),
+        updated_at: parse_dt(updated),
+    })
+}
+
+fn parse_dt(s: String) -> DateTime<Utc> {
+    chrono::DateTime::parse_from_rfc3339(&s)
+        .map(|d| d.with_timezone(&Utc))
+        .unwrap_or_else(|_| Utc::now())
+}
+
+fn parse_opt_dt(s: Option<String>) -> Option<DateTime<Utc>> {
+    s.filter(|s| !s.is_empty()).map(parse_dt)
+}
+
+fn default_db_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".echo-agent").join("task_runtime.db")
+}
+
+// The compile-time test that proves the transaction invariant:
+// a state change without an event would leave the DB inconsistent.
+// We assert both rows land together.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fresh() -> TaskRuntimeStore {
+        TaskRuntimeStore::new_in_memory().expect("in-memory store")
+    }
+
+    #[test]
+    fn create_run_emits_run_created_event() {
+        let s = fresh();
+        let run = s
+            .create_run("r1", "ws", "c1", "m1", DomainProfile::AiCoding, "review runtime")
+            .unwrap();
+        assert_eq!(run.status, TaskRunStatus::Pending);
+        let evs = s.list_events("r1", 0).unwrap();
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].event_type, RuntimeEventKind::RunCreated);
+    }
+
+    #[test]
+    fn transition_run_appends_status_event_atomically() {
+        let s = fresh();
+        s.create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g").unwrap();
+        let run = s.transition_run("r1", TaskRunStatus::Planning).unwrap();
+        assert_eq!(run.status, TaskRunStatus::Planning);
+        let evs = s.list_events("r1", 0).unwrap();
+        // RunCreated + RunStatusChanged
+        assert_eq!(evs.len(), 2);
+        assert_eq!(evs[1].event_type, RuntimeEventKind::RunStatusChanged);
+    }
+
+    #[test]
+    fn illegal_transition_is_rejected_and_leaves_no_event() {
+        let s = fresh();
+        s.create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g").unwrap();
+        let before = s.list_events("r1", 0).unwrap().len();
+        let err = s.transition_run("r1", TaskRunStatus::Running).unwrap_err();
+        assert!(matches!(err, StoreError::IllegalTransition { .. }));
+        // No new event was appended — the tx rolled back.
+        assert_eq!(s.list_events("r1", 0).unwrap().len(), before);
+    }
+
+    #[test]
+    fn attach_plan_creates_tasks_and_todos() {
+        let s = fresh();
+        s.create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g").unwrap();
+        s.transition_run("r1", TaskRunStatus::Planning).unwrap();
+        let plan = TaskPlan {
+            plan_id: "p1".into(),
+            run_id: "r1".into(),
+            domain_profile: DomainProfile::General,
+            goal: "g".into(),
+            assumptions: vec!["a".into()],
+            risks: vec![],
+            execution_mode: ExecutionMode::Parallel,
+            tasks: vec![PlanTask {
+                id: "t1".into(),
+                title: "Review runtime".into(),
+                kind: PlanTaskKind::ReadOnlyReview,
+                agent_role: "code_reviewer".into(),
+                ..Default::default()
+            }],
+        };
+        s.attach_plan(&plan).unwrap();
+
+        let loaded = s.get_plan("r1").unwrap().expect("plan");
+        assert_eq!(loaded.tasks.len(), 1);
+        assert_eq!(loaded.tasks[0].id, "t1");
+
+        let todos = s.list_todos("r1").unwrap();
+        assert_eq!(todos.len(), 1);
+        assert_eq!(todos[0].task_id, "t1");
+        assert_eq!(todos[0].status, TodoStatus::Pending);
+
+        let run = s.get_run("r1").unwrap().unwrap();
+        assert_eq!(run.status, TaskRunStatus::AwaitingPlanApproval);
+        assert_eq!(run.plan_id.as_deref(), Some("p1"));
+    }
+
+    #[test]
+    fn set_task_status_updates_task_todo_and_event_together() {
+        let s = fresh();
+        seed_plan(&s);
+        s.set_task_status("r1", "t1", TodoStatus::Running, Some("code_reviewer"), None)
+            .unwrap();
+        let todos = s.list_todos("r1").unwrap();
+        assert_eq!(todos[0].status, TodoStatus::Running);
+        assert_eq!(todos[0].owner_agent.as_deref(), Some("code_reviewer"));
+        assert!(todos[0].started_at.is_some());
+
+        let evs = s.list_events("r1", 0).unwrap();
+        assert!(evs.iter().any(|e| e.event_type == RuntimeEventKind::TaskStarted));
+    }
+
+    #[test]
+    fn put_summary_upserts_and_get_summary_reads() {
+        let s = fresh();
+        seed_plan(&s);
+        let sum = TaskExecutionSummary {
+            run_id: "r1".into(),
+            task_id: "t1".into(),
+            worker_agent: "code_reviewer".into(),
+            completed_work: vec!["read chat.rs".into()],
+            files_read: vec!["chat.rs".into()],
+            files_changed: vec![],
+            decisions: vec!["route via TaskRuntime".into()],
+            failures: vec![],
+            verification: vec!["cargo check".into()],
+            next_implications: vec!["implement router".into()],
+            created_at: Utc::now(),
+        };
+        s.put_summary(&sum).unwrap();
+        let got = s.get_summary("r1", "t1").unwrap().unwrap();
+        assert_eq!(got.completed_work, vec!["read chat.rs".to_string()]);
+        assert_eq!(got.next_implications.len(), 1);
+    }
+
+    #[test]
+    fn latest_run_for_conversation_orders_by_created_desc() {
+        let s = fresh();
+        s.create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g1").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        s.create_run("r2", "ws", "c1", "m2", DomainProfile::General, "g2").unwrap();
+        let latest = s.latest_run_for_conversation("c1").unwrap().unwrap();
+        assert_eq!(latest.run_id, "r2");
+    }
+
+    fn seed_plan(s: &TaskRuntimeStore) {
+        s.create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g").unwrap();
+        s.transition_run("r1", TaskRunStatus::Planning).unwrap();
+        let plan = TaskPlan {
+            plan_id: "p1".into(),
+            run_id: "r1".into(),
+            domain_profile: DomainProfile::General,
+            goal: "g".into(),
+            assumptions: vec![],
+            risks: vec![],
+            execution_mode: ExecutionMode::Parallel,
+            tasks: vec![PlanTask {
+                id: "t1".into(),
+                title: "Review runtime".into(),
+                kind: PlanTaskKind::ReadOnlyReview,
+                agent_role: "code_reviewer".into(),
+                ..Default::default()
+            }],
+        };
+        s.attach_plan(&plan).unwrap();
+        // approve -> ready -> running so todos can transition freely
+        s.transition_run("r1", TaskRunStatus::Ready).unwrap();
+        s.transition_run("r1", TaskRunStatus::Running).unwrap();
+    }
+}

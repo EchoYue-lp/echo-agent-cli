@@ -1,6 +1,7 @@
 import { useRef, useCallback, useEffect } from 'react';
 import { useChatStore } from '../stores/chatStore';
 import { useConversationStore } from '../stores/conversationStore';
+import { useTaskRuntimeStore } from '../stores/taskRuntimeStore';
 import { isTauri, apiInvoke } from '../lib/tauri-bridge';
 import type { Attachment, ChatRunStatus } from '../types/api';
 
@@ -40,6 +41,13 @@ type ChatEvent = ChatEventBase &
     }
   | { type: 'tool_batch_start'; tool_count: number }
   | { type: 'tool_batch_end' }
+  | {
+      type: 'plan_ready';
+      run_id: string;
+      goal: string;
+      domain_profile: string;
+      signals: string[];
+    }
   | { type: 'done' }
   );
 
@@ -178,6 +186,14 @@ export function useTauriChat() {
         currentMessageKeyRef.current = null;
         isCancelledRef.current = false;
         break;
+      case 'plan_ready': {
+        // A complex input was routed to the TaskRuntime and a plan was
+        // generated. Hand it to the TaskRuntime store so the right-rail
+        // panel renders the plan + approval actions.
+        const runId = (event as { run_id: string }).run_id;
+        useTaskRuntimeStore.getState().notifyPlanReady(runId);
+        break;
+      }
     }
   }, []);
 

@@ -135,6 +135,8 @@ pub fn create_agent(
         .system_prompt(&system_prompt)
         .enable_tools()
         .enable_memory()
+        .enable_planning()
+        .enable_subagent()
         .enable_human_in_loop()
         .max_iterations(app_config.agent.max_iterations)
         .token_limit(token_limit)
@@ -149,6 +151,7 @@ pub fn create_agent(
     // ── Pass the resolved configured model to the LLM client ──
     // Without this, the agent falls back to env vars + echo-agent-models.yaml,
     // which may not exist (especially in GUI apps where shell env vars aren't inherited).
+    let mut injected_llm_config: Option<LlmConfig> = None;
     if let Some(auth_token) = runtime_model.auth_token.as_deref() {
         let provider = runtime_model.provider.as_str();
         let base_url_override = runtime_model.base_url.as_deref();
@@ -160,6 +163,7 @@ pub fn create_agent(
             has_base_url = base_url_override.is_some(),
             "Injecting LlmConfig from configured model"
         );
+        injected_llm_config = Some(llm_config.clone());
         builder = builder.llm_config(llm_config);
     }
 
@@ -210,10 +214,104 @@ pub fn create_agent(
         format!("Failed to initialize agent: {e}. Please check your configuration and try again.")
     })?;
 
+    register_default_subagents(
+        &mut agent,
+        model,
+        injected_llm_config,
+        temperature,
+        max_tokens,
+        token_limit,
+        app_config.agent.tool_timeout_ms,
+    );
+
     // Register default hooks
     register_default_hooks(&mut agent);
 
     Ok(agent)
+}
+
+fn register_default_subagents(
+    agent: &mut ReactAgent,
+    model: &str,
+    llm_config: Option<LlmConfig>,
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
+    token_limit: usize,
+    tool_timeout_ms: u64,
+) {
+    let workers = [
+        (
+            "project_explorer",
+            "你是只读项目探索 worker。负责并行阅读目录、配置、文档和相关代码，输出客观发现、关键文件和不确定点。不要修改文件，不要运行 shell，不要做最终结论包装。",
+        ),
+        (
+            "code_reviewer",
+            "你是只读代码审查 worker。负责并行检查指定模块的 bug、架构问题、重复实现、边界条件和测试缺口。输出带文件路径的发现。不要修改文件，不要运行 shell。",
+        ),
+        (
+            "test_planner",
+            "你是只读验证规划 worker。负责分析应运行哪些检查、测试和手工 walkthrough，指出风险和优先级。不要修改文件，不要运行 shell。",
+        ),
+        (
+            "summary_writer",
+            "你是总结 worker。负责把多个 worker 的发现压缩成清晰的结论、计划或交付说明。不要修改文件，不要运行 shell。",
+        ),
+    ];
+
+    for (name, prompt) in workers {
+        match build_readonly_worker_agent(
+            name,
+            prompt,
+            model,
+            llm_config.clone(),
+            temperature,
+            max_tokens,
+            token_limit,
+            tool_timeout_ms,
+        ) {
+            Ok(worker) => agent.register_agent(Box::new(worker)),
+            Err(err) => tracing::warn!(
+                subagent = name,
+                error = %err,
+                "Failed to register default read-only subagent"
+            ),
+        }
+    }
+}
+
+fn build_readonly_worker_agent(
+    name: &str,
+    prompt: &str,
+    model: &str,
+    llm_config: Option<LlmConfig>,
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
+    token_limit: usize,
+    tool_timeout_ms: u64,
+) -> std::result::Result<ReactAgent, echo_agent::error::ReactError> {
+    let mut builder = ReactAgentBuilder::new()
+        .model(model)
+        .name(name)
+        .system_prompt(prompt)
+        .enable_tools()
+        .enable_memory()
+        .enable_cot()
+        .max_iterations(0)
+        .token_limit(token_limit)
+        .max_tokens(max_tokens.or(Some(DEFAULT_MAX_TOKENS)))
+        .temperature(temperature)
+        .tool_execution(echo_agent::tools::ToolExecutionConfig {
+            timeout_ms: tool_timeout_ms,
+            ..Default::default()
+        });
+
+    if let Some(config) = llm_config {
+        builder = builder.llm_config(config);
+    }
+
+    let mut worker = builder.build()?;
+    worker.set_plan_mode(true);
+    Ok(worker)
 }
 
 /// Register sensible default hooks for the CLI agent.

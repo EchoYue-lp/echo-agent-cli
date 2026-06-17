@@ -97,6 +97,35 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
             commands::tasks::get_task,
             commands::tasks::cancel_task,
             commands::tasks::get_task_dag,
+            // TaskRuntime (complex-task runs, plans, todos, events, artifacts, reviews)
+            commands::task_runtime::get_task_run,
+            commands::task_runtime::latest_task_run_for_conversation,
+            commands::task_runtime::list_task_runs,
+            commands::task_runtime::get_task_plan,
+            commands::task_runtime::list_task_todos,
+            commands::task_runtime::list_task_events,
+            commands::task_runtime::list_task_artifacts,
+            commands::task_runtime::list_task_reviews,
+            commands::task_runtime::get_task_summary,
+            // TaskRuntime mutations (PR 2: planning runtime + plan approval)
+            commands::task_runtime::create_task_run,
+            commands::task_runtime::generate_task_plan,
+            commands::task_runtime::approve_task_plan,
+            commands::task_runtime::reject_task_plan,
+            commands::task_runtime::edit_task_plan,
+            // TaskRuntime execution (PR 3: DAG executor)
+            commands::task_runtime::execute_task_run,
+            commands::task_runtime::cancel_task_run,
+            // TaskRuntime progress ledger (PR 4)
+            commands::task_runtime::get_progress_ledger,
+            // TaskRuntime router toggle
+            commands::task_runtime::set_taskruntime_auto_route,
+            commands::task_runtime::get_taskruntime_auto_route,
+            // TaskRuntime approval scope
+            commands::task_runtime::grant_approval_scope,
+            // TaskRuntime interaction mode (Chat/Plan/Auto)
+            commands::task_runtime::set_interaction_mode,
+            commands::task_runtime::get_interaction_mode,
             // Memory
             commands::memory::list_memory,
             commands::memory::add_memory,

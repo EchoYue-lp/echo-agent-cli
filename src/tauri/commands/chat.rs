@@ -13,6 +13,8 @@ use futures::future::BoxFuture;
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
+use std::sync::atomic::Ordering;
+use echo_agent_app_core::tasks::task_runtime::TaskRunStatus;
 use tauri::Emitter;
 use tokio::sync::{Mutex, oneshot};
 use uuid::Uuid;
@@ -72,6 +74,15 @@ pub enum ChatEvent {
         task_id: Option<String>,
         context: Option<serde_json::Value>,
         phase: Option<String>,
+    },
+    /// A complex-task run was created and a structured plan generated.
+    /// The GUI should render the plan + approval actions from the run_id.
+    #[serde(rename = "plan_ready")]
+    PlanReady {
+        run_id: String,
+        goal: String,
+        domain_profile: String,
+        signals: Vec<String>,
     },
     #[serde(rename = "done")]
     Done,
@@ -331,9 +342,60 @@ pub async fn send_chat_message(
     } else {
         state.app_state.connection.primary_agent()
     };
+    let message_key = message_key.unwrap_or_else(|| Uuid::new_v4().to_string());
+
+    // ── Complex-task router ────────────────────────────────────────────
+    // Classify the input. If it looks like a complex, multi-step task AND a
+    // conversation_id is available, create a TaskRuntime run and generate a
+    // structured plan instead of streaming a normal chat. The run stops at
+    // `AwaitingPlanApproval` — the user must approve before execution (PR 3).
+    //
+    // Safety: auto-routing is gated by a runtime flag on TaskState
+    // (`auto_route`, default OFF). Without it the router is inert and every
+    // message takes the normal chat path, preserving today's behavior
+    // exactly. The GUI toggles it via `set_taskruntime_auto_route` and can
+    // also drive runs explicitly via create_task_run / generate_task_plan.
+    let auto_route_enabled = state.app_state.tasks.auto_route.load(Ordering::Relaxed);
+    // InteractionMode: 0=Auto(heuristic), 1=Chat(force normal chat), 2=Plan(force planning)
+    let interaction_mode = state.app_state.tasks.interaction_mode.load(Ordering::Relaxed);
+
+    let should_route = match interaction_mode {
+        1 => false, // Chat mode: never route to TaskRuntime
+        2 => true,  // Plan mode: always route
+        _ => auto_route_enabled, // Auto: defer to classifier + auto_route flag
+    };
+    let force_complex = interaction_mode == 2;
+
+    if should_route && conversation_id.is_some() {
+        let classification = if force_complex {
+            // Plan mode: fabricate a Complex classification
+            echo_agent_app_core::tasks::task_runtime::Classification {
+                complexity: echo_agent_app_core::tasks::task_runtime::ComplexityLabel::Complex,
+                inferred_profile: echo_agent_app_core::tasks::task_runtime::DomainProfile::General,
+                reason: "forced by Plan mode".into(),
+                signals: vec!["plan_mode".into()],
+            }
+        } else {
+            echo_agent_app_core::tasks::task_runtime::HeuristicClassifier::new()
+                .classify(&message)
+        };
+        if classification.complexity
+            == echo_agent_app_core::tasks::task_runtime::ComplexityLabel::Complex
+        {
+            // Try to route to TaskRuntime. On any failure, log and FALL THROUGH
+            // to the normal chat path — the user's message must not vanish.
+            match route_complex_task(state.inner(), app.clone(), message.clone(), conversation_id.clone(), classification).await {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    tracing::warn!(error = %e, "complex-task routing failed; falling back to normal chat");
+                    // Fall through to normal chat below.
+                }
+            }
+        }
+    }
+
     let agent_inner = agent_handle.inner().clone();
     let cancel_token = CancellationToken::new();
-    let message_key = message_key.unwrap_or_else(|| Uuid::new_v4().to_string());
 
     // Register cancel token
     state
@@ -650,4 +712,97 @@ pub async fn send_selection_response(
             request_id
         )))
     }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Complex-task router (PR 2)
+// ══════════════════════════════════════════════════════════════════════════
+
+/// Handle a complex input by creating a TaskRuntime run and generating a
+/// structured plan. Emits a `plan_ready` chat event so the GUI can render the
+/// plan and approval actions. The run stops at `AwaitingPlanApproval` — the
+/// user must approve before execution (PR 3).
+///
+/// Returns a JSON object with `kind: "complex_task"`, `run_id`, and the plan
+/// so an IPC caller that doesn't listen on `chat://event` still gets the data.
+async fn route_complex_task(
+    state: &TauriState,
+    app: tauri::AppHandle,
+    message: String,
+    conversation_id: Option<String>,
+    classification: echo_agent_app_core::tasks::task_runtime::Classification,
+) -> Result<serde_json::Value, anyhow::Error> {
+    let store = state
+        .app_state
+        .tasks
+        .runtime
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("TaskRuntime store not initialized"))?
+        .clone();
+
+    let conv_id = conversation_id
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("complex-task routing requires a conversation_id"))?;
+
+    // 1. Create the run in Pending.
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let run = store.create_run(
+        &run_id,
+        "default", // workspace_id — resolved properly in PR 6 workspace wiring
+        &conv_id,
+        "", // root_message_id — linked in PR 6
+        classification.inferred_profile,
+        &message,
+    )?;
+
+    // 2. Pending -> Planning (legal direct transition).
+    store.transition_run(&run_id, TaskRunStatus::Planning)?;
+
+    // 3. Obtain the LLM client from the primary agent.
+    let llm = state
+        .app_state
+        .connection
+        .primary_agent()
+        .read(|a| a.llm_client().cloned())
+        .await
+        .ok_or_else(|| anyhow::anyhow!("no LLM client available on primary agent"))?;
+
+    // 4. Generate the structured plan.
+    let generated =
+        echo_agent_app_core::tasks::task_runtime::generate_plan(&llm, &run_id, &message, &classification)
+            .await?;
+
+    // 5. Persist + advance to AwaitingPlanApproval (attach_plan is atomic).
+    store.attach_plan(&generated.plan)?;
+
+    // 6. Emit plan_ready so the GUI can render the plan + approval actions.
+    emit_chat_event(
+        &app,
+        &ChatEvent::PlanReady {
+            run_id: run_id.clone(),
+            goal: generated.plan.goal.clone(),
+            domain_profile: classification.inferred_profile.as_str().to_string(),
+            signals: classification.signals.clone(),
+        },
+        // Empty message_key so the frontend's isCurrentRunEvent guard falls
+        // through to the conversation_id match — PlanReady is a run-scoped
+        // event, not tied to a specific streaming message.
+        "",
+        &conversation_id,
+    );
+
+    tracing::info!(
+        run_id = %run_id,
+        plan_id = %generated.plan.plan_id,
+        task_count = generated.plan.tasks.len(),
+        "complex task routed to TaskRuntime; awaiting plan approval"
+    );
+
+    Ok(serde_json::json!({
+        "kind": "complex_task",
+        "run_id": run_id,
+        "status": run.status.as_str(),
+        "plan": generated.plan,
+        "warnings": generated.warnings,
+    }))
 }

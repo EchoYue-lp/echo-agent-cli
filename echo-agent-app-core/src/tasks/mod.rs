@@ -18,9 +18,11 @@ pub mod long_running;
 pub mod pipelines;
 pub mod progress_bridge;
 pub mod service;
+pub mod task_runtime;
 
 // Re-export key types for convenience
 pub use background::{BackgroundTaskKind, BackgroundTaskMeta, ResearchOutputFormat};
+pub use task_runtime::TaskRuntimeStore;
 pub use pipelines::{
     DataPipelineConfig, ResearchConfig, ResearchToWritingConfig, WritingPipelineConfig,
 };

@@ -1,0 +1,790 @@
+//! TaskRuntime data model — the canonical types for complex-task execution.
+//!
+//! These types live in the application layer because the framework
+//! (`echo-agent`) intentionally holds no `AgentPool` / conversation-registry
+//! / complex-task runtime: those are product-layer concerns. The framework
+//! provides `Task` / `TaskExecutor` / `CheckpointStore` primitives, and this
+//! module composes a higher-level *run → plan → plan-task → todo → event*
+//! lifecycle on top of them.
+//!
+//! Naming note: the framework already re-exports a `TaskEvent`
+//! (`crate::tasks::TaskEvent`). This module's event type is therefore named
+//! [`RuntimeTaskEvent`] and is stored on its own table; we never shadow the
+//! framework type.
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use ts_rs::TS;
+
+// ── Domain profile ──────────────────────────────────────────────────────
+
+/// Cross-domain profile that customizes plan templates, worker roles,
+/// allowed tools, review checklists, and verification standards.
+///
+/// Selection order (resolved by the planning runtime, PR 2):
+/// 1. User-selected profile in GUI
+/// 2. Workspace default profile
+/// 3. Intent router inference
+/// 4. `General` fallback
+///
+/// `General` is always first-class because many tasks declare no domain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename = "DomainProfile")]
+pub enum DomainProfile {
+    General,
+    AiCoding,
+    DataAnalysis,
+    AcademicResearch,
+    MedicalResearch,
+}
+
+impl DomainProfile {
+    /// Stable lowercase identifier used as the SQLite discriminator column.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DomainProfile::General => "general",
+            DomainProfile::AiCoding => "ai_coding",
+            DomainProfile::DataAnalysis => "data_analysis",
+            DomainProfile::AcademicResearch => "academic_research",
+            DomainProfile::MedicalResearch => "medical_research",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "general" => DomainProfile::General,
+            "ai_coding" => DomainProfile::AiCoding,
+            "data_analysis" => DomainProfile::DataAnalysis,
+            "academic_research" => DomainProfile::AcademicResearch,
+            "medical_research" => DomainProfile::MedicalResearch,
+            _ => return None,
+        })
+    }
+}
+
+impl Default for DomainProfile {
+    fn default() -> Self {
+        DomainProfile::General
+    }
+}
+
+// ── Execution mode ──────────────────────────────────────────────────────
+
+/// How the user wants a plan to execute after approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename = "ExecutionMode")]
+pub enum ExecutionMode {
+    /// Execute sequentially, one plan task at a time.
+    Sequential,
+    /// Execute parallel groups concurrently within the configured limits.
+    Parallel,
+    /// Plan only — never execute until the user explicitly launches it.
+    PlanOnly,
+}
+
+/// Manual override of how a user message should be handled (plan §582-586).
+/// `Auto` defers to the heuristic classifier; the other two force a path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename = "InteractionMode")]
+pub enum InteractionMode {
+    /// Force normal chat — never enter TaskRuntime even for complex input.
+    Chat,
+    /// Force planning mode — always generate a plan, never auto-execute.
+    Plan,
+    /// Auto-route: classifier decides (default).
+    Auto,
+}
+
+impl Default for InteractionMode {
+    fn default() -> Self {
+        InteractionMode::Auto
+    }
+}
+
+impl Default for ExecutionMode {
+    fn default() -> Self {
+        ExecutionMode::Parallel
+    }
+}
+
+// ── Plan-task kind ──────────────────────────────────────────────────────
+
+/// Operation class for a single plan task. The scheduler (PR 3) uses this
+/// to decide parallelism and locking: read-only kinds parallelize freely,
+/// mutating kinds serialize behind file/workspace locks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename = "PlanTaskKind")]
+pub enum PlanTaskKind {
+    /// Read-only repository / data exploration or review.
+    ReadOnlyReview,
+    /// Read-only search, grep, file reads, hypothesis investigation.
+    Investigation,
+    /// Read-only verification plan (test layout, repro plan).
+    TestPlan,
+    /// Scoped code or data change (default serialized).
+    Implementation,
+    /// Focused root-cause investigation that may read widely.
+    Debugging,
+    /// Spec / quality review of another task's output.
+    Review,
+    /// Final synthesis / report.
+    Summary,
+    /// Shell / build / test execution (limited concurrency, may mutate).
+    Verification,
+}
+
+impl PlanTaskKind {
+    /// `true` when the task does not mutate workspace state and is therefore
+    /// safe to run in parallel with other read-only tasks.
+    pub fn is_read_only(&self) -> bool {
+        matches!(
+            self,
+            PlanTaskKind::ReadOnlyReview
+                | PlanTaskKind::Investigation
+                | PlanTaskKind::TestPlan
+                | PlanTaskKind::Review
+                | PlanTaskKind::Summary
+        )
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PlanTaskKind::ReadOnlyReview => "read_only_review",
+            PlanTaskKind::Investigation => "investigation",
+            PlanTaskKind::TestPlan => "test_plan",
+            PlanTaskKind::Implementation => "implementation",
+            PlanTaskKind::Debugging => "debugging",
+            PlanTaskKind::Review => "review",
+            PlanTaskKind::Summary => "summary",
+            PlanTaskKind::Verification => "verification",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "read_only_review" => PlanTaskKind::ReadOnlyReview,
+            "investigation" => PlanTaskKind::Investigation,
+            "test_plan" => PlanTaskKind::TestPlan,
+            "implementation" => PlanTaskKind::Implementation,
+            "debugging" => PlanTaskKind::Debugging,
+            "review" => PlanTaskKind::Review,
+            "summary" => PlanTaskKind::Summary,
+            "verification" => PlanTaskKind::Verification,
+            _ => return None,
+        })
+    }
+}
+
+// ── Todo status ─────────────────────────────────────────────────────────
+
+/// Status of an individual todo / plan task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename = "TodoStatus")]
+pub enum TodoStatus {
+    Pending,
+    Running,
+    Blocked,
+    Completed,
+    Failed,
+    Skipped,
+}
+
+impl TodoStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TodoStatus::Pending => "pending",
+            TodoStatus::Running => "running",
+            TodoStatus::Blocked => "blocked",
+            TodoStatus::Completed => "completed",
+            TodoStatus::Failed => "failed",
+            TodoStatus::Skipped => "skipped",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "pending" => TodoStatus::Pending,
+            "running" => TodoStatus::Running,
+            "blocked" => TodoStatus::Blocked,
+            "completed" => TodoStatus::Completed,
+            "failed" => TodoStatus::Failed,
+            "skipped" => TodoStatus::Skipped,
+            _ => return None,
+        })
+    }
+}
+
+impl Default for TodoStatus {
+    fn default() -> Self {
+        TodoStatus::Pending
+    }
+}
+
+// ── Run status (state machine) ──────────────────────────────────────────
+
+/// Lifecycle status of a [`TaskRun`]. The GUI must render from these states
+/// and `RuntimeTaskEvent`s, never from local guesses.
+///
+/// Allowed transitions (see [`TaskRunStatus::can_transition_to`]):
+/// ```text
+/// Pending -> Planning
+/// Planning -> AwaitingPlanApproval
+/// AwaitingPlanApproval -> Ready | Cancelled
+/// Ready -> Running
+/// Running -> WaitingApproval | WaitingInput | Suspended | Cancelling | Failed | Completed
+/// WaitingApproval -> Running | Suspended | Cancelled
+/// WaitingInput -> Running | Suspended | Cancelled
+/// Suspended -> Ready | Cancelled
+/// Cancelling -> Cancelled
+/// Failed -> Ready | Cancelled
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename = "TaskRunStatus")]
+pub enum TaskRunStatus {
+    Pending,
+    Planning,
+    AwaitingPlanApproval,
+    Ready,
+    Running,
+    WaitingApproval,
+    WaitingInput,
+    Suspended,
+    Cancelling,
+    Cancelled,
+    Failed,
+    Completed,
+}
+
+impl TaskRunStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TaskRunStatus::Pending => "pending",
+            TaskRunStatus::Planning => "planning",
+            TaskRunStatus::AwaitingPlanApproval => "awaiting_plan_approval",
+            TaskRunStatus::Ready => "ready",
+            TaskRunStatus::Running => "running",
+            TaskRunStatus::WaitingApproval => "waiting_approval",
+            TaskRunStatus::WaitingInput => "waiting_input",
+            TaskRunStatus::Suspended => "suspended",
+            TaskRunStatus::Cancelling => "cancelling",
+            TaskRunStatus::Cancelled => "cancelled",
+            TaskRunStatus::Failed => "failed",
+            TaskRunStatus::Completed => "completed",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "pending" => TaskRunStatus::Pending,
+            "planning" => TaskRunStatus::Planning,
+            "awaiting_plan_approval" => TaskRunStatus::AwaitingPlanApproval,
+            "ready" => TaskRunStatus::Ready,
+            "running" => TaskRunStatus::Running,
+            "waiting_approval" => TaskRunStatus::WaitingApproval,
+            "waiting_input" => TaskRunStatus::WaitingInput,
+            "suspended" => TaskRunStatus::Suspended,
+            "cancelling" => TaskRunStatus::Cancelling,
+            "cancelled" => TaskRunStatus::Cancelled,
+            "failed" => TaskRunStatus::Failed,
+            "completed" => TaskRunStatus::Completed,
+            _ => return None,
+        })
+    }
+
+    /// Whether transitioning from `self` to `next` is allowed by the
+    /// state machine defined above.
+    pub fn can_transition_to(&self, next: TaskRunStatus) -> bool {
+        use TaskRunStatus::*;
+        match self {
+            Pending => matches!(next, Planning | Cancelled),
+            Planning => matches!(next, AwaitingPlanApproval | Failed | Cancelled),
+            AwaitingPlanApproval => matches!(next, Ready | Cancelled),
+            Ready => matches!(next, Running | Cancelled),
+            Running => matches!(
+                next,
+                WaitingApproval | WaitingInput | Suspended | Cancelling | Failed | Completed
+            ),
+            WaitingApproval => matches!(next, Running | Suspended | Cancelled),
+            WaitingInput => matches!(next, Running | Suspended | Cancelled),
+            Suspended => matches!(next, Ready | Cancelled),
+            Cancelling => matches!(next, Cancelled),
+            Failed => matches!(next, Ready | Cancelled),
+            // Terminal states.
+            Cancelled | Completed => false,
+        }
+    }
+}
+
+impl Default for TaskRunStatus {
+    fn default() -> Self {
+        TaskRunStatus::Pending
+    }
+}
+
+// ── Review outcome / artifact kind / event type ─────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename = "ReviewOutcome")]
+pub enum ReviewOutcome {
+    Pass,
+    NeedsFix,
+    Blocked,
+}
+
+impl ReviewOutcome {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReviewOutcome::Pass => "pass",
+            ReviewOutcome::NeedsFix => "needs_fix",
+            ReviewOutcome::Blocked => "blocked",
+        }
+    }
+    pub fn from_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "pass" => ReviewOutcome::Pass,
+            "needs_fix" => ReviewOutcome::NeedsFix,
+            "blocked" => ReviewOutcome::Blocked,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename = "ArtifactKind")]
+pub enum ArtifactKind {
+    File,
+    Report,
+    Chart,
+    Notebook,
+    EvidenceTable,
+    Trace,
+    Other,
+}
+
+impl ArtifactKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ArtifactKind::File => "file",
+            ArtifactKind::Report => "report",
+            ArtifactKind::Chart => "chart",
+            ArtifactKind::Notebook => "notebook",
+            ArtifactKind::EvidenceTable => "evidence_table",
+            ArtifactKind::Trace => "trace",
+            ArtifactKind::Other => "other",
+        }
+    }
+    pub fn from_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "file" => ArtifactKind::File,
+            "report" => ArtifactKind::Report,
+            "chart" => ArtifactKind::Chart,
+            "notebook" => ArtifactKind::Notebook,
+            "evidence_table" => ArtifactKind::EvidenceTable,
+            "trace" => ArtifactKind::Trace,
+            "other" => ArtifactKind::Other,
+            _ => return None,
+        })
+    }
+}
+
+/// Structured event emitted at every run / task / step boundary.
+///
+/// Every state transition must write one of these inside the same
+/// persistence transaction as the state update (see `store.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename = "RuntimeEventKind")]
+pub enum RuntimeEventKind {
+    RunCreated,
+    RunStatusChanged,
+    PlanGenerated,
+    PlanApproved,
+    PlanRejected,
+    PlanEdited,
+    TaskStarted,
+    TaskCompleted,
+    TaskFailed,
+    TaskSkipped,
+    TaskBlocked,
+    TodoUpdated,
+    WorkerAssigned,
+    WorkerReleased,
+    ArtifactProduced,
+    ReviewPassed,
+    ReviewNeedsFix,
+    ReviewBlocked,
+    ApprovalRequested,
+    ApprovalResolved,
+    ApprovalRejected,
+    CircuitBreakerTripped,
+    RunCancelled,
+    Note,
+}
+
+impl RuntimeEventKind {
+    pub fn as_str(&self) -> &'static str {
+        use RuntimeEventKind::*;
+        match self {
+            RunCreated => "run_created",
+            RunStatusChanged => "run_status_changed",
+            PlanGenerated => "plan_generated",
+            PlanApproved => "plan_approved",
+            PlanRejected => "plan_rejected",
+            PlanEdited => "plan_edited",
+            TaskStarted => "task_started",
+            TaskCompleted => "task_completed",
+            TaskFailed => "task_failed",
+            TaskSkipped => "task_skipped",
+            TaskBlocked => "task_blocked",
+            TodoUpdated => "todo_updated",
+            WorkerAssigned => "worker_assigned",
+            WorkerReleased => "worker_released",
+            ArtifactProduced => "artifact_produced",
+            ReviewPassed => "review_passed",
+            ReviewNeedsFix => "review_needs_fix",
+            ReviewBlocked => "review_blocked",
+            ApprovalRequested => "approval_requested",
+            ApprovalResolved => "approval_resolved",
+            ApprovalRejected => "approval_rejected",
+            CircuitBreakerTripped => "circuit_breaker_tripped",
+            RunCancelled => "run_cancelled",
+            Note => "note",
+        }
+    }
+    pub fn from_str(s: &str) -> Option<Self> {
+        use RuntimeEventKind::*;
+        Some(match s {
+            "run_created" => RunCreated,
+            "run_status_changed" => RunStatusChanged,
+            "plan_generated" => PlanGenerated,
+            "plan_approved" => PlanApproved,
+            "plan_rejected" => PlanRejected,
+            "plan_edited" => PlanEdited,
+            "task_started" => TaskStarted,
+            "task_completed" => TaskCompleted,
+            "task_failed" => TaskFailed,
+            "task_skipped" => TaskSkipped,
+            "task_blocked" => TaskBlocked,
+            "todo_updated" => TodoUpdated,
+            "worker_assigned" => WorkerAssigned,
+            "worker_released" => WorkerReleased,
+            "artifact_produced" => ArtifactProduced,
+            "review_passed" => ReviewPassed,
+            "review_needs_fix" => ReviewNeedsFix,
+            "review_blocked" => ReviewBlocked,
+            "approval_requested" => ApprovalRequested,
+            "approval_resolved" => ApprovalResolved,
+            "approval_rejected" => ApprovalRejected,
+            "circuit_breaker_tripped" => CircuitBreakerTripped,
+            "run_cancelled" => RunCancelled,
+            "note" => Note,
+            _ => return None,
+        })
+    }
+}
+
+// ── Core persisted structs ──────────────────────────────────────────────
+
+/// A single complex-task run. One run = one user goal that goes through the
+/// plan → approve → execute → review → synthesize lifecycle.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, rename = "TaskRun")]
+pub struct TaskRun {
+    pub run_id: String,
+    pub workspace_id: String,
+    pub conversation_id: String,
+    pub root_message_id: String,
+    pub domain_profile: DomainProfile,
+    pub status: TaskRunStatus,
+    pub goal: String,
+    pub plan_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// A structured plan attached to a run. Generated by the planning runtime
+/// (PR 2); never free-form markdown from the model.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, rename = "TaskPlan")]
+pub struct TaskPlan {
+    pub plan_id: String,
+    pub run_id: String,
+    pub domain_profile: DomainProfile,
+    pub goal: String,
+    pub assumptions: Vec<String>,
+    pub risks: Vec<String>,
+    pub execution_mode: ExecutionMode,
+    pub tasks: Vec<PlanTask>,
+}
+
+/// One node in the plan DAG. `depends_on` is the canonical edge list; the
+/// scheduler (PR 3) builds adjacency indexes from it but `PlanTask` remains
+/// the serialized node.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, rename = "PlanTask")]
+pub struct PlanTask {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub kind: PlanTaskKind,
+    pub agent_role: String,
+    pub domain_profile: DomainProfile,
+    pub depends_on: Vec<String>,
+    pub parallel_group: Option<String>,
+    pub files: Vec<String>,
+    pub allowed_tools: Vec<String>,
+    pub verification: Vec<String>,
+    pub retry_count: u32,
+    pub max_retries: u32,
+    pub failure_fingerprint: Option<String>,
+    pub status: TodoStatus,
+}
+
+impl Default for PlanTask {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            title: String::new(),
+            description: String::new(),
+            kind: PlanTaskKind::ReadOnlyReview,
+            agent_role: "general".to_string(),
+            domain_profile: DomainProfile::General,
+            depends_on: Vec::new(),
+            parallel_group: None,
+            files: Vec::new(),
+            allowed_tools: Vec::new(),
+            verification: Vec::new(),
+            retry_count: 0,
+            max_retries: 3,
+            failure_fingerprint: None,
+            status: TodoStatus::Pending,
+        }
+    }
+}
+
+/// A todo row — the GUI-facing projection of a plan task's progress.
+/// One `PlanTask` maps to exactly one `TodoItem`.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, rename = "TodoItem")]
+pub struct TodoItem {
+    pub id: String,
+    pub run_id: String,
+    pub task_id: String,
+    pub title: String,
+    pub status: TodoStatus,
+    pub owner_agent: Option<String>,
+    pub started_at: Option<DateTime<Utc>>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub summary: Option<String>,
+}
+
+/// A structured runtime event. Appended on every state transition.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, rename = "RuntimeTaskEvent")]
+pub struct RuntimeTaskEvent {
+    /// Monotonic event sequence. Serialized as a JSON string (not a number)
+    /// so it survives Tauri/HTTP transport without JS bigint precision loss
+    /// and parses cleanly on the frontend; deserialize accepts a string too.
+    #[serde(serialize_with = "serialize_seq_as_string", deserialize_with = "deserialize_seq_from_string")]
+    #[ts(type = "string")]
+    pub seq: i64,
+    pub run_id: String,
+    pub task_id: Option<String>,
+    pub step_id: Option<String>,
+    pub event_type: RuntimeEventKind,
+    pub payload: serde_json::Value,
+    pub timestamp: DateTime<Utc>,
+}
+
+fn serialize_seq_as_string<S: serde::Serializer>(seq: &i64, s: S) -> Result<S::Ok, S::Error> {
+    s.serialize_str(&seq.to_string())
+}
+
+fn deserialize_seq_from_string<'de, D: serde::Deserializer<'de>>(d: D) -> Result<i64, D::Error> {
+    use serde::Deserialize;
+    // Accept either a string ("123") or a number (123) for robustness.
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Num {
+        Str(String),
+        Num(i64),
+    }
+    match Num::deserialize(d)? {
+        Num::Str(s) => s.parse().map_err(serde::de::Error::custom),
+        Num::Num(n) => Ok(n),
+    }
+}
+
+/// A concrete output produced by a task (file, report, chart, trace, …).
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, rename = "RuntimeArtifact")]
+pub struct Artifact {
+    pub id: String,
+    pub run_id: String,
+    pub task_id: Option<String>,
+    pub kind: ArtifactKind,
+    pub title: String,
+    pub path: Option<String>,
+    pub metadata: serde_json::Value,
+}
+
+/// Result of a review gate over a task. When `outcome == NeedsFix`, the
+/// runtime (PR 4) creates a new fix task and links it via
+/// `created_fix_task_id`.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, rename = "ReviewResult")]
+pub struct ReviewResult {
+    pub id: String,
+    pub run_id: String,
+    pub task_id: String,
+    pub reviewer_agent: String,
+    pub outcome: ReviewOutcome,
+    pub issues: Vec<ReviewIssue>,
+    pub failure_fingerprint: Option<String>,
+    pub created_fix_task_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, rename = "ReviewIssue")]
+pub struct ReviewIssue {
+    pub severity: IssueSeverity,
+    pub category: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename = "IssueSeverity")]
+pub enum IssueSeverity {
+    Info,
+    Warning,
+    Error,
+    Blocker,
+}
+
+impl IssueSeverity {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            IssueSeverity::Info => "info",
+            IssueSeverity::Warning => "warning",
+            IssueSeverity::Error => "error",
+            IssueSeverity::Blocker => "blocker",
+        }
+    }
+    pub fn from_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "info" => IssueSeverity::Info,
+            "warning" => IssueSeverity::Warning,
+            "error" => IssueSeverity::Error,
+            "blocker" => IssueSeverity::Blocker,
+            _ => return None,
+        })
+    }
+}
+
+/// Compact per-task summary produced at every task boundary. Downstream
+/// workers consume this instead of the full raw conversation — see the
+/// "Summary Chain" section of the plan.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, rename = "TaskExecutionSummary")]
+pub struct TaskExecutionSummary {
+    pub run_id: String,
+    pub task_id: String,
+    pub worker_agent: String,
+    pub completed_work: Vec<String>,
+    pub files_read: Vec<String>,
+    pub files_changed: Vec<String>,
+    pub decisions: Vec<String>,
+    pub failures: Vec<String>,
+    pub verification: Vec<String>,
+    pub next_implications: Vec<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_machine_allows_documented_transitions() {
+        use TaskRunStatus::*;
+        // Every transition explicitly named in the plan doc.
+        assert!(Pending.can_transition_to(Planning));
+        assert!(Planning.can_transition_to(AwaitingPlanApproval));
+        assert!(AwaitingPlanApproval.can_transition_to(Ready));
+        assert!(AwaitingPlanApproval.can_transition_to(Cancelled));
+        assert!(Ready.can_transition_to(Running));
+        assert!(Running.can_transition_to(WaitingApproval));
+        assert!(Running.can_transition_to(Completed));
+        assert!(WaitingApproval.can_transition_to(Running));
+        assert!(Suspended.can_transition_to(Ready));
+        assert!(Cancelling.can_transition_to(Cancelled));
+        assert!(Failed.can_transition_to(Ready));
+    }
+
+    #[test]
+    fn status_machine_rejects_invalid_transitions() {
+        use TaskRunStatus::*;
+        assert!(!Pending.can_transition_to(Running));
+        assert!(!Running.can_transition_to(Pending));
+        assert!(!Completed.can_transition_to(Running));
+        assert!(!Cancelled.can_transition_to(Running));
+        assert!(!Ready.can_transition_to(Completed));
+    }
+
+    #[test]
+    fn status_roundtrips_through_string() {
+        // Enumerate every variant — guards against future additions
+        // forgetting to wire up `from_str`.
+        let all = [
+            TaskRunStatus::Pending,
+            TaskRunStatus::Planning,
+            TaskRunStatus::AwaitingPlanApproval,
+            TaskRunStatus::Ready,
+            TaskRunStatus::Running,
+            TaskRunStatus::WaitingApproval,
+            TaskRunStatus::WaitingInput,
+            TaskRunStatus::Suspended,
+            TaskRunStatus::Cancelling,
+            TaskRunStatus::Cancelled,
+            TaskRunStatus::Failed,
+            TaskRunStatus::Completed,
+        ];
+        for s in all {
+            assert_eq!(TaskRunStatus::from_str(s.as_str()), Some(s), "{s:?}");
+        }
+        assert_eq!(TaskRunStatus::from_str("unknown"), None);
+    }
+
+    #[test]
+    fn read_only_kinds_parallelize() {
+        assert!(PlanTaskKind::ReadOnlyReview.is_read_only());
+        assert!(PlanTaskKind::Investigation.is_read_only());
+        assert!(PlanTaskKind::Review.is_read_only());
+        assert!(!PlanTaskKind::Implementation.is_read_only());
+        assert!(!PlanTaskKind::Verification.is_read_only());
+    }
+
+    #[test]
+    fn profile_discriminator_is_stable() {
+        for p in [
+            DomainProfile::General,
+            DomainProfile::AiCoding,
+            DomainProfile::DataAnalysis,
+            DomainProfile::AcademicResearch,
+            DomainProfile::MedicalResearch,
+        ] {
+            assert_eq!(DomainProfile::from_str(p.as_str()), Some(p));
+        }
+        assert_eq!(DomainProfile::from_str("unknown"), None);
+    }
+}

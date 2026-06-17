@@ -17,6 +17,7 @@ pub mod plugins;
 pub mod providers;
 pub mod scheduler;
 pub mod session;
+pub mod task_runtime;
 pub mod tasks;
 pub mod tools;
 pub mod workspace;

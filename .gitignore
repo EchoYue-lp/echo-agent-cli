@@ -10,3 +10,6 @@ web-frontend/dist/
 gen/
 echo-agent.yaml
 .echocowork/
+
+# Worktree directories
+.worktrees/

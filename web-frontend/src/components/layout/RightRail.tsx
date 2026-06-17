@@ -16,6 +16,7 @@ import { useConversationStore } from '../../stores/conversationStore';
 import { useChangesStore } from '../../stores/changesStore';
 import { deriveChangedFiles } from '../../utils/deriveChangedFiles';
 import { ChangesDrawer } from '../changes/ChangesDrawer';
+import { TaskRuntimePanel } from '../task/TaskRuntimePanel';
 
 const TERMINAL_TASK_STATUSES = new Set(['completed', 'failed', 'cancelled', 'timed_out']);
 
@@ -165,6 +166,11 @@ export function RightRail() {
             )}
           </div>
         </section>
+
+        {/* TaskRuntime: structured plan / todo / workers / artifacts for the
+            active conversation's complex-task run. Renders nothing when no run
+            is in flight (panel returns null). */}
+        <TaskRuntimePanel />
 
         <section>
           <div className="mb-3 flex items-center justify-between">
