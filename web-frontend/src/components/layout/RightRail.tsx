@@ -4,7 +4,6 @@ import {
   CheckCircle2,
   Circle,
   Clock3,
-  FileText,
   ShieldAlert,
   XCircle,
 } from 'lucide-react';
@@ -13,6 +12,10 @@ import {
   type BackgroundTask,
 } from '../../api/endpoints';
 import { useChatStore } from '../../stores/chatStore';
+import { useConversationStore } from '../../stores/conversationStore';
+import { useChangesStore } from '../../stores/changesStore';
+import { deriveChangedFiles } from '../../utils/deriveChangedFiles';
+import { ChangesDrawer } from '../changes/ChangesDrawer';
 
 const TERMINAL_TASK_STATUSES = new Set(['completed', 'failed', 'cancelled', 'timed_out']);
 
@@ -85,22 +88,21 @@ export function RightRail() {
   const isRuntimeBusy = isStreaming || activeTasks.length > 0;
   const displayedTasks = tasks.slice(0, 6);
 
-  const latestFiles = useMemo(() => {
-    const names: string[] = [];
-    for (const msg of messages.slice().reverse()) {
-      for (const tool of msg.toolCalls || []) {
-        const result = typeof tool.result === 'string' ? tool.result : '';
-        const matches = result.match(/[A-Za-z0-9_\-./]+?\.(rs|ts|tsx|md|json|toml|yaml|yml|css)/g);
-        if (matches) {
-          for (const name of matches) {
-            if (!names.includes(name)) names.push(name);
-            if (names.length >= 4) return names;
-          }
-        }
-      }
-    }
-    return names;
+  const activeId = useConversationStore((s) => s.activeId);
+  const changesFiles = useChangesStore((s) => s.files);
+  const setSelected = useChangesStore((s) => s.setSelected);
+
+  // 会话切换检测:activeId 变化时清空改动列表
+  useEffect(() => {
+    useChangesStore.getState().checkSessionChange(activeId);
+  }, [activeId]);
+
+  // 从 messages 派生改动文件
+  useEffect(() => {
+    useChangesStore.getState().setFiles(deriveChangedFiles(messages));
   }, [messages]);
+
+  const displayedChanges = changesFiles.slice(0, 12);
 
   return (
     <aside className="hidden h-full w-[300px] shrink-0 border-l border-[var(--border-primary)] bg-[var(--bg-rail)] px-4 py-5 xl:block">
@@ -167,23 +169,58 @@ export function RightRail() {
         <section>
           <div className="mb-3 flex items-center justify-between">
             <h2 className="text-sm font-semibold text-[var(--text-primary)]">输出</h2>
-            <FileText size={14} className="text-[var(--text-tertiary)]" />
+            <span className="text-xs text-[var(--text-tertiary)]">
+              {changesFiles.length ? `${changesFiles.length} 改动` : ''}
+            </span>
           </div>
-          <div className="space-y-2">
-            {latestFiles.length === 0 ? (
+          <div className="space-y-1">
+            {displayedChanges.length === 0 ? (
               <div className="rounded-lg border border-dashed border-[var(--border-primary)] px-3 py-3 text-xs text-[var(--text-tertiary)]">
-                暂无产物
+                本会话暂无文件改动
               </div>
             ) : (
-              latestFiles.map((file) => (
-                <div
-                  key={file}
-                  className="flex items-center gap-2 rounded-md px-2 py-1.5 text-xs text-[var(--text-secondary)]"
-                >
-                  <FileText size={13} className="shrink-0 text-[var(--text-tertiary)]" />
-                  <span className="truncate">{file}</span>
-                </div>
-              ))
+              displayedChanges.map((file) => {
+                const statusMeta =
+                  file.status === 'added'
+                    ? { label: 'A', color: 'var(--color-success, #22c55e)' }
+                    : file.status === 'deleted'
+                      ? { label: 'D', color: 'var(--color-error, #ef4444)' }
+                      : { label: 'M', color: 'var(--color-warning, #f59e0b)' };
+                return (
+                  <button
+                    key={file.path}
+                    onClick={() => setSelected(file.path)}
+                    className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-[var(--bg-hover)]"
+                    title={file.path}
+                  >
+                    <span
+                      className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded text-[9px] font-bold"
+                      style={{
+                        background: `color-mix(in srgb, ${statusMeta.color} 18%, transparent)`,
+                        color: statusMeta.color,
+                      }}
+                    >
+                      {statusMeta.label}
+                    </span>
+                    <span className="min-w-0 flex-1 truncate text-xs text-[var(--text-secondary)]">
+                      <span className="text-[var(--text-primary)]">{file.basename}</span>
+                      {file.dir && (
+                        <span className="text-[var(--text-tertiary)]"> · {file.dir}</span>
+                      )}
+                    </span>
+                    {file.toolCount > 1 && (
+                      <span className="shrink-0 text-[10px] text-[var(--text-tertiary)]">
+                        ×{file.toolCount}
+                      </span>
+                    )}
+                  </button>
+                );
+              })
+            )}
+            {changesFiles.length > displayedChanges.length && (
+              <div className="px-2 text-[11px] text-[var(--text-tertiary)]">
+                另有 {changesFiles.length - displayedChanges.length} 个改动
+              </div>
             )}
           </div>
         </section>
@@ -228,6 +265,7 @@ export function RightRail() {
           </div>
         </section>
       </div>
+      <ChangesDrawer />
     </aside>
   );
 }

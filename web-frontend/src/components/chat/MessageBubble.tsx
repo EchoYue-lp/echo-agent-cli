@@ -106,7 +106,7 @@ export const MessageBubble = memo(function MessageBubble({
       </div>
 
       {/* Content */}
-      <div className={`min-w-0 space-y-2 ${isUser ? 'max-w-[72%] items-end' : 'max-w-[92%]'}`}>
+      <div className={`min-w-0 space-y-2 ${isUser ? 'max-w-[72%] items-end' : 'w-full max-w-[92%]'}`}>
         {/* Execution process — grouped thinking + tool calls in chronological order */}
         {!isUser && (
           <ExecutionProcessBlock
@@ -355,7 +355,7 @@ function ExecutionProcessBlock({
 
   return (
     <div
-      className="my-1 overflow-hidden rounded-lg border border-[var(--border-primary)] bg-[var(--bg-secondary)]"
+      className="my-1 min-w-0 overflow-hidden rounded-lg border border-[var(--border-primary)] bg-[var(--bg-secondary)]"
       style={{
         borderLeft: `2px solid ${isStreaming ? 'var(--color-purple)' : 'var(--border-primary)'}`,
       }}
