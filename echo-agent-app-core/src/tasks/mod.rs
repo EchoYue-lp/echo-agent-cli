@@ -21,8 +21,8 @@ pub mod task_runtime;
 
 // Re-export key types for convenience
 pub use background::{BackgroundTaskKind, BackgroundTaskMeta, ResearchOutputFormat};
-pub use task_runtime::TaskRuntimeStore;
 pub use pipelines::{
     DataPipelineConfig, ResearchConfig, ResearchToWritingConfig, WritingPipelineConfig,
 };
 pub use service::BackgroundTaskService;
+pub use task_runtime::TaskRuntimeStore;

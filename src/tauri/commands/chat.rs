@@ -8,13 +8,13 @@ use crate::tauri::state::TauriState;
 use echo_agent::agent::{Agent, CancellationToken};
 use echo_agent::human_loop::{HumanLoopProvider, HumanLoopRequest, HumanLoopResponse};
 use echo_agent::prelude::AgentEvent;
+use echo_agent_app_core::tasks::task_runtime::TaskRunStatus;
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock};
 use std::sync::atomic::Ordering;
-use echo_agent_app_core::tasks::task_runtime::TaskRunStatus;
+use std::sync::{Arc, LazyLock};
 use tauri::Emitter;
 use tokio::sync::{Mutex, oneshot};
 use uuid::Uuid;
@@ -357,11 +357,15 @@ pub async fn send_chat_message(
     // also drive runs explicitly via create_task_run / generate_task_plan.
     let auto_route_enabled = state.app_state.tasks.auto_route.load(Ordering::Relaxed);
     // InteractionMode: 0=Auto(heuristic), 1=Chat(force normal chat), 2=Plan(force planning)
-    let interaction_mode = state.app_state.tasks.interaction_mode.load(Ordering::Relaxed);
+    let interaction_mode = state
+        .app_state
+        .tasks
+        .interaction_mode
+        .load(Ordering::Relaxed);
 
     let should_route = match interaction_mode {
-        1 => false, // Chat mode: never route to TaskRuntime
-        2 => true,  // Plan mode: always route
+        1 => false,              // Chat mode: never route to TaskRuntime
+        2 => true,               // Plan mode: always route
         _ => auto_route_enabled, // Auto: defer to classifier + auto_route flag
     };
     let force_complex = interaction_mode == 2;
@@ -376,15 +380,22 @@ pub async fn send_chat_message(
                 signals: vec!["plan_mode".into()],
             }
         } else {
-            echo_agent_app_core::tasks::task_runtime::HeuristicClassifier::new()
-                .classify(&message)
+            echo_agent_app_core::tasks::task_runtime::HeuristicClassifier::new().classify(&message)
         };
         if classification.complexity
             == echo_agent_app_core::tasks::task_runtime::ComplexityLabel::Complex
         {
             // Try to route to TaskRuntime. On any failure, log and FALL THROUGH
             // to the normal chat path — the user's message must not vanish.
-            match route_complex_task(state.inner(), app.clone(), message.clone(), conversation_id.clone(), classification).await {
+            match route_complex_task(
+                state.inner(),
+                app.clone(),
+                message.clone(),
+                conversation_id.clone(),
+                classification,
+            )
+            .await
+            {
                 Ok(result) => return Ok(result),
                 Err(e) => {
                     tracing::warn!(error = %e, "complex-task routing failed; falling back to normal chat");
@@ -768,9 +779,13 @@ async fn route_complex_task(
         .ok_or_else(|| anyhow::anyhow!("no LLM client available on primary agent"))?;
 
     // 4. Generate the structured plan.
-    let generated =
-        echo_agent_app_core::tasks::task_runtime::generate_plan(&llm, &run_id, &message, &classification)
-            .await?;
+    let generated = echo_agent_app_core::tasks::task_runtime::generate_plan(
+        &llm,
+        &run_id,
+        &message,
+        &classification,
+    )
+    .await?;
 
     // 5. Persist + advance to AwaitingPlanApproval (attach_plan is atomic).
     store.attach_plan(&generated.plan)?;

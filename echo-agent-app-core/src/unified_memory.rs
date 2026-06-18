@@ -176,7 +176,8 @@ impl UnifiedMemory {
             }
             InstructionTier::Project => {
                 let pwd = std::env::current_dir().map_err(|e| format!("Failed to get cwd: {e}"))?;
-                let root = crate::utils::find_project_root(&pwd).ok_or("Not in a project directory")?;
+                let root =
+                    crate::utils::find_project_root(&pwd).ok_or("Not in a project directory")?;
                 Ok(root.join(".echo-agent").join("project.md"))
             }
             InstructionTier::Local => {
@@ -294,7 +295,6 @@ impl UnifiedMemory {
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
-
 /// Load the hot layer content from MEMORY.md (body only, frontmatter stripped).
 ///
 /// Tries project-level `.echo-agent/MEMORY.md` first, then user-level `~/.echo-agent/MEMORY.md`.
@@ -323,7 +323,6 @@ fn load_hot_content() -> Option<String> {
 
     None
 }
-
 
 #[cfg(test)]
 mod tests {

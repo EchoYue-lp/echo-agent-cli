@@ -115,9 +115,7 @@ pub fn render_progress(store: &TaskRuntimeStore, run_id: &str) -> Result<String,
     // One-line health summary.
     let total = todos.len();
     let done = completed.len();
-    s.push_str(&format!(
-        "## Health\n{done}/{total} tasks completed.\n",
-    ));
+    s.push_str(&format!("## Health\n{done}/{total} tasks completed.\n",));
 
     Ok(s)
 }
@@ -131,22 +129,14 @@ pub fn export_path(run_id: &str, base: Option<&std::path::Path>) -> PathBuf {
 }
 
 /// Export all todos as JSON for debugging/recovery (plan §860).
-pub fn export_todos_json(
-    store: &TaskRuntimeStore,
-    run_id: &str,
-) -> Result<String, StoreError> {
+pub fn export_todos_json(store: &TaskRuntimeStore, run_id: &str) -> Result<String, StoreError> {
     let todos = store.list_todos(run_id)?;
     Ok(serde_json::to_string_pretty(&todos).unwrap_or_else(|_| "[]".to_string()))
 }
 
 /// Archive raw worker output as a trace artifact (plan §1057-1061).
 /// Writes to `{base}/.eko/runtime/{run_id}/artifacts/traces/{task_id}.txt`.
-pub fn archive_trace(
-    run_id: &str,
-    task_id: &str,
-    output: &str,
-    base: Option<&std::path::Path>,
-) {
+pub fn archive_trace(run_id: &str, task_id: &str, output: &str, base: Option<&std::path::Path>) {
     let root = base
         .map(|b| b.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
@@ -202,7 +192,14 @@ mod tests {
     fn seeded_store() -> Arc<TaskRuntimeStore> {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().unwrap());
         store
-            .create_run("r1", "ws", "c1", "m1", DomainProfile::AiCoding, "Build real runtime")
+            .create_run(
+                "r1",
+                "ws",
+                "c1",
+                "m1",
+                DomainProfile::AiCoding,
+                "Build real runtime",
+            )
             .unwrap();
         store.transition_run("r1", TaskRunStatus::Planning).unwrap();
         let plan = TaskPlan {

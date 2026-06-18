@@ -149,8 +149,18 @@ impl HeuristicClassifier {
 
         // 2. Plurality / multi-target cues: "files", "modules", "issues",
         //    "bugs" + an action verb nearby.
-        let multi_target = ["多个文件", "多个模块", "几个文件", "这几个", "all the files", "multiple files", "several modules"];
-        let action_verb = ["修改", "审查", "review", "fix", "update", "refactor", "实现"];
+        let multi_target = [
+            "多个文件",
+            "多个模块",
+            "几个文件",
+            "这几个",
+            "all the files",
+            "multiple files",
+            "several modules",
+        ];
+        let action_verb = [
+            "修改", "审查", "review", "fix", "update", "refactor", "实现",
+        ];
         let lower_ascii = message.to_ascii_lowercase();
         let has_multi = multi_target.iter().any(|m| lower.contains(m));
         let has_verb = action_verb.iter().any(|v| lower_ascii.contains(v));
@@ -161,8 +171,8 @@ impl HeuristicClassifier {
         // 3. Length + question-shape heuristic: a very long message that is
         //    NOT a question is more likely a task brief.
         let char_count = message.chars().count();
-        let looks_like_question = message.trim_end().ends_with('?')
-            || message.trim_end().ends_with('？');
+        let looks_like_question =
+            message.trim_end().ends_with('?') || message.trim_end().ends_with('？');
         if char_count > 280 && !looks_like_question {
             signals.push(format!("long_brief:{char_count}"));
         }
@@ -277,15 +287,18 @@ mod tests {
     #[test]
     fn profile_inference_picks_a_starting_domain() {
         assert_eq!(
-            h().classify("search arxiv for recent LLM papers").inferred_profile,
+            h().classify("search arxiv for recent LLM papers")
+                .inferred_profile,
             DomainProfile::AcademicResearch
         );
         assert_eq!(
-            h().classify("run cargo check and fix the errors").inferred_profile,
+            h().classify("run cargo check and fix the errors")
+                .inferred_profile,
             DomainProfile::AiCoding
         );
         assert_eq!(
-            h().classify("find pubmed guidelines on hypertension").inferred_profile,
+            h().classify("find pubmed guidelines on hypertension")
+                .inferred_profile,
             DomainProfile::MedicalResearch
         );
         assert_eq!(
@@ -295,7 +308,8 @@ mod tests {
         // No domain cue → General. ("refactor" is intentionally treated as an
         // AiCoding signal, so we use domain-neutral wording here.)
         assert_eq!(
-            h().classify("Help me organize my weekend trip").inferred_profile,
+            h().classify("Help me organize my weekend trip")
+                .inferred_profile,
             DomainProfile::General
         );
     }

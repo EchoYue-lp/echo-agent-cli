@@ -593,7 +593,10 @@ pub struct RuntimeTaskEvent {
     /// Monotonic event sequence. Serialized as a JSON string (not a number)
     /// so it survives Tauri/HTTP transport without JS bigint precision loss
     /// and parses cleanly on the frontend; deserialize accepts a string too.
-    #[serde(serialize_with = "serialize_seq_as_string", deserialize_with = "deserialize_seq_from_string")]
+    #[serde(
+        serialize_with = "serialize_seq_as_string",
+        deserialize_with = "deserialize_seq_from_string"
+    )]
     #[ts(type = "string")]
     pub seq: i64,
     pub run_id: String,

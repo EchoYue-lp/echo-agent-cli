@@ -117,7 +117,10 @@ pub async fn generate_plan(
     // across all providers (schema-enforced mode is opt-in per provider; see
     // ProviderCapabilities). Validation is done on our side instead.
     let request = ChatRequest {
-        messages: vec![Message::system(system_preamble(template)), Message::user(prompt)],
+        messages: vec![
+            Message::system(system_preamble(template)),
+            Message::user(prompt),
+        ],
         response_format: Some(ResponseFormat::JsonObject),
         ..Default::default()
     };
@@ -221,13 +224,18 @@ fn normalize_tasks(
     }
 
     // title → id map for dependency rewriting.
-    let mut title_to_id: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut title_to_id: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for (i, d) in drafts.iter().enumerate() {
         let id = slug_id(i, &d.title);
         title_to_id.insert(d.title.trim().to_lowercase(), id);
     }
 
-    let default_role = template.default_worker_roles.first().copied().unwrap_or("general");
+    let default_role = template
+        .default_worker_roles
+        .first()
+        .copied()
+        .unwrap_or("general");
     let mut out = Vec::with_capacity(drafts.len());
     for (i, d) in drafts.iter().enumerate() {
         let id = slug_id(i, &d.title);
@@ -236,7 +244,10 @@ fn normalize_tasks(
             .as_deref()
             .and_then(PlanTaskKind::from_str)
             .unwrap_or(PlanTaskKind::ReadOnlyReview);
-        let role = d.agent_role.clone().unwrap_or_else(|| default_role.to_string());
+        let role = d
+            .agent_role
+            .clone()
+            .unwrap_or_else(|| default_role.to_string());
 
         // If the model claimed an implementation/verification task is parallel
         // with reads, downgrade the parallel_group and warn — mutating work
@@ -248,7 +259,11 @@ fn normalize_tasks(
                 d.title, kind
             ));
         }
-        let parallel_group = if kind.is_read_only() { parallel_group } else { None };
+        let parallel_group = if kind.is_read_only() {
+            parallel_group
+        } else {
+            None
+        };
 
         let depends_on: Vec<String> = d
             .depends_on
@@ -282,7 +297,11 @@ fn normalize_tasks(
     Ok(out)
 }
 
-fn validate_plan(goal: &str, tasks: &[PlanTask], warnings: &mut Vec<String>) -> Result<(), PlanError> {
+fn validate_plan(
+    goal: &str,
+    tasks: &[PlanTask],
+    warnings: &mut Vec<String>,
+) -> Result<(), PlanError> {
     if goal.trim().is_empty() {
         return Err(PlanError::Quality("plan goal is empty".into()));
     }
@@ -298,8 +317,10 @@ fn validate_plan(goal: &str, tasks: &[PlanTask], warnings: &mut Vec<String>) -> 
         }
         // Implementation / verification tasks must list concrete files or a
         // concrete verification step — otherwise they are not actionable.
-        if matches!(t.kind, PlanTaskKind::Implementation | PlanTaskKind::Verification)
-            && t.files.is_empty()
+        if matches!(
+            t.kind,
+            PlanTaskKind::Implementation | PlanTaskKind::Verification
+        ) && t.files.is_empty()
             && t.verification.is_empty()
         {
             errors.push(format!(
@@ -366,7 +387,10 @@ fn validate_plan(goal: &str, tasks: &[PlanTask], warnings: &mut Vec<String>) -> 
                 continue;
             }
             if dfs(&t.id, &id_to_deps, &mut visited, &mut stack) {
-                errors.push(format!("plan contains a dependency cycle involving task '{}'", t.title));
+                errors.push(format!(
+                    "plan contains a dependency cycle involving task '{}'",
+                    t.title
+                ));
                 break;
             }
         }
@@ -402,8 +426,16 @@ fn slug_id(index: usize, title: &str) -> String {
             }
         })
         .collect();
-    let slug: String = slug.split('-').filter(|s| !s.is_empty()).collect::<Vec<_>>().join("-");
-    let slug = if slug.chars().count() > 32 { slug.chars().take(32).collect() } else { slug };
+    let slug: String = slug
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    let slug = if slug.chars().count() > 32 {
+        slug.chars().take(32).collect()
+    } else {
+        slug
+    };
     // Always append index to guarantee uniqueness — two titles that normalise
     // to the same slug (e.g. "A/B" and "A B" → "a-b") would otherwise collide
     // on the PRIMARY KEY in tr_plan_tasks.
@@ -454,7 +486,8 @@ mod tests {
         ];
         let template = ProfileTemplate::for_profile(DomainProfile::AiCoding);
         let mut warnings = Vec::new();
-        let tasks = normalize_tasks(&drafts, &mut warnings, template, DomainProfile::AiCoding).unwrap();
+        let tasks =
+            normalize_tasks(&drafts, &mut warnings, template, DomainProfile::AiCoding).unwrap();
         assert_eq!(tasks.len(), 2);
         // slug_id always appends the index to guarantee uniqueness
         // (see slug_id): "Review runtime" at index 0 → "review-runtime-0".
@@ -481,7 +514,8 @@ mod tests {
             verification: vec!["cargo check".into()],
         }];
         let mut warnings = Vec::new();
-        let tasks = normalize_tasks(&drafts, &mut warnings, template, DomainProfile::AiCoding).unwrap();
+        let tasks =
+            normalize_tasks(&drafts, &mut warnings, template, DomainProfile::AiCoding).unwrap();
         let err = validate_plan("g", &tasks, &mut warnings).unwrap_err();
         match err {
             PlanError::Quality(msg) => {
@@ -508,7 +542,8 @@ mod tests {
             verification: vec![],
         }];
         let mut warnings = Vec::new();
-        let tasks = normalize_tasks(&drafts, &mut warnings, template, DomainProfile::AiCoding).unwrap();
+        let tasks =
+            normalize_tasks(&drafts, &mut warnings, template, DomainProfile::AiCoding).unwrap();
         let err = validate_plan("g", &tasks, &mut warnings).unwrap_err();
         assert!(matches!(err, PlanError::Quality(_)));
     }
@@ -517,26 +552,55 @@ mod tests {
     fn validation_accepts_concrete_plan() {
         let template = ProfileTemplate::for_profile(DomainProfile::AiCoding);
         let drafts = vec![
-            draft("Review chat.rs", "read_only_review", &["chat.rs"], &["report root cause"]),
-            draft("Apply fix", "implementation", &["chat.rs"], &["cargo check"]),
+            draft(
+                "Review chat.rs",
+                "read_only_review",
+                &["chat.rs"],
+                &["report root cause"],
+            ),
+            draft(
+                "Apply fix",
+                "implementation",
+                &["chat.rs"],
+                &["cargo check"],
+            ),
         ];
         let mut warnings = Vec::new();
-        let tasks = normalize_tasks(&drafts, &mut warnings, template, DomainProfile::AiCoding).unwrap();
+        let tasks =
+            normalize_tasks(&drafts, &mut warnings, template, DomainProfile::AiCoding).unwrap();
         validate_plan("Build real runtime", &tasks, &mut warnings).unwrap();
     }
 
     #[test]
     fn execution_mode_parses_leniently() {
-        assert!(matches!(parse_execution_mode(Some("sequential")), ExecutionMode::Sequential));
-        assert!(matches!(parse_execution_mode(Some("PARALLEL")), ExecutionMode::Parallel));
-        assert!(matches!(parse_execution_mode(Some("plan_only")), ExecutionMode::PlanOnly));
-        assert!(matches!(parse_execution_mode(None), ExecutionMode::Parallel));
-        assert!(matches!(parse_execution_mode(Some("garbage")), ExecutionMode::Parallel));
+        assert!(matches!(
+            parse_execution_mode(Some("sequential")),
+            ExecutionMode::Sequential
+        ));
+        assert!(matches!(
+            parse_execution_mode(Some("PARALLEL")),
+            ExecutionMode::Parallel
+        ));
+        assert!(matches!(
+            parse_execution_mode(Some("plan_only")),
+            ExecutionMode::PlanOnly
+        ));
+        assert!(matches!(
+            parse_execution_mode(None),
+            ExecutionMode::Parallel
+        ));
+        assert!(matches!(
+            parse_execution_mode(Some("garbage")),
+            ExecutionMode::Parallel
+        ));
     }
 
     #[test]
     fn slug_id_handles_unicode_and_collapses_separators() {
-        assert_eq!(slug_id(0, "Review HITL approval chain"), "review-hitl-approval-chain-0");
+        assert_eq!(
+            slug_id(0, "Review HITL approval chain"),
+            "review-hitl-approval-chain-0"
+        );
         assert_eq!(slug_id(3, ""), "task-3");
         // Unicode becomes separators, then collapsed.
         let s = slug_id(0, "审查 GUI 主运行时");

@@ -18,7 +18,7 @@ use std::sync::Mutex;
 
 use anyhow::Context;
 use chrono::{DateTime, Utc};
-use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, Row};
+use rusqlite::{Connection, Row, params, params_from_iter, types::Value as SqlValue};
 
 use super::types::*;
 
@@ -290,17 +290,12 @@ impl TaskRuntimeStore {
 
     /// Atomically transition a run to `next` and append `RunStatusChanged`.
     /// Rejects illegal transitions (see [`TaskRunStatus::can_transition_to`]).
-    pub fn transition_run(
-        &self,
-        run_id: &str,
-        next: TaskRunStatus,
-    ) -> Result<TaskRun, StoreError> {
+    pub fn transition_run(&self, run_id: &str, next: TaskRunStatus) -> Result<TaskRun, StoreError> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
 
         let (current_str, mut run) = load_run_for_update(&tx, run_id)?;
-        let current =
-            TaskRunStatus::from_str(&current_str).unwrap_or(TaskRunStatus::Pending);
+        let current = TaskRunStatus::from_str(&current_str).unwrap_or(TaskRunStatus::Pending);
         if !current.can_transition_to(next) {
             return Err(StoreError::IllegalTransition {
                 run_id: run_id.to_string(),
@@ -404,12 +399,16 @@ impl TaskRuntimeStore {
         // and emit RunStatusChanged so the event log stays consistent with the
         // "SQLite state machine is the single source of truth" invariant.
         let (current_status_str, _run) = load_run_for_update(&tx, &plan.run_id)?;
-        let current = TaskRunStatus::from_str(&current_status_str).unwrap_or(TaskRunStatus::Pending);
+        let current =
+            TaskRunStatus::from_str(&current_status_str).unwrap_or(TaskRunStatus::Pending);
         // Allowed entry states for attach_plan: Planning (first generation)
         // and AwaitingPlanApproval (re-edit of an existing plan before
         // approval). Anything else (e.g. Running) is a bug — refuse rather
         // than silently stamp a status.
-        if !matches!(current, TaskRunStatus::Planning | TaskRunStatus::AwaitingPlanApproval) {
+        if !matches!(
+            current,
+            TaskRunStatus::Planning | TaskRunStatus::AwaitingPlanApproval
+        ) {
             return Err(StoreError::IllegalTransition {
                 run_id: plan.run_id.clone(),
                 from: current.as_str().to_string(),
@@ -736,7 +735,10 @@ impl TaskRuntimeStore {
     }
 
     /// Latest run for a conversation (used by GUI to bind a chat to its run).
-    pub fn latest_run_for_conversation(&self, conversation_id: &str) -> Result<Option<TaskRun>, StoreError> {
+    pub fn latest_run_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<TaskRun>, StoreError> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT run_id, workspace_id, conversation_id, root_message_id,
@@ -830,7 +832,11 @@ impl TaskRuntimeStore {
         Ok(rows.filter_map(Result::ok).collect())
     }
 
-    pub fn list_events(&self, run_id: &str, since_seq: i64) -> Result<Vec<RuntimeTaskEvent>, StoreError> {
+    pub fn list_events(
+        &self,
+        run_id: &str,
+        since_seq: i64,
+    ) -> Result<Vec<RuntimeTaskEvent>, StoreError> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT seq, run_id, task_id, step_id, event_type, payload, timestamp
@@ -862,7 +868,8 @@ impl TaskRuntimeStore {
                 id: row.get(0)?,
                 run_id: row.get(1)?,
                 task_id: row.get(2)?,
-                kind: ArtifactKind::from_str(&row.get::<_, String>(3)?).unwrap_or(ArtifactKind::Other),
+                kind: ArtifactKind::from_str(&row.get::<_, String>(3)?)
+                    .unwrap_or(ArtifactKind::Other),
                 title: row.get(4)?,
                 path: row.get(5)?,
                 metadata: serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or_default(),
@@ -871,7 +878,11 @@ impl TaskRuntimeStore {
         Ok(rows.filter_map(Result::ok).collect())
     }
 
-    pub fn list_reviews(&self, run_id: &str, task_id: &str) -> Result<Vec<ReviewResult>, StoreError> {
+    pub fn list_reviews(
+        &self,
+        run_id: &str,
+        task_id: &str,
+    ) -> Result<Vec<ReviewResult>, StoreError> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT id, run_id, task_id, reviewer_agent, outcome, issues,
@@ -884,7 +895,8 @@ impl TaskRuntimeStore {
                 run_id: row.get(1)?,
                 task_id: row.get(2)?,
                 reviewer_agent: row.get(3)?,
-                outcome: ReviewOutcome::from_str(&row.get::<_, String>(4)?).unwrap_or(ReviewOutcome::Blocked),
+                outcome: ReviewOutcome::from_str(&row.get::<_, String>(4)?)
+                    .unwrap_or(ReviewOutcome::Blocked),
                 issues: serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
                 failure_fingerprint: row.get(6)?,
                 created_fix_task_id: row.get(7)?,
@@ -894,7 +906,11 @@ impl TaskRuntimeStore {
         Ok(rows.filter_map(Result::ok).collect())
     }
 
-    pub fn get_summary(&self, run_id: &str, task_id: &str) -> Result<Option<TaskExecutionSummary>, StoreError> {
+    pub fn get_summary(
+        &self,
+        run_id: &str,
+        task_id: &str,
+    ) -> Result<Option<TaskExecutionSummary>, StoreError> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT run_id, task_id, worker_agent, completed_work, files_read,
@@ -932,7 +948,12 @@ impl TaskRuntimeStore {
     }
 
     /// Append a free-form `Note` event for diagnostics / trace breadcrumbs.
-    pub fn note(&self, run_id: &str, task_id: Option<&str>, message: &str) -> Result<(), StoreError> {
+    pub fn note(
+        &self,
+        run_id: &str,
+        task_id: Option<&str>,
+        message: &str,
+    ) -> Result<(), StoreError> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         append_event_tx(
@@ -1072,7 +1093,8 @@ fn load_plan_tasks(conn: &Connection, plan_id: &str) -> Result<Vec<PlanTask>, St
             id: row.get(0)?,
             title: row.get(1)?,
             description: row.get(2)?,
-            kind: PlanTaskKind::from_str(&row.get::<_, String>(3)?).unwrap_or(PlanTaskKind::ReadOnlyReview),
+            kind: PlanTaskKind::from_str(&row.get::<_, String>(3)?)
+                .unwrap_or(PlanTaskKind::ReadOnlyReview),
             agent_role: row.get(4)?,
             domain_profile: DomainProfile::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
             depends_on: serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or_default(),
@@ -1143,7 +1165,9 @@ fn parse_opt_dt(s: Option<String>) -> Option<DateTime<Utc>> {
 
 fn default_db_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".echo-agent").join("task_runtime.db")
+    PathBuf::from(home)
+        .join(".echo-agent")
+        .join("task_runtime.db")
 }
 
 // The compile-time test that proves the transaction invariant:
@@ -1161,7 +1185,14 @@ mod tests {
     fn create_run_emits_run_created_event() {
         let s = fresh();
         let run = s
-            .create_run("r1", "ws", "c1", "m1", DomainProfile::AiCoding, "review runtime")
+            .create_run(
+                "r1",
+                "ws",
+                "c1",
+                "m1",
+                DomainProfile::AiCoding,
+                "review runtime",
+            )
             .unwrap();
         assert_eq!(run.status, TaskRunStatus::Pending);
         let evs = s.list_events("r1", 0).unwrap();
@@ -1172,7 +1203,8 @@ mod tests {
     #[test]
     fn transition_run_appends_status_event_atomically() {
         let s = fresh();
-        s.create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g").unwrap();
+        s.create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g")
+            .unwrap();
         let run = s.transition_run("r1", TaskRunStatus::Planning).unwrap();
         assert_eq!(run.status, TaskRunStatus::Planning);
         let evs = s.list_events("r1", 0).unwrap();
@@ -1184,7 +1216,8 @@ mod tests {
     #[test]
     fn illegal_transition_is_rejected_and_leaves_no_event() {
         let s = fresh();
-        s.create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g").unwrap();
+        s.create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g")
+            .unwrap();
         let before = s.list_events("r1", 0).unwrap().len();
         let err = s.transition_run("r1", TaskRunStatus::Running).unwrap_err();
         assert!(matches!(err, StoreError::IllegalTransition { .. }));
@@ -1195,7 +1228,8 @@ mod tests {
     #[test]
     fn attach_plan_creates_tasks_and_todos() {
         let s = fresh();
-        s.create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g").unwrap();
+        s.create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g")
+            .unwrap();
         s.transition_run("r1", TaskRunStatus::Planning).unwrap();
         let plan = TaskPlan {
             plan_id: "p1".into(),
@@ -1241,7 +1275,10 @@ mod tests {
         assert!(todos[0].started_at.is_some());
 
         let evs = s.list_events("r1", 0).unwrap();
-        assert!(evs.iter().any(|e| e.event_type == RuntimeEventKind::TaskStarted));
+        assert!(
+            evs.iter()
+                .any(|e| e.event_type == RuntimeEventKind::TaskStarted)
+        );
     }
 
     #[test]
@@ -1270,15 +1307,18 @@ mod tests {
     #[test]
     fn latest_run_for_conversation_orders_by_created_desc() {
         let s = fresh();
-        s.create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g1").unwrap();
+        s.create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g1")
+            .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
-        s.create_run("r2", "ws", "c1", "m2", DomainProfile::General, "g2").unwrap();
+        s.create_run("r2", "ws", "c1", "m2", DomainProfile::General, "g2")
+            .unwrap();
         let latest = s.latest_run_for_conversation("c1").unwrap().unwrap();
         assert_eq!(latest.run_id, "r2");
     }
 
     fn seed_plan(s: &TaskRuntimeStore) {
-        s.create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g").unwrap();
+        s.create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g")
+            .unwrap();
         s.transition_run("r1", TaskRunStatus::Planning).unwrap();
         let plan = TaskPlan {
             plan_id: "p1".into(),

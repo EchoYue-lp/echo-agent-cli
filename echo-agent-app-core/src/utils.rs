@@ -29,12 +29,15 @@ pub fn strip_yaml_frontmatter(raw: &str) -> String {
         return raw.to_string();
     }
 
-    let rest = &trimmed[3..]; // skip opening ---
-    if let Some(pos) = rest.find("\n---") {
-        let body = rest[pos + 4..]
+    // Strip the opening `---` fence using character-aware APIs (never byte
+    // slicing — see AGENTS.md UTF-8 rule). `---` is ASCII so the boundary is
+    // safe, but we keep the code character-safe by construction.
+    let rest = trimmed.trim_start_matches("---");
+    if let Some((_fence, body)) = rest.split_once("\n---") {
+        return body
             .trim_start_matches('\n')
-            .trim_start_matches('\r');
-        return body.to_string();
+            .trim_start_matches('\r')
+            .to_string();
     }
 
     // No closing marker — return as-is

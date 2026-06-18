@@ -41,7 +41,10 @@ pub fn check(tool_name: &str, args_json: &str) -> Option<HighRiskMatch> {
     let haystack = lower.as_str();
 
     // ── Shell / bash: destructive commands ───────────────────────────────
-    if matches!(tool_name, "shell" | "bash" | "sh" | "execute_command" | "run_command") {
+    if matches!(
+        tool_name,
+        "shell" | "bash" | "sh" | "execute_command" | "run_command"
+    ) {
         for (pattern, needle, reason) in SHELL_PATTERNS {
             if let Some(idx) = haystack.find(needle) {
                 let snippet = extract_snippet(args_json, idx, needle.len());
@@ -83,7 +86,10 @@ pub fn check(tool_name: &str, args_json: &str) -> Option<HighRiskMatch> {
     // ── File writes outside the workspace ───────────────────────────────
     // Heuristic: absolute paths outside typical project roots. We flag paths
     // that look like system dirs. Conservative — only the clearest cases.
-    if matches!(tool_name, "write_file" | "edit_file" | "move_file" | "delete_file" | "remove_file") {
+    if matches!(
+        tool_name,
+        "write_file" | "edit_file" | "move_file" | "delete_file" | "remove_file"
+    ) {
         for (pattern, needle, reason) in PATH_PATTERNS {
             if let Some(idx) = haystack.find(needle) {
                 let snippet = extract_snippet(args_json, idx, needle.len());
@@ -129,46 +135,138 @@ fn extract_snippet(original: &str, byte_idx: usize, needle_len: usize) -> String
 
 // (pattern_id, lowercase_needle, reason)
 const SHELL_PATTERNS: &[(&str, &str, &str)] = &[
-    ("rm_rf", "rm -rf", "Recursive force-delete can wipe a directory tree"),
-    ("rm_rf_unsafe", "rm -fr", "Recursive force-delete can wipe a directory tree"),
+    (
+        "rm_rf",
+        "rm -rf",
+        "Recursive force-delete can wipe a directory tree",
+    ),
+    (
+        "rm_rf_unsafe",
+        "rm -fr",
+        "Recursive force-delete can wipe a directory tree",
+    ),
     ("sudo", "sudo ", "Privilege escalation via sudo"),
-    ("chmod_r", "chmod -r", "Recursive permission change across a tree"),
-    ("chown_r", "chown -r", "Recursive ownership change across a tree"),
+    (
+        "chmod_r",
+        "chmod -r",
+        "Recursive permission change across a tree",
+    ),
+    (
+        "chown_r",
+        "chown -r",
+        "Recursive ownership change across a tree",
+    ),
     // curl/wget: only flag when piped to a shell (the real danger), not
     // every curl/wget call (which would cause approval fatigue and weaken
     // the signal). We check for the pipe-to-shell pattern in the full args.
-    ("curl_pipe_sh", "| sh", "curl/wget piped to sh — remote script execution"),
-    ("curl_pipe_bash", "| bash", "curl/wget piped to bash — remote script execution"),
-    ("curl_pipe_sh_dash", "| /bin/sh", "curl/wget piped to /bin/sh — remote script execution"),
-    ("curl_pipe_bash_dash", "| /bin/bash", "curl/wget piped to /bin/bash — remote script execution"),
-    ("mkfs", "mkfs", "Filesystem format command destroys the target device"),
+    (
+        "curl_pipe_sh",
+        "| sh",
+        "curl/wget piped to sh — remote script execution",
+    ),
+    (
+        "curl_pipe_bash",
+        "| bash",
+        "curl/wget piped to bash — remote script execution",
+    ),
+    (
+        "curl_pipe_sh_dash",
+        "| /bin/sh",
+        "curl/wget piped to /bin/sh — remote script execution",
+    ),
+    (
+        "curl_pipe_bash_dash",
+        "| /bin/bash",
+        "curl/wget piped to /bin/bash — remote script execution",
+    ),
+    (
+        "mkfs",
+        "mkfs",
+        "Filesystem format command destroys the target device",
+    ),
     ("dd_dev", "dd if=", "Raw disk write via dd can destroy data"),
-    ("kill_dash_9", "kill -9", "Force-kill may leave resources in an inconsistent state"),
-    ("git_push_force", "git push --force", "Force-push rewrites shared history"),
-    ("git_clean_fd", "git clean -fd", "Recursively deletes untracked files and directories"),
+    (
+        "kill_dash_9",
+        "kill -9",
+        "Force-kill may leave resources in an inconsistent state",
+    ),
+    (
+        "git_push_force",
+        "git push --force",
+        "Force-push rewrites shared history",
+    ),
+    (
+        "git_clean_fd",
+        "git clean -fd",
+        "Recursively deletes untracked files and directories",
+    ),
 ];
 
 const EXFIL_PATTERNS: &[(&str, &str, &str)] = &[
     ("aws_key", "akia", "Likely AWS access key id in arguments"),
-    ("private_key_header", "-----begin private key", "Private key material in arguments"),
-    ("private_key_rsa", "-----begin rsa private key", "RSA private key material in arguments"),
-    ("ghp_token", "ghp_", "GitHub personal access token in arguments"),
+    (
+        "private_key_header",
+        "-----begin private key",
+        "Private key material in arguments",
+    ),
+    (
+        "private_key_rsa",
+        "-----begin rsa private key",
+        "RSA private key material in arguments",
+    ),
+    (
+        "ghp_token",
+        "ghp_",
+        "GitHub personal access token in arguments",
+    ),
     ("gho_token", "gho_", "GitHub OAuth token in arguments"),
 ];
 
 const SQL_PATTERNS: &[(&str, &str, &str)] = &[
-    ("drop_database", "drop database", "DROP DATABASE destroys the entire database"),
-    ("drop_table", "drop table", "DROP TABLE destroys the table and its data"),
-    ("truncate", "truncate ", "TRUNCATE deletes all rows from a table"),
-    ("delete_no_where", "delete from", "DELETE without a clear WHERE filter can wipe the table"),
+    (
+        "drop_database",
+        "drop database",
+        "DROP DATABASE destroys the entire database",
+    ),
+    (
+        "drop_table",
+        "drop table",
+        "DROP TABLE destroys the table and its data",
+    ),
+    (
+        "truncate",
+        "truncate ",
+        "TRUNCATE deletes all rows from a table",
+    ),
+    (
+        "delete_no_where",
+        "delete from",
+        "DELETE without a clear WHERE filter can wipe the table",
+    ),
 ];
 
 const PATH_PATTERNS: &[(&str, &str, &str)] = &[
-    ("system_etc", "/etc/", "Write outside the workspace to /etc (system config)"),
-    ("system_bin", "/usr/bin", "Write outside the workspace to /usr/bin (system binaries)"),
+    (
+        "system_etc",
+        "/etc/",
+        "Write outside the workspace to /etc (system config)",
+    ),
+    (
+        "system_bin",
+        "/usr/bin",
+        "Write outside the workspace to /usr/bin (system binaries)",
+    ),
     ("system_root", "/root/", "Write to /root (superuser home)"),
-    ("windows_system", "c:\\\\windows", "Write to C:\\\\Windows (system directory)"),
-    ("dev_null_overwrite", "/dev/sd", "Write to a raw block device can destroy the disk"),
+    (
+        "windows_system",
+        "c:\\\\windows",
+        "Write to C:\\\\Windows (system directory)",
+    ),
+    (
+        "dev_null_overwrite",
+        "/dev/sd",
+        "Write to a raw block device can destroy the disk",
+    ),
 ];
 
 #[cfg(test)]
@@ -179,7 +277,10 @@ mod tests {
     fn rm_rf_is_caught_regardless_of_session_approval() {
         let m = check("shell", r#"{"command": "rm -rf /tmp/thing"}"#).unwrap();
         assert_eq!(m.pattern, "rm_rf");
-        assert!(requires_fresh_approval("shell", r#"{"command":"rm -rf x"}"#));
+        assert!(requires_fresh_approval(
+            "shell",
+            r#"{"command":"rm -rf x"}"#
+        ));
     }
 
     #[test]
@@ -208,7 +309,11 @@ mod tests {
 
     #[test]
     fn secret_exfil_is_caught_on_any_tool() {
-        let m = check("write_file", r#"{"path":"/tmp/log","content":"key AKIAIOSFODNN7EXAMPLE"}"#).unwrap();
+        let m = check(
+            "write_file",
+            r#"{"path":"/tmp/log","content":"key AKIAIOSFODNN7EXAMPLE"}"#,
+        )
+        .unwrap();
         assert_eq!(m.pattern, "aws_key");
         assert!(check("shell", r#"{"command":"echo ghp_abc123"}"#).is_some());
         assert!(check("write_file", r#"{"content":"-----BEGIN PRIVATE KEY-----"}"#).is_some());

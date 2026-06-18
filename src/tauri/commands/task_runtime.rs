@@ -145,7 +145,9 @@ pub async fn list_task_reviews(
     run_id: String,
     task_id: String,
 ) -> Result<Vec<ReviewResult>, IpcError> {
-    Ok(store(&state)?.list_reviews(&run_id, &task_id).map_err(internal)?)
+    Ok(store(&state)?
+        .list_reviews(&run_id, &task_id)
+        .map_err(internal)?)
 }
 
 /// The execution summary a worker produced for a task — used by the Summary
@@ -216,9 +218,7 @@ pub async fn set_interaction_mode(
 
 /// Get the current interaction mode.
 #[tauri::command]
-pub async fn get_interaction_mode(
-    state: tauri::State<'_, TauriState>,
-) -> Result<u8, IpcError> {
+pub async fn get_interaction_mode(state: tauri::State<'_, TauriState>) -> Result<u8, IpcError> {
     Ok(state
         .app_state
         .tasks
@@ -254,9 +254,7 @@ pub async fn create_task_run(
         .and_then(DomainProfile::from_str)
         .unwrap_or_default();
     let run_id = uuid::Uuid::new_v4().to_string();
-    let workspace_id = req
-        .workspace_id
-        .unwrap_or_else(|| "default".to_string());
+    let workspace_id = req.workspace_id.unwrap_or_else(|| "default".to_string());
     let root_message_id = req.root_message_id.unwrap_or_default();
     let run = store
         .create_run(
@@ -317,8 +315,8 @@ pub async fn generate_task_plan(
     // Classify to steer the prompt with an inferred profile + reason. The
     // classifier is heuristic-only here; the run's existing profile wins if
     // the user already set one explicitly (we keep the run's profile).
-    let classification = echo_agent_app_core::tasks::task_runtime::HeuristicClassifier::new()
-        .classify(&run.goal);
+    let classification =
+        echo_agent_app_core::tasks::task_runtime::HeuristicClassifier::new().classify(&run.goal);
     let profile_for_plan = run.domain_profile;
     let classification = echo_agent_app_core::tasks::task_runtime::Classification {
         complexity: classification.complexity,
@@ -475,7 +473,9 @@ pub async fn execute_task_run(
         .transition_run(&run_id, TaskRunStatus::Running)
         .map_err(|e| match e {
             echo_agent_app_core::tasks::task_runtime::StoreError::IllegalTransition { .. } => {
-                IpcError::Validation(format!("run {run_id} is no longer Ready (already executing?)"))
+                IpcError::Validation(format!(
+                    "run {run_id} is no longer Ready (already executing?)"
+                ))
             }
             other => internal(other),
         })?;
@@ -490,9 +490,7 @@ pub async fn execute_task_run(
     let run_id_for_task = run_id.clone();
     // The reviewer LLM is the primary agent's client — review gates use it to
     // evaluate implementation/debugging task output against the domain checklist.
-    let reviewer_llm = primary_agent
-        .read(|a| a.llm_client().cloned())
-        .await;
+    let reviewer_llm = primary_agent.read(|a| a.llm_client().cloned()).await;
     // The memory layer manager sinks run completion/cancellation events into
     // long-term memory through the single write_memory chokepoint. Created
     // from ReviewIntegration when available (mirrors the primary agent's path).

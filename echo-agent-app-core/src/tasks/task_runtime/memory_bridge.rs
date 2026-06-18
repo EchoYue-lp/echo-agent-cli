@@ -85,7 +85,6 @@ async fn write_memory_candidate_inner(
     store: &Arc<TaskRuntimeStore>,
     event: MemoryEvent,
 ) {
-
     let candidates = build_candidates(store, &event).await;
     for candidate in candidates {
         let category = candidate.category.clone();
@@ -134,7 +133,10 @@ async fn build_candidates(
         MemoryEvent::RunCompleted { run_id, goal } => {
             // Summarize completed todos into a decision/fix memory.
             let todos = store.list_todos(run_id).unwrap_or_default();
-            let completed: Vec<&TodoItem> = todos.iter().filter(|t| t.status == TodoStatus::Completed).collect();
+            let completed: Vec<&TodoItem> = todos
+                .iter()
+                .filter(|t| t.status == TodoStatus::Completed)
+                .collect();
             if completed.is_empty() {
                 return Vec::new();
             }
@@ -146,9 +148,7 @@ async fn build_candidates(
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            let content = format!(
-                "Completed complex task.\nGoal: {goal}\nAccomplished:\n{body}"
-            );
+            let content = format!("Completed complex task.\nGoal: {goal}\nAccomplished:\n{body}");
             vec![MemoryCandidate {
                 key: format!("taskrun:completed:{run_id}"),
                 content,
@@ -257,7 +257,14 @@ mod tests {
     fn seeded_store() -> Arc<TaskRuntimeStore> {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().unwrap());
         store
-            .create_run("r1", "ws", "c1", "m1", DomainProfile::AiCoding, "Review runtime")
+            .create_run(
+                "r1",
+                "ws",
+                "c1",
+                "m1",
+                DomainProfile::AiCoding,
+                "Review runtime",
+            )
             .unwrap();
         store.transition_run("r1", TaskRunStatus::Planning).unwrap();
         let plan = TaskPlan {
@@ -280,7 +287,13 @@ mod tests {
         store.transition_run("r1", TaskRunStatus::Ready).unwrap();
         store.transition_run("r1", TaskRunStatus::Running).unwrap();
         store
-            .set_task_status("r1", "t1", TodoStatus::Completed, Some("code_reviewer"), Some("found gap"))
+            .set_task_status(
+                "r1",
+                "t1",
+                TodoStatus::Completed,
+                Some("code_reviewer"),
+                Some("found gap"),
+            )
             .unwrap();
         store
     }

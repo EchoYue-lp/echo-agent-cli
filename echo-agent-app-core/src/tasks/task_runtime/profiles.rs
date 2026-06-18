@@ -222,7 +222,12 @@ mod tests {
         // The four read-only workers registered in infra::register_default_subagents
         // must all appear in the AI Coding profile so the planner can assign them.
         let t = ProfileTemplate::for_profile(DomainProfile::AiCoding);
-        for required in ["project_explorer", "code_reviewer", "test_planner", "summary_writer"] {
+        for required in [
+            "project_explorer",
+            "code_reviewer",
+            "test_planner",
+            "summary_writer",
+        ] {
             assert!(
                 t.default_worker_roles.iter().any(|&r| r == required),
                 "AI Coding profile missing registered worker {required}"

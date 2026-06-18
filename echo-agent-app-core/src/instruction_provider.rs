@@ -182,7 +182,6 @@ impl InstructionProvider {
     }
 }
 
-
 impl Default for InstructionProvider {
     fn default() -> Self {
         Self::load()

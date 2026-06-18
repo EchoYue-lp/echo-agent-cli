@@ -69,13 +69,18 @@ impl Default for ConcurrencyLimits {
 #[derive(Debug, Clone)]
 pub enum RunOutcome {
     Completed,
-    Failed { failed_task_id: String, error: String },
+    Failed {
+        failed_task_id: String,
+        error: String,
+    },
     Cancelled,
     /// The run was suspended by a review-gate circuit breaker or a review
     /// infrastructure failure. The run is already in `Suspended` status when
     /// this is returned; the user must intervene (retry / change plan / skip /
     /// cancel) to resume.
-    Suspended { reason: String },
+    Suspended {
+        reason: String,
+    },
 }
 
 /// Error returned by the executor.
@@ -119,13 +124,24 @@ pub async fn execute_run(
     // shutdown) has no driver to finish it. Auto-transition to Failed so it
     // doesn't block the run list forever.
     if run.status == TaskRunStatus::Cancelling {
-        let _ = store.note(run_id, None, "recovered from Cancelling (interrupted shutdown)");
+        let _ = store.note(
+            run_id,
+            None,
+            "recovered from Cancelling (interrupted shutdown)",
+        );
         let _ = store.transition_run(run_id, TaskRunStatus::Failed);
-        save_trace(run_store.as_ref(), run_id, &run.goal, &run.conversation_id, "failed");
+        save_trace(
+            run_store.as_ref(),
+            run_id,
+            &run.goal,
+            &run.conversation_id,
+            "failed",
+        );
         return Ok(RunOutcome::Failed {
             failed_task_id: "<none>".into(),
-            error: "run was in Cancelling state (interrupted shutdown); auto-transitioned to Failed"
-                .into(),
+            error:
+                "run was in Cancelling state (interrupted shutdown); auto-transitioned to Failed"
+                    .into(),
         });
     }
     // The caller (execute_task_run command) is responsible for the
@@ -150,7 +166,9 @@ pub async fn execute_run(
 
     let outcome = run_dag(
         store.clone(),
-        primary_agent.clone(),
+        RealTaskWorker {
+            primary_agent: primary_agent.clone(),
+        },
         reviewer_llm,
         run_id,
         plan.tasks,
@@ -164,7 +182,13 @@ pub async fn execute_run(
     match &outcome {
         Ok(RunOutcome::Completed) => {
             let _ = store.transition_run(run_id, TaskRunStatus::Completed);
-            save_trace(run_store.as_ref(), run_id, &run.goal, &run.conversation_id, "completed");
+            save_trace(
+                run_store.as_ref(),
+                run_id,
+                &run.goal,
+                &run.conversation_id,
+                "completed",
+            );
             super::memory_bridge::write_memory_candidate(
                 layer_manager.as_ref(),
                 &store,
@@ -174,7 +198,10 @@ pub async fn execute_run(
                 },
             );
         }
-        Ok(RunOutcome::Failed { failed_task_id, error }) => {
+        Ok(RunOutcome::Failed {
+            failed_task_id,
+            error,
+        }) => {
             // Running → Failed is legal. Use None for synthetic task ids
             // (<none>/<join>) to avoid orphan task_id events.
             let tid = if failed_task_id.starts_with('<') {
@@ -184,11 +211,23 @@ pub async fn execute_run(
             };
             let _ = store.note(run_id, tid, &format!("run failed: {error}"));
             let _ = store.transition_run(run_id, TaskRunStatus::Failed);
-            save_trace(run_store.as_ref(), run_id, &run.goal, &run.conversation_id, "failed");
+            save_trace(
+                run_store.as_ref(),
+                run_id,
+                &run.goal,
+                &run.conversation_id,
+                "failed",
+            );
         }
         Ok(RunOutcome::Cancelled) => {
             let _ = store.transition_run(run_id, TaskRunStatus::Cancelled);
-            save_trace(run_store.as_ref(), run_id, &run.goal, &run.conversation_id, "cancelled");
+            save_trace(
+                run_store.as_ref(),
+                run_id,
+                &run.goal,
+                &run.conversation_id,
+                "cancelled",
+            );
             super::memory_bridge::write_memory_candidate(
                 layer_manager.as_ref(),
                 &store,
@@ -202,7 +241,13 @@ pub async fn execute_run(
             // run_dag already transitioned Running → Suspended (legal). Only
             // record the reason; do NOT attempt Suspended → Failed (illegal).
             let _ = store.note(run_id, None, &format!("run suspended: {reason}"));
-            save_trace(run_store.as_ref(), run_id, &run.goal, &run.conversation_id, "suspended");
+            save_trace(
+                run_store.as_ref(),
+                run_id,
+                &run.goal,
+                &run.conversation_id,
+                "suspended",
+            );
         }
         Err(e) => {
             let _ = store.note(run_id, None, &format!("executor error: {e}"));
@@ -213,23 +258,101 @@ pub async fn execute_run(
     outcome
 }
 
+/// Abstraction over how a single ready task is executed on a worker.
+///
+/// `run_dag` depends on this trait (not on `execute_task` directly) so the
+/// scheduling core — frontier computation, dependency resolution, failure
+/// propagation, cancellation, stall detection — can be unit-tested with a
+/// deterministic mock worker instead of a real LLM-backed agent. The
+/// production implementation ([`RealTaskWorker`]) wraps `execute_task`.
+///
+/// The worker is given the semaphores + file locks so it can honor the same
+/// concurrency limits as the real path; mocks usually ignore them.
+pub trait TaskWorker: Send + Sync {
+    /// Execute `task` for `run_id`. Returns `(task_id, summary)` on success or
+    /// `(task_id, error)` on failure (matching `execute_task`'s contract).
+    fn dispatch(
+        &self,
+        store: Arc<TaskRuntimeStore>,
+        run_id: String,
+        task: PlanTask,
+        cancel: CancellationToken,
+        worker_sem: Arc<Semaphore>,
+        write_sem: Arc<Semaphore>,
+        shell_sem: Arc<Semaphore>,
+        llm_sem: Arc<Semaphore>,
+        file_write_locks: Arc<std::sync::Mutex<HashSet<String>>>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<(String, Option<String>), (String, String)>>
+                + Send,
+        >,
+    >;
+}
+
+/// Production worker: delegates to [`execute_task`] against the primary agent.
+///
+/// Note: the reviewer LLM is NOT held here — it is owned by `run_dag` itself
+/// (the review gate runs at the `run_dag` level, after a worker returns). The
+/// worker only needs the agent + concurrency primitives.
+pub struct RealTaskWorker {
+    pub primary_agent: crate::agent_handle::AgentHandle,
+}
+
+impl TaskWorker for RealTaskWorker {
+    fn dispatch(
+        &self,
+        store: Arc<TaskRuntimeStore>,
+        run_id: String,
+        task: PlanTask,
+        cancel: CancellationToken,
+        worker_sem: Arc<Semaphore>,
+        write_sem: Arc<Semaphore>,
+        shell_sem: Arc<Semaphore>,
+        llm_sem: Arc<Semaphore>,
+        file_write_locks: Arc<std::sync::Mutex<HashSet<String>>>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = Result<(String, Option<String>), (String, String)>>
+                + Send,
+        >,
+    > {
+        let primary_agent = self.primary_agent.clone();
+        Box::pin(async move {
+            execute_task(
+                store,
+                primary_agent,
+                worker_sem,
+                write_sem,
+                shell_sem,
+                llm_sem,
+                file_write_locks,
+                run_id,
+                task,
+                cancel,
+            )
+            .await
+        })
+    }
+}
+
 /// Core DAG loop. Maintains a frontier of ready tasks and dispatches them
 /// under the concurrency semaphores until all are done, the run is cancelled,
 /// or a task fails.
-async fn run_dag(
+async fn run_dag<W: TaskWorker + 'static>(
     store: Arc<TaskRuntimeStore>,
-    primary_agent: crate::agent_handle::AgentHandle,
+    worker: W,
     reviewer_llm: Option<Arc<dyn echo_agent::llm::LlmClient>>,
     run_id: &str,
     tasks: Vec<PlanTask>,
     limits: ConcurrencyLimits,
     parent_cancel: CancellationToken,
 ) -> Result<RunOutcome, ExecError> {
+    // Wrap the worker in an Arc so each spawned task can clone the handle.
+    let worker = Arc::new(worker);
     // Index tasks by id.
-    let mut by_id: HashMap<String, PlanTask> = tasks
-        .iter()
-        .map(|t| (t.id.clone(), t.clone()))
-        .collect();
+    let mut by_id: HashMap<String, PlanTask> =
+        tasks.iter().map(|t| (t.id.clone(), t.clone())).collect();
     let all_ids: HashSet<String> = by_id.keys().cloned().collect();
 
     // Track completion state per task id.
@@ -293,7 +416,12 @@ async fn run_dag(
             .iter()
             .filter(|t| !completed.contains(&t.id))
             .filter(|t| t.depends_on.iter().all(|d| completed.contains(d)))
-            .map(|t| tasks_with_fixes.get(&t.id).cloned().unwrap_or_else(|| t.clone()))
+            .map(|t| {
+                tasks_with_fixes
+                    .get(&t.id)
+                    .cloned()
+                    .unwrap_or_else(|| t.clone())
+            })
             .collect();
 
         if ready.is_empty() {
@@ -319,10 +447,12 @@ async fn run_dag(
         // fires every worker's select! guard. If we detect cancellation
         // mid-wave, we abort remaining handles before returning Cancelled so
         // no orphan tasks keep writing files.
-        let mut handles: Vec<tokio::task::JoinHandle<Result<(String, Option<String>), (String, String)>>> = Vec::new();
+        let mut handles: Vec<
+            tokio::task::JoinHandle<Result<(String, Option<String>), (String, String)>>,
+        > = Vec::new();
         for task in ready {
             let store = store.clone();
-            let primary_agent = primary_agent.clone();
+            let worker = worker.clone();
             let worker_sem = worker_sem.clone();
             let write_sem = write_sem.clone();
             let shell_sem = shell_sem.clone();
@@ -332,19 +462,19 @@ async fn run_dag(
             let cancel = parent_cancel.clone();
             let run_id_owned = run_id.to_string();
             handles.push(tokio::spawn(async move {
-                execute_task(
-                    store,
-                    primary_agent,
-                    worker_sem,
-                    write_sem,
-                    shell_sem,
-                    llm_sem,
-                    file_write_locks,
-                    run_id_owned,
-                    task,
-                    cancel,
-                )
-                .await
+                worker
+                    .dispatch(
+                        store,
+                        run_id_owned,
+                        task,
+                        cancel,
+                        worker_sem,
+                        write_sem,
+                        shell_sem,
+                        llm_sem,
+                        file_write_locks,
+                    )
+                    .await
             }));
         }
 
@@ -359,7 +489,10 @@ async fn run_dag(
             match handle.await {
                 Ok(r) => wave_results.push(r),
                 Err(join_err) => {
-                    wave_results.push(Err(("<join>".to_string(), format!("worker task panicked: {join_err}"))));
+                    wave_results.push(Err((
+                        "<join>".to_string(),
+                        format!("worker task panicked: {join_err}"),
+                    )));
                 }
             }
         }
@@ -381,7 +514,9 @@ async fn run_dag(
                     // Review gate: implementation/debugging tasks must pass
                     // review before being marked Completed (plan §776-831).
                     // Read-only kinds are their own review → auto-pass.
-                    let Some(task) = by_id.get(&id).cloned() else { continue };
+                    let Some(task) = by_id.get(&id).cloned() else {
+                        continue;
+                    };
                     let passed = run_review_gate(
                         store.clone(),
                         reviewer_llm.clone(),
@@ -414,13 +549,22 @@ async fn run_dag(
                                 run_id,
                                 &id,
                                 TodoStatus::Pending,
-                                Some(by_id.get(&id).map(|t| t.agent_role.as_str()).unwrap_or("unknown")),
+                                Some(
+                                    by_id
+                                        .get(&id)
+                                        .map(|t| t.agent_role.as_str())
+                                        .unwrap_or("unknown"),
+                                ),
                                 Some("re-queued after review"),
                             );
                             by_id.insert(id.clone(), tasks_with_fixes[&id].clone());
                         }
                         ReviewGateOutcome::Suspend(reason) => {
-                            let _ = store.note(run_id, Some(&id), &format!("circuit breaker: {reason}"));
+                            let _ = store.note(
+                                run_id,
+                                Some(&id),
+                                &format!("circuit breaker: {reason}"),
+                            );
                             let _ = store.transition_run(run_id, TaskRunStatus::Suspended);
                             return Ok(RunOutcome::Suspended { reason });
                         }
@@ -557,9 +701,7 @@ async fn run_review_gate(
                 }
             }
         }
-        ReviewOutcome::Blocked => {
-            ReviewGateOutcome::Suspend("review returned blocked".to_string())
-        }
+        ReviewOutcome::Blocked => ReviewGateOutcome::Suspend("review returned blocked".to_string()),
     }
 }
 
@@ -670,17 +812,21 @@ async fn execute_task(
     // the specific call or edit the plan before the run can resume.
     // Mirrors the review-gate Suspend path to avoid an unsafe "note-and-
     // continue" gap.
+    //
+    // Args snapshot: we scan ALL task strings that may flow into a tool call —
+    // not just `title`. The `verification` field is the most important: it is
+    // injected into the worker prompt ("Run the listed verification when done")
+    // and Verification-kind tasks execute it under a shell permit, so a plan
+    // like `["rm -rf target && cargo test"]` must be caught here. `files` feeds
+    // the file-write tools; `description` is free-form and may carry commands.
     if !task.allowed_tools.is_empty() {
+        let args_snapshot = build_hitrisk_args_snapshot(&task);
         for tool in &task.allowed_tools {
-            let args_json = serde_json::to_string(&serde_json::json!({
-                "task": task.title,
-                "files": task.files,
-            }))
-            .unwrap_or_default();
-            if super::hitrisk::requires_fresh_approval(tool, &args_json) {
+            if let Some(m) = super::hitrisk::check(tool, &args_snapshot) {
                 let reason = format!(
-                    "hitrisk flagged tool '{tool}' for task '{}'; run suspended pending user approval",
-                    task.title,
+                    "hitrisk flagged tool '{tool}' (pattern '{}': {}) for task '{}'; \
+                     run suspended pending user approval. Matched: {}",
+                    m.pattern, m.reason, task.title, m.snippet,
                 );
                 let _ = store.note(&run_id, Some(&task_id), &reason);
                 let _ = store.transition_run(&run_id, TaskRunStatus::Suspended);
@@ -748,6 +894,28 @@ async fn execute_task(
 }
 
 /// Pull the (title, summary) pairs for a task's completed dependencies.
+/// Build a JSON args snapshot covering every task string that may flow into a
+/// tool call, for the pre-execution high-risk check (G10+G11).
+///
+/// The snapshot intentionally includes:
+/// - `verification`: the most important field — Verification-kind tasks run
+///   these under a shell permit, and they are injected into every worker prompt
+///   ("Run the listed verification when done"), so `rm -rf target` here is real.
+/// - `files`: feeds file-write tools (write_file/edit_file/move_file/...).
+/// - `title` / `description`: free-form text the LLM may quote into a command.
+///
+/// This is broader than the old `{"task": title, "files": files}` snapshot,
+/// which only caught patterns literally present in the title.
+fn build_hitrisk_args_snapshot(task: &PlanTask) -> String {
+    serde_json::to_string(&serde_json::json!({
+        "title": task.title,
+        "description": task.description,
+        "files": task.files,
+        "verification": task.verification,
+    }))
+    .unwrap_or_default()
+}
+
 /// Prefers the structured TaskExecutionSummary (persisted by put_summary at
 /// task boundary) over the truncated todo.summary text, so downstream workers
 /// get full context: completed_work, files_changed, decisions, etc.
@@ -934,7 +1102,11 @@ fn save_trace(
         input: goal.to_string(),
         events: vec![],
         final_output: None,
-        error: if status == "failed" { Some("run failed".to_string()) } else { None },
+        error: if status == "failed" {
+            Some("run failed".to_string())
+        } else {
+            None
+        },
         token_usage: Default::default(),
         timings: Default::default(),
         started_at: chrono::Utc::now(),
@@ -1038,9 +1210,7 @@ mod tests {
     #[tokio::test]
     async fn store_transitions_through_running_to_completed() {
         use std::sync::Arc;
-        let store = Arc::new(
-            TaskRuntimeStore::new_in_memory().expect("in-memory store"),
-        );
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().expect("in-memory store"));
         // Seed a run + plan via the public store API, then drive the state
         // machine the way run_dag would.
         store
@@ -1073,14 +1243,394 @@ mod tests {
             .set_task_status("r1", "t1", TodoStatus::Running, Some("code_reviewer"), None)
             .unwrap();
         store
-            .set_task_status("r1", "t1", TodoStatus::Completed, Some("code_reviewer"), Some("done"))
+            .set_task_status(
+                "r1",
+                "t1",
+                TodoStatus::Completed,
+                Some("code_reviewer"),
+                Some("done"),
+            )
             .unwrap();
-        store.transition_run("r1", TaskRunStatus::Completed).unwrap();
+        store
+            .transition_run("r1", TaskRunStatus::Completed)
+            .unwrap();
 
         let run = store.get_run("r1").unwrap().unwrap();
         assert_eq!(run.status, TaskRunStatus::Completed);
         let todos = store.list_todos("r1").unwrap();
         assert_eq!(todos[0].status, TodoStatus::Completed);
         assert!(todos[0].summary.as_deref() == Some("done"));
+    }
+
+    // ── hitrisk args-snapshot coverage (see G10+G11, build_hitrisk_args_snapshot) ──
+    // The old snapshot only scanned {task, files}; the new one also scans
+    // verification (executed under a shell permit) so destructive commands
+    // hidden in the plan's verification list are caught before dispatch.
+
+    #[test]
+    fn hitrisk_snapshot_includes_verification_field() {
+        let task = PlanTask {
+            id: "t1".into(),
+            title: "Clean and test".into(),
+            description: "run the test suite".into(),
+            kind: PlanTaskKind::Verification,
+            agent_role: "verifier".into(),
+            files: vec!["src/lib.rs".into()],
+            verification: vec!["rm -rf target && cargo test".into()],
+            allowed_tools: vec!["shell".into()],
+            ..Default::default()
+        };
+        let snap = build_hitrisk_args_snapshot(&task);
+        // The snapshot must carry the verification string verbatim.
+        assert!(snap.contains("rm -rf target && cargo test"));
+    }
+
+    #[test]
+    fn hitrisk_catches_destructive_command_in_verification() {
+        let task = PlanTask {
+            id: "t1".into(),
+            title: "Clean build".into(),
+            description: "tidy up".into(),
+            kind: PlanTaskKind::Verification,
+            agent_role: "verifier".into(),
+            files: vec![],
+            // A dangerous command placed in the verification list (which the
+            // worker is told to run). The old {task, files} snapshot missed this.
+            verification: vec!["rm -rf /".into()],
+            allowed_tools: vec!["shell".into()],
+            ..Default::default()
+        };
+        let snap = build_hitrisk_args_snapshot(&task);
+        assert!(
+            super::super::hitrisk::check("shell", &snap).is_some(),
+            "destructive command in verification must be flagged"
+        );
+    }
+
+    #[test]
+    fn hitrisk_catches_system_path_in_files() {
+        let task = PlanTask {
+            id: "t1".into(),
+            title: "Patch config".into(),
+            description: "update system config".into(),
+            kind: PlanTaskKind::Implementation,
+            agent_role: "implementer".into(),
+            // A write targeting /etc — must be caught by PATH_PATTERNS.
+            files: vec!["/etc/passwd".into()],
+            verification: vec![],
+            allowed_tools: vec!["write_file".into()],
+            ..Default::default()
+        };
+        let snap = build_hitrisk_args_snapshot(&task);
+        assert!(
+            super::super::hitrisk::check("write_file", &snap).is_some(),
+            "system-path write in files must be flagged"
+        );
+    }
+
+    #[test]
+    fn hitrisk_benign_task_is_not_flagged() {
+        let task = PlanTask {
+            id: "t1".into(),
+            title: "Run unit tests".into(),
+            description: "execute the test suite".into(),
+            kind: PlanTaskKind::Verification,
+            agent_role: "verifier".into(),
+            files: vec!["src/lib.rs".into()],
+            verification: vec!["cargo test".into()],
+            allowed_tools: vec!["shell".into()],
+            ..Default::default()
+        };
+        let snap = build_hitrisk_args_snapshot(&task);
+        assert!(
+            super::super::hitrisk::check("shell", &snap).is_none(),
+            "benign cargo test must not be flagged"
+        );
+    }
+
+    // ── run_dag integration tests with a scripted (mock) worker ──
+    // These exercise the scheduling core — frontier computation, dependency
+    // resolution, failure propagation, cancellation, stall detection — without
+    // a real LLM. The worker returns scripted results keyed by task id.
+
+    use std::collections::HashMap as StdHashMap;
+    use std::sync::Mutex as StdMutex;
+
+    /// A worker that returns scripted results per task id and records the
+    /// order tasks were dispatched. Semaphores/locks are ignored (the mock
+    /// answers instantly).
+    struct ScriptedWorker {
+        /// task_id → result to return. Missing id → generic success.
+        results: StdMutex<StdHashMap<String, Result<String, String>>>,
+        /// Dispatch order, appended as tasks are picked up.
+        order: StdMutex<Vec<String>>,
+    }
+
+    impl ScriptedWorker {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                results: StdMutex::new(StdHashMap::new()),
+                order: StdMutex::new(Vec::new()),
+            })
+        }
+        /// Script a success result for `id`.
+        fn succeed(self: &Arc<Self>, id: &str, summary: &str) {
+            self.results
+                .lock()
+                .unwrap()
+                .insert(id.into(), Ok(summary.into()));
+        }
+        /// Script a failure result for `id`.
+        fn fail(self: &Arc<Self>, id: &str, err: &str) {
+            self.results
+                .lock()
+                .unwrap()
+                .insert(id.into(), Err(err.into()));
+        }
+        fn order(&self) -> Vec<String> {
+            self.order.lock().unwrap().clone()
+        }
+    }
+
+    impl TaskWorker for Arc<ScriptedWorker> {
+        fn dispatch(
+            &self,
+            _store: Arc<TaskRuntimeStore>,
+            _run_id: String,
+            task: PlanTask,
+            cancel: CancellationToken,
+            _worker_sem: Arc<Semaphore>,
+            _write_sem: Arc<Semaphore>,
+            _shell_sem: Arc<Semaphore>,
+            _llm_sem: Arc<Semaphore>,
+            _file_write_locks: Arc<std::sync::Mutex<HashSet<String>>>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<(String, Option<String>), (String, String)>>
+                    + Send,
+            >,
+        > {
+            let results = self.results.lock().unwrap().get(&task.id).cloned();
+            self.order.lock().unwrap().push(task.id.clone());
+            let task_id = task.id.clone();
+            Box::pin(async move {
+                // Honor cancellation even in the mock.
+                if cancel.is_cancelled() {
+                    return Err((task_id, "cancelled".into()));
+                }
+                match results {
+                    Some(Ok(summary)) => Ok((task_id, Some(summary))),
+                    Some(Err(e)) => Err((task_id, e)),
+                    // Default: generic success for unscripted tasks.
+                    None => Ok((task_id, Some("ok".into()))),
+                }
+            })
+        }
+    }
+
+    /// Helper: a single-task plan (read-only, no review needed) that the
+    /// scripted worker can complete.
+    fn solo_readonly_task(id: &str) -> PlanTask {
+        PlanTask {
+            id: id.into(),
+            title: id.into(),
+            description: "desc".into(),
+            kind: PlanTaskKind::ReadOnlyReview,
+            agent_role: "reviewer".into(),
+            ..Default::default()
+        }
+    }
+
+    /// Build a run + plan in the store and return the run id.
+    ///
+    /// Walks the legal state-machine path so attach_plan succeeds:
+    /// Pending → Planning → (attach_plan) → AwaitingPlanApproval → Ready.
+    fn seed_run(store: &Arc<TaskRuntimeStore>, tasks: Vec<PlanTask>) -> String {
+        let run_id = format!("run_{}", uuid::Uuid::new_v4());
+        store
+            .create_run(
+                &run_id,
+                "ws_test",
+                "conv_test",
+                "msg_test",
+                DomainProfile::General,
+                "test goal",
+            )
+            .unwrap();
+        // Pending → Planning (legal), then attach_plan advances to
+        // AwaitingPlanApproval, then approve → Ready so run_dag can start.
+        store
+            .transition_run(&run_id, TaskRunStatus::Planning)
+            .unwrap();
+        let plan = TaskPlan {
+            plan_id: format!("plan_{}", run_id),
+            run_id: run_id.clone(),
+            domain_profile: DomainProfile::General,
+            goal: "test goal".into(),
+            assumptions: vec![],
+            risks: vec![],
+            execution_mode: ExecutionMode::Sequential,
+            tasks,
+        };
+        store.attach_plan(&plan).unwrap();
+        store.transition_run(&run_id, TaskRunStatus::Ready).unwrap();
+        run_id
+    }
+
+    #[tokio::test]
+    async fn run_dag_completes_single_task() {
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().unwrap());
+        let run_id = seed_run(&store, vec![solo_readonly_task("a")]);
+        let worker = ScriptedWorker::new();
+        worker.succeed("a", "reviewed");
+
+        let outcome = run_dag(
+            store.clone(),
+            worker.clone(),
+            None, // no reviewer LLM → read-only tasks auto-pass review
+            &run_id,
+            vec![solo_readonly_task("a")],
+            ConcurrencyLimits::default(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, RunOutcome::Completed));
+        let todos = store.list_todos(&run_id).unwrap();
+        assert_eq!(todos[0].status, TodoStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn run_dag_respects_dependency_order() {
+        // b depends on a → a must be dispatched and completed before b.
+        let mut a = solo_readonly_task("a");
+        let mut b = solo_readonly_task("b");
+        b.depends_on = vec!["a".into()];
+        let _ = &mut a; // silence unused_mut
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().unwrap());
+        let run_id = seed_run(&store, vec![a.clone(), b.clone()]);
+        let worker = ScriptedWorker::new();
+        worker.succeed("a", "done a");
+        worker.succeed("b", "done b");
+
+        let outcome = run_dag(
+            store.clone(),
+            worker.clone(),
+            None,
+            &run_id,
+            vec![a, b],
+            ConcurrencyLimits::default(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, RunOutcome::Completed));
+        let order = worker.order();
+        // a must appear before b in the dispatch order.
+        let pos_a = order.iter().position(|x| x == "a").unwrap();
+        let pos_b = order.iter().position(|x| x == "b").unwrap();
+        assert!(pos_a < pos_b, "dependency violated: b dispatched before a");
+    }
+
+    #[tokio::test]
+    async fn run_dag_failure_propagates_and_skips_downstream() {
+        // a fails; b depends on a and must be Skipped, run ends Failed.
+        let a = solo_readonly_task("a");
+        let mut b = solo_readonly_task("b");
+        b.depends_on = vec!["a".into()];
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().unwrap());
+        let run_id = seed_run(&store, vec![a.clone(), b.clone()]);
+        let worker = ScriptedWorker::new();
+        worker.fail("a", "boom");
+
+        let outcome = run_dag(
+            store.clone(),
+            worker.clone(),
+            None,
+            &run_id,
+            vec![a, b],
+            ConcurrencyLimits::default(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        match outcome {
+            RunOutcome::Failed { failed_task_id, .. } => {
+                assert_eq!(failed_task_id, "a");
+            }
+            other => panic!("expected Failed, got {:?}", other),
+        }
+        // b must be Skipped (never completed, never dispatched as a real run).
+        let todos = store.list_todos(&run_id).unwrap();
+        let b_todo = todos.iter().find(|t| t.task_id == "b").unwrap();
+        assert_eq!(b_todo.status, TodoStatus::Skipped);
+    }
+
+    #[tokio::test]
+    async fn run_dag_cancellation_propagates_to_cancelled_outcome() {
+        // Cancel BEFORE dispatching; run_dag should observe cancellation at the
+        // top of its loop and return Cancelled without running any task.
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().unwrap());
+        let run_id = seed_run(&store, vec![solo_readonly_task("a")]);
+        let worker = ScriptedWorker::new();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let outcome = run_dag(
+            store.clone(),
+            worker.clone(),
+            None,
+            &run_id,
+            vec![solo_readonly_task("a")],
+            ConcurrencyLimits::default(),
+            cancel,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, RunOutcome::Cancelled));
+        // The worker must NOT have been dispatched into.
+        assert!(worker.order().is_empty(), "task ran despite cancellation");
+    }
+
+    #[tokio::test]
+    async fn run_dag_detects_cycle_as_stall() {
+        // a depends on b, b depends on a → neither can ever become ready →
+        // stall. (validate_plan would normally reject this, but run_dag must
+        // still be robust to a malformed plan reaching it.)
+        let mut a = solo_readonly_task("a");
+        a.depends_on = vec!["b".into()];
+        let mut b = solo_readonly_task("b");
+        b.depends_on = vec!["a".into()];
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().unwrap());
+        let run_id = seed_run(&store, vec![a.clone(), b.clone()]);
+        let worker = ScriptedWorker::new();
+
+        let outcome = run_dag(
+            store.clone(),
+            worker.clone(),
+            None,
+            &run_id,
+            vec![a, b],
+            ConcurrencyLimits::default(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        match outcome {
+            RunOutcome::Failed { error, .. } => {
+                assert!(
+                    error.contains("stalled"),
+                    "expected stall message, got: {error}"
+                );
+            }
+            other => panic!("expected Failed (stall), got {:?}", other),
+        }
+        // Nothing should have been dispatched.
+        assert!(worker.order().is_empty(), "worker ran on a cyclic plan");
     }
 }

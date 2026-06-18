@@ -45,10 +45,7 @@ pub enum ReviewError {
 /// Which tasks get reviewed. Read-only kinds (review/investigation/summary)
 /// are their own review; implementation/debugging tasks are gated.
 pub fn requires_review(kind: PlanTaskKind) -> bool {
-    matches!(
-        kind,
-        PlanTaskKind::Implementation | PlanTaskKind::Debugging
-    )
+    matches!(kind, PlanTaskKind::Implementation | PlanTaskKind::Debugging)
 }
 
 /// The LLM is asked to return this shape.
@@ -87,7 +84,10 @@ pub async fn review_task(
     let prompt = build_review_prompt(task, worker_output, template);
 
     let request = ChatRequest {
-        messages: vec![Message::system(review_preamble(template)), Message::user(prompt)],
+        messages: vec![
+            Message::system(review_preamble(template)),
+            Message::user(prompt),
+        ],
         response_format: Some(ResponseFormat::JsonObject),
         ..Default::default()
     };
@@ -278,7 +278,11 @@ fn review_preamble(template: &ProfileTemplate) -> String {
     )
 }
 
-fn build_review_prompt(task: &PlanTask, worker_output: &str, _template: &ProfileTemplate) -> String {
+fn build_review_prompt(
+    task: &PlanTask,
+    worker_output: &str,
+    _template: &ProfileTemplate,
+) -> String {
     let files = if task.files.is_empty() {
         "(none specified)".to_string()
     } else {
@@ -350,7 +354,10 @@ mod tests {
     fn outcome_parsing_is_strict() {
         assert!(matches!(parse_outcome("pass"), ReviewOutcome::Pass));
         assert!(matches!(parse_outcome("PASS"), ReviewOutcome::Pass));
-        assert!(matches!(parse_outcome("needs_fix"), ReviewOutcome::NeedsFix));
+        assert!(matches!(
+            parse_outcome("needs_fix"),
+            ReviewOutcome::NeedsFix
+        ));
         assert!(matches!(parse_outcome("Fix"), ReviewOutcome::NeedsFix));
         assert!(matches!(parse_outcome("blocked"), ReviewOutcome::Blocked));
         // Unknown / empty / garbage → Blocked (NOT Pass). A strict gate never
