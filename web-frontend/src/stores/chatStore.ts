@@ -66,12 +66,21 @@ interface ChatState {
 let msgCounter = 0;
 const nextId = () => `msg-${++msgCounter}-${Date.now()}`;
 
-/** Auto-save to conversationStore after state changes that add messages */
+/** Auto-save to conversationStore after state changes that add messages. */
 function autoSave() {
   const msgs = useChatStore.getState().messages;
   if (msgs.length > 0) {
     useConversationStore.getState().saveCurrent(msgs);
   }
+}
+
+/// Debounced wrapper that replaces synchronous `autoSave()` calls inside
+/// set() closures. Prevents N writes per streaming token and decouples the
+/// chatStore→conversationStore dependency from the hot path.
+let autoSaveTimer: ReturnType<typeof setTimeout> | undefined;
+function scheduleAutoSave() {
+  clearTimeout(autoSaveTimer);
+  autoSaveTimer = setTimeout(autoSave, 300);
 }
 
 export const useChatStore = create<ChatState>((set, get) => ({
@@ -96,7 +105,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         { id: nextId(), role: 'user', content, attachments, timestamp: Date.now() },
       ],
     }));
-    autoSave();
+    scheduleAutoSave();
   },
 
   startAssistantMessage: () => {
@@ -272,7 +281,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       runStatus: 'completed',
       messages: s.messages.map((m) => (m.id === id ? { ...m, content, isStreaming: false } : m)),
     }));
-    autoSave();
+    scheduleAutoSave();
   },
 
   setStreaming: (v) => set({ isStreaming: v }),
@@ -295,7 +304,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         m.isStreaming ? { ...m, isStreaming: false, content: m.content || '' } : m
       ),
     }));
-    autoSave();
+    scheduleAutoSave();
   },
 
   setApprovalRequest: (r) =>

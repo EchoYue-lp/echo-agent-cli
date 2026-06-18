@@ -816,9 +816,15 @@ impl AppState {
         }
 
         // 更新 agent 的 working_dir 配置（影响 project rules 注入等）
+        let new_wd = Some(workspace.root.clone());
         self.connection.agent.try_write(|a| {
-            a.set_working_dir(Some(workspace.root.clone()));
+            a.set_working_dir(new_wd.clone());
         });
+        // Propagate to all pooled agents so background tasks run in the new
+        // workspace (P1-7).
+        if let Some(ref pool) = self.connection.pool {
+            pool.apply_working_dir(new_wd).await;
+        }
 
         // 重新初始化 persistence 以使用工作区路径
         let new_persistence = Persistence::with_base_dir(

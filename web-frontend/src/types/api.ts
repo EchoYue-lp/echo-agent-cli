@@ -195,6 +195,9 @@ export type ServerMessage =
   | { type: 'chart'; id?: string; spec: unknown }
   | { type: 'error'; id?: string; message: string }
   | { type: 'cancelled'; id?: string }
+  | { type: 'done'; id?: string }
+  | { type: 'run_status'; id?: string; status: ChatRunStatus }
+  | { type: 'plan_ready'; id?: string; run_id: string }
   | { type: 'thinking_start'; id?: string }
   | { type: 'thinking_end'; id?: string; prompt_tokens: number; completion_tokens: number }
   | { type: 'pong' };

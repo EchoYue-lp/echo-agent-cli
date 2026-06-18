@@ -1,5 +1,6 @@
 import { useRef, useCallback, useEffect, useState } from 'react';
 import { useChatStore } from '../stores/chatStore';
+import { useTaskRuntimeStore } from '../stores/taskRuntimeStore';
 import { isTauri } from '../lib/tauri-bridge';
 import type { ClientMessage, ServerMessage, Attachment } from '../types/api';
 
@@ -22,6 +23,10 @@ export function useWebSocket() {
   const heartbeatTimeout = useRef<ReturnType<typeof setTimeout>>(undefined);
   const messageQueue = useRef<ClientMessage[]>([]);
   const retryCount = useRef(0);
+  /// Tracks whether the current close was triggered by a heartbeat timeout.
+  /// Heartbeat-detected disconnects do NOT consume a reconnect attempt — they
+  /// reflect an already-broken connection, not a server-side rejection.
+  const isHeartbeatClose = useRef(false);
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('connecting');
 
   const getReconnectDelay = useCallback(() => {
@@ -65,6 +70,7 @@ export function useWebSocket() {
           wsRef.current.send(JSON.stringify({ type: 'ping' }));
           heartbeatTimeout.current = setTimeout(() => {
             console.warn('[WS] Heartbeat timeout, closing connection');
+            isHeartbeatClose.current = true;
             wsRef.current?.close();
           }, HEARTBEAT_TIMEOUT_MS);
         }
@@ -199,12 +205,35 @@ export function useWebSocket() {
           currentMessageIdRef.current = null;
           isCancelledRef.current = false;
           break;
+        case 'run_status':
+          store.setRunStatus(msg.status);
+          break;
+        case 'done':
+          // If no final_answer was received, finalize with empty content.
+          if (assistantIdRef.current && !isCancelledRef.current) {
+            store.finalizeAssistantMessage(assistantIdRef.current, '');
+          }
+          assistantIdRef.current = null;
+          currentMessageIdRef.current = null;
+          isCancelledRef.current = false;
+          break;
+        case 'plan_ready':
+          // A complex input was routed to TaskRuntime and a plan was generated.
+          // Hand it to the TaskRuntime store so the right-rail panel renders the
+          // plan + approval actions (was missing in Web mode, see P1-7).
+          useTaskRuntimeStore.getState().notifyPlanReady(msg.run_id);
+          break;
       }
     };
 
     ws.onclose = () => {
       clearHeartbeat();
-      retryCount.current += 1;
+      // Heartbeat timeouts detect an already-broken connection — they are
+      // NOT a fresh disconnect and should not consume a reconnect attempt.
+      if (!isHeartbeatClose.current) {
+        retryCount.current += 1;
+      }
+      isHeartbeatClose.current = false;
 
       if (retryCount.current > MAX_RECONNECT_ATTEMPTS) {
         console.error(`[WS] Max reconnect attempts (${MAX_RECONNECT_ATTEMPTS}) reached, giving up`);
@@ -330,6 +359,15 @@ export function useWebSocket() {
     send({ type: 'cancel', id: messageId ?? undefined });
   }, [send]);
 
+  /// Manual reconnect — resets the retry counter so the user can recover from
+  /// a permanent-disconnect state (e.g. after 20 failed auto-reconnects).
+  const reconnect = useCallback(() => {
+    clearTimeout(reconnectTimer.current);
+    retryCount.current = 0;
+    setConnectionStatus('connecting');
+    connect();
+  }, [connect]);
+
   useEffect(() => {
     if (isTauri()) return; // In Tauri mode, chat uses IPC events, not WebSocket
     connect();
@@ -340,5 +378,5 @@ export function useWebSocket() {
     };
   }, [connect]);
 
-  return { sendMessage, sendApproval, sendInput, sendSelection, cancel, connectionStatus };
+  return { sendMessage, sendApproval, sendInput, sendSelection, cancel, reconnect, connectionStatus };
 }

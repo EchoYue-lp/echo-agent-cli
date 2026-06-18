@@ -115,6 +115,19 @@ pub async fn execute_run(
     let run = store
         .get_run(run_id)?
         .ok_or(ExecError::RunNotFound(run_id.to_string()))?;
+    // Zombie recovery: a run left in Cancelling (e.g. process crashed during
+    // shutdown) has no driver to finish it. Auto-transition to Failed so it
+    // doesn't block the run list forever.
+    if run.status == TaskRunStatus::Cancelling {
+        let _ = store.note(run_id, None, "recovered from Cancelling (interrupted shutdown)");
+        let _ = store.transition_run(run_id, TaskRunStatus::Failed);
+        save_trace(run_store.as_ref(), run_id, &run.goal, &run.conversation_id, "failed");
+        return Ok(RunOutcome::Failed {
+            failed_task_id: "<none>".into(),
+            error: "run was in Cancelling state (interrupted shutdown); auto-transitioned to Failed"
+                .into(),
+        });
+    }
     // The caller (execute_task_run command) is responsible for the
     // Ready → Running transition (for idempotency: it must succeed atomically
     // before spawning the executor). Here we accept both Ready (caller hasn't
@@ -368,7 +381,7 @@ async fn run_dag(
                     // Review gate: implementation/debugging tasks must pass
                     // review before being marked Completed (plan §776-831).
                     // Read-only kinds are their own review → auto-pass.
-                    let task = by_id[&id].clone();
+                    let Some(task) = by_id.get(&id).cloned() else { continue };
                     let passed = run_review_gate(
                         store.clone(),
                         reviewer_llm.clone(),
@@ -401,7 +414,7 @@ async fn run_dag(
                                 run_id,
                                 &id,
                                 TodoStatus::Pending,
-                                Some(&by_id[&id].agent_role),
+                                Some(by_id.get(&id).map(|t| t.agent_role.as_str()).unwrap_or("unknown")),
                                 Some("re-queued after review"),
                             );
                             by_id.insert(id.clone(), tasks_with_fixes[&id].clone());
@@ -429,6 +442,22 @@ async fn run_dag(
                     }
                 }
                 Err((id, err)) => {
+                    // Hitrisk fail-closed: the task was blocked by a pre-execution
+                    // high-risk safety check. The run was already transitioned to
+                    // Suspended inside execute_task. Propagate up so execute_run
+                    // records the Suspend outcome instead of treating it as Failed.
+                    if let Some(reason) = err.strip_prefix("SUSPEND:") {
+                        let _ = store.set_task_status(
+                            run_id,
+                            &id,
+                            TodoStatus::Pending,
+                            None,
+                            Some("blocked: hitrisk requires user approval"),
+                        );
+                        return Ok(RunOutcome::Suspended {
+                            reason: reason.to_string(),
+                        });
+                    }
                     // Mark this task Failed and record it in wave_failed so
                     // the skip logic (top of loop) does NOT overwrite it to
                     // Skipped. failed_id keeps the FIRST failure for the
@@ -484,17 +513,35 @@ async fn run_review_gate(
         return ReviewGateOutcome::Skipped;
     };
 
-    let review = match super::review::review_task(&llm, &store, run_id, task, worker_output).await {
-        Ok(r) => r,
-        Err(e) => {
-            // Review infrastructure failure (LLM unreachable, malformed JSON,
-            // etc.). Do NOT auto-pass — that would let unreviewed mutating
-            // work through, contradicting the "strict review gate" goal.
-            // Instead suspend the run and surface the error so the user can
-            // retry, lower the standard, or intervene.
-            let reason = format!("review gate failed ({e}); run suspended pending user input");
-            let _ = store.note(run_id, Some(&task.id), &reason);
-            return ReviewGateOutcome::Suspend(reason);
+    // Retry transient review errors (LLM 5xx/timeout, JSON parse failures) up to
+    // 2 times before suspending. Transient failures are expected in production
+    // and should not block the run on the first hiccup.
+    const MAX_REVIEW_RETRIES: u32 = 2;
+    let mut retries: u32 = 0;
+    let review = loop {
+        match super::review::review_task(&llm, &store, run_id, task, worker_output).await {
+            Ok(r) => break r,
+            Err(e) => {
+                retries += 1;
+                if retries <= MAX_REVIEW_RETRIES {
+                    tracing::warn!(
+                        task_id = %task.id,
+                        attempt = retries,
+                        error = %e,
+                        "review gate transient error, retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+                    continue;
+                }
+                // Exhausted retries. Do NOT auto-pass — that would let
+                // unreviewed mutating work through. Surface the error so the
+                // user can retry, lower the standard, or intervene.
+                let reason = format!(
+                    "review gate failed after {MAX_REVIEW_RETRIES} retries ({e}); run suspended pending user input"
+                );
+                let _ = store.note(run_id, Some(&task.id), &reason);
+                return ReviewGateOutcome::Suspend(reason);
+            }
         }
     };
 
@@ -587,7 +634,7 @@ async fn execute_task(
     // We log a warning and proceed rather than deadlocking, since write_sem=1
     // already serializes all writes.
     let _file_lock_guard = if is_write && !task.files.is_empty() {
-        let mut locks = file_write_locks.lock().unwrap();
+        let mut locks = file_write_locks.lock().unwrap_or_else(|e| e.into_inner());
         let conflict = task.files.iter().find(|f| locks.contains(*f));
         if let Some(f) = conflict {
             tracing::warn!(
@@ -617,8 +664,12 @@ async fn execute_task(
 
     // G10+G11: Pre-execution safety check — verify the task's tool calls
     // are covered by an approval scope AND pass the high-risk arg check.
-    // For now this runs at task granularity (not per-tool-call) using the
-    // task's allowed_tools list + a synthetic args check.
+    //
+    // Fail-closed: when a tool+args pair matches a high-risk pattern, we
+    // suspend the run immediately and require the user to either approve
+    // the specific call or edit the plan before the run can resume.
+    // Mirrors the review-gate Suspend path to avoid an unsafe "note-and-
+    // continue" gap.
     if !task.allowed_tools.is_empty() {
         for tool in &task.allowed_tools {
             let args_json = serde_json::to_string(&serde_json::json!({
@@ -627,15 +678,13 @@ async fn execute_task(
             }))
             .unwrap_or_default();
             if super::hitrisk::requires_fresh_approval(tool, &args_json) {
-                let _ = store.note(
-                    &run_id,
-                    Some(&task_id),
-                    &format!("hitrisk flagged tool '{}' for this task; review required", tool),
+                let reason = format!(
+                    "hitrisk flagged tool '{tool}' for task '{}'; run suspended pending user approval",
+                    task.title,
                 );
-                // In a full implementation this would emit an ApprovalRequested
-                // event and wait. For now, log and continue — the main agent's
-                // own HITL handler (TauriHumanLoopHandler) catches dangerous
-                // calls at execution time.
+                let _ = store.note(&run_id, Some(&task_id), &reason);
+                let _ = store.transition_run(&run_id, TaskRunStatus::Suspended);
+                return Err((task_id.clone(), format!("SUSPEND:{reason}")));
             }
         }
     }

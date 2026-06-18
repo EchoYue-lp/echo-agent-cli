@@ -309,12 +309,13 @@ impl TaskRuntimeStore {
             });
         }
 
-        let now = Utc::now().to_rfc3339();
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
         run.status = next;
-        run.updated_at = Utc::now();
+        run.updated_at = now;
         tx.execute(
             "UPDATE tr_runs SET status = ?, updated_at = ? WHERE run_id = ?",
-            params![next.as_str(), now, run_id],
+            params![next.as_str(), now_str, run_id],
         )?;
         append_event_tx(
             &tx,
@@ -950,6 +951,10 @@ impl TaskRuntimeStore {
 
     /// Grant a scoped approval for a tool call. Returns true if newly recorded.
     /// `scope_level` is one of: once | task | conversation | workspace | tool | all_tools.
+    ///
+    /// Reserved for future HITL approval-scope integration (executor does not
+    /// call this yet — see hitrisk fail-closed path in executor.rs).
+    #[allow(dead_code)]
     pub fn grant_approval(
         &self,
         run_id: &str,
@@ -968,6 +973,9 @@ impl TaskRuntimeStore {
 
     /// Check whether a tool call is covered by a prior scope grant
     /// (conversation-level, all-tools wildcard, or per-tool).
+    ///
+    /// Reserved for future HITL approval-scope integration.
+    #[allow(dead_code)]
     pub fn is_approved(
         &self,
         run_id: &str,
@@ -1123,7 +1131,10 @@ fn decode_run(row: &Row<'_>) -> rusqlite::Result<TaskRun> {
 fn parse_dt(s: String) -> DateTime<Utc> {
     chrono::DateTime::parse_from_rfc3339(&s)
         .map(|d| d.with_timezone(&Utc))
-        .unwrap_or_else(|_| Utc::now())
+        .unwrap_or_else(|e| {
+            tracing::warn!(raw = %s, error = %e, "parse_dt: unparseable timestamp, falling back to now");
+            Utc::now()
+        })
 }
 
 fn parse_opt_dt(s: Option<String>) -> Option<DateTime<Utc>> {

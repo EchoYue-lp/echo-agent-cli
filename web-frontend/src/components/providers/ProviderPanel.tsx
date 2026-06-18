@@ -44,6 +44,12 @@ export function ProviderPanel() {
         setConfiguredModels(modelRes.models);
         const active = modelRes.models.find((model) => model.is_default);
         setCurrentModel(active?.display_name || active?.model || '');
+        // Backfill context_window from the active configured model so that
+        // re-saving (e.g. after changing temperature) does not silently
+        // overwrite the stored value with null.
+        if (active?.context_window != null && active.context_window > 0) {
+          setContextWindow(String(active.context_window));
+        }
         const firstProvider = templateRes.providers[0];
         if (firstProvider) {
           setSelectedId(firstProvider.id);
@@ -133,7 +139,7 @@ export function ProviderPanel() {
         base_url: hasCustomBaseUrl || isCustom ? trimmedBaseUrl : undefined,
         temperature: temperature ? Number(temperature) : undefined,
         max_tokens: maxTokens ? Number(maxTokens) : undefined,
-        context_window: contextWindow ? Number(contextWindow) : null,
+        context_window: contextWindow ? Number(contextWindow) : undefined,
         set_default: true,
       });
       setSwitchResult({

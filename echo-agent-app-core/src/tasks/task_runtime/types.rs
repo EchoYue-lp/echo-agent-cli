@@ -240,8 +240,8 @@ impl Default for TodoStatus {
 /// WaitingApproval -> Running | Suspended | Cancelled
 /// WaitingInput -> Running | Suspended | Cancelled
 /// Suspended -> Ready | Cancelled
-/// Cancelling -> Cancelled
-/// Failed -> Ready | Cancelled
+/// Cancelling -> Cancelled | Failed
+/// Failed -> Ready | Cancelled  (Ready: reserved for future retry-from-failed)
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
@@ -313,7 +313,7 @@ impl TaskRunStatus {
             WaitingApproval => matches!(next, Running | Suspended | Cancelled),
             WaitingInput => matches!(next, Running | Suspended | Cancelled),
             Suspended => matches!(next, Ready | Cancelled),
-            Cancelling => matches!(next, Cancelled),
+            Cancelling => matches!(next, Cancelled | Failed),
             Failed => matches!(next, Ready | Cancelled),
             // Terminal states.
             Cancelled | Completed => false,
@@ -728,6 +728,7 @@ mod tests {
         assert!(WaitingApproval.can_transition_to(Running));
         assert!(Suspended.can_transition_to(Ready));
         assert!(Cancelling.can_transition_to(Cancelled));
+        assert!(Cancelling.can_transition_to(Failed));
         assert!(Failed.can_transition_to(Ready));
     }
 

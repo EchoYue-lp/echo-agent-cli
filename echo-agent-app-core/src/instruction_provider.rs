@@ -75,7 +75,7 @@ impl InstructionProvider {
     fn load_project_instructions() -> Option<String> {
         std::env::current_dir()
             .ok()
-            .and_then(|pwd| Self::find_project_root(&pwd))
+            .and_then(|pwd| crate::utils::find_project_root(&pwd))
             .map(|root| root.join(".echo-agent").join("project.md"))
             .filter(|path| path.exists())
             .and_then(|path| std::fs::read_to_string(path).ok())
@@ -99,16 +99,6 @@ impl InstructionProvider {
     }
 
     /// Find the project root (first ancestor containing `.git` or `.echo-agent`).
-    fn find_project_root(start: &std::path::Path) -> Option<PathBuf> {
-        let mut current = Some(start);
-        while let Some(dir) = current {
-            if dir.join(".git").exists() || dir.join(".echo-agent").exists() {
-                return Some(dir.to_path_buf());
-            }
-            current = dir.parent();
-        }
-        None
-    }
 
     /// Save project-level instructions to `<cwd>/.echo-agent/project.md`.
     pub fn save_project_instructions(content: &str) -> std::io::Result<()> {
@@ -150,12 +140,12 @@ impl InstructionProvider {
     fn load_hot_memory() -> Option<String> {
         let raw = std::env::current_dir()
             .ok()
-            .and_then(|pwd| Self::find_project_root(&pwd))
+            .and_then(|pwd| crate::utils::find_project_root(&pwd))
             .map(|root| root.join(".echo-agent").join("MEMORY.md"))
             .filter(|path| path.exists())
             .and_then(|path| std::fs::read_to_string(path).ok())?;
 
-        Some(strip_yaml_frontmatter(&raw))
+        Some(crate::utils::strip_yaml_frontmatter(&raw))
     }
 
     /// Load auto-promoted rules from `<project-root>/.echo-agent/AGENTS.md`.
@@ -166,18 +156,18 @@ impl InstructionProvider {
     fn load_agents_instructions() -> Option<String> {
         std::env::current_dir()
             .ok()
-            .and_then(|pwd| Self::find_project_root(&pwd))
+            .and_then(|pwd| crate::utils::find_project_root(&pwd))
             .map(|root| root.join(".echo-agent").join("AGENTS.md"))
             .filter(|path| path.exists())
             .and_then(|path| std::fs::read_to_string(path).ok())
-            .map(|raw| strip_yaml_frontmatter(&raw))
+            .map(|raw| crate::utils::strip_yaml_frontmatter(&raw))
     }
 
     /// Path to the AGENTS.md file.
     pub fn agents_instructions_path() -> PathBuf {
         std::env::current_dir()
             .ok()
-            .and_then(|pwd| Self::find_project_root(&pwd))
+            .and_then(|pwd| crate::utils::find_project_root(&pwd))
             .map(|root| root.join(".echo-agent").join("AGENTS.md"))
             .unwrap_or_else(|| std::path::PathBuf::from(".echo-agent/AGENTS.md"))
     }
@@ -192,24 +182,6 @@ impl InstructionProvider {
     }
 }
 
-/// Strip YAML frontmatter (between --- markers) from a MEMORY.md file.
-fn strip_yaml_frontmatter(raw: &str) -> String {
-    let trimmed = raw.trim_start();
-    if !trimmed.starts_with("---") {
-        return raw.to_string();
-    }
-
-    let rest = &trimmed[3..]; // skip opening ---
-    if let Some(pos) = rest.find("\n---") {
-        let body = rest[pos + 4..]
-            .trim_start_matches('\n')
-            .trim_start_matches('\r');
-        return body.to_string();
-    }
-
-    // No closing marker — return as-is
-    raw.to_string()
-}
 
 impl Default for InstructionProvider {
     fn default() -> Self {

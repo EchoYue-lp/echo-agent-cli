@@ -14,7 +14,6 @@ pub use echo_agent::tasks::{
 
 pub mod background;
 pub mod hitl_provider;
-pub mod long_running;
 pub mod pipelines;
 pub mod progress_bridge;
 pub mod service;

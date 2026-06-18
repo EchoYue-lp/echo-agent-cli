@@ -30,7 +30,11 @@ function str(args: unknown, key: string): string {
   return '';
 }
 
-/** 工具名 → 产出(路径, 状态, 写入 args)的映射表 */
+/** 工具名 → 产出(路径, 状态, 写入 args)的映射表.
+ *
+ * NOTE: This list intentionally covers the common file-modifying tools. It does
+ * not cover shell commands (sed, git apply, etc.) or arbitrary MCP tools —
+ * those require backend-side git status / file watcher integration. */
 const FILE_TOOL_EXTRACTORS: Record<
   string,
   (tc: ToolCallInfo) => PathStatus[]
@@ -45,6 +49,16 @@ const FILE_TOOL_EXTRACTORS: Record<
     { path: str(tc.args, 'old_path'), status: 'deleted' },
     { path: str(tc.args, 'new_path'), status: 'added', writeArgs: tc.args },
   ],
+  apply_patch: (tc) => [{ path: str(tc.args, 'path'), status: 'modified', writeArgs: tc.args }],
+  multi_edit: (tc) => {
+    const edits = tc.args && typeof tc.args === 'object' && 'edits' in (tc.args as Record<string, unknown>)
+      ? (tc.args as Record<string, unknown>).edits
+      : null;
+    if (!Array.isArray(edits)) return [];
+    return edits
+      .filter((e): e is Record<string, unknown> => e && typeof e === 'object')
+      .map((e) => ({ path: str(e as unknown, 'path'), status: 'modified' as const, writeArgs: tc.args }));
+  },
 };
 
 function splitPath(path: string): { basename: string; dir: string } {

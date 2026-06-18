@@ -98,10 +98,21 @@ export function RightRail() {
     useChangesStore.getState().checkSessionChange(activeId);
   }, [activeId]);
 
-  // 从 messages 派生改动文件
+  // Derive changed files from messages. The effect fires on a stable
+  // tool-call fingerprint (total count of tool calls across messages)
+  // instead of on every streaming token, avoiding O(N×T) recalculation.
+  const toolCallCount = useMemo(() => {
+    let n = 0;
+    for (const m of messages) {
+      n += (m.toolCalls ?? []).length;
+    }
+    return n;
+  }, [messages]);
+
   useEffect(() => {
     useChangesStore.getState().setFiles(deriveChangedFiles(messages));
-  }, [messages]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [toolCallCount]);
 
   const displayedChanges = changesFiles.slice(0, 12);
 

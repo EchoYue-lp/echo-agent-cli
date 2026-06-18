@@ -427,6 +427,32 @@ impl AgentPool {
         tracing::info!(mode = %mode, pooled_agents, "AgentPool: permission mode applied");
     }
 
+    /// Propagate `working_dir` to all pooled agents.
+    ///
+    /// Called after a workspace switch so that background tasks and
+    /// multi-conversation agents operate in the new workspace root.
+    pub async fn apply_working_dir(&self, path: Option<std::path::PathBuf>) {
+        let agents: Vec<AgentHandle> = self
+            .agents
+            .read()
+            .await
+            .values()
+            .map(|pa| pa.handle.clone())
+            .collect();
+        for handle in agents {
+            let path = path.clone();
+            handle
+                .write_async(|agent| {
+                    Box::pin(async move {
+                        agent.set_working_dir(path);
+                    })
+                })
+                .await;
+        }
+        let pooled_agents = self.agents.read().await.len();
+        tracing::info!(?path, pooled_agents, "AgentPool: working_dir applied");
+    }
+
     /// Current number of agents in the pool (including background).
     pub async fn pool_size(&self) -> usize {
         self.agents.read().await.len()
@@ -480,12 +506,34 @@ impl AgentPool {
 
                 let idle_timeout = pool.config.idle_timeout;
                 let mut agents = pool.agents.write().await;
-                let to_remove: Vec<String> = agents
+                // First pass: find agents that exceed idle timeout (except background).
+                let timed_out: Vec<String> = agents
                     .iter()
                     .filter(|(id, agent)| {
                         id.as_str() != "__background__" && agent.last_used.elapsed() > idle_timeout
                     })
                     .map(|(id, _)| id.clone())
+                    .collect();
+
+                // Second pass: only evict agents that are NOT currently executing.
+                // Uses the same try_lock(execution_mutex) check as the acquire() path
+                // so long-running tasks (e.g. TaskRuntime DAG workers) aren't killed.
+                let to_remove: Vec<String> = timed_out
+                    .into_iter()
+                    .filter(|id| {
+                        let is_idle = agents
+                            .get(id)
+                            .and_then(|pa| pa.handle.inner().try_read().ok())
+                            .map(|guard| guard.execution_mutex().try_lock().is_ok())
+                            .unwrap_or(false);
+                        if !is_idle {
+                            tracing::debug!(
+                                conv_id = %id,
+                                "AgentPool: skipping eviction — agent is executing"
+                            );
+                        }
+                        is_idle
+                    })
                     .collect();
 
                 for id in to_remove {

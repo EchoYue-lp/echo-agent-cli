@@ -8,6 +8,11 @@
 //! streaming store) — a TaskRuntime run outlives any single chat turn and
 //! survives page refresh via the canonical SQLite store on the backend.
 
+/// Maximum number of events retained in-memory. Events are not rendered
+/// (only plan/todos/artifacts are), so this cap prevents unbounded growth
+/// on long-running complex tasks without impacting the user-facing UI.
+const MAX_EVENTS = 500;
+
 import { create } from 'zustand';
 import { taskRuntimeApi } from '../api/endpoints';
 import type {
@@ -78,8 +83,9 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
         activeRun: run,
         plan,
         todos,
-        // Append-only: merge new events past lastSeq.
-        events: [...get().events, ...events],
+        // Append-only: merge new events past lastSeq. Cap at 500 to prevent
+        // unbounded growth on long-running tasks (events are not rendered).
+        events: [...get().events, ...events].slice(-MAX_EVENTS),
         artifacts,
         lastSeq,
         awaitingApproval:

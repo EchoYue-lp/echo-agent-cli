@@ -23,7 +23,7 @@
 //! memory.recall("language preference").await;
 //! ```
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use echo_agent::memory::{Store, StoreItem};
 use std::sync::Arc;
@@ -176,7 +176,7 @@ impl UnifiedMemory {
             }
             InstructionTier::Project => {
                 let pwd = std::env::current_dir().map_err(|e| format!("Failed to get cwd: {e}"))?;
-                let root = find_project_root(&pwd).ok_or("Not in a project directory")?;
+                let root = crate::utils::find_project_root(&pwd).ok_or("Not in a project directory")?;
                 Ok(root.join(".echo-agent").join("project.md"))
             }
             InstructionTier::Local => {
@@ -275,24 +275,13 @@ impl UnifiedMemory {
 
     /// Get all context needed for system prompt injection.
     ///
-    /// Re-reads the hot layer MEMORY.md each call so that session mutations
-    /// (auto-promotion, demotion during review) are reflected immediately
-    /// without requiring a restart.
+    /// The instructions suffix (via `InstructionProvider`) already includes the
+    /// MEMORY.md hot layer. We do NOT re-read it here — that would duplicate
+    /// the same content under two different section headers (P0-5).
     pub fn system_prompt_context(&self) -> MemoryContext {
-        let mut memories = Vec::new();
-
-        // Re-read hot layer on each call so review/auto-promotion updates
-        // take effect in the same session.
-        let hot = load_hot_content();
-        if let Some(ref content) = hot
-            && !content.is_empty()
-        {
-            memories.push(content.clone());
-        }
-
         MemoryContext {
             instructions: self.instructions.get_system_prompt_suffix(),
-            memories,
+            memories: Vec::new(),
         }
     }
 
@@ -305,16 +294,6 @@ impl UnifiedMemory {
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
-/// Find the project root by walking up from the given directory.
-fn find_project_root(start: &Path) -> Option<PathBuf> {
-    let mut dir = start;
-    loop {
-        if dir.join(".echo-agent").exists() || dir.join(".git").exists() {
-            return Some(dir.to_path_buf());
-        }
-        dir = dir.parent()?;
-    }
-}
 
 /// Load the hot layer content from MEMORY.md (body only, frontmatter stripped).
 ///
@@ -322,13 +301,13 @@ fn find_project_root(start: &Path) -> Option<PathBuf> {
 fn load_hot_content() -> Option<String> {
     // Project-level
     if let Ok(pwd) = std::env::current_dir()
-        && let Some(root) = find_project_root(&pwd)
+        && let Some(root) = crate::utils::find_project_root(&pwd)
     {
         let path = root.join(".echo-agent").join("MEMORY.md");
         if path.exists()
             && let Ok(raw) = std::fs::read_to_string(&path)
         {
-            return Some(strip_yaml_frontmatter(&raw));
+            return Some(crate::utils::strip_yaml_frontmatter(&raw));
         }
     }
 
@@ -338,31 +317,13 @@ fn load_hot_content() -> Option<String> {
         if path.exists()
             && let Ok(raw) = std::fs::read_to_string(&path)
         {
-            return Some(strip_yaml_frontmatter(&raw));
+            return Some(crate::utils::strip_yaml_frontmatter(&raw));
         }
     }
 
     None
 }
 
-/// Strip YAML frontmatter (between --- markers) from a MEMORY.md file.
-fn strip_yaml_frontmatter(raw: &str) -> String {
-    let trimmed = raw.trim_start();
-    if !trimmed.starts_with("---") {
-        return raw.to_string();
-    }
-
-    let rest = &trimmed[3..]; // skip opening ---
-    if let Some(pos) = rest.find("\n---") {
-        let body = rest[pos + 4..]
-            .trim_start_matches('\n')
-            .trim_start_matches('\r');
-        return body.to_string();
-    }
-
-    // No closing marker — return as-is
-    raw.to_string()
-}
 
 #[cfg(test)]
 mod tests {

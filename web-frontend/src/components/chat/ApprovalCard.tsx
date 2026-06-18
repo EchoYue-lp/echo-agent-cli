@@ -27,9 +27,8 @@ export function ApprovalCard({
     setIsSubmitting(true);
     try {
       await action();
-    } catch (e) {
+    } finally {
       setIsSubmitting(false);
-      throw e;
     }
   };
 

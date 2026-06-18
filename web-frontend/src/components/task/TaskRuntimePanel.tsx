@@ -22,7 +22,7 @@ import {
 } from 'lucide-react';
 import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
 import { useConversationStore } from '../../stores/conversationStore';
-import type { TaskRunStatus, TodoStatus, PlanTaskKind } from '../../generated';
+import type { TodoStatus, PlanTaskKind } from '../../generated';
 
 const STATUS_LABEL: Record<string, string> = {
   pending: '待处理',
@@ -95,7 +95,6 @@ export function TaskRuntimePanel() {
     todos,
     artifacts,
     awaitingApproval,
-    generatingPlan,
     error,
     loadByConversation,
     refresh,

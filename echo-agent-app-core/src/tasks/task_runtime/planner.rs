@@ -313,6 +313,65 @@ fn validate_plan(goal: &str, tasks: &[PlanTask], warnings: &mut Vec<String>) -> 
         }
     }
 
+    // Dependency integrity: every depends_on must reference a task that exists
+    // in the plan. A dangling reference produces a task that can never become
+    // ready → the DAG stalls and the user sees a misleading "cycle or blocked"
+    // error in run_dag.
+    let ids: std::collections::HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+    for t in tasks {
+        for dep in &t.depends_on {
+            if !ids.contains(dep.as_str()) {
+                errors.push(format!(
+                    "task '{}' depends on '{}' which does not exist in the plan",
+                    t.title, dep
+                ));
+            }
+        }
+    }
+
+    // Cycle detection via DFS. A cycle makes the DAG unschedulable.
+    {
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut stack: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let id_to_deps: std::collections::HashMap<String, Vec<String>> = tasks
+            .iter()
+            .map(|t| (t.id.clone(), t.depends_on.clone()))
+            .collect();
+        fn dfs(
+            node: &str,
+            id_to_deps: &std::collections::HashMap<String, Vec<String>>,
+            visited: &mut std::collections::HashSet<String>,
+            stack: &mut std::collections::HashSet<String>,
+        ) -> bool {
+            if stack.contains(node) {
+                return true; // cycle found
+            }
+            if visited.contains(node) {
+                return false;
+            }
+            visited.insert(node.to_string());
+            stack.insert(node.to_string());
+            if let Some(deps) = id_to_deps.get(node) {
+                for dep in deps {
+                    if dfs(dep, id_to_deps, visited, stack) {
+                        return true;
+                    }
+                }
+            }
+            stack.remove(node);
+            false
+        }
+        for t in tasks {
+            if visited.contains(&t.id) {
+                continue;
+            }
+            if dfs(&t.id, &id_to_deps, &mut visited, &mut stack) {
+                errors.push(format!("plan contains a dependency cycle involving task '{}'", t.title));
+                break;
+            }
+        }
+    }
+
     // Drain soft warnings for non-blocking issues.
     if !warnings.is_empty() {
         // already populated by normalize_tasks; nothing to do
@@ -344,11 +403,14 @@ fn slug_id(index: usize, title: &str) -> String {
         })
         .collect();
     let slug: String = slug.split('-').filter(|s| !s.is_empty()).collect::<Vec<_>>().join("-");
-    let slug = if slug.len() > 32 { slug[..32].to_string() } else { slug };
+    let slug = if slug.chars().count() > 32 { slug.chars().take(32).collect() } else { slug };
+    // Always append index to guarantee uniqueness — two titles that normalise
+    // to the same slug (e.g. "A/B" and "A B" → "a-b") would otherwise collide
+    // on the PRIMARY KEY in tr_plan_tasks.
     if slug.is_empty() {
         format!("task-{index}")
     } else {
-        slug
+        format!("{slug}-{index}")
     }
 }
 
@@ -394,9 +456,11 @@ mod tests {
         let mut warnings = Vec::new();
         let tasks = normalize_tasks(&drafts, &mut warnings, template, DomainProfile::AiCoding).unwrap();
         assert_eq!(tasks.len(), 2);
-        assert_eq!(tasks[0].id, "review-runtime");
+        // slug_id always appends the index to guarantee uniqueness
+        // (see slug_id): "Review runtime" at index 0 → "review-runtime-0".
+        assert_eq!(tasks[0].id, "review-runtime-0");
         // Implementation task's depends_on rewritten from title → id.
-        assert_eq!(tasks[1].depends_on, vec!["review-runtime".to_string()]);
+        assert_eq!(tasks[1].depends_on, vec!["review-runtime-0".to_string()]);
         // Implementation task's parallel_group stripped (mutating work serializes).
         assert!(tasks[1].parallel_group.is_none());
         assert!(warnings.iter().any(|w| w.contains("serializing it")));
@@ -472,7 +536,7 @@ mod tests {
 
     #[test]
     fn slug_id_handles_unicode_and_collapses_separators() {
-        assert_eq!(slug_id(0, "Review HITL approval chain"), "review-hitl-approval-chain");
+        assert_eq!(slug_id(0, "Review HITL approval chain"), "review-hitl-approval-chain-0");
         assert_eq!(slug_id(3, ""), "task-3");
         // Unicode becomes separators, then collapsed.
         let s = slug_id(0, "审查 GUI 主运行时");

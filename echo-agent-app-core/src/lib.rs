@@ -28,6 +28,7 @@ pub mod state;
 pub mod tasks;
 pub mod types;
 pub mod unified_memory;
+pub mod utils;
 pub mod webhook;
 pub mod workspace;
 pub mod workspace_routing;

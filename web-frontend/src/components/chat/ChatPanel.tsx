@@ -28,16 +28,20 @@ export function ChatPanel() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const isNearBottomRef = useRef(true);
-  const { sendMessage, sendApproval, sendInput, sendSelection, cancel, connectionStatus } =
+  const { sendMessage, sendApproval, sendInput, sendSelection, cancel, reconnect, connectionStatus } =
     useChatTransport();
 
   const handleRegenerate = () => {
+    // Cancel any in-flight run before regenerating — otherwise late-arriving
+    // token events from the old run land on a deleted message (orphan).
+    cancel();
     const store = useChatStore.getState();
     const content = store.prepareRegenerate();
     if (content) sendMessage(content);
   };
 
   const handleEditAndResend = (messageId: string, newContent: string) => {
+    cancel();
     const store = useChatStore.getState();
     const content = store.prepareEditAndResend(messageId, newContent);
     if (content) sendMessage(content);
@@ -234,7 +238,17 @@ export function ChatPanel() {
             className="inline-block h-2 w-2 rounded-full"
             style={{ background: 'var(--accent)' }}
           />
-          已断开 — 重新连接中...
+          已断开
+          <button
+            onClick={reconnect}
+            className="ml-2 rounded px-2 py-0.5 text-xs font-medium underline hover:opacity-80"
+            style={{
+              background: 'color-mix(in srgb, var(--accent) 20%, transparent)',
+              color: 'var(--accent)',
+            }}
+          >
+            手动重连
+          </button>
         </div>
       )}
 
