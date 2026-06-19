@@ -19,7 +19,7 @@ export function renderMarkdown(text: string): string {
       const escaped = escapeHtml(code.trimEnd());
       const langLabel = lang || 'text';
       codeBlocks.push(
-        `<div class="md-pre-wrap"><div class="md-pre-header"><span>${langLabel}</span><button class="md-pre-copy" onclick="navigator.clipboard.writeText(this.closest('.md-pre-wrap').querySelector('code').textContent)">复制</button></div><pre><code>${escaped}</code></pre></div>`
+        `<div class="md-pre-wrap"><div class="md-pre-header"><span>${langLabel}</span><button type="button" class="md-pre-copy">复制</button></div><pre><code>${escaped}</code></pre></div>`
       );
       return `\x00CB${idx}\x00`;
     }
@@ -166,7 +166,14 @@ function escapeHtml(text: string): string {
 
 /**
  * Sanitize HTML using DOMPurify to prevent XSS attacks.
- * Allows specific safe attributes needed for the copy button in code blocks.
+ *
+ * SECURITY: `onclick` (and all `on*` event handler attributes) is intentionally
+ * NOT in ALLOWED_ATTR. The copy button carries no inline handler — it is
+ * identified purely by its `md-pre-copy` class and wired up via a delegated
+ * click listener on the render container (see `MarkdownContent`). Allowing
+ * `onclick` here would let any LLM-emitted / tool-result text that survives
+ * markdown parsing (e.g. `<button onclick="...">`) execute arbitrary JS in the
+ * page — the XSS pivot to the Tauri fs/shell capabilities.
  */
 function sanitizeHtml(html: string): string {
   return DOMPurify.sanitize(html, {
@@ -190,9 +197,7 @@ function sanitizeHtml(html: string): string {
       'a',
       'button',
     ],
-    ALLOWED_ATTR: ['class', 'href', 'target', 'rel', 'onclick', 'title'],
-    // Allow the specific onclick handler for the copy button
-    // DOMPurify will still sanitize the content, but preserve the attribute
+    ALLOWED_ATTR: ['class', 'href', 'target', 'rel', 'title', 'type'],
     ALLOW_DATA_ATTR: false,
   });
 }

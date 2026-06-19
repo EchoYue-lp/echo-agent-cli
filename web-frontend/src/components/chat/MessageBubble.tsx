@@ -17,7 +17,7 @@ import {
   ChevronRight,
   Brain,
 } from 'lucide-react';
-import { renderMarkdown } from '../../utils/markdown';
+import MarkdownContent from '../common/MarkdownContent';
 
 interface MessageBubbleProps {
   message: ChatMessage;
@@ -247,9 +247,9 @@ export const MessageBubble = memo(function MessageBubble({
                 {isUser ? (
                   <div className="whitespace-pre-wrap break-words">{message.content}</div>
                 ) : (
-                  <div
+                  <MarkdownContent
                     className="break-words"
-                    dangerouslySetInnerHTML={{ __html: renderMarkdown(message.content) }}
+                    content={message.content}
                   />
                 )}
                 {message.isStreaming && (

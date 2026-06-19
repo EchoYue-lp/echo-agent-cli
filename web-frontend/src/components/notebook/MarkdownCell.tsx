@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import type { Cell } from './NotebookPanel';
-import { renderMarkdown } from '../../utils/markdown';
+import MarkdownContent from '../common/MarkdownContent';
 
 interface Props {
   cell: Cell;
@@ -29,7 +29,8 @@ export default function MarkdownCell({ cell, onChange }: Props) {
       className="p-3 text-sm cursor-text prose prose-sm max-w-none"
       style={{ color: 'var(--text-primary)' }}
       onClick={() => setEditing(true)}
-      dangerouslySetInnerHTML={{ __html: renderMarkdown(cell.content) }}
-    />
+    >
+      <MarkdownContent content={cell.content} />
+    </div>
   );
 }
