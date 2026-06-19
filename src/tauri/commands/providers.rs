@@ -276,9 +276,12 @@ pub async fn get_thinking_support(
     let protocol = match profile.thinking_protocol {
         ThinkingProtocol::None => "none",
         ThinkingProtocol::OpenaiReasoningEffort => "openai_reasoning_effort",
+        ThinkingProtocol::AnthropicEffort => "anthropic_effort",
         ThinkingProtocol::AnthropicThinkingBudget => "anthropic_thinking_budget",
         ThinkingProtocol::AnthropicAdaptive => "anthropic_adaptive",
         ThinkingProtocol::EnableThinkingFlag => "enable_thinking_flag",
+        ThinkingProtocol::GlmThinkingType => "glm_thinking_type",
+        ThinkingProtocol::GlmReasoningEffort => "glm_reasoning_effort",
     };
     let supports = profile.thinking_protocol.emits_field();
     // Levels offered by the UI dropdown. Adaptive/None show no levels.
