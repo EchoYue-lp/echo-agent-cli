@@ -17,17 +17,18 @@ jobs:
 
       # echo-agent-cli depends on the echo-agent framework through a local
       # path dependency (path = "../echo-agent" in the root and sub-crate
-      # Cargo.toml files). CI checks this repo out on its own, so the sibling
-      # directory is absent and the workspace cannot even load — every cargo
-      # step (fmt/clippy/test) errors with "failed to read ../echo-agent/
-      # Cargo.toml". Check out echo-agent@main into ../echo-agent to satisfy
-      # the path dependency. (Requires echo-agent to be publicly readable; if
-      # it is ever made private, pass a PAT with contents:read via `token:`.)
+      # Cargo.toml). CI checks out this repo at
+      # /home/runner/work/echo-agent-cli/echo-agent-cli, so we check out
+      # echo-agent inside the workspace and symlink it to ../echo-agent to
+      # satisfy the path references without escaping the workspace root
+      # (actions/checkout@v4 rejects paths outside the workspace).
       - name: Checkout echo-agent (sibling path dependency)
         uses: actions/checkout@v4
         with:
           repository: EchoYue-lp/echo-agent
-          path: ../echo-agent
+          path: echo-agent
+      - name: Symlink echo-agent to expected path
+        run: ln -s $GITHUB_WORKSPACE/echo-agent $GITHUB_WORKSPACE/../echo-agent
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -46,6 +47,25 @@ jobs:
       # fail on warnings — letting regressions slip through.
       - name: Cargo clippy (all features, deny warnings)
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      # Security gate: detect patterns that the AGENTS.md hard constraints forbid.
+      # Fail the build when .expect(), unreachable!(), or byte-slicing (instead of
+      # chars().take()) appears in production code (P3-6.5).
+      - name: Security pattern gate
+        run: |
+          set -e
+          DIRS="echo-agent-cli/src echo-agent-cli/echo-agent-app-core/src echo-agent/src echo-agent/echo-core/src echo-agent/echo-execution/src echo-agent/echo-orchestration/src echo-agent/echo-state/src echo-agent/echo-tools/src echo-agent/echo-integration/src"
+          # .expect() calls (should use proper error propagation)
+          if grep -rn '\.expect(' $DIRS --include='*.rs' | grep -v '/tests/' | grep -v '/examples/' | grep -v '#\[cfg(test)\]' | grep -v '\.lock().unwrap_or_else' | grep -v '/target/' ; then
+            echo "ERROR: .expect() calls found in production code"
+            exit 1
+          fi
+          # unreachable!() in production code
+          if grep -rn 'unreachable!(' $DIRS --include='*.rs' | grep -v '/tests/' | grep -v '/examples/' | grep -v '/target/' ; then
+            echo "ERROR: unreachable!() found in production code"
+            exit 1
+          fi
+          echo "Security pattern gate passed"
 
       - name: Cargo test (all features)
         run: cargo test --workspace --all-features --locked

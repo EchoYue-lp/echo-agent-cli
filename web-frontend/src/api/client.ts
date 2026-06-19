@@ -10,34 +10,36 @@ const TOKEN_TYPE_KEY = 'token_type';
 const EXPIRES_AT_KEY = 'expires_at';
 
 export function getToken(): string | null {
-  return localStorage.getItem(TOKEN_KEY);
+  // sessionStorage: cleared when the browser/tab closes, reducing the
+  // window for XSS-based token theft compared to localStorage (P1-37).
+  return sessionStorage.getItem(TOKEN_KEY);
 }
 
 export function getTokenType(): string | null {
-  return localStorage.getItem(TOKEN_TYPE_KEY) || 'Bearer';
+  return sessionStorage.getItem(TOKEN_TYPE_KEY) || 'Bearer';
 }
 
 export function getExpiresAt(): number | null {
-  const expiresAt = localStorage.getItem(EXPIRES_AT_KEY);
+  const expiresAt = sessionStorage.getItem(EXPIRES_AT_KEY);
   return expiresAt ? parseInt(expiresAt, 10) : null;
 }
 
 export function setToken(token: string, tokenType: string = 'Bearer', expiresIn?: number): void {
-  localStorage.setItem(TOKEN_KEY, token);
-  localStorage.setItem(TOKEN_TYPE_KEY, tokenType);
+  sessionStorage.setItem(TOKEN_KEY, token);
+  sessionStorage.setItem(TOKEN_TYPE_KEY, tokenType);
 
   if (expiresIn) {
     const expiresAt = Date.now() + expiresIn * 1000;
-    localStorage.setItem(EXPIRES_AT_KEY, expiresAt.toString());
+    sessionStorage.setItem(EXPIRES_AT_KEY, expiresAt.toString());
   } else {
-    localStorage.removeItem(EXPIRES_AT_KEY);
+    sessionStorage.removeItem(EXPIRES_AT_KEY);
   }
 }
 
 export function clearToken(): void {
-  localStorage.removeItem(TOKEN_KEY);
-  localStorage.removeItem(TOKEN_TYPE_KEY);
-  localStorage.removeItem(EXPIRES_AT_KEY);
+  sessionStorage.removeItem(TOKEN_KEY);
+  sessionStorage.removeItem(TOKEN_TYPE_KEY);
+  sessionStorage.removeItem(EXPIRES_AT_KEY);
 }
 
 export function isTokenExpired(): boolean {

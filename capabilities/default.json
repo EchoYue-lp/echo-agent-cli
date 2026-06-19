@@ -23,7 +23,7 @@
     {
       "identifier": "shell:allow-open",
       "allow": [
-        { "path": "**" }
+        { "path": "https://*" }
       ]
     }
   ]

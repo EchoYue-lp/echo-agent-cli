@@ -76,8 +76,12 @@ export function useWebSocket() {
         }
       }, HEARTBEAT_INTERVAL_MS);
 
-      // Flush queued messages
-      const queued = messageQueue.current;
+      // Flush queued messages (with TTL: discard messages older than 30s)
+      const now = Date.now();
+      const QUEUE_MAX_AGE_MS = 30_000;
+      const queued = messageQueue.current.filter(
+        (m) => (m as any)._ts && (now - (m as any)._ts) < QUEUE_MAX_AGE_MS
+      );
       messageQueue.current = [];
       for (const msg of queued) {
         ws.send(JSON.stringify(msg));
@@ -206,7 +210,7 @@ export function useWebSocket() {
           isCancelledRef.current = false;
           break;
         case 'run_status':
-          store.setRunStatus(msg.status);
+          if (!isCancelledRef.current) store.setRunStatus(msg.status);
           break;
         case 'done':
           // If no final_answer was received, finalize with empty content.
@@ -271,8 +275,14 @@ export function useWebSocket() {
       wsRef.current.send(JSON.stringify(msg));
       return true;
     }
-    // Queue message for when reconnection succeeds
+    // Queue message for when reconnection succeeds (capped)
+    const MAX_QUEUE = 100;
     if (msg.type !== 'ping' && msg.type !== 'cancel') {
+      if (messageQueue.current.length >= MAX_QUEUE) {
+        messageQueue.current.shift(); // drop oldest
+      }
+      // Attach timestamp for TTL-based eviction on drain (P1-2.13)
+      (msg as any)._ts = Date.now();
       messageQueue.current.push(msg);
     }
     return false;

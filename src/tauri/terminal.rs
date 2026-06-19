@@ -8,7 +8,7 @@
 //!   - `terminal-exit` → `{ id }` (process exited)
 //! - Frontend uses xterm.js + FitAddon for rendering.
 
-use crate::tauri::error::IpcError;
+use crate::tauri::error::{IpcAuth, IpcError};
 use crate::tauri::state::TauriState;
 use base64::Engine;
 use dashmap::DashMap;
@@ -283,6 +283,11 @@ pub async fn create_terminal(
     rows: Option<u16>,
     cols: Option<u16>,
 ) -> Result<serde_json::Value, IpcError> {
+    // Phase 6.2: require full-auto permission for interactive shell access
+    {
+        let mode = state.app_state.config.permission_mode.read().await;
+        IpcAuth::require_full_auto(&mode)?;
+    }
     let rows = rows.unwrap_or(24);
     let cols = cols.unwrap_or(80);
     let pid = state

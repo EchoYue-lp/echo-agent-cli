@@ -4,7 +4,7 @@
 //! previously served via Axum HTTP routes. Each section corresponds to
 //! a deleted server route module.
 
-use crate::tauri::error::IpcError;
+use crate::tauri::error::{IpcAuth, IpcError};
 use crate::tauri::state::TauriState;
 use echo_agent_app_core::state::{AuditDecision, PermissionBehavior, PermissionRuleConfig};
 use echo_agent_app_core::workspace::layout::WorkspaceLayout;
@@ -648,6 +648,11 @@ pub async fn execute_sandbox(
     code: String,
     language: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
+    // Phase 6.2: require full-auto permission for code execution
+    {
+        let mode = state.app_state.config.permission_mode.read().await;
+        IpcAuth::require_full_auto(&mode)?;
+    }
     // P0-5 / N-P0-5: the IPC `execute_sandbox` must NOT be a host-RCE primitive.
     // Previously the fallback `SandboxManager::local_only()` ran frontend-supplied
     // shell directly on the user's machine, and `language: None`/`shell`/`sh`/

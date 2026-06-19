@@ -214,6 +214,11 @@ pub async fn connect_mcp_server(
     transport: McpTransportConfig,
 ) -> Result<serde_json::Value, IpcError> {
     use echo_agent::mcp::McpServerConfig;
+    use crate::tauri::error::IpcAuth;
+    // Phase 6.2: require full-auto permission for process-spawning commands
+    let mode = state.app_state.config.permission_mode.read().await;
+    IpcAuth::require_full_auto(&mode)?;
+    drop(mode);
 
     // P0-2 / N-P0-4: validate before spawning. The frontend must not be able
     // to spawn an arbitrary process or POST to an arbitrary internal URL.

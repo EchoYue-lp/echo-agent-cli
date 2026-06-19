@@ -46,9 +46,9 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
 
   switchTo: async (id: string) => {
     try {
-      console.log('[workspaceStore] switchTo:', id);
+      if (import.meta.env.DEV) console.debug('[workspaceStore] switchTo:', id);
       const res = await workspaceApi.switch(id);
-      console.log(
+      if (import.meta.env.DEV) console.debug(
         '[workspaceStore] switch API returned:',
         res.workspace?.name,
         'debug_conv_count:',
@@ -72,7 +72,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       const { useConversationStore } = await import('./conversationStore');
       useConversationStore.setState({ activeId: null });
       await useConversationStore.getState().init();
-      console.log(
+      if (import.meta.env.DEV) console.debug(
         '[workspaceStore] conversations loaded:',
         useConversationStore.getState().conversations.length
       );

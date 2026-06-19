@@ -1,8 +1,9 @@
 import { useRef, useCallback, useEffect } from 'react';
 import { useChatStore } from '../stores/chatStore';
 import { useConversationStore } from '../stores/conversationStore';
-import { useTaskRuntimeStore } from '../stores/taskRuntimeStore';
+import { useSubagentStore, type SubagentEventPayload } from '../stores/subagentStore';
 import { isTauri, apiInvoke } from '../lib/tauri-bridge';
+import { handleChatEvent } from './chatEventHandler';
 import type { Attachment, ChatRunStatus } from '../types/api';
 
 type ChatEventBase = {
@@ -53,11 +54,11 @@ type ChatEvent = ChatEventBase &
 
 export function useTauriChat() {
   const assistantIdRef = useRef<string | null>(null);
-  const inThinkingRef = useRef(false);
   const isCancelledRef = useRef(false);
   const unlistenRef = useRef<(() => void) | null>(null);
   const currentMessageKeyRef = useRef<string | null>(null);
   const currentConversationIdRef = useRef<string | null>(null);
+  const thinkingIdRef = useRef<string | null>(null);
 
   const isCurrentRunEvent = (event: ChatEvent) => {
     if (event.message_key) {
@@ -71,130 +72,13 @@ export function useTauriChat() {
 
   const handleEvent = useCallback((event: ChatEvent) => {
     if (!isCurrentRunEvent(event)) return;
-    const store = useChatStore.getState();
-
-    switch (event.type) {
-      case 'token': {
-        if (isCancelledRef.current) break;
-        if (!assistantIdRef.current) {
-          assistantIdRef.current = store.startAssistantMessage();
-        }
-        if (!inThinkingRef.current) {
-          inThinkingRef.current = true;
-          store.setThinking(true);
-          store.startThinkingSegment(assistantIdRef.current);
-        }
-        store.appendThinking(assistantIdRef.current, event.data);
-        break;
-      }
-      case 'thinking_start':
-        if (isCancelledRef.current) break;
-        inThinkingRef.current = true;
-        store.setThinking(true);
-        if (!assistantIdRef.current) {
-          assistantIdRef.current = store.startAssistantMessage();
-        }
-        store.startThinkingSegment(assistantIdRef.current);
-        break;
-      case 'thinking_end':
-        inThinkingRef.current = false;
-        store.setThinking(false);
-        break;
-      case 'tool_start':
-        if (isCancelledRef.current) break;
-        inThinkingRef.current = false;
-        store.setThinking(false);
-        store.setRunStatus('using_tool');
-        store.setToolCall(event.name, event.args);
-        break;
-      case 'tool_result':
-        if (isCancelledRef.current) break;
-        store.completeToolCall(event.name, event.result, event.success);
-        store.setRunStatus('running');
-        break;
-      case 'tool_batch_start':
-        if (isCancelledRef.current) break;
-        store.startToolBatch((event as any).tool_count || 0);
-        break;
-      case 'tool_batch_end':
-        if (isCancelledRef.current) break;
-        store.endToolBatch();
-        break;
-      case 'final_answer': {
-        if (!isCancelledRef.current && assistantIdRef.current) {
-          store.finalizeAssistantMessage(assistantIdRef.current, event.data);
-        }
-        inThinkingRef.current = false;
-        assistantIdRef.current = null;
-        currentMessageKeyRef.current = null;
-        isCancelledRef.current = false;
-        break;
-      }
-      case 'approval_request':
-        if (isCancelledRef.current) break;
-        store.setApprovalRequest({
-          requestId: event.request_id,
-          toolName: event.tool_name,
-          args: event.args,
-          prompt: event.prompt,
-        });
-        break;
-      case 'input_request':
-        if (isCancelledRef.current) break;
-        store.setInputRequest({ requestId: event.request_id, prompt: event.prompt });
-        break;
-      case 'selection_request':
-        if (isCancelledRef.current) break;
-        store.setSelectionRequest({
-          requestId: event.request_id,
-          prompt: event.prompt,
-          options: event.options,
-          taskId: event.task_id ?? undefined,
-          context: event.context,
-          phase: event.phase ?? undefined,
-        });
-        break;
-      case 'chart':
-        if (isCancelledRef.current) break;
-        store.addChartMessage(event.spec);
-        break;
-      case 'error': {
-        if (!isCancelledRef.current && assistantIdRef.current) {
-          store.finalizeAssistantMessage(assistantIdRef.current, `[Error] ${event.message}`);
-        }
-        store.setRunStatus('failed');
-        assistantIdRef.current = null;
-        currentMessageKeyRef.current = null;
-        isCancelledRef.current = false;
-        break;
-      }
-      case 'run_status':
-        store.setRunStatus(event.status);
-        break;
-      case 'cancelled':
-        store.setRunStatus('cancelled');
-        assistantIdRef.current = null;
-        currentMessageKeyRef.current = null;
-        isCancelledRef.current = false;
-        break;
-      case 'done':
-        // If no final_answer was received, finalize with empty content
-        if (assistantIdRef.current && !isCancelledRef.current) {
-          store.finalizeAssistantMessage(assistantIdRef.current, '');
-        }
-        assistantIdRef.current = null;
-        currentMessageKeyRef.current = null;
-        isCancelledRef.current = false;
-        break;
-      case 'plan_ready': {
-        // A complex input was routed to the TaskRuntime and a plan was
-        // generated. Hand it to the TaskRuntime store so the right-rail
-        // panel renders the plan + approval actions.
-        const runId = (event as { run_id: string }).run_id;
-        useTaskRuntimeStore.getState().notifyPlanReady(runId);
-        break;
-      }
-    }
+    handleChatEvent(event as any, {
+      assistantIdRef,
+      currentMessageKeyRef,
+      currentMessageIdRef: currentMessageKeyRef,
+      isCancelledRef,
+      currentThinkingIdRef: thinkingIdRef,
+    });
   }, []);
 
   // Set up event listener on mount
@@ -210,7 +94,14 @@ export function useTauriChat() {
           handleEvent(event.payload);
         }
       });
-      unlistenRef.current = unlisten;
+      // Subagent lifecycle events (Phase 5: Subagent visualization)
+      const unlistenSub = await listen<SubagentEventPayload>('subagent://event', (event) => {
+        if (mounted) {
+          useSubagentStore.getState().upsert(event.payload);
+        }
+      });
+      const origUnlisten = unlisten;
+      unlistenRef.current = () => { origUnlisten(); unlistenSub(); };
     };
 
     setupListener();
