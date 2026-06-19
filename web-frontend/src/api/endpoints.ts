@@ -1,7 +1,9 @@
 import { get, post, put, del } from './client';
 import { isTauri, apiInvoke } from '../lib/tauri-bridge';
+// A-tier types that have identical generated counterparts — import from
+// generated to eliminate the same-name duplication (6-10).
+import type { SessionInfo, ContextStats } from '../generated';
 import type {
-  SessionInfo,
   ToolInfo,
   SkillInfo,
   McpServerInfo,
@@ -26,7 +28,6 @@ import type {
   ConversationListItem,
   ConversationRecord,
   SavedMessage,
-  ContextStats,
   FullConfigResponse,
   FullConfigUpdateRequest,
   TrajectoryEntry,

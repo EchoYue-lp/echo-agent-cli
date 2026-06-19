@@ -1,7 +1,7 @@
 import { useState, useMemo } from 'react';
 import { ChevronDown, ChevronRight, Wrench, Copy, Check } from 'lucide-react';
 import { StatusBadge } from '../common/StatusBadge';
-import type { ToolCallInfo } from '../../types/api';
+import type { ToolCallInfo } from '../../generated';
 import { ChartCard, extractVegaLiteSpec } from './ChartCard';
 
 export function ToolCallCard({

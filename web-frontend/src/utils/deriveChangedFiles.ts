@@ -1,4 +1,5 @@
-import type { ChatMessage, ToolCallInfo } from '../types/api';
+import type { ToolCallInfo } from '../generated';
+import type { ChatMessage } from '../types/api';
 
 export type ChangeStatus = 'modified' | 'added' | 'deleted';
 

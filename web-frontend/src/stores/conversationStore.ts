@@ -159,14 +159,7 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
   init: async () => {
     try {
       const items = await conversationApi.list();
-      console.log(
-        '[conversationStore] init: loaded',
-        items.length,
-        'items:',
-        JSON.stringify(
-          items.map((i) => ({ id: i.conversation_id, title: i.title ?? '', msgs: i.message_count }))
-        )
-      );
+      if (import.meta.env.DEV) console.debug('[conversationStore] init: loaded', items.length, 'conversations');
       const metas: ConversationMeta[] = items
         .map((item) => ({
           id: item.conversation_id,
@@ -192,7 +185,7 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
     const title = firstUserMsg?.content?.slice(0, 50) || 'New Chat';
     const savedMessages = chatMessagesToSaved(messages);
 
-    console.log('[saveCurrent] activeId:', activeId, 'msgCount:', messages.length, 'title:', title);
+    if (import.meta.env.DEV) console.debug('[saveCurrent] activeId:', activeId, 'msgCount:', messages.length);
 
     try {
       if (activeId) {
@@ -201,7 +194,7 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
           title,
           messages: savedMessages,
         });
-        console.log('[saveCurrent] update result:', res);
+        if (import.meta.env.DEV) console.debug('[saveCurrent] update result:', res);
       } else {
         // Create new
         const newId = generateId();
@@ -210,7 +203,7 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
           title,
           messages: savedMessages,
         });
-        console.log('[saveCurrent] save result:', res, 'newId:', newId);
+        if (import.meta.env.DEV) console.debug('[saveCurrent] save result:', res, 'newId:', newId);
         set({ activeId: newId });
       }
     } catch (e) {
@@ -221,7 +214,7 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
     // Refresh list (best-effort, must not throw)
     try {
       const items = await conversationApi.list();
-      console.log('[saveCurrent] refreshed list:', items.length, 'conversations');
+      if (import.meta.env.DEV) console.debug('[saveCurrent] refreshed list:', items.length, 'conversations');
       const metas: ConversationMeta[] = items
         .map((item) => ({
           id: item.conversation_id,
@@ -275,11 +268,17 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
           }));
         }
 
-        // Restore execution rounds (round-based model)
+        // Restore execution rounds (round-based model).
+        // Typed via the SavedMessage shape instead of `any` (P1-40).
         if (m.execution_rounds && m.execution_rounds.length > 0) {
-          base.executionRounds = m.execution_rounds.map((r: any) => ({
+          type ExecutionRoundTool = { name: string; args: unknown; result: string; success: boolean };
+          type ExecutionRound = {
+            thinking?: { content: string };
+            tools: ExecutionRoundTool[];
+          };
+          base.executionRounds = (m.execution_rounds as ExecutionRound[]).map((r) => ({
             thinking: r.thinking ? { content: r.thinking.content } : undefined,
-            tools: (r.tools || []).map((t: any) => ({
+            tools: (r.tools || []).map((t): ExecutionRoundTool => ({
               name: t.name,
               args: t.args || {},
               result: t.result || '',
