@@ -113,7 +113,7 @@ pub async fn get_plugin(
 
 #[tauri::command]
 pub async fn install_plugin(
-    _state: tauri::State<'_, TauriState>,
+    state: tauri::State<'_, TauriState>,
     source: String,
     scope: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
@@ -122,6 +122,24 @@ pub async fn install_plugin(
         .and_then(|s| echo_agent::plugin::PluginScope::from_arg(&s))
         .unwrap_or(echo_agent::plugin::PluginScope::User);
     let source = echo_agent::plugin::InstallSource::parse(&source);
+
+    // P1-6: confine a Local install source to an allowed root. A `Local(path)`
+    // source copies that directory into a plugin scope dir; without confinement
+    // a compromised page could aggregate any on-disk directory (e.g. copy
+    // `~/.ssh` into a plugin and read it back). Git sources are SSRF-checked in
+    // the registry. Allow only paths under the current workspace root or home.
+    if let echo_agent::plugin::InstallSource::Local(ref src_path) = source {
+        let canonical = src_path
+            .canonicalize()
+            .map_err(|_| IpcError::NotFound(format!("插件源目录不存在: {}", src_path.display())))?;
+        let allowed = super::panels::allowed_skill_roots(&state).await;
+        if !allowed.iter().any(|root| canonical.starts_with(root)) {
+            return Err(IpcError::Validation(format!(
+                "插件源目录不在允许范围内（须位于当前工作区或用户主目录下）: {}",
+                src_path.display()
+            )));
+        }
+    }
 
     match registry.install(&source, scope) {
         Ok(id) => {

@@ -243,6 +243,7 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
             // Terminal (PTY)
             terminal::create_terminal,
             terminal::write_terminal,
+            terminal::confirm_terminal_consent,
             terminal::resize_terminal,
             terminal::close_terminal,
             terminal::list_terminal_sessions,

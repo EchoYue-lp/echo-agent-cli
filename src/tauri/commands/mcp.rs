@@ -373,7 +373,100 @@ pub async fn get_mcp_config(
     state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
     let config = state.app_state.plugins.mcp_config.read().await;
-    serde_json::to_value(&*config).map_err(|e| IpcError::Internal(e.to_string()))
+    let mut value =
+        serde_json::to_value(&*config).map_err(|e| IpcError::Internal(e.to_string()))?;
+    // P1-3: redact secrets before returning to the frontend. MCP `env` and
+    // `headers` routinely carry API tokens (e.g. `Authorization: Bearer …`,
+    // `API_KEY=sk-…`); returning them verbatim means any page (or XSS) can
+    // exfiltrate every server's credentials via a single `invoke`. Replace
+    // each value with a presence marker so the UI can still show "configured".
+    redact_mcp_config_secrets(&mut value);
+    Ok(value)
+}
+
+/// Replace credential-bearing values in a serialized MCP config with
+/// `"<redacted>"` markers (P1-3). Mutates in place.
+///
+/// - `env` map values → `"<redacted>"` (env vars for stdio servers are almost
+///   always secrets).
+/// - `headers` map values → `"<redact>"` redaction of the credential part
+///   (keeps the scheme, e.g. `Bearer <redacted>`, so the UI can show the auth
+///   type without exposing the token).
+/// - `url` query params named like secrets (`token`/`key`/`secret`/`password`)
+///   → value `<redacted>`.
+fn redact_mcp_config_secrets(value: &mut serde_json::Value) {
+    let Some(servers) = value.get_mut("mcpServers").and_then(|v| v.as_object_mut()) else {
+        return;
+    };
+    for (_name, entry) in servers.iter_mut() {
+        let Some(obj) = entry.as_object_mut() else {
+            continue;
+        };
+        if let Some(env) = obj.get_mut("env").and_then(|v| v.as_object_mut()) {
+            for (_k, v) in env.iter_mut() {
+                *v = serde_json::Value::String("<redacted>".to_string());
+            }
+        }
+        if let Some(headers) = obj.get_mut("headers").and_then(|v| v.as_object_mut()) {
+            for (_k, v) in headers.iter_mut() {
+                if let Some(s) = v.as_str().map(|s| s.to_string()) {
+                    *v = serde_json::Value::String(redact_header_value(&s));
+                }
+            }
+        }
+        if let Some(url) = obj
+            .get_mut("url")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+        {
+            if let Some(redacted) = redact_url_secrets(&url) {
+                obj.insert("url".to_string(), serde_json::Value::String(redacted));
+            }
+        }
+    }
+}
+
+/// Redact the credential portion of a header value, keeping the scheme.
+/// `Bearer sk-abc` → `Bearer <redacted>`; unknown schemes → `<redacted>`.
+fn redact_header_value(value: &str) -> String {
+    if let Some((scheme, _)) = value.split_once(' ') {
+        format!("{scheme} <redacted>")
+    } else {
+        "<redacted>".to_string()
+    }
+}
+
+/// If `url` has a query parameter whose name looks like a secret
+/// (`token`/`key`/`secret`/`password`/`apikey`), return the URL with those
+/// values replaced by `<redacted>`. Returns `None` if nothing to redact.
+fn redact_url_secrets(url: &str) -> Option<String> {
+    let (base, query) = url.split_once('?')?;
+    let secret_names = [
+        "token",
+        "key",
+        "secret",
+        "password",
+        "apikey",
+        "access_token",
+    ];
+    let mut changed = false;
+    let parts: Vec<String> = query
+        .split('&')
+        .map(|kv| {
+            let (k, _v) = kv.split_once('=').unwrap_or((kv, ""));
+            if secret_names.iter().any(|s| k.eq_ignore_ascii_case(s)) {
+                changed = true;
+                format!("{k}=<redacted>")
+            } else {
+                kv.to_string()
+            }
+        })
+        .collect();
+    if changed {
+        Some(format!("{}?{}", base, parts.join("&")))
+    } else {
+        None
+    }
 }
 
 #[tauri::command]

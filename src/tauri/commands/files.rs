@@ -405,10 +405,15 @@ fn is_safe_git_ref(git_ref: &str) -> bool {
     if git_ref.is_empty() {
         return false;
     }
+    // P1-5: tightened charset. `^`/`~`/`@`/`:` are valid git rev syntax
+    // (`HEAD^`, `HEAD~2`, `@`, `ref:path`) but they double as injection /
+    // treeish-traversal surfaces when the ref is interpolated into `git show
+    // <ref>:<path>`. Diff_file only needs branch / tag names, so we restrict
+    // to alphanumerics, `-`, `_`, `.`, `/` (branch names like `feat/x`).
     for c in git_ref.chars() {
         if !matches!(c,
             'a'..='z' | 'A'..='Z' | '0'..='9' |
-            '-' | '_' | '.' | '/' | '^' | '~' | '@' | ':'
+            '-' | '_' | '.' | '/'
         ) {
             return false;
         }

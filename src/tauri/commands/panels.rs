@@ -428,13 +428,27 @@ pub async fn load_skill(
     }
 
     let path = std::path::PathBuf::from(raw);
-    if !path.exists() {
-        return Err(IpcError::NotFound(format!(
-            "技能目录不存在: {}",
+
+    // P1-6: confine the skill directory to an allowed root. Previously any
+    // absolute path the frontend supplied was loaded as a skill — a single XSS
+    // could point the agent at an attacker-controlled SKILL.md anywhere on disk
+    // (e.g. a temp dir) and have it executed with the agent's privileges. We
+    // canonicalize the resolved path and require it to live under the current
+    // workspace root or the user's home directory (where legitimate skill
+    // bundles — project-local `.echo-agent/skills` or the global skills dir —
+    // already reside).
+    let canonical = path
+        .canonicalize()
+        .map_err(|_| IpcError::NotFound(format!("技能目录不存在: {}", path.display())))?;
+    let allowed_roots = allowed_skill_roots(&state).await;
+    if !allowed_roots.iter().any(|root| canonical.starts_with(root)) {
+        return Err(IpcError::Validation(format!(
+            "技能目录不在允许范围内（须位于当前工作区或用户主目录下）: {}",
             path.display()
         )));
     }
-    if !path.is_dir() {
+
+    if !canonical.is_dir() {
         return Err(IpcError::Validation(format!(
             "技能路径不是目录: {}",
             path.display()
@@ -1378,6 +1392,28 @@ async fn workspace_project_root(state: &TauriState) -> Result<PathBuf, IpcError>
         std::env::current_dir()
             .map_err(|e| IpcError::Internal(format!("Failed to resolve current directory: {e}")))
     }
+}
+
+/// Roots under which a skill directory may legitimately reside (P1-6).
+///
+/// Returns the current workspace root (best-effort; skipped if unavailable)
+/// plus the user's home directory (where the global skills bundle lives).
+/// `load_skill` canonicalizes the requested path and requires it to be under
+/// one of these, so a compromised page cannot point the agent at an arbitrary
+/// on-disk SKILL.md.
+pub(crate) async fn allowed_skill_roots(state: &TauriState) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(ws_root) = workspace_project_root(state).await {
+        if let Ok(c) = ws_root.canonicalize() {
+            roots.push(c);
+        }
+    }
+    if let Some(home) = std::env::var("HOME").ok().map(PathBuf::from) {
+        if let Ok(c) = home.canonicalize() {
+            roots.push(c);
+        }
+    }
+    roots
 }
 
 fn run_git(repo: &Path, args: &[&str]) -> Result<String, IpcError> {

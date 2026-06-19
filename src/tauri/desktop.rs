@@ -40,22 +40,26 @@ fn install_panic_hook() {
         );
         let _ = std::fs::write(&log_path, &message);
 
-        // On macOS, also try to show a native dialog
+        // On macOS, also try to show a native dialog. P1-7: do NOT interpolate
+        // the panic payload (`info`) or the log path into the AppleScript
+        // string — a panic message can contain arbitrary text (including
+        // user-controlled filenames) and `replace('"', "\\\"")` is not a
+        // complete AppleScript escape (backslashes, braces, `}`/`{` all break
+        // out). The dialog now uses a fixed string and only points the user at
+        // the crash log file; full details live in the log written above, not
+        // in the dialog.
         #[cfg(target_os = "macos")]
         {
             use std::process::Command;
             let _ = Command::new("osascript")
                 .arg("-e")
-                .arg(format!(
+                .arg(
                     "display dialog \"EchoCoWork crashed during startup.\\n\\n\
-                     Error: {}\\n\\n\
-                     Crash log: {}\\n\\n\
-                     Run from Terminal to see full output:\n\
+                     Details have been written to the crash log.\\n\\n\
+                     Run from Terminal to see full output:\\n\
                      /Applications/EchoCoWork.app/Contents/MacOS/echo-agent-cli\" \
-                     with title \"EchoCoWork\" buttons {{\"OK\"}} default button \"OK\"",
-                    info.to_string().replace('"', "\\\""),
-                    log_path.display()
-                ))
+                     with title \"EchoCoWork\" buttons {\"OK\"} default button \"OK\"",
+                )
                 .output();
         }
     }));

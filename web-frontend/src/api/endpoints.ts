@@ -723,6 +723,10 @@ export const terminalApi = {
     isTauri()
       ? apiInvoke<TerminalSession>('create_terminal', { id: `term-${Date.now()}`, cwd })
       : post<TerminalSession>('/terminal', { cwd }),
+  confirmConsent: (id: string) =>
+    isTauri()
+      ? apiInvoke<{ success: boolean; consented: boolean }>('confirm_terminal_consent', { id })
+      : Promise.resolve({ success: true, consented: true }),
   close: (id: string) =>
     isTauri()
       ? apiInvoke<{ closed: string }>('close_terminal', { id })

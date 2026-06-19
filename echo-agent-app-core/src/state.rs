@@ -529,15 +529,27 @@ impl AppState {
             tasks: TaskState {
                 service: None,
                 cancel_token: CancellationToken::new(),
-                runtime: Some(Arc::new(
-                    crate::tasks::task_runtime::TaskRuntimeStore::new().unwrap_or_else(|e| {
-                        tracing::warn!(
-                            "Failed to open task_runtime.db: {e}; falling back to in-memory store"
+                runtime: Some({
+                    let store = crate::tasks::task_runtime::TaskRuntimeStore::new()
+                        .unwrap_or_else(|e| {
+                            tracing::warn!(
+                                "Failed to open task_runtime.db: {e}; falling back to in-memory store"
+                            );
+                            crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
+                                .expect("in-memory task_runtime store should always init — OOM?")
+                        });
+                    // P1-8: proactively recover runs interrupted by a previous
+                    // process crash, so zombie runs don't linger in an active
+                    // state until (if ever) they're next executed.
+                    let recovered = store.recover_incomplete();
+                    if recovered > 0 {
+                        tracing::info!(
+                            count = recovered,
+                            "Recovered interrupted task-runtime runs at boot"
                         );
-                        crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
-                            .expect("in-memory task_runtime store should always init — OOM?")
-                    }),
-                )),
+                    }
+                    Arc::new(store)
+                }),
                 auto_route: AtomicBool::new(false),
                 interaction_mode: std::sync::atomic::AtomicU8::new(0), // 0 = Auto
                 run_cancel_tokens: DashMap::new(),

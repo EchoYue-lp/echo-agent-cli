@@ -17,7 +17,7 @@
 //! | `.workspace.json` | Workspace directories | Workspace metadata |
 //! | `.lsp.yaml` | Project root | LSP server configuration |
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// A discovered configuration file.
 #[derive(Debug, Clone)]

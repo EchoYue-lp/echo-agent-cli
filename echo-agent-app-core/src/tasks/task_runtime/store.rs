@@ -775,6 +775,74 @@ impl TaskRuntimeStore {
         Ok(rows.filter_map(Result::ok).collect())
     }
 
+    /// Boot-time recovery of runs interrupted by a process restart (P1-8).
+    ///
+    /// A run left in an active state (Running / WaitingApproval / WaitingInput /
+    /// Suspended / Cancelling) when the process died has no driver to finish it
+    /// — it is a zombie that blocks the run list and can never complete. The
+    /// per-run lazy recovery in `run_dag` only fires when *that specific run*
+    /// is next executed, so a zombie that is never revisited stays forever.
+    ///
+    /// This scans all interrupted runs once at startup and transitions each to
+    /// `Failed` (with a note), matching the lazy-recovery outcome but applied
+    /// proactively. Pending / Planning / AwaitingPlanApproval / Ready are left
+    /// untouched: they had not begun executing, so they are not zombies and may
+    /// be resumed by the caller. Returns the number of runs recovered.
+    ///
+    /// Safe to call on an empty/fresh store (no-op).
+    pub fn recover_incomplete(&self) -> usize {
+        const INTERRUPTED: &[TaskRunStatus] = &[
+            TaskRunStatus::Running,
+            TaskRunStatus::WaitingApproval,
+            TaskRunStatus::WaitingInput,
+            TaskRunStatus::Suspended,
+            TaskRunStatus::Cancelling,
+        ];
+        let zombies = match self.list_runs_in(INTERRUPTED) {
+            Ok(z) => z,
+            Err(e) => {
+                tracing::warn!(error = %e, "recover_incomplete: failed to list interrupted runs");
+                return 0;
+            }
+        };
+        let count = zombies.len();
+        for run in &zombies {
+            let reason = format!(
+                "recovered from {} (interrupted by process restart)",
+                run.status.as_str()
+            );
+            if let Err(e) = self.note(&run.run_id, None, &reason) {
+                tracing::warn!(
+                    run_id = %run.run_id,
+                    error = %e,
+                    "recover_incomplete: failed to note recovery"
+                );
+            }
+            match self.transition_run(&run.run_id, TaskRunStatus::Failed) {
+                Ok(_) => tracing::info!(
+                    run_id = %run.run_id,
+                    from = %run.status.as_str(),
+                    "recovered interrupted run → Failed at boot"
+                ),
+                Err(StoreError::IllegalTransition { from, .. }) => {
+                    // State changed concurrently between list and transition —
+                    // not an error, just skip this run.
+                    tracing::debug!(
+                        run_id = %run.run_id,
+                        from,
+                        "recover_incomplete: run no longer in interrupted state, skipped"
+                    );
+                }
+                Err(e) => tracing::warn!(
+                    run_id = %run.run_id,
+                    error = %e,
+                    "recover_incomplete: failed to transition run to Failed"
+                ),
+            }
+        }
+        count
+    }
+
     pub fn get_plan(&self, run_id: &str) -> Result<Option<TaskPlan>, StoreError> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
