@@ -646,10 +646,7 @@ pub async fn execute_sandbox(
     //      safety classifier), never a raw frontend code-runner.
     //   2. Code execution is only allowed when a real container sandbox
     //      (Docker/k8s) is configured. No `local_only()` fallback.
-    let lang = language
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
+    let lang = language.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let is_shell = matches!(
         lang.map(str::to_ascii_lowercase).as_deref(),
         Some("shell") | Some("sh") | Some("bash") | Some("zsh") | Some("fish")

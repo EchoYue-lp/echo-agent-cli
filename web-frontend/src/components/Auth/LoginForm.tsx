@@ -106,7 +106,6 @@ export function LoginForm() {
             )}
           </button>
 
-          <p className="text-center text-xs text-[var(--text-tertiary)]">默认凭证: admin / admin</p>
         </form>
 
         <div className="mt-6 rounded-lg border border-[var(--border-primary)] bg-[var(--bg-hover)] p-3">

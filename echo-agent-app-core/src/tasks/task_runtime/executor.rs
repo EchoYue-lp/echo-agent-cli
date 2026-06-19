@@ -123,12 +123,19 @@ pub async fn execute_run(
     // Zombie recovery: a run left in Cancelling (e.g. process crashed during
     // shutdown) has no driver to finish it. Auto-transition to Failed so it
     // doesn't block the run list forever.
-    if run.status == TaskRunStatus::Cancelling {
-        let _ = store.note(
-            run_id,
-            None,
-            "recovered from Cancelling (interrupted shutdown)",
+    if matches!(
+        run.status,
+        TaskRunStatus::Running
+            | TaskRunStatus::WaitingApproval
+            | TaskRunStatus::WaitingInput
+            | TaskRunStatus::Suspended
+            | TaskRunStatus::Cancelling
+    ) {
+        let reason = format!(
+            "recovered from {} (interrupted by process restart)",
+            run.status.as_str()
         );
+        let _ = store.note(run_id, None, &reason);
         let _ = store.transition_run(run_id, TaskRunStatus::Failed);
         save_trace(
             run_store.as_ref(),
@@ -139,9 +146,10 @@ pub async fn execute_run(
         );
         return Ok(RunOutcome::Failed {
             failed_task_id: "<none>".into(),
-            error:
-                "run was in Cancelling state (interrupted shutdown); auto-transitioned to Failed"
-                    .into(),
+            error: format!(
+                "run was in {} state (interrupted); auto-transitioned to Failed",
+                run.status.as_str()
+            ),
         });
     }
     // The caller (execute_task_run command) is responsible for the

@@ -169,7 +169,7 @@ impl ConfigDiscovery {
 
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-        let project_root = find_project_root(&cwd);
+        let project_root = crate::utils::find_project_root(&cwd);
 
         Self {
             project_root,
@@ -412,16 +412,6 @@ impl Default for ConfigDiscovery {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
-
-fn find_project_root(start: &Path) -> Option<PathBuf> {
-    let mut dir = start;
-    loop {
-        if dir.join(".echo-agent").exists() || dir.join(".git").exists() {
-            return Some(dir.to_path_buf());
-        }
-        dir = dir.parent()?;
-    }
-}
 
 #[cfg(test)]
 mod tests {

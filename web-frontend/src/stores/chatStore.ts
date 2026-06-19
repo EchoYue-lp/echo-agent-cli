@@ -63,6 +63,18 @@ interface ChatState {
   prepareEditAndResend: (messageId: string, newContent: string) => string | null;
 }
 
+/// Maximum number of messages retained in-memory. Beyond this, oldest messages
+/// are evicted to prevent OOM on very long conversations (P0-4).
+const MAX_MESSAGES = 500;
+
+/// Trim oldest messages when an array exceeds MAX_MESSAGES. Applied to every
+/// path that grows or replaces the message list (addUserMessage,
+/// startAssistantMessage, replaceMessages) so the cap cannot be bypassed via
+/// the streaming path or a loaded historical conversation (P0-4).
+function trimToMax(msgs: ChatMessage[]): ChatMessage[] {
+  return msgs.length > MAX_MESSAGES ? msgs.slice(-MAX_MESSAGES) : msgs;
+}
+
 let msgCounter = 0;
 const nextId = () => `msg-${++msgCounter}-${Date.now()}`;
 
@@ -97,21 +109,18 @@ export const useChatStore = create<ChatState>((set, get) => ({
   currentRound: null,
 
   addUserMessage: (content, attachments) => {
-    set((s) => ({
-      isCancelled: false,
-      runStatus: 'running',
-      messages: [
-        ...s.messages,
-        { id: nextId(), role: 'user', content, attachments, timestamp: Date.now() },
-      ],
-    }));
+    set((s) => {
+      const newMsg: ChatMessage = { id: nextId(), role: 'user', content, attachments, timestamp: Date.now() };
+      const msgs = trimToMax([...s.messages, newMsg]);
+      return { isCancelled: false, runStatus: 'running', messages: msgs };
+    });
     scheduleAutoSave();
   },
 
   startAssistantMessage: () => {
     const id = nextId();
     set((s) => ({
-      messages: [
+      messages: trimToMax([
         ...s.messages,
         {
           id,
@@ -124,7 +133,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           isStreaming: true,
           timestamp: Date.now(),
         },
-      ],
+      ]),
       isStreaming: true,
       isCancelled: false,
       runStatus: 'running',
@@ -335,7 +344,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   replaceMessages: (messages) =>
     set({
-      messages,
+      messages: trimToMax(messages),
       isStreaming: false,
       isCancelled: false,
       isHistoryView: true,

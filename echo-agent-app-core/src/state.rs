@@ -308,9 +308,14 @@ impl ConnectionState {
     /// Falls back to the primary `agent` if pool is disabled or acquire fails.
     pub async fn agent_for(&self, conversation_id: &str) -> AgentHandle {
         if let Some(ref pool) = self.pool {
-            pool.acquire(conversation_id)
-                .await
-                .unwrap_or_else(|_| self.agent.clone())
+            pool.acquire(conversation_id).await.unwrap_or_else(|e| {
+                tracing::warn!(
+                    conv_id = %conversation_id,
+                    error = %e,
+                    "AgentPool::acquire failed, falling back to primary agent"
+                );
+                self.agent.clone()
+            })
         } else {
             self.agent.clone()
         }
@@ -929,6 +934,12 @@ impl AppState {
             self.connection
                 .agent
                 .try_write(|a| a.set_state_store(runtime_store));
+        }
+
+        // Reset pooled agents' working_dir so background tasks don't keep
+        // running in the exited workspace (P1 — exit_workspace pool reset).
+        if let Some(ref pool) = self.connection.pool {
+            pool.apply_working_dir(None).await;
         }
 
         tracing::info!("Exited workspace, using global default paths");

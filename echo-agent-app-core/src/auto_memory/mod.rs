@@ -21,7 +21,7 @@ pub fn append_to_project_memory(observations: &[Observation]) -> Result<(), Stri
 
     let formatted = format_observations_for_memory(observations);
     let cwd = std::env::current_dir().map_err(|e| format!("Failed to get cwd: {e}"))?;
-    let root = find_project_root(&cwd).unwrap_or(cwd);
+    let root = crate::utils::find_project_root(&cwd).unwrap_or(cwd);
     let memory_path = root.join(".echo-agent").join("project.md");
 
     if let Some(parent) = memory_path.parent() {
@@ -80,14 +80,4 @@ pub async fn write_observations_to_memory_layer(
         &layer_manager,
     )
     .await
-}
-
-fn find_project_root(start: &std::path::Path) -> Option<std::path::PathBuf> {
-    let mut dir = start;
-    loop {
-        if dir.join(".echo-agent").exists() || dir.join(".git").exists() {
-            return Some(dir.to_path_buf());
-        }
-        dir = dir.parent()?;
-    }
 }

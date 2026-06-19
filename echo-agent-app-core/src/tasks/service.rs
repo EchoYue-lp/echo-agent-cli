@@ -243,10 +243,11 @@ impl BackgroundTaskService {
         let manager = Arc::new(TaskManager::with_logging_and_events());
 
         // Get event bus reference from manager for external subscribers
-        let event_bus = manager
-            .event_bus()
-            .cloned()
-            .expect("with_logging_and_events always creates an event bus");
+        let event_bus = manager.event_bus().cloned().ok_or_else(|| {
+            anyhow::anyhow!(
+                "TaskManager did not create an event bus; background task service cannot start"
+            )
+        })?;
         let event_bus = Arc::new(event_bus);
 
         // Create HITL provider for background tasks.

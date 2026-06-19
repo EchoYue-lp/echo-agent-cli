@@ -43,7 +43,15 @@ function extractVegaLiteSpec(result: string): unknown | null {
 export { extractVegaLiteSpec };
 
 function buildChartHtml(spec: unknown): string {
-  const specJson = JSON.stringify(spec);
+  // Escape `<`, `>`, `&` as JSON unicode escapes so a user-controlled spec
+  // containing `</script>` cannot terminate the inline script element early
+  // (N-P1-14). JSON.parse decodes them back, so the rendered spec is unchanged.
+  const specJson = JSON.stringify(spec)
+    .replace(/</g, '\\u003c')
+    .replace(/>/g, '\\u003e')
+    .replace(/&/g, '\\u0026');
+  // Store spec in a <script type="application/json"> element to avoid
+  // </script> injection from user-controlled Vega-Lite spec data.
   return `<!DOCTYPE html>
 <html>
 <head>
@@ -57,8 +65,11 @@ function buildChartHtml(spec: unknown): string {
 </head>
 <body>
   <div id="vis"></div>
+  <script id="vega-spec" type="application/json">${specJson}</script>
   <script>
-    vegaEmbed('#vis', ${specJson}, {
+    var specEl = document.getElementById('vega-spec');
+    var spec = JSON.parse(specEl.textContent || '{}');
+    vegaEmbed('#vis', spec, {
       actions: { export: true, source: false, compiled: false, editor: false }
     }).catch(function(err) {
       document.body.innerHTML = '<p style="color:red;padding:1rem">Chart render error: ' + err.message + '</p>';
@@ -82,7 +93,9 @@ export function ChartCard({ spec }: ChartCardProps) {
     iframe.style.width = '100%';
     iframe.style.height = expanded ? '600px' : '400px';
     iframe.style.border = 'none';
-    iframe.sandbox.add('allow-scripts', 'allow-same-origin');
+    // Sandbox with allow-scripts only: omit allow-same-origin so a malicious
+    // spec cannot reach out to the parent document's origin (N-P1-14).
+    iframe.sandbox.add('allow-scripts');
     iframe.srcdoc = buildChartHtml(spec);
     container.appendChild(iframe);
   }, [spec, expanded]);

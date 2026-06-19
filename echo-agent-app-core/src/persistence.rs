@@ -295,7 +295,11 @@ impl Persistence {
             fs::create_dir_all(parent)?;
         }
         let json = serde_json::to_string_pretty(data)?;
-        fs::write(path, json)?;
+        // Atomic write: write to temp file then rename, so a crash during write
+        // leaves the original file intact (P1 — persistence non-atomic write).
+        let tmp = path.with_extension("json.tmp");
+        fs::write(&tmp, &json)?;
+        fs::rename(&tmp, path)?;
         Ok(())
     }
 
