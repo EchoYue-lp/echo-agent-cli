@@ -284,12 +284,43 @@ pub async fn write_terminal(
         .terminal_manager
         .get(&id)
         .map_err(IpcError::NotFound)?;
-    // Data is base64-encoded from the frontend
+
+    // P0-4 / N-P0-6: `write_terminal` is an interactive-shell injection channel
+    // reachable from any page JS. We can't fully block it (the user wants the
+    // terminal), but we bound the abuse surface:
+    //   - reject oversized payloads (a single `invoke` writing MBs is almost
+    //     certainly a scripted paste of a malicious payload, not keystrokes);
+    //   - audit-log every write (session id + size + truncated preview) so
+    //     injected commands are observable after the fact.
+    const MAX_WRITE_BYTES: usize = 64 * 1024;
+
+    // Data is base64-encoded from the frontend.
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(&data)
         .map_err(|e| IpcError::Validation(format!("Invalid base64: {e}")))?;
+    if bytes.len() > MAX_WRITE_BYTES {
+        return Err(IpcError::Validation(format!(
+            "Terminal write payload too large ({} bytes > {} max). Batch large inputs or use a file.",
+            bytes.len(),
+            MAX_WRITE_BYTES
+        )));
+    }
+
+    // Audit log: session + size + a short, lossy preview (first 80 bytes).
+    // Lossy UTF-8 conversion so the preview never panics on binary.
+    let preview: String = String::from_utf8_lossy(&bytes[..bytes.len().min(80)])
+        .chars()
+        .take(80)
+        .collect();
+    tracing::info!(
+        terminal_session = %id,
+        bytes = bytes.len(),
+        preview = %preview,
+        "terminal write"
+    );
+
     session.write(&bytes).await.map_err(IpcError::Internal)?;
-    Ok(serde_json::json!({"success": true}))
+    Ok(serde_json::json!({ "success": true }))
 }
 
 #[tauri::command]

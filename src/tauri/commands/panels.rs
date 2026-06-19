@@ -634,20 +634,54 @@ pub async fn execute_sandbox(
     code: String,
     language: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
+    // P0-5 / N-P0-5: the IPC `execute_sandbox` must NOT be a host-RCE primitive.
+    // Previously the fallback `SandboxManager::local_only()` ran frontend-supplied
+    // shell directly on the user's machine, and `language: None`/`shell`/`sh`/
+    // `bash` all routed to `SandboxCommand::shell(code)` — i.e. any XSS reaching
+    // this command got unconditional arbitrary host shell execution.
+    //
+    // Rules enforced here:
+    //   1. Shell languages are REJECTED from IPC. Shell execution must go through
+    //      the agent tool path (which carries HITL approval + the command
+    //      safety classifier), never a raw frontend code-runner.
+    //   2. Code execution is only allowed when a real container sandbox
+    //      (Docker/k8s) is configured. No `local_only()` fallback.
+    let lang = language
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let is_shell = matches!(
+        lang.map(str::to_ascii_lowercase).as_deref(),
+        Some("shell") | Some("sh") | Some("bash") | Some("zsh") | Some("fish")
+    );
+    if is_shell || lang.is_none() {
+        return Err(IpcError::Validation(
+            "Shell execution is not permitted via execute_sandbox; use the agent shell tool (HITL-gated) instead.".to_string(),
+        ));
+    }
+    let lang = lang.expect("non-empty language checked above");
+
     let manager = state
         .app_state
         .connection
         .primary_agent()
         .read(|agent| agent.sandbox_manager().cloned())
-        .await
-        .unwrap_or_else(|| std::sync::Arc::new(echo_agent::sandbox::SandboxManager::local_only()));
-    let command = match language.as_deref().filter(|s| !s.trim().is_empty()) {
-        Some("shell") | Some("sh") | Some("bash") => {
-            echo_agent::sandbox::SandboxCommand::shell(code)
+        .await;
+    let manager = match manager {
+        Some(m) => m,
+        None => {
+            return Err(IpcError::Validation(
+                "No sandbox manager configured on the agent; code execution disabled.".to_string(),
+            ));
         }
-        Some(lang) => echo_agent::sandbox::SandboxCommand::code(lang.to_string(), code),
-        None => echo_agent::sandbox::SandboxCommand::shell(code),
     };
+    if !manager.has_container_sandbox() {
+        return Err(IpcError::Validation(
+            "Code execution requires a containerized sandbox (Docker/k8s); none is configured. Refusing to run untrusted code on the host.".to_string(),
+        ));
+    }
+
+    let command = echo_agent::sandbox::SandboxCommand::code(lang.to_string(), code);
     let result = manager
         .execute(command)
         .await
