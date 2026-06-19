@@ -15,6 +15,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # echo-agent-cli depends on the echo-agent framework through a local
+      # path dependency (path = "../echo-agent" in the root and sub-crate
+      # Cargo.toml files). CI checks this repo out on its own, so the sibling
+      # directory is absent and the workspace cannot even load — every cargo
+      # step (fmt/clippy/test) errors with "failed to read ../echo-agent/
+      # Cargo.toml". Check out echo-agent@main into ../echo-agent to satisfy
+      # the path dependency. (Requires echo-agent to be publicly readable; if
+      # it is ever made private, pass a PAT with contents:read via `token:`.)
+      - name: Checkout echo-agent (sibling path dependency)
+        uses: actions/checkout@v4
+        with:
+          repository: EchoYue-lp/echo-agent
+          path: ../echo-agent
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
