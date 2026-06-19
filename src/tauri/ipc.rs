@@ -8,7 +8,6 @@
 //! Path validation is centralized in [`crate::tauri::path_validator`].
 
 use serde::Serialize;
-use std::path::PathBuf;
 
 use super::path_validator;
 

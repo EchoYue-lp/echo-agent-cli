@@ -41,7 +41,17 @@ export function McpPanel() {
         throw new Error('Config must have "mcpServers" object');
       }
 
-      const result = await mcpApi.updateConfig(parsedConfig);
+      // Timeout guard: even if the backend stalls, the spinner must release so
+      // the user isn't left looking at "保存中..." forever. 20s is well above
+      // the expected config-persist time (the heavy reconnect now runs in the
+      // background on the Rust side).
+      const SAVE_TIMEOUT_MS = 20_000;
+      const result = await Promise.race([
+        mcpApi.updateConfig(parsedConfig),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('保存超时，请重试')), SAVE_TIMEOUT_MS)
+        ),
+      ]);
 
       if (result.success) {
         setSaveMessage({ type: 'success', text: result.message || '配置已保存并应用' });
@@ -54,8 +64,9 @@ export function McpPanel() {
       }
     } catch (e: any) {
       console.error(e);
-      setParseError(e.message || 'Invalid JSON configuration');
-      setSaveMessage({ type: 'error', text: e.message || '无效的JSON配置' });
+      const msg = e?.message || '无效的JSON配置';
+      setParseError(msg);
+      setSaveMessage({ type: 'error', text: msg });
     } finally {
       setIsSaving(false);
     }

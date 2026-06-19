@@ -35,7 +35,8 @@ pub async fn create_workspace(
         .unwrap_or_default();
 
     let result = if let Some(ref root_str) = root {
-        crate::tauri::path_validator::validate_workspace_root(root_str).map_err(IpcError::Validation)?;
+        crate::tauri::path_validator::validate_workspace_root(root_str)
+            .map_err(IpcError::Validation)?;
         let root_path = std::path::PathBuf::from(root_str);
         state
             .app_state

@@ -10,14 +10,22 @@ export function ConfigPanel() {
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState('');
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+
+  const load = async () => {
+    setLoadError(null);
+    try {
+      const [agent, full] = await Promise.all([configApi.get(), configApi.getFull()]);
+      setAgentConfig(agent);
+      setFullConfig(full);
+    } catch (e) {
+      console.error('[ConfigPanel] failed to load config:', e);
+      setLoadError(e instanceof Error ? e.message : String(e));
+    }
+  };
 
   useEffect(() => {
-    Promise.all([configApi.get(), configApi.getFull()])
-      .then(([agent, full]) => {
-        setAgentConfig(agent);
-        setFullConfig(full);
-      })
-      .catch(console.error);
+    load();
   }, []);
 
   const markDirty = (update: Partial<FullConfigUpdateRequest>) => {
@@ -71,6 +79,16 @@ export function ConfigPanel() {
       setSaving(false);
     }
   };
+
+  if (loadError)
+    return (
+      <div className="p-3 text-sm" style={{ color: 'var(--color-error)' }}>
+        配置加载失败：{loadError}
+        <button onClick={load} className="ml-2 underline">
+          重试
+        </button>
+      </div>
+    );
 
   if (!agentConfig || !fullConfig)
     return <div className="p-3 text-sm text-[var(--text-tertiary)]">加载中...</div>;

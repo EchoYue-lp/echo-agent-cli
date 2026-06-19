@@ -81,7 +81,8 @@ pub async fn list_files(
         base.clone()
     };
 
-    crate::tauri::path_validator::validate_within_base(&target, &base).map_err(IpcError::Validation)?;
+    crate::tauri::path_validator::validate_within_base(&target, &base)
+        .map_err(IpcError::Validation)?;
 
     if !target.exists() {
         return Err(IpcError::NotFound("Directory not found".to_string()));
@@ -133,7 +134,8 @@ pub async fn read_file(
     let base = get_workspace_root(&state).await;
     let target = base.join(&path);
 
-    crate::tauri::path_validator::validate_within_base(&target, &base).map_err(IpcError::Validation)?;
+    crate::tauri::path_validator::validate_within_base(&target, &base)
+        .map_err(IpcError::Validation)?;
 
     if !target.exists() {
         return Err(IpcError::NotFound("File not found".to_string()));
@@ -173,7 +175,8 @@ pub async fn diff_file(
     }
 
     let target = base.join(&path);
-    crate::tauri::path_validator::validate_within_base(&target, &base).map_err(IpcError::Validation)?;
+    crate::tauri::path_validator::validate_within_base(&target, &base)
+        .map_err(IpcError::Validation)?;
 
     let new_content = if target.exists() {
         std::fs::read_to_string(&target).unwrap_or_default()
@@ -347,7 +350,6 @@ async fn get_workspace_root(state: &TauriState) -> std::path::PathBuf {
         std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
     }
 }
-
 
 fn detect_language(path: &str) -> Option<String> {
     let ext = path.rsplit('.').next()?;

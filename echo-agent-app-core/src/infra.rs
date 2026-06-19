@@ -670,10 +670,26 @@ pub fn init_logging_with_target(level: &str, target: LogTarget) {
                     }
                 }
                 LogTarget::Stderr => {
-                    let _ = tracing_subscriber::registry()
-                        .with(env_filter())
-                        .with(tracing_subscriber::fmt::layer())
-                        .try_init();
+                    // Dual sink: keep the stderr console output (visible in the
+                    // `cargo tauri dev` terminal) AND mirror to a rotating-ish
+                    // file at ~/.echo-agent/logs/app.log so issues can be
+                    // diagnosed after the fact without re-running. Append mode
+                    // so restarts don't wipe the log.
+                    use tracing_subscriber::layer::SubscriberExt;
+                    let registry = tracing_subscriber::registry().with(env_filter());
+                    let file_layer = app_log_file().map(|file| {
+                        tracing_subscriber::fmt::layer()
+                            .with_writer(std::sync::Mutex::new(file))
+                            .with_ansi(false)
+                    });
+                    if let Some(file_layer) = file_layer {
+                        let _ = registry
+                            .with(tracing_subscriber::fmt::layer())
+                            .with(file_layer)
+                            .try_init();
+                    } else {
+                        let _ = registry.with(tracing_subscriber::fmt::layer()).try_init();
+                    }
                 }
             }
         }
@@ -708,6 +724,25 @@ fn tui_log_path() -> std::path::PathBuf {
         .join("logs");
     let _ = std::fs::create_dir_all(&dir);
     dir.join("tui.log")
+}
+
+/// Open the shared GUI app log file for appending: `~/.echo-agent/logs/app.log`.
+///
+/// Used by the Stderr log target as a second sink so that `cargo tauri dev`
+/// output is also persisted to disk (the stderr stream itself is lost once the
+/// terminal that launched the app is closed). Append mode keeps history across
+/// restarts; rotate/truncate manually if it grows too large.
+fn app_log_file() -> Option<std::fs::File> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let dir = std::path::PathBuf::from(home)
+        .join(".echo-agent")
+        .join("logs");
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("app.log"))
+        .ok()
 }
 
 // ── Doctor 诊断 ──────────────────────────────────────────────────

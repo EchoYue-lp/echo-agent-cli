@@ -6,9 +6,21 @@ import { Wrench, ChevronDown, ChevronRight } from 'lucide-react';
 export function ToolsPanel() {
   const [tools, setTools] = useState<ToolInfo[]>([]);
   const [expanded, setExpanded] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+
+  const load = async () => {
+    setLoadError(null);
+    try {
+      const data = await toolsApi.list();
+      setTools(data);
+    } catch (e) {
+      console.error('[ToolsPanel] failed to load tools:', e);
+      setLoadError(e instanceof Error ? e.message : String(e));
+    }
+  };
 
   useEffect(() => {
-    toolsApi.list().then(setTools).catch(console.error);
+    load();
   }, []);
 
   const toggle = async (name: string, enable: boolean) => {
@@ -28,6 +40,21 @@ export function ToolsPanel() {
           工具 ({tools.length})
         </h3>
       </div>
+      {loadError && (
+        <div
+          className="mb-2 rounded-lg px-3 py-2 text-xs"
+          style={{ background: 'var(--color-error-bg)', color: 'var(--color-error)' }}
+        >
+          工具列表加载失败：{loadError}
+          <button
+            onClick={load}
+            className="ml-2 underline"
+            style={{ color: 'var(--color-error)' }}
+          >
+            重试
+          </button>
+        </div>
+      )}
       {tools.map((tool) => (
         <div
           key={tool.name}

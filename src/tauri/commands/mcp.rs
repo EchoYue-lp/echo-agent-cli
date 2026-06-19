@@ -214,11 +214,11 @@ pub async fn connect_mcp_server(
     transport: McpTransportConfig,
 ) -> Result<serde_json::Value, IpcError> {
     use echo_agent::mcp::McpServerConfig;
-    use crate::tauri::error::IpcAuth;
-    // Phase 6.2: require full-auto permission for process-spawning commands
-    let mode = state.app_state.config.permission_mode.read().await;
-    IpcAuth::require_full_auto(&mode)?;
-    drop(mode);
+    // MCP is a user-driven capability extension: the user explicitly configures
+    // servers they trust. EKO is a local personal assistant with no online /
+    // multi-user threat model, so we don't gate it behind a permission mode.
+    // Input validation (executable allowlist + URL scheme) below still guards
+    // against typos and obvious misconfiguration.
 
     // P0-2 / N-P0-4: validate before spawning. The frontend must not be able
     // to spawn an arbitrary process or POST to an arbitrary internal URL.
@@ -482,43 +482,80 @@ pub async fn update_mcp_config(
     let new_config: echo_agent::mcp::McpConfigFile =
         serde_json::from_value(config).map_err(|e| IpcError::Validation(e.to_string()))?;
 
+    // 1. Persist the new config synchronously and return success immediately.
+    //    Reconnection is potentially slow (stdio spawn / HTTP / SSE with their
+    //    own timeouts) and must NOT block the IPC response — otherwise the
+    //    frontend's "保存中..." spinner spins forever when a server is
+    //    unreachable. We reconcile connections in a background task below.
     {
         let mut cfg = state.app_state.plugins.mcp_config.write().await;
         *cfg = new_config.clone();
     }
 
-    // Reconnect with new config
-    state
-        .app_state
-        .connection
-        .agent
-        .write_async(|agent| {
-            let cfg = new_config.clone();
-            Box::pin(async move {
-                // Disconnect all existing
-                let names: Vec<String> = agent
-                    .list_mcp_servers()
-                    .into_iter()
-                    .map(|s| s.to_string())
-                    .collect();
-                for name in names {
-                    agent.disconnect_mcp(&name).await;
-                }
-                // Reconnect from config
-                for (name, entry) in &cfg.mcp_servers {
-                    if !entry.disabled
-                        && let Ok(server_config) = entry.to_server_config(name)
-                    {
-                        agent.connect_mcp_from_config(server_config).await.ok();
+    let agent_handle = state.app_state.connection.primary_agent();
+
+    // 2. Reconnect in the background. Each server connection is bounded by a
+    //    timeout so one unreachable server (e.g. an `http://localhost:8100`
+    //    that nothing is serving) can't stall the whole reconnect loop for
+    //    tens of seconds. connect_mcp_from_config / disconnect_mcp require
+    //    `&mut self`, so this runs inside write_async (holds the write lock).
+    //    That's acceptable now because no IPC caller is waiting on it.
+    tokio::spawn(async move {
+        const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+        agent_handle
+            .write_async(|agent| {
+                let cfg = new_config.clone();
+                Box::pin(async move {
+                    // Disconnect all existing servers first.
+                    let names: Vec<String> = agent
+                        .list_mcp_servers()
+                        .into_iter()
+                        .map(|s| s.to_string())
+                        .collect();
+                    for name in names {
+                        agent.disconnect_mcp(&name).await;
                     }
-                }
+
+                    // Reconnect each enabled server, each with a timeout.
+                    // A timeout / error on one server is logged and skipped so
+                    // the remaining servers still get connected.
+                    for (name, entry) in &cfg.mcp_servers {
+                        if entry.disabled {
+                            continue;
+                        }
+                        let Ok(server_config) = entry.to_server_config(name) else {
+                            tracing::warn!(
+                                server = %name,
+                                "MCP server config invalid; skipped during reconnect"
+                            );
+                            continue;
+                        };
+                        let connect = agent.connect_mcp_from_config(server_config);
+                        match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
+                            Ok(Ok(_)) => {
+                                tracing::info!(server = %name, "MCP server reconnected");
+                            }
+                            Ok(Err(e)) => {
+                                tracing::warn!(server = %name, error = %e, "MCP server connect failed");
+                            }
+                            Err(_) => {
+                                tracing::warn!(
+                                    server = %name,
+                                    timeout_secs = CONNECT_TIMEOUT.as_secs(),
+                                    "MCP server connect timed out; skipped"
+                                );
+                            }
+                        }
+                    }
+                })
             })
-        })
-        .await;
+            .await;
+    });
 
     Ok(serde_json::json!({
         "success": true,
-        "message": "MCP config updated",
+        "message": "MCP 配置已保存，正在后台连接服务器",
     }))
 }
 

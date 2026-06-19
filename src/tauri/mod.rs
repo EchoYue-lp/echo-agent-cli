@@ -55,6 +55,18 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(TauriState::new(app_state))
+        .setup(|app| {
+            // Auto-open DevTools in debug builds so `cargo tauri dev` users can
+            // inspect the WebView console immediately (Cmd+Option+I to toggle).
+            #[cfg(debug_assertions)]
+            {
+                use tauri::Manager;
+                if let Some(window) = app.get_webview_window("main") {
+                    window.open_devtools();
+                }
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             // Native IPC (existing)
             ipc::native_read_file,
@@ -349,14 +361,11 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
             // (Phase 5: Subagent visualization).
             {
                 let app_handle = app.handle().clone();
-                let agent = app.state::<TauriState>()
-                    .app_state.connection.agent.clone();
+                let agent = app.state::<TauriState>().app_state.connection.agent.clone();
                 tokio::spawn(async move {
                     let mut rx = agent
                         .read_async(|a| {
-                            Box::pin(async move {
-                                a.subagent_registry().event_bus().subscribe()
-                            })
+                            Box::pin(async move { a.subagent_registry().event_bus().subscribe() })
                         })
                         .await;
                     loop {
