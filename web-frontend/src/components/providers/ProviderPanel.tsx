@@ -21,6 +21,10 @@ export function ProviderPanel() {
   const [maxTokens, setMaxTokens] = useState('');
   const [contextWindow, setContextWindow] = useState('');
   const [contextWindowPreset, setContextWindowPreset] = useState('auto');
+  // Thinking-depth control. Only shown when the selected (provider, model)
+  // reports thinking support (queried via get_thinking_support).
+  const [thinking, setThinking] = useState('auto');
+  const [thinkingLevels, setThinkingLevels] = useState<string[] | null>(null);
   const [loading, setLoading] = useState(true);
   const [testing, setTesting] = useState(false);
   const [switching, setSwitching] = useState(false);
@@ -66,6 +70,36 @@ export function ProviderPanel() {
 
   const selected = providers.find((p) => p.id === selectedId) ?? null;
   const isCustom = selectedId === 'custom';
+
+  // Query thinking support whenever the provider or model changes, so the
+  // 思考深度 dropdown only renders for models that actually accept it.
+  useEffect(() => {
+    const provider = selectedId ?? '';
+    const model = customModel.trim() || selectedModel;
+    if (!provider || !model) {
+      setThinkingLevels(null);
+      return;
+    }
+    let cancelled = false;
+    providerApi
+      .getThinkingSupport({ provider, model })
+      .then((res) => {
+        if (cancelled) return;
+        if (res.supports) {
+          setThinkingLevels(res.levels.length > 0 ? res.levels : ['auto', 'low', 'medium', 'high']);
+        } else {
+          setThinkingLevels(null);
+          setThinking('auto');
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setThinkingLevels(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedId, selectedModel, customModel]);
+
   const providerHasModels = (providerId: string) =>
     configuredModels.some((model) => model.provider === providerId);
   const authSourceLabel = (source?: string) => {
@@ -140,6 +174,7 @@ export function ProviderPanel() {
         temperature: temperature ? Number(temperature) : undefined,
         max_tokens: maxTokens ? Number(maxTokens) : undefined,
         context_window: contextWindow ? Number(contextWindow) : undefined,
+        thinking: thinkingLevels ? thinking : undefined,
         set_default: true,
       });
       setSwitchResult({
@@ -425,6 +460,38 @@ export function ProviderPanel() {
               />
             </div>
           </div>
+
+          {/* Thinking depth — only rendered for models that support a thinking
+              control (queried via get_thinking_support). The dropdown's options
+              come from the backend so they match the resolved ThinkingProtocol. */}
+          {thinkingLevels && thinkingLevels.length > 0 && (
+            <div>
+              <label className="mb-1 block text-xs text-[var(--text-secondary)]">
+                思考深度
+                <span className="ml-1 text-[var(--text-tertiary)]">(该模型支持推理控制)</span>
+              </label>
+              <select
+                value={thinking}
+                onChange={(e) => setThinking(e.target.value)}
+                className="w-full rounded-lg border border-[var(--border-primary)] bg-[var(--bg-input)] px-3 py-2 text-sm text-[var(--text-primary)] outline-none focus:border-[var(--border-focus)]"
+              >
+                {thinkingLevels.map((lvl) => {
+                  const labels: Record<string, string> = {
+                    auto: '自动（模型默认）',
+                    minimal: '最低（最快）',
+                    low: '低',
+                    medium: '中',
+                    high: '高（最深思考）',
+                  };
+                  return (
+                    <option key={lvl} value={lvl}>
+                      {labels[lvl] ?? lvl}
+                    </option>
+                  );
+                })}
+              </select>
+            </div>
+          )}
 
           {/* Context Window */}
           <div>

@@ -594,6 +594,26 @@ impl AgentPool {
             agent.set_llm_client(llm.clone());
         }
         if let Some(llm_config) = self.runtime_llm_config.read().await.clone() {
+            // Translate the optional thinking spec (e.g. "high", "4000",
+            // "disabled") into a ThinkingConfig and inject it so every chat
+            // request the agent makes carries the configured reasoning depth.
+            // Unparseable specs are logged and dropped (config typos shouldn't
+            // wedge the agent). "auto"/empty → None (model default).
+            if let Some(spec) = llm_config.thinking.as_deref()
+                && !spec.trim().is_empty()
+            {
+                match echo_agent::llm::ThinkingConfig::parse_spec(spec) {
+                    Ok(Some(cfg)) => agent.set_thinking(Some(cfg)),
+                    Ok(None) => agent.set_thinking(None),
+                    Err(e) => {
+                        tracing::warn!(
+                            thinking_spec = spec,
+                            error = %e,
+                            "ignoring unparseable thinking config; using model default"
+                        );
+                    }
+                }
+            }
             agent.set_llm_config(llm_config);
         }
         if let Some(ref tm) = self.shared.tool_manager {

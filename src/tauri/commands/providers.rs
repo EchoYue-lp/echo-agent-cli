@@ -21,6 +21,8 @@ pub struct UpsertConfiguredModelRequest {
     pub context_window: Option<u32>,
     pub enabled: Option<bool>,
     pub set_default: Option<bool>,
+    /// 思考深度(`auto`/`disabled`/`minimal`/`low`/`medium`/`high`/`<number>`)。
+    pub thinking: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -89,6 +91,22 @@ async fn apply_runtime_model(
                 }
                 agent.set_temperature(runtime.temperature);
                 agent.set_max_tokens(runtime.max_tokens);
+                // Apply thinking depth: translate the spec string into a
+                // ThinkingConfig and inject it. "auto"/empty → None (model
+                // default). Unparseable specs are warned and dropped.
+                match runtime.thinking.as_deref() {
+                    Some(spec) if !spec.trim().is_empty() => {
+                        match echo_agent::llm::ThinkingConfig::parse_spec(spec) {
+                            Ok(cfg) => agent.set_thinking(cfg),
+                            Err(e) => tracing::warn!(
+                                thinking_spec = spec,
+                                error = %e,
+                                "ignoring unparseable thinking config"
+                            ),
+                        }
+                    }
+                    _ => agent.set_thinking(None),
+                }
                 // Apply context_window: if set, use it as token_limit so the
                 // agent gets the right budget/compression behavior. If not
                 // set, leave token_limit unchanged (framework infers).
@@ -172,6 +190,7 @@ pub async fn upsert_configured_model(
             max_tokens: req.max_tokens,
             temperature: req.temperature,
             context_window: req.context_window,
+            thinking: req.thinking,
         };
         model_id = model_config::upsert_configured_model(&mut cfg, configured);
         if req.set_default.unwrap_or(false) {
@@ -233,6 +252,47 @@ pub async fn set_default_model(
         "display_name": runtime.display_name,
         "model": runtime.model,
         "provider": runtime.provider,
+    }))
+}
+
+/// Query whether a given (provider, model) supports a thinking-depth control,
+/// and which protocol it speaks. The frontend uses this to show/hide the
+/// "思考深度" dropdown next to the model selector.
+///
+/// Returns:
+/// - `supports`: bool — whether a thinking field would be honored (not None /
+///   not AnthropicAdaptive, since adaptive models silently ignore it).
+/// - `protocol`: one of "none" | "openai_reasoning_effort" |
+///   "anthropic_thinking_budget" | "anthropic_adaptive" | "enable_thinking_flag".
+/// - `levels`: list of user-facing level strings valid for this protocol.
+#[tauri::command]
+pub async fn get_thinking_support(
+    provider: String,
+    model: String,
+) -> Result<serde_json::Value, IpcError> {
+    use echo_agent::llm::{ModelProfile, ProviderCapabilities, ThinkingProtocol};
+    let caps = ProviderCapabilities::from_provider_name(&provider);
+    let profile = ModelProfile::new(&model, &provider, caps);
+    let protocol = match profile.thinking_protocol {
+        ThinkingProtocol::None => "none",
+        ThinkingProtocol::OpenaiReasoningEffort => "openai_reasoning_effort",
+        ThinkingProtocol::AnthropicThinkingBudget => "anthropic_thinking_budget",
+        ThinkingProtocol::AnthropicAdaptive => "anthropic_adaptive",
+        ThinkingProtocol::EnableThinkingFlag => "enable_thinking_flag",
+    };
+    let supports = profile.thinking_protocol.emits_field();
+    // Levels offered by the UI dropdown. Adaptive/None show no levels.
+    let levels: Vec<&str> = if supports {
+        vec!["auto", "minimal", "low", "medium", "high"]
+    } else {
+        vec!["auto"]
+    };
+    Ok(serde_json::json!({
+        "supports": supports,
+        "protocol": protocol,
+        "levels": levels,
+        "model": model,
+        "provider": provider,
     }))
 }
 

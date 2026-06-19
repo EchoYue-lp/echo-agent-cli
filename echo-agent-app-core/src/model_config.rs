@@ -40,6 +40,10 @@ pub struct ModelRuntimeConfig {
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
     pub context_window: Option<u32>,
+    /// 思考深度配置（可选）。可读值:`"auto"`/`""`(默认)、`"disabled"`、
+    /// `"minimal"`/`"low"`/`"medium"`/`"high"`、或裸数字(token 预算)。
+    /// 由前端 UI 设置,运行时翻译成 `ThinkingConfig` 注入到 agent。
+    pub thinking: Option<String>,
 }
 
 pub fn provider_env_vars(provider: &str) -> &'static [&'static str] {
@@ -157,6 +161,7 @@ pub fn set_default_model(
     config.model.temperature = model.temperature;
     config.model.max_tokens = model.max_tokens;
     config.model.context_window = model.context_window;
+    config.model.thinking = model.thinking.clone();
 
     if let Some(provider_config) = config.model_providers.get(&model.provider) {
         config.model.auth_token = provider_config.auth_token.clone();
@@ -267,6 +272,8 @@ pub fn resolve_runtime_model(config: &AppConfig, model_id: Option<&str>) -> Mode
         temperature,
         max_tokens,
         context_window,
+        // Forward the configured thinking spec (e.g. "high", "4000") if any.
+        thinking: config.model.thinking.clone(),
     }
 }
 

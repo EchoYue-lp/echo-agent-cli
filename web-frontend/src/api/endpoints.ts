@@ -998,6 +998,8 @@ export const providerApi = {
     context_window?: number | null;
     enabled?: boolean;
     set_default?: boolean;
+    /** 思考深度:`auto`/`disabled`/`minimal`/`low`/`medium`/`high`/`<number>` */
+    thinking?: string;
   }) =>
     isTauri()
       ? apiInvoke<{
@@ -1023,6 +1025,27 @@ export const providerApi = {
           baseUrl: req.base_url,
         })
       : post<TestConnectionResponse>('/providers/test', req),
+  /** Query whether a (provider, model) supports a thinking-depth control.
+   *  Used to show/hide the 思考深度 dropdown. */
+  getThinkingSupport: (req: { provider: string; model: string }) =>
+    isTauri()
+      ? apiInvoke<{
+          supports: boolean;
+          protocol: string;
+          levels: string[];
+          model: string;
+          provider: string;
+        }>('get_thinking_support', {
+          provider: req.provider,
+          model: req.model,
+        })
+      : get<{
+          supports: boolean;
+          protocol: string;
+          levels: string[];
+          model: string;
+          provider: string;
+        }>(`/models/thinking-support?provider=${encodeURIComponent(req.provider)}&model=${encodeURIComponent(req.model)}`),
 };
 
 // ── Plugin API ──────────────────────────────────────────────────────────
