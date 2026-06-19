@@ -8,6 +8,7 @@ import {
   Terminal,
   ShieldCheck,
   Cpu,
+  Brain,
   ChevronDown,
   Check,
 } from 'lucide-react';
@@ -26,6 +27,31 @@ import {
   normalizePermissionMode,
   notifyPermissionsChanged,
 } from '../../lib/permissionModes';
+
+/**
+ * 思考深度选项。与模型解耦:所有模型都展示这个下拉,后端按
+ * ThinkingProtocol 决定是否真正下发(不支持的模型静默忽略 + warn),
+ * 所以控制始终安全暴露。
+ *
+ * 持久化在 localStorage,默认 'auto'(模型默认行为,不发 thinking 字段)。
+ */
+const THINKING_LEVELS = [
+  { id: 'auto', label: '自动' },
+  { id: 'minimal', label: '最低' },
+  { id: 'low', label: '低' },
+  { id: 'medium', label: '中' },
+  { id: 'high', label: '高' },
+] as const;
+const THINKING_STORAGE_KEY = 'echo_thinking_level';
+function loadThinkingLevel(): string {
+  try {
+    const v = localStorage.getItem(THINKING_STORAGE_KEY);
+    if (v && THINKING_LEVELS.some((l) => l.id === v)) return v;
+  } catch {
+    /* localStorage may be unavailable */
+  }
+  return 'auto';
+}
 
 interface PendingFile {
   id: string;
@@ -191,6 +217,9 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
   const [permissionMode, setPermissionMode] = useState('default');
   const [permissionMenuOpen, setPermissionMenuOpen] = useState(false);
   const [switchingPermissionMode, setSwitchingPermissionMode] = useState<string | null>(null);
+  const [thinkingLevel, setThinkingLevel] = useState<string>(loadThinkingLevel);
+  const [thinkingMenuOpen, setThinkingMenuOpen] = useState(false);
+  const [switchingThinking, setSwitchingThinking] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const setActiveSettingsTab = useUiStore((s) => s.setActiveSettingsTab);
@@ -289,6 +318,30 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
       }
     },
     [permissionMode, switchingPermissionMode]
+  );
+
+  // Switch the active agent's thinking-depth at runtime. Decoupled from model
+  // config — every model exposes this; unsupported ones silently ignore it.
+  const switchThinkingLevel = useCallback(
+    async (level: string) => {
+      if (level === thinkingLevel || switchingThinking) return;
+      setSwitchingThinking(true);
+      try {
+        await providerApi.setThinking(level);
+        setThinkingLevel(level);
+        try {
+          localStorage.setItem(THINKING_STORAGE_KEY, level);
+        } catch {
+          /* ignore persistence failure */
+        }
+        setThinkingMenuOpen(false);
+      } catch (e) {
+        console.error('[ChatInput] Failed to switch thinking level:', e);
+      } finally {
+        setSwitchingThinking(false);
+      }
+    },
+    [thinkingLevel, switchingThinking]
   );
 
   // Auto-resize textarea
@@ -634,6 +687,7 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
                   onClick={() => {
                     setPermissionMenuOpen((open) => !open);
                     setModelMenuOpen(false);
+                    setThinkingMenuOpen(false);
                   }}
                   className="flex max-w-[180px] items-center gap-1.5 rounded-md px-1.5 py-1 text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
                   title="切换审批模式"
@@ -678,6 +732,7 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
                   type="button"
                   onClick={() => {
                     setPermissionMenuOpen(false);
+                    setThinkingMenuOpen(false);
                     if (visibleModels.length === 0) {
                       openModelSettings();
                     } else {
@@ -723,6 +778,55 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
                     >
                       管理模型
                     </button>
+                  </div>
+                )}
+              </div>
+              {/* 思考深度 — 运行时每会话控制,与模型解耦。所有模型都展示;
+                  不支持的模型后端静默忽略(框架会 warn)。 */}
+              <div className="relative">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPermissionMenuOpen(false);
+                    setModelMenuOpen(false);
+                    setThinkingMenuOpen((open) => !open);
+                  }}
+                  className="flex max-w-[140px] items-center gap-1.5 rounded-md px-1.5 py-1 text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                  title="切换思考深度"
+                >
+                  <Brain size={13} />
+                  <span className="truncate">
+                    {THINKING_LEVELS.find((l) => l.id === thinkingLevel)?.label ?? '自动'}
+                  </span>
+                  <ChevronDown size={12} />
+                </button>
+                {thinkingMenuOpen && (
+                  <div className="absolute bottom-full left-0 z-50 mb-2 w-56 overflow-hidden rounded-lg border border-[var(--border-primary)] bg-[var(--bg-primary)] shadow-[var(--shadow-md)]">
+                    <div className="border-b border-[var(--border-secondary)] px-3 py-2 text-[10px] font-medium text-[var(--text-tertiary)]">
+                      思考深度
+                    </div>
+                    <div className="p-1">
+                      {THINKING_LEVELS.map((lvl) => (
+                        <button
+                          key={lvl.id}
+                          type="button"
+                          onClick={() => switchThinkingLevel(lvl.id)}
+                          disabled={switchingThinking}
+                          className="flex w-full items-start gap-2 rounded-md px-2 py-2 text-left transition-colors hover:bg-[var(--bg-hover)] disabled:cursor-wait disabled:opacity-70"
+                        >
+                          <span className="mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center text-[var(--accent)]">
+                            {lvl.id === thinkingLevel && <Check size={13} />}
+                          </span>
+                          <span className="min-w-0 flex-1">
+                            <span className="block text-xs text-[var(--text-primary)]">
+                              {switchingThinking && lvl.id === thinkingLevel
+                                ? '切换中...'
+                                : lvl.label}
+                            </span>
+                          </span>
+                        </button>
+                      ))}
+                    </div>
                   </div>
                 )}
               </div>

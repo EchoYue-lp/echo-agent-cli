@@ -1046,6 +1046,19 @@ export const providerApi = {
           model: string;
           provider: string;
         }>(`/models/thinking-support?provider=${encodeURIComponent(req.provider)}&model=${encodeURIComponent(req.model)}`),
+  /** Dynamically set the active agent's thinking-depth at runtime. Decoupled
+   *  from model config — the user toggles it from the chat input toolbar.
+   *  Models that don't support thinking silently ignore it. */
+  setThinking: (spec: string) =>
+    isTauri()
+      ? apiInvoke<{ success: boolean; spec: string; applied: boolean }>(
+          'set_thinking',
+          { spec },
+        )
+      : post<{ success: boolean; spec: string; applied: boolean }>(
+          '/models/thinking',
+          { spec },
+        ),
 };
 
 // ── Plugin API ──────────────────────────────────────────────────────────

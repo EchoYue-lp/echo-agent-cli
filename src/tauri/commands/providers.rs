@@ -296,6 +296,52 @@ pub async fn get_thinking_support(
     }))
 }
 
+/// Dynamically set the thinking-depth for the active agent at runtime.
+///
+/// Unlike the model-config `thinking` field, this is a per-session toggle the
+/// user changes from the chat input toolbar (next to "审批模式"/"模型管理"),
+/// independent of which model is configured. Every model offers the dropdown;
+/// the spec is translated to a `ThinkingConfig` and applied via
+/// `agent.set_thinking()`. Models that don't support a thinking protocol
+/// silently ignore it (the framework already warns in that case), so the
+/// control is always safe to expose.
+///
+/// `spec` accepts: `"auto"`/`""` (reset to model default), `"disabled"`,
+/// `"minimal"`/`"low"`/`"medium"`/`"high"`, or a bare number (token budget).
+/// Invalid specs return an error so the UI can surface a typo.
+#[tauri::command]
+pub async fn set_thinking(
+    state: tauri::State<'_, crate::tauri::TauriState>,
+    spec: String,
+) -> Result<serde_json::Value, IpcError> {
+    let cfg = match echo_agent::llm::ThinkingConfig::parse_spec(&spec) {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            return Err(IpcError::Validation(format!(
+                "invalid thinking spec '{spec}': {e}"
+            )));
+        }
+    };
+    let applied = cfg.is_some();
+
+    state
+        .app_state
+        .connection
+        .agent
+        .write_async(|agent| {
+            Box::pin(async move {
+                agent.set_thinking(cfg);
+            })
+        })
+        .await;
+
+    Ok(serde_json::json!({
+        "success": true,
+        "spec": spec,
+        "applied": applied,
+    }))
+}
+
 #[tauri::command]
 pub async fn test_connection(
     state: tauri::State<'_, TauriState>,

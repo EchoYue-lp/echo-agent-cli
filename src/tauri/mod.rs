@@ -160,6 +160,7 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
             commands::providers::set_default_model,
             commands::providers::test_connection,
             commands::providers::get_thinking_support,
+            commands::providers::set_thinking,
             // Scheduler
             commands::scheduler::list_scheduler_tasks,
             commands::scheduler::add_scheduler_task,
