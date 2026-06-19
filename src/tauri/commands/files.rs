@@ -81,7 +81,7 @@ pub async fn list_files(
         base.clone()
     };
 
-    validate_path_within_base(&target, &base).map_err(IpcError::Validation)?;
+    crate::tauri::path_validator::validate_within_base(&target, &base).map_err(IpcError::Validation)?;
 
     if !target.exists() {
         return Err(IpcError::NotFound("Directory not found".to_string()));
@@ -133,7 +133,7 @@ pub async fn read_file(
     let base = get_workspace_root(&state).await;
     let target = base.join(&path);
 
-    validate_path_within_base(&target, &base).map_err(IpcError::Validation)?;
+    crate::tauri::path_validator::validate_within_base(&target, &base).map_err(IpcError::Validation)?;
 
     if !target.exists() {
         return Err(IpcError::NotFound("File not found".to_string()));
@@ -173,7 +173,7 @@ pub async fn diff_file(
     }
 
     let target = base.join(&path);
-    validate_path_within_base(&target, &base).map_err(IpcError::Validation)?;
+    crate::tauri::path_validator::validate_within_base(&target, &base).map_err(IpcError::Validation)?;
 
     let new_content = if target.exists() {
         std::fs::read_to_string(&target).unwrap_or_default()
@@ -348,33 +348,6 @@ async fn get_workspace_root(state: &TauriState) -> std::path::PathBuf {
     }
 }
 
-fn validate_path_within_base(
-    target: &std::path::Path,
-    base: &std::path::Path,
-) -> Result<(), String> {
-    let canonical_base = base
-        .canonicalize()
-        .map_err(|e| format!("Cannot resolve base path: {}", e))?;
-
-    let canonical_target = if target.exists() {
-        target
-            .canonicalize()
-            .map_err(|e| format!("Cannot resolve path: {}", e))?
-    } else {
-        let parent = target.parent().ok_or("Path has no parent")?;
-        let filename = target.file_name().ok_or("Path has no filename")?;
-        let canonical_parent = parent
-            .canonicalize()
-            .map_err(|e| format!("Cannot resolve parent path: {}", e))?;
-        canonical_parent.join(filename)
-    };
-
-    if !canonical_target.starts_with(&canonical_base) {
-        return Err("Path traversal detected: path escapes workspace boundary".to_string());
-    }
-
-    Ok(())
-}
 
 fn detect_language(path: &str) -> Option<String> {
     let ext = path.rsplit('.').next()?;

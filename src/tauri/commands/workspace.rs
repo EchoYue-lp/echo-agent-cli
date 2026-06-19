@@ -5,45 +5,6 @@ use crate::tauri::state::TauriState;
 use echo_agent_app_core::workspace::WorkspaceKind;
 use echo_agent_app_core::workspace::migration::LegacyMigrator;
 
-/// Validate that a workspace root path is within the user's home directory.
-fn validate_workspace_root(root: &str) -> Result<(), String> {
-    if root.trim().is_empty() {
-        return Err("Workspace root path cannot be empty".to_string());
-    }
-
-    let root_path = std::path::PathBuf::from(root);
-
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .map(std::path::PathBuf::from)
-        .map_err(|_| "Cannot determine home directory".to_string())?;
-
-    let mut check = root_path.as_path();
-    while !check.exists() {
-        match check.parent() {
-            Some(p) if p != check => check = p,
-            _ => break,
-        }
-    }
-
-    let canonical_check = check
-        .canonicalize()
-        .map_err(|e| format!("Cannot resolve workspace root path: {}", e))?;
-    let canonical_home = home
-        .canonicalize()
-        .map_err(|e| format!("Cannot resolve home directory: {}", e))?;
-
-    if !canonical_check.starts_with(&canonical_home) {
-        return Err(format!(
-            "Workspace root must be within the home directory ({}). Got: {}",
-            canonical_home.display(),
-            canonical_check.display()
-        ));
-    }
-
-    Ok(())
-}
-
 #[tauri::command]
 pub async fn list_workspaces(
     state: tauri::State<'_, TauriState>,
@@ -74,7 +35,7 @@ pub async fn create_workspace(
         .unwrap_or_default();
 
     let result = if let Some(ref root_str) = root {
-        validate_workspace_root(root_str).map_err(IpcError::Validation)?;
+        crate::tauri::path_validator::validate_workspace_root(root_str).map_err(IpcError::Validation)?;
         let root_path = std::path::PathBuf::from(root_str);
         state
             .app_state

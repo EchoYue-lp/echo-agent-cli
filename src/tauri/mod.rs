@@ -7,6 +7,7 @@ pub mod commands;
 pub mod desktop;
 pub mod error;
 pub mod ipc;
+pub mod path_validator;
 pub mod state;
 pub mod terminal;
 
@@ -339,6 +340,82 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                 tracing::info!("Task event bus closed, stopping emitter");
                                 break;
                             }
+                        }
+                    }
+                });
+            }
+
+            // Spawn subagent event emitter — bridges SubagentEventBus to Tauri events
+            // (Phase 5: Subagent visualization).
+            {
+                let app_handle = app.handle().clone();
+                let agent = app.state::<TauriState>()
+                    .app_state.connection.agent.clone();
+                tokio::spawn(async move {
+                    let mut rx = agent
+                        .read_async(|a| {
+                            Box::pin(async move {
+                                a.subagent_registry().event_bus().subscribe()
+                            })
+                        })
+                        .await;
+                    loop {
+                        match rx.recv().await {
+                            Ok(event) => {
+                                use echo_agent::agent::subagent::SubagentEvent;
+                                let payload = match event.as_ref() {
+                                    SubagentEvent::DispatchStarted {
+                                        parent,
+                                        agent: name,
+                                        mode,
+                                        task,
+                                    } => serde_json::json!({
+                                        "type": "subagent_started",
+                                        "parent": parent,
+                                        "agent": name,
+                                        "mode": format!("{:?}", mode),
+                                        "task": task,
+                                    }),
+                                    SubagentEvent::DispatchCompleted {
+                                        parent,
+                                        agent: name,
+                                        duration_ms,
+                                        tokens_used,
+                                        iterations,
+                                    } => serde_json::json!({
+                                        "type": "subagent_completed",
+                                        "parent": parent,
+                                        "agent": name,
+                                        "duration_ms": duration_ms,
+                                        "tokens_used": tokens_used,
+                                        "iteration_count": iterations,
+                                    }),
+                                    SubagentEvent::DispatchFailed {
+                                        parent,
+                                        agent: name,
+                                        error,
+                                    } => serde_json::json!({
+                                        "type": "subagent_failed",
+                                        "parent": parent,
+                                        "agent": name,
+                                        "error": error,
+                                    }),
+                                    SubagentEvent::DispatchCancelled {
+                                        parent,
+                                        agent: name,
+                                    } => serde_json::json!({
+                                        "type": "subagent_cancelled",
+                                        "parent": parent,
+                                        "agent": name,
+                                    }),
+                                    _ => continue,
+                                };
+                                let _ = app_handle.emit("subagent://event", &payload);
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                tracing::warn!("Subagent event receiver lagged by {} events", n);
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         }
                     }
                 });
