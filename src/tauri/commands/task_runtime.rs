@@ -41,7 +41,7 @@ pub async fn get_task_run(
     state: tauri::State<'_, TauriState>,
     run_id: String,
 ) -> Result<Option<TaskRun>, IpcError> {
-    Ok(store(&state)?.get_run(&run_id).map_err(internal)?)
+    store(&state)?.get_run(&run_id).map_err(internal)
 }
 
 /// Latest run for a conversation — binds a chat thread to its runtime run.
@@ -50,9 +50,9 @@ pub async fn latest_task_run_for_conversation(
     state: tauri::State<'_, TauriState>,
     conversation_id: String,
 ) -> Result<Option<TaskRun>, IpcError> {
-    Ok(store(&state)?
+    store(&state)?
         .latest_run_for_conversation(&conversation_id)
-        .map_err(internal)?)
+        .map_err(internal)
 }
 
 /// All runs in any of the given statuses. Pass `None` or an empty list to
@@ -88,7 +88,7 @@ pub async fn list_task_runs(
     } else {
         parsed
     };
-    Ok(s.list_runs_in(&query).map_err(internal)?)
+    s.list_runs_in(&query).map_err(internal)
 }
 
 /// The structured plan attached to a run, or `None` if not yet generated.
@@ -97,7 +97,7 @@ pub async fn get_task_plan(
     state: tauri::State<'_, TauriState>,
     run_id: String,
 ) -> Result<Option<TaskPlan>, IpcError> {
-    Ok(store(&state)?.get_plan(&run_id).map_err(internal)?)
+    store(&state)?.get_plan(&run_id).map_err(internal)
 }
 
 /// Todo projection for a run — what the right-rail Todo panel renders from.
@@ -106,7 +106,7 @@ pub async fn list_task_todos(
     state: tauri::State<'_, TauriState>,
     run_id: String,
 ) -> Result<Vec<TodoItem>, IpcError> {
-    Ok(store(&state)?.list_todos(&run_id).map_err(internal)?)
+    store(&state)?.list_todos(&run_id).map_err(internal)
 }
 
 /// Events since `since_seq` (polling-style incremental event feed).
@@ -123,9 +123,7 @@ pub async fn list_task_events(
         .as_deref()
         .and_then(|s| s.parse::<i64>().ok())
         .unwrap_or(0);
-    Ok(store(&state)?
-        .list_events(&run_id, since)
-        .map_err(internal)?)
+    store(&state)?.list_events(&run_id, since).map_err(internal)
 }
 
 /// Artifacts produced by a run (files, reports, charts, traces).
@@ -134,7 +132,7 @@ pub async fn list_task_artifacts(
     state: tauri::State<'_, TauriState>,
     run_id: String,
 ) -> Result<Vec<Artifact>, IpcError> {
-    Ok(store(&state)?.list_artifacts(&run_id).map_err(internal)?)
+    store(&state)?.list_artifacts(&run_id).map_err(internal)
 }
 
 /// Reviews recorded against a task within a run (scoped to run_id + task_id
@@ -145,9 +143,9 @@ pub async fn list_task_reviews(
     run_id: String,
     task_id: String,
 ) -> Result<Vec<ReviewResult>, IpcError> {
-    Ok(store(&state)?
+    store(&state)?
         .list_reviews(&run_id, &task_id)
-        .map_err(internal)?)
+        .map_err(internal)
 }
 
 /// The execution summary a worker produced for a task — used by the Summary
@@ -158,9 +156,9 @@ pub async fn get_task_summary(
     run_id: String,
     task_id: String,
 ) -> Result<Option<TaskExecutionSummary>, IpcError> {
-    Ok(store(&state)?
+    store(&state)?
         .get_summary(&run_id, &task_id)
-        .map_err(internal)?)
+        .map_err(internal)
 }
 
 // ── Error mapping ────────────────────────────────────────────────────────
