@@ -7,7 +7,6 @@
     "core:default",
     "core:event:default",
     "core:event:allow-listen",
-    "core:event:allow-emit",
     "dialog:default",
     "dialog:allow-open",
     "dialog:allow-save",
@@ -19,11 +18,10 @@
     "notification:allow-request-permission",
     "notification:allow-notify",
     "global-shortcut:default",
-    "fs:default",
     {
       "identifier": "shell:allow-open",
       "allow": [
-        { "path": "**" }
+        { "path": "https://*" }
       ]
     }
   ]
