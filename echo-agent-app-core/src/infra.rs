@@ -1022,5 +1022,12 @@ pub fn build_llm_config(
     {
         config.base_url = url.to_string();
     }
+    // Ensure provider_name is set so the thinking-protocol resolver picks the
+    // right wire field (e.g. enable_thinking for dashscope vs reasoning_effort
+    // for deepseek). The named constructors already set it; the generic
+    // fallback (`LlmConfig::new`) does not, so set it here uniformly.
+    if config.provider_name.is_none() && !provider.trim().is_empty() {
+        config.provider_name = Some(provider.to_string());
+    }
     config
 }
