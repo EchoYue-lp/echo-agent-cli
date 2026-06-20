@@ -46,6 +46,7 @@ interface ChatState {
   startToolBatch: (toolCount: number) => void;
   endToolBatch: () => void;
   finalizeAssistantMessage: (id: string, content: string) => void;
+  handoffToTaskRuntime: (id: string, content: string, isRunning: boolean) => void;
   setStreaming: (v: boolean) => void;
   setThinking: (v: boolean) => void;
   setRunStatus: (status: ChatRunStatus) => void;
@@ -82,7 +83,7 @@ const nextId = () => `msg-${++msgCounter}-${Date.now()}`;
 function autoSave() {
   const msgs = useChatStore.getState().messages;
   if (msgs.length > 0) {
-    useConversationStore.getState().saveCurrent(msgs);
+    void useConversationStore.getState().saveCurrent(msgs);
   }
 }
 
@@ -288,6 +289,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
       isStreaming: false,
       isThinking: false,
       runStatus: 'completed',
+      messages: s.messages.map((m) => (m.id === id ? { ...m, content, isStreaming: false } : m)),
+    }));
+    scheduleAutoSave();
+  },
+
+  handoffToTaskRuntime: (id, content, isRunning) => {
+    set((s) => ({
+      isStreaming: false,
+      isThinking: false,
+      runStatus: isRunning ? 'running' : 'waiting_approval',
       messages: s.messages.map((m) => (m.id === id ? { ...m, content, isStreaming: false } : m)),
     }));
     scheduleAutoSave();

@@ -38,6 +38,22 @@ async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T
   return tauriInvoke<T>(cmd, args);
 }
 
+export function errorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (typeof error === 'string') return error;
+  if (error && typeof error === 'object') {
+    const record = error as Record<string, unknown>;
+    if (typeof record.message === 'string') return record.message;
+    if (typeof record.error === 'string') return record.error;
+    try {
+      return JSON.stringify(record);
+    } catch {
+      return 'Unknown error';
+    }
+  }
+  return String(error);
+}
+
 // ── File System (IPC in Tauri, HTTP in Web) ──
 
 export const fileSystem = {
@@ -138,7 +154,11 @@ export async function apiInvoke<T>(command: string, args?: Record<string, unknow
   if (!isTauri()) {
     throw new Error('apiInvoke requires Tauri environment');
   }
-  return invoke<T>(command, args);
+  try {
+    return await invoke<T>(command, args);
+  } catch (error) {
+    throw new Error(errorMessage(error));
+  }
 }
 
 export { isTauri };

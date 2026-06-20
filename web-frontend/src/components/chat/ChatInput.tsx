@@ -45,9 +45,9 @@ const THINKING_LEVELS = [
 ] as const;
 const THINKING_STORAGE_KEY = 'echo_thinking_level';
 const INTERACTION_MODES = [
-  { id: 0, label: 'Auto' },
-  { id: 1, label: 'Chat' },
-  { id: 2, label: 'Task' },
+  { id: 1, label: 'Chat', description: '简单对话，不进入 TaskRuntime' },
+  { id: 2, label: 'Task', description: '复杂任务，强制进入 TaskRuntime' },
+  { id: 0, label: 'Auto', description: '由运行时判断 Chat 或 Task' },
 ] as const;
 function loadThinkingLevel(): string {
   try {
@@ -236,6 +236,8 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
   const displayModel = activeModel ?? visibleModels[0] ?? null;
   const activePermissionMode =
     PERMISSION_MODES.find((mode) => mode.id === permissionMode) ?? PERMISSION_MODES[0];
+  const activeInteractionMode =
+    INTERACTION_MODES.find((mode) => mode.id === interactionMode) ?? INTERACTION_MODES[2];
 
   const loadConfiguredModels = useCallback(async () => {
     try {
@@ -817,10 +819,10 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
                     </button>
                   </div>
                 )}
-	              </div>
+              </div>
               <div
                 className="flex shrink-0 items-center rounded-md border border-[var(--border-secondary)] p-0.5"
-                title="切换交互模式"
+                title={`运行模式: ${activeInteractionMode.description}`}
               >
                 <Workflow size={12} className="mx-1 text-[var(--text-tertiary)]" />
                 {INTERACTION_MODES.map((mode) => (
@@ -829,7 +831,8 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
                     type="button"
                     onClick={() => switchInteractionMode(mode.id)}
                     disabled={switchingInteractionMode !== null}
-                    className={`h-6 rounded px-1.5 text-[10px] transition-colors disabled:cursor-wait ${
+                    title={mode.description}
+                    className={`h-6 rounded px-2 text-[10px] transition-colors disabled:cursor-wait ${
                       interactionMode === mode.id
                         ? 'bg-[var(--accent)] text-[var(--text-on-accent)]'
                         : 'text-[var(--text-tertiary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'

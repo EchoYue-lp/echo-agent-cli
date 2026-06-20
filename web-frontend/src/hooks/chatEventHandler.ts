@@ -8,6 +8,7 @@
  */
 
 import { useChatStore } from '../stores/chatStore';
+import { useTaskRuntimeStore } from '../stores/taskRuntimeStore';
 
 interface ChatEventLike {
   type: string;
@@ -20,6 +21,19 @@ interface ChatEventLike {
   status?: string;
   message_key?: string;
   conversation_id?: string | null;
+  run_id?: string;
+  goal?: string;
+  domain_profile?: string;
+  route?: string;
+  interaction_mode?: string;
+  permission_mode?: string;
+  approval_policy?: string;
+  route_reason?: string;
+  confidence?: number;
+  auto_execute?: boolean;
+  suggested_workers?: string[];
+  route_signals?: string[];
+  classification_signals?: string[];
 }
 
 interface EventContext {
@@ -143,10 +157,31 @@ export function handleChatEvent(
     }
     case 'plan_ready': {
       if (ctx.isCancelledRef.current) break;
+      if (event.run_id) {
+        void useTaskRuntimeStore.getState().notifyPlanReady(event.run_id, {
+          goal: event.goal,
+          domainProfile: event.domain_profile,
+          route: event.route,
+          interactionMode: event.interaction_mode,
+          permissionMode: event.permission_mode,
+          approvalPolicy: event.approval_policy,
+          routeReason: event.route_reason,
+          confidence: event.confidence,
+          autoExecute: event.auto_execute,
+          suggestedWorkers: event.suggested_workers ?? [],
+          routeSignals: event.route_signals ?? [],
+          classificationSignals: event.classification_signals ?? [],
+        });
+      }
       ctx.currentThinkingIdRef.current = null;
       const id = ctx.assistantIdRef.current;
       if (id) {
-        store.finalizeAssistantMessage(id, '任务计划已生成。');
+        const workerCount = event.suggested_workers?.length ?? 0;
+        const workerText = workerCount > 0 ? `，${workerCount} 个 worker 已接入` : '';
+        const content = event.auto_execute
+          ? `已进入 TaskRuntime 并开始执行${workerText}。下面会展示触发原因、worker 执行过程和最终结果；右侧仅保留任务状态概览。`
+          : `任务计划已生成，等待确认后执行${workerText}。下面会展示触发原因、worker 执行过程和最终结果；右侧仅保留任务状态概览。`;
+        store.handoffToTaskRuntime(id, content, event.auto_execute === true);
       } else {
         store.setStreaming(false);
       }
@@ -158,6 +193,13 @@ export function handleChatEvent(
     case 'error': {
       ctx.isCancelledRef.current = true;
       store.setRunStatus('failed');
+      const message = (event as { message?: string }).message ?? '请求失败';
+      if (ctx.assistantIdRef.current) {
+        store.finalizeAssistantMessage(ctx.assistantIdRef.current, `[Error] ${message}`);
+      }
+      ctx.assistantIdRef.current = null;
+      ctx.currentMessageKeyRef.current = null;
+      ctx.currentMessageIdRef.current = null;
       break;
     }
     case 'cancelled': {

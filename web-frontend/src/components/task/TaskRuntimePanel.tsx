@@ -1,11 +1,12 @@
-//! TaskRuntime right-rail panel.
+//! TaskRuntime panels.
 //!
 //! Renders the structured state of a complex-task run from the canonical
 //! SQLite store (via taskRuntimeStore), NOT from regex-scanned chat messages.
 //! Shows: run header, plan + approval actions (when AwaitingPlanApproval),
 //! todo list with live status, parallel worker view, and artifacts.
 //!
-//! Mounted inside RightRail as a new section above "输出".
+//! The compact panel is mounted inside RightRail; the full detail panel is
+//! mounted in the main chat/work area.
 
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import {
@@ -23,6 +24,10 @@ import {
   Brain,
   Wrench,
   MessageSquareText,
+  ShieldCheck,
+  Workflow,
+  Sparkles,
+  Copy,
 } from 'lucide-react';
 import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
 import { useConversationStore } from '../../stores/conversationStore';
@@ -32,7 +37,8 @@ import {
   type WorkerTraceState,
   type WorkerTraceStatus,
 } from '../../stores/workerTraceStore';
-import type { TodoStatus, PlanTaskKind } from '../../generated';
+import type { TodoStatus, PlanTaskKind, TaskRun, TaskPlan, TodoItem } from '../../generated';
+import type { RouteExplanation } from '../../stores/taskRuntimeStore';
 
 const STATUS_LABEL: Record<string, string> = {
   pending: '待处理',
@@ -97,6 +103,108 @@ function kindLabel(kind: string): string {
   return map[kind] ?? kind;
 }
 
+function routeLabel(route?: string): string {
+  const map: Record<string, string> = {
+    normal_chat: '普通对话',
+    plan_only: '只规划',
+    complex_runtime: '任务运行时',
+    parallel_readonly_delegation: '只读并行',
+    background_task: '后台任务',
+    direct_edit: '直接编辑',
+  };
+  return route ? map[route] ?? route : '未知';
+}
+
+function modeLabel(mode?: string): string {
+  const map: Record<string, string> = {
+    auto: 'Auto',
+    chat: 'Chat',
+    task: 'Task',
+  };
+  return mode ? map[mode] ?? mode : 'Auto';
+}
+
+function permissionLabel(mode?: string): string {
+  const map: Record<string, string> = {
+    default: '默认审批',
+    'auto-edit': '自动编辑',
+    'full-auto': '全自动',
+    strict: '严格确认',
+  };
+  return mode ? map[mode] ?? mode : '默认审批';
+}
+
+function domainProfileLabel(profile?: string): string {
+  const map: Record<string, string> = {
+    general: '通用',
+    ai_coding: 'AI Coding',
+    data_analysis: '数据分析',
+    academic_research: '学术研究',
+    medical_research: '医学研究',
+  };
+  return profile ? map[profile] ?? profile : '通用';
+}
+
+function isReadOnlyKind(kind: PlanTaskKind): boolean {
+  return ['read_only_review', 'investigation', 'test_plan', 'review', 'summary'].includes(kind);
+}
+
+function uniqueValues(values: Array<string | null | undefined>): string[] {
+  return [...new Set(values.filter((value): value is string => Boolean(value && value.trim())))];
+}
+
+function deriveRouteExplanation(
+  run: TaskRun,
+  plan: TaskPlan | null,
+  todos: TodoItem[],
+  workers: WorkerTraceState[],
+  liveExplanation: RouteExplanation | null
+): RouteExplanation {
+  if (liveExplanation && liveExplanation.runId === run.run_id) return liveExplanation;
+
+  const plannedTasks = plan?.tasks ?? [];
+  const readOnlyCount = plannedTasks.filter((task) => isReadOnlyKind(task.kind)).length;
+  const allReadOnly = plannedTasks.length > 0 && readOnlyCount === plannedTasks.length;
+  const workerNames = uniqueValues([
+    ...workers.map((worker) => worker.agentName),
+    ...todos.map((todo) => todo.owner_agent),
+    ...plannedTasks.map((task) => task.agent_role),
+  ]);
+  const hasParallelWorkers = workerNames.length > 1 || workers.length > 1;
+  const route = allReadOnly && hasParallelWorkers ? 'parallel_readonly_delegation' : 'complex_runtime';
+  const autoExecute = allReadOnly && route === 'parallel_readonly_delegation';
+
+  return {
+    runId: run.run_id,
+    goal: run.goal,
+    domainProfile: run.domain_profile,
+    route,
+    routeReason: [
+      '实时 plan_ready 路由事件不可用，以下说明根据已保存的运行记录推断。',
+      `${plannedTasks.length || todos.length} 个计划任务，${readOnlyCount} 个只读任务，${workerNames.length} 个 worker/角色。`,
+      allReadOnly && hasParallelWorkers
+        ? '任务形态符合只读并行：可以拆给多个 worker 并发探索、审查和汇总。'
+        : '任务需要 TaskRuntime 维护计划、状态和审批，而不是普通 chat 串行回复。',
+    ].join(' '),
+    confidence: undefined,
+    autoExecute,
+    suggestedWorkers: workerNames,
+    routeSignals: allReadOnly ? ['saved_plan_all_read_only'] : ['saved_task_runtime_run'],
+    classificationSignals: [`domain:${domainProfileLabel(run.domain_profile)}`],
+  };
+}
+
+function CompactTag({ children }: { children: ReactNode }) {
+  return (
+    <span
+      className="rounded px-1.5 py-0.5 text-[9px]"
+      style={{ background: 'var(--bg-hover)', color: 'var(--text-tertiary)' }}
+    >
+      {children}
+    </span>
+  );
+}
+
 function workerStatusLabel(status: WorkerTraceStatus): string {
   const map: Record<WorkerTraceStatus, string> = {
     planned: '已规划',
@@ -116,6 +224,81 @@ function payloadValue(event: WorkerTraceEvent, key: string): string | undefined 
   if (typeof value === 'string') return value;
   if (typeof value === 'number' || typeof value === 'boolean') return String(value);
   return undefined;
+}
+
+function payloadBool(event: WorkerTraceEvent, key: string): boolean | undefined {
+  if (!event.payload || typeof event.payload !== 'object' || Array.isArray(event.payload)) {
+    return undefined;
+  }
+  const value = (event.payload as Record<string, unknown>)[key];
+  return typeof value === 'boolean' ? value : undefined;
+}
+
+function copyToClipboard(text: string) {
+  if (typeof navigator === 'undefined' || !navigator.clipboard) return;
+  void navigator.clipboard.writeText(text);
+}
+
+function workerResult(worker: WorkerTraceState): string {
+  const completed = [...worker.events]
+    .reverse()
+    .find((event) => event.event_type === 'worker_completed');
+  const summary = completed ? payloadValue(completed, 'summary') : undefined;
+  if (summary) return summary;
+
+  const output = worker.events
+    .filter((event) => event.event_type === 'worker_token_delta')
+    .map((event) => payloadValue(event, 'content') ?? '')
+    .join('')
+    .trim();
+  return output;
+}
+
+function workerThinking(worker: WorkerTraceState): string {
+  return worker.events
+    .filter((event) => event.event_type === 'worker_thinking_delta')
+    .map((event) => payloadValue(event, 'content') ?? '')
+    .join('')
+    .trim();
+}
+
+function workerToolEvents(worker: WorkerTraceState): WorkerTraceEvent[] {
+  return worker.events.filter(
+    (event) => event.event_type === 'worker_tool_start' || event.event_type === 'worker_tool_result'
+  );
+}
+
+function traceWorkerForTodo(todo: { owner_agent: string | null }, workers: WorkerTraceState[]) {
+  if (!todo.owner_agent) return undefined;
+  return workers.find((worker) => worker.agentName === todo.owner_agent);
+}
+
+function displayedTodoStatus(todo: { status: TodoStatus; owner_agent: string | null }, workers: WorkerTraceState[]): TodoStatus {
+  const worker = traceWorkerForTodo(todo, workers);
+  if (!worker) return todo.status;
+  if (worker.status === 'completed' && todo.status !== ('completed' as TodoStatus)) {
+    return 'completed' as TodoStatus;
+  }
+  if (worker.status === 'failed' && todo.status !== ('failed' as TodoStatus)) {
+    return 'failed' as TodoStatus;
+  }
+  if (worker.status === 'cancelled' && todo.status !== ('skipped' as TodoStatus)) {
+    return 'skipped' as TodoStatus;
+  }
+  return todo.status;
+}
+
+function finalRunResult(workers: WorkerTraceState[], todos: Array<{ title: string; summary: string | null }>): string | null {
+  const summaryWorker =
+    workers.find((worker) => worker.agentName === 'summary_writer') ??
+    workers.find((worker) => /summary|synthesize/i.test(worker.title ?? worker.workerId));
+  const workerSummary = summaryWorker ? workerResult(summaryWorker) : '';
+  if (workerSummary) return workerSummary;
+
+  const summarizedTodos = todos
+    .filter((todo) => todo.summary && todo.summary.trim())
+    .map((todo) => `- ${todo.title}: ${todo.summary}`);
+  return summarizedTodos.length > 0 ? summarizedTodos.join('\n') : null;
 }
 
 function eventLabel(event: WorkerTraceEvent): { icon: ReactNode; label: string; detail?: string } {
@@ -194,53 +377,77 @@ function WorkerTraceRow({
   worker,
   expanded,
   onToggle,
+  roomy = false,
 }: {
   worker: WorkerTraceState;
   expanded: boolean;
   onToggle: () => void;
+  roomy?: boolean;
 }) {
   const latest = worker.events[worker.events.length - 1];
   const latestLabel = latest ? eventLabel(latest) : null;
-  const recentEvents = expanded ? worker.events.slice(-80) : [];
+  const thinking = workerThinking(worker);
+  const tools = workerToolEvents(worker);
+  const result = workerResult(worker);
+  const hasDetails = Boolean(worker.task || thinking || tools.length || result);
+  const [copied, setCopied] = useState<string | null>(null);
+
+  const copy = (label: string, text: string) => {
+    copyToClipboard(text);
+    setCopied(label);
+    window.setTimeout(() => setCopied(null), 1600);
+  };
 
   return (
-    <div className="rounded px-1.5 py-1" style={{ background: 'var(--bg-secondary)' }}>
+    <div
+      className={`rounded-lg ${roomy ? 'border p-3' : 'px-1.5 py-1'}`}
+      style={{
+        background: 'var(--bg-secondary)',
+        borderColor: roomy ? 'var(--border-primary)' : undefined,
+      }}
+    >
       <button
         type="button"
         onClick={onToggle}
-        className="flex w-full items-start gap-1.5 text-left"
+        className="flex w-full items-start gap-2 text-left"
       >
         <div className="mt-0.5">
           {expanded ? (
-            <ChevronDown size={12} style={{ color: 'var(--text-tertiary)' }} />
+            <ChevronDown size={roomy ? 15 : 12} style={{ color: 'var(--text-tertiary)' }} />
           ) : (
-            <ChevronRight size={12} style={{ color: 'var(--text-tertiary)' }} />
+            <ChevronRight size={roomy ? 15 : 12} style={{ color: 'var(--text-tertiary)' }} />
           )}
         </div>
         <div className="mt-0.5">
           {worker.status === 'running' ? (
-            <Loader2 size={12} className="animate-spin" style={{ color: 'var(--color-info)' }} />
+            <Loader2 size={roomy ? 15 : 12} className="animate-spin" style={{ color: 'var(--color-info)' }} />
           ) : worker.status === 'completed' ? (
-            <CheckCircle2 size={12} style={{ color: 'var(--color-success)' }} />
+            <CheckCircle2 size={roomy ? 15 : 12} style={{ color: 'var(--color-success)' }} />
           ) : worker.status === 'failed' ? (
-            <AlertCircle size={12} style={{ color: 'var(--color-error)' }} />
+            <AlertCircle size={roomy ? 15 : 12} style={{ color: 'var(--color-error)' }} />
           ) : (
-            <Circle size={12} style={{ color: 'var(--text-tertiary)' }} />
+            <Circle size={roomy ? 15 : 12} style={{ color: 'var(--text-tertiary)' }} />
           )}
         </div>
         <div className="min-w-0 flex-1">
           <div className="flex min-w-0 items-center gap-1">
-            <span className="truncate text-[11px] font-medium" style={{ color: 'var(--text-primary)' }}>
+            <span
+              className={`truncate font-medium ${roomy ? 'text-sm' : 'text-[11px]'}`}
+              style={{ color: 'var(--text-primary)' }}
+            >
               {worker.title ?? worker.task ?? worker.workerId}
             </span>
             <span
-              className="shrink-0 rounded px-1 text-[9px]"
+              className={`shrink-0 rounded px-1 ${roomy ? 'text-[10px]' : 'text-[9px]'}`}
               style={{ color: statusColor(worker.status), background: 'var(--bg-hover)' }}
             >
               {workerStatusLabel(worker.status)}
             </span>
           </div>
-          <div className="mt-0.5 flex min-w-0 items-center gap-1 text-[9px]" style={{ color: 'var(--text-tertiary)' }}>
+          <div
+            className={`mt-0.5 flex min-w-0 items-center gap-1 ${roomy ? 'text-[11px]' : 'text-[9px]'}`}
+            style={{ color: 'var(--text-tertiary)' }}
+          >
             <span className="shrink-0 font-mono">{worker.agentName ?? 'worker'}</span>
             {latestLabel && (
               <>
@@ -253,40 +460,331 @@ function WorkerTraceRow({
       </button>
 
       {expanded && (
-        <div className="mt-1.5 border-l pl-2" style={{ borderColor: 'var(--border-primary)' }}>
-          {recentEvents.map((event) => {
-            const item = eventLabel(event);
-            return (
-              <div key={event.event_id} className="mb-1 flex gap-1.5 text-[10px] last:mb-0">
-                <div className="mt-0.5 shrink-0">{item.icon}</div>
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-1" style={{ color: 'var(--text-secondary)' }}>
-                    <span className="shrink-0">{item.label}</span>
-                    <span className="shrink-0 text-[9px]" style={{ color: 'var(--text-tertiary)' }}>
-                      {eventTime(event.timestamp)}
-                    </span>
-                  </div>
-                  {item.detail && (
-                    <div
-                      className="mt-0.5 max-h-20 overflow-hidden whitespace-pre-wrap break-words text-[9px] leading-snug"
-                      style={{ color: 'var(--text-tertiary)' }}
-                      title={item.detail}
-                    >
-                      {item.detail}
-                    </div>
-                  )}
+        <div className="mt-3 space-y-3 border-l pl-3" style={{ borderColor: 'var(--border-primary)' }}>
+          {!hasDetails && (
+            <div className="text-[11px]" style={{ color: 'var(--text-tertiary)' }}>
+              暂无详细事件。worker 已接入，但尚未收到思考、工具或输出流。
+            </div>
+          )}
+
+          {worker.task && (
+            <TraceSection
+              title="提示词"
+              icon={<MessageSquareText size={12} />}
+              action={<TraceCopyButton copied={copied === 'prompt'} onClick={() => copy('prompt', worker.task ?? '')} />}
+            >
+              <ScrollableText text={worker.task} maxHeight={288} className="text-[11px]" />
+            </TraceSection>
+          )}
+
+          {result && (
+            <TraceSection
+              title="结果"
+              icon={<CheckCircle2 size={12} />}
+              action={<TraceCopyButton copied={copied === 'result'} onClick={() => copy('result', result)} />}
+            >
+              <ScrollableText text={result} maxHeight={520} className="text-[11px]" />
+            </TraceSection>
+          )}
+
+          {(thinking || tools.length > 0) && (
+            <TraceSection
+              title="中间过程"
+              icon={<Brain size={12} />}
+              action={thinking ? <TraceCopyButton copied={copied === 'thinking'} onClick={() => copy('thinking', thinking)} /> : undefined}
+            >
+              {thinking && (
+                <ScrollableText text={thinking} maxHeight={288} className="mb-2 text-[11px]" />
+              )}
+              {tools.length > 0 && (
+                <div className="space-y-1.5">
+                  {tools.slice(-40).map((event) => {
+                    const name = payloadValue(event, 'name') ?? 'tool';
+                    const success = payloadBool(event, 'success');
+                    const detail =
+                      event.event_type === 'worker_tool_start'
+                        ? payloadValue(event, 'args')
+                        : payloadValue(event, 'result');
+                    return (
+                      <div
+                        key={event.event_id}
+                        className="rounded-md border px-2 py-1.5"
+                        style={{ borderColor: 'var(--border-primary)', background: 'var(--bg-primary)' }}
+                      >
+                        <div className="flex items-center gap-1.5 text-[11px]" style={{ color: 'var(--text-primary)' }}>
+                          <Wrench size={11} style={{ color: success === false ? 'var(--color-error)' : 'var(--color-warning)' }} />
+                          <span className="font-mono">{name}</span>
+                          <span className="ml-auto text-[9px]" style={{ color: 'var(--text-tertiary)' }}>
+                            {event.event_type === 'worker_tool_start'
+                              ? '调用'
+                              : success === false
+                                ? '失败'
+                                : '完成'} · {eventTime(event.timestamp)}
+                          </span>
+                        </div>
+                        {detail && (
+                          <ScrollableText
+                            text={detail}
+                            maxHeight={144}
+                            className="mt-1 text-[10px] leading-snug"
+                            subtle
+                          />
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
-              </div>
-            );
-          })}
+              )}
+            </TraceSection>
+          )}
         </div>
       )}
     </div>
   );
 }
 
+function TraceSection({
+  title,
+  icon,
+  action,
+  children,
+}: {
+  title: string;
+  icon: ReactNode;
+  action?: ReactNode;
+  children: ReactNode;
+}) {
+  return (
+    <div>
+      <div className="mb-1.5 flex items-center justify-between gap-2 text-[11px] font-medium" style={{ color: 'var(--text-tertiary)' }}>
+        <div className="flex items-center gap-1.5">
+          {icon}
+          <span>{title}</span>
+        </div>
+        {action}
+      </div>
+      <div style={{ color: 'var(--text-secondary)' }}>{children}</div>
+    </div>
+  );
+}
+
+function TraceCopyButton({ copied, onClick }: { copied: boolean; onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={(event) => {
+        event.stopPropagation();
+        onClick();
+      }}
+      className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px]"
+      style={{ color: 'var(--text-tertiary)', background: 'var(--bg-hover)' }}
+    >
+      <Copy size={10} />
+      {copied ? '已复制' : '复制'}
+    </button>
+  );
+}
+
+function ScrollableText({
+  text,
+  maxHeight,
+  className = '',
+  subtle = false,
+}: {
+  text: string;
+  maxHeight: number;
+  className?: string;
+  subtle?: boolean;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const lineCount = text.split('\n').length;
+  const charCount = Array.from(text).length;
+  const effectiveMaxHeight = expanded ? Math.max(maxHeight * 2, 720) : maxHeight;
+
+  return (
+    <div className="min-w-0">
+      <div className="mb-1 flex items-center justify-between gap-2">
+        <span className="text-[10px]" style={{ color: 'var(--text-tertiary)' }}>
+          {expanded ? `已展开滚动区域 · ${lineCount} 行 · ${charCount} 字` : `区域内滚动查看 · ${lineCount} 行 · ${charCount} 字`}
+        </span>
+        <button
+          type="button"
+          onClick={(event) => {
+            event.stopPropagation();
+            setExpanded((value) => !value);
+          }}
+          className="shrink-0 rounded px-1.5 py-0.5 text-[10px]"
+          style={{ color: 'var(--text-tertiary)', background: 'var(--bg-hover)' }}
+        >
+          {expanded ? '收起' : '展开全文'}
+        </button>
+      </div>
+      <div
+        tabIndex={0}
+        role="region"
+        className={`min-w-0 overflow-y-auto whitespace-pre-wrap break-words rounded-md p-2 leading-relaxed ${className}`}
+        style={{
+          background: subtle ? 'transparent' : 'var(--bg-primary)',
+          color: subtle ? 'var(--text-tertiary)' : 'var(--text-secondary)',
+          border: subtle ? 'none' : '1px solid var(--border-secondary)',
+          maxHeight: `${effectiveMaxHeight}px`,
+          overflowX: 'auto',
+          WebkitOverflowScrolling: 'touch',
+        }}
+      >
+        {text}
+      </div>
+    </div>
+  );
+}
+
 export function TaskRuntimePanel() {
+  const activeId = useConversationStore((s) => s.activeId);
+  const traceWorkers = useWorkerTraceStore((s) => s.workers);
+  const { activeRun, plan, todos, routeExplanation, loadByConversation, refresh } =
+    useTaskRuntimeStore();
+
+  useEffect(() => {
+    if (activeId) loadByConversation(activeId);
+  }, [activeId, loadByConversation]);
+
+  const visibleTraceWorkers = useMemo(
+    () =>
+      activeRun
+        ? Object.values(traceWorkers)
+            .filter((worker) => worker.runId === activeRun.run_id)
+            .sort((a, b) => (a.startedAt ?? '').localeCompare(b.startedAt ?? ''))
+        : [],
+    [activeRun, traceWorkers]
+  );
+
+  if (!activeRun && !routeExplanation) return null;
+
+  const runId = activeRun?.run_id ?? routeExplanation?.runId;
+  const completedCount = todos.filter(
+    (t) => displayedTodoStatus(t, visibleTraceWorkers) === ('completed' as TodoStatus)
+  ).length;
+
+  return (
+    <section className="border-b border-[var(--border-primary)] px-3 py-2.5">
+      <div className="mb-2 flex items-center justify-between">
+        <div className="flex min-w-0 items-center gap-1.5">
+          <ListTodo size={13} style={{ color: 'var(--accent)' }} />
+          <span className="truncate text-xs font-medium" style={{ color: 'var(--text-primary)' }}>
+            任务运行
+          </span>
+        </div>
+        <span
+          className="rounded px-1.5 py-0.5 text-[10px] font-medium"
+          style={{
+            color: activeRun ? statusColor(activeRun.status) : 'var(--text-tertiary)',
+            background: 'var(--bg-hover)',
+          }}
+        >
+          {activeRun ? STATUS_LABEL[activeRun.status] ?? activeRun.status : '连接中'}
+        </span>
+      </div>
+
+      <div
+        className="mb-2 truncate rounded-md px-2 py-1.5 text-[11px]"
+        style={{ background: 'var(--bg-secondary)', color: 'var(--text-secondary)' }}
+        title={activeRun?.goal ?? routeExplanation?.goal}
+      >
+        {activeRun?.goal ?? routeExplanation?.goal ?? '正在读取任务'}
+      </div>
+
+      {todos.length > 0 && (
+        <div className="mb-2">
+          <div className="mb-1 flex items-center justify-between">
+            <span className="text-[10px] font-medium" style={{ color: 'var(--text-tertiary)' }}>
+              任务列表
+            </span>
+            <span className="text-[10px]" style={{ color: 'var(--text-tertiary)' }}>
+              {completedCount}/{todos.length}
+            </span>
+          </div>
+          <div className="space-y-0.5">
+            {todos.map((todo) => {
+              const task = plan?.tasks.find((t) => t.id === todo.task_id);
+              const status = displayedTodoStatus(todo, visibleTraceWorkers);
+              return (
+                <div
+                  key={todo.id}
+                  className="flex items-start gap-1.5 rounded px-1.5 py-1"
+                  style={{ background: 'var(--bg-secondary)' }}
+                >
+                  <div className="mt-0.5">
+                    <TodoIcon status={status} />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-[11px]" style={{ color: 'var(--text-primary)' }} title={todo.title}>
+                      {todo.title}
+                    </div>
+                    <div className="flex min-w-0 items-center gap-1 text-[9px]" style={{ color: 'var(--text-tertiary)' }}>
+                      {task && <span className="rounded px-1" style={{ background: 'var(--bg-hover)' }}>{kindLabel(task.kind)}</span>}
+                      {todo.owner_agent && <span className="truncate">· {todo.owner_agent}</span>}
+                      <span>· {TODO_LABEL[status] ?? status}</span>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {visibleTraceWorkers.length > 0 && (
+        <div className="mb-2">
+          <div className="mb-1 flex items-center justify-between">
+            <span className="text-[10px] font-medium" style={{ color: 'var(--text-tertiary)' }}>
+              Worker 状态
+            </span>
+            <span className="text-[10px]" style={{ color: 'var(--text-tertiary)' }}>
+              {visibleTraceWorkers.filter((w) => w.status === 'running').length} 运行中
+            </span>
+          </div>
+          <div className="space-y-0.5">
+            {visibleTraceWorkers.map((worker) => (
+              <div
+                key={`${worker.runId}:${worker.workerId}`}
+                className="flex items-center gap-1.5 rounded px-1.5 py-1 text-[10px]"
+                style={{ background: 'var(--bg-secondary)', color: 'var(--text-secondary)' }}
+              >
+                {worker.status === 'running' ? (
+                  <Loader2 size={11} className="animate-spin" style={{ color: 'var(--color-info)' }} />
+                ) : worker.status === 'completed' ? (
+                  <CheckCircle2 size={11} style={{ color: 'var(--color-success)' }} />
+                ) : worker.status === 'failed' ? (
+                  <AlertCircle size={11} style={{ color: 'var(--color-error)' }} />
+                ) : (
+                  <Circle size={11} style={{ color: 'var(--text-tertiary)' }} />
+                )}
+                <span className="min-w-0 flex-1 truncate">{worker.title || worker.workerId}</span>
+                <span className="shrink-0" style={{ color: 'var(--text-tertiary)' }}>
+                  {workerStatusLabel(worker.status)}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {runId && (
+        <button
+          onClick={() => refresh(runId)}
+          className="ml-auto flex items-center gap-1 text-[10px]"
+          style={{ color: 'var(--text-tertiary)' }}
+        >
+          <RefreshCw size={11} /> 刷新
+        </button>
+      )}
+    </section>
+  );
+}
+
+export function TaskRuntimeMainPanel() {
   const [expandedWorkers, setExpandedWorkers] = useState<Record<string, boolean>>({});
+  const [copiedFinalResult, setCopiedFinalResult] = useState(false);
   const activeId = useConversationStore((s) => s.activeId);
   const traceWorkers = useWorkerTraceStore((s) => s.workers);
   const {
@@ -296,6 +794,7 @@ export function TaskRuntimePanel() {
     artifacts,
     awaitingApproval,
     error,
+    routeExplanation,
     loadByConversation,
     refresh,
     approve,
@@ -321,30 +820,126 @@ export function TaskRuntimePanel() {
     return () => window.clearInterval(id);
   }, [activeRun, isTerminal, refresh]);
 
+  const visibleTraceWorkers = useMemo(
+    () =>
+      activeRun
+        ? Object.values(traceWorkers)
+            .filter((worker) => worker.runId === activeRun.run_id)
+            .sort((a, b) => (a.startedAt ?? '').localeCompare(b.startedAt ?? ''))
+        : [],
+    [activeRun, traceWorkers]
+  );
+
   if (!activeRun) {
-    // No complex task in flight — render nothing (the section is omitted by
-    // RightRail when this returns null).
+    if (routeExplanation || error) {
+      return (
+        <section
+          className="my-3 rounded-lg border p-4"
+          style={{ borderColor: 'var(--border-primary)', background: 'var(--bg-primary)' }}
+        >
+          <div className="mb-2 flex items-center justify-between">
+            <div className="flex items-center gap-1.5">
+              <Workflow size={15} style={{ color: 'var(--accent)' }} />
+              <span className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>
+                任务详情
+              </span>
+            </div>
+            <span className="text-[10px]" style={{ color: 'var(--text-tertiary)' }}>
+              正在连接运行状态
+            </span>
+          </div>
+
+          {routeExplanation && (
+            <div
+              className="mb-2 rounded-md border p-2"
+              style={{ borderColor: 'var(--border-primary)', background: 'var(--bg-secondary)' }}
+            >
+              <div className="mb-1.5 flex items-center justify-between gap-2">
+                <div className="flex min-w-0 items-center gap-1.5">
+                  <Workflow size={12} style={{ color: 'var(--accent)' }} />
+                  <span className="truncate text-[11px] font-medium" style={{ color: 'var(--text-primary)' }}>
+                    路由决策
+                  </span>
+                </div>
+                {typeof routeExplanation.confidence === 'number' && (
+                  <span className="text-[9px]" style={{ color: 'var(--text-tertiary)' }}>
+                    {Math.round(routeExplanation.confidence * 100)}%
+                  </span>
+                )}
+              </div>
+
+              <div className="mb-1.5 flex flex-wrap gap-1">
+                <CompactTag>模式 {modeLabel(routeExplanation.interactionMode)}</CompactTag>
+                <CompactTag>路径 {routeLabel(routeExplanation.route)}</CompactTag>
+                <CompactTag>{routeExplanation.autoExecute ? '自动执行' : '等待确认'}</CompactTag>
+                <CompactTag>{permissionLabel(routeExplanation.permissionMode)}</CompactTag>
+              </div>
+
+              {routeExplanation.routeReason && (
+                <div className="mb-1.5 text-[10px] leading-snug" style={{ color: 'var(--text-secondary)' }}>
+                  {routeExplanation.routeReason}
+                </div>
+              )}
+
+              {routeExplanation.approvalPolicy && (
+                <div className="mb-1.5 flex gap-1.5 text-[10px] leading-snug" style={{ color: 'var(--text-tertiary)' }}>
+                  <ShieldCheck size={11} className="mt-0.5 shrink-0" />
+                  <span>{routeExplanation.approvalPolicy}</span>
+                </div>
+              )}
+
+              {routeExplanation.suggestedWorkers.length > 0 && (
+                <div className="flex flex-wrap gap-1">
+                  {routeExplanation.suggestedWorkers.map((worker) => (
+                    <CompactTag key={worker}>{worker}</CompactTag>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {error && (
+            <div
+              className="mb-2 rounded px-2 py-1 text-[10px]"
+              style={{ color: 'var(--color-error)', background: 'var(--bg-hover)' }}
+            >
+              {error}
+            </div>
+          )}
+
+          {routeExplanation && (
+            <button
+              onClick={() => refresh(routeExplanation.runId)}
+              className="flex w-full items-center justify-center gap-1 rounded px-2 py-1 text-[11px] font-medium"
+              style={{ background: 'var(--bg-secondary)', color: 'var(--text-primary)' }}
+            >
+              <RefreshCw size={12} /> 重试读取运行状态
+            </button>
+          )}
+        </section>
+      );
+    }
     return null;
   }
 
-  const completedCount = todos.filter((t) => t.status === ('completed' as TodoStatus)).length;
+  const completedCount = todos.filter(
+    (t) => displayedTodoStatus(t, visibleTraceWorkers) === ('completed' as TodoStatus)
+  ).length;
   const runningWorkers = todos.filter((t) => t.status === ('running' as TodoStatus));
-  const visibleTraceWorkers = useMemo(
-    () =>
-      Object.values(traceWorkers)
-        .filter((worker) => worker.runId === activeRun.run_id)
-        .sort((a, b) => (a.startedAt ?? '').localeCompare(b.startedAt ?? '')),
-    [activeRun.run_id, traceWorkers]
-  );
+  const finalResult = finalRunResult(visibleTraceWorkers, todos);
+  const effectiveRouteExplanation = deriveRouteExplanation(activeRun, plan, todos, visibleTraceWorkers, routeExplanation);
 
   return (
-    <section className="border-b border-[var(--border-primary)] px-3 py-2.5">
+    <section
+      className="my-3 rounded-lg border p-4"
+      style={{ borderColor: 'var(--border-primary)', background: 'var(--bg-primary)' }}
+    >
       {/* ── Run header ─────────────────────────────────────────────── */}
       <div className="mb-2 flex items-center justify-between">
         <div className="flex items-center gap-1.5">
-          <ListTodo size={13} style={{ color: 'var(--accent)' }} />
-          <span className="text-xs font-medium" style={{ color: 'var(--text-primary)' }}>
-            任务运行
+          <ListTodo size={15} style={{ color: 'var(--accent)' }} />
+          <span className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>
+            任务执行
           </span>
         </div>
         <span
@@ -364,6 +959,45 @@ export function TaskRuntimePanel() {
       >
         {activeRun.goal}
       </div>
+
+      {effectiveRouteExplanation && (
+        <div className="mb-3 flex gap-2 rounded-lg p-3" style={{ background: 'var(--bg-secondary)' }}>
+          <Sparkles size={15} className="mt-0.5 shrink-0" style={{ color: 'var(--accent)' }} />
+          <div className="min-w-0 flex-1">
+            <div className="mb-1 text-[12px] font-medium" style={{ color: 'var(--text-primary)' }}>
+              已进入 TaskRuntime，并发委派 {effectiveRouteExplanation.suggestedWorkers.length || visibleTraceWorkers.length} 个 worker
+            </div>
+            <div className="text-[11px] leading-relaxed" style={{ color: 'var(--text-secondary)' }}>
+              {effectiveRouteExplanation.routeReason ||
+                `当前请求被识别为${routeLabel(effectiveRouteExplanation.route)}，适合拆分给多个 worker 并行处理。`}
+            </div>
+            <div className="mt-2 flex flex-wrap gap-1">
+              {effectiveRouteExplanation.interactionMode && (
+                <CompactTag>模式 {modeLabel(effectiveRouteExplanation.interactionMode)}</CompactTag>
+              )}
+              <CompactTag>路径 {routeLabel(effectiveRouteExplanation.route)}</CompactTag>
+              <CompactTag>{effectiveRouteExplanation.autoExecute ? '自动执行' : '等待确认'}</CompactTag>
+              {effectiveRouteExplanation.permissionMode && (
+                <CompactTag>{permissionLabel(effectiveRouteExplanation.permissionMode)}</CompactTag>
+              )}
+              <CompactTag>领域 {domainProfileLabel(effectiveRouteExplanation.domainProfile)}</CompactTag>
+            </div>
+            {effectiveRouteExplanation.approvalPolicy && (
+              <div className="mt-2 flex gap-1.5 text-[11px] leading-snug" style={{ color: 'var(--text-tertiary)' }}>
+                <ShieldCheck size={12} className="mt-0.5 shrink-0" />
+                <span>{effectiveRouteExplanation.approvalPolicy}</span>
+              </div>
+            )}
+            {(effectiveRouteExplanation.routeSignals.length > 0 || effectiveRouteExplanation.classificationSignals.length > 0) && (
+              <div className="mt-2 flex flex-wrap gap-1">
+                {[...effectiveRouteExplanation.routeSignals, ...effectiveRouteExplanation.classificationSignals].map((signal) => (
+                  <CompactTag key={signal}>{signal}</CompactTag>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       {error && (
         <div
@@ -432,74 +1066,18 @@ export function TaskRuntimePanel() {
         </div>
       )}
 
-      {/* ── Plan task list (when there's a plan) ───────────────────── */}
-      {plan && plan.tasks.length > 0 && (
-        <div className="mb-2">
-          <div className="mb-1 flex items-center justify-between">
-            <span className="text-[10px] font-medium" style={{ color: 'var(--text-tertiary)' }}>
-              计划任务
-            </span>
-            <span className="text-[10px]" style={{ color: 'var(--text-tertiary)' }}>
-              {completedCount}/{todos.length}
-            </span>
-          </div>
-          <div className="space-y-0.5">
-            {todos.map((todo) => {
-              const task = plan.tasks.find((t) => t.id === todo.task_id);
-              return (
-                <div
-                  key={todo.id}
-                  className="flex items-start gap-1.5 rounded px-1.5 py-1"
-                  style={{ background: 'var(--bg-secondary)' }}
-                >
-                  <div className="mt-0.5">
-                    <TodoIcon status={todo.status} />
-                  </div>
-                  <div className="min-w-0 flex-1">
-                    <div
-                      className="truncate text-[11px]"
-                      style={{ color: 'var(--text-primary)' }}
-                      title={todo.title}
-                    >
-                      {todo.title}
-                    </div>
-                    <div className="flex items-center gap-1 text-[9px]" style={{ color: 'var(--text-tertiary)' }}>
-                      {task && (
-                        <span
-                          className="rounded px-1"
-                          style={{ background: 'var(--bg-hover)' }}
-                        >
-                          {kindLabel(task.kind)}
-                        </span>
-                      )}
-                      {todo.owner_agent && <span>· {todo.owner_agent}</span>}
-                      <span>· {TODO_LABEL[todo.status] ?? todo.status}</span>
-                    </div>
-                    {todo.summary && (
-                      <div className="mt-0.5 truncate text-[9px]" style={{ color: 'var(--text-tertiary)' }} title={todo.summary}>
-                        {todo.summary}
-                      </div>
-                    )}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        </div>
-      )}
-
       {/* ── Parallel workers (live trace) ──────────────────────────── */}
       {visibleTraceWorkers.length > 0 ? (
-        <div className="mb-2">
+        <div className="mb-3">
           <div className="mb-1 flex items-center justify-between">
-            <span className="text-[10px] font-medium" style={{ color: 'var(--text-tertiary)' }}>
-              Worker Trace
+            <span className="text-[12px] font-medium" style={{ color: 'var(--text-primary)' }}>
+              Subagent / Worker Trace
             </span>
-            <span className="text-[10px]" style={{ color: 'var(--text-tertiary)' }}>
-              {visibleTraceWorkers.filter((w) => w.status === 'running').length} 运行中
+            <span className="text-[11px]" style={{ color: 'var(--text-tertiary)' }}>
+              {completedCount}/{todos.length || visibleTraceWorkers.length} 完成
             </span>
           </div>
-          <div className="space-y-0.5">
+          <div className="space-y-2">
             {visibleTraceWorkers.map((worker) => (
               <WorkerTraceRow
                 key={`${worker.runId}:${worker.workerId}`}
@@ -509,6 +1087,7 @@ export function TaskRuntimePanel() {
                   const key = `${worker.runId}:${worker.workerId}`;
                   setExpandedWorkers((prev) => ({ ...prev, [key]: !prev[key] }));
                 }}
+                roomy
               />
             ))}
           </div>
@@ -526,6 +1105,29 @@ export function TaskRuntimePanel() {
               <span className="truncate">{w.title}</span>
             </div>
           ))}
+        </div>
+      )}
+
+      {finalResult && (
+        <div
+          className="mb-3 rounded-lg border p-3"
+          style={{ borderColor: 'var(--border-primary)', background: 'var(--bg-secondary)' }}
+        >
+          <div className="mb-2 flex items-center justify-between gap-2">
+            <div className="flex items-center gap-1.5 text-[12px] font-medium" style={{ color: 'var(--text-primary)' }}>
+              <CheckCircle2 size={14} style={{ color: 'var(--color-success)' }} />
+              <span>最终任务结果</span>
+            </div>
+            <TraceCopyButton
+              copied={copiedFinalResult}
+              onClick={() => {
+                copyToClipboard(finalResult);
+                setCopiedFinalResult(true);
+                window.setTimeout(() => setCopiedFinalResult(false), 1600);
+              }}
+            />
+          </div>
+          <ScrollableText text={finalResult} maxHeight={720} className="text-[12px]" />
         </div>
       )}
 

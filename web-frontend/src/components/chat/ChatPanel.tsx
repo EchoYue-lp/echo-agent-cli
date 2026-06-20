@@ -8,6 +8,7 @@ import { useWebSocket } from '../../hooks/useWebSocket';
 import { useTauriChat } from '../../hooks/useTauriChat';
 import { isTauri } from '../../lib/tauri-bridge';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
+import { TaskRuntimeMainPanel } from '../task/TaskRuntimePanel';
 import type { Attachment } from '../../types/api';
 
 function useChatTransport() {
@@ -144,6 +145,8 @@ export function ChatPanel() {
                   </div>
                 );
               })}
+
+              <TaskRuntimeMainPanel />
 
               {isStreaming &&
                 !messages.some(

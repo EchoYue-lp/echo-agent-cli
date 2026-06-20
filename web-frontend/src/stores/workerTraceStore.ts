@@ -3,6 +3,10 @@ import { create } from 'zustand';
 const MAX_RUN_EVENTS = 1000;
 const MAX_WORKER_EVENTS = 300;
 
+function isFallbackWorkerTitle(title: string | undefined, agentName: string | undefined): boolean {
+  return Boolean(title && agentName && title === agentName);
+}
+
 export type WorkerTraceEventKind =
   | 'run_started'
   | 'run_status_changed'
@@ -106,14 +110,20 @@ export const useWorkerTraceStore = create<WorkerTraceStore>((set) => ({
         status === 'completed' || status === 'failed' || status === 'cancelled'
           ? event.timestamp
           : prev?.completedAt;
+      const eventAgentName = event.agent_name ?? undefined;
+      const eventTitle = event.title ?? undefined;
+      const eventTask = event.task ?? undefined;
 
       const nextWorker: WorkerTraceState = {
         workerId: event.worker_id,
         runId: event.run_id,
         parentWorkerId: event.parent_worker_id ?? prev?.parentWorkerId,
-        agentName: event.agent_name ?? prev?.agentName,
-        title: event.title ?? prev?.title,
-        task: event.task ?? prev?.task,
+        agentName: eventAgentName ?? prev?.agentName,
+        title:
+          eventTitle && !isFallbackWorkerTitle(eventTitle, eventAgentName ?? prev?.agentName)
+            ? eventTitle
+            : prev?.title ?? eventTitle,
+        task: eventTask ?? prev?.task,
         status,
         startedAt,
         completedAt,

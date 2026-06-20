@@ -27,7 +27,7 @@ interface ConversationState {
   /** Initialize: load from backend */
   init: () => Promise<void>;
   /** Save current chat messages as a conversation (upsert) */
-  saveCurrent: (messages: ChatMessage[]) => void;
+  saveCurrent: (messages: ChatMessage[]) => Promise<void>;
   /** Load a conversation and display it */
   loadConversation: (id: string) => Promise<void>;
   /** Delete a conversation */

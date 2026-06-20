@@ -150,11 +150,17 @@ pub fn generate_parallel_readonly_plan(
         warnings.push("read-only plan needed at least one discovery worker".to_string());
     }
 
-    let parallel_group = "readonly-fanout".to_string();
+    let run_slug = role_slug(run_id);
+    let parallel_group = format!("readonly-fanout-{run_slug}");
     let mut tasks = Vec::new();
     let mut fanout_ids = Vec::new();
     for (i, worker) in discovery_workers.iter().enumerate() {
-        let id = format!("readonly-{}-{}", i.saturating_add(1), role_slug(worker));
+        let id = format!(
+            "readonly-{}-{}-{}",
+            run_slug,
+            i.saturating_add(1),
+            role_slug(worker)
+        );
         fanout_ids.push(id.clone());
         tasks.push(PlanTask {
             id,
@@ -190,7 +196,7 @@ pub fn generate_parallel_readonly_plan(
 
     if has_synthesis || tasks.len() > 1 {
         tasks.push(PlanTask {
-            id: "readonly-synthesis-summary_writer".to_string(),
+            id: format!("readonly-{run_slug}-synthesis-summary_writer"),
             title: "Synthesize worker findings".to_string(),
             description: format!(
                 "Combine parallel read-only findings into an actionable answer for: {}",
@@ -837,10 +843,21 @@ mod tests {
             .plan
             .tasks
             .iter()
-            .filter(|task| task.parallel_group.as_deref() == Some("readonly-fanout"))
+            .filter(|task| {
+                task.parallel_group
+                    .as_deref()
+                    .is_some_and(|group| group.starts_with("readonly-fanout-run-1"))
+            })
             .collect::<Vec<_>>();
         assert_eq!(fanout.len(), 3);
         assert!(fanout.iter().all(|task| task.depends_on.is_empty()));
+        assert!(
+            generated
+                .plan
+                .tasks
+                .iter()
+                .all(|task| task.id.starts_with("readonly-run-1-"))
+        );
 
         let summary = generated
             .plan
@@ -859,6 +876,34 @@ mod tests {
                 .all(|task| task.kind.is_read_only())
         );
         assert!(generated.warnings.is_empty());
+    }
+
+    #[test]
+    fn deterministic_readonly_task_ids_are_unique_across_runs() {
+        let classification = Classification {
+            complexity: ComplexityLabel::Complex,
+            inferred_profile: DomainProfile::AiCoding,
+            reason: "test".to_string(),
+            signals: vec!["analysis".to_string()],
+        };
+        let first = generate_parallel_readonly_plan(
+            "run-a",
+            "分析项目",
+            &classification,
+            &["project_explorer".to_string(), "summary_writer".to_string()],
+        );
+        let second = generate_parallel_readonly_plan(
+            "run-b",
+            "分析项目",
+            &classification,
+            &["project_explorer".to_string(), "summary_writer".to_string()],
+        );
+
+        for first_task in &first.plan.tasks {
+            for second_task in &second.plan.tasks {
+                assert_ne!(first_task.id, second_task.id);
+            }
+        }
     }
 
     #[test]

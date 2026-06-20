@@ -24,6 +24,22 @@ import type {
   TaskRunStatus,
 } from '../generated';
 
+export interface RouteExplanation {
+  runId: string;
+  goal?: string;
+  domainProfile?: string;
+  route?: string;
+  interactionMode?: string;
+  permissionMode?: string;
+  approvalPolicy?: string;
+  routeReason?: string;
+  confidence?: number;
+  autoExecute?: boolean;
+  suggestedWorkers: string[];
+  routeSignals: string[];
+  classificationSignals: string[];
+}
+
 export interface TaskRuntimeState {
   /// The run the right rail is currently focused on (latest for the active
   /// conversation). Null when no complex task is in flight.
@@ -41,6 +57,8 @@ export interface TaskRuntimeState {
   error: string | null;
   /// Loading flag for plan generation (the LLM call can take a few seconds).
   generatingPlan: boolean;
+  /// Latest route/mode/approval explanation received from plan_ready.
+  routeExplanation: RouteExplanation | null;
 
   // ── Actions ───────────────────────────────────────────────────────────
   refresh: (runId: string) => Promise<void>;
@@ -52,7 +70,7 @@ export interface TaskRuntimeState {
   cancel: (runId: string) => Promise<void>;
   /// Mark that a plan_ready chat event arrived for this run — the panel
   /// should fetch the plan + show approval actions.
-  notifyPlanReady: (runId: string) => Promise<void>;
+  notifyPlanReady: (runId: string, explanation?: Partial<RouteExplanation>) => Promise<void>;
   reset: () => void;
 }
 
@@ -66,6 +84,7 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
   awaitingApproval: false,
   error: null,
   generatingPlan: false,
+  routeExplanation: null,
 
   refresh: async (runId: string) => {
     try {
@@ -79,6 +98,19 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
       const lastSeq = events.length
         ? events[events.length - 1].seq
         : get().lastSeq;
+      if (!run) {
+        set({
+          activeRun: null,
+          plan,
+          todos,
+          events: [...get().events, ...events].slice(-MAX_EVENTS),
+          artifacts,
+          lastSeq,
+          awaitingApproval: false,
+          error: `TaskRuntime run ${runId} 暂时不可用`,
+        });
+        return;
+      }
       set({
         activeRun: run,
         plan,
@@ -103,10 +135,10 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
       const run = await taskRuntimeApi.latestRunForConversation(conversationId);
       if (run) {
         // Reset event cursor when switching runs so we don't cross streams.
-        set({ events: [], lastSeq: '0' });
+        set({ events: [], lastSeq: '0', routeExplanation: null });
         await get().refresh(run.run_id);
       } else {
-        set({ activeRun: null, plan: null, todos: [], events: [], artifacts: [], lastSeq: '0' });
+        set({ activeRun: null, plan: null, todos: [], events: [], artifacts: [], lastSeq: '0', routeExplanation: null });
       }
     } catch (e) {
       set({ error: e instanceof Error ? e.message : String(e) });
@@ -169,11 +201,26 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
     }
   },
 
-  notifyPlanReady: async (runId: string) => {
+  notifyPlanReady: async (runId: string, explanation?: Partial<RouteExplanation>) => {
     // A plan_ready event arrived — load the run + plan so the panel can
     // render the approval UI.
-    set({ events: [], lastSeq: '0' });
+    set({
+      events: [],
+      lastSeq: '0',
+      routeExplanation: {
+        runId,
+        suggestedWorkers: [],
+        routeSignals: [],
+        classificationSignals: [],
+        ...explanation,
+      },
+    });
     await get().refresh(runId);
+    if (!get().activeRun) {
+      window.setTimeout(() => {
+        void get().refresh(runId);
+      }, 500);
+    }
   },
 
   reset: () =>
@@ -187,5 +234,6 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
       awaitingApproval: false,
       error: null,
       generatingPlan: false,
+      routeExplanation: null,
     }),
 }));

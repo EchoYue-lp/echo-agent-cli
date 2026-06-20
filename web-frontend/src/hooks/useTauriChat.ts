@@ -3,7 +3,7 @@ import { useChatStore } from '../stores/chatStore';
 import { useConversationStore } from '../stores/conversationStore';
 import { useSubagentStore, type SubagentEventPayload } from '../stores/subagentStore';
 import { useWorkerTraceStore, type WorkerTraceEvent } from '../stores/workerTraceStore';
-import { isTauri, apiInvoke } from '../lib/tauri-bridge';
+import { isTauri, apiInvoke, errorMessage } from '../lib/tauri-bridge';
 import { handleChatEvent } from './chatEventHandler';
 import type { Attachment, ChatRunStatus } from '../types/api';
 
@@ -48,7 +48,16 @@ type ChatEvent = ChatEventBase &
       run_id: string;
       goal: string;
       domain_profile: string;
-      signals: string[];
+      route: string;
+      interaction_mode: string;
+      permission_mode: string;
+      approval_policy: string;
+      route_reason: string;
+      confidence: number;
+      auto_execute: boolean;
+      suggested_workers: string[];
+      route_signals: string[];
+      classification_signals: string[];
     }
   | { type: 'done' }
   );
@@ -138,8 +147,20 @@ export function useTauriChat() {
       thinkingIdRef.current = null;
       assistantIdRef.current = store.startAssistantMessage();
 
-      // Pass conversation_id for pool-based parallel execution
+      // TaskRuntime runs are keyed by conversation_id. On the first turn there
+      // is no active conversation yet, so create it before routing; otherwise
+      // the backend falls back to a message-scoped id and the right rail loses
+      // the run as soon as the conversation is later saved as conv-*.
+      if (!useConversationStore.getState().activeId) {
+        await useConversationStore.getState().saveCurrent(useChatStore.getState().messages);
+      }
+
+      // Pass conversation_id for pool-based parallel execution and TaskRuntime
+      // run binding.
       const conversation_id = useConversationStore.getState().activeId;
+      if (!conversation_id) {
+        throw new Error('创建会话失败，无法启动 TaskRuntime。');
+      }
       const message_key =
         typeof crypto !== 'undefined' && 'randomUUID' in crypto
           ? crypto.randomUUID()
@@ -156,7 +177,7 @@ export function useTauriChat() {
     } catch (e) {
       console.error('[TauriChat] Failed to send message:', e);
       if (assistantIdRef.current) {
-        store.finalizeAssistantMessage(assistantIdRef.current, `[Error] ${e}`);
+        store.finalizeAssistantMessage(assistantIdRef.current, `[Error] ${errorMessage(e)}`);
       }
       store.setRunStatus('failed');
       assistantIdRef.current = null;

@@ -386,6 +386,21 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn auto_mode_routes_current_directory_project_analysis_to_parallel_runtime() {
+        let decision = route_message(None, "帮我分析当前目录的项目", InteractionMode::Auto).await;
+        assert_eq!(decision.route, TaskRouteKind::ParallelReadonlyDelegation);
+        assert!(decision.route.should_auto_execute());
+        assert!(
+            decision
+                .suggested_workers
+                .iter()
+                .any(|w| w == "project_explorer"),
+            "expected project_explorer worker, got {:?}",
+            decision.suggested_workers
+        );
+    }
+
     #[test]
     fn deterministic_router_uses_academic_workers_for_literature_tasks() {
         let decision =

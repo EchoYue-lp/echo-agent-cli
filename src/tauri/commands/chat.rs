@@ -85,8 +85,15 @@ pub enum ChatEvent {
         goal: String,
         domain_profile: String,
         route: String,
+        interaction_mode: String,
+        permission_mode: String,
+        approval_policy: String,
+        route_reason: String,
+        confidence: f32,
         auto_execute: bool,
-        signals: Vec<String>,
+        suggested_workers: Vec<String>,
+        route_signals: Vec<String>,
+        classification_signals: Vec<String>,
     },
     #[serde(rename = "done")]
     Done,
@@ -391,22 +398,45 @@ pub async fn send_chat_message(
         )
         .await;
         if route_decision.route.should_create_runtime_run() {
-            // Try to route to TaskRuntime. On any failure, log and FALL THROUGH
-            // to the normal chat path — the user's message must not vanish.
+            let route_label = route_decision.route.as_str();
+            // Try to route to TaskRuntime. If routing/planning fails after the
+            // router has selected a runtime path, surface that failure instead
+            // of silently falling back to normal chat. Silent fallback re-enters
+            // the legacy agent-tool path and makes Task/Auto mode look ignored.
             match route_complex_task(
                 state.inner(),
                 app.clone(),
                 message.clone(),
                 conversation_id.clone(),
                 message_key.clone(),
+                interaction_mode,
                 route_decision,
             )
             .await
             {
                 Ok(result) => return Ok(result),
                 Err(e) => {
-                    tracing::warn!(error = %e, "complex-task routing failed; falling back to normal chat");
-                    // Fall through to normal chat below.
+                    tracing::warn!(
+                        error = %e,
+                        route = route_label,
+                        "complex-task routing failed"
+                    );
+                    emit_chat_event(
+                        &app,
+                        &ChatEvent::Error {
+                            message: format!(
+                                "TaskRuntime 路由失败，已停止而不是回落到普通 chat：{}",
+                                e
+                            ),
+                        },
+                        &message_key,
+                        &conversation_id,
+                    );
+                    return Ok(serde_json::json!({
+                        "kind": "complex_task_error",
+                        "route": route_label,
+                        "error": e.to_string(),
+                    }));
                 }
             }
         }
@@ -883,6 +913,7 @@ async fn route_complex_task(
     message: String,
     conversation_id: Option<String>,
     message_key: String,
+    interaction_mode: InteractionMode,
     route_decision: TaskRouteDecision,
 ) -> Result<serde_json::Value, anyhow::Error> {
     let store = state
@@ -896,6 +927,7 @@ async fn route_complex_task(
     let conv_id = conversation_id
         .clone()
         .unwrap_or_else(|| format!("message:{message_key}"));
+    let permission_mode = state.app_state.config.permission_mode.read().await.clone();
 
     // 1. Create the run in Pending.
     let run_id = uuid::Uuid::new_v4().to_string();
@@ -970,8 +1002,25 @@ async fn route_complex_task(
                 .as_str()
                 .to_string(),
             route: route_decision.route.as_str().to_string(),
+            interaction_mode: interaction_mode.as_str().to_string(),
+            permission_mode: permission_mode.clone(),
+            approval_policy: approval_policy_summary(
+                &permission_mode,
+                route_decision.route.should_auto_execute(),
+                auto_execute,
+            )
+            .to_string(),
+            route_reason: route_decision.reason.clone(),
+            confidence: route_decision.confidence,
             auto_execute,
-            signals: route_decision.classification.signals.clone(),
+            suggested_workers: route_decision.suggested_workers.clone(),
+            route_signals: route_decision
+                .reason
+                .split("routing_signals:")
+                .nth(1)
+                .map(|value| value.split(',').map(|s| s.trim().to_string()).collect())
+                .unwrap_or_default(),
+            classification_signals: route_decision.classification.signals.clone(),
         },
         // Use message_key so first-turn messages without an active
         // conversation_id still pass the frontend event guard.
@@ -998,6 +1047,25 @@ async fn route_complex_task(
         "plan": generated.plan,
         "warnings": generated.warnings,
     }))
+}
+
+fn approval_policy_summary(
+    permission_mode: &str,
+    route_auto_execute: bool,
+    auto_execute: bool,
+) -> &'static str {
+    if auto_execute {
+        "只读并行任务已自动执行；后续工具审批仍由当前审批模式控制"
+    } else if route_auto_execute {
+        "已识别为只读并行路径，但计划包含需确认步骤，等待用户确认"
+    } else {
+        match permission_mode {
+            "full-auto" => "工具操作默认自动通过，高风险保护仍会拦截",
+            "auto-edit" => "读取和编辑类操作自动通过，高风险操作会询问",
+            "strict" => "写入、命令、网络等敏感操作都会询问",
+            _ => "高风险操作会询问，计划执行前需要用户确认",
+        }
+    }
 }
 
 async fn launch_task_run_execution(

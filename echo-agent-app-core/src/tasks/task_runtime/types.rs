@@ -105,6 +105,16 @@ impl Default for InteractionMode {
     }
 }
 
+impl InteractionMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            InteractionMode::Chat => "chat",
+            InteractionMode::Task => "task",
+            InteractionMode::Auto => "auto",
+        }
+    }
+}
+
 impl Default for ExecutionMode {
     fn default() -> Self {
         ExecutionMode::Parallel

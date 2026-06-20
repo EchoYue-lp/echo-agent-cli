@@ -489,12 +489,12 @@ export const taskRuntimeApi = {
   // ── Reads ────────────────────────────────────────────────────────────
   getRun: (runId: string) =>
     isTauri()
-      ? apiInvoke<TaskRun | null>('get_task_run', { run_id: runId })
+      ? apiInvoke<TaskRun | null>('get_task_run', { runId })
       : get<TaskRun | null>(`/task_runtime/runs/${runId}`),
   latestRunForConversation: (conversationId: string) =>
     isTauri()
       ? apiInvoke<TaskRun | null>('latest_task_run_for_conversation', {
-          conversation_id: conversationId,
+          conversationId,
         })
       : get<TaskRun | null>(`/task_runtime/conversations/${conversationId}/latest_run`),
   listRuns: (statuses?: string[]) =>
@@ -503,34 +503,34 @@ export const taskRuntimeApi = {
       : get<TaskRun[]>('/task_runtime/runs'),
   getPlan: (runId: string) =>
     isTauri()
-      ? apiInvoke<TaskPlan | null>('get_task_plan', { run_id: runId })
+      ? apiInvoke<TaskPlan | null>('get_task_plan', { runId })
       : get<TaskPlan | null>(`/task_runtime/runs/${runId}/plan`),
   listTodos: (runId: string) =>
     isTauri()
-      ? apiInvoke<TodoItem[]>('list_task_todos', { run_id: runId })
+      ? apiInvoke<TodoItem[]>('list_task_todos', { runId })
       : get<TodoItem[]>(`/task_runtime/runs/${runId}/todos`),
   listEvents: (runId: string, sinceSeq?: string) =>
     isTauri()
       ? apiInvoke<RuntimeTaskEvent[]>('list_task_events', {
-          run_id: runId,
-          since_seq: sinceSeq ?? null,
+          runId,
+          sinceSeq: sinceSeq ?? null,
         })
       : get<RuntimeTaskEvent[]>(`/task_runtime/runs/${runId}/events`),
   listArtifacts: (runId: string) =>
     isTauri()
-      ? apiInvoke<RuntimeArtifact[]>('list_task_artifacts', { run_id: runId })
+      ? apiInvoke<RuntimeArtifact[]>('list_task_artifacts', { runId })
       : get<RuntimeArtifact[]>(`/task_runtime/runs/${runId}/artifacts`),
   getProgressLedger: (runId: string) =>
     isTauri()
-      ? apiInvoke<string>('get_progress_ledger', { run_id: runId })
+      ? apiInvoke<string>('get_progress_ledger', { runId })
       : get<string>(`/task_runtime/runs/${runId}/progress.md`),
   listReviews: (runId: string, taskId: string) =>
     isTauri()
-      ? apiInvoke<ReviewResult[]>('list_task_reviews', { run_id: runId, task_id: taskId })
+      ? apiInvoke<ReviewResult[]>('list_task_reviews', { runId, taskId })
       : get<ReviewResult[]>(`/task_runtime/runs/${runId}/tasks/${taskId}/reviews`),
   getTaskSummary: (runId: string, taskId: string) =>
     isTauri()
-      ? apiInvoke<TaskExecutionSummary | null>('get_task_summary', { run_id: runId, task_id: taskId })
+      ? apiInvoke<TaskExecutionSummary | null>('get_task_summary', { runId, taskId })
       : get<TaskExecutionSummary | null>(`/task_runtime/runs/${runId}/tasks/${taskId}/summary`),
 
   // ── Mutations (plan lifecycle) ───────────────────────────────────────
@@ -547,31 +547,31 @@ export const taskRuntimeApi = {
   generatePlan: (runId: string) =>
     isTauri()
       ? apiInvoke<{ plan: TaskPlan; warnings: string[] }>('generate_task_plan', {
-          run_id: runId,
+          runId,
         })
       : post<{ plan: TaskPlan; warnings: string[] }>(`/task_runtime/runs/${runId}/plan`),
   approvePlan: (runId: string, note?: string) =>
     isTauri()
-      ? apiInvoke<TaskRun>('approve_task_plan', { run_id: runId, note: note ?? null })
+      ? apiInvoke<TaskRun>('approve_task_plan', { runId, note: note ?? null })
       : post<TaskRun>(`/task_runtime/runs/${runId}/approve`, { note }),
   rejectPlan: (runId: string, note?: string) =>
     isTauri()
-      ? apiInvoke<TaskRun>('reject_task_plan', { run_id: runId, note: note ?? null })
+      ? apiInvoke<TaskRun>('reject_task_plan', { runId, note: note ?? null })
       : post<TaskRun>(`/task_runtime/runs/${runId}/reject`, { note }),
   editPlan: (runId: string, tasks: PlanTask[]) =>
     isTauri()
-      ? apiInvoke<TaskPlan>('edit_task_plan', { run_id: runId, tasks })
+      ? apiInvoke<TaskPlan>('edit_task_plan', { runId, tasks })
       : put<TaskPlan>(`/task_runtime/runs/${runId}/plan`, { tasks }),
 
   // ── Execution ────────────────────────────────────────────────────────
   executeRun: (runId: string) =>
     isTauri()
-      ? apiInvoke<{ kind: string; run_id: string }>('execute_task_run', { run_id: runId })
+      ? apiInvoke<{ kind: string; run_id: string }>('execute_task_run', { runId })
       : post<{ kind: string; run_id: string }>(`/task_runtime/runs/${runId}/execute`),
   cancelRun: (runId: string) =>
     isTauri()
       ? apiInvoke<{ success: boolean; run_id: string }>('cancel_task_run', {
-          run_id: runId,
+          runId,
         })
       : post<{ success: boolean; run_id: string }>(`/task_runtime/runs/${runId}/cancel`),
 
