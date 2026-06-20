@@ -50,7 +50,7 @@ pub mod store;
 pub mod types;
 
 pub use classify::{Classification, Complexity, ComplexityLabel, HeuristicClassifier};
-pub use executor::{ConcurrencyLimits, ExecError, RunOutcome, execute_run};
+pub use executor::{ConcurrencyLimits, ExecError, RunOutcome, WorkerTraceSink, execute_run};
 pub use hitrisk::{HighRiskMatch, check as check_high_risk, requires_fresh_approval};
 pub use ledger::{export_path, render_progress, write_progress};
 pub use memory_bridge::{MemoryEvent, write_memory_candidate};

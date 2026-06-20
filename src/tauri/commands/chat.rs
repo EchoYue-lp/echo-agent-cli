@@ -953,7 +953,7 @@ async fn route_complex_task(
             .all(|task| task.kind.is_read_only())
     {
         store.transition_run(&run_id, TaskRunStatus::Ready)?;
-        launch_task_run_execution(state, &run_id).await?;
+        launch_task_run_execution(state, app.clone(), &run_id).await?;
         auto_execute = true;
         response_status = TaskRunStatus::Running;
     }
@@ -1000,7 +1000,11 @@ async fn route_complex_task(
     }))
 }
 
-async fn launch_task_run_execution(state: &TauriState, run_id: &str) -> Result<(), anyhow::Error> {
+async fn launch_task_run_execution(
+    state: &TauriState,
+    app: tauri::AppHandle,
+    run_id: &str,
+) -> Result<(), anyhow::Error> {
     let store = state
         .app_state
         .tasks
@@ -1028,6 +1032,10 @@ async fn launch_task_run_execution(state: &TauriState, run_id: &str) -> Result<(
         .run_cancel_tokens
         .insert(run_key, cancel.clone());
     let run_cancel_tokens = state.app_state.tasks.run_cancel_tokens.clone();
+    let trace_sink: echo_agent_app_core::tasks::task_runtime::WorkerTraceSink =
+        Arc::new(move |event| {
+            let _ = app.emit("worker://trace", event);
+        });
 
     tokio::spawn(async move {
         let outcome = echo_agent_app_core::tasks::task_runtime::execute_run(
@@ -1036,6 +1044,7 @@ async fn launch_task_run_execution(state: &TauriState, run_id: &str) -> Result<(
             reviewer_llm,
             layer_manager,
             run_store_for_task,
+            Some(trace_sink),
             &run_id_for_task,
             cancel,
         )

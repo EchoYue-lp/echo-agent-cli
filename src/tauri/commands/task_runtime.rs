@@ -19,6 +19,8 @@ use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
 
 use echo_agent_app_core::tasks::task_runtime::types::*;
+use std::sync::Arc;
+use tauri::Emitter;
 
 // ── Helper: borrow the store or error ────────────────────────────────────
 
@@ -441,6 +443,7 @@ pub async fn edit_task_plan(
 #[tauri::command]
 pub async fn execute_task_run(
     state: tauri::State<'_, TauriState>,
+    app: tauri::AppHandle,
     run_id: String,
 ) -> Result<serde_json::Value, IpcError> {
     let store = store(&state)?;
@@ -506,6 +509,10 @@ pub async fn execute_task_run(
         .run_cancel_tokens
         .insert(run_key.clone(), cancel.clone());
     let run_cancel_tokens = state.app_state.tasks.run_cancel_tokens.clone();
+    let trace_sink: echo_agent_app_core::tasks::task_runtime::WorkerTraceSink =
+        Arc::new(move |event| {
+            let _ = app.emit("worker://trace", event);
+        });
 
     tokio::spawn(async move {
         let outcome = echo_agent_app_core::tasks::task_runtime::execute_run(
@@ -514,6 +521,7 @@ pub async fn execute_task_run(
             reviewer_llm,
             layer_manager,
             run_store_for_task,
+            Some(trace_sink),
             &run_id_for_task,
             cancel,
         )

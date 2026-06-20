@@ -143,6 +143,16 @@ export function handleChatEvent(
     }
     case 'plan_ready': {
       if (ctx.isCancelledRef.current) break;
+      ctx.currentThinkingIdRef.current = null;
+      const id = ctx.assistantIdRef.current;
+      if (id) {
+        store.finalizeAssistantMessage(id, '任务计划已生成。');
+      } else {
+        store.setStreaming(false);
+      }
+      ctx.assistantIdRef.current = null;
+      ctx.currentMessageKeyRef.current = null;
+      ctx.currentMessageIdRef.current = null;
       break;
     }
     case 'error': {

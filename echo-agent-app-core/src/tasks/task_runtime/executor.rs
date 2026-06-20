@@ -33,11 +33,14 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use echo_agent::agent::{Agent, CancellationToken};
+use echo_agent::agent::{Agent, AgentEvent, CancellationToken};
+use futures::StreamExt;
 use tokio::sync::Semaphore;
 
 use super::store::{StoreError, TaskRuntimeStore};
 use super::types::*;
+
+pub type WorkerTraceSink = Arc<dyn Fn(WorkerTraceEvent) + Send + Sync>;
 
 /// Concurrency caps. Sourced from the AgentPool when available, else defaults
 /// from the plan's "Initial limits" (max 3–4 workers, writes serialized).
@@ -114,6 +117,7 @@ pub async fn execute_run(
     reviewer_llm: Option<Arc<dyn echo_agent::llm::LlmClient>>,
     layer_manager: Option<Arc<echo_agent::evolution::MemoryLayerManager>>,
     run_store: Option<Arc<dyn echo_agent::trace::RunStore>>,
+    trace_sink: Option<WorkerTraceSink>,
     run_id: &str,
     parent_cancel: CancellationToken,
 ) -> Result<RunOutcome, ExecError> {
@@ -162,6 +166,18 @@ pub async fn execute_run(
     let plan = store
         .get_plan(run_id)?
         .ok_or(ExecError::NoPlan(run_id.to_string()))?;
+    emit_worker_trace(
+        trace_sink.as_ref(),
+        WorkerTraceEvent::new(
+            run_id.to_string(),
+            WorkerTraceEventKind::RunStarted,
+            serde_json::json!({
+                "goal": &run.goal,
+                "conversation_id": &run.conversation_id,
+                "mode": "task_runtime",
+            }),
+        ),
+    );
 
     let primary_agent = primary_agent.ok_or(ExecError::NoAgent)?;
     let limits = ConcurrencyLimits::default();
@@ -182,6 +198,7 @@ pub async fn execute_run(
         plan.tasks,
         limits,
         parent_cancel,
+        trace_sink.clone(),
     )
     .await;
 
@@ -189,6 +206,14 @@ pub async fn execute_run(
     // Run record when a RunStore is available.
     match &outcome {
         Ok(RunOutcome::Completed) => {
+            emit_worker_trace(
+                trace_sink.as_ref(),
+                WorkerTraceEvent::new(
+                    run_id.to_string(),
+                    WorkerTraceEventKind::RunCompleted,
+                    serde_json::json!({ "status": "completed" }),
+                ),
+            );
             let _ = store.transition_run(run_id, TaskRunStatus::Completed);
             save_trace(
                 run_store.as_ref(),
@@ -210,6 +235,17 @@ pub async fn execute_run(
             failed_task_id,
             error,
         }) => {
+            emit_worker_trace(
+                trace_sink.as_ref(),
+                WorkerTraceEvent::new(
+                    run_id.to_string(),
+                    WorkerTraceEventKind::RunFailed,
+                    serde_json::json!({
+                        "failed_task_id": failed_task_id,
+                        "error": error,
+                    }),
+                ),
+            );
             // Running → Failed is legal. Use None for synthetic task ids
             // (<none>/<join>) to avoid orphan task_id events.
             let tid = if failed_task_id.starts_with('<') {
@@ -228,6 +264,14 @@ pub async fn execute_run(
             );
         }
         Ok(RunOutcome::Cancelled) => {
+            emit_worker_trace(
+                trace_sink.as_ref(),
+                WorkerTraceEvent::new(
+                    run_id.to_string(),
+                    WorkerTraceEventKind::RunCancelled,
+                    serde_json::json!({ "status": "cancelled" }),
+                ),
+            );
             let _ = store.transition_run(run_id, TaskRunStatus::Cancelled);
             save_trace(
                 run_store.as_ref(),
@@ -246,6 +290,17 @@ pub async fn execute_run(
             );
         }
         Ok(RunOutcome::Suspended { reason }) => {
+            emit_worker_trace(
+                trace_sink.as_ref(),
+                WorkerTraceEvent::new(
+                    run_id.to_string(),
+                    WorkerTraceEventKind::RunStatusChanged,
+                    serde_json::json!({
+                        "status": "suspended",
+                        "reason": reason,
+                    }),
+                ),
+            );
             // run_dag already transitioned Running → Suspended (legal). Only
             // record the reason; do NOT attempt Suspended → Failed (illegal).
             let _ = store.note(run_id, None, &format!("run suspended: {reason}"));
@@ -258,6 +313,14 @@ pub async fn execute_run(
             );
         }
         Err(e) => {
+            emit_worker_trace(
+                trace_sink.as_ref(),
+                WorkerTraceEvent::new(
+                    run_id.to_string(),
+                    WorkerTraceEventKind::RunFailed,
+                    serde_json::json!({ "error": e.to_string() }),
+                ),
+            );
             let _ = store.note(run_id, None, &format!("executor error: {e}"));
             // Running → Failed is legal even if some tasks were mid-flight.
             let _ = store.transition_run(run_id, TaskRunStatus::Failed);
@@ -290,6 +353,7 @@ pub trait TaskWorker: Send + Sync {
         shell_sem: Arc<Semaphore>,
         llm_sem: Arc<Semaphore>,
         file_write_locks: Arc<std::sync::Mutex<HashSet<String>>>,
+        trace_sink: Option<WorkerTraceSink>,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<Output = Result<(String, Option<String>), (String, String)>>
@@ -319,6 +383,7 @@ impl TaskWorker for RealTaskWorker {
         shell_sem: Arc<Semaphore>,
         llm_sem: Arc<Semaphore>,
         file_write_locks: Arc<std::sync::Mutex<HashSet<String>>>,
+        trace_sink: Option<WorkerTraceSink>,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<Output = Result<(String, Option<String>), (String, String)>>
@@ -335,6 +400,7 @@ impl TaskWorker for RealTaskWorker {
                 shell_sem,
                 llm_sem,
                 file_write_locks,
+                trace_sink,
                 run_id,
                 task,
                 cancel,
@@ -355,6 +421,7 @@ async fn run_dag<W: TaskWorker + 'static>(
     tasks: Vec<PlanTask>,
     limits: ConcurrencyLimits,
     parent_cancel: CancellationToken,
+    trace_sink: Option<WorkerTraceSink>,
 ) -> Result<RunOutcome, ExecError> {
     // Wrap the worker in an Arc so each spawned task can clone the handle.
     let worker = Arc::new(worker);
@@ -466,6 +533,7 @@ async fn run_dag<W: TaskWorker + 'static>(
             let shell_sem = shell_sem.clone();
             let llm_sem = llm_sem.clone();
             let file_write_locks = file_write_locks.clone();
+            let trace_sink = trace_sink.clone();
             // clone shares the same cancellation tree — parent cancel fires here.
             let cancel = parent_cancel.clone();
             let run_id_owned = run_id.to_string();
@@ -481,6 +549,7 @@ async fn run_dag<W: TaskWorker + 'static>(
                         shell_sem,
                         llm_sem,
                         file_write_locks,
+                        trace_sink,
                     )
                     .await
             }));
@@ -724,12 +793,18 @@ async fn execute_task(
     shell_sem: Arc<Semaphore>,
     llm_sem: Arc<Semaphore>,
     file_write_locks: Arc<std::sync::Mutex<HashSet<String>>>,
+    trace_sink: Option<WorkerTraceSink>,
     run_id: String,
     task: PlanTask,
     cancel: CancellationToken,
 ) -> Result<(String, Option<String>), (String, String)> {
     let task_id = task.id.clone();
     let is_write = !task.kind.is_read_only();
+    let worker_trace_id = if task.kind.is_read_only() {
+        format!("{run_id}:{}", task.agent_role)
+    } else {
+        task_id.clone()
+    };
 
     // Mark the task running + emit TaskStarted (transactional with the todo
     // projection update).
@@ -742,6 +817,21 @@ async fn execute_task(
     ) {
         tracing::warn!(task_id = %task_id, error = %e, "failed to mark task running");
     }
+    emit_worker_trace(
+        trace_sink.as_ref(),
+        WorkerTraceEvent::for_worker(
+            run_id.clone(),
+            worker_trace_id.clone(),
+            WorkerTraceEventKind::WorkerStarted,
+            serde_json::json!({
+                "kind": task.kind.as_str(),
+                "agent_role": &task.agent_role,
+            }),
+        )
+        .with_agent(task.agent_role.clone())
+        .with_title(task.title.clone())
+        .with_task(task.description.clone()),
+    );
 
     // Acquire concurrency permits with cancel awareness:
     // - Read-only tasks take a worker permit (fan-out up to max_concurrent_workers).
@@ -863,9 +953,17 @@ async fn execute_task(
     //   (workers can't write). The primary agent's execution_mutex serializes
     //   them further, which is correct — mutating work must not race.
     let result = if task.kind.is_read_only() {
-        run_readonly_worker(&primary_agent, &task.agent_role, &prompt, cancel).await
+        run_readonly_worker(&primary_agent, &run_id, &task.agent_role, &prompt, cancel).await
     } else {
-        run_main_agent_task(&primary_agent, &prompt, cancel).await
+        run_main_agent_task(
+            &primary_agent,
+            &run_id,
+            &task,
+            &prompt,
+            cancel,
+            trace_sink.clone(),
+        )
+        .await
     };
 
     match result {
@@ -895,9 +993,37 @@ async fn execute_task(
             }) {
                 tracing::warn!(task_id = %task_id, error = %e, "failed to persist TaskExecutionSummary");
             }
+            emit_worker_trace(
+                trace_sink.as_ref(),
+                WorkerTraceEvent::for_worker(
+                    run_id.clone(),
+                    worker_trace_id.clone(),
+                    WorkerTraceEventKind::WorkerCompleted,
+                    serde_json::json!({
+                        "summary": &summary,
+                    }),
+                )
+                .with_agent(task.agent_role.clone())
+                .with_title(task.title.clone()),
+            );
             Ok((task_id, Some(summary)))
         }
-        Err(e) => Err((task_id, e)),
+        Err(e) => {
+            emit_worker_trace(
+                trace_sink.as_ref(),
+                WorkerTraceEvent::for_worker(
+                    run_id,
+                    worker_trace_id,
+                    WorkerTraceEventKind::WorkerFailed,
+                    serde_json::json!({
+                        "error": &e,
+                    }),
+                )
+                .with_agent(task.agent_role.clone())
+                .with_title(task.title.clone()),
+            );
+            Err((task_id, e))
+        }
     }
 }
 
@@ -1025,6 +1151,7 @@ fn build_task_prompt(task: &PlanTask, dep_summaries: &[(String, String)]) -> Str
 /// parallel. The child cancel token propagates parent-run cancellation.
 async fn run_readonly_worker(
     primary_agent: &crate::agent_handle::AgentHandle,
+    run_id: &str,
     role: &str,
     prompt: &str,
     cancel: CancellationToken,
@@ -1033,9 +1160,10 @@ async fn run_readonly_worker(
         .read_async(|agent| {
             let prompt = prompt.to_string();
             let role = role.to_string();
+            let run_id = run_id.to_string();
             Box::pin(async move {
                 agent
-                    .delegate_to_agent_with_cancel(&role, &prompt, cancel)
+                    .delegate_to_agent_with_parent_and_cancel(&role, &prompt, &run_id, cancel)
                     .await
                     .map_err(|e| format!("subagent dispatch failed: {e}"))
             })
@@ -1054,20 +1182,171 @@ async fn run_readonly_worker(
 /// the task is marked Failed (the run then goes Cancelled/Failed).
 async fn run_main_agent_task(
     primary_agent: &crate::agent_handle::AgentHandle,
+    run_id: &str,
+    task: &PlanTask,
     prompt: &str,
     cancel: CancellationToken,
+    trace_sink: Option<WorkerTraceSink>,
 ) -> Result<String, String> {
-    // Race the (non-cancel-aware) Agent::execute against the cancel token.
-    // tokio::select! handles the !Unpin read_async future correctly.
-    tokio::select! {
-        biased; // check cancel first to avoid a wasted LLM call
-        _ = cancel.cancelled() => Err("task cancelled".to_string()),
-        res = primary_agent.read_async(|agent| {
+    let run_id = run_id.to_string();
+    let task_id = task.id.clone();
+    let agent_role = task.agent_role.clone();
+    let title = task.title.clone();
+
+    primary_agent
+        .read_async(|agent| {
             let prompt = prompt.to_string();
-            Box::pin(async move { agent.execute(&prompt).await })
-        }) => {
-            res.map_err(|e| format!("main agent execute failed: {e}"))
-        }
+            Box::pin(async move {
+                let mut stream = agent
+                    .execute_stream_with_cancel(&prompt, cancel)
+                    .await
+                    .map_err(|e| format!("main agent stream failed: {e}"))?;
+                let mut output = String::new();
+                let mut in_thinking = false;
+
+                while let Some(event_result) = stream.next().await {
+                    let event =
+                        event_result.map_err(|e| format!("main agent stream failed: {e}"))?;
+                    match event {
+                        AgentEvent::Token(content) => {
+                            if in_thinking {
+                                emit_worker_trace(
+                                    trace_sink.as_ref(),
+                                    WorkerTraceEvent::for_worker(
+                                        run_id.clone(),
+                                        task_id.clone(),
+                                        WorkerTraceEventKind::WorkerThinkingDelta,
+                                        serde_json::json!({ "content": content }),
+                                    )
+                                    .with_agent(agent_role.clone())
+                                    .with_title(title.clone()),
+                                );
+                            } else {
+                                output.push_str(&content);
+                                emit_worker_trace(
+                                    trace_sink.as_ref(),
+                                    WorkerTraceEvent::for_worker(
+                                        run_id.clone(),
+                                        task_id.clone(),
+                                        WorkerTraceEventKind::WorkerTokenDelta,
+                                        serde_json::json!({ "content": content }),
+                                    )
+                                    .with_agent(agent_role.clone())
+                                    .with_title(title.clone()),
+                                );
+                            }
+                        }
+                        AgentEvent::ThinkStart => {
+                            in_thinking = true;
+                            emit_worker_trace(
+                                trace_sink.as_ref(),
+                                WorkerTraceEvent::for_worker(
+                                    run_id.clone(),
+                                    task_id.clone(),
+                                    WorkerTraceEventKind::WorkerThinkingStart,
+                                    serde_json::json!({}),
+                                )
+                                .with_agent(agent_role.clone())
+                                .with_title(title.clone()),
+                            );
+                        }
+                        AgentEvent::ThinkEnd {
+                            prompt_tokens,
+                            completion_tokens,
+                        } => {
+                            in_thinking = false;
+                            emit_worker_trace(
+                                trace_sink.as_ref(),
+                                WorkerTraceEvent::for_worker(
+                                    run_id.clone(),
+                                    task_id.clone(),
+                                    WorkerTraceEventKind::WorkerThinkingEnd,
+                                    serde_json::json!({
+                                        "prompt_tokens": prompt_tokens,
+                                        "completion_tokens": completion_tokens,
+                                    }),
+                                )
+                                .with_agent(agent_role.clone())
+                                .with_title(title.clone()),
+                            );
+                        }
+                        AgentEvent::ToolCall { name, args } => {
+                            emit_worker_trace(
+                                trace_sink.as_ref(),
+                                WorkerTraceEvent::for_worker(
+                                    run_id.clone(),
+                                    task_id.clone(),
+                                    WorkerTraceEventKind::WorkerToolStart,
+                                    serde_json::json!({
+                                        "name": name,
+                                        "args": args,
+                                    }),
+                                )
+                                .with_agent(agent_role.clone())
+                                .with_title(title.clone()),
+                            );
+                        }
+                        AgentEvent::ToolResult {
+                            name,
+                            output: result,
+                        } => {
+                            emit_worker_trace(
+                                trace_sink.as_ref(),
+                                WorkerTraceEvent::for_worker(
+                                    run_id.clone(),
+                                    task_id.clone(),
+                                    WorkerTraceEventKind::WorkerToolResult,
+                                    serde_json::json!({
+                                        "name": name,
+                                        "result": result,
+                                        "success": true,
+                                    }),
+                                )
+                                .with_agent(agent_role.clone())
+                                .with_title(title.clone()),
+                            );
+                        }
+                        AgentEvent::ToolError { name, error } => {
+                            emit_worker_trace(
+                                trace_sink.as_ref(),
+                                WorkerTraceEvent::for_worker(
+                                    run_id.clone(),
+                                    task_id.clone(),
+                                    WorkerTraceEventKind::WorkerToolResult,
+                                    serde_json::json!({
+                                        "name": name,
+                                        "result": error,
+                                        "success": false,
+                                    }),
+                                )
+                                .with_agent(agent_role.clone())
+                                .with_title(title.clone()),
+                            );
+                        }
+                        AgentEvent::FinalAnswer(answer) => {
+                            if !answer.is_empty() {
+                                output = answer;
+                            }
+                        }
+                        AgentEvent::Cancelled => {
+                            return Err("task cancelled".to_string());
+                        }
+                        AgentEvent::Error { source, message } => {
+                            return Err(format!("{source}: {message}"));
+                        }
+                        _ => {}
+                    }
+                }
+
+                Ok(output)
+            })
+        })
+        .await
+}
+
+fn emit_worker_trace(sink: Option<&WorkerTraceSink>, event: WorkerTraceEvent) {
+    if let Some(sink) = sink {
+        sink(event);
     }
 }
 
@@ -1412,6 +1691,7 @@ mod tests {
             _shell_sem: Arc<Semaphore>,
             _llm_sem: Arc<Semaphore>,
             _file_write_locks: Arc<std::sync::Mutex<HashSet<String>>>,
+            _trace_sink: Option<WorkerTraceSink>,
         ) -> std::pin::Pin<
             Box<
                 dyn std::future::Future<Output = Result<(String, Option<String>), (String, String)>>
@@ -1500,6 +1780,7 @@ mod tests {
             vec![solo_readonly_task("a")],
             ConcurrencyLimits::default(),
             CancellationToken::new(),
+            None,
         )
         .await
         .unwrap();
@@ -1530,6 +1811,7 @@ mod tests {
             vec![a, b],
             ConcurrencyLimits::default(),
             CancellationToken::new(),
+            None,
         )
         .await
         .unwrap();
@@ -1561,6 +1843,7 @@ mod tests {
             vec![a, b],
             ConcurrencyLimits::default(),
             CancellationToken::new(),
+            None,
         )
         .await
         .unwrap();
@@ -1595,6 +1878,7 @@ mod tests {
             vec![solo_readonly_task("a")],
             ConcurrencyLimits::default(),
             cancel,
+            None,
         )
         .await
         .unwrap();
@@ -1625,6 +1909,7 @@ mod tests {
             vec![a, b],
             ConcurrencyLimits::default(),
             CancellationToken::new(),
+            None,
         )
         .await
         .unwrap();
