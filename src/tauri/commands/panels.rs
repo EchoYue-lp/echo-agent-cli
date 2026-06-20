@@ -33,14 +33,13 @@ pub async fn set_permissions_mode(
 ) -> Result<serde_json::Value, IpcError> {
     let normalized = match mode.as_str() {
         "default" => "default",
-        "plan" => "plan",
         "auto-edit" | "autoedit" | "accept-edits" | "auto-approve" => "auto-edit",
         "full-auto" | "fullauto" | "bypass" => "full-auto",
         "auto" => "auto",
         "strict" | "strict-confirm" | "strict-confirmation" => "strict",
         _ => {
             return Err(IpcError::Validation(format!(
-                "Invalid permission mode '{}'. Valid: default, plan, auto-edit, full-auto, auto, strict",
+                "Invalid permission mode '{}'. Valid: default, auto-edit, full-auto, auto, strict",
                 mode
             )));
         }

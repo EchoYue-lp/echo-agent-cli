@@ -568,8 +568,9 @@ async fn cmd_permission(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         println!();
         println!("Available modes:");
         println!("  default    — Ask before dangerous operations (file writes, shell commands)");
-        println!("  plan       — Read-only; all write operations are blocked");
-        println!("  auto-edit  — File edits are auto-approved; shell still requires confirmation");
+        println!(
+            "  auto-edit  — Read and file edit operations are auto-approved; shell still requires confirmation"
+        );
         println!("  full-auto  — All operations auto-approved (bypass permissions)");
         println!("  auto       — AI classifier decides (when available)");
         println!("  strict     — Ask before writes, shell, network, and sensitive operations");
@@ -581,14 +582,13 @@ async fn cmd_permission(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     // Validate the mode
     let normalized = match mode {
         "default" => "default",
-        "plan" => "plan",
         "auto-edit" | "autoedit" | "accept-edits" => "auto-edit",
         "full-auto" | "fullauto" | "bypass" => "full-auto",
         "auto" => "auto",
         "strict" | "strict-confirm" | "strict-confirmation" => "strict",
         _ => {
             println!("Unknown permission mode: '{}'", mode);
-            println!("Valid modes: default, plan, auto-edit, full-auto, auto, strict");
+            println!("Valid modes: default, auto-edit, full-auto, auto, strict");
             return CommandOutcome::Continue;
         }
     };
@@ -596,8 +596,9 @@ async fn cmd_permission(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     ctx.agent.write(|a| a.set_permission_mode(normalized)).await;
 
     match normalized {
-        "plan" => println!("Permission mode: plan — write operations are now BLOCKED."),
-        "auto-edit" => println!("Permission mode: auto-edit — file edits are auto-approved."),
+        "auto-edit" => {
+            println!("Permission mode: auto-edit — reads and file edits are auto-approved.")
+        }
         "full-auto" => {
             println!("Permission mode: full-auto — all operations auto-approved. Use with caution.")
         }

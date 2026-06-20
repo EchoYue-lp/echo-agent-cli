@@ -79,7 +79,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   {
     name: '/permission',
     aliases: ['/perm'],
-    description: 'Set permission mode (default/plan/auto-edit/full-auto)',
+    description: 'Set permission mode (default/auto-edit/full-auto/strict)',
     category: 'Security',
     action: 'send',
   },
