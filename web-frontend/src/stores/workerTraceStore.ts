@@ -1,5 +1,8 @@
 import { create } from 'zustand';
 
+const MAX_RUN_EVENTS = 1000;
+const MAX_WORKER_EVENTS = 300;
+
 export type WorkerTraceEventKind =
   | 'run_started'
   | 'run_status_changed'
@@ -87,14 +90,15 @@ export const useWorkerTraceStore = create<WorkerTraceStore>((set) => ({
 
   append: (event) => {
     set((state) => {
-      const runEvents = [...(state.runs[event.run_id] ?? []), event];
+      const runEvents = [...(state.runs[event.run_id] ?? []), event].slice(-MAX_RUN_EVENTS);
       const nextRuns = { ...state.runs, [event.run_id]: runEvents };
 
       if (!event.worker_id) {
         return { runs: nextRuns };
       }
 
-      const prev = state.workers[event.worker_id];
+      const key = `${event.run_id}::${event.worker_id}`;
+      const prev = state.workers[key];
       const status = statusFromEvent(event.event_type) ?? prev?.status ?? 'running';
       const startedAt =
         prev?.startedAt ?? (event.event_type === 'worker_started' ? event.timestamp : undefined);
@@ -113,12 +117,12 @@ export const useWorkerTraceStore = create<WorkerTraceStore>((set) => ({
         status,
         startedAt,
         completedAt,
-        events: [...(prev?.events ?? []), event],
+        events: [...(prev?.events ?? []), event].slice(-MAX_WORKER_EVENTS),
       };
 
       return {
         runs: nextRuns,
-        workers: { ...state.workers, [event.worker_id]: nextWorker },
+        workers: { ...state.workers, [key]: nextWorker },
       };
     });
   },

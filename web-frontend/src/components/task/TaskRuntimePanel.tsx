@@ -7,7 +7,7 @@
 //!
 //! Mounted inside RightRail as a new section above "输出".
 
-import { useEffect } from 'react';
+import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import {
   CheckCircle2,
   Circle,
@@ -19,9 +19,19 @@ import {
   XCircle,
   RefreshCw,
   ChevronRight,
+  ChevronDown,
+  Brain,
+  Wrench,
+  MessageSquareText,
 } from 'lucide-react';
 import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
 import { useConversationStore } from '../../stores/conversationStore';
+import {
+  useWorkerTraceStore,
+  type WorkerTraceEvent,
+  type WorkerTraceState,
+  type WorkerTraceStatus,
+} from '../../stores/workerTraceStore';
 import type { TodoStatus, PlanTaskKind } from '../../generated';
 
 const STATUS_LABEL: Record<string, string> = {
@@ -87,8 +97,198 @@ function kindLabel(kind: string): string {
   return map[kind] ?? kind;
 }
 
+function workerStatusLabel(status: WorkerTraceStatus): string {
+  const map: Record<WorkerTraceStatus, string> = {
+    planned: '已规划',
+    running: '运行中',
+    completed: '已完成',
+    failed: '失败',
+    cancelled: '已取消',
+  };
+  return map[status];
+}
+
+function payloadValue(event: WorkerTraceEvent, key: string): string | undefined {
+  if (!event.payload || typeof event.payload !== 'object' || Array.isArray(event.payload)) {
+    return undefined;
+  }
+  const value = (event.payload as Record<string, unknown>)[key];
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  return undefined;
+}
+
+function eventLabel(event: WorkerTraceEvent): { icon: ReactNode; label: string; detail?: string } {
+  switch (event.event_type) {
+    case 'worker_thinking_start':
+      return {
+        icon: <Brain size={11} style={{ color: 'var(--color-info)' }} />,
+        label: '开始思考',
+      };
+    case 'worker_thinking_delta':
+      return {
+        icon: <Brain size={11} style={{ color: 'var(--color-info)' }} />,
+        label: '思考',
+        detail: payloadValue(event, 'content'),
+      };
+    case 'worker_thinking_end':
+      return {
+        icon: <Brain size={11} style={{ color: 'var(--text-tertiary)' }} />,
+        label: '思考结束',
+        detail: [
+          payloadValue(event, 'prompt_tokens') && `in ${payloadValue(event, 'prompt_tokens')}`,
+          payloadValue(event, 'completion_tokens') && `out ${payloadValue(event, 'completion_tokens')}`,
+        ].filter(Boolean).join(' · ') || undefined,
+      };
+    case 'worker_tool_start':
+      return {
+        icon: <Wrench size={11} style={{ color: 'var(--color-warning)' }} />,
+        label: `调用工具 ${payloadValue(event, 'name') ?? ''}`.trim(),
+        detail: payloadValue(event, 'args'),
+      };
+    case 'worker_tool_result':
+      return {
+        icon: <Wrench size={11} style={{ color: payloadValue(event, 'success') === 'false' ? 'var(--color-error)' : 'var(--color-success)' }} />,
+        label: `工具结果 ${payloadValue(event, 'name') ?? ''}`.trim(),
+        detail: payloadValue(event, 'result'),
+      };
+    case 'worker_token_delta':
+      return {
+        icon: <MessageSquareText size={11} style={{ color: 'var(--text-tertiary)' }} />,
+        label: '输出',
+        detail: payloadValue(event, 'content'),
+      };
+    case 'worker_started':
+      return {
+        icon: <Loader2 size={11} className="animate-spin" style={{ color: 'var(--color-info)' }} />,
+        label: '开始运行',
+        detail: payloadValue(event, 'kind'),
+      };
+    case 'worker_completed':
+      return {
+        icon: <CheckCircle2 size={11} style={{ color: 'var(--color-success)' }} />,
+        label: '完成',
+        detail: payloadValue(event, 'summary'),
+      };
+    case 'worker_failed':
+      return {
+        icon: <AlertCircle size={11} style={{ color: 'var(--color-error)' }} />,
+        label: '失败',
+        detail: payloadValue(event, 'error'),
+      };
+    default:
+      return {
+        icon: <Circle size={11} style={{ color: 'var(--text-tertiary)' }} />,
+        label: event.event_type,
+      };
+  }
+}
+
+function eventTime(timestamp: string): string {
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) return '';
+  return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+function WorkerTraceRow({
+  worker,
+  expanded,
+  onToggle,
+}: {
+  worker: WorkerTraceState;
+  expanded: boolean;
+  onToggle: () => void;
+}) {
+  const latest = worker.events[worker.events.length - 1];
+  const latestLabel = latest ? eventLabel(latest) : null;
+  const recentEvents = expanded ? worker.events.slice(-80) : [];
+
+  return (
+    <div className="rounded px-1.5 py-1" style={{ background: 'var(--bg-secondary)' }}>
+      <button
+        type="button"
+        onClick={onToggle}
+        className="flex w-full items-start gap-1.5 text-left"
+      >
+        <div className="mt-0.5">
+          {expanded ? (
+            <ChevronDown size={12} style={{ color: 'var(--text-tertiary)' }} />
+          ) : (
+            <ChevronRight size={12} style={{ color: 'var(--text-tertiary)' }} />
+          )}
+        </div>
+        <div className="mt-0.5">
+          {worker.status === 'running' ? (
+            <Loader2 size={12} className="animate-spin" style={{ color: 'var(--color-info)' }} />
+          ) : worker.status === 'completed' ? (
+            <CheckCircle2 size={12} style={{ color: 'var(--color-success)' }} />
+          ) : worker.status === 'failed' ? (
+            <AlertCircle size={12} style={{ color: 'var(--color-error)' }} />
+          ) : (
+            <Circle size={12} style={{ color: 'var(--text-tertiary)' }} />
+          )}
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="flex min-w-0 items-center gap-1">
+            <span className="truncate text-[11px] font-medium" style={{ color: 'var(--text-primary)' }}>
+              {worker.title ?? worker.task ?? worker.workerId}
+            </span>
+            <span
+              className="shrink-0 rounded px-1 text-[9px]"
+              style={{ color: statusColor(worker.status), background: 'var(--bg-hover)' }}
+            >
+              {workerStatusLabel(worker.status)}
+            </span>
+          </div>
+          <div className="mt-0.5 flex min-w-0 items-center gap-1 text-[9px]" style={{ color: 'var(--text-tertiary)' }}>
+            <span className="shrink-0 font-mono">{worker.agentName ?? 'worker'}</span>
+            {latestLabel && (
+              <>
+                <span>·</span>
+                <span className="truncate">{latestLabel.label}</span>
+              </>
+            )}
+          </div>
+        </div>
+      </button>
+
+      {expanded && (
+        <div className="mt-1.5 border-l pl-2" style={{ borderColor: 'var(--border-primary)' }}>
+          {recentEvents.map((event) => {
+            const item = eventLabel(event);
+            return (
+              <div key={event.event_id} className="mb-1 flex gap-1.5 text-[10px] last:mb-0">
+                <div className="mt-0.5 shrink-0">{item.icon}</div>
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-1" style={{ color: 'var(--text-secondary)' }}>
+                    <span className="shrink-0">{item.label}</span>
+                    <span className="shrink-0 text-[9px]" style={{ color: 'var(--text-tertiary)' }}>
+                      {eventTime(event.timestamp)}
+                    </span>
+                  </div>
+                  {item.detail && (
+                    <div
+                      className="mt-0.5 max-h-20 overflow-hidden whitespace-pre-wrap break-words text-[9px] leading-snug"
+                      style={{ color: 'var(--text-tertiary)' }}
+                      title={item.detail}
+                    >
+                      {item.detail}
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function TaskRuntimePanel() {
+  const [expandedWorkers, setExpandedWorkers] = useState<Record<string, boolean>>({});
   const activeId = useConversationStore((s) => s.activeId);
+  const traceWorkers = useWorkerTraceStore((s) => s.workers);
   const {
     activeRun,
     plan,
@@ -129,6 +329,13 @@ export function TaskRuntimePanel() {
 
   const completedCount = todos.filter((t) => t.status === ('completed' as TodoStatus)).length;
   const runningWorkers = todos.filter((t) => t.status === ('running' as TodoStatus));
+  const visibleTraceWorkers = useMemo(
+    () =>
+      Object.values(traceWorkers)
+        .filter((worker) => worker.runId === activeRun.run_id)
+        .sort((a, b) => (a.startedAt ?? '').localeCompare(b.startedAt ?? '')),
+    [activeRun.run_id, traceWorkers]
+  );
 
   return (
     <section className="border-b border-[var(--border-primary)] px-3 py-2.5">
@@ -281,8 +488,32 @@ export function TaskRuntimePanel() {
         </div>
       )}
 
-      {/* ── Parallel workers (live) ────────────────────────────────── */}
-      {runningWorkers.length > 0 && (
+      {/* ── Parallel workers (live trace) ──────────────────────────── */}
+      {visibleTraceWorkers.length > 0 ? (
+        <div className="mb-2">
+          <div className="mb-1 flex items-center justify-between">
+            <span className="text-[10px] font-medium" style={{ color: 'var(--text-tertiary)' }}>
+              Worker Trace
+            </span>
+            <span className="text-[10px]" style={{ color: 'var(--text-tertiary)' }}>
+              {visibleTraceWorkers.filter((w) => w.status === 'running').length} 运行中
+            </span>
+          </div>
+          <div className="space-y-0.5">
+            {visibleTraceWorkers.map((worker) => (
+              <WorkerTraceRow
+                key={`${worker.runId}:${worker.workerId}`}
+                worker={worker}
+                expanded={Boolean(expandedWorkers[`${worker.runId}:${worker.workerId}`])}
+                onToggle={() => {
+                  const key = `${worker.runId}:${worker.workerId}`;
+                  setExpandedWorkers((prev) => ({ ...prev, [key]: !prev[key] }));
+                }}
+              />
+            ))}
+          </div>
+        </div>
+      ) : runningWorkers.length > 0 && (
         <div className="mb-2">
           <div className="mb-1 text-[10px] font-medium" style={{ color: 'var(--text-tertiary)' }}>
             并行执行 {runningWorkers.length}
