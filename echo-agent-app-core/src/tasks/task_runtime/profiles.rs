@@ -17,10 +17,7 @@ pub struct ProfileTemplate {
     /// Human-readable label.
     pub label: &'static str,
     /// Default worker roles the planner may assign to plan tasks. These map
-    /// 1:1 to the subagents registered in `infra::register_default_subagents`
-    /// (project_explorer, code_reviewer, test_planner, summary_writer) for
-    /// the AI Coding profile; other profiles list their domain-specific
-    /// roles that the runtime will provision later.
+    /// 1:1 to the subagents registered in `infra::register_default_subagents`.
     pub default_worker_roles: &'static [&'static str],
     /// Extra instructions appended to the plan-generation prompt to steer the
     /// LLM toward domain-appropriate tasks, artifacts, and verification.
@@ -68,24 +65,41 @@ impl ProfileTemplate {
     }
 }
 
-/// The worker roles actually registered on the primary agent at startup
-/// (infra::register_default_subagents). Every profile uses the SAME role
-/// set — the read-only workers are domain-agnostic; what changes between
-/// profiles is the prompt_suffix (domain guidance) and review_checklist.
-/// Implementation/mutating work is NOT delegated to a worker — the main
-/// agent does it directly, serially and approval-gated. So every role here
-/// is a read-only investigation/review/summary worker.
-pub const REGISTERED_WORKER_ROLES: &[&str] = &[
+pub const AI_CODING_WORKER_ROLES: &[&str] = &[
     "project_explorer",
     "code_reviewer",
     "test_planner",
+    "summary_writer",
+];
+pub const DATA_ANALYSIS_WORKER_ROLES: &[&str] = &[
+    "data_profiler",
+    "analysis_reviewer",
+    "reproducibility_planner",
+    "summary_writer",
+];
+pub const ACADEMIC_RESEARCH_WORKER_ROLES: &[&str] = &[
+    "literature_scout",
+    "evidence_reviewer",
+    "synthesis_planner",
+    "summary_writer",
+];
+pub const MEDICAL_RESEARCH_WORKER_ROLES: &[&str] = &[
+    "medical_literature_scout",
+    "clinical_evidence_reviewer",
+    "safety_reviewer",
+    "summary_writer",
+];
+pub const GENERAL_WORKER_ROLES: &[&str] = &[
+    "project_explorer",
+    "literature_scout",
+    "data_profiler",
     "summary_writer",
 ];
 
 pub static GENERAL: ProfileTemplate = ProfileTemplate {
     key: "general",
     label: "General",
-    default_worker_roles: REGISTERED_WORKER_ROLES,
+    default_worker_roles: GENERAL_WORKER_ROLES,
     prompt_suffix: "\
 Use the universal task methodology: clarify the goal, split work into small \
 verifiable tasks, mark read-only investigation tasks as parallelizable, and \
@@ -106,7 +120,7 @@ phrasing like 'continue improving' or 'handle edge cases'.",
 pub static AI_CODING: ProfileTemplate = ProfileTemplate {
     key: "ai_coding",
     label: "AI Coding",
-    default_worker_roles: REGISTERED_WORKER_ROLES,
+    default_worker_roles: AI_CODING_WORKER_ROLES,
     prompt_suffix: "\
 This is a software-engineering workspace. Split work into read-only review / \
 investigation tasks (parallelizable) and implementation tasks (serialized). \
@@ -132,7 +146,7 @@ review, summary) a worker role from the registered set.",
 pub static DATA_ANALYSIS: ProfileTemplate = ProfileTemplate {
     key: "data_analysis",
     label: "Data Analysis",
-    default_worker_roles: REGISTERED_WORKER_ROLES,
+    default_worker_roles: DATA_ANALYSIS_WORKER_ROLES,
     prompt_suffix: "\
 This is a data-analysis task. Make data provenance explicit. Split work into \
 profiling, cleaning, analysis, and reproducibility checks. Every \
@@ -154,7 +168,7 @@ conclusions overfit to a convenient subset of the data.",
 pub static ACADEMIC_RESEARCH: ProfileTemplate = ProfileTemplate {
     key: "academic_research",
     label: "Academic Research",
-    default_worker_roles: REGISTERED_WORKER_ROLES,
+    default_worker_roles: ACADEMIC_RESEARCH_WORKER_ROLES,
     prompt_suffix: "\
 This is an academic-research task. Make the search strategy explicit. Every \
 claim must cite a real, verifiable source. Distinguish study types and state \
@@ -176,7 +190,7 @@ table and a bibliography artifact.",
 pub static MEDICAL_RESEARCH: ProfileTemplate = ProfileTemplate {
     key: "medical_research",
     label: "Medical Research",
-    default_worker_roles: REGISTERED_WORKER_ROLES,
+    default_worker_roles: MEDICAL_RESEARCH_WORKER_ROLES,
     prompt_suffix: "\
 This is a medical-research task with strict safety and evidence boundaries. \
 Prioritize authoritative sources (guidelines, systematic reviews). \
@@ -218,19 +232,34 @@ mod tests {
     }
 
     #[test]
-    fn ai_coding_workers_match_registered_subagents() {
-        // The four read-only workers registered in infra::register_default_subagents
-        // must all appear in the AI Coding profile so the planner can assign them.
-        let t = ProfileTemplate::for_profile(DomainProfile::AiCoding);
-        for required in [
-            "project_explorer",
-            "code_reviewer",
-            "test_planner",
-            "summary_writer",
+    fn every_profile_uses_registered_subagent_roles() {
+        let registered = [
+            AI_CODING_WORKER_ROLES,
+            DATA_ANALYSIS_WORKER_ROLES,
+            ACADEMIC_RESEARCH_WORKER_ROLES,
+            MEDICAL_RESEARCH_WORKER_ROLES,
+            GENERAL_WORKER_ROLES,
+        ]
+        .concat();
+        for profile in [
+            DomainProfile::General,
+            DomainProfile::AiCoding,
+            DomainProfile::DataAnalysis,
+            DomainProfile::AcademicResearch,
+            DomainProfile::MedicalResearch,
         ] {
+            let t = ProfileTemplate::for_profile(profile);
+            for required in t.default_worker_roles {
+                assert!(
+                    registered.iter().any(|r| r == required),
+                    "{profile:?} profile references unregistered worker {required}"
+                );
+            }
             assert!(
-                t.default_worker_roles.iter().any(|&r| r == required),
-                "AI Coding profile missing registered worker {required}"
+                t.default_worker_roles
+                    .iter()
+                    .any(|&r| r == "summary_writer"),
+                "{profile:?} profile should keep summary_writer for synthesis"
             );
         }
     }

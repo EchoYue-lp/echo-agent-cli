@@ -44,6 +44,7 @@ pub mod memory_bridge;
 pub mod planner;
 pub mod profiles;
 pub mod review;
+pub mod router;
 pub mod store;
 pub mod types;
 
@@ -58,5 +59,6 @@ pub use review::{
     BreakerAction, ReviewError, build_fix_task, circuit_breaker_action, requires_review,
     review_task,
 };
+pub use router::{TaskRouteDecision, TaskRouteKind, route_message};
 pub use store::{StoreError, TaskRuntimeStore};
 pub use types::*;

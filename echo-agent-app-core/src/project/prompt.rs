@@ -129,6 +129,7 @@ impl PromptAssembler {
   - `code_reviewer`：只读审查指定模块的 bug、重复实现、架构问题和测试缺口。
   - `test_planner`：只读规划应运行的检查、测试和 walkthrough。
   - `summary_writer`：汇总多个 worker 的发现为结论、计划或交付说明。
+- 对项目分析、架构 review、代码库 review、跨模块排查这类大型只读任务，首轮必须先做计划，并在同一轮中发起多个 `agent_tool` 调用委派给不同 worker；不要由主 agent 自己串行 `repo_map`/`glob`/`read_file` 扫全项目。
 - 对独立只读审查，优先在同一轮中发起多个 `agent_tool` 调用，让 worker 并行返回结果；再由主 agent 汇总和决定下一步。
 - 写文件、删除文件、执行命令、安装依赖、网络访问和高风险操作由主 agent 串行处理，并遵守当前审批模式；worker 默认只读，不负责修改。
 - “计划模式”不是停止工作：它表示先形成计划和风险说明，待用户确认后再进入执行。
