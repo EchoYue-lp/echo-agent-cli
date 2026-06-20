@@ -772,6 +772,7 @@ async fn route_complex_task(
         &run_id,
         &message,
         &route_decision.classification,
+        &route_decision.suggested_workers,
     )
     .await?;
 

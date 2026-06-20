@@ -119,18 +119,19 @@ pub async fn route_message(
             return forced_decision(TaskRouteKind::NormalChat, message, "forced chat mode");
         }
         InteractionMode::Task => {
-            return forced_decision(TaskRouteKind::ComplexRuntime, message, "forced task mode");
+            return forced_task_decision(message);
         }
         InteractionMode::Auto => {}
     }
 
+    let deterministic = route_deterministically(message);
     if let Some(llm) = llm
         && let Ok(decision) = route_with_llm(&llm, message).await
     {
-        return decision;
+        return reconcile_llm_with_deterministic(decision, deterministic);
     }
 
-    route_deterministically(message)
+    deterministic
 }
 
 fn forced_decision(route: TaskRouteKind, message: &str, reason: &str) -> TaskRouteDecision {
@@ -142,6 +143,39 @@ fn forced_decision(route: TaskRouteKind, message: &str, reason: &str) -> TaskRou
         suggested_workers: select_workers(route, classification.inferred_profile, message),
         classification,
     }
+}
+
+fn forced_task_decision(message: &str) -> TaskRouteDecision {
+    let route = if looks_like_parallel_readonly(message) {
+        TaskRouteKind::ParallelReadonlyDelegation
+    } else {
+        TaskRouteKind::ComplexRuntime
+    };
+    forced_decision(route, message, "forced task mode")
+}
+
+fn reconcile_llm_with_deterministic(
+    mut llm: TaskRouteDecision,
+    deterministic: TaskRouteDecision,
+) -> TaskRouteDecision {
+    if deterministic.route == TaskRouteKind::PlanOnly {
+        return deterministic;
+    }
+    if deterministic.route == TaskRouteKind::ParallelReadonlyDelegation
+        && llm.route != TaskRouteKind::PlanOnly
+    {
+        let llm_route = llm.route.as_str();
+        let llm_reason = llm.reason;
+        llm.route = TaskRouteKind::ParallelReadonlyDelegation;
+        llm.confidence = llm.confidence.max(deterministic.confidence);
+        llm.reason = format!(
+            "deterministic read-only fanout override; llm_route={llm_route}; llm_reason={llm_reason}"
+        );
+        if llm.suggested_workers.is_empty() {
+            llm.suggested_workers = deterministic.suggested_workers;
+        }
+    }
+    llm
 }
 
 async fn route_with_llm(
@@ -431,5 +465,21 @@ mod tests {
         let decision = route_message(None, "帮我处理这个任务", InteractionMode::Task).await;
         assert_eq!(decision.route, TaskRouteKind::ComplexRuntime);
         assert_eq!(decision.reason, "forced task mode");
+    }
+
+    #[tokio::test]
+    async fn task_mode_forces_parallel_delegation_for_readonly_analysis() {
+        let decision = route_message(None, "请分析这个项目架构", InteractionMode::Task).await;
+        assert_eq!(decision.route, TaskRouteKind::ParallelReadonlyDelegation);
+        assert!(decision.route.should_auto_execute());
+    }
+
+    #[test]
+    fn deterministic_readonly_signal_upgrades_llm_chat_route() {
+        let llm = TaskRouteDecision::normal("llm chose chat");
+        let deterministic = route_deterministically("请分析这个项目架构");
+        let decision = reconcile_llm_with_deterministic(llm, deterministic);
+        assert_eq!(decision.route, TaskRouteKind::ParallelReadonlyDelegation);
+        assert!(decision.reason.contains("read-only fanout override"));
     }
 }

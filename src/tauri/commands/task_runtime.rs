@@ -328,6 +328,7 @@ pub async fn generate_task_plan(
         &run_id,
         &run.goal,
         &classification,
+        &[],
     )
     .await
     .map_err(|e| match e {

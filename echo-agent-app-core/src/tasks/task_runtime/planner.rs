@@ -108,10 +108,11 @@ pub async fn generate_plan(
     run_id: &str,
     goal: &str,
     classification: &Classification,
+    suggested_workers: &[String],
 ) -> Result<GeneratedPlan, PlanError> {
     let profile = classification.inferred_profile;
     let template = ProfileTemplate::for_profile(profile);
-    let prompt = build_prompt(goal, template);
+    let prompt = build_prompt(goal, template, suggested_workers);
 
     // JSON-mode request. We use JsonObject rather than JsonSchema so we work
     // across all providers (schema-enforced mode is opt-in per provider; see
@@ -170,15 +171,27 @@ fn system_preamble(template: &ProfileTemplate) -> String {
     )
 }
 
-fn build_prompt(goal: &str, template: &ProfileTemplate) -> String {
+fn build_prompt(goal: &str, template: &ProfileTemplate, suggested_workers: &[String]) -> String {
     let checklist = template
         .review_checklist
         .iter()
         .map(|c| format!("- {c}"))
         .collect::<Vec<_>>()
         .join("\n");
+    let worker_hint = if suggested_workers.is_empty() {
+        "Router suggested workers: none. Select workers from the capability catalog.".to_string()
+    } else {
+        format!(
+            "Router suggested workers: {}.\n\
+            If the goal is read-only investigation/review, split the plan into \
+            independent parallel tasks that use these worker roles where useful. \
+            Do not collapse a broad read-only request into one generic task.",
+            suggested_workers.join(", ")
+        )
+    };
     format!(
         "Goal:\n{goal}\n\n\
+        {worker_hint}\n\n\
         Return JSON with this exact shape:\n\
         {{\n  \
           \"goal\": string (restate the user's goal concretely),\n  \
