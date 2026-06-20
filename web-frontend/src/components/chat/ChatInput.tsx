@@ -9,10 +9,11 @@ import {
   ShieldCheck,
   Cpu,
   Brain,
+  Workflow,
   ChevronDown,
   Check,
 } from 'lucide-react';
-import { permissionsApi, providerApi } from '../../api/endpoints';
+import { permissionsApi, providerApi, taskRuntimeApi } from '../../api/endpoints';
 import { useUiStore } from '../../stores/uiStore';
 import type { Attachment, ConfiguredModel } from '../../types/api';
 import {
@@ -43,6 +44,11 @@ const THINKING_LEVELS = [
   { id: 'high', label: '高' },
 ] as const;
 const THINKING_STORAGE_KEY = 'echo_thinking_level';
+const INTERACTION_MODES = [
+  { id: 0, label: 'Auto' },
+  { id: 1, label: 'Chat' },
+  { id: 2, label: 'Plan' },
+] as const;
 function loadThinkingLevel(): string {
   try {
     const v = localStorage.getItem(THINKING_STORAGE_KEY);
@@ -220,6 +226,8 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
   const [thinkingLevel, setThinkingLevel] = useState<string>(loadThinkingLevel);
   const [thinkingMenuOpen, setThinkingMenuOpen] = useState(false);
   const [switchingThinking, setSwitchingThinking] = useState(false);
+  const [interactionMode, setInteractionMode] = useState<number>(0);
+  const [switchingInteractionMode, setSwitchingInteractionMode] = useState<number | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const setActiveSettingsTab = useUiStore((s) => s.setActiveSettingsTab);
@@ -254,6 +262,19 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
   useEffect(() => {
     loadPermissionMode();
   }, [loadPermissionMode]);
+
+  const loadInteractionMode = useCallback(async () => {
+    try {
+      const mode = await taskRuntimeApi.getInteractionMode();
+      setInteractionMode(INTERACTION_MODES.some((m) => m.id === mode) ? mode : 0);
+    } catch (e) {
+      console.error('[ChatInput] Failed to load interaction mode:', e);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadInteractionMode();
+  }, [loadInteractionMode]);
 
   useEffect(() => {
     const refreshPermissionMode = () => {
@@ -318,6 +339,22 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
       }
     },
     [permissionMode, switchingPermissionMode]
+  );
+
+  const switchInteractionMode = useCallback(
+    async (mode: number) => {
+      if (mode === interactionMode || switchingInteractionMode !== null) return;
+      setSwitchingInteractionMode(mode);
+      try {
+        const next = await taskRuntimeApi.setInteractionMode(mode);
+        setInteractionMode(INTERACTION_MODES.some((m) => m.id === next) ? next : mode);
+      } catch (e) {
+        console.error('[ChatInput] Failed to switch interaction mode:', e);
+      } finally {
+        setSwitchingInteractionMode(null);
+      }
+    },
+    [interactionMode, switchingInteractionMode]
   );
 
   // Switch the active agent's thinking-depth at runtime. Decoupled from model
@@ -780,6 +817,27 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
                     </button>
                   </div>
                 )}
+	              </div>
+              <div
+                className="flex shrink-0 items-center rounded-md border border-[var(--border-secondary)] p-0.5"
+                title="切换交互模式"
+              >
+                <Workflow size={12} className="mx-1 text-[var(--text-tertiary)]" />
+                {INTERACTION_MODES.map((mode) => (
+                  <button
+                    key={mode.id}
+                    type="button"
+                    onClick={() => switchInteractionMode(mode.id)}
+                    disabled={switchingInteractionMode !== null}
+                    className={`h-6 rounded px-1.5 text-[10px] transition-colors disabled:cursor-wait ${
+                      interactionMode === mode.id
+                        ? 'bg-[var(--accent)] text-[var(--text-on-accent)]'
+                        : 'text-[var(--text-tertiary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
+                    }`}
+                  >
+                    {switchingInteractionMode === mode.id ? '...' : mode.label}
+                  </button>
+                ))}
               </div>
               {/* 思考深度 — 运行时每会话控制,与模型解耦。所有模型都展示;
                   不支持的模型后端静默忽略(框架会 warn)。 */}

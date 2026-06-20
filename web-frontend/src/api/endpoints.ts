@@ -584,6 +584,14 @@ export const taskRuntimeApi = {
     isTauri()
       ? apiInvoke<boolean>('get_taskruntime_auto_route')
       : get<boolean>('/task_runtime/auto_route'),
+  setInteractionMode: (mode: number) =>
+    isTauri()
+      ? apiInvoke<number>('set_interaction_mode', { mode })
+      : post<number>('/task_runtime/interaction_mode', { mode }),
+  getInteractionMode: () =>
+    isTauri()
+      ? apiInvoke<number>('get_interaction_mode')
+      : get<number>('/task_runtime/interaction_mode'),
 };
 
 // ── Trace Events API ─────────────────────────────────────────────────
