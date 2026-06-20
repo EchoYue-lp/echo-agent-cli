@@ -388,28 +388,36 @@ function ExecutionProcessBlock({
 
       {expanded && (
         <div className="border-t border-[var(--border-primary)] px-3 pb-2 pt-2 space-y-1.5 max-h-80 overflow-y-auto">
-          {steps.map((step, i) => {
-            if (step.type === 'thinking') {
-              return (
-                <div
-                  key={`thinking-${step.index}`}
-                  className="rounded border-l-2 border-[var(--color-purple)] bg-[var(--bg-primary)] px-2 py-1.5"
-                >
-                  <div className="mb-1 flex items-center gap-1.5">
-                    <Brain size={10} className="text-[var(--color-purple)]" />
-                    <span className="text-[10px] font-medium text-[var(--color-purple)]">
-                      思考 {thinkingCount > 1 ? `${i + 1}/${thinkingCount}` : ''}
-                    </span>
+          {(() => {
+            // Thinking steps must be numbered independently of their position in
+            // the mixed thinking+tool `steps` array — otherwise a thinking step
+            // that follows N tool calls shows "思考 (N+1)/total" instead of
+            // "思考 2/total". Track a separate counter.
+            let thinkingIndex = 0;
+            return steps.map((step) => {
+              if (step.type === 'thinking') {
+                thinkingIndex += 1;
+                return (
+                  <div
+                    key={`thinking-${step.index}`}
+                    className="rounded border-l-2 border-[var(--color-purple)] bg-[var(--bg-primary)] px-2 py-1.5"
+                  >
+                    <div className="mb-1 flex items-center gap-1.5">
+                      <Brain size={10} className="text-[var(--color-purple)]" />
+                      <span className="text-[10px] font-medium text-[var(--color-purple)]">
+                        思考 {thinkingCount > 1 ? `${thinkingIndex}/${thinkingCount}` : ''}
+                      </span>
+                    </div>
+                    <div className="max-h-60 overflow-y-auto text-xs leading-relaxed text-[var(--text-secondary)] whitespace-pre-wrap break-words">
+                      {step.content}
+                    </div>
                   </div>
-                  <div className="max-h-48 overflow-y-auto text-xs leading-relaxed text-[var(--text-secondary)] whitespace-pre-wrap break-words">
-                    {step.content}
-                  </div>
-                </div>
-              );
-            } else {
-              return <ToolCallCard key={`tool-${step.index}`} toolCall={step.toolCall} compact />;
-            }
-          })}
+                );
+              } else {
+                return <ToolCallCard key={`tool-${step.index}`} toolCall={step.toolCall} compact />;
+              }
+            });
+          })()}
         </div>
       )}
     </div>

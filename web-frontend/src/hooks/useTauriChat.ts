@@ -125,6 +125,7 @@ export function useTauriChat() {
 
     try {
       isCancelledRef.current = false;
+      thinkingIdRef.current = null;
       assistantIdRef.current = store.startAssistantMessage();
 
       // Pass conversation_id for pool-based parallel execution

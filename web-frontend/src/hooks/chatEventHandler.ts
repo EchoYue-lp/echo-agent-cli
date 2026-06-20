@@ -40,7 +40,20 @@ export function handleChatEvent(
     case 'token': {
       if (ctx.isCancelledRef.current) break;
       const id = ctx.assistantIdRef.current;
-      if (id && event.data) store.appendToken(id, event.data);
+      if (id && event.data) {
+        // Route the token by thinking state: tokens arriving between
+        // thinking_start and thinking_end are the model's reasoning / per-step
+        // thought (emitted by the backend as ThinkStart→Token→ThinkEnd). They
+        // must go into thinkingSegments so they render in the collapsible
+        // "思考与执行" block, NOT into message.content (which is reserved for
+        // the final answer). Without this split, the thought is silently
+        // merged into the answer text and the thinking block stays empty.
+        if (ctx.currentThinkingIdRef.current) {
+          store.appendThinking(id, event.data);
+        } else {
+          store.appendToken(id, event.data);
+        }
+      }
       break;
     }
     case 'thinking_start': {
@@ -54,6 +67,8 @@ export function handleChatEvent(
     }
     case 'thinking_end': {
       if (ctx.isCancelledRef.current) break;
+      // Close the thinking window so subsequent tokens route to content again.
+      ctx.currentThinkingIdRef.current = null;
       break;
     }
     case 'tool_start': {
@@ -86,6 +101,7 @@ export function handleChatEvent(
     case 'final_answer': {
       if (ctx.isCancelledRef.current) break;
       ctx.isCancelledRef.current = false;
+      ctx.currentThinkingIdRef.current = null;
       const id = ctx.assistantIdRef.current;
       if (id) {
         store.finalizeAssistantMessage(id, (event.data || event.result || '') as string);
