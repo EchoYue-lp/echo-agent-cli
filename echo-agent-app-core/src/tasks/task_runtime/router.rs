@@ -12,9 +12,7 @@ use ts_rs::TS;
 
 use super::classify::{Classification, ComplexityLabel, HeuristicClassifier};
 use super::profiles::{ALL_WORKER_ROLES, worker_catalog_prompt};
-use super::signals::{
-    CapabilityArea, PLAN_ONLY_CUES, READ_INTENT_CUES, contains_any, matched_capability_areas,
-};
+use super::signals::{CapabilityArea, RoutingSignals};
 use super::types::{DomainProfile, InteractionMode};
 
 /// Runtime path selected for a user message.
@@ -146,12 +144,20 @@ fn forced_decision(route: TaskRouteKind, message: &str, reason: &str) -> TaskRou
 }
 
 fn forced_task_decision(message: &str) -> TaskRouteDecision {
-    let route = if looks_like_parallel_readonly(message) {
+    let classification = HeuristicClassifier::new().classify(message);
+    let signals = RoutingSignals::analyze(classification.inferred_profile, message);
+    let route = if signals.supports_parallel_readonly() {
         TaskRouteKind::ParallelReadonlyDelegation
     } else {
         TaskRouteKind::ComplexRuntime
     };
-    forced_decision(route, message, "forced task mode")
+    TaskRouteDecision {
+        route,
+        confidence: 1.0,
+        reason: format!("forced task mode; {}", signals.reason_suffix()),
+        suggested_workers: select_workers_from_signals(route, &signals),
+        classification,
+    }
 }
 
 fn reconcile_llm_with_deterministic(
@@ -253,9 +259,10 @@ Choose "background_task" for long detached tasks the user expects to run asynchr
 
 fn route_deterministically(message: &str) -> TaskRouteDecision {
     let classification = HeuristicClassifier::new().classify(message);
-    let route = if looks_like_plan_only(message) {
+    let signals = RoutingSignals::analyze(classification.inferred_profile, message);
+    let route = if signals.plan_only {
         TaskRouteKind::PlanOnly
-    } else if looks_like_parallel_readonly(message) {
+    } else if signals.supports_parallel_readonly() {
         TaskRouteKind::ParallelReadonlyDelegation
     } else if classification.complexity == ComplexityLabel::Complex {
         TaskRouteKind::ComplexRuntime
@@ -269,21 +276,14 @@ fn route_deterministically(message: &str) -> TaskRouteDecision {
         } else {
             0.78
         },
-        reason: format!("deterministic fallback: {}", classification.reason),
-        suggested_workers: select_workers(route, classification.inferred_profile, message),
+        reason: format!(
+            "deterministic fallback: {}; {}",
+            classification.reason,
+            signals.reason_suffix()
+        ),
+        suggested_workers: select_workers_from_signals(route, &signals),
         classification,
     }
-}
-
-fn looks_like_plan_only(message: &str) -> bool {
-    let lower = message.to_lowercase();
-    contains_any(&lower, PLAN_ONLY_CUES)
-}
-
-fn looks_like_parallel_readonly(message: &str) -> bool {
-    let lower = message.to_lowercase();
-    contains_any(&lower, READ_INTENT_CUES)
-        && !matched_capability_areas(DomainProfile::General, message).is_empty()
 }
 
 fn normalize_workers(
@@ -310,10 +310,15 @@ fn normalize_workers(
 }
 
 fn select_workers(route: TaskRouteKind, profile: DomainProfile, message: &str) -> Vec<String> {
+    let signals = RoutingSignals::analyze(profile, message);
+    select_workers_from_signals(route, &signals)
+}
+
+fn select_workers_from_signals(route: TaskRouteKind, signals: &RoutingSignals) -> Vec<String> {
     match route {
-        TaskRouteKind::ParallelReadonlyDelegation => select_readonly_workers(profile, message),
+        TaskRouteKind::ParallelReadonlyDelegation => select_readonly_workers(signals),
         TaskRouteKind::PlanOnly | TaskRouteKind::ComplexRuntime => {
-            let mut workers = select_readonly_workers(profile, message);
+            let mut workers = select_readonly_workers(signals);
             if workers.len() > 4 {
                 workers.truncate(4);
             }
@@ -323,9 +328,9 @@ fn select_workers(route: TaskRouteKind, profile: DomainProfile, message: &str) -
     }
 }
 
-fn select_readonly_workers(profile: DomainProfile, message: &str) -> Vec<String> {
+fn select_readonly_workers(signals: &RoutingSignals) -> Vec<String> {
     let mut out = Vec::new();
-    for area in matched_capability_areas(profile, message) {
+    for area in &signals.capability_areas {
         push_workers(&mut out, workers_for_area(area));
     }
     if out.is_empty() {
@@ -340,7 +345,7 @@ fn select_readonly_workers(profile: DomainProfile, message: &str) -> Vec<String>
     out
 }
 
-fn workers_for_area(area: CapabilityArea) -> &'static [&'static str] {
+fn workers_for_area(area: &CapabilityArea) -> &'static [&'static str] {
     match area {
         CapabilityArea::Coding => &["project_explorer", "code_reviewer", "test_planner"],
         CapabilityArea::Data => &[
@@ -464,7 +469,8 @@ mod tests {
     async fn task_mode_forces_complex_runtime_not_plan_only() {
         let decision = route_message(None, "帮我处理这个任务", InteractionMode::Task).await;
         assert_eq!(decision.route, TaskRouteKind::ComplexRuntime);
-        assert_eq!(decision.reason, "forced task mode");
+        assert!(decision.reason.contains("forced task mode"));
+        assert!(decision.reason.contains("routing_signals"));
     }
 
     #[tokio::test]

@@ -20,6 +20,66 @@ pub struct CapabilitySignal {
     pub terms: &'static [&'static str],
 }
 
+#[derive(Debug, Clone)]
+pub struct RoutingSignals {
+    pub plan_only: bool,
+    pub read_intent: bool,
+    pub capability_areas: Vec<CapabilityArea>,
+    pub labels: Vec<String>,
+}
+
+impl RoutingSignals {
+    pub fn analyze(profile: DomainProfile, message: &str) -> Self {
+        let lower = message.to_lowercase();
+        let mut labels = Vec::new();
+        let plan_only = contains_any(&lower, PLAN_ONLY_CUES);
+        if plan_only {
+            labels.push("plan_only".to_string());
+        }
+
+        let read_intent = contains_any(&lower, READ_INTENT_CUES);
+        if read_intent {
+            labels.push("read_intent".to_string());
+        }
+
+        let capability_areas = matched_capability_areas(profile, message);
+        for area in &capability_areas {
+            labels.push(format!("capability:{area}"));
+        }
+
+        Self {
+            plan_only,
+            read_intent,
+            capability_areas,
+            labels,
+        }
+    }
+
+    pub fn supports_parallel_readonly(&self) -> bool {
+        self.read_intent && !self.capability_areas.is_empty()
+    }
+
+    pub fn reason_suffix(&self) -> String {
+        if self.labels.is_empty() {
+            "routing_signals:none".to_string()
+        } else {
+            format!("routing_signals:{}", self.labels.join(","))
+        }
+    }
+}
+
+impl std::fmt::Display for CapabilityArea {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let label = match self {
+            CapabilityArea::Coding => "coding",
+            CapabilityArea::Data => "data",
+            CapabilityArea::Academic => "academic",
+            CapabilityArea::Medical => "medical",
+        };
+        f.write_str(label)
+    }
+}
+
 pub const PLAN_ONLY_CUES: &[&str] = &[
     "只给计划",
     "先给计划",
