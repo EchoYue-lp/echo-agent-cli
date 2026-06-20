@@ -338,7 +338,9 @@ pub async fn send_chat_message(
     conversation_id: Option<String>,
     message_key: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    // Route to pool agent if conversation_id is provided and pool is active
+    // Route to pool agent if conversation_id is provided and pool is active.
+    // First-turn messages can arrive before the GUI has an active conversation;
+    // TaskRuntime routing must still be allowed in that case.
     let agent_handle = if let Some(ref conv_id) = conversation_id {
         state.app_state.connection.agent_for(conv_id).await
     } else {
@@ -347,10 +349,10 @@ pub async fn send_chat_message(
     let message_key = message_key.unwrap_or_else(|| Uuid::new_v4().to_string());
 
     // ── Complex-task router ────────────────────────────────────────────
-    // Classify the input. If it looks like a complex, multi-step task AND a
-    // conversation_id is available, create a TaskRuntime run and generate a
-    // structured plan instead of streaming a normal chat. The run stops at
-    // `AwaitingPlanApproval` — the user must approve before execution (PR 3).
+    // Classify the input. If it looks like a complex, multi-step task, create
+    // a TaskRuntime run and generate a structured plan instead of streaming a
+    // normal chat. Missing conversation_id is handled by route_complex_task via
+    // a message-scoped run id so Welcome-screen first turns still route.
     //
     // InteractionMode: 0=Auto(router), 1=Chat(force normal chat), 2=Task(force TaskRuntime)
     let interaction_mode_raw = state
@@ -364,7 +366,7 @@ pub async fn send_chat_message(
         _ => InteractionMode::Auto,
     };
 
-    if interaction_mode != InteractionMode::Chat && conversation_id.is_some() {
+    if interaction_mode != InteractionMode::Chat {
         let route_llm = agent_handle.read(|a| a.llm_client().cloned()).await;
         let route_decision = echo_agent_app_core::tasks::task_runtime::route_message(
             route_llm,
@@ -380,6 +382,7 @@ pub async fn send_chat_message(
                 app.clone(),
                 message.clone(),
                 conversation_id.clone(),
+                message_key.clone(),
                 route_decision,
             )
             .await
@@ -729,6 +732,7 @@ async fn route_complex_task(
     app: tauri::AppHandle,
     message: String,
     conversation_id: Option<String>,
+    message_key: String,
     route_decision: TaskRouteDecision,
 ) -> Result<serde_json::Value, anyhow::Error> {
     let store = state
@@ -741,7 +745,7 @@ async fn route_complex_task(
 
     let conv_id = conversation_id
         .clone()
-        .ok_or_else(|| anyhow::anyhow!("complex-task routing requires a conversation_id"))?;
+        .unwrap_or_else(|| format!("message:{message_key}"));
 
     // 1. Create the run in Pending.
     let run_id = uuid::Uuid::new_v4().to_string();
@@ -808,10 +812,9 @@ async fn route_complex_task(
             auto_execute,
             signals: route_decision.classification.signals.clone(),
         },
-        // Empty message_key so the frontend's isCurrentRunEvent guard falls
-        // through to the conversation_id match — PlanReady is a run-scoped
-        // event, not tied to a specific streaming message.
-        "",
+        // Use message_key so first-turn messages without an active
+        // conversation_id still pass the frontend event guard.
+        &message_key,
         &conversation_id,
     );
 
@@ -830,6 +833,7 @@ async fn route_complex_task(
         "status": response_status.as_str(),
         "route": route_decision.route,
         "auto_execute": auto_execute,
+        "conversation_id": conv_id,
         "plan": generated.plan,
         "warnings": generated.warnings,
     }))
