@@ -285,54 +285,67 @@ mod tests {
     use crate::sessions::SessionMessage;
 
     #[test]
-    fn test_session_create_and_list() {
-        let mut manager = SessionManager::new();
-        let session = manager.create("test-session", "qwen3.6-plus").unwrap();
+    fn test_session_create_and_list() -> anyhow::Result<()> {
+        let (_dir, mut manager) = test_manager("session-create")?;
+        let session = manager.create("test-session", "qwen3.6-plus")?;
         assert!(!session.id.is_empty());
         assert_eq!(session.name, "test-session");
 
-        let list = manager.list().unwrap();
+        let list = manager.list()?;
         assert!(list.iter().any(|s| s.id == session.id));
 
-        manager.delete(&session.id).unwrap();
+        manager.delete(&session.id)?;
+        Ok(())
     }
 
     #[test]
-    fn test_session_branch() {
-        let mut manager = SessionManager::new();
-        let parent = manager.create("parent", "qwen3.6-plus").unwrap();
-        let branch = manager.branch(&parent.id, "experiment").unwrap();
+    fn test_session_branch() -> anyhow::Result<()> {
+        let (_dir, mut manager) = test_manager("session-branch")?;
+        let parent = manager.create("parent", "qwen3.6-plus")?;
+        let branch = manager.branch(&parent.id, "experiment")?;
 
         assert_eq!(branch.parent_id, Some(parent.id.clone()));
         assert_eq!(branch.branch, Some("experiment".to_string()));
 
-        manager.delete(&parent.id).unwrap();
-        manager.delete(&branch.id).unwrap();
+        manager.delete(&parent.id)?;
+        manager.delete(&branch.id)?;
+        Ok(())
     }
 
     #[test]
-    fn test_session_diff() {
-        let mut manager = SessionManager::new();
-        let mut a = manager.create("diff-a", "qwen3.6-plus").unwrap();
+    fn test_session_diff() -> anyhow::Result<()> {
+        let (_dir, mut manager) = test_manager("session-diff")?;
+        let mut a = manager.create("diff-a", "qwen3.6-plus")?;
         a.messages.push(SessionMessage {
             role: "user".into(),
             content: Some("hello".into()),
             tool_calls: None,
         });
-        manager.save(&a).unwrap();
+        manager.save(&a)?;
 
-        let mut b = manager.create("diff-b", "qwen3.6-plus").unwrap();
+        let mut b = manager.create("diff-b", "qwen3.6-plus")?;
         b.messages.push(SessionMessage {
             role: "user".into(),
             content: Some("world".into()),
             tool_calls: None,
         });
-        manager.save(&b).unwrap();
+        manager.save(&b)?;
 
-        let diff = manager.diff(&a.id, &b.id).unwrap();
+        let diff = manager.diff(&a.id, &b.id)?;
         assert!(diff.added > 0 || diff.removed > 0);
 
-        manager.delete(&a.id).unwrap();
-        manager.delete(&b.id).unwrap();
+        manager.delete(&a.id)?;
+        manager.delete(&b.id)?;
+        Ok(())
+    }
+
+    fn test_manager(label: &str) -> anyhow::Result<(tempfile::TempDir, SessionManager)> {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-tmp");
+        fs::create_dir_all(&root)?;
+        let dir = tempfile::Builder::new().prefix(label).tempdir_in(root)?;
+        let manager = SessionManager::with_base_dir(dir.path().to_path_buf());
+        Ok((dir, manager))
     }
 }

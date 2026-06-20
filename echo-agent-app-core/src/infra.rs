@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use echo_agent::agent::subagent::SubagentBuilder;
 use echo_agent::llm::LlmConfig;
 use echo_agent::memory::ConversationStore;
 use echo_agent::memory::SqliteConversationStore;
@@ -254,23 +255,27 @@ fn register_default_subagents(
     let workers = [
         (
             "project_explorer",
+            "只读探索项目结构、配置、文档和相关代码，输出关键文件、事实发现和不确定点。",
             "你是只读项目探索 worker。负责并行阅读目录、配置、文档和相关代码，输出客观发现、关键文件和不确定点。不要修改文件，不要运行 shell，不要做最终结论包装。",
         ),
         (
             "code_reviewer",
+            "只读审查指定模块的 bug、重复实现、架构问题、边界条件和测试缺口。",
             "你是只读代码审查 worker。负责并行检查指定模块的 bug、架构问题、重复实现、边界条件和测试缺口。输出带文件路径的发现。不要修改文件，不要运行 shell。",
         ),
         (
             "test_planner",
+            "只读规划应运行的检查、测试和 walkthrough，说明验证优先级和风险。",
             "你是只读验证规划 worker。负责分析应运行哪些检查、测试和手工 walkthrough，指出风险和优先级。不要修改文件，不要运行 shell。",
         ),
         (
             "summary_writer",
+            "汇总多个 worker 的发现，压缩成清晰结论、计划或交付说明。",
             "你是总结 worker。负责把多个 worker 的发现压缩成清晰的结论、计划或交付说明。不要修改文件，不要运行 shell。",
         ),
     ];
 
-    for (name, prompt) in workers {
+    for (name, description, prompt) in workers {
         match build_readonly_worker_agent(
             name,
             prompt,
@@ -281,7 +286,15 @@ fn register_default_subagents(
             token_limit,
             tool_timeout_ms,
         ) {
-            Ok(worker) => agent.register_agent(Box::new(worker)),
+            Ok(worker) => {
+                let def = SubagentBuilder::new(name)
+                    .description(description)
+                    .fork_mode()
+                    .tag("readonly")
+                    .tag("parallel")
+                    .build();
+                agent.register_subagent_with_definition(def, Box::new(worker));
+            }
             Err(err) => tracing::warn!(
                 subagent = name,
                 error = %err,

@@ -155,34 +155,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_profile_crud() {
-        let manager = ProfileManager::new();
+    fn test_profile_crud() -> anyhow::Result<()> {
+        let (_dir, manager) = test_manager("profile-crud")?;
         let profile = Profile::new("test-profile", "qwen3.6-plus");
-        manager.save(&profile).unwrap();
+        manager.save(&profile)?;
 
-        let loaded = manager.get("test-profile").unwrap();
+        let loaded = manager.get("test-profile")?;
         assert_eq!(loaded.model, "qwen3.6-plus");
 
-        let list = manager.list().unwrap();
+        let list = manager.list()?;
         assert!(list.iter().any(|s| s.name == "test-profile"));
 
-        manager.delete("test-profile").unwrap();
+        manager.delete("test-profile")?;
+        Ok(())
     }
 
     #[test]
-    fn test_activate_profile() {
-        let manager = ProfileManager::new();
+    fn test_activate_profile() -> anyhow::Result<()> {
+        let (_dir, manager) = test_manager("profile-activate")?;
 
         let a = Profile::new("prof-a", "model-a");
         let b = Profile::new("prof-b", "model-b");
-        manager.save(&a).unwrap();
-        manager.save(&b).unwrap();
+        manager.save(&a)?;
+        manager.save(&b)?;
 
-        manager.activate("prof-a").unwrap();
-        let active = manager.get_active().unwrap();
+        manager.activate("prof-a")?;
+        let active = manager
+            .get_active()
+            .ok_or_else(|| anyhow::anyhow!("active profile missing"))?;
         assert_eq!(active.name, "prof-a");
 
-        manager.delete("prof-a").unwrap();
-        manager.delete("prof-b").unwrap();
+        manager.delete("prof-a")?;
+        manager.delete("prof-b")?;
+        Ok(())
+    }
+
+    fn test_manager(label: &str) -> anyhow::Result<(tempfile::TempDir, ProfileManager)> {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join("test-tmp");
+        fs::create_dir_all(&root)?;
+        let dir = tempfile::Builder::new().prefix(label).tempdir_in(root)?;
+        let manager = ProfileManager {
+            base_dir: dir.path().to_path_buf(),
+        };
+        Ok((dir, manager))
     }
 }
