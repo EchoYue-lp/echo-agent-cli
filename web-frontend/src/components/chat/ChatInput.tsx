@@ -47,7 +47,7 @@ const THINKING_STORAGE_KEY = 'echo_thinking_level';
 const INTERACTION_MODES = [
   { id: 0, label: 'Auto' },
   { id: 1, label: 'Chat' },
-  { id: 2, label: 'Plan' },
+  { id: 2, label: 'Task' },
 ] as const;
 function loadThinkingLevel(): string {
   try {

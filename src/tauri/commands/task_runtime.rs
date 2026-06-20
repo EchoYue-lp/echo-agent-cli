@@ -199,7 +199,7 @@ pub async fn get_taskruntime_auto_route(
         .load(std::sync::atomic::Ordering::Relaxed))
 }
 
-/// Set the manual interaction mode: 0=Auto, 1=Chat, 2=Plan (plan §582-586).
+/// Set the manual interaction mode: 0=Auto, 1=Chat, 2=Task.
 #[tauri::command]
 pub async fn set_interaction_mode(
     state: tauri::State<'_, TauriState>,

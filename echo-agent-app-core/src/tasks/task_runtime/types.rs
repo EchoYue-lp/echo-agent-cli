@@ -84,16 +84,16 @@ pub enum ExecutionMode {
     PlanOnly,
 }
 
-/// Manual override of how a user message should be handled (plan §582-586).
-/// `Auto` defers to the heuristic classifier; the other two force a path.
+/// Manual override of how a user message should be handled.
+/// `Auto` defers to the router; the other two force a path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export, rename = "InteractionMode")]
 pub enum InteractionMode {
     /// Force normal chat — never enter TaskRuntime even for complex input.
     Chat,
-    /// Force planning mode — always generate a plan, never auto-execute.
-    Plan,
+    /// Force TaskRuntime for the message instead of leaving it to Auto.
+    Task,
     /// Auto-route: classifier decides (default).
     Auto,
 }

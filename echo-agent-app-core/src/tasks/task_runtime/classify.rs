@@ -17,6 +17,9 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+use super::signals::{
+    ACTION_VERB_CUES, COMPLEX_TASK_CUES, MULTI_TARGET_CUES, PROFILE_CUES, contains_any,
+};
 use super::types::DomainProfile;
 
 /// Heuristic verdict.
@@ -66,10 +69,7 @@ impl From<Complexity> for ComplexityLabel {
 
 /// Deterministic, dependency-free classifier. Construct once (cheap), call
 /// [`HeuristicClassifier::classify`] per message.
-pub struct HeuristicClassifier {
-    complex_keywords: &'static [&'static str],
-    profile_keywords: &'static [(&'static str, DomainProfile)],
-}
+pub struct HeuristicClassifier;
 
 impl Default for HeuristicClassifier {
     fn default() -> Self {
@@ -79,79 +79,7 @@ impl Default for HeuristicClassifier {
 
 impl HeuristicClassifier {
     pub fn new() -> Self {
-        Self {
-            // Match the plan's "complex task triggers" (lines 570-579).
-            // Multi-word phrases use a substring match on the lowercased
-            // message; single tokens use word-boundary matching below.
-            complex_keywords: &[
-                // explicit review / optimize intents
-                "全面优化",
-                "全面 review",
-                "彻底 review",
-                "深入排查",
-                "architecture review",
-                "analyze architecture",
-                "analyze the architecture",
-                "analyze project",
-                "analyze the project",
-                "项目 review",
-                "项目分析",
-                "分析项目",
-                "项目架构",
-                "分析架构",
-                "架构分析",
-                "代码库分析",
-                "分析代码库",
-                "codebase review",
-                "codebase analysis",
-                "full review",
-                "refactor the",
-                "重 构 整 个",
-                // multi-step continuation cues
-                "继续修复",
-                "继续完善",
-                "fix several",
-                "fix multiple",
-                "修复这些",
-                "修复这几个",
-                "这些 bug",
-                "these bugs",
-                // explicit plan-mode language
-                "制定计划",
-                "拆分任务",
-                "分解任务",
-                "make a plan",
-                "break this down",
-            ],
-            // Lightweight domain inference. The user may still override the
-            // profile in the GUI; this is just a starting guess.
-            profile_keywords: &[
-                ("arxiv", DomainProfile::AcademicResearch),
-                ("pubmed", DomainProfile::MedicalResearch),
-                ("literature review", DomainProfile::AcademicResearch),
-                ("systematic review", DomainProfile::AcademicResearch),
-                ("论文", DomainProfile::AcademicResearch),
-                ("文献", DomainProfile::AcademicResearch),
-                ("clinical", DomainProfile::MedicalResearch),
-                ("medical", DomainProfile::MedicalResearch),
-                ("guideline", DomainProfile::MedicalResearch),
-                ("医学", DomainProfile::MedicalResearch),
-                ("临床", DomainProfile::MedicalResearch),
-                ("指南", DomainProfile::MedicalResearch),
-                ("诊断", DomainProfile::MedicalResearch),
-                ("循证", DomainProfile::MedicalResearch),
-                ("数据集", DomainProfile::DataAnalysis),
-                ("数据分析", DomainProfile::DataAnalysis),
-                ("data analysis", DomainProfile::DataAnalysis),
-                ("notebook", DomainProfile::DataAnalysis),
-                ("eda", DomainProfile::DataAnalysis),
-                ("cargo", DomainProfile::AiCoding),
-                ("npm", DomainProfile::AiCoding),
-                ("cargo check", DomainProfile::AiCoding),
-                ("refactor", DomainProfile::AiCoding),
-                ("代码", DomainProfile::AiCoding),
-            ],
-        }
+        Self
     }
 
     /// Classify a single user message. Pure function — safe to call from
@@ -161,7 +89,7 @@ impl HeuristicClassifier {
         let mut signals: Vec<String> = Vec::new();
 
         // 1. Keyword triggers.
-        for kw in self.complex_keywords {
+        for kw in COMPLEX_TASK_CUES {
             if lower.contains(kw) {
                 signals.push(format!("keyword:{kw}"));
             }
@@ -169,21 +97,9 @@ impl HeuristicClassifier {
 
         // 2. Plurality / multi-target cues: "files", "modules", "issues",
         //    "bugs" + an action verb nearby.
-        let multi_target = [
-            "多个文件",
-            "多个模块",
-            "几个文件",
-            "这几个",
-            "all the files",
-            "multiple files",
-            "several modules",
-        ];
-        let action_verb = [
-            "修改", "审查", "review", "fix", "update", "refactor", "实现",
-        ];
         let lower_ascii = message.to_ascii_lowercase();
-        let has_multi = multi_target.iter().any(|m| lower.contains(m));
-        let has_verb = action_verb.iter().any(|v| lower_ascii.contains(v));
+        let has_multi = contains_any(&lower, MULTI_TARGET_CUES);
+        let has_verb = contains_any(&lower_ascii, ACTION_VERB_CUES);
         if has_multi && has_verb {
             signals.push("multi_target+verb".into());
         }
@@ -199,7 +115,7 @@ impl HeuristicClassifier {
 
         // 4. Profile inference.
         let mut inferred_profile = DomainProfile::General;
-        for (kw, profile) in self.profile_keywords {
+        for (kw, profile) in PROFILE_CUES {
             if lower.contains(kw) {
                 inferred_profile = *profile;
                 signals.push(format!("profile:{kw}"));

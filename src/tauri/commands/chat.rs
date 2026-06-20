@@ -352,7 +352,7 @@ pub async fn send_chat_message(
     // structured plan instead of streaming a normal chat. The run stops at
     // `AwaitingPlanApproval` — the user must approve before execution (PR 3).
     //
-    // InteractionMode: 0=Auto(router), 1=Chat(force normal chat), 2=Plan(force planning)
+    // InteractionMode: 0=Auto(router), 1=Chat(force normal chat), 2=Task(force TaskRuntime)
     let interaction_mode_raw = state
         .app_state
         .tasks
@@ -360,7 +360,7 @@ pub async fn send_chat_message(
         .load(Ordering::Relaxed);
     let interaction_mode = match interaction_mode_raw {
         1 => InteractionMode::Chat,
-        2 => InteractionMode::Plan,
+        2 => InteractionMode::Task,
         _ => InteractionMode::Auto,
     };
 

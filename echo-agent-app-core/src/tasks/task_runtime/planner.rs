@@ -21,7 +21,7 @@ use echo_agent::llm::{ChatRequest, LlmClient, ResponseFormat};
 use echo_agent::prelude::Message;
 
 use super::classify::Classification;
-use super::profiles::ProfileTemplate;
+use super::profiles::{ALL_WORKER_ROLES, ProfileTemplate, worker_catalog_prompt};
 use super::types::*;
 
 /// Error returned by plan generation. Distinguishes infrastructure failures
@@ -157,10 +157,16 @@ fn system_preamble(template: &ProfileTemplate) -> String {
         Return ONLY valid JSON matching the requested schema — no markdown, \
         no prose before or after.\n\n\
         Domain guidance: {suffix}\n\n\
-        Workers available for read-only roles: {workers}.",
+        Registered read-only worker capability catalog:
+        {workers}
+
+        Domain profiles are guidance and review context, not hard worker
+        boundaries. Pick worker roles by the actual capability needed for each
+        task; cross-domain plans may mix coding, data, research, and medical
+        workers.",
         label = template.label,
         suffix = template.prompt_suffix,
-        workers = template.default_worker_roles.join(", "),
+        workers = worker_catalog_prompt(),
     )
 }
 
@@ -183,7 +189,7 @@ fn build_prompt(goal: &str, template: &ProfileTemplate) -> String {
             \"title\": string,\n    \
             \"description\": string (concrete, not vague),\n    \
             \"kind\": \"read_only_review\" | \"investigation\" | \"test_plan\" | \"implementation\" | \"debugging\" | \"review\" | \"summary\" | \"verification\",\n    \
-            \"agent_role\": string (one of the available workers for read-only kinds),\n    \
+            \"agent_role\": string (one of the registered workers for read-only kinds),\n    \
             \"depends_on\": string[] (titles or ids of tasks this one waits for),\n    \
             \"parallel_group\": string | null,\n    \
             \"files\": string[] (concrete paths or discovery targets; empty for non-coding),\n    \
@@ -235,7 +241,7 @@ fn normalize_tasks(
         .default_worker_roles
         .first()
         .copied()
-        .unwrap_or("general");
+        .unwrap_or("project_explorer");
     let mut out = Vec::with_capacity(drafts.len());
     for (i, d) in drafts.iter().enumerate() {
         let id = slug_id(i, &d.title);
@@ -244,10 +250,22 @@ fn normalize_tasks(
             .as_deref()
             .and_then(PlanTaskKind::from_str)
             .unwrap_or(PlanTaskKind::ReadOnlyReview);
-        let role = d
+        let requested_role = d
             .agent_role
             .clone()
             .unwrap_or_else(|| default_role.to_string());
+        let role = if ALL_WORKER_ROLES
+            .iter()
+            .any(|allowed| allowed == &requested_role.as_str())
+        {
+            requested_role
+        } else {
+            warnings.push(format!(
+                "task '{}' used unknown worker '{}'; falling back to '{}'",
+                d.title, requested_role, default_role
+            ));
+            default_role.to_string()
+        };
 
         // If the model claimed an implementation/verification task is parallel
         // with reads, downgrade the parallel_group and warn — mutating work
@@ -569,6 +587,36 @@ mod tests {
         let tasks =
             normalize_tasks(&drafts, &mut warnings, template, DomainProfile::AiCoding).unwrap();
         validate_plan("Build real runtime", &tasks, &mut warnings).unwrap();
+    }
+
+    #[test]
+    fn normalize_allows_cross_domain_worker_roles() {
+        let template = ProfileTemplate::for_profile(DomainProfile::AcademicResearch);
+        let drafts = vec![PlanTaskDraft {
+            title: "Profile paper datasets".into(),
+            description: "Inspect dataset schema and metric definitions from selected papers"
+                .into(),
+            kind: Some("read_only_review".into()),
+            agent_role: Some("data_profiler".into()),
+            depends_on: vec![],
+            parallel_group: Some("evidence".into()),
+            files: vec!["paper datasets".into()],
+            allowed_tools: vec![],
+            verification: vec!["dataset profile findings".into()],
+        }];
+        let mut warnings = Vec::new();
+        let tasks = normalize_tasks(
+            &drafts,
+            &mut warnings,
+            template,
+            DomainProfile::AcademicResearch,
+        )
+        .unwrap();
+        assert_eq!(tasks[0].agent_role, "data_profiler");
+        assert!(
+            warnings.is_empty(),
+            "cross-domain workers should not be downgraded: {warnings:?}"
+        );
     }
 
     #[test]

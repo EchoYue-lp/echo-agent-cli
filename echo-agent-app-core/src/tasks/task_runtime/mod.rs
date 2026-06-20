@@ -45,6 +45,7 @@ pub mod planner;
 pub mod profiles;
 pub mod review;
 pub mod router;
+pub mod signals;
 pub mod store;
 pub mod types;
 

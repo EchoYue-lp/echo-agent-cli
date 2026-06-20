@@ -1,7 +1,7 @@
 //! Domain profile templates.
 //!
 //! Each profile customizes the universal task methodology (plan templates,
-//! default worker roles, plan-prompt suffix, review checklist) for a domain.
+//! seed worker roles, plan-prompt suffix, review checklist) for a domain.
 //! The profile does NOT replace the methodology — it specializes it.
 //!
 //! See the plan's "Domain Profiles" section. These templates are consumed by
@@ -16,8 +16,8 @@ pub struct ProfileTemplate {
     pub key: &'static str,
     /// Human-readable label.
     pub label: &'static str,
-    /// Default worker roles the planner may assign to plan tasks. These map
-    /// 1:1 to the subagents registered in `infra::register_default_subagents`.
+    /// Seed worker roles for this domain. These are defaults, not hard
+    /// boundaries; real tasks may blend workers from every capability area.
     pub default_worker_roles: &'static [&'static str],
     /// Extra instructions appended to the plan-generation prompt to steer the
     /// LLM toward domain-appropriate tasks, artifacts, and verification.
@@ -96,6 +96,85 @@ pub const GENERAL_WORKER_ROLES: &[&str] = &[
     "summary_writer",
 ];
 
+pub const ALL_WORKER_ROLES: &[&str] = &[
+    "project_explorer",
+    "code_reviewer",
+    "test_planner",
+    "data_profiler",
+    "analysis_reviewer",
+    "reproducibility_planner",
+    "literature_scout",
+    "evidence_reviewer",
+    "synthesis_planner",
+    "medical_literature_scout",
+    "clinical_evidence_reviewer",
+    "safety_reviewer",
+    "summary_writer",
+];
+
+pub const WORKER_CAPABILITY_CATALOG: &[(&str, &str)] = &[
+    (
+        "project_explorer",
+        "workspace/codebase discovery: files, configs, modules, docs",
+    ),
+    (
+        "code_reviewer",
+        "software correctness, architecture, duplication, edge cases",
+    ),
+    (
+        "test_planner",
+        "verification strategy for code, scripts, notebooks, builds",
+    ),
+    (
+        "data_profiler",
+        "data sources, schema, missing values, outliers, sample boundaries",
+    ),
+    (
+        "analysis_reviewer",
+        "metrics, statistical assumptions, plots, data-supported conclusions",
+    ),
+    (
+        "reproducibility_planner",
+        "rerunnable pipelines, notebooks, scripts, reports, audit trail",
+    ),
+    (
+        "literature_scout",
+        "academic search strategy, candidate papers, keywords, evidence gaps",
+    ),
+    (
+        "evidence_reviewer",
+        "evidence quality, study type, citation reliability, claim strength",
+    ),
+    (
+        "synthesis_planner",
+        "review structure, evidence tables, bibliography, final research artifact",
+    ),
+    (
+        "medical_literature_scout",
+        "medical guidelines, systematic reviews, clinical studies, PubMed-style search",
+    ),
+    (
+        "clinical_evidence_reviewer",
+        "clinical evidence level, applicability, guideline consistency",
+    ),
+    (
+        "safety_reviewer",
+        "medical safety boundaries, disclaimers, contraindication risk",
+    ),
+    (
+        "summary_writer",
+        "cross-worker synthesis into conclusions, plan, or delivery notes",
+    ),
+];
+
+pub fn worker_catalog_prompt() -> String {
+    WORKER_CAPABILITY_CATALOG
+        .iter()
+        .map(|(role, capability)| format!("- {role}: {capability}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub static GENERAL: ProfileTemplate = ProfileTemplate {
     key: "general",
     label: "General",
@@ -126,11 +205,12 @@ This is a software-engineering workspace. Split work into read-only review / \
 investigation tasks (parallelizable) and implementation tasks (serialized). \
 Every implementation task must list concrete file paths and a verification \
 step (cargo check / npm build / relevant tests). Read-only work is delegated \
-to the registered workers (project_explorer, code_reviewer, test_planner, \
-summary_writer); implementation/debugging tasks are NOT delegated to a worker \
-— the main agent performs writes directly, serially and approval-gated. So \
-only assign read-only kinds (read_only_review, investigation, test_plan, \
-review, summary) a worker role from the registered set.",
+to registered capability workers; implementation/debugging tasks are NOT \
+delegated to a worker — the main agent performs writes directly, serially and \
+approval-gated. So only assign read-only kinds (read_only_review, \
+investigation, test_plan, review, summary) a worker role from the registered \
+set. Coding tasks can still use data, research, or medical workers when the \
+actual goal crosses those boundaries.",
     workflows: CODING_WORKFLOWS,
     review_checklist: &[
         "Architecture fit with existing code?",
@@ -152,7 +232,9 @@ This is a data-analysis task. Make data provenance explicit. Split work into \
 profiling, cleaning, analysis, and reproducibility checks. Every \
 transformation must be reproducible from a script or notebook artifact. \
 Flag missing values, outliers, and metric-definition inconsistencies. Avoid \
-conclusions overfit to a convenient subset of the data.",
+conclusions overfit to a convenient subset of the data. Use coding workers \
+when the analysis depends on scripts/notebooks/packages, and research or \
+medical workers when the data question depends on external evidence.",
     workflows: UNIVERSAL_WORKFLOWS,
     review_checklist: &[
         "Data source and provenance are clear?",
@@ -174,7 +256,9 @@ This is an academic-research task. Make the search strategy explicit. Every \
 claim must cite a real, verifiable source. Distinguish study types and state \
 evidence level where possible. Include disagreements and limitations. Do not \
 let claims exceed the strength of the underlying evidence. Output an evidence \
-table and a bibliography artifact.",
+table and a bibliography artifact. Use data-analysis workers when papers, \
+datasets, statistics, or plots need scrutiny; use coding workers when the \
+research includes reproducible code, tools, notebooks, or implementation.",
     workflows: UNIVERSAL_WORKFLOWS,
     review_checklist: &[
         "Search strategy explicit and reproducible?",
@@ -197,7 +281,9 @@ Prioritize authoritative sources (guidelines, systematic reviews). \
 Distinguish guideline / systematic-review / trial types and state evidence \
 level. Make uncertainty explicit. NEVER present a diagnosis or treatment as \
 medical advice — include a non-diagnostic disclaimer where appropriate. \
-Every clinical statement must be directly supported by a reliable citation.",
+Every clinical statement must be directly supported by a reliable citation. \
+Use data-analysis workers for cohorts, datasets, statistics, or biomedical \
+tables, and coding workers for notebooks, scripts, pipelines, or tool review.",
     workflows: UNIVERSAL_WORKFLOWS,
     review_checklist: &[
         "Authoritative sources prioritized?",
@@ -233,14 +319,6 @@ mod tests {
 
     #[test]
     fn every_profile_uses_registered_subagent_roles() {
-        let registered = [
-            AI_CODING_WORKER_ROLES,
-            DATA_ANALYSIS_WORKER_ROLES,
-            ACADEMIC_RESEARCH_WORKER_ROLES,
-            MEDICAL_RESEARCH_WORKER_ROLES,
-            GENERAL_WORKER_ROLES,
-        ]
-        .concat();
         for profile in [
             DomainProfile::General,
             DomainProfile::AiCoding,
@@ -251,7 +329,7 @@ mod tests {
             let t = ProfileTemplate::for_profile(profile);
             for required in t.default_worker_roles {
                 assert!(
-                    registered.iter().any(|r| r == required),
+                    ALL_WORKER_ROLES.iter().any(|r| r == required),
                     "{profile:?} profile references unregistered worker {required}"
                 );
             }
@@ -261,6 +339,17 @@ mod tests {
                     .any(|&r| r == "summary_writer"),
                 "{profile:?} profile should keep summary_writer for synthesis"
             );
+        }
+    }
+
+    #[test]
+    fn catalog_lists_every_registered_worker_once() {
+        for role in ALL_WORKER_ROLES {
+            let matches = WORKER_CAPABILITY_CATALOG
+                .iter()
+                .filter(|(catalog_role, _)| catalog_role == role)
+                .count();
+            assert_eq!(matches, 1, "worker {role} must be described exactly once");
         }
     }
 }

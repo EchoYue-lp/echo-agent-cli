@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use super::classify::{Classification, ComplexityLabel, HeuristicClassifier};
-use super::profiles::ProfileTemplate;
+use super::profiles::{ALL_WORKER_ROLES, worker_catalog_prompt};
+use super::signals::{
+    CapabilityArea, PLAN_ONLY_CUES, READ_INTENT_CUES, contains_any, matched_capability_areas,
+};
 use super::types::{DomainProfile, InteractionMode};
 
 /// Runtime path selected for a user message.
@@ -115,8 +118,8 @@ pub async fn route_message(
         InteractionMode::Chat => {
             return forced_decision(TaskRouteKind::NormalChat, message, "forced chat mode");
         }
-        InteractionMode::Plan => {
-            return forced_decision(TaskRouteKind::PlanOnly, message, "forced plan mode");
+        InteractionMode::Task => {
+            return forced_decision(TaskRouteKind::ComplexRuntime, message, "forced task mode");
         }
         InteractionMode::Auto => {}
     }
@@ -136,7 +139,7 @@ fn forced_decision(route: TaskRouteKind, message: &str, reason: &str) -> TaskRou
         route,
         confidence: 1.0,
         reason: reason.to_string(),
-        suggested_workers: default_workers(route, classification.inferred_profile),
+        suggested_workers: select_workers(route, classification.inferred_profile, message),
         classification,
     }
 }
@@ -182,36 +185,36 @@ async fn route_with_llm(
             raw.suggested_workers,
             route,
             classification.inferred_profile,
+            message,
         ),
         classification,
     })
 }
 
 fn router_system_prompt() -> String {
-    r#"You route a user's message for a local AI coding assistant runtime.
+    format!(
+        r#"You route a user's message for a local AI coding assistant runtime.
 Return ONLY JSON:
-{
+{{
   "route": "normal_chat" | "plan_only" | "complex_runtime" | "parallel_readonly_delegation" | "background_task" | "direct_edit",
   "domain_profile": "general" | "ai_coding" | "academic_research" | "data_analysis" | "medical_research",
   "confidence": number between 0 and 1,
   "reason": string,
   "suggested_workers": string[]
-}
+}}
 
 EKO's main domains are AI coding, academic research, data processing/analysis, and medical research. Choose "parallel_readonly_delegation" for broad read-only work that benefits from multiple workers in any of these domains: project architecture analysis, codebase review, literature exploration, evidence review, dataset profiling, analysis-method review, clinical evidence review, safety review, or comparing several candidate root causes.
 
-Suggested workers are not a fixed count. Pick the smallest useful set from:
-- AI coding: project_explorer, code_reviewer, test_planner, summary_writer
-- Academic research: literature_scout, evidence_reviewer, synthesis_planner, summary_writer
-- Data analysis: data_profiler, analysis_reviewer, reproducibility_planner, summary_writer
-- Medical research: medical_literature_scout, clinical_evidence_reviewer, safety_reviewer, summary_writer
+Domains are context labels, not worker boundaries. A medical or academic task may need data-analysis workers; a data task may need coding workers; a coding task may need literature/evidence workers. Suggested workers are not a fixed count. Pick the smallest useful cross-domain set from this capability catalog:
+{catalog}
 
 Choose "plan_only" when the user explicitly asks for a plan or says not to execute.
 Choose "complex_runtime" for multi-step work that may include edits, verification, or review gates.
 Choose "normal_chat" for small questions, explanations, or single-file/simple answers.
 Choose "direct_edit" only for tiny obvious edits.
-Choose "background_task" for long detached tasks the user expects to run asynchronously."#
-        .to_string()
+Choose "background_task" for long detached tasks the user expects to run asynchronously."#,
+        catalog = worker_catalog_prompt()
+    )
 }
 
 fn route_deterministically(message: &str) -> TaskRouteDecision {
@@ -233,87 +236,31 @@ fn route_deterministically(message: &str) -> TaskRouteDecision {
             0.78
         },
         reason: format!("deterministic fallback: {}", classification.reason),
-        suggested_workers: default_workers(route, classification.inferred_profile),
+        suggested_workers: select_workers(route, classification.inferred_profile, message),
         classification,
     }
 }
 
 fn looks_like_plan_only(message: &str) -> bool {
     let lower = message.to_lowercase();
-    [
-        "只给计划",
-        "先给计划",
-        "不要执行",
-        "先不要执行",
-        "plan only",
-        "only make a plan",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
+    contains_any(&lower, PLAN_ONLY_CUES)
 }
 
 fn looks_like_parallel_readonly(message: &str) -> bool {
     let lower = message.to_lowercase();
-    let read_intents = [
-        "分析",
-        "review",
-        "审查",
-        "过一遍",
-        "看看",
-        "explore",
-        "analyze",
-        "investigate",
-        "检索",
-        "综述",
-        "画像",
-        "profiling",
-    ];
-    let broad_targets = [
-        "项目",
-        "架构",
-        "代码库",
-        "仓库",
-        "模块",
-        "codebase",
-        "architecture",
-        "project",
-        "repository",
-        "repo",
-        "论文",
-        "文献",
-        "研究",
-        "证据",
-        "literature",
-        "paper",
-        "papers",
-        "evidence",
-        "dataset",
-        "数据集",
-        "数据",
-        "指标",
-        "analysis",
-        "医学",
-        "临床",
-        "指南",
-        "medical",
-        "clinical",
-        "guideline",
-    ];
-    let has_read_intent = read_intents.iter().any(|needle| lower.contains(needle));
-    let has_broad_target = broad_targets.iter().any(|needle| lower.contains(needle));
-    has_read_intent && has_broad_target
+    contains_any(&lower, READ_INTENT_CUES)
+        && !matched_capability_areas(DomainProfile::General, message).is_empty()
 }
 
 fn normalize_workers(
     workers: Vec<String>,
     route: TaskRouteKind,
     profile: DomainProfile,
+    message: &str,
 ) -> Vec<String> {
-    let template = ProfileTemplate::for_profile(profile);
     let mut out = Vec::new();
     for worker in workers {
-        if template
-            .default_worker_roles
+        if ALL_WORKER_ROLES
             .iter()
             .any(|allowed| allowed == &worker.as_str())
             && !out.contains(&worker)
@@ -322,28 +269,65 @@ fn normalize_workers(
         }
     }
     if out.is_empty() {
-        default_workers(route, profile)
+        select_workers(route, profile, message)
     } else {
         out
     }
 }
 
-fn default_workers(route: TaskRouteKind, profile: DomainProfile) -> Vec<String> {
+fn select_workers(route: TaskRouteKind, profile: DomainProfile, message: &str) -> Vec<String> {
     match route {
-        TaskRouteKind::ParallelReadonlyDelegation => ProfileTemplate::for_profile(profile)
-            .default_worker_roles
-            .iter()
-            .map(|role| role.to_string())
-            .collect(),
+        TaskRouteKind::ParallelReadonlyDelegation => select_readonly_workers(profile, message),
         TaskRouteKind::PlanOnly | TaskRouteKind::ComplexRuntime => {
-            ProfileTemplate::for_profile(profile)
-                .default_worker_roles
-                .iter()
-                .take(2)
-                .map(|role| role.to_string())
-                .collect()
+            let mut workers = select_readonly_workers(profile, message);
+            if workers.len() > 4 {
+                workers.truncate(4);
+            }
+            workers
         }
         _ => Vec::new(),
+    }
+}
+
+fn select_readonly_workers(profile: DomainProfile, message: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for area in matched_capability_areas(profile, message) {
+        push_workers(&mut out, workers_for_area(area));
+    }
+    if out.is_empty() {
+        push_workers(
+            &mut out,
+            &["project_explorer", "literature_scout", "data_profiler"],
+        );
+    }
+    if out.len() > 1 {
+        push_workers(&mut out, &["summary_writer"]);
+    }
+    out
+}
+
+fn workers_for_area(area: CapabilityArea) -> &'static [&'static str] {
+    match area {
+        CapabilityArea::Coding => &["project_explorer", "code_reviewer", "test_planner"],
+        CapabilityArea::Data => &[
+            "data_profiler",
+            "analysis_reviewer",
+            "reproducibility_planner",
+        ],
+        CapabilityArea::Academic => &["literature_scout", "evidence_reviewer", "synthesis_planner"],
+        CapabilityArea::Medical => &[
+            "medical_literature_scout",
+            "clinical_evidence_reviewer",
+            "safety_reviewer",
+        ],
+    }
+}
+
+fn push_workers(out: &mut Vec<String>, workers: &[&str]) {
+    for worker in workers {
+        if !out.iter().any(|existing| existing == worker) {
+            out.push((*worker).to_string());
+        }
     }
 }
 
@@ -395,6 +379,42 @@ mod tests {
     }
 
     #[test]
+    fn deterministic_router_blends_medical_data_and_code_workers() {
+        let decision = route_deterministically(
+            "分析这个医学 cohort 数据集和 Python notebook，审查临床证据和复现代码",
+        );
+        assert_eq!(decision.route, TaskRouteKind::ParallelReadonlyDelegation);
+        for expected in [
+            "medical_literature_scout",
+            "clinical_evidence_reviewer",
+            "data_profiler",
+            "analysis_reviewer",
+            "code_reviewer",
+            "test_planner",
+            "summary_writer",
+        ] {
+            assert!(
+                decision.suggested_workers.iter().any(|w| w == expected),
+                "expected blended worker {expected}, got {:?}",
+                decision.suggested_workers
+            );
+        }
+    }
+
+    #[test]
+    fn deterministic_router_blends_academic_and_data_workers() {
+        let decision = route_deterministically("review 这些论文里的实验数据、统计指标和图表证据");
+        assert_eq!(decision.route, TaskRouteKind::ParallelReadonlyDelegation);
+        for expected in ["literature_scout", "evidence_reviewer", "data_profiler"] {
+            assert!(
+                decision.suggested_workers.iter().any(|w| w == expected),
+                "expected blended worker {expected}, got {:?}",
+                decision.suggested_workers
+            );
+        }
+    }
+
+    #[test]
     fn deterministic_router_keeps_simple_questions_in_chat() {
         let decision = route_deterministically("Rust 的 closure 是什么？");
         assert_eq!(decision.route, TaskRouteKind::NormalChat);
@@ -404,5 +424,12 @@ mod tests {
     fn deterministic_router_respects_plan_only_language() {
         let decision = route_deterministically("先给计划，不要执行");
         assert_eq!(decision.route, TaskRouteKind::PlanOnly);
+    }
+
+    #[tokio::test]
+    async fn task_mode_forces_complex_runtime_not_plan_only() {
+        let decision = route_message(None, "帮我处理这个任务", InteractionMode::Task).await;
+        assert_eq!(decision.route, TaskRouteKind::ComplexRuntime);
+        assert_eq!(decision.reason, "forced task mode");
     }
 }
