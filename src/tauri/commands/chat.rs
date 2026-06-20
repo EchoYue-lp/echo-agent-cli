@@ -761,26 +761,37 @@ async fn route_complex_task(
     // 2. Pending -> Planning (legal direct transition).
     store.transition_run(&run_id, TaskRunStatus::Planning)?;
 
-    // 3. Obtain the LLM client from the primary agent.
-    let llm = state
-        .app_state
-        .connection
-        .primary_agent()
-        .read(|a| a.llm_client().cloned())
-        .await
-        .ok_or_else(|| anyhow::anyhow!("no LLM client available on primary agent"))?;
+    // 3. Generate the structured plan. Broad read-only fanout must be a
+    // reliable runtime path, so it is built deterministically from the router
+    // decision instead of depending on a second LLM planning call.
+    let generated = if route_decision.route
+        == echo_agent_app_core::tasks::task_runtime::TaskRouteKind::ParallelReadonlyDelegation
+    {
+        echo_agent_app_core::tasks::task_runtime::generate_parallel_readonly_plan(
+            &run_id,
+            &message,
+            &route_decision.classification,
+            &route_decision.suggested_workers,
+        )
+    } else {
+        let llm = state
+            .app_state
+            .connection
+            .primary_agent()
+            .read(|a| a.llm_client().cloned())
+            .await
+            .ok_or_else(|| anyhow::anyhow!("no LLM client available on primary agent"))?;
+        echo_agent_app_core::tasks::task_runtime::generate_plan(
+            &llm,
+            &run_id,
+            &message,
+            &route_decision.classification,
+            &route_decision.suggested_workers,
+        )
+        .await?
+    };
 
-    // 4. Generate the structured plan.
-    let generated = echo_agent_app_core::tasks::task_runtime::generate_plan(
-        &llm,
-        &run_id,
-        &message,
-        &route_decision.classification,
-        &route_decision.suggested_workers,
-    )
-    .await?;
-
-    // 5. Persist + advance to AwaitingPlanApproval (attach_plan is atomic).
+    // 4. Persist + advance to AwaitingPlanApproval (attach_plan is atomic).
     store.attach_plan(&generated.plan)?;
     let mut auto_execute = false;
     let mut response_status = TaskRunStatus::AwaitingPlanApproval;
@@ -797,7 +808,7 @@ async fn route_complex_task(
         response_status = TaskRunStatus::Running;
     }
 
-    // 6. Emit plan_ready so the GUI can render the plan + approval actions.
+    // 5. Emit plan_ready so the GUI can render the plan + approval actions.
     emit_chat_event(
         &app,
         &ChatEvent::PlanReady {

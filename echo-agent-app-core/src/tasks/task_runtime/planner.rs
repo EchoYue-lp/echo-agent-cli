@@ -3,6 +3,9 @@
 //! Turns a complex user goal into a structured [`TaskPlan`] via a single
 //! JSON-mode LLM call, then validates plan quality (rejects vague wording,
 //! ensures every task has concrete targets + verification).
+//! Broad read-only fanout is the exception: the router has already selected
+//! workers, so we generate that DAG deterministically instead of asking the
+//! model for a plan that may fail on wording or JSON shape.
 //!
 //! This is the structured-output counterpart to the plan's "writing-plans
 //! integration" section (lines 587-633). The LLM is asked to return strict
@@ -21,7 +24,9 @@ use echo_agent::llm::{ChatRequest, LlmClient, ResponseFormat};
 use echo_agent::prelude::Message;
 
 use super::classify::Classification;
-use super::profiles::{ALL_WORKER_ROLES, ProfileTemplate, worker_catalog_prompt};
+use super::profiles::{
+    ALL_WORKER_ROLES, ProfileTemplate, WORKER_CAPABILITY_CATALOG, worker_catalog_prompt,
+};
 use super::types::*;
 
 /// Error returned by plan generation. Distinguishes infrastructure failures
@@ -97,6 +102,136 @@ const FORBIDDEN_PHRASES: &[&str] = &[
 pub struct GeneratedPlan {
     pub plan: TaskPlan,
     pub warnings: Vec<String>,
+}
+
+/// Build a deterministic parallel read-only plan from the router's worker
+/// decision. This is the stable runtime path for broad analysis/review tasks:
+/// once routing says "fan out", execution must not depend on a second LLM call
+/// producing perfect planning JSON.
+pub fn generate_parallel_readonly_plan(
+    run_id: &str,
+    goal: &str,
+    classification: &Classification,
+    suggested_workers: &[String],
+) -> GeneratedPlan {
+    let profile = classification.inferred_profile;
+    let template = ProfileTemplate::for_profile(profile);
+    let mut warnings = Vec::new();
+    let mut workers = Vec::new();
+
+    for worker in suggested_workers {
+        if ALL_WORKER_ROLES
+            .iter()
+            .any(|allowed| allowed == &worker.as_str())
+            && !workers.iter().any(|existing| existing == worker)
+        {
+            workers.push(worker.clone());
+        }
+    }
+
+    if workers.is_empty() {
+        for worker in template.default_worker_roles {
+            if !workers.iter().any(|existing| existing == worker) {
+                workers.push((*worker).to_string());
+            }
+        }
+        warnings.push("router returned no usable workers; used profile defaults".to_string());
+    }
+
+    let has_synthesis = workers.iter().any(|worker| worker == "summary_writer");
+    let mut discovery_workers = workers
+        .iter()
+        .filter(|worker| worker.as_str() != "summary_writer")
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if discovery_workers.is_empty() {
+        discovery_workers.push("project_explorer".to_string());
+        warnings.push("read-only plan needed at least one discovery worker".to_string());
+    }
+
+    let parallel_group = "readonly-fanout".to_string();
+    let mut tasks = Vec::new();
+    let mut fanout_ids = Vec::new();
+    for (i, worker) in discovery_workers.iter().enumerate() {
+        let id = format!("readonly-{}-{}", i.saturating_add(1), role_slug(worker));
+        fanout_ids.push(id.clone());
+        tasks.push(PlanTask {
+            id,
+            title: worker_title(worker),
+            description: format!(
+                "{} Focus on this goal: {}",
+                worker_description(worker),
+                goal.trim()
+            ),
+            kind: PlanTaskKind::ReadOnlyReview,
+            agent_role: worker.clone(),
+            domain_profile: profile,
+            depends_on: Vec::new(),
+            parallel_group: Some(parallel_group.clone()),
+            files: vec!["workspace".to_string()],
+            allowed_tools: vec![
+                "repo_map".to_string(),
+                "glob".to_string(),
+                "list_dir".to_string(),
+                "read_file".to_string(),
+                "rg".to_string(),
+            ],
+            verification: vec![format!(
+                "Return concrete findings from {} with file paths, evidence, and uncertainty.",
+                worker
+            )],
+            retry_count: 0,
+            max_retries: 3,
+            failure_fingerprint: None,
+            status: TodoStatus::Pending,
+        });
+    }
+
+    if has_synthesis || tasks.len() > 1 {
+        tasks.push(PlanTask {
+            id: "readonly-synthesis-summary_writer".to_string(),
+            title: "Synthesize worker findings".to_string(),
+            description: format!(
+                "Combine parallel read-only findings into an actionable answer for: {}",
+                goal.trim()
+            ),
+            kind: PlanTaskKind::Summary,
+            agent_role: "summary_writer".to_string(),
+            domain_profile: profile,
+            depends_on: fanout_ids,
+            parallel_group: None,
+            files: Vec::new(),
+            allowed_tools: vec!["read_file".to_string()],
+            verification: vec![
+                "Summarize agreements, conflicts, evidence gaps, and recommended next actions."
+                    .to_string(),
+            ],
+            retry_count: 0,
+            max_retries: 3,
+            failure_fingerprint: None,
+            status: TodoStatus::Pending,
+        });
+    }
+
+    let plan = TaskPlan {
+        plan_id: uuid::Uuid::new_v4().to_string(),
+        run_id: run_id.to_string(),
+        domain_profile: profile,
+        goal: goal.trim().to_string(),
+        assumptions: vec![
+            "This is a read-only analysis/review request; workers must not modify files."
+                .to_string(),
+        ],
+        risks: vec![
+            "Worker findings may overlap; synthesis should reconcile conflicts and cite evidence."
+                .to_string(),
+        ],
+        execution_mode: ExecutionMode::Parallel,
+        tasks,
+    };
+
+    GeneratedPlan { plan, warnings }
 }
 
 /// Generate a structured plan for a run.
@@ -258,6 +393,9 @@ fn normalize_tasks(
     let mut out = Vec::with_capacity(drafts.len());
     for (i, d) in drafts.iter().enumerate() {
         let id = slug_id(i, &d.title);
+        let fallback_title = format!("Task {}", i.saturating_add(1));
+        let title = sanitize_plan_text(&d.title, &fallback_title, warnings);
+        let description = sanitize_plan_text(&d.description, &title, warnings);
         let kind = d
             .kind
             .as_deref()
@@ -309,8 +447,8 @@ fn normalize_tasks(
 
         out.push(PlanTask {
             id,
-            title: d.title.trim().to_string(),
-            description: d.description.trim().to_string(),
+            title,
+            description,
             kind,
             agent_role: role,
             domain_profile,
@@ -328,6 +466,73 @@ fn normalize_tasks(
     Ok(out)
 }
 
+fn sanitize_plan_text(raw: &str, fallback: &str, warnings: &mut Vec<String>) -> String {
+    let mut text = raw.trim().to_string();
+    for bad in FORBIDDEN_PHRASES {
+        if text.to_lowercase().contains(&bad.to_lowercase()) {
+            warnings.push(format!(
+                "removed vague phrase '{}' from plan text '{}'",
+                bad, raw
+            ));
+            text = text.replace(bad, "");
+            text = text.replace(&bad.to_ascii_uppercase(), "");
+            text = text.replace(&bad.to_ascii_lowercase(), "");
+        }
+    }
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let trimmed = compact.trim_matches(|c: char| {
+        c.is_whitespace() || matches!(c, ',' | '，' | '.' | '。' | ';' | '；' | ':' | '：')
+    });
+    if trimmed.is_empty() {
+        fallback.trim().to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn role_slug(role: &str) -> String {
+    role.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+fn worker_title(worker: &str) -> String {
+    match worker {
+        "project_explorer" => "Explore project structure and architecture".to_string(),
+        "code_reviewer" => "Review code architecture and correctness risks".to_string(),
+        "test_planner" => "Map verification and test strategy".to_string(),
+        "data_profiler" => "Profile data sources and analysis shape".to_string(),
+        "analysis_reviewer" => "Review metrics and analytical assumptions".to_string(),
+        "reproducibility_planner" => "Plan reproducibility checks".to_string(),
+        "literature_scout" => "Scout relevant literature and sources".to_string(),
+        "evidence_reviewer" => "Review evidence quality and claim strength".to_string(),
+        "synthesis_planner" => "Plan research synthesis structure".to_string(),
+        "medical_literature_scout" => "Scout medical literature and guidelines".to_string(),
+        "clinical_evidence_reviewer" => "Review clinical evidence and applicability".to_string(),
+        "safety_reviewer" => "Review safety boundaries and risk notes".to_string(),
+        "summary_writer" => "Synthesize worker findings".to_string(),
+        _ => format!("Run read-only worker {}", worker),
+    }
+}
+
+fn worker_description(worker: &str) -> String {
+    WORKER_CAPABILITY_CATALOG
+        .iter()
+        .find(|(role, _)| role == &worker)
+        .map(|(_, capability)| format!("Use {} capability: {}.", worker, capability))
+        .unwrap_or_else(|| format!("Use {} for read-only investigation.", worker))
+}
+
 fn validate_plan(
     goal: &str,
     tasks: &[PlanTask],
@@ -339,13 +544,9 @@ fn validate_plan(
 
     let mut errors: Vec<String> = Vec::new();
     for t in tasks {
-        // Forbidden vague wording anywhere in title/description.
-        let hay = format!("{} {}", t.title, t.description).to_lowercase();
-        for bad in FORBIDDEN_PHRASES {
-            if hay.contains(&bad.to_lowercase()) {
-                errors.push(format!("task '{}' uses forbidden phrase '{bad}'", t.title));
-            }
-        }
+        // Vague wording is sanitized in normalize_tasks and surfaced as a
+        // warning. Do not reject the whole runtime path for a removable phrase
+        // such as "etc."; reserve hard errors for structural plan defects.
         // Implementation / verification tasks must list concrete files or a
         // concrete verification step — otherwise they are not actionable.
         if matches!(
@@ -483,6 +684,7 @@ fn head(s: &str, n: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::classify::ComplexityLabel;
     use super::*;
 
     fn draft(title: &str, kind: &str, files: &[&str], verification: &[&str]) -> PlanTaskDraft {
@@ -531,10 +733,10 @@ mod tests {
     }
 
     #[test]
-    fn validation_rejects_vague_phrasing() {
+    fn normalize_sanitizes_vague_phrasing() {
         let template = ProfileTemplate::for_profile(DomainProfile::General);
         let drafts = vec![PlanTaskDraft {
-            title: "继续完善相关代码".into(),
+            title: "Project Structure Discovery etc.".into(),
             description: "处理边界情况，后续补测试".into(),
             kind: Some("implementation".into()),
             agent_role: Some("implementer".into()),
@@ -547,15 +749,18 @@ mod tests {
         let mut warnings = Vec::new();
         let tasks =
             normalize_tasks(&drafts, &mut warnings, template, DomainProfile::AiCoding).unwrap();
-        let err = validate_plan("g", &tasks, &mut warnings).unwrap_err();
-        match err {
-            PlanError::Quality(msg) => {
-                assert!(msg.contains("继续完善"), "{msg}");
-                assert!(msg.contains("处理边界情况"), "{msg}");
-                assert!(msg.contains("后续补测试"), "{msg}");
-            }
-            _ => panic!("expected Quality error, got {err:?}"),
+        let task = tasks.first();
+        assert!(task.is_some());
+        if let Some(task) = task {
+            assert_eq!(task.title, "Project Structure Discovery");
+            assert!(!task.description.contains("处理边界情况"));
+            assert!(!task.description.contains("后续补测试"));
         }
+        assert!(
+            warnings.iter().any(|w| w.contains("removed vague phrase")),
+            "{warnings:?}"
+        );
+        validate_plan("g", &tasks, &mut warnings).unwrap();
     }
 
     #[test]
@@ -600,6 +805,60 @@ mod tests {
         let tasks =
             normalize_tasks(&drafts, &mut warnings, template, DomainProfile::AiCoding).unwrap();
         validate_plan("Build real runtime", &tasks, &mut warnings).unwrap();
+    }
+
+    #[test]
+    fn deterministic_readonly_plan_builds_parallel_fanout_without_llm() {
+        let classification = Classification {
+            complexity: ComplexityLabel::Complex,
+            inferred_profile: DomainProfile::AiCoding,
+            reason: "test".to_string(),
+            signals: vec!["analysis".to_string()],
+        };
+        let generated = generate_parallel_readonly_plan(
+            "run-1",
+            "请分析这个项目架构",
+            &classification,
+            &[
+                "project_explorer".to_string(),
+                "code_reviewer".to_string(),
+                "test_planner".to_string(),
+                "summary_writer".to_string(),
+            ],
+        );
+
+        assert_eq!(generated.plan.run_id, "run-1");
+        assert!(matches!(
+            generated.plan.execution_mode,
+            ExecutionMode::Parallel
+        ));
+        assert_eq!(generated.plan.tasks.len(), 4);
+        let fanout = generated
+            .plan
+            .tasks
+            .iter()
+            .filter(|task| task.parallel_group.as_deref() == Some("readonly-fanout"))
+            .collect::<Vec<_>>();
+        assert_eq!(fanout.len(), 3);
+        assert!(fanout.iter().all(|task| task.depends_on.is_empty()));
+
+        let summary = generated
+            .plan
+            .tasks
+            .iter()
+            .find(|task| task.agent_role == "summary_writer");
+        assert!(summary.is_some());
+        if let Some(summary) = summary {
+            assert_eq!(summary.depends_on.len(), fanout.len());
+        }
+        assert!(
+            generated
+                .plan
+                .tasks
+                .iter()
+                .all(|task| task.kind.is_read_only())
+        );
+        assert!(generated.warnings.is_empty());
     }
 
     #[test]

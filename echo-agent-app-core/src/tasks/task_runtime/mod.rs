@@ -54,7 +54,7 @@ pub use executor::{ConcurrencyLimits, ExecError, RunOutcome, execute_run};
 pub use hitrisk::{HighRiskMatch, check as check_high_risk, requires_fresh_approval};
 pub use ledger::{export_path, render_progress, write_progress};
 pub use memory_bridge::{MemoryEvent, write_memory_candidate};
-pub use planner::{GeneratedPlan, PlanError, generate_plan};
+pub use planner::{GeneratedPlan, PlanError, generate_parallel_readonly_plan, generate_plan};
 pub use profiles::ProfileTemplate;
 pub use review::{
     BreakerAction, ReviewError, build_fix_task, circuit_breaker_action, requires_review,
