@@ -2,6 +2,7 @@ import { useRef, useCallback, useEffect } from 'react';
 import { useChatStore } from '../stores/chatStore';
 import { useConversationStore } from '../stores/conversationStore';
 import { useSubagentStore, type SubagentEventPayload } from '../stores/subagentStore';
+import { useWorkerTraceStore, type WorkerTraceEvent } from '../stores/workerTraceStore';
 import { isTauri, apiInvoke } from '../lib/tauri-bridge';
 import { handleChatEvent } from './chatEventHandler';
 import type { Attachment, ChatRunStatus } from '../types/api';
@@ -100,8 +101,17 @@ export function useTauriChat() {
           useSubagentStore.getState().upsert(event.payload);
         }
       });
+      const unlistenWorkerTrace = await listen<WorkerTraceEvent>('worker://trace', (event) => {
+        if (mounted) {
+          useWorkerTraceStore.getState().append(event.payload);
+        }
+      });
       const origUnlisten = unlisten;
-      unlistenRef.current = () => { origUnlisten(); unlistenSub(); };
+      unlistenRef.current = () => {
+        origUnlisten();
+        unlistenSub();
+        unlistenWorkerTrace();
+      };
     };
 
     setupListener();

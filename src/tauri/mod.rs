@@ -12,6 +12,7 @@ pub mod state;
 pub mod terminal;
 
 use echo_agent_app_core::AppState;
+use echo_agent_app_core::tasks::task_runtime::{WorkerTraceEvent, WorkerTraceEventKind};
 use serde::Serialize;
 use state::TauriState;
 use std::sync::Arc;
@@ -378,45 +379,106 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                         agent: name,
                                         mode,
                                         task,
-                                    } => serde_json::json!({
-                                        "type": "subagent_started",
-                                        "parent": parent,
-                                        "agent": name,
-                                        "mode": format!("{:?}", mode),
-                                        "task": task,
-                                    }),
+                                    } => {
+                                        let worker_id = format!("{parent}:{name}");
+                                        let trace = WorkerTraceEvent::for_worker(
+                                            parent.clone(),
+                                            worker_id,
+                                            WorkerTraceEventKind::WorkerStarted,
+                                            serde_json::json!({
+                                                "mode": format!("{:?}", mode),
+                                            }),
+                                        )
+                                        .with_agent(name.clone())
+                                        .with_parent_worker(parent.clone())
+                                        .with_title(name.clone())
+                                        .with_task(task.clone());
+                                        let _ = app_handle.emit("worker://trace", &trace);
+                                        serde_json::json!({
+                                            "type": "subagent_started",
+                                            "parent": parent,
+                                            "agent": name,
+                                            "mode": format!("{:?}", mode),
+                                            "task": task,
+                                        })
+                                    }
                                     SubagentEvent::DispatchCompleted {
                                         parent,
                                         agent: name,
                                         duration_ms,
                                         tokens_used,
                                         iterations,
-                                    } => serde_json::json!({
-                                        "type": "subagent_completed",
-                                        "parent": parent,
-                                        "agent": name,
-                                        "duration_ms": duration_ms,
-                                        "tokens_used": tokens_used,
-                                        "iteration_count": iterations,
-                                    }),
+                                    } => {
+                                        let worker_id = format!("{parent}:{name}");
+                                        let trace = WorkerTraceEvent::for_worker(
+                                            parent.clone(),
+                                            worker_id,
+                                            WorkerTraceEventKind::WorkerCompleted,
+                                            serde_json::json!({
+                                                "duration_ms": duration_ms,
+                                                "tokens_used": tokens_used,
+                                                "iteration_count": iterations,
+                                            }),
+                                        )
+                                        .with_agent(name.clone())
+                                        .with_parent_worker(parent.clone())
+                                        .with_title(name.clone());
+                                        let _ = app_handle.emit("worker://trace", &trace);
+                                        serde_json::json!({
+                                            "type": "subagent_completed",
+                                            "parent": parent,
+                                            "agent": name,
+                                            "duration_ms": duration_ms,
+                                            "tokens_used": tokens_used,
+                                            "iteration_count": iterations,
+                                        })
+                                    }
                                     SubagentEvent::DispatchFailed {
                                         parent,
                                         agent: name,
                                         error,
-                                    } => serde_json::json!({
-                                        "type": "subagent_failed",
-                                        "parent": parent,
-                                        "agent": name,
-                                        "error": error,
-                                    }),
+                                    } => {
+                                        let worker_id = format!("{parent}:{name}");
+                                        let trace = WorkerTraceEvent::for_worker(
+                                            parent.clone(),
+                                            worker_id,
+                                            WorkerTraceEventKind::WorkerFailed,
+                                            serde_json::json!({
+                                                "error": error,
+                                            }),
+                                        )
+                                        .with_agent(name.clone())
+                                        .with_parent_worker(parent.clone())
+                                        .with_title(name.clone());
+                                        let _ = app_handle.emit("worker://trace", &trace);
+                                        serde_json::json!({
+                                            "type": "subagent_failed",
+                                            "parent": parent,
+                                            "agent": name,
+                                            "error": error,
+                                        })
+                                    }
                                     SubagentEvent::DispatchCancelled {
                                         parent,
                                         agent: name,
-                                    } => serde_json::json!({
-                                        "type": "subagent_cancelled",
-                                        "parent": parent,
-                                        "agent": name,
-                                    }),
+                                    } => {
+                                        let worker_id = format!("{parent}:{name}");
+                                        let trace = WorkerTraceEvent::for_worker(
+                                            parent.clone(),
+                                            worker_id,
+                                            WorkerTraceEventKind::WorkerCancelled,
+                                            serde_json::json!({}),
+                                        )
+                                        .with_agent(name.clone())
+                                        .with_parent_worker(parent.clone())
+                                        .with_title(name.clone());
+                                        let _ = app_handle.emit("worker://trace", &trace);
+                                        serde_json::json!({
+                                            "type": "subagent_cancelled",
+                                            "parent": parent,
+                                            "agent": name,
+                                        })
+                                    }
                                     _ => continue,
                                 };
                                 let _ = app_handle.emit("subagent://event", &payload);

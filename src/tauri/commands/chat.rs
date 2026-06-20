@@ -8,7 +8,9 @@ use crate::tauri::state::TauriState;
 use echo_agent::agent::{Agent, CancellationToken};
 use echo_agent::human_loop::{HumanLoopProvider, HumanLoopRequest, HumanLoopResponse};
 use echo_agent::prelude::AgentEvent;
-use echo_agent_app_core::tasks::task_runtime::{InteractionMode, TaskRouteDecision, TaskRunStatus};
+use echo_agent_app_core::tasks::task_runtime::{
+    InteractionMode, TaskRouteDecision, TaskRunStatus, WorkerTraceEvent, WorkerTraceEventKind,
+};
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use serde::Serialize;
@@ -119,6 +121,20 @@ fn emit_chat_event(
     }
 
     app.emit("chat://event", payload).is_ok()
+}
+
+fn emit_worker_trace_event(app: &tauri::AppHandle, event: WorkerTraceEvent) -> bool {
+    app.emit("worker://trace", event).is_ok()
+}
+
+fn chat_trace_event(
+    message_key: &str,
+    event_type: WorkerTraceEventKind,
+    payload: serde_json::Value,
+) -> WorkerTraceEvent {
+    WorkerTraceEvent::for_worker(message_key, "main", event_type, payload)
+        .with_agent("echo-assistant")
+        .with_title("Assistant")
 }
 
 /// Global pending map for approval/input responses.
@@ -442,6 +458,27 @@ pub async fn send_chat_message(
             &event_message_key,
             &event_conversation_id,
         );
+        emit_worker_trace_event(
+            &app_handle,
+            chat_trace_event(
+                &event_message_key,
+                WorkerTraceEventKind::RunStarted,
+                serde_json::json!({
+                    "conversation_id": event_conversation_id,
+                    "mode": "chat"
+                }),
+            ),
+        );
+        emit_worker_trace_event(
+            &app_handle,
+            chat_trace_event(
+                &event_message_key,
+                WorkerTraceEventKind::WorkerStarted,
+                serde_json::json!({
+                    "role": "assistant"
+                }),
+            ),
+        );
 
         // ReactAgent serializes execution internally via execution_mutex.
         //
@@ -461,7 +498,17 @@ pub async fn send_chat_message(
                     match event_result {
                         Ok(event) => {
                             let chat_event = match event {
-                                AgentEvent::Token(data) => ChatEvent::Token { data },
+                                AgentEvent::Token(data) => {
+                                    emit_worker_trace_event(
+                                        &app_handle,
+                                        chat_trace_event(
+                                            &event_message_key,
+                                            WorkerTraceEventKind::WorkerTokenDelta,
+                                            serde_json::json!({ "content": data }),
+                                        ),
+                                    );
+                                    ChatEvent::Token { data }
+                                }
                                 AgentEvent::ThinkStart => {
                                     emit_chat_event(
                                         &app_handle,
@@ -471,15 +518,36 @@ pub async fn send_chat_message(
                                         &event_message_key,
                                         &event_conversation_id,
                                     );
+                                    emit_worker_trace_event(
+                                        &app_handle,
+                                        chat_trace_event(
+                                            &event_message_key,
+                                            WorkerTraceEventKind::WorkerThinkingStart,
+                                            serde_json::json!({}),
+                                        ),
+                                    );
                                     ChatEvent::ThinkingStart
                                 }
                                 AgentEvent::ThinkEnd {
                                     prompt_tokens,
                                     completion_tokens,
-                                } => ChatEvent::ThinkingEnd {
-                                    prompt_tokens,
-                                    completion_tokens,
-                                },
+                                } => {
+                                    emit_worker_trace_event(
+                                        &app_handle,
+                                        chat_trace_event(
+                                            &event_message_key,
+                                            WorkerTraceEventKind::WorkerThinkingEnd,
+                                            serde_json::json!({
+                                                "prompt_tokens": prompt_tokens,
+                                                "completion_tokens": completion_tokens
+                                            }),
+                                        ),
+                                    );
+                                    ChatEvent::ThinkingEnd {
+                                        prompt_tokens,
+                                        completion_tokens,
+                                    }
+                                }
                                 AgentEvent::ToolCall { name, args } => {
                                     emit_chat_event(
                                         &app_handle,
@@ -489,18 +557,57 @@ pub async fn send_chat_message(
                                         &event_message_key,
                                         &event_conversation_id,
                                     );
+                                    emit_worker_trace_event(
+                                        &app_handle,
+                                        chat_trace_event(
+                                            &event_message_key,
+                                            WorkerTraceEventKind::WorkerToolStart,
+                                            serde_json::json!({
+                                                "name": name,
+                                                "args": args
+                                            }),
+                                        ),
+                                    );
                                     ChatEvent::ToolStart { name, args }
                                 }
-                                AgentEvent::ToolResult { name, output } => ChatEvent::ToolResult {
-                                    name,
-                                    result: output,
-                                    success: true,
-                                },
-                                AgentEvent::ToolError { name, error } => ChatEvent::ToolResult {
-                                    name,
-                                    result: error,
-                                    success: false,
-                                },
+                                AgentEvent::ToolResult { name, output } => {
+                                    emit_worker_trace_event(
+                                        &app_handle,
+                                        chat_trace_event(
+                                            &event_message_key,
+                                            WorkerTraceEventKind::WorkerToolResult,
+                                            serde_json::json!({
+                                                "name": name,
+                                                "result": output,
+                                                "success": true
+                                            }),
+                                        ),
+                                    );
+                                    ChatEvent::ToolResult {
+                                        name,
+                                        result: output,
+                                        success: true,
+                                    }
+                                }
+                                AgentEvent::ToolError { name, error } => {
+                                    emit_worker_trace_event(
+                                        &app_handle,
+                                        chat_trace_event(
+                                            &event_message_key,
+                                            WorkerTraceEventKind::WorkerToolResult,
+                                            serde_json::json!({
+                                                "name": name,
+                                                "result": error,
+                                                "success": false
+                                            }),
+                                        ),
+                                    );
+                                    ChatEvent::ToolResult {
+                                        name,
+                                        result: error,
+                                        success: false,
+                                    }
+                                }
                                 AgentEvent::ToolBatchStart { tool_count } => {
                                     ChatEvent::ToolBatchStart { tool_count }
                                 }
@@ -508,14 +615,41 @@ pub async fn send_chat_message(
                                 AgentEvent::Chart { spec } => ChatEvent::Chart { spec },
                                 AgentEvent::FinalAnswer(data) => {
                                     terminal_status = "completed".to_string();
+                                    emit_worker_trace_event(
+                                        &app_handle,
+                                        chat_trace_event(
+                                            &event_message_key,
+                                            WorkerTraceEventKind::WorkerCompleted,
+                                            serde_json::json!({}),
+                                        ),
+                                    );
                                     ChatEvent::FinalAnswer { data }
                                 }
                                 AgentEvent::Cancelled => {
                                     terminal_status = "cancelled".to_string();
+                                    emit_worker_trace_event(
+                                        &app_handle,
+                                        chat_trace_event(
+                                            &event_message_key,
+                                            WorkerTraceEventKind::WorkerCancelled,
+                                            serde_json::json!({}),
+                                        ),
+                                    );
                                     ChatEvent::Cancelled
                                 }
                                 AgentEvent::Error { source, message } => {
                                     terminal_status = "failed".to_string();
+                                    emit_worker_trace_event(
+                                        &app_handle,
+                                        chat_trace_event(
+                                            &event_message_key,
+                                            WorkerTraceEventKind::WorkerFailed,
+                                            serde_json::json!({
+                                                "source": source,
+                                                "message": message
+                                            }),
+                                        ),
+                                    );
                                     ChatEvent::Error {
                                         message: format!("{source}: {message}"),
                                     }
@@ -561,6 +695,22 @@ pub async fn send_chat_message(
         }
 
         // Emit done event
+        let terminal_trace_kind = match terminal_status.as_str() {
+            "completed" => WorkerTraceEventKind::RunCompleted,
+            "cancelled" => WorkerTraceEventKind::RunCancelled,
+            "failed" => WorkerTraceEventKind::RunFailed,
+            _ => WorkerTraceEventKind::RunStatusChanged,
+        };
+        emit_worker_trace_event(
+            &app_handle,
+            chat_trace_event(
+                &event_message_key,
+                terminal_trace_kind,
+                serde_json::json!({
+                    "status": terminal_status.clone()
+                }),
+            ),
+        );
         let _ = emit_chat_event(
             &app_handle,
             &ChatEvent::RunStatus {
