@@ -33,6 +33,7 @@ interface ChatEventLike {
   auto_execute?: boolean;
   planned_workers?: string[];
   suggested_workers?: string[];
+  active_skills?: string[];
   route_signals?: string[];
   classification_signals?: string[];
 }
@@ -171,6 +172,7 @@ export function handleChatEvent(
           autoExecute: event.auto_execute,
           plannedWorkers: event.planned_workers ?? [],
           suggestedWorkers: event.suggested_workers ?? [],
+          activeSkills: event.active_skills ?? [],
           routeSignals: event.route_signals ?? [],
           classificationSignals: event.classification_signals ?? [],
         });

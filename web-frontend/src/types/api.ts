@@ -53,6 +53,14 @@ export interface SkillInfo {
   name: string;
   description: string;
   file: string;
+  loaded?: boolean;
+  source?: string;
+  triggers?: string[];
+  tags?: string[];
+  version?: string | null;
+  author?: string | null;
+  has_sandbox?: boolean;
+  depends_on?: string[];
 }
 
 export interface McpServerInfo {
@@ -211,6 +219,7 @@ export type ServerMessage =
       auto_execute?: boolean;
       planned_workers?: string[];
       suggested_workers?: string[];
+      active_skills?: string[];
       route_signals?: string[];
       classification_signals?: string[];
     }

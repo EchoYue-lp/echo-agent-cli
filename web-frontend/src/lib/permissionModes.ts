@@ -22,6 +22,7 @@ export function normalizePermissionMode(mode?: string) {
     case 'strict':
       return 'strict';
     case 'plan':
+    case 'auto':
       return 'default';
     case 'ask':
       return 'default';

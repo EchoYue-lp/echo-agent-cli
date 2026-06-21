@@ -182,7 +182,7 @@ pub struct AgentPool {
     permission_mode: RwLock<String>,
     /// Skill descriptors extracted from the primary agent.
     /// Pool agents register these instead of re-reading from disk.
-    skill_descriptors: Vec<echo_agent::skills::external::SkillDescriptor>,
+    skill_descriptors: RwLock<Vec<echo_agent::skills::external::SkillDescriptor>>,
     /// Cancellation token for the cleanup monitor task.
     cleanup_cancel: CancellationToken,
 }
@@ -209,7 +209,7 @@ impl AgentPool {
             app_config: RwLock::new(runtime.app_config.clone()),
             runtime_llm_config: RwLock::new(None),
             permission_mode: RwLock::new("default".to_string()),
-            skill_descriptors,
+            skill_descriptors: RwLock::new(skill_descriptors),
             cleanup_cancel: CancellationToken::new(),
         };
 
@@ -425,6 +425,43 @@ impl AgentPool {
 
         let pooled_agents = self.agents.read().await.len();
         tracing::info!(mode = %mode, pooled_agents, "AgentPool: permission mode applied");
+    }
+
+    /// Refresh available file-based skill descriptors for future and existing
+    /// pooled agents after the primary agent discovers or loads skills.
+    pub async fn refresh_skill_descriptors(
+        &self,
+        descriptors: Vec<echo_agent::skills::external::SkillDescriptor>,
+    ) {
+        *self.skill_descriptors.write().await = descriptors.clone();
+
+        let agents: Vec<AgentHandle> = self
+            .agents
+            .read()
+            .await
+            .values()
+            .map(|pa| pa.handle.clone())
+            .collect();
+        let descriptor_count = descriptors.len();
+        for handle in agents {
+            let descriptors = descriptors.clone();
+            handle
+                .write_async(|agent| {
+                    Box::pin(async move {
+                        for desc in descriptors {
+                            agent.skill_registry_mut().register_descriptor(desc);
+                        }
+                    })
+                })
+                .await;
+        }
+
+        let pooled_agents = self.agents.read().await.len();
+        tracing::info!(
+            descriptor_count,
+            pooled_agents,
+            "AgentPool: skill descriptors refreshed"
+        );
     }
 
     /// Propagate `working_dir` to all pooled agents.
@@ -657,7 +694,8 @@ impl AgentPool {
 
         // 3. Register skill descriptors extracted from primary agent
         //    (avoids re-reading SKILL.md files from disk for each pool agent)
-        for desc in &self.skill_descriptors {
+        let skill_descriptors = self.skill_descriptors.read().await.clone();
+        for desc in &skill_descriptors {
             agent.skill_registry_mut().register_descriptor(desc.clone());
         }
 
@@ -935,7 +973,7 @@ mod tests {
             app_config: RwLock::new(AppConfig::default()),
             runtime_llm_config: RwLock::new(None),
             permission_mode: RwLock::new("default".to_string()),
-            skill_descriptors: vec![],
+            skill_descriptors: RwLock::new(vec![]),
             cleanup_cancel: CancellationToken::new(),
         }
     }
@@ -967,7 +1005,7 @@ mod tests {
             app_config: RwLock::new(AppConfig::default()),
             runtime_llm_config: RwLock::new(None),
             permission_mode: RwLock::new("default".to_string()),
-            skill_descriptors: vec![],
+            skill_descriptors: RwLock::new(vec![]),
             cleanup_cancel: CancellationToken::new(),
         }
     }

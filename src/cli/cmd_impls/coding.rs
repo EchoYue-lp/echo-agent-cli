@@ -572,7 +572,6 @@ async fn cmd_permission(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             "  auto-edit  — Read and file edit operations are auto-approved; shell still requires confirmation"
         );
         println!("  full-auto  — All operations auto-approved (bypass permissions)");
-        println!("  auto       — AI classifier decides (when available)");
         println!("  strict     — Ask before writes, shell, network, and sensitive operations");
         println!();
         println!("Usage: /permission <mode>");
@@ -584,11 +583,11 @@ async fn cmd_permission(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         "default" => "default",
         "auto-edit" | "autoedit" | "accept-edits" => "auto-edit",
         "full-auto" | "fullauto" | "bypass" => "full-auto",
-        "auto" => "auto",
+        "auto" | "plan" => "default",
         "strict" | "strict-confirm" | "strict-confirmation" => "strict",
         _ => {
             println!("Unknown permission mode: '{}'", mode);
-            println!("Valid modes: default, auto-edit, full-auto, auto, strict");
+            println!("Valid modes: default, auto-edit, full-auto, strict");
             return CommandOutcome::Continue;
         }
     };
@@ -605,7 +604,6 @@ async fn cmd_permission(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         "strict" => println!(
             "Permission mode: strict — writes, shell, network, and sensitive operations require confirmation."
         ),
-        "auto" => println!("Permission mode: auto — AI classifier decides."),
         _ => println!("Permission mode: default — standard approval flow."),
     }
 

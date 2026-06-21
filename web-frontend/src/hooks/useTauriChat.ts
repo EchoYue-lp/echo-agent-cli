@@ -57,6 +57,7 @@ type ChatEvent = ChatEventBase &
       auto_execute: boolean;
       planned_workers: string[];
       suggested_workers: string[];
+      active_skills: string[];
       route_signals: string[];
       classification_signals: string[];
     }

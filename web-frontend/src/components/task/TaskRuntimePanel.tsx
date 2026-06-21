@@ -179,6 +179,7 @@ function deriveRouteExplanation(
       domainProfile: liveExplanation.domainProfile ?? run.domain_profile,
       plannedWorkers,
       suggestedWorkers: liveExplanation.suggestedWorkers ?? [],
+      activeSkills: liveExplanation.activeSkills ?? [],
     };
   }
 
@@ -202,6 +203,7 @@ function deriveRouteExplanation(
     autoExecute,
     plannedWorkers: workerNames,
     suggestedWorkers: workerNames,
+    activeSkills: [],
     routeSignals: allReadOnly ? ['saved_plan_all_read_only'] : ['saved_task_runtime_run'],
     classificationSignals: [`domain:${domainProfileLabel(run.domain_profile)}`],
   };
@@ -1009,6 +1011,9 @@ export function TaskRuntimeMainPanel() {
                 <CompactTag>{permissionLabel(effectiveRouteExplanation.permissionMode)}</CompactTag>
               )}
               <CompactTag>领域 {domainProfileLabel(effectiveRouteExplanation.domainProfile)}</CompactTag>
+              {effectiveRouteExplanation.activeSkills?.map((skill) => (
+                <CompactTag key={skill}>技能 {skill}</CompactTag>
+              ))}
             </div>
             {effectiveRouteExplanation.approvalPolicy && (
               <div className="mt-2 flex gap-1.5 text-[11px] leading-snug" style={{ color: 'var(--text-tertiary)' }}>

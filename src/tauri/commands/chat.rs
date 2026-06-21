@@ -94,6 +94,7 @@ pub enum ChatEvent {
         auto_execute: bool,
         planned_workers: Vec<String>,
         suggested_workers: Vec<String>,
+        active_skills: Vec<String>,
         route_signals: Vec<String>,
         classification_signals: Vec<String>,
     },
@@ -994,6 +995,12 @@ async fn route_complex_task(
     }
 
     // 5. Emit plan_ready so the GUI can render the plan + approval actions.
+    let active_skills = state
+        .app_state
+        .connection
+        .primary_agent()
+        .read(|agent| agent.skill_registry().activated_names())
+        .await;
     emit_chat_event(
         &app,
         &ChatEvent::PlanReady {
@@ -1018,6 +1025,7 @@ async fn route_complex_task(
             auto_execute,
             planned_workers,
             suggested_workers: route_decision.suggested_workers.clone(),
+            active_skills,
             route_signals: route_decision
                 .reason
                 .split("routing_signals:")

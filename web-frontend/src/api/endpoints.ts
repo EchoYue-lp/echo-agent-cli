@@ -168,6 +168,20 @@ export const skillsApi = {
     isTauri()
       ? apiInvoke<LoadSkillsResponse>('load_skill', { name: dir })
       : post<LoadSkillsResponse>('/skills/load', { dir }),
+  enable: (name: string) =>
+    isTauri()
+      ? apiInvoke<LoadSkillsResponse>('enable_skill', { name })
+      : post<LoadSkillsResponse>(`/skills/${name}/enable`, {}),
+  disable: (name: string) =>
+    isTauri()
+      ? apiInvoke<{ success: boolean; requires_restart?: boolean; message?: string; skills?: SkillInfo[] }>(
+          'disable_skill',
+          { name }
+        )
+      : post<{ success: boolean; requires_restart?: boolean; message?: string; skills?: SkillInfo[] }>(
+          `/skills/${name}/disable`,
+          {}
+        ),
   upload: (rootDir: string, files: { path: string; content: string }[]) =>
     isTauri()
       ? Promise.reject(new Error('Tauri 模式请使用“浏览”选择本地技能目录加载'))

@@ -212,6 +212,8 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
             commands::panels::list_skills,
             commands::panels::get_skill,
             commands::panels::load_skill,
+            commands::panels::enable_skill,
+            commands::panels::disable_skill,
             commands::panels::upload_skill,
             commands::panels::list_workflows,
             commands::panels::get_workflow,

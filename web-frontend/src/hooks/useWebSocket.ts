@@ -237,6 +237,7 @@ export function useWebSocket() {
             autoExecute: msg.auto_execute,
             plannedWorkers: msg.planned_workers ?? [],
             suggestedWorkers: msg.suggested_workers ?? [],
+            activeSkills: msg.active_skills ?? [],
             routeSignals: msg.route_signals ?? [],
             classificationSignals: msg.classification_signals ?? [],
           });

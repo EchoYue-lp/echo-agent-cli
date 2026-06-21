@@ -35,11 +35,14 @@ pub async fn set_permissions_mode(
         "default" => "default",
         "auto-edit" | "autoedit" | "accept-edits" | "auto-approve" => "auto-edit",
         "full-auto" | "fullauto" | "bypass" => "full-auto",
-        "auto" => "auto",
+        // Legacy config/UI alias from before interaction mode was separated
+        // from approval mode. Auto routing is controlled by InteractionMode;
+        // approval mode has only the four user-facing variants below.
+        "auto" | "plan" => "default",
         "strict" | "strict-confirm" | "strict-confirmation" => "strict",
         _ => {
             return Err(IpcError::Validation(format!(
-                "Invalid permission mode '{}'. Valid: default, auto-edit, full-auto, auto, strict",
+                "Invalid permission mode '{}'. Valid: default, auto-edit, full-auto, strict",
                 mode
             )));
         }
@@ -390,16 +393,84 @@ fn skill_descriptor_json(d: &echo_agent::skills::external::SkillDescriptor) -> s
         "description": d.description,
         "triggers": d.triggers,
         "file": d.location.display().to_string(),
+        "loaded": true,
+        "source": "runtime",
     })
+}
+
+fn hub_skill_json(entry: &echo_agent_app_core::skills_hub::SkillHubEntry) -> serde_json::Value {
+    json!({
+        "name": entry.name,
+        "description": entry.description,
+        "file": entry.path.display().to_string(),
+        "loaded": entry.loaded,
+        "source": "hub",
+        "license": entry.license,
+        "version": entry.version,
+        "author": entry.author,
+        "tags": entry.tags,
+        "has_sandbox": entry.has_sandbox,
+        "depends_on": entry.depends_on,
+    })
+}
+
+async fn runtime_skill_names(state: &TauriState) -> Vec<String> {
+    let agent = state.app_state.connection.primary_agent();
+    agent
+        .read(|a| {
+            a.skill_descriptors()
+                .iter()
+                .map(|descriptor| descriptor.name.clone())
+                .collect::<Vec<_>>()
+        })
+        .await
+}
+
+async fn refresh_skill_hub_loaded_state(state: &TauriState) {
+    let names = runtime_skill_names(state).await;
+    let mut hub = state.app_state.skills_hub.write().await;
+    hub.refresh();
+    hub.set_loaded_skills(names);
+}
+
+async fn refresh_pool_skill_descriptors(state: &TauriState) {
+    let descriptors = state
+        .app_state
+        .connection
+        .primary_agent()
+        .read(|a| a.skill_descriptors())
+        .await;
+    if let Some(pool) = &state.app_state.connection.pool {
+        pool.refresh_skill_descriptors(descriptors).await;
+    }
 }
 
 #[tauri::command]
 pub async fn list_skills(
     state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
+    refresh_skill_hub_loaded_state(&state).await;
     let agent = state.app_state.connection.primary_agent();
     let descriptors = agent.read(|a| a.skill_descriptors()).await;
-    let skills: Vec<serde_json::Value> = descriptors.iter().map(skill_descriptor_json).collect();
+    let mut skills: Vec<serde_json::Value> = {
+        let hub = state.app_state.skills_hub.read().await;
+        hub.list().into_iter().map(hub_skill_json).collect()
+    };
+    for descriptor in descriptors {
+        if !skills.iter().any(|skill| {
+            skill
+                .get("name")
+                .and_then(|name| name.as_str())
+                .is_some_and(|name| name == descriptor.name)
+        }) {
+            skills.push(skill_descriptor_json(&descriptor));
+        }
+    }
+    skills.sort_by(|a, b| {
+        let a_name = a.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+        let b_name = b.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+        a_name.cmp(b_name)
+    });
     Ok(json!(skills))
 }
 
@@ -463,6 +534,8 @@ pub async fn load_skill(
         .await
         .map_err(|e| IpcError::Internal(e.to_string()))?;
     let count = loaded.len();
+    refresh_skill_hub_loaded_state(&state).await;
+    refresh_pool_skill_descriptors(&state).await;
 
     let skills: Vec<serde_json::Value> = agent
         .read(|a| {
@@ -478,6 +551,65 @@ pub async fn load_skill(
         "loaded": loaded,
         "count": count,
         "skills": skills,
+    }))
+}
+
+#[tauri::command]
+pub async fn enable_skill(
+    state: tauri::State<'_, TauriState>,
+    name: String,
+) -> Result<serde_json::Value, IpcError> {
+    let skill_path = {
+        let mut hub = state.app_state.skills_hub.write().await;
+        hub.refresh();
+        hub.enable_skill(&name).map_err(IpcError::Validation)?;
+        hub.get(&name)
+            .map(|entry| entry.path.clone())
+            .ok_or_else(|| IpcError::NotFound(format!("Skill '{}' not found", name)))?
+    };
+
+    let load_root = skill_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or(skill_path);
+    let loaded = state
+        .app_state
+        .connection
+        .primary_agent()
+        .write_async(|agent| {
+            let path = load_root.clone();
+            Box::pin(async move { agent.load_skills_from_dir(path).await })
+        })
+        .await
+        .map_err(|e| IpcError::Internal(e.to_string()))?;
+    let count = loaded.len();
+    refresh_skill_hub_loaded_state(&state).await;
+    refresh_pool_skill_descriptors(&state).await;
+
+    Ok(json!({
+        "success": true,
+        "loaded": loaded,
+        "count": count,
+        "skills": list_skills(state).await?,
+    }))
+}
+
+#[tauri::command]
+pub async fn disable_skill(
+    state: tauri::State<'_, TauriState>,
+    name: String,
+) -> Result<serde_json::Value, IpcError> {
+    {
+        let mut hub = state.app_state.skills_hub.write().await;
+        hub.refresh();
+        hub.disable_skill(&name).map_err(IpcError::Validation)?;
+    }
+
+    Ok(json!({
+        "success": true,
+        "requires_restart": true,
+        "message": "技能已经从 Hub 启用列表移除；当前运行中的 agent 已发现的技能不能热卸载，新会话或重启后生效。",
+        "skills": list_skills(state).await?,
     }))
 }
 
