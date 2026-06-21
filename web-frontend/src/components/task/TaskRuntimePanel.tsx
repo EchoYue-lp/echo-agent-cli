@@ -29,6 +29,7 @@ import {
   Sparkles,
   Copy,
   Gauge,
+  AlertTriangle,
 } from 'lucide-react';
 import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
 import { useConversationStore } from '../../stores/conversationStore';
@@ -289,6 +290,12 @@ interface CacheUsageSummary {
   models: string[];
 }
 
+interface CacheDiagnostic {
+  severity: 'good' | 'warn' | 'info';
+  label: string;
+  detail: string;
+}
+
 function cacheUsageFromEvents(events: WorkerTraceEvent[]): CacheUsageSummary {
   const usageEvents = events.filter((event) => event.event_type === 'worker_llm_usage');
   const models = uniqueValues(usageEvents.map((event) => payloadValue(event, 'model')));
@@ -327,6 +334,72 @@ function cacheReadRate(summary: CacheUsageSummary): number | null {
   return summary.cachedPromptTokens / summary.inputTokens;
 }
 
+function cacheDiagnostics(summary: CacheUsageSummary): CacheDiagnostic[] {
+  if (summary.calls === 0) return [];
+  const diagnostics: CacheDiagnostic[] = [];
+  const rate = cacheReadRate(summary);
+
+  if (summary.missingUsage > 0) {
+    diagnostics.push({
+      severity: 'warn',
+      label: 'provider usage 缺失',
+      detail: `${summary.missingUsage} 次 LLM 请求没有返回 usage 元数据，缓存命中率会被低估或无法判断。`,
+    });
+  }
+
+  if (summary.models.length > 1) {
+    diagnostics.push({
+      severity: 'warn',
+      label: '模型不一致',
+      detail: `本次任务使用了 ${summary.models.length} 个模型。不同模型通常不会共享 provider prompt cache。`,
+    });
+  }
+
+  if (rate != null && summary.inputTokens > 0 && summary.cachedPromptTokens === 0 && summary.missingUsage < summary.calls) {
+    diagnostics.push({
+      severity: 'warn',
+      label: '没有 cache read',
+      detail: 'provider 已返回 usage，但 cached prompt tokens 为 0。优先检查 system prefix、tools 定义、worker prompt 和动态上下文是否每轮变化。',
+    });
+  } else if (rate != null && rate < 0.2 && summary.inputTokens >= 1000) {
+    diagnostics.push({
+      severity: 'warn',
+      label: 'cache read 偏低',
+      detail: `当前 read rate ${(rate * 100).toFixed(1)}%。建议对比同模型同任务下的 system prefix、tools 顺序、cwd/记忆/hook 注入位置。`,
+    });
+  } else if (rate != null && rate >= 0.8) {
+    diagnostics.push({
+      severity: 'good',
+      label: 'cache read 良好',
+      detail: `当前 read rate ${(rate * 100).toFixed(1)}%，说明稳定前缀大概率已被 provider 复用。`,
+    });
+  }
+
+  if (summary.cacheCreationPromptTokens > summary.cachedPromptTokens && summary.cacheCreationPromptTokens > 0) {
+    diagnostics.push({
+      severity: 'info',
+      label: 'cache write 高于 read',
+      detail: '本轮更多是在创建缓存而非读取缓存。连续重复同类任务时，如果 read 仍不升高，再检查前缀稳定性。',
+    });
+  }
+
+  if (diagnostics.length === 0 && summary.calls > 0) {
+    diagnostics.push({
+      severity: 'info',
+      label: '数据不足',
+      detail: '当前 usage 数据不足以判断命中低的原因。重复同模型同提示词任务后再观察 cached tokens 和 read rate。',
+    });
+  }
+
+  return diagnostics;
+}
+
+function diagnosticColor(severity: CacheDiagnostic['severity']): string {
+  if (severity === 'good') return 'var(--color-success)';
+  if (severity === 'warn') return 'var(--color-warning)';
+  return 'var(--text-tertiary)';
+}
+
 function CacheUsageCard({
   summary,
   compact = false,
@@ -336,6 +409,7 @@ function CacheUsageCard({
 }) {
   if (summary.calls === 0) return null;
   const rate = cacheReadRate(summary);
+  const diagnostics = cacheDiagnostics(summary);
   const valueClass = compact ? 'text-[11px]' : 'text-sm';
   const labelClass = compact ? 'text-[9px]' : 'text-[10px]';
 
@@ -371,6 +445,26 @@ function CacheUsageCard({
       {summary.missingUsage > 0 && (
         <div className="mt-1 text-[9px] leading-snug" style={{ color: 'var(--color-warning)' }}>
           有 {summary.missingUsage} 次请求没有 provider usage 元数据；这些请求不会被计入缓存命中率。
+        </div>
+      )}
+      {!compact && diagnostics.length > 0 && (
+        <div className="mt-3 space-y-1.5">
+          <div className="flex items-center gap-1 text-[10px] font-medium" style={{ color: 'var(--text-secondary)' }}>
+            <AlertTriangle size={11} />
+            缓存诊断
+          </div>
+          {diagnostics.map((diagnostic) => (
+            <div
+              key={`${diagnostic.label}:${diagnostic.detail}`}
+              className="rounded-md px-2 py-1.5 text-[10px] leading-snug"
+              style={{ background: 'var(--bg-hover)', color: 'var(--text-secondary)' }}
+            >
+              <div className="mb-0.5 font-medium" style={{ color: diagnosticColor(diagnostic.severity) }}>
+                {diagnostic.label}
+              </div>
+              <div>{diagnostic.detail}</div>
+            </div>
+          ))}
         </div>
       )}
     </div>
