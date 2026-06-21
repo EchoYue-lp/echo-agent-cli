@@ -44,53 +44,60 @@ interface SettingsItem {
   id: SettingsTabId;
   label: string;
   icon: typeof Settings;
+  maturity: 'core' | 'live' | 'advanced' | 'lab';
+  description: string;
 }
 
 const settingsGroups: { label: string; icon: typeof Settings; items: SettingsItem[] }[] = [
   {
-    label: '智能体',
+    label: '核心工作流',
     icon: Cpu,
     items: [
-      { id: 'config', label: '配置', icon: Settings },
-      { id: 'providers', label: '模型供应商', icon: Cpu },
-      { id: 'tools', label: '工具', icon: Wrench },
-      { id: 'mcp', label: 'MCP', icon: Globe },
-      { id: 'skills', label: '技能', icon: BookOpen },
-      { id: 'plugins', label: '插件', icon: Package },
-      { id: 'memory', label: '记忆', icon: Brain },
+      { id: 'providers', label: '模型', icon: Cpu, maturity: 'core', description: '模型、供应商和默认模型' },
+      { id: 'tools', label: '工具', icon: Wrench, maturity: 'core', description: 'Agent 可用工具与权限' },
+      { id: 'mcp', label: 'MCP', icon: Globe, maturity: 'core', description: '本地扩展服务连接' },
+      { id: 'routeFeedback', label: '路由学习', icon: BrainCircuit, maturity: 'core', description: 'Chat/Task/Auto 反馈规则' },
+      { id: 'observability', label: '运行观测', icon: Activity, maturity: 'core', description: 'Token、缓存、trace 与诊断' },
+      { id: 'memory', label: '记忆', icon: Brain, maturity: 'live', description: '项目与用户记忆' },
     ],
   },
   {
-    label: '数据',
+    label: '项目数据',
     icon: Database,
     items: [
-      { id: 'sessions', label: '会话', icon: Save },
-      { id: 'scratchpad', label: '草稿', icon: FileEdit },
-      { id: 'decisions', label: '决策', icon: Scale },
-      { id: 'compress', label: '压缩', icon: Minimize2 },
+      { id: 'sessions', label: '会话', icon: Save, maturity: 'live', description: '会话历史与恢复' },
+      { id: 'decisions', label: '决策', icon: Scale, maturity: 'live', description: '关键决策记录' },
+      { id: 'scratchpad', label: '草稿', icon: FileEdit, maturity: 'advanced', description: '临时笔记与中间材料' },
+      { id: 'compress', label: '压缩', icon: Minimize2, maturity: 'advanced', description: '上下文压缩与摘要' },
     ],
   },
   {
-    label: '安全',
+    label: '治理',
     icon: ShieldCheck,
-    items: [{ id: 'audit', label: '审计', icon: ShieldCheck }],
-  },
-  {
-    label: '运行时',
-    icon: Activity,
     items: [
-      { id: 'observability', label: '运行观测', icon: Activity },
-      { id: 'routeFeedback', label: '路由学习', icon: BrainCircuit },
-      { id: 'scheduler', label: '定时任务', icon: Timer },
-      { id: 'worktree', label: 'Worktree', icon: GitBranch },
+      { id: 'audit', label: '审计', icon: ShieldCheck, maturity: 'live', description: '审批、工具与风险日志' },
+      { id: 'config', label: '配置', icon: Settings, maturity: 'advanced', description: '底层应用配置' },
+      { id: 'worktree', label: 'Worktree', icon: GitBranch, maturity: 'advanced', description: '并行开发工作区' },
     ],
   },
   {
-    label: '智能',
+    label: '扩展与实验',
     icon: Sparkles,
-    items: [{ id: 'evolution', label: '自进化', icon: Sparkles }],
+    items: [
+      { id: 'skills', label: '技能', icon: BookOpen, maturity: 'advanced', description: '可加载的能力包' },
+      { id: 'plugins', label: '插件', icon: Package, maturity: 'advanced', description: '本地插件市场' },
+      { id: 'scheduler', label: '定时任务', icon: Timer, maturity: 'advanced', description: '后台计划任务' },
+      { id: 'evolution', label: '自进化', icon: Sparkles, maturity: 'lab', description: '实验性自我改进流程' },
+    ],
   },
 ];
+
+const maturityLabel: Record<SettingsItem['maturity'], string> = {
+  core: '核心',
+  live: '可用',
+  advanced: '高级',
+  lab: '实验',
+};
 
 const panels: Record<SettingsTabId, React.FC> = {
   tools: ToolsPanel,
@@ -180,19 +187,29 @@ export function SettingsDialog() {
                     {group.label}
                   </span>
                 </div>
-                {group.items.map(({ id, label, icon: Icon }) => (
+                {group.items.map(({ id, label, icon: Icon, maturity, description }) => (
                   <button
                     key={id}
                     onClick={() => setActiveSettingsTab(id)}
-                    className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-[13px] font-medium transition-all duration-150
+                    className={`flex w-full items-start gap-3 rounded-lg px-3 py-2.5 text-left transition-all duration-150
                       ${
                         effectiveSettingsTab === id
                           ? 'bg-[var(--settings-active-bg)] text-[var(--text-primary)]'
                           : 'text-[var(--text-secondary)] hover:bg-[var(--bg-sidebar-hover)] hover:text-[var(--text-primary)]'
                       }`}
                   >
-                    <Icon size={15} className="shrink-0" />
-                    {label}
+                    <Icon size={15} className="mt-0.5 shrink-0" />
+                    <span className="min-w-0 flex-1">
+                      <span className="flex min-w-0 items-center gap-2">
+                        <span className="truncate text-[13px] font-medium">{label}</span>
+                        <span className="shrink-0 rounded bg-[var(--bg-hover)] px-1.5 py-0.5 text-[9px] text-[var(--text-tertiary)]">
+                          {maturityLabel[maturity]}
+                        </span>
+                      </span>
+                      <span className="mt-0.5 block truncate text-[10px] font-normal text-[var(--text-tertiary)]">
+                        {description}
+                      </span>
+                    </span>
                   </button>
                 ))}
               </div>
@@ -203,9 +220,23 @@ export function SettingsDialog() {
         {/* Content area */}
         <div className="flex flex-1 flex-col min-w-0 bg-[var(--settings-content-bg)]">
           <div className="flex items-center justify-between border-b border-[var(--border-secondary)] bg-[var(--settings-panel-bg)] px-6 py-3.5">
-            <span className="text-sm font-semibold text-[var(--text-primary)]">
-              {effectiveItem?.label}
-            </span>
+            <div className="min-w-0">
+              <div className="flex items-center gap-2">
+                <span className="text-sm font-semibold text-[var(--text-primary)]">
+                  {effectiveItem?.label}
+                </span>
+                {effectiveItem && (
+                  <span className="rounded bg-[var(--bg-hover)] px-1.5 py-0.5 text-[10px] text-[var(--text-tertiary)]">
+                    {maturityLabel[effectiveItem.maturity]}
+                  </span>
+                )}
+              </div>
+              {effectiveItem && (
+                <div className="mt-0.5 text-xs text-[var(--text-tertiary)]">
+                  {effectiveItem.description}
+                </div>
+              )}
+            </div>
           </div>
           <div className="flex-1 overflow-y-auto">
             <div className="animate-fade-up p-6">

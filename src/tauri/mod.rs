@@ -140,6 +140,7 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
             // TaskRuntime interaction mode (Chat/Task/Auto)
             commands::task_runtime::set_interaction_mode,
             commands::task_runtime::get_interaction_mode,
+            commands::task_runtime::get_execution_policy,
             // TaskRuntime route feedback
             commands::task_runtime::list_route_feedback_rules,
             commands::task_runtime::upsert_route_feedback_rule,

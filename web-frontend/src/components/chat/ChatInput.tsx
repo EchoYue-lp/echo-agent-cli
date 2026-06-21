@@ -13,7 +13,12 @@ import {
   ChevronDown,
   Check,
 } from 'lucide-react';
-import { permissionsApi, providerApi, taskRuntimeApi } from '../../api/endpoints';
+import {
+  permissionsApi,
+  providerApi,
+  taskRuntimeApi,
+  type ExecutionPolicySnapshot,
+} from '../../api/endpoints';
 import { useUiStore } from '../../stores/uiStore';
 import type { Attachment, ConfiguredModel } from '../../types/api';
 import {
@@ -227,6 +232,7 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
   const [thinkingMenuOpen, setThinkingMenuOpen] = useState(false);
   const [switchingThinking, setSwitchingThinking] = useState(false);
   const [interactionMode, setInteractionMode] = useState<number>(0);
+  const [executionPolicy, setExecutionPolicy] = useState<ExecutionPolicySnapshot | null>(null);
   const [switchingInteractionMode, setSwitchingInteractionMode] = useState<number | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -274,9 +280,25 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
     }
   }, []);
 
+  const loadExecutionPolicy = useCallback(async () => {
+    try {
+      const policy = await taskRuntimeApi.getExecutionPolicy();
+      setExecutionPolicy(policy);
+      setInteractionMode(
+        INTERACTION_MODES.some((m) => m.id === policy.interaction_mode)
+          ? policy.interaction_mode
+          : 0
+      );
+      setPermissionMode(normalizePermissionMode(policy.permission_mode));
+    } catch (e) {
+      console.error('[ChatInput] Failed to load execution policy:', e);
+    }
+  }, []);
+
   useEffect(() => {
     loadInteractionMode();
-  }, [loadInteractionMode]);
+    loadExecutionPolicy();
+  }, [loadInteractionMode, loadExecutionPolicy]);
 
   useEffect(() => {
     const refreshPermissionMode = () => {
@@ -332,6 +354,7 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
       try {
         await permissionsApi.setMode(mode);
         setPermissionMode(mode);
+        await loadExecutionPolicy();
         notifyPermissionsChanged();
         setPermissionMenuOpen(false);
       } catch (e) {
@@ -340,7 +363,7 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
         setSwitchingPermissionMode(null);
       }
     },
-    [permissionMode, switchingPermissionMode]
+    [loadExecutionPolicy, permissionMode, switchingPermissionMode]
   );
 
   const switchInteractionMode = useCallback(
@@ -350,13 +373,14 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
       try {
         const next = await taskRuntimeApi.setInteractionMode(mode);
         setInteractionMode(INTERACTION_MODES.some((m) => m.id === next) ? next : mode);
+        await loadExecutionPolicy();
       } catch (e) {
         console.error('[ChatInput] Failed to switch interaction mode:', e);
       } finally {
         setSwitchingInteractionMode(null);
       }
     },
-    [interactionMode, switchingInteractionMode]
+    [interactionMode, loadExecutionPolicy, switchingInteractionMode]
   );
 
   // Switch the active agent's thinking-depth at runtime. Decoupled from model
@@ -897,6 +921,19 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
               {text.length > 0 && <span>{text.length} 字</span>}
             </div>
           </div>
+          {executionPolicy && (
+            <div className="border-t border-[var(--border-secondary)] px-4 py-2 text-[10px] leading-relaxed text-[var(--text-tertiary)]">
+              <span className="font-medium text-[var(--text-secondary)]">
+                {executionPolicy.interaction_mode_label} · {executionPolicy.permission_mode_label}
+              </span>
+              <span className="mx-1">·</span>
+              <span>{executionPolicy.router_behavior}</span>
+              <span className="mx-1">·</span>
+              <span>{executionPolicy.approval_behavior}</span>
+              <span className="mx-1">·</span>
+              <span>{executionPolicy.parallel_behavior}</span>
+            </div>
+          )}
         </div>
       </div>
     </div>

@@ -97,6 +97,17 @@ export interface RouteFeedbackRule {
   last_matched_at?: string | null;
 }
 
+export interface ExecutionPolicySnapshot {
+  interaction_mode: number;
+  interaction_mode_label: string;
+  permission_mode: string;
+  permission_mode_label: string;
+  auto_route_legacy_enabled: boolean;
+  router_behavior: string;
+  approval_behavior: string;
+  parallel_behavior: string;
+}
+
 export const sessionApi = {
   get: () => (isTauri() ? apiInvoke<SessionInfo>('get_session') : get<SessionInfo>('/session')),
   reset: () =>
@@ -615,6 +626,10 @@ export const taskRuntimeApi = {
     isTauri()
       ? apiInvoke<number>('get_interaction_mode')
       : get<number>('/task_runtime/interaction_mode'),
+  getExecutionPolicy: () =>
+    isTauri()
+      ? apiInvoke<ExecutionPolicySnapshot>('get_execution_policy')
+      : get<ExecutionPolicySnapshot>('/task_runtime/execution_policy'),
   listRouteFeedbackRules: () =>
     isTauri()
       ? apiInvoke<RouteFeedbackRule[]>('list_route_feedback_rules')
