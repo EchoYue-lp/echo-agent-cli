@@ -13,7 +13,7 @@ async fn cmd_reset(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
                 let mut ctx = a.context().lock().await;
                 ctx.clear();
                 ctx.push(echo_agent::llm::types::Message::system(
-                    "You are a helpful assistant.".to_string(),
+                    "You are EchoCoWork (EKO), a practical local AI workspace agent. Establish facts from context, use tools when they can verify or advance the task, protect user work, validate results when possible, and report concise evidence-backed outcomes.".to_string(),
                 ));
             })
         })
