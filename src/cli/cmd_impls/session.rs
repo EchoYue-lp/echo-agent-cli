@@ -10,11 +10,10 @@ async fn cmd_reset(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
     ctx.agent
         .read_async(|a| {
             Box::pin(async move {
+                let system_prompt = a.system_prompt().to_string();
                 let mut ctx = a.context().lock().await;
                 ctx.clear();
-                ctx.push(echo_agent::llm::types::Message::system(
-                    "You are EchoCoWork (EKO), a practical local AI workspace agent. Establish facts from context, use tools when they can verify or advance the task, protect user work, validate results when possible, and report concise evidence-backed outcomes.".to_string(),
-                ));
+                ctx.push(echo_agent::llm::types::Message::system(system_prompt));
             })
         })
         .await;
