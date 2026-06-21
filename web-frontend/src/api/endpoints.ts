@@ -618,7 +618,15 @@ export interface TraceEvent {
 }
 
 export type TraceKind =
-  | { type: 'llm_call'; model: string; input_tokens: number; output_tokens: number }
+  | {
+      type: 'llm_call';
+      model: string;
+      input_tokens: number;
+      output_tokens: number;
+      cached_input_tokens: number;
+      cache_creation_input_tokens: number;
+      usage_reported: boolean;
+    }
   | { type: 'tool_call'; tool: string; success: boolean; error?: string }
   | { type: 'agent_step'; step_number: number; thought_preview?: string }
   | { type: 'pipeline_stage'; pipeline: string; stage: string }
@@ -638,6 +646,9 @@ export interface TraceSummary {
   llm_calls: number;
   total_input_tokens: number;
   total_output_tokens: number;
+  total_cached_input_tokens: number;
+  total_cache_creation_input_tokens: number;
+  llm_calls_missing_usage: number;
   tool_calls: number;
   tool_success_rate: number;
   agent_steps: number;

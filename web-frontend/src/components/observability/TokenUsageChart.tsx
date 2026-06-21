@@ -10,6 +10,9 @@ interface LlmCallData {
   model: string;
   input: number;
   output: number;
+  cached: number;
+  cacheWrite: number;
+  usageReported: boolean;
   total: number;
 }
 
@@ -26,6 +29,9 @@ export function TokenUsageChart({ events }: TokenUsageChartProps) {
           model: k.model,
           input: k.input_tokens,
           output: k.output_tokens,
+          cached: k.cached_input_tokens,
+          cacheWrite: k.cache_creation_input_tokens,
+          usageReported: k.usage_reported,
           total: k.input_tokens + k.output_tokens,
         };
       })
@@ -35,7 +41,11 @@ export function TokenUsageChart({ events }: TokenUsageChartProps) {
   const totals = useMemo(() => {
     const input = calls.reduce((sum, c) => sum + c.input, 0);
     const output = calls.reduce((sum, c) => sum + c.output, 0);
-    return { input, output, total: input + output };
+    const cached = calls.reduce((sum, c) => sum + c.cached, 0);
+    const cacheWrite = calls.reduce((sum, c) => sum + c.cacheWrite, 0);
+    const missingUsage = calls.filter((c) => !c.usageReported).length;
+    const cacheReadRate = input > 0 ? cached / input : 0;
+    return { input, output, cached, cacheWrite, missingUsage, cacheReadRate, total: input + output };
   }, [calls]);
 
   const maxTotal = useMemo(() => Math.max(1, ...calls.map((c) => c.total)), [calls]);
@@ -51,6 +61,7 @@ export function TokenUsageChart({ events }: TokenUsageChartProps) {
 
   const inputColor = 'var(--color-info, #3b82f6)';
   const outputColor = 'var(--color-success, #22c55e)';
+  const cachedColor = 'var(--color-warning, #f59e0b)';
 
   if (calls.length === 0) {
     return (
@@ -66,7 +77,14 @@ export function TokenUsageChart({ events }: TokenUsageChartProps) {
       <div className="grid grid-cols-3 gap-2">
         <SummaryCard label="Input" value={totals.input} color={inputColor} />
         <SummaryCard label="Output" value={totals.output} color={outputColor} />
-        <SummaryCard label="Total" value={totals.total} color={s.text} />
+        <SummaryCard label="Cached" value={totals.cached} color={cachedColor} />
+        <SummaryCard label="Cache write" value={totals.cacheWrite} color={s.textSec} />
+        <SummaryCard
+          label="Cache read"
+          value={`${(totals.cacheReadRate * 100).toFixed(1)}%`}
+          color={cachedColor}
+        />
+        <SummaryCard label="Missing usage" value={totals.missingUsage} color={s.textTer} />
       </div>
 
       {/* Legend */}
@@ -84,6 +102,13 @@ export function TokenUsageChart({ events }: TokenUsageChartProps) {
             style={{ background: outputColor }}
           />
           Output
+        </span>
+        <span className="flex items-center gap-1 text-[10px]" style={{ color: s.textSec }}>
+          <span
+            className="inline-block w-2.5 h-2.5 rounded-sm"
+            style={{ background: cachedColor }}
+          />
+          Cached input
         </span>
       </div>
 
@@ -105,6 +130,7 @@ export function TokenUsageChart({ events }: TokenUsageChartProps) {
                 </span>
                 <span className="text-[10px] font-mono" style={{ color: s.textTer }}>
                   {call.total.toLocaleString()} tokens
+                  {!call.usageReported ? ' · usage missing' : ''}
                 </span>
               </div>
               <div
@@ -123,6 +149,8 @@ export function TokenUsageChart({ events }: TokenUsageChartProps) {
               <div className="flex justify-between mt-0.5">
                 <span className="text-[9px]" style={{ color: s.textTer }}>
                   {call.input.toLocaleString()} in
+                  {call.cached > 0 ? ` · ${call.cached.toLocaleString()} cached` : ''}
+                  {call.cacheWrite > 0 ? ` · ${call.cacheWrite.toLocaleString()} written` : ''}
                 </span>
                 <span className="text-[9px]" style={{ color: s.textTer }}>
                   {call.output.toLocaleString()} out
@@ -136,11 +164,19 @@ export function TokenUsageChart({ events }: TokenUsageChartProps) {
   );
 }
 
-function SummaryCard({ label, value, color }: { label: string; value: number; color: string }) {
+function SummaryCard({
+  label,
+  value,
+  color,
+}: {
+  label: string;
+  value: number | string;
+  color: string;
+}) {
   return (
     <div className="rounded-lg p-2 text-center" style={{ background: 'var(--bg-hover)' }}>
       <div className="text-sm font-semibold font-mono" style={{ color }}>
-        {value.toLocaleString()}
+        {typeof value === 'number' ? value.toLocaleString() : value}
       </div>
       <div className="text-[10px]" style={{ color: 'var(--text-tertiary)' }}>
         {label}

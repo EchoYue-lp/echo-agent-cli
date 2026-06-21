@@ -428,6 +428,17 @@ async fn chat_with_agent(agent: &AgentHandle, message: &str, output: &OutputRend
                                     "think_end".into(),
                                     format!("in={prompt_tokens} out={completion_tokens}"),
                                 ),
+                                AgentEvent::LlmUsage {
+                                    cached_prompt_tokens,
+                                    cache_creation_prompt_tokens,
+                                    usage_reported,
+                                    ..
+                                } => (
+                                    "llm_usage".into(),
+                                    format!(
+                                        "cached={cached_prompt_tokens} cache_write={cache_creation_prompt_tokens} usage_reported={usage_reported}"
+                                    ),
+                                ),
                                 AgentEvent::ToolCall { name, .. } => {
                                     ("tool_call".into(), name.clone())
                                 }
@@ -475,6 +486,7 @@ async fn chat_with_agent(agent: &AgentHandle, message: &str, output: &OutputRend
                                 TOTAL_INPUT_TOKENS.fetch_add(prompt_tokens, Ordering::Relaxed);
                                 TOTAL_OUTPUT_TOKENS.fetch_add(completion_tokens, Ordering::Relaxed);
                             }
+                            AgentEvent::LlmUsage { .. } => {}
                             AgentEvent::Token(token) => {
                                 clear_spinner!();
                                 if first_chunk {

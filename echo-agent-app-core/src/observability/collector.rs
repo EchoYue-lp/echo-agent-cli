@@ -71,6 +71,9 @@ impl TraceCollector {
         let mut llm_calls = 0;
         let mut total_input_tokens = 0u64;
         let mut total_output_tokens = 0u64;
+        let mut total_cached_input_tokens = 0u64;
+        let mut total_cache_creation_input_tokens = 0u64;
+        let mut llm_calls_missing_usage = 0usize;
         let mut tool_calls = 0;
         let mut tool_successes = 0;
         let mut agent_steps = 0;
@@ -80,11 +83,19 @@ impl TraceCollector {
                 TraceKind::LlmCall {
                     input_tokens,
                     output_tokens,
+                    cached_input_tokens,
+                    cache_creation_input_tokens,
+                    usage_reported,
                     ..
                 } => {
                     llm_calls += 1;
                     total_input_tokens += input_tokens;
                     total_output_tokens += output_tokens;
+                    total_cached_input_tokens += cached_input_tokens;
+                    total_cache_creation_input_tokens += cache_creation_input_tokens;
+                    if !usage_reported {
+                        llm_calls_missing_usage += 1;
+                    }
                 }
                 TraceKind::ToolCall { success, .. } => {
                     tool_calls += 1;
@@ -115,6 +126,9 @@ impl TraceCollector {
             llm_calls,
             total_input_tokens,
             total_output_tokens,
+            total_cached_input_tokens,
+            total_cache_creation_input_tokens,
+            llm_calls_missing_usage,
             tool_calls,
             tool_success_rate: if tool_calls > 0 {
                 tool_successes as f64 / tool_calls as f64
@@ -186,6 +200,9 @@ mod tests {
                         model: "qwen".into(),
                         input_tokens: 100,
                         output_tokens: 50,
+                        cached_input_tokens: 80,
+                        cache_creation_input_tokens: 0,
+                        usage_reported: true,
                     },
                     duration_ms: Some(200),
                     metadata: HashMap::new(),
@@ -212,6 +229,8 @@ mod tests {
         let summary = collector.get_summary("s1").await.unwrap();
         assert_eq!(summary.llm_calls, 1);
         assert_eq!(summary.total_input_tokens, 100);
+        assert_eq!(summary.total_cached_input_tokens, 80);
+        assert_eq!(summary.llm_calls_missing_usage, 0);
         assert_eq!(summary.tool_calls, 1);
         assert_eq!(summary.tool_success_rate, 1.0);
     }

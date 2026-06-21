@@ -5,9 +5,11 @@
 
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
+use chrono::Utc;
 use echo_agent::agent::{Agent, CancellationToken};
 use echo_agent::human_loop::{HumanLoopProvider, HumanLoopRequest, HumanLoopResponse};
 use echo_agent::prelude::AgentEvent;
+use echo_agent_app_core::observability::{TraceEvent, TraceKind};
 use echo_agent_app_core::tasks::task_runtime::{
     InteractionMode, TaskPlan, TaskRouteDecision, TaskRunStatus, WorkerTraceEvent,
     WorkerTraceEventKind,
@@ -34,6 +36,16 @@ pub enum ChatEvent {
     ThinkingEnd {
         prompt_tokens: usize,
         completion_tokens: usize,
+    },
+    #[serde(rename = "llm_usage")]
+    LlmUsage {
+        model: String,
+        prompt_tokens: usize,
+        completion_tokens: usize,
+        total_tokens: usize,
+        cached_prompt_tokens: usize,
+        cache_creation_prompt_tokens: usize,
+        usage_reported: bool,
     },
     #[serde(rename = "tool_start")]
     ToolStart {
@@ -478,6 +490,10 @@ pub async fn send_chat_message(
     let cleanup_agent = agent_handle.clone();
     let event_message_key = message_key.clone();
     let event_conversation_id = conversation_id.clone();
+    let trace_collector = state.app_state.trace.collector.clone();
+    let trace_session_id = conversation_id
+        .clone()
+        .unwrap_or_else(|| event_message_key.clone());
 
     tokio::spawn(async move {
         let start = std::time::Instant::now();
@@ -579,6 +595,72 @@ pub async fn send_chat_message(
                                     ChatEvent::ThinkingEnd {
                                         prompt_tokens,
                                         completion_tokens,
+                                    }
+                                }
+                                AgentEvent::LlmUsage {
+                                    model,
+                                    prompt_tokens,
+                                    completion_tokens,
+                                    total_tokens,
+                                    cached_prompt_tokens,
+                                    cache_creation_prompt_tokens,
+                                    usage_reported,
+                                } => {
+                                    trace_collector
+                                        .record(
+                                            &trace_session_id,
+                                            TraceEvent {
+                                                timestamp: Utc::now(),
+                                                kind: TraceKind::LlmCall {
+                                                    model: model.clone(),
+                                                    input_tokens: prompt_tokens as u64,
+                                                    output_tokens: completion_tokens as u64,
+                                                    cached_input_tokens: cached_prompt_tokens
+                                                        as u64,
+                                                    cache_creation_input_tokens:
+                                                        cache_creation_prompt_tokens as u64,
+                                                    usage_reported,
+                                                },
+                                                duration_ms: None,
+                                                metadata: HashMap::from([
+                                                    (
+                                                        "message_key".to_string(),
+                                                        serde_json::json!(
+                                                            event_message_key.clone()
+                                                        ),
+                                                    ),
+                                                    (
+                                                        "total_tokens".to_string(),
+                                                        serde_json::json!(total_tokens),
+                                                    ),
+                                                ]),
+                                            },
+                                        )
+                                        .await;
+                                    emit_worker_trace_event(
+                                        &app_handle,
+                                        chat_trace_event(
+                                            &event_message_key,
+                                            WorkerTraceEventKind::WorkerLlmUsage,
+                                            serde_json::json!({
+                                                "model": model.clone(),
+                                                "prompt_tokens": prompt_tokens,
+                                                "completion_tokens": completion_tokens,
+                                                "total_tokens": total_tokens,
+                                                "cached_prompt_tokens": cached_prompt_tokens,
+                                                "cache_creation_prompt_tokens": cache_creation_prompt_tokens,
+                                                "usage_reported": usage_reported
+                                            }),
+                                        ),
+                                    );
+                                    ChatEvent::LlmUsage {
+                                        model: model.clone(),
+                                        prompt_tokens,
+                                        completion_tokens,
+                                        total_tokens,
+                                        cached_prompt_tokens,
+                                        cache_creation_prompt_tokens,
+                                        usage_reported,
                                     }
                                 }
                                 AgentEvent::ToolCall { name, args } => {

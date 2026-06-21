@@ -1270,6 +1270,35 @@ async fn run_main_agent_task(
                                 .with_title(title.clone()),
                             );
                         }
+                        AgentEvent::LlmUsage {
+                            model,
+                            prompt_tokens,
+                            completion_tokens,
+                            total_tokens,
+                            cached_prompt_tokens,
+                            cache_creation_prompt_tokens,
+                            usage_reported,
+                        } => {
+                            emit_worker_trace(
+                                trace_sink.as_ref(),
+                                WorkerTraceEvent::for_worker(
+                                    run_id.clone(),
+                                    task_id.clone(),
+                                    WorkerTraceEventKind::WorkerLlmUsage,
+                                    serde_json::json!({
+                                        "model": model,
+                                        "prompt_tokens": prompt_tokens,
+                                        "completion_tokens": completion_tokens,
+                                        "total_tokens": total_tokens,
+                                        "cached_prompt_tokens": cached_prompt_tokens,
+                                        "cache_creation_prompt_tokens": cache_creation_prompt_tokens,
+                                        "usage_reported": usage_reported,
+                                    }),
+                                )
+                                .with_agent(agent_role.clone())
+                                .with_title(title.clone()),
+                            );
+                        }
                         AgentEvent::ToolCall { name, args } => {
                             emit_worker_trace(
                                 trace_sink.as_ref(),

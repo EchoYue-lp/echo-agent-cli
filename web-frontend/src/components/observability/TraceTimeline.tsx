@@ -164,6 +164,13 @@ export function TraceTimeline({ events, onSelect, selectedEvent }: TraceTimeline
               <p className="mt-1 text-[10px]" style={{ color: s.textTer }}>
                 {event.kind.input_tokens.toLocaleString()} in /{' '}
                 {event.kind.output_tokens.toLocaleString()} out tokens
+                {event.kind.cached_input_tokens > 0
+                  ? ` / ${event.kind.cached_input_tokens.toLocaleString()} cached`
+                  : ''}
+                {event.kind.cache_creation_input_tokens > 0
+                  ? ` / ${event.kind.cache_creation_input_tokens.toLocaleString()} cache write`
+                  : ''}
+                {!event.kind.usage_reported ? ' / usage missing' : ''}
               </p>
             )}
             {event.kind.type === 'tool_call' && event.kind.error && (

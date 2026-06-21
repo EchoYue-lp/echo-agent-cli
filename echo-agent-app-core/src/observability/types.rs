@@ -28,6 +28,12 @@ pub enum TraceKind {
         model: String,
         input_tokens: u64,
         output_tokens: u64,
+        #[serde(default)]
+        cached_input_tokens: u64,
+        #[serde(default)]
+        cache_creation_input_tokens: u64,
+        #[serde(default)]
+        usage_reported: bool,
     },
     /// 工具调用。
     ToolCall {
@@ -73,6 +79,15 @@ pub struct TraceSummary {
     pub total_input_tokens: u64,
     /// 总 output tokens。
     pub total_output_tokens: u64,
+    /// Provider 侧 prompt cache 命中的 input tokens。
+    #[serde(default)]
+    pub total_cached_input_tokens: u64,
+    /// Provider 侧 prompt cache 写入的 input tokens。
+    #[serde(default)]
+    pub total_cache_creation_input_tokens: u64,
+    /// 没有返回 usage metadata 的 LLM 请求数。
+    #[serde(default)]
+    pub llm_calls_missing_usage: usize,
     /// 工具调用次数。
     pub tool_calls: usize,
     /// 工具调用成功率。

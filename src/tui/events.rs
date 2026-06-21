@@ -781,6 +781,7 @@ async fn send_to_agent(
                         completion_tokens,
                     });
                 }
+                Ok(echo_agent::agent::AgentEvent::LlmUsage { .. }) => {}
                 Ok(echo_agent::agent::AgentEvent::ToolBatchStart { tool_count }) => {
                     let _ = agent_tx.send(AgentEvent::ToolBatchStart { tool_count });
                 }

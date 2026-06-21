@@ -87,6 +87,11 @@ export function handleChatEvent(
       ctx.currentThinkingIdRef.current = null;
       break;
     }
+    case 'llm_usage': {
+      // Observability-only event. Worker trace / trace panels consume the same
+      // facts; the chat transcript should not render cache telemetry as text.
+      break;
+    }
     case 'tool_start': {
       if (ctx.isCancelledRef.current) break;
       // `event.args` is typed `unknown` in ChatEventLike; setToolCall accepts

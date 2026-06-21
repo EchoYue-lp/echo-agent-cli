@@ -459,6 +459,7 @@ pub enum WorkerTraceEventKind {
     WorkerThinkingStart,
     WorkerThinkingDelta,
     WorkerThinkingEnd,
+    WorkerLlmUsage,
     WorkerToolStart,
     WorkerToolResult,
     WorkerTokenDelta,

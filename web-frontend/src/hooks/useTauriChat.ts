@@ -17,6 +17,16 @@ type ChatEvent = ChatEventBase &
   | { type: 'token'; data: string }
   | { type: 'thinking_start' }
   | { type: 'thinking_end'; prompt_tokens: number; completion_tokens: number }
+  | {
+      type: 'llm_usage';
+      model: string;
+      prompt_tokens: number;
+      completion_tokens: number;
+      total_tokens: number;
+      cached_prompt_tokens: number;
+      cache_creation_prompt_tokens: number;
+      usage_reported: boolean;
+    }
   | { type: 'tool_start'; name: string; args: unknown }
   | { type: 'tool_result'; name: string; result: string; success: boolean }
   | { type: 'chart'; spec: unknown }

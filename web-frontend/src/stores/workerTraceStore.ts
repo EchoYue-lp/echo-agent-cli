@@ -18,6 +18,7 @@ export type WorkerTraceEventKind =
   | 'worker_thinking_start'
   | 'worker_thinking_delta'
   | 'worker_thinking_end'
+  | 'worker_llm_usage'
   | 'worker_tool_start'
   | 'worker_tool_result'
   | 'worker_token_delta'
@@ -72,6 +73,7 @@ function statusFromEvent(eventType: WorkerTraceEventKind): WorkerTraceStatus | u
     case 'worker_thinking_start':
     case 'worker_thinking_delta':
     case 'worker_thinking_end':
+    case 'worker_llm_usage':
     case 'worker_tool_start':
     case 'worker_tool_result':
     case 'worker_token_delta':

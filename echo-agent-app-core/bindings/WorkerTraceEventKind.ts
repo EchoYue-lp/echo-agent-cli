@@ -7,4 +7,4 @@
  * lightweight realtime protocol used by Chat, TaskRuntime, Auto routing, and
  * subagents so the frontend can render one coherent "run with workers" view.
  */
-export type WorkerTraceEventKind = "run_started" | "run_status_changed" | "run_completed" | "run_failed" | "run_cancelled" | "worker_planned" | "worker_started" | "worker_thinking_start" | "worker_thinking_delta" | "worker_thinking_end" | "worker_tool_start" | "worker_tool_result" | "worker_token_delta" | "worker_artifact" | "worker_completed" | "worker_failed" | "worker_cancelled" | "approval_requested" | "approval_resolved" | "note";
+export type WorkerTraceEventKind = "run_started" | "run_status_changed" | "run_completed" | "run_failed" | "run_cancelled" | "worker_planned" | "worker_started" | "worker_thinking_start" | "worker_thinking_delta" | "worker_thinking_end" | "worker_llm_usage" | "worker_tool_start" | "worker_tool_result" | "worker_token_delta" | "worker_artifact" | "worker_completed" | "worker_failed" | "worker_cancelled" | "approval_requested" | "approval_resolved" | "note";
