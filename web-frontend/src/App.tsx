@@ -104,6 +104,15 @@ function App() {
         category: 'Settings',
       },
       {
+        id: 'settings-observability',
+        label: 'Settings: Observability',
+        description: 'Inspect token, cache, model, and session trends',
+        action: () => {
+          setActiveSettingsTab('observability');
+        },
+        category: 'Settings',
+      },
+      {
         id: 'settings-evolution',
         label: 'Settings: Self-Evolution',
         description: 'Trajectory management, background review, and skill curation',

@@ -36,6 +36,7 @@ import { SchedulerPanel } from '../scheduler/SchedulerPanel';
 import { ScratchpadPanel } from '../scratchpad/ScratchpadPanel';
 import { DecisionLogPanel } from '../decisions/DecisionLogPanel';
 import { WorktreePanel } from '../coding/WorktreePanel';
+import { ObservabilityPanel } from '../observability/ObservabilityPanel';
 
 interface SettingsItem {
   id: SettingsTabId;
@@ -76,6 +77,7 @@ const settingsGroups: { label: string; icon: typeof Settings; items: SettingsIte
     label: '运行时',
     icon: Activity,
     items: [
+      { id: 'observability', label: '运行观测', icon: Activity },
       { id: 'scheduler', label: '定时任务', icon: Timer },
       { id: 'worktree', label: 'Worktree', icon: GitBranch },
     ],
@@ -99,6 +101,7 @@ const panels: Record<SettingsTabId, React.FC> = {
   audit: AuditPanel,
   scratchpad: ScratchpadPanel,
   decisions: DecisionLogPanel,
+  observability: ObservabilityPanel,
   compress: CompressPanel,
   evolution: EvolutionPanel,
   plugins: PluginPanel,
