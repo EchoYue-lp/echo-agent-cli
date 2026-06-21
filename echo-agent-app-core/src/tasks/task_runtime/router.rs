@@ -84,6 +84,8 @@ pub struct TaskRouteDecision {
     pub reason: String,
     pub suggested_workers: Vec<String>,
     pub classification: Classification,
+    #[serde(default)]
+    pub matched_feedback_pattern: Option<String>,
 }
 
 impl TaskRouteDecision {
@@ -94,6 +96,7 @@ impl TaskRouteDecision {
             reason: reason.into(),
             suggested_workers: Vec::new(),
             classification: HeuristicClassifier::new().classify(""),
+            matched_feedback_pattern: None,
         }
     }
 }
@@ -167,9 +170,26 @@ pub fn record_route_feedback_match(message: &str, rules: &mut [RouteFeedbackRule
         return false;
     };
 
+    update_route_feedback_hit(rule);
+    true
+}
+
+pub fn record_route_feedback_pattern(pattern: &str, rules: &mut [RouteFeedbackRule]) -> bool {
+    let key = normalize_feedback_text(pattern);
+    let Some(rule) = rules
+        .iter_mut()
+        .find(|rule| normalize_feedback_text(&rule.pattern) == key)
+    else {
+        return false;
+    };
+
+    update_route_feedback_hit(rule);
+    true
+}
+
+fn update_route_feedback_hit(rule: &mut RouteFeedbackRule) {
     rule.hit_count = rule.hit_count.saturating_add(1);
     rule.last_matched_at = Some(Utc::now().to_rfc3339());
-    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -183,6 +203,8 @@ struct RawRouteDecision {
     reason: Option<String>,
     #[serde(default)]
     suggested_workers: Vec<String>,
+    #[serde(default)]
+    matched_feedback_pattern: Option<String>,
 }
 
 /// Route with an LLM first, falling back to deterministic local signals.
@@ -213,7 +235,7 @@ pub async fn route_message_with_feedback(
 
     let deterministic = route_deterministically(message);
     let decision = if let Some(llm) = llm
-        && let Ok(decision) = route_with_llm(&llm, message).await
+        && let Ok(decision) = route_with_llm(&llm, message, feedback_rules).await
     {
         reconcile_llm_with_deterministic(decision, deterministic)
     } else {
@@ -231,6 +253,7 @@ fn forced_decision(route: TaskRouteKind, message: &str, reason: &str) -> TaskRou
         reason: reason.to_string(),
         suggested_workers: select_workers(route, classification.inferred_profile, message),
         classification,
+        matched_feedback_pattern: None,
     }
 }
 
@@ -248,6 +271,7 @@ fn forced_task_decision(message: &str) -> TaskRouteDecision {
         reason: format!("forced task mode; {}", signals.reason_suffix()),
         suggested_workers: select_workers_from_signals(route, &signals),
         classification,
+        matched_feedback_pattern: None,
     }
 }
 
@@ -255,6 +279,9 @@ fn reconcile_llm_with_deterministic(
     mut llm: TaskRouteDecision,
     deterministic: TaskRouteDecision,
 ) -> TaskRouteDecision {
+    if llm.matched_feedback_pattern.is_some() {
+        return llm;
+    }
     if deterministic.route == TaskRouteKind::PlanOnly {
         return deterministic;
     }
@@ -304,6 +331,7 @@ fn apply_route_feedback(
         decision.classification.inferred_profile,
         message,
     );
+    decision.matched_feedback_pattern = Some(rule.pattern.clone());
     if matches!(
         rule.route,
         TaskRouteKind::NormalChat | TaskRouteKind::DirectEdit | TaskRouteKind::BackgroundTask
@@ -328,14 +356,76 @@ fn normalize_feedback_text(text: &str) -> String {
         .join(" ")
 }
 
+fn find_route_feedback_rule<'a>(
+    feedback_rules: &'a [RouteFeedbackRule],
+    pattern: &str,
+) -> Option<&'a RouteFeedbackRule> {
+    let key = normalize_feedback_text(pattern);
+    feedback_rules
+        .iter()
+        .find(|rule| normalize_feedback_text(&rule.pattern) == key)
+}
+
+fn route_feedback_prompt(feedback_rules: &[RouteFeedbackRule]) -> String {
+    if feedback_rules.is_empty() {
+        return "Historical route feedback: []".to_string();
+    }
+
+    let mut rules = feedback_rules.to_vec();
+    rules.sort_by(|a, b| {
+        b.hit_count
+            .cmp(&a.hit_count)
+            .then_with(|| a.pattern.cmp(&b.pattern))
+    });
+
+    let lines = rules
+        .iter()
+        .take(12)
+        .map(|rule| {
+            format!(
+                r#"{{"pattern":"{}","route":"{}","reason":"{}","workers":[{}],"hits":{}}}"#,
+                feedback_prompt_text(&rule.pattern, 120),
+                rule.route.as_str(),
+                feedback_prompt_text(&rule.reason, 160),
+                rule.suggested_workers
+                    .iter()
+                    .take(6)
+                    .map(|worker| format!(r#""{}""#, feedback_prompt_text(worker, 80)))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                rule.hit_count,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    format!(
+        "Historical route feedback rules. If the user message is semantically equivalent to one rule, set matched_feedback_pattern exactly to that rule's pattern and choose that route. Do not invent patterns.\n{lines}"
+    )
+}
+
+fn feedback_prompt_text(value: &str, max_chars: usize) -> String {
+    value
+        .chars()
+        .take(max_chars)
+        .collect::<String>()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', " ")
+}
+
 async fn route_with_llm(
     llm: &Arc<dyn LlmClient>,
     message: &str,
+    feedback_rules: &[RouteFeedbackRule],
 ) -> Result<TaskRouteDecision, String> {
     let request = ChatRequest {
         messages: vec![
             Message::system(router_system_prompt()),
-            Message::user(format!("User message:\n{message}")),
+            Message::user(format!(
+                "{}\n\nUser message:\n{message}",
+                route_feedback_prompt(feedback_rules)
+            )),
         ],
         response_format: Some(ResponseFormat::JsonObject),
         ..Default::default()
@@ -358,6 +448,35 @@ async fn route_with_llm(
     {
         classification.inferred_profile = profile;
     }
+    let semantic_feedback = raw
+        .matched_feedback_pattern
+        .as_deref()
+        .and_then(|pattern| find_route_feedback_rule(feedback_rules, pattern));
+    if let Some(rule) = semantic_feedback {
+        return Ok(TaskRouteDecision {
+            route: rule.route,
+            confidence: confidence.max(0.9),
+            reason: format!(
+                "semantic router feedback override: {}; llm_reason={}",
+                if rule.reason.trim().is_empty() {
+                    "matched prior user correction"
+                } else {
+                    rule.reason.trim()
+                },
+                raw.reason
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| "LLM matched historical feedback".to_string())
+            ),
+            suggested_workers: normalize_workers(
+                rule.suggested_workers.clone(),
+                rule.route,
+                classification.inferred_profile,
+                message,
+            ),
+            classification,
+            matched_feedback_pattern: Some(rule.pattern.clone()),
+        });
+    }
     Ok(TaskRouteDecision {
         route,
         confidence,
@@ -372,6 +491,7 @@ async fn route_with_llm(
             message,
         ),
         classification,
+        matched_feedback_pattern: None,
     })
 }
 
@@ -384,7 +504,8 @@ Return ONLY JSON:
   "domain_profile": "general" | "ai_coding" | "academic_research" | "data_analysis" | "medical_research",
   "confidence": number between 0 and 1,
   "reason": string,
-  "suggested_workers": string[]
+  "suggested_workers": string[],
+  "matched_feedback_pattern": string | null
 }}
 
 EKO's main domains are AI coding, academic research, data processing/analysis, and medical research. Choose "parallel_readonly_delegation" for broad read-only work that benefits from multiple workers in any of these domains: project architecture analysis, codebase review, literature exploration, evidence review, dataset profiling, analysis-method review, clinical evidence review, safety review, or comparing several candidate root causes.
@@ -396,7 +517,9 @@ Choose "plan_only" when the user explicitly asks for a plan or says not to execu
 Choose "complex_runtime" for multi-step work that may include edits, verification, or review gates.
 Choose "normal_chat" for small questions, explanations, or single-file/simple answers.
 Choose "direct_edit" only for tiny obvious edits.
-Choose "background_task" for long detached tasks the user expects to run asynchronously."#,
+Choose "background_task" for long detached tasks the user expects to run asynchronously.
+
+If the user message is semantically equivalent to a historical route feedback rule provided in the user message, set matched_feedback_pattern to that rule's exact pattern. Otherwise set it to null."#,
         catalog = worker_catalog_prompt()
     )
 }
@@ -427,6 +550,7 @@ fn route_deterministically(message: &str) -> TaskRouteDecision {
         ),
         suggested_workers: select_workers_from_signals(route, &signals),
         classification,
+        matched_feedback_pattern: None,
     }
 }
 
@@ -616,6 +740,25 @@ mod tests {
     }
 
     #[test]
+    fn record_route_feedback_pattern_updates_semantic_hit_stats() {
+        let mut feedback = vec![feedback_rule(
+            "看下这个仓库架构",
+            TaskRouteKind::ParallelReadonlyDelegation,
+            "semantic prior correction",
+            Vec::new(),
+        )];
+        assert!(record_route_feedback_pattern(
+            "看下这个仓库架构",
+            &mut feedback
+        ));
+        assert_eq!(feedback.len(), 1);
+        if let Some(rule) = feedback.first() {
+            assert_eq!(rule.hit_count, 1);
+            assert!(rule.last_matched_at.is_some());
+        }
+    }
+
+    #[test]
     fn deterministic_router_uses_academic_workers_for_literature_tasks() {
         let decision =
             route_deterministically("请做一个 arxiv literature review，分析相关论文证据");
@@ -716,5 +859,18 @@ mod tests {
         let decision = reconcile_llm_with_deterministic(llm, deterministic);
         assert_eq!(decision.route, TaskRouteKind::ParallelReadonlyDelegation);
         assert!(decision.reason.contains("read-only fanout override"));
+    }
+
+    #[test]
+    fn semantic_feedback_route_is_not_overridden_by_deterministic_readonly() {
+        let mut llm = TaskRouteDecision::normal("semantic router feedback override");
+        llm.matched_feedback_pattern = Some("看下这个仓库架构".to_string());
+        let deterministic = route_deterministically("请分析这个项目架构");
+        let decision = reconcile_llm_with_deterministic(llm, deterministic);
+        assert_eq!(decision.route, TaskRouteKind::NormalChat);
+        assert_eq!(
+            decision.matched_feedback_pattern,
+            Some("看下这个仓库架构".to_string())
+        );
     }
 }

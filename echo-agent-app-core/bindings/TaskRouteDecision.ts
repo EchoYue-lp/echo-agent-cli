@@ -5,4 +5,4 @@ import type { TaskRuntimeClassification } from "./TaskRuntimeClassification";
 /**
  * Router verdict used by UI traces and the Tauri chat path.
  */
-export type TaskRouteDecision = { route: TaskRouteKind, confidence: number, reason: string, suggested_workers: Array<string>, classification: TaskRuntimeClassification, };
+export type TaskRouteDecision = { route: TaskRouteKind, confidence: number, reason: string, suggested_workers: Array<string>, classification: TaskRuntimeClassification, matched_feedback_pattern: string | null, };

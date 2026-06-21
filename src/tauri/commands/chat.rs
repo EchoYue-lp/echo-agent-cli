@@ -415,13 +415,11 @@ pub async fn send_chat_message(
         )
         .await;
         if interaction_mode == InteractionMode::Auto
-            && route_decision
-                .reason
-                .starts_with("historical router feedback override")
+            && let Some(pattern) = route_decision.matched_feedback_pattern.as_deref()
         {
             let mut feedback = state.app_state.tasks.route_feedback.write().await;
-            if echo_agent_app_core::tasks::task_runtime::record_route_feedback_match(
-                &message,
+            if echo_agent_app_core::tasks::task_runtime::record_route_feedback_pattern(
+                pattern,
                 &mut feedback,
             ) && let Err(error) =
                 echo_agent_app_core::tasks::task_runtime::save_route_feedback_rules(&feedback)

@@ -64,8 +64,8 @@ pub use review::{
 };
 pub use router::{
     RouteFeedbackRule, TaskRouteDecision, TaskRouteKind, load_route_feedback_rules,
-    record_route_feedback_match, route_message, route_message_with_feedback,
-    save_route_feedback_rules,
+    record_route_feedback_match, record_route_feedback_pattern, route_message,
+    route_message_with_feedback, save_route_feedback_rules,
 };
 pub use store::{StoreError, TaskRuntimeStore};
 pub use types::*;
