@@ -1926,4 +1926,78 @@ mod tests {
         // Nothing should have been dispatched.
         assert!(worker.order().is_empty(), "worker ran on a cyclic plan");
     }
+
+    #[tokio::test]
+    async fn main_agent_task_streams_tool_events_to_worker_trace() -> Result<(), String> {
+        use crate::agent_handle::AgentHandle;
+        use echo_agent::agent::react::builder::ReactAgentBuilder;
+        use echo_agent::testing::{MockLlmClient, MockTool};
+        use std::sync::Mutex;
+
+        let llm = MockLlmClient::new()
+            .then_tool_call("call_1", "mock_calc", r#"{"x":6,"y":7}"#)
+            .with_response("The result is 42.");
+        let agent = ReactAgentBuilder::new()
+            .llm_client(Arc::new(llm))
+            .system_prompt("You are a test assistant.")
+            .tool(Box::new(MockTool::new("mock_calc").with_response("42")))
+            .build()
+            .map_err(|error| format!("test agent should build: {error}"))?;
+        let handle = AgentHandle::new(agent);
+
+        let task = PlanTask {
+            id: "implementation-a".into(),
+            title: "Run calculation".into(),
+            description: "Use the tool and report the result".into(),
+            kind: PlanTaskKind::Implementation,
+            agent_role: "implementer".into(),
+            ..Default::default()
+        };
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let captured = events.clone();
+        let sink: WorkerTraceSink = Arc::new(move |event| {
+            if let Ok(mut guard) = captured.lock() {
+                guard.push(event);
+            }
+        });
+
+        let output = run_main_agent_task(
+            &handle,
+            "run-trace",
+            &task,
+            "What is 6 times 7?",
+            CancellationToken::new(),
+            Some(sink),
+        )
+        .await
+        .map_err(|error| format!("main agent task should complete: {error}"))?;
+
+        assert!(output.contains("42"));
+        let events = events
+            .lock()
+            .map_err(|error| format!("trace events lock poisoned: {error}"))?
+            .clone();
+        assert!(
+            events.iter().any(|event| {
+                event.event_type == WorkerTraceEventKind::WorkerToolStart
+                    && event.worker_id.as_deref() == Some("implementation-a")
+                    && event.payload.get("name").and_then(|v| v.as_str()) == Some("mock_calc")
+            }),
+            "expected WorkerToolStart for mock_calc, got {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| {
+                event.event_type == WorkerTraceEventKind::WorkerToolResult
+                    && event.worker_id.as_deref() == Some("implementation-a")
+                    && event.payload.get("success").and_then(|v| v.as_bool()) == Some(true)
+                    && event
+                        .payload
+                        .get("result")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|text| text.contains("42"))
+            }),
+            "expected successful WorkerToolResult with tool output, got {events:?}"
+        );
+        Ok(())
+    }
 }

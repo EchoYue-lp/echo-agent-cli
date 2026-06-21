@@ -333,6 +333,32 @@ Acceptance:
 - Frontend `npm run build`
 - Manual GUI smoke test for Chat, Task, Auto, worker expansion.
 
+Implementation status:
+
+- Completed through Phase 6 in commits:
+  - `echo-agent`: `721adda fix(runtime): harden permissions and skill activation`
+  - `echo-agent-cli`: `0d8c609 feat(runtime): complete approval and skills hardening`
+- Phase 7 regression coverage added:
+  - Auto complex project analysis routes to `parallel_readonly_delegation` and suggests worker roles.
+  - Deterministic readonly plans create runtime worker task specs without relying on `agent_tool`.
+  - Task mode promotes readonly analysis to worker delegation instead of plan-only mode.
+  - Main-agent TaskRuntime execution streams tool start/result events into `WorkerTraceEvent`.
+  - Legacy approval aliases (`auto`, `plan`) normalize to `default`.
+  - IntentRouter skill activation injects `<skill_content>` protected blocks that survive compression.
+- Transitional compatibility that remains intentionally:
+  - `agent_tool` remains available as an escape hatch, but deterministic readonly fanout is runtime-orchestrated.
+  - Legacy saved approval mode aliases remain accepted and normalized; they are not exposed as user-facing approval modes.
+  - `subagent://event` remains alongside `worker://trace` until all older UI consumers are removed.
+
+Manual GUI smoke checklist:
+
+1. Chat mode: send a simple question and confirm normal thinking/answer streaming.
+2. Auto mode: send "帮我分析当前目录的项目" and confirm TaskRuntime route explanation, worker count, worker cards, and final result appear in the main run.
+3. Task mode: send the same project-analysis prompt and confirm it enters TaskRuntime directly, not plan-only.
+4. Worker expansion: open each worker and verify prompt, result, and middle trace are scrollable/inspectable.
+5. Skills panel: search a skill, enable it, verify it appears loaded/active in runtime metadata, then disable it and confirm the UI explains restart/new-session requirements.
+6. Approval mode: switch `default`, `auto-edit`, `full-auto`, `strict`; verify planning/routing does not ask for approval, while actual risky tool execution still follows the selected approval policy.
+
 ## Suggested Execution Order
 
 1. Phase 1 and Phase 2 first, because observability must exist before deeper orchestration changes.
@@ -362,4 +388,3 @@ When resuming from context compaction, check this list first:
 3. Identify the active phase.
 4. Run the phase's acceptance checks before moving on.
 5. Do not start Phase 4 until Phase 1-3 trace visibility is working.
-
