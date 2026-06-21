@@ -176,7 +176,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
         <div className="flex items-center gap-2">
           <BrandIcon size="md" />
           <span className="text-sm font-semibold tracking-tight text-[var(--text-primary)]">
-            EchoCoWork
+            EKO
           </span>
           {current && (
             <div className="flex items-center gap-1">

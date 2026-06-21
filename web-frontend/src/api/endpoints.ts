@@ -95,6 +95,10 @@ export interface RouteFeedbackRule {
   suggested_workers: string[];
   hit_count: number;
   last_matched_at?: string | null;
+  success_count?: number;
+  failure_count?: number;
+  score?: number;
+  last_failure_reason?: string | null;
 }
 
 export interface ExecutionPolicySnapshot {
@@ -651,6 +655,29 @@ export const taskRuntimeApi = {
       : del<RouteFeedbackRule[]>(
           `/task_runtime/route_feedback?pattern=${encodeURIComponent(pattern)}`
         ),
+  // Usage trends
+  queryUsageRecords: (filter: Record<string, unknown>) =>
+    isTauri()
+      ? apiInvoke<Record<string, unknown>[]>('query_usage_records', { filter })
+      : post<Record<string, unknown>[]>('/task_runtime/usage/query', filter),
+  getRunUsageSummary: (runId: string) =>
+    isTauri()
+      ? apiInvoke<Record<string, unknown> | null>('get_run_usage_summary', { runId })
+      : get<Record<string, unknown> | null>(`/task_runtime/runs/${runId}/usage`),
+  // Route feedback learning
+  submitRouteFeedback: (messageHash: string, correction: string, note?: string) =>
+    isTauri()
+      ? apiInvoke<{ success: boolean; scored_rules: RouteFeedbackRule[] }>('submit_route_feedback', { messageHash, correction, note: note ?? null })
+      : post<{ success: boolean; scored_rules: RouteFeedbackRule[] }>('/task_runtime/route_feedback/submit', { message_hash: messageHash, correction, note }),
+  getScoredRouteFeedbackRules: () =>
+    isTauri()
+      ? apiInvoke<RouteFeedbackRule[]>('get_scored_route_feedback_rules')
+      : get<RouteFeedbackRule[]>('/task_runtime/route_feedback/scored'),
+  // Conversation events replay
+  listConversationEvents: (conversationId: string, sinceSeq?: string) =>
+    isTauri()
+      ? apiInvoke<Record<string, unknown>[]>('list_conversation_events', { conversationId, sinceSeq: sinceSeq ?? null })
+      : get<Record<string, unknown>[]>(`/task_runtime/conversations/${conversationId}/events${sinceSeq ? `?since_seq=${sinceSeq}` : ''}`),
 };
 
 // ── Trace Events API ─────────────────────────────────────────────────
@@ -700,6 +727,46 @@ export interface TraceSummary {
   events: TraceEvent[];
 }
 
+// ── Cache Diagnostics types ───────────────────────────────────────────
+
+export interface CacheIssueData {
+  kind: string;
+  severity: 'info' | 'warning' | 'critical';
+  message: string;
+  affected_calls: number;
+}
+
+export interface RecentCallFingerprint {
+  model: string;
+  input_tokens: number;
+  cached_input_tokens: number;
+  system_prompt_hash?: string | null;
+  tools_schema_hash?: string | null;
+  cwd_hash?: string | null;
+  worker_prompt_hash?: string | null;
+  provider?: string | null;
+}
+
+export interface CacheDiagnosticsData {
+  overall_read_rate: number;
+  total_input_tokens: number;
+  total_cached_input_tokens: number;
+  total_cache_creation_input_tokens: number;
+  total_llm_calls: number;
+  calls_missing_usage: number;
+  distinct_models: number;
+  issues: CacheIssueData[];
+  suggested_fixes: string[];
+  recent_calls: RecentCallFingerprint[];
+  fingerprint_changes: {
+    system_prompt_hash_changes: number;
+    tools_schema_hash_changes: number;
+    cwd_hash_changes: number;
+    worker_prompt_hash_changes: number;
+    distinct_providers: number;
+  };
+}
+
 export const traceEventsApi = {
   listSessions: () =>
     isTauri()
@@ -717,6 +784,10 @@ export const traceEventsApi = {
     isTauri()
       ? apiInvoke<{ cleared: string }>('clear_trace_session', { session_id: sessionId })
       : del<{ cleared: string }>(`/trace-events/${sessionId}`),
+  getCacheDiagnostics: (sessionId?: string) =>
+    isTauri()
+      ? apiInvoke<CacheDiagnosticsData>('get_cache_diagnostics', { sessionId: sessionId ?? null })
+      : get<CacheDiagnosticsData>(`/trace-events/diagnostics${sessionId ? `?session_id=${sessionId}` : ''}`),
 };
 
 // ── Files API ───────────────────────────────────────────────────────

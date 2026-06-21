@@ -1,10 +1,10 @@
 # Worker Runtime Redesign Plan
 
-This document is the durable execution plan for redesigning EchoCoWork's approval modes, run modes, worker/subagent parallelism, and GUI trace visibility.
+This document is the durable execution plan for redesigning EKO's approval modes, run modes, worker/subagent parallelism, and GUI trace visibility.
 
 ## North Star
 
-EchoCoWork should show one coherent run:
+EKO should show one coherent run:
 
 - The main assistant thinking and response.
 - The active workers/subagents underneath the run.

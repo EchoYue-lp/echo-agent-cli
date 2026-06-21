@@ -222,6 +222,41 @@ impl TaskRuntimeStore {
             );
             CREATE INDEX IF NOT EXISTS ix_approvals_lookup
                 ON tr_approvals(run_id, conversation_id, tool_name);
+
+            CREATE TABLE IF NOT EXISTS tr_usage_records (
+                id                            TEXT PRIMARY KEY,
+                session_id                    TEXT NOT NULL,
+                run_id                        TEXT,
+                worker_id                     TEXT,
+                model                         TEXT NOT NULL,
+                provider                      TEXT,
+                route_kind                    TEXT,
+                input_tokens                  INTEGER NOT NULL DEFAULT 0,
+                output_tokens                 INTEGER NOT NULL DEFAULT 0,
+                cached_input_tokens           INTEGER NOT NULL DEFAULT 0,
+                cache_creation_input_tokens   INTEGER NOT NULL DEFAULT 0,
+                usage_reported                INTEGER NOT NULL DEFAULT 1,
+                system_prompt_hash            TEXT,
+                tools_schema_hash             TEXT,
+                cwd_hash                      TEXT,
+                worker_prompt_hash            TEXT,
+                created_at                    TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS ix_usage_model ON tr_usage_records(model);
+            CREATE INDEX IF NOT EXISTS ix_usage_run ON tr_usage_records(run_id);
+            CREATE INDEX IF NOT EXISTS ix_usage_created ON tr_usage_records(created_at);
+            CREATE INDEX IF NOT EXISTS ix_usage_route ON tr_usage_records(route_kind);
+            CREATE INDEX IF NOT EXISTS ix_usage_session ON tr_usage_records(session_id);
+
+            CREATE TABLE IF NOT EXISTS tr_conversation_events (
+                seq               INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id   TEXT NOT NULL,
+                event_type        TEXT NOT NULL,
+                payload           TEXT NOT NULL DEFAULT '{}',
+                timestamp         TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS ix_conv_events
+                ON tr_conversation_events(conversation_id, seq);
             ",
         )?;
         Ok(())
@@ -1062,8 +1097,35 @@ impl TaskRuntimeStore {
                 "worker_id": worker_id,
                 "agent_name": agent_name,
                 "title": title,
-                "usage": payload,
+                "usage": payload.clone(),
             }),
+        )?;
+        tx.execute(
+            "INSERT OR REPLACE INTO tr_usage_records
+             (id, session_id, run_id, worker_id, model, provider, route_kind,
+              input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
+              usage_reported, system_prompt_hash, tools_schema_hash, cwd_hash,
+              worker_prompt_hash, created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                json_string(&payload, "session_id").unwrap_or_else(|| run_id.to_string()),
+                run_id,
+                worker_id,
+                json_string(&payload, "model").unwrap_or_else(|| "unknown".to_string()),
+                json_string(&payload, "provider"),
+                json_string(&payload, "route_kind").or_else(|| Some("task_runtime".to_string())),
+                json_u64(&payload, "prompt_tokens") as i64,
+                json_u64(&payload, "completion_tokens") as i64,
+                json_u64(&payload, "cached_prompt_tokens") as i64,
+                json_u64(&payload, "cache_creation_prompt_tokens") as i64,
+                json_bool(&payload, "usage_reported", true) as i32,
+                json_string(&payload, "system_prompt_hash"),
+                json_string(&payload, "tools_schema_hash"),
+                json_string(&payload, "cwd_hash"),
+                json_string(&payload, "worker_prompt_hash"),
+                Utc::now().to_rfc3339(),
+            ],
         )?;
         tx.commit()?;
         Ok(())
@@ -1145,6 +1207,22 @@ fn append_event_tx(
         ],
     )?;
     Ok(())
+}
+
+fn json_u64(value: &serde_json::Value, key: &str) -> u64 {
+    value.get(key).and_then(|v| v.as_u64()).unwrap_or(0)
+}
+
+fn json_bool(value: &serde_json::Value, key: &str, default: bool) -> bool {
+    value.get(key).and_then(|v| v.as_bool()).unwrap_or(default)
+}
+
+fn json_string(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string())
 }
 
 fn insert_plan_task_tx(
@@ -1475,5 +1553,260 @@ mod tests {
         // approve -> ready -> running so todos can transition freely
         s.transition_run("r1", TaskRunStatus::Ready).unwrap();
         s.transition_run("r1", TaskRunStatus::Running).unwrap();
+    }
+}
+
+// ── Usage records persistence ──────────────────────────────────────────
+
+impl TaskRuntimeStore {
+    /// Insert a usage record.
+    pub fn insert_usage_record(
+        &self,
+        record: &super::types::UsageRecord,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT OR REPLACE INTO tr_usage_records
+             (id, session_id, run_id, worker_id, model, provider, route_kind,
+              input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
+              usage_reported, system_prompt_hash, tools_schema_hash, cwd_hash,
+              worker_prompt_hash, created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+            rusqlite::params![
+                record.id,
+                record.session_id,
+                record.run_id,
+                record.worker_id,
+                record.model,
+                record.provider,
+                record.route_kind,
+                record.input_tokens as i64,
+                record.output_tokens as i64,
+                record.cached_input_tokens as i64,
+                record.cache_creation_input_tokens as i64,
+                record.usage_reported as i32,
+                record.system_prompt_hash,
+                record.tools_schema_hash,
+                record.cwd_hash,
+                record.worker_prompt_hash,
+                record.created_at.to_rfc3339(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Query usage records with optional filters.
+    pub fn query_usage_records(
+        &self,
+        filter: &super::types::UsageQueryFilter,
+    ) -> Result<Vec<super::types::UsageRecord>, StoreError> {
+        use super::types::UsageRecord;
+        let conn = self.lock()?;
+        let mut sql = String::from(
+            "SELECT id, session_id, run_id, worker_id, model, provider, route_kind,
+                    input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
+                    usage_reported, system_prompt_hash, tools_schema_hash, cwd_hash,
+                    worker_prompt_hash, created_at
+             FROM tr_usage_records WHERE 1=1",
+        );
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+        if let Some(ref v) = filter.session_id {
+            params.push(Box::new(v.clone()));
+            sql.push_str(&format!(" AND session_id = ?{}", params.len()));
+        }
+        if let Some(ref v) = filter.run_id {
+            params.push(Box::new(v.clone()));
+            sql.push_str(&format!(" AND run_id = ?{}", params.len()));
+        }
+        if let Some(ref v) = filter.model {
+            params.push(Box::new(v.clone()));
+            sql.push_str(&format!(" AND model = ?{}", params.len()));
+        }
+        if let Some(ref v) = filter.provider {
+            params.push(Box::new(v.clone()));
+            sql.push_str(&format!(" AND provider = ?{}", params.len()));
+        }
+        if let Some(ref v) = filter.route_kind {
+            params.push(Box::new(v.clone()));
+            sql.push_str(&format!(" AND route_kind = ?{}", params.len()));
+        }
+        if let Some(ref v) = filter.created_after {
+            params.push(Box::new(v.to_rfc3339()));
+            sql.push_str(&format!(" AND created_at >= ?{}", params.len()));
+        }
+        if let Some(ref v) = filter.created_before {
+            params.push(Box::new(v.to_rfc3339()));
+            sql.push_str(&format!(" AND created_at <= ?{}", params.len()));
+        }
+
+        sql.push_str(" ORDER BY created_at DESC");
+
+        if let Some(limit) = filter.limit {
+            params.push(Box::new(limit as i64));
+            sql.push_str(&format!(" LIMIT ?{}", params.len()));
+        }
+        if let Some(offset) = filter.offset {
+            params.push(Box::new(offset as i64));
+            sql.push_str(&format!(" OFFSET ?{}", params.len()));
+        }
+
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(param_refs.as_slice(), |row| {
+            Ok(UsageRecord {
+                id: row.get(0)?,
+                session_id: row.get(1)?,
+                run_id: row.get(2)?,
+                worker_id: row.get(3)?,
+                model: row.get(4)?,
+                provider: row.get(5)?,
+                route_kind: row.get(6)?,
+                input_tokens: row.get::<_, i64>(7)? as u64,
+                output_tokens: row.get::<_, i64>(8)? as u64,
+                cached_input_tokens: row.get::<_, i64>(9)? as u64,
+                cache_creation_input_tokens: row.get::<_, i64>(10)? as u64,
+                usage_reported: row.get::<_, i32>(11)? != 0,
+                system_prompt_hash: row.get(12)?,
+                tools_schema_hash: row.get(13)?,
+                cwd_hash: row.get(14)?,
+                worker_prompt_hash: row.get(15)?,
+                created_at: {
+                    let s: String = row.get(16)?;
+                    chrono::DateTime::parse_from_rfc3339(&s)
+                        .map(|dt| dt.with_timezone(&chrono::Utc))
+                        .unwrap_or_else(|_| chrono::Utc::now())
+                },
+            })
+        })?;
+
+        let mut records = Vec::new();
+        for row in rows {
+            records.push(row.map_err(StoreError::Sqlite)?);
+        }
+        Ok(records)
+    }
+
+    /// Get an end-of-run usage summary from persisted records.
+    pub fn get_run_usage_summary(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<super::types::RunUsageSummary>, StoreError> {
+        use super::types::{ModelUsageSummary, RunUsageSummary};
+        let records = self.query_usage_records(&super::types::UsageQueryFilter {
+            run_id: Some(run_id.to_string()),
+            ..Default::default()
+        })?;
+
+        if records.is_empty() {
+            return Ok(None);
+        }
+
+        let mut total_input = 0u64;
+        let mut total_output = 0u64;
+        let mut total_cached = 0u64;
+        let mut total_cache_write = 0u64;
+        let mut model_map: std::collections::HashMap<String, (u64, u64, u64, u64)> =
+            std::collections::HashMap::new();
+
+        for r in &records {
+            total_input += r.input_tokens;
+            total_output += r.output_tokens;
+            total_cached += r.cached_input_tokens;
+            total_cache_write += r.cache_creation_input_tokens;
+
+            let entry = model_map.entry(r.model.clone()).or_insert((0, 0, 0, 0));
+            entry.0 += 1; // llm_calls
+            entry.1 += r.input_tokens;
+            entry.2 += r.output_tokens;
+            entry.3 += r.cached_input_tokens;
+        }
+
+        let cache_read_rate = if total_input > 0 {
+            total_cached as f64 / total_input as f64
+        } else {
+            0.0
+        };
+
+        let model_breakdown: Vec<ModelUsageSummary> = model_map
+            .into_iter()
+            .map(|(model, (calls, inp, out, cached))| ModelUsageSummary {
+                model,
+                llm_calls: calls,
+                input_tokens: inp,
+                output_tokens: out,
+                cached_input_tokens: cached,
+            })
+            .collect();
+
+        let top_low_hit_reasons = if cache_read_rate < 0.1 && total_input > 0 {
+            vec!["cache read rate below 10% — check system prompt stability and tools schema consistency".to_string()]
+        } else {
+            vec![]
+        };
+
+        Ok(Some(RunUsageSummary {
+            run_id: Some(run_id.to_string()),
+            total_input_tokens: total_input,
+            total_output_tokens: total_output,
+            total_cached_input_tokens: total_cached,
+            total_cache_creation_input_tokens: total_cache_write,
+            cache_read_rate,
+            llm_calls: records.len() as u64,
+            model_breakdown,
+            top_low_hit_reasons,
+        }))
+    }
+
+    // ── Conversation events (replay support) ───────────────────────────
+
+    pub fn append_conversation_event(
+        &self,
+        conversation_id: &str,
+        event_type: &str,
+        payload: &str,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock()?;
+        conn.execute(
+            "INSERT INTO tr_conversation_events (conversation_id, event_type, payload, timestamp)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                conversation_id,
+                event_type,
+                payload,
+                chrono::Utc::now().to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_conversation_events(
+        &self,
+        conversation_id: &str,
+        since_seq: Option<i64>,
+    ) -> Result<Vec<serde_json::Value>, StoreError> {
+        let conn = self.lock()?;
+        let sql = if let Some(seq) = since_seq {
+            format!(
+                "SELECT seq, event_type, payload, timestamp FROM tr_conversation_events WHERE conversation_id = ?1 AND seq > {seq} ORDER BY seq"
+            )
+        } else {
+            "SELECT seq, event_type, payload, timestamp FROM tr_conversation_events WHERE conversation_id = ?1 ORDER BY seq".to_string()
+        };
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params![conversation_id], |row| {
+            Ok(serde_json::json!({
+                "seq": row.get::<_, i64>(0)?,
+                "event_type": row.get::<_, String>(1)?,
+                "payload": row.get::<_, String>(2)?,
+                "timestamp": row.get::<_, String>(3)?,
+            }))
+        })?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row.map_err(StoreError::Sqlite)?);
+        }
+        Ok(events)
     }
 }

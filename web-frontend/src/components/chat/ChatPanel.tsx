@@ -9,6 +9,7 @@ import { useTauriChat } from '../../hooks/useTauriChat';
 import { isTauri } from '../../lib/tauri-bridge';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
 import { TaskRuntimeMainPanel } from '../task/TaskRuntimePanel';
+import { ConversationTimeline } from './ConversationTimeline';
 import type { Attachment } from '../../types/api';
 
 function useChatTransport() {
@@ -74,7 +75,7 @@ export function ChatPanel() {
       <div className="flex h-12 shrink-0 items-center justify-between border-b border-[var(--border-primary)] bg-[var(--bg-primary)] px-12">
         <div className="min-w-0">
           <div className="truncate text-sm font-semibold text-[var(--text-primary)]">
-            {currentWorkspace?.name || 'EchoCoWork'}
+            {currentWorkspace?.name || 'EKO'}
           </div>
           <div className="truncate text-[11px] text-[var(--text-tertiary)]">
             {currentWorkspace?.root || '选择或创建一个任务开始工作'}
@@ -146,6 +147,7 @@ export function ChatPanel() {
                 );
               })}
 
+              <ConversationTimeline />
               <TaskRuntimeMainPanel />
 
               {isStreaming &&

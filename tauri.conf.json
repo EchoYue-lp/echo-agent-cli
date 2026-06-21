@@ -1,8 +1,8 @@
 {
   "$schema": "https://raw.githubusercontent.com/nickel-lang/json-schema-store/main/tauri.v2.schema.json",
-  "productName": "EchoCoWork",
+  "productName": "EKO",
   "version": "1.0.0",
-  "identifier": "com.echocowork.desktop",
+  "identifier": "com.eko.desktop",
   "mainBinaryName": "echo-agent-tauri",
   "build": {
     "runner": {
@@ -19,7 +19,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "EchoCoWork",
+        "title": "EKO",
         "width": 1400,
         "height": 900,
         "minWidth": 900,

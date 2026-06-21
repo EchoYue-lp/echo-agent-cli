@@ -42,7 +42,7 @@ impl Widget for StatusBar {
 
         let line = Line::from(vec![
             Span::styled(
-                " EchoCoWork",
+                " EKO",
                 Style::default().fg(mode_color).add_modifier(Modifier::BOLD),
             ),
             Span::styled(format!("  {}", app.mode), Style::default().fg(t.text)),

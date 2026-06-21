@@ -19,6 +19,20 @@ pub struct TraceEvent {
     pub metadata: HashMap<String, serde_json::Value>,
 }
 
+/// Content fingerprint for tracking cache stability across LLM calls.
+///
+/// Each hash covers the canonical content of one dimension that affects
+/// prompt-cache hit rate: system prompt, tools schema, working-directory,
+/// and worker prompt. When the hash changes between calls, the provider
+/// cannot reuse the prior cache entry.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ContentFingerprint {
+    /// Truncated hash (first 16 hex chars of SHA-256).
+    pub hash: String,
+    /// First 80 chars of the content for quick visual scanning.
+    pub preview: String,
+}
+
 /// 追踪事件类型。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -34,6 +48,26 @@ pub enum TraceKind {
         cache_creation_input_tokens: u64,
         #[serde(default)]
         usage_reported: bool,
+        /// SHA-256 hash of system prompt content (first 16 hex chars).
+        /// Changes when system prompt, memory injection, or hook output varies.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        system_prompt_hash: Option<String>,
+        /// SHA-256 hash of sorted tool names + parameter JSON.
+        /// Changes when tools are added, removed, or reordered.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tools_schema_hash: Option<String>,
+        /// SHA-256 hash of current working directory + workspace root.
+        /// Changes when the agent switches workspaces mid-session.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cwd_hash: Option<String>,
+        /// SHA-256 hash of the worker/sub-agent prompt template.
+        /// None for main-agent calls; changes when worker prompts vary.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worker_prompt_hash: Option<String>,
+        /// Provider ID string (e.g. "deepseek", "openai", "anthropic").
+        /// Different providers never share prompt cache.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
     },
     /// 工具调用。
     ToolCall {

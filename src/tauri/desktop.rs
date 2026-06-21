@@ -1,4 +1,4 @@
-//! EchoCoWork — Tauri desktop runtime.
+//! EKO — Tauri desktop runtime.
 //!
 //! Shared by the dedicated `echo-agent-tauri` binary and by the package-name
 //! binary when Tauri CLI builds the app with `--no-default-features --features gui`.
@@ -30,7 +30,7 @@ fn install_panic_hook() {
             let _ = std::fs::create_dir_all(parent);
         }
         let message = format!(
-            "EchoCoWork crashed at {}\n\
+            "EKO crashed at {}\n\
              Location: {:?}\n\n\
              {}\n\n\
              Please report this issue or check your configuration.\n",
@@ -54,11 +54,11 @@ fn install_panic_hook() {
             let _ = Command::new("osascript")
                 .arg("-e")
                 .arg(
-                    "display dialog \"EchoCoWork crashed during startup.\\n\\n\
+                    "display dialog \"EKO crashed during startup.\\n\\n\
                      Details have been written to the crash log.\\n\\n\
                      Run from Terminal to see full output:\\n\
-                     /Applications/EchoCoWork.app/Contents/MacOS/echo-agent-cli\" \
-                     with title \"EchoCoWork\" buttons {\"OK\"} default button \"OK\"",
+                     /Applications/EKO.app/Contents/MacOS/echo-agent-cli\" \
+                     with title \"EKO\" buttons {\"OK\"} default button \"OK\"",
                 )
                 .output();
         }
@@ -78,10 +78,10 @@ pub async fn run_desktop_entry() -> anyhow::Result<()> {
         let _ = std::fs::write(
             &log_path,
             format!(
-                "EchoCoWork starting at {}\n\
+                "EKO starting at {}\n\
                  If you see this file, the app is running but may have failed to display.\n\
                  Try running from Terminal:\n\
-                 /Applications/EchoCoWork.app/Contents/MacOS/echo-agent-cli\n",
+                 /Applications/EKO.app/Contents/MacOS/echo-agent-cli\n",
                 chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
             ),
         );
@@ -90,7 +90,7 @@ pub async fn run_desktop_entry() -> anyhow::Result<()> {
     if let Err(e) = run_desktop().await {
         let log_path = crash_log_path();
         let message = format!(
-            "EchoCoWork failed to start at {}\n\nError: {:?}\n",
+            "EKO failed to start at {}\n\nError: {:?}\n",
             chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC"),
             e
         );
@@ -103,10 +103,10 @@ pub async fn run_desktop_entry() -> anyhow::Result<()> {
             let _ = Command::new("osascript")
                 .arg("-e")
                 .arg(format!(
-                    "display dialog \"EchoCoWork failed to start.\\n\\n\
+                    "display dialog \"EKO failed to start.\\n\\n\
                      Error: {}\\n\\n\
                      Crash log: {}\" \
-                     with title \"EchoCoWork\" buttons {{\"OK\"}} default button \"OK\"",
+                     with title \"EKO\" buttons {{\"OK\"}} default button \"OK\"",
                     format!("{:?}", e).replace('"', "\\\""),
                     log_path.display()
                 ))

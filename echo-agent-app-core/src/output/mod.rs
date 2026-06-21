@@ -288,7 +288,7 @@ impl OutputRenderer {
         println!();
         println!("{}", border);
         self.print_banner_line("", width);
-        let title = format!("EchoCoWork v{}", version);
+        let title = format!("EKO v{}", version);
         self.print_banner_line(&format!("{:^width$}", title, width = width - 2), width);
         self.print_banner_line("", width);
         let tagline = "Production-grade AI Agent — ReAct / MCP / Multi-Modal";

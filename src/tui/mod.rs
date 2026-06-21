@@ -299,7 +299,7 @@ impl TuiApp {
             messages: vec![ChatMessage {
                 role: MessageRole::System,
                 content: format!(
-                    "EchoCoWork · {mode} · {model}\n输入消息开始协作，/ 查看命令，Ctrl+C 退出。"
+                    "EKO · {mode} · {model}\n输入消息开始协作，/ 查看命令，Ctrl+C 退出。"
                 ),
             }],
             message_groups: vec![],

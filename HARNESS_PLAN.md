@@ -1,4 +1,4 @@
-# EchoCoWork Harness 实施计划
+# EKO Harness 实施计划
 
 ## 设计原则
 

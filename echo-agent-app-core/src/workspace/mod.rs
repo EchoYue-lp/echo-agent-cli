@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! ~/.echo-agent/workspaces/{id}/
-//! └── .echocowork/           # 系统数据（默认隐藏）
+//! └── .eko/           # 系统数据（默认隐藏）
 //!     ├── workspace.json     # 清单文件
 //!     ├── sessions/          # 会话历史
 //!     ├── conversations/     # 对话记录（前端持久化）

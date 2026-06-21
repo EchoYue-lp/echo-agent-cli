@@ -1,4 +1,4 @@
-//! EchoCoWork — Tauri desktop entry point.
+//! EKO — Tauri desktop entry point.
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

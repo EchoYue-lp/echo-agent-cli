@@ -661,3 +661,234 @@ pub async fn grant_approval_scope(
         .map_err(internal)?;
     Ok(serde_json::json!({ "granted": created }))
 }
+
+// ── Route feedback learning ───────────────────────────────────────────
+
+#[tauri::command]
+pub async fn submit_route_feedback(
+    state: tauri::State<'_, TauriState>,
+    message_hash: String,
+    correction: String,
+    note: Option<String>,
+) -> Result<serde_json::Value, IpcError> {
+    use echo_agent_app_core::tasks::task_runtime::{
+        RouteFeedbackAction, compute_scored_rules, load_route_records, route_feedback_matches,
+    };
+
+    let action = match correction.as_str() {
+        "correct" => RouteFeedbackAction::Correct,
+        "should_be_chat" => RouteFeedbackAction::ShouldBeChat,
+        "should_be_task" => RouteFeedbackAction::ShouldBeTask,
+        "should_be_readonly_parallel" => RouteFeedbackAction::ShouldBeReadonlyParallel,
+        "too_many_workers" => RouteFeedbackAction::TooManyWorkers,
+        "too_few_workers" => RouteFeedbackAction::TooFewWorkers,
+        other => {
+            return Err(IpcError::Internal(format!("unknown correction: {other}")));
+        }
+    };
+
+    let mut records = load_route_records();
+    let mut found = false;
+    let mut learned_rule: Option<RouteFeedbackRule> = None;
+    for record in &mut records {
+        if record.message_hash == message_hash {
+            record.user_correction = Some(action);
+            if record.matched_feedback_pattern.is_none()
+                && let Some(message_text) = record.message_text.as_deref()
+            {
+                let rules = state.app_state.tasks.route_feedback.read().await;
+                record.matched_feedback_pattern = rules
+                    .iter()
+                    .find(|rule| route_feedback_matches(message_text, &rule.pattern))
+                    .map(|rule| rule.pattern.clone());
+            }
+            if record.matched_feedback_pattern.is_none()
+                && let Some(message_text) = record.message_text.as_deref()
+                && let Some(target_route) = feedback_target_route(action, record.route)
+            {
+                let reason = note.clone().unwrap_or_else(|| {
+                    format!(
+                        "user corrected route from {} to {}",
+                        record.route.as_str(),
+                        target_route.as_str()
+                    )
+                });
+                let rule = RouteFeedbackRule {
+                    pattern: message_text.to_string(),
+                    route: target_route,
+                    reason,
+                    suggested_workers: if target_route == TaskRouteKind::NormalChat {
+                        Vec::new()
+                    } else {
+                        record
+                            .actual_workers
+                            .clone()
+                            .unwrap_or_else(|| record.suggested_workers.clone())
+                    },
+                    hit_count: 0,
+                    last_matched_at: None,
+                };
+                record.matched_feedback_pattern = Some(rule.pattern.clone());
+                learned_rule = Some(rule);
+            }
+            found = true;
+            break;
+        }
+    }
+
+    // Also add a new record if no existing one matched
+    if !found {
+        let record = echo_agent_app_core::tasks::task_runtime::RouteDecisionRecord {
+            message_hash: message_hash.clone(),
+            message_text: None,
+            route: echo_agent_app_core::tasks::task_runtime::TaskRouteKind::NormalChat,
+            confidence: 0.0,
+            matched_feedback_pattern: None,
+            suggested_workers: vec![],
+            actual_workers: None,
+            final_run_status: None,
+            user_correction: Some(action),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        };
+        records.push(record);
+    }
+
+    // Persist all records
+    let path = echo_agent_app_core::tasks::task_runtime::default_route_records_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| IpcError::Internal(e.to_string()))?;
+    }
+    let content = records
+        .iter()
+        .map(|r| serde_json::to_string(r).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    std::fs::write(&path, content).map_err(|e| IpcError::Internal(e.to_string()))?;
+
+    if let Some(rule) = learned_rule {
+        let key = route_feedback_key(&rule.pattern);
+        let mut rules = state.app_state.tasks.route_feedback.write().await;
+        let previous = rules
+            .iter()
+            .find(|existing| route_feedback_key(&existing.pattern) == key)
+            .cloned();
+        rules.retain(|existing| route_feedback_key(&existing.pattern) != key);
+        rules.push(RouteFeedbackRule {
+            hit_count: previous
+                .as_ref()
+                .map(|existing| existing.hit_count)
+                .unwrap_or(0),
+            last_matched_at: previous.and_then(|existing| existing.last_matched_at),
+            ..rule
+        });
+        save_route_feedback_rules(&rules).map_err(internal)?;
+    }
+
+    // Recompute scored rules from feedback rules + records
+    let rules = {
+        let guard = state.app_state.tasks.route_feedback.read().await;
+        guard.clone()
+    };
+    let scored = compute_scored_rules(&rules, &records);
+
+    Ok(serde_json::json!({
+        "success": true,
+        "scored_rules": scored.iter().map(|s| serde_json::json!({
+            "pattern": s.rule.pattern,
+            "route": s.rule.route.as_str(),
+            "hit_count": s.rule.hit_count,
+            "success_count": s.success_count,
+            "failure_count": s.failure_count,
+            "score": s.score,
+            "last_failure_reason": s.last_failure_reason,
+        })).collect::<Vec<_>>(),
+    }))
+}
+
+fn feedback_target_route(
+    action: echo_agent_app_core::tasks::task_runtime::RouteFeedbackAction,
+    current_route: TaskRouteKind,
+) -> Option<TaskRouteKind> {
+    use echo_agent_app_core::tasks::task_runtime::RouteFeedbackAction;
+    match action {
+        RouteFeedbackAction::Correct => None,
+        RouteFeedbackAction::ShouldBeChat => Some(TaskRouteKind::NormalChat),
+        RouteFeedbackAction::ShouldBeTask => Some(TaskRouteKind::ComplexRuntime),
+        RouteFeedbackAction::ShouldBeReadonlyParallel => {
+            Some(TaskRouteKind::ParallelReadonlyDelegation)
+        }
+        RouteFeedbackAction::TooManyWorkers | RouteFeedbackAction::TooFewWorkers => {
+            Some(current_route)
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn get_scored_route_feedback_rules(
+    state: tauri::State<'_, TauriState>,
+) -> Result<Vec<serde_json::Value>, IpcError> {
+    use echo_agent_app_core::tasks::task_runtime::{compute_scored_rules, load_route_records};
+
+    let rules = {
+        let guard = state.app_state.tasks.route_feedback.read().await;
+        guard.clone()
+    };
+    let records = load_route_records();
+    let scored = compute_scored_rules(&rules, &records);
+
+    Ok(scored
+        .iter()
+        .map(|s| {
+            serde_json::json!({
+                "pattern": s.rule.pattern,
+                "route": s.rule.route.as_str(),
+                "hit_count": s.rule.hit_count,
+                "success_count": s.success_count,
+                "failure_count": s.failure_count,
+                "score": s.score,
+                "last_failure_reason": s.last_failure_reason,
+            })
+        })
+        .collect())
+}
+
+// ── Conversation event replay ─────────────────────────────────────────
+
+#[tauri::command]
+pub async fn list_conversation_events(
+    state: tauri::State<'_, TauriState>,
+    conversation_id: String,
+    since_seq: Option<String>,
+) -> Result<Vec<serde_json::Value>, IpcError> {
+    let store = store(&state)?;
+    let since = since_seq.and_then(|s| s.parse::<i64>().ok());
+    store
+        .list_conversation_events(&conversation_id, since)
+        .map_err(internal)
+}
+
+// ── Usage trend queries ───────────────────────────────────────────────
+
+#[tauri::command]
+pub async fn query_usage_records(
+    state: tauri::State<'_, TauriState>,
+    filter: echo_agent_app_core::tasks::task_runtime::UsageQueryFilter,
+) -> Result<Vec<serde_json::Value>, IpcError> {
+    let store = store(&state)?;
+    let records = store.query_usage_records(&filter).map_err(internal)?;
+    Ok(records
+        .into_iter()
+        .map(|r| serde_json::to_value(r).unwrap_or_default())
+        .collect())
+}
+
+#[tauri::command]
+pub async fn get_run_usage_summary(
+    state: tauri::State<'_, TauriState>,
+    run_id: String,
+) -> Result<Option<serde_json::Value>, IpcError> {
+    let store = store(&state)?;
+    let summary = store.get_run_usage_summary(&run_id).map_err(internal)?;
+    Ok(summary.map(|s| serde_json::to_value(s).unwrap_or_default()))
+}

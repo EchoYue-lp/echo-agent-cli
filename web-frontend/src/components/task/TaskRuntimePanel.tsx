@@ -977,6 +977,8 @@ export function TaskRuntimePanel() {
 
   if (!activeRun && !routeExplanation) return null;
 
+  // Detailed execution timeline is now in ConversationTimeline (main panel).
+  // This right-rail panel serves as a compact status summary only.
   const runId = activeRun?.run_id ?? routeExplanation?.runId;
   const usageSummary = cacheUsageForWorkers(visibleTraceWorkers);
   const completedCount = todos.filter(

@@ -1,8 +1,8 @@
-# EchoCoWork 架构说明
+# EKO 架构说明
 
 ## 整体架构
 
-EchoCoWork 采用分层架构设计，分为三个主要层次：
+EKO 采用分层架构设计，分为三个主要层次：
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -216,7 +216,7 @@ impl SchedulerRunner {
 ```
 workspaces/
 ├── {workspace-id}/
-│   └── .echocowork/
+│   └── .eko/
 │       ├── sessions/         # 会话历史 (JSON)
 │       ├── conversations/    # 对话记录
 │       ├── memory/           # 记忆存储 (SQLite)
@@ -331,7 +331,7 @@ async fn main() -> Result<()> {
 
 ### 内置工具
 
-EchoCoWork 继承 echo-agent 的 67+ 内置工具：
+EKO 继承 echo-agent 的 67+ 内置工具：
 
 ```rust
 pub trait Tool: Send + Sync {

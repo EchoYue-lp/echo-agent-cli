@@ -53,7 +53,16 @@ export function RouteFeedbackPanel() {
     setLoading(true);
     setError(null);
     try {
-      setRules(await taskRuntimeApi.listRouteFeedbackRules());
+      const [basic, scored] = await Promise.all([
+        taskRuntimeApi.listRouteFeedbackRules(),
+        taskRuntimeApi.getScoredRouteFeedbackRules().catch(() => [] as RouteFeedbackRule[]),
+      ]);
+      // Merge scored data into basic rules
+      const merged = basic.map((rule) => {
+        const s = scored.find((sr) => sr.pattern === rule.pattern);
+        return s ? { ...rule, ...s } : rule;
+      });
+      setRules(merged);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -260,6 +269,14 @@ export function RouteFeedbackPanel() {
                     <span className="rounded px-2 py-0.5 text-[11px]" style={{ background: 'var(--bg-hover)', color: 'var(--text-tertiary)' }}>
                       命中 {rule.hit_count ?? 0}
                     </span>
+                    {rule.score != null && (
+                      <span className="rounded px-2 py-0.5 text-[11px] font-mono" style={{
+                        background: rule.score > 0.8 ? 'rgba(0,200,0,0.1)' : rule.score < 0.3 ? 'rgba(200,0,0,0.1)' : 'var(--bg-hover)',
+                        color: rule.score > 0.8 ? 'var(--color-success)' : rule.score < 0.3 ? 'var(--color-error)' : 'var(--text-tertiary)',
+                      }}>
+                        {(rule.score * 100).toFixed(0)}%
+                      </span>
+                    )}
                   </div>
                 </div>
                 <button

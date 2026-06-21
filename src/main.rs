@@ -1,4 +1,4 @@
-//! EchoCoWork - TUI/GUI 通用 Agent
+//! EKO - TUI/GUI 通用 Agent
 //!
 //! 默认启动全屏 TUI；GUI 使用独立的 Tauri 入口。Web/REPL 仅保留为内部兼容入口。
 //!

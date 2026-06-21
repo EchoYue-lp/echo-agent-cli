@@ -32,59 +32,59 @@ impl WorkspaceLayout {
 
     // ── 子目录 ──
 
-    /// 工作区系统数据目录：`{root}/.echocowork/`
+    /// 工作区系统数据目录：`{root}/.eko/`
     pub fn state_dir(root: &Path) -> PathBuf {
-        root.join(".echocowork")
+        root.join(".eko")
     }
 
-    /// 会话历史目录：`{root}/.echocowork/sessions/`
+    /// 会话历史目录：`{root}/.eko/sessions/`
     pub fn sessions(root: &Path) -> PathBuf {
         Self::state_dir(root).join("sessions")
     }
 
-    /// 对话记录目录（前端持久化）：`{root}/.echocowork/conversations/`
+    /// 对话记录目录（前端持久化）：`{root}/.eko/conversations/`
     pub fn conversations(root: &Path) -> PathBuf {
         Self::state_dir(root).join("conversations")
     }
 
-    /// 记忆存储目录：`{root}/.echocowork/memory/`
+    /// 记忆存储目录：`{root}/.eko/memory/`
     pub fn memory(root: &Path) -> PathBuf {
         Self::state_dir(root).join("memory")
     }
 
-    /// 数据集目录（数据分析工作区）：`{root}/.echocowork/data/`
+    /// 数据集目录（数据分析工作区）：`{root}/.eko/data/`
     pub fn data(root: &Path) -> PathBuf {
         Self::state_dir(root).join("data")
     }
 
-    /// 论文目录（学术研究工作区）：`{root}/.echocowork/papers/`
+    /// 论文目录（学术研究工作区）：`{root}/.eko/papers/`
     pub fn papers(root: &Path) -> PathBuf {
         Self::state_dir(root).join("papers")
     }
 
-    /// 生成物目录（报告、论文、图表）：`{root}/.echocowork/artifacts/`
+    /// 生成物目录（报告、论文、图表）：`{root}/.eko/artifacts/`
     pub fn artifacts(root: &Path) -> PathBuf {
         Self::state_dir(root).join("artifacts")
     }
 
-    /// 任务状态目录（SQLite DB）：`{root}/.echocowork/tasks/`
+    /// 任务状态目录（SQLite DB）：`{root}/.eko/tasks/`
     pub fn tasks(root: &Path) -> PathBuf {
         Self::state_dir(root).join("tasks")
     }
 
-    /// 执行轨迹目录（JSONL）：`{root}/.echocowork/traces/`
+    /// 执行轨迹目录（JSONL）：`{root}/.eko/traces/`
     pub fn traces(root: &Path) -> PathBuf {
         Self::state_dir(root).join("traces")
     }
 
-    /// 日志目录：`{root}/.echocowork/logs/`
+    /// 日志目录：`{root}/.eko/logs/`
     pub fn logs(root: &Path) -> PathBuf {
         Self::state_dir(root).join("logs")
     }
 
     // ── 特殊文件 ──
 
-    /// 工作区清单文件：`{root}/.echocowork/workspace.json`
+    /// 工作区清单文件：`{root}/.eko/workspace.json`
     pub fn manifest(root: &Path) -> PathBuf {
         Self::state_dir(root).join("workspace.json")
     }
@@ -104,17 +104,17 @@ impl WorkspaceLayout {
         }
     }
 
-    /// 共享草稿文件：`{root}/.echocowork/scratchpad.md`
+    /// 共享草稿文件：`{root}/.eko/scratchpad.md`
     pub fn scratchpad(root: &Path) -> PathBuf {
         Self::state_dir(root).join("scratchpad.md")
     }
 
-    /// 决策日志文件：`{root}/.echocowork/decisions.jsonl`
+    /// 决策日志文件：`{root}/.eko/decisions.jsonl`
     pub fn decisions(root: &Path) -> PathBuf {
         Self::state_dir(root).join("decisions.jsonl")
     }
 
-    /// 上传文件临时目录：`{root}/.echocowork/uploads/`
+    /// 上传文件临时目录：`{root}/.eko/uploads/`
     pub fn uploads(root: &Path) -> PathBuf {
         Self::state_dir(root).join("uploads")
     }
@@ -172,15 +172,15 @@ mod tests {
 
         assert_eq!(
             WorkspaceLayout::sessions(root),
-            PathBuf::from("/tmp/test-workspace/.echocowork/sessions")
+            PathBuf::from("/tmp/test-workspace/.eko/sessions")
         );
         assert_eq!(
             WorkspaceLayout::papers(root),
-            PathBuf::from("/tmp/test-workspace/.echocowork/papers")
+            PathBuf::from("/tmp/test-workspace/.eko/papers")
         );
         assert_eq!(
             WorkspaceLayout::manifest(root),
-            PathBuf::from("/tmp/test-workspace/.echocowork/workspace.json")
+            PathBuf::from("/tmp/test-workspace/.eko/workspace.json")
         );
     }
 

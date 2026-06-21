@@ -1,8 +1,10 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
-import { Activity, AlertTriangle, Cpu, Gauge, RefreshCw, Server } from 'lucide-react';
+import { Activity, AlertTriangle, Cpu, Gauge, RefreshCw, Server, Stethoscope, TrendingUp } from 'lucide-react';
 import { traceEventsApi, type TraceEvent, type TraceSummary } from '../../api/endpoints';
 import { TraceTimeline } from './TraceTimeline';
 import { TokenUsageChart } from './TokenUsageChart';
+import { CacheDiagnosticsPanel } from './CacheDiagnosticsPanel';
+import { UsageTrendsPanel } from './UsageTrendsPanel';
 
 type WindowId = '1h' | '24h' | '7d' | 'all';
 
@@ -96,6 +98,7 @@ function diagnosticMessages(total: UsageAggregate, models: ModelAggregate[]): st
 }
 
 export function ObservabilityPanel() {
+  const [activeTab, setActiveTab] = useState<'overview' | 'diagnostics' | 'trends'>('overview');
   const [windowId, setWindowId] = useState<WindowId>('24h');
   const [sessions, setSessions] = useState<SessionSnapshot[]>([]);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
@@ -189,6 +192,49 @@ export function ObservabilityPanel() {
         </button>
       </div>
 
+      {/* Tab bar */}
+      <div className="mb-4 flex gap-1 border-b" style={{ borderColor: 'var(--border-secondary)' }}>
+        <button
+          onClick={() => setActiveTab('overview')}
+          className="rounded-t-md px-3 py-1.5 text-xs font-medium"
+          style={{
+            background: activeTab === 'overview' ? 'var(--bg-secondary)' : 'transparent',
+            color: activeTab === 'overview' ? 'var(--text-primary)' : 'var(--text-tertiary)',
+            borderBottom: activeTab === 'overview' ? `2px solid var(--accent)` : '2px solid transparent',
+          }}
+        >
+          <Activity size={13} className="inline mr-1" /> 运行概览
+        </button>
+        <button
+          onClick={() => setActiveTab('diagnostics')}
+          className="rounded-t-md px-3 py-1.5 text-xs font-medium"
+          style={{
+            background: activeTab === 'diagnostics' ? 'var(--bg-secondary)' : 'transparent',
+            color: activeTab === 'diagnostics' ? 'var(--text-primary)' : 'var(--text-tertiary)',
+            borderBottom: activeTab === 'diagnostics' ? `2px solid var(--accent)` : '2px solid transparent',
+          }}
+        >
+          <Stethoscope size={13} className="inline mr-1" /> 缓存诊断
+        </button>
+        <button
+          onClick={() => setActiveTab('trends')}
+          className="rounded-t-md px-3 py-1.5 text-xs font-medium"
+          style={{
+            background: activeTab === 'trends' ? 'var(--bg-secondary)' : 'transparent',
+            color: activeTab === 'trends' ? 'var(--text-primary)' : 'var(--text-tertiary)',
+            borderBottom: activeTab === 'trends' ? `2px solid var(--accent)` : '2px solid transparent',
+          }}
+        >
+          <TrendingUp size={13} className="inline mr-1" /> Usage 趋势
+        </button>
+      </div>
+
+      {activeTab === 'diagnostics' ? (
+        <CacheDiagnosticsPanel />
+      ) : activeTab === 'trends' ? (
+        <UsageTrendsPanel />
+      ) : (
+        <>
       <div className="mb-4 flex flex-wrap gap-1">
         {WINDOWS.map((window) => (
           <button
@@ -291,6 +337,8 @@ export function ObservabilityPanel() {
           )}
         </section>
       </div>
+        </>
+      )}
     </div>
   );
 }

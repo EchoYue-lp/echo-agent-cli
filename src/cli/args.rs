@@ -4,11 +4,11 @@
 
 use clap::Parser;
 
-/// EchoCoWork - TUI/GUI 通用 Agent
+/// EKO - TUI/GUI 通用 Agent
 #[derive(Parser, Debug)]
 #[command(name = "echo-agent-cli")]
 #[command(version = "1.0.0")]
-#[command(about = "EchoCoWork TUI/GUI 通用 Agent", long_about = None)]
+#[command(about = "EKO TUI/GUI 通用 Agent", long_about = None)]
 pub struct Args {
     /// 启动全屏 TUI 交互（默认）
     #[arg(long, short = 't', default_value_t = false)]

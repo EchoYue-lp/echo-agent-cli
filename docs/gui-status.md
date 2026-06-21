@@ -50,8 +50,8 @@ These GUI surfaces are visible and backed by real Tauri IPC or runtime state:
 | Evolution trajectory/curator/trace | Connected |
 | Terminal | Connected |
 | Workspace basics | Connected |
-| Scratchpad | Connected to `.echocowork/scratchpad.md` |
-| Decisions | Connected to `.echocowork/decisions.jsonl` |
+| Scratchpad | Connected to `.eko/scratchpad.md` |
+| Decisions | Connected to `.eko/decisions.jsonl` |
 | Worktree | Connected to `git worktree` |
 
 ## Hidden Or Partial GUI Features

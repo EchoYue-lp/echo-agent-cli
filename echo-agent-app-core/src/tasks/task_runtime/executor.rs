@@ -938,7 +938,18 @@ async fn execute_task(
     // (or in addition to) re-reading everything from scratch (plan §1039).
     let dep_summaries = collect_dependency_summaries(&store, &run_id, &task);
 
+    // Stable workspace context for the worker — prepended to the task prompt
+    // so workers know where to operate without needing CWD in their system prompt.
+    let ws_prefix = {
+        let wd = primary_agent.read(|a| a.working_dir()).await;
+        if let Some(ref wd) = wd {
+            format!("[workspace]\n- root: {}\n[/workspace]\n\n", wd.display())
+        } else {
+            String::new()
+        }
+    };
     let prompt = build_task_prompt(&task, &dep_summaries);
+    let prompt = format!("{ws_prefix}{prompt}");
 
     // Dispatch the task. Two paths, by kind:
     // - Read-only kinds (read_only_review, investigation, test_plan, review,
@@ -1139,6 +1150,11 @@ fn collect_dependency_summaries(
 /// and a read-only reminder for non-mutating kinds.
 fn build_task_prompt(task: &PlanTask, dep_summaries: &[(String, String)]) -> String {
     let mut s = String::new();
+    // [task_context] marker: all content below is dynamic per-task information.
+    // Worker system prompts are fixed templates — dynamic task descriptions,
+    // target files, verification steps, and dependency summaries go HERE
+    // (in the user message), keeping the system prefix cache-stable.
+    s.push_str("[task_context]\n");
     s.push_str(&format!("Task: {}\n\n{}\n\n", task.title, task.description));
     // Summary Chain: compact context from completed upstream tasks. Replaces
     // the raw upstream worker conversations (plan §1039-1062).

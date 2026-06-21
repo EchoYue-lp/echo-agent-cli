@@ -298,7 +298,7 @@ impl WorkspaceRegistry {
             }
             fs::remove_dir_all(&canonical_root)?;
         } else {
-            // 自定义路径 → 只删除 EchoCoWork 系统目录，保留用户原有文件
+            // 自定义路径 → 只删除 EKO 系统目录，保留用户原有文件
             let state_dir = WorkspaceLayout::state_dir(&root);
             if state_dir.exists() {
                 fs::remove_dir_all(&state_dir).ok();
@@ -307,7 +307,7 @@ impl WorkspaceRegistry {
             if legacy_manifest.exists() {
                 fs::remove_file(&legacy_manifest).ok();
             }
-            // 清理旧版本在 root 下直接创建的系统子目录（新版已移入 .echocowork/）。
+            // 清理旧版本在 root 下直接创建的系统子目录（新版已移入 .eko/）。
             for subdir in [
                 "sessions",
                 "conversations",
@@ -383,7 +383,7 @@ impl WorkspaceRegistry {
         None
     }
 
-    /// 通过向上遍历目录查找 `.echocowork/workspace.json` 或旧版 `.workspace.json` 来检测工作区。
+    /// 通过向上遍历目录查找 `.eko/workspace.json` 或旧版 `.workspace.json` 来检测工作区。
     pub fn detect_from_manifest(cwd: &Path) -> Option<Workspace> {
         let mut current = cwd.to_path_buf();
         loop {
@@ -516,7 +516,7 @@ mod tests {
 
         // Custom path: user's original file should be preserved
         assert!(custom.join("README.md").exists());
-        // But EchoCoWork system data should be cleaned up
+        // But EKO system data should be cleaned up
         assert!(!WorkspaceLayout::state_dir(&custom).exists());
         assert!(!WorkspaceLayout::manifest(&custom).exists());
     }

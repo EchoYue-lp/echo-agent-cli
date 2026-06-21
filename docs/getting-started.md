@@ -1,4 +1,4 @@
-# EchoCoWork 快速入门
+# EKO 快速入门
 
 ## 安装
 
@@ -50,7 +50,7 @@ model:
   
 agent:
   name: "echo-assistant"
-  system_prompt: "你是 EchoCoWork，一个面向真实项目协作的 AI 编程与研究代理。你帮助用户理解需求、检查项目、修改代码、运行验证、整理结论，并在需要时使用记忆和自进化能力沉淀长期经验。"
+  system_prompt: "你是 EKO，一个面向真实项目协作的 AI 编程与研究代理。你帮助用户理解需求、检查项目、修改代码、运行验证、整理结论，并在需要时使用记忆和自进化能力沉淀长期经验。"
 ```
 
 设置环境变量：
@@ -143,7 +143,7 @@ echo-agent-cli sessions delete <id>   # 删除会话
 
 ### 3. 工具使用
 
-EchoCoWork 内置了 67+ 工具，包括：
+EKO 内置了 67+ 工具，包括：
 
 - **文件操作**: read, write, edit, list
 - **Shell 执行**: bash, powershell
@@ -167,7 +167,7 @@ EchoCoWork 内置了 67+ 工具，包括：
 
 ### 5. 记忆系统
 
-EchoCoWork 支持长期记忆：
+EKO 支持长期记忆：
 
 - 自动记录重要信息
 - 跨会话保持上下文
@@ -187,7 +187,7 @@ model:
 
 agent:
   name: "echo-assistant"
-  system_prompt: "你是 EchoCoWork，一个面向真实项目协作的 AI 编程与研究代理。你帮助用户理解需求、检查项目、修改代码、运行验证、整理结论，并在需要时使用记忆和自进化能力沉淀长期经验。"
+  system_prompt: "你是 EKO，一个面向真实项目协作的 AI 编程与研究代理。你帮助用户理解需求、检查项目、修改代码、运行验证、整理结论，并在需要时使用记忆和自进化能力沉淀长期经验。"
   max_iterations: 0            # 0 = 无限制
   enable_tools: true
   enable_memory: true

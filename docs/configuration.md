@@ -1,8 +1,8 @@
-# EchoCoWork 配置指南
+# EKO 配置指南
 
 ## 配置文件位置
 
-EchoCoWork 按以下优先级查找配置文件：
+EKO 按以下优先级查找配置文件：
 
 1. 命令行参数: `--config <path>`
 2. 当前目录: `./echo-agent.yaml`
@@ -51,7 +51,7 @@ configured_models:
 # ── Agent 配置 ─────────────────────────────────────────────────────
 agent:
   name: "echo-assistant"                              # Agent 名称
-  system_prompt: "你是 EchoCoWork，一个面向真实项目协作的 AI 编程与研究代理。你帮助用户理解需求、检查项目、修改代码、运行验证、整理结论，并在需要时使用记忆和自进化能力沉淀长期经验。"  # 系统提示词
+  system_prompt: "你是 EKO，一个面向真实项目协作的 AI 编程与研究代理。你帮助用户理解需求、检查项目、修改代码、运行验证、整理结论，并在需要时使用记忆和自进化能力沉淀长期经验。"  # 系统提示词
   max_iterations: 0            # ReAct 最大迭代次数（0 = 无限制，直到任务完成或用户取消）
   enable_tools: true          # 启用工具调用
   enable_memory: true         # 启用记忆

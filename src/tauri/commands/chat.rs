@@ -10,6 +10,7 @@ use echo_agent::agent::{Agent, CancellationToken};
 use echo_agent::human_loop::{HumanLoopProvider, HumanLoopRequest, HumanLoopResponse};
 use echo_agent::prelude::AgentEvent;
 use echo_agent_app_core::observability::{TraceEvent, TraceKind};
+use echo_agent_app_core::tasks::conversation_runtime::ConversationRuntimeEvent;
 use echo_agent_app_core::tasks::task_runtime::{
     ExecutionPolicy, InteractionMode, TaskPlan, TaskRouteDecision, TaskRunStatus, WorkerTraceEvent,
     WorkerTraceEventKind,
@@ -17,12 +18,54 @@ use echo_agent_app_core::tasks::task_runtime::{
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, LazyLock};
 use tauri::Emitter;
 use tokio::sync::{Mutex, oneshot};
 use uuid::Uuid;
+
+/// Compute a content fingerprint hash (first 16 hex chars of SHA-256).
+fn compute_content_hash(content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    hex::encode(&hasher.finalize()[..8])
+}
+
+/// Emit a unified conversation runtime event to the frontend.
+fn emit_conversation_event(
+    app: &tauri::AppHandle,
+    event: &echo_agent_app_core::tasks::conversation_runtime::ConversationRuntimeEvent,
+    conversation_id: &str,
+    store: Option<&std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
+) {
+    let payload = serde_json::json!({
+        "conversation_id": conversation_id,
+        "event": event,
+    });
+    let _ = app.emit("conversation://event", payload);
+
+    // Persist for replay on history refresh
+    if let Some(ref store) = store {
+        let event_type = match event {
+            ConversationRuntimeEvent::RouteDecision { .. } => "route_decision",
+            ConversationRuntimeEvent::InitialThinking { .. } => "initial_thinking",
+            ConversationRuntimeEvent::WorkerStarted { .. } => "worker_started",
+            ConversationRuntimeEvent::WorkerToolCall { .. } => "worker_tool_call",
+            ConversationRuntimeEvent::WorkerResult { .. } => "worker_result",
+            ConversationRuntimeEvent::LlmUsage { .. } => "llm_usage",
+            ConversationRuntimeEvent::FinalAnswer { .. } => "final_answer",
+            ConversationRuntimeEvent::ApprovalRequest { .. } => "approval_request",
+            ConversationRuntimeEvent::Error { .. } => "error",
+        };
+        let _ = store.append_conversation_event(
+            conversation_id,
+            event_type,
+            &serde_json::to_string(event).unwrap_or_default(),
+        );
+    }
+}
 
 /// Event payload emitted to the frontend via `app.emit("chat://event", ...)`.
 #[derive(Clone, Serialize)]
@@ -386,6 +429,22 @@ pub async fn send_chat_message(
     };
     let message_key = message_key.unwrap_or_else(|| Uuid::new_v4().to_string());
 
+    // Ensure stable cache_user_id for KVCache isolation (DeepSeek requires this
+    // for prompt cache reuse across requests; without it, cache hit rate drops
+    // to <1% because every request is treated as from a different user).
+    //
+    // Persisted to ~/.echo-agent/cache_user_id — generated once, reused forever.
+    {
+        let cache_id = echo_agent_app_core::infra::load_or_create_cache_user_id();
+        agent_handle
+            .write_async(|a| {
+                Box::pin(async move {
+                    a.config_mut().set_cache_user_id(&cache_id);
+                })
+            })
+            .await;
+    }
+
     // ── Complex-task router ────────────────────────────────────────────
     // Classify the input. If it looks like a complex, multi-step task, create
     // a TaskRuntime run and generate a structured plan instead of streaming a
@@ -410,6 +469,25 @@ pub async fn send_chat_message(
             &route_feedback,
         )
         .await;
+        // ── Record route decision for long-term learning ──────────────
+        {
+            use echo_agent_app_core::tasks::task_runtime::{
+                RouteDecisionRecord, append_route_record,
+            };
+            let record = RouteDecisionRecord {
+                message_hash: compute_content_hash(&message),
+                message_text: Some(message.clone()),
+                route: route_decision.route,
+                confidence: route_decision.confidence,
+                matched_feedback_pattern: route_decision.matched_feedback_pattern.clone(),
+                suggested_workers: route_decision.suggested_workers.clone(),
+                actual_workers: None,
+                final_run_status: None,
+                user_correction: None,
+                created_at: chrono::Utc::now().to_rfc3339(),
+            };
+            let _ = append_route_record(&record);
+        }
         if execution_policy.interaction_mode == InteractionMode::Auto
             && let Some(pattern) = route_decision.matched_feedback_pattern.as_deref()
         {
@@ -502,6 +580,7 @@ pub async fn send_chat_message(
     let event_message_key = message_key.clone();
     let event_conversation_id = conversation_id.clone();
     let trace_collector = state.app_state.trace.collector.clone();
+    let usage_store = state.app_state.tasks.runtime.clone();
     let trace_session_id = conversation_id
         .clone()
         .unwrap_or_else(|| event_message_key.clone());
@@ -548,6 +627,21 @@ pub async fn send_chat_message(
         // so no cross-conversation contention; (2) writes only happen via
         // `write_async` for config changes, which are rare during streaming.
         let agent = agent_inner.read().await;
+
+        // ── Capture cache-diagnostic fingerprints before streaming ──
+        let sys_prompt_hash = compute_content_hash(agent.config().get_system_prompt());
+        let tools_hash = {
+            let mut names: Vec<String> = agent.tool_names();
+            names.sort();
+            compute_content_hash(&names.join(","))
+        };
+        let cwd_hash = std::env::current_dir()
+            .ok()
+            .map(|p| compute_content_hash(&p.display().to_string()));
+        // Infer provider from model name prefix (e.g. "deepseek-v4-pro" → "deepseek")
+        let model_name = agent.config().get_model_name().to_string();
+        let provider_name = model_name.split('-').next().map(|s| s.to_string());
+
         let stream_result = agent
             .chat_stream_with_cancel(&message, cancel_token_for_task)
             .await;
@@ -631,6 +725,13 @@ pub async fn send_chat_message(
                                                     cache_creation_input_tokens:
                                                         cache_creation_prompt_tokens as u64,
                                                     usage_reported,
+                                                    system_prompt_hash: Some(
+                                                        sys_prompt_hash.clone(),
+                                                    ),
+                                                    tools_schema_hash: Some(tools_hash.clone()),
+                                                    cwd_hash: cwd_hash.clone(),
+                                                    worker_prompt_hash: None,
+                                                    provider: provider_name.clone(),
                                                 },
                                                 duration_ms: None,
                                                 metadata: HashMap::from([
@@ -648,6 +749,31 @@ pub async fn send_chat_message(
                                             },
                                         )
                                         .await;
+                                    // Persist usage to SQLite for trend analysis
+                                    if let Some(ref store) = usage_store {
+                                        let record =
+                                            echo_agent_app_core::tasks::task_runtime::UsageRecord {
+                                                id: uuid::Uuid::new_v4().to_string(),
+                                                session_id: trace_session_id.clone(),
+                                                run_id: None,
+                                                worker_id: Some("main".to_string()),
+                                                model: model.clone(),
+                                                provider: provider_name.clone(),
+                                                route_kind: Some("normal_chat".to_string()),
+                                                input_tokens: prompt_tokens as u64,
+                                                output_tokens: completion_tokens as u64,
+                                                cached_input_tokens: cached_prompt_tokens as u64,
+                                                cache_creation_input_tokens:
+                                                    cache_creation_prompt_tokens as u64,
+                                                usage_reported,
+                                                system_prompt_hash: Some(sys_prompt_hash.clone()),
+                                                tools_schema_hash: Some(tools_hash.clone()),
+                                                cwd_hash: cwd_hash.clone(),
+                                                worker_prompt_hash: None,
+                                                created_at: chrono::Utc::now(),
+                                            };
+                                        let _ = store.insert_usage_record(&record);
+                                    }
                                     emit_worker_trace_event(
                                         &app_handle,
                                         chat_trace_event(
@@ -741,6 +867,17 @@ pub async fn send_chat_message(
                                 AgentEvent::Chart { spec } => ChatEvent::Chart { spec },
                                 AgentEvent::FinalAnswer(data) => {
                                     terminal_status = "completed".to_string();
+                                    if let Some(ref cid) = event_conversation_id {
+                                        emit_conversation_event(
+                                            &app_handle,
+                                            &ConversationRuntimeEvent::FinalAnswer {
+                                                content: data.clone(),
+                                                usage_summary: None,
+                                            },
+                                            cid,
+                                            usage_store.as_ref(),
+                                        );
+                                    }
                                     emit_worker_trace_event(
                                         &app_handle,
                                         chat_trace_event(
@@ -765,6 +902,18 @@ pub async fn send_chat_message(
                                 }
                                 AgentEvent::Error { source, message } => {
                                     terminal_status = "failed".to_string();
+                                    if let Some(ref cid) = event_conversation_id {
+                                        emit_conversation_event(
+                                            &app_handle,
+                                            &ConversationRuntimeEvent::Error {
+                                                stage: source.clone(),
+                                                message: message.clone(),
+                                                worker_id: None,
+                                            },
+                                            cid,
+                                            usage_store.as_ref(),
+                                        );
+                                    }
                                     emit_worker_trace_event(
                                         &app_handle,
                                         chat_trace_event(
@@ -1081,7 +1230,13 @@ async fn route_complex_task(
     let mut response_status = TaskRunStatus::AwaitingPlanApproval;
     if launch_policy.auto_execute {
         store.transition_run(&run_id, TaskRunStatus::Ready)?;
-        launch_task_run_execution(state, app.clone(), &run_id).await?;
+        launch_task_run_execution(
+            state,
+            app.clone(),
+            &run_id,
+            Some(compute_content_hash(&message)),
+        )
+        .await?;
         response_status = TaskRunStatus::Running;
     }
 
@@ -1126,6 +1281,25 @@ async fn route_complex_task(
         &conversation_id,
     );
 
+    // Emit unified conversation event
+    if let Some(ref cid) = conversation_id {
+        use echo_agent_app_core::tasks::conversation_runtime::ConversationRuntimeEvent;
+        let store_ref = state.app_state.tasks.runtime.as_ref();
+        emit_conversation_event(
+            &app,
+            &ConversationRuntimeEvent::RouteDecision {
+                route: route_decision.route.as_str().to_string(),
+                confidence: route_decision.confidence,
+                reason: route_decision.reason.clone(),
+                matched_feedback_pattern: route_decision.matched_feedback_pattern.clone(),
+                suggested_workers: route_decision.suggested_workers.clone(),
+                interaction_mode: execution_policy.interaction_mode.as_str().to_string(),
+            },
+            cid,
+            store_ref,
+        );
+    }
+
     tracing::info!(
         run_id = %run_id,
         plan_id = %generated.plan.plan_id,
@@ -1164,6 +1338,7 @@ async fn launch_task_run_execution(
     state: &TauriState,
     app: tauri::AppHandle,
     run_id: &str,
+    message_hash: Option<String>,
 ) -> Result<(), anyhow::Error> {
     let store = state
         .app_state
@@ -1185,6 +1360,7 @@ async fn launch_task_run_execution(
         .map(|ri| std::sync::Arc::new(ri.create_layer_manager()));
     let cancel = echo_agent::agent::CancellationToken::new();
     let run_id_for_task = run_id.to_string();
+    let message_hash_for_task = message_hash.clone();
     let run_key = format!("__run__:{run_id_for_task}");
     state
         .app_state
@@ -1210,18 +1386,154 @@ async fn launch_task_run_execution(
         )
         .await;
         run_cancel_tokens.remove(&format!("__run__:{run_id_for_task}"));
-        match outcome {
+        let final_status = match &outcome {
             Ok(echo_agent_app_core::tasks::task_runtime::RunOutcome::Completed) => {
                 tracing::info!(run_id = %run_id_for_task, "auto-routed run completed");
+                Some("completed".to_string())
             }
             Ok(other) => {
                 tracing::warn!(run_id = %run_id_for_task, ?other, "auto-routed run ended non-completed");
+                Some(format!("{:?}", other))
             }
             Err(e) => {
                 tracing::error!(run_id = %run_id_for_task, error = %e, "auto-routed run executor error");
+                Some("failed".to_string())
             }
+        };
+        // Update route decision record with run outcome
+        if let Some(ref hash) = message_hash_for_task {
+            use echo_agent_app_core::tasks::task_runtime::load_route_records;
+            let mut records = load_route_records();
+            let actual_workers = store_for_task
+                .get_plan(&run_id_for_task)
+                .ok()
+                .flatten()
+                .map(|plan| planned_worker_roles(&plan));
+            // Update the latest matching record
+            for record in records.iter_mut().rev() {
+                if record.message_hash == *hash && record.final_run_status.is_none() {
+                    record.final_run_status = final_status.clone();
+                    record.actual_workers = actual_workers.clone();
+                    break;
+                }
+            }
+            // Re-persist all records (simplified: rewrite)
+            let path = echo_agent_app_core::tasks::task_runtime::default_route_records_path();
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let content = records
+                .iter()
+                .map(|r| serde_json::to_string(r).unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n";
+            let _ = std::fs::write(&path, content);
         }
     });
 
     Ok(())
+}
+
+/// Compute cache diagnostics for a session or across all sessions.
+#[tauri::command]
+pub async fn get_cache_diagnostics(
+    state: tauri::State<'_, TauriState>,
+    session_id: Option<String>,
+) -> Result<serde_json::Value, IpcError> {
+    use echo_agent_app_core::observability::compute_cache_diagnostics;
+
+    let collector = &state.app_state.trace.collector;
+    let events = if let Some(sid) = &session_id {
+        collector.get_events(sid).await
+    } else {
+        let sessions = collector.list_sessions().await;
+        let mut all = Vec::new();
+        for sid in &sessions {
+            all.extend(collector.get_events(sid).await);
+        }
+        all
+    };
+
+    // If the in-memory trace is empty (e.g. after restart), fall back to
+    // persisted usage records from the last 24h.
+    if events.is_empty() {
+        if let Some(ref store) = state.app_state.tasks.runtime {
+            if let Ok(records) = store.query_usage_records(
+                &echo_agent_app_core::tasks::task_runtime::UsageQueryFilter {
+                    limit: Some(200),
+                    ..Default::default()
+                },
+            ) {
+                for r in &records {
+                    events.push(TraceEvent {
+                        timestamp: r.created_at,
+                        kind: TraceKind::LlmCall {
+                            model: r.model.clone(),
+                            input_tokens: r.input_tokens,
+                            output_tokens: r.output_tokens,
+                            cached_input_tokens: r.cached_input_tokens,
+                            cache_creation_input_tokens: r.cache_creation_input_tokens,
+                            usage_reported: r.usage_reported,
+                            system_prompt_hash: r.system_prompt_hash.clone(),
+                            tools_schema_hash: r.tools_schema_hash.clone(),
+                            cwd_hash: r.cwd_hash.clone(),
+                            worker_prompt_hash: r.worker_prompt_hash.clone(),
+                            provider: r.provider.clone(),
+                        },
+                        duration_ms: None,
+                        metadata: std::collections::HashMap::new(),
+                    });
+                }
+            }
+        }
+    }
+
+    let diagnostics = compute_cache_diagnostics(&events);
+    let recent_calls: Vec<serde_json::Value> = events
+        .iter()
+        .rev()
+        .filter_map(|e| match &e.kind {
+            TraceKind::LlmCall {
+                model,
+                input_tokens,
+                cached_input_tokens: cached,
+                system_prompt_hash,
+                tools_schema_hash,
+                cwd_hash,
+                worker_prompt_hash,
+                provider,
+                ..
+            } => Some(serde_json::json!({
+                "model": model,
+                "input_tokens": input_tokens,
+                "cached_input_tokens": cached,
+                "system_prompt_hash": system_prompt_hash,
+                "tools_schema_hash": tools_schema_hash,
+                "cwd_hash": cwd_hash,
+                "worker_prompt_hash": worker_prompt_hash,
+                "provider": provider,
+            })),
+            _ => None,
+        })
+        .take(20)
+        .collect();
+
+    Ok(serde_json::json!({
+        "overall_read_rate": diagnostics.overall_read_rate,
+        "total_input_tokens": diagnostics.total_input_tokens,
+        "total_cached_input_tokens": diagnostics.total_cached_input_tokens,
+        "total_cache_creation_input_tokens": diagnostics.total_cache_creation_input_tokens,
+        "total_llm_calls": diagnostics.total_llm_calls,
+        "calls_missing_usage": diagnostics.calls_missing_usage,
+        "distinct_models": diagnostics.distinct_models,
+        "issues": diagnostics.issues.iter().map(|i| serde_json::json!({
+            "kind": i.kind,
+            "severity": i.severity,
+            "message": i.message,
+            "affected_calls": i.affected_calls,
+        })).collect::<Vec<_>>(),
+        "suggested_fixes": diagnostics.suggested_fixes,
+        "recent_calls": recent_calls,
+    }))
 }

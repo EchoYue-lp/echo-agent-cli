@@ -42,7 +42,7 @@ pub struct AgentCreateParams {
     /// will save `AgentCheckpoint`s + TaskNode DAG entries every iteration.
     pub state_store: Option<Arc<dyn RuntimeStateStore>>,
     /// Pre-computed instruction/profile context to inject into the system prompt
-    /// (for example, user/project/local EchoCoWork instruction files). Dynamic
+    /// (for example, user/project/local EKO instruction files). Dynamic
     /// long-term memories are recalled per turn through the agent memory store,
     /// not baked into this boot-time suffix.
     pub memory_context_suffix: Option<String>,
@@ -60,6 +60,33 @@ pub struct AgentCreateParams {
 /// id instead of writing every checkpoint to a shared "primary" row.
 pub fn default_primary_conversation_id() -> String {
     format!("primary-{}", uuid::Uuid::new_v4())
+}
+
+/// Load or create the stable machine-scoped cache user id used by provider KV caches.
+///
+/// This id is shared by the primary agent and built-in worker agents so repeated
+/// project prompts land in the same provider cache partition across sessions.
+pub fn load_or_create_cache_user_id() -> String {
+    let path = {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        std::path::PathBuf::from(home)
+            .join(".echo-agent")
+            .join("cache_user_id")
+    };
+
+    if let Ok(existing) = std::fs::read_to_string(&path)
+        && !existing.trim().is_empty()
+    {
+        return existing.trim().to_string();
+    }
+
+    let id = uuid::Uuid::new_v4().to_string();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, &id);
+    tracing::info!(%id, "created new cache_user_id");
+    id
 }
 /// 创建 Agent 实例
 ///
@@ -119,7 +146,7 @@ pub fn create_agent(
     let mut assembler =
         PromptAssembler::default(base_system_prompt, project_ctx.as_ref(), model_window);
     // Inject the unified instruction/profile context so the agent's system prompt
-    // reflects EchoCoWork user/project/local instruction files. Dynamic long-term
+    // reflects EKO user/project/local instruction files. Dynamic long-term
     // memories stay query-dependent and are recalled per turn through the Store.
     if let Some(ref memory_suffix) = params.memory_context_suffix {
         assembler.add_memory_context(memory_suffix);
@@ -226,6 +253,8 @@ pub fn create_agent(
         tracing::error!("Failed to build agent: {e}");
         format!("Failed to initialize agent: {e}. Please check your configuration and try again.")
     })?;
+    let cache_user_id = load_or_create_cache_user_id();
+    agent.config_mut().set_cache_user_id(&cache_user_id);
 
     register_default_subagents(
         &mut agent,
@@ -235,6 +264,7 @@ pub fn create_agent(
         max_tokens,
         token_limit,
         app_config.agent.tool_timeout_ms,
+        &cache_user_id,
     );
 
     // Register default hooks
@@ -251,6 +281,7 @@ fn register_default_subagents(
     max_tokens: Option<u32>,
     token_limit: usize,
     tool_timeout_ms: u64,
+    cache_user_id: &str,
 ) {
     let workers = [
         (
@@ -386,6 +417,7 @@ fn register_default_subagents(
             max_tokens,
             token_limit,
             tool_timeout_ms,
+            cache_user_id,
         ) {
             Ok(worker) => {
                 let def = SubagentBuilder::new(name)
@@ -414,6 +446,7 @@ fn build_readonly_worker_agent(
     max_tokens: Option<u32>,
     token_limit: usize,
     tool_timeout_ms: u64,
+    cache_user_id: &str,
 ) -> std::result::Result<ReactAgent, echo_agent::error::ReactError> {
     let mut builder = ReactAgentBuilder::new()
         .model(model)
@@ -436,6 +469,7 @@ fn build_readonly_worker_agent(
     }
 
     let mut worker = builder.build()?;
+    worker.config_mut().set_cache_user_id(cache_user_id);
     worker.set_plan_mode(true);
     Ok(worker)
 }
@@ -689,9 +723,9 @@ pub fn load_shell_env() {
             "GLM_API_KEY",
             "GEMINI_API_KEY",
             "GOOGLE_API_KEY",
-            "ECHOCOWORK_AUTH_TOKEN",
-            "ECHOCOWORK_BASE_URL",
-            "ECHOCOWORK_MODEL",
+            "EKO_AUTH_TOKEN",
+            "EKO_BASE_URL",
+            "EKO_MODEL",
             "MCP_CONFIG_PATH",
         ];
 
@@ -1116,7 +1150,7 @@ pub async fn fire_startup_hook(agent: &AgentHandle) {
 pub fn print_doctor_result(result: &DoctorResult) {
     println!();
     println!("╭─────────────────────────────────────────────────────────────╮");
-    println!("│                    🏥 EchoCoWork 诊断                        │");
+    println!("│                    🏥 EKO 诊断                        │");
     println!("╰─────────────────────────────────────────────────────────────╯");
 
     if !result.issues.is_empty() {

@@ -22,7 +22,7 @@ const isTauri = (): boolean => {
   const hasTauriProtocol = window.location.protocol === 'tauri:';
   const hasTauriUserAgent = navigator.userAgent.toLowerCase().includes('tauri');
   const hasTauriDevFlag = new URLSearchParams(window.location.search).has('tauri');
-  const hasTauriViteMode = import.meta.env.VITE_ECHOCOWORK_TAURI === '1';
+  const hasTauriViteMode = import.meta.env.VITE_EKO_TAURI === '1';
 
   return (
     hasTauriGlobals || hasTauriProtocol || hasTauriUserAgent || hasTauriDevFlag || hasTauriViteMode

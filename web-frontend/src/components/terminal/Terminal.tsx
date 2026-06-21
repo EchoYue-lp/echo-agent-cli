@@ -273,7 +273,7 @@ export function Terminal({ sessionId }: TerminalProps) {
     <div className="flex flex-col h-full bg-[#0a0a0a] rounded-lg overflow-hidden">
       {/* Status bar */}
       <div className="flex items-center justify-between px-3 py-1 border-b border-gray-800">
-        <span className="text-[10px] text-gray-500 font-mono">EchoCoWork Terminal</span>
+        <span className="text-[10px] text-gray-500 font-mono">EKO Terminal</span>
         <span className={`text-[10px] ${connected ? 'text-green-500' : 'text-red-500'}`}>
           {connected ? '● Connected' : '○ Disconnected'}
         </span>

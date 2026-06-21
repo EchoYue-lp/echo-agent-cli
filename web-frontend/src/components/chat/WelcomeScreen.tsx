@@ -103,7 +103,7 @@ export function WelcomeScreen({
           className="animate-slide-up mt-2 text-sm text-[var(--text-secondary)]"
           style={{ animationDelay: '0.1s' }}
         >
-          我是 EchoCoWork，你的智能协作助手
+          我是 EKO，你的智能协作助手
         </p>
       </div>
 

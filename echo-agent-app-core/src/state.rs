@@ -42,8 +42,8 @@ pub struct WebConfig {
 impl Default for WebConfig {
     fn default() -> Self {
         Self {
-            model: "qwen3.6-plus".to_string(),
-            system_prompt: "你是 EchoCoWork（EKO），运行在用户本机的高级 AI 工作台，面向真实代码、学术/医学研究、数据分析和长任务协作。先建立事实基础，再使用工具推进；保护用户工作区，优先根因修复，能验证就验证；大型只读分析应进入 TaskRuntime 并行 worker，动态记忆、工具结果和任务状态只作为当轮上下文，不改写稳定身份与规则。".to_string(),
+            model: String::new(),
+            system_prompt: "你是 EKO，运行在用户本机的 AI 工作台，面向编程、研究、数据分析和专业写作。你的核心原则：先读后做、连续推进、事实可追溯、如实汇报。具体行为规范参见你的完整系统提示。".to_string(),
             token_limit: 8000,
             max_upload_size_bytes: 10 * 1024 * 1024,
         }

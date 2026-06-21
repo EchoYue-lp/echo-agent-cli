@@ -3,6 +3,7 @@
 //! This is intentionally above the old complexity classifier: the classifier is
 //! a cheap fallback signal, while the router decides the product path.
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -126,6 +127,156 @@ pub struct RouteFeedbackRule {
     pub last_matched_at: Option<String>,
 }
 
+/// User feedback action on a route decision.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteFeedbackAction {
+    Correct,
+    ShouldBeChat,
+    ShouldBeTask,
+    ShouldBeReadonlyParallel,
+    TooManyWorkers,
+    TooFewWorkers,
+}
+
+/// Persistent record of every route decision, including user feedback.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteDecisionRecord {
+    /// SHA-256 hex of the user message (first 16 chars).
+    pub message_hash: String,
+    /// Original user message for learning attribution. This stays local in the
+    /// user's route history and lets feedback match future natural-language
+    /// requests instead of trying to learn from an opaque hash.
+    #[serde(default)]
+    pub message_text: Option<String>,
+    /// The route that was selected.
+    pub route: TaskRouteKind,
+    /// Confidence from the router at decision time.
+    pub confidence: f32,
+    /// Feedback pattern that matched (if any).
+    pub matched_feedback_pattern: Option<String>,
+    /// Workers suggested by the router.
+    pub suggested_workers: Vec<String>,
+    /// Workers actually used (None if no run was created).
+    pub actual_workers: Option<Vec<String>>,
+    /// Final status of the run, if a run was created.
+    pub final_run_status: Option<String>,
+    /// User correction submitted after the decision.
+    pub user_correction: Option<RouteFeedbackAction>,
+    /// When this decision was made.
+    pub created_at: String,
+}
+
+/// Scored route feedback rule — extends RouteFeedbackRule with learning stats.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScoredRouteFeedbackRule {
+    #[serde(flatten)]
+    pub rule: RouteFeedbackRule,
+    #[serde(default)]
+    pub success_count: u64,
+    #[serde(default)]
+    pub failure_count: u64,
+    /// Running score 0.0–1.0: success / (success + failure).
+    /// Returns 0.5 when no feedback yet (neutral).
+    #[serde(default = "default_score")]
+    pub score: f64,
+    #[serde(default)]
+    pub last_failure_reason: Option<String>,
+}
+
+fn default_score() -> f64 {
+    0.5
+}
+
+// ── Route decision record persistence (JSONL, append-only) ────────────
+
+pub fn default_route_records_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home)
+        .join(".echo-agent")
+        .join("route_records.jsonl")
+}
+
+pub fn load_route_records() -> Vec<RouteDecisionRecord> {
+    let path = default_route_records_path();
+    match std::fs::read_to_string(&path) {
+        Ok(raw) => raw
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .filter_map(|l| {
+                serde_json::from_str(l)
+                    .map_err(
+                        |e| tracing::warn!(error = %e, line = %l, "skipping corrupt route record"),
+                    )
+                    .ok()
+            })
+            .collect(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to read route records");
+            Vec::new()
+        }
+    }
+}
+
+pub fn append_route_record(record: &RouteDecisionRecord) -> anyhow::Result<()> {
+    let path = default_route_records_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut line = serde_json::to_string(record)?;
+    line.push('\n');
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?
+        .write_all(line.as_bytes())?;
+    Ok(())
+}
+
+pub fn compute_scored_rules(
+    rules: &[RouteFeedbackRule],
+    records: &[RouteDecisionRecord],
+) -> Vec<ScoredRouteFeedbackRule> {
+    rules
+        .iter()
+        .map(|rule| {
+            let mut success = 0u64;
+            let mut failure = 0u64;
+            let mut last_reason = None;
+            for record in records {
+                if record
+                    .matched_feedback_pattern
+                    .as_deref()
+                    .is_some_and(|p| p == rule.pattern)
+                {
+                    match record.user_correction {
+                        Some(RouteFeedbackAction::Correct) => success += 1,
+                        Some(action) => {
+                            failure += 1;
+                            last_reason = Some(format!("user corrected to {:?}", action));
+                        }
+                        None => {} // no feedback yet
+                    }
+                }
+            }
+            let total = success + failure;
+            let score = if total == 0 {
+                0.5 // neutral: no feedback yet
+            } else {
+                success as f64 / total as f64
+            };
+            ScoredRouteFeedbackRule {
+                rule: rule.clone(),
+                success_count: success,
+                failure_count: failure,
+                score,
+                last_failure_reason: last_reason,
+            }
+        })
+        .collect()
+}
+
 pub fn default_route_feedback_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home)
@@ -242,7 +393,10 @@ pub async fn route_message_with_feedback(
         deterministic
     };
 
-    apply_route_feedback(decision, message, feedback_rules)
+    // Compute scored rules from feedback history for auto-correction
+    let records = load_route_records();
+    let scored = compute_scored_rules(feedback_rules, &records);
+    apply_route_feedback(decision, message, feedback_rules, &scored)
 }
 
 fn forced_decision(route: TaskRouteKind, message: &str, reason: &str) -> TaskRouteDecision {
@@ -306,6 +460,7 @@ fn apply_route_feedback(
     mut decision: TaskRouteDecision,
     message: &str,
     feedback_rules: &[RouteFeedbackRule],
+    scored_rules: &[ScoredRouteFeedbackRule],
 ) -> TaskRouteDecision {
     let Some(rule) = feedback_rules
         .iter()
@@ -313,6 +468,24 @@ fn apply_route_feedback(
     else {
         return decision;
     };
+
+    // ── Auto-correction based on scoring ──────────────────────────────
+    if let Some(scored) = scored_rules.iter().find(|s| s.rule.pattern == rule.pattern) {
+        // Low-score rules: skip the override entirely
+        if scored.score < 0.3 && scored.failure_count >= 3 {
+            tracing::info!(
+                pattern = %rule.pattern,
+                score = %scored.score,
+                failures = scored.failure_count,
+                "skipping low-score route feedback override — rule has been wrong repeatedly"
+            );
+            return decision;
+        }
+        // High-score rules: apply with max confidence
+        if scored.score > 0.9 && scored.success_count >= 5 {
+            decision.confidence = 1.0;
+        }
+    }
 
     let previous_route = decision.route.as_str();
     decision.route = rule.route;
@@ -341,7 +514,7 @@ fn apply_route_feedback(
     decision
 }
 
-fn route_feedback_matches(message: &str, pattern: &str) -> bool {
+pub fn route_feedback_matches(message: &str, pattern: &str) -> bool {
     let normalized_message = normalize_feedback_text(message);
     let normalized_pattern = normalize_feedback_text(pattern);
     !normalized_pattern.is_empty()

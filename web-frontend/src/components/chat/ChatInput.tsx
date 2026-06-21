@@ -212,7 +212,7 @@ function CommandPalette({ commands, selectedIndex, onSelect }: CommandPalettePro
 
 // ─── Main ChatInput ──────────────────────────────────────────────────────────
 
-const MODELS_CHANGED_EVENT = 'echocowork:models-changed';
+const MODELS_CHANGED_EVENT = 'eko:models-changed';
 
 function notifyModelsChanged() {
   window.dispatchEvent(new Event(MODELS_CHANGED_EVENT));

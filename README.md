@@ -1,4 +1,4 @@
-# EchoCoWork
+# EKO
 
 > 一个基于 [echo-agent](https://github.com/EchoYue-lp/echo-agent) 的通用 AI Agent 产品，支持 Coding、数据分析和学术研究三大核心能力。
 
@@ -7,7 +7,7 @@
 
 ## 📋 项目简介
 
-EchoCoWork 是一个生产级的通用 Agent 产品，基于 Rust 生态构建，提供 **TUI（终端界面）** 和 **GUI（桌面应用）** 两种交互模式，专注于以下核心场景：
+EKO 是一个生产级的通用 Agent 产品，基于 Rust 生态构建，提供 **TUI（终端界面）** 和 **GUI（桌面应用）** 两种交互模式，专注于以下核心场景：
 
 - **💻 Coding** — 代码生成、审查、重构、调试、测试
 - **📊 数据分析** — 结构化数据分析、统计、可视化、报告生成
@@ -98,7 +98,7 @@ GUI 用户推荐在 **设置 → 模型供应商** 中添加模型。每个厂�
 
 #### 配置文件位置
 
-EchoCoWork 按以下优先级查找配置文件：
+EKO 按以下优先级查找配置文件：
 
 1. 命令行参数: `--config <path>`
 2. 当前目录: `./echo-agent.yaml`
@@ -176,12 +176,12 @@ cargo tauri build
 
 | 平台 | 产物 |
 |------|------|
-| macOS | `target/release/bundle/macos/EchoCoWork.app` |
-|       | `target/release/bundle/dmg/EchoCoWork_*.dmg` |
+| macOS | `target/release/bundle/macos/EKO.app` |
+|       | `target/release/bundle/dmg/EKO_*.dmg` |
 | Linux | `target/release/bundle/deb/echo-agent-tauri_*.deb` |
 |       | `target/release/bundle/appimage/echo-agent-tauri_*.AppImage` |
-| Windows | `target/release/bundle/msi/EchoCoWork_*.msi` |
-|         | `target/release/bundle/nsis/EchoCoWork_*.exe` |
+| Windows | `target/release/bundle/msi/EKO_*.msi` |
+|         | `target/release/bundle/nsis/EKO_*.exe` |
 
 > **注意**：不要只把 `target/release/echo-agent-tauri` 复制进 `.app` 目录来当作安装包；那只是裸后端二进制，可能缺少前端资源、图标和平台元数据。
 
@@ -530,7 +530,7 @@ echo-agent (AI Agent 框架)
 三层记忆架构：
 
 - **User** — 全局用户偏好和指令（`~/.echo-agent/`）
-- **Project** — 项目级上下文和规则（`.echocowork/`）
+- **Project** — 项目级上下文和规则（`.eko/`）
 - **Local** — 本地开发环境特定配置
 
 支持 `/auto-memory` 自动从会话中提取记忆。
@@ -554,7 +554,7 @@ echo-agent (AI Agent 框架)
 ```
 workspaces/
 ├── {workspace-id}/
-│   └── .echocowork/
+│   └── .eko/
 │       ├── sessions/         # 会话历史（SQLite + FTS）
 │       ├── conversations/    # 对话记录
 │       ├── memory/            # 记忆存储
