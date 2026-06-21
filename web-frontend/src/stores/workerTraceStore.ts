@@ -73,7 +73,6 @@ function statusFromEvent(eventType: WorkerTraceEventKind): WorkerTraceStatus | u
     case 'worker_thinking_start':
     case 'worker_thinking_delta':
     case 'worker_thinking_end':
-    case 'worker_llm_usage':
     case 'worker_tool_start':
     case 'worker_tool_result':
     case 'worker_token_delta':
@@ -96,6 +95,9 @@ export const useWorkerTraceStore = create<WorkerTraceStore>((set) => ({
 
   append: (event) => {
     set((state) => {
+      if ((state.runs[event.run_id] ?? []).some((existing) => existing.event_id === event.event_id)) {
+        return state;
+      }
       const runEvents = [...(state.runs[event.run_id] ?? []), event].slice(-MAX_RUN_EVENTS);
       const nextRuns = { ...state.runs, [event.run_id]: runEvents };
 
@@ -105,7 +107,10 @@ export const useWorkerTraceStore = create<WorkerTraceStore>((set) => ({
 
       const key = `${event.run_id}::${event.worker_id}`;
       const prev = state.workers[key];
-      const status = statusFromEvent(event.event_type) ?? prev?.status ?? 'running';
+      const status =
+        statusFromEvent(event.event_type) ??
+        prev?.status ??
+        (event.event_type === 'worker_llm_usage' ? 'completed' : 'running');
       const startedAt =
         prev?.startedAt ?? (event.event_type === 'worker_started' ? event.timestamp : undefined);
       const completedAt =

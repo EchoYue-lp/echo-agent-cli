@@ -23,6 +23,7 @@ import type {
   RuntimeArtifact,
   TaskRunStatus,
 } from '../generated';
+import { useWorkerTraceStore, type WorkerTraceEvent } from './workerTraceStore';
 
 export interface RouteExplanation {
   runId: string;
@@ -76,6 +77,41 @@ export interface TaskRuntimeState {
   reset: () => void;
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === 'object' && !Array.isArray(value));
+}
+
+function stringField(record: Record<string, unknown>, key: string): string | undefined {
+  const value = record[key];
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
+function replayPersistedWorkerUsage(events: RuntimeTaskEvent[]) {
+  const append = useWorkerTraceStore.getState().append;
+  for (const event of events) {
+    if (event.event_type !== 'worker_llm_usage' || !isRecord(event.payload)) continue;
+
+    const usage = isRecord(event.payload.usage) ? event.payload.usage : event.payload;
+    const workerId =
+      stringField(event.payload, 'worker_id') ?? event.step_id ?? event.task_id ?? undefined;
+    if (!workerId) continue;
+
+    const workerEvent: WorkerTraceEvent = {
+      event_id: `runtime:${event.run_id}:${event.seq}`,
+      run_id: event.run_id,
+      worker_id: workerId,
+      parent_worker_id: null,
+      agent_name: stringField(event.payload, 'agent_name') ?? null,
+      title: stringField(event.payload, 'title') ?? null,
+      task: null,
+      event_type: 'worker_llm_usage',
+      payload: usage,
+      timestamp: event.timestamp,
+    };
+    append(workerEvent);
+  }
+}
+
 export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
   activeRun: null,
   plan: null,
@@ -100,6 +136,7 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
       const lastSeq = events.length
         ? events[events.length - 1].seq
         : get().lastSeq;
+      replayPersistedWorkerUsage(events);
       if (!run) {
         set({
           activeRun: null,

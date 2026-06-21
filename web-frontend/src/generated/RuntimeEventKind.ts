@@ -6,4 +6,4 @@
  * Every state transition must write one of these inside the same
  * persistence transaction as the state update (see `store.rs`).
  */
-export type RuntimeEventKind = "run_created" | "run_status_changed" | "plan_generated" | "plan_approved" | "plan_rejected" | "plan_edited" | "task_started" | "task_completed" | "task_failed" | "task_skipped" | "task_blocked" | "todo_updated" | "worker_assigned" | "worker_released" | "artifact_produced" | "review_passed" | "review_needs_fix" | "review_blocked" | "approval_requested" | "approval_resolved" | "approval_rejected" | "circuit_breaker_tripped" | "run_cancelled" | "note";
+export type RuntimeEventKind = "run_created" | "run_status_changed" | "plan_generated" | "plan_approved" | "plan_rejected" | "plan_edited" | "task_started" | "task_completed" | "task_failed" | "task_skipped" | "task_blocked" | "todo_updated" | "worker_assigned" | "worker_released" | "worker_llm_usage" | "artifact_produced" | "review_passed" | "review_needs_fix" | "review_blocked" | "approval_requested" | "approval_resolved" | "approval_rejected" | "circuit_breaker_tripped" | "run_cancelled" | "note";

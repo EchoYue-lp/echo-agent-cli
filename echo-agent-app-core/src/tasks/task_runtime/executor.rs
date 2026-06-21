@@ -952,11 +952,13 @@ async fn execute_task(
     //   the write_sem above; they are never delegated to a read-only worker
     //   (workers can't write). The primary agent's execution_mutex serializes
     //   them further, which is correct — mutating work must not race.
-    let result = if task.kind.is_read_only() {
+    let is_read_only_task = task.kind.is_read_only();
+    let result = if is_read_only_task {
         run_readonly_worker(&primary_agent, &run_id, &task.agent_role, &prompt, cancel).await
     } else {
         run_main_agent_task(
             &primary_agent,
+            store.clone(),
             &run_id,
             &task,
             &prompt,
@@ -965,6 +967,38 @@ async fn execute_task(
         )
         .await
     };
+
+    if is_read_only_task && result.is_ok() {
+        let usage_payload = unavailable_llm_usage_payload(
+            "readonly_delegate_path_does_not_expose_provider_usage_yet",
+        );
+        if let Err(error) = store.record_worker_llm_usage(
+            &run_id,
+            &task_id,
+            &worker_trace_id,
+            &task.agent_role,
+            &task.title,
+            usage_payload.clone(),
+        ) {
+            tracing::warn!(
+                run_id = %run_id,
+                task_id = %task_id,
+                error = %error,
+                "failed to persist unavailable read-only worker LLM usage marker"
+            );
+        }
+        emit_worker_trace(
+            trace_sink.as_ref(),
+            WorkerTraceEvent::for_worker(
+                run_id.clone(),
+                worker_trace_id.clone(),
+                WorkerTraceEventKind::WorkerLlmUsage,
+                usage_payload,
+            )
+            .with_agent(task.agent_role.clone())
+            .with_title(task.title.clone()),
+        );
+    }
 
     match result {
         Ok(text) => {
@@ -1182,6 +1216,7 @@ async fn run_readonly_worker(
 /// the task is marked Failed (the run then goes Cancelled/Failed).
 async fn run_main_agent_task(
     primary_agent: &crate::agent_handle::AgentHandle,
+    store: Arc<TaskRuntimeStore>,
     run_id: &str,
     task: &PlanTask,
     prompt: &str,
@@ -1279,21 +1314,37 @@ async fn run_main_agent_task(
                             cache_creation_prompt_tokens,
                             usage_reported,
                         } => {
+                            let usage_payload = serde_json::json!({
+                                "model": model,
+                                "prompt_tokens": prompt_tokens,
+                                "completion_tokens": completion_tokens,
+                                "total_tokens": total_tokens,
+                                "cached_prompt_tokens": cached_prompt_tokens,
+                                "cache_creation_prompt_tokens": cache_creation_prompt_tokens,
+                                "usage_reported": usage_reported,
+                            });
+                            if let Err(error) = store.record_worker_llm_usage(
+                                &run_id,
+                                &task_id,
+                                &task_id,
+                                &agent_role,
+                                &title,
+                                usage_payload.clone(),
+                            ) {
+                                tracing::warn!(
+                                    run_id = %run_id,
+                                    task_id = %task_id,
+                                    error = %error,
+                                    "failed to persist worker LLM usage"
+                                );
+                            }
                             emit_worker_trace(
                                 trace_sink.as_ref(),
                                 WorkerTraceEvent::for_worker(
                                     run_id.clone(),
                                     task_id.clone(),
                                     WorkerTraceEventKind::WorkerLlmUsage,
-                                    serde_json::json!({
-                                        "model": model,
-                                        "prompt_tokens": prompt_tokens,
-                                        "completion_tokens": completion_tokens,
-                                        "total_tokens": total_tokens,
-                                        "cached_prompt_tokens": cached_prompt_tokens,
-                                        "cache_creation_prompt_tokens": cache_creation_prompt_tokens,
-                                        "usage_reported": usage_reported,
-                                    }),
+                                    usage_payload,
                                 )
                                 .with_agent(agent_role.clone())
                                 .with_title(title.clone()),
@@ -1371,6 +1422,19 @@ async fn run_main_agent_task(
             })
         })
         .await
+}
+
+fn unavailable_llm_usage_payload(reason: &'static str) -> serde_json::Value {
+    serde_json::json!({
+        "model": "unknown",
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "cached_prompt_tokens": 0,
+        "cache_creation_prompt_tokens": 0,
+        "usage_reported": false,
+        "reason": reason,
+    })
 }
 
 fn emit_worker_trace(sink: Option<&WorkerTraceSink>, event: WorkerTraceEvent) {
@@ -1989,9 +2053,14 @@ mod tests {
                 guard.push(event);
             }
         });
+        let store = Arc::new(
+            TaskRuntimeStore::new_in_memory()
+                .map_err(|error| format!("in-memory store should initialize: {error}"))?,
+        );
 
         let output = run_main_agent_task(
             &handle,
+            store,
             "run-trace",
             &task,
             "What is 6 times 7?",

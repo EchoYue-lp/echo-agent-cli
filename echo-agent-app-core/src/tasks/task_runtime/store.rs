@@ -1036,6 +1036,39 @@ impl TaskRuntimeStore {
         Ok(())
     }
 
+    /// Persist a provider-reported LLM usage event for a worker.
+    ///
+    /// This is intentionally a low-frequency structured event rather than raw
+    /// token streaming. It lets the GUI reconstruct token/cache metrics after
+    /// refresh or restart without storing every text delta in SQLite.
+    pub fn record_worker_llm_usage(
+        &self,
+        run_id: &str,
+        task_id: &str,
+        worker_id: &str,
+        agent_name: &str,
+        title: &str,
+        payload: serde_json::Value,
+    ) -> Result<(), StoreError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        append_event_tx(
+            &tx,
+            run_id,
+            Some(task_id),
+            Some(worker_id),
+            RuntimeEventKind::WorkerLlmUsage,
+            serde_json::json!({
+                "worker_id": worker_id,
+                "agent_name": agent_name,
+                "title": title,
+                "usage": payload,
+            }),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     // ── Approval scope tracking ─────────────────────────────────────────
 
     /// Grant a scoped approval for a tool call. Returns true if newly recorded.
