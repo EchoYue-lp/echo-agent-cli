@@ -28,6 +28,7 @@ import {
   Workflow,
   Sparkles,
   Copy,
+  Gauge,
 } from 'lucide-react';
 import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
 import { useConversationStore } from '../../stores/conversationStore';
@@ -264,6 +265,141 @@ function payloadBool(event: WorkerTraceEvent, key: string): boolean | undefined 
   return typeof value === 'boolean' ? value : undefined;
 }
 
+function payloadNumber(event: WorkerTraceEvent, key: string): number {
+  if (!event.payload || typeof event.payload !== 'object' || Array.isArray(event.payload)) {
+    return 0;
+  }
+  const value = (event.payload as Record<string, unknown>)[key];
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string') {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+  return 0;
+}
+
+interface CacheUsageSummary {
+  calls: number;
+  missingUsage: number;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  cachedPromptTokens: number;
+  cacheCreationPromptTokens: number;
+  models: string[];
+}
+
+function cacheUsageFromEvents(events: WorkerTraceEvent[]): CacheUsageSummary {
+  const usageEvents = events.filter((event) => event.event_type === 'worker_llm_usage');
+  const models = uniqueValues(usageEvents.map((event) => payloadValue(event, 'model')));
+  return usageEvents.reduce<CacheUsageSummary>(
+    (summary, event) => {
+      summary.calls += 1;
+      summary.inputTokens += payloadNumber(event, 'prompt_tokens');
+      summary.outputTokens += payloadNumber(event, 'completion_tokens');
+      summary.totalTokens += payloadNumber(event, 'total_tokens');
+      summary.cachedPromptTokens += payloadNumber(event, 'cached_prompt_tokens');
+      summary.cacheCreationPromptTokens += payloadNumber(event, 'cache_creation_prompt_tokens');
+      if (payloadBool(event, 'usage_reported') === false) {
+        summary.missingUsage += 1;
+      }
+      return summary;
+    },
+    {
+      calls: 0,
+      missingUsage: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      totalTokens: 0,
+      cachedPromptTokens: 0,
+      cacheCreationPromptTokens: 0,
+      models,
+    }
+  );
+}
+
+function cacheUsageForWorkers(workers: WorkerTraceState[]): CacheUsageSummary {
+  return cacheUsageFromEvents(workers.flatMap((worker) => worker.events));
+}
+
+function cacheReadRate(summary: CacheUsageSummary): number | null {
+  if (summary.inputTokens <= 0) return null;
+  return summary.cachedPromptTokens / summary.inputTokens;
+}
+
+function CacheUsageCard({
+  summary,
+  compact = false,
+}: {
+  summary: CacheUsageSummary;
+  compact?: boolean;
+}) {
+  if (summary.calls === 0) return null;
+  const rate = cacheReadRate(summary);
+  const valueClass = compact ? 'text-[11px]' : 'text-sm';
+  const labelClass = compact ? 'text-[9px]' : 'text-[10px]';
+
+  return (
+    <div
+      className={`rounded-lg border ${compact ? 'p-2' : 'p-3'}`}
+      style={{ borderColor: 'var(--border-primary)', background: 'var(--bg-secondary)' }}
+    >
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <div className="flex min-w-0 items-center gap-1.5">
+          <Gauge size={compact ? 12 : 14} style={{ color: 'var(--accent)' }} />
+          <span className={compact ? 'text-[10px] font-medium' : 'text-[12px] font-medium'} style={{ color: 'var(--text-primary)' }}>
+            Token / Cache
+          </span>
+        </div>
+        <span className="shrink-0 text-[9px]" style={{ color: 'var(--text-tertiary)' }}>
+          {summary.calls} LLM call{summary.calls > 1 ? 's' : ''}
+        </span>
+      </div>
+      <div className="grid grid-cols-3 gap-1.5">
+        <MetricCell label="Input" value={summary.inputTokens.toLocaleString()} valueClass={valueClass} labelClass={labelClass} />
+        <MetricCell label="Output" value={summary.outputTokens.toLocaleString()} valueClass={valueClass} labelClass={labelClass} />
+        <MetricCell label="Cached" value={summary.cachedPromptTokens.toLocaleString()} valueClass={valueClass} labelClass={labelClass} />
+        <MetricCell label="Cache write" value={summary.cacheCreationPromptTokens.toLocaleString()} valueClass={valueClass} labelClass={labelClass} />
+        <MetricCell label="Read rate" value={rate == null ? 'unknown' : `${(rate * 100).toFixed(1)}%`} valueClass={valueClass} labelClass={labelClass} />
+        <MetricCell label="Missing usage" value={summary.missingUsage.toLocaleString()} valueClass={valueClass} labelClass={labelClass} />
+      </div>
+      {summary.models.length > 0 && (
+        <div className="mt-2 truncate text-[9px]" style={{ color: 'var(--text-tertiary)' }} title={summary.models.join(', ')}>
+          model: {summary.models.join(', ')}
+        </div>
+      )}
+      {summary.missingUsage > 0 && (
+        <div className="mt-1 text-[9px] leading-snug" style={{ color: 'var(--color-warning)' }}>
+          有 {summary.missingUsage} 次请求没有 provider usage 元数据；这些请求不会被计入缓存命中率。
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MetricCell({
+  label,
+  value,
+  valueClass,
+  labelClass,
+}: {
+  label: string;
+  value: string;
+  valueClass: string;
+  labelClass: string;
+}) {
+  return (
+    <div className="rounded-md px-2 py-1" style={{ background: 'var(--bg-primary)' }}>
+      <div className={`${labelClass} truncate`} style={{ color: 'var(--text-tertiary)' }}>
+        {label}
+      </div>
+      <div className={`${valueClass} truncate font-mono`} style={{ color: 'var(--text-primary)' }}>
+        {value}
+      </div>
+    </div>
+  );
+}
+
 function copyToClipboard(text: string) {
   if (typeof navigator === 'undefined' || !navigator.clipboard) return;
   void navigator.clipboard.writeText(text);
@@ -353,6 +489,19 @@ function eventLabel(event: WorkerTraceEvent): { icon: ReactNode; label: string; 
           payloadValue(event, 'completion_tokens') && `out ${payloadValue(event, 'completion_tokens')}`,
         ].filter(Boolean).join(' · ') || undefined,
       };
+    case 'worker_llm_usage':
+      return {
+        icon: <Gauge size={11} style={{ color: 'var(--accent)' }} />,
+        label: 'Token / Cache',
+        detail: [
+          payloadValue(event, 'model'),
+          payloadValue(event, 'prompt_tokens') && `in ${payloadValue(event, 'prompt_tokens')}`,
+          payloadValue(event, 'completion_tokens') && `out ${payloadValue(event, 'completion_tokens')}`,
+          payloadValue(event, 'cached_prompt_tokens') && `cached ${payloadValue(event, 'cached_prompt_tokens')}`,
+          payloadValue(event, 'cache_creation_prompt_tokens') && `write ${payloadValue(event, 'cache_creation_prompt_tokens')}`,
+          payloadBool(event, 'usage_reported') === false && 'usage missing',
+        ].filter(Boolean).join(' · ') || undefined,
+      };
     case 'worker_tool_start':
       return {
         icon: <Wrench size={11} style={{ color: 'var(--color-warning)' }} />,
@@ -419,6 +568,7 @@ function WorkerTraceRow({
   const thinking = workerThinking(worker);
   const tools = workerToolEvents(worker);
   const result = workerResult(worker);
+  const usage = cacheUsageFromEvents(worker.events);
   const hasDetails = Boolean(worker.task || thinking || tools.length || result);
   const [copied, setCopied] = useState<string | null>(null);
 
@@ -506,6 +656,8 @@ function WorkerTraceRow({
               <ScrollableText text={worker.task} maxHeight={288} className="text-[11px]" />
             </TraceSection>
           )}
+
+          <CacheUsageCard summary={usage} compact />
 
           {result && (
             <TraceSection
@@ -691,6 +843,7 @@ export function TaskRuntimePanel() {
   if (!activeRun && !routeExplanation) return null;
 
   const runId = activeRun?.run_id ?? routeExplanation?.runId;
+  const usageSummary = cacheUsageForWorkers(visibleTraceWorkers);
   const completedCount = todos.filter(
     (t) => displayedTodoStatus(t, visibleTraceWorkers) === ('completed' as TodoStatus)
   ).length;
@@ -721,6 +874,10 @@ export function TaskRuntimePanel() {
         title={activeRun?.goal ?? routeExplanation?.goal}
       >
         {activeRun?.goal ?? routeExplanation?.goal ?? '正在读取任务'}
+      </div>
+
+      <div className="mb-2">
+        <CacheUsageCard summary={usageSummary} compact />
       </div>
 
       {todos.length > 0 && (
@@ -958,6 +1115,7 @@ export function TaskRuntimeMainPanel() {
   const runningWorkers = todos.filter((t) => t.status === ('running' as TodoStatus));
   const finalResult = finalRunResult(visibleTraceWorkers, todos);
   const effectiveRouteExplanation = deriveRouteExplanation(activeRun, plan, todos, visibleTraceWorkers, routeExplanation);
+  const usageSummary = cacheUsageForWorkers(visibleTraceWorkers);
 
   return (
     <section
@@ -1031,6 +1189,10 @@ export function TaskRuntimeMainPanel() {
           </div>
         </div>
       )}
+
+      <div className="mb-3">
+        <CacheUsageCard summary={usageSummary} />
+      </div>
 
       {error && (
         <div
