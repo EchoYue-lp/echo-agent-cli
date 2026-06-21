@@ -113,6 +113,30 @@ impl InteractionMode {
             InteractionMode::Auto => "auto",
         }
     }
+
+    pub fn as_u8(&self) -> u8 {
+        match self {
+            InteractionMode::Chat => 1,
+            InteractionMode::Task => 2,
+            InteractionMode::Auto => 0,
+        }
+    }
+
+    pub fn from_u8(value: u8) -> Self {
+        match value {
+            1 => InteractionMode::Chat,
+            2 => InteractionMode::Task,
+            _ => InteractionMode::Auto,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            InteractionMode::Chat => "Chat",
+            InteractionMode::Task => "Task",
+            InteractionMode::Auto => "Auto",
+        }
+    }
 }
 
 impl Default for ExecutionMode {

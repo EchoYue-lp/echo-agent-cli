@@ -132,9 +132,6 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
             commands::task_runtime::cancel_task_run,
             // TaskRuntime progress ledger (PR 4)
             commands::task_runtime::get_progress_ledger,
-            // TaskRuntime router toggle
-            commands::task_runtime::set_taskruntime_auto_route,
-            commands::task_runtime::get_taskruntime_auto_route,
             // TaskRuntime approval scope
             commands::task_runtime::grant_approval_scope,
             // TaskRuntime interaction mode (Chat/Task/Auto)

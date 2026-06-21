@@ -43,6 +43,7 @@ pub mod hitrisk;
 pub mod ledger;
 pub mod memory_bridge;
 pub mod planner;
+pub mod policy;
 pub mod profiles;
 pub mod review;
 pub mod router;
@@ -57,6 +58,7 @@ pub use hitrisk::{HighRiskMatch, check as check_high_risk, requires_fresh_approv
 pub use ledger::{export_path, render_progress, write_progress};
 pub use memory_bridge::{MemoryEvent, write_memory_candidate};
 pub use planner::{GeneratedPlan, PlanError, generate_parallel_readonly_plan, generate_plan};
+pub use policy::{ExecutionPolicy, ExecutionPolicySnapshot, PermissionMode, RuntimeLaunchPolicy};
 pub use profiles::ProfileTemplate;
 pub use review::{
     BreakerAction, ReviewError, build_fix_task, circuit_breaker_action, requires_review,

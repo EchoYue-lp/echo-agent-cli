@@ -11,7 +11,7 @@ use echo_agent::human_loop::{HumanLoopProvider, HumanLoopRequest, HumanLoopRespo
 use echo_agent::prelude::AgentEvent;
 use echo_agent_app_core::observability::{TraceEvent, TraceKind};
 use echo_agent_app_core::tasks::task_runtime::{
-    InteractionMode, TaskPlan, TaskRouteDecision, TaskRunStatus, WorkerTraceEvent,
+    ExecutionPolicy, InteractionMode, TaskPlan, TaskRouteDecision, TaskRunStatus, WorkerTraceEvent,
     WorkerTraceEventKind,
 };
 use futures::StreamExt;
@@ -392,29 +392,25 @@ pub async fn send_chat_message(
     // normal chat. Missing conversation_id is handled by route_complex_task via
     // a message-scoped run id so Welcome-screen first turns still route.
     //
-    // InteractionMode: 0=Auto(router), 1=Chat(force normal chat), 2=Task(force TaskRuntime)
     let interaction_mode_raw = state
         .app_state
         .tasks
         .interaction_mode
         .load(Ordering::Relaxed);
-    let interaction_mode = match interaction_mode_raw {
-        1 => InteractionMode::Chat,
-        2 => InteractionMode::Task,
-        _ => InteractionMode::Auto,
-    };
+    let permission_mode = state.app_state.config.permission_mode.read().await.clone();
+    let execution_policy = ExecutionPolicy::from_raw(interaction_mode_raw, &permission_mode);
 
-    if interaction_mode != InteractionMode::Chat {
+    if execution_policy.should_route_runtime() {
         let route_llm = agent_handle.read(|a| a.llm_client().cloned()).await;
         let route_feedback = state.app_state.tasks.route_feedback.read().await.clone();
         let route_decision = echo_agent_app_core::tasks::task_runtime::route_message_with_feedback(
             route_llm,
             &message,
-            interaction_mode,
+            execution_policy.interaction_mode,
             &route_feedback,
         )
         .await;
-        if interaction_mode == InteractionMode::Auto
+        if execution_policy.interaction_mode == InteractionMode::Auto
             && let Some(pattern) = route_decision.matched_feedback_pattern.as_deref()
         {
             let mut feedback = state.app_state.tasks.route_feedback.write().await;
@@ -439,7 +435,7 @@ pub async fn send_chat_message(
                 message.clone(),
                 conversation_id.clone(),
                 message_key.clone(),
-                interaction_mode,
+                execution_policy,
                 route_decision,
             )
             .await
@@ -1013,7 +1009,7 @@ async fn route_complex_task(
     message: String,
     conversation_id: Option<String>,
     message_key: String,
-    interaction_mode: InteractionMode,
+    execution_policy: ExecutionPolicy,
     route_decision: TaskRouteDecision,
 ) -> Result<serde_json::Value, anyhow::Error> {
     let store = state
@@ -1027,7 +1023,6 @@ async fn route_complex_task(
     let conv_id = conversation_id
         .clone()
         .unwrap_or_else(|| format!("message:{message_key}"));
-    let permission_mode = state.app_state.config.permission_mode.read().await.clone();
 
     // 1. Create the run in Pending.
     let run_id = uuid::Uuid::new_v4().to_string();
@@ -1076,18 +1071,17 @@ async fn route_complex_task(
     // 4. Persist + advance to AwaitingPlanApproval (attach_plan is atomic).
     store.attach_plan(&generated.plan)?;
     let planned_workers = planned_worker_roles(&generated.plan);
-    let mut auto_execute = false;
+    let all_plan_tasks_read_only = generated
+        .plan
+        .tasks
+        .iter()
+        .all(|task| task.kind.is_read_only());
+    let launch_policy =
+        execution_policy.runtime_launch_policy(route_decision.route, all_plan_tasks_read_only);
     let mut response_status = TaskRunStatus::AwaitingPlanApproval;
-    if route_decision.route.should_auto_execute()
-        && generated
-            .plan
-            .tasks
-            .iter()
-            .all(|task| task.kind.is_read_only())
-    {
+    if launch_policy.auto_execute {
         store.transition_run(&run_id, TaskRunStatus::Ready)?;
         launch_task_run_execution(state, app.clone(), &run_id).await?;
-        auto_execute = true;
         response_status = TaskRunStatus::Running;
     }
 
@@ -1109,17 +1103,12 @@ async fn route_complex_task(
                 .as_str()
                 .to_string(),
             route: route_decision.route.as_str().to_string(),
-            interaction_mode: interaction_mode.as_str().to_string(),
-            permission_mode: permission_mode.clone(),
-            approval_policy: approval_policy_summary(
-                &permission_mode,
-                route_decision.route.should_auto_execute(),
-                auto_execute,
-            )
-            .to_string(),
+            interaction_mode: execution_policy.interaction_mode.as_str().to_string(),
+            permission_mode: execution_policy.permission_mode.as_str().to_string(),
+            approval_policy: launch_policy.approval_policy.clone(),
             route_reason: route_decision.reason.clone(),
             confidence: route_decision.confidence,
-            auto_execute,
+            auto_execute: launch_policy.auto_execute,
             planned_workers,
             suggested_workers: route_decision.suggested_workers.clone(),
             active_skills,
@@ -1142,7 +1131,7 @@ async fn route_complex_task(
         plan_id = %generated.plan.plan_id,
         task_count = generated.plan.tasks.len(),
         route = ?route_decision.route,
-        auto_execute,
+        auto_execute = launch_policy.auto_execute,
         "task routed to TaskRuntime"
     );
 
@@ -1151,7 +1140,7 @@ async fn route_complex_task(
         "run_id": run_id,
         "status": response_status.as_str(),
         "route": route_decision.route,
-        "auto_execute": auto_execute,
+        "auto_execute": launch_policy.auto_execute,
         "conversation_id": conv_id,
         "plan": generated.plan,
         "warnings": generated.warnings,
@@ -1169,25 +1158,6 @@ fn planned_worker_roles(plan: &TaskPlan) -> Vec<String> {
         }
     }
     workers
-}
-
-fn approval_policy_summary(
-    permission_mode: &str,
-    route_auto_execute: bool,
-    auto_execute: bool,
-) -> &'static str {
-    if auto_execute {
-        "只读并行任务已自动执行；后续工具审批仍由当前审批模式控制"
-    } else if route_auto_execute {
-        "已识别为只读并行路径，但计划包含需确认步骤，等待用户确认"
-    } else {
-        match permission_mode {
-            "full-auto" => "工具操作默认自动通过，高风险保护仍会拦截",
-            "auto-edit" => "读取和编辑类操作自动通过，高风险操作会询问",
-            "strict" => "写入、命令、网络等敏感操作都会询问",
-            _ => "高风险操作会询问，计划执行前需要用户确认",
-        }
-    }
 }
 
 async fn launch_task_run_execution(

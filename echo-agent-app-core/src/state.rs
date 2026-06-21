@@ -13,7 +13,6 @@ use echo_agent::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 pub use crate::hitl::HitlDispatcher;
 use tokio::sync::RwLock;
@@ -390,11 +389,6 @@ pub struct TaskState {
     /// looks up a run here and triggers it; execute_task_run inserts one
     /// when it spawns the executor.
     pub run_cancel_tokens: DashMap<String, CancellationToken>,
-    /// Whether `send_chat_message` should auto-route complex input to the
-    /// TaskRuntime (create a run + generate a plan). Default OFF — every
-    /// message takes the normal chat path until the GUI opts in via
-    /// `set_taskruntime_auto_route`. Toggleable at runtime; no restart needed.
-    pub auto_route: AtomicBool,
     /// Manual interaction mode override (Chat/Task/Auto). `Auto` defers to
     /// the router; `Chat` forces normal chat; `Task` forces TaskRuntime.
     /// Toggleable at runtime via Tauri command.
@@ -553,7 +547,6 @@ impl AppState {
                     }
                     Arc::new(store)
                 }),
-                auto_route: AtomicBool::new(false),
                 interaction_mode: std::sync::atomic::AtomicU8::new(0), // 0 = Auto
                 route_feedback: RwLock::new(crate::tasks::task_runtime::load_route_feedback_rules()),
                 run_cancel_tokens: DashMap::new(),

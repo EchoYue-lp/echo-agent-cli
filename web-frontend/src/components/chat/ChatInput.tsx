@@ -285,8 +285,8 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
       const policy = await taskRuntimeApi.getExecutionPolicy();
       setExecutionPolicy(policy);
       setInteractionMode(
-        INTERACTION_MODES.some((m) => m.id === policy.interaction_mode)
-          ? policy.interaction_mode
+        INTERACTION_MODES.some((m) => m.id === policy.interaction_mode_id)
+          ? policy.interaction_mode_id
           : 0
       );
       setPermissionMode(normalizePermissionMode(policy.permission_mode));

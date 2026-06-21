@@ -98,11 +98,11 @@ export interface RouteFeedbackRule {
 }
 
 export interface ExecutionPolicySnapshot {
-  interaction_mode: number;
+  interaction_mode: string;
+  interaction_mode_id: number;
   interaction_mode_label: string;
   permission_mode: string;
   permission_mode_label: string;
-  auto_route_legacy_enabled: boolean;
   router_behavior: string;
   approval_behavior: string;
   parallel_behavior: string;
@@ -609,15 +609,7 @@ export const taskRuntimeApi = {
         })
       : post<{ success: boolean; run_id: string }>(`/task_runtime/runs/${runId}/cancel`),
 
-  // ── Router toggle ────────────────────────────────────────────────────
-  setAutoRoute: (enabled: boolean) =>
-    isTauri()
-      ? apiInvoke<boolean>('set_taskruntime_auto_route', { enabled })
-      : post<boolean>('/task_runtime/auto_route', { enabled }),
-  getAutoRoute: () =>
-    isTauri()
-      ? apiInvoke<boolean>('get_taskruntime_auto_route')
-      : get<boolean>('/task_runtime/auto_route'),
+  // ── Execution policy ─────────────────────────────────────────────────
   setInteractionMode: (mode: number) =>
     isTauri()
       ? apiInvoke<number>('set_interaction_mode', { mode })

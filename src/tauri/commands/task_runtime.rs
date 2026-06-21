@@ -20,9 +20,9 @@ use crate::tauri::state::TauriState;
 
 use echo_agent_app_core::tasks::task_runtime::types::*;
 use echo_agent_app_core::tasks::task_runtime::{
-    RouteFeedbackRule, TaskRouteKind, save_route_feedback_rules,
+    ExecutionPolicy, ExecutionPolicySnapshot, RouteFeedbackRule, TaskRouteKind,
+    save_route_feedback_rules,
 };
-use serde::Serialize;
 use std::sync::Arc;
 use tauri::Emitter;
 
@@ -175,36 +175,6 @@ fn internal<E: std::fmt::Display>(e: E) -> IpcError {
 
 // ── Router toggle ────────────────────────────────────────────────────────
 
-/// Enable/disable auto-routing of complex chat input into the TaskRuntime.
-/// Default OFF. When ON, `send_chat_message` classifies each message and, for
-/// complex ones, creates a run + generates a plan instead of streaming chat.
-/// Returns the new value.
-#[tauri::command]
-pub async fn set_taskruntime_auto_route(
-    state: tauri::State<'_, TauriState>,
-    enabled: bool,
-) -> Result<bool, IpcError> {
-    state
-        .app_state
-        .tasks
-        .auto_route
-        .store(enabled, std::sync::atomic::Ordering::Relaxed);
-    tracing::info!(enabled, "taskruntime auto-route toggled");
-    Ok(enabled)
-}
-
-/// Read the current auto-route flag.
-#[tauri::command]
-pub async fn get_taskruntime_auto_route(
-    state: tauri::State<'_, TauriState>,
-) -> Result<bool, IpcError> {
-    Ok(state
-        .app_state
-        .tasks
-        .auto_route
-        .load(std::sync::atomic::Ordering::Relaxed))
-}
-
 /// Set the manual interaction mode: 0=Auto, 1=Chat, 2=Task.
 #[tauri::command]
 pub async fn set_interaction_mode(
@@ -230,22 +200,10 @@ pub async fn get_interaction_mode(state: tauri::State<'_, TauriState>) -> Result
         .load(std::sync::atomic::Ordering::Relaxed))
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct ExecutionPolicySnapshot {
-    pub interaction_mode: u8,
-    pub interaction_mode_label: &'static str,
-    pub permission_mode: String,
-    pub permission_mode_label: &'static str,
-    pub auto_route_legacy_enabled: bool,
-    pub router_behavior: &'static str,
-    pub approval_behavior: &'static str,
-    pub parallel_behavior: &'static str,
-}
-
 /// Single GUI-facing snapshot of the execution policy. This intentionally
-/// keeps Chat/Task/Auto mode, legacy auto-route compatibility, approval mode,
-/// and read-only worker fanout in one place so the product can explain the
-/// runtime path before a message is sent.
+/// keeps Chat/Task/Auto mode, approval mode, and read-only worker fanout in
+/// one place so the product can explain the runtime path before a message is
+/// sent.
 #[tauri::command]
 pub async fn get_execution_policy(
     state: tauri::State<'_, TauriState>,
@@ -256,63 +214,7 @@ pub async fn get_execution_policy(
         .interaction_mode
         .load(std::sync::atomic::Ordering::Relaxed);
     let permission_mode = state.app_state.config.permission_mode.read().await.clone();
-    let auto_route_legacy_enabled = state
-        .app_state
-        .tasks
-        .auto_route
-        .load(std::sync::atomic::Ordering::Relaxed);
-    Ok(ExecutionPolicySnapshot {
-        interaction_mode,
-        interaction_mode_label: interaction_mode_label(interaction_mode),
-        permission_mode_label: permission_mode_label(&permission_mode),
-        auto_route_legacy_enabled,
-        router_behavior: router_behavior(interaction_mode),
-        approval_behavior: approval_behavior(&permission_mode),
-        parallel_behavior: parallel_behavior(interaction_mode),
-        permission_mode,
-    })
-}
-
-fn interaction_mode_label(mode: u8) -> &'static str {
-    match mode {
-        1 => "Chat",
-        2 => "Task",
-        _ => "Auto",
-    }
-}
-
-fn router_behavior(mode: u8) -> &'static str {
-    match mode {
-        1 => "强制普通对话，不进入 TaskRuntime。",
-        2 => "强制进入 TaskRuntime；只读大任务会优先并行 worker。",
-        _ => "由语义路由、确定性信号和历史反馈共同决定 Chat 或 TaskRuntime。",
-    }
-}
-
-fn parallel_behavior(mode: u8) -> &'static str {
-    match mode {
-        1 => "Chat 模式不会自动派生 worker。",
-        2 => "Task 模式会为可并行只读任务生成 runtime-owned worker。",
-        _ => "Auto 模式会在项目分析、代码审查、研究综述、数据画像等只读大任务上自动并行。",
-    }
-}
-
-fn permission_mode_label(mode: &str) -> &'static str {
-    match mode {
-        "auto-edit" => "自动编辑",
-        "full-auto" => "全自动",
-        "strict" => "严格确认",
-        _ => "默认审批",
-    }
-}
-
-fn approval_behavior(mode: &str) -> &'static str {
-    match mode {
-        "full-auto" => "尽量不打断执行；工具操作默认通过，框架级硬保护仍保留。",
-        "auto-edit" => "读取和编辑类操作自动通过；命令、网络和敏感操作按风险询问。",
-        "strict" => "写入、命令、网络和敏感操作都需要确认。",
-        _ => "高风险操作会询问；普通读取和低风险动作尽量不中断。",
-    }
+    Ok(ExecutionPolicy::from_raw(interaction_mode, permission_mode).snapshot())
 }
 
 /// List user-learned route feedback rules.
