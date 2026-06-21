@@ -24,9 +24,11 @@ use echo_agent::llm::{ChatRequest, LlmClient, ResponseFormat};
 use echo_agent::prelude::Message;
 
 use super::classify::Classification;
-use super::profiles::{
-    ALL_WORKER_ROLES, ProfileTemplate, WORKER_CAPABILITY_CATALOG, worker_catalog_prompt,
+use super::delegation::{
+    DEFAULT_MAX_READONLY_WORKERS, DelegationPlanner, DelegationRequest, WorkerSpec, role_slug,
 };
+use super::profiles::{ALL_WORKER_ROLES, ProfileTemplate, worker_catalog_prompt};
+use super::signals::RoutingSignals;
 use super::types::*;
 
 /// Error returned by plan generation. Distinguishes infrastructure failures
@@ -115,63 +117,38 @@ pub fn generate_parallel_readonly_plan(
     suggested_workers: &[String],
 ) -> GeneratedPlan {
     let profile = classification.inferred_profile;
-    let template = ProfileTemplate::for_profile(profile);
     let mut warnings = Vec::new();
-    let mut workers = Vec::new();
-
-    for worker in suggested_workers {
-        if ALL_WORKER_ROLES
-            .iter()
-            .any(|allowed| allowed == &worker.as_str())
-            && !workers.iter().any(|existing| existing == worker)
-        {
-            workers.push(worker.clone());
-        }
-    }
-
-    if workers.is_empty() {
-        for worker in template.default_worker_roles {
-            if !workers.iter().any(|existing| existing == worker) {
-                workers.push((*worker).to_string());
-            }
-        }
-        warnings.push("router returned no usable workers; used profile defaults".to_string());
-    }
-
-    let has_synthesis = workers.iter().any(|worker| worker == "summary_writer");
-    let mut discovery_workers = workers
-        .iter()
-        .filter(|worker| worker.as_str() != "summary_writer")
-        .cloned()
-        .collect::<Vec<_>>();
-
-    if discovery_workers.is_empty() {
-        discovery_workers.push("project_explorer".to_string());
-        warnings.push("read-only plan needed at least one discovery worker".to_string());
-    }
+    let signals = RoutingSignals::analyze(profile, goal);
+    let worker_specs = DelegationPlanner::plan_readonly(DelegationRequest {
+        goal,
+        profile,
+        signals: &signals,
+        suggested_workers,
+        max_workers: DEFAULT_MAX_READONLY_WORKERS,
+    });
 
     let run_slug = role_slug(run_id);
     let parallel_group = format!("readonly-fanout-{run_slug}");
     let mut tasks = Vec::new();
-    let mut fanout_ids = Vec::new();
-    for (i, worker) in discovery_workers.iter().enumerate() {
+    let mut worker_task_ids = std::collections::HashMap::new();
+    for (i, spec) in worker_specs
+        .iter()
+        .filter(|spec| spec.depends_on.is_empty())
+        .enumerate()
+    {
         let id = format!(
             "readonly-{}-{}-{}",
             run_slug,
             i.saturating_add(1),
-            role_slug(worker)
+            role_slug(&spec.agent_name)
         );
-        fanout_ids.push(id.clone());
+        worker_task_ids.insert(spec.agent_name.clone(), id.clone());
         tasks.push(PlanTask {
             id,
-            title: worker_title(worker),
-            description: format!(
-                "{} Focus on this goal: {}",
-                worker_description(worker),
-                goal.trim()
-            ),
+            title: spec.title.clone(),
+            description: worker_task_description(spec),
             kind: PlanTaskKind::ReadOnlyReview,
-            agent_role: worker.clone(),
+            agent_role: spec.agent_name.clone(),
             domain_profile: profile,
             depends_on: Vec::new(),
             parallel_group: Some(parallel_group.clone()),
@@ -183,10 +160,7 @@ pub fn generate_parallel_readonly_plan(
                 "read_file".to_string(),
                 "rg".to_string(),
             ],
-            verification: vec![format!(
-                "Return concrete findings from {} with file paths, evidence, and uncertainty.",
-                worker
-            )],
+            verification: vec![spec.expected_output.clone()],
             retry_count: 0,
             max_retries: 3,
             failure_fingerprint: None,
@@ -194,23 +168,63 @@ pub fn generate_parallel_readonly_plan(
         });
     }
 
-    if has_synthesis || tasks.len() > 1 {
+    for spec in worker_specs
+        .iter()
+        .filter(|spec| !spec.depends_on.is_empty())
+    {
+        let depends_on = spec
+            .depends_on
+            .iter()
+            .filter_map(|agent_name| worker_task_ids.get(agent_name).cloned())
+            .collect::<Vec<_>>();
+        let id = format!(
+            "readonly-{run_slug}-synthesis-{}",
+            role_slug(&spec.agent_name)
+        );
         tasks.push(PlanTask {
-            id: format!("readonly-{run_slug}-synthesis-summary_writer"),
-            title: "Synthesize worker findings".to_string(),
-            description: format!(
-                "Combine parallel read-only findings into an actionable answer for: {}",
-                goal.trim()
-            ),
+            id: id.clone(),
+            title: spec.title.clone(),
+            description: worker_task_description(spec),
             kind: PlanTaskKind::Summary,
-            agent_role: "summary_writer".to_string(),
+            agent_role: spec.agent_name.clone(),
             domain_profile: profile,
-            depends_on: fanout_ids,
+            depends_on,
             parallel_group: None,
             files: Vec::new(),
             allowed_tools: vec!["read_file".to_string()],
+            verification: vec![spec.expected_output.clone()],
+            retry_count: 0,
+            max_retries: 3,
+            failure_fingerprint: None,
+            status: TodoStatus::Pending,
+        });
+        worker_task_ids.insert(spec.agent_name.clone(), id);
+    }
+
+    if tasks.is_empty() {
+        warnings.push(
+            "delegation planner produced no workers; inserted project exploration fallback"
+                .to_string(),
+        );
+        tasks.push(PlanTask {
+            id: format!("readonly-{run_slug}-1-project-explorer"),
+            title: "Explore project structure and architecture".to_string(),
+            description: format!("Read-only fallback exploration for: {}", goal.trim()),
+            kind: PlanTaskKind::ReadOnlyReview,
+            agent_role: "project_explorer".to_string(),
+            domain_profile: profile,
+            depends_on: Vec::new(),
+            parallel_group: Some(parallel_group),
+            files: vec!["workspace".to_string()],
+            allowed_tools: vec![
+                "repo_map".to_string(),
+                "glob".to_string(),
+                "list_dir".to_string(),
+                "read_file".to_string(),
+                "rg".to_string(),
+            ],
             verification: vec![
-                "Summarize agreements, conflicts, evidence gaps, and recommended next actions."
+                "Return concrete findings with paths, evidence, uncertainty, and risks."
                     .to_string(),
             ],
             retry_count: 0,
@@ -238,6 +252,16 @@ pub fn generate_parallel_readonly_plan(
     };
 
     GeneratedPlan { plan, warnings }
+}
+
+fn worker_task_description(spec: &WorkerSpec) -> String {
+    format!(
+        "{}\n\nPurpose: {}\nExpected output: {}\nRead-only: {}",
+        spec.task,
+        spec.purpose,
+        spec.expected_output,
+        if spec.readonly { "yes" } else { "no" }
+    )
 }
 
 /// Generate a structured plan for a run.
@@ -494,49 +518,6 @@ fn sanitize_plan_text(raw: &str, fallback: &str, warnings: &mut Vec<String>) -> 
     } else {
         trimmed.to_string()
     }
-}
-
-fn role_slug(role: &str) -> String {
-    role.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>()
-        .split('-')
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join("-")
-}
-
-fn worker_title(worker: &str) -> String {
-    match worker {
-        "project_explorer" => "Explore project structure and architecture".to_string(),
-        "code_reviewer" => "Review code architecture and correctness risks".to_string(),
-        "test_planner" => "Map verification and test strategy".to_string(),
-        "data_profiler" => "Profile data sources and analysis shape".to_string(),
-        "analysis_reviewer" => "Review metrics and analytical assumptions".to_string(),
-        "reproducibility_planner" => "Plan reproducibility checks".to_string(),
-        "literature_scout" => "Scout relevant literature and sources".to_string(),
-        "evidence_reviewer" => "Review evidence quality and claim strength".to_string(),
-        "synthesis_planner" => "Plan research synthesis structure".to_string(),
-        "medical_literature_scout" => "Scout medical literature and guidelines".to_string(),
-        "clinical_evidence_reviewer" => "Review clinical evidence and applicability".to_string(),
-        "safety_reviewer" => "Review safety boundaries and risk notes".to_string(),
-        "summary_writer" => "Synthesize worker findings".to_string(),
-        _ => format!("Run read-only worker {}", worker),
-    }
-}
-
-fn worker_description(worker: &str) -> String {
-    WORKER_CAPABILITY_CATALOG
-        .iter()
-        .find(|(role, _)| role == &worker)
-        .map(|(_, capability)| format!("Use {} capability: {}.", worker, capability))
-        .unwrap_or_else(|| format!("Use {} for read-only investigation.", worker))
 }
 
 fn validate_plan(

@@ -11,8 +11,11 @@ use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 use super::classify::{Classification, ComplexityLabel, HeuristicClassifier};
+use super::delegation::{
+    DEFAULT_MAX_READONLY_WORKERS, DelegationPlanner, DelegationRequest, worker_role_names,
+};
 use super::profiles::{ALL_WORKER_ROLES, worker_catalog_prompt};
-use super::signals::{CapabilityArea, RoutingSignals};
+use super::signals::RoutingSignals;
 use super::types::{DomainProfile, InteractionMode};
 
 /// Runtime path selected for a user message.
@@ -329,45 +332,13 @@ fn select_workers_from_signals(route: TaskRouteKind, signals: &RoutingSignals) -
 }
 
 fn select_readonly_workers(signals: &RoutingSignals) -> Vec<String> {
-    let mut out = Vec::new();
-    for area in &signals.capability_areas {
-        push_workers(&mut out, workers_for_area(area));
-    }
-    if out.is_empty() {
-        push_workers(
-            &mut out,
-            &["project_explorer", "literature_scout", "data_profiler"],
-        );
-    }
-    if out.len() > 1 {
-        push_workers(&mut out, &["summary_writer"]);
-    }
-    out
-}
-
-fn workers_for_area(area: &CapabilityArea) -> &'static [&'static str] {
-    match area {
-        CapabilityArea::Coding => &["project_explorer", "code_reviewer", "test_planner"],
-        CapabilityArea::Data => &[
-            "data_profiler",
-            "analysis_reviewer",
-            "reproducibility_planner",
-        ],
-        CapabilityArea::Academic => &["literature_scout", "evidence_reviewer", "synthesis_planner"],
-        CapabilityArea::Medical => &[
-            "medical_literature_scout",
-            "clinical_evidence_reviewer",
-            "safety_reviewer",
-        ],
-    }
-}
-
-fn push_workers(out: &mut Vec<String>, workers: &[&str]) {
-    for worker in workers {
-        if !out.iter().any(|existing| existing == worker) {
-            out.push((*worker).to_string());
-        }
-    }
+    worker_role_names(&DelegationPlanner::plan_readonly(DelegationRequest {
+        goal: "",
+        profile: DomainProfile::General,
+        signals,
+        suggested_workers: &[],
+        max_workers: DEFAULT_MAX_READONLY_WORKERS,
+    }))
 }
 
 #[cfg(test)]

@@ -37,6 +37,7 @@
 //! To avoid shadowing, this module's event type is named `RuntimeTaskEvent`
 //! and its event-kind enum is `RuntimeEventKind`.
 pub mod classify;
+pub mod delegation;
 pub mod executor;
 pub mod hitrisk;
 pub mod ledger;
@@ -50,6 +51,7 @@ pub mod store;
 pub mod types;
 
 pub use classify::{Classification, Complexity, ComplexityLabel, HeuristicClassifier};
+pub use delegation::{DelegationPlanner, DelegationRequest, WorkerSpec};
 pub use executor::{ConcurrencyLimits, ExecError, RunOutcome, WorkerTraceSink, execute_run};
 pub use hitrisk::{HighRiskMatch, check as check_high_risk, requires_fresh_approval};
 pub use ledger::{export_path, render_progress, write_progress};
