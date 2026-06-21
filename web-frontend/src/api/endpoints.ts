@@ -88,6 +88,13 @@ export interface AutoMemoryExtractResult extends AutoMemoryPreview {
   message?: string;
 }
 
+export interface RouteFeedbackRule {
+  pattern: string;
+  route: string;
+  reason: string;
+  suggested_workers: string[];
+}
+
 export const sessionApi = {
   get: () => (isTauri() ? apiInvoke<SessionInfo>('get_session') : get<SessionInfo>('/session')),
   reset: () =>
@@ -606,6 +613,35 @@ export const taskRuntimeApi = {
     isTauri()
       ? apiInvoke<number>('get_interaction_mode')
       : get<number>('/task_runtime/interaction_mode'),
+  listRouteFeedbackRules: () =>
+    isTauri()
+      ? apiInvoke<RouteFeedbackRule[]>('list_route_feedback_rules')
+      : get<RouteFeedbackRule[]>('/task_runtime/route_feedback'),
+  upsertRouteFeedbackRule: (
+    pattern: string,
+    route: string,
+    reason: string,
+    suggestedWorkers?: string[]
+  ) =>
+    isTauri()
+      ? apiInvoke<RouteFeedbackRule[]>('upsert_route_feedback_rule', {
+          pattern,
+          route,
+          reason,
+          suggestedWorkers: suggestedWorkers ?? null,
+        })
+      : post<RouteFeedbackRule[]>('/task_runtime/route_feedback', {
+          pattern,
+          route,
+          reason,
+          suggested_workers: suggestedWorkers ?? [],
+        }),
+  deleteRouteFeedbackRule: (pattern: string) =>
+    isTauri()
+      ? apiInvoke<RouteFeedbackRule[]>('delete_route_feedback_rule', { pattern })
+      : del<RouteFeedbackRule[]>(
+          `/task_runtime/route_feedback?pattern=${encodeURIComponent(pattern)}`
+        ),
 };
 
 // ── Trace Events API ─────────────────────────────────────────────────

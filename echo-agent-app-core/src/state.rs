@@ -395,10 +395,13 @@ pub struct TaskState {
     /// message takes the normal chat path until the GUI opts in via
     /// `set_taskruntime_auto_route`. Toggleable at runtime; no restart needed.
     pub auto_route: AtomicBool,
-    /// Manual interaction mode override (Chat/Plan/Auto). `Auto` defers to
-    /// auto_route + classifier; `Chat` forces normal chat; `Plan` forces plan
-    /// generation without execution. Toggleable at runtime via Tauri command.
+    /// Manual interaction mode override (Chat/Task/Auto). `Auto` defers to
+    /// the router; `Chat` forces normal chat; `Task` forces TaskRuntime.
+    /// Toggleable at runtime via Tauri command.
     pub interaction_mode: std::sync::atomic::AtomicU8,
+    /// User-learned router corrections. Loaded from disk at startup and
+    /// applied only in Auto mode, after LLM routing and deterministic signals.
+    pub route_feedback: RwLock<Vec<crate::tasks::task_runtime::RouteFeedbackRule>>,
 }
 
 /// Webhook 状态
@@ -552,6 +555,7 @@ impl AppState {
                 }),
                 auto_route: AtomicBool::new(false),
                 interaction_mode: std::sync::atomic::AtomicU8::new(0), // 0 = Auto
+                route_feedback: RwLock::new(crate::tasks::task_runtime::load_route_feedback_rules()),
                 run_cancel_tokens: DashMap::new(),
             },
             webhook: WebhookState {

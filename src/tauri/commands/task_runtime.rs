@@ -19,6 +19,9 @@ use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
 
 use echo_agent_app_core::tasks::task_runtime::types::*;
+use echo_agent_app_core::tasks::task_runtime::{
+    RouteFeedbackRule, TaskRouteKind, save_route_feedback_rules,
+};
 use std::sync::Arc;
 use tauri::Emitter;
 
@@ -224,6 +227,65 @@ pub async fn get_interaction_mode(state: tauri::State<'_, TauriState>) -> Result
         .tasks
         .interaction_mode
         .load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// List user-learned route feedback rules.
+#[tauri::command]
+pub async fn list_route_feedback_rules(
+    state: tauri::State<'_, TauriState>,
+) -> Result<Vec<RouteFeedbackRule>, IpcError> {
+    Ok(state.app_state.tasks.route_feedback.read().await.clone())
+}
+
+/// Add or replace a route feedback rule and persist it to disk.
+#[tauri::command]
+pub async fn upsert_route_feedback_rule(
+    state: tauri::State<'_, TauriState>,
+    pattern: String,
+    route: String,
+    reason: String,
+    suggested_workers: Option<Vec<String>>,
+) -> Result<Vec<RouteFeedbackRule>, IpcError> {
+    let pattern = pattern.trim().to_string();
+    if pattern.is_empty() {
+        return Err(IpcError::Validation(
+            "route feedback pattern cannot be empty".to_string(),
+        ));
+    }
+    let route = TaskRouteKind::from_str(route.trim())
+        .ok_or_else(|| IpcError::Validation(format!("unknown route: {}", route.trim())))?;
+    let key = route_feedback_key(&pattern);
+    let mut rules = state.app_state.tasks.route_feedback.write().await;
+    rules.retain(|rule| route_feedback_key(&rule.pattern) != key);
+    rules.push(RouteFeedbackRule {
+        pattern,
+        route,
+        reason,
+        suggested_workers: suggested_workers.unwrap_or_default(),
+    });
+    save_route_feedback_rules(&rules).map_err(internal)?;
+    Ok(rules.clone())
+}
+
+/// Delete a route feedback rule by pattern and persist the remaining rules.
+#[tauri::command]
+pub async fn delete_route_feedback_rule(
+    state: tauri::State<'_, TauriState>,
+    pattern: String,
+) -> Result<Vec<RouteFeedbackRule>, IpcError> {
+    let key = route_feedback_key(&pattern);
+    let mut rules = state.app_state.tasks.route_feedback.write().await;
+    rules.retain(|rule| route_feedback_key(&rule.pattern) != key);
+    save_route_feedback_rules(&rules).map_err(internal)?;
+    Ok(rules.clone())
+}
+
+fn route_feedback_key(pattern: &str) -> String {
+    pattern
+        .to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 // ══════════════════════════════════════════════════════════════════════════

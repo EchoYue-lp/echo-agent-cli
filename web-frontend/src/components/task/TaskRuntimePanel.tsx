@@ -33,6 +33,8 @@ import {
 } from 'lucide-react';
 import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
 import { useConversationStore } from '../../stores/conversationStore';
+import { useUiStore } from '../../stores/uiStore';
+import { taskRuntimeApi } from '../../api/endpoints';
 import {
   useWorkerTraceStore,
   type WorkerTraceEvent,
@@ -1105,7 +1107,9 @@ export function TaskRuntimePanel() {
 export function TaskRuntimeMainPanel() {
   const [expandedWorkers, setExpandedWorkers] = useState<Record<string, boolean>>({});
   const [copiedFinalResult, setCopiedFinalResult] = useState(false);
+  const [routeFeedbackMessage, setRouteFeedbackMessage] = useState<string | null>(null);
   const activeId = useConversationStore((s) => s.activeId);
+  const setActiveSettingsTab = useUiStore((s) => s.setActiveSettingsTab);
   const traceWorkers = useWorkerTraceStore((s) => s.workers);
   const {
     activeRun,
@@ -1250,6 +1254,25 @@ export function TaskRuntimeMainPanel() {
   const effectiveRouteExplanation = deriveRouteExplanation(activeRun, plan, todos, visibleTraceWorkers, routeExplanation);
   const usageSummary = cacheUsageForWorkers(visibleTraceWorkers);
 
+  const rememberRouteFeedback = async (targetRoute: string) => {
+    const pattern = activeRun.goal.trim();
+    if (!pattern || !effectiveRouteExplanation) return;
+    const selectedWorkers =
+      targetRoute === 'normal_chat' ? [] : routeWorkerNames(effectiveRouteExplanation);
+    try {
+      await taskRuntimeApi.upsertRouteFeedbackRule(
+        pattern,
+        targetRoute,
+        `user corrected route from ${routeLabel(effectiveRouteExplanation.route)} to ${routeLabel(targetRoute)}`,
+        selectedWorkers
+      );
+      setRouteFeedbackMessage(`已记住: 下次类似请求走 ${routeLabel(targetRoute)}`);
+      window.setTimeout(() => setRouteFeedbackMessage(null), 2200);
+    } catch (err) {
+      setRouteFeedbackMessage(err instanceof Error ? err.message : String(err));
+    }
+  };
+
   return (
     <section
       className="my-3 rounded-lg border p-4"
@@ -1320,6 +1343,34 @@ export function TaskRuntimeMainPanel() {
                   ))}
                 </div>
               )}
+              <div className="mt-3 flex flex-wrap items-center gap-1.5">
+                <button
+                  onClick={() => void rememberRouteFeedback('normal_chat')}
+                  className="rounded-md px-2 py-1 text-[11px] font-medium"
+                  style={{ background: 'var(--bg-hover)', color: 'var(--text-secondary)' }}
+                >
+                  下次走 Chat
+                </button>
+                <button
+                  onClick={() => void rememberRouteFeedback('parallel_readonly_delegation')}
+                  className="rounded-md px-2 py-1 text-[11px] font-medium"
+                  style={{ background: 'var(--bg-hover)', color: 'var(--text-secondary)' }}
+                >
+                  下次只读并行
+                </button>
+                <button
+                  onClick={() => setActiveSettingsTab('routeFeedback')}
+                  className="rounded-md px-2 py-1 text-[11px]"
+                  style={{ color: 'var(--text-tertiary)' }}
+                >
+                  管理规则
+                </button>
+                {routeFeedbackMessage && (
+                  <span className="text-[11px]" style={{ color: 'var(--text-tertiary)' }}>
+                    {routeFeedbackMessage}
+                  </span>
+                )}
+              </div>
             </div>
           </RuntimeStoryStep>
         )}

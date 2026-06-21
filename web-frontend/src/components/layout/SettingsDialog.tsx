@@ -13,6 +13,7 @@ import {
   Cpu,
   Database,
   Activity,
+  BrainCircuit,
   Sparkles,
   Package,
   Timer,
@@ -37,6 +38,7 @@ import { ScratchpadPanel } from '../scratchpad/ScratchpadPanel';
 import { DecisionLogPanel } from '../decisions/DecisionLogPanel';
 import { WorktreePanel } from '../coding/WorktreePanel';
 import { ObservabilityPanel } from '../observability/ObservabilityPanel';
+import { RouteFeedbackPanel } from '../runtime/RouteFeedbackPanel';
 
 interface SettingsItem {
   id: SettingsTabId;
@@ -78,6 +80,7 @@ const settingsGroups: { label: string; icon: typeof Settings; items: SettingsIte
     icon: Activity,
     items: [
       { id: 'observability', label: '运行观测', icon: Activity },
+      { id: 'routeFeedback', label: '路由学习', icon: BrainCircuit },
       { id: 'scheduler', label: '定时任务', icon: Timer },
       { id: 'worktree', label: 'Worktree', icon: GitBranch },
     ],
@@ -102,6 +105,7 @@ const panels: Record<SettingsTabId, React.FC> = {
   scratchpad: ScratchpadPanel,
   decisions: DecisionLogPanel,
   observability: ObservabilityPanel,
+  routeFeedback: RouteFeedbackPanel,
   compress: CompressPanel,
   evolution: EvolutionPanel,
   plugins: PluginPanel,

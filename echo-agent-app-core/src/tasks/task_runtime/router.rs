@@ -3,6 +3,7 @@
 //! This is intentionally above the old complexity classifier: the classifier is
 //! a cheap fallback signal, while the router decides the product path.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use echo_agent::llm::{ChatRequest, LlmClient, ResponseFormat};
@@ -96,6 +97,61 @@ impl TaskRouteDecision {
     }
 }
 
+/// User or runtime correction learned from prior route decisions.
+///
+/// The router itself is LLM-first, with deterministic signals as the safety
+/// net. Feedback rules are the third layer: they let the product remember
+/// "messages like this should be handled as that route" without expanding the
+/// heuristic cue tables forever.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RouteFeedbackRule {
+    /// A normalized phrase or full user request to match against.
+    pub pattern: String,
+    /// Route to force when the pattern matches in Auto mode.
+    pub route: TaskRouteKind,
+    /// Human-readable correction reason shown in route traces.
+    pub reason: String,
+    /// Optional worker override. Invalid worker names are ignored.
+    #[serde(default)]
+    pub suggested_workers: Vec<String>,
+}
+
+pub fn default_route_feedback_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home)
+        .join(".echo-agent")
+        .join("route_feedback.json")
+}
+
+pub fn load_route_feedback_rules() -> Vec<RouteFeedbackRule> {
+    match try_load_route_feedback_rules() {
+        Ok(rules) => rules,
+        Err(error) => {
+            tracing::warn!(%error, "failed to load route feedback rules");
+            Vec::new()
+        }
+    }
+}
+
+pub fn try_load_route_feedback_rules() -> anyhow::Result<Vec<RouteFeedbackRule>> {
+    let path = default_route_feedback_path();
+    match std::fs::read_to_string(&path) {
+        Ok(raw) => Ok(serde_json::from_str(&raw)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub fn save_route_feedback_rules(rules: &[RouteFeedbackRule]) -> anyhow::Result<()> {
+    let path = default_route_feedback_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let raw = serde_json::to_string_pretty(rules)?;
+    std::fs::write(path, raw)?;
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 struct RawRouteDecision {
     route: String,
@@ -115,6 +171,16 @@ pub async fn route_message(
     message: &str,
     mode: InteractionMode,
 ) -> TaskRouteDecision {
+    route_message_with_feedback(llm, message, mode, &[]).await
+}
+
+/// Route a message and apply historical feedback corrections in Auto mode.
+pub async fn route_message_with_feedback(
+    llm: Option<Arc<dyn LlmClient>>,
+    message: &str,
+    mode: InteractionMode,
+    feedback_rules: &[RouteFeedbackRule],
+) -> TaskRouteDecision {
     match mode {
         InteractionMode::Chat => {
             return forced_decision(TaskRouteKind::NormalChat, message, "forced chat mode");
@@ -126,13 +192,15 @@ pub async fn route_message(
     }
 
     let deterministic = route_deterministically(message);
-    if let Some(llm) = llm
+    let decision = if let Some(llm) = llm
         && let Ok(decision) = route_with_llm(&llm, message).await
     {
-        return reconcile_llm_with_deterministic(decision, deterministic);
-    }
+        reconcile_llm_with_deterministic(decision, deterministic)
+    } else {
+        deterministic
+    };
 
-    deterministic
+    apply_route_feedback(decision, message, feedback_rules)
 }
 
 fn forced_decision(route: TaskRouteKind, message: &str, reason: &str) -> TaskRouteDecision {
@@ -185,6 +253,59 @@ fn reconcile_llm_with_deterministic(
         }
     }
     llm
+}
+
+fn apply_route_feedback(
+    mut decision: TaskRouteDecision,
+    message: &str,
+    feedback_rules: &[RouteFeedbackRule],
+) -> TaskRouteDecision {
+    let Some(rule) = feedback_rules
+        .iter()
+        .find(|rule| route_feedback_matches(message, &rule.pattern))
+    else {
+        return decision;
+    };
+
+    let previous_route = decision.route.as_str();
+    decision.route = rule.route;
+    decision.confidence = decision.confidence.max(0.95);
+    decision.reason = format!(
+        "historical router feedback override: {}; previous_route={previous_route}",
+        if rule.reason.trim().is_empty() {
+            "matched prior user correction"
+        } else {
+            rule.reason.trim()
+        }
+    );
+    decision.suggested_workers = normalize_workers(
+        rule.suggested_workers.clone(),
+        rule.route,
+        decision.classification.inferred_profile,
+        message,
+    );
+    if matches!(
+        rule.route,
+        TaskRouteKind::NormalChat | TaskRouteKind::DirectEdit | TaskRouteKind::BackgroundTask
+    ) {
+        decision.suggested_workers.clear();
+    }
+    decision
+}
+
+fn route_feedback_matches(message: &str, pattern: &str) -> bool {
+    let normalized_message = normalize_feedback_text(message);
+    let normalized_pattern = normalize_feedback_text(pattern);
+    !normalized_pattern.is_empty()
+        && (normalized_message == normalized_pattern
+            || normalized_message.contains(&normalized_pattern))
+}
+
+fn normalize_feedback_text(text: &str) -> String {
+    text.to_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 async fn route_with_llm(
@@ -370,6 +491,73 @@ mod tests {
             "expected project_explorer worker, got {:?}",
             decision.suggested_workers
         );
+    }
+
+    #[tokio::test]
+    async fn auto_mode_applies_feedback_to_keep_repeated_prompt_in_chat() {
+        let feedback = vec![RouteFeedbackRule {
+            pattern: "帮我分析当前目录的项目".to_string(),
+            route: TaskRouteKind::NormalChat,
+            reason: "user rejected TaskRuntime for this prompt".to_string(),
+            suggested_workers: Vec::new(),
+        }];
+        let decision = route_message_with_feedback(
+            None,
+            "帮我分析当前目录的项目",
+            InteractionMode::Auto,
+            &feedback,
+        )
+        .await;
+        assert_eq!(decision.route, TaskRouteKind::NormalChat);
+        assert!(decision.suggested_workers.is_empty());
+        assert!(decision.reason.contains("historical router feedback"));
+        assert!(
+            decision
+                .reason
+                .contains("user rejected TaskRuntime for this prompt")
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_mode_feedback_can_force_parallel_workers() {
+        let feedback = vec![RouteFeedbackRule {
+            pattern: "closure 是什么".to_string(),
+            route: TaskRouteKind::ParallelReadonlyDelegation,
+            reason: "user asked to always inspect the codebase for this phrase".to_string(),
+            suggested_workers: vec![
+                "project_explorer".to_string(),
+                "not_a_worker".to_string(),
+                "code_reviewer".to_string(),
+            ],
+        }];
+        let decision = route_message_with_feedback(
+            None,
+            "Rust 的 closure 是什么？",
+            InteractionMode::Auto,
+            &feedback,
+        )
+        .await;
+        assert_eq!(decision.route, TaskRouteKind::ParallelReadonlyDelegation);
+        assert_eq!(
+            decision.suggested_workers,
+            vec!["project_explorer".to_string(), "code_reviewer".to_string()]
+        );
+        assert!(decision.confidence >= 0.95);
+    }
+
+    #[tokio::test]
+    async fn forced_modes_ignore_feedback() {
+        let feedback = vec![RouteFeedbackRule {
+            pattern: "帮我处理这个任务".to_string(),
+            route: TaskRouteKind::NormalChat,
+            reason: "prior correction".to_string(),
+            suggested_workers: Vec::new(),
+        }];
+        let decision =
+            route_message_with_feedback(None, "帮我处理这个任务", InteractionMode::Task, &feedback)
+                .await;
+        assert_eq!(decision.route, TaskRouteKind::ComplexRuntime);
+        assert!(decision.reason.contains("forced task mode"));
     }
 
     #[test]

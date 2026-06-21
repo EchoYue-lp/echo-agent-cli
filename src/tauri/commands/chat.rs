@@ -406,10 +406,12 @@ pub async fn send_chat_message(
 
     if interaction_mode != InteractionMode::Chat {
         let route_llm = agent_handle.read(|a| a.llm_client().cloned()).await;
-        let route_decision = echo_agent_app_core::tasks::task_runtime::route_message(
+        let route_feedback = state.app_state.tasks.route_feedback.read().await.clone();
+        let route_decision = echo_agent_app_core::tasks::task_runtime::route_message_with_feedback(
             route_llm,
             &message,
             interaction_mode,
+            &route_feedback,
         )
         .await;
         if route_decision.route.should_create_runtime_run() {

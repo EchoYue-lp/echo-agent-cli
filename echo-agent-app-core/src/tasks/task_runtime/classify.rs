@@ -1,14 +1,11 @@
 //! Complex-task input classifier.
 //!
-//! Decides whether a user message should take the normal chat path or enter
-//! the TaskRuntime (plan → approve → execute). Two layers, mirroring the
-//! plan's "deterministic heuristics plus optional LLM classification":
+//! Produces cheap deterministic signals for the TaskRuntime router.
 //!
-//! 1. [`HeuristicClassifier`] — fast, zero-cost, deterministic keyword /
-//!    intent heuristics. This is the only layer used by default and in tests.
-//! 2. [`LlmComplexityClassifier`] — optional second opinion via a single
-//!    JSON-mode LLM call. Used only when heuristics are ambiguous (`Maybe`)
-//!    AND an LLM client is available.
+//! The product route decision lives in [`super::router`]: it asks an LLM first,
+//! reconciles that semantic verdict with deterministic safety signals, and can
+//! apply historical user feedback. This module is deliberately smaller: it
+//! provides a zero-cost fallback and transparent signals for traces/tests.
 //!
 //! We deliberately do NOT reuse the framework's `IntentRouter`: its `Intent`
 //! enum has no "complex task" variant and its thresholding is tuned for

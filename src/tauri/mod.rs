@@ -137,9 +137,13 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
             commands::task_runtime::get_taskruntime_auto_route,
             // TaskRuntime approval scope
             commands::task_runtime::grant_approval_scope,
-            // TaskRuntime interaction mode (Chat/Plan/Auto)
+            // TaskRuntime interaction mode (Chat/Task/Auto)
             commands::task_runtime::set_interaction_mode,
             commands::task_runtime::get_interaction_mode,
+            // TaskRuntime route feedback
+            commands::task_runtime::list_route_feedback_rules,
+            commands::task_runtime::upsert_route_feedback_rule,
+            commands::task_runtime::delete_route_feedback_rule,
             // Memory
             commands::memory::list_memory,
             commands::memory::add_memory,

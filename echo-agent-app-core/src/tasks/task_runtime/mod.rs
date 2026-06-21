@@ -62,6 +62,9 @@ pub use review::{
     BreakerAction, ReviewError, build_fix_task, circuit_breaker_action, requires_review,
     review_task,
 };
-pub use router::{TaskRouteDecision, TaskRouteKind, route_message};
+pub use router::{
+    RouteFeedbackRule, TaskRouteDecision, TaskRouteKind, load_route_feedback_rules, route_message,
+    route_message_with_feedback, save_route_feedback_rules,
+};
 pub use store::{StoreError, TaskRuntimeStore};
 pub use types::*;
