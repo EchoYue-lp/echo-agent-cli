@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 
 export type SettingsTabId =
+  | 'overview'
   | 'tools'
   | 'mcp'
   | 'skills'
@@ -13,10 +14,7 @@ export type SettingsTabId =
   | 'routeFeedback'
   | 'scratchpad'
   | 'decisions'
-  | 'workflow'
-  | 'sandbox'
   | 'compress'
-  | 'extract'
   | 'evolution'
   | 'plugins'
   | 'scheduler'
@@ -55,7 +53,7 @@ function applyTheme(theme: Theme) {
 export const useUiStore = create<UiState>((set, get) => ({
   leftSidebarOpen: typeof window !== 'undefined' && window.innerWidth >= 768,
   settingsOpen: false,
-  activeSettingsTab: 'tools',
+  activeSettingsTab: 'overview',
   theme: getInitialTheme(),
   terminalOpen: false,
 

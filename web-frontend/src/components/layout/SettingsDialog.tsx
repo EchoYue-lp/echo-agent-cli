@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type { CSSProperties } from 'react';
 import {
   X,
@@ -20,6 +20,9 @@ import {
   FileEdit,
   GitBranch,
   Scale,
+  LayoutDashboard,
+  ChevronDown,
+  ChevronRight,
 } from 'lucide-react';
 import { useUiStore, type SettingsTabId } from '../../stores/uiStore';
 import { ConfigPanel } from '../config/ConfigPanel';
@@ -48,10 +51,28 @@ interface SettingsItem {
   description: string;
 }
 
-const settingsGroups: { label: string; icon: typeof Settings; items: SettingsItem[] }[] = [
+interface SettingsGroup {
+  label: string;
+  icon: typeof Settings;
+  tier: 'core' | 'advanced';
+  defaultOpen?: boolean;
+  items: SettingsItem[];
+}
+
+const overviewItem: SettingsItem = {
+  id: 'overview',
+  label: '总览',
+  icon: LayoutDashboard,
+  maturity: 'core',
+  description: '核心工作流入口',
+};
+
+const settingsGroups: SettingsGroup[] = [
   {
     label: '核心工作流',
     icon: Cpu,
+    tier: 'core',
+    defaultOpen: true,
     items: [
       { id: 'providers', label: '模型', icon: Cpu, maturity: 'core', description: '模型、供应商和默认模型' },
       { id: 'tools', label: '工具', icon: Wrench, maturity: 'core', description: 'Agent 可用工具与权限' },
@@ -64,26 +85,31 @@ const settingsGroups: { label: string; icon: typeof Settings; items: SettingsIte
   {
     label: '项目数据',
     icon: Database,
+    tier: 'core',
+    defaultOpen: true,
     items: [
       { id: 'sessions', label: '会话', icon: Save, maturity: 'live', description: '会话历史与恢复' },
       { id: 'decisions', label: '决策', icon: Scale, maturity: 'live', description: '关键决策记录' },
-      { id: 'scratchpad', label: '草稿', icon: FileEdit, maturity: 'advanced', description: '临时笔记与中间材料' },
-      { id: 'compress', label: '压缩', icon: Minimize2, maturity: 'advanced', description: '上下文压缩与摘要' },
     ],
   },
   {
     label: '治理',
     icon: ShieldCheck,
+    tier: 'core',
+    defaultOpen: true,
     items: [
       { id: 'audit', label: '审计', icon: ShieldCheck, maturity: 'live', description: '审批、工具与风险日志' },
-      { id: 'config', label: '配置', icon: Settings, maturity: 'advanced', description: '底层应用配置' },
-      { id: 'worktree', label: 'Worktree', icon: GitBranch, maturity: 'advanced', description: '并行开发工作区' },
     ],
   },
   {
-    label: '扩展与实验',
+    label: '高级与实验',
     icon: Sparkles,
+    tier: 'advanced',
     items: [
+      { id: 'scratchpad', label: '草稿', icon: FileEdit, maturity: 'advanced', description: '临时笔记与中间材料' },
+      { id: 'compress', label: '压缩', icon: Minimize2, maturity: 'advanced', description: '上下文压缩与摘要' },
+      { id: 'config', label: '配置', icon: Settings, maturity: 'advanced', description: '底层应用配置' },
+      { id: 'worktree', label: 'Worktree', icon: GitBranch, maturity: 'advanced', description: '并行开发工作区' },
       { id: 'skills', label: '技能', icon: BookOpen, maturity: 'advanced', description: '可加载的能力包' },
       { id: 'plugins', label: '插件', icon: Package, maturity: 'advanced', description: '本地插件市场' },
       { id: 'scheduler', label: '定时任务', icon: Timer, maturity: 'advanced', description: '后台计划任务' },
@@ -100,6 +126,7 @@ const maturityLabel: Record<SettingsItem['maturity'], string> = {
 };
 
 const panels: Record<SettingsTabId, React.FC> = {
+  overview: SettingsOverview,
   tools: ToolsPanel,
   mcp: McpPanel,
   skills: SkillsPanel,
@@ -117,19 +144,112 @@ const panels: Record<SettingsTabId, React.FC> = {
   evolution: EvolutionPanel,
   plugins: PluginPanel,
   scheduler: SchedulerPanel,
-  workflow: () => null,
-  sandbox: () => null,
-  extract: () => null,
   worktree: WorktreePanel,
 };
 
+function SettingsOverview() {
+  const setActiveSettingsTab = useUiStore((s) => s.setActiveSettingsTab);
+  const workflows: Array<{
+    title: string;
+    icon: typeof Settings;
+    items: SettingsItem[];
+  }> = [
+    {
+      title: '执行主链路',
+      icon: BrainCircuit,
+      items: [
+        settingsGroups[0].items.find((item) => item.id === 'routeFeedback') ?? overviewItem,
+        settingsGroups[0].items.find((item) => item.id === 'observability') ?? overviewItem,
+        settingsGroups[2].items.find((item) => item.id === 'audit') ?? overviewItem,
+      ],
+    },
+    {
+      title: '模型与工具',
+      icon: Cpu,
+      items: [
+        settingsGroups[0].items.find((item) => item.id === 'providers') ?? overviewItem,
+        settingsGroups[0].items.find((item) => item.id === 'tools') ?? overviewItem,
+        settingsGroups[0].items.find((item) => item.id === 'mcp') ?? overviewItem,
+      ],
+    },
+    {
+      title: '上下文与历史',
+      icon: Database,
+      items: [
+        settingsGroups[0].items.find((item) => item.id === 'memory') ?? overviewItem,
+        settingsGroups[1].items.find((item) => item.id === 'sessions') ?? overviewItem,
+        settingsGroups[3].items.find((item) => item.id === 'compress') ?? overviewItem,
+      ],
+    },
+    {
+      title: '高级扩展',
+      icon: Sparkles,
+      items: [
+        settingsGroups[3].items.find((item) => item.id === 'skills') ?? overviewItem,
+        settingsGroups[3].items.find((item) => item.id === 'plugins') ?? overviewItem,
+        settingsGroups[3].items.find((item) => item.id === 'scheduler') ?? overviewItem,
+      ],
+    },
+  ];
+
+  return (
+    <div className="grid gap-4 md:grid-cols-2">
+      {workflows.map((workflow) => (
+        <section
+          key={workflow.title}
+          className="rounded-lg border border-[var(--border-primary)] bg-[var(--bg-secondary)] p-4"
+        >
+          <div className="mb-3 flex items-center gap-2">
+            <workflow.icon size={16} className="text-[var(--text-secondary)]" />
+            <h3 className="text-sm font-semibold text-[var(--text-primary)]">
+              {workflow.title}
+            </h3>
+          </div>
+          <div className="space-y-2">
+            {workflow.items.map(({ id, label, icon: Icon, maturity, description }) => (
+              <button
+                key={`${workflow.title}-${id}`}
+                type="button"
+                onClick={() => setActiveSettingsTab(id)}
+                className="flex w-full items-start gap-3 rounded-md px-3 py-2 text-left transition-colors hover:bg-[var(--bg-hover)]"
+              >
+                <Icon size={15} className="mt-0.5 shrink-0 text-[var(--text-tertiary)]" />
+                <span className="min-w-0 flex-1">
+                  <span className="flex items-center gap-2">
+                    <span className="truncate text-sm font-medium text-[var(--text-primary)]">
+                      {label}
+                    </span>
+                    <span className="shrink-0 rounded bg-[var(--bg-hover)] px-1.5 py-0.5 text-[9px] text-[var(--text-tertiary)]">
+                      {maturityLabel[maturity]}
+                    </span>
+                  </span>
+                  <span className="mt-0.5 block truncate text-xs text-[var(--text-tertiary)]">
+                    {description}
+                  </span>
+                </span>
+              </button>
+            ))}
+          </div>
+        </section>
+      ))}
+    </div>
+  );
+}
+
 export function SettingsDialog() {
   const { settingsOpen, closeSettings, activeSettingsTab, setActiveSettingsTab } = useUiStore();
-  const visibleItems = settingsGroups.flatMap((g) => g.items);
-  const activeItem = visibleItems.find((i) => i.id === activeSettingsTab);
-  const effectiveSettingsTab = activeItem ? activeSettingsTab : 'tools';
-  const effectiveItem = activeItem ?? visibleItems.find((i) => i.id === effectiveSettingsTab);
+  const allItems = useMemo(
+    () => [overviewItem, ...settingsGroups.flatMap((group) => group.items)],
+    []
+  );
+  const activeItem = allItems.find((i) => i.id === activeSettingsTab);
+  const effectiveSettingsTab = activeItem ? activeSettingsTab : 'overview';
+  const effectiveItem = activeItem ?? overviewItem;
   const Panel = panels[effectiveSettingsTab];
+  const [expandedAdvanced, setExpandedAdvanced] = useState<Record<string, boolean>>({});
+  const activeGroup = settingsGroups.find((group) =>
+    group.items.some((item) => item.id === effectiveSettingsTab)
+  );
 
   // Close on Escape key
   useEffect(() => {
@@ -178,16 +298,54 @@ export function SettingsDialog() {
             </button>
           </div>
           <nav className="flex-1 overflow-y-auto p-3 space-y-5">
+            <button
+              onClick={() => setActiveSettingsTab('overview')}
+              className={`flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left transition-all duration-150 ${
+                effectiveSettingsTab === 'overview'
+                  ? 'bg-[var(--settings-active-bg)] text-[var(--text-primary)]'
+                  : 'text-[var(--text-secondary)] hover:bg-[var(--bg-sidebar-hover)] hover:text-[var(--text-primary)]'
+              }`}
+            >
+              <LayoutDashboard size={15} className="shrink-0" />
+              <span className="min-w-0 flex-1">
+                <span className="truncate text-[13px] font-medium">总览</span>
+                <span className="mt-0.5 block truncate text-[10px] font-normal text-[var(--text-tertiary)]">
+                  核心工作流入口
+                </span>
+              </span>
+            </button>
             {settingsGroups.map((group) => (
               <div key={group.label}>
                 {/* Group header */}
-                <div className="flex items-center gap-2 px-2.5 pb-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (group.tier === 'advanced') {
+                      setExpandedAdvanced((prev) => ({
+                        ...prev,
+                        [group.label]: !prev[group.label],
+                      }));
+                    }
+                  }}
+                  className="flex w-full items-center gap-2 px-2.5 pb-2 text-left"
+                >
                   <group.icon size={12} className="text-[var(--text-tertiary)]" />
-                  <span className="text-[11px] font-semibold uppercase tracking-widest text-[var(--text-tertiary)]">
+                  <span className="flex-1 text-[11px] font-semibold uppercase tracking-widest text-[var(--text-tertiary)]">
                     {group.label}
                   </span>
-                </div>
-                {group.items.map(({ id, label, icon: Icon, maturity, description }) => (
+                  {group.tier === 'advanced' &&
+                    (expandedAdvanced[group.label] ||
+                    activeGroup?.label === group.label ? (
+                      <ChevronDown size={12} className="text-[var(--text-tertiary)]" />
+                    ) : (
+                      <ChevronRight size={12} className="text-[var(--text-tertiary)]" />
+                    ))}
+                </button>
+                {(group.tier === 'core' ||
+                  group.defaultOpen ||
+                  expandedAdvanced[group.label] ||
+                  activeGroup?.label === group.label) &&
+                  group.items.map(({ id, label, icon: Icon, maturity, description }) => (
                   <button
                     key={id}
                     onClick={() => setActiveSettingsTab(id)}
