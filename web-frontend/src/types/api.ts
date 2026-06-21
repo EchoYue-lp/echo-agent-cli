@@ -209,6 +209,7 @@ export type ServerMessage =
       route_reason?: string;
       confidence?: number;
       auto_execute?: boolean;
+      planned_workers?: string[];
       suggested_workers?: string[];
       route_signals?: string[];
       classification_signals?: string[];

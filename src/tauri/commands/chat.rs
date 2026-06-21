@@ -9,7 +9,8 @@ use echo_agent::agent::{Agent, CancellationToken};
 use echo_agent::human_loop::{HumanLoopProvider, HumanLoopRequest, HumanLoopResponse};
 use echo_agent::prelude::AgentEvent;
 use echo_agent_app_core::tasks::task_runtime::{
-    InteractionMode, TaskRouteDecision, TaskRunStatus, WorkerTraceEvent, WorkerTraceEventKind,
+    InteractionMode, TaskPlan, TaskRouteDecision, TaskRunStatus, WorkerTraceEvent,
+    WorkerTraceEventKind,
 };
 use futures::StreamExt;
 use futures::future::BoxFuture;
@@ -91,6 +92,7 @@ pub enum ChatEvent {
         route_reason: String,
         confidence: f32,
         auto_execute: bool,
+        planned_workers: Vec<String>,
         suggested_workers: Vec<String>,
         route_signals: Vec<String>,
         classification_signals: Vec<String>,
@@ -975,6 +977,7 @@ async fn route_complex_task(
 
     // 4. Persist + advance to AwaitingPlanApproval (attach_plan is atomic).
     store.attach_plan(&generated.plan)?;
+    let planned_workers = planned_worker_roles(&generated.plan);
     let mut auto_execute = false;
     let mut response_status = TaskRunStatus::AwaitingPlanApproval;
     if route_decision.route.should_auto_execute()
@@ -1013,6 +1016,7 @@ async fn route_complex_task(
             route_reason: route_decision.reason.clone(),
             confidence: route_decision.confidence,
             auto_execute,
+            planned_workers,
             suggested_workers: route_decision.suggested_workers.clone(),
             route_signals: route_decision
                 .reason
@@ -1047,6 +1051,19 @@ async fn route_complex_task(
         "plan": generated.plan,
         "warnings": generated.warnings,
     }))
+}
+
+fn planned_worker_roles(plan: &TaskPlan) -> Vec<String> {
+    let mut workers = Vec::new();
+    for task in &plan.tasks {
+        if task.agent_role.trim().is_empty() {
+            continue;
+        }
+        if !workers.iter().any(|worker| worker == &task.agent_role) {
+            workers.push(task.agent_role.clone());
+        }
+    }
+    workers
 }
 
 fn approval_policy_summary(

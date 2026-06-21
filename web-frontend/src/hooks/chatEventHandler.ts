@@ -31,6 +31,7 @@ interface ChatEventLike {
   route_reason?: string;
   confidence?: number;
   auto_execute?: boolean;
+  planned_workers?: string[];
   suggested_workers?: string[];
   route_signals?: string[];
   classification_signals?: string[];
@@ -168,6 +169,7 @@ export function handleChatEvent(
           routeReason: event.route_reason,
           confidence: event.confidence,
           autoExecute: event.auto_execute,
+          plannedWorkers: event.planned_workers ?? [],
           suggestedWorkers: event.suggested_workers ?? [],
           routeSignals: event.route_signals ?? [],
           classificationSignals: event.classification_signals ?? [],
@@ -176,7 +178,8 @@ export function handleChatEvent(
       ctx.currentThinkingIdRef.current = null;
       const id = ctx.assistantIdRef.current;
       if (id) {
-        const workerCount = event.suggested_workers?.length ?? 0;
+        const workerCount =
+          event.planned_workers?.length ?? event.suggested_workers?.length ?? 0;
         const workerText = workerCount > 0 ? `，${workerCount} 个 worker 已接入` : '';
         const content = event.auto_execute
           ? `已进入 TaskRuntime 并开始执行${workerText}。下面会展示触发原因、worker 执行过程和最终结果；右侧仅保留任务状态概览。`

@@ -160,8 +160,6 @@ function deriveRouteExplanation(
   workers: WorkerTraceState[],
   liveExplanation: RouteExplanation | null
 ): RouteExplanation {
-  if (liveExplanation && liveExplanation.runId === run.run_id) return liveExplanation;
-
   const plannedTasks = plan?.tasks ?? [];
   const readOnlyCount = plannedTasks.filter((task) => isReadOnlyKind(task.kind)).length;
   const allReadOnly = plannedTasks.length > 0 && readOnlyCount === plannedTasks.length;
@@ -170,6 +168,20 @@ function deriveRouteExplanation(
     ...todos.map((todo) => todo.owner_agent),
     ...plannedTasks.map((task) => task.agent_role),
   ]);
+  if (liveExplanation && liveExplanation.runId === run.run_id) {
+    const plannedWorkers = uniqueValues([
+      ...workerNames,
+      ...(liveExplanation.plannedWorkers ?? []),
+    ]);
+    return {
+      ...liveExplanation,
+      goal: liveExplanation.goal ?? run.goal,
+      domainProfile: liveExplanation.domainProfile ?? run.domain_profile,
+      plannedWorkers,
+      suggestedWorkers: liveExplanation.suggestedWorkers ?? [],
+    };
+  }
+
   const hasParallelWorkers = workerNames.length > 1 || workers.length > 1;
   const route = allReadOnly && hasParallelWorkers ? 'parallel_readonly_delegation' : 'complex_runtime';
   const autoExecute = allReadOnly && route === 'parallel_readonly_delegation';
@@ -188,10 +200,26 @@ function deriveRouteExplanation(
     ].join(' '),
     confidence: undefined,
     autoExecute,
+    plannedWorkers: workerNames,
     suggestedWorkers: workerNames,
     routeSignals: allReadOnly ? ['saved_plan_all_read_only'] : ['saved_task_runtime_run'],
     classificationSignals: [`domain:${domainProfileLabel(run.domain_profile)}`],
   };
+}
+
+function routeWorkerCount(explanation: RouteExplanation, traceWorkerCount: number): number {
+  return (
+    explanation.plannedWorkers?.length ||
+    traceWorkerCount ||
+    explanation.suggestedWorkers?.length ||
+    0
+  );
+}
+
+function routeWorkerNames(explanation: RouteExplanation): string[] {
+  return explanation.plannedWorkers?.length
+    ? explanation.plannedWorkers
+    : explanation.suggestedWorkers ?? [];
 }
 
 function CompactTag({ children }: { children: ReactNode }) {
@@ -888,9 +916,9 @@ export function TaskRuntimeMainPanel() {
                 </div>
               )}
 
-              {routeExplanation.suggestedWorkers.length > 0 && (
+              {routeWorkerNames(routeExplanation).length > 0 && (
                 <div className="flex flex-wrap gap-1">
-                  {routeExplanation.suggestedWorkers.map((worker) => (
+                  {routeWorkerNames(routeExplanation).map((worker) => (
                     <CompactTag key={worker}>{worker}</CompactTag>
                   ))}
                 </div>
@@ -965,7 +993,7 @@ export function TaskRuntimeMainPanel() {
           <Sparkles size={15} className="mt-0.5 shrink-0" style={{ color: 'var(--accent)' }} />
           <div className="min-w-0 flex-1">
             <div className="mb-1 text-[12px] font-medium" style={{ color: 'var(--text-primary)' }}>
-              已进入 TaskRuntime，并发委派 {effectiveRouteExplanation.suggestedWorkers.length || visibleTraceWorkers.length} 个 worker
+              已进入 TaskRuntime，并发委派 {routeWorkerCount(effectiveRouteExplanation, visibleTraceWorkers.length)} 个 worker
             </div>
             <div className="text-[11px] leading-relaxed" style={{ color: 'var(--text-secondary)' }}>
               {effectiveRouteExplanation.routeReason ||

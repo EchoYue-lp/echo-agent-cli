@@ -35,6 +35,7 @@ export interface RouteExplanation {
   routeReason?: string;
   confidence?: number;
   autoExecute?: boolean;
+  plannedWorkers: string[];
   suggestedWorkers: string[];
   routeSignals: string[];
   classificationSignals: string[];
@@ -209,6 +210,7 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
       lastSeq: '0',
       routeExplanation: {
         runId,
+        plannedWorkers: [],
         suggestedWorkers: [],
         routeSignals: [],
         classificationSignals: [],
