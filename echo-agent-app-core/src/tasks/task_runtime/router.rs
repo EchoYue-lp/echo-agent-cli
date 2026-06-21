@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use chrono::Utc;
 use echo_agent::llm::{ChatRequest, LlmClient, ResponseFormat};
 use echo_agent::prelude::Message;
 use serde::{Deserialize, Serialize};
@@ -114,6 +115,12 @@ pub struct RouteFeedbackRule {
     /// Optional worker override. Invalid worker names are ignored.
     #[serde(default)]
     pub suggested_workers: Vec<String>,
+    /// Number of Auto-route decisions corrected by this rule.
+    #[serde(default)]
+    pub hit_count: u64,
+    /// Last UTC timestamp when this rule matched.
+    #[serde(default)]
+    pub last_matched_at: Option<String>,
 }
 
 pub fn default_route_feedback_path() -> PathBuf {
@@ -150,6 +157,19 @@ pub fn save_route_feedback_rules(rules: &[RouteFeedbackRule]) -> anyhow::Result<
     let raw = serde_json::to_string_pretty(rules)?;
     std::fs::write(path, raw)?;
     Ok(())
+}
+
+pub fn record_route_feedback_match(message: &str, rules: &mut [RouteFeedbackRule]) -> bool {
+    let Some(rule) = rules
+        .iter_mut()
+        .find(|rule| route_feedback_matches(message, &rule.pattern))
+    else {
+        return false;
+    };
+
+    rule.hit_count = rule.hit_count.saturating_add(1);
+    rule.last_matched_at = Some(Utc::now().to_rfc3339());
+    true
 }
 
 #[derive(Debug, Deserialize)]
@@ -466,6 +486,22 @@ fn select_readonly_workers(signals: &RoutingSignals) -> Vec<String> {
 mod tests {
     use super::*;
 
+    fn feedback_rule(
+        pattern: &str,
+        route: TaskRouteKind,
+        reason: &str,
+        suggested_workers: Vec<String>,
+    ) -> RouteFeedbackRule {
+        RouteFeedbackRule {
+            pattern: pattern.to_string(),
+            route,
+            reason: reason.to_string(),
+            suggested_workers,
+            hit_count: 0,
+            last_matched_at: None,
+        }
+    }
+
     #[test]
     fn deterministic_router_detects_broad_readonly_project_analysis() {
         let decision = route_deterministically("请帮我分析一下这个项目架构");
@@ -495,12 +531,12 @@ mod tests {
 
     #[tokio::test]
     async fn auto_mode_applies_feedback_to_keep_repeated_prompt_in_chat() {
-        let feedback = vec![RouteFeedbackRule {
-            pattern: "帮我分析当前目录的项目".to_string(),
-            route: TaskRouteKind::NormalChat,
-            reason: "user rejected TaskRuntime for this prompt".to_string(),
-            suggested_workers: Vec::new(),
-        }];
+        let feedback = vec![feedback_rule(
+            "帮我分析当前目录的项目",
+            TaskRouteKind::NormalChat,
+            "user rejected TaskRuntime for this prompt",
+            Vec::new(),
+        )];
         let decision = route_message_with_feedback(
             None,
             "帮我分析当前目录的项目",
@@ -520,16 +556,16 @@ mod tests {
 
     #[tokio::test]
     async fn auto_mode_feedback_can_force_parallel_workers() {
-        let feedback = vec![RouteFeedbackRule {
-            pattern: "closure 是什么".to_string(),
-            route: TaskRouteKind::ParallelReadonlyDelegation,
-            reason: "user asked to always inspect the codebase for this phrase".to_string(),
-            suggested_workers: vec![
+        let feedback = vec![feedback_rule(
+            "closure 是什么",
+            TaskRouteKind::ParallelReadonlyDelegation,
+            "user asked to always inspect the codebase for this phrase",
+            vec![
                 "project_explorer".to_string(),
                 "not_a_worker".to_string(),
                 "code_reviewer".to_string(),
             ],
-        }];
+        )];
         let decision = route_message_with_feedback(
             None,
             "Rust 的 closure 是什么？",
@@ -547,17 +583,36 @@ mod tests {
 
     #[tokio::test]
     async fn forced_modes_ignore_feedback() {
-        let feedback = vec![RouteFeedbackRule {
-            pattern: "帮我处理这个任务".to_string(),
-            route: TaskRouteKind::NormalChat,
-            reason: "prior correction".to_string(),
-            suggested_workers: Vec::new(),
-        }];
+        let feedback = vec![feedback_rule(
+            "帮我处理这个任务",
+            TaskRouteKind::NormalChat,
+            "prior correction",
+            Vec::new(),
+        )];
         let decision =
             route_message_with_feedback(None, "帮我处理这个任务", InteractionMode::Task, &feedback)
                 .await;
         assert_eq!(decision.route, TaskRouteKind::ComplexRuntime);
         assert!(decision.reason.contains("forced task mode"));
+    }
+
+    #[test]
+    fn record_route_feedback_match_updates_hit_stats() {
+        let mut feedback = vec![feedback_rule(
+            "分析当前目录",
+            TaskRouteKind::ParallelReadonlyDelegation,
+            "prior correction",
+            Vec::new(),
+        )];
+        assert!(record_route_feedback_match(
+            "请帮我分析当前目录的项目",
+            &mut feedback
+        ));
+        assert_eq!(feedback.len(), 1);
+        if let Some(rule) = feedback.first() {
+            assert_eq!(rule.hit_count, 1);
+            assert!(rule.last_matched_at.is_some());
+        }
     }
 
     #[test]

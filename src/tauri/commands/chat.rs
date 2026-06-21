@@ -414,6 +414,21 @@ pub async fn send_chat_message(
             &route_feedback,
         )
         .await;
+        if interaction_mode == InteractionMode::Auto
+            && route_decision
+                .reason
+                .starts_with("historical router feedback override")
+        {
+            let mut feedback = state.app_state.tasks.route_feedback.write().await;
+            if echo_agent_app_core::tasks::task_runtime::record_route_feedback_match(
+                &message,
+                &mut feedback,
+            ) && let Err(error) =
+                echo_agent_app_core::tasks::task_runtime::save_route_feedback_rules(&feedback)
+            {
+                tracing::warn!(%error, "failed to persist route feedback hit stats");
+            }
+        }
         if route_decision.route.should_create_runtime_run() {
             let route_label = route_decision.route.as_str();
             // Try to route to TaskRuntime. If routing/planning fails after the

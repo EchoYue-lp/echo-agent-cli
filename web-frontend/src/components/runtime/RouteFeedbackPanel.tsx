@@ -32,6 +32,13 @@ function splitWorkers(value: string): string[] {
     .filter(Boolean);
 }
 
+function formatTime(value?: string | null): string {
+  if (!value) return '尚未命中';
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) return value;
+  return new Date(parsed).toLocaleString();
+}
+
 export function RouteFeedbackPanel() {
   const [rules, setRules] = useState<RouteFeedbackRule[]>([]);
   const [pattern, setPattern] = useState('');
@@ -62,7 +69,12 @@ export function RouteFeedbackPanel() {
   const canSave = pattern.trim().length > 0 && !saving;
 
   const sortedRules = useMemo(
-    () => [...rules].sort((a, b) => a.pattern.localeCompare(b.pattern)),
+    () =>
+      [...rules].sort(
+        (a, b) =>
+          (b.hit_count ?? 0) - (a.hit_count ?? 0) ||
+          a.pattern.localeCompare(b.pattern)
+      ),
     [rules]
   );
 
@@ -245,6 +257,9 @@ export function RouteFeedbackPanel() {
                         {worker}
                       </span>
                     ))}
+                    <span className="rounded px-2 py-0.5 text-[11px]" style={{ background: 'var(--bg-hover)', color: 'var(--text-tertiary)' }}>
+                      命中 {rule.hit_count ?? 0}
+                    </span>
                   </div>
                 </div>
                 <button
@@ -261,6 +276,9 @@ export function RouteFeedbackPanel() {
                   {rule.reason}
                 </div>
               )}
+              <div className="mt-2 text-[11px]" style={{ color: 'var(--text-tertiary)' }}>
+                最近命中: {formatTime(rule.last_matched_at)}
+              </div>
             </div>
           ))}
           {sortedRules.length === 0 && (

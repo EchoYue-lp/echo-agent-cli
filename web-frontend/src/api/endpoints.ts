@@ -93,6 +93,8 @@ export interface RouteFeedbackRule {
   route: string;
   reason: string;
   suggested_workers: string[];
+  hit_count: number;
+  last_matched_at?: string | null;
 }
 
 export const sessionApi = {

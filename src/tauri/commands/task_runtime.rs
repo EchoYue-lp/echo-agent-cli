@@ -256,12 +256,18 @@ pub async fn upsert_route_feedback_rule(
         .ok_or_else(|| IpcError::Validation(format!("unknown route: {}", route.trim())))?;
     let key = route_feedback_key(&pattern);
     let mut rules = state.app_state.tasks.route_feedback.write().await;
+    let previous = rules
+        .iter()
+        .find(|rule| route_feedback_key(&rule.pattern) == key)
+        .cloned();
     rules.retain(|rule| route_feedback_key(&rule.pattern) != key);
     rules.push(RouteFeedbackRule {
         pattern,
         route,
         reason,
         suggested_workers: suggested_workers.unwrap_or_default(),
+        hit_count: previous.as_ref().map(|rule| rule.hit_count).unwrap_or(0),
+        last_matched_at: previous.and_then(|rule| rule.last_matched_at),
     });
     save_route_feedback_rules(&rules).map_err(internal)?;
     Ok(rules.clone())
