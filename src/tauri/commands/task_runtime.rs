@@ -360,13 +360,14 @@ pub async fn generate_task_plan(
     }
 
     // Obtain the LLM client from the primary agent.
-    let llm = state
+    let (llm, plan_cache_user_id) = state
         .app_state
         .connection
         .primary_agent()
-        .read(|a| a.llm_client().cloned())
-        .await
-        .ok_or_else(|| IpcError::Internal("no LLM client available on primary agent".into()))?;
+        .read(|a| (a.llm_client().cloned(), a.config().get_cache_user_id().map(|s| s.to_string())))
+        .await;
+    let llm = llm.ok_or_else(|| IpcError::Internal("no LLM client available on primary agent".into()))?;
+    let plan_cache_user_id = plan_cache_user_id.unwrap_or_default();
 
     // Classify to steer the prompt with an inferred profile + reason. The
     // classifier is heuristic-only here; the run's existing profile wins if
@@ -387,6 +388,7 @@ pub async fn generate_task_plan(
         &run.goal,
         &classification,
         &[],
+        &plan_cache_user_id,
     )
     .await
     .map_err(|e| match e {
@@ -548,7 +550,10 @@ pub async fn execute_task_run(
     let run_id_for_task = run_id.clone();
     // The reviewer LLM is the primary agent's client — review gates use it to
     // evaluate implementation/debugging task output against the domain checklist.
-    let reviewer_llm = primary_agent.read(|a| a.llm_client().cloned()).await;
+    let (reviewer_llm, exec_cache_user_id) = primary_agent
+        .read(|a| (a.llm_client().cloned(), a.config().get_cache_user_id().map(|s| s.to_string())))
+        .await;
+    let exec_cache_user_id = exec_cache_user_id.unwrap_or_default();
     // The memory layer manager sinks run completion/cancellation events into
     // long-term memory through the single write_memory chokepoint. Created
     // from ReviewIntegration when available (mirrors the primary agent's path).
@@ -579,6 +584,7 @@ pub async fn execute_task_run(
             run_store_for_task,
             Some(trace_sink),
             &run_id_for_task,
+            exec_cache_user_id.clone(),
             cancel,
         )
         .await;

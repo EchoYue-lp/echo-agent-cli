@@ -274,6 +274,7 @@ pub async fn generate_plan(
     goal: &str,
     classification: &Classification,
     suggested_workers: &[String],
+    cache_user_id: &str,
 ) -> Result<GeneratedPlan, PlanError> {
     let profile = classification.inferred_profile;
     let template = ProfileTemplate::for_profile(profile);
@@ -288,6 +289,7 @@ pub async fn generate_plan(
             Message::user(prompt),
         ],
         response_format: Some(ResponseFormat::JsonObject),
+        user_id: Some(cache_user_id.to_string()),
         ..Default::default()
     };
     let response = llm

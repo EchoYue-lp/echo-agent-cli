@@ -363,8 +363,9 @@ pub async fn route_message(
     llm: Option<Arc<dyn LlmClient>>,
     message: &str,
     mode: InteractionMode,
+    cache_user_id: Option<&str>,
 ) -> TaskRouteDecision {
-    route_message_with_feedback(llm, message, mode, &[]).await
+    route_message_with_feedback(llm, message, mode, &[], cache_user_id).await
 }
 
 /// Route a message and apply historical feedback corrections in Auto mode.
@@ -373,6 +374,7 @@ pub async fn route_message_with_feedback(
     message: &str,
     mode: InteractionMode,
     feedback_rules: &[RouteFeedbackRule],
+    cache_user_id: Option<&str>,
 ) -> TaskRouteDecision {
     match mode {
         InteractionMode::Chat => {
@@ -386,7 +388,7 @@ pub async fn route_message_with_feedback(
 
     let deterministic = route_deterministically(message);
     let decision = if let Some(llm) = llm
-        && let Ok(decision) = route_with_llm(&llm, message, feedback_rules).await
+        && let Ok(decision) = route_with_llm(&llm, message, feedback_rules, cache_user_id).await
     {
         reconcile_llm_with_deterministic(decision, deterministic)
     } else {
@@ -591,6 +593,7 @@ async fn route_with_llm(
     llm: &Arc<dyn LlmClient>,
     message: &str,
     feedback_rules: &[RouteFeedbackRule],
+    cache_user_id: Option<&str>,
 ) -> Result<TaskRouteDecision, String> {
     let request = ChatRequest {
         messages: vec![
@@ -601,6 +604,7 @@ async fn route_with_llm(
             )),
         ],
         response_format: Some(ResponseFormat::JsonObject),
+        user_id: cache_user_id.map(|s| s.to_string()),
         ..Default::default()
     };
     let response = llm.chat(request).await.map_err(|e| e.to_string())?;
@@ -813,7 +817,7 @@ mod tests {
 
     #[tokio::test]
     async fn auto_mode_routes_current_directory_project_analysis_to_parallel_runtime() {
-        let decision = route_message(None, "帮我分析当前目录的项目", InteractionMode::Auto).await;
+        let decision = route_message(None, "帮我分析当前目录的项目", InteractionMode::Auto, None).await;
         assert_eq!(decision.route, TaskRouteKind::ParallelReadonlyDelegation);
         assert!(decision.route.should_auto_execute());
         assert!(
@@ -839,6 +843,7 @@ mod tests {
             "帮我分析当前目录的项目",
             InteractionMode::Auto,
             &feedback,
+            None,
         )
         .await;
         assert_eq!(decision.route, TaskRouteKind::NormalChat);
@@ -868,6 +873,7 @@ mod tests {
             "Rust 的 closure 是什么？",
             InteractionMode::Auto,
             &feedback,
+            None,
         )
         .await;
         assert_eq!(decision.route, TaskRouteKind::ParallelReadonlyDelegation);
@@ -887,7 +893,7 @@ mod tests {
             Vec::new(),
         )];
         let decision =
-            route_message_with_feedback(None, "帮我处理这个任务", InteractionMode::Task, &feedback)
+            route_message_with_feedback(None, "帮我处理这个任务", InteractionMode::Task, &feedback, None)
                 .await;
         assert_eq!(decision.route, TaskRouteKind::ComplexRuntime);
         assert!(decision.reason.contains("forced task mode"));
@@ -1012,7 +1018,7 @@ mod tests {
 
     #[tokio::test]
     async fn task_mode_forces_complex_runtime_not_plan_only() {
-        let decision = route_message(None, "帮我处理这个任务", InteractionMode::Task).await;
+        let decision = route_message(None, "帮我处理这个任务", InteractionMode::Task, None).await;
         assert_eq!(decision.route, TaskRouteKind::ComplexRuntime);
         assert!(decision.reason.contains("forced task mode"));
         assert!(decision.reason.contains("routing_signals"));
@@ -1020,7 +1026,7 @@ mod tests {
 
     #[tokio::test]
     async fn task_mode_forces_parallel_delegation_for_readonly_analysis() {
-        let decision = route_message(None, "请分析这个项目架构", InteractionMode::Task).await;
+        let decision = route_message(None, "请分析这个项目架构", InteractionMode::Task, None).await;
         assert_eq!(decision.route, TaskRouteKind::ParallelReadonlyDelegation);
         assert!(decision.route.should_auto_execute());
     }

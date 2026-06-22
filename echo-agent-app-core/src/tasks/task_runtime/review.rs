@@ -79,6 +79,7 @@ pub async fn review_task(
     run_id: &str,
     task: &PlanTask,
     worker_output: &str,
+    cache_user_id: &str,
 ) -> Result<ReviewResult, ReviewError> {
     let template = ProfileTemplate::for_profile(task.domain_profile);
     let prompt = build_review_prompt(task, worker_output, template);
@@ -89,6 +90,7 @@ pub async fn review_task(
             Message::user(prompt),
         ],
         response_format: Some(ResponseFormat::JsonObject),
+        user_id: Some(cache_user_id.to_string()),
         ..Default::default()
     };
     let response = llm

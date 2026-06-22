@@ -119,6 +119,7 @@ pub async fn execute_run(
     run_store: Option<Arc<dyn echo_agent::trace::RunStore>>,
     trace_sink: Option<WorkerTraceSink>,
     run_id: &str,
+    cache_user_id: String,
     parent_cancel: CancellationToken,
 ) -> Result<RunOutcome, ExecError> {
     let run = store
@@ -199,6 +200,7 @@ pub async fn execute_run(
         limits,
         parent_cancel,
         trace_sink.clone(),
+        cache_user_id.clone(),
     )
     .await;
 
@@ -422,6 +424,7 @@ async fn run_dag<W: TaskWorker + 'static>(
     limits: ConcurrencyLimits,
     parent_cancel: CancellationToken,
     trace_sink: Option<WorkerTraceSink>,
+    cache_user_id: String,
 ) -> Result<RunOutcome, ExecError> {
     // Wrap the worker in an Arc so each spawned task can clone the handle.
     let worker = Arc::new(worker);
@@ -600,6 +603,7 @@ async fn run_dag<W: TaskWorker + 'static>(
                         run_id,
                         &task,
                         summary.as_deref().unwrap_or(""),
+                        &cache_user_id,
                     )
                     .await;
                     match passed {
@@ -725,6 +729,7 @@ async fn run_review_gate(
     run_id: &str,
     task: &PlanTask,
     worker_output: &str,
+    cache_user_id: &str,
 ) -> ReviewGateOutcome {
     // Read-only kinds are their own review — no gate.
     if !super::review::requires_review(task.kind) {
@@ -740,7 +745,7 @@ async fn run_review_gate(
     const MAX_REVIEW_RETRIES: u32 = 2;
     let mut retries: u32 = 0;
     let review = loop {
-        match super::review::review_task(&llm, &store, run_id, task, worker_output).await {
+        match super::review::review_task(&llm, &store, run_id, task, worker_output, cache_user_id).await {
             Ok(r) => break r,
             Err(e) => {
                 retries += 1;
@@ -1888,6 +1893,7 @@ mod tests {
             ConcurrencyLimits::default(),
             CancellationToken::new(),
             None,
+            String::new(),
         )
         .await
         .unwrap();
@@ -1919,6 +1925,7 @@ mod tests {
             ConcurrencyLimits::default(),
             CancellationToken::new(),
             None,
+            String::new(),
         )
         .await
         .unwrap();
@@ -1951,6 +1958,7 @@ mod tests {
             ConcurrencyLimits::default(),
             CancellationToken::new(),
             None,
+            String::new(),
         )
         .await
         .unwrap();
@@ -1986,6 +1994,7 @@ mod tests {
             ConcurrencyLimits::default(),
             cancel,
             None,
+            String::new(),
         )
         .await
         .unwrap();
@@ -2017,6 +2026,7 @@ mod tests {
             ConcurrencyLimits::default(),
             CancellationToken::new(),
             None,
+            String::new(),
         )
         .await
         .unwrap();
