@@ -303,14 +303,17 @@ function cacheUsageFromEvents(events: WorkerTraceEvent[]): CacheUsageSummary {
   const models = uniqueValues(usageEvents.map((event) => payloadValue(event, 'model')));
   return usageEvents.reduce<CacheUsageSummary>(
     (summary, event) => {
+      const reported = payloadBool(event, 'usage_reported');
       summary.calls += 1;
-      summary.inputTokens += payloadNumber(event, 'prompt_tokens');
-      summary.outputTokens += payloadNumber(event, 'completion_tokens');
-      summary.totalTokens += payloadNumber(event, 'total_tokens');
-      summary.cachedPromptTokens += payloadNumber(event, 'cached_prompt_tokens');
-      summary.cacheCreationPromptTokens += payloadNumber(event, 'cache_creation_prompt_tokens');
-      if (payloadBool(event, 'usage_reported') === false) {
+      if (!reported) {
+        // Unreported usage: count but don't pollute main token statistics.
         summary.missingUsage += 1;
+      } else {
+        summary.inputTokens += payloadNumber(event, 'prompt_tokens');
+        summary.outputTokens += payloadNumber(event, 'completion_tokens');
+        summary.totalTokens += payloadNumber(event, 'total_tokens');
+        summary.cachedPromptTokens += payloadNumber(event, 'cached_prompt_tokens');
+        summary.cacheCreationPromptTokens += payloadNumber(event, 'cache_creation_prompt_tokens');
       }
       return summary;
     },
@@ -429,6 +432,12 @@ function CacheUsageCard({
         </div>
         <span className="shrink-0 text-[9px]" style={{ color: 'var(--text-tertiary)' }}>
           {summary.calls} LLM call{summary.calls > 1 ? 's' : ''}
+          {summary.missingUsage > 0 && (
+            <span style={{ color: 'var(--color-warning)' }}>
+              {' '}
+              ({summary.missingUsage} 未上报)
+            </span>
+          )}
         </span>
       </div>
       <div className="grid grid-cols-3 gap-1.5">

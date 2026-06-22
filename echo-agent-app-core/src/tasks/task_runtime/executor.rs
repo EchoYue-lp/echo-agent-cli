@@ -964,25 +964,34 @@ async fn execute_task(
     //   (workers can't write). The primary agent's execution_mutex serializes
     //   them further, which is correct — mutating work must not race.
     let is_read_only_task = task.kind.is_read_only();
-    let result = if is_read_only_task {
-        run_readonly_worker(&primary_agent, &run_id, &task.agent_role, &prompt, cancel).await
+    let (result, readonly_usage) = if is_read_only_task {
+        match run_readonly_worker(&primary_agent, &run_id, &task.agent_role, &prompt, cancel).await {
+            Ok(sub_result) => (Ok(sub_result.output), sub_result.usage),
+            Err(e) => (Err(e), None),
+        }
     } else {
-        run_main_agent_task(
-            &primary_agent,
-            store.clone(),
-            &run_id,
-            &task,
-            &prompt,
-            cancel,
-            trace_sink.clone(),
+        (
+            run_main_agent_task(
+                &primary_agent,
+                store.clone(),
+                &run_id,
+                &task,
+                &prompt,
+                cancel,
+                trace_sink.clone(),
+            )
+            .await,
+            None,
         )
-        .await
     };
 
     if is_read_only_task && result.is_ok() {
-        let usage_payload = unavailable_llm_usage_payload(
-            "readonly_delegate_path_does_not_expose_provider_usage_yet",
-        );
+        let usage_payload = match &readonly_usage {
+            Some(stats) => stats.to_payload(&run_id),
+            None => unavailable_llm_usage_payload(
+                "provider_returned_no_usage_for_readonly_worker",
+            ),
+        };
         if let Err(error) = store.record_worker_llm_usage(
             &run_id,
             &task_id,
@@ -995,7 +1004,7 @@ async fn execute_task(
                 run_id = %run_id,
                 task_id = %task_id,
                 error = %error,
-                "failed to persist unavailable read-only worker LLM usage marker"
+                "failed to persist read-only worker LLM usage"
             );
         }
         emit_worker_trace(
@@ -1014,15 +1023,8 @@ async fn execute_task(
     match result {
         Ok(text) => {
             let summary = summarize_output(&text);
-            // G14: Archive raw worker output as a trace artifact (plan §1057-1061).
             super::ledger::archive_trace(&run_id, &task_id, &text, None);
-            // G13: Compression snapshot — write progress.md at this boundary
-            // so recovery context stays current (plan §1019-1038).
             let _ = super::ledger::write_progress(&store, &run_id, None);
-            // Persist the structured TaskExecutionSummary so recovery path
-            // and downstream workers get full context (not just the 280-char
-            // truncation from todo.summary). Best-effort: a write failure
-            // does NOT fail the task.
             if let Err(e) = store.put_summary(&TaskExecutionSummary {
                 run_id: run_id.clone(),
                 task_id: task_id.clone(),
@@ -1044,9 +1046,7 @@ async fn execute_task(
                     run_id.clone(),
                     worker_trace_id.clone(),
                     WorkerTraceEventKind::WorkerCompleted,
-                    serde_json::json!({
-                        "summary": &summary,
-                    }),
+                    serde_json::json!({ "summary": &summary }),
                 )
                 .with_agent(task.agent_role.clone())
                 .with_title(task.title.clone()),
@@ -1060,9 +1060,7 @@ async fn execute_task(
                     run_id,
                     worker_trace_id,
                     WorkerTraceEventKind::WorkerFailed,
-                    serde_json::json!({
-                        "error": &e,
-                    }),
+                    serde_json::json!({ "error": &e }),
                 )
                 .with_agent(task.agent_role.clone())
                 .with_title(task.title.clone()),
@@ -1205,7 +1203,7 @@ async fn run_readonly_worker(
     role: &str,
     prompt: &str,
     cancel: CancellationToken,
-) -> Result<String, String> {
+) -> Result<echo_agent::agent::subagent::SubagentResult, String> {
     primary_agent
         .read_async(|agent| {
             let prompt = prompt.to_string();
