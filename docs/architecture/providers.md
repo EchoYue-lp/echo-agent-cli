@@ -3,11 +3,12 @@
 > **状态**：已采纳（2026-06）
 > **适用范围**：echo-agent / echo-integration / echo-agent-cli 全栈
 > **决策性质**：架构约束——偏离此决策需显式评审
+> **最后更新**：2026-06-22（Provider 收敛至 2 个 client 实现）
 
 ## 决策陈述
 
-**LLM provider 层只维护两个基础实现：OpenAI Chat Completions + Anthropic Messages。**
-所有其他厂商通过 `LlmConfig` 预设接入对应基础协议，个性化差异收敛在 usage 解析与缓存适配器。**不实现 OpenAI Responses API**，不为每个国内厂商建独立 provider 文件。
+**LLM provider 层只维护两个 `LlmClient` 实现：OpenAI Chat Completions + Anthropic Messages。**
+所有其他厂商通过 `LlmConfig` 预设接入对应基础协议，个性化差异收敛在 thinking 协议翻译（`translate_thinking_openai_compat`）+ usage 解析 fallback + 缓存适配器。**不实现 OpenAI Responses API**。
 
 ## 决策理由
 
@@ -29,9 +30,9 @@ OpenAI Responses API（2025 年推出）把对话状态移到服务端，客户�
 
 Chat Completions 已能覆盖 OpenAI 自家模型，Responses API 投入产出比低且会削弱缓存效果，**不实现**。
 
-### 4. 不为每个国内厂商建独立 provider
+### 4. 已删除冗余厂商 client 文件
 
-国内厂商的"兼容 OpenAI"是有条件的（usage 字段名差异、非标准扩展参数），但这些差异通过 `LlmConfig` 预设 + usage 解析 fallback + 缓存适配器就能处理，**不需要独立 provider 实现**。为每个厂商建文件会导致维护成本倍增且重复代码。
+2026-06-22 收敛中删除了 7 个冗余/不支持的 vendor client 文件（DeepSeek/Qwen/Glm/Kimi Gemini/Azure/Ollama）。其中 4 个国内厂商 client 是纯冗余——`OpenAiClient` 已通过 `config.provider_name` + `translate_thinking_openai_compat` 正确处理它们的 thinking 协议，两者逻辑完全一致。Gemini/Azure/Ollama 因 auth 机制差异（如 Gemini 的 `x-goog-api-key` header、Azure 的 `api-key` header + URL query param、Ollama 的无 auth）暂不支持。
 
 ## 当前架构
 
@@ -39,14 +40,14 @@ Chat Completions 已能覆盖 OpenAI 自家模型，Responses API 投入产出�
 
 ```
 echo-integration/src/providers/
-├── openai.rs            ← OpenAI Chat Completions 基础实现（覆盖 OpenAI/DeepSeek/GLM/Kimi/Qwen 等）
-│   ├── chat()           ← 独立函数（非流式，接收 user_id）
-│   ├── stream_chat()    ← 独立函数（流式，接收 user_id）
-│   └── impl LlmClient   ← trait 实现（转发 request.user_id）
-├── openai_cache.rs      ← OpenAI 缓存适配器（稳定 user_id + 前缀缓存）
-├── anthropic.rs         ← Anthropic Messages API 独立实现
-├── anthropic_cache.rs   ← Anthropic 缓存适配器（cache_control 断点策略）
-└── config.rs            ← LlmConfig 预设（openai/anthropic/deepseek 等）
+├── openai.rs              ← OpenAI Chat Completions 基础实现（覆盖 OpenAI/DeepSeek/Qwen/GLM/Kimi 等）
+├── openai_cache.rs        ← OpenAI 缓存适配器（稳定 user_id + 前缀缓存）
+├── anthropic.rs           ← Anthropic Messages API 独立实现
+├── anthropic_cache.rs     ← Anthropic 缓存适配器（cache_control 断点策略）
+├── client.rs              ← 通用 HTTP post/stream_post
+├── thinking_translate.rs  ← thinking 协议策略（函数式，translate_thinking_openai_compat）
+├── config.rs              ← LlmConfig 预设 + ProviderMetadata + build_client
+└── adapter_client.rs      ← 协议适配器
 ```
 
 ### 个性化差异的处理位置
@@ -107,17 +108,6 @@ pub fn new_provider(api_key: impl Into<String>, model: impl Into<String>) -> Sel
 
 ## 反模式（不要做）
 
-### ❌ 为每个国内厂商建独立 provider 文件
-
-```rust
-// 不要这样做
-echo-integration/src/providers/deepseek.rs   // ❌
-echo-integration/src/providers/glm.rs        // ❌
-echo-integration/src/providers/kimi.rs       // ❌
-```
-
-这些厂商都是 OpenAI Chat Completions 协议，差异通过 `LlmConfig` + usage fallback 处理。建独立文件会导致 90% 代码重复。
-
 ### ❌ 实现 OpenAI Responses API
 
 ```rust
@@ -149,20 +139,34 @@ pub struct ChatRequest {
 | 厂商 | 接入方式 | 缓存支持 | 备注 |
 |---|---|---|---|
 | OpenAI | `LlmConfig::openai()` + `OpenAiClient` | ✅ `cached_tokens` | 基础实现 |
-| DeepSeek | `LlmConfig::deepseek()` + `OpenAiClient` | ✅ `prompt_cache_hit_tokens` | usage 字段已 fallback 处理 |
+| DeepSeek | `LlmConfig::deepseek()` + `OpenAiClient` | ✅ `prompt_cache_hit_tokens` | thinking 由 `translate_thinking_openai_compat` 处理 |
 | Anthropic Claude | `LlmConfig::anthropic()` + `AnthropicClient` | ✅ `cache_control` 断点 | 独立实现 |
 | 智谱 GLM | `LlmConfig::new()` + `OpenAiClient` | ✅ OpenAI 兼容路径 | `glm_thinking` 字段处理扩展参数 |
 | Kimi (Moonshot) | `LlmConfig::new()` + `OpenAiClient` | ✅ OpenAI 兼容路径 | |
-| 通义千问 (Qwen) | `LlmConfig::new()` + `OpenAiClient` | ✅ OpenAI 兼容路径 | |
+| 通义千问 (Qwen/DashScope) | `LlmConfig::dashscope()` + `OpenAiClient` | ✅ OpenAI 兼容路径 | thinking 由 `translate_thinking_openai_compat` 处理 |
 | xAI / Groq / Mistral 等 | `LlmConfig::new()` + `OpenAiClient` | ✅ OpenAI 兼容路径 | |
+
+## 暂不支持的厂商
+
+以下厂商因 auth 机制差异暂不支持，直接删除。未来若恢复支持，需评估 auth 差异是否用策略抽象：
+
+| 厂商 | 原因 |
+|---|---|
+| Google Gemini | 使用 `x-goog-api-key` header（非标准 Bearer） |
+| Azure OpenAI | 使用 `api-key` header + URL 含 `?api-version=` query param |
+| Ollama | 无 auth（本地），但已删除 |
+
+已配置这些 provider 的用户，启动时会走兜底分支并收到 warn 日志提示。
 
 ## 相关代码索引
 
-- `echo-integration/src/providers/config.rs` — `LlmConfig` 预设
-- `echo-integration/src/providers/openai.rs` — OpenAI Chat Completions 实现
+- `echo-integration/src/providers/config.rs` — `LlmConfig` 预设 + `LlmProvider` 枚举 + `build_client()` + `ProviderFactory`
+- `echo-integration/src/providers/openai.rs` — OpenAI Chat Completions 实现（覆盖 OpenAI/DeepSeek/Qwen/GLM/Kimi 等）
 - `echo-integration/src/providers/openai_cache.rs` — OpenAI 缓存适配器
 - `echo-integration/src/providers/anthropic.rs` — Anthropic Messages 实现
 - `echo-integration/src/providers/anthropic_cache.rs` — Anthropic 缓存适配器
+- `echo-integration/src/providers/thinking_translate.rs` — thinking 协议策略（`translate_thinking_openai_compat`）
+- `echo-integration/src/providers/client.rs` — 通用 HTTP post/stream_post
 - `echo-core/src/llm/types.rs:566` — `ChatRequest`（含 `glm_thinking` 字段，待改进）
 - `echo-core/src/llm/types.rs:690-703` — `Usage::cached_prompt_tokens()` 多厂商 fallback
 - `echo-core/src/llm/cache/layout.rs` — `PromptCacheLayout`（与 Responses API 冲突的根因）

@@ -939,7 +939,6 @@ fn provider_required_keys(provider: &str) -> &'static [&'static str] {
         "dashscope" | "qwen" | "aliyun" => &["DASHSCOPE_API_KEY", "QWEN_API_KEY"],
         "moonshot" | "kimi" => &["MOONSHOT_API_KEY", "KIMI_API_KEY"],
         "zhipu" | "glm" => &["ZHIPU_API_KEY", "GLM_API_KEY"],
-        "ollama" => &[],
         _ => &[],
     }
 }
@@ -1192,17 +1191,24 @@ pub fn build_llm_config(
         "anthropic" => LlmConfig::anthropic(auth_token, model),
         "deepseek" => LlmConfig::deepseek(auth_token, model),
         "dashscope" | "qwen" | "aliyun" => LlmConfig::dashscope(auth_token, model),
-        "gemini" | "google" => LlmConfig::gemini(auth_token, model),
-        "ollama" => LlmConfig::ollama(model),
         _ => {
-            // Default to OpenAI-compatible
+            // 兜底：按 OpenAI 兼容处理。gemini/azure/ollama 等暂不支持的
+            // provider 会落到这里，其 auth 差异可能导致请求失败。
+            if matches!(
+                provider.to_lowercase().as_str(),
+                "gemini" | "google" | "ollama" | "azure" | "azure_openai"
+            ) {
+                tracing::warn!(
+                    provider = %provider,
+                    "provider 暂不支持，按 OpenAI 兼容处理（auth 差异可能导致失败）"
+                );
+            }
             let url = base_url_override.unwrap_or(default_base_url);
             LlmConfig::new(url, auth_token, model)
         }
     };
-    // Apply base_url override for non-default providers (except ollama which has its own URL)
+    // Apply base_url override for non-default providers
     if let Some(url) = base_url_override
-        && provider.to_lowercase() != "ollama"
     {
         config.base_url = url.to_string();
     }
