@@ -6,9 +6,6 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-use super::super::router::{TaskRouteDecision, TaskRouteKind};
-use super::super::types::InteractionMode;
-
 /// A single event in the unified conversation timeline.
 ///
 /// The frontend subscribes to `conversation://event` and appends each event
@@ -28,9 +25,7 @@ pub enum ConversationRuntimeEvent {
         interaction_mode: String,
     },
     /// The agent started thinking.
-    InitialThinking {
-        worker_id: Option<String>,
-    },
+    InitialThinking { worker_id: Option<String> },
     /// A worker started execution.
     WorkerStarted {
         worker_id: String,

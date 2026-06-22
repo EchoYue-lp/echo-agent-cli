@@ -1444,7 +1444,7 @@ pub async fn get_cache_diagnostics(
     use echo_agent_app_core::observability::compute_cache_diagnostics;
 
     let collector = &state.app_state.trace.collector;
-    let events = if let Some(sid) = &session_id {
+    let mut events = if let Some(sid) = &session_id {
         collector.get_events(sid).await
     } else {
         let sessions = collector.list_sessions().await;
