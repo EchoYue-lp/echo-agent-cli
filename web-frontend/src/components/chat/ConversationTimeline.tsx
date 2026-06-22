@@ -1,6 +1,7 @@
 import { Activity, CheckCircle, ChevronDown, ChevronRight, Cpu, Route, Wrench, XCircle } from 'lucide-react';
 import { useState } from 'react';
 import { useConversationRuntimeStore, type ConversationRuntimeEventData } from '../../stores/conversationRuntimeStore';
+import MarkdownContent from '../common/MarkdownContent';
 
 function formatRate(value: number | undefined): string {
   if (value == null) return '—';
@@ -89,9 +90,11 @@ function TimelineCard({
           {expanded && (
             <div className="mt-2 space-y-1 pl-6 text-xs" style={{ color: 'var(--text-secondary)' }}>
               {event.agent_role && <div>Role: {event.agent_role}</div>}
-              {event.task_description && <div className="text-[11px]" style={{ color: 'var(--text-tertiary)' }}>{event.task_description.slice(0, 200)}</div>}
+              {event.task_description && <MarkdownContent content={event.task_description.slice(0, 500)} className="text-[11px]" />}
               {w?.summary && (
-                <div className="mt-1 rounded p-2 text-[11px]" style={{ background: 'var(--bg-primary)' }}>{w.summary}</div>
+                <div className="mt-1 rounded p-2 text-[11px]" style={{ background: 'var(--bg-primary)' }}>
+                  <MarkdownContent content={w.summary} />
+                </div>
               )}
               {w?.filesChanged && w.filesChanged.length > 0 && (
                 <div className="flex flex-wrap gap-1 mt-1">
@@ -121,7 +124,7 @@ function TimelineCard({
         <div className="space-y-2">
           {event.content && (
             <div className="rounded-lg p-3 text-sm" style={{ background: 'var(--bg-secondary)', color: 'var(--text-primary)' }}>
-              {event.content}
+              <MarkdownContent content={event.content} />
             </div>
           )}
           {event.usage_summary != null && (
@@ -150,7 +153,7 @@ function TimelineCard({
       return (
         <div className="rounded border p-2 text-xs" style={{ borderColor: 'var(--border-secondary)', color: 'var(--text-secondary)' }}>
           <div className="font-medium" style={{ color: 'var(--text-primary)' }}>{event.worker_id}</div>
-          {event.summary && <div className="mt-1 text-[11px]">{event.summary.slice(0, 200)}</div>}
+          {event.summary && <div className="mt-1 text-[11px]"><MarkdownContent content={event.summary.slice(0, 500)} /></div>}
           {event.files_changed && event.files_changed.length > 0 && (
             <div className="mt-1 flex flex-wrap gap-1">
               {event.files_changed.map((f) => (

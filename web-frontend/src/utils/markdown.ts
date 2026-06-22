@@ -60,6 +60,17 @@ export function renderMarkdown(text: string): string {
       continue;
     }
 
+    // GFM table detection: a table starts with a line containing | that has
+    // a following separator line (e.g. |---|:---:|---|).
+    const tableBlock = tryCollectTableBlock(lines, i);
+    if (tableBlock) {
+      flushParagraph();
+      flushList();
+      result.push(tableBlock.html);
+      i = tableBlock.endIndex;
+      continue;
+    }
+
     // Headers
     const headerMatch = line.match(/^(#{1,3})\s+(.+)/);
     if (headerMatch) {
@@ -107,7 +118,7 @@ export function renderMarkdown(text: string): string {
       continue;
     }
 
-    // Horizontal rule
+    // Horizontal rule — but NOT a table separator line (|---|)
     if (/^---+$/.test(line.trim())) {
       flushParagraph();
       flushList();
@@ -156,6 +167,75 @@ function inlineFormat(text: string): string {
   return result;
 }
 
+/**
+ * Try to collect a GFM table block starting at lines[startIndex].
+ * Returns the HTML string + end index, or null if not a table.
+ */
+function tryCollectTableBlock(
+  lines: string[],
+  startIndex: number
+): { html: string; endIndex: number } | null {
+  if (startIndex >= lines.length - 1) return null;
+
+  const headerLine = lines[startIndex];
+  const separatorLine = lines[startIndex + 1];
+
+  // Header must contain |
+  if (!headerLine.includes('|')) return null;
+
+  // Separator must match the GFM pattern: each cell is :?----:? with optional pipes
+  const separatorCells = splitTableRow(separatorLine);
+  if (separatorCells.length < 2) return null;
+  if (
+    !separatorCells.every((cell) => /^:?-{2,}:?$/.test(cell))
+  ) {
+    return null;
+  }
+
+  const headerCells = splitTableRow(headerLine);
+  if (headerCells.length === 0) return null;
+
+  // Collect data rows (subsequent lines containing |)
+  let endIndex = startIndex + 1; // points at separator
+  const dataRows: string[][] = [];
+  while (endIndex + 1 < lines.length) {
+    const nextLine = lines[endIndex + 1];
+    if (!nextLine.includes('|')) break;
+    const cells = splitTableRow(nextLine);
+    if (cells.length === 0) break;
+    dataRows.push(cells);
+    endIndex++;
+  }
+
+  const thead = `<thead><tr>${headerCells
+    .map((cell) => `<th>${inlineFormat(cell)}</th>`)
+    .join('')}</tr></thead>`;
+
+  const tbody =
+    dataRows.length > 0
+      ? `<tbody>${dataRows
+          .map(
+            (row) =>
+              `<tr>${row.map((cell) => `<td>${inlineFormat(cell)}</td>`).join('')}</tr>`
+          )
+          .join('')}</tbody>`
+      : '';
+
+  return {
+    html: `<div class="md-table-wrap"><table>${thead}${tbody}</table></div>`,
+    endIndex,
+  };
+}
+
+function splitTableRow(line: string): string[] {
+  return line
+    .trim()
+    .replace(/^\|/, '')
+    .replace(/\|$/, '')
+    .split('|')
+    .map((cell) => cell.trim());
+}
+
 function escapeHtml(text: string): string {
   return text
     .replace(/&/g, '&amp;')
@@ -196,6 +276,12 @@ function sanitizeHtml(html: string): string {
       'h3',
       'a',
       'button',
+      'table',
+      'thead',
+      'tbody',
+      'tr',
+      'th',
+      'td',
     ],
     ALLOWED_ATTR: ['class', 'href', 'target', 'rel', 'title', 'type'],
     ALLOW_DATA_ATTR: false,

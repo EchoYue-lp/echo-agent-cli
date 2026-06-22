@@ -17,10 +17,16 @@ interface Props {
   className?: string;
   /** Extra inline style on the wrapper div. */
   style?: React.CSSProperties;
+  /** When set, the content area is capped at this height and scrolls vertically. */
+  maxHeight?: number | string;
 }
 
-export default function MarkdownContent({ content, className, style }: Props) {
+export default function MarkdownContent({ content, className, style, maxHeight }: Props) {
   const ref = useRef<HTMLDivElement>(null);
+
+  const containerStyle: React.CSSProperties = maxHeight
+    ? { ...style, maxHeight, overflowY: 'auto' }
+    : { ...style };
 
   useEffect(() => {
     const root = ref.current;
@@ -63,7 +69,7 @@ export default function MarkdownContent({ content, className, style }: Props) {
     <div
       ref={ref}
       className={className}
-      style={style}
+      style={containerStyle}
       dangerouslySetInnerHTML={{ __html: renderMarkdown(content) }}
     />
   );

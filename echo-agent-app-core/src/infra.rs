@@ -968,6 +968,7 @@ async fn probe_model_connectivity(model: &str) -> echo_agent::error::Result<()> 
         None,
         None,
         None,
+        None,
     )
     .await?;
 

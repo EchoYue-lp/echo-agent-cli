@@ -26,7 +26,6 @@ import {
   MessageSquareText,
   ShieldCheck,
   Workflow,
-  Sparkles,
   Copy,
   Gauge,
   AlertTriangle,
@@ -43,6 +42,10 @@ import {
 } from '../../stores/workerTraceStore';
 import type { TodoStatus, PlanTaskKind, TaskRun, TaskPlan, TodoItem } from '../../generated';
 import type { RouteExplanation } from '../../stores/taskRuntimeStore';
+import MarkdownContent from '../common/MarkdownContent';
+import { RuntimeStoryCard } from './RuntimeStoryCard';
+import { PlanEditor } from './PlanEditor';
+import { ResultFullView } from './ResultFullView';
 
 const STATUS_LABEL: Record<string, string> = {
   pending: '待处理',
@@ -505,45 +508,6 @@ function MetricCell({
   );
 }
 
-function RuntimeStoryStep({
-  icon,
-  title,
-  meta,
-  children,
-}: {
-  icon: ReactNode;
-  title: string;
-  meta?: ReactNode;
-  children: ReactNode;
-}) {
-  return (
-    <div className="grid grid-cols-[26px_1fr] gap-3">
-      <div className="flex flex-col items-center">
-        <div
-          className="flex h-6 w-6 items-center justify-center rounded-full border"
-          style={{ borderColor: 'var(--border-primary)', background: 'var(--bg-secondary)', color: 'var(--accent)' }}
-        >
-          {icon}
-        </div>
-        <div className="mt-2 min-h-4 flex-1 border-l" style={{ borderColor: 'var(--border-primary)' }} />
-      </div>
-      <div className="min-w-0 pb-5">
-        <div className="mb-2 flex min-w-0 items-center justify-between gap-2">
-          <div className="truncate text-[13px] font-medium" style={{ color: 'var(--text-primary)' }}>
-            {title}
-          </div>
-          {meta && (
-            <div className="shrink-0 text-[10px]" style={{ color: 'var(--text-tertiary)' }}>
-              {meta}
-            </div>
-          )}
-        </div>
-        {children}
-      </div>
-    </div>
-  );
-}
-
 function copyToClipboard(text: string) {
   if (typeof navigator === 'undefined' || !navigator.clipboard) return;
   void navigator.clipboard.writeText(text);
@@ -712,7 +676,6 @@ function WorkerTraceRow({
   const thinking = workerThinking(worker);
   const tools = workerToolEvents(worker);
   const result = workerResult(worker);
-  const usage = cacheUsageFromEvents(worker.events);
   const hasDetails = Boolean(worker.task || thinking || tools.length || result);
   const [copied, setCopied] = useState<string | null>(null);
 
@@ -797,11 +760,9 @@ function WorkerTraceRow({
               icon={<MessageSquareText size={12} />}
               action={<TraceCopyButton copied={copied === 'prompt'} onClick={() => copy('prompt', worker.task ?? '')} />}
             >
-              <ScrollableText text={worker.task} maxHeight={288} className="text-[11px]" />
+              <MarkdownContent content={worker.task} maxHeight={288} className="text-[11px]" />
             </TraceSection>
           )}
-
-          <CacheUsageCard summary={usage} compact />
 
           {result && (
             <TraceSection
@@ -809,7 +770,7 @@ function WorkerTraceRow({
               icon={<CheckCircle2 size={12} />}
               action={<TraceCopyButton copied={copied === 'result'} onClick={() => copy('result', result)} />}
             >
-              <ScrollableText text={result} maxHeight={520} className="text-[11px]" />
+              <MarkdownContent content={result} maxHeight={520} className="text-[11px]" />
             </TraceSection>
           )}
 
@@ -820,7 +781,7 @@ function WorkerTraceRow({
               action={thinking ? <TraceCopyButton copied={copied === 'thinking'} onClick={() => copy('thinking', thinking)} /> : undefined}
             >
               {thinking && (
-                <ScrollableText text={thinking} maxHeight={288} className="mb-2 text-[11px]" />
+                <MarkdownContent content={thinking} maxHeight={288} className="mb-2 text-[11px]" />
               )}
               {tools.length > 0 && (
                 <div className="space-y-1.5">
@@ -1119,6 +1080,8 @@ export function TaskRuntimeMainPanel() {
   const [expandedWorkers, setExpandedWorkers] = useState<Record<string, boolean>>({});
   const [copiedFinalResult, setCopiedFinalResult] = useState(false);
   const [routeFeedbackMessage, setRouteFeedbackMessage] = useState<string | null>(null);
+  const [editingPlan, setEditingPlan] = useState<Array<{ id: string; title: string; description?: string; status?: string }> | null>(null);
+  const [showFullResult, setShowFullResult] = useState(false);
   const activeId = useConversationStore((s) => s.activeId);
   const setActiveSettingsTab = useUiStore((s) => s.setActiveSettingsTab);
   const traceWorkers = useWorkerTraceStore((s) => s.workers);
@@ -1263,7 +1226,6 @@ export function TaskRuntimeMainPanel() {
   const runningWorkers = todos.filter((t) => t.status === ('running' as TodoStatus));
   const finalResult = finalRunResult(visibleTraceWorkers, todos);
   const effectiveRouteExplanation = deriveRouteExplanation(activeRun, plan, todos, visibleTraceWorkers, routeExplanation);
-  const usageSummary = cacheUsageForWorkers(visibleTraceWorkers);
 
   const rememberRouteFeedback = async (targetRoute: string) => {
     const pattern = activeRun.goal.trim();
@@ -1284,123 +1246,118 @@ export function TaskRuntimeMainPanel() {
     }
   };
 
+  const isInferred = effectiveRouteExplanation?.routeReason?.includes('实时 plan_ready 路由事件不可用');
+
   return (
-    <section
-      className="my-3 rounded-lg border p-4"
-      style={{ borderColor: 'var(--border-primary)', background: 'var(--bg-primary)' }}
-    >
-      {/* ── Run header ─────────────────────────────────────────────── */}
-      <div className="mb-2 flex items-center justify-between">
-        <div className="flex items-center gap-1.5">
-          <ListTodo size={15} style={{ color: 'var(--accent)' }} />
-          <span className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>
-            任务执行
-          </span>
-        </div>
-        <span
-          className="rounded px-1.5 py-0.5 text-[10px] font-medium"
-          style={{
-            color: statusColor(activeRun.status),
-            background: 'var(--bg-hover)',
-          }}
-        >
-          {STATUS_LABEL[activeRun.status] ?? activeRun.status}
-        </span>
-      </div>
-
-      <div
-        className="mb-2 rounded-md px-2 py-1.5 text-[11px] leading-snug"
-        style={{ background: 'var(--bg-secondary)', color: 'var(--text-secondary)' }}
+    <>
+      {/* ── Run header card ────────────────────────────────────────── */}
+      <RuntimeStoryCard
+        title="任务执行"
+        status={['completed'].includes(activeRun.status) ? 'done' : ['failed', 'cancelled'].includes(activeRun.status) ? 'error' : activeRun.status === 'running' ? 'active' : 'pending'}
+        meta={<span className="rounded px-1.5 py-0.5 text-[10px] font-medium" style={{ color: statusColor(activeRun.status), background: 'var(--bg-hover)' }}>{STATUS_LABEL[activeRun.status] ?? activeRun.status}</span>}
+        defaultCollapsed={false}
       >
-        {activeRun.goal}
-      </div>
+        <div
+          className="rounded-md px-2 py-1.5 text-[11px] leading-snug"
+          style={{ background: 'var(--bg-secondary)', color: 'var(--text-secondary)' }}
+        >
+          {activeRun.goal}
+        </div>
 
-      <div className="mt-4">
-        {effectiveRouteExplanation && (
-          <RuntimeStoryStep
-            icon={<Sparkles size={14} />}
-            title="路由决策"
-            meta={`并发委派 ${routeWorkerCount(effectiveRouteExplanation, visibleTraceWorkers.length)} 个 worker`}
+        {error && (
+          <div
+            className="mt-2 rounded px-2 py-1 text-[10px]"
+            style={{ color: 'var(--color-error)', background: 'var(--bg-hover)' }}
           >
-            <div className="rounded-lg p-3" style={{ background: 'var(--bg-secondary)' }}>
-              <div className="text-[11px] leading-relaxed" style={{ color: 'var(--text-secondary)' }}>
-                {effectiveRouteExplanation.routeReason ||
-                  `当前请求被识别为${routeLabel(effectiveRouteExplanation.route)}，适合拆分给多个 worker 并行处理。`}
+            {error}
+          </div>
+        )}
+      </RuntimeStoryCard>
+
+      {/* ── Route decision card ────────────────────────────────────── */}
+      {effectiveRouteExplanation && (
+        <RuntimeStoryCard
+          title="路由决策"
+          status="done"
+          defaultCollapsed={isInferred}
+          meta={`并发委派 ${routeWorkerCount(effectiveRouteExplanation, visibleTraceWorkers.length)} 个 worker`}
+        >
+          {isInferred && (
+            <div className="mb-2 text-[10px]" style={{ color: 'var(--color-warning)' }}>
+              ⚠ 基于运行记录推断，非实时事件
+            </div>
+          )}
+          <div className="rounded-lg p-3" style={{ background: 'var(--bg-secondary)' }}>
+            <div className="text-[11px] leading-relaxed" style={{ color: 'var(--text-secondary)' }}>
+              {effectiveRouteExplanation.routeReason ||
+                `当前请求被识别为${routeLabel(effectiveRouteExplanation.route)}，适合拆分给多个 worker 并行处理。`}
+            </div>
+            <div className="mt-2 flex flex-wrap gap-1">
+              {effectiveRouteExplanation.interactionMode && (
+                <CompactTag>模式 {modeLabel(effectiveRouteExplanation.interactionMode)}</CompactTag>
+              )}
+              <CompactTag>路径 {routeLabel(effectiveRouteExplanation.route)}</CompactTag>
+              <CompactTag>{effectiveRouteExplanation.autoExecute ? '自动执行' : '等待确认'}</CompactTag>
+              {effectiveRouteExplanation.permissionMode && (
+                <CompactTag>{permissionLabel(effectiveRouteExplanation.permissionMode)}</CompactTag>
+              )}
+              <CompactTag>领域 {domainProfileLabel(effectiveRouteExplanation.domainProfile)}</CompactTag>
+              {effectiveRouteExplanation.activeSkills?.map((skill) => (
+                <CompactTag key={skill}>技能 {skill}</CompactTag>
+              ))}
+            </div>
+            {effectiveRouteExplanation.approvalPolicy && (
+              <div className="mt-2 flex gap-1.5 text-[11px] leading-snug" style={{ color: 'var(--text-tertiary)' }}>
+                <ShieldCheck size={12} className="mt-0.5 shrink-0" />
+                <span>{effectiveRouteExplanation.approvalPolicy}</span>
               </div>
+            )}
+            {(effectiveRouteExplanation.routeSignals.length > 0 || effectiveRouteExplanation.classificationSignals.length > 0) && (
               <div className="mt-2 flex flex-wrap gap-1">
-                {effectiveRouteExplanation.interactionMode && (
-                  <CompactTag>模式 {modeLabel(effectiveRouteExplanation.interactionMode)}</CompactTag>
-                )}
-                <CompactTag>路径 {routeLabel(effectiveRouteExplanation.route)}</CompactTag>
-                <CompactTag>{effectiveRouteExplanation.autoExecute ? '自动执行' : '等待确认'}</CompactTag>
-                {effectiveRouteExplanation.permissionMode && (
-                  <CompactTag>{permissionLabel(effectiveRouteExplanation.permissionMode)}</CompactTag>
-                )}
-                <CompactTag>领域 {domainProfileLabel(effectiveRouteExplanation.domainProfile)}</CompactTag>
-                {effectiveRouteExplanation.activeSkills?.map((skill) => (
-                  <CompactTag key={skill}>技能 {skill}</CompactTag>
+                {[...effectiveRouteExplanation.routeSignals, ...effectiveRouteExplanation.classificationSignals].map((signal) => (
+                  <CompactTag key={signal}>{signal}</CompactTag>
                 ))}
               </div>
-              {effectiveRouteExplanation.approvalPolicy && (
-                <div className="mt-2 flex gap-1.5 text-[11px] leading-snug" style={{ color: 'var(--text-tertiary)' }}>
-                  <ShieldCheck size={12} className="mt-0.5 shrink-0" />
-                  <span>{effectiveRouteExplanation.approvalPolicy}</span>
-                </div>
+            )}
+            <div className="mt-3 flex flex-wrap items-center gap-1.5">
+              <button
+                onClick={() => void rememberRouteFeedback('normal_chat')}
+                className="rounded-md px-2 py-1 text-[11px] font-medium"
+                style={{ background: 'var(--bg-hover)', color: 'var(--text-secondary)' }}
+              >
+                下次走 Chat
+              </button>
+              <button
+                onClick={() => void rememberRouteFeedback('parallel_readonly_delegation')}
+                className="rounded-md px-2 py-1 text-[11px] font-medium"
+                style={{ background: 'var(--bg-hover)', color: 'var(--text-secondary)' }}
+              >
+                下次只读并行
+              </button>
+              <button
+                onClick={() => setActiveSettingsTab('routeFeedback')}
+                className="rounded-md px-2 py-1 text-[11px]"
+                style={{ color: 'var(--text-tertiary)' }}
+              >
+                管理规则
+              </button>
+              {routeFeedbackMessage && (
+                <span className="text-[11px]" style={{ color: 'var(--text-tertiary)' }}>
+                  {routeFeedbackMessage}
+                </span>
               )}
-              {(effectiveRouteExplanation.routeSignals.length > 0 || effectiveRouteExplanation.classificationSignals.length > 0) && (
-                <div className="mt-2 flex flex-wrap gap-1">
-                  {[...effectiveRouteExplanation.routeSignals, ...effectiveRouteExplanation.classificationSignals].map((signal) => (
-                    <CompactTag key={signal}>{signal}</CompactTag>
-                  ))}
-                </div>
-              )}
-              <div className="mt-3 flex flex-wrap items-center gap-1.5">
-                <button
-                  onClick={() => void rememberRouteFeedback('normal_chat')}
-                  className="rounded-md px-2 py-1 text-[11px] font-medium"
-                  style={{ background: 'var(--bg-hover)', color: 'var(--text-secondary)' }}
-                >
-                  下次走 Chat
-                </button>
-                <button
-                  onClick={() => void rememberRouteFeedback('parallel_readonly_delegation')}
-                  className="rounded-md px-2 py-1 text-[11px] font-medium"
-                  style={{ background: 'var(--bg-hover)', color: 'var(--text-secondary)' }}
-                >
-                  下次只读并行
-                </button>
-                <button
-                  onClick={() => setActiveSettingsTab('routeFeedback')}
-                  className="rounded-md px-2 py-1 text-[11px]"
-                  style={{ color: 'var(--text-tertiary)' }}
-                >
-                  管理规则
-                </button>
-                {routeFeedbackMessage && (
-                  <span className="text-[11px]" style={{ color: 'var(--text-tertiary)' }}>
-                    {routeFeedbackMessage}
-                  </span>
-                )}
-              </div>
             </div>
-          </RuntimeStoryStep>
-        )}
-
-      {error && (
-        <div
-          className="mb-2 rounded px-2 py-1 text-[10px]"
-          style={{ color: 'var(--color-error)', background: 'var(--bg-hover)' }}
-        >
-          {error}
-        </div>
+          </div>
+        </RuntimeStoryCard>
       )}
 
       {/* ── Plan approval card ─────────────────────────────────────── */}
       {awaitingApproval && plan && (
-        <RuntimeStoryStep
-          icon={<ShieldCheck size={14} />}
+        <RuntimeStoryCard
           title="计划确认"
+          status="active"
           meta={`${plan.tasks.length} 个任务`}
+          defaultCollapsed={false}
         >
           <div
             className="rounded-md border p-2"
@@ -1428,20 +1385,7 @@ export function TaskRuntimeMainPanel() {
                 <Play size={12} /> 执行全部
               </button>
               <button
-                onClick={() => {
-                  // G3: Edit plan — user can modify tasks before approving.
-                  // For now this opens the plan for inline editing via the
-                  // edit_task_plan API; a full editor UI is a future enhancement.
-                  const edited = window.prompt('编辑计划 (JSON 格式)', JSON.stringify(plan.tasks, null, 2));
-                  if (edited) {
-                    try {
-                      const tasks = JSON.parse(edited);
-                      import('../../api/endpoints').then(({ taskRuntimeApi }) =>
-                        taskRuntimeApi.editPlan(activeRun.run_id, tasks).then(() => refresh(activeRun.run_id))
-                      );
-                    } catch { /* ignore parse errors */ }
-                  }
-                }}
+                onClick={() => setEditingPlan(plan.tasks as Array<{ id: string; title: string; description?: string; status?: string }>)}
                 className="flex items-center justify-center gap-1 rounded px-2 py-1 text-[11px]"
                 style={{ background: 'var(--bg-hover)', color: 'var(--text-secondary)' }}
               >
@@ -1456,15 +1400,16 @@ export function TaskRuntimeMainPanel() {
               </button>
             </div>
           </div>
-        </RuntimeStoryStep>
+        </RuntimeStoryCard>
       )}
 
       {/* ── Parallel workers (live trace) ──────────────────────────── */}
       {visibleTraceWorkers.length > 0 ? (
-        <RuntimeStoryStep
-          icon={<Workflow size={14} />}
+        <RuntimeStoryCard
           title="并行执行"
+          status={visibleTraceWorkers.some(w => w.status === 'running') ? 'active' : 'done'}
           meta={`${completedCount}/${todos.length || visibleTraceWorkers.length} 完成`}
+          defaultCollapsed={false}
         >
           <div className="space-y-2">
             {visibleTraceWorkers.map((worker) => (
@@ -1480,12 +1425,13 @@ export function TaskRuntimeMainPanel() {
               />
             ))}
           </div>
-        </RuntimeStoryStep>
+        </RuntimeStoryCard>
       ) : runningWorkers.length > 0 && (
-        <RuntimeStoryStep
-          icon={<Workflow size={14} />}
+        <RuntimeStoryCard
           title="并行执行"
+          status="active"
           meta={`${runningWorkers.length} 运行中`}
+          defaultCollapsed={false}
         >
           {runningWorkers.map((w) => (
             <div key={w.id} className="flex items-center gap-1 px-1 py-0.5 text-[10px]" style={{ color: 'var(--text-secondary)' }}>
@@ -1495,20 +1441,30 @@ export function TaskRuntimeMainPanel() {
               <span className="truncate">{w.title}</span>
             </div>
           ))}
-        </RuntimeStoryStep>
+        </RuntimeStoryCard>
       )}
 
+      {/* ── Final result card ──────────────────────────────────────── */}
       {finalResult && (
-        <RuntimeStoryStep
-          icon={<CheckCircle2 size={14} />}
+        <RuntimeStoryCard
           title="最终任务结果"
+          status="done"
           meta="已汇总"
+          defaultCollapsed={false}
         >
           <div
             className="rounded-lg border p-3"
             style={{ borderColor: 'var(--border-primary)', background: 'var(--bg-secondary)' }}
           >
-            <div className="mb-2 flex justify-end">
+            <div className="mb-2 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setShowFullResult(true)}
+                className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px]"
+                style={{ color: 'var(--text-tertiary)', background: 'var(--bg-hover)' }}
+              >
+                全屏查看
+              </button>
               <TraceCopyButton
                 copied={copiedFinalResult}
                 onClick={() => {
@@ -1518,27 +1474,18 @@ export function TaskRuntimeMainPanel() {
                 }}
               />
             </div>
-            <ScrollableText text={finalResult} maxHeight={720} className="text-[12px]" />
+            <MarkdownContent content={finalResult} maxHeight={720} className="text-[12px]" />
           </div>
-        </RuntimeStoryStep>
+        </RuntimeStoryCard>
       )}
 
-      {usageSummary.calls > 0 && (
-        <RuntimeStoryStep
-          icon={<Gauge size={14} />}
-          title="Token / Cache 总结"
-          meta={`${usageSummary.calls} LLM call${usageSummary.calls > 1 ? 's' : ''}`}
-        >
-          <CacheUsageCard summary={usageSummary} />
-        </RuntimeStoryStep>
-      )}
-
-      {/* ── Artifacts ──────────────────────────────────────────────── */}
+      {/* ── Artifacts card ─────────────────────────────────────────── */}
       {artifacts.length > 0 && (
-        <RuntimeStoryStep
-          icon={<FileText size={14} />}
+        <RuntimeStoryCard
           title="产出"
+          status="done"
           meta={`${artifacts.length} 个 artifact`}
+          defaultCollapsed={true}
         >
           {artifacts.map((a) => (
             <div
@@ -1551,35 +1498,37 @@ export function TaskRuntimeMainPanel() {
               <span className="truncate">{a.title}</span>
             </div>
           ))}
-        </RuntimeStoryStep>
+        </RuntimeStoryCard>
       )}
 
-      {/* ── Files changed (G15) ────────────────────────────────────── */}
+      {/* ── Files changed card ─────────────────────────────────────── */}
       {plan && (() => {
         const changedFiles = new Set<string>();
         plan.tasks.forEach((t) => t.files.forEach((f) => changedFiles.add(f)));
         if (changedFiles.size === 0) return null;
         return (
-          <RuntimeStoryStep
-            icon={<FileText size={14} />}
+          <RuntimeStoryCard
             title="文件变更"
+            status="done"
             meta={`${changedFiles.size} 个文件`}
+            defaultCollapsed={true}
           >
             {[...changedFiles].map((f) => (
               <div key={f} className="truncate px-1 py-0.5 text-[10px]" style={{ color: 'var(--text-secondary)' }} title={f}>
                 {f}
               </div>
             ))}
-          </RuntimeStoryStep>
+          </RuntimeStoryCard>
         );
       })()}
 
-      {/* ── Review results (G15) ───────────────────────────────────── */}
+      {/* ── Review results card ────────────────────────────────────── */}
       {todos.some((t) => t.status === ('failed' as TodoStatus)) && (
-        <RuntimeStoryStep
-          icon={<AlertCircle size={14} />}
+        <RuntimeStoryCard
           title="审查结果"
+          status="error"
           meta="存在失败项"
+          defaultCollapsed={false}
         >
           {todos
             .filter((t) => t.status === ('failed' as TodoStatus))
@@ -1589,14 +1538,15 @@ export function TaskRuntimeMainPanel() {
                 {t.title}: {t.summary ?? '审查未通过'}
               </div>
             ))}
-        </RuntimeStoryStep>
+        </RuntimeStoryCard>
       )}
 
-      {/* ── Test results (G15) — from verification tasks ───────────── */}
+      {/* ── Test/verification card ─────────────────────────────────── */}
       {plan && plan.tasks.some((t) => t.kind === ('verification' as PlanTaskKind)) && (
-        <RuntimeStoryStep
-          icon={<CheckCircle2 size={14} />}
+        <RuntimeStoryCard
           title="测试 / 验证"
+          status="done"
+          defaultCollapsed={true}
         >
           {todos
             .filter((t) => {
@@ -1609,15 +1559,11 @@ export function TaskRuntimeMainPanel() {
                 <span className="truncate">{t.title}</span>
               </div>
             ))}
-        </RuntimeStoryStep>
+        </RuntimeStoryCard>
       )}
 
-      </div>
-
       {/* ── Footer actions ─────────────────────────────────────────── */}
-      <div className="flex items-center justify-between">
-        {/* Ready state: show an "执行" button so the user can (re)launch
-            execution if auto-execute after approve failed or was skipped. */}
+      <div className="flex items-center justify-between px-1 py-2">
         {activeRun.status === 'ready' && (
           <button
             onClick={() => execute(activeRun.run_id)}
@@ -1644,6 +1590,27 @@ export function TaskRuntimeMainPanel() {
           <RefreshCw size={11} /> 刷新
         </button>
       </div>
-    </section>
+
+      {editingPlan && (
+        <PlanEditor
+          initialTasks={editingPlan}
+          onSave={async (json) => {
+            try {
+              const tasks = JSON.parse(json);
+              await taskRuntimeApi.editPlan(activeRun.run_id, tasks);
+              refresh(activeRun.run_id);
+            } catch { /* ignore parse errors */ }
+          }}
+          onClose={() => setEditingPlan(null)}
+        />
+      )}
+
+      {showFullResult && finalResult && (
+        <ResultFullView
+          content={finalResult}
+          onClose={() => setShowFullResult(false)}
+        />
+      )}
+    </>
   );
 }
