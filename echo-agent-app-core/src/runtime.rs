@@ -119,6 +119,12 @@ impl AgentRuntime {
 
         let agent_handle = AgentHandle::new(agent);
 
+        // ── 3a. Register delegate_readonly tool ──
+        {
+            use crate::tasks::task_runtime::delegate_readonly_tool::register_delegate_readonly_on_handle;
+            register_delegate_readonly_on_handle(&agent_handle).await;
+        }
+
         // ── 4. HITL dispatcher ──
         let hitl_dispatcher = {
             let dispatcher = Arc::new(HitlDispatcher::new());

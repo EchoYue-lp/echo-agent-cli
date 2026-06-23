@@ -50,6 +50,7 @@ pub mod router;
 pub mod signals;
 pub mod store;
 pub mod task_tools;
+pub mod delegate_readonly_tool;
 pub mod types;
 
 pub use classify::{Classification, Complexity, ComplexityLabel, HeuristicClassifier};

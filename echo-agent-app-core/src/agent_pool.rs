@@ -725,6 +725,12 @@ impl AgentPool {
         // 4. Wrap in AgentHandle
         let handle = AgentHandle::new(agent);
 
+        // 4a. Register delegate_readonly tool (lets main agent dispatch readonly workers)
+        {
+            use crate::tasks::task_runtime::delegate_readonly_tool::register_delegate_readonly_on_handle;
+            register_delegate_readonly_on_handle(&handle).await;
+        }
+
         // 5. Configure HITL for this agent.
         // Use an empty HitlDispatcher (no REPL provider!) so that if the caller
         // hasn't yet called set_human_loop_provider, approval requests

@@ -25,21 +25,36 @@ use super::types::{PlanTask, PlanTaskKind, TaskPatch, TodoStatus};
 
 tokio::task_local! {
     /// The run_id of the currently executing task run. Set by the executor via
-    /// [`with_run_id`] around the worker dispatch so tools can read it.
+    /// [`with_run_context`] around the worker dispatch so tools can read it.
     pub static CURRENT_RUN_ID: String;
+    /// The cancel token for the currently executing task run. Set alongside
+    /// CURRENT_RUN_ID so delegate_readonly and other tools can read it.
+    pub static CURRENT_CANCEL: tokio_util::sync::CancellationToken;
 }
 
-/// Run `f` with `run_id` available to all task tools on the current async task.
+/// Run `f` with both `run_id` and `cancel` available to all task tools.
 ///
-/// Called by the executor before dispatching task work. The value is scoped:
-/// it is automatically unavailable once `f` completes (no manual clear needed,
-/// unlike the old thread_local approach), and it survives `.await` points even
-/// when tokio moves the task across threads.
+/// Called by the executor before dispatching task work. Replaces the old
+/// [`with_run_id`] which only scoped the run_id.
+pub async fn with_run_context<F, R>(
+    run_id: String,
+    cancel: tokio_util::sync::CancellationToken,
+    f: F,
+) -> R
+where
+    F: std::future::Future<Output = R>,
+{
+    let cell_cancel = cancel.clone();
+    CURRENT_RUN_ID.scope(run_id, CURRENT_CANCEL.scope(cell_cancel, f)).await
+}
+
+/// Legacy wrapper — keeps old callers compiling. Prefer [`with_run_context`].
 pub async fn with_run_id<F, R>(run_id: String, f: F) -> R
 where
     F: std::future::Future<Output = R>,
 {
-    CURRENT_RUN_ID.scope(run_id, f).await
+    let cancel = tokio_util::sync::CancellationToken::new();
+    with_run_context(run_id, cancel, f).await
 }
 
 fn current_run_id() -> Option<String> {
@@ -48,7 +63,7 @@ fn current_run_id() -> Option<String> {
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
-fn require_run_id() -> std::result::Result<String, ToolResult> {
+pub(crate) fn require_run_id() -> std::result::Result<String, ToolResult> {
     current_run_id().ok_or_else(|| ToolResult::error("no active run — run_id not set in context"))
 }
 
