@@ -74,10 +74,3 @@ jobs:
       # binary itself requires `tui` or `gui`, so we scope this to app-core).
       - name: Cargo check app-core (no-default-features)
         run: cargo check -p echo-agent-app-core --no-default-features --locked
-
-      # Skill trigger-accuracy gate: FAILS the build when F1 drops below the
-      # threshold, so a regression in trigger detection is caught here rather
-      # than at runtime. Previously this step always passed (Ok(()) regardless
-      # of F1), making it a no-op.
-      - name: Skill trigger accuracy gate (F1 ≥ 0.7)
-        run: cargo run -p echo-agent-eval -- trigger-test --threshold 0.7

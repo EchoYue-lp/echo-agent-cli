@@ -1744,6 +1744,7 @@ dependencies = [
  "cron",
  "crossterm 0.28.1",
  "dashmap",
+ "dirs",
  "dotenvy",
  "echo-agent-app-core",
  "echo_agent",
@@ -1782,25 +1783,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unicode-width 0.2.0",
- "uuid",
-]
-
-[[package]]
-name = "echo-agent-eval"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "clap",
- "echo-agent-app-core",
- "echo_agent",
- "regex",
- "serde",
- "serde_json",
- "serde_yaml",
- "tokio",
- "tracing",
- "tracing-subscriber",
  "uuid",
 ]
 

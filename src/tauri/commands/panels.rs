@@ -399,19 +399,75 @@ fn skill_descriptor_json(d: &echo_agent::skills::external::SkillDescriptor) -> s
 }
 
 fn hub_skill_json(entry: &echo_agent_app_core::skills_hub::SkillHubEntry) -> serde_json::Value {
+    // 下发前端 SkillInfo 所需的全部字段(M4 修复:此前缺 category/is_baseline/
+    // is_builtin/upstream_version/source,且 source 被写死成 "hub" 覆盖真实来源)。
+    // source: 优先用 entry.source(上游来源 superpowers/anthropic/builtin),
+    // 缺失时回退 "hub"(表示由 SkillsHub 发现,与 runtime 相对)。
+    let source = entry.source.clone().unwrap_or_else(|| "hub".to_string());
     json!({
         "name": entry.name,
         "description": entry.description,
         "file": entry.path.display().to_string(),
         "loaded": entry.loaded,
-        "source": "hub",
+        "source": source,
+        "category": entry.category,
+        "is_baseline": entry.is_baseline,
+        "is_builtin": entry.is_builtin,
+        "upstream_version": entry.upstream_version,
         "license": entry.license,
         "version": entry.version,
         "author": entry.author,
         "tags": entry.tags,
         "has_sandbox": entry.has_sandbox,
         "depends_on": entry.depends_on,
+        // 缺失的系统二进制(scan 时探测 requires-binaries 得出)。
+        // 前端 SkillsPanel 据此显示 ⚠️ AlertTriangle + tooltip。
+        "missing_dependencies": entry.missing_dependencies,
+        // has_updates: 需 upstream registry + git fetch 比对(P6 sync 未实现),
+        // 暂返回 false。
+        "has_updates": false,
     })
+}
+
+/// ~/.echo-agent/enabled-skills.json 路径(B3:enable/disable 同步写此文件,
+/// 消除"SkillsHub 内存 / enabled-skills.json / is_baseline 硬编码"三套状态不同步)。
+fn enabled_skills_json_path() -> Option<std::path::PathBuf> {
+    let home = dirs::home_dir()?;
+    Some(home.join(".echo-agent").join("enabled-skills.json"))
+}
+
+/// 同步 enabled-skills.json:确保 skill entry 存在(带 category),设置 enabled。
+/// 失败仅记日志不阻断(技能已加载进 agent,持久化失败不应让 UI 操作报错)。
+fn persist_skill_enabled(name: &str, category: &str, enabled: bool) {
+    use echo_agent_app_core::skills_hub::enabled_skills::{EnabledSkillsConfig, SkillEnableEntry};
+    let Some(path) = enabled_skills_json_path() else {
+        tracing::warn!("无法获取 HOME,enabled-skills.json 未更新");
+        return;
+    };
+    let mut config = match EnabledSkillsConfig::load(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "读取 enabled-skills.json 失败,用默认配置");
+            EnabledSkillsConfig::default()
+        }
+    };
+    // 确保 entry 存在(set_enabled 只改已有 entry,新启用的技能需先插入)。
+    // 仅当 entry 不存在时插入,避免覆盖用户已设的 baseline 标记。
+    if !config.skills.contains_key(name) {
+        config.skills.insert(
+            name.to_string(),
+            SkillEnableEntry {
+                category: category.to_string(),
+                enabled,
+                baseline: false, // 新启用默认非 baseline;用户可另行设 baseline
+            },
+        );
+    } else {
+        config.set_enabled(name, enabled);
+    }
+    if let Err(e) = config.save(&path) {
+        tracing::warn!(error = %e, "写入 enabled-skills.json 失败");
+    }
 }
 
 async fn runtime_skill_names(state: &TauriState) -> Vec<String> {
@@ -559,13 +615,14 @@ pub async fn enable_skill(
     state: tauri::State<'_, TauriState>,
     name: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let skill_path = {
+    let (skill_path, category) = {
         let mut hub = state.app_state.skills_hub.write().await;
         hub.refresh();
         hub.enable_skill(&name).map_err(IpcError::Validation)?;
-        hub.get(&name)
-            .map(|entry| entry.path.clone())
-            .ok_or_else(|| IpcError::NotFound(format!("Skill '{}' not found", name)))?
+        let entry = hub
+            .get(&name)
+            .ok_or_else(|| IpcError::NotFound(format!("Skill '{}' not found", name)))?;
+        (entry.path.clone(), entry.category.clone())
     };
 
     let load_root = skill_path
@@ -583,6 +640,8 @@ pub async fn enable_skill(
         .await
         .map_err(|e| IpcError::Internal(e.to_string()))?;
     let count = loaded.len();
+    // B3:同步写 enabled-skills.json,消除三套状态不同步。
+    persist_skill_enabled(&name, &category, true);
     refresh_skill_hub_loaded_state(&state).await;
     refresh_pool_skill_descriptors(&state).await;
 
@@ -599,16 +658,26 @@ pub async fn disable_skill(
     state: tauri::State<'_, TauriState>,
     name: String,
 ) -> Result<serde_json::Value, IpcError> {
-    {
+    let category = {
         let mut hub = state.app_state.skills_hub.write().await;
         hub.refresh();
+        // 先取 category(disable 前entry 还在),再 disable。
+        let category = hub
+            .get(&name)
+            .map(|e| e.category.clone())
+            .unwrap_or_default();
         hub.disable_skill(&name).map_err(IpcError::Validation)?;
-    }
+        category
+    };
+    // B3:同步写 enabled-skills.json(标记 enabled=false)。
+    // 运行中 agent 已发现的技能不能热卸载,但持久化状态必须更新,
+    // 这样下次 bootstrap 不会再加载它,与 UI 显示一致。
+    persist_skill_enabled(&name, &category, false);
 
     Ok(json!({
         "success": true,
         "requires_restart": true,
-        "message": "技能已经从 Hub 启用列表移除；当前运行中的 agent 已发现的技能不能热卸载，新会话或重启后生效。",
+        "message": "技能已从启用列表移除(enabled-skills.json 已更新);当前运行中的 agent 已发现的技能不能热卸载,新会话或重启后生效。",
         "skills": list_skills(state).await?,
     }))
 }

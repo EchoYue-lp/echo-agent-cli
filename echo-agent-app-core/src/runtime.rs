@@ -22,7 +22,7 @@ use crate::infra::{self, AgentCreateParams};
 use crate::state::AppState;
 use echo_agent::evolution::ReviewConfig;
 use echo_agent::intent::{
-    ChainedClassifier, KeywordClassifier, LlmIntentClassifier, SkillDescription,
+    KeywordClassifier, LlmIntentClassifier, SkillDescription, TriggerSupervisor,
 };
 
 /// Shared agent runtime context.
@@ -159,6 +159,51 @@ impl AgentRuntime {
             }
         }
 
+        // ── 5b. Methodology baseline injection ──
+        // Inject core methodology skill bodies (brainstorming / debugging /
+        // verification / planning) directly into the system prompt so they
+        // are always active without requiring explicit activate_skill calls.
+        {
+            let echo_home = std::path::PathBuf::from(
+                std::env::var("HOME").unwrap_or_else(|_| ".".to_string()),
+            )
+            .join(".echo-agent");
+            let enabled_config_path = echo_home.join("enabled-skills.json");
+            let enabled_config = crate::skills_hub::EnabledSkillsConfig::load(&enabled_config_path)
+                .unwrap_or_default();
+            // 收集 baseline 名为 owned Vec<String>,move 进 async 闭包(闭包要 'static,
+            // 不能借用会在块结束 drop 的 enabled_config)。
+            let baseline_names: Vec<String> = enabled_config
+                .enabled_baseline_names()
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect();
+            tracing::info!(
+                count = baseline_names.len(),
+                skills = ?baseline_names,
+                "Methodology baseline skills loaded from enabled-skills.json"
+            );
+            if !baseline_names.is_empty() {
+                agent_handle
+                    .write_async(|a| {
+                        Box::pin(async move {
+                            // 用 public API 读当前有效 system_prompt(优先 runtime
+                            // override,否则 config.system_prompt)。bootstrap 阶段
+                            // mutable_system_prompt 还是 None,返回 config 值。
+                            // 避免访问 pub(crate) 私有字段 system_prompt。
+                            let mut sp = a.current_system_prompt();
+                            // baseline_names 已 move 进闭包,此处借用安全。
+                            let refs: Vec<&str> = baseline_names.iter().map(|s| s.as_str()).collect();
+                            a.skill_registry()
+                                .inject_methodology_baseline(&mut sp, &refs);
+                            a.set_system_prompt(sp).await;
+                        })
+                    })
+                    .await;
+                tracing::info!("Methodology baseline injected into system prompt");
+            }
+        }
+
         // ── 6. User hooks ──
         infra::load_user_hooks(&agent_handle, app_config).await;
         let hooks_load = crate::hooks_config::load_hooks_files();
@@ -254,29 +299,31 @@ impl AgentRuntime {
             );
         }
 
-        // Build ChainedClassifier: keyword first (fast, zero-cost),
-        // LLM fallback (semantic, ~500 tokens) for ambiguous inputs.
-        let chained = {
-            let mut classifiers: Vec<Box<dyn echo_agent::intent::IntentClassifier>> =
-                vec![Box::new(keyword_classifier.clone())];
-
-            // Add LLM classifier as fallback if LLM client is available
-            if let Some(llm) = agent_handle.read(|a| a.llm_client().cloned()).await {
-                let llm_classifier = LlmIntentClassifier::new(llm, skill_descriptions);
-                classifiers.push(Box::new(llm_classifier));
-                tracing::info!("ChainedClassifier: Keyword → LlmIntent (fallback)");
-            } else {
-                tracing::info!("ChainedClassifier: Keyword only (no LLM client for fallback)");
-            }
-
-            ChainedClassifier::new(classifiers)
+        // ── 12. TriggerSupervisor (Keyword + LLM + Hook fusion) + IntentRouter ──
+        // Build LLM classifier as fallback if LLM client is available,
+        // otherwise TriggerSupervisor operates keyword-only.
+        let hook_cache = agent_handle
+            .read(|a| a.hook_activation_cache())
+            .await;
+        let supervisor = {
+            let llm_classifier = agent_handle
+                .read(|a| a.llm_client().cloned())
+                .await
+                .map(|llm| LlmIntentClassifier::new(llm, skill_descriptions));
+            let has_llm = llm_classifier.is_some();
+            let sv = TriggerSupervisor::new(keyword_classifier.clone(), llm_classifier, hook_cache);
+            tracing::info!(
+                has_llm = has_llm,
+                "TriggerSupervisor: Keyword → {} → Hook slot (fusion)",
+                if has_llm { "LlmIntent" } else { "Hook-only fallback" }
+            );
+            sv
         };
 
-        // Wire ChainedClassifier as the IntentRouter's classifier.
         {
             use echo_agent::intent::{IntentRouter, IntentRouterConfig};
             let router = IntentRouter::new(
-                Box::new(chained),
+                Box::new(supervisor),
                 IntentRouterConfig {
                     confidence_threshold: 0.7,
                     enable_direct_answer: true,
@@ -291,7 +338,7 @@ impl AgentRuntime {
                     })
                 })
                 .await;
-            tracing::info!("IntentRouter wired with ChainedClassifier");
+            tracing::info!("IntentRouter wired with TriggerSupervisor");
         }
 
         Ok(Self {

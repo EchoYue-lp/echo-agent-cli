@@ -17,6 +17,21 @@ pub struct SkillHubEntry {
     pub description: String,
     /// 安装路径
     pub path: PathBuf,
+    /// 分类
+    #[serde(default)]
+    pub category: String,
+    /// 是否 baseline 注入
+    #[serde(default)]
+    pub is_baseline: bool,
+    /// 是否内置技能
+    #[serde(default)]
+    pub is_builtin: bool,
+    /// 上游版本
+    #[serde(default)]
+    pub upstream_version: Option<String>,
+    /// 上游来源
+    #[serde(default)]
+    pub source: Option<String>,
     /// 许可证
     pub license: Option<String>,
     /// 兼容性
@@ -35,6 +50,10 @@ pub struct SkillHubEntry {
     /// 依赖的其他技能
     #[serde(default)]
     pub depends_on: Vec<String>,
+    /// 缺失的系统二进制(scan 时探测 requires-binaries,前端据此显示 ⚠️)。
+    /// 仅含 required 且本机 PATH 上找不到的二进制名。
+    #[serde(default)]
+    pub missing_dependencies: Vec<String>,
 }
 
 /// 本地技能注册表
@@ -165,7 +184,7 @@ impl SkillsHub {
         &self.root
     }
 
-    /// 扫描目录
+    /// 扫描目录，支持扁平结构和 category/<skill>/ 子目录结构。
     fn scan(&mut self) {
         if !self.root.exists() {
             return;
@@ -178,11 +197,36 @@ impl SkillsHub {
             if !path.is_dir() {
                 continue;
             }
-            let skill_md = path.join("SKILL.md");
-            if skill_md.exists()
-                && let Some(hub_entry) = Self::parse_skill_dir(&path, &skill_md)
-            {
-                self.entries.insert(hub_entry.name.clone(), hub_entry);
+            // Check if this is a category directory (contains subdirectories with SKILL.md)
+            // or a skill directory directly (contains SKILL.md).
+            let direct_skill_md = path.join("SKILL.md");
+            if direct_skill_md.exists() {
+                if let Some(hub_entry) = Self::parse_skill_dir(&path, &direct_skill_md) {
+                    self.entries.insert(hub_entry.name.clone(), hub_entry);
+                }
+            } else {
+                // Category subdirectory: scan each child for SKILL.md
+                let Ok(sub_dirs) = std::fs::read_dir(&path) else { continue };
+                for sub in sub_dirs.flatten() {
+                    let sub_path = sub.path();
+                    if !sub_path.is_dir() {
+                        continue;
+                    }
+                    let skill_md = sub_path.join("SKILL.md");
+                    if skill_md.exists()
+                        && let Some(mut hub_entry) = Self::parse_skill_dir(&sub_path, &skill_md)
+                    {
+                        // Inherit category from parent directory name if not set
+                        if hub_entry.category.is_empty() {
+                            hub_entry.category = path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("")
+                                .to_string();
+                        }
+                        self.entries.insert(hub_entry.name.clone(), hub_entry);
+                    }
+                }
             }
         }
     }
@@ -194,10 +238,49 @@ impl SkillsHub {
 
         let dir_name = dir.file_name()?.to_str()?.to_string();
 
+        // Extract metadata sub-map. The frontmatter parser flattens YAML
+        // nested maps: `metadata:\n  category: x` → key `category` = `x`.
+        let metadata_category = frontmatter.get("category").cloned().unwrap_or_default();
+        let metadata_source = frontmatter.get("source").cloned();
+        let upstream_version = frontmatter.get("upstream-version").cloned();
+
+        // Determine baseline status from enabled-skills.json (checked later)
+        let is_baseline = match metadata_category.as_str() {
+            "methodology" => {
+                // Core 4 methodology skills default to baseline
+                matches!(
+                    dir_name.as_str(),
+                    "brainstorming"
+                        | "systematic-debugging"
+                        | "verification-before-completion"
+                        | "writing-plans"
+                )
+            }
+            _ => false,
+        };
+
+        // 探测 requires-binaries 中本机缺失的(missing_dependencies 链路)。
+        // frontmatter.get 能拿到 "soffice, pdftoppm" 这种逗号串(parse_frontmatter
+        // 已把 metadata 子映射扁平化)。inline 探测,不引入跨 crate 类型耦合。
+        let missing_dependencies = frontmatter
+            .get("requires-binaries")
+            .map(|raw| {
+                raw.split(',')
+                    .map(|s| s.trim().trim_matches(|c: char| c == '"' || c == '\'').to_string())
+                    .filter(|n| !n.is_empty() && !binary_available(n))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         Some(SkillHubEntry {
             name: frontmatter.get("name").cloned().unwrap_or(dir_name),
             description: frontmatter.get("description").cloned().unwrap_or_default(),
             path: dir.to_path_buf(),
+            category: metadata_category,
+            is_baseline,
+            is_builtin: true, // skills in CARGO_MANIFEST_DIR/skills are built-in
+            upstream_version,
+            source: metadata_source,
             license: frontmatter.get("license").cloned(),
             compatibility: frontmatter.get("compatibility").cloned(),
             version: frontmatter.get("version").cloned(),
@@ -209,8 +292,22 @@ impl SkillsHub {
             loaded: false,
             has_sandbox: frontmatter.contains_key("sandbox"),
             depends_on: list_fields.get("depends_on").cloned().unwrap_or_default(),
+            missing_dependencies,
         })
     }
+}
+
+/// 探测单个二进制是否在 PATH 上(走 `which` 子进程)。
+/// 与 echo-execution/src/skills/dependency_probe.rs 的 binary_available 同实现,
+/// 此处 inline 一份避免 registry 反向依赖 echo_execution 的类型。
+fn binary_available(name: &str) -> bool {
+    std::process::Command::new("which")
+        .arg(name)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// 简单 YAML frontmatter 解析器

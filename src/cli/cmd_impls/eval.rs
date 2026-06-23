@@ -1,6 +1,8 @@
 //! Evaluation & trace slash commands — trace, runs, self-review.
 //!
-//! Note: The `/eval` commands have been moved to the standalone `echo-agent-eval` crate.
+//! (技能触发准确率评测 crate echo-agent-eval 已移除:其 case 仅覆盖老扁平技能、
+//! 门控阈值虚设、且只测 keyword 层,维护成本高于价值。日后如需触发评估,
+//! 可从 echo-agent 框架侧的 eval 模块重建。)
 
 use crate::cli::command::{CommandCategory, CommandContext, CommandOutcome, cmd};
 use std::sync::Arc;

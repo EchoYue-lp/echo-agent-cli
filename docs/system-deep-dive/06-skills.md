@@ -417,7 +417,7 @@ pub struct SkillTelemetry { /* :37-56 */
 
 ## §10 已删除组件：`SkillGateway`
 
-`SkillGateway` 是早期产品层的 skill 路由器，已**完全删除**。grep `SkillGateway` 仅命中一行 doc comment（`echo-agent-cli/echo-agent-eval/src/trigger_test.rs:21`，描述早期 eval harness 形态，类型本身已不存在）。
+`SkillGateway` 是早期产品层的 skill 路由器，已**完全删除**（类型本身不存在；曾引用它的 echo-agent-eval crate 也已移除）。
 
 它的职责拆给：
 
