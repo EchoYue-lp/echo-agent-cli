@@ -62,6 +62,10 @@ export interface TaskRuntimeState {
   generatingPlan: boolean;
   /// Latest route/mode/approval explanation received from plan_ready.
   routeExplanation: RouteExplanation | null;
+  /// Interrupt prompt: set when a new message arrives while a run is
+  /// in-progress. The GUI shows a dialog letting the user choose:
+  /// resume / edit-and-resume / abandon.
+  interruptPrompt: { runId: string; goal: string; newMessage: string } | null;
 
   // ── Actions ───────────────────────────────────────────────────────────
   refresh: (runId: string) => Promise<void>;
@@ -74,6 +78,14 @@ export interface TaskRuntimeState {
   /// Mark that a plan_ready chat event arrived for this run — the panel
   /// should fetch the plan + show approval actions.
   notifyPlanReady: (runId: string, explanation?: Partial<RouteExplanation>) => Promise<void>;
+  openInterruptPrompt: (data: { runId: string; goal: string; newMessage: string }) => void;
+  dismissInterruptPrompt: () => void;
+  // Dynamic task operations (Phase 2).
+  insertTask: (afterTaskId: string | null, task: Record<string, unknown>) => Promise<void>;
+  removeTask: (taskId: string) => Promise<void>;
+  updateTask: (taskId: string, patch: Record<string, unknown>) => Promise<void>;
+  reorderTasks: (newOrder: string[]) => Promise<void>;
+  resumeTaskRun: () => Promise<void>;
   reset: () => void;
 }
 
@@ -123,6 +135,7 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
   error: null,
   generatingPlan: false,
   routeExplanation: null,
+  interruptPrompt: null,
 
   refresh: async (runId: string) => {
     try {
@@ -264,6 +277,41 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
     }
   },
 
+  openInterruptPrompt: (data) => set({ interruptPrompt: data }),
+  dismissInterruptPrompt: () => set({ interruptPrompt: null }),
+
+  insertTask: async (afterTaskId, task) => {
+    const runId = get().activeRun?.run_id;
+    if (!runId) return;
+    await taskRuntimeApi.insertTask(runId, afterTaskId, task as unknown as import('../generated').PlanTask);
+    await get().refresh(runId);
+  },
+  removeTask: async (taskId) => {
+    const runId = get().activeRun?.run_id;
+    if (!runId) return;
+    await taskRuntimeApi.removeTask(runId, taskId);
+    await get().refresh(runId);
+  },
+  updateTask: async (taskId, patch) => {
+    const runId = get().activeRun?.run_id;
+    if (!runId) return;
+    await taskRuntimeApi.updateTask(runId, taskId, patch);
+    await get().refresh(runId);
+  },
+  reorderTasks: async (newOrder) => {
+    const runId = get().activeRun?.run_id;
+    if (!runId) return;
+    await taskRuntimeApi.reorderTasks(runId, newOrder);
+    await get().refresh(runId);
+  },
+  resumeTaskRun: async () => {
+    const runId = get().activeRun?.run_id;
+    if (!runId) return;
+    await taskRuntimeApi.resumeRun(runId);
+    set({ interruptPrompt: null });
+    await get().refresh(runId);
+  },
+
   reset: () =>
     set({
       activeRun: null,
@@ -276,5 +324,6 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
       error: null,
       generatingPlan: false,
       routeExplanation: null,
+      interruptPrompt: null,
     }),
 }));

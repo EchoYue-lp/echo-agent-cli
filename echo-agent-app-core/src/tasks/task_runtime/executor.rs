@@ -125,15 +125,20 @@ pub async fn execute_run(
     let run = store
         .get_run(run_id)?
         .ok_or(ExecError::RunNotFound(run_id.to_string()))?;
-    // Zombie recovery: a run left in Cancelling (e.g. process crashed during
-    // shutdown) has no driver to finish it. Auto-transition to Failed so it
-    // doesn't block the run list forever.
+    // Zombie recovery: a run left in a non-terminal state (e.g. process crashed
+    // during shutdown) has no driver to finish it. Auto-transition to Failed so
+    // it doesn't block the run list forever.
+    //
+    // `Running` is intentionally excluded: if the run is already Running when
+    // the executor starts, it was either just transitioned by the IPC (resume
+    // path) or left behind by a crash. In both cases the executor can safely
+    // proceed — it re-reads the plan from the store and skips completed tasks.
     if matches!(
         run.status,
-        TaskRunStatus::Running
-            | TaskRunStatus::WaitingApproval
+        TaskRunStatus::WaitingApproval
             | TaskRunStatus::WaitingInput
             | TaskRunStatus::Suspended
+            | TaskRunStatus::Paused
             | TaskRunStatus::Cancelling
     ) {
         let reason = format!(
@@ -434,7 +439,14 @@ async fn run_dag<W: TaskWorker + 'static>(
     let all_ids: HashSet<String> = by_id.keys().cloned().collect();
 
     // Track completion state per task id.
-    let mut completed: HashSet<String> = HashSet::new();
+    // Pre-populate with tasks already marked Completed — this is the resume
+    // path: the executor re-reads the plan from the store and skips tasks
+    // that finished in the previous run.
+    let mut completed: HashSet<String> = tasks
+        .iter()
+        .filter(|t| t.status == TodoStatus::Completed)
+        .map(|t| t.id.clone())
+        .collect();
     let mut failed_id: Option<String> = None;
     // All tasks that have been marked Failed across waves. The skip logic
     // (top of loop) uses this to avoid overwriting a Failed todo to Skipped.

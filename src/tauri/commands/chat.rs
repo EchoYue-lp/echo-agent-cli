@@ -155,6 +155,15 @@ pub enum ChatEvent {
     },
     #[serde(rename = "done")]
     Done,
+    /// An in-progress run was detected for this conversation. The GUI should
+    /// prompt the user to choose: resume the old plan, edit-and-resume, or
+    /// abandon it and start fresh.
+    #[serde(rename = "interrupt_prompt")]
+    InterruptPrompt {
+        run_id: String,
+        goal: String,
+        new_message: String,
+    },
 }
 
 fn emit_chat_event(
@@ -443,6 +452,32 @@ pub async fn send_chat_message(
                 })
             })
             .await;
+    }
+
+    // ── Interrupt detection ─────────────────────────────────────────────
+    // If the same conversation already has an in-progress (Running/Paused)
+    // run, do NOT start a new one. Instead, emit an InterruptPrompt event
+    // so the GUI can ask the user what to do (resume / edit-and-resume /
+    // abandon).
+    if let Some(ref conv_id) = conversation_id {
+        if let Some(store) = state.app_state.tasks.runtime.as_ref() {
+            if let Ok(Some(existing)) = store.find_in_progress_run_by_conversation(conv_id) {
+                emit_chat_event(
+                    &app,
+                    &ChatEvent::InterruptPrompt {
+                        run_id: existing.run_id.clone(),
+                        goal: existing.goal.clone(),
+                        new_message: message.clone(),
+                    },
+                    &message_key,
+                    &conversation_id,
+                );
+                return Ok(serde_json::json!({
+                    "kind": "interrupt_prompt",
+                    "run_id": existing.run_id,
+                }));
+            }
+        }
     }
 
     // ── Complex-task router ────────────────────────────────────────────

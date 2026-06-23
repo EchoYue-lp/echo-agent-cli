@@ -45,6 +45,8 @@ pub enum StoreError {
     LockPoisoned,
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("invalid plan: {0}")]
+    InvalidPlan(String),
 }
 
 /// Canonical TaskRuntime store. One instance per process; cheap to clone
@@ -369,6 +371,281 @@ impl TaskRuntimeStore {
         }
         tx.commit()?;
         Ok(run)
+    }
+
+    /// Resume a paused run: `Paused → Running`.
+    ///
+    /// The caller (IPC layer) is responsible for re-launching the executor
+    /// after this succeeds — the store only handles the state transition.
+    pub fn resume_task_run(&self, run_id: &str) -> Result<TaskRun, StoreError> {
+        self.transition_run(run_id, TaskRunStatus::Running)
+    }
+
+    /// Insert a new task into the plan, optionally after a given task id.
+    /// Works in any run state (not limited to `AwaitingPlanApproval`).
+    /// Validates dependency integrity and acyclicity. Emits `PlanEdited`.
+    pub fn insert_task(
+        &self,
+        run_id: &str,
+        after_task_id: Option<String>,
+        task: PlanTask,
+    ) -> Result<(), StoreError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+
+        // Load the current plan.
+        let plan_id: String = tx
+            .query_row(
+                "SELECT plan_id FROM tr_plans WHERE run_id = ? ORDER BY rowid DESC LIMIT 1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| StoreError::PlanNotFound(run_id.to_string()))?;
+
+        let existing_tasks = load_plan_tasks_tx(&tx, &plan_id)?;
+
+        // Build the new task list: insert after `after_task_id` (or at front).
+        let mut new_tasks = existing_tasks.clone();
+        let insert_pos = after_task_id
+            .as_ref()
+            .and_then(|id| new_tasks.iter().position(|t| &t.id == id))
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        new_tasks.insert(insert_pos, task.clone());
+
+        // Validate deps (dangling refs + cycle detection).
+        if let Err(errs) = super::planner::validate_plan_deps(&new_tasks) {
+            return Err(StoreError::InvalidPlan(errs.join("; ")));
+        }
+
+        // Persist the new task.
+        insert_plan_task_tx(&tx, &plan_id, run_id, &task)?;
+
+        // Mirror todo row (id = task_id, matching attach_plan convention).
+        tx.execute(
+            "INSERT INTO tr_todos (id, run_id, task_id, title, status)
+             VALUES (?, ?, ?, ?, ?)",
+            params![task.id, run_id, task.id, task.title, task.status.as_str()],
+        )?;
+
+        // Emit PlanEdited event.
+        append_event_tx(
+            &tx,
+            run_id,
+            None,
+            None,
+            RuntimeEventKind::PlanEdited,
+            serde_json::json!({
+                "action": "insert",
+                "task_id": task.id,
+                "after_task_id": after_task_id,
+            }),
+        )?;
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Soft-delete a task: set its status to `Skipped`. The task remains in
+    /// the plan (for audit) but is no longer scheduled. Emits `PlanEdited`.
+    pub fn remove_task(&self, run_id: &str, task_id: &str) -> Result<(), StoreError> {
+        self.set_task_status(
+            run_id,
+            task_id,
+            TodoStatus::Skipped,
+            None,
+            Some("removed by user"),
+        )?;
+        // Emit PlanEdited (the set_task_status already emits TaskSkipped).
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        append_event_tx(
+            &tx,
+            run_id,
+            None,
+            None,
+            RuntimeEventKind::PlanEdited,
+            serde_json::json!({ "action": "remove", "task_id": task_id }),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Update a task with a partial patch. Only `Pending`/`Blocked` tasks can
+    /// be fully updated; `Running` tasks can only change `title`/`description`
+    /// (to avoid runtime tearing). `Completed`/`Failed`/`Skipped` tasks reject
+    /// any update. Emits `PlanEdited`.
+    pub fn update_task(
+        &self,
+        run_id: &str,
+        task_id: &str,
+        patch: TaskPatch,
+    ) -> Result<(), StoreError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+
+        // Read current task status.
+        let current_status_str: String = tx
+            .query_row(
+                "SELECT status FROM tr_plan_tasks WHERE run_id = ? AND id = ?",
+                params![run_id, task_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| StoreError::TaskNotFound(task_id.to_string()))?;
+        let current_status =
+            TodoStatus::from_str(&current_status_str).unwrap_or(TodoStatus::Pending);
+
+        // State guard.
+        match current_status {
+            TodoStatus::Completed | TodoStatus::Failed | TodoStatus::Skipped => {
+                return Err(StoreError::InvalidPlan(format!(
+                    "cannot update task in terminal status {:?}",
+                    current_status
+                )));
+            }
+            TodoStatus::Running => {
+                if patch.kind.is_some() || patch.depends_on.is_some() || patch.agent_role.is_some()
+                {
+                    return Err(StoreError::InvalidPlan(
+                        "cannot change kind/depends_on/agent_role of a Running task".into(),
+                    ));
+                }
+            }
+            _ => {} // Pending/Blocked: all fields mutable.
+        }
+
+        // Apply each non-None field.
+        if let Some(title) = &patch.title {
+            tx.execute(
+                "UPDATE tr_plan_tasks SET title = ? WHERE run_id = ? AND id = ?",
+                params![title, run_id, task_id],
+            )?;
+            tx.execute(
+                "UPDATE tr_todos SET title = ? WHERE run_id = ? AND task_id = ?",
+                params![title, run_id, task_id],
+            )?;
+        }
+        if let Some(desc) = &patch.description {
+            tx.execute(
+                "UPDATE tr_plan_tasks SET description = ? WHERE run_id = ? AND id = ?",
+                params![desc, run_id, task_id],
+            )?;
+        }
+        if let Some(kind) = &patch.kind {
+            tx.execute(
+                "UPDATE tr_plan_tasks SET kind = ? WHERE run_id = ? AND id = ?",
+                params![kind.as_str(), run_id, task_id],
+            )?;
+        }
+        if let Some(role) = &patch.agent_role {
+            tx.execute(
+                "UPDATE tr_plan_tasks SET agent_role = ? WHERE run_id = ? AND id = ?",
+                params![role, run_id, task_id],
+            )?;
+        }
+        if let Some(files) = &patch.files {
+            let json = serde_json::to_string(files).unwrap_or_default();
+            tx.execute(
+                "UPDATE tr_plan_tasks SET files = ? WHERE run_id = ? AND id = ?",
+                params![json, run_id, task_id],
+            )?;
+        }
+        if let Some(tools) = &patch.allowed_tools {
+            let json = serde_json::to_string(tools).unwrap_or_default();
+            tx.execute(
+                "UPDATE tr_plan_tasks SET allowed_tools = ? WHERE run_id = ? AND id = ?",
+                params![json, run_id, task_id],
+            )?;
+        }
+        if let Some(deps) = &patch.depends_on {
+            let json = serde_json::to_string(deps).unwrap_or_default();
+            tx.execute(
+                "UPDATE tr_plan_tasks SET depends_on = ? WHERE run_id = ? AND id = ?",
+                params![json, run_id, task_id],
+            )?;
+            // Re-validate cycle after changing deps.
+            let plan_id: String = tx
+                .query_row(
+                    "SELECT plan_id FROM tr_plans WHERE run_id = ? ORDER BY rowid DESC LIMIT 1",
+                    params![run_id],
+                    |row| row.get(0),
+                )
+                .map_err(|_| StoreError::PlanNotFound(run_id.to_string()))?;
+            let mut tasks = load_plan_tasks_tx(&tx, &plan_id)?;
+            if let Some(t) = tasks.iter_mut().find(|t| t.id == task_id) {
+                t.depends_on = deps.clone();
+            }
+            if let Err(errs) = super::planner::validate_plan_deps(&tasks) {
+                return Err(StoreError::InvalidPlan(errs.join("; ")));
+            }
+        }
+
+        append_event_tx(
+            &tx,
+            run_id,
+            None,
+            None,
+            RuntimeEventKind::PlanEdited,
+            serde_json::json!({ "action": "update", "task_id": task_id }),
+        )?;
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Reorder non-terminal tasks. `new_order` must be a permutation of all
+    /// task ids that are not in a terminal state (Completed/Failed/Skipped).
+    /// Emits `PlanEdited`.
+    pub fn reorder_tasks(&self, run_id: &str, new_order: Vec<String>) -> Result<(), StoreError> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+
+        let plan_id: String = tx
+            .query_row(
+                "SELECT plan_id FROM tr_plans WHERE run_id = ? ORDER BY rowid DESC LIMIT 1",
+                params![run_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| StoreError::PlanNotFound(run_id.to_string()))?;
+
+        let tasks = load_plan_tasks_tx(&tx, &plan_id)?;
+        let non_terminal: std::collections::HashSet<String> = tasks
+            .iter()
+            .filter(|t| {
+                !matches!(
+                    t.status,
+                    TodoStatus::Completed | TodoStatus::Failed | TodoStatus::Skipped
+                )
+            })
+            .map(|t| t.id.clone())
+            .collect();
+        let new_set: std::collections::HashSet<String> = new_order.iter().cloned().collect();
+
+        if non_terminal != new_set {
+            return Err(StoreError::InvalidPlan(
+                "new_order must be a permutation of all non-terminal task ids".into(),
+            ));
+        }
+
+        // Update parallel_group to encode order (using index as sort key).
+        for (idx, task_id) in new_order.iter().enumerate() {
+            tx.execute(
+                "UPDATE tr_plan_tasks SET parallel_group = ? WHERE run_id = ? AND id = ?",
+                params![format!("order:{idx}"), run_id, task_id],
+            )?;
+        }
+
+        append_event_tx(
+            &tx,
+            run_id,
+            None,
+            None,
+            RuntimeEventKind::PlanEdited,
+            serde_json::json!({ "action": "reorder" }),
+        )?;
+
+        tx.commit()?;
+        Ok(())
     }
 
     /// Attach a generated plan to a run, replacing any prior plan, and
@@ -779,6 +1056,29 @@ impl TaskRuntimeStore {
             "SELECT run_id, workspace_id, conversation_id, root_message_id,
                     domain_profile, status, goal, plan_id, created_at, updated_at
              FROM tr_runs WHERE conversation_id = ?
+             ORDER BY created_at DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![conversation_id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(decode_run(&row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Find an in-progress (Running or Paused) run for a conversation, if any.
+    /// Used by the interrupt-detection logic: if a user sends a new message
+    /// while a run is still executing, the system should prompt them rather
+    /// than silently starting a second run.
+    pub fn find_in_progress_run_by_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<TaskRun>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(
+            "SELECT run_id, workspace_id, conversation_id, root_message_id,
+                    domain_profile, status, goal, plan_id, created_at, updated_at
+             FROM tr_runs
+             WHERE conversation_id = ? AND status IN ('running', 'paused')
              ORDER BY created_at DESC LIMIT 1",
         )?;
         let mut rows = stmt.query(params![conversation_id])?;
@@ -1260,6 +1560,15 @@ fn insert_plan_task_tx(
     Ok(())
 }
 
+/// Load plan tasks from a transaction (same query as `load_plan_tasks`, but
+/// accepts `&Transaction` for use inside transactional write paths).
+fn load_plan_tasks_tx(
+    tx: &rusqlite::Transaction<'_>,
+    plan_id: &str,
+) -> Result<Vec<PlanTask>, StoreError> {
+    load_plan_tasks(&**tx, plan_id)
+}
+
 fn load_plan_tasks(conn: &Connection, plan_id: &str) -> Result<Vec<PlanTask>, StoreError> {
     let mut stmt = conn.prepare(
         "SELECT id, title, description, kind, agent_role, domain_profile,
@@ -1553,6 +1862,131 @@ mod tests {
         // approve -> ready -> running so todos can transition freely
         s.transition_run("r1", TaskRunStatus::Ready).unwrap();
         s.transition_run("r1", TaskRunStatus::Running).unwrap();
+    }
+
+    #[test]
+    fn resume_task_run_transitions_paused_to_running() {
+        let s = fresh();
+        seed_plan(&s);
+        // Simulate user interrupt: Running -> Paused.
+        s.transition_run("r1", TaskRunStatus::Paused).unwrap();
+        let run = s.get_run("r1").unwrap().unwrap();
+        assert_eq!(run.status, TaskRunStatus::Paused);
+
+        // Resume: Paused -> Running.
+        let run = s.resume_task_run("r1").unwrap();
+        assert_eq!(run.status, TaskRunStatus::Running);
+
+        // Event log contains the Paused and Running transitions.
+        let evs = s.list_events("r1", 0).unwrap();
+        let status_changes: Vec<_> = evs
+            .iter()
+            .filter(|e| e.event_type == RuntimeEventKind::RunStatusChanged)
+            .collect();
+        assert!(status_changes.len() >= 2);
+    }
+
+    #[test]
+    fn find_in_progress_run_by_conversation_returns_running() {
+        let s = fresh();
+        seed_plan(&s); // run "r1" in conversation "c1" is now Running.
+        let found = s.find_in_progress_run_by_conversation("c1").unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().run_id, "r1");
+    }
+
+    #[test]
+    fn find_in_progress_run_by_conversation_returns_paused() {
+        let s = fresh();
+        seed_plan(&s);
+        s.transition_run("r1", TaskRunStatus::Paused).unwrap();
+        let found = s.find_in_progress_run_by_conversation("c1").unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().run_id, "r1");
+    }
+
+    #[test]
+    fn find_in_progress_run_by_conversation_returns_none_for_completed() {
+        let s = fresh();
+        seed_plan(&s);
+        s.transition_run("r1", TaskRunStatus::Completed).unwrap();
+        let found = s.find_in_progress_run_by_conversation("c1").unwrap();
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn insert_task_adds_to_plan_and_emits_plan_edited() {
+        let s = fresh();
+        seed_plan(&s);
+        // Plan has one task "t1". Insert "t2" after "t1".
+        let t2 = PlanTask {
+            id: "t2".into(),
+            title: "Second task".into(),
+            kind: PlanTaskKind::Implementation,
+            depends_on: vec!["t1".into()],
+            ..Default::default()
+        };
+        s.insert_task("r1", Some("t1".into()), t2).unwrap();
+
+        let plan = s.get_plan("r1").unwrap().unwrap();
+        assert_eq!(plan.tasks.len(), 2);
+        assert_eq!(plan.tasks[0].id, "t1");
+        assert_eq!(plan.tasks[1].id, "t2");
+
+        let todos = s.list_todos("r1").unwrap();
+        assert!(todos.iter().any(|t| t.task_id == "t2"));
+
+        let evs = s.list_events("r1", 0).unwrap();
+        assert!(
+            evs.iter()
+                .any(|e| e.event_type == RuntimeEventKind::PlanEdited)
+        );
+    }
+
+    #[test]
+    fn remove_task_soft_deletes_via_skipped() {
+        let s = fresh();
+        seed_plan(&s);
+        s.remove_task("r1", "t1").unwrap();
+        let todos = s.list_todos("r1").unwrap();
+        let t1 = todos.iter().find(|t| t.task_id == "t1").unwrap();
+        assert_eq!(t1.status, TodoStatus::Skipped);
+    }
+
+    #[test]
+    fn update_task_applies_title_patch() {
+        let s = fresh();
+        seed_plan(&s);
+        s.update_task(
+            "r1",
+            "t1",
+            TaskPatch {
+                title: Some("Updated title".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let plan = s.get_plan("r1").unwrap().unwrap();
+        assert_eq!(plan.tasks[0].title, "Updated title");
+    }
+
+    #[test]
+    fn update_task_rejects_terminal_status() {
+        let s = fresh();
+        seed_plan(&s);
+        s.set_task_status("r1", "t1", TodoStatus::Completed, None, None)
+            .unwrap();
+        let err = s
+            .update_task(
+                "r1",
+                "t1",
+                TaskPatch {
+                    title: Some("nope".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, StoreError::InvalidPlan(_)));
     }
 }
 

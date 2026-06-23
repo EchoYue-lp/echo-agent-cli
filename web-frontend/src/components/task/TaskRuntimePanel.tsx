@@ -8,7 +8,7 @@
 //! The compact panel is mounted inside RightRail; the full detail panel is
 //! mounted in the main chat/work area.
 
-import { useEffect, useMemo } from 'react';
+import { useEffect, useMemo, useState, useCallback } from 'react';
 import {
   CheckCircle2,
   Circle,
@@ -17,6 +17,12 @@ import {
   ListTodo,
   RefreshCw,
   Gauge,
+  Pencil,
+  Trash2,
+  Plus,
+  Play,
+  Edit3,
+  X,
   AlertTriangle,
 } from 'lucide-react';
 import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
@@ -38,6 +44,7 @@ const STATUS_LABEL: Record<string, string> = {
   waiting_approval: '等待审批',
   waiting_input: '等待输入',
   suspended: '已挂起',
+  paused: '已暂停',
   cancelling: '取消中',
   cancelled: '已取消',
   failed: '失败',
@@ -57,7 +64,7 @@ function statusColor(status: string): string {
   if (['completed'].includes(status)) return 'var(--color-success)';
   if (['running', 'planning', 'ready'].includes(status)) return 'var(--color-info)';
   if (['failed', 'cancelled'].includes(status)) return 'var(--color-error)';
-  if (['suspended', 'blocked', 'waiting_approval', 'awaiting_plan_approval', 'waiting_input', 'cancelling'].includes(status))
+  if (['suspended', 'paused', 'blocked', 'waiting_approval', 'awaiting_plan_approval', 'waiting_input', 'cancelling'].includes(status))
     return 'var(--color-warning)';
   return 'var(--text-tertiary)';
 }
@@ -458,10 +465,11 @@ export function TaskRuntimePanel() {
             {todos.map((todo) => {
               const task = plan?.tasks.find((t) => t.id === todo.task_id);
               const status = displayedTodoStatus(todo, visibleTraceWorkers);
+              const isEditable = status === 'pending' || status === 'blocked';
               return (
                 <div
                   key={todo.id}
-                  className="flex items-start gap-1.5 rounded px-1.5 py-1"
+                  className="group/task flex items-start gap-1.5 rounded px-1.5 py-1 hover:bg-[var(--bg-hover)]"
                   style={{ background: 'var(--bg-secondary)' }}
                 >
                   <div className="mt-0.5">
@@ -477,10 +485,66 @@ export function TaskRuntimePanel() {
                       <span>· {TODO_LABEL[status] ?? status}</span>
                     </div>
                   </div>
+                  {/* Edit/delete buttons — visible on hover, only for editable tasks */}
+                  {isEditable && (
+                    <div className="hidden group-hover/task:flex gap-0.5">
+                      <button
+                        className="rounded p-0.5 hover:bg-[var(--bg-active)]"
+                        title="编辑"
+                        onClick={() => {
+                          const newTitle = prompt('新标题', todo.title);
+                          if (newTitle && newTitle !== todo.title) {
+                            useTaskRuntimeStore.getState().updateTask(todo.task_id, { title: newTitle });
+                          }
+                        }}
+                      >
+                        <Pencil size={10} style={{ color: 'var(--text-tertiary)' }} />
+                      </button>
+                      <button
+                        className="rounded p-0.5 hover:bg-[var(--bg-active)]"
+                        title="删除"
+                        onClick={() => {
+                          if (confirm(`确定删除任务「${todo.title}」？`)) {
+                            useTaskRuntimeStore.getState().removeTask(todo.task_id);
+                          }
+                        }}
+                      >
+                        <Trash2 size={10} style={{ color: 'var(--color-error)' }} />
+                      </button>
+                    </div>
+                  )}
                 </div>
               );
             })}
           </div>
+          {/* Add task button */}
+          <button
+            className="mt-1 flex w-full items-center justify-center gap-1 rounded px-2 py-1 text-[10px] hover:bg-[var(--bg-hover)]"
+            style={{ color: 'var(--text-tertiary)', border: '1px dashed var(--border-secondary)' }}
+            onClick={() => {
+              const title = prompt('新任务标题');
+              if (title) {
+                const lastId = todos.length > 0 ? todos[todos.length - 1].task_id : null;
+                useTaskRuntimeStore.getState().insertTask(lastId, {
+                  id: `task_${Date.now()}`,
+                  title,
+                  description: '',
+                  kind: 'implementation',
+                  agent_role: 'general',
+                  domain_profile: 'general',
+                  depends_on: [],
+                  files: [],
+                  allowed_tools: [],
+                  verification: [],
+                  retry_count: 0,
+                  max_retries: 3,
+                  status: 'pending',
+                });
+              }
+            }}
+          >
+            <Plus size={10} /> 新增任务
+          </button>
         </div>
       )}
 
@@ -530,5 +594,92 @@ export function TaskRuntimePanel() {
         </button>
       )}
     </section>
+  );
+}
+
+/**
+ * Interrupt prompt dialog — shown when a new message arrives while a run is
+ * in-progress. Lets the user choose: resume, edit-and-resume, or abandon.
+ */
+export function InterruptPromptDialog() {
+  const interruptPrompt = useTaskRuntimeStore((s) => s.interruptPrompt);
+  const dismiss = useTaskRuntimeStore((s) => s.dismissInterruptPrompt);
+  const resume = useTaskRuntimeStore((s) => s.resumeTaskRun);
+
+  if (!interruptPrompt) return null;
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center"
+      style={{ background: 'rgba(0,0,0,0.4)' }}
+    >
+      <div
+        className="mx-4 w-full max-w-sm rounded-lg p-4 shadow-lg"
+        style={{ background: 'var(--bg-primary)', border: '1px solid var(--border-primary)' }}
+      >
+        <div className="mb-3 flex items-center justify-between">
+          <span className="text-sm font-medium" style={{ color: 'var(--text-primary)' }}>
+            任务正在执行中
+          </span>
+          <button onClick={dismiss} className="rounded p-1 hover:bg-[var(--bg-hover)]">
+            <X size={14} style={{ color: 'var(--text-tertiary)' }} />
+          </button>
+        </div>
+        <p className="mb-1 text-xs" style={{ color: 'var(--text-secondary)' }}>
+          当前有一个正在执行的任务计划：
+        </p>
+        <p className="mb-3 truncate text-xs font-medium" style={{ color: 'var(--text-primary)' }}>
+          {interruptPrompt.goal}
+        </p>
+        <p className="mb-3 text-xs" style={{ color: 'var(--text-secondary)' }}>
+          你想怎么处理？
+        </p>
+        <div className="flex flex-col gap-2">
+          <button
+            className="flex items-center gap-2 rounded px-3 py-2 text-xs hover:bg-[var(--bg-hover)]"
+            style={{ border: '1px solid var(--border-primary)', color: 'var(--text-primary)' }}
+            onClick={() => {
+              resume();
+            }}
+          >
+            <Play size={12} /> 继续执行旧计划
+          </button>
+          <button
+            className="flex items-center gap-2 rounded px-3 py-2 text-xs hover:bg-[var(--bg-hover)]"
+            style={{ border: '1px solid var(--border-primary)', color: 'var(--text-primary)' }}
+            onClick={async () => {
+              // Transition to AwaitingPlanApproval so the user can edit.
+              const runId = interruptPrompt.runId;
+              try {
+                const { invoke } = await import('@tauri-apps/api/core');
+                await invoke('reject_task_plan', { runId, note: null });
+                // Don't cancel — just go back to plan editing.
+              } catch {
+                // ignore
+              }
+              dismiss();
+            }}
+          >
+            <Edit3 size={12} /> 编辑计划后继续
+          </button>
+          <button
+            className="flex items-center gap-2 rounded px-3 py-2 text-xs hover:bg-[var(--bg-hover)]"
+            style={{ border: '1px solid var(--border-primary)', color: 'var(--color-error)' }}
+            onClick={async () => {
+              const runId = interruptPrompt.runId;
+              try {
+                const { invoke } = await import('@tauri-apps/api/core');
+                await invoke('cancel_task_run', { runId });
+              } catch {
+                // ignore
+              }
+              dismiss();
+            }}
+          >
+            <Trash2 size={12} /> 废弃旧计划，开始新任务
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }

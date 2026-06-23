@@ -235,6 +235,21 @@ export function handleChatEvent(
       }
       break;
     }
+    case 'interrupt_prompt': {
+      // An in-progress run was detected — the GUI should show a dialog
+      // letting the user choose: resume / edit-and-resume / abandon.
+      const { run_id, goal, new_message } = event as unknown as {
+        run_id: string;
+        goal: string;
+        new_message: string;
+      };
+      useTaskRuntimeStore.getState().openInterruptPrompt({
+        runId: run_id,
+        goal: goal ?? '',
+        newMessage: new_message ?? '',
+      });
+      break;
+    }
     case 'done': {
       if (ctx.assistantIdRef.current && !ctx.isCancelledRef.current) {
         store.finalizeAssistantMessage(ctx.assistantIdRef.current, '');

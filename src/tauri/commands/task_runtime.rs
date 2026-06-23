@@ -499,6 +499,144 @@ pub async fn edit_task_plan(
     Ok(plan)
 }
 
+/// Resume a paused run. Transitions `Paused → Running` and re-launches the
+/// executor, which re-reads the plan from the store and skips already-completed
+/// tasks.
+#[tauri::command]
+pub async fn resume_task_run(
+    state: tauri::State<'_, TauriState>,
+    app: tauri::AppHandle,
+    run_id: String,
+) -> Result<serde_json::Value, IpcError> {
+    let store = store(&state)?;
+    // Paused → Running (validated by the store's state machine).
+    store.resume_task_run(&run_id).map_err(internal)?;
+    tracing::info!(run_id = %run_id, "resumed → Running");
+
+    // Re-launch the executor (same pattern as execute_task_run).
+    let primary_agent = state.app_state.connection.primary_agent();
+    let store_for_task = store.clone();
+    let primary_agent_for_task = primary_agent.clone();
+    let run_store_for_task = primary_agent.read(|a| a.run_store().cloned()).await;
+    let (reviewer_llm, exec_cache_user_id) = primary_agent
+        .read(|a| {
+            (
+                a.llm_client().cloned(),
+                a.config().get_cache_user_id().map(|s| s.to_string()),
+            )
+        })
+        .await;
+    let exec_cache_user_id = exec_cache_user_id.unwrap_or_default();
+    let layer_manager = state
+        .app_state
+        .review_integration
+        .as_ref()
+        .map(|ri| std::sync::Arc::new(ri.create_layer_manager()));
+    let cancel = echo_agent::agent::CancellationToken::new();
+    let run_key = format!("__run__:{run_id}");
+    state
+        .app_state
+        .tasks
+        .run_cancel_tokens
+        .insert(run_key.clone(), cancel.clone());
+    let run_cancel_tokens = state.app_state.tasks.run_cancel_tokens.clone();
+    let trace_sink: echo_agent_app_core::tasks::task_runtime::WorkerTraceSink =
+        Arc::new(move |event| {
+            let _ = app.emit("worker://trace", event);
+        });
+    let run_id_for_task = run_id.clone();
+
+    tokio::spawn(async move {
+        let outcome = echo_agent_app_core::tasks::task_runtime::execute_run(
+            store_for_task.clone(),
+            Some(primary_agent_for_task),
+            reviewer_llm,
+            layer_manager,
+            run_store_for_task,
+            Some(trace_sink),
+            &run_id_for_task,
+            exec_cache_user_id.clone(),
+            cancel,
+        )
+        .await;
+        run_cancel_tokens.remove(&format!("__run__:{run_id_for_task}"));
+        match outcome {
+            Ok(echo_agent_app_core::tasks::task_runtime::RunOutcome::Completed) => {
+                tracing::info!(run_id = %run_id_for_task, "resumed run completed");
+            }
+            Ok(other) => {
+                tracing::warn!(run_id = %run_id_for_task, ?other, "resumed run ended non-completed");
+            }
+            Err(e) => {
+                tracing::error!(run_id = %run_id_for_task, error = %e, "resumed run executor error");
+            }
+        }
+    });
+
+    Ok(serde_json::json!({
+        "kind": "resumed",
+        "run_id": run_id,
+    }))
+}
+
+/// Insert a new task into a run's plan. Works in any run state. The task is
+/// inserted after `after_task_id` (or at the front if null). Validates
+/// dependency integrity and acyclicity.
+#[tauri::command]
+pub async fn insert_task(
+    state: tauri::State<'_, TauriState>,
+    run_id: String,
+    after_task_id: Option<String>,
+    task: PlanTask,
+) -> Result<(), IpcError> {
+    let store = store(&state)?;
+    store
+        .insert_task(&run_id, after_task_id, task)
+        .map_err(internal)?;
+    Ok(())
+}
+
+/// Soft-delete a task from a run's plan (marks it Skipped).
+#[tauri::command]
+pub async fn remove_task(
+    state: tauri::State<'_, TauriState>,
+    run_id: String,
+    task_id: String,
+) -> Result<(), IpcError> {
+    let store = store(&state)?;
+    store.remove_task(&run_id, &task_id).map_err(internal)?;
+    Ok(())
+}
+
+/// Update a task with a partial patch. Only non-None fields are applied.
+/// Running tasks can only change title/description; terminal tasks reject
+/// any update.
+#[tauri::command]
+pub async fn update_task(
+    state: tauri::State<'_, TauriState>,
+    run_id: String,
+    task_id: String,
+    patch: echo_agent_app_core::tasks::task_runtime::types::TaskPatch,
+) -> Result<(), IpcError> {
+    let store = store(&state)?;
+    store
+        .update_task(&run_id, &task_id, patch)
+        .map_err(internal)?;
+    Ok(())
+}
+
+/// Reorder non-terminal tasks in a run's plan.
+#[tauri::command]
+pub async fn reorder_tasks(
+    state: tauri::State<'_, TauriState>,
+    run_id: String,
+    new_order: Vec<String>,
+) -> Result<(), IpcError> {
+    let store = store(&state)?;
+    store.reorder_tasks(&run_id, new_order).map_err(internal)?;
+    Ok(())
+}
+
 /// Launch execution of an approved run. The run must be in `Ready` (i.e. the
 /// plan was approved). Execution runs on a detached background task so the
 /// IPC returns immediately; progress is observable via `list_task_events` /

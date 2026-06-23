@@ -271,10 +271,11 @@ impl Default for TodoStatus {
 /// Planning -> AwaitingPlanApproval
 /// AwaitingPlanApproval -> Ready | Cancelled
 /// Ready -> Running
-/// Running -> WaitingApproval | WaitingInput | Suspended | Cancelling | Failed | Completed
+/// Running -> WaitingApproval | WaitingInput | Suspended | Paused | Cancelling | Failed | Completed
 /// WaitingApproval -> Running | Suspended | Cancelled
 /// WaitingInput -> Running | Suspended | Cancelled
 /// Suspended -> Ready | Cancelled
+/// Paused -> Running | AwaitingPlanApproval | Cancelled
 /// Cancelling -> Cancelled | Failed
 /// Failed -> Ready | Cancelled  (Ready: reserved for future retry-from-failed)
 /// ```
@@ -290,6 +291,7 @@ pub enum TaskRunStatus {
     WaitingApproval,
     WaitingInput,
     Suspended,
+    Paused,
     Cancelling,
     Cancelled,
     Failed,
@@ -307,6 +309,7 @@ impl TaskRunStatus {
             TaskRunStatus::WaitingApproval => "waiting_approval",
             TaskRunStatus::WaitingInput => "waiting_input",
             TaskRunStatus::Suspended => "suspended",
+            TaskRunStatus::Paused => "paused",
             TaskRunStatus::Cancelling => "cancelling",
             TaskRunStatus::Cancelled => "cancelled",
             TaskRunStatus::Failed => "failed",
@@ -324,6 +327,7 @@ impl TaskRunStatus {
             "waiting_approval" => TaskRunStatus::WaitingApproval,
             "waiting_input" => TaskRunStatus::WaitingInput,
             "suspended" => TaskRunStatus::Suspended,
+            "paused" => TaskRunStatus::Paused,
             "cancelling" => TaskRunStatus::Cancelling,
             "cancelled" => TaskRunStatus::Cancelled,
             "failed" => TaskRunStatus::Failed,
@@ -343,11 +347,18 @@ impl TaskRunStatus {
             Ready => matches!(next, Running | Cancelled),
             Running => matches!(
                 next,
-                WaitingApproval | WaitingInput | Suspended | Cancelling | Failed | Completed
+                WaitingApproval
+                    | WaitingInput
+                    | Suspended
+                    | Paused
+                    | Cancelling
+                    | Failed
+                    | Completed
             ),
             WaitingApproval => matches!(next, Running | Suspended | Cancelled),
             WaitingInput => matches!(next, Running | Suspended | Cancelled),
             Suspended => matches!(next, Ready | Cancelled),
+            Paused => matches!(next, Running | AwaitingPlanApproval | Cancelled),
             Cancelling => matches!(next, Cancelled | Failed),
             Failed => matches!(next, Ready | Cancelled),
             // Terminal states.
@@ -709,6 +720,20 @@ impl Default for PlanTask {
     }
 }
 
+/// Partial update patch for a [`PlanTask`]. Only non-`None` fields are applied.
+/// Used by [`TaskRuntimeStore::update_task`] for in-flight plan edits.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
+#[ts(export, rename = "TaskPatch")]
+pub struct TaskPatch {
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub kind: Option<PlanTaskKind>,
+    pub agent_role: Option<String>,
+    pub depends_on: Option<Vec<String>>,
+    pub files: Option<Vec<String>>,
+    pub allowed_tools: Option<Vec<String>>,
+}
+
 /// A todo row — the GUI-facing projection of a plan task's progress.
 /// One `PlanTask` maps to exactly one `TodoItem`.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -982,6 +1007,11 @@ mod tests {
         assert!(Cancelling.can_transition_to(Cancelled));
         assert!(Cancelling.can_transition_to(Failed));
         assert!(Failed.can_transition_to(Ready));
+        // Paused transitions: user interrupt / resume / edit plan / abandon.
+        assert!(Running.can_transition_to(Paused));
+        assert!(Paused.can_transition_to(Running));
+        assert!(Paused.can_transition_to(AwaitingPlanApproval));
+        assert!(Paused.can_transition_to(Cancelled));
     }
 
     #[test]
@@ -992,6 +1022,8 @@ mod tests {
         assert!(!Completed.can_transition_to(Running));
         assert!(!Cancelled.can_transition_to(Running));
         assert!(!Ready.can_transition_to(Completed));
+        // Paused cannot go to Suspended (different semantics).
+        assert!(!Paused.can_transition_to(Suspended));
     }
 
     #[test]
@@ -1007,6 +1039,7 @@ mod tests {
             TaskRunStatus::WaitingApproval,
             TaskRunStatus::WaitingInput,
             TaskRunStatus::Suspended,
+            TaskRunStatus::Paused,
             TaskRunStatus::Cancelling,
             TaskRunStatus::Cancelled,
             TaskRunStatus::Failed,
