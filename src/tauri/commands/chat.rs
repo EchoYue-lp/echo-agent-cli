@@ -1227,45 +1227,56 @@ async fn route_complex_task(
         &message,
     )?;
 
-    // 2. Pending -> Planning (legal direct transition).
-    store.transition_run(&run_id, TaskRunStatus::Planning)?;
-
-    // 3. Generate the structured plan. Broad read-only fanout must be a
-    // reliable runtime path, so it is built deterministically from the router
-    // decision instead of depending on a second LLM planning call.
-    let generated = if route_decision.route
+    // 2. For ParallelReadonlyDelegation: main agent runs ReAct directly,
+    //    planning + worker dispatch happens inside the ReAct loop.
+    //    No pre-generated deterministic plan, no batch processing.
+    if route_decision.route
         == echo_agent_app_core::tasks::task_runtime::TaskRouteKind::ParallelReadonlyDelegation
     {
-        echo_agent_app_core::tasks::task_runtime::generate_parallel_readonly_plan(
+        store.transition_run(&run_id, TaskRunStatus::Running)?;
+        let cancel = echo_agent::agent::CancellationToken::new();
+        launch_main_agent_react(
+            app.clone(),
+            state,
             &run_id,
+            &message_key,
+            conversation_id.clone(),
             &message,
-            &route_decision.classification,
-            &route_decision.suggested_workers,
+            cancel,
         )
-    } else {
-        let (llm, plan_cache_user_id) = state
-            .app_state
-            .connection
-            .primary_agent()
-            .read(|a| {
-                (
-                    a.llm_client().cloned(),
-                    a.config().get_cache_user_id().map(|s| s.to_string()),
-                )
-            })
-            .await;
-        let llm = llm.ok_or_else(|| anyhow::anyhow!("no LLM client available on primary agent"))?;
-        let cache_user_id = plan_cache_user_id.unwrap_or_default();
-        echo_agent_app_core::tasks::task_runtime::generate_plan(
-            &llm,
-            &run_id,
-            &message,
-            &route_decision.classification,
-            &route_decision.suggested_workers,
-            &cache_user_id,
-        )
-        .await?
-    };
+        .await?;
+        return Ok(serde_json::json!({
+            "success": true,
+            "run_id": run_id,
+            "status": "running",
+            "mode": "main_agent_react"
+        }));
+    }
+
+    // 3. Other complex routes: generate structured plan via LLM.
+    store.transition_run(&run_id, TaskRunStatus::Planning)?;
+    let (llm, plan_cache_user_id) = state
+        .app_state
+        .connection
+        .primary_agent()
+        .read(|a| {
+            (
+                a.llm_client().cloned(),
+                a.config().get_cache_user_id().map(|s| s.to_string()),
+            )
+        })
+        .await;
+    let llm = llm.ok_or_else(|| anyhow::anyhow!("no LLM client available on primary agent"))?;
+    let cache_user_id = plan_cache_user_id.unwrap_or_default();
+    let generated = echo_agent_app_core::tasks::task_runtime::generate_plan(
+        &llm,
+        &run_id,
+        &message,
+        &route_decision.classification,
+        &route_decision.suggested_workers,
+        &cache_user_id,
+    )
+    .await?;
 
     // 4. Persist + advance to AwaitingPlanApproval (attach_plan is atomic).
     store.attach_plan(&generated.plan)?;
@@ -1382,6 +1393,403 @@ fn planned_worker_roles(plan: &TaskPlan) -> Vec<String> {
         }
     }
     workers
+}
+
+/// Launch the main agent's ReAct loop directly (replaces batch processing for
+/// ParallelReadonlyDelegation). The main agent uses task_create + delegate_readonly
+/// to decompose and execute the task, with events streamed to chat://event.
+async fn launch_main_agent_react(
+    app: tauri::AppHandle,
+    state: &TauriState,
+    run_id: &str,
+    message_key: &str,
+    conversation_id: Option<String>,
+    goal: &str,
+    parent_cancel: CancellationToken,
+) -> Result<(), anyhow::Error> {
+    let primary_agent = state.app_state.connection.primary_agent();
+    let child_cancel = parent_cancel.child_token();
+    let run_key = format!("__run__:{run_id}");
+    state
+        .app_state
+        .tasks
+        .run_cancel_tokens
+        .insert(run_key.clone(), child_cancel.clone());
+    let run_cancel_tokens = state.app_state.tasks.run_cancel_tokens.clone();
+    let store = state.app_state.tasks.runtime.clone();
+    let trace_collector = state.app_state.trace.collector.clone();
+    let usage_store = store.clone();
+    let app_handle = app.clone();
+    let run_id_owned = run_id.to_string();
+    let message_key_owned = message_key.to_string();
+    let goal_owned = goal.to_string();
+    let event_message_key = message_key_owned.clone();
+    let event_conversation_id = conversation_id.clone();
+    let trace_session_id = conversation_id
+        .clone()
+        .unwrap_or_else(|| event_message_key.clone());
+
+    tokio::spawn(async move {
+        let start = std::time::Instant::now();
+        let mut terminal_status = "completed".to_string();
+
+        // Set up task_local context so delegate_readonly + task_* tools work
+        let _ = echo_agent_app_core::tasks::task_runtime::task_tools::with_run_context(
+            run_id_owned.clone(),
+            child_cancel.clone(),
+            async {
+                emit_chat_event(
+                    &app_handle,
+                    &ChatEvent::RunStatus {
+                        status: "running".to_string(),
+                    },
+                    &event_message_key,
+                    &event_conversation_id,
+                );
+                emit_worker_trace_event(
+                    &app_handle,
+                    chat_trace_event(
+                        &event_message_key,
+                        WorkerTraceEventKind::RunStarted,
+                        serde_json::json!({
+                            "conversation_id": event_conversation_id,
+                            "mode": "main_agent_react",
+                            "run_id": run_id_owned
+                        }),
+                    ),
+                );
+
+                // Acquire agent and run ReAct
+                let agent_inner = primary_agent.inner().clone();
+                let agent = agent_inner.read().await;
+
+                let stream_result = agent
+                    .execute_stream_with_cancel(&goal_owned, child_cancel.clone())
+                    .await;
+
+                match stream_result {
+                    Ok(mut stream) => {
+                        while let Some(event_result) = stream.next().await {
+                            if child_cancel.is_cancelled() {
+                                terminal_status = "cancelled".to_string();
+                                break;
+                            }
+                            match event_result {
+                                Ok(event) => {
+                                    let chat_event = agent_event_to_chat_event(
+                                        &app_handle,
+                                        &event,
+                                        &event_message_key,
+                                        &event_conversation_id,
+                                        &trace_session_id,
+                                        &trace_collector,
+                                        usage_store.as_ref(),
+                                    );
+                                    if let Some(ce) = chat_event {
+                                        if !emit_chat_event(
+                                            &app_handle,
+                                            &ce,
+                                            &event_message_key,
+                                            &event_conversation_id,
+                                        ) {
+                                            break;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    terminal_status = "failed".to_string();
+                                    let _ = emit_chat_event(
+                                        &app_handle,
+                                        &ChatEvent::Error {
+                                            message: e.to_string(),
+                                        },
+                                        &event_message_key,
+                                        &event_conversation_id,
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        terminal_status = "failed".to_string();
+                        let _ = emit_chat_event(
+                            &app_handle,
+                            &ChatEvent::Error {
+                                message: e.to_string(),
+                            },
+                            &event_message_key,
+                            &event_conversation_id,
+                        );
+                    }
+                }
+            },
+        )
+        .await;
+
+        // Emit terminal status
+        let terminal_trace_kind = match terminal_status.as_str() {
+            "completed" => WorkerTraceEventKind::RunCompleted,
+            "cancelled" => WorkerTraceEventKind::RunCancelled,
+            "failed" => WorkerTraceEventKind::RunFailed,
+            _ => WorkerTraceEventKind::RunStatusChanged,
+        };
+        emit_worker_trace_event(
+            &app_handle,
+            chat_trace_event(
+                &event_message_key,
+                terminal_trace_kind,
+                serde_json::json!({ "status": terminal_status.clone() }),
+            ),
+        );
+        let _ = emit_chat_event(
+            &app_handle,
+            &ChatEvent::RunStatus {
+                status: terminal_status.clone(),
+            },
+            &event_message_key,
+            &event_conversation_id,
+        );
+        let _ = emit_chat_event(
+            &app_handle,
+            &ChatEvent::Done,
+            &event_message_key,
+            &event_conversation_id,
+        );
+
+        // Update run status in store
+        if let Some(ref store) = store {
+            let new_status = match terminal_status.as_str() {
+                "completed" => TaskRunStatus::Completed,
+                "cancelled" => TaskRunStatus::Cancelled,
+                "failed" => TaskRunStatus::Failed,
+                _ => TaskRunStatus::Completed,
+            };
+            let _ = store.transition_run(&run_id_owned, new_status);
+        }
+
+        run_cancel_tokens.remove(&run_key);
+        tracing::info!(
+            elapsed_ms = start.elapsed().as_millis() as u64,
+            run_id = %run_id_owned,
+            status = %terminal_status,
+            "main_agent_react finished"
+        );
+    });
+
+    Ok(())
+}
+
+/// Map an AgentEvent to a ChatEvent, also emitting worker://trace side effects.
+/// Returns None for events that should be silently ignored.
+fn agent_event_to_chat_event(
+    app: &tauri::AppHandle,
+    event: &AgentEvent,
+    message_key: &str,
+    conversation_id: &Option<String>,
+    _trace_session_id: &str,
+    _trace_collector: &std::sync::Arc<echo_agent_app_core::observability::TraceCollector>,
+    _usage_store: Option<&std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
+) -> Option<ChatEvent> {
+    match event {
+        AgentEvent::Token(ref data) => {
+            emit_worker_trace_event(
+                app,
+                chat_trace_event(
+                    message_key,
+                    WorkerTraceEventKind::WorkerTokenDelta,
+                    serde_json::json!({ "content": data }),
+                ),
+            );
+            Some(ChatEvent::Token {
+                data: data.clone(),
+            })
+        }
+        AgentEvent::ThinkStart => {
+            let _ = emit_chat_event(
+                app,
+                &ChatEvent::RunStatus {
+                    status: "thinking".to_string(),
+                },
+                message_key,
+                conversation_id,
+            );
+            emit_worker_trace_event(
+                app,
+                chat_trace_event(
+                    message_key,
+                    WorkerTraceEventKind::WorkerThinkingStart,
+                    serde_json::json!({}),
+                ),
+            );
+            Some(ChatEvent::ThinkingStart)
+        }
+        AgentEvent::ThinkEnd {
+            prompt_tokens,
+            completion_tokens,
+        } => {
+            emit_worker_trace_event(
+                app,
+                chat_trace_event(
+                    message_key,
+                    WorkerTraceEventKind::WorkerThinkingEnd,
+                    serde_json::json!({
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens
+                    }),
+                ),
+            );
+            Some(ChatEvent::ThinkingEnd {
+                prompt_tokens: *prompt_tokens,
+                completion_tokens: *completion_tokens,
+            })
+        }
+        AgentEvent::LlmUsage {
+            model,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            cached_prompt_tokens,
+            cache_creation_prompt_tokens,
+            usage_reported,
+        } => {
+            emit_worker_trace_event(
+                app,
+                chat_trace_event(
+                    message_key,
+                    WorkerTraceEventKind::WorkerLlmUsage,
+                    serde_json::json!({
+                        "model": model.clone(),
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "total_tokens": total_tokens,
+                        "cached_prompt_tokens": cached_prompt_tokens,
+                        "cache_creation_prompt_tokens": cache_creation_prompt_tokens,
+                        "usage_reported": usage_reported
+                    }),
+                ),
+            );
+            Some(ChatEvent::LlmUsage {
+                model: model.clone(),
+                prompt_tokens: *prompt_tokens,
+                completion_tokens: *completion_tokens,
+                total_tokens: *total_tokens,
+                cached_prompt_tokens: *cached_prompt_tokens,
+                cache_creation_prompt_tokens: *cache_creation_prompt_tokens,
+                usage_reported: *usage_reported,
+            })
+        }
+        AgentEvent::ToolCall { name, args } => {
+            let _ = emit_chat_event(
+                app,
+                &ChatEvent::RunStatus {
+                    status: "using_tool".to_string(),
+                },
+                message_key,
+                conversation_id,
+            );
+            emit_worker_trace_event(
+                app,
+                chat_trace_event(
+                    message_key,
+                    WorkerTraceEventKind::WorkerToolStart,
+                    serde_json::json!({ "name": name, "args": args }),
+                ),
+            );
+            Some(ChatEvent::ToolStart {
+                name: name.clone(),
+                args: args.clone(),
+            })
+        }
+        AgentEvent::ToolResult { name, output } => {
+            emit_worker_trace_event(
+                app,
+                chat_trace_event(
+                    message_key,
+                    WorkerTraceEventKind::WorkerToolResult,
+                    serde_json::json!({
+                        "name": name,
+                        "result": output,
+                        "success": true
+                    }),
+                ),
+            );
+            Some(ChatEvent::ToolResult {
+                name: name.clone(),
+                result: output.clone(),
+                success: true,
+            })
+        }
+        AgentEvent::ToolError { name, error } => {
+            emit_worker_trace_event(
+                app,
+                chat_trace_event(
+                    message_key,
+                    WorkerTraceEventKind::WorkerToolResult,
+                    serde_json::json!({
+                        "name": name,
+                        "result": error,
+                        "success": false
+                    }),
+                ),
+            );
+            Some(ChatEvent::ToolResult {
+                name: name.clone(),
+                result: error.clone(),
+                success: false,
+            })
+        }
+        AgentEvent::ToolBatchStart { tool_count } => {
+            Some(ChatEvent::ToolBatchStart {
+                tool_count: *tool_count,
+            })
+        }
+        AgentEvent::ToolBatchEnd => Some(ChatEvent::ToolBatchEnd),
+        AgentEvent::Chart { spec } => Some(ChatEvent::Chart {
+            spec: spec.clone(),
+        }),
+        AgentEvent::FinalAnswer(ref data) => {
+            emit_worker_trace_event(
+                app,
+                chat_trace_event(
+                    message_key,
+                    WorkerTraceEventKind::WorkerCompleted,
+                    serde_json::json!({}),
+                ),
+            );
+            Some(ChatEvent::FinalAnswer {
+                data: data.clone(),
+            })
+        }
+        AgentEvent::Cancelled => {
+            emit_worker_trace_event(
+                app,
+                chat_trace_event(
+                    message_key,
+                    WorkerTraceEventKind::WorkerCancelled,
+                    serde_json::json!({}),
+                ),
+            );
+            Some(ChatEvent::Cancelled)
+        }
+        AgentEvent::Error { source, message } => {
+            emit_worker_trace_event(
+                app,
+                chat_trace_event(
+                    message_key,
+                    WorkerTraceEventKind::WorkerFailed,
+                    serde_json::json!({
+                        "source": source,
+                        "message": message
+                    }),
+                ),
+            );
+            Some(ChatEvent::Error {
+                message: format!("{source}: {message}"),
+            })
+        }
+        _ => None,
+    }
 }
 
 async fn launch_task_run_execution(

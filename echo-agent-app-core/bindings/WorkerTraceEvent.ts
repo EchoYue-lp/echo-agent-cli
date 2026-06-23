@@ -5,4 +5,9 @@ import type { WorkerTraceEventKind } from "./WorkerTraceEventKind";
 /**
  * A realtime event scoped to a top-level run and, optionally, a child worker.
  */
-export type WorkerTraceEvent = { event_id: string, run_id: string, worker_id: string | null, parent_worker_id: string | null, agent_name: string | null, title: string | null, task: string | null, event_type: WorkerTraceEventKind, payload: JsonValue, timestamp: string, };
+export type WorkerTraceEvent = { event_id: string, run_id: string, worker_id: string | null, parent_worker_id: string | null, agent_name: string | null, title: string | null, task: string | null, 
+/**
+ * 关联触发该 worker 的 assistant message id(用于前端按 message 过滤 worker)。
+ * 可空:兼容旧事件或不适用场景。
+ */
+message_id: string | null, event_type: WorkerTraceEventKind, payload: JsonValue, timestamp: string, };
