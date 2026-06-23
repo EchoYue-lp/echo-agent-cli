@@ -8,7 +8,7 @@
 //! The compact panel is mounted inside RightRail; the full detail panel is
 //! mounted in the main chat/work area.
 
-import { useEffect, useMemo, useState, useCallback } from 'react';
+import { useEffect, useMemo } from 'react';
 import {
   CheckCircle2,
   Circle,

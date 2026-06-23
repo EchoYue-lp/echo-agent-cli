@@ -303,7 +303,9 @@ export function SkillsPanel() {
                         </span>
                       )}
                       {sk.missing_dependencies && sk.missing_dependencies.length > 0 && (
-                        <AlertTriangle size={10} className="shrink-0" style={{ color: '#f59e0b' }} title={sk.missing_dependencies.join(', ')} />
+                        <span title={sk.missing_dependencies.join(', ')}>
+                          <AlertTriangle size={10} className="shrink-0" style={{ color: '#f59e0b' }} />
+                        </span>
                       )}
                       <span
                         className="shrink-0 rounded px-1.5 py-0.5 text-[9px]"
@@ -338,24 +340,27 @@ export function SkillsPanel() {
                 </div>
                 {sk.tags && sk.tags.length > 0 && (
                   <div className="mt-1.5 flex flex-wrap gap-1">
-              {sk.tags.map((tag) => (
-                <span
-                  key={tag}
-                  className="rounded px-1.5 py-0.5 text-[9px]"
-                  style={{ background: 'var(--bg-hover)', color: s.textTer }}
-                >
-                  {tag}
-                </span>
-              ))}
-            </div>
-          )}
-          {sk.file && (
-            <p className="mt-1 text-[10px]" style={{ color: s.textTer }}>
-              {sk.file}
-            </p>
-          )}
-        </div>
-      ))}
+                    {sk.tags.map((tag) => (
+                      <span
+                        key={tag}
+                        className="rounded px-1.5 py-0.5 text-[9px]"
+                        style={{ background: 'var(--bg-hover)', color: s.textTer }}
+                      >
+                        {tag}
+                      </span>
+                    ))}
+                  </div>
+                )}
+                {sk.file && (
+                  <p className="mt-1 text-[10px]" style={{ color: s.textTer }}>
+                    {sk.file}
+                  </p>
+                )}
+              </div>
+            ))}
+          </div>
+        );
+      })}
     </div>
   );
 }
