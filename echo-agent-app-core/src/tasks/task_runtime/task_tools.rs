@@ -45,7 +45,9 @@ where
     F: std::future::Future<Output = R>,
 {
     let cell_cancel = cancel.clone();
-    CURRENT_RUN_ID.scope(run_id, CURRENT_CANCEL.scope(cell_cancel, f)).await
+    CURRENT_RUN_ID
+        .scope(run_id, CURRENT_CANCEL.scope(cell_cancel, f))
+        .await
 }
 
 /// Legacy wrapper — keeps old callers compiling. Prefer [`with_run_context`].

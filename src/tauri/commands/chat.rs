@@ -1589,7 +1589,9 @@ fn agent_event_to_chat_event(
     conversation_id: &Option<String>,
     _trace_session_id: &str,
     _trace_collector: &std::sync::Arc<echo_agent_app_core::observability::TraceCollector>,
-    _usage_store: Option<&std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
+    _usage_store: Option<
+        &std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
+    >,
 ) -> Option<ChatEvent> {
     match event {
         AgentEvent::Token(ref data) => {
@@ -1601,9 +1603,7 @@ fn agent_event_to_chat_event(
                     serde_json::json!({ "content": data }),
                 ),
             );
-            Some(ChatEvent::Token {
-                data: data.clone(),
-            })
+            Some(ChatEvent::Token { data: data.clone() })
         }
         AgentEvent::ThinkStart => {
             let _ = emit_chat_event(
@@ -1739,15 +1739,11 @@ fn agent_event_to_chat_event(
                 success: false,
             })
         }
-        AgentEvent::ToolBatchStart { tool_count } => {
-            Some(ChatEvent::ToolBatchStart {
-                tool_count: *tool_count,
-            })
-        }
-        AgentEvent::ToolBatchEnd => Some(ChatEvent::ToolBatchEnd),
-        AgentEvent::Chart { spec } => Some(ChatEvent::Chart {
-            spec: spec.clone(),
+        AgentEvent::ToolBatchStart { tool_count } => Some(ChatEvent::ToolBatchStart {
+            tool_count: *tool_count,
         }),
+        AgentEvent::ToolBatchEnd => Some(ChatEvent::ToolBatchEnd),
+        AgentEvent::Chart { spec } => Some(ChatEvent::Chart { spec: spec.clone() }),
         AgentEvent::FinalAnswer(ref data) => {
             emit_worker_trace_event(
                 app,
@@ -1757,9 +1753,7 @@ fn agent_event_to_chat_event(
                     serde_json::json!({}),
                 ),
             );
-            Some(ChatEvent::FinalAnswer {
-                data: data.clone(),
-            })
+            Some(ChatEvent::FinalAnswer { data: data.clone() })
         }
         AgentEvent::Cancelled => {
             emit_worker_trace_event(

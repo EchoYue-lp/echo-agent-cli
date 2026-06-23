@@ -49,10 +49,7 @@ impl Tool for DelegateReadonlyTool {
         })
     }
 
-    fn execute<'a>(
-        &'a self,
-        params: ToolParameters,
-    ) -> BoxFuture<'a, error::Result<ToolResult>> {
+    fn execute<'a>(&'a self, params: ToolParameters) -> BoxFuture<'a, error::Result<ToolResult>> {
         Box::pin(async move {
             // 从 task_local 拿 run_id(与 task_* 工具一致)
             let run_id = match super::task_tools::require_run_id() {
@@ -92,9 +89,7 @@ impl Tool for DelegateReadonlyTool {
 
             match result {
                 Ok(subagent_result) => Ok(ToolResult::success(subagent_result.output)),
-                Err(e) => Ok(ToolResult::error(&format!(
-                    "delegate_readonly 失败: {e}"
-                ))),
+                Err(e) => Ok(ToolResult::error(format!("delegate_readonly 失败: {e}"))),
             }
         })
     }
