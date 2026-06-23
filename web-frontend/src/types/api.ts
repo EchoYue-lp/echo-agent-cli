@@ -61,7 +61,24 @@ export interface SkillInfo {
   author?: string | null;
   has_sandbox?: boolean;
   depends_on?: string[];
+  // Superpowers deep integration fields
+  category?: string;
+  is_baseline?: boolean;
+  is_builtin?: boolean;
+  upstream_version?: string | null;
+  has_updates?: boolean;
+  missing_dependencies?: string[];
 }
+
+/** Category display names (i18n). */
+export const CATEGORY_LABELS: Record<string, string> = {
+  methodology: '方法论',
+  development: '开发',
+  document: '文档',
+  design: '设计',
+  research: '研究',
+  automation: '自动化',
+};
 
 export interface McpServerInfo {
   name: string;
