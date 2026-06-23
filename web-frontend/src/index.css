@@ -496,6 +496,14 @@ body {
 .story-dot--error { background: #ef4444; }
 
 /* Code blocks */
+.md-inline-code {
+  background: var(--bg-code);
+  color: var(--color-code-text);
+  padding: 0.12em 0.4em;
+  border-radius: 4px;
+  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', Menlo, monospace;
+  font-size: 0.88em;
+}
 .md-pre-wrap {
   position: relative;
   margin: 0.6em 0;

@@ -1,76 +1,126 @@
-//! Safe markdown render container.
+//! Markdown render container backed by `react-markdown` + `remark-gfm`.
 //!
-//! Wraps the sanitized HTML from `renderMarkdown` and wires the code-block copy
-//! button via a single delegated click listener — NOT an inline `onclick`
-//! handler (which would re-open the XSS pivot closed in `utils/markdown.ts`).
+//! Replaces the former hand-rolled parser (`utils/markdown.ts`). react-markdown
+//! is secure by default (does not render raw HTML), supports GFM tables / task
+//! lists / strikethrough / autolinks, and handles nested lists correctly.
 //!
-//! The copy button is identified purely by its `md-pre-copy` class; the
-//! associated `<code>` is found by walking up to the enclosing `.md-pre-wrap`.
+//! The code-block copy button is rendered via a custom `code` component (not a
+//! delegated document-level listener), so it stays scoped to this instance.
 
-import { useEffect, useRef } from 'react';
-import { renderMarkdown } from '../../utils/markdown';
+import { memo, useState, type CSSProperties } from 'react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 
 interface Props {
   /** Raw markdown source (LLM / tool output). */
   content: string;
   /** Extra class on the wrapper div. */
   className?: string;
-  /** Extra inline style on the wrapper div. */
-  style?: React.CSSProperties;
   /** When set, the content area is capped at this height and scrolls vertically. */
   maxHeight?: number | string;
 }
 
-export default function MarkdownContent({ content, className, style, maxHeight }: Props) {
-  const ref = useRef<HTMLDivElement>(null);
+/** Detect a fenced code block language from the className like "language-rust". */
+function langFromClassName(className?: string): string {
+  if (!className) return 'text';
+  const m = /language-(\S+)/.exec(className);
+  return m ? m[1] : 'text';
+}
 
-  const containerStyle: React.CSSProperties = maxHeight
-    ? { ...style, maxHeight, overflowY: 'auto' }
-    : { ...style };
+function CodeBlock({ className, children }: { className?: string; children?: React.ReactNode }) {
+  const [copied, setCopied] = useState(false);
+  const lang = langFromClassName(className);
+  // children is the raw code text for fenced blocks (react-markdown passes a
+  // string). Normalize newlines for display and copying.
+  const text = String(children ?? '').replace(/\n$/, '');
 
-  useEffect(() => {
-    const root = ref.current;
-    if (!root) return;
-
-    // Delegated click handler: one listener for all current and future copy
-    // buttons within this container. Avoids per-button listeners (which would
-    // need re-binding on every streaming token update) and avoids inline
-    // onclick (the XSS vector).
-    const onClick = (e: MouseEvent) => {
-      const target = e.target as HTMLElement | null;
-      const btn = target?.closest<HTMLButtonElement>('.md-pre-copy');
-      if (!btn) return;
-      const wrap = btn.closest<HTMLElement>('.md-pre-wrap');
-      const codeEl = wrap?.querySelector('code');
-      const text = codeEl?.textContent ?? '';
-      // Mark the button so the user sees the copy happened.
-      const prev = btn.textContent;
-      navigator.clipboard.writeText(text).then(
-        () => {
-          btn.textContent = '已复制';
-          window.setTimeout(() => {
-            btn.textContent = prev;
-          }, 1200);
-        },
-        () => {
-          btn.textContent = '复制失败';
-          window.setTimeout(() => {
-            btn.textContent = prev;
-          }, 1200);
-        },
-      );
-    };
-
-    root.addEventListener('click', onClick);
-    return () => root.removeEventListener('click', onClick);
-  }, [content]);
+  const copy = () => {
+    navigator.clipboard.writeText(text).then(
+      () => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1200);
+      },
+      () => {},
+    );
+  };
 
   return (
-    <div
-      ref={ref}
-      className={className}
-      style={containerStyle}
-      dangerouslySetInnerHTML={{ __html: renderMarkdown(content) }}
-    />
+    <div className="md-pre-wrap">
+      <div className="md-pre-header">
+        <span>{lang}</span>
+        <button type="button" className="md-pre-copy" onClick={copy}>
+          {copied ? '已复制' : '复制'}
+        </button>
+      </div>
+      <pre>
+        <code className={className}>{text}</code>
+      </pre>
+    </div>
   );
 }
+
+/**
+ * Inline `code` rendering — no wrapper, just styled inline code.
+ * Kept simple so it flows inline within paragraphs / list items.
+ */
+function InlineCode({ children }: { children?: React.ReactNode }) {
+  return <code className="md-inline-code">{children}</code>;
+}
+
+const MarkdownContent = memo(function MarkdownContent({
+  content,
+  className,
+  maxHeight,
+}: Props) {
+  const wrapperStyle: CSSProperties = {};
+  if (maxHeight) {
+    wrapperStyle.maxHeight = maxHeight;
+    wrapperStyle.overflowY = 'auto';
+  }
+
+  return (
+    <div className={`md-content ${className ?? ''}`.trim()} style={wrapperStyle}>
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          // Distinguish fenced code blocks (block, with header/copy) from
+          // inline code. react-markdown renders both via the `code` component;
+          // `inline` was removed in v9, so we detect block vs inline by whether
+          // the parent is a `pre` — but react-markdown v9 always wraps block
+          // code in <pre><code>. We render the wrapper ourselves and return
+          // null for the wrapping `pre` to avoid double-nesting.
+          pre({ children }) {
+            // children is the <CodeBlock> element we produced via `code`.
+            // Return it directly; we don't want react-markdown's own <pre>.
+            return <>{children}</>;
+          },
+          code(props) {
+            const { className: cn, children: ch } = props;
+            // Block code: react-markdown passes a language-* className from the
+            // fence. Inline code has no language class and is short. Heuristic:
+            // if there's a language- class OR the content contains a newline,
+            // treat as a block.
+            const isBlock = (cn && /language-/.test(cn)) || String(ch).includes('\n');
+            return isBlock ? (
+              <CodeBlock className={cn}>{ch}</CodeBlock>
+            ) : (
+              <InlineCode>{ch}</InlineCode>
+            );
+          },
+          // Target _blank for links, keep them in-place otherwise.
+          a({ href, children }) {
+            return (
+              <a href={href} target="_blank" rel="noopener noreferrer">
+                {children}
+              </a>
+            );
+          },
+        }}
+      >
+        {content}
+      </ReactMarkdown>
+    </div>
+  );
+});
+
+export default MarkdownContent;

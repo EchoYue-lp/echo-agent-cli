@@ -12,11 +12,14 @@ import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
 import { useConversationStore } from './stores/conversationStore';
 import { useUiStore } from './stores/uiStore';
 import { useWorkspaceStore } from './stores/workspaceStore';
+import { useTaskRuntimeStore } from './stores/taskRuntimeStore';
 import { RequireAuth } from './components/Auth/RequireAuth';
 
 function App() {
   const startNew = useConversationStore((s) => s.startNew);
   const initConversations = useConversationStore((s) => s.init);
+  const activeId = useConversationStore((s) => s.activeId);
+  const loadTaskRun = useTaskRuntimeStore((s) => s.loadByConversation);
   const toggleSidebar = useUiStore((s) => s.toggleLeftSidebar);
   const openSettings = useUiStore((s) => s.openSettings);
   const setActiveSettingsTab = useUiStore((s) => s.setActiveSettingsTab);
@@ -32,6 +35,13 @@ function App() {
     initWorkspaces();
     initConversations();
   }, [initWorkspaces, initConversations]);
+
+  // Load the active conversation's TaskRuntime run so the main-window
+  // ParallelExecutionBlock and the RightRail can render worker state.
+  // (Previously this was triggered by the now-removed TaskRuntimePanel.)
+  useEffect(() => {
+    if (activeId) loadTaskRun(activeId);
+  }, [activeId, loadTaskRun]);
 
   const handleNewTask = useCallback(() => {
     setNewTaskOpen(true);
