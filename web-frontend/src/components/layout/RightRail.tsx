@@ -7,7 +7,7 @@ import { useWorkerTraceStore } from '../../stores/workerTraceStore';
 import { deriveChangedFiles } from '../../utils/deriveChangedFiles';
 import { useChatStore } from '../../stores/chatStore';
 import { ChangesDrawer } from '../changes/ChangesDrawer';
-import { CacheUsageCard, cacheUsageForWorkers } from '../task/TaskRuntimePanel';
+import { TaskRuntimePanel, CacheUsageCard, cacheUsageForWorkers } from '../task/TaskRuntimePanel';
 
 const STATUS_LABEL: Record<string, string> = {
   pending: '待处理', planning: '规划中', awaiting_plan_approval: '待确认计划', ready: '就绪',
@@ -62,7 +62,10 @@ export function RightRail() {
   return (
     <aside className="hidden h-full w-[300px] shrink-0 border-l border-[var(--border-primary)] bg-[var(--bg-rail)] px-4 py-5 xl:block">
       <div className="flex h-full flex-col gap-5 overflow-y-auto">
-        {/* ── 任务执行进度 ── */}
+        {/* ── 任务运行(TaskRuntimePanel: todos + worker + cache) ── */}
+        <TaskRuntimePanel />
+
+        {/* ── 任务执行进度(审批等) ── */}
         <section>
           <div className="mb-3 flex items-center justify-between">
             <div className="flex items-center gap-1.5">

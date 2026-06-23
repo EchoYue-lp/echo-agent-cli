@@ -487,7 +487,7 @@ export function TaskRuntimePanel() {
                   </div>
                   {/* Edit/delete buttons — visible on hover, only for editable tasks */}
                   {isEditable && (
-                    <div className="hidden group-hover/task:flex gap-0.5">
+                    <div className="flex gap-0.5">
                       <button
                         className="rounded p-0.5 hover:bg-[var(--bg-active)]"
                         title="编辑"

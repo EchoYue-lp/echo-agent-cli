@@ -4,6 +4,7 @@ import { LeftSidebar } from './components/layout/LeftSidebar';
 import { RightRail } from './components/layout/RightRail';
 import { ChatPanel } from './components/chat/ChatPanel';
 import { SettingsDialog } from './components/layout/SettingsDialog';
+import { InterruptPromptDialog } from './components/task/TaskRuntimePanel';
 import { ToastContainer } from './components/common/Toast';
 import { ErrorBoundary } from './components/common/ErrorBoundary';
 import CommandPalette, { type CommandItem } from './components/common/CommandPalette';
@@ -187,6 +188,7 @@ function App() {
           commands={commands}
         />
         <ToastContainer />
+        <InterruptPromptDialog />
       </RequireAuth>
     </ErrorBoundary>
   );
