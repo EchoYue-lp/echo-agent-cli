@@ -883,6 +883,33 @@ async fn execute_task(
 ) -> Result<(String, Option<String>), (String, String)> {
     let task_id = task.id.clone();
     let is_write = !task.kind.is_read_only();
+
+    // Create a child cancellation token for THIS task and register it with the
+    // store. remove_task / update_task can cancel it to stop this worker
+    // promptly without cancelling sibling tasks. child_token() means run-level
+    // cancel still propagates here (child fires when parent fires).
+    let task_cancel = cancel.child_token();
+    store.register_task_cancel_token(&run_id, &task_id, task_cancel.clone());
+    // RAII guard: always unregister on exit (success/fail/cancel), so the
+    // token map doesn't leak finished tasks. Owns its key strings to avoid
+    // borrowing task_id/run_id (which may be moved later in this function).
+    struct TokenGuard {
+        store: std::sync::Arc<TaskRuntimeStore>,
+        run_id: String,
+        task_id: String,
+    }
+    impl Drop for TokenGuard {
+        fn drop(&mut self) {
+            self.store
+                .unregister_task_cancel_token(&self.run_id, &self.task_id);
+        }
+    }
+    let _token_guard = TokenGuard {
+        store: store.clone(),
+        run_id: run_id.clone(),
+        task_id: task_id.clone(),
+    };
+
     let worker_trace_id = if task.kind.is_read_only() {
         format!("{run_id}:{}", task.agent_role)
     } else {
@@ -925,26 +952,26 @@ async fn execute_task(
     let (_worker_permit, _write_permit, _shell_permit) = if is_shell {
         let wp = tokio::select! {
             biased;
-            _ = cancel.cancelled() => return Err((task_id.clone(), "cancelled while waiting for write permit".to_string())),
+            _ = task_cancel.cancelled() => return Err((task_id.clone(), "cancelled while waiting for write permit".to_string())),
             p = write_sem.acquire() => p.map_err(|e| (task_id.clone(), e.to_string()))?,
         };
         let sp = tokio::select! {
             biased;
-            _ = cancel.cancelled() => return Err((task_id.clone(), "cancelled while waiting for shell permit".to_string())),
+            _ = task_cancel.cancelled() => return Err((task_id.clone(), "cancelled while waiting for shell permit".to_string())),
             p = shell_sem.acquire() => p.map_err(|e| (task_id.clone(), e.to_string()))?,
         };
         (None, Some(wp), Some(sp))
     } else if is_write {
         let wp = tokio::select! {
             biased;
-            _ = cancel.cancelled() => return Err((task_id.clone(), "cancelled while waiting for write permit".to_string())),
+            _ = task_cancel.cancelled() => return Err((task_id.clone(), "cancelled while waiting for write permit".to_string())),
             p = write_sem.acquire() => p.map_err(|e| (task_id.clone(), e.to_string()))?,
         };
         (None, Some(wp), None)
     } else {
         let wp = tokio::select! {
             biased;
-            _ = cancel.cancelled() => return Err((task_id.clone(), "cancelled while waiting for worker permit".to_string())),
+            _ = task_cancel.cancelled() => return Err((task_id.clone(), "cancelled while waiting for worker permit".to_string())),
             p = worker_sem.acquire() => p.map_err(|e| (task_id.clone(), e.to_string()))?,
         };
         (Some(wp), None, None)
@@ -1048,7 +1075,14 @@ async fn execute_task(
     //   them further, which is correct — mutating work must not race.
     let is_read_only_task = task.kind.is_read_only();
     let (result, readonly_usage) = if is_read_only_task {
-        match run_readonly_worker(&primary_agent, &run_id, &task.agent_role, &prompt, cancel).await
+        match run_readonly_worker(
+            &primary_agent,
+            &run_id,
+            &task.agent_role,
+            &prompt,
+            task_cancel.clone(),
+        )
+        .await
         {
             Ok(sub_result) => (Ok(sub_result.output), sub_result.usage),
             Err(e) => (Err(e), None),
@@ -1061,7 +1095,7 @@ async fn execute_task(
                 &run_id,
                 &task,
                 &prompt,
-                cancel,
+                task_cancel.clone(),
                 trace_sink.clone(),
             )
             .await,

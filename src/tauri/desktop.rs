@@ -142,6 +142,10 @@ async fn run_desktop() -> anyhow::Result<()> {
         state_store: None,
         memory_context_suffix: None,
         working_dir: None,
+        // The TaskRuntimeStore doesn't exist yet at primary-agent build time
+        // (AppState creates it later). Tools are registered post-hoc via
+        // `register_task_tools_on_agent` once AppState is built.
+        task_runtime_store: None,
     };
 
     let runtime =
@@ -173,7 +177,9 @@ async fn run_desktop() -> anyhow::Result<()> {
 
     // ── Initialize agent pool for multi-conversation parallel execution ──
     // init_pool() also starts the cleanup monitor automatically.
-    let pool = runtime
+    // `mut`: we may inject the TaskRuntimeStore via Arc::get_mut before handing
+    // the pool to AppState.
+    let mut pool = runtime
         .init_pool(echo_agent_app_core::agent_pool::PoolConfig::default())
         .await;
     tracing::info!(
@@ -188,6 +194,22 @@ async fn run_desktop() -> anyhow::Result<()> {
         app_config.clone(),
     )
     .with_review_integration(runtime.review_integration.clone());
+
+    // Inject the TaskRuntimeStore into the pool so pooled agents get the
+    // task-management tools, and register those tools on the primary agent
+    // too (the primary agent also runs tasks). Done here because the store is
+    // created inside AppState::from_shared above, after the pool was built.
+    if let Some(task_store) = state_inner.tasks.runtime.clone() {
+        // pool is still a unique Arc here (not yet handed to set_pool), so
+        // get_mut succeeds and lets us inject the store into SharedResources.
+        if let Some(pool_mut) = std::sync::Arc::get_mut(&mut pool) {
+            pool_mut.set_task_runtime_store(task_store.clone());
+        } else {
+            tracing::warn!("Could not inject TaskRuntimeStore into pool (Arc not unique)");
+        }
+        register_task_tools_on_agent(&agent_handle, task_store).await;
+    }
+
     state_inner.set_pool(pool);
 
     // Wire task hook bridge so YAML hooks see task lifecycle events
@@ -212,4 +234,45 @@ async fn run_desktop() -> anyhow::Result<()> {
     cancel_token.cancel();
 
     Ok(())
+}
+
+/// Register the 5 task-management tools (task_create/update/complete/skip/list)
+/// on an existing agent via its handle's write lock. Used for the primary agent,
+/// which is created before the TaskRuntimeStore exists and thus can't receive
+/// the tools at construction time (unlike pooled agents, which get them via
+/// SharedResources.task_runtime_store).
+async fn register_task_tools_on_agent(
+    agent_handle: &echo_agent_app_core::agent_handle::AgentHandle,
+    store: std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
+) {
+    use echo_agent_app_core::tasks::task_runtime::task_tools::{
+        TaskCompleteTool, TaskCreateTool, TaskListTool, TaskSkipTool, TaskUpdateTool,
+    };
+    let added = agent_handle
+        .write(|agent| {
+            agent.add_tool(Box::new(TaskCreateTool {
+                store: store.clone(),
+            }));
+            agent.add_tool(Box::new(TaskUpdateTool {
+                store: store.clone(),
+            }));
+            agent.add_tool(Box::new(TaskCompleteTool {
+                store: store.clone(),
+            }));
+            agent.add_tool(Box::new(TaskSkipTool {
+                store: store.clone(),
+            }));
+            agent.add_tool(Box::new(TaskListTool {
+                store: store.clone(),
+            }));
+            true
+        })
+        .await;
+    if added {
+        tracing::info!("Registered 5 task-management tools on primary agent");
+    } else {
+        tracing::warn!(
+            "Failed to register task-management tools on primary agent (write lock poisoned)"
+        );
+    }
 }

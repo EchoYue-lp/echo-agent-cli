@@ -64,6 +64,10 @@ pub struct AgentCreateParams {
     /// tool call's `ToolContext` — so shell/file/git tools run inside the
     /// isolated checkout. None = use process cwd (backward compatible).
     pub working_dir: Option<std::path::PathBuf>,
+    /// TaskRuntime store handle. When supplied, `create_agent` registers the
+    /// task-management tools (task_create/update/complete/skip/list) so the
+    /// main agent can autonomously manage its plan during execution.
+    pub task_runtime_store: Option<Arc<crate::tasks::task_runtime::TaskRuntimeStore>>,
 }
 
 /// Generate a fresh conversation id for the primary (non-pooled) agent.
@@ -285,6 +289,35 @@ pub fn create_agent(
 
     // Register default hooks
     register_default_hooks(&mut agent);
+
+    // Register task-management tools when a TaskRuntimeStore is available.
+    // These let the main agent autonomously create / update / complete / skip /
+    // list tasks during execution (mirrors Claude Code's TaskCreate/Update).
+    // The store handle is threaded from AppState → SharedResources → params.
+    if let Some(store) = &params.task_runtime_store {
+        use crate::tasks::task_runtime::task_tools::{
+            TaskCompleteTool, TaskCreateTool, TaskListTool, TaskSkipTool, TaskUpdateTool,
+        };
+        let store = Arc::clone(store);
+        agent.add_tool(Box::new(TaskCreateTool {
+            store: Arc::clone(&store),
+        }));
+        agent.add_tool(Box::new(TaskUpdateTool {
+            store: Arc::clone(&store),
+        }));
+        agent.add_tool(Box::new(TaskCompleteTool {
+            store: Arc::clone(&store),
+        }));
+        agent.add_tool(Box::new(TaskSkipTool {
+            store: Arc::clone(&store),
+        }));
+        agent.add_tool(Box::new(TaskListTool {
+            store: Arc::clone(&store),
+        }));
+        tracing::info!(
+            "Registered 5 task-management tools (task_create/update/complete/skip/list)"
+        );
+    }
 
     Ok(agent)
 }

@@ -104,6 +104,10 @@ pub struct SharedResources {
     pub tool_execution_pipeline:
         Option<Arc<echo_agent::agent::react::run::pipeline::ToolExecutionPipeline>>,
     pub review_integration: Option<Arc<crate::evolution::ReviewIntegration>>,
+    /// TaskRuntime store handle. When present, pool agents get the task
+    /// management tools (task_create/update/complete/skip/list) registered so
+    /// the main agent can autonomously manage its plan during execution.
+    pub task_runtime_store: Option<Arc<crate::tasks::task_runtime::TaskRuntimeStore>>,
 }
 
 impl SharedResources {
@@ -142,6 +146,11 @@ impl SharedResources {
                     state_store,
                     tool_execution_pipeline,
                     review_integration,
+                    // TaskRuntimeStore is not part of the agent handle — it lives
+                    // in AppState. extract_from leaves it None; the caller
+                    // (AppState / pool init) injects it separately so pooled
+                    // agents can register task-management tools.
+                    task_runtime_store: None,
                 }
             })
             .await
@@ -188,6 +197,17 @@ pub struct AgentPool {
 }
 
 impl AgentPool {
+    /// Inject the TaskRuntimeStore so subsequently-created pool agents get
+    /// the task-management tools (task_create/update/complete/skip/list)
+    /// registered. Must be called before any pool agent is created (i.e. right
+    /// after AppState builds the store). Existing pool agents are unaffected.
+    pub fn set_task_runtime_store(
+        &mut self,
+        store: Arc<crate::tasks::task_runtime::TaskRuntimeStore>,
+    ) {
+        self.shared.task_runtime_store = Some(store);
+    }
+
     /// Create a pool from an already-bootstrapped `AgentRuntime`.
     ///
     /// Extracts shared resources from the runtime's primary agent and
@@ -622,6 +642,9 @@ impl AgentPool {
             // Stage 2 will bind a per-conversation worktree here; for now the
             // pooled agent runs in the process cwd.
             working_dir: None,
+            // Thread the TaskRuntimeStore so pooled agents get task-management
+            // tools registered (matches the primary agent wiring).
+            task_runtime_store: self.shared.task_runtime_store.clone(),
         };
         let mut agent =
             infra::create_agent(&params, &app_config).map_err(|e| anyhow::anyhow!("{e}"))?;

@@ -55,6 +55,13 @@ pub enum StoreError {
 /// hot-path tool calls.
 pub struct TaskRuntimeStore {
     conn: Mutex<Connection>,
+    /// Per-task cancellation tokens (in-memory runtime state, not persisted).
+    /// Key = `"{run_id}::{task_id}"`. `execute_task` registers a token when a
+    /// task starts and removes it on completion; `remove_task` cancels the
+    /// token of a running task so its worker stops promptly (rather than the
+    /// status flipping to Skipped while execution continues).
+    task_cancel_tokens:
+        std::sync::Mutex<std::collections::HashMap<String, echo_agent::agent::CancellationToken>>,
 }
 
 impl TaskRuntimeStore {
@@ -75,6 +82,7 @@ impl TaskRuntimeStore {
             .with_context(|| format!("opening task_runtime db at {}", path.display()))?;
         let store = Self {
             conn: Mutex::new(conn),
+            task_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         store.init_schema()?;
         Ok(store)
@@ -85,6 +93,7 @@ impl TaskRuntimeStore {
         let conn = Connection::open_in_memory()?;
         let store = Self {
             conn: Mutex::new(conn),
+            task_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
         };
         store.init_schema()?;
         Ok(store)
@@ -434,6 +443,47 @@ impl TaskRuntimeStore {
         self.transition_run(run_id, TaskRunStatus::Running)
     }
 
+    // ── Task-level cancellation (gap-2 fix) ───────────────────────────────
+    // These are in-memory runtime tokens, NOT persisted. They let remove_task
+    // stop a running task's worker promptly instead of leaving it executing
+    // after the status has flipped to Skipped.
+
+    /// Register a cancellation token for a task that is about to start running.
+    /// Called by the executor before dispatching the worker. The token is a
+    /// child of the run-level cancel, so run cancel still propagates.
+    pub fn register_task_cancel_token(
+        &self,
+        run_id: &str,
+        task_id: &str,
+        token: echo_agent::agent::CancellationToken,
+    ) {
+        let key = format!("{run_id}::{task_id}");
+        if let Ok(mut map) = self.task_cancel_tokens.lock() {
+            map.insert(key, token);
+        }
+    }
+
+    /// Remove a task's cancellation token after it completes (success/fail).
+    /// Called by the executor when execute_task returns.
+    pub fn unregister_task_cancel_token(&self, run_id: &str, task_id: &str) {
+        let key = format!("{run_id}::{task_id}");
+        if let Ok(mut map) = self.task_cancel_tokens.lock() {
+            map.remove(&key);
+        }
+    }
+
+    /// Cancel a specific task's worker (if running). Called by remove_task /
+    /// update_task when a running task is being skipped or fundamentally
+    /// changed. No-op if the task isn't currently running (no token registered).
+    pub fn cancel_task(&self, run_id: &str, task_id: &str) {
+        let key = format!("{run_id}::{task_id}");
+        if let Ok(mut map) = self.task_cancel_tokens.lock() {
+            if let Some(token) = map.remove(&key) {
+                token.cancel();
+            }
+        }
+    }
+
     /// Insert a new task into the plan, optionally after a given task id.
     /// Works in any run state (not limited to `AwaitingPlanApproval`).
     /// Validates dependency integrity and acyclicity. Emits `PlanEdited`.
@@ -521,6 +571,22 @@ impl TaskRuntimeStore {
     /// Soft-delete a task: set its status to `Skipped`. The task remains in
     /// the plan (for audit) but is no longer scheduled. Emits `PlanEdited`.
     pub fn remove_task(&self, run_id: &str, task_id: &str) -> Result<(), StoreError> {
+        // If the task is currently running, cancel its worker FIRST (before
+        // flipping status), so execution stops promptly instead of continuing
+        // after the status says Skipped.
+        let currently_running = self
+            .list_todos(run_id)
+            .ok()
+            .and_then(|todos| {
+                todos
+                    .into_iter()
+                    .find(|t| t.task_id == task_id)
+                    .map(|t| t.status == TodoStatus::Running)
+            })
+            .unwrap_or(false);
+        if currently_running {
+            self.cancel_task(run_id, task_id);
+        }
         self.set_task_status(
             run_id,
             task_id,
