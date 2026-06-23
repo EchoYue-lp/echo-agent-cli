@@ -364,9 +364,15 @@ pub async fn generate_task_plan(
         .app_state
         .connection
         .primary_agent()
-        .read(|a| (a.llm_client().cloned(), a.config().get_cache_user_id().map(|s| s.to_string())))
+        .read(|a| {
+            (
+                a.llm_client().cloned(),
+                a.config().get_cache_user_id().map(|s| s.to_string()),
+            )
+        })
         .await;
-    let llm = llm.ok_or_else(|| IpcError::Internal("no LLM client available on primary agent".into()))?;
+    let llm =
+        llm.ok_or_else(|| IpcError::Internal("no LLM client available on primary agent".into()))?;
     let plan_cache_user_id = plan_cache_user_id.unwrap_or_default();
 
     // Classify to steer the prompt with an inferred profile + reason. The
@@ -551,7 +557,12 @@ pub async fn execute_task_run(
     // The reviewer LLM is the primary agent's client — review gates use it to
     // evaluate implementation/debugging task output against the domain checklist.
     let (reviewer_llm, exec_cache_user_id) = primary_agent
-        .read(|a| (a.llm_client().cloned(), a.config().get_cache_user_id().map(|s| s.to_string())))
+        .read(|a| {
+            (
+                a.llm_client().cloned(),
+                a.config().get_cache_user_id().map(|s| s.to_string()),
+            )
+        })
         .await;
     let exec_cache_user_id = exec_cache_user_id.unwrap_or_default();
     // The memory layer manager sinks run completion/cancellation events into

@@ -1208,8 +1208,7 @@ pub fn build_llm_config(
         }
     };
     // Apply base_url override for non-default providers
-    if let Some(url) = base_url_override
-    {
+    if let Some(url) = base_url_override {
         config.base_url = url.to_string();
     }
     // Ensure provider_name is set so the thinking-protocol resolver picks the

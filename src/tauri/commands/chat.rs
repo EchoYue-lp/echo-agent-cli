@@ -461,7 +461,12 @@ pub async fn send_chat_message(
 
     if execution_policy.should_route_runtime() {
         let (route_llm, route_cache_user_id) = agent_handle
-            .read(|a| (a.llm_client().cloned(), a.config().get_cache_user_id().map(|s| s.to_string())))
+            .read(|a| {
+                (
+                    a.llm_client().cloned(),
+                    a.config().get_cache_user_id().map(|s| s.to_string()),
+                )
+            })
             .await;
         let route_feedback = state.app_state.tasks.route_feedback.read().await.clone();
         let route_decision = echo_agent_app_core::tasks::task_runtime::route_message_with_feedback(
@@ -1207,7 +1212,12 @@ async fn route_complex_task(
             .app_state
             .connection
             .primary_agent()
-            .read(|a| (a.llm_client().cloned(), a.config().get_cache_user_id().map(|s| s.to_string())))
+            .read(|a| {
+                (
+                    a.llm_client().cloned(),
+                    a.config().get_cache_user_id().map(|s| s.to_string()),
+                )
+            })
             .await;
         let llm = llm.ok_or_else(|| anyhow::anyhow!("no LLM client available on primary agent"))?;
         let cache_user_id = plan_cache_user_id.unwrap_or_default();
@@ -1358,7 +1368,12 @@ async fn launch_task_run_execution(
     let primary_agent_for_task = primary_agent.clone();
     let run_store_for_task = primary_agent.read(|a| a.run_store().cloned()).await;
     let (reviewer_llm, exec_cache_user_id) = primary_agent
-        .read(|a| (a.llm_client().cloned(), a.config().get_cache_user_id().map(|s| s.to_string())))
+        .read(|a| {
+            (
+                a.llm_client().cloned(),
+                a.config().get_cache_user_id().map(|s| s.to_string()),
+            )
+        })
         .await;
     let exec_cache_user_id = exec_cache_user_id.unwrap_or_default();
     let layer_manager = state

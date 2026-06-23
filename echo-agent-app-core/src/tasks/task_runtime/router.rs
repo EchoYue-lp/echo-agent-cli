@@ -817,7 +817,8 @@ mod tests {
 
     #[tokio::test]
     async fn auto_mode_routes_current_directory_project_analysis_to_parallel_runtime() {
-        let decision = route_message(None, "帮我分析当前目录的项目", InteractionMode::Auto, None).await;
+        let decision =
+            route_message(None, "帮我分析当前目录的项目", InteractionMode::Auto, None).await;
         assert_eq!(decision.route, TaskRouteKind::ParallelReadonlyDelegation);
         assert!(decision.route.should_auto_execute());
         assert!(
@@ -892,9 +893,14 @@ mod tests {
             "prior correction",
             Vec::new(),
         )];
-        let decision =
-            route_message_with_feedback(None, "帮我处理这个任务", InteractionMode::Task, &feedback, None)
-                .await;
+        let decision = route_message_with_feedback(
+            None,
+            "帮我处理这个任务",
+            InteractionMode::Task,
+            &feedback,
+            None,
+        )
+        .await;
         assert_eq!(decision.route, TaskRouteKind::ComplexRuntime);
         assert!(decision.reason.contains("forced task mode"));
     }

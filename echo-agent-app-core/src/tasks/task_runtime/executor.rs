@@ -745,7 +745,9 @@ async fn run_review_gate(
     const MAX_REVIEW_RETRIES: u32 = 2;
     let mut retries: u32 = 0;
     let review = loop {
-        match super::review::review_task(&llm, &store, run_id, task, worker_output, cache_user_id).await {
+        match super::review::review_task(&llm, &store, run_id, task, worker_output, cache_user_id)
+            .await
+        {
             Ok(r) => break r,
             Err(e) => {
                 retries += 1;
@@ -970,7 +972,8 @@ async fn execute_task(
     //   them further, which is correct — mutating work must not race.
     let is_read_only_task = task.kind.is_read_only();
     let (result, readonly_usage) = if is_read_only_task {
-        match run_readonly_worker(&primary_agent, &run_id, &task.agent_role, &prompt, cancel).await {
+        match run_readonly_worker(&primary_agent, &run_id, &task.agent_role, &prompt, cancel).await
+        {
             Ok(sub_result) => (Ok(sub_result.output), sub_result.usage),
             Err(e) => (Err(e), None),
         }
@@ -993,9 +996,7 @@ async fn execute_task(
     if is_read_only_task && result.is_ok() {
         let usage_payload = match &readonly_usage {
             Some(stats) => stats.to_payload(&run_id),
-            None => unavailable_llm_usage_payload(
-                "provider_returned_no_usage_for_readonly_worker",
-            ),
+            None => unavailable_llm_usage_payload("provider_returned_no_usage_for_readonly_worker"),
         };
         if let Err(error) = store.record_worker_llm_usage(
             &run_id,

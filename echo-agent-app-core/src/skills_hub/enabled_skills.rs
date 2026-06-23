@@ -95,8 +95,7 @@ impl EnabledSkillsConfig {
             return Ok(config);
         }
         let text = std::fs::read_to_string(path)?;
-        serde_json::from_str(&text)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        serde_json::from_str(&text).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
     }
 
     /// Write to disk.
@@ -182,6 +181,12 @@ mod tests {
     fn set_enabled_toggles_correctly() {
         let mut config = EnabledSkillsConfig::default();
         config.set_enabled("test-driven-development", true);
-        assert!(config.skills.get("test-driven-development").unwrap().enabled);
+        assert!(
+            config
+                .skills
+                .get("test-driven-development")
+                .unwrap()
+                .enabled
+        );
     }
 }

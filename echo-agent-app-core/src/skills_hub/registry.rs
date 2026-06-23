@@ -206,7 +206,9 @@ impl SkillsHub {
                 }
             } else {
                 // Category subdirectory: scan each child for SKILL.md
-                let Ok(sub_dirs) = std::fs::read_dir(&path) else { continue };
+                let Ok(sub_dirs) = std::fs::read_dir(&path) else {
+                    continue;
+                };
                 for sub in sub_dirs.flatten() {
                     let sub_path = sub.path();
                     if !sub_path.is_dir() {
@@ -266,7 +268,11 @@ impl SkillsHub {
             .get("requires-binaries")
             .map(|raw| {
                 raw.split(',')
-                    .map(|s| s.trim().trim_matches(|c: char| c == '"' || c == '\'').to_string())
+                    .map(|s| {
+                        s.trim()
+                            .trim_matches(|c: char| c == '"' || c == '\'')
+                            .to_string()
+                    })
                     .filter(|n| !n.is_empty() && !binary_available(n))
                     .collect()
             })

@@ -164,10 +164,9 @@ impl AgentRuntime {
         // verification / planning) directly into the system prompt so they
         // are always active without requiring explicit activate_skill calls.
         {
-            let echo_home = std::path::PathBuf::from(
-                std::env::var("HOME").unwrap_or_else(|_| ".".to_string()),
-            )
-            .join(".echo-agent");
+            let echo_home =
+                std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string()))
+                    .join(".echo-agent");
             let enabled_config_path = echo_home.join("enabled-skills.json");
             let enabled_config = crate::skills_hub::EnabledSkillsConfig::load(&enabled_config_path)
                 .unwrap_or_default();
@@ -193,7 +192,8 @@ impl AgentRuntime {
                             // 避免访问 pub(crate) 私有字段 system_prompt。
                             let mut sp = a.current_system_prompt();
                             // baseline_names 已 move 进闭包,此处借用安全。
-                            let refs: Vec<&str> = baseline_names.iter().map(|s| s.as_str()).collect();
+                            let refs: Vec<&str> =
+                                baseline_names.iter().map(|s| s.as_str()).collect();
                             a.skill_registry()
                                 .inject_methodology_baseline(&mut sp, &refs);
                             a.set_system_prompt(sp).await;
@@ -302,9 +302,7 @@ impl AgentRuntime {
         // ── 12. TriggerSupervisor (Keyword + LLM + Hook fusion) + IntentRouter ──
         // Build LLM classifier as fallback if LLM client is available,
         // otherwise TriggerSupervisor operates keyword-only.
-        let hook_cache = agent_handle
-            .read(|a| a.hook_activation_cache())
-            .await;
+        let hook_cache = agent_handle.read(|a| a.hook_activation_cache()).await;
         let supervisor = {
             let llm_classifier = agent_handle
                 .read(|a| a.llm_client().cloned())
@@ -315,7 +313,11 @@ impl AgentRuntime {
             tracing::info!(
                 has_llm = has_llm,
                 "TriggerSupervisor: Keyword → {} → Hook slot (fusion)",
-                if has_llm { "LlmIntent" } else { "Hook-only fallback" }
+                if has_llm {
+                    "LlmIntent"
+                } else {
+                    "Hook-only fallback"
+                }
             );
             sv
         };
