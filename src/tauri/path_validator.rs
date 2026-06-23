@@ -2,14 +2,15 @@
 //!
 //! Consolidates the three legacy validators (`validate_ipc_path`,
 //! `validate_path_within_base`, `validate_workspace_root`) onto the canonical
-//! [`echo_tools::security::PathValidator`] (6-7). The secret-denylist logic
-//! (`.ssh`, `.aws`, cookie/history files) — which `PathValidator` does not
-//! provide — stays here as a thin wrapper layer, since it is specific to the
-//! IPC threat model (XSS exfiltrating credentials via `native_read_file`).
+//! [`echo_agent::tools::security::PathValidator`] (re-exported from
+//! `echo_tools::security`). The secret-denylist logic (`.ssh`, `.aws`,
+//! cookie/history files) — which `PathValidator` does not provide — stays
+//! here as a thin wrapper layer, since it is specific to the IPC threat
+//! model (XSS exfiltrating credentials via `native_read_file`).
 
 use std::path::{Component, Path, PathBuf};
 
-use echo_tools::security::PathValidator;
+use echo_agent::tools::security::PathValidator;
 
 // ── Secret denylist ────────────────────────────────────────────────
 

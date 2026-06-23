@@ -48,9 +48,6 @@ required-features = ["gui"]
 [dependencies]
 echo-agent-app-core = { path = "./echo-agent-app-core" }
 echo-agent = { version = "0.2.0", package = "echo_agent", path = "../echo-agent", features = ["sqlite", "mcp", "lsp", "human-loop", "subagent", "tasks", "eval", "improve"] }
-# Direct dep on echo-tools for PathValidator (path-confinement / secret-denylist).
-# `security` is a non-feature-gated pub mod, so no features needed.
-echo-tools = { version = "0.2.0", package = "echo_tools", path = "../echo-agent/echo-tools" }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

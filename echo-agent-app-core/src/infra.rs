@@ -708,7 +708,14 @@ pub fn load_shell_env() {
         let stdout = String::from_utf8_lossy(&output.stdout);
 
         // Whitelist of env vars to import — known API keys and config paths
-        // that the agent framework needs.
+        // that EKO needs. These are provider-specific standard names
+        // (DEEPSEEK_API_KEY etc.) plus EKO product aliases and MCP path.
+        //
+        // Note: the framework (echo-agent) does NOT read LLM credential env
+        // vars itself — EKO's `resolve_runtime_model` reads them and injects
+        // the values into ModelConfig fields before passing to the framework.
+        // EKO_AUTH_TOKEN / EKO_BASE_URL / EKO_MODEL are EKO product aliases
+        // kept for backwards compatibility with existing user setups.
         const API_KEY_VARS: &[&str] = &[
             "DEEPSEEK_API_KEY",
             "OPENAI_API_KEY",
@@ -723,6 +730,7 @@ pub fn load_shell_env() {
             "GLM_API_KEY",
             "GEMINI_API_KEY",
             "GOOGLE_API_KEY",
+            // EKO product aliases (backwards compat).
             "EKO_AUTH_TOKEN",
             "EKO_BASE_URL",
             "EKO_MODEL",

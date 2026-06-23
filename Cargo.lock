@@ -1748,7 +1748,6 @@ dependencies = [
  "dotenvy",
  "echo-agent-app-core",
  "echo_agent",
- "echo_tools",
  "futures",
  "hex",
  "indicatif",
