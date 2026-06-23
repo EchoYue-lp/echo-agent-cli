@@ -18,3 +18,6 @@ echo-agent.yaml
 # Worktree directories
 .worktrees/
 .eko/
+
+# Superpowers plan/spec 工作流文档(本地保留用于后续执行,不进仓库分发)
+docs/superpowers/
