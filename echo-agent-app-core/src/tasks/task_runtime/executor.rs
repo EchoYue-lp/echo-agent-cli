@@ -84,6 +84,14 @@ pub enum RunOutcome {
     Suspended {
         reason: String,
     },
+    /// A task failed and the run is paused for user/agent decision. The
+    /// failed task is marked `Failed`; downstream dependents are `Blocked`.
+    /// The run is transitioned to `Paused`. The user can retry, skip, or
+    /// edit the plan before resuming.
+    Paused {
+        failed_task_id: String,
+        error: String,
+    },
 }
 
 /// Error returned by the executor.
@@ -319,6 +327,36 @@ pub async fn execute_run(
                 "suspended",
             );
         }
+        Ok(RunOutcome::Paused {
+            failed_task_id,
+            error,
+        }) => {
+            emit_worker_trace(
+                trace_sink.as_ref(),
+                WorkerTraceEvent::new(
+                    run_id.to_string(),
+                    WorkerTraceEventKind::RunStatusChanged,
+                    serde_json::json!({
+                        "status": "paused",
+                        "failed_task_id": failed_task_id,
+                        "error": error,
+                    }),
+                ),
+            );
+            // run_dag already transitioned Running → Paused. Record the reason.
+            let _ = store.note(
+                run_id,
+                Some(failed_task_id),
+                &format!("run paused: {error}"),
+            );
+            save_trace(
+                run_store.as_ref(),
+                run_id,
+                &run.goal,
+                &run.conversation_id,
+                "paused",
+            );
+        }
         Err(e) => {
             emit_worker_trace(
                 trace_sink.as_ref(),
@@ -473,26 +511,45 @@ async fn run_dag<W: TaskWorker + 'static>(
             return Ok(RunOutcome::Cancelled);
         }
         if let Some(id) = &failed_id {
-            // A task failed: mark unfinished downstream tasks Skipped, but
-            // NEVER overwrite a task that's already Failed (failed_set) —
-            // those keep their real failure reason.
+            // A task failed: propagate Blocked to downstream dependents
+            // (but NEVER overwrite a task that's already Failed).
             for t in &tasks {
-                if !completed.contains(&t.id) && !failed_set.contains(&t.id) {
+                if !completed.contains(&t.id)
+                    && !failed_set.contains(&t.id)
+                    && t.depends_on.iter().any(|d| failed_set.contains(d))
+                {
                     let _ = store.set_task_status(
                         run_id,
                         &t.id,
-                        TodoStatus::Skipped,
+                        TodoStatus::Blocked,
                         None,
-                        Some("skipped: upstream task failed"),
+                        Some("blocked: upstream task failed"),
                     );
                 }
             }
+            // Check if ALL non-terminal tasks are Failed or Blocked — if so,
+            // the run is unrecoverable and should fail outright. Otherwise,
+            // pause for user/agent decision.
+            let all_dead = tasks.iter().all(|t| {
+                completed.contains(&t.id)
+                    || failed_set.contains(&t.id)
+                    || t.depends_on.iter().any(|d| failed_set.contains(d))
+            });
             let failed = by_id.get(id).cloned();
-            return Ok(RunOutcome::Failed {
+            let error = failed
+                .map(|t| format!("task '{}' failed", t.title))
+                .unwrap_or_else(|| "task failed".into());
+            if all_dead {
+                return Ok(RunOutcome::Failed {
+                    failed_task_id: id.clone(),
+                    error,
+                });
+            }
+            // Pause the run for decision rather than failing outright.
+            let _ = store.transition_run(run_id, TaskRunStatus::Paused);
+            return Ok(RunOutcome::Paused {
                 failed_task_id: id.clone(),
-                error: failed
-                    .map(|t| format!("task '{}' failed", t.title))
-                    .unwrap_or_else(|| "task failed".into()),
+                error,
             });
         }
         if completed.len() == all_ids.len() {
@@ -1952,8 +2009,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_dag_failure_propagates_and_skips_downstream() {
-        // a fails; b depends on a and must be Skipped, run ends Failed.
+    async fn run_dag_failure_propagates_and_blocks_downstream() {
+        // a fails; b depends on a and must be Blocked, run ends Failed
+        // (because all non-terminal tasks are Failed/Blocked).
         let a = solo_readonly_task("a");
         let mut b = solo_readonly_task("b");
         b.depends_on = vec!["a".into()];
@@ -1982,10 +2040,10 @@ mod tests {
             }
             other => panic!("expected Failed, got {:?}", other),
         }
-        // b must be Skipped (never completed, never dispatched as a real run).
+        // b must be Blocked (downstream of failed a).
         let todos = store.list_todos(&run_id).unwrap();
         let b_todo = todos.iter().find(|t| t.task_id == "b").unwrap();
-        assert_eq!(b_todo.status, TodoStatus::Skipped);
+        assert_eq!(b_todo.status, TodoStatus::Blocked);
     }
 
     #[tokio::test]

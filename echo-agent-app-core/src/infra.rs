@@ -22,6 +22,19 @@ const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
 /// Default max output tokens when not configured (sensible for 128K context models).
 const DEFAULT_MAX_TOKENS: u32 = 8192;
 
+/// Guide appended to the system prompt when task management tools are
+/// available. Instructs the agent to actively manage its task plan.
+const TASK_MANAGEMENT_GUIDE: &str = r#"
+
+## Task Management
+You have tools to manage your task plan: task_create, task_update, task_complete, task_skip, task_list.
+- When you discover additional work is needed, use task_create to add it.
+- When a task is no longer relevant (e.g., you found it's unnecessary), use task_skip.
+- When you complete a task, use task_complete to mark it done.
+- Use task_list to review current plan state.
+Update your plan frequently as your understanding deepens.
+"#;
+
 /// Agent creation parameters (extracted from CLI args or config).
 #[derive(Default)]
 pub struct AgentCreateParams {
@@ -151,7 +164,10 @@ pub fn create_agent(
     if let Some(ref memory_suffix) = params.memory_context_suffix {
         assembler.add_memory_context(memory_suffix);
     }
-    let system_prompt = assembler.assemble();
+    let mut system_prompt = assembler.assemble();
+
+    // Inject task management guide when the agent has task tools available.
+    system_prompt.push_str(TASK_MANAGEMENT_GUIDE);
 
     // Determine config values from AppConfig
     let token_limit = if app_config.agent.token_limit > 0 {

@@ -10,12 +10,13 @@
  * Planning -> AwaitingPlanApproval
  * AwaitingPlanApproval -> Ready | Cancelled
  * Ready -> Running
- * Running -> WaitingApproval | WaitingInput | Suspended | Cancelling | Failed | Completed
+ * Running -> WaitingApproval | WaitingInput | Suspended | Paused | Cancelling | Failed | Completed
  * WaitingApproval -> Running | Suspended | Cancelled
  * WaitingInput -> Running | Suspended | Cancelled
  * Suspended -> Ready | Cancelled
+ * Paused -> Running | AwaitingPlanApproval | Cancelled
  * Cancelling -> Cancelled | Failed
  * Failed -> Ready | Cancelled  (Ready: reserved for future retry-from-failed)
  * ```
  */
-export type TaskRunStatus = "pending" | "planning" | "awaiting_plan_approval" | "ready" | "running" | "waiting_approval" | "waiting_input" | "suspended" | "cancelling" | "cancelled" | "failed" | "completed";
+export type TaskRunStatus = "pending" | "planning" | "awaiting_plan_approval" | "ready" | "running" | "waiting_approval" | "waiting_input" | "suspended" | "paused" | "cancelling" | "cancelled" | "failed" | "completed";

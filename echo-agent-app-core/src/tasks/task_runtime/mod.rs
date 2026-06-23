@@ -49,6 +49,7 @@ pub mod review;
 pub mod router;
 pub mod signals;
 pub mod store;
+pub mod task_tools;
 pub mod types;
 
 pub use classify::{Classification, Complexity, ComplexityLabel, HeuristicClassifier};
