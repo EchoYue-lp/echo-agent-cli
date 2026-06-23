@@ -437,19 +437,26 @@ impl TaskWorker for RealTaskWorker {
     > {
         let primary_agent = self.primary_agent.clone();
         Box::pin(async move {
-            execute_task(
-                store,
-                primary_agent,
-                worker_sem,
-                write_sem,
-                shell_sem,
-                llm_sem,
-                file_write_locks,
-                trace_sink,
-                run_id,
-                task,
-                cancel,
-            )
+            // Scope the run_id into the task-local so agent task-management
+            // tools (task_create/update/complete/skip/list) can read it.
+            // task_local survives `.await` across tokio thread hops, unlike
+            // thread_local.
+            super::task_tools::with_run_id(run_id.clone(), async {
+                execute_task(
+                    store,
+                    primary_agent,
+                    worker_sem,
+                    write_sem,
+                    shell_sem,
+                    llm_sem,
+                    file_write_locks,
+                    trace_sink,
+                    run_id,
+                    task,
+                    cancel,
+                )
+                .await
+            })
             .await
         })
     }

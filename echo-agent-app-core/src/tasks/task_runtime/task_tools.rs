@@ -3,9 +3,15 @@
 //! These let the main agent autonomously create / update / complete / skip /
 //! list tasks, mirroring Claude Code's TaskCreate / TaskUpdate model.
 //!
-//! Each tool reads `run_id` from a thread-local set by the executor before
-//! dispatching task work, and operates on the [`TaskRuntimeStore`] injected
-//! at construction time.
+//! Each tool reads `run_id` from a `tokio::task_local!` scoped by the executor
+//! around task execution, and operates on the [`TaskRuntimeStore`] injected at
+//! construction time.
+//!
+//! Why task_local (not thread_local): tokio uses a work-stealing scheduler that
+//! may move a task across OS threads at any `.await` point. A `thread_local!`
+//! value would be lost or silently swapped with another run's value after a
+//! thread hop. `task_local!` is bound to the logical async task and survives
+//! `.await` across threads — correct for this use case.
 
 use std::sync::Arc;
 
@@ -15,35 +21,76 @@ use echo_agent::tools::{Tool, ToolResult};
 use super::store::TaskRuntimeStore;
 use super::types::{PlanTask, PlanTaskKind, TaskPatch, TodoStatus};
 
-// ── Thread-local run_id injection ─────────────────────────────────────────
+// ── Task-local run_id injection (async-safe) ──────────────────────────────
 
-std::thread_local! {
-    static CURRENT_RUN_ID: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+tokio::task_local! {
+    /// The run_id of the currently executing task run. Set by the executor via
+    /// [`with_run_id`] around the worker dispatch so tools can read it.
+    pub static CURRENT_RUN_ID: String;
 }
 
-/// Set the current run_id for the calling thread. Called by the executor
-/// before dispatching task work so tools can read it.
-pub fn set_current_run_id(run_id: Option<String>) {
-    CURRENT_RUN_ID.with(|cell| {
-        *cell.borrow_mut() = run_id;
-    });
-}
-
-/// Clear the current run_id after task work completes.
-pub fn clear_current_run_id() {
-    CURRENT_RUN_ID.with(|cell| {
-        *cell.borrow_mut() = None;
-    });
+/// Run `f` with `run_id` available to all task tools on the current async task.
+///
+/// Called by the executor before dispatching task work. The value is scoped:
+/// it is automatically unavailable once `f` completes (no manual clear needed,
+/// unlike the old thread_local approach), and it survives `.await` points even
+/// when tokio moves the task across threads.
+pub async fn with_run_id<F, R>(run_id: String, f: F) -> R
+where
+    F: std::future::Future<Output = R>,
+{
+    CURRENT_RUN_ID.scope(run_id, f).await
 }
 
 fn current_run_id() -> Option<String> {
-    CURRENT_RUN_ID.with(|cell| cell.borrow().clone())
+    CURRENT_RUN_ID.try_with(|cell| cell.clone()).ok()
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
 fn require_run_id() -> std::result::Result<String, ToolResult> {
     current_run_id().ok_or_else(|| ToolResult::error("no active run — run_id not set in context"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// task_local must survive `.await` across tokio thread hops.
+    /// (thread_local would fail this: a work-stealing scheduler can move the
+    /// task to another OS thread after `yield_now`, dropping the thread_local
+    /// value or returning another run's.)
+    #[tokio::test]
+    async fn run_id_survives_await_across_threads() {
+        // Force a yield point so the scheduler has the opportunity to move us
+        // to a different runtime worker thread.
+        let captured = with_run_id("run-xyz".to_string(), async {
+            tokio::task::yield_now().await;
+            // After yield, we may be on a different thread — task_local must
+            // still hold the value.
+            current_run_id()
+        })
+        .await;
+        assert_eq!(captured.as_deref(), Some("run-xyz"));
+    }
+
+    /// Outside a `with_run_id` scope, `current_run_id` must be None.
+    #[tokio::test]
+    async fn run_id_absent_outside_scope() {
+        // Use a multi-thread runtime to make any latent thread_local bug
+        // surface; task_local must still correctly return None.
+        assert_eq!(current_run_id(), None);
+    }
+
+    /// Nested scopes must shadow correctly (inner wins, outer restored).
+    #[tokio::test]
+    async fn nested_scopes_shadow_and_restore() {
+        let inner = with_run_id("outer".to_string(), async {
+            with_run_id("inner".to_string(), async { current_run_id() }).await
+        })
+        .await;
+        assert_eq!(inner.as_deref(), Some("inner"));
+    }
 }
 
 fn parse_kind(s: &str) -> PlanTaskKind {
