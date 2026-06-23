@@ -696,6 +696,11 @@ pub struct PlanTask {
     pub max_retries: u32,
     pub failure_fingerprint: Option<String>,
     pub status: TodoStatus,
+    /// Stable sort key for display ordering. Set by plan generation (sequential
+    /// index) and updated by `reorder_tasks`. Separated from `parallel_group`
+    /// (which encodes parallel-fanout grouping, not display order) to avoid
+    /// semantic pollution.
+    pub sort_order: i64,
 }
 
 impl Default for PlanTask {
@@ -716,6 +721,7 @@ impl Default for PlanTask {
             max_retries: 3,
             failure_fingerprint: None,
             status: TodoStatus::Pending,
+            sort_order: 0,
         }
     }
 }

@@ -144,7 +144,8 @@ impl TaskRuntimeStore {
                 retry_count       INTEGER NOT NULL DEFAULT 0,
                 max_retries       INTEGER NOT NULL DEFAULT 3,
                 failure_fingerprint TEXT,
-                status            TEXT NOT NULL DEFAULT 'pending'
+                status            TEXT NOT NULL DEFAULT 'pending',
+                sort_order        INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS ix_tasks_plan ON tr_plan_tasks(plan_id);
             CREATE INDEX IF NOT EXISTS ix_tasks_run  ON tr_plan_tasks(run_id);
@@ -261,6 +262,58 @@ impl TaskRuntimeStore {
                 ON tr_conversation_events(conversation_id, seq);
             ",
         )?;
+
+        // ── Migrations for pre-existing databases ────────────────────────
+        // CREATE TABLE IF NOT EXISTS won't add columns to an existing table,
+        // so columns introduced after the initial release must be added here
+        // via ALTER TABLE, guarded by a PRAGMA table_info existence check
+        // (SQLite has no "ADD COLUMN IF NOT EXISTS").
+
+        // Migration: sort_order column on tr_plan_tasks.
+        // Separates display ordering from parallel_group (which encodes
+        // parallel-fanout grouping, not order). Previously reorder_tasks
+        // abused parallel_group with "order:N" values — this migration
+        // backfills sort_order from any legacy "order:N" parallel_group and
+        // clears that hack, restoring parallel_group's original semantics.
+        let has_sort_order: bool = {
+            let mut stmt = conn.prepare("PRAGMA table_info(tr_plan_tasks)")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            let mut found = false;
+            for r in rows {
+                if r?.eq_ignore_ascii_case("sort_order") {
+                    found = true;
+                }
+            }
+            found
+        };
+        if !has_sort_order {
+            conn.execute(
+                "ALTER TABLE tr_plan_tasks ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+            // Backfill from legacy "order:N" parallel_group hack (if any),
+            // then clear the hack so parallel_group returns to its real semantics.
+            let legacy: Vec<(String, i64)> = conn
+                .prepare("SELECT id, parallel_group FROM tr_plan_tasks WHERE parallel_group LIKE 'order:%'")?
+                .query_map([], |row| {
+                    let id: String = row.get(0)?;
+                    let pg: String = row.get(1)?;
+                    let n: i64 = pg
+                        .trim_start_matches("order:")
+                        .parse()
+                        .unwrap_or(0);
+                    Ok((id, n))
+                })?
+                .filter_map(std::result::Result::ok)
+                .collect();
+            for (id, n) in legacy {
+                conn.execute(
+                    "UPDATE tr_plan_tasks SET sort_order = ?, parallel_group = NULL WHERE id = ?",
+                    rusqlite::params![n, id],
+                )?;
+            }
+        }
+
         Ok(())
     }
 
@@ -418,8 +471,27 @@ impl TaskRuntimeStore {
             return Err(StoreError::InvalidPlan(errs.join("; ")));
         }
 
-        // Persist the new task.
-        insert_plan_task_tx(&tx, &plan_id, run_id, &task)?;
+        // Persist the new task with its display position as sort_order.
+        let mut task_with_order = task.clone();
+        task_with_order.sort_order = insert_pos as i64;
+        insert_plan_task_tx(&tx, &plan_id, run_id, &task_with_order)?;
+
+        // Shift sort_order of tasks at/after the insertion point so the list
+        // stays stably ordered (new task doesn't collide with an existing one).
+        for (idx, t) in new_tasks.iter().enumerate() {
+            if t.id != task.id {
+                let order = if idx < insert_pos {
+                    idx as i64
+                } else {
+                    (idx as i64) + 1
+                };
+                // Only bump when needed to avoid unnecessary writes.
+                tx.execute(
+                    "UPDATE tr_plan_tasks SET sort_order = ? WHERE run_id = ? AND id = ? AND sort_order != ?",
+                    params![order, run_id, t.id, order],
+                )?;
+            }
+        }
 
         // Mirror todo row (id = task_id, matching attach_plan convention).
         tx.execute(
@@ -627,11 +699,13 @@ impl TaskRuntimeStore {
             ));
         }
 
-        // Update parallel_group to encode order (using index as sort key).
+        // Update sort_order to encode the new display order. (Previously this
+        // abused parallel_group with "order:N" values, polluting its real
+        // semantics. sort_order is the dedicated column for this.)
         for (idx, task_id) in new_order.iter().enumerate() {
             tx.execute(
-                "UPDATE tr_plan_tasks SET parallel_group = ? WHERE run_id = ? AND id = ?",
-                params![format!("order:{idx}"), run_id, task_id],
+                "UPDATE tr_plan_tasks SET sort_order = ? WHERE run_id = ? AND id = ?",
+                params![idx as i64, run_id, task_id],
             )?;
         }
 
@@ -692,8 +766,10 @@ impl TaskRuntimeStore {
             params![plan.run_id],
         )?;
 
-        for t in &plan.tasks {
-            insert_plan_task_tx(&tx, &plan.plan_id, &plan.run_id, t)?;
+        for (idx, t) in plan.tasks.iter().enumerate() {
+            let mut t = t.clone();
+            t.sort_order = idx as i64;
+            insert_plan_task_tx(&tx, &plan.plan_id, &plan.run_id, &t)?;
             // Mirror each task into the todo projection.
             tx.execute(
                 "INSERT INTO tr_todos
@@ -1535,8 +1611,8 @@ fn insert_plan_task_tx(
         "INSERT INTO tr_plan_tasks
             (id, plan_id, run_id, title, description, kind, agent_role, domain_profile,
              depends_on, parallel_group, files, allowed_tools, verification,
-             retry_count, max_retries, failure_fingerprint, status)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+             retry_count, max_retries, failure_fingerprint, status, sort_order)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         params![
             t.id,
             plan_id,
@@ -1555,6 +1631,7 @@ fn insert_plan_task_tx(
             t.max_retries,
             t.failure_fingerprint,
             t.status.as_str(),
+            t.sort_order,
         ],
     )?;
     Ok(())
@@ -1573,8 +1650,8 @@ fn load_plan_tasks(conn: &Connection, plan_id: &str) -> Result<Vec<PlanTask>, St
     let mut stmt = conn.prepare(
         "SELECT id, title, description, kind, agent_role, domain_profile,
                 depends_on, parallel_group, files, allowed_tools, verification,
-                retry_count, max_retries, failure_fingerprint, status
-         FROM tr_plan_tasks WHERE plan_id = ? ORDER BY rowid ASC",
+                retry_count, max_retries, failure_fingerprint, status, sort_order
+         FROM tr_plan_tasks WHERE plan_id = ? ORDER BY sort_order ASC, rowid ASC",
     )?;
     let rows = stmt.query_map(params![plan_id], |row| {
         Ok(PlanTask {
@@ -1594,6 +1671,7 @@ fn load_plan_tasks(conn: &Connection, plan_id: &str) -> Result<Vec<PlanTask>, St
             max_retries: row.get(12)?,
             failure_fingerprint: row.get(13)?,
             status: TodoStatus::from_str(&row.get::<_, String>(14)?).unwrap_or_default(),
+            sort_order: row.get(15)?,
         })
     })?;
     Ok(rows.filter_map(Result::ok).collect())

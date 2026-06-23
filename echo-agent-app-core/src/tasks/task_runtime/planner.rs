@@ -165,6 +165,7 @@ pub fn generate_parallel_readonly_plan(
             max_retries: 3,
             failure_fingerprint: None,
             status: TodoStatus::Pending,
+            sort_order: 0,
         });
     }
 
@@ -197,6 +198,7 @@ pub fn generate_parallel_readonly_plan(
             max_retries: 3,
             failure_fingerprint: None,
             status: TodoStatus::Pending,
+            sort_order: 0,
         });
         worker_task_ids.insert(spec.agent_name.clone(), id);
     }
@@ -231,6 +233,7 @@ pub fn generate_parallel_readonly_plan(
             max_retries: 3,
             failure_fingerprint: None,
             status: TodoStatus::Pending,
+            sort_order: 0,
         });
     }
 
@@ -493,6 +496,7 @@ fn normalize_tasks(
             max_retries: 3,
             failure_fingerprint: None,
             status: TodoStatus::Pending,
+            sort_order: 0,
         });
     }
     Ok(out)
