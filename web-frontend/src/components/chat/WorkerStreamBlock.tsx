@@ -63,11 +63,27 @@ function reconstructSteps(events: WorkerTraceEvent[]): { steps: WorkerStep[]; th
 
 function workerResult(worker: WorkerTraceState): string {
   const completed = [...worker.events].reverse().find((e) => e.event_type === 'worker_completed');
-  const summary = completed ? String((completed.payload as Record<string, unknown> | null)?.summary ?? '') : '';
+  // 多字段兜底:summary / output / text / content
+  const summary = completed
+    ? String(
+        (completed.payload as Record<string, unknown> | null)?.summary ??
+          (completed.payload as Record<string, unknown> | null)?.output ??
+          (completed.payload as Record<string, unknown> | null)?.text ??
+          (completed.payload as Record<string, unknown> | null)?.content ??
+          ''
+      )
+    : '';
   if (summary) return summary;
   return worker.events
     .filter((e) => e.event_type === 'worker_token_delta')
-    .map((e) => String((e.payload as Record<string, unknown> | null)?.content ?? ''))
+    .map((e) =>
+      String(
+        (e.payload as Record<string, unknown> | null)?.content ??
+          (e.payload as Record<string, unknown> | null)?.text ??
+          (e.payload as Record<string, unknown> | null)?.delta ??
+          ''
+      )
+    )
     .join('')
     .trim();
 }
@@ -102,7 +118,7 @@ export const WorkerStreamBlock = memo(function WorkerStreamBlock({ worker, allWo
     );
 
   return (
-    <div className="my-1 rounded-md border-l-2 border-[var(--color-purple)] bg-[var(--bg-primary)] px-3 py-1.5">
+    <div className="my-0.5 rounded-sm px-2 py-1 hover:bg-[var(--bg-hover)] transition-colors">
       {/* Header (always visible): title + status + progress summary */}
       <button
         onClick={() => setExpanded((e) => !e)}
@@ -200,7 +216,7 @@ export const WorkerStreamBlock = memo(function WorkerStreamBlock({ worker, allWo
                 结果
               </button>
               {sectionExpanded.result && (
-                <MarkdownContent content={result} className="text-sm" />
+                <MarkdownContent content={result} className="text-sm" maxHeight={400} />
               )}
             </div>
           )}

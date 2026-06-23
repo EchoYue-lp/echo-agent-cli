@@ -519,6 +519,9 @@ pub struct WorkerTraceEvent {
     pub agent_name: Option<String>,
     pub title: Option<String>,
     pub task: Option<String>,
+    /// 关联触发该 worker 的 assistant message id(用于前端按 message 过滤 worker)。
+    /// 可空:兼容旧事件或不适用场景。
+    pub message_id: Option<String>,
     pub event_type: WorkerTraceEventKind,
     pub payload: serde_json::Value,
     pub timestamp: DateTime<Utc>,
@@ -538,6 +541,7 @@ impl WorkerTraceEvent {
             agent_name: None,
             title: None,
             task: None,
+            message_id: None,
             event_type,
             payload,
             timestamp: Utc::now(),
@@ -573,6 +577,11 @@ impl WorkerTraceEvent {
 
     pub fn with_task(mut self, task: impl Into<String>) -> Self {
         self.task = Some(task.into());
+        self
+    }
+
+    pub fn with_message_id(mut self, message_id: impl Into<String>) -> Self {
+        self.message_id = Some(message_id.into());
         self
     }
 }

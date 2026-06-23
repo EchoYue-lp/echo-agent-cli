@@ -242,7 +242,8 @@ export type ServerMessage =
     }
   | { type: 'thinking_start'; id?: string }
   | { type: 'thinking_end'; id?: string; prompt_tokens: number; completion_tokens: number }
-  | { type: 'pong' };
+  | { type: 'pong' }
+  | { type: 'worker://trace'; payload: Record<string, unknown> };
 
 // Execution round: one ReAct loop iteration (think → tools)
 export interface ExecutionRound {

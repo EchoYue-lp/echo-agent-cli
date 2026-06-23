@@ -260,7 +260,7 @@ export const MessageBubble = memo(function MessageBubble({
             )}
 
             {/* Parallel execution segment (run-level workers) — inline, no wrapper */}
-            <ParallelExecutionBlock />
+            <ParallelExecutionBlock messageId={message.id} />
 
             {/* Final text — no left border, plain markdown flow */}
             {message.content && (

@@ -185,12 +185,7 @@ export function handleChatEvent(
       ctx.currentThinkingIdRef.current = null;
       const id = ctx.assistantIdRef.current;
       if (id) {
-        const workerCount =
-          event.planned_workers?.length ?? event.suggested_workers?.length ?? 0;
-        const workerText = workerCount > 0 ? `，${workerCount} 个 worker 已接入` : '';
-        const content = event.auto_execute
-          ? `已进入 TaskRuntime 并开始执行${workerText}。下面会展示触发原因、worker 执行过程和最终结果；右侧仅保留任务状态概览。`
-          : `任务计划已生成，等待确认后执行${workerText}。下面会展示触发原因、worker 执行过程和最终结果；右侧仅保留任务状态概览。`;
+        const content = '';
         store.handoffToTaskRuntime(id, content, event.auto_execute === true);
       } else {
         store.setStreaming(false);

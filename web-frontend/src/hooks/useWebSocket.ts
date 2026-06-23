@@ -1,6 +1,7 @@
 import { useRef, useCallback, useEffect, useState } from 'react';
 import { useChatStore } from '../stores/chatStore';
 import { useTaskRuntimeStore } from '../stores/taskRuntimeStore';
+import { useWorkerTraceStore, type WorkerTraceEvent } from '../stores/workerTraceStore';
 import { isTauri } from '../lib/tauri-bridge';
 import type { ClientMessage, ServerMessage, Attachment } from '../types/api';
 
@@ -97,7 +98,7 @@ export function useWebSocket() {
         return;
       }
       const store = useChatStore.getState();
-      if (msg.type !== 'pong' && 'id' in msg && msg.id && currentMessageIdRef.current !== msg.id) {
+      if (msg.type !== 'pong' && msg.type !== 'worker://trace' && 'id' in msg && msg.id && currentMessageIdRef.current !== msg.id) {
         return;
       }
 
@@ -220,6 +221,9 @@ export function useWebSocket() {
           assistantIdRef.current = null;
           currentMessageIdRef.current = null;
           isCancelledRef.current = false;
+          break;
+        case 'worker://trace':
+          useWorkerTraceStore.getState().append(msg.payload as unknown as WorkerTraceEvent);
           break;
         case 'plan_ready':
           // A complex input was routed to TaskRuntime and a plan was generated.

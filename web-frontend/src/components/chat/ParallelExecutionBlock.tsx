@@ -11,7 +11,11 @@ import { WorkerStreamBlock } from './WorkerStreamBlock';
  * Workers flow as part of the conversation, just like thinking segments and
  * tool calls, matching the Cursor/Codex/Claude Code desktop pattern.
  */
-export const ParallelExecutionBlock = memo(function ParallelExecutionBlock() {
+interface ParallelExecutionBlockProps {
+  messageId: string;
+}
+
+export const ParallelExecutionBlock = memo(function ParallelExecutionBlock({ messageId }: ParallelExecutionBlockProps) {
   const activeRun = useTaskRuntimeStore((s) => s.activeRun);
   const workers = useWorkerTraceStore((s) => s.workers);
 
@@ -21,21 +25,15 @@ export const ParallelExecutionBlock = memo(function ParallelExecutionBlock() {
       .filter(
         (w) =>
           w.runId === activeRun.run_id &&
+          w.messageId === messageId &&
           // Top-level workers: parentWorkerId is empty OR equals the run_id.
-          // (TaskRuntime path emits top-level workers with parent_worker_id =
-          // run_id via SubagentEvent bridge; agent_tool path leaves it empty.
-          // Both are top-level — their parent is the run itself, not another worker.)
           !w.parentWorkerId || w.parentWorkerId === activeRun.run_id
       )
       .sort((a, b) => (a.startedAt ?? '').localeCompare(b.startedAt ?? ''));
-  }, [activeRun, workers]);
+  }, [activeRun, workers, messageId]);
 
   if (visibleWorkers.length === 0) return null;
 
-  // Inline: workers flow directly in the stream. No outer card, no separate
-  // "并行执行" header bar. Each worker is its own inline collapsible block
-  // (handled by WorkerStreamBlock), visually continuous with the surrounding
-  // thinking segments and tool calls.
   return (
     <>
       {visibleWorkers.map((w) => (

@@ -38,6 +38,7 @@ export interface WorkerTraceEvent {
   agent_name?: string | null;
   title?: string | null;
   task?: string | null;
+  message_id?: string | null;
   event_type: WorkerTraceEventKind;
   payload: unknown;
   timestamp: string;
@@ -52,6 +53,7 @@ export interface WorkerTraceState {
   agentName?: string;
   title?: string;
   task?: string;
+  messageId?: string;
   status: WorkerTraceStatus;
   startedAt?: string;
   completedAt?: string;
@@ -131,6 +133,7 @@ export const useWorkerTraceStore = create<WorkerTraceStore>((set) => ({
             ? eventTitle
             : prev?.title ?? eventTitle,
         task: eventTask ?? prev?.task,
+        messageId: event.message_id ?? prev?.messageId,
         status,
         startedAt,
         completedAt,
