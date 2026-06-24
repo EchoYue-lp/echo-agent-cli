@@ -556,8 +556,10 @@ async fn register_default_subagents(
                 // Register delegate_readonly on the worker so it can
                 // recursively delegate to L3 sub-workers (spec §3.3).
                 let worker_handle = crate::agent_handle::AgentHandle::new(worker);
+                // Workers are subagents, not orchestrators — plan-existence
+                // interception is unnecessary (only main agent creates plans).
                 crate::tasks::task_runtime::delegate_readonly_tool::
-                    register_delegate_readonly_on_handle(&worker_handle).await;
+                    register_delegate_readonly_on_handle(&worker_handle, None).await;
 
                 let def = SubagentBuilder::new(name)
                     .description(description)

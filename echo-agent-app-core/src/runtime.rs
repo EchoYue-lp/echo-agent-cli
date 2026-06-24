@@ -123,7 +123,8 @@ impl AgentRuntime {
         // ── 3a. Register delegate_readonly tool ──
         {
             use crate::tasks::task_runtime::delegate_readonly_tool::register_delegate_readonly_on_handle;
-            register_delegate_readonly_on_handle(&agent_handle).await;
+            register_delegate_readonly_on_handle(&agent_handle, params.task_runtime_store.clone())
+                .await;
         }
 
         // ── NOTE: ExecutePlanTool is NOT registered here. In GUI mode the

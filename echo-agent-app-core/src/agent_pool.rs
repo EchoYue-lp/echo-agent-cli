@@ -732,7 +732,8 @@ impl AgentPool {
         // 4a. Register delegate_readonly tool (lets main agent dispatch readonly workers)
         {
             use crate::tasks::task_runtime::delegate_readonly_tool::register_delegate_readonly_on_handle;
-            register_delegate_readonly_on_handle(&handle).await;
+            register_delegate_readonly_on_handle(&handle, self.shared.task_runtime_store.clone())
+                .await;
         }
 
         // 5. Configure HITL for this agent.

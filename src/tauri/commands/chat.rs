@@ -1315,7 +1315,10 @@ async fn launch_unified_run(
         let app_for_sink = app_handle.clone();
         let msg_key_for_sink = event_message_key.clone();
         let trace_sink: Option<std::sync::Arc<dyn Fn(WorkerTraceEvent) + Send + Sync>> =
-            Some(std::sync::Arc::new(move |event| {
+            Some(std::sync::Arc::new(move |mut event| {
+                if event.message_id.is_none() {
+                    event.message_id = Some(msg_key_for_sink.clone());
+                }
                 let _ = emit_worker_trace_event(&app_for_sink, event);
             }));
 

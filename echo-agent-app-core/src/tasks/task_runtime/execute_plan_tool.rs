@@ -25,7 +25,7 @@ use futures::future::BoxFuture;
 use super::executor::{RunOutcome, execute_run};
 use super::router::TaskRouteKind;
 use super::store::TaskRuntimeStore;
-use super::types::TaskRunStatus;
+use super::types::{DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, TaskPlan, TaskRunStatus};
 use crate::agent_handle::AgentHandle;
 
 /// L1→L2 桥接工具: 把 plan 提交给 run_dag 并行调度器。
@@ -87,6 +87,50 @@ impl Tool for ExecutePlanTool {
             let cancel = super::task_tools::CURRENT_CANCEL
                 .try_with(|c| c.clone())
                 .unwrap_or_else(|_| tokio_util::sync::CancellationToken::new());
+
+            // ── 兜底: 若主 agent 跳过了 task_create 直接调 execute_plan ──
+            // LLM 可能不遵守 system prompt 的两阶段顺序。若 plan 为空,
+            // 从 run goal 动态生成一个单 task plan,保证执行始终经过 run_dag
+            // (有 wave 调度 + 信号量限流 + 失败传播保护),不会退化成裸 delegate_readonly。
+            let plan_exists = self
+                .store
+                .get_plan(&run_id)
+                .ok()
+                .flatten()
+                .map(|p| !p.tasks.is_empty())
+                .unwrap_or(false);
+            if !plan_exists {
+                let goal = self
+                    .store
+                    .get_run(&run_id)
+                    .ok()
+                    .flatten()
+                    .map(|r| r.goal)
+                    .unwrap_or_default();
+                let task_id = format!("auto_{}", uuid::Uuid::new_v4().as_simple());
+                let task = PlanTask {
+                    id: task_id.clone(),
+                    title: goal.chars().take(80).collect(),
+                    description: goal.clone(),
+                    kind: PlanTaskKind::ReadOnlyReview,
+                    ..Default::default()
+                };
+                let plan = TaskPlan {
+                    plan_id: uuid::Uuid::new_v4().to_string(),
+                    run_id: run_id.clone(),
+                    domain_profile: DomainProfile::General,
+                    goal: goal.clone(),
+                    assumptions: Vec::new(),
+                    risks: Vec::new(),
+                    execution_mode: ExecutionMode::Parallel,
+                    tasks: vec![task],
+                };
+                if let Err(e) = self.store.attach_plan(&plan) {
+                    return Ok(ToolResult::error(format!(
+                        "execute_plan: 自动生成 plan 失败: {e}"
+                    )));
+                }
+            }
 
             // ── §10.5: ComplexRuntime 审批闭环 ──
             // Route is read from the persisted run record so the tool struct
