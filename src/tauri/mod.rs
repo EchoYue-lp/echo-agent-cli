@@ -121,12 +121,8 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
             commands::task_runtime::list_task_artifacts,
             commands::task_runtime::list_task_reviews,
             commands::task_runtime::get_task_summary,
-            // TaskRuntime mutations (PR 2: planning runtime + plan approval)
+            // TaskRuntime mutations (PR 2)
             commands::task_runtime::create_task_run,
-            commands::task_runtime::generate_task_plan,
-            commands::task_runtime::approve_task_plan,
-            commands::task_runtime::reject_task_plan,
-            commands::task_runtime::edit_task_plan,
             // TaskRuntime dynamic tasks (resume / insert / remove / update / reorder)
             commands::task_runtime::resume_task_run,
             commands::task_runtime::insert_task,

@@ -133,26 +133,6 @@ pub enum ChatEvent {
         context: Option<serde_json::Value>,
         phase: Option<String>,
     },
-    /// A complex-task run was created and a structured plan generated.
-    /// The GUI should render the plan + approval actions from the run_id.
-    #[serde(rename = "plan_ready")]
-    PlanReady {
-        run_id: String,
-        goal: String,
-        domain_profile: String,
-        route: String,
-        interaction_mode: String,
-        permission_mode: String,
-        approval_policy: String,
-        route_reason: String,
-        confidence: f32,
-        auto_execute: bool,
-        planned_workers: Vec<String>,
-        suggested_workers: Vec<String>,
-        active_skills: Vec<String>,
-        route_signals: Vec<String>,
-        classification_signals: Vec<String>,
-    },
     #[serde(rename = "done")]
     Done,
     /// An in-progress run was detected for this conversation. The GUI should
@@ -1190,9 +1170,8 @@ pub async fn send_selection_response(
 // ══════════════════════════════════════════════════════════════════════════
 
 /// Handle a complex input by creating a TaskRuntime run and generating a
-/// structured plan. Emits a `plan_ready` chat event so the GUI can render the
-/// plan and approval actions. The run stops at `AwaitingPlanApproval` — the
-/// user must approve before execution (PR 3).
+/// structured plan. The run transitions to Running and auto-executes when
+/// the launch policy allows it.
 ///
 /// Returns a JSON object with `kind: "complex_task"`, `run_id`, and the plan
 /// so an IPC caller that doesn't listen on `chat://event` still gets the data.
@@ -1282,7 +1261,6 @@ async fn route_complex_task(
 
     // 4. Persist the plan (attach_plan is atomic; does not change status).
     store.attach_plan(&generated.plan)?;
-    let planned_workers = planned_worker_roles(&generated.plan);
     let all_plan_tasks_read_only = generated
         .plan
         .tasks
@@ -1300,47 +1278,6 @@ async fn route_complex_task(
         )
         .await?;
     }
-
-    // 5. Emit plan_ready so the GUI can render the plan + approval actions.
-    let active_skills = state
-        .app_state
-        .connection
-        .primary_agent()
-        .read(|agent| agent.skill_registry().activated_names())
-        .await;
-    emit_chat_event(
-        &app,
-        &ChatEvent::PlanReady {
-            run_id: run_id.clone(),
-            goal: generated.plan.goal.clone(),
-            domain_profile: route_decision
-                .classification
-                .inferred_profile
-                .as_str()
-                .to_string(),
-            route: route_decision.route.as_str().to_string(),
-            interaction_mode: execution_policy.interaction_mode.as_str().to_string(),
-            permission_mode: execution_policy.permission_mode.as_str().to_string(),
-            approval_policy: launch_policy.approval_policy.clone(),
-            route_reason: route_decision.reason.clone(),
-            confidence: route_decision.confidence,
-            auto_execute: launch_policy.auto_execute,
-            planned_workers,
-            suggested_workers: route_decision.suggested_workers.clone(),
-            active_skills,
-            route_signals: route_decision
-                .reason
-                .split("routing_signals:")
-                .nth(1)
-                .map(|value| value.split(',').map(|s| s.trim().to_string()).collect())
-                .unwrap_or_default(),
-            classification_signals: route_decision.classification.signals.clone(),
-        },
-        // Use message_key so first-turn messages without an active
-        // conversation_id still pass the frontend event guard.
-        &message_key,
-        &conversation_id,
-    );
 
     // Emit unified conversation event
     if let Some(ref cid) = conversation_id {

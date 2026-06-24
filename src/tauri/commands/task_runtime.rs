@@ -1,19 +1,7 @@
 //! Tauri IPC commands for the TaskRuntime.
 //!
-//! PR 1 shipped read-only query commands. PR 2 adds the mutation commands
-//! that drive the plan-approval lifecycle:
-//!
-//! - [`create_task_run`] — start a complex-task run in `Pending`.
-//! - [`generate_task_plan`] — call the planner (LLM JSON mode) for a run and
-//!   persist the structured plan.
-//! - [`approve_task_plan`] / [`reject_task_plan`] — user resolution of the
-//!   plan; approve advances to `Running`, reject to `Cancelled`.
-//! - [`edit_task_plan`] — replace a plan's tasks before approving.
-//!
-//! The complex-task router itself (the `send_chat_message` classification
-//! branch that auto-creates a run for complex input) is wired in the chat
-//! command module, not here — these commands are the explicit,
-//! user-controllable surface.
+//! Read-only query commands, mutations for creating/managing task runs,
+//! worker execution, and route feedback learning.
 
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
@@ -276,10 +264,6 @@ fn route_feedback_key(pattern: &str) -> String {
         .join(" ")
 }
 
-// ══════════════════════════════════════════════════════════════════════════
-// Mutation commands (PR 2: planning runtime + plan-approval lifecycle)
-// ══════════════════════════════════════════════════════════════════════════
-
 /// Request body for [`create_task_run`].
 #[derive(Debug, serde::Deserialize)]
 pub struct CreateRunRequest {
@@ -290,8 +274,7 @@ pub struct CreateRunRequest {
     pub domain_profile: Option<String>,
 }
 
-/// Create a new complex-task run in `Pending`. Does NOT generate a plan yet —
-/// call [`generate_task_plan`] next. Returns the created run.
+/// Create a new complex-task run in `Pending`. Returns the created run.
 #[tauri::command]
 pub async fn create_task_run(
     state: tauri::State<'_, TauriState>,
@@ -318,154 +301,6 @@ pub async fn create_task_run(
         .map_err(internal)?;
     tracing::info!(run_id = %run.run_id, profile = ?profile, "TaskRuntime run created");
     Ok(run)
-}
-
-/// Generate a structured plan for a run via the LLM (JSON mode), persist it.
-/// The run may be in any state; attach_plan does not change the run status.
-///
-/// Uses the primary agent's LLM client. Returns the persisted plan plus any
-/// non-blocking warnings the planner produced (e.g. a mutating task that
-/// claimed a parallel group was serialized).
-#[tauri::command]
-pub async fn generate_task_plan(
-    state: tauri::State<'_, TauriState>,
-    run_id: String,
-) -> Result<GeneratedPlanResponse, IpcError> {
-    let store = store(&state)?;
-
-    // Load the run to get goal + (inferred) profile.
-    let run = store
-        .get_run(&run_id)
-        .map_err(internal)?
-        .ok_or_else(|| IpcError::NotFound(format!("run {run_id} not found")))?;
-
-    // Obtain the LLM client from the primary agent.
-    let (llm, plan_cache_user_id) = state
-        .app_state
-        .connection
-        .primary_agent()
-        .read(|a| {
-            (
-                a.llm_client().cloned(),
-                a.config().get_cache_user_id().map(|s| s.to_string()),
-            )
-        })
-        .await;
-    let llm =
-        llm.ok_or_else(|| IpcError::Internal("no LLM client available on primary agent".into()))?;
-    let plan_cache_user_id = plan_cache_user_id.unwrap_or_default();
-
-    // Classify to steer the prompt with an inferred profile + reason. The
-    // classifier is heuristic-only here; the run's existing profile wins if
-    // the user already set one explicitly (we keep the run's profile).
-    let classification =
-        echo_agent_app_core::tasks::task_runtime::HeuristicClassifier::new().classify(&run.goal);
-    let profile_for_plan = run.domain_profile;
-    let classification = echo_agent_app_core::tasks::task_runtime::Classification {
-        complexity: classification.complexity,
-        inferred_profile: profile_for_plan,
-        reason: classification.reason,
-        signals: classification.signals,
-    };
-
-    let generated = echo_agent_app_core::tasks::task_runtime::generate_plan(
-        &llm,
-        &run_id,
-        &run.goal,
-        &classification,
-        &[],
-        &plan_cache_user_id,
-    )
-    .await
-    .map_err(|e| match e {
-        echo_agent_app_core::tasks::task_runtime::PlanError::Quality(msg) => {
-            IpcError::Validation(format!("plan rejected by quality check: {msg}"))
-        }
-        other => IpcError::Internal(format!("plan generation failed: {other}")),
-    })?;
-
-    // Persist the plan (attach_plan no longer changes run status).
-    store.attach_plan(&generated.plan).map_err(internal)?;
-    tracing::info!(
-        run_id = %run_id,
-        plan_id = %generated.plan.plan_id,
-        task_count = generated.plan.tasks.len(),
-        warning_count = generated.warnings.len(),
-        "TaskRuntime plan generated"
-    );
-
-    Ok(GeneratedPlanResponse {
-        plan: generated.plan,
-        warnings: generated.warnings,
-    })
-}
-
-/// Response shape for [`generate_task_plan`].
-#[derive(Debug, serde::Serialize)]
-pub struct GeneratedPlanResponse {
-    pub plan: TaskPlan,
-    pub warnings: Vec<String>,
-}
-
-/// Approve the run's current plan and advance to `Running`.
-#[tauri::command]
-pub async fn approve_task_plan(
-    state: tauri::State<'_, TauriState>,
-    run_id: String,
-    note: Option<String>,
-) -> Result<TaskRun, IpcError> {
-    let store = store(&state)?;
-    store
-        .resolve_plan(&run_id, true, note.as_deref())
-        .map_err(internal)?;
-    let run = store
-        .transition_run(&run_id, TaskRunStatus::Running)
-        .map_err(internal)?;
-    tracing::info!(run_id = %run.run_id, "plan approved → Running");
-    Ok(run)
-}
-
-/// Reject the run's plan and cancel the run.
-#[tauri::command]
-pub async fn reject_task_plan(
-    state: tauri::State<'_, TauriState>,
-    run_id: String,
-    note: Option<String>,
-) -> Result<TaskRun, IpcError> {
-    let store = store(&state)?;
-    store
-        .resolve_plan(&run_id, false, note.as_deref())
-        .map_err(internal)?;
-    // Pending -> Cancelled is a legal direct transition.
-    let run = store
-        .transition_run(&run_id, TaskRunStatus::Cancelled)
-        .map_err(internal)?;
-    tracing::info!(run_id = %run.run_id, "plan rejected → Cancelled");
-    Ok(run)
-}
-
-/// Replace a run's plan tasks before approving. Keeps the existing plan_id
-/// and goal; only the task list changes (user-edited plan).
-#[tauri::command]
-pub async fn edit_task_plan(
-    state: tauri::State<'_, TauriState>,
-    run_id: String,
-    tasks: Vec<PlanTask>,
-) -> Result<TaskPlan, IpcError> {
-    let store = store(&state)?;
-    let run = store
-        .get_run(&run_id)
-        .map_err(internal)?
-        .ok_or_else(|| IpcError::NotFound(format!("run {run_id} not found")))?;
-    let mut plan = store
-        .get_plan(&run_id)
-        .map_err(internal)?
-        .ok_or_else(|| IpcError::NotFound(format!("no plan for run {run_id}")))?;
-    plan.tasks = tasks;
-    // Re-persist via attach_plan (replaces tasks + todos atomically).
-    store.attach_plan(&plan).map_err(internal)?;
-    tracing::info!(run_id = %run_id, task_count = plan.tasks.len(), "plan edited");
-    Ok(plan)
 }
 
 /// Resume a paused run. Transitions `Paused → Running` and re-launches the
@@ -630,9 +465,9 @@ pub async fn execute_task_run(
         .get_run(&run_id)
         .map_err(internal)?
         .ok_or_else(|| IpcError::NotFound(format!("run {run_id} not found")))?;
-    if run.status != TaskRunStatus::Running {
+    if run.status != TaskRunStatus::Pending && run.status != TaskRunStatus::Running {
         return Err(IpcError::Validation(format!(
-            "run {run_id} is {:?}; must be Running to execute",
+            "run {run_id} is {:?}; must be Pending or Running to execute",
             run.status
         )));
     }
