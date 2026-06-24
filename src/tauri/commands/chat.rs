@@ -12,8 +12,8 @@ use echo_agent::prelude::AgentEvent;
 use echo_agent_app_core::observability::{TraceEvent, TraceKind};
 use echo_agent_app_core::tasks::conversation_runtime::ConversationRuntimeEvent;
 use echo_agent_app_core::tasks::task_runtime::{
-    ExecutionPolicy, InteractionMode, TaskPlan, TaskRouteDecision, TaskRunStatus, WorkerTraceEvent,
-    WorkerTraceEventKind,
+    ExecutionPolicy, InteractionMode, TaskRouteDecision, TaskRouteKind, TaskRunStatus,
+    WorkerTraceEvent, WorkerTraceEventKind,
 };
 use futures::StreamExt;
 use futures::future::BoxFuture;
@@ -1169,12 +1169,12 @@ pub async fn send_selection_response(
 // Complex-task router (PR 2)
 // ══════════════════════════════════════════════════════════════════════════
 
-/// Handle a complex input by creating a TaskRuntime run and generating a
-/// structured plan. The run transitions to Running and auto-executes when
-/// the launch policy allows it.
+/// Handle a complex input by creating a TaskRuntime run and dispatching it to
+/// the unified launcher. All complex routes (ParallelReadonlyDelegation,
+/// ComplexRuntime, PlanOnly) converge here.
 ///
-/// Returns a JSON object with `kind: "complex_task"`, `run_id`, and the plan
-/// so an IPC caller that doesn't listen on `chat://event` still gets the data.
+/// The main agent runs a ReAct loop (with execute_plan tool for plan →
+/// parallel execution), and events are streamed to chat://event.
 async fn route_complex_task(
     state: &TauriState,
     app: tauri::AppHandle,
@@ -1207,79 +1207,24 @@ async fn route_complex_task(
         &message,
     )?;
 
-    // 2. For ParallelReadonlyDelegation: main agent runs ReAct directly,
-    //    planning + worker dispatch happens inside the ReAct loop.
-    //    No pre-generated deterministic plan, no batch processing.
-    if route_decision.route
-        == echo_agent_app_core::tasks::task_runtime::TaskRouteKind::ParallelReadonlyDelegation
-    {
-        store.transition_run(&run_id, TaskRunStatus::Running)?;
-        let cancel = echo_agent::agent::CancellationToken::new();
-        launch_main_agent_react(
-            app.clone(),
-            state,
-            &run_id,
-            &message_key,
-            conversation_id.clone(),
-            &message,
-            cancel,
-        )
-        .await?;
-        return Ok(serde_json::json!({
-            "success": true,
-            "run_id": run_id,
-            "status": "running",
-            "mode": "main_agent_react"
-        }));
-    }
-
-    // 3. Other complex routes: generate structured plan via LLM.
-    // Transition Pending → Running (legal in the new 6-state machine).
+    // 2. Transition Pending → Running (valid in 6-state machine) and launch
+    //    unified run. All routes share the same launcher — the route parameter
+    //    controls execute_plan tool behavior (e.g. ComplexRuntime approval).
     store.transition_run(&run_id, TaskRunStatus::Running)?;
-    let (llm, plan_cache_user_id) = state
-        .app_state
-        .connection
-        .primary_agent()
-        .read(|a| {
-            (
-                a.llm_client().cloned(),
-                a.config().get_cache_user_id().map(|s| s.to_string()),
-            )
-        })
-        .await;
-    let llm = llm.ok_or_else(|| anyhow::anyhow!("no LLM client available on primary agent"))?;
-    let cache_user_id = plan_cache_user_id.unwrap_or_default();
-    let generated = echo_agent_app_core::tasks::task_runtime::generate_plan(
-        &llm,
+    let cancel = echo_agent::agent::CancellationToken::new();
+    launch_unified_run(
+        app.clone(),
+        state,
         &run_id,
+        &message_key,
+        conversation_id.clone(),
         &message,
-        &route_decision.classification,
-        &route_decision.suggested_workers,
-        &cache_user_id,
+        route_decision.route,
+        cancel,
     )
     .await?;
 
-    // 4. Persist the plan (attach_plan is atomic; does not change status).
-    store.attach_plan(&generated.plan)?;
-    let all_plan_tasks_read_only = generated
-        .plan
-        .tasks
-        .iter()
-        .all(|task| task.kind.is_read_only());
-    let launch_policy =
-        execution_policy.runtime_launch_policy(route_decision.route, all_plan_tasks_read_only);
-    let mut response_status = TaskRunStatus::Running;
-    if launch_policy.auto_execute {
-        launch_task_run_execution(
-            state,
-            app.clone(),
-            &run_id,
-            Some(compute_content_hash(&message)),
-        )
-        .await?;
-    }
-
-    // Emit unified conversation event
+    // 3. Emit unified conversation event
     if let Some(ref cid) = conversation_id {
         use echo_agent_app_core::tasks::conversation_runtime::ConversationRuntimeEvent;
         let store_ref = state.app_state.tasks.runtime.as_ref();
@@ -1300,48 +1245,30 @@ async fn route_complex_task(
 
     tracing::info!(
         run_id = %run_id,
-        plan_id = %generated.plan.plan_id,
-        task_count = generated.plan.tasks.len(),
         route = ?route_decision.route,
-        auto_execute = launch_policy.auto_execute,
-        "task routed to TaskRuntime"
+        "task routed to unified run launcher"
     );
 
     Ok(serde_json::json!({
-        "kind": "complex_task",
+        "success": true,
         "run_id": run_id,
-        "status": response_status.as_str(),
+        "status": "running",
+        "mode": "unified_run",
         "route": route_decision.route,
-        "auto_execute": launch_policy.auto_execute,
-        "conversation_id": conv_id,
-        "plan": generated.plan,
-        "warnings": generated.warnings,
     }))
 }
 
-fn planned_worker_roles(plan: &TaskPlan) -> Vec<String> {
-    let mut workers = Vec::new();
-    for task in &plan.tasks {
-        if task.agent_role.trim().is_empty() {
-            continue;
-        }
-        if !workers.iter().any(|worker| worker == &task.agent_role) {
-            workers.push(task.agent_role.clone());
-        }
-    }
-    workers
-}
-
-/// Launch the main agent's ReAct loop directly (replaces batch processing for
-/// ParallelReadonlyDelegation). The main agent uses task_create + delegate_readonly
-/// to decompose and execute the task, with events streamed to chat://event.
-async fn launch_main_agent_react(
+/// 统一启动器:所有复杂路由(ParallelReadonlyDelegation/ComplexRuntime/PlanOnly)
+/// 都走这里。主 agent ReAct(pool 复用)+ execute_plan 工具(L1→L2)。
+/// 替代 launch_main_agent_react + launch_task_run_execution(spec §3.1.2)。
+async fn launch_unified_run(
     app: tauri::AppHandle,
     state: &TauriState,
     run_id: &str,
     message_key: &str,
     conversation_id: Option<String>,
     goal: &str,
+    route: TaskRouteKind,
     parent_cancel: CancellationToken,
 ) -> Result<(), anyhow::Error> {
     let primary_agent = state.app_state.connection.primary_agent();
@@ -1390,8 +1317,9 @@ async fn launch_main_agent_react(
                         WorkerTraceEventKind::RunStarted,
                         serde_json::json!({
                             "conversation_id": event_conversation_id,
-                            "mode": "main_agent_react",
-                            "run_id": run_id_owned
+                            "mode": "unified_run",
+                            "run_id": run_id_owned,
+                            "route": route.as_str(),
                         }),
                     ),
                 );
@@ -1510,7 +1438,7 @@ async fn launch_main_agent_react(
             elapsed_ms = start.elapsed().as_millis() as u64,
             run_id = %run_id_owned,
             status = %terminal_status,
-            "main_agent_react finished"
+            "unified_run finished"
         );
     });
 
@@ -1721,116 +1649,6 @@ fn agent_event_to_chat_event(
         }
         _ => None,
     }
-}
-
-async fn launch_task_run_execution(
-    state: &TauriState,
-    app: tauri::AppHandle,
-    run_id: &str,
-    message_hash: Option<String>,
-) -> Result<(), anyhow::Error> {
-    let store = state
-        .app_state
-        .tasks
-        .runtime
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("TaskRuntime store not initialized"))?
-        .clone();
-    let primary_agent = state.app_state.connection.primary_agent();
-
-    let store_for_task = store.clone();
-    let primary_agent_for_task = primary_agent.clone();
-    let run_store_for_task = primary_agent.read(|a| a.run_store().cloned()).await;
-    let (reviewer_llm, exec_cache_user_id) = primary_agent
-        .read(|a| {
-            (
-                a.llm_client().cloned(),
-                a.config().get_cache_user_id().map(|s| s.to_string()),
-            )
-        })
-        .await;
-    let exec_cache_user_id = exec_cache_user_id.unwrap_or_default();
-    let layer_manager = state
-        .app_state
-        .review_integration
-        .as_ref()
-        .map(|ri| std::sync::Arc::new(ri.create_layer_manager()));
-    let cancel = echo_agent::agent::CancellationToken::new();
-    let run_id_for_task = run_id.to_string();
-    let message_hash_for_task = message_hash.clone();
-    let run_key = format!("__run__:{run_id_for_task}");
-    state
-        .app_state
-        .tasks
-        .run_cancel_tokens
-        .insert(run_key, cancel.clone());
-    let run_cancel_tokens = state.app_state.tasks.run_cancel_tokens.clone();
-    let trace_sink: echo_agent_app_core::tasks::task_runtime::WorkerTraceSink =
-        Arc::new(move |event| {
-            let _ = app.emit("worker://trace", event);
-        });
-
-    tokio::spawn(async move {
-        let outcome = echo_agent_app_core::tasks::task_runtime::execute_run(
-            store_for_task.clone(),
-            Some(primary_agent_for_task),
-            reviewer_llm,
-            layer_manager,
-            run_store_for_task,
-            Some(trace_sink),
-            &run_id_for_task,
-            exec_cache_user_id.clone(),
-            cancel,
-        )
-        .await;
-        run_cancel_tokens.remove(&format!("__run__:{run_id_for_task}"));
-        let final_status = match &outcome {
-            Ok(echo_agent_app_core::tasks::task_runtime::RunOutcome::Completed) => {
-                tracing::info!(run_id = %run_id_for_task, "auto-routed run completed");
-                Some("completed".to_string())
-            }
-            Ok(other) => {
-                tracing::warn!(run_id = %run_id_for_task, ?other, "auto-routed run ended non-completed");
-                Some(format!("{:?}", other))
-            }
-            Err(e) => {
-                tracing::error!(run_id = %run_id_for_task, error = %e, "auto-routed run executor error");
-                Some("failed".to_string())
-            }
-        };
-        // Update route decision record with run outcome
-        if let Some(ref hash) = message_hash_for_task {
-            use echo_agent_app_core::tasks::task_runtime::load_route_records;
-            let mut records = load_route_records();
-            let actual_workers = store_for_task
-                .get_plan(&run_id_for_task)
-                .ok()
-                .flatten()
-                .map(|plan| planned_worker_roles(&plan));
-            // Update the latest matching record
-            for record in records.iter_mut().rev() {
-                if record.message_hash == *hash && record.final_run_status.is_none() {
-                    record.final_run_status = final_status.clone();
-                    record.actual_workers = actual_workers.clone();
-                    break;
-                }
-            }
-            // Re-persist all records (simplified: rewrite)
-            let path = echo_agent_app_core::tasks::task_runtime::default_route_records_path();
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let content = records
-                .iter()
-                .map(|r| serde_json::to_string(r).unwrap_or_default())
-                .collect::<Vec<_>>()
-                .join("\n")
-                + "\n";
-            let _ = std::fs::write(&path, content);
-        }
-    });
-
-    Ok(())
 }
 
 /// Compute cache diagnostics for a session or across all sessions.
