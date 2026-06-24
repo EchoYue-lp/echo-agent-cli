@@ -126,23 +126,10 @@ impl AgentRuntime {
             register_delegate_readonly_on_handle(&agent_handle).await;
         }
 
-        // ── 3b. Register execute_plan tool (only on main agent, §10.2) ──
-        if let (Some(store), Some(route)) =
-            (params.task_runtime_store.as_ref(), params.route.as_ref())
-        {
-            use crate::tasks::task_runtime::ExecutePlanTool;
-            let tool = ExecutePlanTool::new(store.clone(), agent_handle.clone());
-            let added = agent_handle
-                .write(|a| {
-                    a.add_tool(Box::new(tool));
-                    true
-                })
-                .await;
-            if added {
-                tracing::info!(?route, "Registered execute_plan tool on main agent");
-            }
-        }
-
+        // ── NOTE: ExecutePlanTool is NOT registered here. In GUI mode the
+        // TaskRuntimeStore doesn't exist yet (AppState creates it later), so
+        // registration happens in desktop.rs::register_task_tools_on_agent().
+        // TUI/CLI mode doesn't use the task runtime at all.
         // ── 4. HITL dispatcher ──
         let hitl_dispatcher = {
             let dispatcher = Arc::new(HitlDispatcher::new());
