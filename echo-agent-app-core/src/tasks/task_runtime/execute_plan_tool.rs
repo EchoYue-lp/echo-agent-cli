@@ -100,8 +100,12 @@ impl Tool for ExecutePlanTool {
                 if let Err(e) = self.store.transition_run(&run_id, TaskRunStatus::Paused) {
                     return Ok(ToolResult::error(format!("Failed to pause run: {e}")));
                 }
+                // Register the signal so resume_task_run can find it.
+                super::task_tools::register_approval_signal(&run_id, self.approval_signal.clone());
                 // 等待 resume_run 通过 approval_signal 唤醒
                 self.approval_signal.notified().await;
+                // Remove the signal -- the run has been woken.
+                super::task_tools::remove_approval_signal(&run_id);
                 if let Err(e) = self.store.transition_run(&run_id, TaskRunStatus::Running) {
                     return Ok(ToolResult::error(format!("Failed to resume run: {e}")));
                 }

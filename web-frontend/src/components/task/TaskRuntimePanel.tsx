@@ -653,15 +653,7 @@ export function InterruptPromptDialog() {
             className="flex items-center gap-2 rounded px-3 py-2 text-xs hover:bg-[var(--bg-hover)]"
             style={{ border: '1px solid var(--border-primary)', color: 'var(--text-primary)' }}
             onClick={async () => {
-              // Transition to AwaitingPlanApproval so the user can edit.
-              const runId = interruptPrompt.runId;
-              try {
-                const { invoke } = await import('@tauri-apps/api/core');
-                await invoke('reject_task_plan', { runId, note: null });
-                // Don't cancel — just go back to plan editing.
-              } catch {
-                // ignore
-              }
+              // Just dismiss the prompt — the user will be able to edit and re-run.
               dismiss();
             }}
           >

@@ -582,24 +582,8 @@ export const taskRuntimeApi = {
     isTauri()
       ? apiInvoke<TaskRun>('create_task_run', { req })
       : post<TaskRun>('/task_runtime/runs', req),
-  generatePlan: (runId: string) =>
-    isTauri()
-      ? apiInvoke<{ plan: TaskPlan; warnings: string[] }>('generate_task_plan', {
-          runId,
-        })
-      : post<{ plan: TaskPlan; warnings: string[] }>(`/task_runtime/runs/${runId}/plan`),
-  approvePlan: (runId: string, note?: string) =>
-    isTauri()
-      ? apiInvoke<TaskRun>('approve_task_plan', { runId, note: note ?? null })
-      : post<TaskRun>(`/task_runtime/runs/${runId}/approve`, { note }),
-  rejectPlan: (runId: string, note?: string) =>
-    isTauri()
-      ? apiInvoke<TaskRun>('reject_task_plan', { runId, note: note ?? null })
-      : post<TaskRun>(`/task_runtime/runs/${runId}/reject`, { note }),
-  editPlan: (runId: string, tasks: PlanTask[]) =>
-    isTauri()
-      ? apiInvoke<TaskPlan>('edit_task_plan', { runId, tasks })
-      : put<TaskPlan>(`/task_runtime/runs/${runId}/plan`, { tasks }),
+
+
 
   // ── Execution ────────────────────────────────────────────────────────
   executeRun: (runId: string) =>

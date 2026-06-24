@@ -865,31 +865,6 @@ impl TaskRuntimeStore {
         Ok(())
     }
 
-    /// Record that the user approved/rejected/edited the plan.
-    pub fn resolve_plan(
-        &self,
-        run_id: &str,
-        approved: bool,
-        note: Option<&str>,
-    ) -> Result<(), StoreError> {
-        let mut conn = self.lock()?;
-        let tx = conn.transaction()?;
-        append_event_tx(
-            &tx,
-            run_id,
-            None,
-            None,
-            if approved {
-                RuntimeEventKind::PlanApproved
-            } else {
-                RuntimeEventKind::PlanRejected
-            },
-            serde_json::json!({ "note": note.unwrap_or("") }),
-        )?;
-        tx.commit()?;
-        Ok(())
-    }
-
     // ── Task / todo mutations ───────────────────────────────────────────
 
     /// Update a plan task's status and its mirrored todo row, emitting a

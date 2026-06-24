@@ -13,13 +13,46 @@
 //! thread hop. `task_local!` is bound to the logical async task and survives
 //! `.await` across threads — correct for this use case.
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
+use dashmap::DashMap;
 use echo_agent::prelude::*;
 use echo_agent::tools::{Tool, ToolResult};
+use tokio::sync::Notify;
 
 use super::store::TaskRuntimeStore;
 use super::types::{PlanTask, PlanTaskKind, TaskPatch, TodoStatus};
+
+// ── Approval-signal registry (spec §10.5 ComplexRuntime) ──────────────────
+
+/// Shared map of approval signals for ComplexRuntime runs (spec §10.5).
+/// Stores `Arc<Notify>` handles keyed by `run_id` so the Tauri
+/// `resume_task_run` command can wake the waiting `execute_plan` tool instead
+/// of bypassing it (which would cause TWO concurrent execute_run calls).
+pub(crate) static APPROVAL_NOTIFIES: LazyLock<DashMap<String, Arc<Notify>>> =
+    LazyLock::new(DashMap::new);
+
+/// Register an approval signal so `resume_task_run` can find it.
+pub fn register_approval_signal(run_id: &str, signal: Arc<Notify>) {
+    APPROVAL_NOTIFIES.insert(run_id.to_string(), signal);
+}
+
+/// Remove an approval signal after the execute_plan tool has been woken.
+pub fn remove_approval_signal(run_id: &str) {
+    APPROVAL_NOTIFIES.remove(run_id);
+}
+
+/// Notify a waiting `execute_plan` tool to resume. Returns `true` if a signal
+/// was found and notified, `false` if the run_id has no registered signal
+/// (the caller should fall back to a direct execution path).
+pub fn notify_approval_signal(run_id: &str) -> bool {
+    if let Some(signal) = APPROVAL_NOTIFIES.get(run_id) {
+        signal.notify_one();
+        true
+    } else {
+        false
+    }
+}
 
 // ── Task-local run_id injection (async-safe) ──────────────────────────────
 

@@ -67,14 +67,8 @@ export interface TaskRuntimeState {
   // ── Actions ───────────────────────────────────────────────────────────
   refresh: (runId: string) => Promise<void>;
   loadByConversation: (conversationId: string) => Promise<void>;
-  generatePlan: (runId: string) => Promise<void>;
-  approve: (runId: string, note?: string) => Promise<void>;
-  reject: (runId: string, note?: string) => Promise<void>;
   execute: (runId: string) => Promise<void>;
   cancel: (runId: string) => Promise<void>;
-  /// Mark that a plan_ready chat event arrived for this run — the panel
-  /// should fetch the plan + show approval actions.
-  notifyPlanReady: (runId: string, explanation?: Partial<RouteExplanation>) => Promise<void>;
   openInterruptPrompt: (data: { runId: string; goal: string; newMessage: string }) => void;
   dismissInterruptPrompt: () => void;
   // Dynamic task operations (Phase 2).
@@ -189,43 +183,7 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
     }
   },
 
-  generatePlan: async (runId: string) => {
-    set({ generatingPlan: true, error: null });
-    try {
-      await taskRuntimeApi.generatePlan(runId);
-      await get().refresh(runId);
-    } catch (e) {
-      set({ error: e instanceof Error ? e.message : String(e) });
-    } finally {
-      set({ generatingPlan: false });
-    }
-  },
 
-  approve: async (runId: string, note?: string) => {
-    try {
-      await taskRuntimeApi.approvePlan(runId, note);
-      // After approval the run is Ready. Try to auto-launch execution; if it
-      // fails (e.g. transient error), the run stays Ready and the panel shows
-      // a "执行" button so the user can retry without re-approving.
-      try {
-        await taskRuntimeApi.executeRun(runId);
-      } catch (execErr) {
-        set({ error: `批准成功但启动执行失败: ${execErr instanceof Error ? execErr.message : String(execErr)}。可点击"执行"重试。` });
-      }
-      await get().refresh(runId);
-    } catch (e) {
-      set({ error: e instanceof Error ? e.message : String(e) });
-    }
-  },
-
-  reject: async (runId: string, note?: string) => {
-    try {
-      await taskRuntimeApi.rejectPlan(runId, note);
-      await get().refresh(runId);
-    } catch (e) {
-      set({ error: e instanceof Error ? e.message : String(e) });
-    }
-  },
 
   execute: async (runId: string) => {
     try {
@@ -242,30 +200,6 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
       await get().refresh(runId);
     } catch (e) {
       set({ error: e instanceof Error ? e.message : String(e) });
-    }
-  },
-
-  notifyPlanReady: async (runId: string, explanation?: Partial<RouteExplanation>) => {
-    // A plan_ready event arrived — load the run + plan so the panel can
-    // render the approval UI.
-    set({
-      events: [],
-      lastSeq: '0',
-      routeExplanation: {
-        runId,
-        plannedWorkers: [],
-        suggestedWorkers: [],
-        activeSkills: [],
-        routeSignals: [],
-        classificationSignals: [],
-        ...explanation,
-      },
-    });
-    await get().refresh(runId);
-    if (!get().activeRun) {
-      window.setTimeout(() => {
-        void get().refresh(runId);
-      }, 500);
     }
   },
 
