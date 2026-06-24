@@ -3,8 +3,4 @@
 /**
  * PUT /api/config
  */
-export type UpdateConfigRequest = {
-  model: string | null;
-  system_prompt: string | null;
-  token_limit: number | null;
-};
+export type UpdateConfigRequest = { model: string | null, system_prompt: string | null, token_limit: number | null, };

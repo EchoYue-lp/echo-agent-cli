@@ -8,8 +8,6 @@ import { useWebSocket } from '../../hooks/useWebSocket';
 import { useTauriChat } from '../../hooks/useTauriChat';
 import { isTauri } from '../../lib/tauri-bridge';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
-import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
-import { PlanApprovalCard } from './PlanApprovalCard';
 import { FailureToast } from './FailureToast';
 import type { Attachment } from '../../types/api';
 
@@ -31,7 +29,6 @@ export function ChatPanel() {
 
   // ── 按需卡片状态 ──
   const [failureToastDismissed, setFailureToastDismissed] = useState(false);
-  const awaitingApproval = useTaskRuntimeStore((s) => s.awaitingApproval);
 
   // Reset failure toast dismiss when a new run starts (status changes)
   useEffect(() => {
@@ -228,13 +225,6 @@ export function ChatPanel() {
                       sendSelection(selectionRequest.requestId, selection, instructions)
                     }
                   />
-                </div>
-              )}
-
-              {/* Plan approval card (spec §3.4) */}
-              {awaitingApproval && (
-                <div className="py-2">
-                  <PlanApprovalCard onDismiss={() => {}} />
                 </div>
               )}
 

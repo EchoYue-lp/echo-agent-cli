@@ -1,6 +1,5 @@
 import { useRef, useCallback, useEffect, useState } from 'react';
 import { useChatStore } from '../stores/chatStore';
-import { useTaskRuntimeStore } from '../stores/taskRuntimeStore';
 import { useWorkerTraceStore, type WorkerTraceEvent } from '../stores/workerTraceStore';
 import { isTauri } from '../lib/tauri-bridge';
 import type { ClientMessage, ServerMessage, Attachment } from '../types/api';
@@ -224,27 +223,6 @@ export function useWebSocket() {
           break;
         case 'worker://trace':
           useWorkerTraceStore.getState().append(msg.payload as unknown as WorkerTraceEvent);
-          break;
-        case 'plan_ready':
-          // A complex input was routed to TaskRuntime and a plan was generated.
-          // Hand it to the TaskRuntime store so the right-rail panel renders the
-          // plan + approval actions (was missing in Web mode, see P1-7).
-          useTaskRuntimeStore.getState().notifyPlanReady(msg.run_id, {
-            goal: msg.goal,
-            domainProfile: msg.domain_profile,
-            route: msg.route,
-            interactionMode: msg.interaction_mode,
-            permissionMode: msg.permission_mode,
-            approvalPolicy: msg.approval_policy,
-            routeReason: msg.route_reason,
-            confidence: msg.confidence,
-            autoExecute: msg.auto_execute,
-            plannedWorkers: msg.planned_workers ?? [],
-            suggestedWorkers: msg.suggested_workers ?? [],
-            activeSkills: msg.active_skills ?? [],
-            routeSignals: msg.route_signals ?? [],
-            classificationSignals: msg.classification_signals ?? [],
-          });
           break;
       }
     };

@@ -221,25 +221,6 @@ export type ServerMessage =
   | { type: 'cancelled'; id?: string }
   | { type: 'done'; id?: string }
   | { type: 'run_status'; id?: string; status: ChatRunStatus }
-  | {
-      type: 'plan_ready';
-      id?: string;
-      run_id: string;
-      goal?: string;
-      domain_profile?: string;
-      route?: string;
-      interaction_mode?: string;
-      permission_mode?: string;
-      approval_policy?: string;
-      route_reason?: string;
-      confidence?: number;
-      auto_execute?: boolean;
-      planned_workers?: string[];
-      suggested_workers?: string[];
-      active_skills?: string[];
-      route_signals?: string[];
-      classification_signals?: string[];
-    }
   | { type: 'thinking_start'; id?: string }
   | { type: 'thinking_end'; id?: string; prompt_tokens: number; completion_tokens: number }
   | { type: 'pong' }

@@ -5,17 +5,17 @@
  * and `RuntimeTaskEvent`s, never from local guesses.
  *
  * Allowed transitions (see [`TaskRunStatus::can_transition_to`]):
+ *
  * ```text
- * Pending -> Planning
- * Planning -> AwaitingPlanApproval
- * AwaitingPlanApproval -> Ready | Cancelled
- * Ready -> Running
- * Running -> WaitingApproval | WaitingInput | Suspended | Cancelling | Failed | Completed
- * WaitingApproval -> Running | Suspended | Cancelled
- * WaitingInput -> Running | Suspended | Cancelled
- * Suspended -> Ready | Cancelled
- * Cancelling -> Cancelled
- * Failed -> Ready | Cancelled
+ * Pending → Running → Completed
+ *              │  ↘
+ *           Paused  Failed → Running (retry)
+ *              │
+ *           Cancelled
  * ```
+ *
+ * 极简 6 态(对齐 Claude Code/Codex:plan 审批不进状态机,用 Paused 表达)。
+ * 删去了 Planning/AwaitingPlanApproval/Ready/WaitingApproval/WaitingInput/Suspended/Cancelling
+ * —— 这些"plan 是否被批准"的语义改由编排层(L1) + Paused 承载,不进 run 状态机。
  */
-export type TaskRunStatus = "pending" | "planning" | "awaiting_plan_approval" | "ready" | "running" | "waiting_approval" | "waiting_input" | "suspended" | "cancelling" | "cancelled" | "failed" | "completed";
+export type TaskRunStatus = "pending" | "running" | "paused" | "cancelled" | "failed" | "completed";

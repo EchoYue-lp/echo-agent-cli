@@ -54,24 +54,6 @@ type ChatEvent = ChatEventBase &
     }
   | { type: 'tool_batch_start'; tool_count: number }
   | { type: 'tool_batch_end' }
-  | {
-      type: 'plan_ready';
-      run_id: string;
-      goal: string;
-      domain_profile: string;
-      route: string;
-      interaction_mode: string;
-      permission_mode: string;
-      approval_policy: string;
-      route_reason: string;
-      confidence: number;
-      auto_execute: boolean;
-      planned_workers: string[];
-      suggested_workers: string[];
-      active_skills: string[];
-      route_signals: string[];
-      classification_signals: string[];
-    }
   | { type: 'done' }
   );
 

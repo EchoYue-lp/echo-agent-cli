@@ -162,39 +162,6 @@ export function handleChatEvent(
       });
       break;
     }
-    case 'plan_ready': {
-      if (ctx.isCancelledRef.current) break;
-      if (event.run_id) {
-        void useTaskRuntimeStore.getState().notifyPlanReady(event.run_id, {
-          goal: event.goal,
-          domainProfile: event.domain_profile,
-          route: event.route,
-          interactionMode: event.interaction_mode,
-          permissionMode: event.permission_mode,
-          approvalPolicy: event.approval_policy,
-          routeReason: event.route_reason,
-          confidence: event.confidence,
-          autoExecute: event.auto_execute,
-          plannedWorkers: event.planned_workers ?? [],
-          suggestedWorkers: event.suggested_workers ?? [],
-          activeSkills: event.active_skills ?? [],
-          routeSignals: event.route_signals ?? [],
-          classificationSignals: event.classification_signals ?? [],
-        });
-      }
-      ctx.currentThinkingIdRef.current = null;
-      const id = ctx.assistantIdRef.current;
-      if (id) {
-        const content = '';
-        store.handoffToTaskRuntime(id, content, event.auto_execute === true);
-      } else {
-        store.setStreaming(false);
-      }
-      ctx.assistantIdRef.current = null;
-      ctx.currentMessageKeyRef.current = null;
-      ctx.currentMessageIdRef.current = null;
-      break;
-    }
     case 'error': {
       ctx.isCancelledRef.current = true;
       store.setRunStatus('failed');

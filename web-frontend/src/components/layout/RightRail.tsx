@@ -10,23 +10,22 @@ import { ChangesDrawer } from '../changes/ChangesDrawer';
 import { TaskRuntimePanel, CacheUsageCard, cacheUsageForWorkers } from '../task/TaskRuntimePanel';
 
 const STATUS_LABEL: Record<string, string> = {
-  pending: '待处理', planning: '规划中', awaiting_plan_approval: '待确认计划', ready: '就绪',
-  running: '执行中', waiting_approval: '等待审批', waiting_input: '等待输入', suspended: '已挂起',
-  cancelling: '取消中', cancelled: '已取消', failed: '失败', completed: '已完成',
+  pending: '待处理', running: '执行中', paused: '已暂停',
+  cancelled: '已取消', failed: '失败', completed: '已完成',
 };
 
 function runStatusColor(status: string): string {
   if (['completed'].includes(status)) return 'var(--color-success)';
-  if (['running', 'planning', 'ready'].includes(status)) return 'var(--color-info)';
+  if (['running'].includes(status)) return 'var(--color-info)';
   if (['failed', 'cancelled'].includes(status)) return 'var(--color-error)';
-  if (['suspended', 'blocked', 'waiting_approval', 'awaiting_plan_approval', 'waiting_input', 'cancelling'].includes(status)) return 'var(--color-warning)';
+  if (['paused', 'blocked'].includes(status)) return 'var(--color-warning)';
   return 'var(--text-tertiary)';
 }
 
 export function RightRail() {
   const activeId = useConversationStore((s) => s.activeId);
   const messages = useChatStore((s) => s.messages);
-  const { activeRun, plan, todos: _todos, artifacts, awaitingApproval, approve, reject, refresh } =
+  const { activeRun, todos: _todos, artifacts, refresh } =
     useTaskRuntimeStore();
   const traceWorkers = useWorkerTraceStore((s) => s.workers);
 
@@ -97,13 +96,6 @@ export function RightRail() {
                       <div className="text-[9px]" style={{ color: runStatusColor(w.status) }}>{w.status}</div>
                     </div>
                   ))}
-                </div>
-              )}
-              {/* Plan approval (when awaiting) */}
-              {awaitingApproval && plan && (
-                <div className="mt-2 flex gap-1.5">
-                  <button onClick={() => approve(activeRun.run_id)} className="flex-1 rounded px-2 py-1 text-[11px] font-medium" style={{ background: 'var(--accent)', color: 'var(--text-on-accent)' }}>执行全部</button>
-                  <button onClick={() => reject(activeRun.run_id)} className="rounded px-2 py-1 text-[11px]" style={{ background: 'var(--bg-hover)', color: 'var(--text-secondary)' }}>取消</button>
                 </div>
               )}
             </>

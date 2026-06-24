@@ -18,12 +18,11 @@ interface PlanApprovalCardProps {
 export function PlanApprovalCard({ onDismiss }: PlanApprovalCardProps) {
   const activeRun = useTaskRuntimeStore((s) => s.activeRun);
   const plan = useTaskRuntimeStore((s) => s.plan);
-  const awaitingApproval = useTaskRuntimeStore((s) => s.awaitingApproval);
   const approve = useTaskRuntimeStore((s) => s.approve);
   const reject = useTaskRuntimeStore((s) => s.reject);
   const execute = useTaskRuntimeStore((s) => s.execute);
 
-  if (!awaitingApproval || !plan || !activeRun) return null;
+  if (!plan || !activeRun) return null;
 
   const taskCount = plan.tasks.length ?? 0;
 

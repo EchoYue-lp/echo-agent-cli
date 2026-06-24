@@ -37,15 +37,8 @@ import type { TodoStatus } from '../../generated';
 
 const STATUS_LABEL: Record<string, string> = {
   pending: '待处理',
-  planning: '规划中',
-  awaiting_plan_approval: '待确认计划',
-  ready: '就绪',
   running: '执行中',
-  waiting_approval: '等待审批',
-  waiting_input: '等待输入',
-  suspended: '已挂起',
   paused: '已暂停',
-  cancelling: '取消中',
   cancelled: '已取消',
   failed: '失败',
   completed: '已完成',
@@ -62,9 +55,9 @@ const TODO_LABEL: Record<string, string> = {
 
 function statusColor(status: string): string {
   if (['completed'].includes(status)) return 'var(--color-success)';
-  if (['running', 'planning', 'ready'].includes(status)) return 'var(--color-info)';
+  if (['running'].includes(status)) return 'var(--color-info)';
   if (['failed', 'cancelled'].includes(status)) return 'var(--color-error)';
-  if (['suspended', 'paused', 'blocked', 'waiting_approval', 'awaiting_plan_approval', 'waiting_input', 'cancelling'].includes(status))
+  if (['paused', 'blocked'].includes(status))
     return 'var(--color-warning)';
   return 'var(--text-tertiary)';
 }
@@ -392,7 +385,7 @@ function displayedTodoStatus(todo: { status: TodoStatus; owner_agent: string | n
 export function TaskRuntimePanel() {
   const activeId = useConversationStore((s) => s.activeId);
   const traceWorkers = useWorkerTraceStore((s) => s.workers);
-  const { activeRun, plan, todos, routeExplanation, loadByConversation, refresh } =
+  const { activeRun, plan, todos, routeExplanation, loadByConversation, refresh, resumeTaskRun } =
     useTaskRuntimeStore();
 
   useEffect(() => {
@@ -446,6 +439,18 @@ export function TaskRuntimePanel() {
       >
         {activeRun?.goal ?? routeExplanation?.goal ?? '正在读取任务'}
       </div>
+
+      {activeRun?.status === 'paused' && routeExplanation?.route === 'complex_runtime' && (
+        <div className="mb-2">
+          <button
+            onClick={() => resumeTaskRun()}
+            className="w-full rounded px-3 py-1.5 text-[11px] font-medium"
+            style={{ background: 'var(--accent)', color: 'var(--text-on-accent)' }}
+          >
+            开始执行
+          </button>
+        </div>
+      )}
 
       <div className="mb-2">
         <CacheUsageCard summary={usageSummary} compact />

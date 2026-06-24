@@ -3,11 +3,9 @@
 /**
  * POST /api/chat
  */
-export type ChatRequest = {
-  message: string;
-  /**
-   * Optional session ID — when provided, the agent's conversation history
-   * is restored from the persisted session before processing this message.
-   */
-  session_id: string | null;
-};
+export type ChatRequest = { message: string, 
+/**
+ * Optional session ID — when provided, the agent's conversation history
+ * is restored from the persisted session before processing this message.
+ */
+session_id: string | null, };

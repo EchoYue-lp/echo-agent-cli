@@ -21,7 +21,6 @@ import type {
   TodoItem,
   RuntimeTaskEvent,
   RuntimeArtifact,
-  TaskRunStatus,
 } from '../generated';
 import { useWorkerTraceStore, type WorkerTraceEvent } from './workerTraceStore';
 
@@ -54,8 +53,6 @@ export interface TaskRuntimeState {
   /// Highest event seq we've already ingested (string per the seq-as-string
   /// transport contract). Used for incremental polling.
   lastSeq: string;
-  /// True while a plan is awaiting the user's approve/reject decision.
-  awaitingApproval: boolean;
   ///Transient error surfaced as a toast/banner.
   error: string | null;
   /// Loading flag for plan generation (the LLM call can take a few seconds).
@@ -131,7 +128,6 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
   events: [],
   artifacts: [],
   lastSeq: '0',
-  awaitingApproval: false,
   error: null,
   generatingPlan: false,
   routeExplanation: null,
@@ -158,7 +154,6 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
           events: [...get().events, ...events].slice(-MAX_EVENTS),
           artifacts,
           lastSeq,
-          awaitingApproval: false,
           error: `TaskRuntime run ${runId} 暂时不可用`,
         });
         return;
@@ -172,9 +167,6 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
         events: [...get().events, ...events].slice(-MAX_EVENTS),
         artifacts,
         lastSeq,
-        awaitingApproval:
-          run?.status === ('awaiting_plan_approval' as TaskRunStatus) ||
-          run?.status === ('waiting_approval' as TaskRunStatus),
         error: null,
       });
     } catch (e) {
@@ -320,7 +312,6 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
       events: [],
       artifacts: [],
       lastSeq: '0',
-      awaitingApproval: false,
       error: null,
       generatingPlan: false,
       routeExplanation: null,
