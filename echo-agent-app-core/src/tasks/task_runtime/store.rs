@@ -1813,7 +1813,7 @@ mod tests {
         s.transition_run("r1", TaskRunStatus::Running).unwrap();
         // Running → Completed is legal. Now test that Completed → Running is
         // illegal (terminal state → non-terminal is always rejected).
-        let before = s.list_events("r1", 0).unwrap().len();
+        let _before = s.list_events("r1", 0).unwrap().len();
         s.transition_run("r1", TaskRunStatus::Completed).unwrap();
         let before_terminal = s.list_events("r1", 0).unwrap().len();
         let err = s.transition_run("r1", TaskRunStatus::Running).unwrap_err();

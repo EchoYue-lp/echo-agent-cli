@@ -644,7 +644,10 @@ impl AgentPool {
             working_dir: None,
             // Thread the TaskRuntimeStore so pooled agents get task-management
             // tools registered (matches the primary agent wiring).
+            // route is intentionally None for pooled agents (workers never get
+            // execute_plan per §10.2).
             task_runtime_store: self.shared.task_runtime_store.clone(),
+            route: None,
         };
         let mut agent =
             infra::create_agent(&params, &app_config).map_err(|e| anyhow::anyhow!("{e}"))?;

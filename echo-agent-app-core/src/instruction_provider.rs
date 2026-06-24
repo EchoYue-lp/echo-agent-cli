@@ -98,8 +98,6 @@ impl InstructionProvider {
             .and_then(|path| std::fs::read_to_string(path).ok())
     }
 
-    /// Find the project root (first ancestor containing `.git` or `.echo-agent`).
-
     /// Save project-level instructions to `<cwd>/.echo-agent/project.md`.
     pub fn save_project_instructions(content: &str) -> std::io::Result<()> {
         let path = Self::project_instructions_path();

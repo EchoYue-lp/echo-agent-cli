@@ -15,6 +15,7 @@ use crate::agent_handle::AgentHandle;
 use crate::config::AppConfig;
 use crate::model_config;
 use crate::project::prompt::PromptAssembler;
+use crate::tasks::task_runtime::TaskRouteKind;
 
 /// Default context window size in tokens (128K).
 const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
@@ -77,6 +78,11 @@ pub struct AgentCreateParams {
     /// task-management tools (task_create/update/complete/skip/list) so the
     /// main agent can autonomously manage its plan during execution.
     pub task_runtime_store: Option<Arc<crate::tasks::task_runtime::TaskRuntimeStore>>,
+    /// Route kind for execute_plan tool registration. When Some, the
+    /// `execute_plan` tool is registered on the agent (never on workers,
+    /// per §10.2). The route determines whether ComplexRuntime approval
+    /// gating is active (§10.5).
+    pub route: Option<TaskRouteKind>,
 }
 
 /// Generate a fresh conversation id for the primary (non-pooled) agent.

@@ -76,6 +76,7 @@ async fn create_agent_threads_state_store_and_conversation_id() {
         memory_context_suffix: None,
         working_dir: None,
         task_runtime_store: None,
+        route: None,
     };
     let app_config = make_app_config();
     let agent = infra::create_agent(&params, &app_config)
@@ -105,6 +106,7 @@ async fn create_agent_without_state_store_leaves_it_none() {
         memory_context_suffix: None,
         working_dir: None,
         task_runtime_store: None,
+        route: None,
     };
     let app_config = make_app_config();
     let agent = infra::create_agent(&params, &app_config)
@@ -136,6 +138,7 @@ async fn memory_context_suffix_lands_in_system_prompt() {
         memory_context_suffix: Some(suffix.clone()),
         working_dir: None,
         task_runtime_store: None,
+        route: None,
     };
     let app_config = make_app_config();
     let agent = infra::create_agent(&params, &app_config)

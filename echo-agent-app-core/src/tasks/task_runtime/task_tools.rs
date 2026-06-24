@@ -30,12 +30,17 @@ tokio::task_local! {
     /// The cancel token for the currently executing task run. Set alongside
     /// CURRENT_RUN_ID so delegate_readonly and other tools can read it.
     pub static CURRENT_CANCEL: tokio_util::sync::CancellationToken;
+    /// Delegate nesting depth — incremented each time a subagent is delegated
+    /// during tool execution. Used by Task 6 (L3 nesting) to prevent runaway
+    /// recursion and to route subagent tool calls correctly.
+    pub static CURRENT_DELEGATE_DEPTH: u32;
 }
 
-/// Run `f` with both `run_id` and `cancel` available to all task tools.
+/// Run `f` with run_id, cancel, and delegate_depth available to all task tools.
 ///
 /// Called by the executor before dispatching task work. Replaces the old
-/// [`with_run_id`] which only scoped the run_id.
+/// [`with_run_id`] which only scoped the run_id. Delegate depth starts at 0
+/// and is incremented by the L3 nesting layer (Task 6).
 pub async fn with_run_context<F, R>(
     run_id: String,
     cancel: tokio_util::sync::CancellationToken,
@@ -46,7 +51,10 @@ where
 {
     let cell_cancel = cancel.clone();
     CURRENT_RUN_ID
-        .scope(run_id, CURRENT_CANCEL.scope(cell_cancel, f))
+        .scope(
+            run_id,
+            CURRENT_CANCEL.scope(cell_cancel, CURRENT_DELEGATE_DEPTH.scope(0, f)),
+        )
         .await
 }
 

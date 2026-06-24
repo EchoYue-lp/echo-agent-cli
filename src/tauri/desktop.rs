@@ -146,6 +146,7 @@ async fn run_desktop() -> anyhow::Result<()> {
         // (AppState creates it later). Tools are registered post-hoc via
         // `register_task_tools_on_agent` once AppState is built.
         task_runtime_store: None,
+        route: None,
     };
 
     let runtime =
@@ -237,10 +238,10 @@ async fn run_desktop() -> anyhow::Result<()> {
 }
 
 /// Register the 5 task-management tools (task_create/update/complete/skip/list)
-/// on an existing agent via its handle's write lock. Used for the primary agent,
-/// which is created before the TaskRuntimeStore exists and thus can't receive
-/// the tools at construction time (unlike pooled agents, which get them via
-/// SharedResources.task_runtime_store).
+/// and the execute_plan tool on an existing agent via its handle's write lock.
+/// Used for the primary agent, which is created before the TaskRuntimeStore
+/// exists and thus can't receive the tools at construction time (unlike pooled
+/// agents, which get them via SharedResources.task_runtime_store).
 async fn register_task_tools_on_agent(
     agent_handle: &echo_agent_app_core::agent_handle::AgentHandle,
     store: std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
@@ -273,6 +274,30 @@ async fn register_task_tools_on_agent(
     } else {
         tracing::warn!(
             "Failed to register task-management tools on primary agent (write lock poisoned)"
+        );
+    }
+
+    // Also register execute_plan tool (only on main agent per §10.2).
+    // Use ParallelReadonlyDelegation as the default route; the route is
+    // resolved per-run by the router at the orchestration layer.
+    use echo_agent_app_core::tasks::task_runtime::ExecutePlanTool;
+    use echo_agent_app_core::tasks::task_runtime::TaskRouteKind;
+    let tool = ExecutePlanTool::new(
+        store,
+        agent_handle.clone(),
+        TaskRouteKind::ParallelReadonlyDelegation,
+    );
+    let ep_added = agent_handle
+        .write(|agent| {
+            agent.add_tool(Box::new(tool));
+            true
+        })
+        .await;
+    if ep_added {
+        tracing::info!("Registered execute_plan tool on primary agent");
+    } else {
+        tracing::warn!(
+            "Failed to register execute_plan tool on primary agent (write lock poisoned)"
         );
     }
 }
