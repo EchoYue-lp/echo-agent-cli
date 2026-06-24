@@ -159,6 +159,11 @@ impl Tool for DelegateReadonlyTool {
                 .unwrap_or(0);
 
             let handle = self.agent_handle.clone();
+            // Clone for post-dispatch token recording (the async move closure
+            // below takes ownership of role/task/run_id).
+            let role_for_usage = role.clone();
+            let task_for_usage = task.clone();
+            let run_id_for_usage = run_id.clone();
             let result = handle
                 .read_async(|a| {
                     Box::pin(async move {
@@ -171,7 +176,36 @@ impl Tool for DelegateReadonlyTool {
                 .await;
 
             match result {
-                Ok(subagent_result) => Ok(ToolResult::success(subagent_result.output)),
+                Ok(subagent_result) => {
+                    // 消费 token 统计(根因②: 之前只取 output 丢弃 usage)。
+                    // 经 execute_plan 路径的 worker token 由 execute_task 统计;
+                    // 这里补 delegate_readonly 路径,防御性确保两条路都不丢 token。
+                    if let Some(ref store) = self.store {
+                        let usage_payload = match &subagent_result.usage {
+                            Some(stats) => stats.to_payload(&run_id_for_usage),
+                            None => serde_json::json!({
+                                "session_id": run_id_for_usage,
+                                "model": "unknown",
+                                "usage_reported": false,
+                                "reason": "delegate_readonly: provider returned no usage",
+                            }),
+                        };
+                        let worker_trace_id = format!("{run_id_for_usage}:{role_for_usage}");
+                        let task_id = format!("delegate_{}", chrono::Utc::now().timestamp_millis());
+                        let title: String = task_for_usage.chars().take(80).collect();
+                        if let Err(e) = store.record_worker_llm_usage(
+                            &run_id_for_usage,
+                            &task_id,
+                            &worker_trace_id,
+                            &role_for_usage,
+                            &title,
+                            usage_payload.clone(),
+                        ) {
+                            tracing::warn!(error = %e, "delegate_readonly: 记录 token 失败");
+                        }
+                    }
+                    Ok(ToolResult::success(subagent_result.output))
+                }
                 Err(e) => Ok(ToolResult::error(format!("delegate_readonly 失败: {e}"))),
             }
         })

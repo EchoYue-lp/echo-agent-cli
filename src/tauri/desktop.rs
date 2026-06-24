@@ -281,7 +281,7 @@ async fn register_task_tools_on_agent(
     // Use ParallelReadonlyDelegation as the default route; the route is
     // resolved per-run by the router at the orchestration layer.
     use echo_agent_app_core::tasks::task_runtime::ExecutePlanTool;
-    let tool = ExecutePlanTool::new(store, agent_handle.clone());
+    let tool = ExecutePlanTool::new(store.clone(), agent_handle.clone());
     let ep_added = agent_handle
         .write(|agent| {
             agent.add_tool(Box::new(tool));
@@ -294,5 +294,32 @@ async fn register_task_tools_on_agent(
         tracing::warn!(
             "Failed to register execute_plan tool on primary agent (write lock poisoned)"
         );
+    }
+
+    // Re-register delegate_readonly WITH the store. At bootstrap (runtime.rs:126)
+    // the store didn't exist yet, so delegate_readonly was registered with
+    // store=None — which disables the "plan exists → refuse, tell LLM to use
+    // execute_plan" interception (delegate_readonly_tool.rs:123). Replacing it
+    // here (after the store exists) makes the interception effective, so the
+    // main agent is forced down the execute_plan path when it has a plan.
+    // (根因①修复)
+    use echo_agent_app_core::tasks::task_runtime::delegate_readonly_tool::DelegateReadonlyTool;
+    let removed = agent_handle
+        .write(|agent| agent.remove_tool("delegate_readonly").is_some())
+        .await;
+    if removed {
+        tracing::debug!("Removed store-less delegate_readonly from primary agent");
+    }
+    let dr_tool = DelegateReadonlyTool::new(agent_handle.clone()).with_store(store.clone());
+    let dr_added = agent_handle
+        .write(|agent| {
+            agent.add_tool(Box::new(dr_tool));
+            true
+        })
+        .await;
+    if dr_added {
+        tracing::info!("Re-registered delegate_readonly WITH store on primary agent");
+    } else {
+        tracing::warn!("Failed to re-register delegate_readonly with store");
     }
 }

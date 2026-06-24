@@ -322,16 +322,25 @@ impl TaskCreateTool {
         run_id: String,
         params: ToolParameters,
     ) -> echo_agent::error::Result<ToolResult> {
-        let title = params
-            .get("title")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
         let description = params
             .get("description")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        // title 兜底:LLM 偶尔漏传 title,用 description 首行(前 60 字符)代替,
+        // 避免右侧栏显示空标题(日志里 "Created task ''")。
+        let title = params
+            .get("title")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .unwrap_or_else(|| {
+                if description.is_empty() {
+                    "未命名任务".to_string()
+                } else {
+                    description.chars().take(60).collect()
+                }
+            });
         let kind_str = params
             .get("kind")
             .and_then(|v| v.as_str())
