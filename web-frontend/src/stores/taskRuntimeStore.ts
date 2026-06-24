@@ -64,7 +64,12 @@ export interface TaskRuntimeState {
   /// resume / edit-and-resume / abandon.
   interruptPrompt: { runId: string; goal: string; newMessage: string } | null;
 
+  /// Polling interval ID — non-null while actively polling a running run.
+  pollingInterval: ReturnType<typeof setInterval> | null;
+
   // ── Actions ───────────────────────────────────────────────────────────
+  startPolling: (runId: string) => void;
+  stopPolling: () => void;
   refresh: (runId: string) => Promise<void>;
   loadByConversation: (conversationId: string) => Promise<void>;
   execute: (runId: string) => Promise<void>;
@@ -126,6 +131,32 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
   generatingPlan: false,
   routeExplanation: null,
   interruptPrompt: null,
+  pollingInterval: null,
+
+  startPolling: (runId: string) => {
+    const running = ['pending', 'running', 'paused'] as const;
+    const { pollingInterval } = get();
+    if (pollingInterval !== null) return; // already polling
+    const interval = setInterval(() => {
+      get().refresh(runId).then(() => {
+        const status = get().activeRun?.status;
+        if (status && !running.includes(status as typeof running[number])) {
+          get().stopPolling();
+        }
+      }).catch(() => {
+        // refresh errors are handled inside refresh()
+      });
+    }, 2000);
+    set({ pollingInterval: interval });
+  },
+
+  stopPolling: () => {
+    const { pollingInterval } = get();
+    if (pollingInterval !== null) {
+      clearInterval(pollingInterval);
+      set({ pollingInterval: null });
+    }
+  },
 
   refresh: async (runId: string) => {
     try {
@@ -238,7 +269,8 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
     await get().refresh(runId);
   },
 
-  reset: () =>
+  reset: () => {
+    get().stopPolling();
     set({
       activeRun: null,
       plan: null,
@@ -250,5 +282,6 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
       generatingPlan: false,
       routeExplanation: null,
       interruptPrompt: null,
-    }),
+    });
+  },
 }));

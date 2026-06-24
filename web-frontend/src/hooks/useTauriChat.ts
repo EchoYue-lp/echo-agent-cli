@@ -193,6 +193,13 @@ export function useTauriChat() {
       if (createdRunId && conversation_id) {
         import('../stores/taskRuntimeStore').then(({ useTaskRuntimeStore }) => {
           useTaskRuntimeStore.getState().loadByConversation(conversation_id!)
+            .then(() => {
+              const store = useTaskRuntimeStore.getState();
+              const run = store.activeRun;
+              if (run && (run.status === 'pending' || run.status === 'running' || run.status === 'paused')) {
+                store.startPolling(run.run_id);
+              }
+            })
             .catch((e) => console.warn('[TauriChat] Failed to load task runtime:', e));
         }).catch((e) => console.warn('[TauriChat] Failed to import taskRuntimeStore:', e));
       }
