@@ -264,6 +264,7 @@ mod tests {
                 "m1",
                 DomainProfile::AiCoding,
                 "Review runtime",
+                "",
             )
             .unwrap();
         let plan = TaskPlan {

@@ -1682,7 +1682,7 @@ mod tests {
         // Seed a run + plan via the public store API, then drive the state
         // machine the way run_dag would.
         store
-            .create_run("r1", "ws", "c1", "m1", DomainProfile::AiCoding, "g")
+            .create_run("r1", "ws", "c1", "m1", DomainProfile::AiCoding, "g", "")
             .unwrap();
         let plan = TaskPlan {
             plan_id: "p1".into(),
@@ -1922,6 +1922,7 @@ mod tests {
                 "msg_test",
                 DomainProfile::General,
                 "test goal",
+                "",
             )
             .unwrap();
         let plan = TaskPlan {

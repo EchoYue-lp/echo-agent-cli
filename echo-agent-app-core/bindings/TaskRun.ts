@@ -6,4 +6,4 @@ import type { TaskRunStatus } from "./TaskRunStatus";
  * A single complex-task run. One run = one user goal that goes through the
  * plan → approve → execute → review → synthesize lifecycle.
  */
-export type TaskRun = { run_id: string, workspace_id: string, conversation_id: string, root_message_id: string, domain_profile: DomainProfile, status: TaskRunStatus, goal: string, plan_id: string | null, created_at: string, updated_at: string, };
+export type TaskRun = { run_id: string, workspace_id: string, conversation_id: string, root_message_id: string, domain_profile: DomainProfile, status: TaskRunStatus, goal: string, plan_id: string | null, route: string, created_at: string, updated_at: string, };

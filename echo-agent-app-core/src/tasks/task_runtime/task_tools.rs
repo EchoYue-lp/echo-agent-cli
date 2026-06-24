@@ -21,7 +21,11 @@ use echo_agent::tools::{Tool, ToolResult};
 use tokio::sync::Notify;
 
 use super::store::TaskRuntimeStore;
-use super::types::{PlanTask, PlanTaskKind, TaskPatch, TodoStatus};
+use super::types::{PlanTask, PlanTaskKind, TaskPatch, TodoStatus, WorkerTraceEvent};
+
+/// Convenience alias for a trace-sink callback that forwards worker trace
+/// events out of the task-runtime executor.
+pub type TraceSink = Arc<dyn Fn(WorkerTraceEvent) + Send + Sync>;
 
 // ── Approval-signal registry (spec §10.5 ComplexRuntime) ──────────────────
 
@@ -67,9 +71,18 @@ tokio::task_local! {
     /// during tool execution. Used by Task 6 (L3 nesting) to prevent runaway
     /// recursion and to route subagent tool calls correctly.
     pub static CURRENT_DELEGATE_DEPTH: std::cell::Cell<u32>;
+    /// An optional trace-sink that forwards `WorkerTraceEvent` items out of the
+    /// executor so the frontend can render real-time worker trace views. Set
+    /// alongside `CURRENT_RUN_ID` by [`with_run_context`].
+    pub static CURRENT_TRACE_SINK: Option<TraceSink>;
+    /// The cache user id for the currently executing run. Used when dispatching
+    /// LLM calls so that cache keys are scoped per user. Falls back to the empty
+    /// string when no user context is available.
+    pub static CURRENT_CACHE_USER_ID: String;
 }
 
-/// Run `f` with run_id, cancel, and delegate_depth available to all task tools.
+/// Run `f` with run_id, cancel, delegate_depth, trace_sink, and cache_user_id
+/// available to all task tools.
 ///
 /// Called by the executor before dispatching task work. Replaces the old
 /// [`with_run_id`] which only scoped the run_id. Delegate depth starts at 0
@@ -77,6 +90,8 @@ tokio::task_local! {
 pub async fn with_run_context<F, R>(
     run_id: String,
     cancel: tokio_util::sync::CancellationToken,
+    trace_sink: Option<TraceSink>,
+    cache_user_id: String,
     f: F,
 ) -> R
 where
@@ -88,7 +103,11 @@ where
             run_id,
             CURRENT_CANCEL.scope(
                 cell_cancel,
-                CURRENT_DELEGATE_DEPTH.scope(std::cell::Cell::new(0), f),
+                CURRENT_DELEGATE_DEPTH.scope(
+                    std::cell::Cell::new(0),
+                    CURRENT_TRACE_SINK
+                        .scope(trace_sink, CURRENT_CACHE_USER_ID.scope(cache_user_id, f)),
+                ),
             ),
         )
         .await
@@ -100,7 +119,7 @@ where
     F: std::future::Future<Output = R>,
 {
     let cancel = tokio_util::sync::CancellationToken::new();
-    with_run_context(run_id, cancel, f).await
+    with_run_context(run_id, cancel, None, String::new(), f).await
 }
 
 fn current_run_id() -> Option<String> {

@@ -33,28 +33,21 @@ use crate::agent_handle::AgentHandle;
 /// 字段说明:
 /// - `store`: TaskRuntimeStore (用来读/写 run 状态)
 /// - `primary_agent`: AgentHandle (传给 execute_run 做 worker 调度)
-/// - `route`: TaskRouteKind, 决定是否走 ComplexRuntime 审批闭环 (§10.5)
 /// - `approval_signal`: ComplexRuntime 模式下等 resume_run 唤醒的 channel
 pub struct ExecutePlanTool {
     store: Arc<TaskRuntimeStore>,
     primary_agent: AgentHandle,
-    route: TaskRouteKind,
     /// ComplexRuntime 审批唤醒通道 (spec §10.5)。
-    /// 首次调用时若 `route == ComplexRuntime`, 工具 transition `Paused`
+    /// 首次调用时若 route == ComplexRuntime, 工具 transition `Paused`
     /// 并等待此 signal; 外部调用 `notify_one()` 恢复。
     approval_signal: Arc<tokio::sync::Notify>,
 }
 
 impl ExecutePlanTool {
-    pub fn new(
-        store: Arc<TaskRuntimeStore>,
-        primary_agent: AgentHandle,
-        route: TaskRouteKind,
-    ) -> Self {
+    pub fn new(store: Arc<TaskRuntimeStore>, primary_agent: AgentHandle) -> Self {
         Self {
             store,
             primary_agent,
-            route,
             approval_signal: Arc::new(tokio::sync::Notify::new()),
         }
     }
@@ -96,7 +89,16 @@ impl Tool for ExecutePlanTool {
                 .unwrap_or_else(|_| tokio_util::sync::CancellationToken::new());
 
             // ── §10.5: ComplexRuntime 审批闭环 ──
-            if self.route == TaskRouteKind::ComplexRuntime {
+            // Route is read from the persisted run record so the tool struct
+            // doesn't need it baked in at construction time.
+            let route_str = self
+                .store
+                .get_run_route(&run_id)
+                .unwrap_or_default()
+                .unwrap_or_default();
+            let route = TaskRouteKind::from_str(&route_str)
+                .unwrap_or(TaskRouteKind::ParallelReadonlyDelegation);
+            if route == TaskRouteKind::ComplexRuntime {
                 if let Err(e) = self.store.transition_run(&run_id, TaskRunStatus::Paused) {
                     return Ok(ToolResult::error(format!("Failed to pause run: {e}")));
                 }
@@ -111,6 +113,15 @@ impl Tool for ExecutePlanTool {
                 }
             }
 
+            // ── Read trace_sink and cache_user_id from task_local ──
+            let trace_sink = super::task_tools::CURRENT_TRACE_SINK
+                .try_with(|s| s.clone())
+                .ok()
+                .flatten();
+            let cache_user_id = super::task_tools::CURRENT_CACHE_USER_ID
+                .try_with(|s| s.clone())
+                .unwrap_or_default();
+
             // ── §10.1: 必须 await RunOutcome, 不得 fire-and-forget ──
             let outcome = execute_run(
                 self.store.clone(),
@@ -118,9 +129,9 @@ impl Tool for ExecutePlanTool {
                 None, // reviewer_llm — 暂时 None, 后续由上层配置
                 None, // layer_manager — 暂时 None
                 None, // run_store — 暂时 None
-                None, // trace_sink — L2 内部按需建
+                trace_sink,
                 &run_id,
-                String::new(), // cache_user_id — 暂时空, 后续从 agent config 读取
+                cache_user_id,
                 cancel,
             )
             .await;
@@ -162,7 +173,7 @@ mod tests {
             .build()
             .expect("Failed to create test agent");
         let handle = crate::agent_handle::AgentHandle::new(agent);
-        let tool = ExecutePlanTool::new(store, handle, TaskRouteKind::ParallelReadonlyDelegation);
+        let tool = ExecutePlanTool::new(store, handle);
         let result = tool.execute(ToolParameters::default()).await.unwrap();
         assert!(
             !result.success,
@@ -181,7 +192,7 @@ mod tests {
             .build()
             .expect("Failed to create test agent");
         let handle = crate::agent_handle::AgentHandle::new(agent);
-        let tool = ExecutePlanTool::new(store, handle, TaskRouteKind::ParallelReadonlyDelegation);
+        let tool = ExecutePlanTool::new(store, handle);
         assert_eq!(tool.name(), "execute_plan");
         assert!(!tool.description().is_empty());
         assert!(tool.parameters().is_object());

@@ -117,6 +117,7 @@ impl TaskRuntimeStore {
                 status            TEXT NOT NULL DEFAULT 'pending',
                 goal              TEXT NOT NULL DEFAULT '',
                 plan_id           TEXT,
+                route             TEXT NOT NULL DEFAULT '',
                 created_at        TEXT NOT NULL,
                 updated_at        TEXT NOT NULL
             );
@@ -323,6 +324,27 @@ impl TaskRuntimeStore {
             }
         }
 
+        // Migration: route column on tr_runs (F1 event-wiring fix).
+        // Added after initial release so existing databases need ALTER TABLE.
+        let has_route: bool = {
+            let mut stmt = conn.prepare("PRAGMA table_info(tr_runs)")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            let mut found = false;
+            for r in rows {
+                if r?.eq_ignore_ascii_case("route") {
+                    found = true;
+                }
+            }
+            found
+        };
+        if !has_route {
+            // Wrap in try — column may already exist if schema was recreated.
+            let _ = conn.execute(
+                "ALTER TABLE tr_runs ADD COLUMN route TEXT NOT NULL DEFAULT ''",
+                [],
+            );
+        }
+
         Ok(())
     }
 
@@ -342,6 +364,7 @@ impl TaskRuntimeStore {
         root_message_id: &str,
         domain_profile: DomainProfile,
         goal: &str,
+        route: &str,
     ) -> Result<TaskRun, StoreError> {
         let now = Utc::now();
         let run = TaskRun {
@@ -353,6 +376,7 @@ impl TaskRuntimeStore {
             status: TaskRunStatus::Pending,
             goal: goal.to_string(),
             plan_id: None,
+            route: route.to_string(),
             created_at: now,
             updated_at: now,
         };
@@ -362,8 +386,8 @@ impl TaskRuntimeStore {
         tx.execute(
             "INSERT INTO tr_runs
                 (run_id, workspace_id, conversation_id, root_message_id, domain_profile,
-                 status, goal, plan_id, created_at, updated_at)
-             VALUES (?,?,?,?,?, 'pending', ?, NULL, ?, ?)",
+                 status, goal, plan_id, route, created_at, updated_at)
+             VALUES (?,?,?,?,?, 'pending', ?, NULL, ?, ?, ?)",
             params![
                 run.run_id,
                 run.workspace_id,
@@ -371,6 +395,7 @@ impl TaskRuntimeStore {
                 run.root_message_id,
                 domain_profile.as_str(),
                 run.goal,
+                run.route,
                 run.created_at.to_rfc3339(),
                 run.updated_at.to_rfc3339(),
             ],
@@ -1115,12 +1140,24 @@ impl TaskRuntimeStore {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT run_id, workspace_id, conversation_id, root_message_id,
-                    domain_profile, status, goal, plan_id, created_at, updated_at
+                    domain_profile, status, goal, plan_id, route, created_at, updated_at
              FROM tr_runs WHERE run_id = ?",
         )?;
         let mut rows = stmt.query(params![run_id])?;
         match rows.next()? {
             Some(row) => Ok(Some(decode_run(&row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Read just the `route` column for a given run. Returns `None` when the
+    /// run does not exist.
+    pub fn get_run_route(&self, run_id: &str) -> Result<Option<String>, StoreError> {
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare("SELECT route FROM tr_runs WHERE run_id = ?")?;
+        let mut rows = stmt.query(params![run_id])?;
+        match rows.next()? {
+            Some(row) => Ok(Some(row.get(0)?)),
             None => Ok(None),
         }
     }
@@ -1133,7 +1170,7 @@ impl TaskRuntimeStore {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT run_id, workspace_id, conversation_id, root_message_id,
-                    domain_profile, status, goal, plan_id, created_at, updated_at
+                    domain_profile, status, goal, plan_id, route, created_at, updated_at
              FROM tr_runs WHERE conversation_id = ?
              ORDER BY created_at DESC LIMIT 1",
         )?;
@@ -1155,7 +1192,7 @@ impl TaskRuntimeStore {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT run_id, workspace_id, conversation_id, root_message_id,
-                    domain_profile, status, goal, plan_id, created_at, updated_at
+                    domain_profile, status, goal, plan_id, route, created_at, updated_at
              FROM tr_runs
              WHERE conversation_id = ? AND status IN ('running', 'paused')
              ORDER BY created_at DESC LIMIT 1",
@@ -1175,7 +1212,7 @@ impl TaskRuntimeStore {
         let placeholders: Vec<String> = (0..statuses.len()).map(|_| "?".to_string()).collect();
         let sql = format!(
             "SELECT run_id, workspace_id, conversation_id, root_message_id,
-                    domain_profile, status, goal, plan_id, created_at, updated_at
+                    domain_profile, status, goal, plan_id, route, created_at, updated_at
              FROM tr_runs WHERE status IN ({})
              ORDER BY created_at DESC",
             placeholders.join(", ")
@@ -1684,7 +1721,7 @@ fn load_run_for_update(
 ) -> Result<(String, TaskRun), StoreError> {
     let mut stmt = tx.prepare(
         "SELECT run_id, workspace_id, conversation_id, root_message_id,
-                domain_profile, status, goal, plan_id, created_at, updated_at
+                domain_profile, status, goal, plan_id, route, created_at, updated_at
          FROM tr_runs WHERE run_id = ?",
     )?;
     let mut rows = stmt.query(params![run_id])?;
@@ -1698,8 +1735,8 @@ fn load_run_for_update(
 fn decode_run(row: &Row<'_>) -> rusqlite::Result<TaskRun> {
     let domain_str: String = row.get(4)?;
     let status_str: String = row.get(5)?;
-    let created: String = row.get(8)?;
-    let updated: String = row.get(9)?;
+    let created: String = row.get(9)?;
+    let updated: String = row.get(10)?;
     Ok(TaskRun {
         run_id: row.get(0)?,
         workspace_id: row.get(1)?,
@@ -1709,6 +1746,7 @@ fn decode_run(row: &Row<'_>) -> rusqlite::Result<TaskRun> {
         status: TaskRunStatus::from_str(&status_str).unwrap_or_default(),
         goal: row.get(6)?,
         plan_id: row.get(7)?,
+        route: row.get(8)?,
         created_at: parse_dt(created),
         updated_at: parse_dt(updated),
     })
@@ -1756,6 +1794,7 @@ mod tests {
                 "m1",
                 DomainProfile::AiCoding,
                 "review runtime",
+                "",
             )
             .unwrap();
         assert_eq!(run.status, TaskRunStatus::Pending);
@@ -1767,7 +1806,7 @@ mod tests {
     #[test]
     fn transition_run_appends_status_event_atomically() {
         let s = fresh();
-        s.create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g")
+        s.create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g", "")
             .unwrap();
         let run = s.transition_run("r1", TaskRunStatus::Running).unwrap();
         assert_eq!(run.status, TaskRunStatus::Running);
@@ -1780,7 +1819,7 @@ mod tests {
     #[test]
     fn illegal_transition_is_rejected_and_leaves_no_event() {
         let s = fresh();
-        s.create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g")
+        s.create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g", "")
             .unwrap();
         // First transition to Running (was Pending → now legal).
         s.transition_run("r1", TaskRunStatus::Running).unwrap();
@@ -1798,7 +1837,7 @@ mod tests {
     #[test]
     fn attach_plan_creates_tasks_and_todos() {
         let s = fresh();
-        s.create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g")
+        s.create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g", "")
             .unwrap();
         // attach_plan no longer changes the run status; caller decides.
         let plan = TaskPlan {
@@ -1878,17 +1917,17 @@ mod tests {
     #[test]
     fn latest_run_for_conversation_orders_by_created_desc() {
         let s = fresh();
-        s.create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g1")
+        s.create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g1", "")
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
-        s.create_run("r2", "ws", "c1", "m2", DomainProfile::General, "g2")
+        s.create_run("r2", "ws", "c1", "m2", DomainProfile::General, "g2", "")
             .unwrap();
         let latest = s.latest_run_for_conversation("c1").unwrap().unwrap();
         assert_eq!(latest.run_id, "r2");
     }
 
     fn seed_plan(s: &TaskRuntimeStore) {
-        s.create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g")
+        s.create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g", "")
             .unwrap();
         let plan = TaskPlan {
             plan_id: "p1".into(),

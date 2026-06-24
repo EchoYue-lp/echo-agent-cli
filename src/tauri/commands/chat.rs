@@ -1205,6 +1205,7 @@ async fn route_complex_task(
         "", // root_message_id — linked in PR 6
         route_decision.classification.inferred_profile,
         &message,
+        route_decision.route.as_str(),
     )?;
 
     // 2. Transition Pending → Running (valid in 6-state machine) and launch
@@ -1293,14 +1294,38 @@ async fn launch_unified_run(
         .clone()
         .unwrap_or_else(|| event_message_key.clone());
 
+    // Read the cache_user_id from the primary agent config so it can be
+    // scoped into task locals for execute_plan and the executor.
+    let cache_user_id: String = primary_agent
+        .read(|a| a.config().get_cache_user_id().map(|s| s.to_string()))
+        .await
+        .unwrap_or_else(|| {
+            conversation_id
+                .clone()
+                .unwrap_or_else(|| run_id.to_string())
+        });
+
     tokio::spawn(async move {
         let start = std::time::Instant::now();
         let mut terminal_status = "completed".to_string();
 
+        // Construct a trace_sink that forwards WorkerTraceEvent to the frontend.
+        // This reconnects the trace channel so execute_plan can send worker
+        // trace events through the task-local mechanism (F1 fix).
+        let app_for_sink = app_handle.clone();
+        let msg_key_for_sink = event_message_key.clone();
+        let trace_sink: Option<std::sync::Arc<dyn Fn(WorkerTraceEvent) + Send + Sync>> =
+            Some(std::sync::Arc::new(move |event| {
+                let _ = emit_worker_trace_event(&app_for_sink, event);
+            }));
+
         // Set up task_local context so delegate_readonly + task_* tools work
+        // (F1: also scope trace_sink and cache_user_id).
         let _ = echo_agent_app_core::tasks::task_runtime::task_tools::with_run_context(
             run_id_owned.clone(),
             child_cancel.clone(),
+            trace_sink,
+            cache_user_id.clone(),
             async {
                 emit_chat_event(
                     &app_handle,

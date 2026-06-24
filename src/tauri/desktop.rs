@@ -281,12 +281,7 @@ async fn register_task_tools_on_agent(
     // Use ParallelReadonlyDelegation as the default route; the route is
     // resolved per-run by the router at the orchestration layer.
     use echo_agent_app_core::tasks::task_runtime::ExecutePlanTool;
-    use echo_agent_app_core::tasks::task_runtime::TaskRouteKind;
-    let tool = ExecutePlanTool::new(
-        store,
-        agent_handle.clone(),
-        TaskRouteKind::ParallelReadonlyDelegation,
-    );
+    let tool = ExecutePlanTool::new(store, agent_handle.clone());
     let ep_added = agent_handle
         .write(|agent| {
             agent.add_tool(Box::new(tool));

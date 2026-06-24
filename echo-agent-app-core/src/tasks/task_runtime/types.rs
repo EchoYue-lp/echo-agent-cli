@@ -621,6 +621,7 @@ pub struct TaskRun {
     pub status: TaskRunStatus,
     pub goal: String,
     pub plan_id: Option<String>,
+    pub route: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

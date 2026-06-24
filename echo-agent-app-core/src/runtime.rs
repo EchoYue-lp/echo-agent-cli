@@ -131,7 +131,7 @@ impl AgentRuntime {
             (params.task_runtime_store.as_ref(), params.route.as_ref())
         {
             use crate::tasks::task_runtime::ExecutePlanTool;
-            let tool = ExecutePlanTool::new(store.clone(), agent_handle.clone(), *route);
+            let tool = ExecutePlanTool::new(store.clone(), agent_handle.clone());
             let added = agent_handle
                 .write(|a| {
                     a.add_tool(Box::new(tool));

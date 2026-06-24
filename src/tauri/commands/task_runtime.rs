@@ -272,6 +272,7 @@ pub struct CreateRunRequest {
     pub workspace_id: Option<String>,
     pub root_message_id: Option<String>,
     pub domain_profile: Option<String>,
+    pub route: Option<String>,
 }
 
 /// Create a new complex-task run in `Pending`. Returns the created run.
@@ -289,6 +290,7 @@ pub async fn create_task_run(
     let run_id = uuid::Uuid::new_v4().to_string();
     let workspace_id = req.workspace_id.unwrap_or_else(|| "default".to_string());
     let root_message_id = req.root_message_id.unwrap_or_default();
+    let route = req.route.unwrap_or_default();
     let run = store
         .create_run(
             &run_id,
@@ -297,6 +299,7 @@ pub async fn create_task_run(
             &root_message_id,
             profile,
             &req.goal,
+            &route,
         )
         .map_err(internal)?;
     tracing::info!(run_id = %run.run_id, profile = ?profile, "TaskRuntime run created");

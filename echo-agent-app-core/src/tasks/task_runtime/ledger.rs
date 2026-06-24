@@ -199,6 +199,7 @@ mod tests {
                 "m1",
                 DomainProfile::AiCoding,
                 "Build real runtime",
+                "",
             )
             .unwrap();
         let plan = TaskPlan {
