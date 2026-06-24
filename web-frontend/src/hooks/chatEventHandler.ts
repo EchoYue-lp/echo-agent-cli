@@ -194,6 +194,13 @@ export function handleChatEvent(
           ? (status as (typeof VALID_STATUSES)[number])
           : 'idle';
         store.setRunStatus(validated);
+        // NEW: Also update taskRuntimeStore so the right rail reflects terminal status
+        import('../stores/taskRuntimeStore').then(({ useTaskRuntimeStore }) => {
+          const taskStore = useTaskRuntimeStore.getState();
+          if (taskStore.activeRun) {
+            taskStore.updateRunStatus(validated);
+          }
+        }).catch(() => {});
       }
       break;
     }

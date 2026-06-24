@@ -21,6 +21,7 @@ import type {
   TodoItem,
   RuntimeTaskEvent,
   RuntimeArtifact,
+  TaskRunStatus,
 } from '../generated';
 import { useWorkerTraceStore, type WorkerTraceEvent } from './workerTraceStore';
 
@@ -76,6 +77,7 @@ export interface TaskRuntimeState {
   cancel: (runId: string) => Promise<void>;
   openInterruptPrompt: (data: { runId: string; goal: string; newMessage: string }) => void;
   dismissInterruptPrompt: () => void;
+  updateRunStatus: (status: string) => void;
   // Dynamic task operations (Phase 2).
   insertTask: (afterTaskId: string | null, task: Record<string, unknown>) => Promise<void>;
   removeTask: (taskId: string) => Promise<void>;
@@ -236,6 +238,16 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
 
   openInterruptPrompt: (data) => set({ interruptPrompt: data }),
   dismissInterruptPrompt: () => set({ interruptPrompt: null }),
+
+  updateRunStatus: (status: string) => {
+    const run = get().activeRun;
+    if (run) {
+      set({ activeRun: { ...run, status: status as TaskRunStatus } });
+      if (['completed', 'failed', 'cancelled'].includes(status)) {
+        get().stopPolling?.();
+      }
+    }
+  },
 
   insertTask: async (afterTaskId, task) => {
     const runId = get().activeRun?.run_id;

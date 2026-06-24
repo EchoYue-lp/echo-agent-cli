@@ -1455,7 +1455,9 @@ async fn launch_unified_run(
                 "failed" => TaskRunStatus::Failed,
                 _ => TaskRunStatus::Completed,
             };
-            let _ = store.transition_run(&run_id_owned, new_status);
+            if let Err(e) = store.transition_run(&run_id_owned, new_status) {
+                tracing::error!(error = %e, run_id = %run_id_owned, "终态 transition 失败");
+            }
         }
 
         run_cancel_tokens.remove(&run_key);
