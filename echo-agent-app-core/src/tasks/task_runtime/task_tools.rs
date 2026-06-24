@@ -33,7 +33,7 @@ tokio::task_local! {
     /// Delegate nesting depth — incremented each time a subagent is delegated
     /// during tool execution. Used by Task 6 (L3 nesting) to prevent runaway
     /// recursion and to route subagent tool calls correctly.
-    pub static CURRENT_DELEGATE_DEPTH: u32;
+    pub static CURRENT_DELEGATE_DEPTH: std::cell::Cell<u32>;
 }
 
 /// Run `f` with run_id, cancel, and delegate_depth available to all task tools.
@@ -53,7 +53,10 @@ where
     CURRENT_RUN_ID
         .scope(
             run_id,
-            CURRENT_CANCEL.scope(cell_cancel, CURRENT_DELEGATE_DEPTH.scope(0, f)),
+            CURRENT_CANCEL.scope(
+                cell_cancel,
+                CURRENT_DELEGATE_DEPTH.scope(std::cell::Cell::new(0), f),
+            ),
         )
         .await
 }

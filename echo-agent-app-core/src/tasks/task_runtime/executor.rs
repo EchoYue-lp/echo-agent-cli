@@ -1285,7 +1285,7 @@ async fn run_readonly_worker(
             let run_id = run_id.to_string();
             Box::pin(async move {
                 agent
-                    .delegate_to_agent_with_parent_and_cancel(&role, &prompt, &run_id, cancel)
+                    .delegate_to_agent_with_parent_and_cancel(&role, &prompt, &run_id, cancel, 0)
                     .await
                     .map_err(|e| format!("subagent dispatch failed: {e}"))
             })

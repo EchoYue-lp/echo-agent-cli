@@ -77,12 +77,21 @@ impl Tool for DelegateReadonlyTool {
                 .try_with(|c| c.clone())
                 .unwrap_or_else(|_| CancellationToken::new());
 
+            // Read delegate depth from task_local and increment by 1 for
+            // the next delegation level. The framework's MAX_DELEGATE_DEPTH=3
+            // guards against runaway recursion (see executor.rs).
+            let depth = super::task_tools::CURRENT_DELEGATE_DEPTH
+                .try_with(|d| d.get() + 1)
+                .unwrap_or(0);
+
             let handle = self.agent_handle.clone();
             let result = handle
                 .read_async(|a| {
                     Box::pin(async move {
-                        a.delegate_to_agent_with_parent_and_cancel(&role, &task, &run_id, cancel)
-                            .await
+                        a.delegate_to_agent_with_parent_and_cancel(
+                            &role, &task, &run_id, cancel, depth,
+                        )
+                        .await
                     })
                 })
                 .await;
