@@ -521,14 +521,62 @@ impl TaskRuntimeStore {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
 
-        // Load the current plan.
-        let plan_id: String = tx
-            .query_row(
-                "SELECT plan_id FROM tr_plans WHERE run_id = ? ORDER BY rowid DESC LIMIT 1",
-                params![run_id],
-                |row| row.get(0),
-            )
-            .map_err(|_| StoreError::PlanNotFound(run_id.to_string()))?;
+        // Load the current plan. If no plan exists yet, lazily create an empty
+        // one — in the unified-run model, the plan is produced by the main
+        // agent's `task_create` calls (not by an upfront generate_plan), so the
+        // first task_create must be able to bootstrap the plan row. This removes
+        // the old dependency on a separate attach_plan step before any task can
+        // be inserted.
+        let plan_id: String = match tx.query_row(
+            "SELECT plan_id FROM tr_plans WHERE run_id = ? ORDER BY rowid DESC LIMIT 1",
+            params![run_id],
+            |row| row.get(0),
+        ) {
+            Ok(id) => id,
+            Err(_) => {
+                // Lazily create an empty plan for this run.
+                let new_plan_id = uuid::Uuid::new_v4().to_string();
+                let now = Utc::now().to_rfc3339();
+                let goal: String = tx
+                    .query_row(
+                        "SELECT goal FROM tr_runs WHERE run_id = ?",
+                        params![run_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or_default();
+                tx.execute(
+                    "INSERT INTO tr_plans
+                        (plan_id, run_id, domain_profile, goal, assumptions, risks,
+                         execution_mode, created_at)
+                     VALUES (?,?,?,?,?,?,?,?)",
+                    params![
+                        new_plan_id,
+                        run_id,
+                        DomainProfile::General.as_str(),
+                        goal,
+                        serde_json::to_string(&Vec::<String>::new())
+                            .unwrap_or_else(|_| "[]".into()),
+                        serde_json::to_string(&Vec::<String>::new())
+                            .unwrap_or_else(|_| "[]".into()),
+                        "parallel",
+                        now,
+                    ],
+                )?;
+                tx.execute(
+                    "UPDATE tr_runs SET plan_id = ?, updated_at = ? WHERE run_id = ?",
+                    params![new_plan_id, now, run_id],
+                )?;
+                append_event_tx(
+                    &tx,
+                    run_id,
+                    None,
+                    None,
+                    RuntimeEventKind::PlanGenerated,
+                    serde_json::json!({ "plan_id": new_plan_id, "task_count": 0, "bootstrapped": true }),
+                )?;
+                new_plan_id
+            }
+        };
 
         let existing_tasks = load_plan_tasks_tx(&tx, &plan_id)?;
 

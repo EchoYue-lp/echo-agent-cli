@@ -233,6 +233,27 @@ fn parse_kind(s: &str) -> PlanTaskKind {
     }
 }
 
+/// 按 task kind 推导默认 agent_role(映射到 infra.rs 注册的 worker 角色)。
+///
+/// 必要性:PlanTask 的 agent_role 默认是 "general",但框架只注册了 13 个具体角色
+/// (project_explorer/code_reviewer/...),委派 "general" 必然 "Subagent not found"。
+/// 只读 kind(read_only_review/investigation/test_plan/review/summary)委派给对应
+/// 只读 worker;变更 kind(implementation/debugging/verification)由主 agent 直接
+/// 执行(不委派 worker),用 "primary" 占位(run_readonly_worker 不会触及)。
+fn role_for_kind(kind: PlanTaskKind) -> &'static str {
+    match kind {
+        PlanTaskKind::ReadOnlyReview | PlanTaskKind::Investigation => "project_explorer",
+        PlanTaskKind::TestPlan => "test_planner",
+        PlanTaskKind::Review => "code_reviewer",
+        PlanTaskKind::Summary => "summary_writer",
+        // 变更类:主 agent 直接执行(executor.rs run_main_agent_task),不委派 worker。
+        // agent_role 仅作记录,不会被 run_readonly_worker 用到。
+        PlanTaskKind::Implementation | PlanTaskKind::Debugging | PlanTaskKind::Verification => {
+            "primary"
+        }
+    }
+}
+
 // ── task_create ───────────────────────────────────────────────────────────
 
 pub struct TaskCreateTool {
@@ -330,11 +351,13 @@ impl TaskCreateTool {
             .map(String::from);
 
         let task_id = format!("task_{}", chrono::Utc::now().timestamp_millis());
+        let kind = parse_kind(kind_str);
         let task = PlanTask {
             id: task_id.clone(),
             title: title.clone(),
             description,
-            kind: parse_kind(kind_str),
+            kind,
+            agent_role: role_for_kind(kind).to_string(),
             depends_on,
             status: TodoStatus::Pending,
             ..Default::default()

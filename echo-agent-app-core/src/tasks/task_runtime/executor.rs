@@ -391,26 +391,37 @@ impl TaskWorker for RealTaskWorker {
     > {
         let primary_agent = self.primary_agent.clone();
         Box::pin(async move {
-            // Scope the run_id into the task-local so agent task-management
-            // tools (task_create/update/complete/skip/list) can read it.
-            // task_local survives `.await` across tokio thread hops, unlike
-            // thread_local.
-            super::task_tools::with_run_id(run_id.clone(), async {
-                execute_task(
-                    store,
-                    primary_agent,
-                    worker_sem,
-                    write_sem,
-                    shell_sem,
-                    llm_sem,
-                    file_write_locks,
-                    trace_sink,
-                    run_id,
-                    task,
-                    cancel,
-                )
-                .await
-            })
+            // Scope run_id + cancel + trace_sink into task-local so worker-internal
+            // tools (task_*/delegate_readonly, and their execute_with_context
+            // fallback path) and L3 nested sub-workers can read them.
+            // NOTE: trace_sink/cancel are also passed as explicit params to
+            // execute_task (which uses them directly, not via task_local) — but
+            // scoping them here keeps the task_local consistent for any code
+            // path that reads CURRENT_TRACE_SINK/CURRENT_CANCEL directly.
+            let sink_clone = trace_sink.clone();
+            let cancel_clone = cancel.clone();
+            super::task_tools::with_run_context(
+                run_id.clone(),
+                cancel_clone,
+                sink_clone,
+                String::new(),
+                async {
+                    execute_task(
+                        store,
+                        primary_agent,
+                        worker_sem,
+                        write_sem,
+                        shell_sem,
+                        llm_sem,
+                        file_write_locks,
+                        trace_sink,
+                        run_id,
+                        task,
+                        cancel,
+                    )
+                    .await
+                },
+            )
             .await
         })
     }

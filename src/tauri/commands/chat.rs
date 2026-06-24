@@ -1476,16 +1476,40 @@ async fn launch_unified_run(
             &event_conversation_id,
         );
 
-        // Update run status in store
+        // Update run status in store.
+        // 注意:execute_plan 工具内部调 execute_run 时,execute_run 可能已把 run
+        // 转成终态(Completed/Failed,executor.rs:209/249)。若主 agent ReAct 结束
+        // 吐 FinalAnswer 时 terminal_status 与 store 现状冲突(如 execute_plan
+        // Failed 但 terminal_status="completed"),不要覆盖——保留 execute_run 设
+        // 的更准确状态(它反映 plan 实际执行结果)。只在 store 还在 Running 时才转。
         if let Some(ref store) = store {
-            let new_status = match terminal_status.as_str() {
-                "completed" => TaskRunStatus::Completed,
-                "cancelled" => TaskRunStatus::Cancelled,
-                "failed" => TaskRunStatus::Failed,
-                _ => TaskRunStatus::Completed,
-            };
-            if let Err(e) = store.transition_run(&run_id_owned, new_status) {
-                tracing::error!(error = %e, run_id = %run_id_owned, "终态 transition 失败");
+            let current_is_terminal = store
+                .get_run(&run_id_owned)
+                .ok()
+                .flatten()
+                .map(|r| {
+                    matches!(
+                        r.status,
+                        TaskRunStatus::Completed | TaskRunStatus::Failed | TaskRunStatus::Cancelled
+                    )
+                })
+                .unwrap_or(false);
+            if !current_is_terminal {
+                let new_status = match terminal_status.as_str() {
+                    "completed" => TaskRunStatus::Completed,
+                    "cancelled" => TaskRunStatus::Cancelled,
+                    "failed" => TaskRunStatus::Failed,
+                    _ => TaskRunStatus::Completed,
+                };
+                if let Err(e) = store.transition_run(&run_id_owned, new_status) {
+                    tracing::error!(error = %e, run_id = %run_id_owned, "终态 transition 失败");
+                }
+            } else {
+                tracing::info!(
+                    run_id = %run_id_owned,
+                    terminal_status = %terminal_status,
+                    "run 已是终态(execute_plan 设的),保留不覆盖"
+                );
             }
         }
 

@@ -113,6 +113,7 @@ impl Tool for ExecutePlanTool {
                     title: goal.chars().take(80).collect(),
                     description: goal.clone(),
                     kind: PlanTaskKind::ReadOnlyReview,
+                    agent_role: "project_explorer".to_string(),
                     ..Default::default()
                 };
                 let plan = TaskPlan {
@@ -181,7 +182,32 @@ impl Tool for ExecutePlanTool {
             .await;
 
             match outcome {
-                Ok(RunOutcome::Completed) => Ok(ToolResult::success("计划执行完成。")),
+                Ok(RunOutcome::Completed) => {
+                    // 把各 worker 的 summary 拼进返回文本,给主 agent 写最终答案的
+                    // 素材(否则主 agent 只拿到一句"计划执行完成",无法产出实质答案)。
+                    let summaries = self
+                        .store
+                        .list_todos(&run_id)
+                        .map(|todos| {
+                            todos
+                                .into_iter()
+                                .filter(|t| t.summary.as_deref().is_some_and(|s| !s.is_empty()))
+                                .map(|t| {
+                                    format!(
+                                        "## {} ({})\n{}",
+                                        t.title,
+                                        t.owner_agent.as_deref().unwrap_or("worker"),
+                                        t.summary.as_deref().unwrap_or("")
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n\n")
+                        })
+                        .unwrap_or_default();
+                    Ok(ToolResult::success(format!(
+                        "计划执行完成。各 worker 的产出如下,请基于这些内容撰写最终答案:\n\n{summaries}"
+                    )))
+                }
                 Ok(RunOutcome::Cancelled) => Ok(ToolResult::success("计划执行被取消。")),
                 Ok(RunOutcome::Failed {
                     failed_task_id,
