@@ -209,6 +209,7 @@ fn chat_trace_event(
     WorkerTraceEvent::for_worker(message_key, "main", event_type, payload)
         .with_agent("echo-assistant")
         .with_title("Assistant")
+        .with_message_id(message_key)
 }
 
 /// Global pending map for approval/input responses.
