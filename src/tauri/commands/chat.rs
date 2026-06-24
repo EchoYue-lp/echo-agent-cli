@@ -1322,6 +1322,19 @@ async fn launch_unified_run(
                 let _ = emit_worker_trace_event(&app_for_sink, event);
             }));
 
+        // 适配 trace_sink 为框架的 TraceSinkFn(Value-based),供主 agent 的
+        // external context 使用(跨 spawn 安全,worker 经 ToolContext 读取)。
+        // worker 的 emit_worker_trace 传 Value,这里反序列化成 WorkerTraceEvent
+        // 再转发到原 sink(发前端)。
+        let ext_trace_sink: Option<echo_core::tools::TraceSinkFn> = trace_sink.as_ref().map(|s| {
+            let s = s.clone();
+            std::sync::Arc::new(move |value: serde_json::Value| {
+                if let Ok(ev) = serde_json::from_value::<WorkerTraceEvent>(value.clone()) {
+                    s(ev);
+                }
+            }) as echo_core::tools::TraceSinkFn
+        });
+
         // Set up task_local context so delegate_readonly + task_* tools work
         // (F1: also scope trace_sink and cache_user_id).
         let _ = echo_agent_app_core::tasks::task_runtime::task_tools::with_run_context(
@@ -1355,6 +1368,19 @@ async fn launch_unified_run(
                 // Acquire agent and run ReAct
                 let agent_inner = primary_agent.inner().clone();
                 let agent = agent_inner.read().await;
+
+                // 把 run context 注入主 agent(跨 spawn 安全的值传递)。
+                // 主 agent 调 delegate_readonly/execute_plan 时,build_runtime_context
+                // 从这些 external_* 读取并透传给 worker——绕开会跨 spawn 断裂的
+                // task_local。worker 内的工具经 ToolContext 读到 run_id/cancel/...
+                use echo_agent::agent::Agent;
+                use echo_core::tools::ExternalRunContext;
+                agent.set_external_context(&ExternalRunContext {
+                    run_id: run_id_owned.clone(),
+                    cancel: Some(std::sync::Arc::new(child_cancel.clone())),
+                    trace_sink: ext_trace_sink.clone(),
+                    cache_user_id: Some(cache_user_id.clone()),
+                });
 
                 let stream_result = agent
                     .execute_stream_with_cancel(&goal_owned, child_cancel.clone())

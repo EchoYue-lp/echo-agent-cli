@@ -132,6 +132,52 @@ pub(crate) fn require_run_id() -> std::result::Result<String, ToolResult> {
     current_run_id().ok_or_else(|| ToolResult::error("no active run — run_id not set in context"))
 }
 
+/// 从 ToolContext 优先读 run_id(跨 spawn 安全),回退 task_local(主 agent scope)。
+///
+/// 这是根治 task_local 跨 tokio::spawn 断裂的关键:worker 在框架层 dispatch_fork
+/// 的 spawn 里执行,task_local 全部丢失;但 ToolContext 是值传递(经 dispatch_fork
+/// → set_external_context → pipeline 填入),跨 spawn 安全。工具 override
+/// `execute_with_context` 后用此 helper 读 run_id,主 agent 和 worker 都能拿到。
+pub(crate) fn run_id_from_ctx_or_local(
+    ctx: &echo_core::tools::ToolContext,
+) -> std::result::Result<String, ToolResult> {
+    ctx.run_id
+        .clone()
+        .or_else(current_run_id)
+        .ok_or_else(|| ToolResult::error("no active run — run_id not in ToolContext or task_local"))
+}
+
+/// 在 ToolContext.run_id(若有)的 task_local 覆盖作用域内执行 f。
+///
+/// 这样工具既有的 `execute`(读 task_local 的 require_run_id)无需改动即可在
+/// worker 场景工作:execute_with_context 调本函数包住原 execute,ctx.run_id 被
+/// 临时注入 task_local,require_run_id 读到的是 ToolContext 的值(跨 spawn 安全)。
+/// ctx.run_id 为 None 时直接执行 f(回退原 task_local,主 agent 场景)。
+pub(crate) async fn scoped_with_ctx_run_id<F, Fut, R>(
+    ctx: &echo_core::tools::ToolContext,
+    f: F,
+) -> R
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = R>,
+{
+    match &ctx.run_id {
+        Some(rid) => {
+            // 同时覆盖 run_id 和 cancel(若有),让 require_run_id / CURRENT_CANCEL
+            // 在 worker 场景读到 ToolContext 的值(跨 spawn 安全)。
+            let cancel = ctx
+                .cancel
+                .as_ref()
+                .map(|c| (**c).clone())
+                .unwrap_or_else(CancellationToken::new);
+            CURRENT_CANCEL
+                .scope(cancel, CURRENT_RUN_ID.scope(rid.clone(), f()))
+                .await
+        }
+        None => f().await,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,51 +276,75 @@ impl Tool for TaskCreateTool {
                 Ok(id) => id,
                 Err(e) => return Ok(e),
             };
-            let title = params
-                .get("title")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let description = params
-                .get("description")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let kind_str = params
-                .get("kind")
-                .and_then(|v| v.as_str())
-                .unwrap_or("implementation");
-            let depends_on: Vec<String> = params
-                .get("depends_on")
-                .and_then(|v| v.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let after_task_id = params
-                .get("after_task_id")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-
-            let task_id = format!("task_{}", chrono::Utc::now().timestamp_millis());
-            let task = PlanTask {
-                id: task_id.clone(),
-                title: title.clone(),
-                description,
-                kind: parse_kind(kind_str),
-                depends_on,
-                status: TodoStatus::Pending,
-                ..Default::default()
-            };
-            match self.store.insert_task(&run_id, after_task_id, task) {
-                Ok(()) => Ok(ToolResult::success(format!(
-                    "Created task '{title}' (id: {task_id})"
-                ))),
-                Err(e) => Ok(ToolResult::error(format!("Failed to create task: {e}"))),
-            }
+            self.create_task(run_id, params).await
         })
+    }
+
+    fn execute_with_context<'a>(
+        &'a self,
+        params: ToolParameters,
+        ctx: &'a echo_core::tools::ToolContext,
+    ) -> futures::future::BoxFuture<'a, echo_agent::error::Result<ToolResult>> {
+        Box::pin(async move {
+            let run_id = match run_id_from_ctx_or_local(ctx) {
+                Ok(id) => id,
+                Err(e) => return Ok(e),
+            };
+            self.create_task(run_id, params).await
+        })
+    }
+}
+
+impl TaskCreateTool {
+    async fn create_task(
+        &self,
+        run_id: String,
+        params: ToolParameters,
+    ) -> echo_agent::error::Result<ToolResult> {
+        let title = params
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let description = params
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let kind_str = params
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or("implementation");
+        let depends_on: Vec<String> = params
+            .get("depends_on")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let after_task_id = params
+            .get("after_task_id")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        let task_id = format!("task_{}", chrono::Utc::now().timestamp_millis());
+        let task = PlanTask {
+            id: task_id.clone(),
+            title: title.clone(),
+            description,
+            kind: parse_kind(kind_str),
+            depends_on,
+            status: TodoStatus::Pending,
+            ..Default::default()
+        };
+        match self.store.insert_task(&run_id, after_task_id, task) {
+            Ok(()) => Ok(ToolResult::success(format!(
+                "Created task '{title}' (id: {task_id})"
+            ))),
+            Err(e) => Ok(ToolResult::error(format!("Failed to create task: {e}"))),
+        }
     }
 }
 
@@ -345,6 +415,14 @@ impl Tool for TaskUpdateTool {
             }
         })
     }
+
+    fn execute_with_context<'a>(
+        &'a self,
+        params: ToolParameters,
+        ctx: &'a echo_core::tools::ToolContext,
+    ) -> futures::future::BoxFuture<'a, echo_agent::error::Result<ToolResult>> {
+        Box::pin(async move { scoped_with_ctx_run_id(ctx, || self.execute(params)).await })
+    }
 }
 
 // ── task_complete ─────────────────────────────────────────────────────────
@@ -389,6 +467,14 @@ impl Tool for TaskCompleteTool {
                 Err(e) => Ok(ToolResult::error(format!("Failed: {e}"))),
             }
         })
+    }
+
+    fn execute_with_context<'a>(
+        &'a self,
+        params: ToolParameters,
+        ctx: &'a echo_core::tools::ToolContext,
+    ) -> futures::future::BoxFuture<'a, echo_agent::error::Result<ToolResult>> {
+        Box::pin(async move { scoped_with_ctx_run_id(ctx, || self.execute(params)).await })
     }
 }
 
@@ -437,6 +523,14 @@ impl Tool for TaskSkipTool {
             }
         })
     }
+
+    fn execute_with_context<'a>(
+        &'a self,
+        params: ToolParameters,
+        ctx: &'a echo_core::tools::ToolContext,
+    ) -> futures::future::BoxFuture<'a, echo_agent::error::Result<ToolResult>> {
+        Box::pin(async move { scoped_with_ctx_run_id(ctx, || self.execute(params)).await })
+    }
 }
 
 // ── task_list ─────────────────────────────────────────────────────────────
@@ -479,5 +573,13 @@ impl Tool for TaskListTool {
                 Err(e) => Ok(ToolResult::error(format!("Failed: {e}"))),
             }
         })
+    }
+
+    fn execute_with_context<'a>(
+        &'a self,
+        params: ToolParameters,
+        ctx: &'a echo_core::tools::ToolContext,
+    ) -> futures::future::BoxFuture<'a, echo_agent::error::Result<ToolResult>> {
+        Box::pin(async move { scoped_with_ctx_run_id(ctx, || self.execute(params)).await })
     }
 }

@@ -176,6 +176,16 @@ impl Tool for DelegateReadonlyTool {
             }
         })
     }
+
+    fn execute_with_context<'a>(
+        &'a self,
+        params: ToolParameters,
+        ctx: &'a echo_core::tools::ToolContext,
+    ) -> BoxFuture<'a, error::Result<ToolResult>> {
+        Box::pin(async move {
+            super::task_tools::scoped_with_ctx_run_id(ctx, || self.execute(params)).await
+        })
+    }
 }
 
 /// Register `delegate_readonly` tool on an agent via its handle.

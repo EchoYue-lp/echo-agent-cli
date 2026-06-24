@@ -292,6 +292,12 @@ pub async fn create_agent(
     let cache_user_id = load_or_create_cache_user_id();
     agent.config_mut().set_cache_user_id(&cache_user_id);
 
+    tracing::info!(
+        has_llm_config = injected_llm_config.is_some(),
+        model = %model,
+        "main agent: registering default subagents with llm_config={}",
+        injected_llm_config.as_ref().map(|c| c.model.as_str()).unwrap_or("NONE")
+    );
     register_default_subagents(
         &mut agent,
         model,
@@ -607,11 +613,31 @@ fn build_readonly_worker_agent(
             ..Default::default()
         });
 
+    let has_llm_config = llm_config.is_some();
     if let Some(config) = llm_config {
+        tracing::info!(
+            worker_name = name,
+            model = %config.model,
+            has_auth = !config.api_key.is_empty(),
+            "worker: injecting LlmConfig"
+        );
         builder = builder.llm_config(config);
+    } else {
+        tracing::warn!(
+            worker_name = name,
+            "worker: NO LlmConfig injected — will fall back to env vars / models.yaml"
+        );
     }
 
     let mut worker = builder.build()?;
+    let has_client = worker.llm_client().is_some();
+    tracing::info!(
+        worker_name = name,
+        has_llm_config,
+        has_llm_client = has_client,
+        model = %worker.model_name(),
+        "worker built: LLM client status"
+    );
     worker.config_mut().set_cache_user_id(cache_user_id);
     worker.set_plan_mode(true);
     Ok(worker)

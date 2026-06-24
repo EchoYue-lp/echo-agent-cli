@@ -48,6 +48,7 @@ required-features = ["gui"]
 [dependencies]
 echo-agent-app-core = { path = "./echo-agent-app-core" }
 echo-agent = { version = "0.2.0", package = "echo_agent", path = "../echo-agent", features = ["sqlite", "mcp", "lsp", "human-loop", "subagent", "tasks", "eval", "improve"] }
+echo-core = { version = "0.2", package = "echo_core", path = "../echo-agent/echo-core" }
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

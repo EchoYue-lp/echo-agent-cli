@@ -199,6 +199,16 @@ impl Tool for ExecutePlanTool {
             }
         })
     }
+
+    fn execute_with_context<'a>(
+        &'a self,
+        params: echo_agent::tools::ToolParameters,
+        ctx: &'a echo_core::tools::ToolContext,
+    ) -> futures::future::BoxFuture<'a, echo_agent::error::Result<ToolResult>> {
+        Box::pin(async move {
+            super::task_tools::scoped_with_ctx_run_id(ctx, || self.execute(params)).await
+        })
+    }
 }
 
 #[cfg(test)]
