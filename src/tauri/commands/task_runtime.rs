@@ -5,9 +5,9 @@
 //!
 //! - [`create_task_run`] — start a complex-task run in `Pending`.
 //! - [`generate_task_plan`] — call the planner (LLM JSON mode) for a run and
-//!   persist the structured plan; the run advances to `AwaitingPlanApproval`.
+//!   persist the structured plan.
 //! - [`approve_task_plan`] / [`reject_task_plan`] — user resolution of the
-//!   plan; approve advances to `Ready`, reject to `Cancelled`.
+//!   plan; approve advances to `Running`, reject to `Cancelled`.
 //! - [`edit_task_plan`] — replace a plan's tasks before approving.
 //!
 //! The complex-task router itself (the `send_chat_message` classification
@@ -79,14 +79,8 @@ pub async fn list_task_runs(
     let query: Vec<TaskRunStatus> = if parsed.is_empty() {
         vec![
             TaskRunStatus::Pending,
-            TaskRunStatus::Planning,
-            TaskRunStatus::AwaitingPlanApproval,
-            TaskRunStatus::Ready,
             TaskRunStatus::Running,
-            TaskRunStatus::WaitingApproval,
-            TaskRunStatus::WaitingInput,
-            TaskRunStatus::Suspended,
-            TaskRunStatus::Cancelling,
+            TaskRunStatus::Paused,
             TaskRunStatus::Cancelled,
             TaskRunStatus::Failed,
             TaskRunStatus::Completed,
@@ -326,9 +320,8 @@ pub async fn create_task_run(
     Ok(run)
 }
 
-/// Generate a structured plan for a run via the LLM (JSON mode), persist it,
-/// and advance the run to `AwaitingPlanApproval`. The run must currently be
-/// in `Pending` or `Planning`.
+/// Generate a structured plan for a run via the LLM (JSON mode), persist it.
+/// The run may be in any state; attach_plan does not change the run status.
 ///
 /// Uses the primary agent's LLM client. Returns the persisted plan plus any
 /// non-blocking warnings the planner produced (e.g. a mutating task that
@@ -345,19 +338,6 @@ pub async fn generate_task_plan(
         .get_run(&run_id)
         .map_err(internal)?
         .ok_or_else(|| IpcError::NotFound(format!("run {run_id} not found")))?;
-
-    // Transition Pending -> Planning (allowed from Pending; idempotent-ish if
-    // already Planning — that's a no-op illegal-transition we tolerate).
-    if run.status == TaskRunStatus::Pending {
-        store
-            .transition_run(&run_id, TaskRunStatus::Planning)
-            .map_err(internal)?;
-    } else if run.status != TaskRunStatus::Planning {
-        return Err(IpcError::Validation(format!(
-            "run {run_id} is in state {:?}; must be Pending or Planning to generate a plan",
-            run.status
-        )));
-    }
 
     // Obtain the LLM client from the primary agent.
     let (llm, plan_cache_user_id) = state
@@ -404,7 +384,7 @@ pub async fn generate_task_plan(
         other => IpcError::Internal(format!("plan generation failed: {other}")),
     })?;
 
-    // Persist + advance to AwaitingPlanApproval (attach_plan does both in one tx).
+    // Persist the plan (attach_plan no longer changes run status).
     store.attach_plan(&generated.plan).map_err(internal)?;
     tracing::info!(
         run_id = %run_id,
@@ -427,8 +407,7 @@ pub struct GeneratedPlanResponse {
     pub warnings: Vec<String>,
 }
 
-/// Approve the run's current plan and advance to `Ready` (ready for PR 3's
-/// DAG executor to pick up). The run must be `AwaitingPlanApproval`.
+/// Approve the run's current plan and advance to `Running`.
 #[tauri::command]
 pub async fn approve_task_plan(
     state: tauri::State<'_, TauriState>,
@@ -440,14 +419,13 @@ pub async fn approve_task_plan(
         .resolve_plan(&run_id, true, note.as_deref())
         .map_err(internal)?;
     let run = store
-        .transition_run(&run_id, TaskRunStatus::Ready)
+        .transition_run(&run_id, TaskRunStatus::Running)
         .map_err(internal)?;
-    tracing::info!(run_id = %run.run_id, "plan approved → Ready");
+    tracing::info!(run_id = %run.run_id, "plan approved → Running");
     Ok(run)
 }
 
-/// Reject the run's plan and cancel the run. The run must be
-/// `AwaitingPlanApproval`.
+/// Reject the run's plan and cancel the run.
 #[tauri::command]
 pub async fn reject_task_plan(
     state: tauri::State<'_, TauriState>,
@@ -458,7 +436,7 @@ pub async fn reject_task_plan(
     store
         .resolve_plan(&run_id, false, note.as_deref())
         .map_err(internal)?;
-    // AwaitingPlanApproval -> Cancelled is a legal direct transition.
+    // Pending -> Cancelled is a legal direct transition.
     let run = store
         .transition_run(&run_id, TaskRunStatus::Cancelled)
         .map_err(internal)?;
@@ -466,9 +444,8 @@ pub async fn reject_task_plan(
     Ok(run)
 }
 
-/// Replace a run's plan tasks before approving. The run must be
-/// `AwaitingPlanApproval`. Keeps the existing plan_id and goal; only the
-/// task list changes (user-edited plan).
+/// Replace a run's plan tasks before approving. Keeps the existing plan_id
+/// and goal; only the task list changes (user-edited plan).
 #[tauri::command]
 pub async fn edit_task_plan(
     state: tauri::State<'_, TauriState>,
@@ -480,20 +457,12 @@ pub async fn edit_task_plan(
         .get_run(&run_id)
         .map_err(internal)?
         .ok_or_else(|| IpcError::NotFound(format!("run {run_id} not found")))?;
-    if run.status != TaskRunStatus::AwaitingPlanApproval {
-        return Err(IpcError::Validation(format!(
-            "run {run_id} is {:?}; can only edit a plan while AwaitingPlanApproval",
-            run.status
-        )));
-    }
     let mut plan = store
         .get_plan(&run_id)
         .map_err(internal)?
         .ok_or_else(|| IpcError::NotFound(format!("no plan for run {run_id}")))?;
     plan.tasks = tasks;
-    // Re-persist via attach_plan (replaces tasks + todos atomically, stays in
-    // AwaitingPlanApproval since the run is already there — attach_plan sets
-    // it again idempotently).
+    // Re-persist via attach_plan (replaces tasks + todos atomically).
     store.attach_plan(&plan).map_err(internal)?;
     tracing::info!(run_id = %run_id, task_count = plan.tasks.len(), "plan edited");
     Ok(plan)
@@ -637,9 +606,9 @@ pub async fn reorder_tasks(
     Ok(())
 }
 
-/// Launch execution of an approved run. The run must be in `Ready` (i.e. the
-/// plan was approved). Execution runs on a detached background task so the
-/// IPC returns immediately; progress is observable via `list_task_events` /
+/// Launch execution of a run. The run must be in `Running`.
+/// Execution runs on a detached background task so the IPC returns
+/// immediately; progress is observable via `list_task_events` /
 /// `list_task_todos` polling or (PR 6) the GUI event feed. Returns immediately
 /// with the run's id so the caller can track it.
 #[tauri::command]
@@ -661,30 +630,14 @@ pub async fn execute_task_run(
         .get_run(&run_id)
         .map_err(internal)?
         .ok_or_else(|| IpcError::NotFound(format!("run {run_id} not found")))?;
-    if run.status != TaskRunStatus::Ready {
+    if run.status != TaskRunStatus::Running {
         return Err(IpcError::Validation(format!(
-            "run {run_id} is {:?}; must be Ready (approve the plan first)",
+            "run {run_id} is {:?}; must be Running to execute",
             run.status
         )));
     }
 
-    // Idempotency: atomically transition Ready → Running BEFORE spawning.
-    // This prevents a double-click / re-entrant call from spawning two
-    // executors on the same run (TOCTOU between the check above and spawn).
-    // If the transition fails (someone else already moved it), we get an
-    // IllegalTransition error and return it as a validation error.
-    store
-        .transition_run(&run_id, TaskRunStatus::Running)
-        .map_err(|e| match e {
-            echo_agent_app_core::tasks::task_runtime::StoreError::IllegalTransition { .. } => {
-                IpcError::Validation(format!(
-                    "run {run_id} is no longer Ready (already executing?)"
-                ))
-            }
-            other => internal(other),
-        })?;
-
-    // Detached execution: the executor drives Ready → Running → terminal and
+    // Detached execution: the executor drives Running → terminal and
     // writes every transition + TaskEvent to the store. The GUI observes via
     // the read commands. A run-scoped CancellationToken is stored on the
     // session map (same mechanism as chat cancel) so cancel_task_run can find it.

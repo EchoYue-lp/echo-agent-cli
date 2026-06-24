@@ -266,7 +266,6 @@ mod tests {
                 "Review runtime",
             )
             .unwrap();
-        store.transition_run("r1", TaskRunStatus::Planning).unwrap();
         let plan = TaskPlan {
             plan_id: "p1".into(),
             run_id: "r1".into(),
@@ -284,7 +283,6 @@ mod tests {
             }],
         };
         store.attach_plan(&plan).unwrap();
-        store.transition_run("r1", TaskRunStatus::Ready).unwrap();
         store.transition_run("r1", TaskRunStatus::Running).unwrap();
         store
             .set_task_status(

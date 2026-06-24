@@ -1255,7 +1255,8 @@ async fn route_complex_task(
     }
 
     // 3. Other complex routes: generate structured plan via LLM.
-    store.transition_run(&run_id, TaskRunStatus::Planning)?;
+    // Transition Pending → Running (legal in the new 6-state machine).
+    store.transition_run(&run_id, TaskRunStatus::Running)?;
     let (llm, plan_cache_user_id) = state
         .app_state
         .connection
@@ -1279,7 +1280,7 @@ async fn route_complex_task(
     )
     .await?;
 
-    // 4. Persist + advance to AwaitingPlanApproval (attach_plan is atomic).
+    // 4. Persist the plan (attach_plan is atomic; does not change status).
     store.attach_plan(&generated.plan)?;
     let planned_workers = planned_worker_roles(&generated.plan);
     let all_plan_tasks_read_only = generated
@@ -1289,9 +1290,8 @@ async fn route_complex_task(
         .all(|task| task.kind.is_read_only());
     let launch_policy =
         execution_policy.runtime_launch_policy(route_decision.route, all_plan_tasks_read_only);
-    let mut response_status = TaskRunStatus::AwaitingPlanApproval;
+    let mut response_status = TaskRunStatus::Running;
     if launch_policy.auto_execute {
-        store.transition_run(&run_id, TaskRunStatus::Ready)?;
         launch_task_run_execution(
             state,
             app.clone(),
@@ -1299,7 +1299,6 @@ async fn route_complex_task(
             Some(compute_content_hash(&message)),
         )
         .await?;
-        response_status = TaskRunStatus::Running;
     }
 
     // 5. Emit plan_ready so the GUI can render the plan + approval actions.

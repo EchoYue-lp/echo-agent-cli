@@ -846,51 +846,13 @@ impl TaskRuntimeStore {
             )?;
         }
 
-        // Link run -> plan and advance to AwaitingPlanApproval. This goes
-        // through the state-machine path: read current status, validate the
-        // transition is legal (Planning → AwaitingPlanApproval, or
-        // AwaitingPlanApproval → AwaitingPlanApproval when re-editing a plan),
-        // and emit RunStatusChanged so the event log stays consistent with the
-        // "SQLite state machine is the single source of truth" invariant.
-        let (current_status_str, _run) = load_run_for_update(&tx, &plan.run_id)?;
-        let current =
-            TaskRunStatus::from_str(&current_status_str).unwrap_or(TaskRunStatus::Pending);
-        // Allowed entry states for attach_plan: Planning (first generation)
-        // and AwaitingPlanApproval (re-edit of an existing plan before
-        // approval). Anything else (e.g. Running) is a bug — refuse rather
-        // than silently stamp a status.
-        if !matches!(
-            current,
-            TaskRunStatus::Planning | TaskRunStatus::AwaitingPlanApproval
-        ) {
-            return Err(StoreError::IllegalTransition {
-                run_id: plan.run_id.clone(),
-                from: current.as_str().to_string(),
-                to: TaskRunStatus::AwaitingPlanApproval.as_str().to_string(),
-            });
-        }
+        // Link run -> plan. Status is decided by the caller (attach_plan
+        // does NOT change the run status).
         let now = Utc::now().to_rfc3339();
         tx.execute(
-            "UPDATE tr_runs SET plan_id = ?, updated_at = ?, status = 'awaiting_plan_approval'
-             WHERE run_id = ?",
+            "UPDATE tr_runs SET plan_id = ?, updated_at = ? WHERE run_id = ?",
             params![plan.plan_id, now, plan.run_id],
         )?;
-        // Only emit RunStatusChanged when the status actually changes —
-        // re-editing a plan (Already AwaitingPlanApproval) shouldn't log a
-        // no-op transition, but PlanEdited captures the edit.
-        if current != TaskRunStatus::AwaitingPlanApproval {
-            append_event_tx(
-                &tx,
-                plan.run_id.as_str(),
-                None,
-                None,
-                RuntimeEventKind::RunStatusChanged,
-                serde_json::json!({
-                    "from": current.as_str(),
-                    "to": TaskRunStatus::AwaitingPlanApproval.as_str(),
-                }),
-            )?;
-        }
         append_event_tx(
             &tx,
             plan.run_id.as_str(),
@@ -1254,27 +1216,22 @@ impl TaskRuntimeStore {
 
     /// Boot-time recovery of runs interrupted by a process restart (P1-8).
     ///
-    /// A run left in an active state (Running / WaitingApproval / WaitingInput /
-    /// Suspended / Cancelling) when the process died has no driver to finish it
+    /// Boot-time recovery of runs interrupted by a process restart.
+    ///
+    /// A run left in `Running` when the process died has no driver to finish it
     /// — it is a zombie that blocks the run list and can never complete. The
     /// per-run lazy recovery in `run_dag` only fires when *that specific run*
     /// is next executed, so a zombie that is never revisited stays forever.
     ///
     /// This scans all interrupted runs once at startup and transitions each to
     /// `Failed` (with a note), matching the lazy-recovery outcome but applied
-    /// proactively. Pending / Planning / AwaitingPlanApproval / Ready are left
-    /// untouched: they had not begun executing, so they are not zombies and may
-    /// be resumed by the caller. Returns the number of runs recovered.
+    /// proactively. Pending / Paused are left untouched: they had not begun
+    /// executing, so they are not zombies and may be resumed by the caller.
+    /// Returns the number of runs recovered.
     ///
     /// Safe to call on an empty/fresh store (no-op).
     pub fn recover_incomplete(&self) -> usize {
-        const INTERRUPTED: &[TaskRunStatus] = &[
-            TaskRunStatus::Running,
-            TaskRunStatus::WaitingApproval,
-            TaskRunStatus::WaitingInput,
-            TaskRunStatus::Suspended,
-            TaskRunStatus::Cancelling,
-        ];
+        const INTERRUPTED: &[TaskRunStatus] = &[TaskRunStatus::Running];
         let zombies = match self.list_runs_in(INTERRUPTED) {
             Ok(z) => z,
             Err(e) => {
@@ -1839,8 +1796,8 @@ mod tests {
         let s = fresh();
         s.create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g")
             .unwrap();
-        let run = s.transition_run("r1", TaskRunStatus::Planning).unwrap();
-        assert_eq!(run.status, TaskRunStatus::Planning);
+        let run = s.transition_run("r1", TaskRunStatus::Running).unwrap();
+        assert_eq!(run.status, TaskRunStatus::Running);
         let evs = s.list_events("r1", 0).unwrap();
         // RunCreated + RunStatusChanged
         assert_eq!(evs.len(), 2);
@@ -1852,11 +1809,17 @@ mod tests {
         let s = fresh();
         s.create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g")
             .unwrap();
+        // First transition to Running (was Pending → now legal).
+        s.transition_run("r1", TaskRunStatus::Running).unwrap();
+        // Running → Completed is legal. Now test that Completed → Running is
+        // illegal (terminal state → non-terminal is always rejected).
         let before = s.list_events("r1", 0).unwrap().len();
+        s.transition_run("r1", TaskRunStatus::Completed).unwrap();
+        let before_terminal = s.list_events("r1", 0).unwrap().len();
         let err = s.transition_run("r1", TaskRunStatus::Running).unwrap_err();
         assert!(matches!(err, StoreError::IllegalTransition { .. }));
         // No new event was appended — the tx rolled back.
-        assert_eq!(s.list_events("r1", 0).unwrap().len(), before);
+        assert_eq!(s.list_events("r1", 0).unwrap().len(), before_terminal);
     }
 
     #[test]
@@ -1864,7 +1827,7 @@ mod tests {
         let s = fresh();
         s.create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g")
             .unwrap();
-        s.transition_run("r1", TaskRunStatus::Planning).unwrap();
+        // attach_plan no longer changes the run status; caller decides.
         let plan = TaskPlan {
             plan_id: "p1".into(),
             run_id: "r1".into(),
@@ -1893,7 +1856,8 @@ mod tests {
         assert_eq!(todos[0].status, TodoStatus::Pending);
 
         let run = s.get_run("r1").unwrap().unwrap();
-        assert_eq!(run.status, TaskRunStatus::AwaitingPlanApproval);
+        // attach_plan no longer transitions status; run stays Pending.
+        assert_eq!(run.status, TaskRunStatus::Pending);
         assert_eq!(run.plan_id.as_deref(), Some("p1"));
     }
 
@@ -1910,7 +1874,6 @@ mod tests {
         for run_id in ["r1", "r2"] {
             s.create_run(run_id, "ws", "c1", "m1", DomainProfile::AiCoding, "g")
                 .unwrap();
-            s.transition_run(run_id, TaskRunStatus::Planning).unwrap();
             let generated = generate_parallel_readonly_plan(
                 run_id,
                 "帮我分析当前目录的项目",
@@ -1985,7 +1948,6 @@ mod tests {
     fn seed_plan(s: &TaskRuntimeStore) {
         s.create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g")
             .unwrap();
-        s.transition_run("r1", TaskRunStatus::Planning).unwrap();
         let plan = TaskPlan {
             plan_id: "p1".into(),
             run_id: "r1".into(),
@@ -2003,8 +1965,6 @@ mod tests {
             }],
         };
         s.attach_plan(&plan).unwrap();
-        // approve -> ready -> running so todos can transition freely
-        s.transition_run("r1", TaskRunStatus::Ready).unwrap();
         s.transition_run("r1", TaskRunStatus::Running).unwrap();
     }
 

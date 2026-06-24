@@ -20,12 +20,11 @@
 //! in-flight task.
 //!
 //! Guarantees:
-//! - the run transitions Ready → Running → (Completed | Failed | Cancelled |
-//!   Suspended);
+//! - the run transitions Running → (Completed | Failed | Cancelled | Paused);
 //! - every task boundary writes a TaskEvent + updates the todo projection;
 //! - implementation/debugging tasks pass a review gate before being marked
 //!   Completed; a failing review either re-queues a fix task or trips the
-//!   circuit breaker (Suspended);
+//!   circuit breaker (Paused);
 //! - cancellation propagates to all in-flight tasks;
 //! - a failed task marks itself Failed but lets already-running siblings
 //!   finish (the run ends Failed); downstream tasks are skipped.
@@ -77,13 +76,6 @@ pub enum RunOutcome {
         error: String,
     },
     Cancelled,
-    /// The run was suspended by a review-gate circuit breaker or a review
-    /// infrastructure failure. The run is already in `Suspended` status when
-    /// this is returned; the user must intervene (retry / change plan / skip /
-    /// cancel) to resume.
-    Suspended {
-        reason: String,
-    },
     /// A task failed and the run is paused for user/agent decision. The
     /// failed task is marked `Failed`; downstream dependents are `Blocked`.
     /// The run is transitioned to `Paused`. The user can retry, skip, or
@@ -101,8 +93,8 @@ pub enum ExecError {
     RunNotFound(String),
     #[error("run {0} has no plan")]
     NoPlan(String),
-    #[error("run {0} is in state {1:?}, expected Ready")]
-    NotReady(String, TaskRunStatus),
+    #[error("run {0} is in state {1:?}, expected Running")]
+    NotRunning(String, TaskRunStatus),
     #[error("primary agent required to dispatch subagent workers")]
     NoAgent,
     #[error("store: {0}")]
@@ -141,14 +133,7 @@ pub async fn execute_run(
     // the executor starts, it was either just transitioned by the IPC (resume
     // path) or left behind by a crash. In both cases the executor can safely
     // proceed — it re-reads the plan from the store and skips completed tasks.
-    if matches!(
-        run.status,
-        TaskRunStatus::WaitingApproval
-            | TaskRunStatus::WaitingInput
-            | TaskRunStatus::Suspended
-            | TaskRunStatus::Paused
-            | TaskRunStatus::Cancelling
-    ) {
+    if matches!(run.status, TaskRunStatus::Paused) {
         let reason = format!(
             "recovered from {} (interrupted by process restart)",
             run.status.as_str()
@@ -170,12 +155,10 @@ pub async fn execute_run(
             ),
         });
     }
-    // The caller (execute_task_run command) is responsible for the
-    // Ready → Running transition (for idempotency: it must succeed atomically
-    // before spawning the executor). Here we accept both Ready (caller hasn't
-    // transitioned yet, e.g. tests) and Running (caller already did).
-    if run.status != TaskRunStatus::Ready && run.status != TaskRunStatus::Running {
-        return Err(ExecError::NotReady(run_id.to_string(), run.status));
+    // The caller must have transitioned Pending → Running before spawning
+    // the executor. Here we only accept Running.
+    if run.status != TaskRunStatus::Running {
+        return Err(ExecError::NotRunning(run_id.to_string(), run.status));
     }
     let plan = store
         .get_plan(run_id)?
@@ -195,12 +178,6 @@ pub async fn execute_run(
 
     let primary_agent = primary_agent.ok_or(ExecError::NoAgent)?;
     let limits = ConcurrencyLimits::default();
-
-    // Ready → Running (idempotent: if caller already transitioned, this is
-    // Running → Running which the state machine rejects — tolerate it).
-    if run.status == TaskRunStatus::Ready {
-        let _ = store.transition_run(run_id, TaskRunStatus::Running);
-    }
 
     let outcome = run_dag(
         store.clone(),
@@ -302,29 +279,6 @@ pub async fn execute_run(
                     run_id: run_id.to_string(),
                     goal: run.goal.clone(),
                 },
-            );
-        }
-        Ok(RunOutcome::Suspended { reason }) => {
-            emit_worker_trace(
-                trace_sink.as_ref(),
-                WorkerTraceEvent::new(
-                    run_id.to_string(),
-                    WorkerTraceEventKind::RunStatusChanged,
-                    serde_json::json!({
-                        "status": "suspended",
-                        "reason": reason,
-                    }),
-                ),
-            );
-            // run_dag already transitioned Running → Suspended (legal). Only
-            // record the reason; do NOT attempt Suspended → Failed (illegal).
-            let _ = store.note(run_id, None, &format!("run suspended: {reason}"));
-            save_trace(
-                run_store.as_ref(),
-                run_id,
-                &run.goal,
-                &run.conversation_id,
-                "suspended",
             );
         }
         Ok(RunOutcome::Paused {
@@ -722,8 +676,11 @@ async fn run_dag<W: TaskWorker + 'static>(
                                 Some(&id),
                                 &format!("circuit breaker: {reason}"),
                             );
-                            let _ = store.transition_run(run_id, TaskRunStatus::Suspended);
-                            return Ok(RunOutcome::Suspended { reason });
+                            let _ = store.transition_run(run_id, TaskRunStatus::Paused);
+                            return Ok(RunOutcome::Paused {
+                                failed_task_id: id.clone(),
+                                error: reason,
+                            });
                         }
                         ReviewGateOutcome::Skipped => {
                             let _ = store.note(
@@ -745,8 +702,8 @@ async fn run_dag<W: TaskWorker + 'static>(
                 Err((id, err)) => {
                     // Hitrisk fail-closed: the task was blocked by a pre-execution
                     // high-risk safety check. The run was already transitioned to
-                    // Suspended inside execute_task. Propagate up so execute_run
-                    // records the Suspend outcome instead of treating it as Failed.
+                    // Paused inside execute_task. Propagate up so execute_run
+                    // records the Paused outcome instead of treating it as Failed.
                     if let Some(reason) = err.strip_prefix("SUSPEND:") {
                         let _ = store.set_task_status(
                             run_id,
@@ -755,8 +712,9 @@ async fn run_dag<W: TaskWorker + 'static>(
                             None,
                             Some("blocked: hitrisk requires user approval"),
                         );
-                        return Ok(RunOutcome::Suspended {
-                            reason: reason.to_string(),
+                        return Ok(RunOutcome::Paused {
+                            failed_task_id: id.clone(),
+                            error: reason.to_string(),
                         });
                     }
                     // Mark this task Failed and record it in wave_failed so
@@ -1033,11 +991,11 @@ async fn execute_task(
             if let Some(m) = super::hitrisk::check(tool, &args_snapshot) {
                 let reason = format!(
                     "hitrisk flagged tool '{tool}' (pattern '{}': {}) for task '{}'; \
-                     run suspended pending user approval. Matched: {}",
+                     run paused pending user approval. Matched: {}",
                     m.pattern, m.reason, task.title, m.snippet,
                 );
                 let _ = store.note(&run_id, Some(&task_id), &reason);
-                let _ = store.transition_run(&run_id, TaskRunStatus::Suspended);
+                let _ = store.transition_run(&run_id, TaskRunStatus::Paused);
                 return Err((task_id.clone(), format!("SUSPEND:{reason}")));
             }
         }
@@ -1605,7 +1563,7 @@ fn save_trace(
         session_id: conversation_id.to_string(),
         status: match status {
             "completed" => echo_agent::trace::RunStatus::Completed,
-            "failed" | "suspended" => echo_agent::trace::RunStatus::Failed,
+            "failed" => echo_agent::trace::RunStatus::Failed,
             "cancelled" => echo_agent::trace::RunStatus::Cancelled,
             _ => echo_agent::trace::RunStatus::Completed,
         },
@@ -1726,7 +1684,6 @@ mod tests {
         store
             .create_run("r1", "ws", "c1", "m1", DomainProfile::AiCoding, "g")
             .unwrap();
-        store.transition_run("r1", TaskRunStatus::Planning).unwrap();
         let plan = TaskPlan {
             plan_id: "p1".into(),
             run_id: "r1".into(),
@@ -1744,9 +1701,8 @@ mod tests {
             }],
         };
         store.attach_plan(&plan).unwrap();
-        store.transition_run("r1", TaskRunStatus::Ready).unwrap();
 
-        // Simulate the executor: Ready → Running, mark task running then
+        // Simulate the executor: Running, mark task running then
         // completed, then Running → Completed.
         store.transition_run("r1", TaskRunStatus::Running).unwrap();
         store
@@ -1954,8 +1910,8 @@ mod tests {
 
     /// Build a run + plan in the store and return the run id.
     ///
-    /// Walks the legal state-machine path so attach_plan succeeds:
-    /// Pending → Planning → (attach_plan) → AwaitingPlanApproval → Ready.
+    /// Creates run (Pending), attaches plan (no status change), transitions
+    /// Pending → Running so run_dag can start.
     fn seed_run(store: &Arc<TaskRuntimeStore>, tasks: Vec<PlanTask>) -> String {
         let run_id = format!("run_{}", uuid::Uuid::new_v4());
         store
@@ -1968,11 +1924,6 @@ mod tests {
                 "test goal",
             )
             .unwrap();
-        // Pending → Planning (legal), then attach_plan advances to
-        // AwaitingPlanApproval, then approve → Ready so run_dag can start.
-        store
-            .transition_run(&run_id, TaskRunStatus::Planning)
-            .unwrap();
         let plan = TaskPlan {
             plan_id: format!("plan_{}", run_id),
             run_id: run_id.clone(),
@@ -1984,7 +1935,9 @@ mod tests {
             tasks,
         };
         store.attach_plan(&plan).unwrap();
-        store.transition_run(&run_id, TaskRunStatus::Ready).unwrap();
+        store
+            .transition_run(&run_id, TaskRunStatus::Running)
+            .unwrap();
         run_id
     }
 

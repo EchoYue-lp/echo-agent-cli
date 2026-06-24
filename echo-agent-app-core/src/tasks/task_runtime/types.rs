@@ -266,33 +266,25 @@ impl Default for TodoStatus {
 /// and `RuntimeTaskEvent`s, never from local guesses.
 ///
 /// Allowed transitions (see [`TaskRunStatus::can_transition_to`]):
+///
 /// ```text
-/// Pending -> Planning
-/// Planning -> AwaitingPlanApproval
-/// AwaitingPlanApproval -> Ready | Cancelled
-/// Ready -> Running
-/// Running -> WaitingApproval | WaitingInput | Suspended | Paused | Cancelling | Failed | Completed
-/// WaitingApproval -> Running | Suspended | Cancelled
-/// WaitingInput -> Running | Suspended | Cancelled
-/// Suspended -> Ready | Cancelled
-/// Paused -> Running | AwaitingPlanApproval | Cancelled
-/// Cancelling -> Cancelled | Failed
-/// Failed -> Ready | Cancelled  (Ready: reserved for future retry-from-failed)
+/// Pending → Running → Completed
+///              │  ↘
+///           Paused  Failed → Running (retry)
+///              │
+///           Cancelled
 /// ```
+///
+/// 极简 6 态(对齐 Claude Code/Codex:plan 审批不进状态机,用 Paused 表达)。
+/// 删去了 Planning/AwaitingPlanApproval/Ready/WaitingApproval/WaitingInput/Suspended/Cancelling
+/// —— 这些"plan 是否被批准"的语义改由编排层(L1) + Paused 承载,不进 run 状态机。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export, rename = "TaskRunStatus")]
 pub enum TaskRunStatus {
     Pending,
-    Planning,
-    AwaitingPlanApproval,
-    Ready,
     Running,
-    WaitingApproval,
-    WaitingInput,
-    Suspended,
     Paused,
-    Cancelling,
     Cancelled,
     Failed,
     Completed,
@@ -302,15 +294,8 @@ impl TaskRunStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
             TaskRunStatus::Pending => "pending",
-            TaskRunStatus::Planning => "planning",
-            TaskRunStatus::AwaitingPlanApproval => "awaiting_plan_approval",
-            TaskRunStatus::Ready => "ready",
             TaskRunStatus::Running => "running",
-            TaskRunStatus::WaitingApproval => "waiting_approval",
-            TaskRunStatus::WaitingInput => "waiting_input",
-            TaskRunStatus::Suspended => "suspended",
             TaskRunStatus::Paused => "paused",
-            TaskRunStatus::Cancelling => "cancelling",
             TaskRunStatus::Cancelled => "cancelled",
             TaskRunStatus::Failed => "failed",
             TaskRunStatus::Completed => "completed",
@@ -320,15 +305,8 @@ impl TaskRunStatus {
     pub fn from_str(s: &str) -> Option<Self> {
         Some(match s {
             "pending" => TaskRunStatus::Pending,
-            "planning" => TaskRunStatus::Planning,
-            "awaiting_plan_approval" => TaskRunStatus::AwaitingPlanApproval,
-            "ready" => TaskRunStatus::Ready,
             "running" => TaskRunStatus::Running,
-            "waiting_approval" => TaskRunStatus::WaitingApproval,
-            "waiting_input" => TaskRunStatus::WaitingInput,
-            "suspended" => TaskRunStatus::Suspended,
             "paused" => TaskRunStatus::Paused,
-            "cancelling" => TaskRunStatus::Cancelling,
             "cancelled" => TaskRunStatus::Cancelled,
             "failed" => TaskRunStatus::Failed,
             "completed" => TaskRunStatus::Completed,
@@ -341,27 +319,11 @@ impl TaskRunStatus {
     pub fn can_transition_to(&self, next: TaskRunStatus) -> bool {
         use TaskRunStatus::*;
         match self {
-            Pending => matches!(next, Planning | Cancelled),
-            Planning => matches!(next, AwaitingPlanApproval | Failed | Cancelled),
-            AwaitingPlanApproval => matches!(next, Ready | Cancelled),
-            Ready => matches!(next, Running | Cancelled),
-            Running => matches!(
-                next,
-                WaitingApproval
-                    | WaitingInput
-                    | Suspended
-                    | Paused
-                    | Cancelling
-                    | Failed
-                    | Completed
-            ),
-            WaitingApproval => matches!(next, Running | Suspended | Cancelled),
-            WaitingInput => matches!(next, Running | Suspended | Cancelled),
-            Suspended => matches!(next, Ready | Cancelled),
-            Paused => matches!(next, Running | AwaitingPlanApproval | Cancelled),
-            Cancelling => matches!(next, Cancelled | Failed),
-            Failed => matches!(next, Ready | Cancelled),
-            // Terminal states.
+            Pending => matches!(next, Running | Cancelled),
+            Running => matches!(next, Paused | Failed | Completed | Cancelled),
+            Paused => matches!(next, Running | Cancelled),
+            Failed => matches!(next, Running | Cancelled),
+            // 终态
             Cancelled | Completed => false,
         }
     }
@@ -1009,36 +971,24 @@ mod tests {
     #[test]
     fn status_machine_allows_documented_transitions() {
         use TaskRunStatus::*;
-        // Every transition explicitly named in the plan doc.
-        assert!(Pending.can_transition_to(Planning));
-        assert!(Planning.can_transition_to(AwaitingPlanApproval));
-        assert!(AwaitingPlanApproval.can_transition_to(Ready));
-        assert!(AwaitingPlanApproval.can_transition_to(Cancelled));
-        assert!(Ready.can_transition_to(Running));
-        assert!(Running.can_transition_to(WaitingApproval));
-        assert!(Running.can_transition_to(Completed));
-        assert!(WaitingApproval.can_transition_to(Running));
-        assert!(Suspended.can_transition_to(Ready));
-        assert!(Cancelling.can_transition_to(Cancelled));
-        assert!(Cancelling.can_transition_to(Failed));
-        assert!(Failed.can_transition_to(Ready));
-        // Paused transitions: user interrupt / resume / edit plan / abandon.
+        assert!(Pending.can_transition_to(Running));
+        assert!(Pending.can_transition_to(Cancelled));
         assert!(Running.can_transition_to(Paused));
+        assert!(Running.can_transition_to(Completed));
+        assert!(Running.can_transition_to(Failed));
         assert!(Paused.can_transition_to(Running));
-        assert!(Paused.can_transition_to(AwaitingPlanApproval));
-        assert!(Paused.can_transition_to(Cancelled));
+        assert!(Failed.can_transition_to(Running)); // 重试
+        assert!(!Cancelled.can_transition_to(Running));
+        assert!(!Completed.can_transition_to(Running));
     }
 
     #[test]
     fn status_machine_rejects_invalid_transitions() {
         use TaskRunStatus::*;
-        assert!(!Pending.can_transition_to(Running));
+        assert!(Pending.can_transition_to(Running)); // 修复:主 agent ReAct 路径需要 Pending→Running 直达
         assert!(!Running.can_transition_to(Pending));
         assert!(!Completed.can_transition_to(Running));
         assert!(!Cancelled.can_transition_to(Running));
-        assert!(!Ready.can_transition_to(Completed));
-        // Paused cannot go to Suspended (different semantics).
-        assert!(!Paused.can_transition_to(Suspended));
     }
 
     #[test]
@@ -1047,15 +997,8 @@ mod tests {
         // forgetting to wire up `from_str`.
         let all = [
             TaskRunStatus::Pending,
-            TaskRunStatus::Planning,
-            TaskRunStatus::AwaitingPlanApproval,
-            TaskRunStatus::Ready,
             TaskRunStatus::Running,
-            TaskRunStatus::WaitingApproval,
-            TaskRunStatus::WaitingInput,
-            TaskRunStatus::Suspended,
             TaskRunStatus::Paused,
-            TaskRunStatus::Cancelling,
             TaskRunStatus::Cancelled,
             TaskRunStatus::Failed,
             TaskRunStatus::Completed,
