@@ -199,6 +199,8 @@ fn task_status_display(status: &TaskStatus) -> &'static str {
         TaskStatus::Blocked(_) => "Blocked",
         TaskStatus::TimedOut { .. } => "TimedOut",
         TaskStatus::Retrying { .. } => "Retrying",
+        TaskStatus::Skipped => "Skipped",
+        TaskStatus::Paused(_) => "Paused",
     }
 }
 cmd!(

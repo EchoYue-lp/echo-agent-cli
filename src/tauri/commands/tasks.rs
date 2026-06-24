@@ -213,6 +213,10 @@ fn task_to_info(
             "retrying".to_string(),
             Some(format!("attempt {attempt}: {last_error}")),
         ),
+        echo_agent_app_core::tasks::TaskStatus::Skipped => ("skipped".to_string(), None),
+        echo_agent_app_core::tasks::TaskStatus::Paused(reason) => {
+            ("paused".to_string(), Some(reason.clone()))
+        }
     };
 
     // Extract progress from the live progress cache (updated by ProgressBridge)
@@ -289,6 +293,8 @@ pub async fn get_task_dag(state: tauri::State<'_, TauriState>) -> Result<TaskDag
                 echo_agent_app_core::tasks::TaskStatus::Blocked(_) => "blocked".to_string(),
                 echo_agent_app_core::tasks::TaskStatus::TimedOut { .. } => "timed_out".to_string(),
                 echo_agent_app_core::tasks::TaskStatus::Retrying { .. } => "retrying".to_string(),
+                echo_agent_app_core::tasks::TaskStatus::Skipped => "skipped".to_string(),
+                echo_agent_app_core::tasks::TaskStatus::Paused(_) => "paused".to_string(),
             };
             TaskDagNode {
                 id: task.id,
