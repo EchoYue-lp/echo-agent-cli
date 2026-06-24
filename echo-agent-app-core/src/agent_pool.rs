@@ -649,8 +649,9 @@ impl AgentPool {
             task_runtime_store: self.shared.task_runtime_store.clone(),
             route: None,
         };
-        let mut agent =
-            infra::create_agent(&params, &app_config).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut agent = infra::create_agent(&params, &app_config)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         // 2. Inject shared resources (replace independently-created ones)
         if let Some(ref llm) = self.shared.llm_client {

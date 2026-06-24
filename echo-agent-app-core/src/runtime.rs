@@ -105,8 +105,9 @@ impl AgentRuntime {
         );
 
         // ── 1. Create Agent ──
-        let mut agent =
-            infra::create_agent(&params, app_config).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut agent = infra::create_agent(&params, app_config)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
 
         // ── 2. Load MCP ──
         infra::load_mcp_config(&mut agent, None, app_config).await;

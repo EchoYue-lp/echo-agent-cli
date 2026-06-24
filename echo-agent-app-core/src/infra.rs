@@ -131,7 +131,7 @@ pub fn load_or_create_cache_user_id() -> String {
 /// Returns `Err` if the agent builder fails (e.g. missing required config like
 /// an API key or an invalid model name). Callers should surface this to the user
 /// rather than crashing.
-pub fn create_agent(
+pub async fn create_agent(
     params: &AgentCreateParams,
     app_config: &AppConfig,
 ) -> std::result::Result<ReactAgent, String> {
@@ -301,7 +301,8 @@ pub fn create_agent(
         token_limit,
         app_config.agent.tool_timeout_ms,
         &cache_user_id,
-    );
+    )
+    .await;
 
     // Register default hooks
     register_default_hooks(&mut agent);
@@ -472,7 +473,7 @@ const WORKER_DEFINITIONS: &[(&str, &str, &str)] = &[
 /// Used by the main agent for L2 delegation, and called on each worker
 /// agent for L3 nesting (spec §3.3).
 #[allow(clippy::too_many_arguments)]
-fn register_worker_subagents(
+async fn register_worker_subagents(
     agent: &mut ReactAgent,
     model: &str,
     llm_config: Option<LlmConfig>,
@@ -513,7 +514,7 @@ fn register_worker_subagents(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn register_default_subagents(
+async fn register_default_subagents(
     agent: &mut ReactAgent,
     model: &str,
     llm_config: Option<LlmConfig>,
@@ -549,7 +550,14 @@ fn register_default_subagents(
                     token_limit,
                     tool_timeout_ms,
                     cache_user_id,
-                );
+                )
+                .await;
+
+                // Register delegate_readonly on the worker so it can
+                // recursively delegate to L3 sub-workers (spec §3.3).
+                let worker_handle = crate::agent_handle::AgentHandle::new(worker);
+                crate::tasks::task_runtime::delegate_readonly_tool::
+                    register_delegate_readonly_on_handle(&worker_handle).await;
 
                 let def = SubagentBuilder::new(name)
                     .description(description)
@@ -557,7 +565,7 @@ fn register_default_subagents(
                     .tag("readonly")
                     .tag("parallel")
                     .build();
-                agent.register_subagent_with_definition(def, Box::new(worker));
+                agent.register_subagent_with_definition(def, worker_handle.to_boxed_agent().await);
             }
             Err(err) => tracing::warn!(
                 subagent = name,
