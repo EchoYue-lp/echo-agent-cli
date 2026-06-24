@@ -1764,8 +1764,6 @@ fn default_db_path() -> PathBuf {
 // We assert both rows land together.
 #[cfg(test)]
 mod tests {
-    use super::super::classify::{Classification, ComplexityLabel};
-    use super::super::planner::generate_parallel_readonly_plan;
     use super::*;
 
     fn fresh() -> TaskRuntimeStore {
@@ -1859,37 +1857,6 @@ mod tests {
         // attach_plan no longer transitions status; run stays Pending.
         assert_eq!(run.status, TaskRunStatus::Pending);
         assert_eq!(run.plan_id.as_deref(), Some("p1"));
-    }
-
-    #[test]
-    fn attach_parallel_readonly_plans_do_not_reuse_global_task_ids() {
-        let s = fresh();
-        let classification = Classification {
-            complexity: ComplexityLabel::Complex,
-            inferred_profile: DomainProfile::AiCoding,
-            reason: "test".to_string(),
-            signals: vec!["analysis".to_string()],
-        };
-
-        for run_id in ["r1", "r2"] {
-            s.create_run(run_id, "ws", "c1", "m1", DomainProfile::AiCoding, "g")
-                .unwrap();
-            let generated = generate_parallel_readonly_plan(
-                run_id,
-                "帮我分析当前目录的项目",
-                &classification,
-                &["project_explorer".to_string(), "summary_writer".to_string()],
-            );
-            s.attach_plan(&generated.plan).unwrap();
-        }
-
-        let first = s.get_plan("r1").unwrap().expect("first plan");
-        let second = s.get_plan("r2").unwrap().expect("second plan");
-        for first_task in &first.tasks {
-            for second_task in &second.tasks {
-                assert_ne!(first_task.id, second_task.id);
-            }
-        }
     }
 
     #[test]

@@ -472,7 +472,10 @@ mod tests {
             route: None,
         };
         let app_config = config::AppConfig::default();
-        let agent = match infra::create_agent(&params, &app_config) {
+        let agent = match tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(infra::create_agent(&params, &app_config))
+        {
             Ok(a) => a,
             Err(e) => {
                 eprintln!("test setup failed: create_agent: {e}");
