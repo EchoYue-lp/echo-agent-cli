@@ -29,7 +29,22 @@ impl Tool for DelegateReadonlyTool {
 
     fn description(&self) -> &str {
         "派一个只读 worker(独立 ReAct agent)执行任务并返回 summary。\
-         用于调研/审查/分析类子任务。worker 跑独立 ReAct,不修改文件,返回结论给你。"
+         用于调研/审查/分析类子任务。worker 跑独立 ReAct,不修改文件,返回结论给你。\n\
+         \n\
+         可用 agent_role (必须从下列选择,不要自创):\n\
+         - project_explorer: 探索项目结构、配置、文档\n\
+         - code_reviewer: 审查代码 bug/架构/边界条件\n\
+         - test_planner: 规划测试和验证方案\n\
+         - summary_writer: 汇总多个 worker 发现,综合结论\n\
+         - data_profiler: 检查数据来源/schema/质量\n\
+         - analysis_reviewer: 审查分析方法/统计假设/图表\n\
+         - reproducibility_planner: 规划可复现路径和交付物\n\
+         - literature_scout: 探索学术资料/检索策略\n\
+         - evidence_reviewer: 审查证据质量/引用可靠性\n\
+         - synthesis_planner: 规划综述/证据表/报告结构\n\
+         - medical_literature_scout: 探索医学指南/系统综述\n\
+         - clinical_evidence_reviewer: 审查临床证据等级/适用性\n\
+         - safety_reviewer: 审查安全边界/免责声明/过度建议风险"
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -38,7 +53,22 @@ impl Tool for DelegateReadonlyTool {
             "properties": {
                 "agent_role": {
                     "type": "string",
-                    "description": "worker 角色(如 project_explorer, summary_writer, code_reviewer, test_planner)"
+                    "enum": [
+                        "project_explorer",
+                        "code_reviewer",
+                        "test_planner",
+                        "summary_writer",
+                        "data_profiler",
+                        "analysis_reviewer",
+                        "reproducibility_planner",
+                        "literature_scout",
+                        "evidence_reviewer",
+                        "synthesis_planner",
+                        "medical_literature_scout",
+                        "clinical_evidence_reviewer",
+                        "safety_reviewer"
+                    ],
+                    "description": "worker 角色名。必须从上述 enum 值中精确选择,不要自创。"
                 },
                 "task": {
                     "type": "string",

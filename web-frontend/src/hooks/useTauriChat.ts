@@ -172,13 +172,30 @@ export function useTauriChat() {
           : `chat-${Date.now()}-${Math.random().toString(36).slice(2)}`;
       currentMessageKeyRef.current = message_key;
       currentConversationIdRef.current = conversation_id ?? null;
-      await apiInvoke('send_chat_message', {
+      const chatResult = await apiInvoke<{
+        success: boolean;
+        run_id?: string;
+        status?: string;
+        mode?: string;
+        route?: string;
+        runId?: string;
+      }>('send_chat_message', {
         message: text,
         conversationId: conversation_id ?? undefined,
         conversation_id: conversation_id ?? undefined,
         messageKey: message_key,
         message_key,
       });
+      // If the backend created a TaskRuntime run, load it so the right rail
+      // panel can show plan/todos/workers/tokens (replaces the old plan_ready
+      // event handler deleted in the 13→6 state machine migration).
+      const createdRunId = chatResult?.run_id ?? chatResult?.runId;
+      if (createdRunId && conversation_id) {
+        import('../stores/taskRuntimeStore').then(({ useTaskRuntimeStore }) => {
+          useTaskRuntimeStore.getState().loadByConversation(conversation_id!)
+            .catch((e) => console.warn('[TauriChat] Failed to load task runtime:', e));
+        }).catch((e) => console.warn('[TauriChat] Failed to import taskRuntimeStore:', e));
+      }
     } catch (e) {
       console.error('[TauriChat] Failed to send message:', e);
       if (assistantIdRef.current) {
