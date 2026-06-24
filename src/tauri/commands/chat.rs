@@ -1595,7 +1595,7 @@ fn agent_event_to_chat_event(
     >,
 ) -> Option<ChatEvent> {
     match event {
-        AgentEvent::Token(ref data) => {
+        AgentEvent::Token(data) => {
             emit_worker_trace_event(
                 app,
                 chat_trace_event(
@@ -1745,7 +1745,7 @@ fn agent_event_to_chat_event(
         }),
         AgentEvent::ToolBatchEnd => Some(ChatEvent::ToolBatchEnd),
         AgentEvent::Chart { spec } => Some(ChatEvent::Chart { spec: spec.clone() }),
-        AgentEvent::FinalAnswer(ref data) => {
+        AgentEvent::FinalAnswer(data) => {
             emit_worker_trace_event(
                 app,
                 chat_trace_event(
