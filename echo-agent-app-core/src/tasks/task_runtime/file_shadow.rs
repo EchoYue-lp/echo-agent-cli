@@ -165,7 +165,8 @@ mod tests {
     use super::*;
     use crate::tasks::task_runtime::store::TaskRuntimeStore;
     use crate::tasks::task_runtime::types::{
-        DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, TaskPatch, TaskPlan, TodoStatus,
+        DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, TaskPatch, TaskPlan, TaskRunStatus,
+        TodoStatus,
     };
     use std::sync::Arc;
 
@@ -275,5 +276,191 @@ mod tests {
         assert_eq!(ft1.title, rt1.title);
         assert_eq!(ft1.title, "renamed t1");
         assert_eq!(ft1.status, rt1.status);
+    }
+
+    /// Helper: assert file shadow plan matches SQL-rebuilt plan on the fields the
+    /// rebuilder tracks (run header, plan envelope, task count + per-task identity).
+    fn assert_parity(store: &TaskRuntimeStore, shadow: &FileTaskShadow, run_id: &str) {
+        let sql_events = store.list_events(run_id, 0).unwrap();
+        let file_events = shadow.read_events(run_id).unwrap();
+        assert_eq!(
+            sql_events.len(),
+            file_events.len(),
+            "[{run_id}] event count parity: sql={} file={}",
+            sql_events.len(),
+            file_events.len()
+        );
+        for (s, f) in sql_events.iter().zip(file_events.iter()) {
+            assert_eq!(s.seq, f.seq, "[{run_id}] seq parity");
+            assert_eq!(
+                s.event_type, f.event_type,
+                "[{run_id}] kind parity at seq {}",
+                s.seq
+            );
+        }
+        let file_plan = shadow.read_plan(run_id).unwrap();
+        let rebuilt = rebuild_plan_from_events(&sql_events).unwrap();
+        let file_plan = file_plan.expect("plan.json written");
+        assert_eq!(
+            file_plan.run.run_id, rebuilt.run.run_id,
+            "[{run_id}] run_id"
+        );
+        assert_eq!(file_plan.run.goal, rebuilt.run.goal, "[{run_id}] goal");
+        assert_eq!(file_plan.run.route, rebuilt.run.route, "[{run_id}] route");
+        assert_eq!(
+            file_plan.run.status, rebuilt.run.status,
+            "[{run_id}] run status"
+        );
+        assert_eq!(
+            file_plan.plan.plan_id, rebuilt.plan.plan_id,
+            "[{run_id}] plan_id"
+        );
+        assert_eq!(
+            file_plan.tasks.len(),
+            rebuilt.tasks.len(),
+            "[{run_id}] task count"
+        );
+        for (ft, rt) in file_plan.tasks.iter().zip(rebuilt.tasks.iter()) {
+            assert_eq!(ft.id, rt.id, "[{run_id}] task id");
+            assert_eq!(ft.title, rt.title, "[{run_id}] task {} title", ft.id);
+            assert_eq!(ft.kind, rt.kind, "[{run_id}] task {} kind", ft.id);
+            assert_eq!(ft.status, rt.status, "[{run_id}] task {} status", ft.id);
+            assert_eq!(
+                ft.sort_order, rt.sort_order,
+                "[{run_id}] task {} sort_order",
+                ft.id
+            );
+        }
+    }
+
+    /// Parity across reorder + remove: ordering changes and deletions must be
+    /// reflected identically in the file shadow and the SQL rebuild.
+    #[test]
+    fn shadow_parity_reorder_and_remove() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shadow = Arc::new(FileTaskShadow::new(tmp.path()));
+        let mut store = TaskRuntimeStore::new_in_memory().unwrap();
+        store.attach_shadow(shadow.clone());
+
+        store
+            .create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g", "")
+            .unwrap();
+        let plan = TaskPlan {
+            plan_id: "p1".to_string(),
+            run_id: "r1".to_string(),
+            domain_profile: DomainProfile::General,
+            goal: "g".to_string(),
+            assumptions: Vec::new(),
+            risks: Vec::new(),
+            execution_mode: ExecutionMode::Parallel,
+            tasks: vec![
+                task("t1", PlanTaskKind::Investigation),
+                task("t2", PlanTaskKind::Investigation),
+                task("t3", PlanTaskKind::Investigation),
+            ],
+        };
+        store.attach_plan(&plan).unwrap();
+        // Reorder: move t3 to front.
+        store
+            .reorder_tasks(
+                "r1",
+                vec!["t3".to_string(), "t1".to_string(), "t2".to_string()],
+            )
+            .unwrap();
+        assert_parity(&store, &shadow, "r1");
+        // Remove t2.
+        store.remove_task("r1", "t2").unwrap();
+        assert_parity(&store, &shadow, "r1");
+        // After remove, file plan should have 2 tasks (t3, t1).
+        let file_plan = shadow.read_plan("r1").unwrap().unwrap();
+        assert_eq!(file_plan.tasks.len(), 2);
+        assert!(file_plan.tasks.iter().all(|t| t.id != "t2"));
+    }
+
+    /// Parity across multiple runs: events and plans must not cross-contaminate.
+    #[test]
+    fn shadow_parity_multiple_runs_isolated() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shadow = Arc::new(FileTaskShadow::new(tmp.path()));
+        let mut store = TaskRuntimeStore::new_in_memory().unwrap();
+        store.attach_shadow(shadow.clone());
+
+        for rid in ["r1", "r2"] {
+            store
+                .create_run(
+                    rid,
+                    "ws",
+                    rid,
+                    "m",
+                    DomainProfile::AiCoding,
+                    &format!("goal {rid}"),
+                    "complex",
+                )
+                .unwrap();
+            let plan = TaskPlan {
+                plan_id: format!("p_{rid}"),
+                run_id: rid.to_string(),
+                domain_profile: DomainProfile::AiCoding,
+                goal: format!("goal {rid}"),
+                assumptions: Vec::new(),
+                risks: Vec::new(),
+                execution_mode: ExecutionMode::Parallel,
+                tasks: vec![task(&format!("{rid}_t1"), PlanTaskKind::Summary)],
+            };
+            store.attach_plan(&plan).unwrap();
+        }
+        assert_parity(&store, &shadow, "r1");
+        assert_parity(&store, &shadow, "r2");
+        // r1's file plan must not contain r2's task.
+        let p1 = shadow.read_plan("r1").unwrap().unwrap();
+        assert!(p1.tasks.iter().all(|t| t.id == "r1_t1"));
+    }
+
+    /// Parity across run status transitions (Pending → Running → Paused → Completed).
+    #[test]
+    fn shadow_parity_run_status_transitions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shadow = Arc::new(FileTaskShadow::new(tmp.path()));
+        let mut store = TaskRuntimeStore::new_in_memory().unwrap();
+        store.attach_shadow(shadow.clone());
+
+        store
+            .create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g", "")
+            .unwrap();
+        store.transition_run("r1", TaskRunStatus::Running).unwrap();
+        assert_parity(&store, &shadow, "r1");
+        store.transition_run("r1", TaskRunStatus::Paused).unwrap();
+        assert_parity(&store, &shadow, "r1");
+        store.transition_run("r1", TaskRunStatus::Running).unwrap();
+        store
+            .transition_run("r1", TaskRunStatus::Completed)
+            .unwrap();
+        assert_parity(&store, &shadow, "r1");
+        // Final status in file plan must be Completed.
+        let p = shadow.read_plan("r1").unwrap().unwrap();
+        assert_eq!(p.run.status, TaskRunStatus::Completed);
+    }
+
+    /// Parity with a bootstrap plan (insert_task without attach_plan) — the
+    /// lazy-bootstrap path that creates a PlanGenerated event with empty tasks.
+    #[test]
+    fn shadow_parity_bootstrap_plan_via_insert_task() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shadow = Arc::new(FileTaskShadow::new(tmp.path()));
+        let mut store = TaskRuntimeStore::new_in_memory().unwrap();
+        store.attach_shadow(shadow.clone());
+
+        store
+            .create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g", "")
+            .unwrap();
+        // insert_task triggers lazy bootstrap (no prior attach_plan).
+        store
+            .insert_task("r1", None, task("t1", PlanTaskKind::Investigation))
+            .unwrap();
+        assert_parity(&store, &shadow, "r1");
+        // File plan should have the 1 task from insert.
+        let p = shadow.read_plan("r1").unwrap().unwrap();
+        assert_eq!(p.tasks.len(), 1);
+        assert_eq!(p.tasks[0].id, "t1");
     }
 }
