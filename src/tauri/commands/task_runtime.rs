@@ -603,24 +603,6 @@ pub async fn get_progress_ledger(
         .map_err(internal)
 }
 
-/// Grant a scoped approval for tool calls within a run. Scope levels:
-/// once | task | conversation | workspace | tool | all_tools.
-/// The hitrisk re-check still applies regardless of scope.
-#[tauri::command]
-pub async fn grant_approval_scope(
-    state: tauri::State<'_, TauriState>,
-    run_id: String,
-    tool_name: String,
-    scope_level: String,
-    conversation_id: String,
-) -> Result<serde_json::Value, IpcError> {
-    let store = store(&state)?;
-    let created = store
-        .grant_approval(&run_id, &tool_name, &scope_level, &conversation_id)
-        .map_err(internal)?;
-    Ok(serde_json::json!({ "granted": created }))
-}
-
 // ── Route feedback learning ───────────────────────────────────────────
 
 #[tauri::command]

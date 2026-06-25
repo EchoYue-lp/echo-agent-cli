@@ -1,18 +1,15 @@
-//! File-based shadow store (U1c phase-0/0a step 9).
+//! File-based authoritative store (U1c phase-0/0bc).
 //!
-//! Writes a non-authoritative file mirror (`events.jsonl` + `plan.json`) of the
-//! SQLite `TaskRuntimeStore`, so that 0b can switch the read path to files and
-//! 0c can retire SQL. In 0a the SQL store remains the read/write authority;
-//! this is a shadow that must stay in parity (verified by the parity test).
+//! The file system (`events.jsonl` + `plan.json`) is the read/write authority
+//! for all task data. SQL was retired in 0bc step 5 (except tr_usage_records
+//! and tr_conversation_events).
 //!
 //! Layout: `{root}/{run_id}/events.jsonl` (append-only) + `plan.json` (snapshot).
 //! `root` defaults to `~/.echo-agent/tasks/` (global, spec §2 path A).
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use super::event_rebuild::{RebuiltPlan, rebuild_plan_from_events};
-use super::store::TaskRuntimeStore;
 use super::types::RuntimeTaskEvent;
 
 /// Shadow writer for one root directory. Cheap to clone (wraps a root path; the
@@ -20,12 +17,23 @@ use super::types::RuntimeTaskEvent;
 #[derive(Clone)]
 pub struct FileTaskShadow {
     root: PathBuf,
+    /// In-memory seq cache (run_id → last assigned seq) to avoid re-reading
+    /// the whole `events.jsonl` on every append (O(n) per write → O(n²) per
+    /// run). Seeded lazily from the file's line count on first append per run,
+    /// so it self-heals across restarts. Shared across clones via `Arc` so all
+    /// clones of this shadow agree on seq. Contention is low: the store holds
+    /// a single `Mutex` serializing all writes (the in-memory usage/conv-event
+    /// mutexes, not a DB connection).
+    seq_cache: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, i64>>>,
 }
 
 impl FileTaskShadow {
     /// Create a shadow rooted at `root`. The directory is created lazily on first write.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            seq_cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        }
     }
 
     /// Default shadow root: `~/.echo-agent/tasks/`.
@@ -46,51 +54,6 @@ impl FileTaskShadow {
 
     fn plan_path(&self, run_id: &str) -> PathBuf {
         self.run_dir(run_id).join("plan.json")
-    }
-
-    /// Re-read all events for `run_id` via the caller's already-held `conn`
-    /// guard (the SQL authority), and rewrite `events.jsonl` + `plan.json` from
-    /// the rebuilt snapshot.
-    ///
-    /// Taking `&Connection` (not `&TaskRuntimeStore`) avoids re-locking the store
-    /// mutex — callers hold the guard for the whole write method, so re-locking
-    /// would deadlock. O(events) per flush; acceptable for a non-authoritative
-    /// shadow in 0a (0b optimizes to incremental append).
-    pub fn flush_from_conn(
-        &self,
-        conn: &rusqlite::Connection,
-        run_id: &str,
-    ) -> Result<(), ShadowError> {
-        let events = TaskRuntimeStore::list_events_conn(conn, run_id, 0)
-            .map_err(|e| ShadowError::Read(e.to_string()))?;
-        if events.is_empty() {
-            return Ok(());
-        }
-
-        // Ensure run dir exists.
-        let dir = self.run_dir(run_id);
-        std::fs::create_dir_all(&dir).map_err(|e| ShadowError::Io(e.to_string()))?;
-
-        // Rewrite events.jsonl (full — shadow is non-authoritative; simplest correct form).
-        let events_path = self.events_path(run_id);
-        let mut text = String::new();
-        for ev in &events {
-            // Each line: one RuntimeTaskEvent as JSON. (seq + payload + kind.)
-            let line = serde_json::to_string(ev).map_err(|e| ShadowError::Encode(e.to_string()))?;
-            text.push_str(&line);
-            text.push('\n');
-        }
-        atomic_write(&events_path, text.as_bytes()).map_err(|e| ShadowError::Io(e.to_string()))?;
-
-        // Rebuild plan.json from the events (gate 1 proved this is faithful).
-        let rebuilt =
-            rebuild_plan_from_events(&events).map_err(|e| ShadowError::Rebuild(e.to_string()))?;
-        let plan_json = serde_json::to_string_pretty(&rebuilt)
-            .map_err(|e| ShadowError::Encode(e.to_string()))?;
-        atomic_write(&self.plan_path(run_id), plan_json.as_bytes())
-            .map_err(|e| ShadowError::Io(e.to_string()))?;
-
-        Ok(())
     }
 
     // ── 0bc step-2: file-authority write path (replaces SQL INSERT + flush) ──
@@ -119,8 +82,9 @@ impl FileTaskShadow {
         let dir = self.run_dir(run_id);
         std::fs::create_dir_all(&dir).map_err(|e| ShadowError::Io(e.to_string()))?;
 
-        // seq = current line count + 1 (1-based). Reading the existing file
-        // makes seq self-healing across restarts — no in-memory counter needed.
+        // seq = last assigned + 1 (1-based). Cached in memory per run to avoid
+        // re-reading events.jsonl on every append; seeded from the file's line
+        // count on first touch per run so it self-heals across restarts.
         let next_seq = self.next_seq(run_id)?;
 
         let event = RuntimeTaskEvent {
@@ -140,6 +104,11 @@ impl FileTaskShadow {
         line.push('\n');
         append_line(&self.events_path(run_id), line.as_bytes())
             .map_err(|e| ShadowError::Io(e.to_string()))?;
+
+        // Advance the in-memory cache so the next append doesn't re-read the file.
+        if let Ok(mut cache) = self.seq_cache.lock() {
+            cache.insert(run_id.to_string(), next_seq);
+        }
         Ok(event)
     }
 
@@ -159,9 +128,20 @@ impl FileTaskShadow {
         let rebuilt = match rebuild_plan_from_events(&events) {
             Ok(r) => r,
             Err(super::event_rebuild::RebuildError::NoRunCreated) => {
-                // No run header yet — nothing to snapshot. Events are still
-                // authoritative on disk; plan.json will be written once a
-                // RunCreated event lands.
+                // No RunCreated in the stream. On the live file path every
+                // write that reaches here has either just appended RunCreated
+                // (create_run) or operates on an existing run — so hitting this
+                // branch means an orphan write (e.g. add_review before
+                // create_run, which SQL tolerated) or a corrupted/partial
+                // events.jsonl. Events are still authoritative on disk; we skip
+                // the plan.json snapshot but log so this stays diagnosable
+                // rather than a silent no-op.
+                tracing::warn!(
+                    run_id = %run_id,
+                    event_count = events.len(),
+                    "rewrite_plan: no RunCreated in event stream, skipping plan.json snapshot \
+                     (orphan write or corrupted events.jsonl)"
+                );
                 return Ok(());
             }
         };
@@ -174,10 +154,23 @@ impl FileTaskShadow {
         Ok(())
     }
 
-    /// Compute the next seq for `run_id`: current event count + 1 (1-based).
-    /// Returns 1 if the file does not exist yet.
+    /// Compute the next seq for `run_id`: last assigned + 1 (1-based).
+    ///
+    /// Uses the in-memory `seq_cache` to avoid re-reading `events.jsonl` on
+    /// every append. On first touch per run (cache miss) it seeds from the
+    /// file's line count, so the cache self-heals across restarts or when a
+    /// different process wrote to the same file. Returns 1 if the file does
+    /// not exist yet.
     fn next_seq(&self, run_id: &str) -> Result<i64, ShadowError> {
-        Ok(self.read_events(run_id)?.len() as i64 + 1)
+        // Fast path: cached.
+        if let Ok(cache) = self.seq_cache.lock()
+            && let Some(&last) = cache.get(run_id)
+        {
+            return Ok(last + 1);
+        }
+        // Slow path: seed from file line count (self-healing).
+        let file_len = self.read_events(run_id)?.len() as i64;
+        Ok(file_len + 1)
     }
 
     /// Enumerate every run_id known to the file store: the directory names
@@ -290,13 +283,6 @@ fn append_line(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-// `Mutex` import retained for future per-run append-lock; the current shadow uses
-// full-rewrite which is already serialized by the single `TaskRuntimeStore` mutex.
-#[allow(dead_code)]
-fn _lock_type_anchor() -> Mutex<()> {
-    Mutex::new(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,8 +321,7 @@ mod tests {
     fn shadow_parity_after_full_lifecycle() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let shadow = Arc::new(FileTaskShadow::new(tmp.path()));
-        let mut store = TaskRuntimeStore::new_in_memory().expect("store");
-        store.attach_shadow(shadow.clone());
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(tmp.path()).expect("store");
 
         // Drive a lifecycle.
         store
@@ -476,8 +461,7 @@ mod tests {
     fn shadow_parity_reorder_and_remove() {
         let tmp = tempfile::tempdir().unwrap();
         let shadow = Arc::new(FileTaskShadow::new(tmp.path()));
-        let mut store = TaskRuntimeStore::new_in_memory().unwrap();
-        store.attach_shadow(shadow.clone());
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(tmp.path()).unwrap();
 
         store
             .create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g", "")
@@ -525,8 +509,7 @@ mod tests {
     fn shadow_parity_multiple_runs_isolated() {
         let tmp = tempfile::tempdir().unwrap();
         let shadow = Arc::new(FileTaskShadow::new(tmp.path()));
-        let mut store = TaskRuntimeStore::new_in_memory().unwrap();
-        store.attach_shadow(shadow.clone());
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(tmp.path()).unwrap();
 
         for rid in ["r1", "r2"] {
             store
@@ -564,8 +547,7 @@ mod tests {
     fn shadow_parity_run_status_transitions() {
         let tmp = tempfile::tempdir().unwrap();
         let shadow = Arc::new(FileTaskShadow::new(tmp.path()));
-        let mut store = TaskRuntimeStore::new_in_memory().unwrap();
-        store.attach_shadow(shadow.clone());
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(tmp.path()).unwrap();
 
         store
             .create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g", "")
@@ -590,8 +572,7 @@ mod tests {
     fn shadow_parity_bootstrap_plan_via_insert_task() {
         let tmp = tempfile::tempdir().unwrap();
         let shadow = Arc::new(FileTaskShadow::new(tmp.path()));
-        let mut store = TaskRuntimeStore::new_in_memory().unwrap();
-        store.attach_shadow(shadow.clone());
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(tmp.path()).unwrap();
 
         store
             .create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g", "")

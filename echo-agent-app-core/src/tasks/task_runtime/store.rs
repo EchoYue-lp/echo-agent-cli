@@ -1,24 +1,16 @@
-//! SQLite-backed canonical store for the TaskRuntime.
+//! File-backed canonical store for the TaskRuntime.
 //!
-//! Design constraints (from the plan):
+//! U1c phase-0/0bc: the file system (`plan.json` + `events.jsonl`) is the
+//! single source of truth for all task/plan data. Usage records and
+//! conversation-replay events are held in memory (EKO is a local tool; these
+//! are ephemeral and need not survive a restart). No SQLite dependency.
 //!
-//! - SQLite is the **single source of truth**. JSON/Markdown exports under
-//!   `.eko/runtime/{run_id}/` are derived from these tables, never the
-//!   canonical state.
-//! - Every state mutation must append a [`RuntimeTaskEvent`] **inside the
-//!   same transaction** as the state update. This module enforces that by
-//!   routing all writes through transaction-scoped helpers.
-//!
-//! This mirrors the `SessionSearchEngine` pattern (`Mutex<Connection>` +
-//! `init_schema` + `new_in_memory`) so it composes with the rest of the
-//! app's rusqlite usage.
+//! Every state mutation appends a [`RuntimeTaskEvent`] to `events.jsonl` and
+//! rebuilds `plan.json` from the full event stream.
 
 use std::path::PathBuf;
-use std::sync::Mutex;
 
-use anyhow::Context;
-use chrono::{DateTime, Utc};
-use rusqlite::{Connection, Row, params, params_from_iter, types::Value as SqlValue};
+use chrono::Utc;
 
 use super::types::*;
 
@@ -39,8 +31,6 @@ pub enum StoreError {
         from: String,
         to: String,
     },
-    #[error("sqlite: {0}")]
-    Sqlite(#[from] rusqlite::Error),
     #[error("lock poisoned")]
     LockPoisoned,
     #[error("json: {0}")]
@@ -51,12 +41,12 @@ pub enum StoreError {
     Shadow(#[from] super::file_shadow::ShadowError),
 }
 
-/// Canonical TaskRuntime store. One instance per process; cheap to clone
-/// behind `Arc`. The connection is single-writer (`Mutex`), which is fine
-/// because TaskRuntime writes are low-frequency state transitions, not
-/// hot-path tool calls.
+/// File-backed TaskRuntime store. One instance per process; cheap to clone
+/// behind `Arc`. The file system (plan.json + events.jsonl) is the read/write
+/// authority for all task/plan data. Usage records and conversation-replay
+/// events are kept in-memory (EKO is a local tool; these are ephemeral and
+/// need not survive a restart — see AGENTS.md "no compat/recovery" stance).
 pub struct TaskRuntimeStore {
-    conn: Mutex<Connection>,
     /// Per-task cancellation tokens (in-memory runtime state, not persisted).
     /// Key = `"{run_id}::{task_id}"`. `execute_task` registers a token when a
     /// task starts and removes it on completion; `remove_task` cancels the
@@ -64,348 +54,89 @@ pub struct TaskRuntimeStore {
     /// status flipping to Skipped while execution continues).
     task_cancel_tokens:
         std::sync::Mutex<std::collections::HashMap<String, echo_agent::agent::CancellationToken>>,
-    /// Optional file shadow (U1c phase-0/0a). When set, every write method flushes a
-    /// non-authoritative `events.jsonl` + `plan.json` mirror under `{root}/{run_id}/`.
-    /// SQL remains the read/write authority in 0a; the shadow is for parity + 0b read switch.
-    shadow: Option<std::sync::Arc<super::file_shadow::FileTaskShadow>>,
+    /// File shadow (U1c phase-0/0bc). The read/write authority for all task data.
+    shadow: std::sync::Arc<super::file_shadow::FileTaskShadow>,
+    /// In-memory LLM usage records (token spend per worker call). Not persisted
+    /// —重启清零,符合 EKO 本地工具定位(usage 是参考指标,非账本)。
+    usage_records: std::sync::Mutex<Vec<super::types::UsageRecord>>,
+    /// In-memory conversation-replay events, with a per-store autoincrement seq.
+    conv_events: std::sync::Mutex<ConvEventLog>,
+}
+
+/// In-memory conversation-event log: events + a monotonic seq counter.
+struct ConvEventLog {
+    next_seq: i64,
+    events: Vec<ConvEventEntry>,
+}
+
+/// One conversation-replay event entry (replaces `tr_conversation_events` row).
+struct ConvEventEntry {
+    seq: i64,
+    conversation_id: String,
+    event_type: String,
+    payload: String,
+    timestamp: chrono::DateTime<chrono::Utc>,
 }
 
 impl TaskRuntimeStore {
-    /// Open (or create) the store at the default location:
-    /// `~/.echo-agent/task_runtime.db`.
+    /// Create the store at the default location.
+    ///
+    /// task/plan data lives under the file shadow root (`~/.echo-agent/tasks/`);
+    /// usage/conversation-events are in-memory. No database is opened, so this
+    /// does not fail in practice — the `Result` is kept for call-site compat.
     pub fn new() -> anyhow::Result<Self> {
-        Self::open(&default_db_path())
+        Self::open()
     }
 
-    /// Open (or create) the store at an explicit path. Used for
-    /// workspace-scoped databases and tests.
-    pub fn open(path: &PathBuf) -> anyhow::Result<Self> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating db parent dir {}", parent.display()))?;
-        }
-        let conn = Connection::open(path)
-            .with_context(|| format!("opening task_runtime db at {}", path.display()))?;
-        // U1c phase-0/0bc step-2: file is the read/write authority; SQL stays
-        // as a non-writing fallback (schema still init'd, tables kept). Attach
-        // the default file shadow at `~/.echo-agent/tasks/`.
+    /// Create the store. No path is needed anymore (no SQLite); the file shadow
+    /// root is the real storage location. Kept as `open()` with no args for
+    /// call-site compatibility with the old `open(path)` constructor.
+    pub fn open() -> anyhow::Result<Self> {
         let shadow = std::sync::Arc::new(super::file_shadow::FileTaskShadow::new(
             super::file_shadow::FileTaskShadow::default_root(),
         ));
-        let store = Self {
-            conn: Mutex::new(conn),
+        Ok(Self {
             task_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
-            shadow: Some(shadow),
-        };
-        store.init_schema()?;
-        Ok(store)
+            shadow,
+            usage_records: std::sync::Mutex::new(Vec::new()),
+            conv_events: std::sync::Mutex::new(ConvEventLog {
+                next_seq: 1,
+                events: Vec::new(),
+            }),
+        })
     }
 
-    /// In-memory store for tests / fallback. Schema is identical.
-    ///
-    /// U1c phase-0/0bc step-2: even the in-memory store attaches a file shadow
-    /// (backed by a per-process temp dir) so that the file-authority path is
-    /// exercised by every test — the 321 store tests double as the
-    /// behavior-equivalence proof that file read/write matches the old SQL
-    /// read/write. Uses `std::env::temp_dir` (not the `tempfile` crate, which is
-    /// a dev-only dependency) so this stays a production-callable constructor.
+    /// In-memory store for tests / fallback. The file shadow is backed by a
+    /// per-process temp dir so every test exercises the file-authority path.
     pub fn new_in_memory() -> anyhow::Result<Self> {
-        let conn = Connection::open_in_memory()?;
         let shadow_root = std::env::temp_dir().join(format!(
             "echo-agent-task-runtime-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4()
         ));
+        Self::new_in_memory_with_shadow_root(shadow_root)
+    }
+
+    /// In-memory store whose file shadow is rooted at `shadow_root`. Tests use
+    /// this (with a `tempfile::tempdir()` root) so they can read the written
+    /// `events.jsonl` / `plan.json` back directly and so runs are isolated
+    /// under a known directory. Replaces the old `attach_shadow` test hook.
+    pub fn new_in_memory_with_shadow_root(shadow_root: impl Into<PathBuf>) -> anyhow::Result<Self> {
         let shadow = std::sync::Arc::new(super::file_shadow::FileTaskShadow::new(shadow_root));
-        let store = Self {
-            conn: Mutex::new(conn),
+        Ok(Self {
             task_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
-            shadow: Some(shadow),
-        };
-        store.init_schema()?;
-        Ok(store)
+            shadow,
+            usage_records: std::sync::Mutex::new(Vec::new()),
+            conv_events: std::sync::Mutex::new(ConvEventLog {
+                next_seq: 1,
+                events: Vec::new(),
+            }),
+        })
     }
 
-    /// Attach a file shadow (U1c phase-0/0a). After this, every write method
-    /// flushes a non-authoritative `events.jsonl` + `plan.json` mirror. SQL
-    /// remains the read/write authority. Shadow failures are logged, not fatal.
-    pub fn attach_shadow(&mut self, shadow: std::sync::Arc<super::file_shadow::FileTaskShadow>) {
-        self.shadow = Some(shadow);
-    }
-
-    /// Flush the file shadow for `run_id` after a write, using the already-held
-    /// `conn` guard to read events (avoids re-locking the store mutex, which would
-    /// deadlock since callers hold the guard for the whole write method).
-    /// No-op if no shadow attached. Shadow errors are logged, not fatal.
-    fn flush_shadow(&self, run_id: &str, conn: &Connection) {
-        if let Some(shadow) = &self.shadow
-            && let Err(e) = shadow.flush_from_conn(conn, run_id)
-        {
-            tracing::warn!(run_id = %run_id, error = %e, "file shadow flush failed (non-authoritative, continuing)");
-        }
-    }
-
-    /// Build a `FileTaskStore` over the attached shadow, for read delegation.
-    /// U1c phase-0/0bc step-2: read methods delegate to the file store (file is
-    /// the read authority); SQL reads remain only as a fallback when no shadow
-    /// is attached (should not happen post-step-D, but keeps the path safe).
-    fn file_store(&self) -> Option<super::file_store::FileTaskStore> {
-        self.shadow
-            .as_ref()
-            .map(|s| super::file_store::FileTaskStore::new((**s).clone()))
-    }
-
-    // ── Schema ──────────────────────────────────────────────────────────
-
-    fn init_schema(&self) -> anyhow::Result<()> {
-        let conn = self.conn.lock().map_err(|e| anyhow::anyhow!("lock: {e}"))?;
-        conn.execute_batch(
-            // NOTE: every table uses TEXT PRIMARY KEY ids (UUIDs from the
-            // caller). Status / kind columns store the `as_str()` discriminator
-            // for human-readable SQL and stable cross-version decoding.
-            "
-            CREATE TABLE IF NOT EXISTS tr_runs (
-                run_id            TEXT PRIMARY KEY,
-                workspace_id      TEXT NOT NULL,
-                conversation_id   TEXT NOT NULL,
-                root_message_id   TEXT NOT NULL DEFAULT '',
-                domain_profile    TEXT NOT NULL DEFAULT 'general',
-                status            TEXT NOT NULL DEFAULT 'pending',
-                goal              TEXT NOT NULL DEFAULT '',
-                plan_id           TEXT,
-                route             TEXT NOT NULL DEFAULT '',
-                created_at        TEXT NOT NULL,
-                updated_at        TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS ix_runs_conv ON tr_runs(conversation_id);
-            CREATE INDEX IF NOT EXISTS ix_runs_workspace ON tr_runs(workspace_id);
-            CREATE INDEX IF NOT EXISTS ix_runs_status ON tr_runs(status);
-
-            CREATE TABLE IF NOT EXISTS tr_plans (
-                plan_id           TEXT PRIMARY KEY,
-                run_id            TEXT NOT NULL,
-                domain_profile    TEXT NOT NULL DEFAULT 'general',
-                goal              TEXT NOT NULL DEFAULT '',
-                assumptions       TEXT NOT NULL DEFAULT '[]',
-                risks             TEXT NOT NULL DEFAULT '[]',
-                execution_mode    TEXT NOT NULL DEFAULT 'parallel',
-                created_at        TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS ix_plans_run ON tr_plans(run_id);
-
-            CREATE TABLE IF NOT EXISTS tr_plan_tasks (
-                id                TEXT PRIMARY KEY,
-                plan_id           TEXT NOT NULL,
-                run_id            TEXT NOT NULL,
-                title             TEXT NOT NULL DEFAULT '',
-                description       TEXT NOT NULL DEFAULT '',
-                kind              TEXT NOT NULL DEFAULT 'read_only_review',
-                agent_role        TEXT NOT NULL DEFAULT 'general',
-                domain_profile    TEXT NOT NULL DEFAULT 'general',
-                depends_on        TEXT NOT NULL DEFAULT '[]',
-                parallel_group    TEXT,
-                files             TEXT NOT NULL DEFAULT '[]',
-                allowed_tools     TEXT NOT NULL DEFAULT '[]',
-                verification      TEXT NOT NULL DEFAULT '[]',
-                retry_count       INTEGER NOT NULL DEFAULT 0,
-                max_retries       INTEGER NOT NULL DEFAULT 3,
-                failure_fingerprint TEXT,
-                status            TEXT NOT NULL DEFAULT 'pending',
-                sort_order        INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE INDEX IF NOT EXISTS ix_tasks_plan ON tr_plan_tasks(plan_id);
-            CREATE INDEX IF NOT EXISTS ix_tasks_run  ON tr_plan_tasks(run_id);
-            CREATE INDEX IF NOT EXISTS ix_tasks_status ON tr_plan_tasks(status);
-
-            CREATE TABLE IF NOT EXISTS tr_todos (
-                id                TEXT PRIMARY KEY,
-                run_id            TEXT NOT NULL,
-                task_id           TEXT NOT NULL,
-                title             TEXT NOT NULL DEFAULT '',
-                status            TEXT NOT NULL DEFAULT 'pending',
-                owner_agent       TEXT,
-                started_at        TEXT,
-                completed_at      TEXT,
-                summary           TEXT
-            );
-            CREATE INDEX IF NOT EXISTS ix_todos_run ON tr_todos(run_id);
-
-            CREATE TABLE IF NOT EXISTS tr_events (
-                seq               INTEGER PRIMARY KEY AUTOINCREMENT,
-                run_id            TEXT NOT NULL,
-                task_id           TEXT,
-                step_id           TEXT,
-                event_type        TEXT NOT NULL,
-                payload           TEXT NOT NULL DEFAULT '{}',
-                timestamp         TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS ix_events_run ON tr_events(run_id, seq);
-
-            CREATE TABLE IF NOT EXISTS tr_artifacts (
-                id                TEXT PRIMARY KEY,
-                run_id            TEXT NOT NULL,
-                task_id           TEXT,
-                kind              TEXT NOT NULL DEFAULT 'other',
-                title             TEXT NOT NULL DEFAULT '',
-                path              TEXT,
-                metadata          TEXT NOT NULL DEFAULT '{}'
-            );
-            CREATE INDEX IF NOT EXISTS ix_artifacts_run ON tr_artifacts(run_id);
-            CREATE INDEX IF NOT EXISTS ix_artifacts_task ON tr_artifacts(task_id);
-
-            CREATE TABLE IF NOT EXISTS tr_reviews (
-                id                TEXT PRIMARY KEY,
-                run_id            TEXT NOT NULL,
-                task_id           TEXT NOT NULL,
-                reviewer_agent    TEXT NOT NULL DEFAULT '',
-                outcome           TEXT NOT NULL DEFAULT 'pass',
-                issues            TEXT NOT NULL DEFAULT '[]',
-                failure_fingerprint TEXT,
-                created_fix_task_id TEXT,
-                created_at        TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS ix_reviews_task ON tr_reviews(task_id);
-
-            CREATE TABLE IF NOT EXISTS tr_summaries (
-                run_id            TEXT NOT NULL,
-                task_id           TEXT NOT NULL,
-                worker_agent      TEXT NOT NULL DEFAULT '',
-                completed_work    TEXT NOT NULL DEFAULT '[]',
-                files_read        TEXT NOT NULL DEFAULT '[]',
-                files_changed     TEXT NOT NULL DEFAULT '[]',
-                decisions         TEXT NOT NULL DEFAULT '[]',
-                failures          TEXT NOT NULL DEFAULT '[]',
-                verification      TEXT NOT NULL DEFAULT '[]',
-                next_implications TEXT NOT NULL DEFAULT '[]',
-                created_at        TEXT NOT NULL,
-                PRIMARY KEY (run_id, task_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS tr_approvals (
-                run_id            TEXT NOT NULL,
-                tool_name         TEXT NOT NULL,
-                scope_level       TEXT NOT NULL DEFAULT 'conversation',
-                conversation_id   TEXT NOT NULL,
-                created_at        TEXT NOT NULL,
-                PRIMARY KEY (run_id, tool_name, conversation_id)
-            );
-            CREATE INDEX IF NOT EXISTS ix_approvals_lookup
-                ON tr_approvals(run_id, conversation_id, tool_name);
-
-            CREATE TABLE IF NOT EXISTS tr_usage_records (
-                id                            TEXT PRIMARY KEY,
-                session_id                    TEXT NOT NULL,
-                run_id                        TEXT,
-                worker_id                     TEXT,
-                model                         TEXT NOT NULL,
-                provider                      TEXT,
-                route_kind                    TEXT,
-                input_tokens                  INTEGER NOT NULL DEFAULT 0,
-                output_tokens                 INTEGER NOT NULL DEFAULT 0,
-                cached_input_tokens           INTEGER NOT NULL DEFAULT 0,
-                cache_creation_input_tokens   INTEGER NOT NULL DEFAULT 0,
-                usage_reported                INTEGER NOT NULL DEFAULT 1,
-                system_prompt_hash            TEXT,
-                tools_schema_hash             TEXT,
-                cwd_hash                      TEXT,
-                worker_prompt_hash            TEXT,
-                created_at                    TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS ix_usage_model ON tr_usage_records(model);
-            CREATE INDEX IF NOT EXISTS ix_usage_run ON tr_usage_records(run_id);
-            CREATE INDEX IF NOT EXISTS ix_usage_created ON tr_usage_records(created_at);
-            CREATE INDEX IF NOT EXISTS ix_usage_route ON tr_usage_records(route_kind);
-            CREATE INDEX IF NOT EXISTS ix_usage_session ON tr_usage_records(session_id);
-
-            CREATE TABLE IF NOT EXISTS tr_conversation_events (
-                seq               INTEGER PRIMARY KEY AUTOINCREMENT,
-                conversation_id   TEXT NOT NULL,
-                event_type        TEXT NOT NULL,
-                payload           TEXT NOT NULL DEFAULT '{}',
-                timestamp         TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS ix_conv_events
-                ON tr_conversation_events(conversation_id, seq);
-            ",
-        )?;
-
-        // ── Migrations for pre-existing databases ────────────────────────
-        // CREATE TABLE IF NOT EXISTS won't add columns to an existing table,
-        // so columns introduced after the initial release must be added here
-        // via ALTER TABLE, guarded by a PRAGMA table_info existence check
-        // (SQLite has no "ADD COLUMN IF NOT EXISTS").
-
-        // Migration: sort_order column on tr_plan_tasks.
-        // Separates display ordering from parallel_group (which encodes
-        // parallel-fanout grouping, not order). Previously reorder_tasks
-        // abused parallel_group with "order:N" values — this migration
-        // backfills sort_order from any legacy "order:N" parallel_group and
-        // clears that hack, restoring parallel_group's original semantics.
-        let has_sort_order: bool = {
-            let mut stmt = conn.prepare("PRAGMA table_info(tr_plan_tasks)")?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-            let mut found = false;
-            for r in rows {
-                if r?.eq_ignore_ascii_case("sort_order") {
-                    found = true;
-                }
-            }
-            found
-        };
-        if !has_sort_order {
-            conn.execute(
-                "ALTER TABLE tr_plan_tasks ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0",
-                [],
-            )?;
-            // Backfill from legacy "order:N" parallel_group hack (if any),
-            // then clear the hack so parallel_group returns to its real semantics.
-            let legacy: Vec<(String, i64)> = conn
-                .prepare("SELECT id, parallel_group FROM tr_plan_tasks WHERE parallel_group LIKE 'order:%'")?
-                .query_map([], |row| {
-                    let id: String = row.get(0)?;
-                    let pg: String = row.get(1)?;
-                    let n: i64 = pg
-                        .trim_start_matches("order:")
-                        .parse()
-                        .unwrap_or(0);
-                    Ok((id, n))
-                })?
-                .filter_map(std::result::Result::ok)
-                .collect();
-            for (id, n) in legacy {
-                conn.execute(
-                    "UPDATE tr_plan_tasks SET sort_order = ?, parallel_group = NULL WHERE id = ?",
-                    rusqlite::params![n, id],
-                )?;
-            }
-        }
-
-        // Migration: route column on tr_runs (F1 event-wiring fix).
-        // Added after initial release so existing databases need ALTER TABLE.
-        let has_route: bool = {
-            let mut stmt = conn.prepare("PRAGMA table_info(tr_runs)")?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
-            let mut found = false;
-            for r in rows {
-                if r?.eq_ignore_ascii_case("route") {
-                    found = true;
-                }
-            }
-            found
-        };
-        if !has_route {
-            // Wrap in try — column may already exist if schema was recreated.
-            let _ = conn.execute(
-                "ALTER TABLE tr_runs ADD COLUMN route TEXT NOT NULL DEFAULT ''",
-                [],
-            );
-        }
-
-        Ok(())
-    }
-
-    fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>, StoreError> {
-        self.conn.lock().map_err(|_| StoreError::LockPoisoned)
+    /// Build a `FileTaskStore` over the shadow, for read delegation.
+    fn file_store(&self) -> super::file_store::FileTaskStore {
+        super::file_store::FileTaskStore::new((*self.shadow).clone())
     }
 
     // ── Runs ────────────────────────────────────────────────────────────
@@ -440,49 +171,8 @@ impl TaskRuntimeStore {
 
         // U1c phase-0/0bc step-2: file is the write authority. Append the
         // RunCreated event to events.jsonl and rebuild plan.json — no SQL
-        // write. SQL stays as a non-writing fallback (tables kept).
-        if let Some(shadow) = &self.shadow {
-            shadow.append_event_line(
-                run.run_id.as_str(),
-                None,
-                None,
-                RuntimeEventKind::RunCreated,
-                serde_json::json!({
-                    "goal": goal,
-                    "domain_profile": domain_profile.as_str(),
-                    "workspace_id": run.workspace_id,
-                    "conversation_id": run.conversation_id,
-                    "root_message_id": run.root_message_id,
-                    "route": run.route,
-                    "created_at": run.created_at.to_rfc3339(),
-                }),
-            )?;
-            shadow.rewrite_plan(&run.run_id)?;
-            return Ok(run);
-        }
-
-        // Legacy SQL path (no shadow attached — not the default post-step-D).
-        let mut conn = self.lock()?;
-        let tx = conn.transaction()?;
-        tx.execute(
-            "INSERT INTO tr_runs
-                (run_id, workspace_id, conversation_id, root_message_id, domain_profile,
-                 status, goal, plan_id, route, created_at, updated_at)
-             VALUES (?,?,?,?,?, 'pending', ?, NULL, ?, ?, ?)",
-            params![
-                run.run_id,
-                run.workspace_id,
-                run.conversation_id,
-                run.root_message_id,
-                domain_profile.as_str(),
-                run.goal,
-                run.route,
-                run.created_at.to_rfc3339(),
-                run.updated_at.to_rfc3339(),
-            ],
-        )?;
-        append_event_tx(
-            &tx,
+        // write.
+        self.shadow.append_event_line(
             run.run_id.as_str(),
             None,
             None,
@@ -497,8 +187,7 @@ impl TaskRuntimeStore {
                 "created_at": run.created_at.to_rfc3339(),
             }),
         )?;
-        tx.commit()?;
-        self.flush_shadow(&run.run_id, &conn);
+        self.shadow.rewrite_plan(&run.run_id)?;
         Ok(run)
     }
 
@@ -508,48 +197,10 @@ impl TaskRuntimeStore {
         // U1c phase-0/0bc step-2: file is the read/write authority. Read the
         // current run from the file to validate the transition, then append the
         // status-changed event + rewrite plan.json. No SQL write.
-        if let Some(shadow) = &self.shadow {
-            let run = self
-                .get_run(run_id)?
-                .ok_or(StoreError::RunNotFound(run_id.to_string()))?;
-            let current = run.status;
-            if !current.can_transition_to(next) {
-                return Err(StoreError::IllegalTransition {
-                    run_id: run_id.to_string(),
-                    from: current.as_str().to_string(),
-                    to: next.as_str().to_string(),
-                });
-            }
-            let now = Utc::now();
-            shadow.append_event_line(
-                run_id,
-                None,
-                None,
-                RuntimeEventKind::RunStatusChanged,
-                serde_json::json!({ "from": current.as_str(), "to": next.as_str() }),
-            )?;
-            if next == TaskRunStatus::Cancelled {
-                shadow.append_event_line(
-                    run_id,
-                    None,
-                    None,
-                    RuntimeEventKind::RunCancelled,
-                    serde_json::json!({}),
-                )?;
-            }
-            shadow.rewrite_plan(run_id)?;
-            let mut run = run;
-            run.status = next;
-            run.updated_at = now;
-            return Ok(run);
-        }
-
-        // Legacy SQL path (no shadow attached).
-        let mut conn = self.lock()?;
-        let tx = conn.transaction()?;
-
-        let (current_str, mut run) = load_run_for_update(&tx, run_id)?;
-        let current = TaskRunStatus::from_str(&current_str).unwrap_or(TaskRunStatus::Pending);
+        let run = self
+            .get_run(run_id)?
+            .ok_or(StoreError::RunNotFound(run_id.to_string()))?;
+        let current = run.status;
         if !current.can_transition_to(next) {
             return Err(StoreError::IllegalTransition {
                 run_id: run_id.to_string(),
@@ -557,28 +208,16 @@ impl TaskRuntimeStore {
                 to: next.as_str().to_string(),
             });
         }
-
         let now = Utc::now();
-        let now_str = now.to_rfc3339();
-        run.status = next;
-        run.updated_at = now;
-        tx.execute(
-            "UPDATE tr_runs SET status = ?, updated_at = ? WHERE run_id = ?",
-            params![next.as_str(), now_str, run_id],
-        )?;
-        append_event_tx(
-            &tx,
+        self.shadow.append_event_line(
             run_id,
             None,
             None,
             RuntimeEventKind::RunStatusChanged,
             serde_json::json!({ "from": current.as_str(), "to": next.as_str() }),
         )?;
-        // A run moving to Cancelled is significant enough to deserve its own
-        // event kind for consumers that filter on it.
         if next == TaskRunStatus::Cancelled {
-            append_event_tx(
-                &tx,
+            self.shadow.append_event_line(
                 run_id,
                 None,
                 None,
@@ -586,8 +225,10 @@ impl TaskRuntimeStore {
                 serde_json::json!({}),
             )?;
         }
-        tx.commit()?;
-        self.flush_shadow(run_id, &conn);
+        self.shadow.rewrite_plan(run_id)?;
+        let mut run = run;
+        run.status = next;
+        run.updated_at = now;
         Ok(run)
     }
 
@@ -654,190 +295,55 @@ impl TaskRuntimeStore {
         // U1c phase-0/0bc step-2: file authority. Read the current plan from
         // the file (bootstrapping an empty plan if none exists), validate deps,
         // then append PlanEdited{insert} + rewrite plan.json. No SQL write.
-        if let Some(shadow) = &self.shadow {
-            // Load current plan/tasks from the file (None if no plan yet).
-            let current_plan = self.get_plan(run_id)?;
-            let existing_tasks: Vec<PlanTask> = current_plan
-                .as_ref()
-                .map(|p| p.tasks.clone())
-                .unwrap_or_default();
+        // Load current plan/tasks from the file (None if no plan yet).
+        let current_plan = self.get_plan(run_id)?;
+        let existing_tasks: Vec<PlanTask> = current_plan
+            .as_ref()
+            .map(|p| p.tasks.clone())
+            .unwrap_or_default();
 
-            // Lazy bootstrap: if no plan exists, emit a PlanGenerated first
-            // (matching the SQL path that creates an empty plan row). The run
-            // goal comes from the run header (already on file via create_run).
-            if current_plan.is_none() {
-                let run = self.get_run(run_id)?;
-                let goal = run.as_ref().map(|r| r.goal.clone()).unwrap_or_default();
-                let new_plan_id = uuid::Uuid::new_v4().to_string();
-                shadow.append_event_line(
-                    run_id,
-                    None,
-                    None,
-                    RuntimeEventKind::PlanGenerated,
-                    serde_json::json!({
-                        "plan_id": new_plan_id,
-                        "task_count": 0,
-                        "bootstrapped": true,
-                        "domain_profile": DomainProfile::General.as_str(),
-                        "goal": goal,
-                        "assumptions": Vec::<String>::new(),
-                        "risks": Vec::<String>::new(),
-                        "execution_mode": "parallel",
-                    }),
-                )?;
-            }
-
-            // Build the new task list: insert after `after_task_id` (or front).
-            let mut new_tasks = existing_tasks.clone();
-            let insert_pos = after_task_id
-                .as_ref()
-                .and_then(|id| new_tasks.iter().position(|t| &t.id == id))
-                .map(|i| i + 1)
-                .unwrap_or(0);
-            let mut task_with_order = task.clone();
-            task_with_order.sort_order = insert_pos as i64;
-            new_tasks.insert(insert_pos, task_with_order.clone());
-
-            // Validate deps (dangling refs + cycle detection).
-            if let Err(errs) = super::planner::validate_plan_deps(&new_tasks) {
-                return Err(StoreError::InvalidPlan(errs.join("; ")));
-            }
-
-            shadow.append_event_line(
+        // Lazy bootstrap: if no plan exists, emit a PlanGenerated first
+        // (matching the SQL path that creates an empty plan row). The run
+        // goal comes from the run header (already on file via create_run).
+        if current_plan.is_none() {
+            let run = self.get_run(run_id)?;
+            let goal = run.as_ref().map(|r| r.goal.clone()).unwrap_or_default();
+            let new_plan_id = uuid::Uuid::new_v4().to_string();
+            self.shadow.append_event_line(
                 run_id,
                 None,
                 None,
-                RuntimeEventKind::PlanEdited,
+                RuntimeEventKind::PlanGenerated,
                 serde_json::json!({
-                    "action": "insert",
-                    "task_id": task_with_order.id,
-                    "after_task_id": after_task_id,
-                    // Full PlanTask body so events.jsonl can rebuild plan.json.
-                    "task": task_with_order,
+                    "plan_id": new_plan_id,
+                    "task_count": 0,
+                    "bootstrapped": true,
+                    "domain_profile": DomainProfile::General.as_str(),
+                    "goal": goal,
+                    "assumptions": Vec::<String>::new(),
+                    "risks": Vec::<String>::new(),
+                    "execution_mode": "parallel",
                 }),
             )?;
-            shadow.rewrite_plan(run_id)?;
-            return Ok(());
         }
 
-        // Legacy SQL path (no shadow attached).
-        let mut conn = self.lock()?;
-        let tx = conn.transaction()?;
-
-        // Load the current plan. If no plan exists yet, lazily create an empty
-        // one — in the unified-run model, the plan is produced by the main
-        // agent's `task_create` calls (not by an upfront generate_plan), so the
-        // first task_create must be able to bootstrap the plan row. This removes
-        // the old dependency on a separate attach_plan step before any task can
-        // be inserted.
-        let plan_id: String = match tx.query_row(
-            "SELECT plan_id FROM tr_plans WHERE run_id = ? ORDER BY rowid DESC LIMIT 1",
-            params![run_id],
-            |row| row.get(0),
-        ) {
-            Ok(id) => id,
-            Err(_) => {
-                // Lazily create an empty plan for this run.
-                let new_plan_id = uuid::Uuid::new_v4().to_string();
-                let now = Utc::now().to_rfc3339();
-                let goal: String = tx
-                    .query_row(
-                        "SELECT goal FROM tr_runs WHERE run_id = ?",
-                        params![run_id],
-                        |row| row.get(0),
-                    )
-                    .unwrap_or_default();
-                tx.execute(
-                    "INSERT INTO tr_plans
-                        (plan_id, run_id, domain_profile, goal, assumptions, risks,
-                         execution_mode, created_at)
-                     VALUES (?,?,?,?,?,?,?,?)",
-                    params![
-                        new_plan_id,
-                        run_id,
-                        DomainProfile::General.as_str(),
-                        goal,
-                        serde_json::to_string(&Vec::<String>::new())
-                            .unwrap_or_else(|_| "[]".into()),
-                        serde_json::to_string(&Vec::<String>::new())
-                            .unwrap_or_else(|_| "[]".into()),
-                        "parallel",
-                        now,
-                    ],
-                )?;
-                tx.execute(
-                    "UPDATE tr_runs SET plan_id = ?, updated_at = ? WHERE run_id = ?",
-                    params![new_plan_id, now, run_id],
-                )?;
-                append_event_tx(
-                    &tx,
-                    run_id,
-                    None,
-                    None,
-                    RuntimeEventKind::PlanGenerated,
-                    serde_json::json!({
-                        "plan_id": new_plan_id,
-                        "task_count": 0,
-                        "bootstrapped": true,
-                        "domain_profile": DomainProfile::General.as_str(),
-                        "goal": goal,
-                        "assumptions": Vec::<String>::new(),
-                        "risks": Vec::<String>::new(),
-                        "execution_mode": "parallel",
-                    }),
-                )?;
-                new_plan_id
-            }
-        };
-
-        let existing_tasks = load_plan_tasks_tx(&tx, &plan_id)?;
-
-        // Build the new task list: insert after `after_task_id` (or at front).
+        // Build the new task list: insert after `after_task_id` (or front).
         let mut new_tasks = existing_tasks.clone();
         let insert_pos = after_task_id
             .as_ref()
             .and_then(|id| new_tasks.iter().position(|t| &t.id == id))
             .map(|i| i + 1)
             .unwrap_or(0);
-        new_tasks.insert(insert_pos, task.clone());
+        let mut task_with_order = task.clone();
+        task_with_order.sort_order = insert_pos as i64;
+        new_tasks.insert(insert_pos, task_with_order.clone());
 
         // Validate deps (dangling refs + cycle detection).
         if let Err(errs) = super::planner::validate_plan_deps(&new_tasks) {
             return Err(StoreError::InvalidPlan(errs.join("; ")));
         }
 
-        // Persist the new task with its display position as sort_order.
-        let mut task_with_order = task.clone();
-        task_with_order.sort_order = insert_pos as i64;
-        insert_plan_task_tx(&tx, &plan_id, run_id, &task_with_order)?;
-
-        // Shift sort_order of tasks at/after the insertion point so the list
-        // stays stably ordered (new task doesn't collide with an existing one).
-        for (idx, t) in new_tasks.iter().enumerate() {
-            if t.id != task.id {
-                let order = if idx < insert_pos {
-                    idx as i64
-                } else {
-                    (idx as i64) + 1
-                };
-                // Only bump when needed to avoid unnecessary writes.
-                tx.execute(
-                    "UPDATE tr_plan_tasks SET sort_order = ? WHERE run_id = ? AND id = ? AND sort_order != ?",
-                    params![order, run_id, t.id, order],
-                )?;
-            }
-        }
-
-        // Mirror todo row (id = task_id, matching attach_plan convention).
-        tx.execute(
-            "INSERT INTO tr_todos (id, run_id, task_id, title, status)
-             VALUES (?, ?, ?, ?, ?)",
-            params![task.id, run_id, task.id, task.title, task.status.as_str()],
-        )?;
-
-        // Emit PlanEdited event.
-        append_event_tx(
-            &tx,
+        self.shadow.append_event_line(
             run_id,
             None,
             None,
@@ -846,13 +352,11 @@ impl TaskRuntimeStore {
                 "action": "insert",
                 "task_id": task_with_order.id,
                 "after_task_id": after_task_id,
-                // Full PlanTask body so events.jsonl can rebuild plan.json (U1c phase-0/0a).
+                // Full PlanTask body so events.jsonl can rebuild plan.json.
                 "task": task_with_order,
             }),
         )?;
-
-        tx.commit()?;
-        self.flush_shadow(run_id, &conn);
+        self.shadow.rewrite_plan(run_id)?;
         Ok(())
     }
 
@@ -884,29 +388,14 @@ impl TaskRuntimeStore {
         )?;
         // Emit PlanEdited (the set_task_status already emits TaskSkipped).
         // U1c phase-0/0bc step-2: file authority — append + rewrite, no SQL.
-        if let Some(shadow) = &self.shadow {
-            shadow.append_event_line(
-                run_id,
-                None,
-                None,
-                RuntimeEventKind::PlanEdited,
-                serde_json::json!({ "action": "remove", "task_id": task_id }),
-            )?;
-            shadow.rewrite_plan(run_id)?;
-            return Ok(());
-        }
-        let mut conn = self.lock()?;
-        let tx = conn.transaction()?;
-        append_event_tx(
-            &tx,
+        self.shadow.append_event_line(
             run_id,
             None,
             None,
             RuntimeEventKind::PlanEdited,
             serde_json::json!({ "action": "remove", "task_id": task_id }),
         )?;
-        tx.commit()?;
-        self.flush_shadow(run_id, &conn);
+        self.shadow.rewrite_plan(run_id)?;
         Ok(())
     }
 
@@ -923,81 +412,15 @@ impl TaskRuntimeStore {
         // U1c phase-0/0bc step-2: file authority. Read the task status + plan
         // from the file, validate (state guard + cycle on deps change), then
         // append PlanEdited{update} + rewrite plan.json. No SQL write.
-        if let Some(shadow) = &self.shadow {
-            let plan = self
-                .get_plan(run_id)?
-                .ok_or(StoreError::PlanNotFound(run_id.to_string()))?;
-            let current_task = plan
-                .tasks
-                .iter()
-                .find(|t| t.id == task_id)
-                .ok_or_else(|| StoreError::TaskNotFound(task_id.to_string()))?;
-            let current_status = current_task.status;
-
-            // State guard.
-            match current_status {
-                TodoStatus::Completed | TodoStatus::Failed | TodoStatus::Skipped => {
-                    return Err(StoreError::InvalidPlan(format!(
-                        "cannot update task in terminal status {:?}",
-                        current_status
-                    )));
-                }
-                TodoStatus::Running => {
-                    #[allow(clippy::collapsible_match)]
-                    // guard is a multi-field ||, not a single pattern; collapsing reads worse
-                    if patch.kind.is_some()
-                        || patch.depends_on.is_some()
-                        || patch.agent_role.is_some()
-                    {
-                        return Err(StoreError::InvalidPlan(
-                            "cannot change kind/depends_on/agent_role of a Running task".into(),
-                        ));
-                    }
-                }
-                _ => {} // Pending/Blocked: all fields mutable.
-            }
-
-            // Re-validate cycle after changing deps.
-            if let Some(deps) = &patch.depends_on {
-                let mut tasks = plan.tasks.clone();
-                if let Some(t) = tasks.iter_mut().find(|t| t.id == task_id) {
-                    t.depends_on = deps.clone();
-                }
-                if let Err(errs) = super::planner::validate_plan_deps(&tasks) {
-                    return Err(StoreError::InvalidPlan(errs.join("; ")));
-                }
-            }
-
-            shadow.append_event_line(
-                run_id,
-                None,
-                None,
-                RuntimeEventKind::PlanEdited,
-                serde_json::json!({
-                    "action": "update",
-                    "task_id": task_id,
-                    // Applied patch fields so events.jsonl can rebuild plan.json.
-                    "patch": patch,
-                }),
-            )?;
-            shadow.rewrite_plan(run_id)?;
-            return Ok(());
-        }
-
-        // Legacy SQL path (no shadow attached).
-        let mut conn = self.lock()?;
-        let tx = conn.transaction()?;
-
-        // Read current task status.
-        let current_status_str: String = tx
-            .query_row(
-                "SELECT status FROM tr_plan_tasks WHERE run_id = ? AND id = ?",
-                params![run_id, task_id],
-                |row| row.get(0),
-            )
-            .map_err(|_| StoreError::TaskNotFound(task_id.to_string()))?;
-        let current_status =
-            TodoStatus::from_str(&current_status_str).unwrap_or(TodoStatus::Pending);
+        let plan = self
+            .get_plan(run_id)?
+            .ok_or(StoreError::PlanNotFound(run_id.to_string()))?;
+        let current_task = plan
+            .tasks
+            .iter()
+            .find(|t| t.id == task_id)
+            .ok_or_else(|| StoreError::TaskNotFound(task_id.to_string()))?;
+        let current_status = current_task.status;
 
         // State guard.
         match current_status {
@@ -1020,64 +443,9 @@ impl TaskRuntimeStore {
             _ => {} // Pending/Blocked: all fields mutable.
         }
 
-        // Apply each non-None field.
-        if let Some(title) = &patch.title {
-            tx.execute(
-                "UPDATE tr_plan_tasks SET title = ? WHERE run_id = ? AND id = ?",
-                params![title, run_id, task_id],
-            )?;
-            tx.execute(
-                "UPDATE tr_todos SET title = ? WHERE run_id = ? AND task_id = ?",
-                params![title, run_id, task_id],
-            )?;
-        }
-        if let Some(desc) = &patch.description {
-            tx.execute(
-                "UPDATE tr_plan_tasks SET description = ? WHERE run_id = ? AND id = ?",
-                params![desc, run_id, task_id],
-            )?;
-        }
-        if let Some(kind) = &patch.kind {
-            tx.execute(
-                "UPDATE tr_plan_tasks SET kind = ? WHERE run_id = ? AND id = ?",
-                params![kind.as_str(), run_id, task_id],
-            )?;
-        }
-        if let Some(role) = &patch.agent_role {
-            tx.execute(
-                "UPDATE tr_plan_tasks SET agent_role = ? WHERE run_id = ? AND id = ?",
-                params![role, run_id, task_id],
-            )?;
-        }
-        if let Some(files) = &patch.files {
-            let json = serde_json::to_string(files).unwrap_or_default();
-            tx.execute(
-                "UPDATE tr_plan_tasks SET files = ? WHERE run_id = ? AND id = ?",
-                params![json, run_id, task_id],
-            )?;
-        }
-        if let Some(tools) = &patch.allowed_tools {
-            let json = serde_json::to_string(tools).unwrap_or_default();
-            tx.execute(
-                "UPDATE tr_plan_tasks SET allowed_tools = ? WHERE run_id = ? AND id = ?",
-                params![json, run_id, task_id],
-            )?;
-        }
+        // Re-validate cycle after changing deps.
         if let Some(deps) = &patch.depends_on {
-            let json = serde_json::to_string(deps).unwrap_or_default();
-            tx.execute(
-                "UPDATE tr_plan_tasks SET depends_on = ? WHERE run_id = ? AND id = ?",
-                params![json, run_id, task_id],
-            )?;
-            // Re-validate cycle after changing deps.
-            let plan_id: String = tx
-                .query_row(
-                    "SELECT plan_id FROM tr_plans WHERE run_id = ? ORDER BY rowid DESC LIMIT 1",
-                    params![run_id],
-                    |row| row.get(0),
-                )
-                .map_err(|_| StoreError::PlanNotFound(run_id.to_string()))?;
-            let mut tasks = load_plan_tasks_tx(&tx, &plan_id)?;
+            let mut tasks = plan.tasks.clone();
             if let Some(t) = tasks.iter_mut().find(|t| t.id == task_id) {
                 t.depends_on = deps.clone();
             }
@@ -1086,8 +454,7 @@ impl TaskRuntimeStore {
             }
         }
 
-        append_event_tx(
-            &tx,
+        self.shadow.append_event_line(
             run_id,
             None,
             None,
@@ -1095,13 +462,11 @@ impl TaskRuntimeStore {
             serde_json::json!({
                 "action": "update",
                 "task_id": task_id,
-                // Applied patch fields so events.jsonl can rebuild plan.json (U1c phase-0/0a).
+                // Applied patch fields so events.jsonl can rebuild plan.json.
                 "patch": patch,
             }),
         )?;
-
-        tx.commit()?;
-        self.flush_shadow(run_id, &conn);
+        self.shadow.rewrite_plan(run_id)?;
         Ok(())
     }
 
@@ -1112,58 +477,11 @@ impl TaskRuntimeStore {
         // U1c phase-0/0bc step-2: file authority. Read tasks from file,
         // validate new_order is a permutation of non-terminal task ids, then
         // append PlanEdited{reorder} + rewrite plan.json. No SQL write.
-        if let Some(shadow) = &self.shadow {
-            let plan = self
-                .get_plan(run_id)?
-                .ok_or(StoreError::PlanNotFound(run_id.to_string()))?;
-            let non_terminal: std::collections::HashSet<String> = plan
-                .tasks
-                .iter()
-                .filter(|t| {
-                    !matches!(
-                        t.status,
-                        TodoStatus::Completed | TodoStatus::Failed | TodoStatus::Skipped
-                    )
-                })
-                .map(|t| t.id.clone())
-                .collect();
-            let new_set: std::collections::HashSet<String> = new_order.iter().cloned().collect();
-
-            if non_terminal != new_set {
-                return Err(StoreError::InvalidPlan(
-                    "new_order must be a permutation of all non-terminal task ids".into(),
-                ));
-            }
-
-            shadow.append_event_line(
-                run_id,
-                None,
-                None,
-                RuntimeEventKind::PlanEdited,
-                serde_json::json!({
-                    "action": "reorder",
-                    // Full new ordering (task ids) so events.jsonl can rebuild plan.json.
-                    "new_order": new_order,
-                }),
-            )?;
-            shadow.rewrite_plan(run_id)?;
-            return Ok(());
-        }
-
-        // Legacy SQL path (no shadow attached).
-        let mut conn = self.lock()?;
-        let tx = conn.transaction()?;
-
-        let plan_id: String = tx
-            .query_row(
-                "SELECT plan_id FROM tr_plans WHERE run_id = ? ORDER BY rowid DESC LIMIT 1",
-                params![run_id],
-                |row| row.get(0),
-            )
-            .map_err(|_| StoreError::PlanNotFound(run_id.to_string()))?;
-
-        let tasks = load_plan_tasks_tx(&tx, &plan_id)?;
-        let non_terminal: std::collections::HashSet<String> = tasks
+        let plan = self
+            .get_plan(run_id)?
+            .ok_or(StoreError::PlanNotFound(run_id.to_string()))?;
+        let non_terminal: std::collections::HashSet<String> = plan
+            .tasks
             .iter()
             .filter(|t| {
                 !matches!(
@@ -1181,31 +499,18 @@ impl TaskRuntimeStore {
             ));
         }
 
-        // Update sort_order to encode the new display order. (Previously this
-        // abused parallel_group with "order:N" values, polluting its real
-        // semantics. sort_order is the dedicated column for this.)
-        for (idx, task_id) in new_order.iter().enumerate() {
-            tx.execute(
-                "UPDATE tr_plan_tasks SET sort_order = ? WHERE run_id = ? AND id = ?",
-                params![idx as i64, run_id, task_id],
-            )?;
-        }
-
-        append_event_tx(
-            &tx,
+        self.shadow.append_event_line(
             run_id,
             None,
             None,
             RuntimeEventKind::PlanEdited,
             serde_json::json!({
                 "action": "reorder",
-                // Full new ordering (task ids) so events.jsonl can rebuild plan.json (U1c phase-0/0a).
+                // Full new ordering (task ids) so events.jsonl can rebuild plan.json.
                 "new_order": new_order,
             }),
         )?;
-
-        tx.commit()?;
-        self.flush_shadow(run_id, &conn);
+        self.shadow.rewrite_plan(run_id)?;
         Ok(())
     }
 
@@ -1216,93 +521,7 @@ impl TaskRuntimeStore {
         // U1c phase-0/0bc step-2: file authority. PlanGenerated carries the
         // full plan envelope + task bodies; the rebuilder reconstructs the
         // plan from it. No SQL write.
-        if let Some(shadow) = &self.shadow {
-            shadow.append_event_line(
-                plan.run_id.as_str(),
-                None,
-                None,
-                RuntimeEventKind::PlanGenerated,
-                serde_json::json!({
-                    "plan_id": plan.plan_id,
-                    "task_count": plan.tasks.len(),
-                    "domain_profile": plan.domain_profile.as_str(),
-                    "goal": plan.goal,
-                    "assumptions": plan.assumptions,
-                    "risks": plan.risks,
-                    "execution_mode": plan.execution_mode,
-                    // Full task bodies: attach_plan is the authoritative plan-creation path
-                    // so PlanGenerated must carry the tasks for events.jsonl to rebuild plan.json.
-                    "tasks": plan.tasks,
-                }),
-            )?;
-            shadow.rewrite_plan(&plan.run_id)?;
-            return Ok(());
-        }
-
-        // Legacy SQL path (no shadow attached).
-        let mut conn = self.lock()?;
-        let tx = conn.transaction()?;
-
-        // Upsert the plan row.
-        tx.execute(
-            "INSERT INTO tr_plans
-                (plan_id, run_id, domain_profile, goal, assumptions, risks,
-                 execution_mode, created_at)
-             VALUES (?,?,?,?,?,?,?,?)
-             ON CONFLICT(plan_id) DO UPDATE SET
-                goal=excluded.goal,
-                assumptions=excluded.assumptions,
-                risks=excluded.risks,
-                execution_mode=excluded.execution_mode",
-            params![
-                plan.plan_id,
-                plan.run_id,
-                plan.domain_profile.as_str(),
-                plan.goal,
-                serde_json::to_string(&plan.assumptions)?,
-                serde_json::to_string(&plan.risks)?,
-                match plan.execution_mode {
-                    ExecutionMode::Sequential => "sequential",
-                    ExecutionMode::Parallel => "parallel",
-                    ExecutionMode::PlanOnly => "plan_only",
-                },
-                Utc::now().to_rfc3339(),
-            ],
-        )?;
-
-        // Replace all plan-task rows for this plan atomically.
-        tx.execute(
-            "DELETE FROM tr_plan_tasks WHERE plan_id = ?",
-            params![plan.plan_id],
-        )?;
-        tx.execute(
-            "DELETE FROM tr_todos WHERE run_id = ?",
-            params![plan.run_id],
-        )?;
-
-        for (idx, t) in plan.tasks.iter().enumerate() {
-            let mut t = t.clone();
-            t.sort_order = idx as i64;
-            insert_plan_task_tx(&tx, &plan.plan_id, &plan.run_id, &t)?;
-            // Mirror each task into the todo projection.
-            tx.execute(
-                "INSERT INTO tr_todos
-                    (id, run_id, task_id, title, status, owner_agent,
-                     started_at, completed_at, summary)
-                 VALUES (?,?,?,?,'pending',NULL,NULL,NULL,NULL)",
-                params![t.id, plan.run_id, t.id, t.title],
-            )?;
-        }
-
-        // Link run -> plan. Status is decided by the caller (attach_plan
-        // does NOT change the run status).
-        let now = Utc::now().to_rfc3339();
-        tx.execute(
-            "UPDATE tr_runs SET plan_id = ?, updated_at = ? WHERE run_id = ?",
-            params![plan.plan_id, now, plan.run_id],
-        )?;
-        append_event_tx(
-            &tx,
+        self.shadow.append_event_line(
             plan.run_id.as_str(),
             None,
             None,
@@ -1316,13 +535,11 @@ impl TaskRuntimeStore {
                 "risks": plan.risks,
                 "execution_mode": plan.execution_mode,
                 // Full task bodies: attach_plan is the authoritative plan-creation path
-                // (insert_plan_task_tx, NOT insert_task), so PlanGenerated must carry the
-                // tasks for events.jsonl to rebuild plan.json (U1c phase-0/0a).
+                // so PlanGenerated must carry the tasks for events.jsonl to rebuild plan.json.
                 "tasks": plan.tasks,
             }),
         )?;
-        tx.commit()?;
-        self.flush_shadow(&plan.run_id, &conn);
+        self.shadow.rewrite_plan(&plan.run_id)?;
         Ok(())
     }
 
@@ -1342,84 +559,18 @@ impl TaskRuntimeStore {
         // U1c phase-0/0bc step-2: file authority. Validate the task exists
         // (read plan from file), then append the Task*/TodoUpdated event with
         // explicit started_at/completed_at and rewrite plan.json. No SQL write.
-        if let Some(shadow) = &self.shadow {
-            let plan = self
-                .get_plan(run_id)?
-                .ok_or(StoreError::PlanNotFound(run_id.to_string()))?;
-            if !plan.tasks.iter().any(|t| t.id == task_id) {
-                return Err(StoreError::TaskNotFound(task_id.to_string()));
-            }
-            let now = Utc::now().to_rfc3339();
-            let started = matches!(status, TodoStatus::Running);
-            let finished = matches!(
-                status,
-                TodoStatus::Completed | TodoStatus::Failed | TodoStatus::Skipped
-            );
-            let kind = match status {
-                TodoStatus::Running => RuntimeEventKind::TaskStarted,
-                TodoStatus::Completed => RuntimeEventKind::TaskCompleted,
-                TodoStatus::Failed => RuntimeEventKind::TaskFailed,
-                TodoStatus::Skipped => RuntimeEventKind::TaskSkipped,
-                TodoStatus::Blocked => RuntimeEventKind::TaskBlocked,
-                TodoStatus::Pending => RuntimeEventKind::TodoUpdated,
-            };
-            shadow.append_event_line(
-                run_id,
-                Some(task_id),
-                None,
-                kind,
-                serde_json::json!({
-                    "status": status.as_str(),
-                    "owner_agent": owner_agent,
-                    "summary": summary,
-                    // Explicit timestamps so events.jsonl can rebuild todo runtime fields
-                    // without relying on the event `timestamp` as a proxy.
-                    "started_at": if started { Some(now.as_str()) } else { None },
-                    "completed_at": if finished { Some(now.as_str()) } else { None },
-                }),
-            )?;
-            shadow.rewrite_plan(run_id)?;
-            return Ok(());
-        }
-
-        // Legacy SQL path (no shadow attached).
-        let mut conn = self.lock()?;
-        let tx = conn.transaction()?;
-        let now = Utc::now().to_rfc3339();
-
-        tx.execute(
-            "UPDATE tr_plan_tasks SET status = ? WHERE id = ?",
-            params![status.as_str(), task_id],
-        )?;
-        if tx.changes() == 0 {
+        let plan = self
+            .get_plan(run_id)?
+            .ok_or(StoreError::PlanNotFound(run_id.to_string()))?;
+        if !plan.tasks.iter().any(|t| t.id == task_id) {
             return Err(StoreError::TaskNotFound(task_id.to_string()));
         }
-
-        // Keep the todo projection in lock-step.
+        let now = Utc::now().to_rfc3339();
         let started = matches!(status, TodoStatus::Running);
         let finished = matches!(
             status,
             TodoStatus::Completed | TodoStatus::Failed | TodoStatus::Skipped
         );
-        tx.execute(
-            "UPDATE tr_todos SET status = ?, owner_agent = ?,
-                started_at = CASE WHEN ? THEN ? ELSE started_at END,
-                completed_at = CASE WHEN ? THEN ? ELSE completed_at END,
-                summary = ?
-             WHERE run_id = ? AND task_id = ?",
-            params![
-                status.as_str(),
-                owner_agent,
-                started,
-                if started { Some(&now) } else { None },
-                finished,
-                if finished { Some(&now) } else { None },
-                summary,
-                run_id,
-                task_id
-            ],
-        )?;
-
         let kind = match status {
             TodoStatus::Running => RuntimeEventKind::TaskStarted,
             TodoStatus::Completed => RuntimeEventKind::TaskCompleted,
@@ -1428,8 +579,7 @@ impl TaskRuntimeStore {
             TodoStatus::Blocked => RuntimeEventKind::TaskBlocked,
             TodoStatus::Pending => RuntimeEventKind::TodoUpdated,
         };
-        append_event_tx(
-            &tx,
+        self.shadow.append_event_line(
             run_id,
             Some(task_id),
             None,
@@ -1439,13 +589,12 @@ impl TaskRuntimeStore {
                 "owner_agent": owner_agent,
                 "summary": summary,
                 // Explicit timestamps so events.jsonl can rebuild todo runtime fields
-                // without relying on the event `timestamp` as a proxy (U1c phase-0/0a).
+                // without relying on the event `timestamp` as a proxy.
                 "started_at": if started { Some(now.as_str()) } else { None },
                 "completed_at": if finished { Some(now.as_str()) } else { None },
             }),
         )?;
-        tx.commit()?;
-        self.flush_shadow(run_id, &conn);
+        self.shadow.rewrite_plan(run_id)?;
         Ok(())
     }
 
@@ -1459,57 +608,13 @@ impl TaskRuntimeStore {
         // U1c phase-0/0bc step-2: file authority. Validate the task exists, then
         // emit Note{fix_task_persisted} carrying the full task body so the
         // rebuilder can replace the task (see event_rebuild Note handler). No SQL.
-        if let Some(shadow) = &self.shadow {
-            let plan = self
-                .get_plan(run_id)?
-                .ok_or(StoreError::PlanNotFound(run_id.to_string()))?;
-            if !plan.tasks.iter().any(|t| t.id == task.id) {
-                return Err(StoreError::TaskNotFound(task.id.clone()));
-            }
-            shadow.append_event_line(
-                run_id,
-                Some(task.id.as_str()),
-                None,
-                RuntimeEventKind::Note,
-                serde_json::json!({
-                    "kind": "fix_task_persisted",
-                    "retry_count": task.retry_count,
-                    "failure_fingerprint": task.failure_fingerprint,
-                    // Full task body so events.jsonl can rebuild plan.json
-                    // (the rebuilder replaces the matching task).
-                    "task": task,
-                }),
-            )?;
-            shadow.rewrite_plan(run_id)?;
-            return Ok(());
-        }
-        let mut conn = self.lock()?;
-        let tx = conn.transaction()?;
-        tx.execute(
-            "UPDATE tr_plan_tasks SET
-                title = ?, description = ?, retry_count = ?,
-                failure_fingerprint = ?, status = ?
-             WHERE run_id = ? AND id = ?",
-            params![
-                task.title,
-                task.description,
-                task.retry_count,
-                task.failure_fingerprint,
-                task.status.as_str(),
-                run_id,
-                task.id,
-            ],
-        )?;
-        if tx.changes() == 0 {
+        let plan = self
+            .get_plan(run_id)?
+            .ok_or(StoreError::PlanNotFound(run_id.to_string()))?;
+        if !plan.tasks.iter().any(|t| t.id == task.id) {
             return Err(StoreError::TaskNotFound(task.id.clone()));
         }
-        // Keep the todo title in sync (it shows in the GUI).
-        tx.execute(
-            "UPDATE tr_todos SET title = ?, status = ? WHERE run_id = ? AND task_id = ?",
-            params![task.title, task.status.as_str(), run_id, task.id],
-        )?;
-        append_event_tx(
-            &tx,
+        self.shadow.append_event_line(
             run_id,
             Some(task.id.as_str()),
             None,
@@ -1518,10 +623,12 @@ impl TaskRuntimeStore {
                 "kind": "fix_task_persisted",
                 "retry_count": task.retry_count,
                 "failure_fingerprint": task.failure_fingerprint,
+                // Full task body so events.jsonl can rebuild plan.json
+                // (the rebuilder replaces the matching task).
                 "task": task,
             }),
         )?;
-        tx.commit()?;
+        self.shadow.rewrite_plan(run_id)?;
         Ok(())
     }
 
@@ -1530,56 +637,12 @@ impl TaskRuntimeStore {
     pub fn add_review(&self, r: &ReviewResult) -> Result<(), StoreError> {
         // U1c phase-0/0bc step-2: file authority. Review* carries the full
         // review so FileTaskStore.list_reviews can derive it. No SQL.
-        if let Some(shadow) = &self.shadow {
-            let kind = match r.outcome {
-                ReviewOutcome::Pass => RuntimeEventKind::ReviewPassed,
-                ReviewOutcome::NeedsFix => RuntimeEventKind::ReviewNeedsFix,
-                ReviewOutcome::Blocked => RuntimeEventKind::ReviewBlocked,
-            };
-            shadow.append_event_line(
-                r.run_id.as_str(),
-                Some(r.task_id.as_str()),
-                None,
-                kind,
-                serde_json::json!({
-                    "review_id": r.id,
-                    "reviewer": r.reviewer_agent,
-                    "outcome": r.outcome.as_str(),
-                    "issues": r.issues,
-                    "failure_fingerprint": r.failure_fingerprint,
-                    "created_fix_task_id": r.created_fix_task_id,
-                    "created_at": r.created_at.to_rfc3339(),
-                }),
-            )?;
-            shadow.rewrite_plan(&r.run_id)?;
-            return Ok(());
-        }
-        let mut conn = self.lock()?;
-        let tx = conn.transaction()?;
-        tx.execute(
-            "INSERT INTO tr_reviews
-                (id, run_id, task_id, reviewer_agent, outcome, issues,
-                 failure_fingerprint, created_fix_task_id, created_at)
-             VALUES (?,?,?,?,?,?,?,?,?)",
-            params![
-                r.id,
-                r.run_id,
-                r.task_id,
-                r.reviewer_agent,
-                r.outcome.as_str(),
-                serde_json::to_string(&r.issues)?,
-                r.failure_fingerprint,
-                r.created_fix_task_id,
-                r.created_at.to_rfc3339(),
-            ],
-        )?;
         let kind = match r.outcome {
             ReviewOutcome::Pass => RuntimeEventKind::ReviewPassed,
             ReviewOutcome::NeedsFix => RuntimeEventKind::ReviewNeedsFix,
             ReviewOutcome::Blocked => RuntimeEventKind::ReviewBlocked,
         };
-        append_event_tx(
-            &tx,
+        self.shadow.append_event_line(
             r.run_id.as_str(),
             Some(r.task_id.as_str()),
             None,
@@ -1594,56 +657,26 @@ impl TaskRuntimeStore {
                 "created_at": r.created_at.to_rfc3339(),
             }),
         )?;
-        tx.commit()?;
-        self.flush_shadow(&r.run_id, &conn);
+        self.shadow.rewrite_plan(&r.run_id)?;
         Ok(())
     }
 
     pub fn add_artifact(&self, a: &Artifact) -> Result<(), StoreError> {
         // U1c phase-0/0bc step-2: file authority. ArtifactProduced carries the
         // full artifact so FileTaskStore.list_artifacts can derive it. No SQL.
-        if let Some(shadow) = &self.shadow {
-            shadow.append_event_line(
-                a.run_id.as_str(),
-                a.task_id.as_deref(),
-                None,
-                RuntimeEventKind::ArtifactProduced,
-                serde_json::json!({
-                    "artifact_id": a.id,
-                    "kind": a.kind.as_str(),
-                    "title": a.title,
-                    "task_id": a.task_id,
-                }),
-            )?;
-            shadow.rewrite_plan(&a.run_id)?;
-            return Ok(());
-        }
-        let mut conn = self.lock()?;
-        let tx = conn.transaction()?;
-        tx.execute(
-            "INSERT INTO tr_artifacts
-                (id, run_id, task_id, kind, title, path, metadata)
-             VALUES (?,?,?,?,?,?,?)",
-            params![
-                a.id,
-                a.run_id,
-                a.task_id,
-                a.kind.as_str(),
-                a.title,
-                a.path,
-                a.metadata.to_string(),
-            ],
-        )?;
-        append_event_tx(
-            &tx,
+        self.shadow.append_event_line(
             a.run_id.as_str(),
             a.task_id.as_deref(),
             None,
             RuntimeEventKind::ArtifactProduced,
-            serde_json::json!({ "artifact_id": a.id, "kind": a.kind.as_str(), "title": a.title }),
+            serde_json::json!({
+                "artifact_id": a.id,
+                "kind": a.kind.as_str(),
+                "title": a.title,
+                "task_id": a.task_id,
+            }),
         )?;
-        tx.commit()?;
-        self.flush_shadow(&a.run_id, &conn);
+        self.shadow.rewrite_plan(&a.run_id)?;
         Ok(())
     }
 
@@ -1655,68 +688,18 @@ impl TaskRuntimeStore {
     pub fn put_summary(&self, s: &TaskExecutionSummary) -> Result<(), StoreError> {
         // U1c phase-0/0bc step-2: file authority. Note{summary_persisted}
         // carries the full summary so FileTaskStore.get_summary can derive it.
-        if let Some(shadow) = &self.shadow {
-            shadow.append_event_line(
-                s.run_id.as_str(),
-                Some(s.task_id.as_str()),
-                None,
-                RuntimeEventKind::Note,
-                serde_json::json!({
-                    "kind": "summary_persisted",
-                    // Full summary so events.jsonl can rebuild plan.json task summaries.
-                    "summary": s,
-                }),
-            )?;
-            shadow.rewrite_plan(&s.run_id)?;
-            return Ok(());
-        }
-        let mut conn = self.lock()?;
-        let tx = conn.transaction()?;
-        tx.execute(
-            "INSERT INTO tr_summaries
-                (run_id, task_id, worker_agent, completed_work, files_read,
-                 files_changed, decisions, failures, verification,
-                 next_implications, created_at)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?)
-             ON CONFLICT(run_id, task_id) DO UPDATE SET
-                worker_agent=excluded.worker_agent,
-                completed_work=excluded.completed_work,
-                files_read=excluded.files_read,
-                files_changed=excluded.files_changed,
-                decisions=excluded.decisions,
-                failures=excluded.failures,
-                verification=excluded.verification,
-                next_implications=excluded.next_implications,
-                created_at=excluded.created_at",
-            params![
-                s.run_id,
-                s.task_id,
-                s.worker_agent,
-                serde_json::to_string(&s.completed_work)?,
-                serde_json::to_string(&s.files_read)?,
-                serde_json::to_string(&s.files_changed)?,
-                serde_json::to_string(&s.decisions)?,
-                serde_json::to_string(&s.failures)?,
-                serde_json::to_string(&s.verification)?,
-                serde_json::to_string(&s.next_implications)?,
-                s.created_at.to_rfc3339(),
-            ],
-        )?;
-        append_event_tx(
-            &tx,
+        self.shadow.append_event_line(
             s.run_id.as_str(),
             Some(s.task_id.as_str()),
             None,
             RuntimeEventKind::Note,
             serde_json::json!({
                 "kind": "summary_persisted",
-                // Full summary so events.jsonl can rebuild plan.json task summaries
-                // (U1c phase-0/0a).
+                // Full summary so events.jsonl can rebuild plan.json task summaries.
                 "summary": s,
             }),
         )?;
-        tx.commit()?;
-        self.flush_shadow(&s.run_id, &conn);
+        self.shadow.rewrite_plan(&s.run_id)?;
         Ok(())
     }
 
@@ -1724,41 +707,19 @@ impl TaskRuntimeStore {
 
     pub fn get_run(&self, run_id: &str) -> Result<Option<TaskRun>, StoreError> {
         // U1c phase-0/0bc step-2: read delegates to the file store (file authority).
-        if let Some(file) = self.file_store() {
-            return file
-                .get_run(run_id)
-                .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")));
-        }
-        let conn = self.lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT run_id, workspace_id, conversation_id, root_message_id,
-                    domain_profile, status, goal, plan_id, route, created_at, updated_at
-             FROM tr_runs WHERE run_id = ?",
-        )?;
-        let mut rows = stmt.query(params![run_id])?;
-        match rows.next()? {
-            Some(row) => Ok(Some(decode_run(row)?)),
-            None => Ok(None),
-        }
+        self.file_store()
+            .get_run(run_id)
+            .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")))
     }
 
     /// Read just the `route` column for a given run. Returns `None` when the
     /// run does not exist.
     pub fn get_run_route(&self, run_id: &str) -> Result<Option<String>, StoreError> {
         // U1c phase-0/0bc step-2: delegate to file store, project the route field.
-        if let Some(file) = self.file_store() {
-            return file
-                .get_run(run_id)
-                .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")))
-                .map(|r| r.map(|r| r.route));
-        }
-        let conn = self.lock()?;
-        let mut stmt = conn.prepare("SELECT route FROM tr_runs WHERE run_id = ?")?;
-        let mut rows = stmt.query(params![run_id])?;
-        match rows.next()? {
-            Some(row) => Ok(Some(row.get(0)?)),
-            None => Ok(None),
-        }
+        self.file_store()
+            .get_run(run_id)
+            .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")))
+            .map(|r| r.map(|r| r.route))
     }
 
     /// Latest run for a conversation (used by GUI to bind a chat to its run).
@@ -1766,23 +727,9 @@ impl TaskRuntimeStore {
         &self,
         conversation_id: &str,
     ) -> Result<Option<TaskRun>, StoreError> {
-        if let Some(file) = self.file_store() {
-            return file
-                .latest_run_for_conversation(conversation_id)
-                .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")));
-        }
-        let conn = self.lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT run_id, workspace_id, conversation_id, root_message_id,
-                    domain_profile, status, goal, plan_id, route, created_at, updated_at
-             FROM tr_runs WHERE conversation_id = ?
-             ORDER BY created_at DESC LIMIT 1",
-        )?;
-        let mut rows = stmt.query(params![conversation_id])?;
-        match rows.next()? {
-            Some(row) => Ok(Some(decode_run(row)?)),
-            None => Ok(None),
-        }
+        self.file_store()
+            .latest_run_for_conversation(conversation_id)
+            .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")))
     }
 
     /// Find an in-progress (Running or Paused) run for a conversation, if any.
@@ -1793,51 +740,15 @@ impl TaskRuntimeStore {
         &self,
         conversation_id: &str,
     ) -> Result<Option<TaskRun>, StoreError> {
-        if let Some(file) = self.file_store() {
-            return file
-                .find_in_progress_run_by_conversation(conversation_id)
-                .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")));
-        }
-        let conn = self.lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT run_id, workspace_id, conversation_id, root_message_id,
-                    domain_profile, status, goal, plan_id, route, created_at, updated_at
-             FROM tr_runs
-             WHERE conversation_id = ? AND status IN ('running', 'paused')
-             ORDER BY created_at DESC LIMIT 1",
-        )?;
-        let mut rows = stmt.query(params![conversation_id])?;
-        match rows.next()? {
-            Some(row) => Ok(Some(decode_run(row)?)),
-            None => Ok(None),
-        }
+        self.file_store()
+            .find_in_progress_run_by_conversation(conversation_id)
+            .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")))
     }
 
     pub fn list_runs_in(&self, statuses: &[TaskRunStatus]) -> Result<Vec<TaskRun>, StoreError> {
-        if let Some(file) = self.file_store() {
-            return file
-                .list_runs_in(statuses)
-                .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")));
-        }
-        let conn = self.lock()?;
-        if statuses.is_empty() {
-            return Ok(Vec::new());
-        }
-        let placeholders: Vec<String> = (0..statuses.len()).map(|_| "?".to_string()).collect();
-        let sql = format!(
-            "SELECT run_id, workspace_id, conversation_id, root_message_id,
-                    domain_profile, status, goal, plan_id, route, created_at, updated_at
-             FROM tr_runs WHERE status IN ({})
-             ORDER BY created_at DESC",
-            placeholders.join(", ")
-        );
-        let vals: Vec<SqlValue> = statuses
-            .iter()
-            .map(|s| SqlValue::Text(s.as_str().to_string()))
-            .collect();
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_from_iter(vals.iter()), decode_run)?;
-        Ok(rows.filter_map(Result::ok).collect())
+        self.file_store()
+            .list_runs_in(statuses)
+            .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")))
     }
 
     /// Boot-time recovery of runs interrupted by a process restart (P1-8).
@@ -1904,70 +815,15 @@ impl TaskRuntimeStore {
     }
 
     pub fn get_plan(&self, run_id: &str) -> Result<Option<TaskPlan>, StoreError> {
-        if let Some(file) = self.file_store() {
-            return file
-                .get_plan(run_id)
-                .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")));
-        }
-        let conn = self.lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT plan_id, run_id, domain_profile, goal, assumptions, risks, execution_mode
-             FROM tr_plans WHERE run_id = ? ORDER BY rowid DESC LIMIT 1",
-        )?;
-        let mut rows = stmt.query(params![run_id])?;
-        let Some(row) = rows.next()? else {
-            return Ok(None);
-        };
-        let plan_id: String = row.get(0)?;
-        let domain_profile = DomainProfile::from_str(&row.get::<_, String>(2)?).unwrap_or_default();
-        let goal: String = row.get(3)?;
-        let assumptions: Vec<String> = serde_json::from_str(&row.get::<_, String>(4)?)?;
-        let risks: Vec<String> = serde_json::from_str(&row.get::<_, String>(5)?)?;
-        let execution_mode = match row.get::<_, String>(6)?.as_str() {
-            "sequential" => ExecutionMode::Sequential,
-            "plan_only" => ExecutionMode::PlanOnly,
-            _ => ExecutionMode::Parallel,
-        };
-
-        let tasks = load_plan_tasks(&conn, &plan_id)?;
-        Ok(Some(TaskPlan {
-            plan_id,
-            run_id: run_id.to_string(),
-            domain_profile,
-            goal,
-            assumptions,
-            risks,
-            execution_mode,
-            tasks,
-        }))
+        self.file_store()
+            .get_plan(run_id)
+            .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")))
     }
 
     pub fn list_todos(&self, run_id: &str) -> Result<Vec<TodoItem>, StoreError> {
-        if let Some(file) = self.file_store() {
-            return file
-                .list_todos(run_id)
-                .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")));
-        }
-        let conn = self.lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, run_id, task_id, title, status, owner_agent,
-                    started_at, completed_at, summary
-             FROM tr_todos WHERE run_id = ? ORDER BY rowid ASC",
-        )?;
-        let rows = stmt.query_map(params![run_id], |row| {
-            Ok(TodoItem {
-                id: row.get(0)?,
-                run_id: row.get(1)?,
-                task_id: row.get(2)?,
-                title: row.get(3)?,
-                status: TodoStatus::from_str(&row.get::<_, String>(4)?).unwrap_or_default(),
-                owner_agent: row.get(5)?,
-                started_at: parse_opt_dt(row.get(6)?),
-                completed_at: parse_opt_dt(row.get(7)?),
-                summary: row.get(8)?,
-            })
-        })?;
-        Ok(rows.filter_map(Result::ok).collect())
+        self.file_store()
+            .list_todos(run_id)
+            .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")))
     }
 
     pub fn list_events(
@@ -1975,82 +831,15 @@ impl TaskRuntimeStore {
         run_id: &str,
         since_seq: i64,
     ) -> Result<Vec<RuntimeTaskEvent>, StoreError> {
-        if let Some(file) = self.file_store() {
-            return file
-                .list_events(run_id, since_seq)
-                .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")));
-        }
-        let conn = self.lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT seq, run_id, task_id, step_id, event_type, payload, timestamp
-             FROM tr_events WHERE run_id = ? AND seq > ? ORDER BY seq ASC",
-        )?;
-        let rows = stmt.query_map(params![run_id, since_seq], |row| {
-            Ok(RuntimeTaskEvent {
-                seq: row.get(0)?,
-                run_id: row.get(1)?,
-                task_id: row.get(2)?,
-                step_id: row.get(3)?,
-                event_type: RuntimeEventKind::from_str(&row.get::<_, String>(4)?)
-                    .unwrap_or(RuntimeEventKind::Note),
-                payload: serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
-                timestamp: parse_dt(row.get(6)?),
-            })
-        })?;
-        Ok(rows.filter_map(Result::ok).collect())
-    }
-
-    /// Read events for `run_id` via a caller-held `&Connection` (no re-lock).
-    /// Used by the file shadow flush path, which runs inside a write method that
-    /// already holds the store mutex guard.
-    pub(crate) fn list_events_conn(
-        conn: &Connection,
-        run_id: &str,
-        since_seq: i64,
-    ) -> Result<Vec<RuntimeTaskEvent>, StoreError> {
-        let mut stmt = conn.prepare(
-            "SELECT seq, run_id, task_id, step_id, event_type, payload, timestamp
-             FROM tr_events WHERE run_id = ? AND seq > ? ORDER BY seq ASC",
-        )?;
-        let rows = stmt.query_map(params![run_id, since_seq], |row| {
-            Ok(RuntimeTaskEvent {
-                seq: row.get(0)?,
-                run_id: row.get(1)?,
-                task_id: row.get(2)?,
-                step_id: row.get(3)?,
-                event_type: RuntimeEventKind::from_str(&row.get::<_, String>(4)?)
-                    .unwrap_or(RuntimeEventKind::Note),
-                payload: serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
-                timestamp: parse_dt(row.get(6)?),
-            })
-        })?;
-        Ok(rows.filter_map(Result::ok).collect())
+        self.file_store()
+            .list_events(run_id, since_seq)
+            .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")))
     }
 
     pub fn list_artifacts(&self, run_id: &str) -> Result<Vec<Artifact>, StoreError> {
-        if let Some(file) = self.file_store() {
-            return file
-                .list_artifacts(run_id)
-                .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")));
-        }
-        let conn = self.lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, run_id, task_id, kind, title, path, metadata
-             FROM tr_artifacts WHERE run_id = ? ORDER BY rowid ASC",
-        )?;
-        let rows = stmt.query_map(params![run_id], |row| {
-            Ok(Artifact {
-                id: row.get(0)?,
-                run_id: row.get(1)?,
-                task_id: row.get(2)?,
-                kind: ArtifactKind::from_str(&row.get::<_, String>(3)?)
-                    .unwrap_or(ArtifactKind::Other),
-                title: row.get(4)?,
-                path: row.get(5)?,
-                metadata: serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or_default(),
-            })
-        })?;
-        Ok(rows.filter_map(Result::ok).collect())
+        self.file_store()
+            .list_artifacts(run_id)
+            .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")))
     }
 
     pub fn list_reviews(
@@ -2058,35 +847,12 @@ impl TaskRuntimeStore {
         run_id: &str,
         task_id: &str,
     ) -> Result<Vec<ReviewResult>, StoreError> {
-        if let Some(file) = self.file_store() {
-            // FileTaskStore.list_reviews returns all reviews for a run; filter
-            // by task_id to match the SQL signature.
-            return file
-                .list_reviews(run_id)
-                .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")))
-                .map(|rs| rs.into_iter().filter(|r| r.task_id == task_id).collect());
-        }
-        let conn = self.lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT id, run_id, task_id, reviewer_agent, outcome, issues,
-                    failure_fingerprint, created_fix_task_id, created_at
-             FROM tr_reviews WHERE run_id = ? AND task_id = ? ORDER BY created_at ASC",
-        )?;
-        let rows = stmt.query_map(params![run_id, task_id], |row| {
-            Ok(ReviewResult {
-                id: row.get(0)?,
-                run_id: row.get(1)?,
-                task_id: row.get(2)?,
-                reviewer_agent: row.get(3)?,
-                outcome: ReviewOutcome::from_str(&row.get::<_, String>(4)?)
-                    .unwrap_or(ReviewOutcome::Blocked),
-                issues: serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
-                failure_fingerprint: row.get(6)?,
-                created_fix_task_id: row.get(7)?,
-                created_at: parse_dt(row.get(8)?),
-            })
-        })?;
-        Ok(rows.filter_map(Result::ok).collect())
+        // FileTaskStore.list_reviews returns all reviews for a run; filter
+        // by task_id to match the SQL signature.
+        self.file_store()
+            .list_reviews(run_id)
+            .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")))
+            .map(|rs| rs.into_iter().filter(|r| r.task_id == task_id).collect())
     }
 
     pub fn get_summary(
@@ -2094,45 +860,9 @@ impl TaskRuntimeStore {
         run_id: &str,
         task_id: &str,
     ) -> Result<Option<TaskExecutionSummary>, StoreError> {
-        if let Some(file) = self.file_store() {
-            return file
-                .get_summary(run_id, task_id)
-                .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")));
-        }
-        let conn = self.lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT run_id, task_id, worker_agent, completed_work, files_read,
-                    files_changed, decisions, failures, verification,
-                    next_implications, created_at
-             FROM tr_summaries WHERE run_id = ? AND task_id = ?",
-        )?;
-        let mut rows = stmt.query(params![run_id, task_id])?;
-        match rows.next()? {
-            Some(row) => {
-                let completed_work: String = row.get(3)?;
-                let files_read: String = row.get(4)?;
-                let files_changed: String = row.get(5)?;
-                let decisions: String = row.get(6)?;
-                let failures: String = row.get(7)?;
-                let verification: String = row.get(8)?;
-                let next_implications: String = row.get(9)?;
-                let created_at: String = row.get(10)?;
-                Ok(Some(TaskExecutionSummary {
-                    run_id: row.get(0)?,
-                    task_id: row.get(1)?,
-                    worker_agent: row.get(2)?,
-                    completed_work: serde_json::from_str(&completed_work).unwrap_or_default(),
-                    files_read: serde_json::from_str(&files_read).unwrap_or_default(),
-                    files_changed: serde_json::from_str(&files_changed).unwrap_or_default(),
-                    decisions: serde_json::from_str(&decisions).unwrap_or_default(),
-                    failures: serde_json::from_str(&failures).unwrap_or_default(),
-                    verification: serde_json::from_str(&verification).unwrap_or_default(),
-                    next_implications: serde_json::from_str(&next_implications).unwrap_or_default(),
-                    created_at: parse_dt(created_at),
-                }))
-            }
-            None => Ok(None),
-        }
+        self.file_store()
+            .get_summary(run_id, task_id)
+            .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")))
     }
 
     /// Append a free-form `Note` event for diagnostics / trace breadcrumbs.
@@ -2142,38 +872,27 @@ impl TaskRuntimeStore {
         task_id: Option<&str>,
         message: &str,
     ) -> Result<(), StoreError> {
-        // U1c phase-0/0bc step-2: file authority.
-        if let Some(shadow) = &self.shadow {
-            shadow.append_event_line(
-                run_id,
-                task_id,
-                None,
-                RuntimeEventKind::Note,
-                serde_json::json!({ "message": message }),
-            )?;
-            shadow.rewrite_plan(run_id)?;
-            return Ok(());
-        }
-        let mut conn = self.lock()?;
-        let tx = conn.transaction()?;
-        append_event_tx(
-            &tx,
+        // U1c phase-0/0bc step-2: file authority. A plain Note{message} does
+        // not affect plan.json (the rebuilder only mutates the plan for
+        // Note{kind: fix_task_persisted | summary_persisted}), so we skip the
+        // rewrite — appending the event is enough.
+        self.shadow.append_event_line(
             run_id,
             task_id,
             None,
             RuntimeEventKind::Note,
             serde_json::json!({ "message": message }),
         )?;
-        tx.commit()?;
-        self.flush_shadow(run_id, &conn);
         Ok(())
     }
 
     /// Persist a provider-reported LLM usage event for a worker.
     ///
     /// This is intentionally a low-frequency structured event rather than raw
-    /// token streaming. It lets the GUI reconstruct token/cache metrics after
-    /// refresh or restart without storing every text delta in SQLite.
+    /// token streaming. The event goes to the file authority (events.jsonl) for
+    /// traceability; the usage record is held in memory for the GUI's token
+    /// metrics (EKO is a local tool — usage is an ephemeral reference, not a
+    /// ledger, and need not survive a restart).
     pub fn record_worker_llm_usage(
         &self,
         run_id: &str,
@@ -2183,60 +902,9 @@ impl TaskRuntimeStore {
         title: &str,
         payload: serde_json::Value,
     ) -> Result<(), StoreError> {
-        // U1c phase-0/0bc step-2: the event goes to the file authority; the
-        // usage record stays in SQL (usage.db is NOT lightweighted, see spec).
-        if let Some(shadow) = &self.shadow {
-            shadow.append_event_line(
-                run_id,
-                Some(task_id),
-                Some(worker_id),
-                RuntimeEventKind::WorkerLlmUsage,
-                serde_json::json!({
-                    "worker_id": worker_id,
-                    "agent_name": agent_name,
-                    "title": title,
-                    "usage": payload.clone(),
-                }),
-            )?;
-            shadow.rewrite_plan(run_id)?;
-            // Still persist the usage row in SQL (usage is not lightweighted).
-            let conn = self.lock()?;
-            conn.execute(
-                "INSERT OR REPLACE INTO tr_usage_records
-                 (id, session_id, run_id, worker_id, model, provider, route_kind,
-                  input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
-                  usage_reported, system_prompt_hash, tools_schema_hash, cwd_hash,
-                  worker_prompt_hash, created_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
-                params![
-                    uuid::Uuid::new_v4().to_string(),
-                    json_string(&payload, "session_id").unwrap_or_else(|| run_id.to_string()),
-                    run_id,
-                    worker_id,
-                    json_string(&payload, "model").unwrap_or_else(|| "unknown".to_string()),
-                    json_string(&payload, "provider"),
-                    json_string(&payload, "route_kind")
-                        .or_else(|| Some("task_runtime".to_string())),
-                    json_u64(&payload, "prompt_tokens") as i64,
-                    json_u64(&payload, "completion_tokens") as i64,
-                    json_u64(&payload, "cached_prompt_tokens") as i64,
-                    json_u64(&payload, "cache_creation_prompt_tokens") as i64,
-                    json_bool(&payload, "usage_reported", true) as i32,
-                    json_string(&payload, "system_prompt_hash"),
-                    json_string(&payload, "tools_schema_hash"),
-                    json_string(&payload, "cwd_hash"),
-                    json_string(&payload, "worker_prompt_hash"),
-                    Utc::now().to_rfc3339(),
-                ],
-            )?;
-            return Ok(());
-        }
-
-        // Legacy SQL path (no shadow attached): event + usage both in SQL.
-        let mut conn = self.lock()?;
-        let tx = conn.transaction()?;
-        append_event_tx(
-            &tx,
+        // WorkerLlmUsage does not affect plan.json (the rebuilder ignores it),
+        // so we append the event for traceability but skip the plan rewrite.
+        self.shadow.append_event_line(
             run_id,
             Some(task_id),
             Some(worker_id),
@@ -2248,114 +916,86 @@ impl TaskRuntimeStore {
                 "usage": payload.clone(),
             }),
         )?;
-        tx.execute(
-            "INSERT OR REPLACE INTO tr_usage_records
-             (id, session_id, run_id, worker_id, model, provider, route_kind,
-              input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
-              usage_reported, system_prompt_hash, tools_schema_hash, cwd_hash,
-              worker_prompt_hash, created_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
-            params![
-                uuid::Uuid::new_v4().to_string(),
-                json_string(&payload, "session_id").unwrap_or_else(|| run_id.to_string()),
-                run_id,
-                worker_id,
-                json_string(&payload, "model").unwrap_or_else(|| "unknown".to_string()),
-                json_string(&payload, "provider"),
-                json_string(&payload, "route_kind").or_else(|| Some("task_runtime".to_string())),
-                json_u64(&payload, "prompt_tokens") as i64,
-                json_u64(&payload, "completion_tokens") as i64,
-                json_u64(&payload, "cached_prompt_tokens") as i64,
-                json_u64(&payload, "cache_creation_input_tokens") as i64,
-                json_bool(&payload, "usage_reported", true),
-                json_string(&payload, "system_prompt_hash"),
-                json_string(&payload, "tools_schema_hash"),
-                json_string(&payload, "cwd_hash"),
-                json_string(&payload, "worker_prompt_hash"),
-                Utc::now().to_rfc3339(),
-            ],
-        )?;
-        tx.commit()?;
+        // Hold the usage record in memory for query_usage_records / summaries.
+        let record = super::types::UsageRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            session_id: json_string(&payload, "session_id").unwrap_or_else(|| run_id.to_string()),
+            run_id: Some(run_id.to_string()),
+            worker_id: Some(worker_id.to_string()),
+            model: json_string(&payload, "model").unwrap_or_else(|| "unknown".to_string()),
+            provider: json_string(&payload, "provider"),
+            route_kind: json_string(&payload, "route_kind")
+                .or_else(|| Some("task_runtime".to_string())),
+            input_tokens: json_u64(&payload, "prompt_tokens"),
+            output_tokens: json_u64(&payload, "completion_tokens"),
+            cached_input_tokens: json_u64(&payload, "cached_prompt_tokens"),
+            cache_creation_input_tokens: json_u64(&payload, "cache_creation_prompt_tokens"),
+            usage_reported: json_bool(&payload, "usage_reported", true),
+            system_prompt_hash: json_string(&payload, "system_prompt_hash"),
+            tools_schema_hash: json_string(&payload, "tools_schema_hash"),
+            cwd_hash: json_string(&payload, "cwd_hash"),
+            worker_prompt_hash: json_string(&payload, "worker_prompt_hash"),
+            created_at: Utc::now(),
+        };
+        if let Ok(mut records) = self.usage_records.lock() {
+            records.push(record);
+        }
         Ok(())
     }
 
-    // ── Approval scope tracking ─────────────────────────────────────────
+    // ── Conversation events (replay support, in-memory) ────────────────
+    // Held in memory: conversation replay is scoped to a live session and need
+    // not survive a restart (EKO local-tool stance). Replaces the old
+    // `tr_conversation_events` SQL table.
 
-    /// Grant a scoped approval for a tool call. Returns true if newly recorded.
-    /// `scope_level` is one of: once | task | conversation | workspace | tool | all_tools.
-    ///
-    /// Reserved for future HITL approval-scope integration (executor does not
-    /// call this yet — see hitrisk fail-closed path in executor.rs).
-    #[allow(dead_code)]
-    pub fn grant_approval(
+    pub fn append_conversation_event(
         &self,
-        run_id: &str,
-        tool_name: &str,
-        scope_level: &str,
         conversation_id: &str,
-    ) -> Result<bool, StoreError> {
-        let conn = self.lock()?;
-        let created = conn.execute(
-            "INSERT OR IGNORE INTO tr_approvals (run_id, tool_name, scope_level, conversation_id, created_at)
-             VALUES (?,?,?,?,?)",
-            params![run_id, tool_name, scope_level, conversation_id, chrono::Utc::now().to_rfc3339()],
-        )?;
-        Ok(created > 0)
-    }
-
-    /// Check whether a tool call is covered by a prior scope grant
-    /// (conversation-level, all-tools wildcard, or per-tool).
-    ///
-    /// Reserved for future HITL approval-scope integration.
-    #[allow(dead_code)]
-    pub fn is_approved(
-        &self,
-        run_id: &str,
-        conversation_id: &str,
-        tool_name: &str,
-    ) -> Result<bool, StoreError> {
-        let conn = self.lock()?;
-        let mut stmt = conn.prepare(
-            "SELECT 1 FROM tr_approvals
-             WHERE run_id = ? AND (tool_name = ? OR tool_name = '*') AND conversation_id = ?
-             LIMIT 1",
-        )?;
-        let mut rows = stmt.query(params![run_id, tool_name, conversation_id])?;
-        Ok(rows.next()?.is_some())
-    }
-
-    /// Revoke all approvals for a run.
-    pub fn revoke_run_approvals(&self, run_id: &str) -> Result<(), StoreError> {
-        let conn = self.lock()?;
-        conn.execute("DELETE FROM tr_approvals WHERE run_id = ?", params![run_id])?;
+        event_type: &str,
+        payload: &str,
+    ) -> Result<(), StoreError> {
+        if let Ok(mut log) = self.conv_events.lock() {
+            let seq = log.next_seq;
+            log.next_seq = log.next_seq.saturating_add(1);
+            log.events.push(ConvEventEntry {
+                seq,
+                conversation_id: conversation_id.to_string(),
+                event_type: event_type.to_string(),
+                payload: payload.to_string(),
+                timestamp: Utc::now(),
+            });
+        }
         Ok(())
     }
+
+    pub fn list_conversation_events(
+        &self,
+        conversation_id: &str,
+        since_seq: Option<i64>,
+    ) -> Result<Vec<serde_json::Value>, StoreError> {
+        let log = self
+            .conv_events
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        let events: Vec<serde_json::Value> = log
+            .events
+            .iter()
+            .filter(|e| e.conversation_id == conversation_id)
+            .filter(|e| since_seq.is_none_or(|s| e.seq > s))
+            .map(|e| {
+                serde_json::json!({
+                    "seq": e.seq,
+                    "event_type": e.event_type,
+                    "payload": e.payload,
+                    "timestamp": e.timestamp.to_rfc3339(),
+                })
+            })
+            .collect();
+        Ok(events)
+    }
 }
 
-// ── transaction-scoped helpers (private) ─────────────────────────────────
-
-fn append_event_tx(
-    tx: &rusqlite::Transaction<'_>,
-    run_id: &str,
-    task_id: Option<&str>,
-    step_id: Option<&str>,
-    event_type: RuntimeEventKind,
-    payload: serde_json::Value,
-) -> Result<(), StoreError> {
-    tx.execute(
-        "INSERT INTO tr_events (run_id, task_id, step_id, event_type, payload, timestamp)
-         VALUES (?,?,?,?,?,?)",
-        params![
-            run_id,
-            task_id,
-            step_id,
-            event_type.as_str(),
-            payload.to_string(),
-            Utc::now().to_rfc3339(),
-        ],
-    )?;
-    Ok(())
-}
+// ── JSON helpers for usage-record extraction ────────────────────────────
 
 fn json_u64(value: &serde_json::Value, key: &str) -> u64 {
     value.get(key).and_then(|v| v.as_u64()).unwrap_or(0)
@@ -2373,142 +1013,6 @@ fn json_string(value: &serde_json::Value, key: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-fn insert_plan_task_tx(
-    tx: &rusqlite::Transaction<'_>,
-    plan_id: &str,
-    run_id: &str,
-    t: &PlanTask,
-) -> Result<(), StoreError> {
-    tx.execute(
-        "INSERT INTO tr_plan_tasks
-            (id, plan_id, run_id, title, description, kind, agent_role, domain_profile,
-             depends_on, parallel_group, files, allowed_tools, verification,
-             retry_count, max_retries, failure_fingerprint, status, sort_order)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        params![
-            t.id,
-            plan_id,
-            run_id,
-            t.title,
-            t.description,
-            t.kind.as_str(),
-            t.agent_role,
-            t.domain_profile.as_str(),
-            serde_json::to_string(&t.depends_on)?,
-            t.parallel_group,
-            serde_json::to_string(&t.files)?,
-            serde_json::to_string(&t.allowed_tools)?,
-            serde_json::to_string(&t.verification)?,
-            t.retry_count,
-            t.max_retries,
-            t.failure_fingerprint,
-            t.status.as_str(),
-            t.sort_order,
-        ],
-    )?;
-    Ok(())
-}
-
-/// Load plan tasks from a transaction (same query as `load_plan_tasks`, but
-/// accepts `&Transaction` for use inside transactional write paths).
-fn load_plan_tasks_tx(
-    tx: &rusqlite::Transaction<'_>,
-    plan_id: &str,
-) -> Result<Vec<PlanTask>, StoreError> {
-    load_plan_tasks(tx, plan_id)
-}
-
-fn load_plan_tasks(conn: &Connection, plan_id: &str) -> Result<Vec<PlanTask>, StoreError> {
-    let mut stmt = conn.prepare(
-        "SELECT id, title, description, kind, agent_role, domain_profile,
-                depends_on, parallel_group, files, allowed_tools, verification,
-                retry_count, max_retries, failure_fingerprint, status, sort_order
-         FROM tr_plan_tasks WHERE plan_id = ? ORDER BY sort_order ASC, rowid ASC",
-    )?;
-    let rows = stmt.query_map(params![plan_id], |row| {
-        Ok(PlanTask {
-            id: row.get(0)?,
-            title: row.get(1)?,
-            description: row.get(2)?,
-            kind: PlanTaskKind::from_str(&row.get::<_, String>(3)?)
-                .unwrap_or(PlanTaskKind::ReadOnlyReview),
-            agent_role: row.get(4)?,
-            domain_profile: DomainProfile::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
-            depends_on: serde_json::from_str(&row.get::<_, String>(6)?).unwrap_or_default(),
-            parallel_group: row.get(7)?,
-            files: serde_json::from_str(&row.get::<_, String>(8)?).unwrap_or_default(),
-            allowed_tools: serde_json::from_str(&row.get::<_, String>(9)?).unwrap_or_default(),
-            verification: serde_json::from_str(&row.get::<_, String>(10)?).unwrap_or_default(),
-            retry_count: row.get(11)?,
-            max_retries: row.get(12)?,
-            failure_fingerprint: row.get(13)?,
-            status: TodoStatus::from_str(&row.get::<_, String>(14)?).unwrap_or_default(),
-            sort_order: row.get(15)?,
-        })
-    })?;
-    Ok(rows.filter_map(Result::ok).collect())
-}
-
-/// Read a run AND take a write lock on its row (via `SELECT ... ` within the
-/// open tx). Returns (current_status_str, run). Caller is inside a tx so the
-/// subsequent UPDATE + event append are atomic with this read.
-fn load_run_for_update(
-    tx: &rusqlite::Transaction<'_>,
-    run_id: &str,
-) -> Result<(String, TaskRun), StoreError> {
-    let mut stmt = tx.prepare(
-        "SELECT run_id, workspace_id, conversation_id, root_message_id,
-                domain_profile, status, goal, plan_id, route, created_at, updated_at
-         FROM tr_runs WHERE run_id = ?",
-    )?;
-    let mut rows = stmt.query(params![run_id])?;
-    let row = rows
-        .next()?
-        .ok_or(StoreError::RunNotFound(run_id.to_string()))?;
-    let run = decode_run(row)?;
-    Ok((run.status.as_str().to_string(), run))
-}
-
-fn decode_run(row: &Row<'_>) -> rusqlite::Result<TaskRun> {
-    let domain_str: String = row.get(4)?;
-    let status_str: String = row.get(5)?;
-    let created: String = row.get(9)?;
-    let updated: String = row.get(10)?;
-    Ok(TaskRun {
-        run_id: row.get(0)?,
-        workspace_id: row.get(1)?,
-        conversation_id: row.get(2)?,
-        root_message_id: row.get(3)?,
-        domain_profile: DomainProfile::from_str(&domain_str).unwrap_or_default(),
-        status: TaskRunStatus::from_str(&status_str).unwrap_or_default(),
-        goal: row.get(6)?,
-        plan_id: row.get(7)?,
-        route: row.get(8)?,
-        created_at: parse_dt(created),
-        updated_at: parse_dt(updated),
-    })
-}
-
-fn parse_dt(s: String) -> DateTime<Utc> {
-    chrono::DateTime::parse_from_rfc3339(&s)
-        .map(|d| d.with_timezone(&Utc))
-        .unwrap_or_else(|e| {
-            tracing::warn!(raw = %s, error = %e, "parse_dt: unparseable timestamp, falling back to now");
-            Utc::now()
-        })
-}
-
-fn parse_opt_dt(s: Option<String>) -> Option<DateTime<Utc>> {
-    s.filter(|s| !s.is_empty()).map(parse_dt)
-}
-
-fn default_db_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home)
-        .join(".echo-agent")
-        .join("task_runtime.db")
-}
-
 // The compile-time test that proves the transaction invariant:
 // a state change without an event would leave the DB inconsistent.
 // We assert both rows land together.
@@ -2519,58 +1023,6 @@ mod tests {
 
     fn fresh() -> TaskRuntimeStore {
         TaskRuntimeStore::new_in_memory().expect("in-memory store")
-    }
-
-    /// Test helper: count rows in `tr_runs` for `run_id` directly via SQL.
-    /// Used by the 0bc step-2 tests to prove the write authority has moved to
-    /// files (a file-authority `create_run` must NOT insert into tr_runs).
-    fn sql_run_row_count(s: &TaskRuntimeStore, run_id: &str) -> i64 {
-        let conn = s.conn.lock().expect("lock");
-        conn.query_row(
-            "SELECT COUNT(*) FROM tr_runs WHERE run_id = ?",
-            params![run_id],
-            |row| row.get(0),
-        )
-        .unwrap_or(0)
-    }
-
-    /// 0bc step-2: `create_run` writes the file authority only — it must NOT
-    /// insert into the SQL `tr_runs` table (SQL stays as a non-writing
-    /// fallback). Yet `get_run` still reads the run back (from the file). This
-    /// is the core proof that write authority moved to files.
-    #[test]
-    fn create_run_writes_file_not_sql() {
-        let s = fresh();
-        let run = s
-            .create_run(
-                "r1",
-                "ws",
-                "c1",
-                "m1",
-                DomainProfile::AiCoding,
-                "review runtime",
-                "complex",
-            )
-            .unwrap();
-        assert_eq!(run.run_id, "r1");
-
-        // SQL must NOT have the run (write authority is the file).
-        assert_eq!(
-            sql_run_row_count(&s, "r1"),
-            0,
-            "create_run must not write SQL tr_runs (file is write authority)"
-        );
-
-        // But get_run reads it back — from the file.
-        let read_back = s.get_run("r1").unwrap().expect("run readable from file");
-        assert_eq!(read_back.run_id, "r1");
-        assert_eq!(read_back.goal, "review runtime");
-        assert_eq!(read_back.route, "complex");
-
-        // And list_events (file) shows the RunCreated event.
-        let evs = s.list_events("r1", 0).unwrap();
-        assert_eq!(evs.len(), 1);
-        assert_eq!(evs[0].event_type, RuntimeEventKind::RunCreated);
     }
 
     #[test]
@@ -2863,138 +1315,194 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, StoreError::InvalidPlan(_)));
     }
+
+    // ── review #4: intent-visible tests that validation fires on the FILE
+    //    authority path (not just transitively). Each asserts the error is
+    //    returned AND no event line was appended — proving the file-path
+    //    validation branch rejected before writing. ──────────────────────
+
+    /// `transition_run` rejects an illegal transition on the file path and
+    /// appends no event. (Completed → Running is always illegal.)
+    #[test]
+    fn file_path_rejects_illegal_transition_and_appends_no_event() {
+        let s = fresh();
+        s.create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g", "")
+            .unwrap();
+        s.transition_run("r1", TaskRunStatus::Running).unwrap();
+        s.transition_run("r1", TaskRunStatus::Completed).unwrap();
+        let before = s.list_events("r1", 0).unwrap().len();
+        let err = s.transition_run("r1", TaskRunStatus::Running).unwrap_err();
+        assert!(matches!(err, StoreError::IllegalTransition { .. }));
+        // No new event appended — the file-path validation rejected before writing.
+        assert_eq!(s.list_events("r1", 0).unwrap().len(), before);
+    }
+
+    /// `insert_task` rejects a dependency cycle on the file path and appends no
+    /// event. t1 depends on t2, t2 depends on t1 → cycle.
+    #[test]
+    fn file_path_rejects_dependency_cycle_and_appends_no_event() {
+        let s = fresh();
+        s.create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g", "")
+            .unwrap();
+        // t1 with no deps (bootstraps the plan).
+        s.insert_task(
+            "r1",
+            None,
+            PlanTask {
+                id: "t1".into(),
+                depends_on: Vec::new(),
+                ..sample_task_body("t1")
+            },
+        )
+        .unwrap();
+        // t2 depends on t1 (legal).
+        s.insert_task(
+            "r1",
+            None,
+            PlanTask {
+                id: "t2".into(),
+                depends_on: vec!["t1".into()],
+                ..sample_task_body("t2")
+            },
+        )
+        .unwrap();
+        let before = s.list_events("r1", 0).unwrap().len();
+        // Now make t1 depend on t2 → cycle. update_task must reject on the file path.
+        let err = s
+            .update_task(
+                "r1",
+                "t1",
+                TaskPatch {
+                    depends_on: Some(vec!["t2".into()]),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, StoreError::InvalidPlan(_)));
+        assert_eq!(s.list_events("r1", 0).unwrap().len(), before);
+    }
+
+    /// `set_task_status` rejects an unknown task on the file path and appends
+    /// no event.
+    #[test]
+    fn file_path_rejects_unknown_task_and_appends_no_event() {
+        let s = fresh();
+        s.create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g", "")
+            .unwrap();
+        let before = s.list_events("r1", 0).unwrap().len();
+        let err = s
+            .set_task_status("r1", "nope", TodoStatus::Running, None, None)
+            .unwrap_err();
+        assert!(matches!(err, StoreError::TaskNotFound(_)));
+        assert_eq!(s.list_events("r1", 0).unwrap().len(), before);
+    }
+
+    /// Helper: a minimal `PlanTask` body with the given id and sane defaults,
+    /// for the cycle test above (avoids repeating the full struct literal).
+    fn sample_task_body(id: &str) -> PlanTask {
+        PlanTask {
+            id: id.to_string(),
+            title: format!("task {id}"),
+            description: format!("do {id}"),
+            kind: PlanTaskKind::Investigation,
+            agent_role: "explorer".to_string(),
+            domain_profile: DomainProfile::General,
+            depends_on: Vec::new(),
+            parallel_group: None,
+            files: Vec::new(),
+            allowed_tools: vec!["read_file".to_string()],
+            verification: Vec::new(),
+            retry_count: 0,
+            max_retries: 3,
+            failure_fingerprint: None,
+            status: TodoStatus::Pending,
+            sort_order: 0,
+        }
+    }
 }
 
-// ── Usage records persistence ──────────────────────────────────────────
+// ── Usage records (in-memory) ──────────────────────────────────────────
 
 impl TaskRuntimeStore {
-    /// Insert a usage record.
+    /// Insert a usage record (in-memory; not persisted across restarts).
     pub fn insert_usage_record(
         &self,
         record: &super::types::UsageRecord,
     ) -> Result<(), StoreError> {
-        let conn = self.lock()?;
-        conn.execute(
-            "INSERT OR REPLACE INTO tr_usage_records
-             (id, session_id, run_id, worker_id, model, provider, route_kind,
-              input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
-              usage_reported, system_prompt_hash, tools_schema_hash, cwd_hash,
-              worker_prompt_hash, created_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
-            rusqlite::params![
-                record.id,
-                record.session_id,
-                record.run_id,
-                record.worker_id,
-                record.model,
-                record.provider,
-                record.route_kind,
-                record.input_tokens as i64,
-                record.output_tokens as i64,
-                record.cached_input_tokens as i64,
-                record.cache_creation_input_tokens as i64,
-                record.usage_reported as i32,
-                record.system_prompt_hash,
-                record.tools_schema_hash,
-                record.cwd_hash,
-                record.worker_prompt_hash,
-                record.created_at.to_rfc3339(),
-            ],
-        )?;
+        if let Ok(mut records) = self.usage_records.lock() {
+            // INSERT OR REPLACE semantics: replace an existing record with the
+            // same id, else push. (Matches the old SQL `ON CONFLICT` behavior.)
+            if let Some(existing) = records.iter_mut().find(|r| r.id == record.id) {
+                *existing = record.clone();
+            } else {
+                records.push(record.clone());
+            }
+        }
         Ok(())
     }
 
-    /// Query usage records with optional filters.
+    /// Query usage records with optional filters. In-memory equivalent of the
+    /// old SQL `SELECT ... WHERE ... ORDER BY created_at DESC LIMIT/OFFSET`.
     pub fn query_usage_records(
         &self,
         filter: &super::types::UsageQueryFilter,
     ) -> Result<Vec<super::types::UsageRecord>, StoreError> {
-        use super::types::UsageRecord;
-        let conn = self.lock()?;
-        let mut sql = String::from(
-            "SELECT id, session_id, run_id, worker_id, model, provider, route_kind,
-                    input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
-                    usage_reported, system_prompt_hash, tools_schema_hash, cwd_hash,
-                    worker_prompt_hash, created_at
-             FROM tr_usage_records WHERE 1=1",
-        );
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-
-        if let Some(ref v) = filter.session_id {
-            params.push(Box::new(v.clone()));
-            sql.push_str(&format!(" AND session_id = ?{}", params.len()));
-        }
-        if let Some(ref v) = filter.run_id {
-            params.push(Box::new(v.clone()));
-            sql.push_str(&format!(" AND run_id = ?{}", params.len()));
-        }
-        if let Some(ref v) = filter.model {
-            params.push(Box::new(v.clone()));
-            sql.push_str(&format!(" AND model = ?{}", params.len()));
-        }
-        if let Some(ref v) = filter.provider {
-            params.push(Box::new(v.clone()));
-            sql.push_str(&format!(" AND provider = ?{}", params.len()));
-        }
-        if let Some(ref v) = filter.route_kind {
-            params.push(Box::new(v.clone()));
-            sql.push_str(&format!(" AND route_kind = ?{}", params.len()));
-        }
-        if let Some(ref v) = filter.created_after {
-            params.push(Box::new(v.to_rfc3339()));
-            sql.push_str(&format!(" AND created_at >= ?{}", params.len()));
-        }
-        if let Some(ref v) = filter.created_before {
-            params.push(Box::new(v.to_rfc3339()));
-            sql.push_str(&format!(" AND created_at <= ?{}", params.len()));
-        }
-
-        sql.push_str(" ORDER BY created_at DESC");
-
-        if let Some(limit) = filter.limit {
-            params.push(Box::new(limit as i64));
-            sql.push_str(&format!(" LIMIT ?{}", params.len()));
-        }
-        if let Some(offset) = filter.offset {
-            params.push(Box::new(offset as i64));
-            sql.push_str(&format!(" OFFSET ?{}", params.len()));
-        }
-
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p.as_ref()).collect();
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(param_refs.as_slice(), |row| {
-            Ok(UsageRecord {
-                id: row.get(0)?,
-                session_id: row.get(1)?,
-                run_id: row.get(2)?,
-                worker_id: row.get(3)?,
-                model: row.get(4)?,
-                provider: row.get(5)?,
-                route_kind: row.get(6)?,
-                input_tokens: row.get::<_, i64>(7)? as u64,
-                output_tokens: row.get::<_, i64>(8)? as u64,
-                cached_input_tokens: row.get::<_, i64>(9)? as u64,
-                cache_creation_input_tokens: row.get::<_, i64>(10)? as u64,
-                usage_reported: row.get::<_, i32>(11)? != 0,
-                system_prompt_hash: row.get(12)?,
-                tools_schema_hash: row.get(13)?,
-                cwd_hash: row.get(14)?,
-                worker_prompt_hash: row.get(15)?,
-                created_at: {
-                    let s: String = row.get(16)?;
-                    chrono::DateTime::parse_from_rfc3339(&s)
-                        .map(|dt| dt.with_timezone(&chrono::Utc))
-                        .unwrap_or_else(|_| chrono::Utc::now())
-                },
+        let records = self
+            .usage_records
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?;
+        let mut out: Vec<super::types::UsageRecord> = records
+            .iter()
+            .filter(|r| {
+                filter
+                    .session_id
+                    .as_deref()
+                    .is_none_or(|v| r.session_id == v)
             })
-        })?;
-
-        let mut records = Vec::new();
-        for row in rows {
-            records.push(row.map_err(StoreError::Sqlite)?);
+            .filter(|r| {
+                filter
+                    .run_id
+                    .as_deref()
+                    .is_none_or(|v| r.run_id.as_deref() == Some(v))
+            })
+            .filter(|r| filter.model.as_deref().is_none_or(|v| r.model == v))
+            .filter(|r| {
+                filter
+                    .provider
+                    .as_deref()
+                    .is_none_or(|v| r.provider.as_deref() == Some(v))
+            })
+            .filter(|r| {
+                filter
+                    .route_kind
+                    .as_deref()
+                    .is_none_or(|v| r.route_kind.as_deref() == Some(v))
+            })
+            .filter(|r| {
+                filter
+                    .created_after
+                    .is_none_or(|after| r.created_at >= after)
+            })
+            .filter(|r| {
+                filter
+                    .created_before
+                    .is_none_or(|before| r.created_at <= before)
+            })
+            .cloned()
+            .collect();
+        // ORDER BY created_at DESC (stable sort preserves insertion order on ties).
+        out.sort_by_key(|a| std::cmp::Reverse(a.created_at));
+        // LIMIT / OFFSET.
+        let offset = filter.offset.unwrap_or(0) as usize;
+        if offset >= out.len() {
+            return Ok(Vec::new());
         }
-        Ok(records)
+        let limited = if let Some(limit) = filter.limit {
+            out[offset..].iter().take(limit as usize).cloned().collect()
+        } else {
+            out[offset..].to_vec()
+        };
+        Ok(limited)
     }
 
     /// Get an end-of-run usage summary from persisted records.
@@ -3066,56 +1574,5 @@ impl TaskRuntimeStore {
             model_breakdown,
             top_low_hit_reasons,
         }))
-    }
-
-    // ── Conversation events (replay support) ───────────────────────────
-
-    pub fn append_conversation_event(
-        &self,
-        conversation_id: &str,
-        event_type: &str,
-        payload: &str,
-    ) -> Result<(), StoreError> {
-        let conn = self.lock()?;
-        conn.execute(
-            "INSERT INTO tr_conversation_events (conversation_id, event_type, payload, timestamp)
-             VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![
-                conversation_id,
-                event_type,
-                payload,
-                chrono::Utc::now().to_rfc3339()
-            ],
-        )?;
-        Ok(())
-    }
-
-    pub fn list_conversation_events(
-        &self,
-        conversation_id: &str,
-        since_seq: Option<i64>,
-    ) -> Result<Vec<serde_json::Value>, StoreError> {
-        let conn = self.lock()?;
-        let sql = if let Some(seq) = since_seq {
-            format!(
-                "SELECT seq, event_type, payload, timestamp FROM tr_conversation_events WHERE conversation_id = ?1 AND seq > {seq} ORDER BY seq"
-            )
-        } else {
-            "SELECT seq, event_type, payload, timestamp FROM tr_conversation_events WHERE conversation_id = ?1 ORDER BY seq".to_string()
-        };
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(rusqlite::params![conversation_id], |row| {
-            Ok(serde_json::json!({
-                "seq": row.get::<_, i64>(0)?,
-                "event_type": row.get::<_, String>(1)?,
-                "payload": row.get::<_, String>(2)?,
-                "timestamp": row.get::<_, String>(3)?,
-            }))
-        })?;
-        let mut events = Vec::new();
-        for row in rows {
-            events.push(row.map_err(StoreError::Sqlite)?);
-        }
-        Ok(events)
     }
 }

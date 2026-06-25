@@ -53,11 +53,18 @@ impl FileTaskStore {
     /// Enumerate every run under root, returning the run headers ordered by
     /// `created_at` descending (matching SQL `list_runs_in` ordering). Replaces
     /// `SELECT ... FROM tr_runs ORDER BY created_at DESC`.
+    ///
+    /// Reads only `plan.json` (the run header lives there) — does NOT read
+    /// `events.jsonl` or rebuild, so this is O(runs) not O(events). The
+    /// collection-query methods (`latest_run_for_conversation` etc.) build on
+    /// this and stay cheap even with many long runs.
     pub fn list_runs(&self) -> Result<Vec<TaskRun>, FileReadError> {
         let mut runs = Vec::new();
         for run_id in self.shadow.list_run_ids()? {
-            if let Some(run) = self.get_run(&run_id)? {
-                runs.push(run);
+            // plan.json already carries the run header (RebuiltPlan.run); no
+            // need to read events.jsonl + rebuild just to get the header.
+            if let Some(plan) = self.shadow.read_plan(&run_id)? {
+                runs.push(plan.run);
             }
         }
         // Descending by created_at (stable on ties, matching SQL behavior closely
@@ -392,8 +399,7 @@ mod tests {
     fn file_store_reads_match_sql() {
         let tmp = tempfile::tempdir().unwrap();
         let shadow = Arc::new(FileTaskShadow::new(tmp.path()));
-        let mut store = TaskRuntimeStore::new_in_memory().unwrap();
-        store.attach_shadow(shadow.clone());
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(tmp.path()).unwrap();
 
         store
             .create_run(
@@ -483,8 +489,7 @@ mod tests {
     fn list_runs_enumerates_all_runs_desc_by_created() {
         let tmp = tempfile::tempdir().unwrap();
         let shadow = Arc::new(FileTaskShadow::new(tmp.path()));
-        let mut store = TaskRuntimeStore::new_in_memory().unwrap();
-        store.attach_shadow(shadow.clone());
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(tmp.path()).unwrap();
         store
             .create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g1", "")
             .unwrap();
@@ -507,8 +512,7 @@ mod tests {
     fn conversation_queries_filter_and_order() {
         let tmp = tempfile::tempdir().unwrap();
         let shadow = Arc::new(FileTaskShadow::new(tmp.path()));
-        let mut store = TaskRuntimeStore::new_in_memory().unwrap();
-        store.attach_shadow(shadow.clone());
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(tmp.path()).unwrap();
         store
             .create_run("r1", "ws", "cX", "m1", DomainProfile::General, "g1", "")
             .unwrap();
@@ -532,8 +536,7 @@ mod tests {
     fn list_runs_in_filters_by_status() {
         let tmp = tempfile::tempdir().unwrap();
         let shadow = Arc::new(FileTaskShadow::new(tmp.path()));
-        let mut store = TaskRuntimeStore::new_in_memory().unwrap();
-        store.attach_shadow(shadow.clone());
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(tmp.path()).unwrap();
         store
             .create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g1", "")
             .unwrap();
