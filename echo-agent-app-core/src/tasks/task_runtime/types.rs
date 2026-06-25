@@ -151,6 +151,39 @@ impl InteractionMode {
     }
 }
 
+// ── Attended mode ───────────────────────────────────────────────────────
+
+/// Whether a human is present during a run. Drives safety-gate behaviour:
+/// unattended runs skip the approval gate (when the plan passes preflight),
+/// reject writes at pre-scan, and never pause for human intervention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename = "AttendedMode")]
+pub enum AttendedMode {
+    /// Chat-triggered run — a human is present and can approve / resume.
+    #[default]
+    Attended,
+    /// Cron / IM triggered run — no human, must be self-contained.
+    Unattended,
+}
+
+impl AttendedMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AttendedMode::Attended => "attended",
+            AttendedMode::Unattended => "unattended",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "attended" => AttendedMode::Attended,
+            "unattended" => AttendedMode::Unattended,
+            _ => return None,
+        })
+    }
+}
+
 // ── Plan-task kind ──────────────────────────────────────────────────────
 
 /// Operation class for a single plan task. The scheduler (PR 3) uses this
@@ -189,6 +222,19 @@ impl PlanTaskKind {
                 | PlanTaskKind::TestPlan
                 | PlanTaskKind::Review
                 | PlanTaskKind::Summary
+        )
+    }
+
+    /// `true` when the task kind is allowed in an unattended (cron/IM) run
+    /// under the `ReadOnlyPlanNoShell` profile. This is stricter than
+    /// `is_read_only()`: `TestPlan` and `Review` are excluded because they
+    /// may involve test execution or output modification in practice.
+    /// This whitelist is the **unattended authorisation** boundary, not the
+    /// concurrency/parallelism signal (which `is_read_only()` provides).
+    pub fn is_unattended_readonly_allowed(&self) -> bool {
+        matches!(
+            self,
+            PlanTaskKind::ReadOnlyReview | PlanTaskKind::Investigation | PlanTaskKind::Summary
         )
     }
 
@@ -624,6 +670,10 @@ pub struct TaskRun {
     pub goal: String,
     pub plan_id: Option<String>,
     pub route: String,
+    /// Whether a human is present (Attended) or this is a cron/IM trigger
+    /// (Unattended). Drives safety-gate behaviour in execute_plan /
+    /// executor.  Default: Attended (chat behaviours unchanged).
+    pub attended_mode: AttendedMode,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -1014,6 +1064,21 @@ mod tests {
         assert!(PlanTaskKind::Review.is_read_only());
         assert!(!PlanTaskKind::Implementation.is_read_only());
         assert!(!PlanTaskKind::Verification.is_read_only());
+    }
+
+    #[test]
+    fn unattended_readonly_whitelist() {
+        // Stage 1 ReadOnlyPlanNoShell: only 3 kinds are allowed.
+        assert!(PlanTaskKind::ReadOnlyReview.is_unattended_readonly_allowed());
+        assert!(PlanTaskKind::Investigation.is_unattended_readonly_allowed());
+        assert!(PlanTaskKind::Summary.is_unattended_readonly_allowed());
+        // TestPlan and Review are read-only for parallelism but NOT for unattended.
+        assert!(!PlanTaskKind::TestPlan.is_unattended_readonly_allowed());
+        assert!(!PlanTaskKind::Review.is_unattended_readonly_allowed());
+        // Mutating kinds are always rejected.
+        assert!(!PlanTaskKind::Implementation.is_unattended_readonly_allowed());
+        assert!(!PlanTaskKind::Debugging.is_unattended_readonly_allowed());
+        assert!(!PlanTaskKind::Verification.is_unattended_readonly_allowed());
     }
 
     #[test]

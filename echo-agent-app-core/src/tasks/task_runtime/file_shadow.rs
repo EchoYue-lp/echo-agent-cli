@@ -288,8 +288,8 @@ mod tests {
     use super::*;
     use crate::tasks::task_runtime::store::TaskRuntimeStore;
     use crate::tasks::task_runtime::types::{
-        DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, RuntimeEventKind, TaskPatch,
-        TaskPlan, TaskRunStatus, TodoStatus,
+        AttendedMode, DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, RuntimeEventKind,
+        TaskPatch, TaskPlan, TaskRunStatus, TodoStatus,
     };
     use std::sync::Arc;
 
@@ -333,6 +333,7 @@ mod tests {
                 DomainProfile::AiCoding,
                 "review runtime",
                 "complex_runtime",
+                AttendedMode::Attended,
             )
             .unwrap();
         let plan = TaskPlan {
@@ -464,7 +465,16 @@ mod tests {
         let store = TaskRuntimeStore::new_in_memory_with_shadow_root(tmp.path()).unwrap();
 
         store
-            .create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g", "")
+            .create_run(
+                "r1",
+                "ws",
+                "c1",
+                "m1",
+                DomainProfile::General,
+                "g",
+                "",
+                AttendedMode::Attended,
+            )
             .unwrap();
         let plan = TaskPlan {
             plan_id: "p1".to_string(),
@@ -521,6 +531,7 @@ mod tests {
                     DomainProfile::AiCoding,
                     &format!("goal {rid}"),
                     "complex",
+                    AttendedMode::Attended,
                 )
                 .unwrap();
             let plan = TaskPlan {
@@ -550,7 +561,16 @@ mod tests {
         let store = TaskRuntimeStore::new_in_memory_with_shadow_root(tmp.path()).unwrap();
 
         store
-            .create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g", "")
+            .create_run(
+                "r1",
+                "ws",
+                "c1",
+                "m1",
+                DomainProfile::General,
+                "g",
+                "",
+                AttendedMode::Attended,
+            )
             .unwrap();
         store.transition_run("r1", TaskRunStatus::Running).unwrap();
         assert_parity(&store, &shadow, "r1");
@@ -575,7 +595,16 @@ mod tests {
         let store = TaskRuntimeStore::new_in_memory_with_shadow_root(tmp.path()).unwrap();
 
         store
-            .create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g", "")
+            .create_run(
+                "r1",
+                "ws",
+                "c1",
+                "m1",
+                DomainProfile::General,
+                "g",
+                "",
+                AttendedMode::Attended,
+            )
             .unwrap();
         // insert_task triggers lazy bootstrap (no prior attach_plan).
         store

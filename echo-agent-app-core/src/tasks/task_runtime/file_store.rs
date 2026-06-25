@@ -368,7 +368,7 @@ mod tests {
     use super::*;
     use crate::tasks::task_runtime::store::TaskRuntimeStore;
     use crate::tasks::task_runtime::types::{
-        DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, TaskPlan, TaskRunStatus,
+        AttendedMode, DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, TaskPlan, TaskRunStatus,
     };
     use std::sync::Arc;
 
@@ -410,6 +410,7 @@ mod tests {
                 DomainProfile::AiCoding,
                 "review",
                 "complex",
+                AttendedMode::Attended,
             )
             .unwrap();
         let plan = TaskPlan {
@@ -491,10 +492,28 @@ mod tests {
         let shadow = Arc::new(FileTaskShadow::new(tmp.path()));
         let store = TaskRuntimeStore::new_in_memory_with_shadow_root(tmp.path()).unwrap();
         store
-            .create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g1", "")
+            .create_run(
+                "r1",
+                "ws",
+                "c1",
+                "m1",
+                DomainProfile::General,
+                "g1",
+                "",
+                AttendedMode::Attended,
+            )
             .unwrap();
         store
-            .create_run("r2", "ws", "c2", "m2", DomainProfile::General, "g2", "")
+            .create_run(
+                "r2",
+                "ws",
+                "c2",
+                "m2",
+                DomainProfile::General,
+                "g2",
+                "",
+                AttendedMode::Attended,
+            )
             .unwrap();
 
         let file = FileTaskStore::new((*shadow).clone());
@@ -514,10 +533,28 @@ mod tests {
         let shadow = Arc::new(FileTaskShadow::new(tmp.path()));
         let store = TaskRuntimeStore::new_in_memory_with_shadow_root(tmp.path()).unwrap();
         store
-            .create_run("r1", "ws", "cX", "m1", DomainProfile::General, "g1", "")
+            .create_run(
+                "r1",
+                "ws",
+                "cX",
+                "m1",
+                DomainProfile::General,
+                "g1",
+                "",
+                AttendedMode::Attended,
+            )
             .unwrap();
         store
-            .create_run("r2", "ws", "cX", "m2", DomainProfile::General, "g2", "")
+            .create_run(
+                "r2",
+                "ws",
+                "cX",
+                "m2",
+                DomainProfile::General,
+                "g2",
+                "",
+                AttendedMode::Attended,
+            )
             .unwrap();
         // r1 Running, r2 Pending — latest is r2 (newer), in-progress is r1.
         store.transition_run("r1", TaskRunStatus::Running).unwrap();
@@ -538,10 +575,28 @@ mod tests {
         let shadow = Arc::new(FileTaskShadow::new(tmp.path()));
         let store = TaskRuntimeStore::new_in_memory_with_shadow_root(tmp.path()).unwrap();
         store
-            .create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g1", "")
+            .create_run(
+                "r1",
+                "ws",
+                "c1",
+                "m1",
+                DomainProfile::General,
+                "g1",
+                "",
+                AttendedMode::Attended,
+            )
             .unwrap();
         store
-            .create_run("r2", "ws", "c2", "m2", DomainProfile::General, "g2", "")
+            .create_run(
+                "r2",
+                "ws",
+                "c2",
+                "m2",
+                DomainProfile::General,
+                "g2",
+                "",
+                AttendedMode::Attended,
+            )
             .unwrap();
         store.transition_run("r1", TaskRunStatus::Running).unwrap();
         store

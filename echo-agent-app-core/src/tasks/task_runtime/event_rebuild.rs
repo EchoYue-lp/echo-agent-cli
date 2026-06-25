@@ -14,8 +14,8 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use super::types::{
-    DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, RuntimeEventKind, RuntimeTaskEvent,
-    TaskPlan, TaskRun, TaskRunStatus, TodoStatus,
+    AttendedMode, DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, RuntimeEventKind,
+    RuntimeTaskEvent, TaskPlan, TaskRun, TaskRunStatus, TodoStatus,
 };
 
 /// Rebuilt plan snapshot — the shape `plan.json` will take.
@@ -77,6 +77,11 @@ pub fn rebuild_plan_from_events(events: &[RuntimeTaskEvent]) -> Result<RebuiltPl
                         .and_then(|v| v.as_str())
                         .unwrap_or_default()
                         .to_string(),
+                    attended_mode: p
+                        .get("attended_mode")
+                        .and_then(|v| v.as_str())
+                        .and_then(AttendedMode::from_str)
+                        .unwrap_or_default(),
                     created_at: parse_event_dt(p, "created_at", ev.timestamp),
                     updated_at: ev.timestamp,
                 });
@@ -386,6 +391,7 @@ mod tests {
                 DomainProfile::AiCoding,
                 "review runtime",
                 "complex_runtime",
+                AttendedMode::Attended,
             )
             .unwrap();
 
@@ -462,8 +468,17 @@ mod tests {
     #[test]
     fn rebuild_reflects_task_patch() {
         let s = fresh();
-        s.create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g", "")
-            .unwrap();
+        s.create_run(
+            "r1",
+            "ws",
+            "c1",
+            "m1",
+            DomainProfile::General,
+            "g",
+            "",
+            AttendedMode::Attended,
+        )
+        .unwrap();
         s.insert_task("r1", None, sample_task("t1", PlanTaskKind::Investigation))
             .unwrap();
         s.update_task(

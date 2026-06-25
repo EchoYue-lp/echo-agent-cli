@@ -856,6 +856,35 @@ async fn execute_task(
     let task_id = task.id.clone();
     let is_write = !task.kind.is_read_only();
 
+    // ── U1c phase-1 CP B: per-task unattended preflight ──
+    // Re-check the task (kind + tools + shell) before acquiring permits.
+    // Chat runs (Attended) skip this; only Unattended runs are checked.
+    // Terminal fail on violation — never Paused, never awaits a human.
+    {
+        let attended_mode = store
+            .get_run(&run_id)
+            .ok()
+            .flatten()
+            .map(|r| r.attended_mode)
+            .unwrap_or_default();
+        if attended_mode == AttendedMode::Unattended {
+            if let Err(rejection) = preflight_unattended_task(&task) {
+                let msg = format!(
+                    "CP B preflight rejected task '{}': {}",
+                    task_id, rejection.reason
+                );
+                let _ = store.set_task_status(
+                    &run_id,
+                    &task_id,
+                    TodoStatus::Failed,
+                    Some(&task.agent_role),
+                    Some(&msg),
+                );
+                return Err((task_id.clone(), msg));
+            }
+        }
+    }
+
     // Create a child cancellation token for THIS task and register it with the
     // store. remove_task / update_task can cancel it to stop this worker
     // promptly without cancelling sibling tasks. child_token() means run-level
@@ -1005,10 +1034,24 @@ async fn execute_task(
             if let Some(m) = super::hitrisk::check(tool, &args_snapshot) {
                 let reason = format!(
                     "hitrisk flagged tool '{tool}' (pattern '{}': {}) for task '{}'; \
-                     run paused pending user approval. Matched: {}",
+                     Matched: {}",
                     m.pattern, m.reason, task.title, m.snippet,
                 );
                 let _ = store.note(&run_id, Some(&task_id), &reason);
+
+                // U1c phase-1: Unattended runs must NOT pause (no human to
+                // resume). Terminal-fail instead. Attended runs keep the
+                // existing Paused behaviour (user can approve/edit/resume).
+                let attended_mode = store
+                    .get_run(&run_id)
+                    .ok()
+                    .flatten()
+                    .map(|r| r.attended_mode)
+                    .unwrap_or_default();
+                if attended_mode == AttendedMode::Unattended {
+                    let _ = store.transition_run(&run_id, TaskRunStatus::Failed);
+                    return Err((task_id.clone(), format!("HITRISK_REJECT:{reason}")));
+                }
                 let _ = store.transition_run(&run_id, TaskRunStatus::Paused);
                 return Err((task_id.clone(), format!("SUSPEND:{reason}")));
             }
@@ -1619,6 +1662,269 @@ fn summarize_output(text: &str) -> String {
     format!("{head}...")
 }
 
+// ── Cron / Unattended run adapter ───────────────────────────────────────
+
+/// Launch a cron-triggered unattended run through the unified TaskRuntime
+/// executor, bypassing the chat routing path entirely.
+///
+/// This is the **stage-1 cron adapter** (spec §3.3 v2): it creates a run,
+/// then drives the primary agent's ReAct loop in the run's context so the
+/// agent itself calls `task_create` (to materialise the plan) and
+/// `execute_plan` (which internally calls `execute_run`).
+///
+/// **Why not call `execute_run` directly?** `execute_run` requires a plan to
+/// already exist (`store.get_plan → NoPlan` if absent). The plan is created
+/// by the agent during its ReAct loop via the `task_create` tool. Skipping
+/// the agent loop would leave the plan empty and the run would fail
+/// immediately. This mirrors how `launch_unified_run` (chat path) works.
+///
+/// The run is created with `attended_mode = Unattended` so the preflight
+/// checks (CP A/B) and approval-gate skip activate inside `execute_plan` /
+/// `execute_task`.
+pub async fn launch_cron_run(
+    store: Arc<TaskRuntimeStore>,
+    primary_agent: crate::agent_handle::AgentHandle,
+    cron_task_id: &str,
+    fire_id: &str,
+    prompt: &str,
+    parent_cancel: CancellationToken,
+) -> Result<(), ExecError> {
+    let run_id = uuid::Uuid::new_v4().to_string();
+    let conversation_id = format!("cron:{cron_task_id}:{fire_id}");
+    let child_cancel = parent_cancel.child_token();
+
+    // 1. Create the run in Pending, attended_mode = Unattended.
+    store.create_run(
+        &run_id,
+        "default",
+        &conversation_id,
+        "", // root_message_id — no chat message for cron
+        DomainProfile::General,
+        prompt,
+        "", // route — empty → defaults to ParallelReadonlyDelegation
+        AttendedMode::Unattended,
+    )?;
+
+    // 2. Transition Pending → Running.
+    store.transition_run(&run_id, TaskRunStatus::Running)?;
+
+    // 3. Drive the agent's ReAct loop in the run's context.
+    //    The agent will call task_create (to build the plan) and execute_plan
+    //    (which internally calls execute_run). The Unattended attended_mode
+    //    ensures preflight checks and approval-gate skip activate.
+    let run_id_for_scope = run_id.clone();
+    let cancel_for_scope = child_cancel.clone();
+    let prompt_owned = prompt.to_string();
+
+    super::task_tools::with_run_context(
+        run_id_for_scope.clone(),
+        cancel_for_scope.clone(),
+        None,          // trace_sink — no GUI event stream for cron
+        String::new(), // cache_user_id — no caching for cron
+        async {
+            // Inject external context so worker-spawned tools can read
+            // run_id/cancel across spawn boundaries (same pattern as
+            // launch_unified_run in chat.rs).
+            use echo_core::tools::ExternalRunContext;
+            let agent_inner = primary_agent.inner().clone();
+            let agent = agent_inner.read().await;
+            agent.set_external_context(&ExternalRunContext {
+                run_id: run_id_for_scope.clone(),
+                cancel: Some(std::sync::Arc::new(cancel_for_scope.clone())),
+                trace_sink: None,
+                cache_user_id: None,
+            });
+
+            // Execute the prompt. The agent's ReAct loop will call
+            // task_create + execute_plan, which runs the plan through
+            // execute_run with all safety gates (preflight, approval skip).
+            match agent
+                .execute_stream_with_cancel(&prompt_owned, cancel_for_scope.clone())
+                .await
+            {
+                Ok(mut stream) => {
+                    // Drain the stream to completion. We don't forward events
+                    // to a GUI (cron has no UI), but we must consume the
+                    // stream so the agent finishes its work.
+                    while let Some(event_result) = stream.next().await {
+                        if cancel_for_scope.is_cancelled() {
+                            break;
+                        }
+                        match event_result {
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::warn!(
+                                    cron_task_id = %cron_task_id,
+                                    run_id = %run_id_for_scope,
+                                    error = %e,
+                                    "Cron agent stream error"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        cron_task_id = %cron_task_id,
+                        run_id = %run_id_for_scope,
+                        error = %e,
+                        "Cron agent failed to start stream"
+                    );
+                }
+            }
+        },
+    )
+    .await;
+
+    // 4. Determine final outcome from the store (execute_plan/execute_run
+    //    may have already transitioned the run to a terminal state).
+    let final_status = store.get_run(&run_id).ok().flatten().map(|r| r.status);
+
+    match final_status {
+        Some(TaskRunStatus::Completed) => {
+            tracing::info!(
+                cron_task_id = %cron_task_id,
+                fire_id = %fire_id,
+                run_id = %run_id,
+                "Cron run completed"
+            );
+        }
+        Some(TaskRunStatus::Failed) => {
+            tracing::warn!(
+                cron_task_id = %cron_task_id,
+                fire_id = %fire_id,
+                run_id = %run_id,
+                "Cron run failed"
+            );
+        }
+        Some(TaskRunStatus::Cancelled) => {
+            tracing::info!(
+                cron_task_id = %cron_task_id,
+                fire_id = %fire_id,
+                run_id = %run_id,
+                "Cron run cancelled"
+            );
+        }
+        Some(TaskRunStatus::Paused) => {
+            // Should not happen in unattended mode (approval gate skipped,
+            // hitrisk terminal-fail). Transition to Failed so the run
+            // doesn't hang forever waiting for a human.
+            tracing::error!(
+                cron_task_id = %cron_task_id,
+                run_id = %run_id,
+                "Cron run unexpectedly Paused — transitioning to Failed"
+            );
+            let _ = store.transition_run(&run_id, TaskRunStatus::Failed);
+            let _ = store.note(
+                &run_id,
+                None,
+                "Cron run unexpectedly Paused; auto-transitioned to Failed.",
+            );
+        }
+        _ => {
+            // Still Running or unknown — the agent finished its stream
+            // without execute_plan transitioning the run to a terminal
+            // state (e.g. agent returned a direct answer without calling
+            // execute_plan). Mark as Completed or Cancelled.
+            if child_cancel.is_cancelled() {
+                let _ = store.transition_run(&run_id, TaskRunStatus::Cancelled);
+            } else {
+                let _ = store.transition_run(&run_id, TaskRunStatus::Completed);
+            }
+            tracing::info!(
+                cron_task_id = %cron_task_id,
+                fire_id = %fire_id,
+                run_id = %run_id,
+                final_status = ?final_status,
+                "Cron run agent stream finished; transitioned to terminal"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+// ── Unattended preflight (dual-checkpoint, spec §4.2 v2) ───────────────
+
+/// Preflight error for unattended runs — terminal, never Paused.
+#[derive(Debug, Clone)]
+pub struct PreflightRejection {
+    pub reason: String,
+}
+
+/// Tool-name allowlist for unattended `ReadOnlyPlanNoShell` runs.
+///
+/// §A: A2 (allow network) — local read-only tools + readonly network tools.
+/// Write / execute / shell tools are NOT on this list.
+/// Tool names verified against actual `Tool::name()` registrations.
+const UNATTENDED_READONLY_TOOLS: &[&str] = &[
+    // Local read-only
+    "read_file",
+    "list_dir",
+    "grep",
+    "glob",
+    "code_search",
+    "task_list",
+    "task_create", // plan construction only (not execution)
+    "task_update",
+    "execute_plan", // plan materialisation trigger
+    // Read-only network (§A = A2)
+    "web_search",
+    "web_fetch",
+];
+
+/// Checkpoint A: scan the full plan after materialisation, before execution.
+///
+/// Returns `Ok(())` if every task in the plan passes the three-layer check:
+/// 1. task kind in `is_unattended_readonly_allowed()` whitelist
+/// 2. every `allowed_tools` entry is in `UNATTENDED_READONLY_TOOLS`
+/// 3. no shell/test commands (verification must be empty)
+///
+/// On violation → `Err(PreflightRejection)` — terminal fail, never Paused.
+pub fn preflight_unattended_plan(tasks: &[PlanTask]) -> Result<(), PreflightRejection> {
+    for t in tasks {
+        // Layer 1: task kind whitelist
+        if !t.kind.is_unattended_readonly_allowed() {
+            return Err(PreflightRejection {
+                reason: format!(
+                    "task kind '{}' is not allowed in unattended ReadOnlyPlanNoShell mode \
+                     (allowed: ReadOnlyReview, Investigation, Summary)",
+                    t.kind.as_str()
+                ),
+            });
+        }
+        // Layer 2: tool allowlist (only if the task declares tools)
+        for tool_name in &t.allowed_tools {
+            if !UNATTENDED_READONLY_TOOLS.contains(&tool_name.as_str()) {
+                return Err(PreflightRejection {
+                    reason: format!(
+                        "tool '{}' is not in the unattended readonly allowlist (task '{}')",
+                        tool_name, t.id
+                    ),
+                });
+            }
+        }
+        // Layer 3: no shell/test commands
+        if !t.verification.is_empty() {
+            return Err(PreflightRejection {
+                reason: format!(
+                    "task '{}' declares verification/shell commands — \
+                     shell is DisabledByDefault in unattended mode",
+                    t.id
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Checkpoint B: per-task preflight — same three layers, for a single task.
+/// Called before each task acquires its permit in `execute_task`.
+pub fn preflight_unattended_task(task: &PlanTask) -> Result<(), PreflightRejection> {
+    preflight_unattended_plan(std::slice::from_ref(task))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1698,7 +2004,16 @@ mod tests {
         // Seed a run + plan via the public store API, then drive the state
         // machine the way run_dag would.
         store
-            .create_run("r1", "ws", "c1", "m1", DomainProfile::AiCoding, "g", "")
+            .create_run(
+                "r1",
+                "ws",
+                "c1",
+                "m1",
+                DomainProfile::AiCoding,
+                "g",
+                "",
+                AttendedMode::Attended,
+            )
             .unwrap();
         let plan = TaskPlan {
             plan_id: "p1".into(),
@@ -1939,6 +2254,7 @@ mod tests {
                 DomainProfile::General,
                 "test goal",
                 "",
+                AttendedMode::Attended,
             )
             .unwrap();
         let plan = TaskPlan {

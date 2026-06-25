@@ -153,6 +153,7 @@ impl TaskRuntimeStore {
         domain_profile: DomainProfile,
         goal: &str,
         route: &str,
+        attended_mode: AttendedMode,
     ) -> Result<TaskRun, StoreError> {
         let now = Utc::now();
         let run = TaskRun {
@@ -165,6 +166,7 @@ impl TaskRuntimeStore {
             goal: goal.to_string(),
             plan_id: None,
             route: route.to_string(),
+            attended_mode,
             created_at: now,
             updated_at: now,
         };
@@ -184,6 +186,7 @@ impl TaskRuntimeStore {
                 "conversation_id": run.conversation_id,
                 "root_message_id": run.root_message_id,
                 "route": run.route,
+                "attended_mode": attended_mode.as_str(),
                 "created_at": run.created_at.to_rfc3339(),
             }),
         )?;
@@ -1037,6 +1040,7 @@ mod tests {
                 DomainProfile::AiCoding,
                 "review runtime",
                 "",
+                AttendedMode::Attended,
             )
             .unwrap();
         assert_eq!(run.status, TaskRunStatus::Pending);
@@ -1048,8 +1052,17 @@ mod tests {
     #[test]
     fn transition_run_appends_status_event_atomically() {
         let s = fresh();
-        s.create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g", "")
-            .unwrap();
+        s.create_run(
+            "r1",
+            "ws",
+            "c1",
+            "m1",
+            DomainProfile::General,
+            "g",
+            "",
+            AttendedMode::Attended,
+        )
+        .unwrap();
         let run = s.transition_run("r1", TaskRunStatus::Running).unwrap();
         assert_eq!(run.status, TaskRunStatus::Running);
         let evs = s.list_events("r1", 0).unwrap();
@@ -1061,8 +1074,17 @@ mod tests {
     #[test]
     fn illegal_transition_is_rejected_and_leaves_no_event() {
         let s = fresh();
-        s.create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g", "")
-            .unwrap();
+        s.create_run(
+            "r1",
+            "ws",
+            "c1",
+            "m1",
+            DomainProfile::General,
+            "g",
+            "",
+            AttendedMode::Attended,
+        )
+        .unwrap();
         // First transition to Running (was Pending → now legal).
         s.transition_run("r1", TaskRunStatus::Running).unwrap();
         // Running → Completed is legal. Now test that Completed → Running is
@@ -1079,8 +1101,17 @@ mod tests {
     #[test]
     fn attach_plan_creates_tasks_and_todos() {
         let s = fresh();
-        s.create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g", "")
-            .unwrap();
+        s.create_run(
+            "r1",
+            "ws",
+            "c1",
+            "m1",
+            DomainProfile::General,
+            "g",
+            "",
+            AttendedMode::Attended,
+        )
+        .unwrap();
         // attach_plan no longer changes the run status; caller decides.
         let plan = TaskPlan {
             plan_id: "p1".into(),
@@ -1159,18 +1190,45 @@ mod tests {
     #[test]
     fn latest_run_for_conversation_orders_by_created_desc() {
         let s = fresh();
-        s.create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g1", "")
-            .unwrap();
+        s.create_run(
+            "r1",
+            "ws",
+            "c1",
+            "m1",
+            DomainProfile::General,
+            "g1",
+            "",
+            AttendedMode::Attended,
+        )
+        .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(10));
-        s.create_run("r2", "ws", "c1", "m2", DomainProfile::General, "g2", "")
-            .unwrap();
+        s.create_run(
+            "r2",
+            "ws",
+            "c1",
+            "m2",
+            DomainProfile::General,
+            "g2",
+            "",
+            AttendedMode::Attended,
+        )
+        .unwrap();
         let latest = s.latest_run_for_conversation("c1").unwrap().unwrap();
         assert_eq!(latest.run_id, "r2");
     }
 
     fn seed_plan(s: &TaskRuntimeStore) {
-        s.create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g", "")
-            .unwrap();
+        s.create_run(
+            "r1",
+            "ws",
+            "c1",
+            "m1",
+            DomainProfile::General,
+            "g",
+            "",
+            AttendedMode::Attended,
+        )
+        .unwrap();
         let plan = TaskPlan {
             plan_id: "p1".into(),
             run_id: "r1".into(),
@@ -1326,8 +1384,17 @@ mod tests {
     #[test]
     fn file_path_rejects_illegal_transition_and_appends_no_event() {
         let s = fresh();
-        s.create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g", "")
-            .unwrap();
+        s.create_run(
+            "r1",
+            "ws",
+            "c1",
+            "m1",
+            DomainProfile::General,
+            "g",
+            "",
+            AttendedMode::Attended,
+        )
+        .unwrap();
         s.transition_run("r1", TaskRunStatus::Running).unwrap();
         s.transition_run("r1", TaskRunStatus::Completed).unwrap();
         let before = s.list_events("r1", 0).unwrap().len();
@@ -1342,8 +1409,17 @@ mod tests {
     #[test]
     fn file_path_rejects_dependency_cycle_and_appends_no_event() {
         let s = fresh();
-        s.create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g", "")
-            .unwrap();
+        s.create_run(
+            "r1",
+            "ws",
+            "c1",
+            "m1",
+            DomainProfile::General,
+            "g",
+            "",
+            AttendedMode::Attended,
+        )
+        .unwrap();
         // t1 with no deps (bootstraps the plan).
         s.insert_task(
             "r1",
@@ -1387,8 +1463,17 @@ mod tests {
     #[test]
     fn file_path_rejects_unknown_task_and_appends_no_event() {
         let s = fresh();
-        s.create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g", "")
-            .unwrap();
+        s.create_run(
+            "r1",
+            "ws",
+            "c1",
+            "m1",
+            DomainProfile::General,
+            "g",
+            "",
+            AttendedMode::Attended,
+        )
+        .unwrap();
         let before = s.list_events("r1", 0).unwrap().len();
         let err = s
             .set_task_status("r1", "nope", TodoStatus::Running, None, None)

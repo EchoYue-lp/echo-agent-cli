@@ -12,8 +12,8 @@ use echo_agent::prelude::AgentEvent;
 use echo_agent_app_core::observability::{TraceEvent, TraceKind};
 use echo_agent_app_core::tasks::conversation_runtime::ConversationRuntimeEvent;
 use echo_agent_app_core::tasks::task_runtime::{
-    ExecutionPolicy, InteractionMode, TaskRouteDecision, TaskRouteKind, TaskRunStatus,
-    WorkerTraceEvent, WorkerTraceEventKind,
+    AttendedMode, ExecutionPolicy, InteractionMode, TaskRouteDecision, TaskRouteKind,
+    TaskRunStatus, WorkerTraceEvent, WorkerTraceEventKind,
 };
 use futures::StreamExt;
 use futures::future::BoxFuture;
@@ -1206,6 +1206,7 @@ async fn route_complex_task(
         route_decision.classification.inferred_profile,
         &message,
         route_decision.route.as_str(),
+        AttendedMode::Attended,
     )?;
 
     // 2. Transition Pending → Running (valid in 6-state machine) and launch

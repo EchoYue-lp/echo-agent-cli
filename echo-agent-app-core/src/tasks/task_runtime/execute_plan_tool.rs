@@ -22,10 +22,12 @@ use echo_agent::error;
 use echo_agent::tools::{Tool, ToolParameters, ToolResult};
 use futures::future::BoxFuture;
 
-use super::executor::{RunOutcome, execute_run};
+use super::executor::{RunOutcome, execute_run, preflight_unattended_plan};
 use super::router::TaskRouteKind;
 use super::store::TaskRuntimeStore;
-use super::types::{DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, TaskPlan, TaskRunStatus};
+use super::types::{
+    AttendedMode, DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, TaskPlan, TaskRunStatus,
+};
 use crate::agent_handle::AgentHandle;
 
 /// L1→L2 桥接工具: 把 plan 提交给 run_dag 并行调度器。
@@ -133,6 +135,38 @@ impl Tool for ExecutePlanTool {
                 }
             }
 
+            // ── U1c phase-1: read attended_mode once for CP A + approval gate ──
+            let attended_mode = self
+                .store
+                .get_run(&run_id)
+                .ok()
+                .flatten()
+                .map(|r| r.attended_mode)
+                .unwrap_or_default();
+
+            // ── U1c phase-1 CP A: unattended preflight ──
+            // Only when attended_mode=Unattended: scan the full plan for
+            // write tasks / write tools / shell commands and terminal-fail
+            // on violation. Chat runs (Attended) skip this entirely.
+            if attended_mode == AttendedMode::Unattended {
+                if let Some(ref plan) = self.store.get_plan(&run_id).ok().flatten() {
+                    if let Err(rejection) = preflight_unattended_plan(&plan.tasks) {
+                        let _ = self.store.transition_run(&run_id, TaskRunStatus::Failed);
+                        let _ = self.store.note(
+                            &run_id,
+                            None,
+                            &format!("CP A preflight rejected: {}", rejection.reason),
+                        );
+                        return Ok(ToolResult::error(format!(
+                            "Unattended run rejected by preflight: {}. \
+                             ReadOnlyPlanNoShell mode only allows read tasks, \
+                             read tools, and no shell/test commands.",
+                            rejection.reason
+                        )));
+                    }
+                }
+            }
+
             // ── §10.5: ComplexRuntime 审批闭环 ──
             // Route is read from the persisted run record so the tool struct
             // doesn't need it baked in at construction time.
@@ -144,17 +178,28 @@ impl Tool for ExecutePlanTool {
             let route = TaskRouteKind::from_str(&route_str)
                 .unwrap_or(TaskRouteKind::ParallelReadonlyDelegation);
             if route == TaskRouteKind::ComplexRuntime {
-                if let Err(e) = self.store.transition_run(&run_id, TaskRunStatus::Paused) {
-                    return Ok(ToolResult::error(format!("Failed to pause run: {e}")));
-                }
-                // Register the signal so resume_task_run can find it.
-                super::task_tools::register_approval_signal(&run_id, self.approval_signal.clone());
-                // 等待 resume_run 通过 approval_signal 唤醒
-                self.approval_signal.notified().await;
-                // Remove the signal -- the run has been woken.
-                super::task_tools::remove_approval_signal(&run_id);
-                if let Err(e) = self.store.transition_run(&run_id, TaskRunStatus::Running) {
-                    return Ok(ToolResult::error(format!("Failed to resume run: {e}")));
+                // U1c phase-1: Skip approval for unattended runs.
+                // Precise condition (spec §4.1 v2): Unattended + ReadOnlyPlanNoShell
+                // + preflight passed (CP A above already returned Ok). In stage 1,
+                // all unattended runs use ReadOnlyPlanNoShell, so the mode check
+                // is sufficient. Without this skip, the run would deadlock waiting
+                // for a human who isn't there.
+                if attended_mode != AttendedMode::Unattended {
+                    if let Err(e) = self.store.transition_run(&run_id, TaskRunStatus::Paused) {
+                        return Ok(ToolResult::error(format!("Failed to pause run: {e}")));
+                    }
+                    // Register the signal so resume_task_run can find it.
+                    super::task_tools::register_approval_signal(
+                        &run_id,
+                        self.approval_signal.clone(),
+                    );
+                    // 等待 resume_run 通过 approval_signal 唤醒
+                    self.approval_signal.notified().await;
+                    // Remove the signal -- the run has been woken.
+                    super::task_tools::remove_approval_signal(&run_id);
+                    if let Err(e) = self.store.transition_run(&run_id, TaskRunStatus::Running) {
+                        return Ok(ToolResult::error(format!("Failed to resume run: {e}")));
+                    }
                 }
             }
 

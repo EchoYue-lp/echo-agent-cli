@@ -265,6 +265,7 @@ mod tests {
                 DomainProfile::AiCoding,
                 "Review runtime",
                 "",
+                AttendedMode::Attended,
             )
             .unwrap();
         let plan = TaskPlan {

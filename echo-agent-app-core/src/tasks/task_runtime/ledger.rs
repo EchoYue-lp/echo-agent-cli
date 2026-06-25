@@ -202,6 +202,7 @@ mod tests {
                 DomainProfile::AiCoding,
                 "Build real runtime",
                 "",
+                AttendedMode::Attended,
             )
             .unwrap();
         let plan = TaskPlan {

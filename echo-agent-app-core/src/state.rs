@@ -617,6 +617,7 @@ impl AppState {
             self.scheduler.cancel_token.clone(),
             self.connection.agent.clone(),
             self.tasks.service.clone(),
+            self.tasks.runtime.clone(),
         );
         let runner = Arc::new(runner);
         runner.clone().spawn();

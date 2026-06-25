@@ -300,6 +300,7 @@ pub async fn create_task_run(
             profile,
             &req.goal,
             &route,
+            AttendedMode::Attended,
         )
         .map_err(internal)?;
     tracing::info!(run_id = %run.run_id, profile = ?profile, "TaskRuntime run created");
