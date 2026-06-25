@@ -62,6 +62,10 @@ pub struct TaskRuntimeStore {
     /// status flipping to Skipped while execution continues).
     task_cancel_tokens:
         std::sync::Mutex<std::collections::HashMap<String, echo_agent::agent::CancellationToken>>,
+    /// Optional file shadow (U1c phase-0/0a). When set, every write method flushes a
+    /// non-authoritative `events.jsonl` + `plan.json` mirror under `{root}/{run_id}/`.
+    /// SQL remains the read/write authority in 0a; the shadow is for parity + 0b read switch.
+    shadow: Option<std::sync::Arc<super::file_shadow::FileTaskShadow>>,
 }
 
 impl TaskRuntimeStore {
@@ -83,6 +87,7 @@ impl TaskRuntimeStore {
         let store = Self {
             conn: Mutex::new(conn),
             task_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
+            shadow: None,
         };
         store.init_schema()?;
         Ok(store)
@@ -94,9 +99,29 @@ impl TaskRuntimeStore {
         let store = Self {
             conn: Mutex::new(conn),
             task_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
+            shadow: None,
         };
         store.init_schema()?;
         Ok(store)
+    }
+
+    /// Attach a file shadow (U1c phase-0/0a). After this, every write method
+    /// flushes a non-authoritative `events.jsonl` + `plan.json` mirror. SQL
+    /// remains the read/write authority. Shadow failures are logged, not fatal.
+    pub fn attach_shadow(&mut self, shadow: std::sync::Arc<super::file_shadow::FileTaskShadow>) {
+        self.shadow = Some(shadow);
+    }
+
+    /// Flush the file shadow for `run_id` after a write, using the already-held
+    /// `conn` guard to read events (avoids re-locking the store mutex, which would
+    /// deadlock since callers hold the guard for the whole write method).
+    /// No-op if no shadow attached. Shadow errors are logged, not fatal.
+    fn flush_shadow(&self, run_id: &str, conn: &Connection) {
+        if let Some(shadow) = &self.shadow
+            && let Err(e) = shadow.flush_from_conn(conn, run_id)
+        {
+            tracing::warn!(run_id = %run_id, error = %e, "file shadow flush failed (non-authoritative, continuing)");
+        }
     }
 
     // ── Schema ──────────────────────────────────────────────────────────
@@ -418,6 +443,7 @@ impl TaskRuntimeStore {
             }),
         )?;
         tx.commit()?;
+        self.flush_shadow(&run.run_id, &conn);
         Ok(run)
     }
 
@@ -466,6 +492,7 @@ impl TaskRuntimeStore {
             )?;
         }
         tx.commit()?;
+        self.flush_shadow(run_id, &conn);
         Ok(run)
     }
 
@@ -660,6 +687,7 @@ impl TaskRuntimeStore {
         )?;
 
         tx.commit()?;
+        self.flush_shadow(run_id, &conn);
         Ok(())
     }
 
@@ -701,6 +729,7 @@ impl TaskRuntimeStore {
             serde_json::json!({ "action": "remove", "task_id": task_id }),
         )?;
         tx.commit()?;
+        self.flush_shadow(run_id, &conn);
         Ok(())
     }
 
@@ -830,6 +859,7 @@ impl TaskRuntimeStore {
         )?;
 
         tx.commit()?;
+        self.flush_shadow(run_id, &conn);
         Ok(())
     }
 
@@ -891,6 +921,7 @@ impl TaskRuntimeStore {
         )?;
 
         tx.commit()?;
+        self.flush_shadow(run_id, &conn);
         Ok(())
     }
 
@@ -980,6 +1011,7 @@ impl TaskRuntimeStore {
             }),
         )?;
         tx.commit()?;
+        self.flush_shadow(&plan.run_id, &conn);
         Ok(())
     }
 
@@ -1058,6 +1090,7 @@ impl TaskRuntimeStore {
             }),
         )?;
         tx.commit()?;
+        self.flush_shadow(run_id, &conn);
         Ok(())
     }
 
@@ -1145,6 +1178,7 @@ impl TaskRuntimeStore {
             serde_json::json!({ "review_id": r.id, "reviewer": r.reviewer_agent }),
         )?;
         tx.commit()?;
+        self.flush_shadow(&r.run_id, &conn);
         Ok(())
     }
 
@@ -1174,6 +1208,7 @@ impl TaskRuntimeStore {
             serde_json::json!({ "artifact_id": a.id, "kind": a.kind.as_str(), "title": a.title }),
         )?;
         tx.commit()?;
+        self.flush_shadow(&a.run_id, &conn);
         Ok(())
     }
 
@@ -1229,6 +1264,7 @@ impl TaskRuntimeStore {
             }),
         )?;
         tx.commit()?;
+        self.flush_shadow(&s.run_id, &conn);
         Ok(())
     }
 
@@ -1469,6 +1505,33 @@ impl TaskRuntimeStore {
         Ok(rows.filter_map(Result::ok).collect())
     }
 
+    /// Read events for `run_id` via a caller-held `&Connection` (no re-lock).
+    /// Used by the file shadow flush path, which runs inside a write method that
+    /// already holds the store mutex guard.
+    pub(crate) fn list_events_conn(
+        conn: &Connection,
+        run_id: &str,
+        since_seq: i64,
+    ) -> Result<Vec<RuntimeTaskEvent>, StoreError> {
+        let mut stmt = conn.prepare(
+            "SELECT seq, run_id, task_id, step_id, event_type, payload, timestamp
+             FROM tr_events WHERE run_id = ? AND seq > ? ORDER BY seq ASC",
+        )?;
+        let rows = stmt.query_map(params![run_id, since_seq], |row| {
+            Ok(RuntimeTaskEvent {
+                seq: row.get(0)?,
+                run_id: row.get(1)?,
+                task_id: row.get(2)?,
+                step_id: row.get(3)?,
+                event_type: RuntimeEventKind::from_str(&row.get::<_, String>(4)?)
+                    .unwrap_or(RuntimeEventKind::Note),
+                payload: serde_json::from_str(&row.get::<_, String>(5)?).unwrap_or_default(),
+                timestamp: parse_dt(row.get(6)?),
+            })
+        })?;
+        Ok(rows.filter_map(Result::ok).collect())
+    }
+
     pub fn list_artifacts(&self, run_id: &str) -> Result<Vec<Artifact>, StoreError> {
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
@@ -1577,6 +1640,7 @@ impl TaskRuntimeStore {
             serde_json::json!({ "message": message }),
         )?;
         tx.commit()?;
+        self.flush_shadow(run_id, &conn);
         Ok(())
     }
 

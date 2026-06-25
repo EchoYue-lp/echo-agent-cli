@@ -42,6 +42,7 @@ pub mod delegation;
 pub mod event_rebuild;
 pub mod execute_plan_tool;
 pub mod executor;
+pub mod file_shadow;
 pub mod hitrisk;
 pub mod ledger;
 pub mod memory_bridge;
