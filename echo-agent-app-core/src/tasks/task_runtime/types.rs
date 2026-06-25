@@ -82,6 +82,26 @@ pub enum ExecutionMode {
     PlanOnly,
 }
 
+impl ExecutionMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ExecutionMode::Sequential => "sequential",
+            ExecutionMode::Parallel => "parallel",
+            ExecutionMode::PlanOnly => "plan_only",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)] // inherent helper returning Option; not the FromStr trait
+    pub fn from_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "sequential" => ExecutionMode::Sequential,
+            "parallel" => ExecutionMode::Parallel,
+            "plan_only" => ExecutionMode::PlanOnly,
+            _ => return None,
+        })
+    }
+}
+
 /// Manual override of how a user message should be handled.
 /// `Auto` defers to the router; the other two force a path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]

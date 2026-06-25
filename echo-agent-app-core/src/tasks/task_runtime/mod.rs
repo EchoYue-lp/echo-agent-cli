@@ -39,6 +39,7 @@
 pub mod classify;
 pub mod delegate_readonly_tool;
 pub mod delegation;
+pub mod event_rebuild;
 pub mod execute_plan_tool;
 pub mod executor;
 pub mod hitrisk;

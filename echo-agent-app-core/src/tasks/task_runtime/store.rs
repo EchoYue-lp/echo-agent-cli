@@ -407,7 +407,15 @@ impl TaskRuntimeStore {
             None,
             None,
             RuntimeEventKind::RunCreated,
-            serde_json::json!({ "goal": goal, "domain_profile": domain_profile.as_str() }),
+            serde_json::json!({
+                "goal": goal,
+                "domain_profile": domain_profile.as_str(),
+                "workspace_id": run.workspace_id,
+                "conversation_id": run.conversation_id,
+                "root_message_id": run.root_message_id,
+                "route": run.route,
+                "created_at": run.created_at.to_rfc3339(),
+            }),
         )?;
         tx.commit()?;
         Ok(run)
@@ -575,7 +583,16 @@ impl TaskRuntimeStore {
                     None,
                     None,
                     RuntimeEventKind::PlanGenerated,
-                    serde_json::json!({ "plan_id": new_plan_id, "task_count": 0, "bootstrapped": true }),
+                    serde_json::json!({
+                        "plan_id": new_plan_id,
+                        "task_count": 0,
+                        "bootstrapped": true,
+                        "domain_profile": DomainProfile::General.as_str(),
+                        "goal": goal,
+                        "assumptions": Vec::<String>::new(),
+                        "risks": Vec::<String>::new(),
+                        "execution_mode": "parallel",
+                    }),
                 )?;
                 new_plan_id
             }
@@ -635,8 +652,10 @@ impl TaskRuntimeStore {
             RuntimeEventKind::PlanEdited,
             serde_json::json!({
                 "action": "insert",
-                "task_id": task.id,
+                "task_id": task_with_order.id,
                 "after_task_id": after_task_id,
+                // Full PlanTask body so events.jsonl can rebuild plan.json (U1c phase-0/0a).
+                "task": task_with_order,
             }),
         )?;
 
@@ -802,7 +821,12 @@ impl TaskRuntimeStore {
             None,
             None,
             RuntimeEventKind::PlanEdited,
-            serde_json::json!({ "action": "update", "task_id": task_id }),
+            serde_json::json!({
+                "action": "update",
+                "task_id": task_id,
+                // Applied patch fields so events.jsonl can rebuild plan.json (U1c phase-0/0a).
+                "patch": patch,
+            }),
         )?;
 
         tx.commit()?;
@@ -859,7 +883,11 @@ impl TaskRuntimeStore {
             None,
             None,
             RuntimeEventKind::PlanEdited,
-            serde_json::json!({ "action": "reorder" }),
+            serde_json::json!({
+                "action": "reorder",
+                // Full new ordering (task ids) so events.jsonl can rebuild plan.json (U1c phase-0/0a).
+                "new_order": new_order,
+            }),
         )?;
 
         tx.commit()?;
@@ -937,7 +965,19 @@ impl TaskRuntimeStore {
             None,
             None,
             RuntimeEventKind::PlanGenerated,
-            serde_json::json!({ "plan_id": plan.plan_id, "task_count": plan.tasks.len() }),
+            serde_json::json!({
+                "plan_id": plan.plan_id,
+                "task_count": plan.tasks.len(),
+                "domain_profile": plan.domain_profile.as_str(),
+                "goal": plan.goal,
+                "assumptions": plan.assumptions,
+                "risks": plan.risks,
+                "execution_mode": plan.execution_mode,
+                // Full task bodies: attach_plan is the authoritative plan-creation path
+                // (insert_plan_task_tx, NOT insert_task), so PlanGenerated must carry the
+                // tasks for events.jsonl to rebuild plan.json (U1c phase-0/0a).
+                "tasks": plan.tasks,
+            }),
         )?;
         tx.commit()?;
         Ok(())
@@ -1011,6 +1051,10 @@ impl TaskRuntimeStore {
                 "status": status.as_str(),
                 "owner_agent": owner_agent,
                 "summary": summary,
+                // Explicit timestamps so events.jsonl can rebuild todo runtime fields
+                // without relying on the event `timestamp` as a proxy (U1c phase-0/0a).
+                "started_at": if started { Some(now.as_str()) } else { None },
+                "completed_at": if finished { Some(now.as_str()) } else { None },
             }),
         )?;
         tx.commit()?;
@@ -1179,8 +1223,9 @@ impl TaskRuntimeStore {
             RuntimeEventKind::Note,
             serde_json::json!({
                 "kind": "summary_persisted",
-                "worker_agent": s.worker_agent,
-                "files_changed": s.files_changed.len(),
+                // Full summary so events.jsonl can rebuild plan.json task summaries
+                // (U1c phase-0/0a).
+                "summary": s,
             }),
         )?;
         tx.commit()?;
