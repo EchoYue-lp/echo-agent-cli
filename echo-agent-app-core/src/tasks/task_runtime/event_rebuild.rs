@@ -157,13 +157,21 @@ pub fn rebuild_plan_from_events(events: &[RuntimeTaskEvent]) -> Result<RebuiltPl
                         }
                     }
                     "remove" => {
+                        // `remove_task` is a SOFT delete: it sets the task's
+                        // status to Skipped (via set_task_status) and then
+                        // emits PlanEdited{remove}. The task row stays in the
+                        // plan so the UI can still show it as skipped. Match
+                        // that semantics here — flip status to Skipped rather
+                        // than dropping the task. (Hard-deleting would diverge
+                        // from SQL `list_todos`, which keeps the row.)
                         if let Some(task_id) = ev
                             .payload
                             .get("task_id")
                             .and_then(|v| v.as_str())
                             .map(str::to_string)
+                            && let Some(t) = tasks.iter_mut().find(|t| t.id == task_id)
                         {
-                            tasks.retain(|t| t.id != task_id);
+                            t.status = TodoStatus::Skipped;
                         }
                     }
                     "reorder" => {
@@ -207,6 +215,16 @@ pub fn rebuild_plan_from_events(events: &[RuntimeTaskEvent]) -> Result<RebuiltPl
             K::Note => {
                 // summary_persisted carries a full TaskExecutionSummary; PlanTask has no field for
                 // it today (tr_summaries stays authoritative until 0c). No plan.json mutation.
+                //
+                // fix_task_persisted (update_plan_task, review gate) carries a full
+                // task body — replace the matching task so plan.json reflects the
+                // retry/fingerprint/title/status update.
+                if ev.payload.get("kind").and_then(|v| v.as_str()) == Some("fix_task_persisted")
+                    && let Some(task) = decode_task(&ev.payload, "task")
+                    && let Some(t) = tasks.iter_mut().find(|t| t.id == task.id)
+                {
+                    *t = task;
+                }
             }
             _ => {} // WorkerLlmUsage/ArtifactProduced/Review*/Approval*/Note(other) don't affect plan.json
         }

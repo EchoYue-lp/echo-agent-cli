@@ -47,6 +47,8 @@ pub enum StoreError {
     Json(#[from] serde_json::Error),
     #[error("invalid plan: {0}")]
     InvalidPlan(String),
+    #[error("file shadow: {0}")]
+    Shadow(#[from] super::file_shadow::ShadowError),
 }
 
 /// Canonical TaskRuntime store. One instance per process; cheap to clone
@@ -84,22 +86,41 @@ impl TaskRuntimeStore {
         }
         let conn = Connection::open(path)
             .with_context(|| format!("opening task_runtime db at {}", path.display()))?;
+        // U1c phase-0/0bc step-2: file is the read/write authority; SQL stays
+        // as a non-writing fallback (schema still init'd, tables kept). Attach
+        // the default file shadow at `~/.echo-agent/tasks/`.
+        let shadow = std::sync::Arc::new(super::file_shadow::FileTaskShadow::new(
+            super::file_shadow::FileTaskShadow::default_root(),
+        ));
         let store = Self {
             conn: Mutex::new(conn),
             task_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
-            shadow: None,
+            shadow: Some(shadow),
         };
         store.init_schema()?;
         Ok(store)
     }
 
     /// In-memory store for tests / fallback. Schema is identical.
+    ///
+    /// U1c phase-0/0bc step-2: even the in-memory store attaches a file shadow
+    /// (backed by a per-process temp dir) so that the file-authority path is
+    /// exercised by every test — the 321 store tests double as the
+    /// behavior-equivalence proof that file read/write matches the old SQL
+    /// read/write. Uses `std::env::temp_dir` (not the `tempfile` crate, which is
+    /// a dev-only dependency) so this stays a production-callable constructor.
     pub fn new_in_memory() -> anyhow::Result<Self> {
         let conn = Connection::open_in_memory()?;
+        let shadow_root = std::env::temp_dir().join(format!(
+            "echo-agent-task-runtime-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let shadow = std::sync::Arc::new(super::file_shadow::FileTaskShadow::new(shadow_root));
         let store = Self {
             conn: Mutex::new(conn),
             task_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
-            shadow: None,
+            shadow: Some(shadow),
         };
         store.init_schema()?;
         Ok(store)
@@ -122,6 +143,16 @@ impl TaskRuntimeStore {
         {
             tracing::warn!(run_id = %run_id, error = %e, "file shadow flush failed (non-authoritative, continuing)");
         }
+    }
+
+    /// Build a `FileTaskStore` over the attached shadow, for read delegation.
+    /// U1c phase-0/0bc step-2: read methods delegate to the file store (file is
+    /// the read authority); SQL reads remain only as a fallback when no shadow
+    /// is attached (should not happen post-step-D, but keeps the path safe).
+    fn file_store(&self) -> Option<super::file_store::FileTaskStore> {
+        self.shadow
+            .as_ref()
+            .map(|s| super::file_store::FileTaskStore::new((**s).clone()))
     }
 
     // ── Schema ──────────────────────────────────────────────────────────
@@ -407,6 +438,30 @@ impl TaskRuntimeStore {
             updated_at: now,
         };
 
+        // U1c phase-0/0bc step-2: file is the write authority. Append the
+        // RunCreated event to events.jsonl and rebuild plan.json — no SQL
+        // write. SQL stays as a non-writing fallback (tables kept).
+        if let Some(shadow) = &self.shadow {
+            shadow.append_event_line(
+                run.run_id.as_str(),
+                None,
+                None,
+                RuntimeEventKind::RunCreated,
+                serde_json::json!({
+                    "goal": goal,
+                    "domain_profile": domain_profile.as_str(),
+                    "workspace_id": run.workspace_id,
+                    "conversation_id": run.conversation_id,
+                    "root_message_id": run.root_message_id,
+                    "route": run.route,
+                    "created_at": run.created_at.to_rfc3339(),
+                }),
+            )?;
+            shadow.rewrite_plan(&run.run_id)?;
+            return Ok(run);
+        }
+
+        // Legacy SQL path (no shadow attached — not the default post-step-D).
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         tx.execute(
@@ -450,6 +505,46 @@ impl TaskRuntimeStore {
     /// Atomically transition a run to `next` and append `RunStatusChanged`.
     /// Rejects illegal transitions (see [`TaskRunStatus::can_transition_to`]).
     pub fn transition_run(&self, run_id: &str, next: TaskRunStatus) -> Result<TaskRun, StoreError> {
+        // U1c phase-0/0bc step-2: file is the read/write authority. Read the
+        // current run from the file to validate the transition, then append the
+        // status-changed event + rewrite plan.json. No SQL write.
+        if let Some(shadow) = &self.shadow {
+            let run = self
+                .get_run(run_id)?
+                .ok_or(StoreError::RunNotFound(run_id.to_string()))?;
+            let current = run.status;
+            if !current.can_transition_to(next) {
+                return Err(StoreError::IllegalTransition {
+                    run_id: run_id.to_string(),
+                    from: current.as_str().to_string(),
+                    to: next.as_str().to_string(),
+                });
+            }
+            let now = Utc::now();
+            shadow.append_event_line(
+                run_id,
+                None,
+                None,
+                RuntimeEventKind::RunStatusChanged,
+                serde_json::json!({ "from": current.as_str(), "to": next.as_str() }),
+            )?;
+            if next == TaskRunStatus::Cancelled {
+                shadow.append_event_line(
+                    run_id,
+                    None,
+                    None,
+                    RuntimeEventKind::RunCancelled,
+                    serde_json::json!({}),
+                )?;
+            }
+            shadow.rewrite_plan(run_id)?;
+            let mut run = run;
+            run.status = next;
+            run.updated_at = now;
+            return Ok(run);
+        }
+
+        // Legacy SQL path (no shadow attached).
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
 
@@ -556,6 +651,76 @@ impl TaskRuntimeStore {
         after_task_id: Option<String>,
         task: PlanTask,
     ) -> Result<(), StoreError> {
+        // U1c phase-0/0bc step-2: file authority. Read the current plan from
+        // the file (bootstrapping an empty plan if none exists), validate deps,
+        // then append PlanEdited{insert} + rewrite plan.json. No SQL write.
+        if let Some(shadow) = &self.shadow {
+            // Load current plan/tasks from the file (None if no plan yet).
+            let current_plan = self.get_plan(run_id)?;
+            let existing_tasks: Vec<PlanTask> = current_plan
+                .as_ref()
+                .map(|p| p.tasks.clone())
+                .unwrap_or_default();
+
+            // Lazy bootstrap: if no plan exists, emit a PlanGenerated first
+            // (matching the SQL path that creates an empty plan row). The run
+            // goal comes from the run header (already on file via create_run).
+            if current_plan.is_none() {
+                let run = self.get_run(run_id)?;
+                let goal = run.as_ref().map(|r| r.goal.clone()).unwrap_or_default();
+                let new_plan_id = uuid::Uuid::new_v4().to_string();
+                shadow.append_event_line(
+                    run_id,
+                    None,
+                    None,
+                    RuntimeEventKind::PlanGenerated,
+                    serde_json::json!({
+                        "plan_id": new_plan_id,
+                        "task_count": 0,
+                        "bootstrapped": true,
+                        "domain_profile": DomainProfile::General.as_str(),
+                        "goal": goal,
+                        "assumptions": Vec::<String>::new(),
+                        "risks": Vec::<String>::new(),
+                        "execution_mode": "parallel",
+                    }),
+                )?;
+            }
+
+            // Build the new task list: insert after `after_task_id` (or front).
+            let mut new_tasks = existing_tasks.clone();
+            let insert_pos = after_task_id
+                .as_ref()
+                .and_then(|id| new_tasks.iter().position(|t| &t.id == id))
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            let mut task_with_order = task.clone();
+            task_with_order.sort_order = insert_pos as i64;
+            new_tasks.insert(insert_pos, task_with_order.clone());
+
+            // Validate deps (dangling refs + cycle detection).
+            if let Err(errs) = super::planner::validate_plan_deps(&new_tasks) {
+                return Err(StoreError::InvalidPlan(errs.join("; ")));
+            }
+
+            shadow.append_event_line(
+                run_id,
+                None,
+                None,
+                RuntimeEventKind::PlanEdited,
+                serde_json::json!({
+                    "action": "insert",
+                    "task_id": task_with_order.id,
+                    "after_task_id": after_task_id,
+                    // Full PlanTask body so events.jsonl can rebuild plan.json.
+                    "task": task_with_order,
+                }),
+            )?;
+            shadow.rewrite_plan(run_id)?;
+            return Ok(());
+        }
+
+        // Legacy SQL path (no shadow attached).
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
 
@@ -718,6 +883,18 @@ impl TaskRuntimeStore {
             Some("removed by user"),
         )?;
         // Emit PlanEdited (the set_task_status already emits TaskSkipped).
+        // U1c phase-0/0bc step-2: file authority — append + rewrite, no SQL.
+        if let Some(shadow) = &self.shadow {
+            shadow.append_event_line(
+                run_id,
+                None,
+                None,
+                RuntimeEventKind::PlanEdited,
+                serde_json::json!({ "action": "remove", "task_id": task_id }),
+            )?;
+            shadow.rewrite_plan(run_id)?;
+            return Ok(());
+        }
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         append_event_tx(
@@ -743,6 +920,71 @@ impl TaskRuntimeStore {
         task_id: &str,
         patch: TaskPatch,
     ) -> Result<(), StoreError> {
+        // U1c phase-0/0bc step-2: file authority. Read the task status + plan
+        // from the file, validate (state guard + cycle on deps change), then
+        // append PlanEdited{update} + rewrite plan.json. No SQL write.
+        if let Some(shadow) = &self.shadow {
+            let plan = self
+                .get_plan(run_id)?
+                .ok_or(StoreError::PlanNotFound(run_id.to_string()))?;
+            let current_task = plan
+                .tasks
+                .iter()
+                .find(|t| t.id == task_id)
+                .ok_or_else(|| StoreError::TaskNotFound(task_id.to_string()))?;
+            let current_status = current_task.status;
+
+            // State guard.
+            match current_status {
+                TodoStatus::Completed | TodoStatus::Failed | TodoStatus::Skipped => {
+                    return Err(StoreError::InvalidPlan(format!(
+                        "cannot update task in terminal status {:?}",
+                        current_status
+                    )));
+                }
+                TodoStatus::Running => {
+                    #[allow(clippy::collapsible_match)]
+                    // guard is a multi-field ||, not a single pattern; collapsing reads worse
+                    if patch.kind.is_some()
+                        || patch.depends_on.is_some()
+                        || patch.agent_role.is_some()
+                    {
+                        return Err(StoreError::InvalidPlan(
+                            "cannot change kind/depends_on/agent_role of a Running task".into(),
+                        ));
+                    }
+                }
+                _ => {} // Pending/Blocked: all fields mutable.
+            }
+
+            // Re-validate cycle after changing deps.
+            if let Some(deps) = &patch.depends_on {
+                let mut tasks = plan.tasks.clone();
+                if let Some(t) = tasks.iter_mut().find(|t| t.id == task_id) {
+                    t.depends_on = deps.clone();
+                }
+                if let Err(errs) = super::planner::validate_plan_deps(&tasks) {
+                    return Err(StoreError::InvalidPlan(errs.join("; ")));
+                }
+            }
+
+            shadow.append_event_line(
+                run_id,
+                None,
+                None,
+                RuntimeEventKind::PlanEdited,
+                serde_json::json!({
+                    "action": "update",
+                    "task_id": task_id,
+                    // Applied patch fields so events.jsonl can rebuild plan.json.
+                    "patch": patch,
+                }),
+            )?;
+            shadow.rewrite_plan(run_id)?;
+            return Ok(());
+        }
+
+        // Legacy SQL path (no shadow attached).
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
 
@@ -867,6 +1109,48 @@ impl TaskRuntimeStore {
     /// task ids that are not in a terminal state (Completed/Failed/Skipped).
     /// Emits `PlanEdited`.
     pub fn reorder_tasks(&self, run_id: &str, new_order: Vec<String>) -> Result<(), StoreError> {
+        // U1c phase-0/0bc step-2: file authority. Read tasks from file,
+        // validate new_order is a permutation of non-terminal task ids, then
+        // append PlanEdited{reorder} + rewrite plan.json. No SQL write.
+        if let Some(shadow) = &self.shadow {
+            let plan = self
+                .get_plan(run_id)?
+                .ok_or(StoreError::PlanNotFound(run_id.to_string()))?;
+            let non_terminal: std::collections::HashSet<String> = plan
+                .tasks
+                .iter()
+                .filter(|t| {
+                    !matches!(
+                        t.status,
+                        TodoStatus::Completed | TodoStatus::Failed | TodoStatus::Skipped
+                    )
+                })
+                .map(|t| t.id.clone())
+                .collect();
+            let new_set: std::collections::HashSet<String> = new_order.iter().cloned().collect();
+
+            if non_terminal != new_set {
+                return Err(StoreError::InvalidPlan(
+                    "new_order must be a permutation of all non-terminal task ids".into(),
+                ));
+            }
+
+            shadow.append_event_line(
+                run_id,
+                None,
+                None,
+                RuntimeEventKind::PlanEdited,
+                serde_json::json!({
+                    "action": "reorder",
+                    // Full new ordering (task ids) so events.jsonl can rebuild plan.json.
+                    "new_order": new_order,
+                }),
+            )?;
+            shadow.rewrite_plan(run_id)?;
+            return Ok(());
+        }
+
+        // Legacy SQL path (no shadow attached).
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
 
@@ -929,6 +1213,33 @@ impl TaskRuntimeStore {
     /// transition the run to `AwaitingPlanApproval` (from `Planning`).
     /// All plan tasks and their todo rows are inserted in the same tx.
     pub fn attach_plan(&self, plan: &TaskPlan) -> Result<(), StoreError> {
+        // U1c phase-0/0bc step-2: file authority. PlanGenerated carries the
+        // full plan envelope + task bodies; the rebuilder reconstructs the
+        // plan from it. No SQL write.
+        if let Some(shadow) = &self.shadow {
+            shadow.append_event_line(
+                plan.run_id.as_str(),
+                None,
+                None,
+                RuntimeEventKind::PlanGenerated,
+                serde_json::json!({
+                    "plan_id": plan.plan_id,
+                    "task_count": plan.tasks.len(),
+                    "domain_profile": plan.domain_profile.as_str(),
+                    "goal": plan.goal,
+                    "assumptions": plan.assumptions,
+                    "risks": plan.risks,
+                    "execution_mode": plan.execution_mode,
+                    // Full task bodies: attach_plan is the authoritative plan-creation path
+                    // so PlanGenerated must carry the tasks for events.jsonl to rebuild plan.json.
+                    "tasks": plan.tasks,
+                }),
+            )?;
+            shadow.rewrite_plan(&plan.run_id)?;
+            return Ok(());
+        }
+
+        // Legacy SQL path (no shadow attached).
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
 
@@ -1028,6 +1339,50 @@ impl TaskRuntimeStore {
         owner_agent: Option<&str>,
         summary: Option<&str>,
     ) -> Result<(), StoreError> {
+        // U1c phase-0/0bc step-2: file authority. Validate the task exists
+        // (read plan from file), then append the Task*/TodoUpdated event with
+        // explicit started_at/completed_at and rewrite plan.json. No SQL write.
+        if let Some(shadow) = &self.shadow {
+            let plan = self
+                .get_plan(run_id)?
+                .ok_or(StoreError::PlanNotFound(run_id.to_string()))?;
+            if !plan.tasks.iter().any(|t| t.id == task_id) {
+                return Err(StoreError::TaskNotFound(task_id.to_string()));
+            }
+            let now = Utc::now().to_rfc3339();
+            let started = matches!(status, TodoStatus::Running);
+            let finished = matches!(
+                status,
+                TodoStatus::Completed | TodoStatus::Failed | TodoStatus::Skipped
+            );
+            let kind = match status {
+                TodoStatus::Running => RuntimeEventKind::TaskStarted,
+                TodoStatus::Completed => RuntimeEventKind::TaskCompleted,
+                TodoStatus::Failed => RuntimeEventKind::TaskFailed,
+                TodoStatus::Skipped => RuntimeEventKind::TaskSkipped,
+                TodoStatus::Blocked => RuntimeEventKind::TaskBlocked,
+                TodoStatus::Pending => RuntimeEventKind::TodoUpdated,
+            };
+            shadow.append_event_line(
+                run_id,
+                Some(task_id),
+                None,
+                kind,
+                serde_json::json!({
+                    "status": status.as_str(),
+                    "owner_agent": owner_agent,
+                    "summary": summary,
+                    // Explicit timestamps so events.jsonl can rebuild todo runtime fields
+                    // without relying on the event `timestamp` as a proxy.
+                    "started_at": if started { Some(now.as_str()) } else { None },
+                    "completed_at": if finished { Some(now.as_str()) } else { None },
+                }),
+            )?;
+            shadow.rewrite_plan(run_id)?;
+            return Ok(());
+        }
+
+        // Legacy SQL path (no shadow attached).
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         let now = Utc::now().to_rfc3339();
@@ -1101,6 +1456,33 @@ impl TaskRuntimeStore {
     /// review-informed brief. The task id is unchanged so downstream
     /// depends_on keeps resolving. Emits a `Note` event for traceability.
     pub fn update_plan_task(&self, run_id: &str, task: &PlanTask) -> Result<(), StoreError> {
+        // U1c phase-0/0bc step-2: file authority. Validate the task exists, then
+        // emit Note{fix_task_persisted} carrying the full task body so the
+        // rebuilder can replace the task (see event_rebuild Note handler). No SQL.
+        if let Some(shadow) = &self.shadow {
+            let plan = self
+                .get_plan(run_id)?
+                .ok_or(StoreError::PlanNotFound(run_id.to_string()))?;
+            if !plan.tasks.iter().any(|t| t.id == task.id) {
+                return Err(StoreError::TaskNotFound(task.id.clone()));
+            }
+            shadow.append_event_line(
+                run_id,
+                Some(task.id.as_str()),
+                None,
+                RuntimeEventKind::Note,
+                serde_json::json!({
+                    "kind": "fix_task_persisted",
+                    "retry_count": task.retry_count,
+                    "failure_fingerprint": task.failure_fingerprint,
+                    // Full task body so events.jsonl can rebuild plan.json
+                    // (the rebuilder replaces the matching task).
+                    "task": task,
+                }),
+            )?;
+            shadow.rewrite_plan(run_id)?;
+            return Ok(());
+        }
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         tx.execute(
@@ -1136,6 +1518,7 @@ impl TaskRuntimeStore {
                 "kind": "fix_task_persisted",
                 "retry_count": task.retry_count,
                 "failure_fingerprint": task.failure_fingerprint,
+                "task": task,
             }),
         )?;
         tx.commit()?;
@@ -1145,6 +1528,32 @@ impl TaskRuntimeStore {
     // ── Reviews, artifacts, summaries ───────────────────────────────────
 
     pub fn add_review(&self, r: &ReviewResult) -> Result<(), StoreError> {
+        // U1c phase-0/0bc step-2: file authority. Review* carries the full
+        // review so FileTaskStore.list_reviews can derive it. No SQL.
+        if let Some(shadow) = &self.shadow {
+            let kind = match r.outcome {
+                ReviewOutcome::Pass => RuntimeEventKind::ReviewPassed,
+                ReviewOutcome::NeedsFix => RuntimeEventKind::ReviewNeedsFix,
+                ReviewOutcome::Blocked => RuntimeEventKind::ReviewBlocked,
+            };
+            shadow.append_event_line(
+                r.run_id.as_str(),
+                Some(r.task_id.as_str()),
+                None,
+                kind,
+                serde_json::json!({
+                    "review_id": r.id,
+                    "reviewer": r.reviewer_agent,
+                    "outcome": r.outcome.as_str(),
+                    "issues": r.issues,
+                    "failure_fingerprint": r.failure_fingerprint,
+                    "created_fix_task_id": r.created_fix_task_id,
+                    "created_at": r.created_at.to_rfc3339(),
+                }),
+            )?;
+            shadow.rewrite_plan(&r.run_id)?;
+            return Ok(());
+        }
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         tx.execute(
@@ -1175,7 +1584,15 @@ impl TaskRuntimeStore {
             Some(r.task_id.as_str()),
             None,
             kind,
-            serde_json::json!({ "review_id": r.id, "reviewer": r.reviewer_agent }),
+            serde_json::json!({
+                "review_id": r.id,
+                "reviewer": r.reviewer_agent,
+                "outcome": r.outcome.as_str(),
+                "issues": r.issues,
+                "failure_fingerprint": r.failure_fingerprint,
+                "created_fix_task_id": r.created_fix_task_id,
+                "created_at": r.created_at.to_rfc3339(),
+            }),
         )?;
         tx.commit()?;
         self.flush_shadow(&r.run_id, &conn);
@@ -1183,6 +1600,24 @@ impl TaskRuntimeStore {
     }
 
     pub fn add_artifact(&self, a: &Artifact) -> Result<(), StoreError> {
+        // U1c phase-0/0bc step-2: file authority. ArtifactProduced carries the
+        // full artifact so FileTaskStore.list_artifacts can derive it. No SQL.
+        if let Some(shadow) = &self.shadow {
+            shadow.append_event_line(
+                a.run_id.as_str(),
+                a.task_id.as_deref(),
+                None,
+                RuntimeEventKind::ArtifactProduced,
+                serde_json::json!({
+                    "artifact_id": a.id,
+                    "kind": a.kind.as_str(),
+                    "title": a.title,
+                    "task_id": a.task_id,
+                }),
+            )?;
+            shadow.rewrite_plan(&a.run_id)?;
+            return Ok(());
+        }
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         tx.execute(
@@ -1218,6 +1653,23 @@ impl TaskRuntimeStore {
     /// recovery path can tell when a summary was updated (consistent with the
     /// "every state-relevant change writes a TaskEvent" invariant).
     pub fn put_summary(&self, s: &TaskExecutionSummary) -> Result<(), StoreError> {
+        // U1c phase-0/0bc step-2: file authority. Note{summary_persisted}
+        // carries the full summary so FileTaskStore.get_summary can derive it.
+        if let Some(shadow) = &self.shadow {
+            shadow.append_event_line(
+                s.run_id.as_str(),
+                Some(s.task_id.as_str()),
+                None,
+                RuntimeEventKind::Note,
+                serde_json::json!({
+                    "kind": "summary_persisted",
+                    // Full summary so events.jsonl can rebuild plan.json task summaries.
+                    "summary": s,
+                }),
+            )?;
+            shadow.rewrite_plan(&s.run_id)?;
+            return Ok(());
+        }
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         tx.execute(
@@ -1271,6 +1723,12 @@ impl TaskRuntimeStore {
     // ── Read paths (used by Tauri query commands + recovery) ────────────
 
     pub fn get_run(&self, run_id: &str) -> Result<Option<TaskRun>, StoreError> {
+        // U1c phase-0/0bc step-2: read delegates to the file store (file authority).
+        if let Some(file) = self.file_store() {
+            return file
+                .get_run(run_id)
+                .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")));
+        }
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT run_id, workspace_id, conversation_id, root_message_id,
@@ -1287,6 +1745,13 @@ impl TaskRuntimeStore {
     /// Read just the `route` column for a given run. Returns `None` when the
     /// run does not exist.
     pub fn get_run_route(&self, run_id: &str) -> Result<Option<String>, StoreError> {
+        // U1c phase-0/0bc step-2: delegate to file store, project the route field.
+        if let Some(file) = self.file_store() {
+            return file
+                .get_run(run_id)
+                .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")))
+                .map(|r| r.map(|r| r.route));
+        }
         let conn = self.lock()?;
         let mut stmt = conn.prepare("SELECT route FROM tr_runs WHERE run_id = ?")?;
         let mut rows = stmt.query(params![run_id])?;
@@ -1301,6 +1766,11 @@ impl TaskRuntimeStore {
         &self,
         conversation_id: &str,
     ) -> Result<Option<TaskRun>, StoreError> {
+        if let Some(file) = self.file_store() {
+            return file
+                .latest_run_for_conversation(conversation_id)
+                .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")));
+        }
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT run_id, workspace_id, conversation_id, root_message_id,
@@ -1323,6 +1793,11 @@ impl TaskRuntimeStore {
         &self,
         conversation_id: &str,
     ) -> Result<Option<TaskRun>, StoreError> {
+        if let Some(file) = self.file_store() {
+            return file
+                .find_in_progress_run_by_conversation(conversation_id)
+                .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")));
+        }
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT run_id, workspace_id, conversation_id, root_message_id,
@@ -1339,6 +1814,11 @@ impl TaskRuntimeStore {
     }
 
     pub fn list_runs_in(&self, statuses: &[TaskRunStatus]) -> Result<Vec<TaskRun>, StoreError> {
+        if let Some(file) = self.file_store() {
+            return file
+                .list_runs_in(statuses)
+                .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")));
+        }
         let conn = self.lock()?;
         if statuses.is_empty() {
             return Ok(Vec::new());
@@ -1424,6 +1904,11 @@ impl TaskRuntimeStore {
     }
 
     pub fn get_plan(&self, run_id: &str) -> Result<Option<TaskPlan>, StoreError> {
+        if let Some(file) = self.file_store() {
+            return file
+                .get_plan(run_id)
+                .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")));
+        }
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT plan_id, run_id, domain_profile, goal, assumptions, risks, execution_mode
@@ -1458,6 +1943,11 @@ impl TaskRuntimeStore {
     }
 
     pub fn list_todos(&self, run_id: &str) -> Result<Vec<TodoItem>, StoreError> {
+        if let Some(file) = self.file_store() {
+            return file
+                .list_todos(run_id)
+                .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")));
+        }
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT id, run_id, task_id, title, status, owner_agent,
@@ -1485,6 +1975,11 @@ impl TaskRuntimeStore {
         run_id: &str,
         since_seq: i64,
     ) -> Result<Vec<RuntimeTaskEvent>, StoreError> {
+        if let Some(file) = self.file_store() {
+            return file
+                .list_events(run_id, since_seq)
+                .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")));
+        }
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT seq, run_id, task_id, step_id, event_type, payload, timestamp
@@ -1533,6 +2028,11 @@ impl TaskRuntimeStore {
     }
 
     pub fn list_artifacts(&self, run_id: &str) -> Result<Vec<Artifact>, StoreError> {
+        if let Some(file) = self.file_store() {
+            return file
+                .list_artifacts(run_id)
+                .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")));
+        }
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT id, run_id, task_id, kind, title, path, metadata
@@ -1558,6 +2058,14 @@ impl TaskRuntimeStore {
         run_id: &str,
         task_id: &str,
     ) -> Result<Vec<ReviewResult>, StoreError> {
+        if let Some(file) = self.file_store() {
+            // FileTaskStore.list_reviews returns all reviews for a run; filter
+            // by task_id to match the SQL signature.
+            return file
+                .list_reviews(run_id)
+                .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")))
+                .map(|rs| rs.into_iter().filter(|r| r.task_id == task_id).collect());
+        }
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT id, run_id, task_id, reviewer_agent, outcome, issues,
@@ -1586,6 +2094,11 @@ impl TaskRuntimeStore {
         run_id: &str,
         task_id: &str,
     ) -> Result<Option<TaskExecutionSummary>, StoreError> {
+        if let Some(file) = self.file_store() {
+            return file
+                .get_summary(run_id, task_id)
+                .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")));
+        }
         let conn = self.lock()?;
         let mut stmt = conn.prepare(
             "SELECT run_id, task_id, worker_agent, completed_work, files_read,
@@ -1629,6 +2142,18 @@ impl TaskRuntimeStore {
         task_id: Option<&str>,
         message: &str,
     ) -> Result<(), StoreError> {
+        // U1c phase-0/0bc step-2: file authority.
+        if let Some(shadow) = &self.shadow {
+            shadow.append_event_line(
+                run_id,
+                task_id,
+                None,
+                RuntimeEventKind::Note,
+                serde_json::json!({ "message": message }),
+            )?;
+            shadow.rewrite_plan(run_id)?;
+            return Ok(());
+        }
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         append_event_tx(
@@ -1658,6 +2183,56 @@ impl TaskRuntimeStore {
         title: &str,
         payload: serde_json::Value,
     ) -> Result<(), StoreError> {
+        // U1c phase-0/0bc step-2: the event goes to the file authority; the
+        // usage record stays in SQL (usage.db is NOT lightweighted, see spec).
+        if let Some(shadow) = &self.shadow {
+            shadow.append_event_line(
+                run_id,
+                Some(task_id),
+                Some(worker_id),
+                RuntimeEventKind::WorkerLlmUsage,
+                serde_json::json!({
+                    "worker_id": worker_id,
+                    "agent_name": agent_name,
+                    "title": title,
+                    "usage": payload.clone(),
+                }),
+            )?;
+            shadow.rewrite_plan(run_id)?;
+            // Still persist the usage row in SQL (usage is not lightweighted).
+            let conn = self.lock()?;
+            conn.execute(
+                "INSERT OR REPLACE INTO tr_usage_records
+                 (id, session_id, run_id, worker_id, model, provider, route_kind,
+                  input_tokens, output_tokens, cached_input_tokens, cache_creation_input_tokens,
+                  usage_reported, system_prompt_hash, tools_schema_hash, cwd_hash,
+                  worker_prompt_hash, created_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+                params![
+                    uuid::Uuid::new_v4().to_string(),
+                    json_string(&payload, "session_id").unwrap_or_else(|| run_id.to_string()),
+                    run_id,
+                    worker_id,
+                    json_string(&payload, "model").unwrap_or_else(|| "unknown".to_string()),
+                    json_string(&payload, "provider"),
+                    json_string(&payload, "route_kind")
+                        .or_else(|| Some("task_runtime".to_string())),
+                    json_u64(&payload, "prompt_tokens") as i64,
+                    json_u64(&payload, "completion_tokens") as i64,
+                    json_u64(&payload, "cached_prompt_tokens") as i64,
+                    json_u64(&payload, "cache_creation_prompt_tokens") as i64,
+                    json_bool(&payload, "usage_reported", true) as i32,
+                    json_string(&payload, "system_prompt_hash"),
+                    json_string(&payload, "tools_schema_hash"),
+                    json_string(&payload, "cwd_hash"),
+                    json_string(&payload, "worker_prompt_hash"),
+                    Utc::now().to_rfc3339(),
+                ],
+            )?;
+            return Ok(());
+        }
+
+        // Legacy SQL path (no shadow attached): event + usage both in SQL.
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         append_event_tx(
@@ -1691,8 +2266,8 @@ impl TaskRuntimeStore {
                 json_u64(&payload, "prompt_tokens") as i64,
                 json_u64(&payload, "completion_tokens") as i64,
                 json_u64(&payload, "cached_prompt_tokens") as i64,
-                json_u64(&payload, "cache_creation_prompt_tokens") as i64,
-                json_bool(&payload, "usage_reported", true) as i32,
+                json_u64(&payload, "cache_creation_input_tokens") as i64,
+                json_bool(&payload, "usage_reported", true),
                 json_string(&payload, "system_prompt_hash"),
                 json_string(&payload, "tools_schema_hash"),
                 json_string(&payload, "cwd_hash"),
@@ -1944,6 +2519,58 @@ mod tests {
 
     fn fresh() -> TaskRuntimeStore {
         TaskRuntimeStore::new_in_memory().expect("in-memory store")
+    }
+
+    /// Test helper: count rows in `tr_runs` for `run_id` directly via SQL.
+    /// Used by the 0bc step-2 tests to prove the write authority has moved to
+    /// files (a file-authority `create_run` must NOT insert into tr_runs).
+    fn sql_run_row_count(s: &TaskRuntimeStore, run_id: &str) -> i64 {
+        let conn = s.conn.lock().expect("lock");
+        conn.query_row(
+            "SELECT COUNT(*) FROM tr_runs WHERE run_id = ?",
+            params![run_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(0)
+    }
+
+    /// 0bc step-2: `create_run` writes the file authority only — it must NOT
+    /// insert into the SQL `tr_runs` table (SQL stays as a non-writing
+    /// fallback). Yet `get_run` still reads the run back (from the file). This
+    /// is the core proof that write authority moved to files.
+    #[test]
+    fn create_run_writes_file_not_sql() {
+        let s = fresh();
+        let run = s
+            .create_run(
+                "r1",
+                "ws",
+                "c1",
+                "m1",
+                DomainProfile::AiCoding,
+                "review runtime",
+                "complex",
+            )
+            .unwrap();
+        assert_eq!(run.run_id, "r1");
+
+        // SQL must NOT have the run (write authority is the file).
+        assert_eq!(
+            sql_run_row_count(&s, "r1"),
+            0,
+            "create_run must not write SQL tr_runs (file is write authority)"
+        );
+
+        // But get_run reads it back — from the file.
+        let read_back = s.get_run("r1").unwrap().expect("run readable from file");
+        assert_eq!(read_back.run_id, "r1");
+        assert_eq!(read_back.goal, "review runtime");
+        assert_eq!(read_back.route, "complex");
+
+        // And list_events (file) shows the RunCreated event.
+        let evs = s.list_events("r1", 0).unwrap();
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].event_type, RuntimeEventKind::RunCreated);
     }
 
     #[test]

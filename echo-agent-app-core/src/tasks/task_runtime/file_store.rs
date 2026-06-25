@@ -50,6 +50,65 @@ impl FileTaskStore {
         Ok(self.load(run_id)?.map(|l| l.plan.run))
     }
 
+    /// Enumerate every run under root, returning the run headers ordered by
+    /// `created_at` descending (matching SQL `list_runs_in` ordering). Replaces
+    /// `SELECT ... FROM tr_runs ORDER BY created_at DESC`.
+    pub fn list_runs(&self) -> Result<Vec<TaskRun>, FileReadError> {
+        let mut runs = Vec::new();
+        for run_id in self.shadow.list_run_ids()? {
+            if let Some(run) = self.get_run(&run_id)? {
+                runs.push(run);
+            }
+        }
+        // Descending by created_at (stable on ties, matching SQL behavior closely
+        // enough for the run-list UI; exact tie-break is not load-bearing here).
+        runs.sort_by_key(|a| std::cmp::Reverse(a.created_at));
+        Ok(runs)
+    }
+
+    /// Most recent run for a conversation (replaces
+    /// `SELECT ... WHERE conversation_id = ? ORDER BY created_at DESC LIMIT 1`).
+    pub fn latest_run_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<TaskRun>, FileReadError> {
+        Ok(self
+            .list_runs()?
+            .into_iter()
+            .find(|r| r.conversation_id == conversation_id))
+    }
+
+    /// Find an in-progress (Running or Paused) run for a conversation, if any.
+    /// Replaces `WHERE conversation_id = ? AND status IN ('running','paused')`.
+    pub fn find_in_progress_run_by_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<TaskRun>, FileReadError> {
+        Ok(self.list_runs()?.into_iter().find(|r| {
+            r.conversation_id == conversation_id
+                && matches!(
+                    r.status,
+                    super::types::TaskRunStatus::Running | super::types::TaskRunStatus::Paused
+                )
+        }))
+    }
+
+    /// Runs whose status is in `statuses` (replaces
+    /// `WHERE status IN (...)`). Empty `statuses` → empty result.
+    pub fn list_runs_in(
+        &self,
+        statuses: &[super::types::TaskRunStatus],
+    ) -> Result<Vec<TaskRun>, FileReadError> {
+        if statuses.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .list_runs()?
+            .into_iter()
+            .filter(|r| statuses.contains(&r.status))
+            .collect())
+    }
+
     pub fn get_plan(&self, run_id: &str) -> Result<Option<TaskPlan>, FileReadError> {
         Ok(self.load(run_id)?.map(|l| {
             // RebuiltPlan.plan has tasks=empty; attach the rebuilt tasks so the
@@ -162,10 +221,23 @@ impl FileTaskStore {
                         RuntimeEventKind::ReviewNeedsFix => super::types::ReviewOutcome::NeedsFix,
                         _ => super::types::ReviewOutcome::Blocked,
                     },
-                    issues: Vec::new(),
-                    failure_fingerprint: None,
-                    created_fix_task_id: None,
-                    created_at: e.timestamp,
+                    issues: p
+                        .get("issues")
+                        .and_then(|v| serde_json::from_value(v.clone()).ok())
+                        .unwrap_or_default(),
+                    failure_fingerprint: p
+                        .get("failure_fingerprint")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    created_fix_task_id: p
+                        .get("created_fix_task_id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    created_at: p
+                        .get("created_at")
+                        .and_then(|v| v.as_str())
+                        .and_then(parse_rfc3339)
+                        .unwrap_or(e.timestamp),
                     task_id: e.task_id.clone().unwrap_or_default(),
                 })
             })
@@ -289,7 +361,7 @@ mod tests {
     use super::*;
     use crate::tasks::task_runtime::store::TaskRuntimeStore;
     use crate::tasks::task_runtime::types::{
-        DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, TaskPlan,
+        DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, TaskPlan, TaskRunStatus,
     };
     use std::sync::Arc;
 
@@ -400,5 +472,86 @@ mod tests {
         let sql_ev = store.list_events("r1", 0).unwrap();
         let file_ev = file.list_events("r1", 0).unwrap();
         assert_eq!(sql_ev.len(), file_ev.len());
+    }
+
+    // ── 0bc step-2: collection-query read API (replaces SQL WHERE/ORDER BY) ──
+
+    /// `list_runs` enumerates every run directory under root and returns the run
+    /// headers, ordered by created_at descending (matching SQL `list_runs_in`
+    /// ordering). Drives a store with two runs and asserts both surface.
+    #[test]
+    fn list_runs_enumerates_all_runs_desc_by_created() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shadow = Arc::new(FileTaskShadow::new(tmp.path()));
+        let mut store = TaskRuntimeStore::new_in_memory().unwrap();
+        store.attach_shadow(shadow.clone());
+        store
+            .create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g1", "")
+            .unwrap();
+        store
+            .create_run("r2", "ws", "c2", "m2", DomainProfile::General, "g2", "")
+            .unwrap();
+
+        let file = FileTaskStore::new((*shadow).clone());
+        let runs = file.list_runs().unwrap();
+        assert_eq!(runs.len(), 2);
+        let ids: Vec<_> = runs.iter().map(|r| r.run_id.as_str()).collect();
+        assert!(ids.contains(&"r1"));
+        assert!(ids.contains(&"r2"));
+    }
+
+    /// `latest_run_for_conversation` returns the most recent run for a
+    /// conversation; `find_in_progress_run_by_conversation` returns one only
+    /// if it is Running/Paused.
+    #[test]
+    fn conversation_queries_filter_and_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shadow = Arc::new(FileTaskShadow::new(tmp.path()));
+        let mut store = TaskRuntimeStore::new_in_memory().unwrap();
+        store.attach_shadow(shadow.clone());
+        store
+            .create_run("r1", "ws", "cX", "m1", DomainProfile::General, "g1", "")
+            .unwrap();
+        store
+            .create_run("r2", "ws", "cX", "m2", DomainProfile::General, "g2", "")
+            .unwrap();
+        // r1 Running, r2 Pending — latest is r2 (newer), in-progress is r1.
+        store.transition_run("r1", TaskRunStatus::Running).unwrap();
+
+        let file = FileTaskStore::new((*shadow).clone());
+        let latest = file.latest_run_for_conversation("cX").unwrap();
+        assert_eq!(latest.as_ref().map(|r| r.run_id.as_str()), Some("r2"));
+        let in_prog = file.find_in_progress_run_by_conversation("cX").unwrap();
+        assert_eq!(in_prog.as_ref().map(|r| r.run_id.as_str()), Some("r1"));
+        // Different conversation → none.
+        assert!(file.latest_run_for_conversation("other").unwrap().is_none());
+    }
+
+    /// `list_runs_in` filters by status set.
+    #[test]
+    fn list_runs_in_filters_by_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shadow = Arc::new(FileTaskShadow::new(tmp.path()));
+        let mut store = TaskRuntimeStore::new_in_memory().unwrap();
+        store.attach_shadow(shadow.clone());
+        store
+            .create_run("r1", "ws", "c1", "m1", DomainProfile::General, "g1", "")
+            .unwrap();
+        store
+            .create_run("r2", "ws", "c2", "m2", DomainProfile::General, "g2", "")
+            .unwrap();
+        store.transition_run("r1", TaskRunStatus::Running).unwrap();
+        store
+            .transition_run("r1", TaskRunStatus::Completed)
+            .unwrap();
+        // r1 Completed, r2 Pending.
+
+        let file = FileTaskStore::new((*shadow).clone());
+        let completed = file.list_runs_in(&[TaskRunStatus::Completed]).unwrap();
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].run_id, "r1");
+        let pending = file.list_runs_in(&[TaskRunStatus::Pending]).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].run_id, "r2");
     }
 }

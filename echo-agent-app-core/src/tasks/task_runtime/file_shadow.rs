@@ -93,6 +93,129 @@ impl FileTaskShadow {
         Ok(())
     }
 
+    // ── 0bc step-2: file-authority write path (replaces SQL INSERT + flush) ──
+
+    /// Append one enriched event to `events.jsonl` for `run_id`, assigning it
+    /// the next seq (1-based, = current line count + 1). Returns the fully
+    /// formed `RuntimeTaskEvent` (with seq + timestamp) that was written.
+    ///
+    /// This is the file-authority write primitive: store write methods call
+    /// this instead of `INSERT INTO tr_events`, then call [`rewrite_plan`] to
+    /// refresh the `plan.json` snapshot. seq is per-run (each run has its own
+    /// `events.jsonl`), so appending to run B does not advance run A's seq.
+    ///
+    /// Atomicity: the append is serialized by the store mutex (single writer),
+    /// and the line is written with a trailing newline. A crash mid-append can
+    /// at worst lose the last partial line — `read_events` skips empty lines
+    /// and a future hardening pass (gate 2) will truncate a partial tail.
+    pub fn append_event_line(
+        &self,
+        run_id: &str,
+        task_id: Option<&str>,
+        step_id: Option<&str>,
+        event_type: super::types::RuntimeEventKind,
+        payload: serde_json::Value,
+    ) -> Result<RuntimeTaskEvent, ShadowError> {
+        let dir = self.run_dir(run_id);
+        std::fs::create_dir_all(&dir).map_err(|e| ShadowError::Io(e.to_string()))?;
+
+        // seq = current line count + 1 (1-based). Reading the existing file
+        // makes seq self-healing across restarts — no in-memory counter needed.
+        let next_seq = self.next_seq(run_id)?;
+
+        let event = RuntimeTaskEvent {
+            seq: next_seq,
+            run_id: run_id.to_string(),
+            task_id: task_id.map(str::to_string),
+            step_id: step_id.map(str::to_string),
+            event_type,
+            payload,
+            timestamp: chrono::Utc::now(),
+        };
+
+        // Append one JSON line. Ensure a trailing newline so the file is a
+        // well-formed JSONL stream (each event on its own line).
+        let mut line =
+            serde_json::to_string(&event).map_err(|e| ShadowError::Encode(e.to_string()))?;
+        line.push('\n');
+        append_line(&self.events_path(run_id), line.as_bytes())
+            .map_err(|e| ShadowError::Io(e.to_string()))?;
+        Ok(event)
+    }
+
+    /// Rebuild `plan.json` for `run_id` from its full `events.jsonl` stream.
+    /// Called by store write methods after `append_event_line` to refresh the
+    /// snapshot. Uses tmp+rename (atomic on the same filesystem).
+    ///
+    /// If the event stream has no `RunCreated` yet (e.g. an orphan review
+    /// written before the run was created — SQL tolerated this), there is no
+    /// plan to snapshot, so this is a no-op rather than an error. The events
+    /// themselves are still durably appended to `events.jsonl`.
+    pub fn rewrite_plan(&self, run_id: &str) -> Result<(), ShadowError> {
+        let events = self.read_events(run_id)?;
+        if events.is_empty() {
+            return Ok(());
+        }
+        let rebuilt = match rebuild_plan_from_events(&events) {
+            Ok(r) => r,
+            Err(super::event_rebuild::RebuildError::NoRunCreated) => {
+                // No run header yet — nothing to snapshot. Events are still
+                // authoritative on disk; plan.json will be written once a
+                // RunCreated event lands.
+                return Ok(());
+            }
+        };
+        let plan_json = serde_json::to_string_pretty(&rebuilt)
+            .map_err(|e| ShadowError::Encode(e.to_string()))?;
+        std::fs::create_dir_all(self.run_dir(run_id))
+            .map_err(|e| ShadowError::Io(e.to_string()))?;
+        atomic_write(&self.plan_path(run_id), plan_json.as_bytes())
+            .map_err(|e| ShadowError::Io(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Compute the next seq for `run_id`: current event count + 1 (1-based).
+    /// Returns 1 if the file does not exist yet.
+    fn next_seq(&self, run_id: &str) -> Result<i64, ShadowError> {
+        Ok(self.read_events(run_id)?.len() as i64 + 1)
+    }
+
+    /// Enumerate every run_id known to the file store: the directory names
+    /// under `root` that contain an `events.jsonl` (or `plan.json`). Used by
+    /// the collection-query read API (`list_runs` / `list_runs_in` / etc.) that
+    /// replaces SQL `SELECT ... FROM tr_runs WHERE ...`.
+    pub fn list_run_ids(&self) -> Result<Vec<String>, ShadowError> {
+        let mut ids = Vec::new();
+        let read_dir = match std::fs::read_dir(&self.root) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(ShadowError::Io(e.to_string())),
+        };
+        for entry in read_dir {
+            let entry = entry.map_err(|e| ShadowError::Io(e.to_string()))?;
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            // A run dir is one that has events.jsonl or plan.json.
+            let has_events = path.join("events.jsonl").exists();
+            let has_plan = path.join("plan.json").exists();
+            if !has_events && !has_plan {
+                continue;
+            }
+            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                ids.push(name.to_string());
+            }
+        }
+        Ok(ids)
+    }
+
+    /// The root path this shadow writes under (used by FileTaskStore to share
+    /// the same root for enumeration).
+    pub fn root_path(&self) -> &Path {
+        &self.root
+    }
+
     /// Read the shadow plan.json for parity comparison. Returns None if not yet written.
     pub fn read_plan(&self, run_id: &str) -> Result<Option<RebuiltPlan>, ShadowError> {
         let path = self.plan_path(run_id);
@@ -153,6 +276,20 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Append `bytes` (one JSONL line, including trailing newline) to `path`.
+/// Creates the file if it does not exist. Uses `O_APPEND` so concurrent
+/// appends (if any) do not interleave within a single write(2) call.
+fn append_line(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    Ok(())
+}
+
 // `Mutex` import retained for future per-run append-lock; the current shadow uses
 // full-rewrite which is already serialized by the single `TaskRuntimeStore` mutex.
 #[allow(dead_code)]
@@ -165,8 +302,8 @@ mod tests {
     use super::*;
     use crate::tasks::task_runtime::store::TaskRuntimeStore;
     use crate::tasks::task_runtime::types::{
-        DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, TaskPatch, TaskPlan, TaskRunStatus,
-        TodoStatus,
+        DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, RuntimeEventKind, TaskPatch,
+        TaskPlan, TaskRunStatus, TodoStatus,
     };
     use std::sync::Arc;
 
@@ -368,13 +505,19 @@ mod tests {
             )
             .unwrap();
         assert_parity(&store, &shadow, "r1");
-        // Remove t2.
+        // Remove t2 — soft delete: the task stays in the plan but is marked
+        // Skipped (matching SQL `remove_task`, which sets status=Skipped and
+        // keeps the row). Hard-deleting would diverge from `list_todos`.
         store.remove_task("r1", "t2").unwrap();
         assert_parity(&store, &shadow, "r1");
-        // After remove, file plan should have 2 tasks (t3, t1).
         let file_plan = shadow.read_plan("r1").unwrap().unwrap();
-        assert_eq!(file_plan.tasks.len(), 2);
-        assert!(file_plan.tasks.iter().all(|t| t.id != "t2"));
+        assert_eq!(file_plan.tasks.len(), 3, "soft delete keeps the task");
+        let t2 = file_plan
+            .tasks
+            .iter()
+            .find(|t| t.id == "t2")
+            .expect("t2 still present after soft delete");
+        assert_eq!(t2.status, TodoStatus::Skipped);
     }
 
     /// Parity across multiple runs: events and plans must not cross-contaminate.
@@ -462,5 +605,113 @@ mod tests {
         let p = shadow.read_plan("r1").unwrap().unwrap();
         assert_eq!(p.tasks.len(), 1);
         assert_eq!(p.tasks[0].id, "t1");
+    }
+
+    // ── 0bc step-2: incremental append API (file becomes write authority) ──
+
+    /// `append_event` writes one event line to events.jsonl with a seq derived
+    /// from the current line count (1-based, monotonically increasing), and
+    /// `rewrite_plan` rebuilds plan.json from the full event stream. This is
+    /// the file-authority path that replaces SQL INSERT + flush_shadow.
+    #[test]
+    fn append_event_assigns_incremental_seq_and_rewinds_plan() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shadow = FileTaskShadow::new(tmp.path());
+
+        // No RunCreated yet — append three events and check seq + plan rebuild.
+        let e1 = shadow
+            .append_event_line(
+                "r1",
+                None,
+                None,
+                RuntimeEventKind::RunCreated,
+                serde_json::json!({
+                    "goal": "g", "domain_profile": "general",
+                    "workspace_id": "ws", "conversation_id": "c1",
+                    "root_message_id": "m1", "route": "", "created_at": "2026-06-25T00:00:00Z",
+                }),
+            )
+            .unwrap();
+        let e2 = shadow
+            .append_event_line(
+                "r1",
+                None,
+                None,
+                RuntimeEventKind::PlanGenerated,
+                serde_json::json!({
+                    "plan_id": "p1", "task_count": 0,
+                    "domain_profile": "general", "goal": "g",
+                    "assumptions": [], "risks": [],
+                    "execution_mode": "parallel", "tasks": [],
+                }),
+            )
+            .unwrap();
+        let e3 = shadow
+            .append_event_line(
+                "r1",
+                Some("t1"),
+                None,
+                RuntimeEventKind::TaskStarted,
+                serde_json::json!({ "status": "running", "owner_agent": "explorer" }),
+            )
+            .unwrap();
+
+        // seq is 1-based, monotonically increasing per run.
+        assert_eq!(e1.seq, 1);
+        assert_eq!(e2.seq, 2);
+        assert_eq!(e3.seq, 3);
+
+        // read_events returns all three in seq order.
+        let read_back = shadow.read_events("r1").unwrap();
+        assert_eq!(read_back.len(), 3);
+        assert_eq!(read_back[0].seq, 1);
+        assert_eq!(read_back[2].event_type, RuntimeEventKind::TaskStarted);
+
+        // rewrite_plan produces a plan.json reflecting the event stream.
+        shadow.rewrite_plan("r1").unwrap();
+        let plan = shadow.read_plan("r1").unwrap().unwrap();
+        assert_eq!(plan.run.run_id, "r1");
+        assert_eq!(plan.run.goal, "g");
+        assert_eq!(plan.plan.plan_id, "p1");
+    }
+
+    /// A second run's events must not perturb the first run's seq or plan —
+    /// seq is per-run (each run has its own events.jsonl).
+    #[test]
+    fn append_event_seq_is_per_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shadow = FileTaskShadow::new(tmp.path());
+
+        let a1 = shadow
+            .append_event_line(
+                "rA",
+                None,
+                None,
+                RuntimeEventKind::RunCreated,
+                serde_json::json!({}),
+            )
+            .unwrap();
+        let b1 = shadow
+            .append_event_line(
+                "rB",
+                None,
+                None,
+                RuntimeEventKind::RunCreated,
+                serde_json::json!({}),
+            )
+            .unwrap();
+        let a2 = shadow
+            .append_event_line(
+                "rA",
+                None,
+                None,
+                RuntimeEventKind::RunStatusChanged,
+                serde_json::json!({}),
+            )
+            .unwrap();
+
+        assert_eq!(a1.seq, 1);
+        assert_eq!(a2.seq, 2); // rA's second event, not affected by rB
+        assert_eq!(b1.seq, 1); // rB starts at 1
     }
 }
