@@ -189,12 +189,16 @@ export function handleChatEvent(
         const VALID_STATUSES = [
           'idle', 'running', 'thinking', 'using_tool',
           'waiting_approval', 'waiting_input',
+          'completed', 'failed', 'cancelled',
         ] as const;
         const validated = VALID_STATUSES.includes(status as (typeof VALID_STATUSES)[number])
           ? (status as (typeof VALID_STATUSES)[number])
           : 'idle';
         store.setRunStatus(validated);
-        // NEW: Also update taskRuntimeStore so the right rail reflects terminal status
+        // Also update taskRuntimeStore so the right rail reflects terminal
+        // status. Without 'completed'/'failed'/'cancelled' in the allowlist,
+        // updateRunStatus would never see a terminal state and polling
+        // would never stop.
         import('../stores/taskRuntimeStore').then(({ useTaskRuntimeStore }) => {
           const taskStore = useTaskRuntimeStore.getState();
           if (taskStore.activeRun) {

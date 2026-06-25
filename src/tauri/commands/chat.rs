@@ -1214,6 +1214,20 @@ async fn route_complex_task(
     //    controls execute_plan tool behavior (e.g. ComplexRuntime approval).
     store.transition_run(&run_id, TaskRunStatus::Running)?;
     let cancel = echo_agent::agent::CancellationToken::new();
+
+    // G2 fix: Register the cancel token in session.cancel_token[message_key]
+    // so that cancel_chat(message_key) — the command the GUI "stop" button
+    // calls — can fire it. Without this, cancel_chat finds nothing for complex
+    // runs (the token was only in run_cancel_tokens["__run__:{run_id}"], a
+    // separate map), so subagents keep running after the user hits stop.
+    // launch_unified_run derives a child_token from this parent, so firing
+    // here propagates to the main agent stream + all workers.
+    state
+        .app_state
+        .session
+        .cancel_token
+        .insert(message_key.clone(), cancel.clone());
+
     launch_unified_run(
         app.clone(),
         state,
@@ -1313,10 +1327,23 @@ async fn launch_unified_run(
         // Construct a trace_sink that forwards WorkerTraceEvent to the frontend.
         // This reconnects the trace channel so execute_plan can send worker
         // trace events through the task-local mechanism (F1 fix).
+        //
+        // G1 fix: rewrite run_id for "main" worker events. chat_trace_event
+        // hardcodes run_id=message_key, but the frontend filters workers by
+        // activeRun.run_id (the TaskRuntime run_id). Without this rewrite,
+        // the main agent's usage/token events are filtered out → the Token/Cache
+        // card only shows subagent data. By rewriting main-agent events to
+        // carry the TaskRuntime run_id, the frontend aggregator sees all agents.
         let app_for_sink = app_handle.clone();
         let msg_key_for_sink = event_message_key.clone();
+        let run_id_for_sink = run_id_owned.clone();
         let trace_sink: Option<std::sync::Arc<dyn Fn(WorkerTraceEvent) + Send + Sync>> =
             Some(std::sync::Arc::new(move |mut event| {
+                // Rewrite run_id for main-agent events so they land under the
+                // TaskRuntime run_id (frontend filters by activeRun.run_id).
+                if event.worker_id.as_deref() == Some("main") {
+                    event.run_id = run_id_for_sink.clone();
+                }
                 if event.message_id.is_none() {
                     event.message_id = Some(msg_key_for_sink.clone());
                 }
@@ -1404,6 +1431,7 @@ async fn launch_unified_run(
                                         &trace_session_id,
                                         &trace_collector,
                                         usage_store.as_ref(),
+                                        &run_id_owned,
                                     );
                                     if let Some(ce) = chat_event {
                                         if !emit_chat_event(
@@ -1528,6 +1556,10 @@ async fn launch_unified_run(
 
 /// Map an AgentEvent to a ChatEvent, also emitting worker://trace side effects.
 /// Returns None for events that should be silently ignored.
+///
+/// G1 fix: `run_id` is the TaskRuntime run_id. Worker trace events for the
+/// main agent carry this run_id (not message_key) so the frontend aggregator
+/// (which filters by activeRun.run_id) sees the main agent's token/usage data.
 fn agent_event_to_chat_event(
     app: &tauri::AppHandle,
     event: &AgentEvent,
@@ -1538,16 +1570,24 @@ fn agent_event_to_chat_event(
     _usage_store: Option<
         &std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
     >,
+    run_id: &str,
 ) -> Option<ChatEvent> {
+    // Local helper: like chat_trace_event but uses the TaskRuntime run_id
+    // so main-agent events land under the correct run in the frontend.
+    let trace = |event_type, payload| {
+        emit_worker_trace_event(
+            app,
+            WorkerTraceEvent::for_worker(run_id, "main", event_type, payload)
+                .with_agent("echo-assistant")
+                .with_title("Assistant")
+                .with_message_id(message_key),
+        )
+    };
     match event {
         AgentEvent::Token(data) => {
-            emit_worker_trace_event(
-                app,
-                chat_trace_event(
-                    message_key,
-                    WorkerTraceEventKind::WorkerTokenDelta,
-                    serde_json::json!({ "content": data }),
-                ),
+            trace(
+                WorkerTraceEventKind::WorkerTokenDelta,
+                serde_json::json!({ "content": data }),
             );
             Some(ChatEvent::Token { data: data.clone() })
         }
@@ -1560,13 +1600,9 @@ fn agent_event_to_chat_event(
                 message_key,
                 conversation_id,
             );
-            emit_worker_trace_event(
-                app,
-                chat_trace_event(
-                    message_key,
-                    WorkerTraceEventKind::WorkerThinkingStart,
-                    serde_json::json!({}),
-                ),
+            trace(
+                WorkerTraceEventKind::WorkerThinkingStart,
+                serde_json::json!({}),
             );
             Some(ChatEvent::ThinkingStart)
         }
@@ -1574,16 +1610,12 @@ fn agent_event_to_chat_event(
             prompt_tokens,
             completion_tokens,
         } => {
-            emit_worker_trace_event(
-                app,
-                chat_trace_event(
-                    message_key,
-                    WorkerTraceEventKind::WorkerThinkingEnd,
-                    serde_json::json!({
-                        "prompt_tokens": prompt_tokens,
-                        "completion_tokens": completion_tokens
-                    }),
-                ),
+            trace(
+                WorkerTraceEventKind::WorkerThinkingEnd,
+                serde_json::json!({
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens
+                }),
             );
             Some(ChatEvent::ThinkingEnd {
                 prompt_tokens: *prompt_tokens,
@@ -1599,21 +1631,17 @@ fn agent_event_to_chat_event(
             cache_creation_prompt_tokens,
             usage_reported,
         } => {
-            emit_worker_trace_event(
-                app,
-                chat_trace_event(
-                    message_key,
-                    WorkerTraceEventKind::WorkerLlmUsage,
-                    serde_json::json!({
-                        "model": model.clone(),
-                        "prompt_tokens": prompt_tokens,
-                        "completion_tokens": completion_tokens,
-                        "total_tokens": total_tokens,
-                        "cached_prompt_tokens": cached_prompt_tokens,
-                        "cache_creation_prompt_tokens": cache_creation_prompt_tokens,
-                        "usage_reported": usage_reported
-                    }),
-                ),
+            trace(
+                WorkerTraceEventKind::WorkerLlmUsage,
+                serde_json::json!({
+                "model": model.clone(),
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": total_tokens,
+                    "cached_prompt_tokens": cached_prompt_tokens,
+                    "cache_creation_prompt_tokens": cache_creation_prompt_tokens,
+                    "usage_reported": usage_reported
+                }),
             );
             Some(ChatEvent::LlmUsage {
                 model: model.clone(),
@@ -1634,13 +1662,9 @@ fn agent_event_to_chat_event(
                 message_key,
                 conversation_id,
             );
-            emit_worker_trace_event(
-                app,
-                chat_trace_event(
-                    message_key,
-                    WorkerTraceEventKind::WorkerToolStart,
-                    serde_json::json!({ "name": name, "args": args }),
-                ),
+            trace(
+                WorkerTraceEventKind::WorkerToolStart,
+                serde_json::json!({ "name": name, "args": args }),
             );
             Some(ChatEvent::ToolStart {
                 name: name.clone(),
@@ -1648,17 +1672,13 @@ fn agent_event_to_chat_event(
             })
         }
         AgentEvent::ToolResult { name, output } => {
-            emit_worker_trace_event(
-                app,
-                chat_trace_event(
-                    message_key,
-                    WorkerTraceEventKind::WorkerToolResult,
-                    serde_json::json!({
-                        "name": name,
-                        "result": output,
-                        "success": true
-                    }),
-                ),
+            trace(
+                WorkerTraceEventKind::WorkerToolResult,
+                serde_json::json!({
+                    "name": name,
+                    "result": output,
+                    "success": true
+                }),
             );
             Some(ChatEvent::ToolResult {
                 name: name.clone(),
@@ -1667,17 +1687,13 @@ fn agent_event_to_chat_event(
             })
         }
         AgentEvent::ToolError { name, error } => {
-            emit_worker_trace_event(
-                app,
-                chat_trace_event(
-                    message_key,
-                    WorkerTraceEventKind::WorkerToolResult,
-                    serde_json::json!({
-                        "name": name,
-                        "result": error,
-                        "success": false
-                    }),
-                ),
+            trace(
+                WorkerTraceEventKind::WorkerToolResult,
+                serde_json::json!({
+                    "name": name,
+                    "result": error,
+                    "success": false
+                }),
             );
             Some(ChatEvent::ToolResult {
                 name: name.clone(),

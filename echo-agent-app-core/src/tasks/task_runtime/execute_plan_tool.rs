@@ -213,12 +213,17 @@ impl Tool for ExecutePlanTool {
                 .unwrap_or_default();
 
             // ── §10.1: 必须 await RunOutcome, 不得 fire-and-forget ──
+            // G3 fix: read run_store from the primary agent instead of passing
+            // None. execute_run uses it to persist trace Run records (token
+            // usage, status). Without it, the execute_plan path silently drops
+            // trace persistence (event-wiring #1残留).
+            let run_store = self.primary_agent.read(|a| a.run_store.clone()).await;
             let outcome = execute_run(
                 self.store.clone(),
                 Some(self.primary_agent.clone()),
                 None, // reviewer_llm — 暂时 None, 后续由上层配置
                 None, // layer_manager — 暂时 None
-                None, // run_store — 暂时 None
+                run_store,
                 trace_sink,
                 &run_id,
                 cache_user_id,
