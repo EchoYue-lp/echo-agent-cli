@@ -21,6 +21,7 @@ pub enum PermissionMode {
 }
 
 impl PermissionMode {
+    #[allow(clippy::should_implement_trait)] // inherent helper with a Default fallback; not the FromStr trait
     pub fn from_str(value: &str) -> Self {
         match value {
             "auto-edit" | "autoedit" | "accept-edits" | "auto-approve" => Self::AutoEdit,

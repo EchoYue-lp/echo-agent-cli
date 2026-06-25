@@ -128,6 +128,7 @@ fn current_run_id() -> Option<String> {
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
+#[allow(clippy::result_large_err)] // ToolResult is the framework error type; boxing would touch every caller
 pub(crate) fn require_run_id() -> std::result::Result<String, ToolResult> {
     current_run_id().ok_or_else(|| ToolResult::error("no active run — run_id not set in context"))
 }
@@ -138,6 +139,7 @@ pub(crate) fn require_run_id() -> std::result::Result<String, ToolResult> {
 /// 的 spawn 里执行,task_local 全部丢失;但 ToolContext 是值传递(经 dispatch_fork
 /// → set_external_context → pipeline 填入),跨 spawn 安全。工具 override
 /// `execute_with_context` 后用此 helper 读 run_id,主 agent 和 worker 都能拿到。
+#[allow(clippy::result_large_err)] // ToolResult is the framework error type; boxing would touch every caller
 pub(crate) fn run_id_from_ctx_or_local(
     ctx: &echo_core::tools::ToolContext,
 ) -> std::result::Result<String, ToolResult> {
@@ -169,7 +171,7 @@ where
                 .cancel
                 .as_ref()
                 .map(|c| (**c).clone())
-                .unwrap_or_else(CancellationToken::new);
+                .unwrap_or_default();
             CURRENT_CANCEL
                 .scope(cancel, CURRENT_RUN_ID.scope(rid.clone(), f()))
                 .await
@@ -179,6 +181,7 @@ where
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)] // tool impls below are production code; reordering is pure churn
 mod tests {
     use super::*;
 

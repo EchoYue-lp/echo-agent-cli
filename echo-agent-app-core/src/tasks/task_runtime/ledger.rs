@@ -170,6 +170,8 @@ pub fn write_progress(
     let markdown = render_progress(store, run_id)?;
     let path = export_path(run_id, base);
     if let Some(parent) = path.parent() {
+        #[allow(clippy::collapsible_if)]
+        // nested let-Some/let-Err reads clearer than a let-chain here
         if let Err(e) = std::fs::create_dir_all(parent) {
             tracing::warn!(path = %path.display(), error = %e, "failed to create progress dir; export stays in-memory");
             return Ok(markdown);

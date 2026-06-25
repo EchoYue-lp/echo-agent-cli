@@ -334,9 +334,7 @@ mod tests {
                 );
             }
             assert!(
-                t.default_worker_roles
-                    .iter()
-                    .any(|&r| r == "summary_writer"),
+                t.default_worker_roles.contains(&"summary_writer"),
                 "{profile:?} profile should keep summary_writer for synthesis"
             );
         }

@@ -356,6 +356,7 @@ impl TaskRuntimeStore {
 
     /// Create a new run in `Pending` and emit `RunCreated`. Returns the
     /// created run.
+    #[allow(clippy::too_many_arguments)] // run identity + routing fields all thread through
     pub fn create_run(
         &self,
         run_id: &str,
@@ -503,6 +504,8 @@ impl TaskRuntimeStore {
     pub fn cancel_task(&self, run_id: &str, task_id: &str) {
         let key = format!("{run_id}::{task_id}");
         if let Ok(mut map) = self.task_cancel_tokens.lock() {
+            #[allow(clippy::collapsible_if)]
+            // nested let-Ok/let-Some reads clearer than a let-chain
             if let Some(token) = map.remove(&key) {
                 token.cancel();
             }
@@ -715,6 +718,8 @@ impl TaskRuntimeStore {
                 )));
             }
             TodoStatus::Running => {
+                #[allow(clippy::collapsible_match)]
+                // guard is a multi-field ||, not a single pattern; collapsing reads worse
                 if patch.kind.is_some() || patch.depends_on.is_some() || patch.agent_role.is_some()
                 {
                     return Err(StoreError::InvalidPlan(
@@ -1193,7 +1198,7 @@ impl TaskRuntimeStore {
         )?;
         let mut rows = stmt.query(params![run_id])?;
         match rows.next()? {
-            Some(row) => Ok(Some(decode_run(&row)?)),
+            Some(row) => Ok(Some(decode_run(row)?)),
             None => Ok(None),
         }
     }
@@ -1224,7 +1229,7 @@ impl TaskRuntimeStore {
         )?;
         let mut rows = stmt.query(params![conversation_id])?;
         match rows.next()? {
-            Some(row) => Ok(Some(decode_run(&row)?)),
+            Some(row) => Ok(Some(decode_run(row)?)),
             None => Ok(None),
         }
     }
@@ -1247,7 +1252,7 @@ impl TaskRuntimeStore {
         )?;
         let mut rows = stmt.query(params![conversation_id])?;
         match rows.next()? {
-            Some(row) => Ok(Some(decode_run(&row)?)),
+            Some(row) => Ok(Some(decode_run(row)?)),
             None => Ok(None),
         }
     }
@@ -1726,7 +1731,7 @@ fn load_plan_tasks_tx(
     tx: &rusqlite::Transaction<'_>,
     plan_id: &str,
 ) -> Result<Vec<PlanTask>, StoreError> {
-    load_plan_tasks(&**tx, plan_id)
+    load_plan_tasks(tx, plan_id)
 }
 
 fn load_plan_tasks(conn: &Connection, plan_id: &str) -> Result<Vec<PlanTask>, StoreError> {
@@ -1776,7 +1781,7 @@ fn load_run_for_update(
     let row = rows
         .next()?
         .ok_or(StoreError::RunNotFound(run_id.to_string()))?;
-    let run = decode_run(&row)?;
+    let run = decode_run(row)?;
     Ok((run.status.as_str().to_string(), run))
 }
 
@@ -1824,6 +1829,7 @@ fn default_db_path() -> PathBuf {
 // a state change without an event would leave the DB inconsistent.
 // We assert both rows land together.
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)] // usage-record impls below are production code kept here for locality with their tests; reordering is pure churn
 mod tests {
     use super::*;
 

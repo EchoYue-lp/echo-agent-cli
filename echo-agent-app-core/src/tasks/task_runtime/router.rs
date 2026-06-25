@@ -52,6 +52,7 @@ impl TaskRouteKind {
         }
     }
 
+    #[allow(clippy::should_implement_trait)] // inherent helper returning Option; not the FromStr trait
     pub fn from_str(s: &str) -> Option<Self> {
         Some(match s {
             "normal_chat" => Self::NormalChat,

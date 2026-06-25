@@ -29,10 +29,11 @@ use uuid::Uuid;
 /// 4. `General` fallback
 ///
 /// `General` is always first-class because many tasks declare no domain.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export, rename = "DomainProfile")]
 pub enum DomainProfile {
+    #[default]
     General,
     AiCoding,
     DataAnalysis,
@@ -52,6 +53,7 @@ impl DomainProfile {
         }
     }
 
+    #[allow(clippy::should_implement_trait)] // inherent helper returning Option; not the FromStr trait
     pub fn from_str(s: &str) -> Option<Self> {
         Some(match s {
             "general" => DomainProfile::General,
@@ -64,22 +66,17 @@ impl DomainProfile {
     }
 }
 
-impl Default for DomainProfile {
-    fn default() -> Self {
-        DomainProfile::General
-    }
-}
-
 // ── Execution mode ──────────────────────────────────────────────────────
 
 /// How the user wants a plan to execute after approval.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export, rename = "ExecutionMode")]
 pub enum ExecutionMode {
     /// Execute sequentially, one plan task at a time.
     Sequential,
     /// Execute parallel groups concurrently within the configured limits.
+    #[default]
     Parallel,
     /// Plan only — never execute until the user explicitly launches it.
     PlanOnly,
@@ -87,7 +84,7 @@ pub enum ExecutionMode {
 
 /// Manual override of how a user message should be handled.
 /// `Auto` defers to the router; the other two force a path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export, rename = "InteractionMode")]
 pub enum InteractionMode {
@@ -96,13 +93,8 @@ pub enum InteractionMode {
     /// Force TaskRuntime for the message instead of leaving it to Auto.
     Task,
     /// Auto-route: classifier decides (default).
+    #[default]
     Auto,
-}
-
-impl Default for InteractionMode {
-    fn default() -> Self {
-        InteractionMode::Auto
-    }
 }
 
 impl InteractionMode {
@@ -136,12 +128,6 @@ impl InteractionMode {
             InteractionMode::Task => "Task",
             InteractionMode::Auto => "Auto",
         }
-    }
-}
-
-impl Default for ExecutionMode {
-    fn default() -> Self {
-        ExecutionMode::Parallel
     }
 }
 
@@ -199,6 +185,7 @@ impl PlanTaskKind {
         }
     }
 
+    #[allow(clippy::should_implement_trait)] // inherent helper returning Option; not the FromStr trait
     pub fn from_str(s: &str) -> Option<Self> {
         Some(match s {
             "read_only_review" => PlanTaskKind::ReadOnlyReview,
@@ -217,10 +204,11 @@ impl PlanTaskKind {
 // ── Todo status ─────────────────────────────────────────────────────────
 
 /// Status of an individual todo / plan task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export, rename = "TodoStatus")]
 pub enum TodoStatus {
+    #[default]
     Pending,
     Running,
     Blocked,
@@ -241,6 +229,7 @@ impl TodoStatus {
         }
     }
 
+    #[allow(clippy::should_implement_trait)] // inherent helper returning Option; not the FromStr trait
     pub fn from_str(s: &str) -> Option<Self> {
         Some(match s {
             "pending" => TodoStatus::Pending,
@@ -251,12 +240,6 @@ impl TodoStatus {
             "skipped" => TodoStatus::Skipped,
             _ => return None,
         })
-    }
-}
-
-impl Default for TodoStatus {
-    fn default() -> Self {
-        TodoStatus::Pending
     }
 }
 
@@ -278,10 +261,11 @@ impl Default for TodoStatus {
 /// 极简 6 态(对齐 Claude Code/Codex:plan 审批不进状态机,用 Paused 表达)。
 /// 删去了 Planning/AwaitingPlanApproval/Ready/WaitingApproval/WaitingInput/Suspended/Cancelling
 /// —— 这些"plan 是否被批准"的语义改由编排层(L1) + Paused 承载,不进 run 状态机。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export, rename = "TaskRunStatus")]
 pub enum TaskRunStatus {
+    #[default]
     Pending,
     Running,
     Paused,
@@ -302,6 +286,7 @@ impl TaskRunStatus {
         }
     }
 
+    #[allow(clippy::should_implement_trait)] // inherent helper returning Option; not the FromStr trait
     pub fn from_str(s: &str) -> Option<Self> {
         Some(match s {
             "pending" => TaskRunStatus::Pending,
@@ -329,12 +314,6 @@ impl TaskRunStatus {
     }
 }
 
-impl Default for TaskRunStatus {
-    fn default() -> Self {
-        TaskRunStatus::Pending
-    }
-}
-
 // ── Review outcome / artifact kind / event type ─────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -354,6 +333,7 @@ impl ReviewOutcome {
             ReviewOutcome::Blocked => "blocked",
         }
     }
+    #[allow(clippy::should_implement_trait)] // inherent helper returning Option; not the FromStr trait
     pub fn from_str(s: &str) -> Option<Self> {
         Some(match s {
             "pass" => ReviewOutcome::Pass,
@@ -389,6 +369,7 @@ impl ArtifactKind {
             ArtifactKind::Other => "other",
         }
     }
+    #[allow(clippy::should_implement_trait)] // inherent helper returning Option; not the FromStr trait
     pub fn from_str(s: &str) -> Option<Self> {
         Some(match s {
             "file" => ArtifactKind::File,
@@ -575,6 +556,7 @@ impl RuntimeEventKind {
             Note => "note",
         }
     }
+    #[allow(clippy::should_implement_trait)] // inherent helper returning Option; not the FromStr trait
     pub fn from_str(s: &str) -> Option<Self> {
         use RuntimeEventKind::*;
         Some(match s {
@@ -819,6 +801,7 @@ impl IssueSeverity {
             IssueSeverity::Blocker => "blocker",
         }
     }
+    #[allow(clippy::should_implement_trait)] // inherent helper returning Option; not the FromStr trait
     pub fn from_str(s: &str) -> Option<Self> {
         Some(match s {
             "info" => IssueSeverity::Info,

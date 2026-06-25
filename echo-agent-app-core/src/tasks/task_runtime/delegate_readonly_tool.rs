@@ -121,6 +121,8 @@ impl Tool for DelegateReadonlyTool {
             // 此时必须调 execute_plan 走 run_dag(wave 调度 + 信号量限流
             // + 失败传播),不允许逐个 delegate_readonly 绕过调度层。
             if let Some(ref store) = self.store {
+                #[allow(clippy::collapsible_if)]
+                // nested let-Ok guards read clearer than a let-chain here
                 if let Ok(Some(plan)) = store.get_plan(&run_id) {
                     if !plan.tasks.is_empty() {
                         return Ok(ToolResult::error(
@@ -193,6 +195,8 @@ impl Tool for DelegateReadonlyTool {
                         let worker_trace_id = format!("{run_id_for_usage}:{role_for_usage}");
                         let task_id = format!("delegate_{}", chrono::Utc::now().timestamp_millis());
                         let title: String = task_for_usage.chars().take(80).collect();
+                        #[allow(clippy::collapsible_if)]
+                        // nested let-Some/let-Err guards the usage-record path; let-chain would obscure the match above
                         if let Err(e) = store.record_worker_llm_usage(
                             &run_id_for_usage,
                             &task_id,

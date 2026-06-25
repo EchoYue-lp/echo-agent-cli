@@ -89,13 +89,12 @@ impl EnabledSkillsConfig {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let text = serde_json::to_string_pretty(&config)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            let text = serde_json::to_string_pretty(&config).map_err(std::io::Error::other)?;
             std::fs::write(path, text)?;
             return Ok(config);
         }
         let text = std::fs::read_to_string(path)?;
-        serde_json::from_str(&text).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+        serde_json::from_str(&text).map_err(std::io::Error::other)
     }
 
     /// Write to disk.
@@ -103,8 +102,7 @@ impl EnabledSkillsConfig {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let text = serde_json::to_string_pretty(self)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let text = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
         std::fs::write(path, text)
     }
 

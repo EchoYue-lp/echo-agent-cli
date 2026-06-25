@@ -111,6 +111,7 @@ pub enum ExecError {
 /// optional `AgentPool`. Execution is driven on the provided runtime; the
 /// caller typically `tokio::spawn`s this and lets it run independently of the
 /// chat stream (so a long run does not block the GUI, per plan §4).
+#[allow(clippy::too_many_arguments)] // many typed handles + concurrency primitives; grouping would fragment the read path
 pub async fn execute_run(
     store: Arc<TaskRuntimeStore>,
     primary_agent: Option<crate::agent_handle::AgentHandle>,
@@ -341,6 +342,7 @@ pub async fn execute_run(
 pub trait TaskWorker: Send + Sync {
     /// Execute `task` for `run_id`. Returns `(task_id, summary)` on success or
     /// `(task_id, error)` on failure (matching `execute_task`'s contract).
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)] // semaphores/locks passed so mocks honor the same limits; boxed-future return is the worker contract
     fn dispatch(
         &self,
         store: Arc<TaskRuntimeStore>,
@@ -430,6 +432,7 @@ impl TaskWorker for RealTaskWorker {
 /// Core DAG loop. Maintains a frontier of ready tasks and dispatches them
 /// under the concurrency semaphores until all are done, the run is cancelled,
 /// or a task fails.
+#[allow(clippy::too_many_arguments)] // semaphores + stores + sinks all thread through; matches framework TaskExecutor style
 async fn run_dag<W: TaskWorker + 'static>(
     store: Arc<TaskRuntimeStore>,
     worker: W,
@@ -566,9 +569,7 @@ async fn run_dag<W: TaskWorker + 'static>(
         // fires every worker's select! guard. If we detect cancellation
         // mid-wave, we abort remaining handles before returning Cancelled so
         // no orphan tasks keep writing files.
-        let mut handles: Vec<
-            tokio::task::JoinHandle<Result<(String, Option<String>), (String, String)>>,
-        > = Vec::new();
+        let mut handles: Vec<_> = Vec::new();
         for task in ready {
             let store = store.clone();
             let worker = worker.clone();
@@ -600,7 +601,7 @@ async fn run_dag<W: TaskWorker + 'static>(
         }
 
         // Await the wave. Collect results; on cancellation, abort stragglers.
-        let mut wave_results: Vec<Result<(String, Option<String>), (String, String)>> = Vec::new();
+        let mut wave_results: Vec<_> = Vec::new();
         let mut cancelled_mid_wave = false;
         for handle in &mut handles {
             if parent_cancel.is_cancelled() {
@@ -751,6 +752,7 @@ async fn run_dag<W: TaskWorker + 'static>(
 }
 
 /// Outcome of the review gate over a freshly-completed task.
+#[allow(clippy::large_enum_variant)] // PlanTask is Clone and short-lived in the review path; Box would add indirection with no win
 enum ReviewGateOutcome {
     /// Task passed review (or is read-only and self-reviewing). Mark Completed.
     Pass,
@@ -837,6 +839,7 @@ async fn run_review_gate(
 /// Execute a single task on a pooled worker. Returns `(task_id, summary)` on
 /// success or `(task_id, error)` on failure. Honors read vs write concurrency
 /// via the two semaphores.
+#[allow(clippy::too_many_arguments)] // store + semaphores + locks + sinks all thread through
 async fn execute_task(
     store: Arc<TaskRuntimeStore>,
     primary_agent: crate::agent_handle::AgentHandle,
@@ -1503,6 +1506,8 @@ async fn run_main_agent_task(
                             );
                         }
                         AgentEvent::FinalAnswer(answer) => {
+                            #[allow(clippy::collapsible_match)]
+                            // guard is a method call on the bound value, not a pattern; collapsing obscures it
                             if !answer.is_empty() {
                                 output = answer;
                             }
@@ -1622,7 +1627,7 @@ mod tests {
     fn concurrency_limits_clamp_pool_value() {
         // composite_parallelism reports 0/1/N → workers clamp to [1,8].
         // We can't easily build a pool in a unit test, so test the clamp math.
-        let clamp = |n: usize| n.max(1).min(8);
+        let clamp = |n: usize| n.clamp(1, 8);
         assert_eq!(clamp(0), 1);
         assert_eq!(clamp(1), 1);
         assert_eq!(clamp(4), 4);
