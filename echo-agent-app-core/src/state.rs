@@ -505,15 +505,17 @@ impl AppState {
             storage: StorageState {
                 conversation_store: RwLock::new(conversation_store),
                 persistence: RwLock::new(Persistence::new()),
-                search_engine: crate::sessions::SessionSearchEngine::new().unwrap_or_else(|e| {
-                    tracing::warn!("Failed to init search engine: {e}, creating empty");
-                    // Fallback: create an in-memory engine that won't persist.
-                    // SAFETY: new_in_memory constructs a pure in-memory SQLite FTS5 table;
-                    // it can only fail under extreme conditions (OOM), at which point the
-                    // process is already in an unrecoverable state.
-                    crate::sessions::SessionSearchEngine::new_in_memory()
-                        .expect("in-memory FTS5 engine should always init — OOM?")
-                }),
+                search_engine: {
+                    // U1c: in-memory substring engine (no SQLite/FTS5). Reindex
+                    // from session files on start; failures just mean an empty
+                    // index (search returns nothing until content is re-added).
+                    let engine = crate::sessions::SessionSearchEngine::new();
+                    match engine.reindex_all() {
+                        Ok(n) => tracing::info!("Session search index rebuilt: {n} sessions"),
+                        Err(e) => tracing::warn!("Session search reindex failed: {e}"),
+                    }
+                    engine
+                },
             },
             history: HistoryState {
                 audit_logs: RwLock::new(Vec::new()),
@@ -849,11 +851,10 @@ impl AppState {
             *persistence = new_persistence;
         }
 
-        // 重新初始化 conversation_store 到工作区的数据库
+        // 重新初始化 conversation_store 到工作区的存储目录（U1c：文件后端）
         let conv_dir = crate::workspace::layout::WorkspaceLayout::conversations(&workspace.root);
         std::fs::create_dir_all(&conv_dir).ok();
-        let db_path = conv_dir.join("conversations.db");
-        match echo_agent::memory::SqliteConversationStore::new(&db_path) {
+        match crate::conversation_file::FileConversationStore::new(&conv_dir) {
             Ok(store) => {
                 let new_store: Arc<dyn echo_agent::memory::ConversationStore> = Arc::new(store);
                 {
@@ -865,7 +866,7 @@ impl AppState {
                     .try_write(|a| a.set_conversation_store(new_store));
                 tracing::info!(
                     workspace = %workspace.id,
-                    db = %db_path.display(),
+                    dir = %conv_dir.display(),
                     "Switched conversation store to workspace"
                 );
 
@@ -926,9 +927,9 @@ impl AppState {
             *persistence = global_persistence;
         }
 
-        // 重置 conversation_store 到全局默认路径
-        let global_db = crate::persistence::Persistence::base_dir().join("conversations.db");
-        match echo_agent::memory::SqliteConversationStore::new(&global_db) {
+        // 重置 conversation_store 到全局默认路径（U1c：文件后端）
+        let global_base = crate::persistence::Persistence::base_dir();
+        match crate::conversation_file::FileConversationStore::new(&global_base) {
             Ok(store) => {
                 let mut guard = self.storage.conversation_store.write().await;
                 *guard = Some(Arc::new(store));

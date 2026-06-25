@@ -2,7 +2,8 @@
 //!
 //! These tests guard against regressions of the review findings:
 //!
-//! 1. `infra::create_runtime_state_store` actually creates a sqlite file.
+//! 1. `infra::create_runtime_state_store` actually creates a (file-backed)
+//!    runtime_state directory.
 //! 2. `AgentCreateParams::state_store + conversation_id` flow through the
 //!    builder so `agent.state_store()` is `Some` and `agent.conversation_id()`
 //!    matches — without this both `save_runtime_checkpoint` and
@@ -16,8 +17,9 @@ use std::sync::Arc;
 use echo_agent::agent::Agent;
 use echo_agent::config::AppConfig;
 use echo_agent::memory::{InMemoryStore, Store};
-use echo_agent::state::{RuntimeStateStore, SqliteRuntimeStateStore};
+use echo_agent::state::RuntimeStateStore;
 use echo_agent_app_core::infra::{self, AgentCreateParams};
+use echo_agent_app_core::runtime_state_file::FileRuntimeStateStore;
 use echo_agent_app_core::unified_memory::UnifiedMemory;
 
 fn make_app_config() -> AppConfig {
@@ -33,7 +35,7 @@ fn make_app_config() -> AppConfig {
 }
 
 #[tokio::test]
-async fn create_runtime_state_store_creates_sqlite_file_with_schema() {
+async fn create_runtime_state_store_creates_file_dir() {
     // Override HOME so the helper writes into a tempdir and can't collide
     // with the developer's real ~/.echo-agent/.
     let tmp = tempfile::tempdir().unwrap();
@@ -46,24 +48,18 @@ async fn create_runtime_state_store_creates_sqlite_file_with_schema() {
     let store = infra::create_runtime_state_store();
     assert!(store.is_some(), "create_runtime_state_store should succeed");
 
-    let db = tmp.path().join(".echo-agent/runtime_state.db");
+    let dir = tmp.path().join(".echo-agent/runtime_state");
     assert!(
-        db.exists(),
-        "runtime_state.db must be created at the canonical path"
+        dir.exists(),
+        "runtime_state/ dir must be created at the canonical path"
     );
-
-    // Schema: opening with a second store on the same path should not error
-    // and the agent_checkpoints / task_nodes tables must exist (init_tables
-    // is idempotent — if the file is half-written this would panic).
-    let _store2 = SqliteRuntimeStateStore::new(&db).expect("re-open existing sqlite store");
 }
 
 #[tokio::test]
 async fn create_agent_threads_state_store_and_conversation_id() {
     let tmp = tempfile::tempdir().unwrap();
-    let db_path = tmp.path().join("rt.db");
     let store: Arc<dyn RuntimeStateStore> =
-        Arc::new(SqliteRuntimeStateStore::new(&db_path).unwrap());
+        Arc::new(FileRuntimeStateStore::new(tmp.path()).unwrap());
 
     let params = AgentCreateParams {
         model: Some("test-model".to_string()),

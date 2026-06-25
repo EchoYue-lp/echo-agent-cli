@@ -33,7 +33,6 @@ dashmap = "6"
 config = "0.14"
 notify = "7"
 tokio-util = "0.7"
-rusqlite = { version = "0.31", features = ["bundled"] }
 cron = "0.12"
 hmac = "0.12"
 sha2 = "0.10"

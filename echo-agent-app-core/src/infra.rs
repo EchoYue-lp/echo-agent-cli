@@ -7,9 +7,8 @@ use std::sync::Arc;
 use echo_agent::agent::subagent::SubagentBuilder;
 use echo_agent::llm::LlmConfig;
 use echo_agent::memory::ConversationStore;
-use echo_agent::memory::SqliteConversationStore;
 use echo_agent::prelude::*;
-use echo_agent::state::{RuntimeStateStore, SqliteRuntimeStateStore};
+use echo_agent::state::RuntimeStateStore;
 
 use crate::agent_handle::AgentHandle;
 use crate::config::AppConfig;
@@ -740,13 +739,14 @@ pub fn spawn_mcp_health_check(
 /// 创建对话持久化 Store（SQLite），失败时返回 None（禁用持久化）
 pub fn create_conversation_store() -> Option<Arc<dyn ConversationStore>> {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let db_path = std::path::PathBuf::from(home)
-        .join(".echo-agent")
-        .join("conversations.db");
+    let base = std::path::PathBuf::from(home).join(".echo-agent");
 
-    match SqliteConversationStore::new(&db_path) {
+    match crate::conversation_file::FileConversationStore::new(&base) {
         Ok(store) => {
-            tracing::info!("ConversationStore (SQLite) 初始化: {}", db_path.display());
+            tracing::info!(
+                "ConversationStore (file) 初始化: {}/conversations",
+                base.display()
+            );
             Some(Arc::new(store))
         }
         Err(e) => {
@@ -774,15 +774,16 @@ pub fn create_runtime_state_store() -> Option<Arc<dyn RuntimeStateStore>> {
     create_runtime_state_store_in(std::path::PathBuf::from(home).join(".echo-agent"))
 }
 
-/// 创建指定 base dir 下的运行时状态 Store（SQLite）。
+/// 创建指定 base dir 下的运行时状态 Store（U1c：文件后端，无 SQLite）。
 pub fn create_runtime_state_store_in(
     base_dir: impl AsRef<std::path::Path>,
 ) -> Option<Arc<dyn RuntimeStateStore>> {
-    let db_path = base_dir.as_ref().join("runtime_state.db");
-
-    match SqliteRuntimeStateStore::new(&db_path) {
+    match crate::runtime_state_file::FileRuntimeStateStore::new(&base_dir) {
         Ok(store) => {
-            tracing::info!("RuntimeStateStore (SQLite) 初始化: {}", db_path.display());
+            tracing::info!(
+                "RuntimeStateStore (file) 初始化: {}/runtime_state",
+                base_dir.as_ref().display()
+            );
             Some(Arc::new(store))
         }
         Err(e) => {
@@ -1263,11 +1264,11 @@ pub fn run_base_doctor_for_model_with_connectivity(
         );
     }
 
-    let db_path = format!("{}/.echo-agent/conversations.db", home);
-    if std::path::Path::new(&db_path).exists() {
-        checks.push("✅ 对话数据库: ~/.echo-agent/conversations.db".to_string());
+    let conv_dir = format!("{}/.echo-agent/conversations", home);
+    if std::path::Path::new(&conv_dir).exists() {
+        checks.push("✅ 对话存储目录: ~/.echo-agent/conversations/".to_string());
     } else {
-        checks.push("ℹ️  对话数据库尚未创建 (首次对话后自动创建)".to_string());
+        checks.push("ℹ️  对话存储目录尚未创建 (首次对话后自动创建)".to_string());
     }
 
     if let Some(root) = crate::project::context::discover_project_root(None) {

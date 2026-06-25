@@ -164,9 +164,12 @@ async fn run_desktop() -> anyhow::Result<()> {
     }
 
     // ── Task store ──
+    // U1c: EKO is local — no SQLite. File-backed store for the background-task
+    // KV backend; in-memory fallback only if the file store can't be opened.
     let task_store: Arc<dyn echo_agent::memory::Store> = {
-        let db_path = echo_agent_app_core::persistence::Persistence::base_dir().join("tasks.db");
-        match echo_agent::memory::SqliteStore::new(&db_path) {
+        let file_path =
+            echo_agent_app_core::persistence::Persistence::base_dir().join("tasks_store");
+        match echo_agent::memory::FileStore::new(&file_path) {
             Ok(store) => Arc::new(store),
             Err(_) => Arc::new(echo_agent::memory::InMemoryStore::new()),
         }

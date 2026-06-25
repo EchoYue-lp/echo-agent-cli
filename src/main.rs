@@ -107,24 +107,17 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
     }
 
     // ── Background task store (all modes) ──
-    // Create a SQLite store for background task persistence.
-    // Passed to mode functions so they can start BackgroundTaskService.
+    // U1c: EKO is a local CoWork platform — no SQLite. Use the file-backed
+    // Store (persists across restarts) for the background-task KV backend;
+    // fall back to in-memory only if the file store cannot be opened.
     let task_store: std::sync::Arc<dyn echo_agent::memory::Store> = {
-        let db_path = echo_agent_app_core::persistence::Persistence::base_dir().join("tasks.db");
-        match echo_agent::memory::SqliteStore::new(&db_path) {
+        let file_path =
+            echo_agent_app_core::persistence::Persistence::base_dir().join("tasks_store");
+        match echo_agent::memory::FileStore::new(&file_path) {
             Ok(store) => std::sync::Arc::new(store),
             Err(e) => {
-                tracing::warn!("Failed to create SQLite store for tasks: {e}");
-                // Fallback: use FileStore
-                let file_path =
-                    echo_agent_app_core::persistence::Persistence::base_dir().join("tasks_store");
-                match echo_agent::memory::FileStore::new(&file_path) {
-                    Ok(store) => std::sync::Arc::new(store),
-                    Err(e2) => {
-                        tracing::error!("Failed to create FileStore for tasks: {e2}");
-                        std::sync::Arc::new(echo_agent::memory::InMemoryStore::new())
-                    }
-                }
+                tracing::warn!("Failed to create FileStore for tasks: {e}; using in-memory");
+                std::sync::Arc::new(echo_agent::memory::InMemoryStore::new())
             }
         }
     };
