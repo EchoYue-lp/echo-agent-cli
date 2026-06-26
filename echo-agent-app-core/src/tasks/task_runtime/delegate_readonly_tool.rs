@@ -61,19 +61,10 @@ impl Tool for DelegateReadonlyTool {
          仅在没有 plan 的 ad-hoc 探索阶段才直接使用本工具。\n\
          \n\
          可用 agent_role (必须从下列选择,不要自创):\n\
-         - project_explorer: 探索项目结构、配置、文档\n\
-         - code_reviewer: 审查代码 bug/架构/边界条件\n\
-         - test_planner: 规划测试和验证方案\n\
-         - summary_writer: 汇总多个 worker 发现,综合结论\n\
-         - data_profiler: 检查数据来源/schema/质量\n\
-         - analysis_reviewer: 审查分析方法/统计假设/图表\n\
-         - reproducibility_planner: 规划可复现路径和交付物\n\
-         - literature_scout: 探索学术资料/检索策略\n\
-         - evidence_reviewer: 审查证据质量/引用可靠性\n\
-         - synthesis_planner: 规划综述/证据表/报告结构\n\
-         - medical_literature_scout: 探索医学指南/系统综述\n\
-         - clinical_evidence_reviewer: 审查临床证据等级/适用性\n\
-         - safety_reviewer: 审查安全边界/免责声明/过度建议风险"
+         - explorer: 探索代码库/数据/文献/配置/文档,建立领域地图\n\
+         - reviewer: 审查代码 bug/分析方法/证据质量/安全边界\n\
+         - planner: 规划验证/测试/可复现路径/综述结构\n\
+         - summarizer: 汇总多个 worker 发现,综合结论"
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -83,19 +74,10 @@ impl Tool for DelegateReadonlyTool {
                 "agent_role": {
                     "type": "string",
                     "enum": [
-                        "project_explorer",
-                        "code_reviewer",
-                        "test_planner",
-                        "summary_writer",
-                        "data_profiler",
-                        "analysis_reviewer",
-                        "reproducibility_planner",
-                        "literature_scout",
-                        "evidence_reviewer",
-                        "synthesis_planner",
-                        "medical_literature_scout",
-                        "clinical_evidence_reviewer",
-                        "safety_reviewer"
+                        "explorer",
+                        "reviewer",
+                        "planner",
+                        "summarizer"
                     ],
                     "description": "worker 角色名。必须从上述 enum 值中精确选择,不要自创。"
                 },

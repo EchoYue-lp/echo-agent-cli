@@ -808,12 +808,7 @@ mod tests {
     fn deterministic_router_detects_broad_readonly_project_analysis() {
         let decision = route_deterministically("请帮我分析一下这个项目架构");
         assert_eq!(decision.route, TaskRouteKind::ParallelReadonlyDelegation);
-        assert!(
-            decision
-                .suggested_workers
-                .iter()
-                .any(|w| w == "project_explorer")
-        );
+        assert!(decision.suggested_workers.iter().any(|w| w == "explorer"));
     }
 
     #[tokio::test]
@@ -823,11 +818,8 @@ mod tests {
         assert_eq!(decision.route, TaskRouteKind::ParallelReadonlyDelegation);
         assert!(decision.route.should_auto_execute());
         assert!(
-            decision
-                .suggested_workers
-                .iter()
-                .any(|w| w == "project_explorer"),
-            "expected project_explorer worker, got {:?}",
+            decision.suggested_workers.iter().any(|w| w == "explorer"),
+            "expected explorer worker, got {:?}",
             decision.suggested_workers
         );
     }
@@ -865,9 +857,9 @@ mod tests {
             TaskRouteKind::ParallelReadonlyDelegation,
             "user asked to always inspect the codebase for this phrase",
             vec![
-                "project_explorer".to_string(),
+                "explorer".to_string(),
                 "not_a_worker".to_string(),
-                "code_reviewer".to_string(),
+                "reviewer".to_string(),
             ],
         )];
         let decision = route_message_with_feedback(
@@ -881,7 +873,7 @@ mod tests {
         assert_eq!(decision.route, TaskRouteKind::ParallelReadonlyDelegation);
         assert_eq!(
             decision.suggested_workers,
-            vec!["project_explorer".to_string(), "code_reviewer".to_string()]
+            vec!["explorer".to_string(), "reviewer".to_string()]
         );
         assert!(decision.confidence >= 0.95);
     }
@@ -949,30 +941,15 @@ mod tests {
         let decision =
             route_deterministically("请做一个 arxiv literature review，分析相关论文证据");
         assert_eq!(decision.route, TaskRouteKind::ParallelReadonlyDelegation);
-        assert!(
-            decision
-                .suggested_workers
-                .iter()
-                .any(|w| w == "literature_scout")
-        );
-        assert!(
-            decision
-                .suggested_workers
-                .iter()
-                .any(|w| w == "evidence_reviewer")
-        );
+        assert!(decision.suggested_workers.iter().any(|w| w == "explorer"));
+        assert!(decision.suggested_workers.iter().any(|w| w == "reviewer"));
     }
 
     #[test]
     fn deterministic_router_uses_data_workers_for_dataset_tasks() {
         let decision = route_deterministically("帮我分析这个数据集，先做数据画像和分析方法 review");
         assert_eq!(decision.route, TaskRouteKind::ParallelReadonlyDelegation);
-        assert!(
-            decision
-                .suggested_workers
-                .iter()
-                .any(|w| w == "data_profiler")
-        );
+        assert!(decision.suggested_workers.iter().any(|w| w == "explorer"));
     }
 
     #[test]
@@ -981,18 +958,11 @@ mod tests {
             "分析这个医学 cohort 数据集和 Python notebook，审查临床证据和复现代码",
         );
         assert_eq!(decision.route, TaskRouteKind::ParallelReadonlyDelegation);
-        for expected in [
-            "medical_literature_scout",
-            "clinical_evidence_reviewer",
-            "data_profiler",
-            "analysis_reviewer",
-            "code_reviewer",
-            "test_planner",
-            "summary_writer",
-        ] {
+        // SA-4: all domains use generic roles now.
+        for expected in ["explorer", "reviewer", "planner", "summarizer"] {
             assert!(
                 decision.suggested_workers.iter().any(|w| w == expected),
-                "expected blended worker {expected}, got {:?}",
+                "expected generic worker {expected}, got {:?}",
                 decision.suggested_workers
             );
         }
@@ -1002,10 +972,10 @@ mod tests {
     fn deterministic_router_blends_academic_and_data_workers() {
         let decision = route_deterministically("review 这些论文里的实验数据、统计指标和图表证据");
         assert_eq!(decision.route, TaskRouteKind::ParallelReadonlyDelegation);
-        for expected in ["literature_scout", "evidence_reviewer", "data_profiler"] {
+        for expected in ["explorer", "reviewer", "planner"] {
             assert!(
                 decision.suggested_workers.iter().any(|w| w == expected),
-                "expected blended worker {expected}, got {:?}",
+                "expected generic worker {expected}, got {:?}",
                 decision.suggested_workers
             );
         }

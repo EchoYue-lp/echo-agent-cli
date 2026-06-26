@@ -65,104 +65,34 @@ impl ProfileTemplate {
     }
 }
 
-pub const AI_CODING_WORKER_ROLES: &[&str] = &[
-    "project_explorer",
-    "code_reviewer",
-    "test_planner",
-    "summary_writer",
-];
-pub const DATA_ANALYSIS_WORKER_ROLES: &[&str] = &[
-    "data_profiler",
-    "analysis_reviewer",
-    "reproducibility_planner",
-    "summary_writer",
-];
-pub const ACADEMIC_RESEARCH_WORKER_ROLES: &[&str] = &[
-    "literature_scout",
-    "evidence_reviewer",
-    "synthesis_planner",
-    "summary_writer",
-];
-pub const MEDICAL_RESEARCH_WORKER_ROLES: &[&str] = &[
-    "medical_literature_scout",
-    "clinical_evidence_reviewer",
-    "safety_reviewer",
-    "summary_writer",
-];
-pub const GENERAL_WORKER_ROLES: &[&str] = &[
-    "project_explorer",
-    "literature_scout",
-    "data_profiler",
-    "summary_writer",
-];
+// SA-4: All domain profiles now use the same 4 generic roles.
+// Domain specialization is achieved via skill/profile prompt injection,
+// not via separate agent definitions.
+pub const AI_CODING_WORKER_ROLES: &[&str] = &["explorer", "reviewer", "planner", "summarizer"];
+pub const DATA_ANALYSIS_WORKER_ROLES: &[&str] = &["explorer", "reviewer", "planner", "summarizer"];
+pub const ACADEMIC_RESEARCH_WORKER_ROLES: &[&str] =
+    &["explorer", "reviewer", "planner", "summarizer"];
+pub const MEDICAL_RESEARCH_WORKER_ROLES: &[&str] =
+    &["explorer", "reviewer", "planner", "summarizer"];
+pub const GENERAL_WORKER_ROLES: &[&str] = &["explorer", "reviewer", "planner", "summarizer"];
 
-pub const ALL_WORKER_ROLES: &[&str] = &[
-    "project_explorer",
-    "code_reviewer",
-    "test_planner",
-    "data_profiler",
-    "analysis_reviewer",
-    "reproducibility_planner",
-    "literature_scout",
-    "evidence_reviewer",
-    "synthesis_planner",
-    "medical_literature_scout",
-    "clinical_evidence_reviewer",
-    "safety_reviewer",
-    "summary_writer",
-];
+pub const ALL_WORKER_ROLES: &[&str] = &["explorer", "reviewer", "planner", "summarizer"];
 
 pub const WORKER_CAPABILITY_CATALOG: &[(&str, &str)] = &[
     (
-        "project_explorer",
-        "workspace/codebase discovery: files, configs, modules, docs",
+        "explorer",
+        "read-only discovery: codebase structure, data sources, literature, configs, docs",
     ),
     (
-        "code_reviewer",
-        "software correctness, architecture, duplication, edge cases",
+        "reviewer",
+        "read-only review: code bugs, analysis methods, evidence quality, safety boundaries",
     ),
     (
-        "test_planner",
-        "verification strategy for code, scripts, notebooks, builds",
+        "planner",
+        "read-only planning: verification strategy, reproducibility paths, review structure",
     ),
     (
-        "data_profiler",
-        "data sources, schema, missing values, outliers, sample boundaries",
-    ),
-    (
-        "analysis_reviewer",
-        "metrics, statistical assumptions, plots, data-supported conclusions",
-    ),
-    (
-        "reproducibility_planner",
-        "rerunnable pipelines, notebooks, scripts, reports, audit trail",
-    ),
-    (
-        "literature_scout",
-        "academic search strategy, candidate papers, keywords, evidence gaps",
-    ),
-    (
-        "evidence_reviewer",
-        "evidence quality, study type, citation reliability, claim strength",
-    ),
-    (
-        "synthesis_planner",
-        "review structure, evidence tables, bibliography, final research artifact",
-    ),
-    (
-        "medical_literature_scout",
-        "medical guidelines, systematic reviews, clinical studies, PubMed-style search",
-    ),
-    (
-        "clinical_evidence_reviewer",
-        "clinical evidence level, applicability, guideline consistency",
-    ),
-    (
-        "safety_reviewer",
-        "medical safety boundaries, disclaimers, contraindication risk",
-    ),
-    (
-        "summary_writer",
+        "summarizer",
         "cross-worker synthesis into conclusions, plan, or delivery notes",
     ),
 ];
@@ -334,8 +264,8 @@ mod tests {
                 );
             }
             assert!(
-                t.default_worker_roles.contains(&"summary_writer"),
-                "{profile:?} profile should keep summary_writer for synthesis"
+                t.default_worker_roles.contains(&"summarizer"),
+                "{profile:?} profile should keep summarizer for synthesis"
             );
         }
     }

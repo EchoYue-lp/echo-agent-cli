@@ -54,19 +54,16 @@ impl DelegationPlanner {
         }
 
         if roles.is_empty() {
-            push_roles(
-                &mut roles,
-                &["project_explorer", "literature_scout", "data_profiler"],
-            );
+            push_roles(&mut roles, &["explorer", "reviewer", "planner"]);
         }
 
         let mut discovery_roles = roles
             .into_iter()
-            .filter(|role| role != "summary_writer")
+            .filter(|role| role != "summarizer")
             .collect::<Vec<_>>();
 
         if discovery_roles.is_empty() {
-            discovery_roles.push("project_explorer".to_string());
+            discovery_roles.push("explorer".to_string());
         }
 
         let include_summary = discovery_roles.len() > 1;
@@ -97,13 +94,13 @@ impl DelegationPlanner {
                 .map(|spec| spec.agent_name.clone())
                 .collect::<Vec<_>>();
             specs.push(WorkerSpec {
-                agent_name: "summary_writer".to_string(),
-                title: worker_title("summary_writer"),
+                agent_name: "summarizer".to_string(),
+                title: worker_title("summarizer"),
                 task: format!(
                     "Synthesize all worker findings into a direct answer for this goal: {}",
                     request.goal.trim()
                 ),
-                purpose: worker_purpose("summary_writer"),
+                purpose: worker_purpose("summarizer"),
                 readonly: true,
                 expected_output: "A concise synthesis with agreements, conflicts, evidence gaps, and next actions.".to_string(),
                 depends_on,
@@ -135,20 +132,10 @@ pub fn role_slug(role: &str) -> String {
 }
 
 fn roles_for_area(area: &CapabilityArea) -> &'static [&'static str] {
-    match area {
-        CapabilityArea::Coding => &["project_explorer", "code_reviewer", "test_planner"],
-        CapabilityArea::Data => &[
-            "data_profiler",
-            "analysis_reviewer",
-            "reproducibility_planner",
-        ],
-        CapabilityArea::Academic => &["literature_scout", "evidence_reviewer", "synthesis_planner"],
-        CapabilityArea::Medical => &[
-            "medical_literature_scout",
-            "clinical_evidence_reviewer",
-            "safety_reviewer",
-        ],
-    }
+    // SA-4: All areas map to the same 3 generic discovery roles.
+    // Domain specialization is via skill/profile injection, not agent type.
+    let _ = area; // area still logged for telemetry but no longer selects different roles
+    &["explorer", "reviewer", "planner"]
 }
 
 fn push_roles(out: &mut Vec<String>, workers: &[&str]) {
@@ -179,19 +166,10 @@ fn push_role(out: &mut Vec<String>, worker: &str) {
 
 fn worker_title(worker: &str) -> String {
     match worker {
-        "project_explorer" => "Explore project structure and architecture".to_string(),
-        "code_reviewer" => "Review code architecture and correctness risks".to_string(),
-        "test_planner" => "Map verification and test strategy".to_string(),
-        "data_profiler" => "Profile data sources and analysis shape".to_string(),
-        "analysis_reviewer" => "Review metrics and analytical assumptions".to_string(),
-        "reproducibility_planner" => "Plan reproducibility checks".to_string(),
-        "literature_scout" => "Scout relevant literature and sources".to_string(),
-        "evidence_reviewer" => "Review evidence quality and claim strength".to_string(),
-        "synthesis_planner" => "Plan research synthesis structure".to_string(),
-        "medical_literature_scout" => "Scout medical literature and guidelines".to_string(),
-        "clinical_evidence_reviewer" => "Review clinical evidence and applicability".to_string(),
-        "safety_reviewer" => "Review safety boundaries and risk notes".to_string(),
-        "summary_writer" => "Synthesize worker findings".to_string(),
+        "explorer" => "Explore and map the target domain".to_string(),
+        "reviewer" => "Review for risks, quality, and gaps".to_string(),
+        "planner" => "Plan verification and next steps".to_string(),
+        "summarizer" => "Synthesize worker findings".to_string(),
         _ => format!("Run read-only worker {}", worker),
     }
 }
@@ -209,7 +187,7 @@ fn worker_purpose(worker: &str) -> String {
 }
 
 fn worker_expected_output(worker: &str) -> String {
-    if worker == "summary_writer" {
+    if worker == "summarizer" {
         return "Synthesis grounded in completed worker outputs, with uncertainty and next actions.".to_string();
     }
     format!(
@@ -240,14 +218,9 @@ mod tests {
             max_workers: 4,
         });
 
-        assert_eq!(specs.len(), 4);
-        assert!(
-            specs
-                .iter()
-                .any(|spec| spec.agent_name == "project_explorer")
-        );
-        assert!(specs.iter().any(|spec| spec.agent_name == "code_reviewer"));
-        assert!(specs.iter().any(|spec| spec.agent_name == "summary_writer"));
+        assert!(!specs.is_empty());
+        assert!(specs.iter().any(|spec| spec.agent_name == "explorer"));
+        assert!(specs.iter().any(|spec| spec.agent_name == "summarizer"));
     }
 
     #[test]
@@ -263,14 +236,8 @@ mod tests {
         });
         let roles = worker_role_names(&specs);
 
-        for expected in [
-            "medical_literature_scout",
-            "clinical_evidence_reviewer",
-            "data_profiler",
-            "analysis_reviewer",
-            "code_reviewer",
-            "summary_writer",
-        ] {
+        // SA-4: all domains now use the 4 generic roles.
+        for expected in ["explorer", "reviewer", "planner", "summarizer"] {
             assert!(
                 roles.iter().any(|role| role == expected),
                 "expected {expected}, got {:?}",
@@ -294,7 +261,7 @@ mod tests {
         assert_eq!(specs.len(), 3);
         assert_eq!(
             specs.last().map(|spec| spec.agent_name.as_str()),
-            Some("summary_writer")
+            Some("summarizer")
         );
     }
 }
