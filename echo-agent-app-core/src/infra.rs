@@ -480,46 +480,8 @@ const WORKER_DEFINITIONS: &[(&str, &str, &str)] = &[
 /// Used by the main agent for L2 delegation, and called on each worker
 /// agent for L3 nesting (spec §3.3).
 #[allow(clippy::too_many_arguments)]
-async fn register_worker_subagents(
-    agent: &mut ReactAgent,
-    model: &str,
-    llm_config: Option<LlmConfig>,
-    temperature: Option<f32>,
-    max_tokens: Option<u32>,
-    token_limit: usize,
-    tool_timeout_ms: u64,
-    cache_user_id: &str,
-) {
-    for &(name, description, prompt) in WORKER_DEFINITIONS {
-        match build_readonly_worker_agent(
-            name,
-            prompt,
-            model,
-            llm_config.clone(),
-            temperature,
-            max_tokens,
-            token_limit,
-            tool_timeout_ms,
-            cache_user_id,
-        ) {
-            Ok(sub_worker) => {
-                let def = SubagentBuilder::new(name)
-                    .description(description)
-                    .fork_mode()
-                    .tag("readonly")
-                    .tag("parallel")
-                    .build();
-                agent.register_subagent_with_definition(def, Box::new(sub_worker));
-            }
-            Err(err) => tracing::warn!(
-                subagent = name,
-                error = %err,
-                "Failed to register read-only subagent"
-            ),
-        }
-    }
-}
-
+// register_worker_subagents removed (SA-3): was 13×13 L3 nesting registration
+// = 182 agent instances. Workers almost never recursively fan out 13 ways.
 #[allow(clippy::too_many_arguments)]
 async fn register_default_subagents(
     agent: &mut ReactAgent,
@@ -543,28 +505,19 @@ async fn register_default_subagents(
             tool_timeout_ms,
             cache_user_id,
         ) {
-            Ok(mut worker) => {
-                // L3 nesting: register sub-agents on this worker so it can
-                // recursively delegate via delegate_readonly (spec §3.3).
-                // Sub-sub-workers are NOT further registered (L4 is blocked
-                // by MAX_DELEGATE_DEPTH=3 in the framework).
-                register_worker_subagents(
-                    &mut worker,
-                    model,
-                    llm_config.clone(),
-                    temperature,
-                    max_tokens,
-                    token_limit,
-                    tool_timeout_ms,
-                    cache_user_id,
-                )
-                .await;
+            Ok(worker) => {
+                // SA-3: REMOVED register_worker_subagents (13×13 L3 nesting).
+                // Previously each of the 13 workers had all 13 re-registered
+                // as L3 sub-workers = 182 agent instances per top-level agent.
+                // Workers almost never recursively fan out 13 ways; the cost
+                // (182 LLM clients + tool managers) vastly exceeded the value.
+                // L3 nesting is still supported via delegate_readonly on the
+                // main agent if a future need arises — just not pre-built.
 
-                // Register delegate_readonly on the worker so it can
-                // recursively delegate to L3 sub-workers (spec §3.3).
+                // Register delegate_readonly on the worker so it can still
+                // delegate if needed (the registry is empty by default; the
+                // framework returns "no subagents registered" gracefully).
                 let worker_handle = crate::agent_handle::AgentHandle::new(worker);
-                // Workers are subagents, not orchestrators — plan-existence
-                // interception is unnecessary (only main agent creates plans).
                 crate::tasks::task_runtime::delegate_readonly_tool::
                     register_delegate_readonly_on_handle(&worker_handle, None).await;
 
@@ -602,6 +555,7 @@ fn build_readonly_worker_agent(
         .name(name)
         .system_prompt(prompt)
         .enable_tools()
+        .readonly_tools() // SA-2: physical enforcement — no shell/write tools
         .enable_memory()
         .enable_cot()
         .enable_subagent()
