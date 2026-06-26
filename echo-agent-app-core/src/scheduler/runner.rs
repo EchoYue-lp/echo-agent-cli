@@ -146,9 +146,8 @@ mod tests {
             .build()
             .expect("test agent should build");
         let handle = AgentHandle::new(agent);
-        let store = Arc::new(
-            TaskRuntimeStore::new_in_memory().expect("in-memory store should init"),
-        );
+        let store =
+            Arc::new(TaskRuntimeStore::new_in_memory().expect("in-memory store should init"));
 
         // task_service=None:Phase 3.1 前会逼非-[plan] prompt 走 execute_direct;
         // 3.1 后 runtime_store(此处置 Some)接管所有 prompt → launch_cron_run。
@@ -178,9 +177,8 @@ mod tests {
             .build()
             .expect("test agent should build");
         let handle = AgentHandle::new(agent);
-        let store = Arc::new(
-            TaskRuntimeStore::new_in_memory().expect("in-memory store should init"),
-        );
+        let store =
+            Arc::new(TaskRuntimeStore::new_in_memory().expect("in-memory store should init"));
         let fire_fn = build_fire_fn(handle, None, Some(store.clone()));
 
         let task = CronTask::new("plan", "*/5 * * * *", "[plan] do the thing");
