@@ -141,3 +141,45 @@ pub fn new_scheduler_runner(
     let fire_fn = build_fire_fn(agent, task_service, task_runtime_store);
     SchedulerRunner::new(store, cancel, fire_fn)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*; // AgentHandle, Arc, CronTask, TaskRuntimeStore, CancellationToken, ...
+    use crate::tasks::task_runtime::TaskRunStatus;
+    use echo_agent::agent::react::builder::ReactAgentBuilder;
+    use echo_agent::testing::MockLlmClient;
+
+    /// Phase 3.1: 非 `[plan]` cron 必须经 `launch_cron_run`(在 store 建 run),
+    /// 而非旧 `agent.chat`/`execute_direct`。mock LLM 返回纯文本(无 tool call),
+    /// agent 直接作答,`launch_cron_run` 的 `_` 分支自动转 Completed。
+    #[tokio::test]
+    async fn build_fire_fn_routes_non_plan_cron_to_launch_cron_run() {
+        let llm = MockLlmClient::new().with_response("ok");
+        let agent = ReactAgentBuilder::new()
+            .llm_client(Arc::new(llm))
+            .system_prompt("test")
+            .build()
+            .expect("test agent should build");
+        let handle = AgentHandle::new(agent);
+        let store = Arc::new(
+            TaskRuntimeStore::new_in_memory().expect("in-memory store should init"),
+        );
+
+        // task_service=None:Phase 3.1 前会逼非-[plan] prompt 走 execute_direct;
+        // 3.1 后 runtime_store(此处置 Some)接管所有 prompt → launch_cron_run。
+        let fire_fn = build_fire_fn(handle, None, Some(store.clone()));
+
+        let task = CronTask::new("plain", "*/5 * * * *", "hello world");
+        let result = fire_fn(task).await;
+        assert!(result.is_ok(), "fire_fn should succeed: {:?}", result.err());
+
+        let completed = store
+            .list_runs_in(&[TaskRunStatus::Completed])
+            .expect("list_runs_in should not error");
+        assert_eq!(
+            completed.len(),
+            1,
+            "非-[plan] cron 应经 launch_cron_run 建恰好 1 个 Completed run"
+        );
+    }
+}
