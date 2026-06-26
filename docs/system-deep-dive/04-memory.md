@@ -66,7 +66,6 @@ const RRF_K: f64 = 60.0;
 | Skill 遥测 | `["agent", "skill_telemetry"]` | `echo-state/src/skill_telemetry.rs:170` |
 | `UnifiedMemory.memories`（产品） | `["agent", "memories"]` (固定字面量) | `echo-agent-cli/.../unified_memory.rs:198, 211, 235, 246` |
 | 任务 store | `["tasks"]` | `echo-orchestration/src/tasks/store.rs:48` |
-| `CheckpointStore` | `["checkpoints"]` | `echo-orchestration/src/tasks/store.rs:186` |
 
 ⚠️ **Note**：`UnifiedMemory` 用的是字面 `"agent"`，**不是** agent 名 —— 这与运行时记忆工具的 `[agent_name, "memories"]` **不匹配**。详见 §7.3。
 

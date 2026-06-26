@@ -867,21 +867,21 @@ async fn execute_task(
             .flatten()
             .map(|r| r.attended_mode)
             .unwrap_or_default();
-        if attended_mode == AttendedMode::Unattended {
-            if let Err(rejection) = preflight_unattended_task(&task) {
-                let msg = format!(
-                    "CP B preflight rejected task '{}': {}",
-                    task_id, rejection.reason
-                );
-                let _ = store.set_task_status(
-                    &run_id,
-                    &task_id,
-                    TodoStatus::Failed,
-                    Some(&task.agent_role),
-                    Some(&msg),
-                );
-                return Err((task_id.clone(), msg));
-            }
+        if attended_mode == AttendedMode::Unattended
+            && let Err(rejection) = preflight_unattended_task(&task)
+        {
+            let msg = format!(
+                "CP B preflight rejected task '{}': {}",
+                task_id, rejection.reason
+            );
+            let _ = store.set_task_status(
+                &run_id,
+                &task_id,
+                TodoStatus::Failed,
+                Some(&task.agent_role),
+                Some(&msg),
+            );
+            return Err((task_id.clone(), msg));
         }
     }
 
@@ -1701,7 +1701,7 @@ pub async fn launch_cron_run(
         "", // root_message_id — no chat message for cron
         DomainProfile::General,
         prompt,
-        "", // route — empty → defaults to ParallelReadonlyDelegation
+        super::router::TaskRouteKind::ParallelReadonlyDelegation.as_str(), // explicit route (was "" → unwrap_or fallback in execute_plan_tool)
         AttendedMode::Unattended,
     )?;
 

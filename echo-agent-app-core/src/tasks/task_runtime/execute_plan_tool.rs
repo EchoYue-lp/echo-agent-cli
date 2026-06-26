@@ -148,23 +148,22 @@ impl Tool for ExecutePlanTool {
             // Only when attended_mode=Unattended: scan the full plan for
             // write tasks / write tools / shell commands and terminal-fail
             // on violation. Chat runs (Attended) skip this entirely.
-            if attended_mode == AttendedMode::Unattended {
-                if let Some(ref plan) = self.store.get_plan(&run_id).ok().flatten() {
-                    if let Err(rejection) = preflight_unattended_plan(&plan.tasks) {
-                        let _ = self.store.transition_run(&run_id, TaskRunStatus::Failed);
-                        let _ = self.store.note(
-                            &run_id,
-                            None,
-                            &format!("CP A preflight rejected: {}", rejection.reason),
-                        );
-                        return Ok(ToolResult::error(format!(
-                            "Unattended run rejected by preflight: {}. \
-                             ReadOnlyPlanNoShell mode only allows read tasks, \
-                             read tools, and no shell/test commands.",
-                            rejection.reason
-                        )));
-                    }
-                }
+            if attended_mode == AttendedMode::Unattended
+                && let Some(ref plan) = self.store.get_plan(&run_id).ok().flatten()
+                && let Err(rejection) = preflight_unattended_plan(&plan.tasks)
+            {
+                let _ = self.store.transition_run(&run_id, TaskRunStatus::Failed);
+                let _ = self.store.note(
+                    &run_id,
+                    None,
+                    &format!("CP A preflight rejected: {}", rejection.reason),
+                );
+                return Ok(ToolResult::error(format!(
+                    "Unattended run rejected by preflight: {}. \
+                     ReadOnlyPlanNoShell mode only allows read tasks, \
+                     read tools, and no shell/test commands.",
+                    rejection.reason
+                )));
             }
 
             // ── §10.5: ComplexRuntime 审批闭环 ──

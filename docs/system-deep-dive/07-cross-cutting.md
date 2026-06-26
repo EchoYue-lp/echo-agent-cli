@@ -17,7 +17,6 @@
 | `["agent", "memories"]` | `echo-agent-cli/echo-agent-app-core/src/unified_memory.rs:198, 211, 235, 246` | ⚠️ `UnifiedMemory.remember/recall/forget/list_memories` 写入命名空间。**字面 `"agent"`，与上一行的 `agent_name` 不一致**（详见 §3 陷阱 #3） |
 | `["agent", "skill_telemetry"]` | `echo-agent/echo-state/src/skill_telemetry.rs:170, 186, 208` | Skill 遥测记录（⚠️ 当前无 runtime 写入端，详见 §3 陷阱 #5） |
 | `["tasks"]` | `echo-agent/echo-orchestration/src/tasks/store.rs:48` | `SqliteTaskStore` |
-| `["checkpoints"]` | `echo-agent/echo-orchestration/src/tasks/store.rs:186` | `SqliteCheckpointStore`（任务 DAG 检查点） |
 
 > **观察**：`agent_name` vs `"agent"` 字面值的不一致是当前代码事实。任何想"在产品层和运行时之间共享同一个记忆桶"的需求都必须显式选择一个 namespace 然后两端都用它，不能默认它们已经联通。
 

@@ -436,7 +436,6 @@ const WORKER_DEFINITIONS: &[(&str, &str, &str)] = &[
 #[allow(clippy::too_many_arguments)]
 // register_worker_subagents removed (SA-3): was 13×13 L3 nesting registration
 // = 182 agent instances. Workers almost never recursively fan out 13 ways.
-#[allow(clippy::too_many_arguments)]
 async fn register_default_subagents(
     agent: &mut ReactAgent,
     model: &str,

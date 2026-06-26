@@ -56,7 +56,6 @@ impl TaskNodeStatus {
 | 名称 | trait/struct 路径 | 数据形态 | 用途 |
 |------|------------------|----------|------|
 | `RuntimeStateStore::save_checkpoint` | `echo-agent/src/state/mod.rs:178` | `AgentCheckpoint`（每 conversation 一份） | ReactAgent 单轮对话的崩溃恢复 |
-| `CheckpointStore::save_checkpoint` | `echo-orchestration/src/tasks/store.rs:163` | `ExecutionCheckpoint`（任务 DAG 快照） | TaskExecutor 长程任务执行恢复 |
 | `workflow::CheckpointStore` | `echo-orchestration/src/workflow/checkpoint_store.rs` | Graph 节点状态 | LangGraph 风格 workflow 的 pause/resume |
 
 它们存的不是同一个东西、不是同一段生命周期、也不是同一个用例。本套文档大多数提到 "checkpoint" 时指的是**第一种**（`RuntimeStateStore`）。
@@ -93,29 +92,6 @@ pub trait RuntimeStateStore: Send + Sync {
 - `task_nodes` —— PK = `(id, conversation_id)`，多行的 DAG 节点
 
 存放路径由产品层决定（默认 `~/.echo-agent/state.db`）。
-
-### §2.2 `CheckpointStore::ExecutionCheckpoint` —— 任务 DAG 执行恢复
-
-```rust,ignore
-// echo-agent/echo-orchestration/src/tasks/store.rs:126
-pub struct ExecutionCheckpoint {
-    pub tasks:               Vec<Task>,
-    pub completed_task_ids:  Vec<String>,
-    pub plan_id:             Option<String>,
-    pub created_at:          DateTime<Utc>,
-}
-
-// store.rs:163
-pub trait CheckpointStore: Send + Sync {
-    fn save_checkpoint(&self, ckpt: ExecutionCheckpoint) -> BoxFuture<…>;
-    fn load_latest_checkpoint(&self, plan_id: Option<&str>) -> BoxFuture<…>;
-    fn list_checkpoints(&self, plan_id: Option<&str>, limit: usize) -> BoxFuture<…>;
-}
-```
-
-实现：`SqliteCheckpointStore`（`store.rs:186`），命名空间 `["checkpoints"]`，背靠 `Store` trait。
-
-它的用例是 `TaskExecutor`（详见 §4）跑长程多任务时——某个 task 被 retry / cancel / 重启进程后，从最近一次 checkpoint 续跑而不是从头来。
 
 ### §2.3 Workflow `CheckpointStore` —— Graph 暂停/恢复
 
@@ -212,13 +188,12 @@ pub struct TaskExecutorConfig {
     pub retry_max_delay_secs:     u64,
     pub retry_jitter:             bool,
     pub enable_hooks:             bool,
-    pub checkpoint_interval_secs: u64,
     pub unified_hook_executor:    Option<UnifiedHookExecutorFn>,  // 桥到 echo-core hooks
     pub round_timeout_secs:       u64,      // 默认 3600 (1 小时)
 }
 ```
 
-`TaskExecutor`（`executor.rs:317`）拥有 `Arc<TaskManager>` + `Arc<Semaphore>` 控并发 + `Arc<TaskHookRegistry>` + 可选 `Arc<dyn CheckpointStore>` + 可选 `Arc<dyn TaskStore>`，通过 `tokio::spawn` 跑每个就绪任务，配 `tokio::time::timeout` 超时杀 + 重试退避 + cancel token。
+`TaskExecutor`（`executor.rs:317`）拥有 `Arc<TaskManager>` + `Arc<Semaphore>` 控并发 + `Arc<TaskHookRegistry>` + 可选 `Arc<dyn TaskStore>`，通过 `tokio::spawn` 跑每个就绪任务，配 `tokio::time::timeout` 超时杀 + 重试退避 + cancel token。
 
 ### §4.2 `Task::checkpoint_policy`
 
@@ -232,9 +207,9 @@ pub enum CheckpointPolicy {
 }
 ```
 
-每个 `Task` 自带一个 `checkpoint_policy: CheckpointPolicy` 字段（`task.rs:470`）；`TaskExecutor` 据此决定何时调用 `CheckpointStore::save_checkpoint`。
+每个 `Task` 自带一个 `checkpoint_policy: CheckpointPolicy` 字段（`task.rs:470`）。
 
-> 与 `RuntimeStateStore` 的"无条件"触发（详见 §5）不同 —— `RuntimeStateStore` 的检查点写入由代码路径决定，不由 enum 控制；`TaskExecutor` 的 `ExecutionCheckpoint` 写入由本字段控制。
+> ⚠️ 2026-06: tasks 层的 `ExecutionCheckpoint` / `CheckpointStore` / `SqliteCheckpointStore` 已移除——是从未被接通的半成品（零 `with_checkpoint_store` 调用、零 `restore_from_checkpoint` 调用、唯一 impl 零实例化、save 逻辑运行时永远不触发）。`CheckpointPolicy` 字段保留在 `Task` 上但当前不驱动任何 save。长程恢复由 `RuntimeStateStore`（§2.1）和 `workflow::CheckpointStore`（§2.3）覆盖。
 
 ### §4.3 Workflow Graph
 

@@ -6,10 +6,9 @@
 // 框架层类型 re-export
 pub use echo_agent::tasks::progress;
 pub use echo_agent::tasks::{
-    CheckpointStore, ExecutionCheckpoint, LoggingHooks, NoopHooks, SqliteCheckpointStore,
-    SqliteTaskStore, Task, TaskContext, TaskEvent, TaskEventBus, TaskExecuteFn,
-    TaskExecutionResult, TaskExecutor, TaskExecutorConfig, TaskHookContext, TaskHookRegistry,
-    TaskHooks, TaskManager, TaskStatus, TaskStore,
+    LoggingHooks, NoopHooks, SqliteTaskStore, Task, TaskContext, TaskEvent, TaskEventBus,
+    TaskExecuteFn, TaskExecutionResult, TaskExecutor, TaskExecutorConfig, TaskHookContext,
+    TaskHookRegistry, TaskHooks, TaskManager, TaskStatus, TaskStore,
 };
 
 pub mod background;
