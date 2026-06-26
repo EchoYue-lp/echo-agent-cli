@@ -47,7 +47,7 @@ fn emit_conversation_event(
     let _ = app.emit("conversation://event", payload);
 
     // Persist for replay on history refresh
-    if let Some(ref store) = store {
+    if let Some(store) = store {
         let event_type = match event {
             ConversationRuntimeEvent::RouteDecision { .. } => "route_decision",
             ConversationRuntimeEvent::InitialThinking { .. } => "initial_thinking",
@@ -440,25 +440,24 @@ pub async fn send_chat_message(
     // run, do NOT start a new one. Instead, emit an InterruptPrompt event
     // so the GUI can ask the user what to do (resume / edit-and-resume /
     // abandon).
-    if let Some(ref conv_id) = conversation_id {
-        if let Some(store) = state.app_state.tasks.runtime.as_ref() {
-            if let Ok(Some(existing)) = store.find_in_progress_run_by_conversation(conv_id) {
-                emit_chat_event(
-                    &app,
-                    &ChatEvent::InterruptPrompt {
-                        run_id: existing.run_id.clone(),
-                        goal: existing.goal.clone(),
-                        new_message: message.clone(),
-                    },
-                    &message_key,
-                    &conversation_id,
-                );
-                return Ok(serde_json::json!({
-                    "kind": "interrupt_prompt",
-                    "run_id": existing.run_id,
-                }));
-            }
-        }
+    if let Some(ref conv_id) = conversation_id
+        && let Some(store) = state.app_state.tasks.runtime.as_ref()
+        && let Ok(Some(existing)) = store.find_in_progress_run_by_conversation(conv_id)
+    {
+        emit_chat_event(
+            &app,
+            &ChatEvent::InterruptPrompt {
+                run_id: existing.run_id.clone(),
+                goal: existing.goal.clone(),
+                new_message: message.clone(),
+            },
+            &message_key,
+            &conversation_id,
+        );
+        return Ok(serde_json::json!({
+            "kind": "interrupt_prompt",
+            "run_id": existing.run_id,
+        }));
     }
 
     // ── Complex-task router ────────────────────────────────────────────
@@ -1277,6 +1276,7 @@ async fn route_complex_task(
 /// 统一启动器:所有复杂路由(ParallelReadonlyDelegation/ComplexRuntime/PlanOnly)
 /// 都走这里。主 agent ReAct(pool 复用)+ execute_plan 工具(L1→L2)。
 /// 替代 launch_main_agent_react + launch_task_run_execution(spec §3.1.2)。
+#[allow(clippy::too_many_arguments)] // app/state/identity/conversation/routing/cancel all required
 async fn launch_unified_run(
     app: tauri::AppHandle,
     state: &TauriState,
@@ -1433,15 +1433,15 @@ async fn launch_unified_run(
                                         usage_store.as_ref(),
                                         &run_id_owned,
                                     );
-                                    if let Some(ce) = chat_event {
-                                        if !emit_chat_event(
+                                    if let Some(ce) = chat_event
+                                        && !emit_chat_event(
                                             &app_handle,
                                             &ce,
                                             &event_message_key,
                                             &event_conversation_id,
-                                        ) {
-                                            break;
-                                        }
+                                        )
+                                    {
+                                        break;
                                     }
                                 }
                                 Err(e) => {
@@ -1560,6 +1560,7 @@ async fn launch_unified_run(
 /// G1 fix: `run_id` is the TaskRuntime run_id. Worker trace events for the
 /// main agent carry this run_id (not message_key) so the frontend aggregator
 /// (which filters by activeRun.run_id) sees the main agent's token/usage data.
+#[allow(clippy::too_many_arguments)] // event mapping requires full context
 fn agent_event_to_chat_event(
     app: &tauri::AppHandle,
     event: &AgentEvent,
@@ -1770,35 +1771,34 @@ pub async fn get_cache_diagnostics(
 
     // If the in-memory trace is empty (e.g. after restart), fall back to
     // persisted usage records from the last 24h.
-    if events.is_empty() {
-        if let Some(ref store) = state.app_state.tasks.runtime {
-            if let Ok(records) = store.query_usage_records(
-                &echo_agent_app_core::tasks::task_runtime::UsageQueryFilter {
-                    limit: Some(200),
-                    ..Default::default()
+    if events.is_empty()
+        && let Some(ref store) = state.app_state.tasks.runtime
+        && let Ok(records) = store.query_usage_records(
+            &echo_agent_app_core::tasks::task_runtime::UsageQueryFilter {
+                limit: Some(200),
+                ..Default::default()
+            },
+        )
+    {
+        for r in &records {
+            events.push(TraceEvent {
+                timestamp: r.created_at,
+                kind: TraceKind::LlmCall {
+                    model: r.model.clone(),
+                    input_tokens: r.input_tokens,
+                    output_tokens: r.output_tokens,
+                    cached_input_tokens: r.cached_input_tokens,
+                    cache_creation_input_tokens: r.cache_creation_input_tokens,
+                    usage_reported: r.usage_reported,
+                    system_prompt_hash: r.system_prompt_hash.clone(),
+                    tools_schema_hash: r.tools_schema_hash.clone(),
+                    cwd_hash: r.cwd_hash.clone(),
+                    worker_prompt_hash: r.worker_prompt_hash.clone(),
+                    provider: r.provider.clone(),
                 },
-            ) {
-                for r in &records {
-                    events.push(TraceEvent {
-                        timestamp: r.created_at,
-                        kind: TraceKind::LlmCall {
-                            model: r.model.clone(),
-                            input_tokens: r.input_tokens,
-                            output_tokens: r.output_tokens,
-                            cached_input_tokens: r.cached_input_tokens,
-                            cache_creation_input_tokens: r.cache_creation_input_tokens,
-                            usage_reported: r.usage_reported,
-                            system_prompt_hash: r.system_prompt_hash.clone(),
-                            tools_schema_hash: r.tools_schema_hash.clone(),
-                            cwd_hash: r.cwd_hash.clone(),
-                            worker_prompt_hash: r.worker_prompt_hash.clone(),
-                            provider: r.provider.clone(),
-                        },
-                        duration_ms: None,
-                        metadata: std::collections::HashMap::new(),
-                    });
-                }
-            }
+                duration_ms: None,
+                metadata: std::collections::HashMap::new(),
+            });
         }
     }
 

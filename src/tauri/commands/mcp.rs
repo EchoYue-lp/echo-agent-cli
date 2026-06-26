@@ -423,10 +423,9 @@ fn redact_mcp_config_secrets(value: &mut serde_json::Value) {
             .get_mut("url")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
+            && let Some(redacted) = redact_url_secrets(&url)
         {
-            if let Some(redacted) = redact_url_secrets(&url) {
-                obj.insert("url".to_string(), serde_json::Value::String(redacted));
-            }
+            obj.insert("url".to_string(), serde_json::Value::String(redacted));
         }
     }
 }

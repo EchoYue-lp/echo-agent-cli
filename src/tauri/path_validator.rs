@@ -105,10 +105,10 @@ pub fn validate_ipc_path(path: &str, must_exist: bool) -> Result<PathBuf, String
     }
 
     // Secret denylist check on the resolved real path.
-    if let Some(rel) = relative_under_home(&resolved, &home) {
-        if is_denied_secret_path(&rel) {
-            return Err("Access denied: path is in a protected credential location".to_string());
-        }
+    if let Some(rel) = relative_under_home(&resolved, &home)
+        && is_denied_secret_path(&rel)
+    {
+        return Err("Access denied: path is in a protected credential location".to_string());
     }
 
     Ok(resolved)

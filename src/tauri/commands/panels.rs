@@ -1608,15 +1608,15 @@ async fn workspace_project_root(state: &TauriState) -> Result<PathBuf, IpcError>
 /// on-disk SKILL.md.
 pub(crate) async fn allowed_skill_roots(state: &TauriState) -> Vec<PathBuf> {
     let mut roots = Vec::new();
-    if let Ok(ws_root) = workspace_project_root(state).await {
-        if let Ok(c) = ws_root.canonicalize() {
-            roots.push(c);
-        }
+    if let Ok(ws_root) = workspace_project_root(state).await
+        && let Ok(c) = ws_root.canonicalize()
+    {
+        roots.push(c);
     }
-    if let Some(home) = std::env::var("HOME").ok().map(PathBuf::from) {
-        if let Ok(c) = home.canonicalize() {
-            roots.push(c);
-        }
+    if let Some(home) = std::env::var("HOME").ok().map(PathBuf::from)
+        && let Ok(c) = home.canonicalize()
+    {
+        roots.push(c);
     }
     roots
 }
