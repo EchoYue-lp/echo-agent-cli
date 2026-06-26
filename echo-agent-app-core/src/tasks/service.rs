@@ -588,6 +588,7 @@ async fn dispatch_task(
             agent_provider,
             hitl_provider,
             service_config.composite_parallelism,
+            task_runtime_store,
             steps.clone(),
             strategy.clone(),
         )
@@ -839,9 +840,108 @@ async fn execute_composite(
     agent_provider: Arc<dyn TaskAgentProvider>,
     hitl_provider: Arc<super::hitl_provider::BackgroundTaskHumanProvider>,
     composite_parallelism: usize,
+    task_runtime_store: Option<Arc<super::task_runtime::TaskRuntimeStore>>,
     steps: Vec<super::background::CompositeStep>,
     strategy: super::background::CompositeStrategy,
 ) -> Result<String, echo_agent::error::ReactError> {
+    // Phase 3.3: when a TaskRuntimeStore is available, run the composite as a
+    // pre-constructed PlanTask DAG through `execute_run`/`run_dag`. This bypasses
+    // the agent's `execute_plan` tool (which the background pool agent lacks,
+    // §10.2) — run_dag is invoked directly with an explicit plan built from the
+    // composite steps (input_from → depends_on). Each PlanTask is dispatched by
+    // run_dag's RealTaskWorker (subagent fork on the leased agent). Note:
+    // composite_parallelism is currently ignored on this path (run_dag applies
+    // its default ConcurrencyLimits); the legacy path below still honors it.
+    if let Some(store) = task_runtime_store {
+        let lease = agent_provider.acquire_for_task(&ctx.task_id).await?;
+        let agent = lease.agent();
+        install_background_hitl_provider(&agent, hitl_provider).await;
+
+        let mut plan_tasks: Vec<super::task_runtime::PlanTask> = Vec::with_capacity(steps.len());
+        let mut prev_id: Option<String> = None;
+        for (i, step) in steps.iter().enumerate() {
+            let id = step
+                .description
+                .clone()
+                .unwrap_or_else(|| format!("step_{}", i + 1));
+            // depends_on: explicit input_from wins; else for Sequential, chain
+            // to the previous step so run_dag preserves order (edges = depends_on).
+            let depends_on = if !step.input_from.is_empty() {
+                step.input_from.clone()
+            } else {
+                match (&strategy, &prev_id) {
+                    (super::background::CompositeStrategy::Sequential, Some(p)) => vec![p.clone()],
+                    _ => Vec::new(),
+                }
+            };
+            plan_tasks.push(super::task_runtime::PlanTask {
+                id: id.clone(),
+                title: id.clone(),
+                description: step.kind.to_prompt(),
+                kind: super::task_runtime::PlanTaskKind::Implementation,
+                agent_role: "implementer".to_string(),
+                sort_order: i as i64,
+                depends_on,
+                ..Default::default()
+            });
+            prev_id = Some(id);
+        }
+
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let goal = format!("composite task {}", ctx.task_id);
+        let conversation_id = format!("background:composite:{}:{}", ctx.task_id, &run_id);
+        store
+            .create_run(
+                &run_id,
+                "default",
+                &conversation_id,
+                "",
+                super::task_runtime::DomainProfile::General,
+                &goal,
+                super::task_runtime::TaskRouteKind::ParallelReadonlyDelegation.as_str(),
+                super::task_runtime::AttendedMode::Unattended,
+            )
+            .map_err(|e| echo_agent::error::ReactError::Other(format!("create_run: {e}")))?;
+        store
+            .transition_run(&run_id, super::task_runtime::TaskRunStatus::Running)
+            .map_err(|e| echo_agent::error::ReactError::Other(format!("transition_run: {e}")))?;
+        let plan = super::task_runtime::TaskPlan {
+            plan_id: uuid::Uuid::new_v4().to_string(),
+            run_id: run_id.clone(),
+            domain_profile: super::task_runtime::DomainProfile::General,
+            goal,
+            assumptions: Vec::new(),
+            risks: Vec::new(),
+            execution_mode: super::task_runtime::ExecutionMode::default(),
+            tasks: plan_tasks,
+        };
+        store
+            .attach_plan(&plan)
+            .map_err(|e| echo_agent::error::ReactError::Other(format!("attach_plan: {e}")))?;
+
+        let cache_user_id = crate::infra::load_or_create_cache_user_id();
+        let cancel = echo_agent::agent::CancellationToken::new();
+        let outcome = super::task_runtime::execute_run(
+            store,
+            Some(agent),
+            None,
+            None,
+            None,
+            None,
+            &run_id,
+            cache_user_id,
+            cancel,
+        )
+        .await;
+        lease.release().await;
+        return outcome
+            .map(|o| format!("composite run {run_id}: {o:?}"))
+            .map_err(|e| {
+                echo_agent::error::ReactError::Other(format!("composite run failed: {e}"))
+            });
+    }
+
+    // Fallback (no store — dead-in-practice): legacy framework composite executor.
     use echo_agent::tasks::composite::{
         CompositePlan as FrameworkCompositePlan, CompositeStep as FrameworkCompositeStep,
         CompositeStrategy as FrameworkCompositeStrategy,
