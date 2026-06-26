@@ -46,7 +46,10 @@ pub async fn list_tasks(state: tauri::State<'_, TauriState>) -> Result<Vec<TaskI
         .as_ref()
         .ok_or_else(|| IpcError::Internal("Task service not initialized".to_string()))?;
 
-    let tasks = service.list(None);
+    // Phase 3.4: unified list merges framework Tasks (pipeline) + Runs
+    // (AgentChat/Composite). Progress is None for run-sourced tasks (filled
+    // in by Task 5 via list_task_events).
+    let tasks = service.list_unified(None);
     Ok(tasks
         .into_iter()
         .map(|task| {
@@ -75,35 +78,51 @@ pub async fn submit_task(
     use echo_agent_app_core::tasks::BackgroundTaskKind;
     let params = params.unwrap_or_default();
 
-    let task_kind = match kind.as_str() {
-        "agent_chat" | "chat" => BackgroundTaskKind::AgentChat {
-            prompt: params
+    // Phase 3.5: agent_chat is now submitted via submit_run (no framework Task).
+    // Pipeline kinds (research) still go through submit_with_options.
+    let (task_id, source) = match kind.as_str() {
+        "agent_chat" | "chat" => {
+            let prompt = params
                 .get("prompt")
                 .and_then(|v| v.as_str())
                 .unwrap_or(&description)
-                .to_string(),
-            session_id: params
-                .get("session_id")
-                .and_then(|v| v.as_str())
-                .map(String::from),
-        },
+                .to_string();
+            let id = service
+                .submit_run(&prompt, &description, "background", "ipc")
+                .await
+                .map_err(|e| IpcError::Internal(format!("Failed to submit task: {e}")))?;
+            (id, "run")
+        }
         "cron" | "workflow" => {
             return Err(IpcError::Validation(format!(
                 "{kind} tasks are not submitted via the background task service. Use the /cron command for scheduled tasks."
             )));
         }
-        "research" => BackgroundTaskKind::Research {
-            topic: params
-                .get("topic")
-                .and_then(|v| v.as_str())
-                .unwrap_or(&description)
-                .to_string(),
-            max_papers: params
-                .get("max_papers")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(20) as usize,
-            output_format: Default::default(),
-        },
+        "research" => {
+            let task_kind = BackgroundTaskKind::Research {
+                topic: params
+                    .get("topic")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&description)
+                    .to_string(),
+                max_papers: params
+                    .get("max_papers")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(20) as usize,
+                output_format: Default::default(),
+            };
+            let id = service
+                .submit_with_options(
+                    task_kind,
+                    &description,
+                    Some("ipc".to_string()),
+                    priority,
+                    depends_on.unwrap_or_default(),
+                )
+                .await
+                .map_err(|e| IpcError::Internal(format!("Failed to submit task: {e}")))?;
+            (id, "framework")
+        }
         other => {
             return Err(IpcError::Validation(format!(
                 "Unknown task kind: {other}. Valid: agent_chat, research"
@@ -111,20 +130,10 @@ pub async fn submit_task(
         }
     };
 
-    let task_id = service
-        .submit_with_options(
-            task_kind,
-            &description,
-            Some("ipc".to_string()),
-            priority,
-            depends_on.unwrap_or_default(),
-        )
-        .await
-        .map_err(|e| IpcError::Internal(format!("Failed to submit task: {e}")))?;
-
     Ok(serde_json::json!({
         "success": true,
         "task_id": task_id,
+        "source": source,
     }))
 }
 
@@ -140,10 +149,9 @@ pub async fn get_task(
         .as_ref()
         .ok_or_else(|| IpcError::Internal("Task service not initialized".to_string()))?;
 
-    let (task, _meta) = service
-        .get(&id)
+    let task = service
+        .get_unified(&id)
         .ok_or_else(|| IpcError::NotFound(format!("Task '{}' not found", id)))?;
-
     let progress = service.get_progress(&id);
     Ok(task_to_info(task, progress))
 }
@@ -160,7 +168,20 @@ pub async fn cancel_task(
         .as_ref()
         .ok_or_else(|| IpcError::Internal("Task service not initialized".to_string()))?;
 
-    let cancelled = service.cancel(&id).await;
+    // Phase 3.4: try the run cancel token first (stronger — interrupts the
+    // driver), then fall back to service.cancel (framework + store transition).
+    let key = format!("__run__:{id}");
+    let cancelled_via_token = state
+        .app_state
+        .tasks
+        .run_cancel_tokens
+        .get(&key)
+        .map(|t| {
+            t.cancel();
+            true
+        })
+        .unwrap_or(false);
+    let cancelled = cancelled_via_token || service.cancel(&id).await;
     Ok(serde_json::json!({
         "success": cancelled,
         "task_id": id,
@@ -168,43 +189,13 @@ pub async fn cancel_task(
 }
 
 fn task_to_info(
-    task: echo_agent_app_core::tasks::Task,
+    task: echo_agent_app_core::tasks::UnifiedTaskInfo,
     progress: Option<echo_agent_app_core::tasks::progress::TaskProgress>,
 ) -> TaskInfo {
-    let kind = task
-        .tags
-        .iter()
-        .find(|t| t.starts_with("bg:kind:"))
-        .cloned();
-
-    let (status_str, error) = match &task.status {
-        echo_agent_app_core::tasks::TaskStatus::Pending => ("pending".to_string(), None),
-        echo_agent_app_core::tasks::TaskStatus::InProgress => ("in_progress".to_string(), None),
-        echo_agent_app_core::tasks::TaskStatus::Completed => ("completed".to_string(), None),
-        echo_agent_app_core::tasks::TaskStatus::Cancelled => ("cancelled".to_string(), None),
-        echo_agent_app_core::tasks::TaskStatus::Failed(e) => {
-            ("failed".to_string(), Some(e.clone()))
-        }
-        echo_agent_app_core::tasks::TaskStatus::Blocked(e) => {
-            ("blocked".to_string(), Some(e.clone()))
-        }
-        echo_agent_app_core::tasks::TaskStatus::TimedOut { error } => {
-            ("timed_out".to_string(), Some(error.clone()))
-        }
-        echo_agent_app_core::tasks::TaskStatus::Retrying {
-            attempt,
-            last_error,
-        } => (
-            "retrying".to_string(),
-            Some(format!("attempt {attempt}: {last_error}")),
-        ),
-        echo_agent_app_core::tasks::TaskStatus::Skipped => ("skipped".to_string(), None),
-        echo_agent_app_core::tasks::TaskStatus::Paused(reason) => {
-            ("paused".to_string(), Some(reason.clone()))
-        }
-    };
-
-    // Extract progress from the live progress cache (updated by ProgressBridge)
+    // Phase 3.4: UnifiedTaskInfo pipes framework Tasks AND Runs through the
+    // same projection. Progress from ProgressBridge is only available for
+    // framework-sourced tasks; run-sourced tasks will get progress from
+    // TaskRuntimeStore events in Task 5.
     let (progress_pct, progress_phase, progress_message, eta_secs) = match progress {
         Some(p) => (
             Some(p.percentage),
@@ -216,17 +207,17 @@ fn task_to_info(
     };
 
     TaskInfo {
-        id: task.id.clone(),
-        description: task.description.clone(),
-        status: status_str,
-        created_at: task.created_at.to_string(),
-        updated_at: task.updated_at.to_string(),
-        result: task.result.clone(),
-        error,
-        kind,
+        id: task.id,
+        description: task.description,
+        status: task.status,
+        created_at: task.created_at,
+        updated_at: task.updated_at,
+        result: task.result,
+        error: task.error,
+        kind: task.kind,
         progress: None,
         priority: task.priority,
-        dependencies: task.dependencies.clone(),
+        dependencies: task.dependencies,
         progress_pct,
         progress_phase,
         progress_message,

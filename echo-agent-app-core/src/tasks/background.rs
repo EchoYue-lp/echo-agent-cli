@@ -21,13 +21,6 @@ pub const BG_KIND_TAG_PREFIX: &str = "bg:kind:";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "params")]
 pub enum BackgroundTaskKind {
-    /// One-shot agent chat: submit a prompt, stream the response.
-    AgentChat {
-        prompt: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        session_id: Option<String>,
-    },
-
     /// Research pipeline: paper search -> fetch -> synthesize -> write (with revision loop).
     Research {
         topic: String,
@@ -81,39 +74,6 @@ pub enum BackgroundTaskKind {
         #[serde(default = "default_wp_quality_threshold")]
         quality_threshold: u32,
     },
-
-    /// Composite task: chains multiple tasks together with dependencies.
-    /// Tasks execute in the specified order, with output from one task
-    /// available as input to the next.
-    Composite {
-        /// List of sub-tasks to execute in sequence
-        steps: Vec<CompositeStep>,
-        /// Execution strategy: "sequential" (default) or "parallel"
-        #[serde(default = "default_strategy")]
-        strategy: CompositeStrategy,
-    },
-}
-
-/// A single step in a composite task chain.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CompositeStep {
-    /// Task kind for this step
-    pub kind: BackgroundTaskKind,
-    /// Optional description override
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    /// Input mapping: which output keys from previous steps to use
-    #[serde(default)]
-    pub input_from: Vec<String>,
-}
-
-/// Execution strategy for composite tasks.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum CompositeStrategy {
-    #[default]
-    Sequential,
-    Parallel,
 }
 
 /// Workspace write policy for parallel background tasks.
@@ -138,10 +98,6 @@ pub enum SandboxExecutionPolicy {
     SharedLimited,
     /// Task should avoid shell/sandbox execution.
     Disabled,
-}
-
-fn default_strategy() -> CompositeStrategy {
-    CompositeStrategy::Sequential
 }
 
 fn default_max_papers() -> usize {
@@ -233,12 +189,10 @@ impl BackgroundTaskKind {
     /// Return the tag string for this kind (used in `Task.tags`).
     pub fn tag(&self) -> String {
         let kind_name = match self {
-            BackgroundTaskKind::AgentChat { .. } => "agent_chat",
             BackgroundTaskKind::Research { .. } => "research",
             BackgroundTaskKind::ResearchToWriting { .. } => "research_to_writing",
             BackgroundTaskKind::DataPipeline { .. } => "data_pipeline",
             BackgroundTaskKind::WritingPipeline { .. } => "writing_pipeline",
-            BackgroundTaskKind::Composite { .. } => "composite",
         };
         format!("{BG_KIND_TAG_PREFIX}{kind_name}")
     }
@@ -251,12 +205,10 @@ impl BackgroundTaskKind {
     /// Human-readable display name.
     pub fn display_name(&self) -> &'static str {
         match self {
-            BackgroundTaskKind::AgentChat { .. } => "Agent Chat",
             BackgroundTaskKind::Research { .. } => "Research",
             BackgroundTaskKind::ResearchToWriting { .. } => "Research to Writing",
             BackgroundTaskKind::DataPipeline { .. } => "Data Analysis",
             BackgroundTaskKind::WritingPipeline { .. } => "Writing",
-            BackgroundTaskKind::Composite { .. } => "Composite Task",
         }
     }
 
@@ -266,11 +218,9 @@ impl BackgroundTaskKind {
     /// prompt and available tools.
     pub fn mode_name(&self) -> &str {
         match self {
-            Self::AgentChat { .. } => "general",
             Self::Research { .. } | Self::ResearchToWriting { .. } => "research",
             Self::DataPipeline { .. } => "data",
             Self::WritingPipeline { .. } => "writing",
-            Self::Composite { .. } => "general",
         }
     }
 
@@ -280,8 +230,6 @@ impl BackgroundTaskKind {
     /// a descriptive prompt that the Agent can execute autonomously.
     pub fn to_prompt(&self) -> String {
         match self {
-            Self::AgentChat { prompt, .. } => prompt.clone(),
-
             Self::Research {
                 topic, max_papers, ..
             } => format!(
@@ -335,29 +283,6 @@ impl BackgroundTaskKind {
                  {max_revisions} revisions)\n\
                  5. Finalize the document"
             ),
-
-            Self::Composite { steps, strategy } => {
-                let strat = match strategy {
-                    CompositeStrategy::Sequential => "in sequence",
-                    CompositeStrategy::Parallel => "in parallel",
-                };
-                let step_list = steps
-                    .iter()
-                    .enumerate()
-                    .map(|(i, s)| {
-                        let desc = s
-                            .description
-                            .as_deref()
-                            .unwrap_or_else(|| s.kind.display_name());
-                        format!("  {}. {}", i + 1, desc)
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                format!(
-                    "Execute the following {count} steps {strat}:\n{step_list}",
-                    count = steps.len()
-                )
-            }
         }
     }
 }
@@ -405,9 +330,10 @@ mod tests {
     #[test]
     fn background_task_meta_defaults_to_guarded_parallel_resource_policies() {
         let meta = BackgroundTaskMeta::new(
-            BackgroundTaskKind::AgentChat {
-                prompt: "hello".to_string(),
-                session_id: None,
+            BackgroundTaskKind::Research {
+                topic: "hello".to_string(),
+                max_papers: 1,
+                output_format: ResearchOutputFormat::default(),
             },
             Some("test".to_string()),
         );

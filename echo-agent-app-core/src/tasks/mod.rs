@@ -15,7 +15,6 @@ pub mod background;
 pub mod conversation_runtime;
 pub mod hitl_provider;
 pub mod pipelines;
-pub mod progress_bridge;
 pub mod service;
 pub mod task_runtime;
 
@@ -24,5 +23,5 @@ pub use background::{BackgroundTaskKind, BackgroundTaskMeta, ResearchOutputForma
 pub use pipelines::{
     DataPipelineConfig, ResearchConfig, ResearchToWritingConfig, WritingPipelineConfig,
 };
-pub use service::BackgroundTaskService;
+pub use service::{BackgroundTaskService, UnifiedTaskInfo};
 pub use task_runtime::TaskRuntimeStore;

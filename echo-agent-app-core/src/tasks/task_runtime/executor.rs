@@ -1692,10 +1692,9 @@ pub async fn launch_unattended_run(
     prompt: &str,
     parent_cancel: CancellationToken,
     route: super::router::TaskRouteKind,
-) -> Result<(), ExecError> {
+) -> Result<String, ExecError> {
     let run_id = uuid::Uuid::new_v4().to_string();
     let conversation_id = format!("{source_kind}:{source_id}:{fire_id}");
-    let child_cancel = parent_cancel.child_token();
 
     // 1. Create the run in Pending, attended_mode = Unattended.
     store.create_run(
@@ -1712,11 +1711,44 @@ pub async fn launch_unattended_run(
     // 2. Transition Pending → Running.
     store.transition_run(&run_id, TaskRunStatus::Running)?;
 
-    // 3. Drive the agent's ReAct loop in the run's context.
-    //    The agent will call task_create (to build the plan) and execute_plan
-    //    (which internally calls execute_run). The Unattended attended_mode
-    //    ensures preflight checks and approval-gate skip activate.
-    let run_id_for_scope = run_id.clone();
+    // 3. Drive the agent's ReAct loop + finalize status. Extracted so callers
+    //    that own the run_id (e.g. submit_run in Phase 3.4) can drive a run
+    //    they created themselves without re-generating the id.
+    drive_unattended_run(
+        store,
+        primary_agent,
+        &run_id,
+        source_id,
+        fire_id,
+        prompt,
+        parent_cancel,
+    )
+    .await
+}
+
+/// Drive an already-created Run to completion via the agent ReAct loop, then
+/// finalize its status from the store. Phase 3.4: extracted from
+/// `launch_unattended_run` so the caller can own the run_id (create_run +
+/// transition_run happen in the caller). This fn only drives the agent's
+/// ReAct loop (which may call task_create + execute_plan) and finalizes the
+/// run status (auto-Complete a direct answer, auto-Fail an unexpected Paused).
+#[allow(clippy::too_many_arguments)] // run identity (run_id/source_id/fire_id) + agent + prompt + cancel
+pub async fn drive_unattended_run(
+    store: Arc<TaskRuntimeStore>,
+    primary_agent: crate::agent_handle::AgentHandle,
+    run_id: &str,
+    source_id: &str,
+    fire_id: &str,
+    prompt: &str,
+    parent_cancel: CancellationToken,
+) -> Result<String, ExecError> {
+    let child_cancel = parent_cancel.child_token();
+
+    // Drive the agent's ReAct loop in the run's context. The agent will call
+    // task_create (to build the plan) and execute_plan (which internally calls
+    // execute_run). The Unattended attended_mode (set by the caller at
+    // create_run) ensures preflight checks and approval-gate skip activate.
+    let run_id_for_scope = run_id.to_string();
     let cancel_for_scope = child_cancel.clone();
     let prompt_owned = prompt.to_string();
 
@@ -1781,9 +1813,9 @@ pub async fn launch_unattended_run(
     )
     .await;
 
-    // 4. Determine final outcome from the store (execute_plan/execute_run
-    //    may have already transitioned the run to a terminal state).
-    let final_status = store.get_run(&run_id).ok().flatten().map(|r| r.status);
+    // Determine final outcome from the store (execute_plan/execute_run
+    // may have already transitioned the run to a terminal state).
+    let final_status = store.get_run(run_id).ok().flatten().map(|r| r.status);
 
     match final_status {
         Some(TaskRunStatus::Completed) => {
@@ -1819,9 +1851,9 @@ pub async fn launch_unattended_run(
                 run_id = %run_id,
                 "Unattended run unexpectedly Paused — transitioning to Failed"
             );
-            let _ = store.transition_run(&run_id, TaskRunStatus::Failed);
+            let _ = store.transition_run(run_id, TaskRunStatus::Failed);
             let _ = store.note(
-                &run_id,
+                run_id,
                 None,
                 "Unattended run unexpectedly Paused; auto-transitioned to Failed.",
             );
@@ -1832,9 +1864,9 @@ pub async fn launch_unattended_run(
             // state (e.g. agent returned a direct answer without calling
             // execute_plan). Mark as Completed or Cancelled.
             if child_cancel.is_cancelled() {
-                let _ = store.transition_run(&run_id, TaskRunStatus::Cancelled);
+                let _ = store.transition_run(run_id, TaskRunStatus::Cancelled);
             } else {
-                let _ = store.transition_run(&run_id, TaskRunStatus::Completed);
+                let _ = store.transition_run(run_id, TaskRunStatus::Completed);
             }
             tracing::info!(
                 source_id = %source_id,
@@ -1846,7 +1878,7 @@ pub async fn launch_unattended_run(
         }
     }
 
-    Ok(())
+    Ok(run_id.to_string())
 }
 
 /// Cron-specific thin wrapper: routes through `launch_unattended_run` with
@@ -1858,7 +1890,7 @@ pub async fn launch_cron_run(
     fire_id: &str,
     prompt: &str,
     parent_cancel: CancellationToken,
-) -> Result<(), ExecError> {
+) -> Result<String, ExecError> {
     launch_unattended_run(
         store,
         primary_agent,
@@ -1955,6 +1987,50 @@ pub fn preflight_unattended_task(task: &PlanTask) -> Result<(), PreflightRejecti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn launch_unattended_run_returns_run_id() {
+        // Phase 3.4-1: launch_unattended_run must return the run_id so callers
+        // (submit) can hand it to the Tauri layer. A simple prompt (mock returns
+        // "ok", agent never calls execute_plan) auto-Completes (Q5).
+        use echo_agent::testing::MockLlmClient;
+        use std::sync::Arc;
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().expect("in-memory store"));
+        let mock = Arc::new(
+            MockLlmClient::new()
+                .with_model_name("t")
+                .with_response("ok"),
+        );
+        let agent = crate::agent_handle::AgentHandle::new(
+            echo_agent::agent::ReactAgentBuilder::new()
+                .model("t")
+                .llm_client(mock)
+                .build()
+                .expect("test agent should build"),
+        );
+        let cancel = echo_agent::agent::CancellationToken::new();
+        let run_id = launch_unattended_run(
+            store.clone(),
+            agent,
+            "test",
+            "src-1",
+            "fire-1",
+            "hello",
+            cancel,
+            crate::tasks::task_runtime::TaskRouteKind::ParallelReadonlyDelegation,
+        )
+        .await
+        .expect("unattended run should succeed");
+        // The returned id must key a real run that auto-Completed (the mock
+        // returns a direct answer, so execute_plan never runs and the finalize
+        // branch auto-Completes — this verifies the contract survived the
+        // extraction: a non-empty id that maps to a Completed run).
+        let run = store
+            .get_run(&run_id)
+            .expect("get_run should succeed")
+            .expect("run should exist");
+        assert_eq!(run.status, TaskRunStatus::Completed);
+    }
 
     #[test]
     fn concurrency_limits_clamp_pool_value() {

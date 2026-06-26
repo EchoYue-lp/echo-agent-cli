@@ -428,17 +428,13 @@ async fn cmd_agent(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     let agent_name = args[1];
     let task = args[2..].join(" ");
 
-    // If task service is available, submit as a background AgentChat task
+    // If task service is available, submit as a background Run (Phase 3.5:
+    // AgentChat variant deleted; use submit_run directly).
     if let Some(ref service) = ctx.task_service {
+        let prompt = format!("Run as subagent '{}': {}", agent_name, task);
+        let description = format!("Agent run: {} — {}", agent_name, task);
         match service
-            .submit(
-                BackgroundTaskKind::AgentChat {
-                    prompt: format!("Run as subagent '{}': {}", agent_name, task),
-                    session_id: None,
-                },
-                &format!("Agent run: {} — {}", agent_name, task),
-                Some("cli".to_string()),
-            )
+            .submit_run(&prompt, &description, "background", "cli")
             .await
         {
             Ok(task_id) => {

@@ -88,16 +88,13 @@ async fn cmd_fetch_paper(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
         }
     };
 
-    let kind = BackgroundTaskKind::AgentChat {
-        prompt: prompt.clone(),
-        session_id: None,
-    };
-
+    // Phase 3.5: AgentChat variant deleted; submit as a Run directly.
     match service
-        .submit(
-            kind,
+        .submit_run(
+            &prompt,
             &format!("Fetch paper: {}", url),
-            Some("cli".to_string()),
+            "background",
+            "cli",
         )
         .await
     {

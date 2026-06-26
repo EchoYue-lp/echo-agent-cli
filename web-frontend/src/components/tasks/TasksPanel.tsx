@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import {
   tasksApi,
+  taskRuntimeApi,
   type BackgroundTask,
   type SubmitTaskRequest,
 } from '../../api/endpoints';
@@ -73,6 +74,26 @@ export function TasksPanel() {
     try {
       const data = await tasksApi.list();
       setTasks(data);
+      // Phase 3.4: fetch plan-based progress for run-sourced tasks.
+      for (const task of data) {
+        if (task.source !== 'run' || task.status !== 'in_progress') continue;
+        try {
+          const plan = await taskRuntimeApi.getPlan(task.id);
+          if (plan && plan.tasks.length > 0) {
+            const done = plan.tasks.filter((t: { status: string }) => t.status === 'completed').length;
+            const pct = Math.round((done / plan.tasks.length) * 100);
+            setProgressMap((prev) => ({
+              ...prev,
+              [task.id]: {
+                percentage: pct,
+                phase: `${done}/${plan.tasks.length}`,
+              },
+            }));
+          }
+        } catch {
+          // plan not yet generated — skip
+        }
+      }
     } catch (e) {
       console.error('Failed to fetch tasks:', e);
     } finally {

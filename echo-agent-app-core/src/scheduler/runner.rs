@@ -12,10 +12,9 @@
 //! called); complex prompts drive task_create + execute_plan.
 
 use crate::agent_handle::AgentHandle;
-use crate::tasks::background::BackgroundTaskKind;
 use crate::tasks::service::BackgroundTaskService;
 use crate::tasks::task_runtime::{TaskRuntimeStore, launch_cron_run};
-use echo_agent::agent::{Agent, CancellationToken};
+use echo_agent::agent::CancellationToken;
 use echo_agent::scheduler::{
     CronTask, CronTaskStore, FireFn, SchedulerRunner as FrameworkSchedulerRunner,
 };
@@ -31,84 +30,58 @@ const PLAN_MARKER: &str = "[plan]";
 
 /// Build a `FireFn` that dispatches cron task execution.
 ///
-/// Phase 3.1: when `task_runtime_store` is `Some` (always, in practice —
-/// `AppState` constructs one at boot), ALL cron prompts route through
-/// `launch_cron_run` (unified TaskRuntime executor, `Unattended`). The
-/// `[plan]` prefix is stripped for backward compatibility. The
-/// `task_service`/`execute_direct` branches below handle the dead-in-practice
-/// `runtime_store=None` case (cleanup deferred to Phase 3.5).
+/// Phase 3.1+: ALL cron prompts route through `launch_cron_run` (unified
+/// TaskRuntime executor, `Unattended`). The `[plan]` prefix is stripped for
+/// backward compatibility. Simple prompts are answered directly by the agent
+/// (auto-Completed); complex prompts drive task_create + execute_plan.
+///
+/// Phase 3.5: the dead-in-practice `runtime_store=None` fallback (legacy
+/// `BackgroundTaskService::submit` + `execute_direct`) has been removed —
+/// `AppState` always constructs a `TaskRuntimeStore` at boot.
 pub fn build_fire_fn(
     agent: AgentHandle,
-    task_service: Option<Arc<BackgroundTaskService>>,
+    _task_service: Option<Arc<BackgroundTaskService>>,
     task_runtime_store: Option<Arc<TaskRuntimeStore>>,
 ) -> FireFn {
     Arc::new(move |task: CronTask| {
         let agent = agent.clone();
-        let service = task_service.clone();
         let runtime_store = task_runtime_store.clone();
         Box::pin(async move {
-            // Phase 3.1: 所有 cron 经 launch_cron_run(统一 TaskRuntime 执行器)。
-            // `[plan]` 前缀 strip 作向后兼容,但不再选路——简单 prompt 由 agent
-            // 直接作答(launch_cron_run 未调 execute_plan 时自动 Completed);
-            // 复杂 prompt 驱动 task_create + execute_plan,与旧 [plan] 路径一致。
-            if let Some(ref store) = runtime_store {
-                let prompt = task
-                    .prompt
-                    .strip_prefix(PLAN_MARKER)
-                    .map(str::trim)
-                    .unwrap_or(&task.prompt);
-                if prompt.is_empty() {
-                    return Err(echo_agent::error::ReactError::Other(
-                        "cron prompt is empty (after [plan] strip)".into(),
-                    ));
-                }
-                let fire_id = uuid::Uuid::new_v4().to_string();
-                let cancel = CancellationToken::new();
-                match launch_cron_run(
-                    store.clone(),
-                    agent.clone(),
-                    &task.id,
-                    &fire_id,
-                    prompt,
-                    cancel,
+            let store = runtime_store.ok_or_else(|| {
+                echo_agent::error::ReactError::Other(
+                    "TaskRuntimeStore not configured — cron cannot run".into(),
                 )
-                .await
-                {
-                    Ok(()) => Ok(format!("cron run finished for task {}", task.id)),
-                    Err(e) => Err(echo_agent::error::ReactError::Other(format!(
-                        "cron run failed: {e}"
-                    ))),
-                }
-            } else if let Some(ref svc) = service {
-                // No runtime store — legacy path only.
-                let kind = BackgroundTaskKind::AgentChat {
-                    prompt: task.prompt.clone(),
-                    session_id: None,
-                };
-                let description = format!("Cron [{}]: {}", task.name, task.prompt);
-                match svc
-                    .submit(kind, &description, Some("cron".to_string()))
-                    .await
-                {
-                    Ok(task_id) => Ok(format!("Submitted as background task: {task_id}")),
-                    Err(e) => {
-                        tracing::warn!(
-                            "BackgroundTaskService submit failed ({e}), falling back to direct execution"
-                        );
-                        execute_direct(&agent, &task).await
-                    }
-                }
-            } else {
-                execute_direct(&agent, &task).await
+            })?;
+            // [plan] prefix strip for backward compat; no longer routes.
+            let prompt = task
+                .prompt
+                .strip_prefix(PLAN_MARKER)
+                .map(str::trim)
+                .unwrap_or(&task.prompt);
+            if prompt.is_empty() {
+                return Err(echo_agent::error::ReactError::Other(
+                    "cron prompt is empty (after [plan] strip)".into(),
+                ));
+            }
+            let fire_id = uuid::Uuid::new_v4().to_string();
+            let cancel = CancellationToken::new();
+            match launch_cron_run(
+                store.clone(),
+                agent.clone(),
+                &task.id,
+                &fire_id,
+                prompt,
+                cancel,
+            )
+            .await
+            {
+                Ok(run_id) => Ok(format!("cron run {run_id} finished for task {}", task.id)),
+                Err(e) => Err(echo_agent::error::ReactError::Other(format!(
+                    "cron run failed: {e}"
+                ))),
             }
         }) as futures::future::BoxFuture<'static, echo_agent::error::Result<String>>
     })
-}
-
-/// Direct execution fallback — sends the prompt to the agent synchronously.
-async fn execute_direct(agent: &AgentHandle, task: &CronTask) -> echo_agent::error::Result<String> {
-    let guard = agent.inner().read().await;
-    guard.chat(&task.prompt).await
 }
 
 /// Convenience constructor: build a `SchedulerRunner` with the CLI's

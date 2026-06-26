@@ -493,6 +493,8 @@ export interface BackgroundTask {
   progress_phase?: string;
   progress_message?: string;
   eta_secs?: number;
+  /** Phase 3.4: "run" for AgentChat/Composite runs, "framework" for pipeline. */
+  source?: 'run' | 'framework';
 }
 
 export interface SubmitTaskRequest {
