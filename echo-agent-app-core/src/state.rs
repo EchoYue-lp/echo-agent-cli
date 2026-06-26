@@ -653,6 +653,7 @@ impl AppState {
                 store_backend,
                 self.tasks.cancel_token.clone(),
                 task_hooks,
+                self.tasks.runtime.clone(),
             )
             .await
         } else {
@@ -661,6 +662,7 @@ impl AppState {
                 store_backend,
                 self.tasks.cancel_token.clone(),
                 task_hooks,
+                self.tasks.runtime.clone(),
             )
             .await
         };

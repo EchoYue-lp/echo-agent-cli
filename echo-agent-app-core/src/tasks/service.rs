@@ -185,8 +185,9 @@ impl BackgroundTaskService {
         agent: AgentHandle,
         store_backend: Arc<dyn Store>,
         cancel: echo_agent::agent::CancellationToken,
+        task_runtime_store: Option<Arc<super::task_runtime::TaskRuntimeStore>>,
     ) -> anyhow::Result<Self> {
-        Self::with_hooks(agent, store_backend, cancel, None).await
+        Self::with_hooks(agent, store_backend, cancel, None, task_runtime_store).await
     }
 
     /// Create with optional task hook bridge for YAML hook integration.
@@ -195,6 +196,7 @@ impl BackgroundTaskService {
         store_backend: Arc<dyn Store>,
         cancel: echo_agent::agent::CancellationToken,
         task_hooks: Option<Arc<dyn echo_agent::workspace::orchestration::tasks::TaskHooks>>,
+        task_runtime_store: Option<Arc<super::task_runtime::TaskRuntimeStore>>,
     ) -> anyhow::Result<Self> {
         Self::with_agent_provider(
             Arc::new(SingleAgentTaskProvider { agent }),
@@ -202,6 +204,7 @@ impl BackgroundTaskService {
             store_backend,
             cancel,
             task_hooks,
+            task_runtime_store,
         )
         .await
     }
@@ -212,6 +215,7 @@ impl BackgroundTaskService {
         store_backend: Arc<dyn Store>,
         cancel: echo_agent::agent::CancellationToken,
         task_hooks: Option<Arc<dyn echo_agent::workspace::orchestration::tasks::TaskHooks>>,
+        task_runtime_store: Option<Arc<super::task_runtime::TaskRuntimeStore>>,
     ) -> anyhow::Result<Self> {
         let max_concurrent = pool.background_task_concurrency();
         let reserve_foreground_agents = pool.foreground_agent_reserve();
@@ -226,6 +230,7 @@ impl BackgroundTaskService {
             store_backend,
             cancel,
             task_hooks,
+            task_runtime_store,
         )
         .await
     }
@@ -236,6 +241,7 @@ impl BackgroundTaskService {
         store_backend: Arc<dyn Store>,
         cancel: echo_agent::agent::CancellationToken,
         task_hooks: Option<Arc<dyn echo_agent::workspace::orchestration::tasks::TaskHooks>>,
+        task_runtime_store: Option<Arc<super::task_runtime::TaskRuntimeStore>>,
     ) -> anyhow::Result<Self> {
         let store = Arc::new(SqliteTaskStore::new(store_backend));
 
@@ -261,12 +267,14 @@ impl BackgroundTaskService {
             let event_bus = event_bus.clone();
             let hitl_provider = hitl_provider.clone();
             let service_config = service_config.clone();
+            let task_runtime_store = task_runtime_store.clone();
             Arc::new(move |ctx: TaskContext| {
                 let agent_provider = agent_provider.clone();
                 let manager = manager.clone();
                 let event_bus = event_bus.clone();
                 let hitl_provider = hitl_provider.clone();
                 let service_config = service_config.clone();
+                let task_runtime_store = task_runtime_store.clone();
                 Box::pin(async move {
                     dispatch_task(
                         ctx,
@@ -275,6 +283,7 @@ impl BackgroundTaskService {
                         event_bus,
                         hitl_provider,
                         service_config,
+                        task_runtime_store,
                     )
                     .await
                 })
@@ -549,6 +558,7 @@ async fn dispatch_task(
     event_bus: Arc<TaskEventBus>,
     hitl_provider: Arc<super::hitl_provider::BackgroundTaskHumanProvider>,
     service_config: BackgroundTaskServiceConfig,
+    task_runtime_store: Option<Arc<super::task_runtime::TaskRuntimeStore>>,
 ) -> Result<String, echo_agent::error::ReactError> {
     let task = manager.get_task(&ctx.task_id).ok_or_else(|| {
         echo_agent::error::ReactError::Other(format!(
@@ -699,7 +709,7 @@ async fn dispatch_task(
         }
 
         // Non-pipeline tasks fall through to generic prompt execution
-        _ => execute_prompt_task(ctx, agent, event_bus, &meta.kind).await,
+        _ => execute_prompt_task(ctx, agent, event_bus, task_runtime_store, &meta.kind).await,
     };
 
     lease.release().await;
@@ -747,6 +757,7 @@ async fn execute_prompt_task(
     ctx: TaskContext,
     agent: AgentHandle,
     event_bus: Arc<TaskEventBus>,
+    task_runtime_store: Option<Arc<super::task_runtime::TaskRuntimeStore>>,
     kind: &BackgroundTaskKind,
 ) -> Result<String, echo_agent::error::ReactError> {
     let prompt = kind.to_prompt();
@@ -771,12 +782,42 @@ async fn execute_prompt_task(
         })
         .await;
 
-    let result = agent
-        .read_async(|a| {
-            let prompt = prompt.clone();
-            Box::pin(async move { a.execute(&prompt).await })
-        })
-        .await;
+    // Phase 3.2: route through the unified unattended-run executor when a
+    // TaskRuntimeStore is available (always, in practice — AppState injects
+    // one). Creates a Run + RuntimeTaskEvent; the agent's ReAct loop may call
+    // task_create + execute_plan (simple prompts auto-Complete, Q5).
+    // ProgressBridge stays transitionally for frontend progress (retired 3.4).
+    // The background pool agent has task_create but not execute_plan (§10.2),
+    // so complex background chats degrade to a direct answer — same as the
+    // legacy `a.execute` path (pre-existing gap, not worsened here).
+    let result = if let Some(store) = task_runtime_store {
+        let fire_id = uuid::Uuid::new_v4().to_string();
+        let cancel = echo_agent::agent::CancellationToken::new();
+        super::task_runtime::launch_unattended_run(
+            store,
+            agent.clone(),
+            "background",
+            &ctx.task_id,
+            &fire_id,
+            &prompt,
+            cancel,
+            super::task_runtime::TaskRouteKind::ParallelReadonlyDelegation,
+        )
+        .await
+        .map(|()| format!("background run finished for task {}", ctx.task_id))
+        .map_err(|e| echo_agent::error::ReactError::Other(format!("Unattended run failed: {e}")))
+    } else {
+        // Fallback (no store — dead-in-practice): legacy single-turn execute.
+        agent
+            .read_async(|a| {
+                let prompt = prompt.clone();
+                Box::pin(async move { a.execute(&prompt).await })
+            })
+            .await
+            .map_err(|e| {
+                echo_agent::error::ReactError::Other(format!("Agent execution failed: {e}"))
+            })
+    };
 
     // Clean up callback. Pool workers execute one task at a time; this remains
     // task-local for pooled execution and preserves legacy single-agent behavior.
@@ -787,7 +828,7 @@ async fn execute_prompt_task(
         })
         .await;
 
-    result.map_err(|e| echo_agent::error::ReactError::Other(format!("Agent execution failed: {e}")))
+    result
 }
 
 /// Execute a composite task by delegating to the framework's composite module.

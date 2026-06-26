@@ -1682,6 +1682,7 @@ fn summarize_output(text: &str) -> String {
 /// The run is created with `attended_mode = Unattended` so the preflight
 /// checks (CP A/B) and approval-gate skip activate inside `execute_plan` /
 /// `execute_task`.
+#[allow(clippy::too_many_arguments)] // run identity + agent + cancel + route all thread through; matches run_dag style
 pub async fn launch_unattended_run(
     store: Arc<TaskRuntimeStore>,
     primary_agent: crate::agent_handle::AgentHandle,

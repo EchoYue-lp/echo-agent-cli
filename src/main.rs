@@ -290,6 +290,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                 task_store.clone(),
                 cancel,
                 None,
+                None, // task_runtime_store — TUI doesn't use the task runtime
             )
             .await
             {
