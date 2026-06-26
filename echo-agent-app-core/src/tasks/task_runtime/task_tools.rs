@@ -79,6 +79,12 @@ tokio::task_local! {
     /// LLM calls so that cache keys are scoped per user. Falls back to the empty
     /// string when no user context is available.
     pub static CURRENT_CACHE_USER_ID: String;
+    /// The unattended write mode for the currently executing run (D7 stage 2).
+    /// Set by `ExecutePlanTool::execute` so CP B preflight in `execute_task`
+    /// can read it without threading the mode through `execute_run` →
+    /// `run_dag` → `execute_task`. Defaults to `Disabled` when no scope is
+    /// active (e.g. tests, attended runs).
+    pub static CURRENT_UNATTENDED_WRITE_MODE: super::types::UnattendedWriteMode;
 }
 
 /// Run `f` with run_id, cancel, delegate_depth, trace_sink, and cache_user_id
@@ -124,6 +130,15 @@ where
 
 fn current_run_id() -> Option<String> {
     CURRENT_RUN_ID.try_with(|cell| cell.clone()).ok()
+}
+
+/// Read the current unattended write mode from the task-local scope (D7
+/// stage 2). Returns `Disabled` when no scope is active (attended runs,
+/// tests) — matching stage-1 behaviour as the safe default.
+pub fn current_unattended_write_mode() -> super::types::UnattendedWriteMode {
+    CURRENT_UNATTENDED_WRITE_MODE
+        .try_with(|m| *m)
+        .unwrap_or_default()
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────

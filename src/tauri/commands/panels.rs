@@ -1865,6 +1865,67 @@ pub async fn remove_worktree(
     Ok(json!({"success": true}))
 }
 
+#[tauri::command]
+pub async fn list_unattended_worktrees(
+    state: tauri::State<'_, TauriState>,
+) -> Result<serde_json::Value, IpcError> {
+    let repo_root = workspace_project_root(&state).await?;
+    let store = state.app_state.connection.task_runtime_store.clone();
+
+    let unattended = echo_agent_app_core::tasks::task_runtime::worktree::list_unattended_worktrees(
+        &repo_root,
+        Some(&store),
+    )
+    .map_err(|e| IpcError::Internal(format!("Failed to list unattended worktrees: {e}")))?;
+
+    let result: Vec<serde_json::Value> = unattended
+        .into_iter()
+        .map(|wt| {
+            json!({
+                "run_id": wt.run_id,
+                "branch": wt.branch,
+                "path": wt.path.to_string_lossy(),
+                "head": wt.head,
+                "status": wt.status,
+            })
+        })
+        .collect();
+
+    Ok(json!(result))
+}
+
+#[tauri::command]
+pub async fn merge_unattended_worktree(
+    state: tauri::State<'_, TauriState>,
+    run_id: String,
+    remove_after_merge: Option<bool>,
+) -> Result<serde_json::Value, IpcError> {
+    let repo_root = workspace_project_root(&state).await?;
+    let remove = remove_after_merge.unwrap_or(true);
+
+    echo_agent_app_core::tasks::task_runtime::worktree::merge_unattended_worktree(
+        &repo_root, &run_id, remove,
+    )
+    .map_err(|e| IpcError::Internal(format!("Failed to merge unattended worktree: {e}")))?;
+
+    Ok(json!({"success": true, "merged": run_id}))
+}
+
+#[tauri::command]
+pub async fn discard_unattended_worktree(
+    state: tauri::State<'_, TauriState>,
+    run_id: String,
+) -> Result<serde_json::Value, IpcError> {
+    let repo_root = workspace_project_root(&state).await?;
+
+    echo_agent_app_core::tasks::task_runtime::worktree::discard_unattended_worktree(
+        &repo_root, &run_id,
+    )
+    .map_err(|e| IpcError::Internal(format!("Failed to discard unattended worktree: {e}")))?;
+
+    Ok(json!({"success": true, "discarded": run_id}))
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // MCP (missing method)
 // ════════════════════════════════════════════════════════════════════════════

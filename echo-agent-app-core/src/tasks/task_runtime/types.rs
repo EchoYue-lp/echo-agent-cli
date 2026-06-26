@@ -185,6 +185,58 @@ impl AttendedMode {
     }
 }
 
+// ── Unattended write mode (D7 stage 2) ───────────────────────────────────
+
+/// Write policy for an unattended (cron / IM) plan run. D7 stage 2 lifts the
+/// stage-1 `ReadOnlyPlanNoShell` blanket write ban: writes become possible,
+/// with safety coming from isolation rather than prohibition.
+///
+/// * `Worktree` (default) — write tasks run inside an isolated git worktree
+///   branched from the main workspace; the main checkout is never touched.
+///   Created lazily: a read-only plan still runs in-place (zero overhead).
+/// * `Disabled` — stage-1 behaviour: write tasks are rejected by preflight.
+/// * `InPlace` — user explicitly accepts the risk; writes go directly to the
+///   main workspace with no isolation. Logged as a warning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename = "UnattendedWriteMode")]
+pub enum UnattendedWriteMode {
+    #[default]
+    Worktree,
+    Disabled,
+    InPlace,
+}
+
+impl UnattendedWriteMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            UnattendedWriteMode::Worktree => "worktree",
+            UnattendedWriteMode::Disabled => "disabled",
+            UnattendedWriteMode::InPlace => "in_place",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)] // inherent helper returning Option; not the FromStr trait
+    pub fn from_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "worktree" => UnattendedWriteMode::Worktree,
+            "disabled" => UnattendedWriteMode::Disabled,
+            "in_place" => UnattendedWriteMode::InPlace,
+            _ => return None,
+        })
+    }
+
+    /// `true` when write task kinds are permitted under this mode. The
+    /// preflight gate loosens accordingly — safety comes from isolation
+    /// (`Worktree`) or explicit user consent (`InPlace`), not from banning.
+    pub fn writes_allowed(&self) -> bool {
+        matches!(
+            self,
+            UnattendedWriteMode::Worktree | UnattendedWriteMode::InPlace
+        )
+    }
+}
+
 // ── Plan-task kind ──────────────────────────────────────────────────────
 
 /// Operation class for a single plan task. The scheduler (PR 3) uses this
@@ -1080,6 +1132,28 @@ mod tests {
         assert!(!PlanTaskKind::Implementation.is_unattended_readonly_allowed());
         assert!(!PlanTaskKind::Debugging.is_unattended_readonly_allowed());
         assert!(!PlanTaskKind::Verification.is_unattended_readonly_allowed());
+    }
+
+    #[test]
+    fn unattended_write_mode_default_and_roundtrip() {
+        // D7 stage 2: default is Worktree (safe isolation).
+        assert_eq!(
+            UnattendedWriteMode::default(),
+            UnattendedWriteMode::Worktree
+        );
+        // Round-trip every variant.
+        for m in [
+            UnattendedWriteMode::Worktree,
+            UnattendedWriteMode::Disabled,
+            UnattendedWriteMode::InPlace,
+        ] {
+            assert_eq!(UnattendedWriteMode::from_str(m.as_str()), Some(m));
+        }
+        assert_eq!(UnattendedWriteMode::from_str("bogus"), None);
+        // writes_allowed: Worktree + InPlace permit writes; Disabled bans them.
+        assert!(UnattendedWriteMode::Worktree.writes_allowed());
+        assert!(UnattendedWriteMode::InPlace.writes_allowed());
+        assert!(!UnattendedWriteMode::Disabled.writes_allowed());
     }
 
     #[test]

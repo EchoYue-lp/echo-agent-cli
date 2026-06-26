@@ -103,6 +103,8 @@ pub enum ExecError {
     Delegate(String),
     #[error("worker execution failed: {0}")]
     Worker(String),
+    #[error("{0}")]
+    Other(String),
 }
 
 /// Execute an approved run to completion.
@@ -868,7 +870,8 @@ async fn execute_task(
             .map(|r| r.attended_mode)
             .unwrap_or_default();
         if attended_mode == AttendedMode::Unattended
-            && let Err(rejection) = preflight_unattended_task(&task)
+            && let Err(rejection) =
+                preflight_unattended_task(&task, super::task_tools::current_unattended_write_mode())
         {
             let msg = format!(
                 "CP B preflight rejected task '{}': {}",
@@ -1692,6 +1695,8 @@ pub async fn launch_unattended_run(
     prompt: &str,
     parent_cancel: CancellationToken,
     route: super::router::TaskRouteKind,
+    write_mode: UnattendedWriteMode,
+    repo_root: Option<std::path::PathBuf>,
 ) -> Result<String, ExecError> {
     let run_id = uuid::Uuid::new_v4().to_string();
     let conversation_id = format!("{source_kind}:{source_id}:{fire_id}");
@@ -1722,6 +1727,8 @@ pub async fn launch_unattended_run(
         fire_id,
         prompt,
         parent_cancel,
+        write_mode,
+        repo_root,
     )
     .await
 }
@@ -1732,7 +1739,14 @@ pub async fn launch_unattended_run(
 /// transition_run happen in the caller). This fn only drives the agent's
 /// ReAct loop (which may call task_create + execute_plan) and finalizes the
 /// run status (auto-Complete a direct answer, auto-Fail an unexpected Paused).
-#[allow(clippy::too_many_arguments)] // run identity (run_id/source_id/fire_id) + agent + prompt + cancel
+///
+/// U1c stage 2 (D7): when `write_mode == Worktree` and `repo_root` is given,
+/// this function creates an isolated git worktree branched from `repo_root`,
+/// sets the agent's `working_dir` to the worktree path so every shell/file/
+/// git tool runs inside the isolated checkout, and after the run finishes
+/// records the worktree diff as a run artifact and keeps the worktree for
+/// later human review (no automatic merge — Q1).
+#[allow(clippy::too_many_arguments)] // run identity (run_id/source_id/fire_id) + agent + prompt + cancel + mode + repo_root
 pub async fn drive_unattended_run(
     store: Arc<TaskRuntimeStore>,
     primary_agent: crate::agent_handle::AgentHandle,
@@ -1741,8 +1755,74 @@ pub async fn drive_unattended_run(
     fire_id: &str,
     prompt: &str,
     parent_cancel: CancellationToken,
+    write_mode: UnattendedWriteMode,
+    repo_root: Option<std::path::PathBuf>,
 ) -> Result<String, ExecError> {
     let child_cancel = parent_cancel.child_token();
+
+    // D7 stage 2: attempt to provision an isolated git worktree for write
+    // operations. Lazy: only when mode is Worktree AND a repo_root is given
+    // AND the worktree can be created. Failure is a soft fallback to Disabled
+    // (logged as warn) so we never fail the whole run just because worktree
+    // setup failed — the user can still review why via the warn.
+    let worktree: Option<super::worktree::RunWorktree> = if write_mode
+        == UnattendedWriteMode::Worktree
+    {
+        if let Some(ref root) = repo_root {
+            match super::worktree::RunWorktree::create(run_id, root) {
+                Ok(wt) => {
+                    tracing::info!(
+                        run_id = %run_id,
+                        branch = %wt.branch,
+                        path = %wt.path.display(),
+                        "U1c stage 2: unattended worktree provisioned"
+                    );
+                    Some(wt)
+                }
+                Err(e) => {
+                    // SAFETY (D7 stage 2): worktree creation failed under
+                    // Worktree mode. We must NOT silently continue — that
+                    // would allow writes to land in the main workspace
+                    // without isolation (the preflight loosens its write
+                    // ban under Worktree mode, expecting isolation to
+                    // provide safety). Fail the run hard so the user sees
+                    // the problem, rather than silently risking their
+                    // uncommitted work.
+                    let msg = format!(
+                        "Unattended worktree creation failed (mode=Worktree): {}. \
+                         Refusing to run without isolation — fix the git state \
+                         or set unattended_write_mode=disabled/in_place.",
+                        e.message
+                    );
+                    tracing::error!(
+                        run_id = %run_id,
+                        error = %e.message,
+                        "U1c stage 2: worktree creation failed — failing run (no silent fallback)"
+                    );
+                    let _ = store.transition_run(run_id, TaskRunStatus::Failed);
+                    let _ = store.note(run_id, None, &msg);
+                    return Err(ExecError::Other(msg));
+                }
+            }
+        } else {
+            // repo_root not available — same safety argument: don't run
+            // writes without isolation under Worktree mode.
+            let msg = "Unattended run requested Worktree mode but repo_root \
+                       could not be resolved. Refusing to run without isolation \
+                       — set unattended_write_mode=disabled/in_place or ensure \
+                       the run starts inside a git repo."
+                .to_string();
+            tracing::error!(
+                run_id = %run_id,
+                "U1c stage 2: no repo_root under Worktree mode — failing run"
+            );
+            let _ = store.transition_run(run_id, TaskRunStatus::Failed);
+            let _ = store.note(run_id, None, &msg);
+            return Err(ExecError::Other(msg));
+        }
+    } else {
+        None
+    };
 
     // Drive the agent's ReAct loop in the run's context. The agent will call
     // task_create (to build the plan) and execute_plan (which internally calls
@@ -1751,6 +1831,7 @@ pub async fn drive_unattended_run(
     let run_id_for_scope = run_id.to_string();
     let cancel_for_scope = child_cancel.clone();
     let prompt_owned = prompt.to_string();
+    let wt_path_for_scope = worktree.as_ref().map(|w| w.path.clone());
 
     super::task_tools::with_run_context(
         run_id_for_scope.clone(),
@@ -1770,6 +1851,14 @@ pub async fn drive_unattended_run(
                 trace_sink: None,
                 cache_user_id: None,
             });
+
+            // D7 stage 2: bind the agent's working_dir to the worktree path
+            // so every shell/file/git tool runs inside the isolated checkout.
+            // Must happen before execute_stream_with_cancel (which triggers
+            // tool calls). set_working_dir is &self and uses internal mutex.
+            if let Some(ref wt_path) = wt_path_for_scope {
+                agent.set_working_dir(Some(wt_path.clone()));
+            }
 
             // Execute the prompt. The agent's ReAct loop will call
             // task_create + execute_plan, which runs the plan through
@@ -1816,6 +1905,52 @@ pub async fn drive_unattended_run(
     // Determine final outcome from the store (execute_plan/execute_run
     // may have already transitioned the run to a terminal state).
     let final_status = store.get_run(run_id).ok().flatten().map(|r| r.status);
+
+    // D7 stage 2: if we provisioned a worktree, record the diff as an
+    // artifact and keep the worktree for later human review (Q1 decision:
+    // no automatic merge, just preserve for inspection).
+    if let Some(wt) = worktree {
+        match wt.diff_summary() {
+            Ok(diff) => {
+                let artifact = Artifact {
+                    id: format!("worktree-diff-{run_id}"),
+                    run_id: run_id.to_string(),
+                    task_id: None,
+                    kind: ArtifactKind::Other,
+                    title: format!("Worktree diff for {}", wt.branch),
+                    path: Some(wt.path.to_string_lossy().to_string()),
+                    metadata: serde_json::json!({
+                        "diff": diff,
+                        "worktree_path": wt.path.to_string_lossy(),
+                        "branch": wt.branch,
+                    }),
+                };
+                if let Err(e) = store.add_artifact(&artifact) {
+                    tracing::warn!(
+                        run_id = %run_id,
+                        error = %e,
+                        "Failed to record worktree diff artifact"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    run_id = %run_id,
+                    error = %e.message,
+                    "Failed to generate worktree diff summary"
+                );
+            }
+        }
+        // Q1: keep the worktree, don't remove it. User can review and merge/discard later.
+        tracing::info!(
+            run_id = %run_id,
+            branch = %wt.branch,
+            path = %wt.path.display(),
+            "U1c stage 2: worktree kept for review (no automatic merge)"
+        );
+        // Drop worktree handle, but don't remove the directory.
+        drop(wt);
+    }
 
     match final_status {
         Some(TaskRunStatus::Completed) => {
@@ -1900,6 +2035,8 @@ pub async fn launch_cron_run(
         prompt,
         parent_cancel,
         super::router::TaskRouteKind::ParallelReadonlyDelegation,
+        UnattendedWriteMode::default(), // D7 stage 2: Worktree (safe default)
+        super::worktree::git_repo_root(std::path::Path::new(".")).ok(), // best-effort repo_root
     )
     .await
 }
@@ -1940,8 +2077,21 @@ const UNATTENDED_READONLY_TOOLS: &[&str] = &[
 /// 2. every `allowed_tools` entry is in `UNATTENDED_READONLY_TOOLS`
 /// 3. no shell/test commands (verification must be empty)
 ///
+/// The three layers are enforced only when `mode` is [`UnattendedWriteMode::Disabled`]
+/// (D7 stage 2). Under `Worktree` / `InPlace` the safety comes from isolation
+/// rather than prohibition, so all layers are skipped.
+///
 /// On violation → `Err(PreflightRejection)` — terminal fail, never Paused.
-pub fn preflight_unattended_plan(tasks: &[PlanTask]) -> Result<(), PreflightRejection> {
+pub fn preflight_unattended_plan(
+    tasks: &[PlanTask],
+    mode: UnattendedWriteMode,
+) -> Result<(), PreflightRejection> {
+    // Under Worktree / InPlace, write safety is provided by the execution
+    // environment (isolated worktree or user consent), not by banning.
+    if mode.writes_allowed() {
+        return Ok(());
+    }
+    // Disabled: stage-1 read-only enforcement.
     for t in tasks {
         // Layer 1: task kind whitelist
         if !t.kind.is_unattended_readonly_allowed() {
@@ -1980,13 +2130,146 @@ pub fn preflight_unattended_plan(tasks: &[PlanTask]) -> Result<(), PreflightReje
 
 /// Checkpoint B: per-task preflight — same three layers, for a single task.
 /// Called before each task acquires its permit in `execute_task`.
-pub fn preflight_unattended_task(task: &PlanTask) -> Result<(), PreflightRejection> {
-    preflight_unattended_plan(std::slice::from_ref(task))
+pub fn preflight_unattended_task(
+    task: &PlanTask,
+    mode: UnattendedWriteMode,
+) -> Result<(), PreflightRejection> {
+    preflight_unattended_plan(std::slice::from_ref(task), mode)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Preflight tests (Phase B) ─────────────────────────────────────────
+
+    /// Helper: build a `PlanTask` stub with just the fields the preflight
+    /// gate actually inspects (kind / allowed_tools / verification).
+    fn preflight_task(
+        id: &str,
+        kind: PlanTaskKind,
+        tools: &[&str],
+        verification: &[&str],
+    ) -> PlanTask {
+        PlanTask {
+            id: id.to_string(),
+            title: id.to_string(),
+            description: String::new(),
+            kind,
+            agent_role: "general".to_string(),
+            domain_profile: DomainProfile::General,
+            depends_on: Vec::new(),
+            parallel_group: None,
+            files: Vec::new(),
+            allowed_tools: tools.iter().map(|s| s.to_string()).collect(),
+            verification: verification.iter().map(|s| s.to_string()).collect(),
+            retry_count: 0,
+            max_retries: 0,
+            failure_fingerprint: None,
+            status: TodoStatus::Pending,
+            sort_order: 0,
+        }
+    }
+
+    #[test]
+    fn preflight_disabled_rejects_write_kinds() {
+        // B1: stage-1 regression — under Disabled, write kinds are rejected.
+        let task = preflight_task("t1", PlanTaskKind::Implementation, &[], &[]);
+        let result = preflight_unattended_plan(&[task], UnattendedWriteMode::Disabled);
+        assert!(
+            result.is_err(),
+            "write kind should be rejected under Disabled"
+        );
+        let reason = result.unwrap_err().reason;
+        assert!(
+            reason.contains("implementation"),
+            "reason should mention 'implementation', got {reason:?}"
+        );
+    }
+
+    #[test]
+    fn preflight_disabled_rejects_write_tools() {
+        // B1: under Disabled, tools outside the readonly allowlist are rejected.
+        let task = preflight_task("t1", PlanTaskKind::Investigation, &["write_file"], &[]);
+        let result = preflight_unattended_plan(&[task], UnattendedWriteMode::Disabled);
+        assert!(
+            result.is_err(),
+            "write tool should be rejected under Disabled"
+        );
+        let reason = result.unwrap_err().reason;
+        assert!(
+            reason.contains("write_file"),
+            "reason should mention 'write_file', got {reason:?}"
+        );
+    }
+
+    #[test]
+    fn preflight_disabled_rejects_verification_shell() {
+        // B1: under Disabled, any verification (shell) entry is rejected.
+        let task = preflight_task("t1", PlanTaskKind::Investigation, &[], &["cargo test"]);
+        let result = preflight_unattended_plan(&[task], UnattendedWriteMode::Disabled);
+        assert!(
+            result.is_err(),
+            "shell verification should be rejected under Disabled"
+        );
+        let reason = result.unwrap_err().reason;
+        assert!(
+            reason.contains("verification/shell"),
+            "reason should mention shell, got {reason:?}"
+        );
+    }
+
+    #[test]
+    fn preflight_disabled_passes_readonly_readonly() {
+        // B1: read-only task with read-only tools and no verification passes.
+        let task = preflight_task(
+            "t1",
+            PlanTaskKind::ReadOnlyReview,
+            &["read_file", "grep"],
+            &[],
+        );
+        let result = preflight_unattended_plan(&[task], UnattendedWriteMode::Disabled);
+        assert!(
+            result.is_ok(),
+            "readonly plan should pass under Disabled, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn preflight_worktree_permits_write_kinds_and_tools() {
+        // B2: under Worktree, write safety comes from isolation — the
+        // preflight gate is fully skipped.
+        let write_task = preflight_task(
+            "w1",
+            PlanTaskKind::Implementation,
+            &["write_file", "shell"],
+            &["cargo check"],
+        );
+        let result = preflight_unattended_plan(&[write_task], UnattendedWriteMode::Worktree);
+        assert!(
+            result.is_ok(),
+            "write task should pass under Worktree (safety from isolation), got {result:?}"
+        );
+    }
+
+    #[test]
+    fn preflight_inplace_permits_write_kinds_and_tools() {
+        // B3: under InPlace, user has explicitly consented — preflight is
+        // fully skipped.
+        let write_task = preflight_task(
+            "w1",
+            PlanTaskKind::Implementation,
+            &["write_file", "shell"],
+            &["cargo check"],
+        );
+        let result = preflight_unattended_plan(&[write_task], UnattendedWriteMode::InPlace);
+        assert!(
+            result.is_ok(),
+            "write task should pass under InPlace (user consent), got {result:?}"
+        );
+    }
+
+    // ── Phase 3.4 regression ─────────────────────────────────────────────
 
     #[tokio::test]
     async fn launch_unattended_run_returns_run_id() {
@@ -2018,6 +2301,8 @@ mod tests {
             "hello",
             cancel,
             crate::tasks::task_runtime::TaskRouteKind::ParallelReadonlyDelegation,
+            UnattendedWriteMode::Disabled,
+            None,
         )
         .await
         .expect("unattended run should succeed");

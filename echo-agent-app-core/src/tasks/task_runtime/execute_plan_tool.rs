@@ -27,6 +27,7 @@ use super::router::TaskRouteKind;
 use super::store::TaskRuntimeStore;
 use super::types::{
     AttendedMode, DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, TaskPlan, TaskRunStatus,
+    UnattendedWriteMode,
 };
 use crate::agent_handle::AgentHandle;
 
@@ -43,14 +44,31 @@ pub struct ExecutePlanTool {
     /// 首次调用时若 route == ComplexRuntime, 工具 transition `Paused`
     /// 并等待此 signal; 外部调用 `notify_one()` 恢复。
     approval_signal: Arc<tokio::sync::Notify>,
+    /// D7 stage 2: unattended write mode for this tool's runs. Determines
+    /// whether the CP A preflight loosens its write ban (Worktree/InPlace)
+    /// or keeps stage-1 rejection (Disabled). Also scoped into a task-local
+    /// so CP B preflight in `execute_task` can read it.
+    write_mode: UnattendedWriteMode,
 }
 
 impl ExecutePlanTool {
     pub fn new(store: Arc<TaskRuntimeStore>, primary_agent: AgentHandle) -> Self {
+        Self::with_write_mode(store, primary_agent, UnattendedWriteMode::default())
+    }
+
+    /// Construct with an explicit write mode (D7 stage 2). Production callers
+    /// that have access to app config should use this to pass the configured
+    /// mode; `new()` defaults to `Worktree` (the spec default).
+    pub fn with_write_mode(
+        store: Arc<TaskRuntimeStore>,
+        primary_agent: AgentHandle,
+        write_mode: UnattendedWriteMode,
+    ) -> Self {
         Self {
             store,
             primary_agent,
             approval_signal: Arc::new(tokio::sync::Notify::new()),
+            write_mode,
         }
     }
 
@@ -150,7 +168,7 @@ impl Tool for ExecutePlanTool {
             // on violation. Chat runs (Attended) skip this entirely.
             if attended_mode == AttendedMode::Unattended
                 && let Some(ref plan) = self.store.get_plan(&run_id).ok().flatten()
-                && let Err(rejection) = preflight_unattended_plan(&plan.tasks)
+                && let Err(rejection) = preflight_unattended_plan(&plan.tasks, self.write_mode)
             {
                 let _ = self.store.transition_run(&run_id, TaskRunStatus::Failed);
                 let _ = self.store.note(
@@ -217,18 +235,26 @@ impl Tool for ExecutePlanTool {
             // usage, status). Without it, the execute_plan path silently drops
             // trace persistence (event-wiring #1残留).
             let run_store = self.primary_agent.read(|a| a.run_store.clone()).await;
-            let outcome = execute_run(
-                self.store.clone(),
-                Some(self.primary_agent.clone()),
-                None, // reviewer_llm — 暂时 None, 后续由上层配置
-                None, // layer_manager — 暂时 None
-                run_store,
-                trace_sink,
-                &run_id,
-                cache_user_id,
-                cancel,
-            )
-            .await;
+            // D7 stage 2: scope the write mode into a task-local so CP B
+            // preflight in `execute_task` (deep inside execute_run → run_dag)
+            // can read it without threading the mode through every signature.
+            let write_mode = self.write_mode;
+            let outcome = super::task_tools::CURRENT_UNATTENDED_WRITE_MODE
+                .scope(write_mode, async {
+                    execute_run(
+                        self.store.clone(),
+                        Some(self.primary_agent.clone()),
+                        None, // reviewer_llm — 暂时 None, 后续由上层配置
+                        None, // layer_manager — 暂时 None
+                        run_store,
+                        trace_sink,
+                        &run_id,
+                        cache_user_id,
+                        cancel,
+                    )
+                    .await
+                })
+                .await;
 
             match outcome {
                 Ok(RunOutcome::Completed) => {

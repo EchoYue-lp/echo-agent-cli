@@ -56,6 +56,7 @@ pub mod signals;
 pub mod store;
 pub mod task_tools;
 pub mod types;
+pub mod worktree;
 
 pub use classify::{Classification, Complexity, ComplexityLabel, HeuristicClassifier};
 pub use delegation::{DelegationPlanner, DelegationRequest, WorkerSpec};

@@ -710,6 +710,8 @@ impl BackgroundTaskService {
                 &fire_id,
                 &prompt_owned,
                 child_cancel,
+                super::task_runtime::UnattendedWriteMode::default(), // D7 stage 2: Worktree
+                super::task_runtime::worktree::git_repo_root(std::path::Path::new(".")).ok(),
             )
             .await;
             lease.release().await;
