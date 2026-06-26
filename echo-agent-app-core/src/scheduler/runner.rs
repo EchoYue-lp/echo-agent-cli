@@ -5,10 +5,11 @@
 //! provides [`build_fire_fn`] which constructs one that submits via
 //! `BackgroundTaskService` when available, falling back to direct agent chat.
 //!
-//! U1c phase-1: when a cron task's prompt starts with `[plan]`, the task is
-//! routed through the unified TaskRuntime executor (`launch_cron_run`) instead
-//! of the legacy `agent.chat(prompt)` path. The `[plan]` prefix is stripped
-//! before the prompt is passed to the executor.
+//! Phase 3.1: ALL cron tasks route through the unified TaskRuntime executor
+//! (`launch_cron_run`). The legacy `[plan]` prefix is stripped for backward
+//! compatibility but no longer selects a separate path — simple prompts are
+//! answered directly by the agent (auto-Completed when execute_plan isn't
+//! called); complex prompts drive task_create + execute_plan.
 
 use crate::agent_handle::AgentHandle;
 use crate::tasks::background::BackgroundTaskKind;
@@ -23,20 +24,19 @@ use std::sync::Arc;
 /// The CLI's scheduler runner is the framework's `SchedulerRunner`.
 pub type SchedulerRunner = FrameworkSchedulerRunner;
 
-/// Plan-orchestration marker prefix. Cron tasks whose prompt starts with
-/// this string are routed through `launch_cron_run` (unified TaskRuntime
-/// executor) rather than `agent.chat(prompt)`.
+/// Legacy plan-orchestration marker prefix. Phase 3.1: stripped for backward
+/// compatibility but no longer routes — all cron tasks go through
+/// `launch_cron_run` regardless.
 const PLAN_MARKER: &str = "[plan]";
 
 /// Build a `FireFn` that dispatches cron task execution.
 ///
-/// When `task_service` is `Some`, tasks are submitted as tracked background
-/// `AgentChat` tasks (gaining progress tracking, retry, and persistence).
-/// Otherwise the prompt is sent directly to the agent via `chat()`.
-///
-/// U1c phase-1: when `task_runtime_store` is `Some` and the prompt starts
-/// with `[plan]`, the task is routed through `launch_cron_run` (unified
-/// TaskRuntime executor with `ReadOnlyPlanNoShell` profile).
+/// Phase 3.1: when `task_runtime_store` is `Some` (always, in practice —
+/// `AppState` constructs one at boot), ALL cron prompts route through
+/// `launch_cron_run` (unified TaskRuntime executor, `Unattended`). The
+/// `[plan]` prefix is stripped for backward compatibility. The
+/// `task_service`/`execute_direct` branches below handle the dead-in-practice
+/// `runtime_store=None` case (cleanup deferred to Phase 3.5).
 pub fn build_fire_fn(
     agent: AgentHandle,
     task_service: Option<Arc<BackgroundTaskService>>,
@@ -114,7 +114,8 @@ async fn execute_direct(agent: &AgentHandle, task: &CronTask) -> echo_agent::err
 /// Convenience constructor: build a `SchedulerRunner` with the CLI's
 /// preferred wiring (agent + optional background task service).
 ///
-/// U1c phase-1: `task_runtime_store` enables the `[plan]` orchestration path.
+/// U1c phase-1 → Phase 3.1: `task_runtime_store` enables the unified
+/// cron→launch_cron_run path (all cron, not just `[plan]`).
 pub fn new_scheduler_runner(
     store: CronTaskStore,
     cancel: echo_agent::agent::CancellationToken,
@@ -164,6 +165,35 @@ mod tests {
             completed.len(),
             1,
             "非-[plan] cron 应经 launch_cron_run 建恰好 1 个 Completed run"
+        );
+    }
+
+    /// `[plan]` 前缀仍经 launch_cron_run(marker strip,向后兼容)。
+    #[tokio::test]
+    async fn build_fire_fn_strips_plan_marker_and_routes_to_launch_cron_run() {
+        let llm = MockLlmClient::new().with_response("ok");
+        let agent = ReactAgentBuilder::new()
+            .llm_client(Arc::new(llm))
+            .system_prompt("test")
+            .build()
+            .expect("test agent should build");
+        let handle = AgentHandle::new(agent);
+        let store = Arc::new(
+            TaskRuntimeStore::new_in_memory().expect("in-memory store should init"),
+        );
+        let fire_fn = build_fire_fn(handle, None, Some(store.clone()));
+
+        let task = CronTask::new("plan", "*/5 * * * *", "[plan] do the thing");
+        let result = fire_fn(task).await;
+        assert!(result.is_ok(), "fire_fn should succeed: {:?}", result.err());
+
+        let completed = store
+            .list_runs_in(&[TaskRunStatus::Completed])
+            .expect("list_runs_in should not error");
+        assert_eq!(
+            completed.len(),
+            1,
+            "[plan] cron 应 strip marker 后建 1 个 Completed run"
         );
     }
 }
