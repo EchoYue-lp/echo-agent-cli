@@ -62,7 +62,7 @@ pub use delegation::{DelegationPlanner, DelegationRequest, WorkerSpec};
 pub use execute_plan_tool::ExecutePlanTool;
 pub use executor::{
     ConcurrencyLimits, ExecError, PreflightRejection, RunOutcome, WorkerTraceSink, execute_run,
-    launch_cron_run, preflight_unattended_plan, preflight_unattended_task,
+    launch_cron_run, launch_unattended_run, preflight_unattended_plan, preflight_unattended_task,
 };
 pub use hitrisk::{HighRiskMatch, check as check_high_risk, requires_fresh_approval};
 pub use ledger::{export_path, render_progress, write_progress};

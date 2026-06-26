@@ -1662,15 +1662,16 @@ fn summarize_output(text: &str) -> String {
     format!("{head}...")
 }
 
-// ── Cron / Unattended run adapter ───────────────────────────────────────
+// ── Unattended run adapter (cron / background AgentChat) ────────────────
 
-/// Launch a cron-triggered unattended run through the unified TaskRuntime
-/// executor, bypassing the chat routing path entirely.
+/// Launch an unattended run through the unified TaskRuntime executor,
+/// bypassing the chat routing path. Generic over the source kind (cron /
+/// background AgentChat) and route.
 ///
-/// This is the **stage-1 cron adapter** (spec §3.3 v2): it creates a run,
-/// then drives the primary agent's ReAct loop in the run's context so the
-/// agent itself calls `task_create` (to materialise the plan) and
-/// `execute_plan` (which internally calls `execute_run`).
+/// Creates a run, then drives the agent's ReAct loop in the run's context so
+/// the agent itself calls `task_create` (to materialise the plan) and
+/// `execute_plan` (which internally calls `execute_run`). Simple prompts that
+/// the agent answers directly (without `execute_plan`) auto-Complete.
 ///
 /// **Why not call `execute_run` directly?** `execute_run` requires a plan to
 /// already exist (`store.get_plan → NoPlan` if absent). The plan is created
@@ -1681,16 +1682,18 @@ fn summarize_output(text: &str) -> String {
 /// The run is created with `attended_mode = Unattended` so the preflight
 /// checks (CP A/B) and approval-gate skip activate inside `execute_plan` /
 /// `execute_task`.
-pub async fn launch_cron_run(
+pub async fn launch_unattended_run(
     store: Arc<TaskRuntimeStore>,
     primary_agent: crate::agent_handle::AgentHandle,
-    cron_task_id: &str,
+    source_kind: &str,
+    source_id: &str,
     fire_id: &str,
     prompt: &str,
     parent_cancel: CancellationToken,
+    route: super::router::TaskRouteKind,
 ) -> Result<(), ExecError> {
     let run_id = uuid::Uuid::new_v4().to_string();
-    let conversation_id = format!("cron:{cron_task_id}:{fire_id}");
+    let conversation_id = format!("{source_kind}:{source_id}:{fire_id}");
     let child_cancel = parent_cancel.child_token();
 
     // 1. Create the run in Pending, attended_mode = Unattended.
@@ -1698,10 +1701,10 @@ pub async fn launch_cron_run(
         &run_id,
         "default",
         &conversation_id,
-        "", // root_message_id — no chat message for cron
+        "", // root_message_id — no chat message for unattended run
         DomainProfile::General,
         prompt,
-        super::router::TaskRouteKind::ParallelReadonlyDelegation.as_str(), // explicit route (was "" → unwrap_or fallback in execute_plan_tool)
+        route.as_str(), // explicit route (parameterized; caller picks)
         AttendedMode::Unattended,
     )?;
 
@@ -1719,8 +1722,8 @@ pub async fn launch_cron_run(
     super::task_tools::with_run_context(
         run_id_for_scope.clone(),
         cancel_for_scope.clone(),
-        None, // trace_sink — no GUI event stream for cron
-        crate::infra::load_or_create_cache_user_id(), // cache_user_id — share machine-stable id so cron review/router LLM calls hit the provider cache
+        None, // trace_sink — no GUI event stream for unattended run
+        crate::infra::load_or_create_cache_user_id(), // cache_user_id — share machine-stable id so review/router LLM calls hit the provider cache
         async {
             // Inject external context so worker-spawned tools can read
             // run_id/cancel across spawn boundaries (same pattern as
@@ -1744,8 +1747,8 @@ pub async fn launch_cron_run(
             {
                 Ok(mut stream) => {
                     // Drain the stream to completion. We don't forward events
-                    // to a GUI (cron has no UI), but we must consume the
-                    // stream so the agent finishes its work.
+                    // to a GUI (unattended run has no UI), but we must consume
+                    // the stream so the agent finishes its work.
                     while let Some(event_result) = stream.next().await {
                         if cancel_for_scope.is_cancelled() {
                             break;
@@ -1754,10 +1757,10 @@ pub async fn launch_cron_run(
                             Ok(_) => {}
                             Err(e) => {
                                 tracing::warn!(
-                                    cron_task_id = %cron_task_id,
+                                    source_id = %source_id,
                                     run_id = %run_id_for_scope,
                                     error = %e,
-                                    "Cron agent stream error"
+                                    "Unattended agent stream error"
                                 );
                                 break;
                             }
@@ -1766,10 +1769,10 @@ pub async fn launch_cron_run(
                 }
                 Err(e) => {
                     tracing::error!(
-                        cron_task_id = %cron_task_id,
+                        source_id = %source_id,
                         run_id = %run_id_for_scope,
                         error = %e,
-                        "Cron agent failed to start stream"
+                        "Unattended agent failed to start stream"
                     );
                 }
             }
@@ -1784,26 +1787,26 @@ pub async fn launch_cron_run(
     match final_status {
         Some(TaskRunStatus::Completed) => {
             tracing::info!(
-                cron_task_id = %cron_task_id,
+                source_id = %source_id,
                 fire_id = %fire_id,
                 run_id = %run_id,
-                "Cron run completed"
+                "Unattended run completed"
             );
         }
         Some(TaskRunStatus::Failed) => {
             tracing::warn!(
-                cron_task_id = %cron_task_id,
+                source_id = %source_id,
                 fire_id = %fire_id,
                 run_id = %run_id,
-                "Cron run failed"
+                "Unattended run failed"
             );
         }
         Some(TaskRunStatus::Cancelled) => {
             tracing::info!(
-                cron_task_id = %cron_task_id,
+                source_id = %source_id,
                 fire_id = %fire_id,
                 run_id = %run_id,
-                "Cron run cancelled"
+                "Unattended run cancelled"
             );
         }
         Some(TaskRunStatus::Paused) => {
@@ -1811,15 +1814,15 @@ pub async fn launch_cron_run(
             // hitrisk terminal-fail). Transition to Failed so the run
             // doesn't hang forever waiting for a human.
             tracing::error!(
-                cron_task_id = %cron_task_id,
+                source_id = %source_id,
                 run_id = %run_id,
-                "Cron run unexpectedly Paused — transitioning to Failed"
+                "Unattended run unexpectedly Paused — transitioning to Failed"
             );
             let _ = store.transition_run(&run_id, TaskRunStatus::Failed);
             let _ = store.note(
                 &run_id,
                 None,
-                "Cron run unexpectedly Paused; auto-transitioned to Failed.",
+                "Unattended run unexpectedly Paused; auto-transitioned to Failed.",
             );
         }
         _ => {
@@ -1833,16 +1836,39 @@ pub async fn launch_cron_run(
                 let _ = store.transition_run(&run_id, TaskRunStatus::Completed);
             }
             tracing::info!(
-                cron_task_id = %cron_task_id,
+                source_id = %source_id,
                 fire_id = %fire_id,
                 run_id = %run_id,
                 final_status = ?final_status,
-                "Cron run agent stream finished; transitioned to terminal"
+                "Unattended run agent stream finished; transitioned to terminal"
             );
         }
     }
 
     Ok(())
+}
+
+/// Cron-specific thin wrapper: routes through `launch_unattended_run` with
+/// the `ParallelReadonlyDelegation` route (legacy `[plan]` behavior, Phase 3.1).
+pub async fn launch_cron_run(
+    store: Arc<TaskRuntimeStore>,
+    primary_agent: crate::agent_handle::AgentHandle,
+    cron_task_id: &str,
+    fire_id: &str,
+    prompt: &str,
+    parent_cancel: CancellationToken,
+) -> Result<(), ExecError> {
+    launch_unattended_run(
+        store,
+        primary_agent,
+        "cron",
+        cron_task_id,
+        fire_id,
+        prompt,
+        parent_cancel,
+        super::router::TaskRouteKind::ParallelReadonlyDelegation,
+    )
+    .await
 }
 
 // ── Unattended preflight (dual-checkpoint, spec §4.2 v2) ───────────────
