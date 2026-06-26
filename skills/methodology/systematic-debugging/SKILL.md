@@ -17,6 +17,18 @@ triggers:
   - 异常
   - 为什么失败
 allowed-tools: []
+hooks:
+  PostToolUseFailure:
+    - matcher: "*"
+      hooks:
+        - type: prompt
+          prompt: |
+            工具执行失败了。不要急着猜原因改代码——先系统化调试：
+            1. 重现：确认能稳定复现吗？
+            2. 隔离：最小化复现条件（哪个输入/路径/状态触发的？）
+            3. 根因：读错误信息、栈、日志，找到真正的失败点
+            4. 验证假设：改之前确认你理解了为什么失败
+            治症状的修复会回来咬你。
 ---
 
 # Systematic Debugging

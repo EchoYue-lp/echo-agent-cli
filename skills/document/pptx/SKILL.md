@@ -16,6 +16,13 @@ triggers:
   - 幻灯片
   - PPT
 allowed-tools: [bash, read, write]
+hooks:
+  UserPromptSubmit:
+    - matcher: "\\.pptx"
+      hooks:
+        - type: activate_skill
+          skill: pptx
+          reason: 检测到 .pptx 文件路径
 ---
 # PPTX Skill
 

@@ -15,6 +15,13 @@ triggers:
   - 导出PDF
   - .pdf
 allowed-tools: [bash, read, write]
+hooks:
+  UserPromptSubmit:
+    - matcher: "\\.pdf"
+      hooks:
+        - type: activate_skill
+          skill: pdf
+          reason: 检测到 .pdf 文件路径
 ---
 # PDF Skill
 

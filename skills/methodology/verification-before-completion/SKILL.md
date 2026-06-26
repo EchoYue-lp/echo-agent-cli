@@ -15,6 +15,17 @@ triggers:
   - 测试通过
   - 修好了
 allowed-tools: []
+hooks:
+  Stop:
+    - matcher: "*"
+      hooks:
+        - type: prompt
+          prompt: |
+            声称完成前，确认你已经验证了结果：
+            - 编译通过？跑过测试？
+            - 改动是否破坏了其他地方？
+            - 声明"完成"必须有证据，不是凭感觉。
+            如果只是"应该可以了"，先验证再说。
 ---
 
 # Verification Before Completion

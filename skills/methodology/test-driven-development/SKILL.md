@@ -13,6 +13,17 @@ triggers:
   - 先写测试
   - red green refactor
 allowed-tools: []
+hooks:
+  PreToolUse:
+    - matcher: "write_file|edit_file|create_file"
+      hooks:
+        - type: prompt
+          prompt: |
+            你即将修改代码文件。先确认：
+            - 这个改动的测试写了吗？测试能跑吗？
+            - 如果是 bugfix：先写一个能复现 bug 的失败测试。
+            - 如果是新功能：先写定义期望行为的测试。
+            不是每次都要完美 TDD，但"先写测试"的习惯能省你大量调试时间。
 ---
 
 # Test-Driven Development

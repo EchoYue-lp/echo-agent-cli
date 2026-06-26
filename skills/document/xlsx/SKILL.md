@@ -16,6 +16,13 @@ triggers:
   - 公式
   - 数据表
 allowed-tools: [bash, read, write]
+hooks:
+  UserPromptSubmit:
+    - matcher: "\\.xlsx"
+      hooks:
+        - type: activate_skill
+          skill: xlsx
+          reason: 检测到 .xlsx 文件路径
 ---
 # XLSX Skill
 
