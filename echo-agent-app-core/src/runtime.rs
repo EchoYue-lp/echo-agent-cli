@@ -238,15 +238,9 @@ impl AgentRuntime {
         let subagent_hook_bridge = agent_handle.read(|a| a.create_subagent_hook_bridge()).await;
         tracing::info!("Hook bridges created");
 
-        // ── 8. Unified memory — already loaded in step 0b. Attach the long-term
-        //       Store for runtime UnifiedMemory APIs. Boot-time prompt context
-        //       remains instruction-only; query-dependent dynamic memories are
-        //       recalled per turn by the agent. ──
-        let unified_memory = if let Some(store) = agent_handle.read(|a| a.store().cloned()).await {
-            unified_memory.with_store(store)
-        } else {
-            unified_memory
-        };
+        // ── 8. Unified memory — already loaded in step 0b (instruction-only).
+        //       Dynamic agent-learned memories are managed by the layered
+        //       MemoryLayerManager, not UnifiedMemory. ──
 
         // ── 8b. Review integration — create when Store is available so
         //       /memory-review and session-end hooks can access it. ──

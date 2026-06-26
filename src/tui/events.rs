@@ -226,6 +226,13 @@ enum AgentEvent {
     ToolResult { name: String, output: String },
     /// An error occurred.
     Error(String),
+    /// Context was auto-compressed to fit within token limits.
+    ContextCompressed {
+        before_count: usize,
+        after_count: usize,
+        before_tokens: usize,
+        after_tokens: usize,
+    },
 }
 
 /// Run the main event loop.
@@ -334,6 +341,22 @@ pub async fn run_event_loop(
                     });
                     app.is_processing = false;
                     app.status_msg = "Error".to_string();
+                }
+                AgentEvent::ContextCompressed {
+                    before_count,
+                    after_count,
+                    before_tokens,
+                    after_tokens,
+                } => {
+                    let saved = before_tokens.saturating_sub(after_tokens);
+                    app.messages.push(ChatMessage {
+                        role: MessageRole::System,
+                        content: format!(
+                            "🗜️ 上下文压缩: {}→{} 条 ({}→{} tokens, 节省 {})",
+                            before_count, after_count, before_tokens, after_tokens, saved
+                        ),
+                    });
+                    app.rebuild_message_groups();
                 }
             }
         }
@@ -801,6 +824,19 @@ async fn send_to_agent(
                 }
                 Ok(echo_agent::agent::AgentEvent::ToolResult { name, output }) => {
                     let _ = agent_tx.send(AgentEvent::ToolResult { name, output });
+                }
+                Ok(echo_agent::agent::AgentEvent::ContextCompressed {
+                    before_count,
+                    after_count,
+                    before_tokens,
+                    after_tokens,
+                }) => {
+                    let _ = agent_tx.send(AgentEvent::ContextCompressed {
+                        before_count,
+                        after_count,
+                        before_tokens,
+                        after_tokens,
+                    });
                 }
                 Ok(_) => {} // Ignore other event types (GuardTriggered, MemoryRecalled, etc.)
                 Err(e) => {

@@ -726,6 +726,14 @@ impl AgentPool {
             agent.skill_registry_mut().register_descriptor(desc.clone());
         }
 
+        // 3b. Auto-compression — pooled agents must not rely solely on the
+        // 200-msg hard cap. Mirror the primary agent wiring (runtime.rs) so
+        // long GUI multi-session runs are protected by the configured strategy.
+        if app_config.has_compressor() {
+            app_config.apply_compressor(&agent).await;
+            tracing::debug!(conversation_id, "pooled agent auto-compression configured");
+        }
+
         // 4. Wrap in AgentHandle
         let handle = AgentHandle::new(agent);
 

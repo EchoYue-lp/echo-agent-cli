@@ -1719,8 +1719,8 @@ pub async fn launch_cron_run(
     super::task_tools::with_run_context(
         run_id_for_scope.clone(),
         cancel_for_scope.clone(),
-        None,          // trace_sink — no GUI event stream for cron
-        String::new(), // cache_user_id — no caching for cron
+        None, // trace_sink — no GUI event stream for cron
+        crate::infra::load_or_create_cache_user_id(), // cache_user_id — share machine-stable id so cron review/router LLM calls hit the provider cache
         async {
             // Inject external context so worker-spawned tools can read
             // run_id/cancel across spawn boundaries (same pattern as

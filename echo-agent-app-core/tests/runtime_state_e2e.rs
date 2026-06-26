@@ -16,11 +16,9 @@ use std::sync::Arc;
 
 use echo_agent::agent::Agent;
 use echo_agent::config::AppConfig;
-use echo_agent::memory::{InMemoryStore, Store};
 use echo_agent::state::RuntimeStateStore;
 use echo_agent_app_core::infra::{self, AgentCreateParams};
 use echo_agent_app_core::runtime_state_file::FileRuntimeStateStore;
-use echo_agent_app_core::unified_memory::UnifiedMemory;
 
 fn make_app_config() -> AppConfig {
     let mut c = AppConfig::default();
@@ -148,38 +146,5 @@ async fn memory_context_suffix_lands_in_system_prompt() {
         prompt.contains(unique),
         "system prompt must contain the memory_context_suffix marker. \
          prompt was: {prompt}"
-    );
-}
-
-#[tokio::test]
-async fn unified_memory_with_store_round_trips_through_recall() {
-    // Verify Phase 3.3: UnifiedMemory.with_store actually wires the Store
-    // through so `recall(...)` returns what `remember(...)` wrote to it.
-    let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
-    let unified = UnifiedMemory::load().with_store(store.clone());
-
-    // Use a marker phrase that won't collide with anything the loader read
-    // from real user.md/project.md files.
-    let marker = "UNIFIED_MEMORY_E2E_PROBE";
-    let _key = unified
-        .remember(marker, 0.9)
-        .await
-        .expect("remember should write to the attached store");
-
-    let hits = unified
-        .recall(marker)
-        .await
-        .expect("recall should query the attached store");
-    assert!(
-        hits.iter().any(|h| h.content.contains(marker)),
-        "expected to recall the value we just remembered, got: {hits:?}"
-    );
-
-    // And: a UnifiedMemory without with_store must error on remember/recall —
-    // this protects against silently swallowing missing-store config.
-    let bare = UnifiedMemory::load();
-    assert!(
-        bare.remember("x", 0.5).await.is_err(),
-        "remember on a UnifiedMemory without a store must surface an error"
     );
 }

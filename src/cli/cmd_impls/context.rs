@@ -116,14 +116,13 @@ async fn cmd_compress(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     ctx.agent
         .read_async(|a| {
             Box::pin(async move {
-                let window = 6;
-                let compressor =
-                    echo_agent::compression::compressor::SlidingWindowCompressor::new(window);
                 let result = if let Some(ref focus_instructions) = focus {
-                    a.force_compress_with_focus_and_hooks(focus_instructions, window, "manual")
+                    a.force_compress_with_focus_and_hooks(focus_instructions, 6, "manual")
                         .await
                 } else {
-                    a.force_compress_with_hooks(&compressor, "manual").await
+                    // Respect the agent's installed compression strategy (e.g.
+                    // Adaptive) instead of forcing a fresh SlidingWindow.
+                    a.force_compress_context().await
                 };
                 match result {
                     Ok((s, checkpoint)) => {
@@ -173,14 +172,13 @@ async fn cmd_compact(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     ctx.agent
         .read_async(|a| {
             Box::pin(async move {
-                let window = 12;
-                let compressor =
-                    echo_agent::compression::compressor::SlidingWindowCompressor::new(window);
                 let result = if let Some(ref focus_instructions) = focus {
-                    a.force_compress_with_focus_and_hooks(focus_instructions, window, "manual")
+                    a.force_compress_with_focus_and_hooks(focus_instructions, 12, "manual")
                         .await
                 } else {
-                    a.force_compress_with_hooks(&compressor, "manual").await
+                    // Respect the agent's installed compression strategy (e.g.
+                    // Adaptive) instead of forcing a fresh SlidingWindow.
+                    a.force_compress_context().await
                 };
                 match result {
                     Ok((s, checkpoint)) => {

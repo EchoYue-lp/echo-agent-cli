@@ -584,21 +584,6 @@ async fn dispatch_task(
         .await;
     }
 
-    // Cron and Workflow are defined but not yet implemented — return clear error
-    match &meta.kind {
-        BackgroundTaskKind::Cron { .. } => {
-            return Err(echo_agent::error::ReactError::Other(
-                "Cron task kind is defined but not yet implemented. Use /cron command for scheduled tasks.".into(),
-            ));
-        }
-        BackgroundTaskKind::Workflow { .. } => {
-            return Err(echo_agent::error::ReactError::Other(
-                "Workflow task kind is defined but not yet implemented. Use /workflow command instead.".into(),
-            ));
-        }
-        _ => {}
-    }
-
     let lease = agent_provider.acquire_for_task(&ctx.task_id).await?;
     let agent = lease.agent();
     install_background_hitl_provider(&agent, hitl_provider.clone()).await;

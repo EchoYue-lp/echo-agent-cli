@@ -1,32 +1,25 @@
-//! Unified memory API — bridges instructions and agent-learned memories.
+//! Instruction-tier memory API — loads the user/project/local `.md` files
+//! and aggregates them for system-prompt injection.
 //!
-//! ## Two memory concepts
-//!
-//! | Concept | Source | Writer | Storage | Purpose |
-//! |---------|--------|--------|---------|---------|
-//! | **Instructions** | User-curated files | User | `user.md` / `project.md` / `local.md` | Tell the agent how to behave |
-//! | **Memories** | Agent-learned | Agent (BackgroundReviewer) | Store (KV) | Knowledge the agent has accumulated |
+//! Dynamic agent-learned memories are managed by the layered
+//! `MemoryLayerManager` (written via AutoMemory / BackgroundReviewer / the
+//! layered `remember` tool), not by this type. The earlier product-level
+//! `remember` / `recall` helpers were半死 (never wired into the production
+//! read path) and have been removed.
 //!
 //! ## Usage
 //!
 //! ```rust,ignore
 //! let memory = UnifiedMemory::load();
 //!
-//! // Get system prompt context
+//! // Get system prompt context (instructions suffix only)
 //! let ctx = memory.system_prompt_context();
 //!
 //! // Manage instructions
 //! memory.get_instructions(InstructionTier::Project);
-//!
-//! // Manage memories (async)
-//! memory.remember("User prefers Rust over Python", 0.8).await;
-//! memory.recall("language preference").await;
 //! ```
 
 use std::path::PathBuf;
-
-use echo_agent::memory::{Store, StoreItem};
-use std::sync::Arc;
 
 use crate::instruction_provider::InstructionProvider;
 
@@ -51,21 +44,6 @@ impl std::fmt::Display for InstructionTier {
             Self::Local => write!(f, "local"),
         }
     }
-}
-
-// ── Memory entry ────────────────────────────────────────────────────
-
-/// A single memory entry retrieved from the Store.
-#[derive(Debug, Clone)]
-pub struct MemoryEntry {
-    /// Memory key.
-    pub key: String,
-    /// Memory content.
-    pub content: String,
-    /// Importance score.
-    pub importance: f32,
-    /// Namespace the memory belongs to.
-    pub namespace: String,
 }
 
 // ── Memory context ──────────────────────────────────────────────────
@@ -114,12 +92,12 @@ impl MemoryContext {
 
 // ── Unified Memory ──────────────────────────────────────────────────
 
-/// Unified memory manager bridging instructions and dynamic memories.
+/// Instructions manager — loads the user/project/local `.md` tiers and
+/// aggregates them for system-prompt injection. Dynamic agent-learned
+/// memories are managed by the layered `MemoryLayerManager`, not this type.
 pub struct UnifiedMemory {
     /// Static file-based instructions (user/project/local .md files).
     instructions: InstructionProvider,
-    /// Dynamic KV store for agent-learned memories.
-    memories: Option<Arc<dyn Store>>,
     /// Hot layer content cached at load time (MEMORY.md body, frontmatter stripped).
     hot_content: Option<String>,
 }
@@ -131,15 +109,8 @@ impl UnifiedMemory {
         let hot_content = load_hot_content();
         Self {
             instructions,
-            memories: None,
             hot_content,
         }
-    }
-
-    /// Attach a Store for dynamic memories.
-    pub fn with_store(mut self, store: Arc<dyn Store>) -> Self {
-        self.memories = Some(store);
-        self
     }
 
     // ── Instructions ─────────────────────────────────────────────────
@@ -185,91 +156,6 @@ impl UnifiedMemory {
                 Ok(pwd.join(".echo-agent").join("local.md"))
             }
         }
-    }
-
-    // ── Memories (async) ─────────────────────────────────────────────
-
-    /// Store a legacy app-level memory in the raw Store namespace.
-    ///
-    /// Runtime-recallable agent memories should use the layered memory path
-    /// (`MemoryLayerManager::write_memory`) rather than this product API.
-    pub async fn remember(&self, content: &str, importance: f32) -> Result<String, String> {
-        let store = self.memories.as_ref().ok_or("No memory store configured")?;
-
-        let key = format!("memory_{}", chrono::Utc::now().timestamp_millis());
-
-        let value = serde_json::json!({
-            "content": content,
-            "importance": importance,
-            "created_at": chrono::Utc::now().to_rfc3339(),
-        });
-
-        let ns: &[&str] = &["agent", "memories"];
-        store
-            .put(ns, &key, value)
-            .await
-            .map_err(|e| format!("Failed to store memory: {e}"))?;
-
-        Ok(key)
-    }
-
-    /// Search memories by keyword.
-    pub async fn recall(&self, query: &str) -> Result<Vec<MemoryEntry>, String> {
-        let store = self.memories.as_ref().ok_or("No memory store configured")?;
-
-        let ns: &[&str] = &["agent", "memories"];
-        let results: Vec<StoreItem> = store
-            .search(ns, query, 10)
-            .await
-            .map_err(|e| format!("Failed to search memories: {e}"))?;
-
-        Ok(results
-            .into_iter()
-            .filter_map(|item| {
-                let content = item.value.get("content")?.as_str()?.to_string();
-                Some(MemoryEntry {
-                    key: item.key,
-                    content,
-                    importance: item.importance,
-                    namespace: item.namespace.join("."),
-                })
-            })
-            .collect())
-    }
-
-    /// Delete a memory by key.
-    pub async fn forget(&self, key: &str) -> Result<bool, String> {
-        let store = self.memories.as_ref().ok_or("No memory store configured")?;
-
-        let ns: &[&str] = &["agent", "memories"];
-        store
-            .delete(ns, key)
-            .await
-            .map_err(|e| format!("Failed to delete memory: {e}"))
-    }
-
-    /// List all memories.
-    pub async fn list_memories(&self) -> Result<Vec<MemoryEntry>, String> {
-        let store = self.memories.as_ref().ok_or("No memory store configured")?;
-
-        let ns: &[&str] = &["agent", "memories"];
-        let results: Vec<StoreItem> = store
-            .list(ns)
-            .await
-            .map_err(|e| format!("Failed to list memories: {e}"))?;
-
-        Ok(results
-            .into_iter()
-            .filter_map(|item| {
-                let content = item.value.get("content")?.as_str()?.to_string();
-                Some(MemoryEntry {
-                    key: item.key,
-                    content,
-                    importance: item.importance,
-                    namespace: item.namespace.join("."),
-                })
-            })
-            .collect())
     }
 
     // ── Aggregated context ───────────────────────────────────────────

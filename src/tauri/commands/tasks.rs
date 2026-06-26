@@ -87,26 +87,11 @@ pub async fn submit_task(
                 .and_then(|v| v.as_str())
                 .map(String::from),
         },
-        "cron" => BackgroundTaskKind::Cron {
-            cron_expr: params
-                .get("cron_expr")
-                .and_then(|v| v.as_str())
-                .unwrap_or("0 * * * *")
-                .to_string(),
-            prompt: params
-                .get("prompt")
-                .and_then(|v| v.as_str())
-                .unwrap_or(&description)
-                .to_string(),
-        },
-        "workflow" => BackgroundTaskKind::Workflow {
-            workflow_id: params
-                .get("workflow_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            input: params.get("input").cloned().unwrap_or_default(),
-        },
+        "cron" | "workflow" => {
+            return Err(IpcError::Validation(format!(
+                "{kind} tasks are not submitted via the background task service. Use the /cron command for scheduled tasks."
+            )));
+        }
         "research" => BackgroundTaskKind::Research {
             topic: params
                 .get("topic")
@@ -121,7 +106,7 @@ pub async fn submit_task(
         },
         other => {
             return Err(IpcError::Validation(format!(
-                "Unknown task kind: {other}. Valid: agent_chat, cron, workflow, research"
+                "Unknown task kind: {other}. Valid: agent_chat, research"
             )));
         }
     };

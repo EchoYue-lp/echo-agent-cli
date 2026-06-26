@@ -28,17 +28,6 @@ pub enum BackgroundTaskKind {
         session_id: Option<String>,
     },
 
-    /// Recurring cron job: fires on a schedule.
-    /// Each firing creates a child `AgentChat` task for tracking.
-    Cron { cron_expr: String, prompt: String },
-
-    /// Multi-step workflow: executes a Graph workflow definition.
-    Workflow {
-        workflow_id: String,
-        #[serde(default)]
-        input: serde_json::Value,
-    },
-
     /// Research pipeline: paper search -> fetch -> synthesize -> write (with revision loop).
     Research {
         topic: String,
@@ -245,8 +234,6 @@ impl BackgroundTaskKind {
     pub fn tag(&self) -> String {
         let kind_name = match self {
             BackgroundTaskKind::AgentChat { .. } => "agent_chat",
-            BackgroundTaskKind::Cron { .. } => "cron",
-            BackgroundTaskKind::Workflow { .. } => "workflow",
             BackgroundTaskKind::Research { .. } => "research",
             BackgroundTaskKind::ResearchToWriting { .. } => "research_to_writing",
             BackgroundTaskKind::DataPipeline { .. } => "data_pipeline",
@@ -265,8 +252,6 @@ impl BackgroundTaskKind {
     pub fn display_name(&self) -> &'static str {
         match self {
             BackgroundTaskKind::AgentChat { .. } => "Agent Chat",
-            BackgroundTaskKind::Cron { .. } => "Cron Job",
-            BackgroundTaskKind::Workflow { .. } => "Workflow",
             BackgroundTaskKind::Research { .. } => "Research",
             BackgroundTaskKind::ResearchToWriting { .. } => "Research to Writing",
             BackgroundTaskKind::DataPipeline { .. } => "Data Analysis",
@@ -281,7 +266,7 @@ impl BackgroundTaskKind {
     /// prompt and available tools.
     pub fn mode_name(&self) -> &str {
         match self {
-            Self::AgentChat { .. } | Self::Cron { .. } | Self::Workflow { .. } => "general",
+            Self::AgentChat { .. } => "general",
             Self::Research { .. } | Self::ResearchToWriting { .. } => "research",
             Self::DataPipeline { .. } => "data",
             Self::WritingPipeline { .. } => "writing",
@@ -295,15 +280,7 @@ impl BackgroundTaskKind {
     /// a descriptive prompt that the Agent can execute autonomously.
     pub fn to_prompt(&self) -> String {
         match self {
-            Self::AgentChat { prompt, .. } | Self::Cron { prompt, .. } => prompt.clone(),
-
-            Self::Workflow { workflow_id, input } => {
-                if input.is_null() {
-                    format!("Execute workflow: {workflow_id}")
-                } else {
-                    format!("Execute workflow: {workflow_id}\nInput: {input}")
-                }
-            }
+            Self::AgentChat { prompt, .. } => prompt.clone(),
 
             Self::Research {
                 topic, max_papers, ..
