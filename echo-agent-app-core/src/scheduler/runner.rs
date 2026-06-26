@@ -47,53 +47,37 @@ pub fn build_fire_fn(
         let service = task_service.clone();
         let runtime_store = task_runtime_store.clone();
         Box::pin(async move {
-            // ── U1c phase-1: plan orchestration path ──
+            // Phase 3.1: 所有 cron 经 launch_cron_run(统一 TaskRuntime 执行器)。
+            // `[plan]` 前缀 strip 作向后兼容,但不再选路——简单 prompt 由 agent
+            // 直接作答(launch_cron_run 未调 execute_plan 时自动 Completed);
+            // 复杂 prompt 驱动 task_create + execute_plan,与旧 [plan] 路径一致。
             if let Some(ref store) = runtime_store {
-                if let Some(plan_prompt) = task.prompt.strip_prefix(PLAN_MARKER) {
-                    let plan_prompt = plan_prompt.trim();
-                    if plan_prompt.is_empty() {
-                        return Err(echo_agent::error::ReactError::Other(
-                            "[plan] marker found but prompt is empty".into(),
-                        ));
-                    }
-                    let fire_id = uuid::Uuid::new_v4().to_string();
-                    let cancel = CancellationToken::new();
-                    match launch_cron_run(
-                        store.clone(),
-                        agent.clone(),
-                        &task.id,
-                        &fire_id,
-                        plan_prompt,
-                        cancel,
-                    )
-                    .await
-                    {
-                        Ok(()) => Ok(format!("[plan] cron run finished for task {}", task.id)),
-                        Err(e) => Err(echo_agent::error::ReactError::Other(format!(
-                            "[plan] run failed: {e}"
-                        ))),
-                    }
-                } else if let Some(ref svc) = service {
-                    // Legacy path: submit via BackgroundTaskService.
-                    let kind = BackgroundTaskKind::AgentChat {
-                        prompt: task.prompt.clone(),
-                        session_id: None,
-                    };
-                    let description = format!("Cron [{}]: {}", task.name, task.prompt);
-                    match svc
-                        .submit(kind, &description, Some("cron".to_string()))
-                        .await
-                    {
-                        Ok(task_id) => Ok(format!("Submitted as background task: {task_id}")),
-                        Err(e) => {
-                            tracing::warn!(
-                                "BackgroundTaskService submit failed ({e}), falling back to direct execution"
-                            );
-                            execute_direct(&agent, &task).await
-                        }
-                    }
-                } else {
-                    execute_direct(&agent, &task).await
+                let prompt = task
+                    .prompt
+                    .strip_prefix(PLAN_MARKER)
+                    .map(str::trim)
+                    .unwrap_or(&task.prompt);
+                if prompt.is_empty() {
+                    return Err(echo_agent::error::ReactError::Other(
+                        "cron prompt is empty (after [plan] strip)".into(),
+                    ));
+                }
+                let fire_id = uuid::Uuid::new_v4().to_string();
+                let cancel = CancellationToken::new();
+                match launch_cron_run(
+                    store.clone(),
+                    agent.clone(),
+                    &task.id,
+                    &fire_id,
+                    prompt,
+                    cancel,
+                )
+                .await
+                {
+                    Ok(()) => Ok(format!("cron run finished for task {}", task.id)),
+                    Err(e) => Err(echo_agent::error::ReactError::Other(format!(
+                        "cron run failed: {e}"
+                    ))),
                 }
             } else if let Some(ref svc) = service {
                 // No runtime store — legacy path only.
