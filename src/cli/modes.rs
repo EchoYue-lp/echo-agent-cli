@@ -50,14 +50,23 @@ pub async fn run_cli_mode(
 }
 
 /// 运行 IM 通道模式（QQ Bot、飞书等）
+///
+/// Channel agent 经 `AgentPool` 全套接通(bootstrap 等价:state_store/store/compressor/
+/// MemoryLayerManager/permission_service/per-sender cache_user_id+conversation_id),
+/// per-sender 隔离由 pool key `channel:{channel_id}:{sender_id}` 承载。
 #[cfg(feature = "channels")]
-pub async fn run_channels_mode(app_config: AppConfig) -> Result<()> {
+pub async fn run_channels_mode(
+    pool: std::sync::Arc<echo_agent_app_core::agent_pool::AgentPool>,
+    app_config: AppConfig,
+) -> Result<()> {
     use std::sync::Arc;
 
     use echo_agent::channels::{
-        AgentChannelHandler, ChannelManager, FeishuChannel, FeishuConfig, MessageHandler,
-        QqChannel, QqConfig, SessionConfig, SessionHandler,
+        ChannelManager, FeishuChannel, FeishuConfig, MessageHandler, QqChannel, QqConfig,
+        SessionConfig, SessionHandler,
     };
+
+    use crate::cli::channels::AppChannelMessageHandler;
 
     let mut manager = ChannelManager::new();
 
@@ -116,54 +125,17 @@ pub async fn run_channels_mode(app_config: AppConfig) -> Result<()> {
     let session_config =
         SessionConfig::default().with_timeout_minutes(app_config.channels.session.timeout_minutes);
 
-    let runtime_model = echo_agent_app_core::model_config::resolve_runtime_model(
-        &app_config,
-        app_config.model.default_model_id.as_deref(),
-    );
-    let model = runtime_model.model;
-    let llm_config = runtime_model.auth_token.as_ref().map(|token| {
-        echo_agent_app_core::infra::build_llm_config(
-            &runtime_model.provider,
-            token,
-            &model,
-            runtime_model.base_url.as_deref(),
-        )
-    });
-    let system_prompt = app_config.agent.system_prompt.clone();
-    let agent_name = app_config.agent.name.clone();
+    // pool create_agent 用 app_config 默认 model(system_prompt/agent_name 来自
+    // app_config),无需在此解析 runtime_model 或裸建 agent —— bootstrap 全套已由
+    // pool 注入。handler_factory 每 channel 产出一个 SessionHandler,其内层工厂
+    // 每 (channel,sender) 产出 AppChannelMessageHandler(持 pool clone)。
     let handler_factory = move |_channel_id: &str| -> Arc<dyn MessageHandler> {
-        let model = model.clone();
-        let llm_config = llm_config.clone();
-        let system_prompt = system_prompt.clone();
-        let agent_name = agent_name.clone();
         let session_config = session_config.clone();
+        let pool = pool.clone();
         Arc::new(SessionHandler::new(
             session_config,
             move || -> Box<dyn MessageHandler> {
-                if let Some(llm_config) = llm_config.clone() {
-                    match AgentChannelHandler::standard_with_llm_config(
-                        &model,
-                        &agent_name,
-                        &system_prompt,
-                        llm_config,
-                    ) {
-                        Ok(handler) => Box::new(handler),
-                        Err(e) => {
-                            tracing::warn!("IM channel agent LLM config failed: {e}");
-                            Box::new(AgentChannelHandler::standard(
-                                &model,
-                                &agent_name,
-                                &system_prompt,
-                            ))
-                        }
-                    }
-                } else {
-                    Box::new(AgentChannelHandler::standard(
-                        &model,
-                        &agent_name,
-                        &system_prompt,
-                    ))
-                }
+                Box::new(AppChannelMessageHandler::new(pool.clone()))
             },
         ))
     };

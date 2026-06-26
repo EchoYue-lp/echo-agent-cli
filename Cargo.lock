@@ -1737,6 +1737,7 @@ version = "1.0.0"
 dependencies = [
  "anyhow",
  "arboard",
+ "async-trait",
  "base64 0.22.1",
  "chrono",
  "clap",

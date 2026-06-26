@@ -3,6 +3,8 @@
 //! 默认用户入口是全屏 TUI；GUI 使用 Tauri 入口。旧 REPL 运行模式保留为内部兼容实现。
 
 pub mod args;
+#[cfg(feature = "channels")]
+pub mod channels;
 pub mod cmd_impls;
 pub mod command;
 pub mod commands;

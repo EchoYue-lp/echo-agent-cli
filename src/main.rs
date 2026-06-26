@@ -374,7 +374,16 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
     if run_channels {
         #[cfg(feature = "channels")]
         {
-            let channels_handle = tokio::spawn(cli::run_channels_mode(app_config.clone()));
+            // Channel agent 经 AgentPool 全套接通(bootstrap 等价),per-sender 隔离。
+            let pool = runtime
+                .init_pool(echo_agent_app_core::agent_pool::PoolConfig::default())
+                .await;
+            tracing::info!(
+                pool_size = pool.pool_size().await,
+                "AgentPool initialized for channels (IM per-sender agents)"
+            );
+
+            let channels_handle = tokio::spawn(cli::run_channels_mode(pool, app_config.clone()));
 
             if run_cli {
                 cli::run_cli_mode(
