@@ -51,6 +51,8 @@ echo-agent = { version = "0.2.0", package = "echo_agent", path = "../echo-agent"
 echo-core = { version = "0.2", package = "echo_core", path = "../echo-agent/echo-core" }
 # async_trait: needed for `impl MessageHandler for AppChannelMessageHandler` (channels feature).
 async-trait = "0.1"
+# async-stream: needed for `aggregate_by_sentence` (AppChannel stream aggregation, channels feature).
+async-stream = "0.3"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

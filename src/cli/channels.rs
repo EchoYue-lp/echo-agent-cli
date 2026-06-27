@@ -64,7 +64,7 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
             .write(|a| a.config_mut().set_cache_user_id(&cache_id))
             .await;
 
-        // 3. 非流式 chat（Phase 1.2 切 chat_stream）。read 锁跨 chat：per-sender 无并发，
+        // 3. 非流式 chat。read 锁跨 chat：per-sender 无并发，
         //    pool cleanup monitor 用 try_read 见忙即不驱逐（与 TUI repl.rs:394 同 pattern）。
         let guard = agent.inner().read().await;
         let reply = guard.chat(&msg.text).await?;
@@ -75,6 +75,73 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
             msg.chat_type,
             &reply,
         ))
+    }
+
+    async fn handle_stream<'a>(
+        &'a self,
+        msg: echo_agent::channels::InboundMessage,
+    ) -> echo_core::error::Result<
+        futures::stream::BoxStream<
+            'a,
+            echo_core::error::Result<echo_agent::channels::OutboundMessage>,
+        >,
+    > {
+        use echo_core::error::ChannelError;
+        use futures::StreamExt;
+
+        let conv = Self::conversation_id(&msg.channel_id, &msg.sender_id);
+        let cache_id = Self::cache_user_id(&msg.channel_id, &msg.sender_id);
+
+        // 1. pool 取/复用 per-sender agent（bootstrap 等价全套已注入）
+        let agent = self
+            .pool
+            .acquire(&conv)
+            .await
+            .map_err(|e| ChannelError::SendError(format!("AgentPool acquire failed: {e}")))?;
+
+        // 2. 设 per-sender cache_user_id（写锁短暂）
+        agent
+            .write(|a| a.config_mut().set_cache_user_id(&cache_id))
+            .await;
+
+        // 3. chat_stream。guard.chat_stream 返回的 BoxStream 借用 guard,且 &msg.text 借用 msg,
+        //    都不能进 'static spawn。解法(同 handle.rs RwLockAgentWrapper::chat_stream pattern):
+        //    把 inner Arc 和 msg.text(owned)移进 spawn,在 spawn 内取 read guard + chat_stream,
+        //    逐事件经 unbounded channel 转发;rx 转成 'static 流(与 'a 兼容)。
+        let inner = agent.inner().clone();
+        let text = msg.text.clone();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<
+            echo_core::error::Result<echo_core::agent::AgentEvent>,
+        >();
+        tokio::spawn(async move {
+            use echo_agent::agent::Agent; // Agent trait 提供 chat_stream
+            use futures::StreamExt;
+            let guard = inner.read().await;
+            let event_stream = match guard.chat_stream(&text).await {
+                Ok(s) => s,
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                    return;
+                }
+            };
+            let mut s = event_stream;
+            while let Some(item) = s.next().await {
+                if tx.send(item).is_err() {
+                    break;
+                }
+            }
+            // guard 在此 drop,释放 read 锁
+        });
+        let event_stream = futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        })
+        .boxed();
+
+        // 4. 聚合成逐段 OutboundMessage 流
+        let channel_id = msg.channel_id.clone();
+        let to = msg.sender_id.clone();
+        let chat_type = msg.chat_type;
+        Ok(aggregate_by_sentence(event_stream, channel_id, to, chat_type).await)
     }
 
     async fn reply(
@@ -103,6 +170,97 @@ fn sanitize_cache_user_id(raw: &str) -> String {
             }
         })
         .collect()
+}
+
+#[cfg(feature = "channels")]
+const FLUSH_THRESHOLD: usize = 80;
+
+/// 句末标点(中英文)触发 flush。
+#[cfg(feature = "channels")]
+fn is_sentence_end(c: char) -> bool {
+    // 中文句末:。 ． ！ ？ … ;英文句末:. ! ?
+    matches!(c, '。' | '．' | '！' | '？' | '…' | '.' | '!' | '?')
+}
+
+/// 把 `AgentEvent` 流按句/段落聚合成逐段 `OutboundMessage` 流。
+///
+/// flush 条件(满足任一):
+/// 1. buf 含换行 → flush 到最后一个换行(含),保留换行后的剩余。
+/// 2. buf 以句末标点结尾 → flush 全 buf。
+/// 3. buf.chars().count() >= FLUSH_THRESHOLD → flush 全 buf。
+///
+/// 终态事件:FinalAnswer / Cancelled 先 flush 剩余 buf(若非空);
+/// Error 先 flush 剩余后 yield Err;其它事件忽略。
+///
+/// 生命周期:返回流借用 'a(随 `events`),由 `try_stream!` 自然处理(宏生成的
+/// future 持有 `events` 的借用)。UTF-8 安全:全用 chars() 判长(AGENTS.md §1);
+/// 无 unwrap/expect(§2);换行切片见下方注释。
+#[cfg(feature = "channels")]
+async fn aggregate_by_sentence<'a>(
+    mut events: futures::stream::BoxStream<
+        'a,
+        echo_core::error::Result<echo_core::agent::AgentEvent>,
+    >,
+    channel_id: String,
+    to: String,
+    chat_type: echo_agent::channels::ChatType,
+) -> futures::stream::BoxStream<'a, echo_core::error::Result<echo_agent::channels::OutboundMessage>>
+{
+    use echo_agent::channels::OutboundMessage;
+    use echo_core::agent::AgentEvent;
+    use echo_core::error::{ChannelError, ReactError};
+    use futures::StreamExt;
+
+    let s = async_stream::try_stream! {
+        let mut buf = String::new();
+        // flush 全 buf(若非空)的统一动作,被多个终态/flush 分支共用。
+        macro_rules! flush_all {
+            () => {
+                if !buf.is_empty() {
+                    yield OutboundMessage::new(&channel_id, &to, chat_type, &buf);
+                    buf.clear();
+                }
+            };
+        }
+        while let Some(ev) = events.next().await {
+            match ev? {
+                AgentEvent::Token(t) => {
+                    buf.push_str(&t);
+                    // 1. 换行 flush(到最后一个 \n 含)
+                    //    安全:`\n` 是 ASCII 单字节,`rfind('\n')` 返字节 idx,
+                    //    其位置必在完整 UTF-8 字符边界(\n 不出现在多字节字符中间),
+                    //    故 buf[..cut] / buf[cut..] 切在字符边界,不会 panic。
+                    if let Some(idx) = buf.rfind('\n') {
+                        let cut = idx + '\n'.len_utf8(); // = idx + 1
+                        let chunk: String = buf[..cut].to_string();
+                        buf = buf[cut..].to_string();
+                        yield OutboundMessage::new(&channel_id, &to, chat_type, &chunk);
+                    }
+                    // 2/3. 句末标点 或 阈值(chars().count() 非字节)→ flush 全 buf
+                    else if buf.chars().last().map(is_sentence_end).unwrap_or(false)
+                        || buf.chars().count() >= FLUSH_THRESHOLD
+                    {
+                        flush_all!();
+                    }
+                }
+                AgentEvent::FinalAnswer(_) => {
+                    flush_all!();
+                }
+                AgentEvent::Cancelled => {
+                    flush_all!();
+                    break;
+                }
+                AgentEvent::Error { message, .. } => {
+                    flush_all!();
+                    Err(ReactError::Channel(Box::new(ChannelError::Other(format!(
+                        "agent stream error: {message}"
+                    )))))?;
+                }
+                _ => {} // ToolCall/ThinkStart/LlmUsage 等本 Phase 忽略
+            }
+        }
+    };
+    s.boxed()
 }
 
 #[cfg(test)]
@@ -156,5 +314,151 @@ mod tests {
             super::AppChannelMessageHandler::cache_user_id("qqbot", "user_123"),
             "im-qqbot-user_123"
         );
+    }
+
+    // ── aggregate_by_sentence 测试(需 channels feature)──────────────────────
+    #[cfg(feature = "channels")]
+    mod aggregate {
+        use super::super::{FLUSH_THRESHOLD, aggregate_by_sentence};
+        use echo_agent::channels::{ChatType, OutboundMessage};
+        use echo_core::agent::AgentEvent;
+        use echo_core::error::Result;
+        use futures::stream::{BoxStream, StreamExt};
+        fn events_to_stream(
+            events: Vec<Result<AgentEvent>>,
+        ) -> BoxStream<'static, Result<AgentEvent>> {
+            futures::stream::iter(events).boxed()
+        }
+
+        async fn collect_texts(s: BoxStream<'_, Result<OutboundMessage>>) -> Vec<String> {
+            let mut out = Vec::new();
+            let mut s = s;
+            while let Some(item) = s.next().await {
+                match item {
+                    Ok(m) => out.push(m.text),
+                    Err(_) => break,
+                }
+            }
+            out
+        }
+
+        #[tokio::test]
+        async fn flush_on_newline() {
+            // Token("a") Token("b\n") Token("c") FinalAnswer("") → "ab\n", "c"
+            let evs = events_to_stream(vec![
+                Ok(AgentEvent::Token("a".into())),
+                Ok(AgentEvent::Token("b\n".into())),
+                Ok(AgentEvent::Token("c".into())),
+                Ok(AgentEvent::FinalAnswer(String::new())),
+            ]);
+            let out = aggregate_by_sentence(evs, "qq".into(), "u1".into(), ChatType::Direct).await;
+            let texts = collect_texts(out).await;
+            assert_eq!(texts, vec!["ab\n".to_string(), "c".to_string()]);
+        }
+
+        #[tokio::test]
+        async fn flush_on_sentence_end() {
+            // 中文句末标点 。 触发 flush
+            let evs = events_to_stream(vec![
+                Ok(AgentEvent::Token("你好。".into())),
+                Ok(AgentEvent::Token("再见".into())),
+                Ok(AgentEvent::FinalAnswer(String::new())),
+            ]);
+            let out = aggregate_by_sentence(evs, "qq".into(), "u1".into(), ChatType::Direct).await;
+            let texts = collect_texts(out).await;
+            assert_eq!(texts, vec!["你好。".to_string(), "再见".to_string()]);
+        }
+
+        #[tokio::test]
+        async fn flush_on_threshold() {
+            // 超过 FLUSH_THRESHOLD 字符阈值 flush(单 Token 阈值+10)
+            let n = FLUSH_THRESHOLD + 10;
+            let long: String = "x".repeat(n);
+            let evs = events_to_stream(vec![
+                Ok(AgentEvent::Token(long.clone())),
+                Ok(AgentEvent::FinalAnswer(String::new())),
+            ]);
+            let out = aggregate_by_sentence(evs, "qq".into(), "u1".into(), ChatType::Direct).await;
+            let texts = collect_texts(out).await;
+            assert_eq!(texts.len(), 1, "threshold flush yields 1");
+            assert_eq!(texts[0].chars().count(), n);
+        }
+
+        #[tokio::test]
+        async fn finalanswer_flushes_remaining() {
+            // 无标点的短串 + FinalAnswer flush 剩余
+            let evs = events_to_stream(vec![
+                Ok(AgentEvent::Token("hi".into())),
+                Ok(AgentEvent::FinalAnswer(String::new())),
+            ]);
+            let out = aggregate_by_sentence(evs, "qq".into(), "u1".into(), ChatType::Direct).await;
+            let texts = collect_texts(out).await;
+            assert_eq!(texts, vec!["hi".to_string()]);
+        }
+
+        #[tokio::test]
+        async fn empty_buf_finalanswer_no_yield() {
+            // FinalAnswer 前无 Token → 不 yield 空
+            let evs = events_to_stream(vec![Ok(AgentEvent::FinalAnswer(String::new()))]);
+            let out = aggregate_by_sentence(evs, "qq".into(), "u1".into(), ChatType::Direct).await;
+            let texts = collect_texts(out).await;
+            assert!(texts.is_empty(), "no token before FinalAnswer → no yield");
+        }
+
+        #[tokio::test]
+        async fn cancelled_flushes_remaining_then_stops() {
+            let evs = events_to_stream(vec![
+                Ok(AgentEvent::Token("partial".into())),
+                Ok(AgentEvent::Cancelled),
+            ]);
+            let out = aggregate_by_sentence(evs, "qq".into(), "u1".into(), ChatType::Direct).await;
+            let texts = collect_texts(out).await;
+            assert_eq!(texts, vec!["partial".to_string()]);
+        }
+
+        #[tokio::test]
+        async fn error_flushes_then_propagates() {
+            let evs = events_to_stream(vec![
+                Ok(AgentEvent::Token("partial".into())),
+                Ok(AgentEvent::Error {
+                    source: "llm".into(),
+                    message: "boom".into(),
+                }),
+            ]);
+            let out = aggregate_by_sentence(evs, "qq".into(), "u1".into(), ChatType::Direct).await;
+            let mut s = out;
+            // 第一条:flush 的 partial
+            let first = s.next().await.unwrap().unwrap();
+            assert_eq!(first.text, "partial");
+            // 之后:Error 事件 → yield Err
+            let second = s.next().await;
+            assert!(second.is_some(), "error propagated as stream item");
+            assert!(second.unwrap().is_err(), "error item is Err");
+        }
+
+        #[tokio::test]
+        async fn multibyte_no_panic() {
+            // 中文 + emoji 不 panic,按 FinalAnswer flush
+            let evs = events_to_stream(vec![
+                Ok(AgentEvent::Token("你好🦀世界".into())),
+                Ok(AgentEvent::FinalAnswer(String::new())),
+            ]);
+            let out = aggregate_by_sentence(evs, "qq".into(), "u1".into(), ChatType::Direct).await;
+            let texts = collect_texts(out).await;
+            assert_eq!(texts, vec!["你好🦀世界".to_string()]);
+        }
+
+        #[tokio::test]
+        async fn fullwidth_punctuation_flushes() {
+            // 全角 ！ ？ 。 触发 flush(验证 is_sentence_end 全角分支)
+            let evs = events_to_stream(vec![
+                Ok(AgentEvent::Token("第一句！".into())),
+                Ok(AgentEvent::Token("第二句？".into())),
+                Ok(AgentEvent::FinalAnswer(String::new())),
+            ]);
+            let out = aggregate_by_sentence(evs, "qq".into(), "u1".into(), ChatType::Direct).await;
+            let texts = collect_texts(out).await;
+            assert_eq!(texts, vec!["第一句！".to_string(), "第二句？".to_string()]);
+        }
     }
 }
