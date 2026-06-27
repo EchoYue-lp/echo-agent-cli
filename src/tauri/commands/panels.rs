@@ -1870,11 +1870,12 @@ pub async fn list_unattended_worktrees(
     state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
     let repo_root = workspace_project_root(&state).await?;
-    let store = state.app_state.connection.task_runtime_store.clone();
+    // 任务运行时存储在 AppState.tasks.runtime(Option<Arc<TaskRuntimeStore>>);ConnectionState 无此字段。
+    let store = state.app_state.tasks.runtime.clone();
 
     let unattended = echo_agent_app_core::tasks::task_runtime::worktree::list_unattended_worktrees(
         &repo_root,
-        Some(&store),
+        store.as_deref(),
     )
     .map_err(|e| IpcError::Internal(format!("Failed to list unattended worktrees: {e}")))?;
 
