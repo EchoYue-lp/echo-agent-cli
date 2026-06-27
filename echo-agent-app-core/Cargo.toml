@@ -11,7 +11,7 @@ export_dir = "../web-frontend/src/generated"
 
 [dependencies]
 echo-agent = { version = "0.2", package = "echo_agent", path = "../../echo-agent", features = [
-    "sqlite", "mcp", "lsp", "human-loop", "subagent", "git", "tasks",
+    "mcp", "lsp", "human-loop", "subagent", "git", "tasks",
     "shell", "files", "web",
     "data", "statistics", "chart", "research", "media",
     "database", "rag",
