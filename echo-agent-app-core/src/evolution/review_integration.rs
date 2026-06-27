@@ -1,11 +1,13 @@
 //! Review scheduling — wires [`MemoryReviewer`] into the product lifecycle.
 //!
-//! Three trigger paths:
+//! Trigger paths (stage4 F1):
 //! 1. **Automatic — session end**: After REPL/TUI exit, alongside existing
 //!    `run_auto_memory_on_exit()`.
-//! 2. **Automatic — write counter**: Every N writes (configurable, default 50),
-//!    trigger a lightweight review.
-//! 3. **Manual — `/memory-review` command**: User-initiated full review.
+//! 2. **Manual — `/memory-review` command**: User-initiated full review.
+//! 3. **Scheduled — Dreaming**: A cron-driven `Dreaming::run` pass does
+//!    recall-frequency-driven promotion + staleness demote (replaces the old
+//!    "every-N-writes" write-counter trigger, which coupled review cadence to
+//!    write volume instead of recall value).
 //!
 //! The struct is self-contained: given a `Store`, an `echo_agent_dir`, and a
 //! [`ReviewConfig`], it creates its own [`MemoryLayerManager`] and
@@ -58,29 +60,25 @@ impl ReviewIntegration {
         self.write_counter.load(Ordering::Relaxed)
     }
 
-    /// Called after each real memory write. The counter is incremented by
-    /// `MemoryLayerManager::write_memory`; this method only observes the shared
-    /// count and triggers a review if the threshold is reached.
+    /// Called after each real memory write. The shared `write_counter` is
+    /// incremented by `MemoryLayerManager::write_memory`; this observer no
+    /// longer triggers a review on a write-count threshold.
     ///
-    /// Returns `None` if the threshold has not been reached, or
-    /// `Some(Ok(report))` if a review was triggered, or `Some(Err(...))` if
-    /// review was triggered but failed.
+    /// (stage4 F1) The old "every-N-writes triggers a full review" model
+    /// coupled review cadence to write volume rather than recall value, and
+    /// wrote through a per-pass layer manager that bypassed the agent's shared
+    /// instance. It is replaced by the scheduled **Dreaming** pass
+    /// (`Dreaming::run`), which promotes high-recall memories and batch-demotes
+    /// stale low-recall ones on a cron cadence. The `write_counter` is retained
+    /// for diagnostics only.
+    ///
+    /// Always returns `None` — reviews happen via `on_session_end`, the manual
+    /// `/memory-review` command, or the scheduled Dreaming pass.
     pub async fn on_memory_write(&self) -> Option<Result<ReviewReport, String>> {
-        let count = self.write_counter.load(Ordering::Relaxed);
-        if count == 0 {
-            return None;
-        }
-        if !count.is_multiple_of(self.config.review_every_n_writes) {
-            return None;
-        }
-
-        tracing::info!(
-            count,
-            threshold = self.config.review_every_n_writes,
-            "Review triggered by write counter"
-        );
-
-        Some(self.run_review_inner().await)
+        // Write-count-triggered review removed (stage4 F1); Dreaming took over.
+        // Counter still increments in `write_memory` for diagnostics.
+        let _ = self.write_counter.load(Ordering::Relaxed);
+        None
     }
 
     /// Called at session end. Runs a full review if configured.
@@ -368,7 +366,9 @@ mod tests {
         let layer_manager = ri.create_layer_manager();
         let meta = MemoryMeta::new(MemoryType::ProjectFact, MemorySource::AutoExtracted, "test");
 
-        // Direct observer calls do not increment. Real MemoryLayerManager writes do.
+        // (stage4 F1) Write-count-triggered review is removed; the shared
+        // write_counter still increments (diagnostics) but on_memory_write never
+        // triggers a review (Dreaming took over recall-frequency-driven passes).
         assert!(ri.on_memory_write().await.is_none());
         assert_eq!(ri.write_count(), 0);
 
@@ -386,10 +386,13 @@ mod tests {
             .write_memory("three", "third project fact", meta)
             .await
             .expect("write three");
-        // Third real write triggers review.
-        let review_result = ri.on_memory_write().await;
-        assert!(review_result.is_some());
-        assert_eq!(ri.write_count(), 3);
+        // Third write no longer triggers a review (Dreaming replaced it).
+        assert!(ri.on_memory_write().await.is_none());
+        assert_eq!(
+            ri.write_count(),
+            3,
+            "counter still increments for diagnostics"
+        );
     }
 
     #[tokio::test]

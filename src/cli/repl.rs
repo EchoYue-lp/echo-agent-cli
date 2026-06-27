@@ -239,15 +239,18 @@ async fn run_auto_memory_on_exit(agent: &AgentHandle) {
     let count = observations.len();
     let formatted = format_observations_for_memory(&observations);
 
-    let typed_written = match agent.read(|a| a.store().cloned()).await {
-        Some(store) => match write_observations_to_memory_layer(&observations, store, None).await {
+    let typed_written = match agent.read(|a| a.memory_layer_manager().cloned()).await {
+        Some(lm) => match write_observations_to_memory_layer(&observations, &lm).await {
             Ok(count) => count,
             Err(e) => {
                 println!("  Auto-memory: failed to save typed memory ({})", e);
                 0
             }
         },
-        None => 0,
+        None => {
+            tracing::debug!("auto_memory: agent has no shared layer manager, skipping typed write");
+            0
+        }
     };
 
     match append_to_project_memory(&observations) {

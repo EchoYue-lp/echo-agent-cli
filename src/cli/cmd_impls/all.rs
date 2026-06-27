@@ -346,17 +346,20 @@ async fn cmd_auto_memory(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
                 return CommandOutcome::Continue;
             }
 
-            let typed_written = match handle.read(|a| a.store().cloned()).await {
-                Some(store) => {
-                    match write_observations_to_memory_layer(&observations, store, None).await {
-                        Ok(count) => count,
-                        Err(e) => {
-                            println!("Typed auto-memory write failed: {e}");
-                            0
-                        }
+            let typed_written = match handle.read(|a| a.memory_layer_manager().cloned()).await {
+                Some(lm) => match write_observations_to_memory_layer(&observations, &lm).await {
+                    Ok(count) => count,
+                    Err(e) => {
+                        println!("Typed auto-memory write failed: {e}");
+                        0
                     }
+                },
+                None => {
+                    tracing::debug!(
+                        "auto-memory: agent has no shared layer manager, skipping typed write"
+                    );
+                    0
                 }
-                None => 0,
             };
 
             match append_to_project_memory(&observations) {
