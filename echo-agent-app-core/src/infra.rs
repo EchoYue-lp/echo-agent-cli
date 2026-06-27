@@ -643,6 +643,53 @@ pub fn spawn_mcp_health_check(
     });
 }
 
+/// Spawn the Dreaming self-evolution pass on a daily cadence (stage4 F1).
+///
+/// Replaces the old "every-N-writes triggers a full review" model with a
+/// recall-frequency-driven pass: promote high-recall memories (incl. Archived,
+/// revived first) to the hot layer (MEMORY.md → system prompt stable prefix)
+/// and batch-demote stale low-recall ones to Archived. Uses the shared
+/// `ReviewIntegration`'s layer manager (same store the agent recalls from, so
+/// revives/demotes land in the unified `["agent","memories"]` namespace).
+/// Best-effort — errors in a pass are logged and the next pass runs on the
+/// next tick.
+pub fn spawn_dreaming_task(
+    review_integration: Arc<crate::evolution::ReviewIntegration>,
+    cancel: echo_agent::agent::CancellationToken,
+) {
+    tokio::spawn(async move {
+        // Initial delay so boot-time activity isn't interrupted.
+        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(86400));
+        interval.tick().await; // discard the immediate first tick
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    tracing::info!("Dreaming task stopped");
+                    break;
+                }
+                _ = interval.tick() => {
+                    let lm = std::sync::Arc::new(review_integration.create_layer_manager());
+                    let dreaming = echo_agent::evolution::Dreaming::new(
+                        lm,
+                        echo_agent::evolution::DreamingConfig::default(),
+                    );
+                    match dreaming.run().await {
+                        Ok(report) => tracing::info!(
+                            scanned = report.scanned,
+                            promoted = report.promoted,
+                            revived = report.revived,
+                            demoted = report.demoted,
+                            "Dreaming pass completed"
+                        ),
+                        Err(e) => tracing::warn!(error = %e, "Dreaming pass failed"),
+                    }
+                }
+            }
+        }
+    });
+}
+
 /// 创建对话持久化 Store（SQLite），失败时返回 None（禁用持久化）
 pub fn create_conversation_store() -> Option<Arc<dyn ConversationStore>> {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());

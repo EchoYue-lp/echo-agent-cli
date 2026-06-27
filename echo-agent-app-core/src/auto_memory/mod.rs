@@ -59,25 +59,22 @@ pub fn run_auto_memory_extraction(
     Ok(count)
 }
 
-/// App-side bridge from the shared Store/ReviewIntegration to framework typed memory writes.
+/// App-side bridge: write observations through the agent's **shared** layer
+/// manager (stage4 F1, 割裂点 6).
+///
+/// Previously this built a fresh per-call `MemoryLayerManager` (via
+/// `ReviewIntegration::create_layer_manager`) that bypassed the agent's shared
+/// security guard, audit log, and write counter/observer. Callers now pass the
+/// agent's shared `MemoryLayerManager` (obtained via
+/// `ReactAgent::memory_layer_manager()`), so session-end auto-memory writes
+/// land on the same chokepoint as explicit `write_memory` calls.
 pub async fn write_observations_to_memory_layer(
     observations: &[Observation],
-    store: Arc<dyn echo_agent::memory::Store>,
-    review_integration: Option<Arc<crate::evolution::ReviewIntegration>>,
+    layer_manager: &Arc<echo_agent::evolution::MemoryLayerManager>,
 ) -> Result<usize, String> {
-    let review_integration = review_integration.unwrap_or_else(|| {
-        Arc::new(crate::evolution::ReviewIntegration::new(
-            echo_agent::evolution::ReviewConfig::default(),
-            crate::evolution::discover_echo_agent_dir(),
-            store,
-        ))
-    });
-    let layer_manager = review_integration
-        .create_layer_manager()
-        .with_write_observer(review_integration.clone());
     echo_agent::evolution::auto_memory::write_observations_to_memory_layer(
         observations,
-        &layer_manager,
+        layer_manager,
     )
     .await
 }

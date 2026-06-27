@@ -283,20 +283,20 @@ async fn write_auto_memory_observations(
         return Ok(0);
     }
 
-    let Some(store) = state
+    let Some(layer_manager) = state
         .app_state
         .connection
         .primary_agent()
-        .read(|agent| agent.store().cloned())
+        .read(|agent| agent.memory_layer_manager().cloned())
         .await
     else {
+        tracing::debug!("auto-memory: primary agent has no shared layer manager");
         return Ok(0);
     };
 
     echo_agent_app_core::auto_memory::write_observations_to_memory_layer(
         observations,
-        store,
-        state.app_state.review_integration.clone(),
+        &layer_manager,
     )
     .await
     .map_err(IpcError::Internal)
