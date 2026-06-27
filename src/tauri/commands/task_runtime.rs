@@ -339,15 +339,9 @@ pub async fn resume_task_run(
     let store_for_task = store.clone();
     let primary_agent_for_task = primary_agent.clone();
     let run_store_for_task = primary_agent.read(|a| a.run_store().cloned()).await;
-    let (reviewer_llm, exec_cache_user_id) = primary_agent
-        .read(|a| {
-            (
-                a.llm_client().cloned(),
-                a.config().get_cache_user_id().map(|s| s.to_string()),
-            )
-        })
-        .await;
-    let exec_cache_user_id = exec_cache_user_id.unwrap_or_default();
+    // (stage4 P4.1) cache_user_id read from single source by execute_run/review
+    // internally — only the reviewer_llm is needed here.
+    let reviewer_llm = primary_agent.read(|a| a.llm_client().cloned()).await;
     let layer_manager = state
         .app_state
         .review_integration
@@ -376,7 +370,6 @@ pub async fn resume_task_run(
             run_store_for_task,
             Some(trace_sink),
             &run_id_for_task,
-            exec_cache_user_id.clone(),
             cancel,
         )
         .await;
@@ -499,15 +492,9 @@ pub async fn execute_task_run(
     let run_id_for_task = run_id.clone();
     // The reviewer LLM is the primary agent's client — review gates use it to
     // evaluate implementation/debugging task output against the domain checklist.
-    let (reviewer_llm, exec_cache_user_id) = primary_agent
-        .read(|a| {
-            (
-                a.llm_client().cloned(),
-                a.config().get_cache_user_id().map(|s| s.to_string()),
-            )
-        })
-        .await;
-    let exec_cache_user_id = exec_cache_user_id.unwrap_or_default();
+    // (stage4 P4.1) cache_user_id read from single source by execute_run/review
+    // internally — only the reviewer_llm is needed here.
+    let reviewer_llm = primary_agent.read(|a| a.llm_client().cloned()).await;
     // The memory layer manager sinks run completion/cancellation events into
     // long-term memory through the single write_memory chokepoint. Created
     // from ReviewIntegration when available (mirrors the primary agent's path).
@@ -538,7 +525,6 @@ pub async fn execute_task_run(
             run_store_for_task,
             Some(trace_sink),
             &run_id_for_task,
-            exec_cache_user_id.clone(),
             cancel,
         )
         .await;

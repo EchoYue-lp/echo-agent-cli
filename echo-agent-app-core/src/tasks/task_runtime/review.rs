@@ -79,18 +79,19 @@ pub async fn review_task(
     run_id: &str,
     task: &PlanTask,
     worker_output: &str,
-    cache_user_id: &str,
 ) -> Result<ReviewResult, ReviewError> {
     let template = ProfileTemplate::for_profile(task.domain_profile);
     let prompt = build_review_prompt(task, worker_output, template);
 
+    // (stage4 P4.1) cache_user_id single source — read directly.
+    let cache_user_id = crate::infra::load_or_create_cache_user_id();
     let request = ChatRequest {
         messages: vec![
             Message::system(review_preamble(template)),
             Message::user(prompt),
         ],
         response_format: Some(ResponseFormat::JsonObject),
-        user_id: Some(cache_user_id.to_string()),
+        user_id: Some(cache_user_id),
         ..Default::default()
     };
     let response = llm

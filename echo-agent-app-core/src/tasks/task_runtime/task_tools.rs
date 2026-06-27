@@ -75,10 +75,6 @@ tokio::task_local! {
     /// executor so the frontend can render real-time worker trace views. Set
     /// alongside `CURRENT_RUN_ID` by [`with_run_context`].
     pub static CURRENT_TRACE_SINK: Option<TraceSink>;
-    /// The cache user id for the currently executing run. Used when dispatching
-    /// LLM calls so that cache keys are scoped per user. Falls back to the empty
-    /// string when no user context is available.
-    pub static CURRENT_CACHE_USER_ID: String;
     /// The unattended write mode for the currently executing run (D7 stage 2).
     /// Set by `ExecutePlanTool::execute` so CP B preflight in `execute_task`
     /// can read it without threading the mode through `execute_run` →
@@ -87,17 +83,19 @@ tokio::task_local! {
     pub static CURRENT_UNATTENDED_WRITE_MODE: super::types::UnattendedWriteMode;
 }
 
-/// Run `f` with run_id, cancel, delegate_depth, trace_sink, and cache_user_id
-/// available to all task tools.
+/// Run `f` with run_id, cancel, delegate_depth, and trace_sink available to all
+/// task tools.
 ///
 /// Called by the executor before dispatching task work. Replaces the old
 /// [`with_run_id`] which only scoped the run_id. Delegate depth starts at 0
 /// and is incremented by the L3 nesting layer (Task 6).
+///
+/// (stage4 P4.1) `cache_user_id` is no longer threaded here — tools/LLM calls
+/// read the single source via `infra::load_or_create_cache_user_id()` instead.
 pub async fn with_run_context<F, R>(
     run_id: String,
     cancel: tokio_util::sync::CancellationToken,
     trace_sink: Option<TraceSink>,
-    cache_user_id: String,
     f: F,
 ) -> R
 where
@@ -111,8 +109,7 @@ where
                 cell_cancel,
                 CURRENT_DELEGATE_DEPTH.scope(
                     std::cell::Cell::new(0),
-                    CURRENT_TRACE_SINK
-                        .scope(trace_sink, CURRENT_CACHE_USER_ID.scope(cache_user_id, f)),
+                    CURRENT_TRACE_SINK.scope(trace_sink, f),
                 ),
             ),
         )
@@ -125,7 +122,7 @@ where
     F: std::future::Future<Output = R>,
 {
     let cancel = tokio_util::sync::CancellationToken::new();
-    with_run_context(run_id, cancel, None, String::new(), f).await
+    with_run_context(run_id, cancel, None, f).await
 }
 
 fn current_run_id() -> Option<String> {
@@ -234,6 +231,22 @@ mod tests {
         })
         .await;
         assert_eq!(inner.as_deref(), Some("inner"));
+    }
+
+    // ── stage4 P4.1: cache_user_id single-source ────────────────────────────
+    // with_run_context no longer threads a cache_user_id param — tools that
+    // need the id read it from config / load_or_create_cache_user_id() instead.
+    // This compile-time assertion guards the signature change.
+    #[tokio::test]
+    async fn with_run_context_drops_cache_user_id_param() {
+        let result: i32 = with_run_context(
+            "r1".to_string(),
+            tokio_util::sync::CancellationToken::new(),
+            None, // trace_sink
+            async { 42 },
+        )
+        .await;
+        assert_eq!(result, 42);
     }
 }
 

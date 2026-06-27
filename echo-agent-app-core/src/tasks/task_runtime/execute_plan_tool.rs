@@ -220,14 +220,13 @@ impl Tool for ExecutePlanTool {
                 }
             }
 
-            // ── Read trace_sink and cache_user_id from task_local ──
+            // ── Read trace_sink from task_local ──
+            // (stage4 P4.1) cache_user_id read from single source inside
+            // execute_run/review_task — no longer threaded.
             let trace_sink = super::task_tools::CURRENT_TRACE_SINK
                 .try_with(|s| s.clone())
                 .ok()
                 .flatten();
-            let cache_user_id = super::task_tools::CURRENT_CACHE_USER_ID
-                .try_with(|s| s.clone())
-                .unwrap_or_default();
 
             // ── §10.1: 必须 await RunOutcome, 不得 fire-and-forget ──
             // G3 fix: read run_store from the primary agent instead of passing
@@ -249,7 +248,6 @@ impl Tool for ExecutePlanTool {
                         run_store,
                         trace_sink,
                         &run_id,
-                        cache_user_id,
                         cancel,
                     )
                     .await

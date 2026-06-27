@@ -475,21 +475,15 @@ pub async fn send_chat_message(
     let execution_policy = ExecutionPolicy::from_raw(interaction_mode_raw, &permission_mode);
 
     if execution_policy.should_route_runtime() {
-        let (route_llm, route_cache_user_id) = agent_handle
-            .read(|a| {
-                (
-                    a.llm_client().cloned(),
-                    a.config().get_cache_user_id().map(|s| s.to_string()),
-                )
-            })
-            .await;
+        // (stage4 P4.1) router reads cache_user_id from the single source itself;
+        // only the llm_client is needed here.
+        let route_llm = agent_handle.read(|a| a.llm_client().cloned()).await;
         let route_feedback = state.app_state.tasks.route_feedback.read().await.clone();
         let route_decision = echo_agent_app_core::tasks::task_runtime::route_message_with_feedback(
             route_llm,
             &message,
             execution_policy.interaction_mode,
             &route_feedback,
-            route_cache_user_id.as_deref(),
         )
         .await;
         // ── Record route decision for long-term learning ──────────────
@@ -1309,17 +1303,6 @@ async fn launch_unified_run(
         .clone()
         .unwrap_or_else(|| event_message_key.clone());
 
-    // Read the cache_user_id from the primary agent config so it can be
-    // scoped into task locals for execute_plan and the executor.
-    let cache_user_id: String = primary_agent
-        .read(|a| a.config().get_cache_user_id().map(|s| s.to_string()))
-        .await
-        .unwrap_or_else(|| {
-            conversation_id
-                .clone()
-                .unwrap_or_else(|| run_id.to_string())
-        });
-
     tokio::spawn(async move {
         let start = std::time::Instant::now();
         let mut terminal_status = "completed".to_string();
@@ -1364,12 +1347,12 @@ async fn launch_unified_run(
         });
 
         // Set up task_local context so delegate_readonly + task_* tools work
-        // (F1: also scope trace_sink and cache_user_id).
+        // (F1: also scope trace_sink). (stage4 P4.1) cache_user_id read from
+        // single source — no longer threaded here.
         let _ = echo_agent_app_core::tasks::task_runtime::task_tools::with_run_context(
             run_id_owned.clone(),
             child_cancel.clone(),
             trace_sink,
-            cache_user_id.clone(),
             async {
                 emit_chat_event(
                     &app_handle,
@@ -1407,7 +1390,6 @@ async fn launch_unified_run(
                     run_id: run_id_owned.clone(),
                     cancel: Some(std::sync::Arc::new(child_cancel.clone())),
                     trace_sink: ext_trace_sink.clone(),
-                    cache_user_id: Some(cache_user_id.clone()),
                 });
 
                 let stream_result = agent

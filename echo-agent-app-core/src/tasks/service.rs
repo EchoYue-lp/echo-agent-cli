@@ -785,7 +785,6 @@ impl BackgroundTaskService {
             .attach_plan(&plan)
             .map_err(|e| anyhow::anyhow!("attach_plan: {e}"))?;
 
-        let cache_user_id = crate::infra::load_or_create_cache_user_id();
         // Child of self.cancel so graceful shutdown propagates to the detached
         // DAG driver (mirrors submit_run). Per-run cancel via
         // AppState.run_cancel_tokens is wired by the Tauri cancel_task command.
@@ -801,7 +800,6 @@ impl BackgroundTaskService {
                 None, // run_store — no trace persistence (mirrors legacy execute_composite)
                 None, // trace_sink — no worker://trace event stream
                 &run_id_owned,
-                cache_user_id,
                 cancel,
             )
             .await;
