@@ -1407,7 +1407,6 @@ async fn launch_unified_run(
                     run_id: run_id_owned.clone(),
                     cancel: Some(std::sync::Arc::new(child_cancel.clone())),
                     trace_sink: ext_trace_sink.clone(),
-                    cache_user_id: Some(cache_user_id.clone()),
                 });
 
                 let stream_result = agent

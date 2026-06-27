@@ -1849,7 +1849,6 @@ pub async fn drive_unattended_run(
                 run_id: run_id_for_scope.clone(),
                 cancel: Some(std::sync::Arc::new(cancel_for_scope.clone())),
                 trace_sink: None,
-                cache_user_id: None,
             });
 
             // D7 stage 2: bind the agent's working_dir to the worktree path
