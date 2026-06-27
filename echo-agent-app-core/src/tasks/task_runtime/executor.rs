@@ -122,7 +122,6 @@ pub async fn execute_run(
     run_store: Option<Arc<dyn echo_agent::trace::RunStore>>,
     trace_sink: Option<WorkerTraceSink>,
     run_id: &str,
-    cache_user_id: String,
     parent_cancel: CancellationToken,
 ) -> Result<RunOutcome, ExecError> {
     let run = store
@@ -193,7 +192,6 @@ pub async fn execute_run(
         limits,
         parent_cancel,
         trace_sink.clone(),
-        cache_user_id.clone(),
     )
     .await;
 
@@ -404,28 +402,22 @@ impl TaskWorker for RealTaskWorker {
             // path that reads CURRENT_TRACE_SINK/CURRENT_CANCEL directly.
             let sink_clone = trace_sink.clone();
             let cancel_clone = cancel.clone();
-            super::task_tools::with_run_context(
-                run_id.clone(),
-                cancel_clone,
-                sink_clone,
-                String::new(),
-                async {
-                    execute_task(
-                        store,
-                        primary_agent,
-                        worker_sem,
-                        write_sem,
-                        shell_sem,
-                        llm_sem,
-                        file_write_locks,
-                        trace_sink,
-                        run_id,
-                        task,
-                        cancel,
-                    )
-                    .await
-                },
-            )
+            super::task_tools::with_run_context(run_id.clone(), cancel_clone, sink_clone, async {
+                execute_task(
+                    store,
+                    primary_agent,
+                    worker_sem,
+                    write_sem,
+                    shell_sem,
+                    llm_sem,
+                    file_write_locks,
+                    trace_sink,
+                    run_id,
+                    task,
+                    cancel,
+                )
+                .await
+            })
             .await
         })
     }
@@ -444,7 +436,6 @@ async fn run_dag<W: TaskWorker + 'static>(
     limits: ConcurrencyLimits,
     parent_cancel: CancellationToken,
     trace_sink: Option<WorkerTraceSink>,
-    cache_user_id: String,
 ) -> Result<RunOutcome, ExecError> {
     // Wrap the worker in an Arc so each spawned task can clone the handle.
     let worker = Arc::new(worker);
@@ -647,7 +638,6 @@ async fn run_dag<W: TaskWorker + 'static>(
                         run_id,
                         &task,
                         summary.as_deref().unwrap_or(""),
-                        &cache_user_id,
                     )
                     .await;
                     match passed {
@@ -778,7 +768,6 @@ async fn run_review_gate(
     run_id: &str,
     task: &PlanTask,
     worker_output: &str,
-    cache_user_id: &str,
 ) -> ReviewGateOutcome {
     // Read-only kinds are their own review — no gate.
     if !super::review::requires_review(task.kind) {
@@ -794,9 +783,7 @@ async fn run_review_gate(
     const MAX_REVIEW_RETRIES: u32 = 2;
     let mut retries: u32 = 0;
     let review = loop {
-        match super::review::review_task(&llm, &store, run_id, task, worker_output, cache_user_id)
-            .await
-        {
+        match super::review::review_task(&llm, &store, run_id, task, worker_output).await {
             Ok(r) => break r,
             Err(e) => {
                 retries += 1;
@@ -1837,7 +1824,6 @@ pub async fn drive_unattended_run(
         run_id_for_scope.clone(),
         cancel_for_scope.clone(),
         None, // trace_sink — no GUI event stream for unattended run
-        crate::infra::load_or_create_cache_user_id(), // cache_user_id — share machine-stable id so review/router LLM calls hit the provider cache
         async {
             // Inject external context so worker-spawned tools can read
             // run_id/cancel across spawn boundaries (same pattern as
@@ -2677,7 +2663,6 @@ mod tests {
             ConcurrencyLimits::default(),
             CancellationToken::new(),
             None,
-            String::new(),
         )
         .await
         .unwrap();
@@ -2709,7 +2694,6 @@ mod tests {
             ConcurrencyLimits::default(),
             CancellationToken::new(),
             None,
-            String::new(),
         )
         .await
         .unwrap();
@@ -2743,7 +2727,6 @@ mod tests {
             ConcurrencyLimits::default(),
             CancellationToken::new(),
             None,
-            String::new(),
         )
         .await
         .unwrap();
@@ -2779,7 +2762,6 @@ mod tests {
             ConcurrencyLimits::default(),
             cancel,
             None,
-            String::new(),
         )
         .await
         .unwrap();
@@ -2811,7 +2793,6 @@ mod tests {
             ConcurrencyLimits::default(),
             CancellationToken::new(),
             None,
-            String::new(),
         )
         .await
         .unwrap();
