@@ -181,6 +181,9 @@ export function useTauriChat() {
         runId?: string;
       }>('send_chat_message', {
         message: text,
+        // Multimodal: forward attachments (base64-encoded) so the backend can
+        // persist them and build a multimodal Message for the LLM.
+        attachments: attachments && attachments.length > 0 ? attachments : undefined,
         conversationId: conversation_id ?? undefined,
         conversation_id: conversation_id ?? undefined,
         messageKey: message_key,

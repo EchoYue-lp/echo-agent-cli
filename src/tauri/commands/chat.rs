@@ -408,7 +408,42 @@ pub async fn send_chat_message(
     message: String,
     conversation_id: Option<String>,
     message_key: Option<String>,
+    attachments: Option<Vec<echo_agent_app_core::types::AttachmentData>>,
 ) -> Result<serde_json::Value, IpcError> {
+    // ── Persist attachments + build multimodal message (if any) ──────────
+    // The frontend base64-encodes uploads; we write them to a per-workspace
+    // uploads dir and rebuild a `Message` with the right ContentParts so the
+    // LLM sees images/files. When there are no attachments we keep the plain
+    // `&str` path unchanged for zero overhead.
+    let saved_attachments = attachments.unwrap_or_default();
+    let multimodal_message: Option<echo_core::llm::types::Message> = if saved_attachments.is_empty()
+    {
+        None
+    } else {
+        let ws_root = state.app_state.current_workspace().await.map(|ws| ws.root);
+        let uploads_dir = echo_agent_app_core::attachments::resolve_uploads_dir(ws_root.as_deref());
+        let saved =
+            echo_agent_app_core::attachments::save_attachments(&saved_attachments, &uploads_dir);
+        if saved.is_empty() {
+            None
+        } else {
+            match echo_agent_app_core::attachments::build_message(&message, &saved) {
+                Ok(msg) => Some(msg),
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to build multimodal message, sending text only");
+                    None
+                }
+            }
+        }
+    };
+    let has_attachments = multimodal_message.is_some();
+    if has_attachments {
+        tracing::info!(
+            count = saved_attachments.len(),
+            "send_chat_message: multimodal message with attachments"
+        );
+    }
+
     // Route to pool agent if conversation_id is provided and pool is active.
     // First-turn messages can arrive before the GUI has an active conversation;
     // TaskRuntime routing must still be allowed in that case.
@@ -528,6 +563,7 @@ pub async fn send_chat_message(
                 state.inner(),
                 app.clone(),
                 message.clone(),
+                multimodal_message.clone(),
                 conversation_id.clone(),
                 message_key.clone(),
                 execution_policy,
@@ -659,9 +695,19 @@ pub async fn send_chat_message(
         let model_name = agent.config().get_model_name().to_string();
         let provider_name = model_name.split('-').next().map(|s| s.to_string());
 
-        let stream_result = agent
-            .chat_stream_with_cancel(&message, cancel_token_for_task)
-            .await;
+        // Multimodal path: when attachments are present, send the pre-built
+        // Message (images/files) via the message+cancel entry point added in
+        // 2A. Otherwise keep the plain `&str` path (zero overhead, no change
+        // to the dominant text-only flow).
+        let stream_result = if let Some(msg) = multimodal_message.as_ref() {
+            agent
+                .chat_stream_message_with_cancel(msg.clone(), cancel_token_for_task)
+                .await
+        } else {
+            agent
+                .chat_stream_with_cancel(&message, cancel_token_for_task)
+                .await
+        };
 
         match stream_result {
             Ok(mut stream) => {
@@ -1172,6 +1218,7 @@ async fn route_complex_task(
     state: &TauriState,
     app: tauri::AppHandle,
     message: String,
+    multimodal: Option<echo_core::llm::types::Message>,
     conversation_id: Option<String>,
     message_key: String,
     execution_policy: ExecutionPolicy,
@@ -1228,6 +1275,7 @@ async fn route_complex_task(
         &message_key,
         conversation_id.clone(),
         &message,
+        multimodal,
         route_decision.route,
         cancel,
     )
@@ -1278,6 +1326,7 @@ async fn launch_unified_run(
     message_key: &str,
     conversation_id: Option<String>,
     goal: &str,
+    multimodal: Option<echo_core::llm::types::Message>,
     route: TaskRouteKind,
     parent_cancel: CancellationToken,
 ) -> Result<(), anyhow::Error> {
@@ -1297,6 +1346,7 @@ async fn launch_unified_run(
     let run_id_owned = run_id.to_string();
     let message_key_owned = message_key.to_string();
     let goal_owned = goal.to_string();
+    let multimodal_owned = multimodal;
     let event_message_key = message_key_owned.clone();
     let event_conversation_id = conversation_id.clone();
     let trace_session_id = conversation_id
@@ -1392,9 +1442,18 @@ async fn launch_unified_run(
                     trace_sink: ext_trace_sink.clone(),
                 });
 
-                let stream_result = agent
-                    .execute_stream_with_cancel(&goal_owned, child_cancel.clone())
-                    .await;
+                // Multimodal: when the user attached images/files, run the
+                // pre-built Message (with ContentParts) via the message+cancel
+                // entry point (2A). Otherwise the plain `&str` path.
+                let stream_result = if let Some(msg) = multimodal_owned.as_ref() {
+                    agent
+                        .execute_stream_message_with_cancel(msg.clone(), child_cancel.clone())
+                        .await
+                } else {
+                    agent
+                        .execute_stream_with_cancel(&goal_owned, child_cancel.clone())
+                        .await
+                };
 
                 match stream_result {
                     Ok(mut stream) => {

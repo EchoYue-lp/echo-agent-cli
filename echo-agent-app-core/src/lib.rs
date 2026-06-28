@@ -1,5 +1,6 @@
 pub mod agent_handle;
 pub mod agent_pool;
+pub mod attachments;
 pub mod auto_memory;
 pub mod config;
 pub mod config_discovery;
