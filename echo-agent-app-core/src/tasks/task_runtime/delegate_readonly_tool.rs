@@ -148,13 +148,34 @@ impl Tool for DelegateReadonlyTool {
             let role_for_usage = role.clone();
             let task_for_usage = task.clone();
             let run_id_for_usage = run_id.clone();
+            // Build a multimodal message when the run carries user attachments,
+            // so the readonly worker sees the same images/files as the main
+            // agent (#1c).
+            let run_message: Option<echo_core::llm::types::Message> = self
+                .store
+                .as_ref()
+                .and_then(|s| s.get_run(&run_id).ok().flatten())
+                .and_then(|r| {
+                    if r.attachments.is_empty() {
+                        None
+                    } else {
+                        crate::attachments::build_message_from_refs(&task, &r.attachments).ok()
+                    }
+                });
             let result = handle
                 .read_async(|a| {
                     Box::pin(async move {
-                        a.delegate_to_agent_with_parent_and_cancel(
-                            &role, &task, &run_id, cancel, depth,
-                        )
-                        .await
+                        if let Some(msg) = run_message {
+                            a.delegate_to_agent_with_parent_cancel_and_message(
+                                &role, &task, msg, &run_id, cancel, depth,
+                            )
+                            .await
+                        } else {
+                            a.delegate_to_agent_with_parent_and_cancel(
+                                &role, &task, &run_id, cancel, depth,
+                            )
+                            .await
+                        }
                     })
                 })
                 .await;

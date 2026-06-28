@@ -195,6 +195,30 @@ impl TaskRuntimeStore {
         Ok(run)
     }
 
+    /// Bind user-uploaded attachments to a run so plan-level workers see the
+    /// same images/files as the main agent.
+    ///
+    /// Follows the event-sourcing pattern: append a `RunAttachmentsUpdated`
+    /// event then rewrite plan.json so subsequent `get_run` reads reflect it.
+    pub fn set_run_attachments(
+        &self,
+        run_id: &str,
+        attachments: &[crate::attachments::AttachmentRef],
+    ) -> Result<(), StoreError> {
+        // Validate the run exists (mirrors set_task_status / transition_run).
+        self.get_run(run_id)?
+            .ok_or(StoreError::RunNotFound(run_id.to_string()))?;
+        self.shadow.append_event_line(
+            run_id,
+            None,
+            None,
+            RuntimeEventKind::RunAttachmentsUpdated,
+            serde_json::json!({ "attachments": attachments }),
+        )?;
+        self.shadow.rewrite_plan(run_id)?;
+        Ok(())
+    }
+
     /// Atomically transition a run to `next` and append `RunStatusChanged`.
     /// Rejects illegal transitions (see [`TaskRunStatus::can_transition_to`]).
     pub fn transition_run(&self, run_id: &str, next: TaskRunStatus) -> Result<TaskRun, StoreError> {

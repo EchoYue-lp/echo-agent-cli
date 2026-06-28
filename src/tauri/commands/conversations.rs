@@ -78,21 +78,17 @@ pub async fn save_conversation(
             // attachments and historically held thinking segments).
             let has_thinking = m.thinking_segments.is_some();
             let has_steps = m.execution_steps.is_some();
-            let has_attachments = m
-                .attachments
-                .as_ref()
-                .is_some_and(|a| !a.is_empty());
-            let attachments_json =
-                if has_thinking || has_steps || has_attachments {
-                    let payload = AttachmentsPayload {
-                        thinking_segments: m.thinking_segments.unwrap_or_default(),
-                        execution_steps: m.execution_steps.unwrap_or_default(),
-                        attachments: m.attachments.unwrap_or_default(),
-                    };
-                    serde_json::to_string(&payload).ok()
-                } else {
-                    None
+            let has_attachments = m.attachments.as_ref().is_some_and(|a| !a.is_empty());
+            let attachments_json = if has_thinking || has_steps || has_attachments {
+                let payload = AttachmentsPayload {
+                    thinking_segments: m.thinking_segments.unwrap_or_default(),
+                    execution_steps: m.execution_steps.unwrap_or_default(),
+                    attachments: m.attachments.unwrap_or_default(),
                 };
+                serde_json::to_string(&payload).ok()
+            } else {
+                None
+            };
 
             StoredMessage {
                 id: None,
@@ -223,21 +219,17 @@ pub async fn update_conversation(
             .map(|m| {
                 let has_thinking = m.thinking_segments.is_some();
                 let has_steps = m.execution_steps.is_some();
-                let has_attachments = m
-                    .attachments
-                    .as_ref()
-                    .is_some_and(|a| !a.is_empty());
-                let attachments_json =
-                    if has_thinking || has_steps || has_attachments {
-                        let payload = AttachmentsPayload {
-                            thinking_segments: m.thinking_segments.unwrap_or_default(),
-                            execution_steps: m.execution_steps.unwrap_or_default(),
-                            attachments: m.attachments.unwrap_or_default(),
-                        };
-                        serde_json::to_string(&payload).ok()
-                    } else {
-                        None
+                let has_attachments = m.attachments.as_ref().is_some_and(|a| !a.is_empty());
+                let attachments_json = if has_thinking || has_steps || has_attachments {
+                    let payload = AttachmentsPayload {
+                        thinking_segments: m.thinking_segments.unwrap_or_default(),
+                        execution_steps: m.execution_steps.unwrap_or_default(),
+                        attachments: m.attachments.unwrap_or_default(),
                     };
+                    serde_json::to_string(&payload).ok()
+                } else {
+                    None
+                };
 
                 StoredMessage {
                     id: None,

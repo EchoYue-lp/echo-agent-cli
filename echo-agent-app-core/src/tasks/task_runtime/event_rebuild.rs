@@ -98,6 +98,19 @@ pub fn rebuild_plan_from_events(events: &[RuntimeTaskEvent]) -> Result<RebuiltPl
                     r.updated_at = ev.timestamp;
                 }
             }
+            K::RunAttachmentsUpdated => {
+                // Attachments bound to the run (so plan-level workers see the
+                // same user uploads as the main agent). Decoded the same way as
+                // the RunCreated `attachments` field above.
+                if let Some(r) = run.as_mut() {
+                    r.attachments = ev
+                        .payload
+                        .get("attachments")
+                        .and_then(|v| serde_json::from_value(v.clone()).ok())
+                        .unwrap_or_default();
+                    r.updated_at = ev.timestamp;
+                }
+            }
             K::PlanGenerated => {
                 let p = &ev.payload;
                 let plan_id = p

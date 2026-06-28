@@ -513,6 +513,9 @@ impl ArtifactKind {
 pub enum RuntimeEventKind {
     RunCreated,
     RunStatusChanged,
+    /// User-uploaded attachments were bound to this run (so plan-level
+    /// workers can see the same images/files as the main agent).
+    RunAttachmentsUpdated,
     PlanGenerated,
     PlanEdited,
     TaskStarted,
@@ -652,6 +655,7 @@ impl RuntimeEventKind {
         match self {
             RunCreated => "run_created",
             RunStatusChanged => "run_status_changed",
+            RunAttachmentsUpdated => "run_attachments_updated",
             PlanGenerated => "plan_generated",
             PlanEdited => "plan_edited",
             TaskStarted => "task_started",
@@ -681,6 +685,7 @@ impl RuntimeEventKind {
         Some(match s {
             "run_created" => RunCreated,
             "run_status_changed" => RunStatusChanged,
+            "run_attachments_updated" => RunAttachmentsUpdated,
             "plan_generated" => PlanGenerated,
             "plan_edited" => PlanEdited,
             "task_started" => TaskStarted,

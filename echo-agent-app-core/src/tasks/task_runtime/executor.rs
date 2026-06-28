@@ -1363,14 +1363,34 @@ async fn run_main_agent_task(
     let agent_role = task.agent_role.clone();
     let title = task.title.clone();
 
+    // Rebuild a multimodal Message when the run carries user attachments, so
+    // write-task workers see the same images/files as the main agent (#1b).
+    let run_message: Option<echo_core::llm::types::Message> =
+        store.get_run(&run_id).ok().flatten().and_then(|r| {
+            if r.attachments.is_empty() {
+                None
+            } else {
+                crate::attachments::build_message_from_refs(prompt, &r.attachments).ok()
+            }
+        });
+
     primary_agent
         .read_async(|agent| {
             let prompt = prompt.to_string();
+            let run_message = run_message.clone();
             Box::pin(async move {
-                let mut stream = agent
-                    .execute_stream_with_cancel(&prompt, cancel)
-                    .await
-                    .map_err(|e| format!("main agent stream failed: {e}"))?;
+                // Multimodal path when the run has attachments; plain text otherwise.
+                let mut stream = if let Some(msg) = run_message {
+                    agent
+                        .execute_stream_message_with_cancel(msg, cancel)
+                        .await
+                        .map_err(|e| format!("main agent stream failed: {e}"))?
+                } else {
+                    agent
+                        .execute_stream_with_cancel(&prompt, cancel)
+                        .await
+                        .map_err(|e| format!("main agent stream failed: {e}"))?
+                };
                 let mut output = String::new();
                 let mut in_thinking = false;
 

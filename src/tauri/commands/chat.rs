@@ -416,15 +416,25 @@ pub async fn send_chat_message(
     // LLM sees images/files. When there are no attachments we keep the plain
     // `&str` path unchanged for zero overhead.
     let saved_attachments = attachments.unwrap_or_default();
-    let multimodal_message: Option<echo_core::llm::types::Message> = if saved_attachments.is_empty()
-    {
-        None
+    let (multimodal_message, attachment_refs): (
+        Option<echo_core::llm::types::Message>,
+        Vec<echo_agent_app_core::attachments::AttachmentRef>,
+    ) = if saved_attachments.is_empty() {
+        (None, Vec::new())
     } else {
         let ws_root = state.app_state.current_workspace().await.map(|ws| ws.root);
         let uploads_dir = echo_agent_app_core::attachments::resolve_uploads_dir(ws_root.as_deref());
         let saved =
             echo_agent_app_core::attachments::save_attachments(&saved_attachments, &uploads_dir);
-        if saved.is_empty() {
+        // Build refs (path + name + mime) for binding to the run so plan-level
+        // workers can rebuild the multimodal message later.
+        let refs: Vec<_> = saved
+            .iter()
+            .map(|(path, att)| {
+                echo_agent_app_core::attachments::AttachmentRef::from_saved(path.clone(), att)
+            })
+            .collect();
+        let msg = if saved.is_empty() {
             None
         } else {
             match echo_agent_app_core::attachments::build_message(&message, &saved) {
@@ -434,7 +444,8 @@ pub async fn send_chat_message(
                     None
                 }
             }
-        }
+        };
+        (msg, refs)
     };
     let has_attachments = multimodal_message.is_some();
     if has_attachments {
@@ -564,6 +575,7 @@ pub async fn send_chat_message(
                 app.clone(),
                 message.clone(),
                 multimodal_message.clone(),
+                attachment_refs.clone(),
                 conversation_id.clone(),
                 message_key.clone(),
                 execution_policy,
@@ -1219,6 +1231,7 @@ async fn route_complex_task(
     app: tauri::AppHandle,
     message: String,
     multimodal: Option<echo_core::llm::types::Message>,
+    attachment_refs: Vec<echo_agent_app_core::attachments::AttachmentRef>,
     conversation_id: Option<String>,
     message_key: String,
     execution_policy: ExecutionPolicy,
@@ -1276,6 +1289,7 @@ async fn route_complex_task(
         conversation_id.clone(),
         &message,
         multimodal,
+        attachment_refs,
         route_decision.route,
         cancel,
     )
@@ -1327,9 +1341,18 @@ async fn launch_unified_run(
     conversation_id: Option<String>,
     goal: &str,
     multimodal: Option<echo_core::llm::types::Message>,
+    attachment_refs: Vec<echo_agent_app_core::attachments::AttachmentRef>,
     route: TaskRouteKind,
     parent_cancel: CancellationToken,
 ) -> Result<(), anyhow::Error> {
+    // Bind user attachments to the run so plan-level workers can see them.
+    if !attachment_refs.is_empty()
+        && let Some(store) = state.app_state.tasks.runtime.as_ref()
+    {
+        if let Err(e) = store.set_run_attachments(run_id, &attachment_refs) {
+            tracing::warn!(error = %e, "failed to bind attachments to run; workers may not see them");
+        }
+    }
     let primary_agent = state.app_state.connection.primary_agent();
     let child_cancel = parent_cancel.child_token();
     let run_key = format!("__run__:{run_id}");
