@@ -73,16 +73,26 @@ pub async fn save_conversation(
     let stored: Vec<StoredMessage> = messages
         .into_iter()
         .map(|m| {
-            // Pack thinking_segments + execution_steps into attachments_json (backward compatible)
-            let attachments_json = if m.thinking_segments.is_some() || m.execution_steps.is_some() {
-                let payload = AttachmentsPayload {
-                    thinking_segments: m.thinking_segments.unwrap_or_default(),
-                    execution_steps: m.execution_steps.unwrap_or_default(),
+            // Pack thinking_segments + execution_steps + attachments into
+            // attachments_json (backward compatible; the column predates real
+            // attachments and historically held thinking segments).
+            let has_thinking = m.thinking_segments.is_some();
+            let has_steps = m.execution_steps.is_some();
+            let has_attachments = m
+                .attachments
+                .as_ref()
+                .is_some_and(|a| !a.is_empty());
+            let attachments_json =
+                if has_thinking || has_steps || has_attachments {
+                    let payload = AttachmentsPayload {
+                        thinking_segments: m.thinking_segments.unwrap_or_default(),
+                        execution_steps: m.execution_steps.unwrap_or_default(),
+                        attachments: m.attachments.unwrap_or_default(),
+                    };
+                    serde_json::to_string(&payload).ok()
+                } else {
+                    None
                 };
-                serde_json::to_string(&payload).ok()
-            } else {
-                None
-            };
 
             StoredMessage {
                 id: None,
@@ -135,9 +145,9 @@ pub async fn get_conversation(
     let messages: Vec<SavedMessage> = stored
         .into_iter()
         .map(|m| {
-            // Parse attachments_json which may contain thinking_segments + execution_steps
-            // or legacy plain array format
-            let (thinking_segments, execution_steps) = m
+            // Parse attachments_json which may contain thinking_segments +
+            // execution_steps + real attachments, or legacy plain array format.
+            let (thinking_segments, execution_steps, attachments) = m
                 .attachments_json
                 .and_then(|s| AttachmentsPayload::parse(&s))
                 .map(|p| {
@@ -151,9 +161,14 @@ pub async fn get_conversation(
                     } else {
                         Some(p.execution_steps)
                     };
-                    (ts, es)
+                    let att = if p.attachments.is_empty() {
+                        None
+                    } else {
+                        Some(p.attachments)
+                    };
+                    (ts, es, att)
                 })
-                .unwrap_or((None, None));
+                .unwrap_or((None, None, None));
 
             SavedMessage {
                 role: m.role,
@@ -164,6 +179,7 @@ pub async fn get_conversation(
                 thinking_segments,
                 tool_result: m.tool_result_json,
                 execution_steps,
+                attachments,
             }
         })
         .collect();
@@ -205,11 +221,18 @@ pub async fn update_conversation(
         let stored: Vec<StoredMessage> = msgs
             .into_iter()
             .map(|m| {
+                let has_thinking = m.thinking_segments.is_some();
+                let has_steps = m.execution_steps.is_some();
+                let has_attachments = m
+                    .attachments
+                    .as_ref()
+                    .is_some_and(|a| !a.is_empty());
                 let attachments_json =
-                    if m.thinking_segments.is_some() || m.execution_steps.is_some() {
+                    if has_thinking || has_steps || has_attachments {
                         let payload = AttachmentsPayload {
                             thinking_segments: m.thinking_segments.unwrap_or_default(),
                             execution_steps: m.execution_steps.unwrap_or_default(),
+                            attachments: m.attachments.unwrap_or_default(),
                         };
                         serde_json::to_string(&payload).ok()
                     } else {

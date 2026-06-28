@@ -183,6 +183,72 @@ pub fn build_message(
     Ok(Message::user_multimodal(parts))
 }
 
+/// A persisted attachment reference (no base64 body — just enough to rebuild a
+/// multimodal message by re-reading the file from disk).
+///
+/// Stored on `TaskRun` so every worker in a complex-task run can see the same
+/// user-uploaded images/files without re-sending them through plan JSON.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AttachmentRef {
+    /// Absolute path of the persisted file under the uploads directory.
+    pub path: PathBuf,
+    /// Original filename (for display + provider content blocks).
+    pub name: String,
+    /// MIME type, decides `ContentPart::ImageUrl` vs `ContentPart::File`.
+    pub mime_type: String,
+}
+
+impl AttachmentRef {
+    /// Build a ref from a saved `(path, attachment)` pair.
+    pub fn from_saved(path: PathBuf, att: &AttachmentData) -> Self {
+        Self {
+            path,
+            name: att.name.clone(),
+            mime_type: att.mime_type.clone(),
+        }
+    }
+}
+
+/// Build a multimodal user [`Message`] from text + attachment refs.
+///
+/// Unlike [`build_message`], this re-reads each file from disk (the refs carry
+/// no base64 body), so it is suitable for workers that reconstruct the message
+/// long after the original upload. Returns a plain text `Message` when there
+/// are no refs.
+pub fn build_message_from_refs(
+    text: &str,
+    attachments: &[AttachmentRef],
+) -> std::io::Result<Message> {
+    if attachments.is_empty() {
+        return Ok(Message::user(text.to_string()));
+    }
+
+    let mut parts = Vec::with_capacity(attachments.len() + 1);
+    parts.push(ContentPart::Text {
+        text: text.to_string(),
+    });
+
+    for att in attachments {
+        let bytes = std::fs::read(&att.path)?;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        if is_image_mime(&att.mime_type) {
+            parts.push(ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: format!("data:{};base64,{}", att.mime_type, b64),
+                    detail: None,
+                },
+            });
+        } else {
+            parts.push(ContentPart::File {
+                name: att.name.clone(),
+                content: b64,
+            });
+        }
+    }
+
+    Ok(Message::user_multimodal(parts))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

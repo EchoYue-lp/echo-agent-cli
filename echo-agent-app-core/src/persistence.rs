@@ -47,6 +47,23 @@ pub struct SavedMessage {
     /// for correct chronological interleaving when loading from history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_steps: Option<Vec<SavedExecutionStep>>,
+    /// User-uploaded attachments (images/documents) attached to this message.
+    /// Stored as a data URL so the message renders identically on reload.
+    /// None or empty for non-multimodal messages.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachments: Option<Vec<SavedAttachment>>,
+}
+
+/// A persisted attachment reference (stored inside SavedMessage).
+///
+/// `url` is a complete data URL (`data:{mime};base64,...`) so the frontend can
+/// render it directly on reload without an extra backend round-trip.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SavedAttachment {
+    pub name: String,
+    pub mime_type: String,
+    pub url: String,
+    pub size: u64,
 }
 
 /// Execution step for tracking thinking/tool interleaving order
@@ -59,13 +76,18 @@ pub struct SavedExecutionStep {
 
 /// Combined payload stored in attachments_json (backward compatible).
 /// Old format: `["thinking1", "thinking2"]` (plain array)
-/// New format: `{"thinking_segments": [...], "execution_steps": [...]}`
+/// New format: `{"thinking_segments": [...], "execution_steps": [...], "attachments": [...]}`
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AttachmentsPayload {
     #[serde(default)]
     pub thinking_segments: Vec<String>,
     #[serde(default)]
     pub execution_steps: Vec<SavedExecutionStep>,
+    /// Real user-uploaded attachments (images/documents). Despite the column
+    /// name `attachments_json` historically holding thinking segments, this key
+    /// holds the actual attachment data URL so messages render on reload.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<SavedAttachment>,
 }
 
 impl AttachmentsPayload {
@@ -80,6 +102,7 @@ impl AttachmentsPayload {
             return Some(Self {
                 thinking_segments: segments,
                 execution_steps: Vec::new(),
+                attachments: Vec::new(),
             });
         }
         None
@@ -320,6 +343,7 @@ impl Persistence {
             thinking_segments: None,
             execution_steps: None,
             tool_result: None,
+            attachments: None,
         }
     }
 }
@@ -347,6 +371,7 @@ mod tests {
             thinking_segments: None,
             execution_steps: None,
             tool_result: None,
+            attachments: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"role\":\"user\""));

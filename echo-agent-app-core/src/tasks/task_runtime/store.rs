@@ -167,6 +167,7 @@ impl TaskRuntimeStore {
             plan_id: None,
             route: route.to_string(),
             attended_mode,
+            attachments: Vec::new(),
             created_at: now,
             updated_at: now,
         };

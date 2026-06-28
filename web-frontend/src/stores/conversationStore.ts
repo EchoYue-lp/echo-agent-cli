@@ -100,6 +100,7 @@ function chatMessagesToSaved(messages: ChatMessage[]) {
       tools: { name: string; args: unknown; result: string; success: boolean }[];
     }[];
     tool_result?: string;
+    attachments?: { name: string; mime_type: string; url: string; size: number }[];
   }[] = [];
 
   for (const m of messages) {
@@ -141,6 +142,16 @@ function chatMessagesToSaved(messages: ChatMessage[]) {
         id: `tc-${m.id}-${i}`,
         name: tc.name,
         arguments: typeof tc.args === 'string' ? tc.args : JSON.stringify(tc.args || {}),
+      }));
+    }
+
+    // Save user-uploaded attachments (data URLs) so the message renders on reload
+    if (m.attachments && m.attachments.length > 0) {
+      entry.attachments = m.attachments.map((a) => ({
+        name: a.name,
+        mime_type: a.mime_type,
+        url: a.url,
+        size: a.size,
       }));
     }
 
@@ -318,6 +329,16 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
             })(),
             result: '',
             success: true,
+          }));
+        }
+
+        // Restore attachments (data URLs) so images/files render on reload.
+        if (m.attachments && m.attachments.length > 0) {
+          base.attachments = m.attachments.map((a) => ({
+            name: a.name,
+            mime_type: a.mime_type,
+            url: a.url,
+            size: a.size,
           }));
         }
 

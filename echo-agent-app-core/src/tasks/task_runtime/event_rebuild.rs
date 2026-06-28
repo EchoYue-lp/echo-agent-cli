@@ -82,6 +82,10 @@ pub fn rebuild_plan_from_events(events: &[RuntimeTaskEvent]) -> Result<RebuiltPl
                         .and_then(|v| v.as_str())
                         .and_then(AttendedMode::from_str)
                         .unwrap_or_default(),
+                    attachments: p
+                        .get("attachments")
+                        .and_then(|v| serde_json::from_value(v.clone()).ok())
+                        .unwrap_or_default(),
                     created_at: parse_event_dt(p, "created_at", ev.timestamp),
                     updated_at: ev.timestamp,
                 });

@@ -285,6 +285,9 @@ export interface SavedMessage {
     tools: { name: string; args: unknown; result: string; success: boolean }[];
   }[];
   tool_result?: string | null;
+  /** User-uploaded attachments (images/documents) as data URLs, so the
+   * message renders identically after reload. */
+  attachments?: { name: string; mime_type: string; url: string; size: number }[];
 }
 
 export interface ConversationRecord {

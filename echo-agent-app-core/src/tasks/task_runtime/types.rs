@@ -727,6 +727,14 @@ pub struct TaskRun {
     /// (Unattended). Drives safety-gate behaviour in execute_plan /
     /// executor.  Default: Attended (chat behaviours unchanged).
     pub attended_mode: AttendedMode,
+    /// User-uploaded attachments shared across all workers in this run (so
+    /// plan-level workers see the same images/files as the main agent).
+    /// Empty for text-only runs. `#[serde(default)]` keeps old run files
+    /// readable. TS-skipped — this is backend-only state (paths on disk),
+    /// not consumed by the frontend.
+    #[serde(default)]
+    #[ts(skip)]
+    pub attachments: Vec<crate::attachments::AttachmentRef>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
