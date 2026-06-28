@@ -4,17 +4,16 @@ import { MessageBubble } from './MessageBubble';
 import { ApprovalCard } from './ApprovalCard';
 import { ChatInput } from './ChatInput';
 import { WelcomeScreen } from './WelcomeScreen';
-import { useWebSocket } from '../../hooks/useWebSocket';
 import { useTauriChat } from '../../hooks/useTauriChat';
-import { isTauri } from '../../lib/tauri-bridge';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
 import { FailureToast } from './FailureToast';
 import type { Attachment } from '../../types/api';
 
+// Tauri IPC is the only live transport. The WebSocket transport
+// (hooks/useWebSocket.ts) was removed after the chat path migrated to Tauri
+// commands (src/tauri/commands/chat.rs).
 function useChatTransport() {
-  const ws = useWebSocket();
-  const tauri = useTauriChat();
-  return isTauri() ? tauri : ws;
+  return useTauriChat();
 }
 
 export function ChatPanel() {
@@ -37,7 +36,7 @@ export function ChatPanel() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const isNearBottomRef = useRef(true);
-  const { sendMessage, sendApproval, sendInput, sendSelection, cancel, reconnect, connectionStatus } =
+  const { sendMessage, sendApproval, sendInput, sendSelection, cancel } =
     useChatTransport();
 
   const handleRegenerate = () => {
@@ -239,34 +238,6 @@ export function ChatPanel() {
           </div>
         )}
       </div>
-
-      {connectionStatus === 'disconnected' && (
-        <div
-          role="status"
-          aria-live="assertive"
-          className="flex items-center justify-center gap-2 px-4 py-1.5 text-xs font-medium"
-          style={{
-            background: 'color-mix(in srgb, var(--accent) 10%, transparent)',
-            color: 'var(--accent)',
-          }}
-        >
-          <span
-            className="inline-block h-2 w-2 rounded-full"
-            style={{ background: 'var(--accent)' }}
-          />
-          已断开
-          <button
-            onClick={reconnect}
-            className="ml-2 rounded px-2 py-0.5 text-xs font-medium underline hover:opacity-80"
-            style={{
-              background: 'color-mix(in srgb, var(--accent) 20%, transparent)',
-              color: 'var(--accent)',
-            }}
-          >
-            手动重连
-          </button>
-        </div>
-      )}
 
       <div>
         {approvalRequest && (

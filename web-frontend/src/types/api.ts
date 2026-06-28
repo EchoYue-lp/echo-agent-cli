@@ -169,63 +169,6 @@ export interface Attachment {
   size: number;
 }
 
-// WebSocket 消息类型
-export type ClientMessage =
-  | { type: 'message'; id?: string; data: string; attachments?: Attachment[] }
-  | {
-      type: 'approval_response';
-      id?: string;
-      request_id: string;
-      approved: boolean;
-      reason?: string;
-    }
-  | { type: 'input_response'; id?: string; request_id: string; text: string }
-  | {
-      type: 'selection_response';
-      id?: string;
-      request_id: string;
-      selection: string;
-      instructions?: string;
-    }
-  | { type: 'cancel'; id?: string }
-  | { type: 'ping' };
-
-export type ServerMessage =
-  | { type: 'token'; id?: string; data: string }
-  | { type: 'tool_start'; id?: string; name: string; args: unknown }
-  | { type: 'tool_result'; id?: string; name: string; result: string; success: boolean }
-  | { type: 'tool_batch_start'; id?: string; tool_count: number }
-  | { type: 'tool_batch_end'; id?: string }
-  | { type: 'final_answer'; id?: string; data: string }
-  | {
-      type: 'approval_request';
-      id?: string;
-      request_id: string;
-      tool_name: string;
-      args: unknown;
-      prompt?: string;
-    }
-  | { type: 'input_request'; id?: string; request_id: string; prompt?: string }
-  | {
-      type: 'selection_request';
-      id?: string;
-      request_id: string;
-      prompt: string;
-      options: string[];
-      task_id?: string | null;
-      context?: unknown;
-      phase?: string | null;
-    }
-  | { type: 'chart'; id?: string; spec: unknown }
-  | { type: 'error'; id?: string; message: string }
-  | { type: 'cancelled'; id?: string }
-  | { type: 'done'; id?: string }
-  | { type: 'run_status'; id?: string; status: ChatRunStatus }
-  | { type: 'thinking_start'; id?: string }
-  | { type: 'thinking_end'; id?: string; prompt_tokens: number; completion_tokens: number }
-  | { type: 'pong' }
-  | { type: 'worker://trace'; payload: Record<string, unknown> };
-
 // Execution round: one ReAct loop iteration (think → tools)
 export interface ExecutionRound {
   /** Thinking that precedes this round's tools */

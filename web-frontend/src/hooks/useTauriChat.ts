@@ -285,7 +285,5 @@ export function useTauriChat() {
     sendInput,
     sendSelection,
     cancel,
-    reconnect: () => {}, // Tauri IPC is always connected; no-op for API compatibility
-    connectionStatus: 'connected' as const,
   };
 }
