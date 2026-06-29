@@ -256,9 +256,24 @@ pub enum ShadowError {
     Rebuild(String),
 }
 
-/// Write `bytes` to `path` atomically: write to `path.tmp`, fsync, rename over `path`.
+/// Write `bytes` to `path` atomically: write to a unique tmp file, fsync,
+/// rename over `path`.
+///
+/// The tmp file name must be **unique per call** (not a fixed `.tmp` suffix):
+/// `TaskRuntimeStore` does not serialize `rewrite_plan` across concurrent
+/// tasks, so two concurrent `atomic_write`s on the same `plan.json` would race
+/// on a shared `plan.json.tmp` — one rename would move the other's tmp away,
+/// making the second `rename` fail with "No such file or directory". A unique
+/// tmp name (pid + counter + nanos) eliminates the collision.
 fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let tmp = path.with_extension("json.tmp");
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let uniq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let tmp = path.with_extension(format!("tmp.{}.{}.{}", std::process::id(), ts, uniq));
     {
         use std::io::Write;
         let mut f = std::fs::File::create(&tmp)?;
@@ -723,5 +738,70 @@ mod tests {
         assert_eq!(a1.seq, 1);
         assert_eq!(a2.seq, 2); // rA's second event, not affected by rB
         assert_eq!(b1.seq, 1); // rB starts at 1
+    }
+
+    /// Regression: concurrent `atomic_write`s on the same path must not collide
+    /// on a shared tmp file name. Before the fix, `atomic_write` used a fixed
+    /// `plan.json.tmp`; two concurrent writers raced on it — one `rename` moved
+    /// the other's tmp away, so the second `rename` failed with
+    /// "No such file or directory". This reproduced as the
+    /// `failed to mark task running ... file shadow: shadow io: No such file`
+    /// WARN spam during parallel readonly delegation (run_dag fans out N tasks,
+    /// each `set_task_status` → `rewrite_plan` → `atomic_write` concurrently).
+    ///
+    /// With per-call unique tmp names (pid + counter + nanos), renames never
+    /// collide, so all concurrent writes succeed.
+    #[test]
+    fn concurrent_atomic_write_no_tmp_collision() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let target = tmpdir.path().join("plan.json");
+
+        // 8 threads × 50 iterations hammering atomic_write on the same path.
+        // Before the fix this reliably produced "No such file" on a multicore
+        // machine; after the fix every write succeeds.
+        const THREADS: usize = 8;
+        const ITERS: usize = 50;
+        let target = Arc::new(target);
+        let errors: Vec<std::io::Error> = (0..THREADS)
+            .map(|t| {
+                let target = target.clone();
+                thread::spawn(move || {
+                    let mut errs = Vec::new();
+                    for i in 0..ITERS {
+                        let payload = format!("t{t}-i{i}");
+                        if let Err(e) = atomic_write(&target, payload.as_bytes()) {
+                            errs.push(e);
+                        }
+                    }
+                    errs
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flat_map(|h| h.join().expect("thread"))
+            .collect();
+
+        assert!(
+            errors.is_empty(),
+            "concurrent atomic_write produced {} errors (expected 0); first: {:?}",
+            errors.len(),
+            errors.first()
+        );
+
+        // Final content is one of the writers' payloads (last rename wins) and
+        // no stray tmp files are left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(tmpdir.path())
+            .expect("read_dir")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            leftovers,
+            vec!["plan.json".to_string()],
+            "only plan.json should remain; got {leftovers:?}"
+        );
     }
 }
