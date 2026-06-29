@@ -72,9 +72,12 @@ pub enum SlashCommand {
     Memory,
     Remember,
     Forget,
+    /// Attach a file (image/document) to the next message (B5.3 multimodal).
+    Attach,
 
     // -- Coding --
     Plan,
+    Mode,
     Tasks,
     Test,
     CodeReview,
@@ -123,8 +126,10 @@ impl SlashCommand {
             Self::Memory => "Show memory contents",
             Self::Remember => "Save a fact to memory",
             Self::Forget => "Remove a fact from memory",
+            Self::Attach => "Attach a file to the next message (/attach <path>)",
 
             Self::Plan => "Enter plan mode (read-only)",
+            Self::Mode => "Switch interaction mode (auto/chat/task)",
             Self::Tasks => "Show active tasks",
             Self::Test => "Run tests",
             Self::CodeReview => "Request a code review",
@@ -165,8 +170,9 @@ impl SlashCommand {
             | Self::System
             | Self::Memory
             | Self::Remember
-            | Self::Forget => Category::Context,
-            Self::Plan | Self::Tasks | Self::Test | Self::CodeReview | Self::Diff => {
+            | Self::Forget
+            | Self::Attach => Category::Context,
+            Self::Plan | Self::Mode | Self::Tasks | Self::Test | Self::CodeReview | Self::Diff => {
                 Category::Coding
             }
             Self::Git => Category::Git,
@@ -194,7 +200,9 @@ impl SlashCommand {
             Self::Cron => "[list|add|remove]",
             Self::Test => "[test-name]",
             Self::Plan => "",
+            Self::Mode => "[auto|chat|task]",
             Self::CodeReview => "[file-or-dir]",
+            Self::Attach => "<file-path>",
             _ => "",
         }
     }

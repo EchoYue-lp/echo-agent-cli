@@ -54,6 +54,12 @@ pub struct TaskRuntimeStore {
     /// status flipping to Skipped while execution continues).
     task_cancel_tokens:
         std::sync::Mutex<std::collections::HashMap<String, echo_agent::agent::CancellationToken>>,
+    /// Run-level cancel tokens (Phase B2). Background runs use an INDEPENDENT
+    /// token — never the chat turn's token (spec §5.5) — so the front-desk
+    /// "stop" doesn't kill a background run. `create_complex_task` registers
+    /// this; `cancel_run` triggers it; `drive_run_async` unregisters on terminal.
+    run_cancel_tokens:
+        std::sync::Mutex<std::collections::HashMap<String, echo_agent::agent::CancellationToken>>,
     /// File shadow (U1c phase-0/0bc). The read/write authority for all task data.
     shadow: std::sync::Arc<super::file_shadow::FileTaskShadow>,
     /// In-memory LLM usage records (token spend per worker call). Not persisted
@@ -97,6 +103,7 @@ impl TaskRuntimeStore {
         ));
         Ok(Self {
             task_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
+            run_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
             shadow,
             usage_records: std::sync::Mutex::new(Vec::new()),
             conv_events: std::sync::Mutex::new(ConvEventLog {
@@ -125,6 +132,7 @@ impl TaskRuntimeStore {
         let shadow = std::sync::Arc::new(super::file_shadow::FileTaskShadow::new(shadow_root));
         Ok(Self {
             task_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
+            run_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
             shadow,
             usage_records: std::sync::Mutex::new(Vec::new()),
             conv_events: std::sync::Mutex::new(ConvEventLog {
@@ -309,6 +317,45 @@ impl TaskRuntimeStore {
                 token.cancel();
             }
         }
+    }
+
+    /// Register a run-level cancel token (Phase B2). Background runs MUST use an
+    /// independent token — never the chat turn's token (spec §5.5) — so the
+    /// front-desk "stop" does not kill a background run. `create_complex_task`
+    /// registers this; `cancel_run` triggers it.
+    pub fn register_run_cancel_token(
+        &self,
+        run_id: &str,
+        token: echo_agent::agent::CancellationToken,
+    ) {
+        if let Ok(mut map) = self.run_cancel_tokens.lock() {
+            map.insert(run_id.to_string(), token);
+        }
+    }
+
+    /// Remove a run's cancel token after the run reaches a terminal state
+    /// (Completed/Failed/Cancelled). Called by `drive_run_async` so the map
+    /// doesn't accumulate stale entries. No-op if already removed by `cancel_run`.
+    pub fn unregister_run_cancel_token(&self, run_id: &str) {
+        if let Ok(mut map) = self.run_cancel_tokens.lock() {
+            map.remove(run_id);
+        }
+    }
+
+    /// Cancel a run via its run-level token (Phase B2). Triggered by the
+    /// `cancel_run` tool or the GUI task panel's stop button. No-op (returns
+    /// `false`) if the run isn't currently active (no token registered, e.g.
+    /// already terminal). Removes the token so a second call is a no-op.
+    pub fn cancel_run(&self, run_id: &str) -> bool {
+        if let Ok(mut map) = self.run_cancel_tokens.lock() {
+            #[allow(clippy::collapsible_if)]
+            // nested let-Ok/let-Some reads clearer than a let-chain
+            if let Some(token) = map.remove(run_id) {
+                token.cancel();
+                return true;
+            }
+        }
+        false
     }
 
     /// Insert a new task into the plan, optionally after a given task id.

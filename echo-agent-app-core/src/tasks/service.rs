@@ -801,6 +801,9 @@ impl BackgroundTaskService {
                 None, // trace_sink — no worker://trace event stream
                 &run_id_owned,
                 cancel,
+                // B5.1: no memory write for background DAG runs (layer_manager is
+                // None anyway); explicit None for clarity.
+                super::task_runtime::MemoryPolicy::None,
             )
             .await;
             lease.release().await;

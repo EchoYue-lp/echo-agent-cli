@@ -35,6 +35,8 @@ use std::time::Instant;
 use textwrap::WordSplitter;
 use unicode_width::UnicodeWidthChar;
 
+use echo_agent_app_core::tasks::task_runtime::types::InteractionMode;
+
 // ── Theme ───────────────────────────────────────────────────────────────────
 
 /// Color theme that adapts to terminal background.
@@ -177,6 +179,10 @@ pub struct TuiApp {
     pub model: String,
     /// Agent mode label.
     pub mode: String,
+    /// Manual routing override (Auto/Chat/Task) for the next message. Set by
+    /// `/mode`. TUI/GUI parity (AGENTS.md): mirrors the GUI's
+    /// `app_state.tasks.interaction_mode` and feeds `drive_chat` the same way.
+    pub interaction_mode: InteractionMode,
     /// Token usage (prompt, completion, total).
     pub tokens: (u32, u32, u32),
     /// Tool count.
@@ -230,6 +236,18 @@ pub struct TuiApp {
     pub pending_approval: Option<
         std::sync::Arc<tokio::sync::Mutex<Option<echo_agent_app_core::hitl::PendingApproval>>>,
     >,
+    /// AgentPool for acquiring an isolated agent per background run (Phase B3).
+    /// Set by `run_tui` at startup; `handle_enter` reads it to build
+    /// `ChatResources` for `drive_chat`. `None` until set.
+    pub pool: Option<std::sync::Arc<echo_agent_app_core::agent_pool::AgentPool>>,
+    /// TaskRuntimeStore for create_run / cancel_run (Phase B3). Set by `run_tui`.
+    pub task_runtime_store:
+        Option<std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
+    /// Staged attachments from `/attach <path>` (B5.3). The next Enter sends
+    /// them alongside the typed text as a multimodal message via
+    /// `drive_chat(multimodal=Some)`, then drains the buffer. Empty = plain
+    /// text turn.
+    pub pending_attachments: Vec<echo_agent_app_core::attachments::AttachmentRef>,
 }
 
 #[derive(Clone, Debug)]
@@ -313,6 +331,7 @@ impl TuiApp {
             chat_scroll: 0,
             model,
             mode,
+            interaction_mode: InteractionMode::default(),
             tokens: (0, 0, 0),
             tool_count: 0,
             iteration_count: 0,
@@ -339,6 +358,9 @@ impl TuiApp {
             selection_start: None,
             selection_end: None,
             pending_approval: None,
+            pool: None,
+            task_runtime_store: None,
+            pending_attachments: Vec::new(),
         }
     }
 
@@ -1100,10 +1122,10 @@ pub async fn run_tui(
     tui_pending: std::sync::Arc<
         tokio::sync::Mutex<Option<echo_agent_app_core::hitl::PendingApproval>>,
     >,
+    pool: std::sync::Arc<echo_agent_app_core::agent_pool::AgentPool>,
     task_runtime_store: Option<
         std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
     >,
-    route_llm: Option<std::sync::Arc<dyn echo_agent::llm::LlmClient>>,
 ) -> anyhow::Result<()> {
     // Use ColorTheme to generate Theme, unifying both theme systems.
     let color_theme = echo_agent_app_core::output::theme::ColorTheme::dark();
@@ -1130,14 +1152,11 @@ pub async fn run_tui(
     app.tool_count = 24; // Default estimate, updated dynamically.
     app.max_display_chars = tui_config.max_display_chars;
     app.pending_approval = Some(tui_pending);
+    app.pool = Some(pool);
+    app.task_runtime_store = task_runtime_store;
 
     // Main event loop.
-    let chat_ctx = events::TuiChatCtx {
-        store: task_runtime_store,
-        route_llm,
-    };
-    let result =
-        events::run_event_loop(&mut terminal, &mut app, agent, task_service, chat_ctx).await;
+    let result = events::run_event_loop(&mut terminal, &mut app, agent, task_service).await;
 
     // Guard drop will restore the terminal.
     result

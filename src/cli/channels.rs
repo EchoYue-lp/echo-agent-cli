@@ -17,14 +17,15 @@ use echo_agent_app_core::agent_pool::AgentPool;
 
 /// IM channel 消息处理器：持 `AgentPool`，每 `handle` 从 pool 取/复用 per-sender agent。
 ///
-/// TUI/GUI functional parity (AGENTS.md): channels drive complex tasks through
-/// the shared `drive_chat` entry (not just `chat_stream`), so they hold a
-/// `TaskRuntimeStore` (complex runs) + an optional route LLM (Auto/Task routing).
+/// TUI/GUI functional parity (AGENTS.md): channels drive chat through the
+/// shared `drive_chat` entry. Holds the per-sender `AgentPool` + the
+/// `TaskRuntimeStore` (so `create_complex_task` can build `ChatResources`).
+/// Whether a complex run is warranted is decided by the agent itself, not
+/// pre-judged here.
 #[cfg(feature = "channels")]
 pub struct AppChannelMessageHandler {
     pool: Arc<AgentPool>,
     store: Option<Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
-    route_llm: Option<Arc<dyn echo_agent::llm::LlmClient>>,
 }
 
 #[cfg(feature = "channels")]
@@ -32,13 +33,8 @@ impl AppChannelMessageHandler {
     pub fn new(
         pool: Arc<AgentPool>,
         store: Option<Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
-        route_llm: Option<Arc<dyn echo_agent::llm::LlmClient>>,
     ) -> Self {
-        Self {
-            pool,
-            store,
-            route_llm,
-        }
+        Self { pool, store }
     }
 
     /// per-sender conversation_id（= pool key）。sender 维度隔离。
@@ -125,34 +121,40 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
         //    inside `drive_chat` (same as TUI send_to_agent).
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<echo_agent::agent::AgentEvent>();
         let text = msg.text.clone();
-        let store = self.store.clone();
-        let route_llm = self.route_llm.clone();
+        // B5.4: convert IM-channel attachments (QQ/飞书 images/files) into a
+        // multimodal Message so the agent sees them — same path the GUI and
+        // TUI /attach use. None when there are no attachments (plain text turn).
+        let multimodal = build_channel_multimodal_message(&text, &msg.attachments);
         let agent_owned = agent.clone();
+        let pool = self.pool.clone();
+        let store = self.store.clone();
+        let conv_owned = conv.clone();
         tokio::spawn(async move {
             use echo_agent_app_core::chat_driver::{ChannelChatSink, drive_chat};
-            use echo_agent_app_core::tasks::task_runtime::router::route_message_with_feedback;
-            use echo_agent_app_core::tasks::task_runtime::types::InteractionMode;
 
-            // Route the message the same way GUI/TUI do. Default Auto so the
-            // router decides normal vs complex (channel complex tasks get a
-            // real run with plan/worker).
-            let decision =
-                route_message_with_feedback(route_llm, &text, InteractionMode::Auto, &[]).await;
+            // 极简入口(Phase B1/B3):channel 不预判 normal/complex——agent 自主
+            // 决定是否建后台 Run(create_complex_task,B3b)。ChatResources 经
+            // drive_chat scope 进 task_local 供工具读。B5.4: multimodal 透传
+            // IM 附件(图片/文件,与 GUI/TUI 同路径)。
             let cancel = echo_agent::agent::CancellationToken::new();
-            let store_ref = store.as_deref();
-            let sink = ChannelChatSink::new(tx);
-            if let Err(e) = drive_chat(
-                &agent_owned,
-                &text,
-                &decision,
-                &sink,
+            let sink: std::sync::Arc<dyn echo_agent_app_core::chat_driver::ChatSink> =
+                std::sync::Arc::new(ChannelChatSink::new(tx));
+            let res = std::sync::Arc::new(echo_agent_app_core::chat_resources::ChatResources {
+                pool: Some(pool),
+                store,
+                sink,
+                conv_id: Some(conv_owned.clone()),
+                root_message_id: uuid::Uuid::new_v4().to_string(),
+                attachments: vec![],
                 cancel,
-                store_ref,
-                Some(&conv),
-            )
-            .await
-            {
-                tracing::warn!(error = %e, conv = %conv, "channel drive_chat failed");
+                // IM channels are always Auto (no mode selector); pure autonomy.
+                mode_hint: None,
+                // B5.1: channels have no review/memory subsystem; autonomous run
+                // memory writes are no-ops (recall closure off).
+                layer_manager: None,
+            });
+            if let Err(e) = drive_chat(&agent_owned, &text, multimodal.as_ref(), res).await {
+                tracing::warn!(error = %e, conv = %conv_owned, "channel drive_chat failed");
             }
         });
         // Wrap each AgentEvent as Ok(...) — drive_chat already handled stream
@@ -197,6 +199,51 @@ fn sanitize_cache_user_id(raw: &str) -> String {
             }
         })
         .collect()
+}
+
+/// Build a multimodal user `Message` from an IM channel's text + attachments
+/// (B5.4). Images become `ContentPart::ImageUrl` (inline base64 data URL); all
+/// other kinds (File/Audio/Video) become `ContentPart::File`. Returns `None`
+/// when there are no attachments (plain text turn — zero overhead, drive_chat
+/// builds `Message::user(text)` itself).
+#[cfg(feature = "channels")]
+fn build_channel_multimodal_message(
+    text: &str,
+    attachments: &[echo_agent::channels::MessageAttachment],
+) -> Option<echo_core::llm::types::Message> {
+    use base64::Engine as _;
+    use echo_agent::channels::AttachmentKind;
+    use echo_agent::llm::types::{ContentPart, ImageUrl};
+
+    if attachments.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::with_capacity(attachments.len() + 1);
+    parts.push(ContentPart::Text {
+        text: text.to_string(),
+    });
+    for att in attachments {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&att.data);
+        match att.kind {
+            AttachmentKind::Image => {
+                // Image MIME inferred from the kind; providers parse the data URL.
+                parts.push(ContentPart::ImageUrl {
+                    image_url: ImageUrl {
+                        url: format!("data:image/png;base64,{b64}"),
+                        detail: None,
+                    },
+                });
+            }
+            AttachmentKind::File | AttachmentKind::Audio | AttachmentKind::Video => {
+                let name = att
+                    .filename
+                    .clone()
+                    .unwrap_or_else(|| "attachment".to_string());
+                parts.push(ContentPart::File { name, content: b64 });
+            }
+        }
+    }
+    Some(echo_agent::llm::types::Message::user_multimodal(parts))
 }
 
 #[cfg(feature = "channels")]
@@ -341,6 +388,55 @@ mod tests {
             super::AppChannelMessageHandler::cache_user_id("qqbot", "user_123"),
             "im-qqbot-user_123"
         );
+    }
+
+    // ── build_channel_multimodal_message 测试(需 channels feature)─────────
+    #[cfg(feature = "channels")]
+    mod multimodal {
+        use super::super::build_channel_multimodal_message;
+        use echo_agent::channels::{AttachmentKind, MessageAttachment};
+        use echo_core::llm::types::{ContentPart, MessageContent};
+
+        #[test]
+        fn no_attachments_returns_none() {
+            assert!(build_channel_multimodal_message("hi", &[]).is_none());
+        }
+
+        #[test]
+        fn image_attachment_becomes_image_url() {
+            let att = MessageAttachment::new(AttachmentKind::Image, vec![1, 2, 3])
+                .with_filename("photo.png");
+            let msg =
+                build_channel_multimodal_message("look", &[att]).expect("Some for attachments");
+            let parts = match &msg.content {
+                MessageContent::Parts(p) => p.clone(),
+                other => panic!("expected Parts, got {other:?}"),
+            };
+            assert_eq!(parts.len(), 2, "text + 1 image");
+            assert!(matches!(parts[0], ContentPart::Text { .. }));
+            match &parts[1] {
+                ContentPart::ImageUrl { image_url } => {
+                    assert!(image_url.url.starts_with("data:image/png;base64,"));
+                }
+                other => panic!("expected ImageUrl, got {other:?}"),
+            }
+        }
+
+        #[test]
+        fn file_attachment_becomes_file_part() {
+            let att = MessageAttachment::new(AttachmentKind::File, vec![9, 9, 9])
+                .with_filename("notes.txt");
+            let msg =
+                build_channel_multimodal_message("see", &[att]).expect("Some for attachments");
+            let parts = match &msg.content {
+                MessageContent::Parts(p) => p.clone(),
+                other => panic!("expected Parts, got {other:?}"),
+            };
+            match &parts[1] {
+                ContentPart::File { name, .. } => assert_eq!(name, "notes.txt"),
+                other => panic!("expected File, got {other:?}"),
+            }
+        }
     }
 
     // ── aggregate_by_sentence 测试(需 channels feature)──────────────────────

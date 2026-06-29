@@ -123,6 +123,7 @@ pub async fn execute_run(
     trace_sink: Option<WorkerTraceSink>,
     run_id: &str,
     parent_cancel: CancellationToken,
+    memory_policy: super::memory_bridge::MemoryPolicy,
 ) -> Result<RunOutcome, ExecError> {
     let run = store
         .get_run(run_id)?
@@ -215,14 +216,16 @@ pub async fn execute_run(
                 &run.conversation_id,
                 "completed",
             );
-            super::memory_bridge::write_memory_candidate(
+            super::memory_bridge::write_memory_candidate_dispatch(
+                memory_policy,
                 layer_manager.as_ref(),
                 &store,
                 super::memory_bridge::MemoryEvent::RunCompleted {
                     run_id: run_id.to_string(),
                     goal: run.goal.clone(),
                 },
-            );
+            )
+            .await;
         }
         Ok(RunOutcome::Failed {
             failed_task_id,
@@ -273,14 +276,16 @@ pub async fn execute_run(
                 &run.conversation_id,
                 "cancelled",
             );
-            super::memory_bridge::write_memory_candidate(
+            super::memory_bridge::write_memory_candidate_dispatch(
+                memory_policy,
                 layer_manager.as_ref(),
                 &store,
                 super::memory_bridge::MemoryEvent::RunCancelledByUser {
                     run_id: run_id.to_string(),
                     goal: run.goal.clone(),
                 },
-            );
+            )
+            .await;
         }
         Ok(RunOutcome::Paused {
             failed_task_id,
@@ -1861,6 +1866,15 @@ pub async fn drive_unattended_run(
             // so every shell/file/git tool runs inside the isolated checkout.
             // Must happen before execute_stream_with_cancel (which triggers
             // tool calls). set_working_dir is &self and uses internal mutex.
+            //
+            // TODO(latent bug, not fixed in B5): this mutates the SHARED
+            // `primary_agent` (cron's single shared chat agent, state.rs:612).
+            // Two overlapping cron runs on the same agent would clobber each
+            // other's working_dir. Today this is masked by the agent's
+            // execution_mutex serializing runs, but adopting pool-per-run here
+            // (per-run agent) is what would actually fix it — tracked for a
+            // future cron-isolation change. Do NOT remove this binding without
+            // a per-run agent, or cron writes would land in the main workspace.
             if let Some(ref wt_path) = wt_path_for_scope {
                 agent.set_working_dir(Some(wt_path.clone()));
             }
@@ -1965,6 +1979,13 @@ pub async fn drive_unattended_run(
                 run_id = %run_id,
                 "Unattended run completed"
             );
+            // B5.1 design: cron/unattended runs use an Ephemeral/DirectReview
+            // memory policy — their results surface to the user via the kept
+            // worktree diff artifact (above), NOT via recall. So we deliberately
+            // do NOT write_memory_candidate here (cron has no recall closure;
+            // adding one would be a separate, scoped change). This is distinct
+            // from the autonomous chat path (create_complex_task), which DOES
+            // block-write its completion memory for recall.
         }
         Some(TaskRunStatus::Failed) => {
             tracing::warn!(

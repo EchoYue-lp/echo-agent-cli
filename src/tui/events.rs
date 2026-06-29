@@ -19,17 +19,6 @@ use echo_agent_app_core::tasks::BackgroundTaskService;
 /// Poll interval for non-blocking event check.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Shared context for driving chat through the unified `drive_chat` entry.
-///
-/// TUI/GUI functional parity (AGENTS.md): TUI drives the same normal + complex
-/// routes as GUI. This bundles the pieces `drive_chat` needs beyond the agent:
-/// the TaskRuntimeStore (complex runs) and an optional LLM client (Auto/Task
-/// routing). `None` store ⇒ only normal chat is possible (graceful fallback).
-pub struct TuiChatCtx {
-    pub store: Option<std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
-    pub route_llm: Option<std::sync::Arc<dyn echo_agent::llm::LlmClient>>,
-}
-
 /// Handle keyboard input when an approval request is pending.
 /// Returns `true` if the key was consumed.
 async fn handle_approval_key(
@@ -252,7 +241,6 @@ pub async fn run_event_loop(
     app: &mut TuiApp,
     agent: AgentHandle,
     task_service: Option<Arc<BackgroundTaskService>>,
-    chat_ctx: TuiChatCtx,
 ) -> anyhow::Result<()> {
     let (agent_tx, mut agent_rx) = mpsc::unbounded_channel();
 
@@ -380,9 +368,7 @@ pub async fn run_event_loop(
         // propagate these as fatal errors — just skip the tick and retry.
         match event::poll(POLL_INTERVAL) {
             Ok(true) => match event::read() {
-                Ok(Event::Key(key)) => {
-                    handle_key(app, key, &agent, agent_tx.clone(), &chat_ctx).await
-                }
+                Ok(Event::Key(key)) => handle_key(app, key, &agent, agent_tx.clone()).await,
                 Ok(Event::Mouse(mouse)) => handle_mouse(app, &mouse),
                 Ok(Event::Resize(_, _)) => {} // ratatui handles resize automatically
                 Ok(_) => {}
@@ -479,7 +465,6 @@ async fn handle_key(
     key: KeyEvent,
     agent: &AgentHandle,
     agent_tx: mpsc::UnboundedSender<AgentEvent>,
-    chat_ctx: &TuiChatCtx,
 ) {
     // ── Approval mode takes priority over everything ──
     if let Some(pending_handle) = app.pending_approval.clone() {
@@ -506,7 +491,7 @@ async fn handle_key(
     {
         return;
     }
-    handle_normal_key(app, &key, agent, agent_tx, chat_ctx).await;
+    handle_normal_key(app, &key, agent, agent_tx).await;
 }
 
 // ── Command palette ────────────────────────────────────────────────────────
@@ -619,7 +604,6 @@ async fn handle_normal_key(
     key: &KeyEvent,
     agent: &AgentHandle,
     agent_tx: mpsc::UnboundedSender<AgentEvent>,
-    chat_ctx: &TuiChatCtx,
 ) {
     // Shift+Enter: newline
     if key.modifiers.contains(KeyModifiers::SHIFT) && key.code == KeyCode::Enter {
@@ -629,7 +613,7 @@ async fn handle_normal_key(
     }
 
     match key.code {
-        KeyCode::Enter => handle_enter(app, agent, agent_tx, chat_ctx).await,
+        KeyCode::Enter => handle_enter(app, agent, agent_tx).await,
         KeyCode::Char(c) => handle_char_input(app, c),
         KeyCode::Backspace => handle_backspace(app),
         KeyCode::Delete => handle_delete(app),
@@ -651,7 +635,6 @@ async fn handle_enter(
     app: &mut TuiApp,
     agent: &AgentHandle,
     agent_tx: mpsc::UnboundedSender<AgentEvent>,
-    chat_ctx: &TuiChatCtx,
 ) {
     if app.is_processing {
         // Can't send while processing; insert newline instead.
@@ -661,7 +644,41 @@ async fn handle_enter(
         if text.starts_with('/') {
             handle_slash_command(app, agent, &text).await;
         } else {
-            send_to_agent(agent, text, agent_tx.clone(), chat_ctx).await;
+            // B5.3: drain staged attachments (/attach). If any, build a
+            // multimodal Message and pass it to drive_chat; also bind them on
+            // ChatResources so any autonomous run the agent spins up sees them.
+            let staged = std::mem::take(&mut app.pending_attachments);
+            let multimodal = if staged.is_empty() {
+                None
+            } else {
+                match echo_agent_app_core::attachments::build_message_from_refs(&text, &staged) {
+                    Ok(msg) => Some(msg),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to build multimodal message; sending text only");
+                        None
+                    }
+                }
+            };
+            let cancel = echo_agent::agent::CancellationToken::new();
+            let sink: std::sync::Arc<dyn echo_agent_app_core::chat_driver::ChatSink> =
+                std::sync::Arc::new(TuiChatSink::new(agent_tx.clone()));
+            let res = std::sync::Arc::new(echo_agent_app_core::chat_resources::ChatResources {
+                pool: app.pool.clone(),
+                store: app.task_runtime_store.clone(),
+                sink,
+                conv_id: None,
+                root_message_id: uuid::Uuid::new_v4().to_string(),
+                // Bind staged refs so workers in an autonomous run see them too.
+                attachments: staged,
+                cancel,
+                // B4.3 mode hint wired for GUI; TUI parity (honoring
+                // app.interaction_mode) is a follow-up — Auto autonomy here.
+                mode_hint: None,
+                // B5.1: TUI has no review/memory subsystem today; autonomous
+                // run memory writes are no-ops until wired (recall closure off).
+                layer_manager: None,
+            });
+            send_to_agent(agent, text, multimodal, res).await;
         }
     }
 }
@@ -814,50 +831,80 @@ impl echo_agent_app_core::chat_driver::ChatSink for TuiChatSink {
 async fn send_to_agent(
     agent: &AgentHandle,
     text: String,
-    agent_tx: mpsc::UnboundedSender<AgentEvent>,
-    chat_ctx: &TuiChatCtx,
+    multimodal: Option<echo_agent::prelude::Message>,
+    res: std::sync::Arc<echo_agent_app_core::chat_resources::ChatResources>,
 ) {
     use echo_agent_app_core::chat_driver::drive_chat;
-    use echo_agent_app_core::tasks::task_runtime::router::route_message_with_feedback;
 
-    // Route the message the same way GUI does. TUI/GUI parity (AGENTS.md):
-    // TUI supports complex tasks. Default to Auto so the router decides normal
-    // vs complex (matching GUI's default). TODO(5b): wire a /mode command to let
-    // the user force Chat / Task.
-    let mode = echo_agent_app_core::tasks::task_runtime::types::InteractionMode::Auto;
-    let decision = route_message_with_feedback(chat_ctx.route_llm.clone(), &text, mode, &[]).await;
-
-    let cancel = echo_agent::agent::CancellationToken::new();
-    let store = chat_ctx.store.clone();
+    // 极简入口(Phase B1/B3):TUI 不预判 normal/complex——agent 自主决定是否
+    // 建后台 Run(create_complex_task 工具,B3b)。ChatResources(pool/store/sink)
+    // 经 drive_chat scope 进 task_local 供工具读。B5.3: multimodal 透传 /attach
+    // 暂存的图片/文档(与 GUI 同路径)。
     let agent_owned = agent.clone();
 
     tokio::spawn(async move {
-        let sink = TuiChatSink::new(agent_tx);
-        let store_ref = store.as_deref();
-        match drive_chat(
-            &agent_owned,
-            &text,
-            &decision,
-            &sink,
-            cancel,
-            store_ref,
-            None,
-        )
-        .await
-        {
-            Ok(outcome) => {
-                if let Some(run_id) = outcome.run_id {
-                    tracing::info!(run_id = %run_id, "TUI complex run completed");
-                }
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "TUI drive_chat failed");
-            }
+        if let Err(e) = drive_chat(&agent_owned, &text, multimodal.as_ref(), res).await {
+            tracing::warn!(error = %e, "TUI drive_chat failed");
         }
     });
 }
 
 // ── Slash command handling ────────────────────────────────────────────
+
+/// Stage a local file as an attachment for the next TUI message (B5.3).
+///
+/// Reads `path`, infers a MIME type from the extension, copies the file into
+/// the global uploads dir (`~/.echo-agent/uploads/`, since the TUI has no
+/// workspace concept), and appends an [`AttachmentRef`] to `out`. The caller
+/// (`handle_enter`) rebuilds a multimodal `Message` from the refs and passes it
+/// to `drive_chat`. Returns the display name + inferred MIME on success.
+fn stage_attachment(
+    out: &mut Vec<echo_agent_app_core::attachments::AttachmentRef>,
+    path: &std::path::Path,
+) -> std::io::Result<(String, String)> {
+    use echo_agent_app_core::attachments::{AttachmentRef, resolve_uploads_dir};
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no filename")
+        })?;
+    let bytes = std::fs::read(path)?;
+    let mime = infer_mime(&name);
+    // Persist under the global uploads dir so the ref's path stays valid for
+    // workers that re-read it later (matches the GUI's per-workspace uploads,
+    // just global here).
+    let uploads_dir = resolve_uploads_dir(None);
+    std::fs::create_dir_all(&uploads_dir)?;
+    let file_name = format!("{}_{}", uuid::Uuid::new_v4(), name);
+    let dest = uploads_dir.join(file_name);
+    std::fs::write(&dest, &bytes)?;
+    out.push(AttachmentRef {
+        path: dest,
+        name: name.clone(),
+        mime_type: mime.clone(),
+    });
+    Ok((name, mime))
+}
+
+/// Infer a MIME type from a filename extension (B5.3 TUI /attach). Defaults to
+/// `application/octet-stream` for unknown extensions. Image MIMEs route to
+/// `ContentPart::ImageUrl`; everything else to `ContentPart::File`.
+fn infer_mime(name: &str) -> String {
+    let ext = name.rsplit('.').next().map(|e| e.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("png") => "image/png".to_string(),
+        Some("jpg") | Some("jpeg") => "image/jpeg".to_string(),
+        Some("gif") => "image/gif".to_string(),
+        Some("webp") => "image/webp".to_string(),
+        Some("svg") => "image/svg+xml".to_string(),
+        Some("pdf") => "application/pdf".to_string(),
+        Some("txt") | Some("md") | Some("rs") | Some("py") | Some("ts") | Some("js")
+        | Some("json") | Some("toml") | Some("yaml") | Some("yml") => "text/plain".to_string(),
+        _ => "application/octet-stream".to_string(),
+    }
+}
 
 /// Handle slash commands locally in the TUI.
 async fn handle_slash_command(app: &mut TuiApp, agent: &AgentHandle, cmd: &str) {
@@ -999,6 +1046,77 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &AgentHandle, cmd: &str) 
                 role: MessageRole::System,
                 content: "Entered plan mode. Write operations are disabled.".to_string(),
             });
+        }
+        Some(SlashCommand::Mode) => {
+            // Manual routing override for the next message (TUI/GUI parity with
+            // `set_interaction_mode`). Auto = router decides; Chat = force normal
+            // chat; Task = force TaskRuntime. Updates the status-bar label too.
+            if args.is_empty() {
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: format!(
+                        "Interaction mode: {} (auto/chat/task)",
+                        app.interaction_mode.label()
+                    ),
+                });
+            } else {
+                match parse_interaction_mode(args) {
+                    Some(m) => {
+                        app.interaction_mode = m;
+                        app.mode = m.label().to_string();
+                        app.messages.push(ChatMessage {
+                            role: MessageRole::System,
+                            content: format!("Interaction mode set to: {}", m.label()),
+                        });
+                    }
+                    None => {
+                        app.messages.push(ChatMessage {
+                            role: MessageRole::System,
+                            content: format!("Unknown mode '{}'; use auto, chat, or task", args),
+                        });
+                    }
+                }
+            }
+        }
+        Some(SlashCommand::Attach) => {
+            // B5.3: stage a file (image/document) for the next message. Reads
+            // the file, persists it under the global uploads dir, and pushes an
+            // AttachmentRef onto pending_attachments. The next Enter sends it
+            // alongside the typed text via drive_chat(multimodal=Some), then
+            // drains the buffer. TUI has no workspace concept, so use the
+            // global ~/.echo-agent/uploads/ dir.
+            if args.is_empty() {
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: "Usage: /attach <path>  (stage a file for the next message)"
+                        .to_string(),
+                });
+            } else {
+                let path = std::path::PathBuf::from(args.trim());
+                match stage_attachment(&mut app.pending_attachments, &path) {
+                    Ok((name, mime)) => {
+                        app.messages.push(ChatMessage {
+                            role: MessageRole::System,
+                            content: format!(
+                                "Attached: {} ({}). It will be sent with your next message.{}",
+                                name,
+                                mime,
+                                if app.pending_attachments.len() > 1 {
+                                    format!("\n{} file(s) staged.", app.pending_attachments.len())
+                                } else {
+                                    String::new()
+                                }
+                            ),
+                        });
+                    }
+                    Err(e) => {
+                        app.messages.push(ChatMessage {
+                            role: MessageRole::System,
+                            content: format!("Failed to attach '{}': {e}", path.display()),
+                        });
+                    }
+                }
+            }
         }
         Some(SlashCommand::Permission) => {
             if args.is_empty() {
@@ -1259,4 +1377,48 @@ fn update_parallel_tasks(app: &mut TuiApp, event: &TaskEvent) {
         TaskStripStatus::Failed(_) => e.started_at.elapsed().as_secs() < 60,
         _ => true,
     });
+}
+
+/// Parse a user-supplied interaction-mode argument (`auto` / `chat` / `task`,
+/// case-insensitive) for the `/mode` command. Returns `None` for unknown or
+/// empty input so the caller can surface an error instead of silently
+/// falling back to `Auto`.
+fn parse_interaction_mode(
+    arg: &str,
+) -> Option<echo_agent_app_core::tasks::task_runtime::types::InteractionMode> {
+    use echo_agent_app_core::tasks::task_runtime::types::InteractionMode;
+    match arg.trim().to_lowercase().as_str() {
+        "auto" => Some(InteractionMode::Auto),
+        "chat" => Some(InteractionMode::Chat),
+        "task" => Some(InteractionMode::Task),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_interaction_mode;
+    use echo_agent_app_core::tasks::task_runtime::types::InteractionMode;
+
+    #[test]
+    fn parses_auto_chat_task_case_insensitively() {
+        assert_eq!(parse_interaction_mode("auto"), Some(InteractionMode::Auto));
+        assert_eq!(parse_interaction_mode("chat"), Some(InteractionMode::Chat));
+        assert_eq!(parse_interaction_mode("task"), Some(InteractionMode::Task));
+        // Case-insensitive.
+        assert_eq!(parse_interaction_mode("Chat"), Some(InteractionMode::Chat));
+        assert_eq!(parse_interaction_mode("TASK"), Some(InteractionMode::Task));
+        // Surrounding whitespace is tolerated (e.g. `/mode  chat`).
+        assert_eq!(
+            parse_interaction_mode(" chat "),
+            Some(InteractionMode::Chat)
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_and_empty() {
+        assert_eq!(parse_interaction_mode("plan"), None);
+        assert_eq!(parse_interaction_mode("xyz"), None);
+        assert_eq!(parse_interaction_mode(""), None);
+    }
 }

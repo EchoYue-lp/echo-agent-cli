@@ -249,6 +249,10 @@ impl Tool for ExecutePlanTool {
                         trace_sink,
                         &run_id,
                         cancel,
+                        // B5.1: execute_plan tool drives an existing run's plan;
+                        // memory write is owned by the outer run's caller
+                        // (drive_run_async / resume_task_run), not this tool.
+                        super::memory_bridge::MemoryPolicy::None,
                     )
                     .await
                 })

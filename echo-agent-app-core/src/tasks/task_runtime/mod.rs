@@ -68,7 +68,10 @@ pub use executor::{
 };
 pub use hitrisk::{HighRiskMatch, check as check_high_risk, requires_fresh_approval};
 pub use ledger::{export_path, render_progress, write_progress};
-pub use memory_bridge::{MemoryEvent, write_memory_candidate};
+pub use memory_bridge::{
+    MemoryEvent, MemoryPolicy, write_memory_candidate, write_memory_candidate_blocking,
+    write_memory_candidate_dispatch,
+};
 pub use planner::validate_plan_deps;
 pub use policy::{ExecutionPolicy, ExecutionPolicySnapshot, PermissionMode, RuntimeLaunchPolicy};
 pub use profiles::ProfileTemplate;

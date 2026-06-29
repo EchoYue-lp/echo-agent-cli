@@ -61,7 +61,6 @@ pub async fn run_channels_mode(
     task_runtime_store: Option<
         std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
     >,
-    route_llm: Option<std::sync::Arc<dyn echo_agent::llm::LlmClient>>,
 ) -> Result<()> {
     use std::sync::Arc;
 
@@ -137,15 +136,10 @@ pub async fn run_channels_mode(
         let session_config = session_config.clone();
         let pool = pool.clone();
         let store = task_runtime_store.clone();
-        let llm = route_llm.clone();
         Arc::new(SessionHandler::new(
             session_config,
             move || -> Box<dyn MessageHandler> {
-                Box::new(AppChannelMessageHandler::new(
-                    pool.clone(),
-                    store.clone(),
-                    llm.clone(),
-                ))
+                Box::new(AppChannelMessageHandler::new(pool.clone(), store.clone()))
             },
         ))
     };

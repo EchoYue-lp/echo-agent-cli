@@ -258,7 +258,8 @@ async fn register_task_tools_on_agent(
     store: std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
 ) {
     use echo_agent_app_core::tasks::task_runtime::task_tools::{
-        TaskCompleteTool, TaskCreateTool, TaskListTool, TaskSkipTool, TaskUpdateTool,
+        CancelRunTool, CheckRunStatusTool, CreateComplexTaskTool, TaskCompleteTool, TaskCreateTool,
+        TaskListTool, TaskSkipTool, TaskUpdateTool,
     };
     let added = agent_handle
         .write(|agent| {
@@ -277,11 +278,17 @@ async fn register_task_tools_on_agent(
             agent.add_tool(Box::new(TaskListTool {
                 store: store.clone(),
             }));
+            // Phase B3: agent-autonomous complex-task tools. These read
+            // pool/store/sink from the chat turn's task_local
+            // (current_chat_resources), so no store injection is needed.
+            agent.add_tool(Box::new(CreateComplexTaskTool));
+            agent.add_tool(Box::new(CheckRunStatusTool));
+            agent.add_tool(Box::new(CancelRunTool));
             true
         })
         .await;
     if added {
-        tracing::info!("Registered 5 task-management tools on primary agent");
+        tracing::info!("Registered 8 task-management tools on primary agent");
     } else {
         tracing::warn!(
             "Failed to register task-management tools on primary agent (write lock poisoned)"

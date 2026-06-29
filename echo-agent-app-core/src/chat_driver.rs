@@ -1,23 +1,23 @@
-//! Stage 2 — shared chat driver.
+//! Stage 2 — shared chat driver (极简入口).
 //!
-//! Unifies TUI/CLI/channel/GUI chat through a single app-core entry
-//! (`drive_chat`) that routes normal vs complex and streams `AgentEvent`s
-//! through a per-mode `ChatSink`. This eliminates A3 (the three non-GUI entry
-//! points bypassed routing by calling `chat_stream` directly) and lets each
-//! mode render the shared stream its own way.
+//! `drive_chat` is the single, thin entry for a chat turn across TUI / CLI
+//! channel / GUI: it wraps the user input into one `Message`, streams the
+//! agent's ReAct reply through a per-mode `ChatSink`, and stops. It does NOT
+//! pre-judge normal vs complex and does NOT create a TaskRuntime run — the
+//! agent itself decides whether to spin up a background run by calling the
+//! `create_complex_task` tool (Phase B3+). Run lifecycle events flow back
+//! through `sink.on_run_status` / `on_worker_trace`, never through this
+//! entry's return value.
 //!
-//! See `docs/stage2-chat-driver-unification-spec.md`.
+//! Multimodal is passed through (`Option<&Message>`) so TUI / channel can
+//! attach images/files the same way GUI already does.
 
-use std::sync::Arc;
-
-use echo_agent::agent::{Agent, AgentEvent, AgentHandle, CancellationToken};
+use echo_agent::agent::{Agent, AgentEvent, AgentHandle};
 use echo_agent::prelude::Message;
 use echo_core::tools::TraceSinkFn;
 use futures::StreamExt;
 
-use crate::tasks::task_runtime::router::TaskRouteDecision;
-use crate::tasks::task_runtime::store::TaskRuntimeStore;
-use crate::tasks::task_runtime::types::{AttendedMode, TaskRunStatus, WorkerTraceEvent};
+use crate::tasks::task_runtime::types::WorkerTraceEvent;
 
 /// Per-mode event consumer for the shared chat driver.
 ///
@@ -32,7 +32,6 @@ pub trait ChatSink: Send + Sync + 'static {
     fn on_agent_event(&self, event: AgentEvent) -> bool;
     fn on_run_status(&self, _status: &str) {}
     fn on_worker_trace(&self, _event: WorkerTraceEvent) {}
-    fn on_route_decision(&self, _decision: &TaskRouteDecision) {}
     fn on_interrupt(&self, _run_id: &str, _goal: &str, _new_message: &str) {}
     /// Trace sink forwarded into the framework's external run context
     /// (`ExternalRunContext.trace_sink`) so worker trace events reach the
@@ -52,36 +51,45 @@ pub trait ChatSink: Send + Sync + 'static {
     }
 }
 
-/// Outcome of driving a chat turn.
-pub struct ChatOutcome {
-    /// `Some(run_id)` when a TaskRuntime run was created (complex route);
-    /// `None` for normal streaming chat.
-    pub run_id: Option<String>,
-}
-
-/// Drive a chat turn through the shared path.
+/// Drive a chat turn through the single shared path (极简入口).
 ///
-/// For a normal route, stream the agent's reply through `sink` without
-/// creating a run. For a complex route, create a TaskRuntime run, transition
-/// it to Running, and launch the unified run driver via `launch_unified_run_core`.
+/// Wraps `message` (plus optional `multimodal`) into one `Message`, streams the
+/// agent's reply through `sink`, and returns. No route pre-judgment, no
+/// TaskRuntime run creation — the agent decides whether a complex run is
+/// warranted and triggers it itself via the `create_complex_task` tool.
 pub async fn drive_chat(
     agent: &AgentHandle,
     message: &str,
-    decision: &TaskRouteDecision,
-    sink: &dyn ChatSink,
-    cancel: CancellationToken,
-    store: Option<&TaskRuntimeStore>,
-    conv_id: Option<&str>,
-) -> Result<ChatOutcome, String> {
-    if !decision.route.should_create_runtime_run() {
-        // Normal chat: stream the agent's reply through the sink without
-        // creating a run. The RwLock read guard is held for the stream's
-        // lifetime because the stream borrows the agent (same pattern as the
-        // GUI's normal chat path in `tauri/commands/chat.rs`).
+    multimodal: Option<&Message>,
+    res: std::sync::Arc<crate::chat_resources::ChatResources>,
+) -> Result<(), String> {
+    let msg: Message = match multimodal {
+        Some(m) => m.clone(),
+        None => {
+            // B4.3 (spec §8): prepend the per-turn mode hint to the user text
+            // when set (Chat/Task modes). Pure prompt — no code route branch,
+            // no re-introduction of route pre-judgment. Auto (None) adds none.
+            let text = match &res.mode_hint {
+                Some(hint) if !hint.is_empty() => {
+                    format!("[Mode: {hint}]\n\n{message}")
+                }
+                _ => message.to_string(),
+            };
+            Message::user(text)
+        }
+    };
+    let cancel = res.cancel.clone();
+    let sink: std::sync::Arc<dyn ChatSink> = res.sink.clone();
+    // Scope the chat resources into a task_local so tools the agent calls
+    // mid-ReAct (create_complex_task / check_run_status / cancel_run, Phase B3)
+    // can reach pool/store/sink via `current_chat_resources()`.
+    crate::chat_resources::with_chat_resources(res, async move {
+        // The RwLock read guard is held for the stream's lifetime because the
+        // stream borrows the agent (same pattern as the GUI's normal chat path).
         let inner = agent.inner().clone();
         let guard = inner.read().await;
         let mut stream = guard
-            .execute_stream_with_cancel(message, cancel)
+            .execute_stream_message_with_cancel(msg, cancel)
             .await
             .map_err(|e| e.to_string())?;
         while let Some(event_result) = stream.next().await {
@@ -92,166 +100,23 @@ pub async fn drive_chat(
                     }
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "agent stream error during normal chat");
+                    tracing::warn!(error = %e, "agent stream error during chat");
                     break;
                 }
             }
         }
-        return Ok(ChatOutcome { run_id: None });
-    }
-
-    // Complex route: create a run, transition to Running, launch the driver.
-    let store = store.ok_or_else(|| {
-        "complex route requires a TaskRuntime store, but none was provided".to_string()
-    })?;
-    let run_id = uuid::Uuid::new_v4().to_string();
-    let conv = conv_id
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("message:{run_id}"));
-    store
-        .create_run(
-            &run_id,
-            "default",
-            &conv,
-            "",
-            decision.classification.inferred_profile,
-            message,
-            decision.route.as_str(),
-            AttendedMode::Attended,
-        )
-        .map_err(|e| e.to_string())?;
-    store
-        .transition_run(&run_id, TaskRunStatus::Running)
-        .map_err(|e| e.to_string())?;
-
-    sink.on_route_decision(decision);
-    let terminal = launch_unified_run_core(agent, &run_id, message, None, sink, cancel).await?;
-
-    // Transition the run to its terminal status. Mirror the GUI's guard: only
-    // transition if the run is not already terminal (execute_plan's inner
-    // execute_run may have set a more accurate status first).
-    let new_status = match terminal.as_str() {
-        "completed" => TaskRunStatus::Completed,
-        "cancelled" => TaskRunStatus::Cancelled,
-        _ => TaskRunStatus::Failed,
-    };
-    let already_terminal = store
-        .get_run(&run_id)
-        .map_err(|e| e.to_string())?
-        .map(|r| {
-            matches!(
-                r.status,
-                TaskRunStatus::Completed | TaskRunStatus::Failed | TaskRunStatus::Cancelled
-            )
-        })
-        .unwrap_or(false);
-    if !already_terminal && let Err(e) = store.transition_run(&run_id, new_status) {
-        tracing::error!(error = %e, run_id = %run_id, "terminal transition failed");
-    }
-
-    Ok(ChatOutcome {
-        run_id: Some(run_id),
+        Ok::<(), String>(())
     })
-}
-
-/// Drive an already-created TaskRuntime run to completion through `sink`.
-///
-/// This is the Tauri-free core extracted from the GUI's
-/// `launch_unified_run` (`tauri/commands/chat.rs`): it injects the run context
-/// (so workers inherit `run_id`/`cancel`/`trace_sink`), streams the agent's
-/// reply through `sink.on_agent_event`, and signals run lifecycle
-/// (`running` → `completed`/`cancelled`/`failed`) via `sink.on_run_status`.
-/// Run creation + attachment setup stay with the caller.
-pub async fn launch_unified_run_core(
-    agent: &AgentHandle,
-    run_id: &str,
-    goal: &str,
-    multimodal: Option<&Message>,
-    sink: &dyn ChatSink,
-    cancel: CancellationToken,
-) -> Result<String, String> {
-    use crate::tasks::task_runtime::task_tools::with_run_context;
-    use echo_core::tools::ExternalRunContext;
-
-    sink.on_run_status("running");
-
-    let worker_trace_sink = sink.worker_trace_sink();
-    let goal_owned = goal.to_string();
-    let run_id_owned = run_id.to_string();
-
-    // Scope the task_local run context around the whole driver so the main
-    // agent's task_tools (`execute_plan` / `delegate_readonly`) can read
-    // run_id / cancel / trace_sink. Without this, a complex run where the main
-    // agent calls execute_plan would fail ("no active run" in task_local).
-    // (GUI's `launch_unified_run` does the same via `with_run_context`.)
-    let terminal = with_run_context(
-        run_id_owned.clone(),
-        cancel.clone(),
-        worker_trace_sink,
-        async {
-            // The RwLock read guard is held for the run's lifetime (the stream
-            // borrows the agent) — same pattern as the GUI's launch_unified_run.
-            let inner = agent.inner().clone();
-            let guard = inner.read().await;
-
-            // Inject the run context so workers (delegate_readonly / execute_plan)
-            // inherit run_id / cancel / trace_sink via `build_runtime_context`,
-            // bypassing the task_local that would break across spawns.
-            guard.set_external_context(&ExternalRunContext {
-                run_id: run_id_owned.clone(),
-                cancel: Some(Arc::new(cancel.clone())),
-                trace_sink: sink.trace_sink(),
-            });
-
-            let mut terminal = "completed".to_string();
-            let stream_result = if let Some(msg) = multimodal {
-                guard
-                    .execute_stream_message_with_cancel(msg.clone(), cancel.clone())
-                    .await
-            } else {
-                guard
-                    .execute_stream_with_cancel(&goal_owned, cancel.clone())
-                    .await
-            };
-            if let Ok(mut stream) = stream_result {
-                while let Some(event_result) = stream.next().await {
-                    if cancel.is_cancelled() {
-                        terminal = "cancelled".to_string();
-                        break;
-                    }
-                    match event_result {
-                        Ok(event) => {
-                            if !sink.on_agent_event(event) {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, "agent stream error during run");
-                            terminal = "failed".to_string();
-                            break;
-                        }
-                    }
-                }
-            } else if let Err(e) = stream_result {
-                tracing::warn!(error = %e, "agent stream setup error during run");
-                terminal = "failed".to_string();
-            }
-            terminal
-        },
-    )
-    .await;
-
-    sink.on_run_status(&terminal);
-    Ok(terminal)
+    .await
 }
 
 /// A `ChatSink` that forwards every `AgentEvent` to an mpsc channel.
 ///
 /// Used by modes whose renderer consumes a stream of `AgentEvent`s over a
 /// channel — TUI (forwards to the UI render loop) and IM channels (aggregate
-/// by sentence). Other event kinds (run status / worker trace / route
-/// decision / interrupt) are no-op for these modes: they render the stream
-/// directly and don't need GUI-style side-event emission.
+/// by sentence). Other event kinds (run status / worker trace / interrupt)
+/// are no-op for these modes: they render the stream directly and don't need
+/// GUI-style side-event emission.
 pub struct ChannelChatSink {
     tx: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
 }
@@ -273,21 +138,16 @@ impl ChatSink for ChannelChatSink {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// Test-only sink that records received events for assertions.
     struct MockChatSink {
         events: std::sync::Mutex<Vec<AgentEvent>>,
-        statuses: std::sync::Mutex<Vec<String>>,
-        route_called: AtomicBool,
     }
 
     impl Default for MockChatSink {
         fn default() -> Self {
             Self {
                 events: std::sync::Mutex::new(Vec::new()),
-                statuses: std::sync::Mutex::new(Vec::new()),
-                route_called: AtomicBool::new(false),
             }
         }
     }
@@ -299,15 +159,6 @@ mod tests {
                 .unwrap_or_else(|e| e.into_inner())
                 .push(event);
             true
-        }
-        fn on_run_status(&self, status: &str) {
-            self.statuses
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(status.to_string());
-        }
-        fn on_route_decision(&self, _decision: &TaskRouteDecision) {
-            self.route_called.store(true, Ordering::Relaxed);
         }
     }
 
@@ -322,19 +173,11 @@ mod tests {
         fn event_count(&self) -> usize {
             self.events.lock().unwrap_or_else(|e| e.into_inner()).len()
         }
-        fn statuses(&self) -> Vec<String> {
-            self.statuses
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone()
-        }
-        fn route_decision_called(&self) -> bool {
-            self.route_called.load(Ordering::Relaxed)
-        }
     }
 
     #[tokio::test]
-    async fn drive_chat_normal_streams_agent_events_via_sink() {
+    async fn drive_chat_streams_agent_events_via_sink() {
+        use echo_agent::agent::CancellationToken;
         use std::sync::Arc;
         let mock = Arc::new(
             echo_agent::testing::MockLlmClient::new()
@@ -349,136 +192,96 @@ mod tests {
                 .expect("test agent should build"),
         );
         let cancel = CancellationToken::new();
-        let sink = MockChatSink::default();
-        let decision = TaskRouteDecision::normal("test");
-        let outcome = drive_chat(&agent, "hi", &decision, &sink, cancel, None, None)
-            .await
-            .expect("drive_chat normal should succeed");
-        // Normal chat streams the agent's FinalAnswer through the sink.
-        assert!(
-            sink.has_final_answer(),
-            "normal chat should stream FinalAnswer to sink; events recorded: {}",
-            sink.event_count()
+        let chat_sink = Arc::new(MockChatSink::default());
+        let sink: Arc<dyn ChatSink> = chat_sink.clone();
+        let store = Arc::new(
+            crate::tasks::task_runtime::store::TaskRuntimeStore::new_in_memory()
+                .expect("in-memory store"),
         );
-        assert!(
-            outcome.run_id.is_none(),
-            "normal chat must not create a run"
-        );
-        assert!(
-            !sink.route_decision_called(),
-            "normal chat must not emit a route decision"
-        );
-    }
-
-    #[tokio::test]
-    async fn launch_unified_run_core_drives_agent_and_signals_sink() {
-        use std::sync::Arc;
-        let mock = Arc::new(
-            echo_agent::testing::MockLlmClient::new()
-                .with_model_name("t")
-                .with_response("ok"),
-        );
-        let agent = AgentHandle::new(
-            echo_agent::agent::ReactAgentBuilder::new()
-                .model("t")
-                .llm_client(mock)
-                .build()
-                .expect("test agent should build"),
-        );
-        let cancel = CancellationToken::new();
-        let sink = MockChatSink::default();
-        launch_unified_run_core(&agent, "run-1", "do it", None, &sink, cancel)
-            .await
-            .expect("launch_unified_run_core should succeed");
-        // The core drives the agent to FinalAnswer + signals the lifecycle.
-        assert!(
-            sink.has_final_answer(),
-            "core should stream FinalAnswer; events recorded: {}",
-            sink.event_count()
-        );
-        let statuses = sink.statuses();
-        assert!(
-            statuses.iter().any(|s| s == "running"),
-            "should signal running; got {:?}",
-            statuses
-        );
-        assert!(
-            statuses.iter().any(|s| s == "completed"),
-            "should signal completed; got {:?}",
-            statuses
-        );
-    }
-
-    #[tokio::test]
-    async fn drive_chat_complex_creates_run_and_launches() {
-        use crate::tasks::task_runtime::router::route_message_with_feedback;
-        use crate::tasks::task_runtime::store::TaskRuntimeStore;
-        use crate::tasks::task_runtime::types::InteractionMode;
-        use std::sync::Arc;
-
-        // Task mode forces a complex route (no LLM needed).
-        let decision =
-            route_message_with_feedback(None, "build a todo app", InteractionMode::Task, &[]).await;
-        assert!(
-            decision.route.should_create_runtime_run(),
-            "Task mode should yield a complex route; got {:?}",
-            decision.route
-        );
-
-        let mock = Arc::new(
-            echo_agent::testing::MockLlmClient::new()
-                .with_model_name("t")
-                .with_response("done"),
-        );
-        let agent = AgentHandle::new(
-            echo_agent::agent::ReactAgentBuilder::new()
-                .model("t")
-                .llm_client(mock)
-                .build()
-                .expect("test agent should build"),
-        );
-        let store = TaskRuntimeStore::new_in_memory().expect("in-memory store should build");
-        let cancel = CancellationToken::new();
-        let sink = MockChatSink::default();
-
-        let outcome = drive_chat(
-            &agent,
-            "build a todo app",
-            &decision,
-            &sink,
+        let res = Arc::new(crate::chat_resources::ChatResources {
+            pool: None,
+            store: Some(store),
+            sink,
+            conv_id: None,
+            root_message_id: "m1".to_string(),
+            attachments: vec![],
             cancel,
-            Some(&store),
-            Some("conv-1"),
-        )
-        .await
-        .expect("drive_chat complex should succeed");
+            mode_hint: None,
+            layer_manager: None,
+        });
+        drive_chat(&agent, "hi", None, res)
+            .await
+            .expect("drive_chat should succeed");
+        // The agent's FinalAnswer is streamed through the sink.
+        assert!(
+            chat_sink.has_final_answer(),
+            "drive_chat should stream FinalAnswer to sink; events recorded: {}",
+            chat_sink.event_count()
+        );
+    }
 
-        // Complex route creates a run and returns its id.
-        let run_id = outcome
-            .run_id
-            .as_ref()
-            .expect("complex route should return a run_id");
-        let run = store
-            .get_run(run_id)
-            .expect("store read should succeed")
-            .expect("run should exist in store");
-        assert!(
-            matches!(
-                run.status,
-                crate::tasks::task_runtime::types::TaskRunStatus::Completed
-            ),
-            "run should be Completed after launch; got {:?}",
-            run.status
+    #[tokio::test]
+    async fn drive_chat_prepends_mode_hint_to_user_text() {
+        // B4.3 (spec §8): the per-turn mode_hint is prepended to the user text
+        // as a bracketed note (pure prompt, no code route branch). Verify the
+        // LLM actually receives the prefixed message.
+        use echo_agent::agent::CancellationToken;
+        use std::sync::Arc;
+        let mock = Arc::new(
+            echo_agent::testing::MockLlmClient::new()
+                .with_model_name("t")
+                .with_response("ok"),
         );
-        // The driver streamed through the sink + signalled the route decision.
+        let agent = AgentHandle::new(
+            echo_agent::agent::ReactAgentBuilder::new()
+                .model("t")
+                .llm_client(mock.clone())
+                .build()
+                .expect("test agent should build"),
+        );
+        let cancel = CancellationToken::new();
+        let chat_sink = Arc::new(MockChatSink::default());
+        let sink: Arc<dyn ChatSink> = chat_sink.clone();
+        let store = Arc::new(
+            crate::tasks::task_runtime::store::TaskRuntimeStore::new_in_memory()
+                .expect("in-memory store"),
+        );
+        let res = Arc::new(crate::chat_resources::ChatResources {
+            pool: None,
+            store: Some(store),
+            sink,
+            conv_id: None,
+            root_message_id: "m1".to_string(),
+            attachments: vec![],
+            cancel,
+            mode_hint: Some("Chat — do not spawn tasks".to_string()),
+            layer_manager: None,
+        });
+        drive_chat(&agent, "hi there", None, res)
+            .await
+            .expect("drive_chat should succeed");
+        let messages = mock
+            .last_messages()
+            .expect("LLM should have been called at least once");
+        let user_text = messages
+            .iter()
+            .filter_map(|m| {
+                use echo_core::llm::types::Role;
+                if m.role == Role::User {
+                    m.content.as_text()
+                } else {
+                    None
+                }
+            })
+            .next()
+            .expect("at least one user message should be sent");
         assert!(
-            sink.route_decision_called(),
-            "complex route should emit the route decision"
+            user_text.contains("[Mode: Chat — do not spawn tasks]"),
+            "user text should carry the mode hint prefix; got: {user_text}"
         );
         assert!(
-            sink.has_final_answer(),
-            "complex route should stream FinalAnswer; got {} events",
-            sink.event_count()
+            user_text.contains("hi there"),
+            "original user text should follow the hint; got: {user_text}"
         );
     }
 

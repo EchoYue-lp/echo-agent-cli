@@ -308,10 +308,6 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
         // drive complex tasks (plan / worker / run lifecycle) via `drive_chat`.
         let task_runtime_store = build_task_runtime_store_for_headless();
 
-        // LLM client for Auto/Task routing decisions (drive_chat → route_message_with_feedback).
-        let route_llm: Option<std::sync::Arc<dyn echo_agent::llm::LlmClient>> =
-            agent_handle.read(|a| a.llm_client().cloned()).await;
-
         // Start BackgroundTaskService with the pool so independent
         // background tasks can use distinct worker agents.
         let tui_task_service = {
@@ -356,8 +352,8 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             &app_config.tui,
             "💬 通用",
             tui_pending,
+            pool,
             task_runtime_store,
-            route_llm,
         )
         .await?;
 
@@ -421,7 +417,6 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                 pool,
                 app_config.clone(),
                 build_task_runtime_store_for_headless(),
-                agent_handle.read(|a| a.llm_client().cloned()).await,
             ));
 
             if run_cli {

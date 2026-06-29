@@ -426,6 +426,346 @@ impl TaskCreateTool {
     }
 }
 
+// ── create_complex_task (Phase B3) ────────────────────────────────────────
+//
+// The "nuclear button": lets the main agent autonomously spin up a background
+// Run when it judges a task complex. Reads pool/store/sink from the chat
+// turn's task_local (`current_chat_resources`, scoped by `drive_chat`), so it
+// only works during an active chat turn. `reason` is required as a CoT
+// anti-misfire gate (spec §4.2). foreground blocks the turn + streams worker
+// events (Claude Code Task style); background spawns + returns run_id (spec §6
+// 主从异步). Default background (spec §4.1 Priority Trap).
+
+/// Create a background orchestrated Run for a complex multi-step task.
+pub struct CreateComplexTaskTool;
+
+impl Tool for CreateComplexTaskTool {
+    fn name(&self) -> &str {
+        "create_complex_task"
+    }
+
+    fn description(&self) -> &str {
+        r#"Create a background orchestrated Run for a complex multi-step task. ONLY use when one of these holds: (1) multi-step & time-consuming (>3 steps, each costly in tokens/time); (2) complex code generation (multi-file / architectural); (3) needs long-lived state (cross-turn / persisted); (4) multi-source research synthesis. For simple Q&A, single-file tweaks, or one-shot queries, DO NOT call this — reply directly. You MUST give a `reason` justifying the complexity. Default `priority`=background (non-blocking); use foreground only for tasks <1min where you need the result in this same reply."#
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "required": ["user_goal", "reason", "domain_profile", "plan_mode"],
+            "properties": {
+                "user_goal": { "type": "string", "description": "The user's full goal (verbatim or distilled), as the Run's goal." },
+                "reason": { "type": "string", "description": "Why this is complex. List the complexity signals hit: multi_step / needs_research / needs_code_gen / long_running / multi_file. Anti-abuse audit." },
+                "domain_profile": { "type": "string", "enum": ["general","ai_coding","data_analysis","academic_research","medical_research"], "description": "Domain. Determines worker roles / review checklist." },
+                "plan_mode": { "type": "string", "enum": ["plan_then_execute","direct_execute"], "description": "plan_then_execute = task_create a plan first (reviewable) then execute_plan; direct_execute = agent ReActs autonomously in the Run." },
+                "initial_plan": { "type": "array", "items": { "type": "object", "properties": { "step_name": {"type":"string"}, "expected_outcome": {"type":"string"} }, "required": ["step_name"] }, "description": "Optional coarse decomposition (>=2 steps) as a brief. Not the PlanTask DAG — the Run's agent refines via task_create." },
+                "priority": { "type": "string", "enum": ["foreground","background"], "default": "background", "description": "Default background (returns run_id immediately, non-blocking). foreground only for <1min tasks where you need the result in this turn (blocks the UI until done)." }
+            }
+        })
+    }
+
+    fn execute<'a>(
+        &'a self,
+        params: ToolParameters,
+    ) -> futures::future::BoxFuture<'a, echo_agent::error::Result<ToolResult>> {
+        Box::pin(async move { self.do_create(params).await })
+    }
+
+    fn execute_with_context<'a>(
+        &'a self,
+        params: ToolParameters,
+        _ctx: &'a echo_core::tools::ToolContext,
+    ) -> futures::future::BoxFuture<'a, echo_agent::error::Result<ToolResult>> {
+        Box::pin(async move { self.do_create(params).await })
+    }
+}
+
+impl CreateComplexTaskTool {
+    async fn do_create(&self, params: ToolParameters) -> echo_agent::error::Result<ToolResult> {
+        let res = match crate::chat_resources::current_chat_resources() {
+            Some(r) => r,
+            None => {
+                return Ok(ToolResult::error(
+                    "create_complex_task can only be used during an active chat turn (no chat resources available)",
+                ));
+            }
+        };
+        let pool = match res.pool.clone() {
+            Some(p) => p,
+            None => {
+                return Ok(ToolResult::error(
+                    "create_complex_task requires an AgentPool; none is available in this context",
+                ));
+            }
+        };
+        let store = match res.store.clone() {
+            Some(s) => s,
+            None => {
+                return Ok(ToolResult::error(
+                    "create_complex_task requires a TaskRuntimeStore; none is available in this context",
+                ));
+            }
+        };
+
+        let user_goal = params
+            .get("user_goal")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if user_goal.is_empty() {
+            return Ok(ToolResult::error("user_goal is required"));
+        }
+        let reason = params
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if reason.is_empty() {
+            return Ok(ToolResult::error(
+                "reason is required — list the complexity signals (multi_step/needs_research/needs_code_gen/long_running/multi_file) that justify this task",
+            ));
+        }
+        let domain_profile_str = params
+            .get("domain_profile")
+            .and_then(|v| v.as_str())
+            .unwrap_or("general");
+        let domain = super::types::DomainProfile::from_str(domain_profile_str)
+            .unwrap_or(super::types::DomainProfile::General);
+        let _plan_mode = params
+            .get("plan_mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("plan_then_execute");
+        let priority = params
+            .get("priority")
+            .and_then(|v| v.as_str())
+            .unwrap_or("background");
+        let initial_plan: Vec<String> = params
+            .get("initial_plan")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| {
+                        v.get("step_name")
+                            .and_then(|s| s.as_str())
+                            .map(String::from)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let goal = if initial_plan.is_empty() {
+            user_goal.clone()
+        } else {
+            format!(
+                "{user_goal}\n\nInitial plan:\n{}",
+                initial_plan
+                    .iter()
+                    .map(|s| format!("- {s}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        };
+
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let conv = res
+            .conv_id
+            .clone()
+            .unwrap_or_else(|| format!("message:{run_id}"));
+        let attended = super::types::AttendedMode::Attended;
+        if let Err(e) = store.create_run(
+            &run_id,
+            "default",
+            &conv,
+            &res.root_message_id,
+            domain,
+            &goal,
+            "agent_autonomous",
+            attended,
+        ) {
+            return Ok(ToolResult::error(format!("Failed to create run: {e}")));
+        }
+        #[allow(clippy::collapsible_if)]
+        // outer guard + inner if-let-Err reads clearer than a let-chain
+        if !res.attachments.is_empty() {
+            if let Err(e) = store.set_run_attachments(&run_id, &res.attachments) {
+                tracing::warn!(error = %e, "failed to bind attachments to run");
+            }
+        }
+        if let Err(e) = store.transition_run(&run_id, super::types::TaskRunStatus::Running) {
+            return Ok(ToolResult::error(format!(
+                "Failed to transition run to Running: {e}"
+            )));
+        }
+        // Independent cancel token (spec §5.5): background runs must NOT reuse
+        // the chat turn's token — the front-desk "stop" must not kill a
+        // background run. cancel_run / GUI task panel trigger this one.
+        let run_cancel = echo_agent::agent::CancellationToken::new();
+        store.register_run_cancel_token(&run_id, run_cancel.clone());
+
+        let trace_sink = if priority == "foreground" {
+            res.sink.worker_trace_sink()
+        } else {
+            None
+        };
+        let payload = crate::run_driver::RunPayload {
+            run_id: run_id.clone(),
+            pool,
+            store: store.clone(),
+            cancel: run_cancel,
+            reviewer_llm: None,
+            // B5.1: forward the chat turn's memory layer so the run's Blocking
+            // memory write (drive_run_async → execute_run) actually lands the
+            // taskrun:completed:{run_id} memory. None when no memory subsystem
+            // is wired (then the Blocking write is a no-op).
+            layer_manager: res.layer_manager.clone(),
+            trace_sink,
+        };
+
+        if priority == "foreground" {
+            // Block the turn: drive_run_async streams worker events to the chat
+            // sink (via trace_sink), returns the terminal RunOutcome so the
+            // agent can use the result in-turn (Claude Code Task style).
+            match crate::run_driver::drive_run_async(payload).await {
+                Ok(outcome) => {
+                    use super::executor::RunOutcome;
+                    let terminal = match outcome {
+                        RunOutcome::Completed => "completed",
+                        RunOutcome::Failed { .. } => "failed",
+                        RunOutcome::Cancelled => "cancelled",
+                        RunOutcome::Paused { .. } => "paused",
+                    };
+                    Ok(ToolResult::success(
+                        serde_json::json!({"status":"completed","run_id":run_id,"terminal":terminal})
+                            .to_string(),
+                    ))
+                }
+                Err(e) => Ok(ToolResult::error(format!("Run failed: {e}"))),
+            }
+        } else {
+            // Background: spawn + return immediately (decoupled, spec §6).
+            tokio::spawn(crate::run_driver::drive_run_async(payload));
+            Ok(ToolResult::success(
+                serde_json::json!({"status":"accepted","run_id":run_id}).to_string(),
+            ))
+        }
+    }
+}
+
+// ── check_run_status / cancel_run (Phase B3) ──────────────────────────────
+
+/// Check the status of a Run created by `create_complex_task`.
+pub struct CheckRunStatusTool;
+
+impl Tool for CheckRunStatusTool {
+    fn name(&self) -> &str {
+        "check_run_status"
+    }
+    fn description(&self) -> &str {
+        "Check the status of a background Run created by create_complex_task. Returns {status, goal}."
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type":"object",
+            "properties":{"run_id":{"type":"string","description":"The run_id returned by create_complex_task"}},
+            "required":["run_id"]
+        })
+    }
+    fn execute<'a>(
+        &'a self,
+        params: ToolParameters,
+    ) -> futures::future::BoxFuture<'a, echo_agent::error::Result<ToolResult>> {
+        Box::pin(async move { Self::do_check(params).await })
+    }
+    fn execute_with_context<'a>(
+        &'a self,
+        params: ToolParameters,
+        _ctx: &'a echo_core::tools::ToolContext,
+    ) -> futures::future::BoxFuture<'a, echo_agent::error::Result<ToolResult>> {
+        Box::pin(async move { Self::do_check(params).await })
+    }
+}
+
+impl CheckRunStatusTool {
+    async fn do_check(params: ToolParameters) -> echo_agent::error::Result<ToolResult> {
+        let run_id = match params.get("run_id").and_then(|v| v.as_str()) {
+            Some(id) => id.to_string(),
+            None => return Ok(ToolResult::error("run_id is required")),
+        };
+        let res = match crate::chat_resources::current_chat_resources() {
+            Some(r) => r,
+            None => {
+                return Ok(ToolResult::error(
+                    "check_run_status requires an active chat turn",
+                ));
+            }
+        };
+        let store = match res.store.clone() {
+            Some(s) => s,
+            None => return Ok(ToolResult::error("no TaskRuntimeStore available")),
+        };
+        match store.get_run(&run_id) {
+            Ok(Some(run)) => Ok(ToolResult::success(
+                serde_json::json!({"status": format!("{:?}", run.status), "goal": run.goal})
+                    .to_string(),
+            )),
+            Ok(None) => Ok(ToolResult::error(format!("Run {run_id} not found"))),
+            Err(e) => Ok(ToolResult::error(format!("Failed to read run: {e}"))),
+        }
+    }
+}
+
+/// Cancel a background Run by run_id.
+pub struct CancelRunTool;
+
+impl Tool for CancelRunTool {
+    fn name(&self) -> &str {
+        "cancel_run"
+    }
+    fn description(&self) -> &str {
+        "Cancel a background Run by run_id. Use when a task is no longer needed or going wrong."
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type":"object",
+            "properties":{"run_id":{"type":"string"}},
+            "required":["run_id"]
+        })
+    }
+    fn execute<'a>(
+        &'a self,
+        params: ToolParameters,
+    ) -> futures::future::BoxFuture<'a, echo_agent::error::Result<ToolResult>> {
+        Box::pin(async move { Self::do_cancel(params).await })
+    }
+    fn execute_with_context<'a>(
+        &'a self,
+        params: ToolParameters,
+        _ctx: &'a echo_core::tools::ToolContext,
+    ) -> futures::future::BoxFuture<'a, echo_agent::error::Result<ToolResult>> {
+        Box::pin(async move { Self::do_cancel(params).await })
+    }
+}
+
+impl CancelRunTool {
+    async fn do_cancel(params: ToolParameters) -> echo_agent::error::Result<ToolResult> {
+        let run_id = match params.get("run_id").and_then(|v| v.as_str()) {
+            Some(id) => id.to_string(),
+            None => return Ok(ToolResult::error("run_id is required")),
+        };
+        let res = match crate::chat_resources::current_chat_resources() {
+            Some(r) => r,
+            None => return Ok(ToolResult::error("cancel_run requires an active chat turn")),
+        };
+        let store = match res.store.clone() {
+            Some(s) => s,
+            None => return Ok(ToolResult::error("no TaskRuntimeStore available")),
+        };
+        let cancelled = store.cancel_run(&run_id);
+        Ok(ToolResult::success(
+            serde_json::json!({"run_id": run_id, "cancelled": cancelled}).to_string(),
+        ))
+    }
+}
+
 // ── task_update ───────────────────────────────────────────────────────────
 
 pub struct TaskUpdateTool {

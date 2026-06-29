@@ -371,6 +371,10 @@ pub async fn resume_task_run(
             Some(trace_sink),
             &run_id_for_task,
             cancel,
+            // B5.1: keep this GUI command's pre-B5.1 fire-and-forget memory write
+            // (resume_task_run / execute_task_run are the two callers that
+            // historically depended on execute_run's internal write).
+            echo_agent_app_core::tasks::task_runtime::MemoryPolicy::FireAndForget,
         )
         .await;
         run_cancel_tokens.remove(&format!("__run__:{run_id_for_task}"));
@@ -526,6 +530,10 @@ pub async fn execute_task_run(
             Some(trace_sink),
             &run_id_for_task,
             cancel,
+            // B5.1: keep this GUI command's pre-B5.1 fire-and-forget memory write
+            // (resume_task_run / execute_task_run are the two callers that
+            // historically depended on execute_run's internal write).
+            echo_agent_app_core::tasks::task_runtime::MemoryPolicy::FireAndForget,
         )
         .await;
         run_cancel_tokens.remove(&format!("__run__:{run_id_for_task}"));

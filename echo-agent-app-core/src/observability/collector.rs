@@ -48,6 +48,23 @@ impl TraceCollector {
         }
     }
 
+    /// Non-async variant of [`record`] for callers that cannot `.await` (e.g.
+    /// the GUI's sync `ChatSink::on_agent_event`, B4). Same broadcast + store,
+    /// but store uses `try_write` — if the lock is contended it falls back to
+    /// broadcast-only (the event still reaches live subscribers + is dropped
+    /// from history). Acceptable for fire-and-forget observability.
+    pub fn record_sync(&self, session_id: &str, event: TraceEvent) {
+        let _ = self.tx.send(event.clone());
+        if let Ok(mut events) = self.events.try_write() {
+            let session_events = events.entry(session_id.to_string()).or_default();
+            session_events.push(event);
+            if session_events.len() > self.max_events_per_session {
+                let excess = session_events.len() - self.max_events_per_session;
+                session_events.drain(0..excess);
+            }
+        }
+    }
+
     /// 订阅实时事件流。
     pub fn subscribe(&self) -> broadcast::Receiver<TraceEvent> {
         self.tx.subscribe()

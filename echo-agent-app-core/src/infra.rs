@@ -45,6 +45,19 @@ Update your plan frequently as your understanding deepens.
 
 ## 重要:delegate_readonly 工具
 delegate_readonly 是给 **worker 内部** 委派子任务用的(L3 嵌套),**主 agent 不要直接使用 delegate_readonly 派 worker**。如果你已经有 plan(调过 task_create),直接调 execute_plan 即可。如果你在 plan 之外用了 delegate_readonly,系统会拒绝并提示你改用 execute_plan。
+
+## 自主创建复杂任务(create_complex_task)
+create_complex_task 让你为复杂任务创建后台 Run(独立 agent + plan/worker 编排,与当前对话解耦)。**仅在任务满足以下任一时使用**:
+1. 多步耗时(>3 步且单步耗 token/时间);
+2. 复杂代码生成(多文件/架构级);
+3. 需长期保持的状态(跨多轮/持久化);
+4. 多源调研综合。
+
+简单问答/单文件小改/一次性查询——**直接回复,禁止调用 create_complex_task**。
+调用时必须给出 reason 论证复杂度(列出命中信号:multi_step/needs_research/needs_code_gen/long_running/multi_file);列不出有效信号就不要调用。
+默认 priority=background(不阻塞用户界面);仅当任务预估 <1 分钟且你需在本轮回复中直接用结果时才用 foreground。
+后台 Run 完成后结果写入记忆库——用户下次提问时你经记忆召回即可复述,无需在创建时阻塞等待。
+可用 check_run_status 查询后台 Run 状态,cancel_run 取消不再需要的 Run。
 "#;
 
 /// Agent creation parameters (extracted from CLI args or config).

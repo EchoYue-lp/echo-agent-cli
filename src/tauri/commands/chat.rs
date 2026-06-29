@@ -6,22 +6,17 @@
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
 use chrono::Utc;
-use echo_agent::agent::{Agent, CancellationToken};
+use echo_agent::agent::CancellationToken;
 use echo_agent::human_loop::{HumanLoopProvider, HumanLoopRequest, HumanLoopResponse};
 use echo_agent::prelude::AgentEvent;
-use echo_agent_app_core::chat_driver::{ChatSink, launch_unified_run_core};
+use echo_agent_app_core::chat_driver::ChatSink;
 use echo_agent_app_core::observability::{TraceEvent, TraceKind};
 use echo_agent_app_core::tasks::conversation_runtime::ConversationRuntimeEvent;
-use echo_agent_app_core::tasks::task_runtime::{
-    AttendedMode, ExecutionPolicy, InteractionMode, TaskRouteDecision, TaskRouteKind,
-    TaskRunStatus, WorkerTraceEvent, WorkerTraceEventKind,
-};
-use futures::StreamExt;
+use echo_agent_app_core::tasks::task_runtime::{WorkerTraceEvent, WorkerTraceEventKind};
 use futures::future::BoxFuture;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, LazyLock};
 use tauri::Emitter;
 use tokio::sync::{Mutex, oneshot};
@@ -35,6 +30,15 @@ fn compute_content_hash(content: &str) -> String {
 }
 
 /// Emit a unified conversation runtime event to the frontend.
+///
+/// NOTE (B4): the only callers were the (now-removed) complex-path functions
+/// (`route_complex_task` / inline normal match). The unified `drive_chat` flow
+/// surfaces worker/run events via the `TauriChatSink` worker-trace + chat-event
+/// paths instead. This is kept (not deleted) because the frontend's
+/// `conversation://event` listener + history-replay still reference these event
+/// kinds; re-wiring it into the unified path (or confirming it's safe to drop)
+/// is tracked for B5. Marked dead_code to keep the build clean meanwhile.
+#[allow(dead_code)]
 fn emit_conversation_event(
     app: &tauri::AppHandle,
     event: &echo_agent_app_core::tasks::conversation_runtime::ConversationRuntimeEvent,
@@ -507,115 +511,12 @@ pub async fn send_chat_message(
         }));
     }
 
-    // ── Complex-task router ────────────────────────────────────────────
-    // Classify the input. If it looks like a complex, multi-step task, create
-    // a TaskRuntime run and generate a structured plan instead of streaming a
-    // normal chat. Missing conversation_id is handled by route_complex_task via
-    // a message-scoped run id so Welcome-screen first turns still route.
-    //
-    let interaction_mode_raw = state
-        .app_state
-        .tasks
-        .interaction_mode
-        .load(Ordering::Relaxed);
-    let permission_mode = state.app_state.config.permission_mode.read().await.clone();
-    let execution_policy = ExecutionPolicy::from_raw(interaction_mode_raw, &permission_mode);
-
-    if execution_policy.should_route_runtime() {
-        // (stage4 P4.1) router reads cache_user_id from the single source itself;
-        // only the llm_client is needed here.
-        let route_llm = agent_handle.read(|a| a.llm_client().cloned()).await;
-        let route_feedback = state.app_state.tasks.route_feedback.read().await.clone();
-        let route_decision = echo_agent_app_core::tasks::task_runtime::route_message_with_feedback(
-            route_llm,
-            &message,
-            execution_policy.interaction_mode,
-            &route_feedback,
-        )
-        .await;
-        // ── Record route decision for long-term learning ──────────────
-        {
-            use echo_agent_app_core::tasks::task_runtime::{
-                RouteDecisionRecord, append_route_record,
-            };
-            let record = RouteDecisionRecord {
-                message_hash: compute_content_hash(&message),
-                message_text: Some(message.clone()),
-                route: route_decision.route,
-                confidence: route_decision.confidence,
-                matched_feedback_pattern: route_decision.matched_feedback_pattern.clone(),
-                suggested_workers: route_decision.suggested_workers.clone(),
-                actual_workers: None,
-                final_run_status: None,
-                user_correction: None,
-                created_at: chrono::Utc::now().to_rfc3339(),
-            };
-            let _ = append_route_record(&record);
-        }
-        if execution_policy.interaction_mode == InteractionMode::Auto
-            && let Some(pattern) = route_decision.matched_feedback_pattern.as_deref()
-        {
-            let mut feedback = state.app_state.tasks.route_feedback.write().await;
-            if echo_agent_app_core::tasks::task_runtime::record_route_feedback_pattern(
-                pattern,
-                &mut feedback,
-            ) && let Err(error) =
-                echo_agent_app_core::tasks::task_runtime::save_route_feedback_rules(&feedback)
-            {
-                tracing::warn!(%error, "failed to persist route feedback hit stats");
-            }
-        }
-        if route_decision.route.should_create_runtime_run() {
-            let route_label = route_decision.route.as_str();
-            // Try to route to TaskRuntime. If routing/planning fails after the
-            // router has selected a runtime path, surface that failure instead
-            // of silently falling back to normal chat. Silent fallback re-enters
-            // the legacy agent-tool path and makes Task/Auto mode look ignored.
-            match route_complex_task(
-                state.inner(),
-                app.clone(),
-                message.clone(),
-                multimodal_message.clone(),
-                attachment_refs.clone(),
-                conversation_id.clone(),
-                message_key.clone(),
-                execution_policy,
-                route_decision,
-            )
-            .await
-            {
-                Ok(result) => return Ok(result),
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        route = route_label,
-                        "complex-task routing failed"
-                    );
-                    emit_chat_event(
-                        &app,
-                        &ChatEvent::Error {
-                            message: format!(
-                                "TaskRuntime 路由失败，已停止而不是回落到普通 chat：{}",
-                                e
-                            ),
-                        },
-                        &message_key,
-                        &conversation_id,
-                    );
-                    return Ok(serde_json::json!({
-                        "kind": "complex_task_error",
-                        "route": route_label,
-                        "error": e.to_string(),
-                    }));
-                }
-            }
-        }
-    }
-
-    let agent_inner = agent_handle.inner().clone();
     let cancel_token = CancellationToken::new();
 
-    // Register cancel token
+    // Register cancel token so `cancel_chat(message_key)` (the GUI "stop"
+    // button) can fire it for this chat turn. Background runs created by the
+    // agent via `create_complex_task` use an INDEPENDENT token (spec §5.5) —
+    // firing this one cancels the inline chat reply, not the background run.
     state
         .app_state
         .session
@@ -638,450 +539,128 @@ pub async fn send_chat_message(
         })
         .await;
 
-    let app_handle = app.clone();
-    let cancel_token_for_task = cancel_token.clone();
-    let cancel_tokens = state.app_state.session.cancel_token.clone();
-    let cleanup_key = message_key.clone();
-    let cleanup_agent = agent_handle.clone();
-    let event_message_key = message_key.clone();
-    let event_conversation_id = conversation_id.clone();
+    // Capture cache-diagnostic fingerprints BEFORE streaming (same as the
+    // pre-B4 inline normal path): they ride along in the sink so the unified
+    // `agent_event_to_chat_event` records usage/trace with cache diagnostics
+    // (B4.1 — fixes the drift where complex runs dropped observability).
     let trace_collector = state.app_state.trace.collector.clone();
     let usage_store = state.app_state.tasks.runtime.clone();
     let trace_session_id = conversation_id
         .clone()
-        .unwrap_or_else(|| event_message_key.clone());
+        .unwrap_or_else(|| message_key.clone());
+    let (sys_prompt_hash, tools_hash, cwd_hash, provider_name) = agent_handle
+        .read(|agent| {
+            let sys_prompt_hash = compute_content_hash(agent.config().get_system_prompt());
+            let mut tool_names: Vec<String> = agent.tool_names();
+            tool_names.sort();
+            let tools_hash = compute_content_hash(&tool_names.join(","));
+            let cwd_hash = std::env::current_dir()
+                .ok()
+                .map(|p| compute_content_hash(&p.display().to_string()));
+            let model_name = agent.config().get_model_name().to_string();
+            let provider_name = model_name.split('-').next().map(|s| s.to_string());
+            (sys_prompt_hash, tools_hash, cwd_hash, provider_name)
+        })
+        .await;
 
+    // Build the GUI sink + per-turn resources, then drive the whole turn
+    // (normal reply AND any complex runs the agent autonomously spins up via
+    // create_complex_task) through the single shared `drive_chat` entry. The
+    // agent decides complexity itself (Phase B3) — no code route pre-judgment.
+    let sink = std::sync::Arc::new(TauriChatSink {
+        app: app.clone(),
+        message_key: message_key.clone(),
+        conversation_id: conversation_id.clone(),
+        trace_session_id: trace_session_id.clone(),
+        trace_collector: trace_collector.clone(),
+        usage_store: usage_store.clone(),
+        run_id: message_key.clone(),
+        route: "normal_chat".to_string(),
+        sys_prompt_hash,
+        tools_hash,
+        cwd_hash,
+        provider_name,
+    });
+    // Signal the inline run lifecycle (running → terminal) so the GUI shows
+    // the spinner / terminal badge for the chat reply itself.
+    sink.on_run_status("running");
+
+    // B4.3 (spec §8): per-turn mode hint. Chat → forbid create_complex_task;
+    // Task → lean towards it; Auto → no hint (pure agent autonomy). Pure
+    // prompt (prepended to the user text by drive_chat) — no code route branch.
+    let mode_hint = {
+        use echo_agent_app_core::tasks::task_runtime::InteractionMode;
+        let raw = state
+            .app_state
+            .tasks
+            .interaction_mode
+            .load(std::sync::atomic::Ordering::Relaxed);
+        match InteractionMode::from_u8(raw) {
+            InteractionMode::Chat => Some(
+                "Chat — this is a simple conversation. Do NOT call \
+                 create_complex_task; reply directly in this turn."
+                    .to_string(),
+            ),
+            InteractionMode::Task => Some(
+                "Task — the user expects involved work. When the request is \
+                 genuinely complex (multi-step / multi-file / long research), \
+                 prefer create_complex_task over a single inline reply."
+                    .to_string(),
+            ),
+            InteractionMode::Auto => None,
+        }
+    };
+
+    let res = std::sync::Arc::new(echo_agent_app_core::chat_resources::ChatResources {
+        pool: state.app_state.connection.pool.clone(),
+        store: state.app_state.tasks.runtime.clone(),
+        sink: sink.clone(),
+        conv_id: conversation_id.clone(),
+        root_message_id: message_key.clone(),
+        attachments: attachment_refs.clone(),
+        cancel: cancel_token.clone(),
+        mode_hint,
+        // B5.1: wire the memory layer so create_complex_task's autonomous runs
+        // block-write their completion memory (recall closure). None when the
+        // review/memory subsystem isn't initialized (write becomes a no-op).
+        layer_manager: state
+            .app_state
+            .review_integration
+            .as_ref()
+            .map(|ri| std::sync::Arc::new(ri.create_layer_manager())),
+    });
+
+    let agent_handle_clone = agent_handle.clone();
+    let cleanup_tokens = state.app_state.session.cancel_token.clone();
+    let cleanup_key = message_key.clone();
     tokio::spawn(async move {
         let start = std::time::Instant::now();
-        let mut terminal_status = "completed".to_string();
-
-        emit_chat_event(
-            &app_handle,
-            &ChatEvent::RunStatus {
-                status: "running".to_string(),
-            },
-            &event_message_key,
-            &event_conversation_id,
-        );
-        emit_worker_trace_event(
-            &app_handle,
-            chat_trace_event(
-                &event_message_key,
-                WorkerTraceEventKind::RunStarted,
-                serde_json::json!({
-                    "conversation_id": event_conversation_id,
-                    "mode": "chat"
-                }),
-            ),
-        );
-        emit_worker_trace_event(
-            &app_handle,
-            chat_trace_event(
-                &event_message_key,
-                WorkerTraceEventKind::WorkerStarted,
-                serde_json::json!({
-                    "role": "assistant"
-                }),
-            ),
-        );
-
-        // ReactAgent serializes execution internally via execution_mutex.
-        //
-        // The RwLock read guard is held for the stream's lifetime because
-        // `chat_stream_with_cancel` borrows from the agent. This is safe
-        // because: (1) with AgentPool, each conversation has its own agent
-        // so no cross-conversation contention; (2) writes only happen via
-        // `write_async` for config changes, which are rare during streaming.
-        let agent = agent_inner.read().await;
-
-        // ── Capture cache-diagnostic fingerprints before streaming ──
-        let sys_prompt_hash = compute_content_hash(agent.config().get_system_prompt());
-        let tools_hash = {
-            let mut names: Vec<String> = agent.tool_names();
-            names.sort();
-            compute_content_hash(&names.join(","))
-        };
-        let cwd_hash = std::env::current_dir()
-            .ok()
-            .map(|p| compute_content_hash(&p.display().to_string()));
-        // Infer provider from model name prefix (e.g. "deepseek-v4-pro" → "deepseek")
-        let model_name = agent.config().get_model_name().to_string();
-        let provider_name = model_name.split('-').next().map(|s| s.to_string());
-
-        // Multimodal path: when attachments are present, send the pre-built
-        // Message (images/files) via the message+cancel entry point added in
-        // 2A. Otherwise keep the plain `&str` path (zero overhead, no change
-        // to the dominant text-only flow).
-        let stream_result = if let Some(msg) = multimodal_message.as_ref() {
-            agent
-                .chat_stream_message_with_cancel(msg.clone(), cancel_token_for_task)
-                .await
+        // Multimodal: drive_chat takes Option<&Message>; pass the pre-built one
+        // (images/files) so the agent sees attachments this turn. Background
+        // runs created by create_complex_task pick up attachments via
+        // ChatResources.attachments (already bound above).
+        let multimodal_ref = multimodal_message.as_ref();
+        let outcome = echo_agent_app_core::chat_driver::drive_chat(
+            &agent_handle_clone,
+            &message,
+            multimodal_ref,
+            res,
+        )
+        .await;
+        let terminal_status = if outcome.is_ok() {
+            "completed"
         } else {
-            agent
-                .chat_stream_with_cancel(&message, cancel_token_for_task)
-                .await
+            "failed"
         };
-
-        match stream_result {
-            Ok(mut stream) => {
-                while let Some(event_result) = stream.next().await {
-                    match event_result {
-                        Ok(event) => {
-                            let chat_event = match event {
-                                AgentEvent::Token(data) => {
-                                    emit_worker_trace_event(
-                                        &app_handle,
-                                        chat_trace_event(
-                                            &event_message_key,
-                                            WorkerTraceEventKind::WorkerTokenDelta,
-                                            serde_json::json!({ "content": data }),
-                                        ),
-                                    );
-                                    ChatEvent::Token { data }
-                                }
-                                AgentEvent::ThinkStart => {
-                                    emit_chat_event(
-                                        &app_handle,
-                                        &ChatEvent::RunStatus {
-                                            status: "thinking".to_string(),
-                                        },
-                                        &event_message_key,
-                                        &event_conversation_id,
-                                    );
-                                    emit_worker_trace_event(
-                                        &app_handle,
-                                        chat_trace_event(
-                                            &event_message_key,
-                                            WorkerTraceEventKind::WorkerThinkingStart,
-                                            serde_json::json!({}),
-                                        ),
-                                    );
-                                    ChatEvent::ThinkingStart
-                                }
-                                AgentEvent::ThinkEnd {
-                                    prompt_tokens,
-                                    completion_tokens,
-                                } => {
-                                    emit_worker_trace_event(
-                                        &app_handle,
-                                        chat_trace_event(
-                                            &event_message_key,
-                                            WorkerTraceEventKind::WorkerThinkingEnd,
-                                            serde_json::json!({
-                                                "prompt_tokens": prompt_tokens,
-                                                "completion_tokens": completion_tokens
-                                            }),
-                                        ),
-                                    );
-                                    ChatEvent::ThinkingEnd {
-                                        prompt_tokens,
-                                        completion_tokens,
-                                    }
-                                }
-                                AgentEvent::LlmUsage {
-                                    model,
-                                    prompt_tokens,
-                                    completion_tokens,
-                                    total_tokens,
-                                    cached_prompt_tokens,
-                                    cache_creation_prompt_tokens,
-                                    usage_reported,
-                                } => {
-                                    trace_collector
-                                        .record(
-                                            &trace_session_id,
-                                            TraceEvent {
-                                                timestamp: Utc::now(),
-                                                kind: TraceKind::LlmCall {
-                                                    model: model.clone(),
-                                                    input_tokens: prompt_tokens as u64,
-                                                    output_tokens: completion_tokens as u64,
-                                                    cached_input_tokens: cached_prompt_tokens
-                                                        as u64,
-                                                    cache_creation_input_tokens:
-                                                        cache_creation_prompt_tokens as u64,
-                                                    usage_reported,
-                                                    system_prompt_hash: Some(
-                                                        sys_prompt_hash.clone(),
-                                                    ),
-                                                    tools_schema_hash: Some(tools_hash.clone()),
-                                                    cwd_hash: cwd_hash.clone(),
-                                                    worker_prompt_hash: None,
-                                                    provider: provider_name.clone(),
-                                                },
-                                                duration_ms: None,
-                                                metadata: HashMap::from([
-                                                    (
-                                                        "message_key".to_string(),
-                                                        serde_json::json!(
-                                                            event_message_key.clone()
-                                                        ),
-                                                    ),
-                                                    (
-                                                        "total_tokens".to_string(),
-                                                        serde_json::json!(total_tokens),
-                                                    ),
-                                                ]),
-                                            },
-                                        )
-                                        .await;
-                                    // Persist usage to SQLite for trend analysis
-                                    if let Some(ref store) = usage_store {
-                                        let record =
-                                            echo_agent_app_core::tasks::task_runtime::UsageRecord {
-                                                id: uuid::Uuid::new_v4().to_string(),
-                                                session_id: trace_session_id.clone(),
-                                                run_id: None,
-                                                worker_id: Some("main".to_string()),
-                                                model: model.clone(),
-                                                provider: provider_name.clone(),
-                                                route_kind: Some("normal_chat".to_string()),
-                                                input_tokens: prompt_tokens as u64,
-                                                output_tokens: completion_tokens as u64,
-                                                cached_input_tokens: cached_prompt_tokens as u64,
-                                                cache_creation_input_tokens:
-                                                    cache_creation_prompt_tokens as u64,
-                                                usage_reported,
-                                                system_prompt_hash: Some(sys_prompt_hash.clone()),
-                                                tools_schema_hash: Some(tools_hash.clone()),
-                                                cwd_hash: cwd_hash.clone(),
-                                                worker_prompt_hash: None,
-                                                created_at: chrono::Utc::now(),
-                                            };
-                                        let _ = store.insert_usage_record(&record);
-                                    }
-                                    emit_worker_trace_event(
-                                        &app_handle,
-                                        chat_trace_event(
-                                            &event_message_key,
-                                            WorkerTraceEventKind::WorkerLlmUsage,
-                                            serde_json::json!({
-                                                "model": model.clone(),
-                                                "prompt_tokens": prompt_tokens,
-                                                "completion_tokens": completion_tokens,
-                                                "total_tokens": total_tokens,
-                                                "cached_prompt_tokens": cached_prompt_tokens,
-                                                "cache_creation_prompt_tokens": cache_creation_prompt_tokens,
-                                                "usage_reported": usage_reported
-                                            }),
-                                        ),
-                                    );
-                                    ChatEvent::LlmUsage {
-                                        model: model.clone(),
-                                        prompt_tokens,
-                                        completion_tokens,
-                                        total_tokens,
-                                        cached_prompt_tokens,
-                                        cache_creation_prompt_tokens,
-                                        usage_reported,
-                                    }
-                                }
-                                AgentEvent::ToolCall { name, args } => {
-                                    emit_chat_event(
-                                        &app_handle,
-                                        &ChatEvent::RunStatus {
-                                            status: "using_tool".to_string(),
-                                        },
-                                        &event_message_key,
-                                        &event_conversation_id,
-                                    );
-                                    emit_worker_trace_event(
-                                        &app_handle,
-                                        chat_trace_event(
-                                            &event_message_key,
-                                            WorkerTraceEventKind::WorkerToolStart,
-                                            serde_json::json!({
-                                                "name": name,
-                                                "args": args
-                                            }),
-                                        ),
-                                    );
-                                    ChatEvent::ToolStart { name, args }
-                                }
-                                AgentEvent::ToolResult { name, output } => {
-                                    emit_worker_trace_event(
-                                        &app_handle,
-                                        chat_trace_event(
-                                            &event_message_key,
-                                            WorkerTraceEventKind::WorkerToolResult,
-                                            serde_json::json!({
-                                                "name": name,
-                                                "result": output,
-                                                "success": true
-                                            }),
-                                        ),
-                                    );
-                                    ChatEvent::ToolResult {
-                                        name,
-                                        result: output,
-                                        success: true,
-                                    }
-                                }
-                                AgentEvent::ToolError { name, error } => {
-                                    emit_worker_trace_event(
-                                        &app_handle,
-                                        chat_trace_event(
-                                            &event_message_key,
-                                            WorkerTraceEventKind::WorkerToolResult,
-                                            serde_json::json!({
-                                                "name": name,
-                                                "result": error,
-                                                "success": false
-                                            }),
-                                        ),
-                                    );
-                                    ChatEvent::ToolResult {
-                                        name,
-                                        result: error,
-                                        success: false,
-                                    }
-                                }
-                                AgentEvent::ToolBatchStart { tool_count } => {
-                                    ChatEvent::ToolBatchStart { tool_count }
-                                }
-                                AgentEvent::ToolBatchEnd => ChatEvent::ToolBatchEnd,
-                                AgentEvent::Chart { spec } => ChatEvent::Chart { spec },
-                                AgentEvent::FinalAnswer(data) => {
-                                    terminal_status = "completed".to_string();
-                                    if let Some(ref cid) = event_conversation_id {
-                                        emit_conversation_event(
-                                            &app_handle,
-                                            &ConversationRuntimeEvent::FinalAnswer {
-                                                content: data.clone(),
-                                                usage_summary: None,
-                                            },
-                                            cid,
-                                            usage_store.as_ref(),
-                                        );
-                                    }
-                                    emit_worker_trace_event(
-                                        &app_handle,
-                                        chat_trace_event(
-                                            &event_message_key,
-                                            WorkerTraceEventKind::WorkerCompleted,
-                                            serde_json::json!({}),
-                                        ),
-                                    );
-                                    ChatEvent::FinalAnswer { data }
-                                }
-                                AgentEvent::Cancelled => {
-                                    terminal_status = "cancelled".to_string();
-                                    emit_worker_trace_event(
-                                        &app_handle,
-                                        chat_trace_event(
-                                            &event_message_key,
-                                            WorkerTraceEventKind::WorkerCancelled,
-                                            serde_json::json!({}),
-                                        ),
-                                    );
-                                    ChatEvent::Cancelled
-                                }
-                                AgentEvent::Error { source, message } => {
-                                    terminal_status = "failed".to_string();
-                                    if let Some(ref cid) = event_conversation_id {
-                                        emit_conversation_event(
-                                            &app_handle,
-                                            &ConversationRuntimeEvent::Error {
-                                                stage: source.clone(),
-                                                message: message.clone(),
-                                                worker_id: None,
-                                            },
-                                            cid,
-                                            usage_store.as_ref(),
-                                        );
-                                    }
-                                    emit_worker_trace_event(
-                                        &app_handle,
-                                        chat_trace_event(
-                                            &event_message_key,
-                                            WorkerTraceEventKind::WorkerFailed,
-                                            serde_json::json!({
-                                                "source": source,
-                                                "message": message
-                                            }),
-                                        ),
-                                    );
-                                    ChatEvent::Error {
-                                        message: format!("{source}: {message}"),
-                                    }
-                                }
-                                _ => continue,
-                            };
-
-                            if !emit_chat_event(
-                                &app_handle,
-                                &chat_event,
-                                &event_message_key,
-                                &event_conversation_id,
-                            ) {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            terminal_status = "failed".to_string();
-                            let _ = emit_chat_event(
-                                &app_handle,
-                                &ChatEvent::Error {
-                                    message: e.to_string(),
-                                },
-                                &event_message_key,
-                                &event_conversation_id,
-                            );
-                            break;
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                terminal_status = "failed".to_string();
-                let _ = emit_chat_event(
-                    &app_handle,
-                    &ChatEvent::Error {
-                        message: e.to_string(),
-                    },
-                    &event_message_key,
-                    &event_conversation_id,
-                );
-            }
+        if let Err(e) = &outcome {
+            tracing::warn!(error = %e, "drive_chat chat turn errored");
         }
-
-        // Emit done event
-        let terminal_trace_kind = match terminal_status.as_str() {
-            "completed" => WorkerTraceEventKind::RunCompleted,
-            "cancelled" => WorkerTraceEventKind::RunCancelled,
-            "failed" => WorkerTraceEventKind::RunFailed,
-            _ => WorkerTraceEventKind::RunStatusChanged,
-        };
-        emit_worker_trace_event(
-            &app_handle,
-            chat_trace_event(
-                &event_message_key,
-                terminal_trace_kind,
-                serde_json::json!({
-                    "status": terminal_status.clone()
-                }),
-            ),
-        );
-        let _ = emit_chat_event(
-            &app_handle,
-            &ChatEvent::RunStatus {
-                status: terminal_status,
-            },
-            &event_message_key,
-            &event_conversation_id,
-        );
-        let _ = emit_chat_event(
-            &app_handle,
-            &ChatEvent::Done,
-            &event_message_key,
-            &event_conversation_id,
-        );
-
-        // Cleanup: restore an empty dispatcher (NOT the REPL-laden runtime
-        // dispatcher) so the agent doesn't fall back to terminal-blocking
-        // approval between messages.
-        cancel_tokens.remove(&cleanup_key);
-        cleanup_agent
+        // Signal terminal status for the inline chat run, then clean up the
+        // turn-scoped cancel token + restore an empty HITL dispatcher so the
+        // agent doesn't fall back to terminal-blocking approval between turns.
+        sink.on_run_status(terminal_status);
+        cleanup_tokens.remove(&cleanup_key);
+        agent_handle_clone
             .write_async(|agent| {
                 Box::pin(async move {
                     let empty = Arc::new(echo_agent_app_core::hitl::HitlDispatcher::new());
@@ -1089,10 +668,10 @@ pub async fn send_chat_message(
                 })
             })
             .await;
-
         tracing::info!(
             elapsed_ms = start.elapsed().as_millis() as u64,
-            "Tauri chat stream finished"
+            status = %terminal_status,
+            "Tauri chat turn finished (drive_chat)"
         );
     });
 
@@ -1217,127 +796,13 @@ pub async fn send_selection_response(
     }
 }
 
-// ══════════════════════════════════════════════════════════════════════════
-// Complex-task router (PR 2)
-// ══════════════════════════════════════════════════════════════════════════
-
-/// Handle a complex input by creating a TaskRuntime run and dispatching it to
-/// the unified launcher. All complex routes (ParallelReadonlyDelegation,
-/// ComplexRuntime, PlanOnly) converge here.
+/// GUI `ChatSink`: bridges the shared `drive_chat` stream to the Tauri frontend
+/// by emitting `ChatEvent`s + worker trace events.
 ///
-/// The main agent runs a ReAct loop (with execute_plan tool for plan →
-/// parallel execution), and events are streamed to chat://event.
-async fn route_complex_task(
-    state: &TauriState,
-    app: tauri::AppHandle,
-    message: String,
-    multimodal: Option<echo_core::llm::types::Message>,
-    attachment_refs: Vec<echo_agent_app_core::attachments::AttachmentRef>,
-    conversation_id: Option<String>,
-    message_key: String,
-    execution_policy: ExecutionPolicy,
-    route_decision: TaskRouteDecision,
-) -> Result<serde_json::Value, anyhow::Error> {
-    let store = state
-        .app_state
-        .tasks
-        .runtime
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("TaskRuntime store not initialized"))?
-        .clone();
-
-    let conv_id = conversation_id
-        .clone()
-        .unwrap_or_else(|| format!("message:{message_key}"));
-
-    // 1. Create the run in Pending.
-    let run_id = uuid::Uuid::new_v4().to_string();
-    store.create_run(
-        &run_id,
-        "default", // workspace_id — resolved properly in PR 6 workspace wiring
-        &conv_id,
-        "", // root_message_id — linked in PR 6
-        route_decision.classification.inferred_profile,
-        &message,
-        route_decision.route.as_str(),
-        AttendedMode::Attended,
-    )?;
-
-    // 2. Transition Pending → Running (valid in 6-state machine) and launch
-    //    unified run. All routes share the same launcher — the route parameter
-    //    controls execute_plan tool behavior (e.g. ComplexRuntime approval).
-    store.transition_run(&run_id, TaskRunStatus::Running)?;
-    let cancel = echo_agent::agent::CancellationToken::new();
-
-    // G2 fix: Register the cancel token in session.cancel_token[message_key]
-    // so that cancel_chat(message_key) — the command the GUI "stop" button
-    // calls — can fire it. Without this, cancel_chat finds nothing for complex
-    // runs (the token was only in run_cancel_tokens["__run__:{run_id}"], a
-    // separate map), so subagents keep running after the user hits stop.
-    // launch_unified_run derives a child_token from this parent, so firing
-    // here propagates to the main agent stream + all workers.
-    state
-        .app_state
-        .session
-        .cancel_token
-        .insert(message_key.clone(), cancel.clone());
-
-    launch_unified_run(
-        app.clone(),
-        state,
-        &run_id,
-        &message_key,
-        conversation_id.clone(),
-        &message,
-        multimodal,
-        attachment_refs,
-        route_decision.route,
-        cancel,
-    )
-    .await?;
-
-    // 3. Emit unified conversation event
-    if let Some(ref cid) = conversation_id {
-        use echo_agent_app_core::tasks::conversation_runtime::ConversationRuntimeEvent;
-        let store_ref = state.app_state.tasks.runtime.as_ref();
-        emit_conversation_event(
-            &app,
-            &ConversationRuntimeEvent::RouteDecision {
-                route: route_decision.route.as_str().to_string(),
-                confidence: route_decision.confidence,
-                reason: route_decision.reason.clone(),
-                matched_feedback_pattern: route_decision.matched_feedback_pattern.clone(),
-                suggested_workers: route_decision.suggested_workers.clone(),
-                interaction_mode: execution_policy.interaction_mode.as_str().to_string(),
-            },
-            cid,
-            store_ref,
-        );
-    }
-
-    tracing::info!(
-        run_id = %run_id,
-        route = ?route_decision.route,
-        "task routed to unified run launcher"
-    );
-
-    Ok(serde_json::json!({
-        "success": true,
-        "run_id": run_id,
-        "status": "running",
-        "mode": "unified_run",
-        "route": route_decision.route,
-    }))
-}
-
-/// GUI `ChatSink`: bridges the shared `drive_chat`/`launch_unified_run_core`
-/// stream to the Tauri frontend by emitting `ChatEvent`s + worker trace events.
-///
-/// This is the TUI-equivalent of `agent_event_to_chat_event` + the GUI emit
-/// sequence, packaged as a `ChatSink` so the GUI complex run can drive through
-/// the same app-core core (`launch_unified_run_core`) as TUI/channel. Each
-/// method mirrors the exact emit the standalone `launch_unified_run` did
-/// before this refactor — behavior is preserved (AGENTS.md: 行为不变).
+/// This is the GUI equivalent of the TUI/channel `ChatSink`: the whole chat
+/// turn (normal reply + any complex runs the agent autonomously spins up via
+/// `create_complex_task`) flows through one unified `drive_chat`, and this sink
+/// turns each `AgentEvent` into the exact GUI emit sequence (`agent_event_to_chat_event`).
 struct TauriChatSink {
     app: tauri::AppHandle,
     message_key: String,
@@ -1347,6 +812,14 @@ struct TauriChatSink {
     usage_store: Option<std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
     run_id: String,
     route: String,
+    // Cache-diagnostic fingerprints captured before streaming starts, so the
+    // unified `agent_event_to_chat_event` can record usage/trace exactly like
+    // the (now-removed) inline normal-chat match did (B4.1/B4.2 — fixes the
+    // drift where complex runs dropped usage/trace observability).
+    sys_prompt_hash: String,
+    tools_hash: String,
+    cwd_hash: Option<String>,
+    provider_name: Option<String>,
 }
 
 impl echo_agent_app_core::chat_driver::ChatSink for TauriChatSink {
@@ -1360,6 +833,11 @@ impl echo_agent_app_core::chat_driver::ChatSink for TauriChatSink {
             &self.trace_collector,
             self.usage_store.as_ref(),
             &self.run_id,
+            &self.sys_prompt_hash,
+            &self.tools_hash,
+            &self.cwd_hash,
+            &self.provider_name,
+            &self.route,
         );
         if let Some(ce) = chat_event {
             emit_chat_event(&self.app, &ce, &self.message_key, &self.conversation_id)
@@ -1455,164 +933,35 @@ impl echo_agent_app_core::chat_driver::ChatSink for TauriChatSink {
     }
 }
 
-/// 统一启动器:所有复杂路由(ParallelReadonlyDelegation/ComplexRuntime/PlanOnly)
-/// 都走这里。主 agent ReAct(pool 复用)+ execute_plan 工具(L1→L2)。
-/// 替代 launch_main_agent_react + launch_task_run_execution(spec §3.1.2)。
-#[allow(clippy::too_many_arguments)] // app/state/identity/conversation/routing/cancel all required
-async fn launch_unified_run(
-    app: tauri::AppHandle,
-    state: &TauriState,
-    run_id: &str,
-    message_key: &str,
-    conversation_id: Option<String>,
-    goal: &str,
-    multimodal: Option<echo_core::llm::types::Message>,
-    attachment_refs: Vec<echo_agent_app_core::attachments::AttachmentRef>,
-    route: TaskRouteKind,
-    parent_cancel: CancellationToken,
-) -> Result<(), anyhow::Error> {
-    // Bind user attachments to the run so plan-level workers can see them.
-    if !attachment_refs.is_empty()
-        && let Some(store) = state.app_state.tasks.runtime.as_ref()
-    {
-        if let Err(e) = store.set_run_attachments(run_id, &attachment_refs) {
-            tracing::warn!(error = %e, "failed to bind attachments to run; workers may not see them");
-        }
-    }
-    let primary_agent = state.app_state.connection.primary_agent();
-    let child_cancel = parent_cancel.child_token();
-    let run_key = format!("__run__:{run_id}");
-    state
-        .app_state
-        .tasks
-        .run_cancel_tokens
-        .insert(run_key.clone(), child_cancel.clone());
-    let run_cancel_tokens = state.app_state.tasks.run_cancel_tokens.clone();
-    let store = state.app_state.tasks.runtime.clone();
-    let trace_collector = state.app_state.trace.collector.clone();
-    let usage_store = store.clone();
-    let app_handle = app.clone();
-    let run_id_owned = run_id.to_string();
-    let message_key_owned = message_key.to_string();
-    let goal_owned = goal.to_string();
-    let multimodal_owned = multimodal;
-    let event_message_key = message_key_owned.clone();
-    let event_conversation_id = conversation_id.clone();
-    let trace_session_id = conversation_id
-        .clone()
-        .unwrap_or_else(|| event_message_key.clone());
-
-    tokio::spawn(async move {
-        let start = std::time::Instant::now();
-
-        // Build the GUI sink that bridges drive_chat/launch_unified_run_core
-        // events to the Tauri frontend (ChatEvent + worker trace). It packages
-        // the exact emit sequence the standalone driver used before this
-        // refactor — behavior is preserved (AGENTS.md: 行为不变).
-        let sink = TauriChatSink {
-            app: app_handle.clone(),
-            message_key: event_message_key.clone(),
-            conversation_id: event_conversation_id.clone(),
-            trace_session_id: trace_session_id.clone(),
-            trace_collector: trace_collector.clone(),
-            usage_store: usage_store.clone(),
-            run_id: run_id_owned.clone(),
-            route: route.as_str().to_string(),
-        };
-
-        // Drive the run through the shared app-core core. launch_unified_run_core
-        // scopes with_run_context (task_local for task_tools/delegate_readonly),
-        // injects ExternalRunContext (worker inheritance), streams AgentEvents
-        // through sink.on_agent_event, and signals running→terminal via
-        // sink.on_run_status — which TauriChatSink turns into the exact GUI emit
-        // (RunStatus/RunStarted/RunCompleted/…/Done).
-        let terminal_status = match launch_unified_run_core(
-            &primary_agent,
-            &run_id_owned,
-            &goal_owned,
-            multimodal_owned.as_ref(),
-            &sink,
-            child_cancel.clone(),
-        )
-        .await
-        {
-            Ok(t) => t,
-            Err(e) => {
-                // Core failed before/during streaming — surface as a failed run
-                // (RunStatus failed + Done), matching the pre-refactor error path.
-                tracing::error!(error = %e, run_id = %run_id_owned, "launch_unified_run_core failed");
-                sink.on_run_status("failed");
-                "failed".to_string()
-            }
-        };
-
-        // Update run status in store.
-        // 注意:execute_plan 工具内部调 execute_run 时,execute_run 可能已把 run
-        // 转成终态(Completed/Failed,executor.rs:209/249)。若主 agent ReAct 结束
-        // 吐 FinalAnswer 时 terminal_status 与 store 现状冲突(如 execute_plan
-        // Failed 但 terminal_status="completed"),不要覆盖——保留 execute_run 设
-        // 的更准确状态(它反映 plan 实际执行结果)。只在 store 还在 Running 时才转。
-        if let Some(ref store) = store {
-            let current_is_terminal = store
-                .get_run(&run_id_owned)
-                .ok()
-                .flatten()
-                .map(|r| {
-                    matches!(
-                        r.status,
-                        TaskRunStatus::Completed | TaskRunStatus::Failed | TaskRunStatus::Cancelled
-                    )
-                })
-                .unwrap_or(false);
-            if !current_is_terminal {
-                let new_status = match terminal_status.as_str() {
-                    "completed" => TaskRunStatus::Completed,
-                    "cancelled" => TaskRunStatus::Cancelled,
-                    "failed" => TaskRunStatus::Failed,
-                    _ => TaskRunStatus::Completed,
-                };
-                if let Err(e) = store.transition_run(&run_id_owned, new_status) {
-                    tracing::error!(error = %e, run_id = %run_id_owned, "终态 transition 失败");
-                }
-            } else {
-                tracing::info!(
-                    run_id = %run_id_owned,
-                    terminal_status = %terminal_status,
-                    "run 已是终态(execute_plan 设的),保留不覆盖"
-                );
-            }
-        }
-
-        run_cancel_tokens.remove(&run_key);
-        tracing::info!(
-            elapsed_ms = start.elapsed().as_millis() as u64,
-            run_id = %run_id_owned,
-            status = %terminal_status,
-            "unified_run finished"
-        );
-    });
-
-    Ok(())
-}
-
 /// Map an AgentEvent to a ChatEvent, also emitting worker://trace side effects.
 /// Returns None for events that should be silently ignored.
 ///
 /// G1 fix: `run_id` is the TaskRuntime run_id. Worker trace events for the
 /// main agent carry this run_id (not message_key) so the frontend aggregator
 /// (which filters by activeRun.run_id) sees the main agent's token/usage data.
+///
+/// B4.1: this unified mapper now ALSO records usage/trace (the work the
+/// removed inline normal-chat match used to do), so normal AND complex runs
+/// keep observability parity. The fingerprints (`sys_prompt_hash`/`tools_hash`
+/// /`cwd_hash`/`provider_name`) come from the `TauriChatSink`, captured before
+/// streaming started.
 #[allow(clippy::too_many_arguments)] // event mapping requires full context
 fn agent_event_to_chat_event(
     app: &tauri::AppHandle,
     event: &AgentEvent,
     message_key: &str,
     conversation_id: &Option<String>,
-    _trace_session_id: &str,
-    _trace_collector: &std::sync::Arc<echo_agent_app_core::observability::TraceCollector>,
-    _usage_store: Option<
+    trace_session_id: &str,
+    trace_collector: &std::sync::Arc<echo_agent_app_core::observability::TraceCollector>,
+    usage_store: Option<
         &std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
     >,
     run_id: &str,
+    sys_prompt_hash: &str,
+    tools_hash: &str,
+    cwd_hash: &Option<String>,
+    provider_name: &Option<String>,
+    route: &str,
 ) -> Option<ChatEvent> {
     // Local helper: like chat_trace_event but uses the TaskRuntime run_id
     // so main-agent events land under the correct run in the frontend.
@@ -1673,6 +1022,58 @@ fn agent_event_to_chat_event(
             cache_creation_prompt_tokens,
             usage_reported,
         } => {
+            // B4.1: record usage/trace exactly like the removed inline
+            // normal-chat match did, so normal AND complex runs keep cache
+            // diagnostics. Ported verbatim (field-for-field) from the pre-B4
+            // inline `LlmUsage` arm. Uses `record_sync` because this mapper
+            // runs inside the sync `ChatSink::on_agent_event`.
+            trace_collector.record_sync(
+                trace_session_id,
+                TraceEvent {
+                    timestamp: Utc::now(),
+                    kind: TraceKind::LlmCall {
+                        model: model.clone(),
+                        input_tokens: *prompt_tokens as u64,
+                        output_tokens: *completion_tokens as u64,
+                        cached_input_tokens: *cached_prompt_tokens as u64,
+                        cache_creation_input_tokens: *cache_creation_prompt_tokens as u64,
+                        usage_reported: *usage_reported,
+                        system_prompt_hash: Some(sys_prompt_hash.to_string()),
+                        tools_schema_hash: Some(tools_hash.to_string()),
+                        cwd_hash: cwd_hash.clone(),
+                        worker_prompt_hash: None,
+                        provider: provider_name.clone(),
+                    },
+                    duration_ms: None,
+                    metadata: HashMap::from([
+                        ("message_key".to_string(), serde_json::json!(message_key)),
+                        ("total_tokens".to_string(), serde_json::json!(total_tokens)),
+                    ]),
+                },
+            );
+            // Persist usage to SQLite for trend analysis
+            if let Some(store) = usage_store {
+                let record = echo_agent_app_core::tasks::task_runtime::UsageRecord {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    session_id: trace_session_id.to_string(),
+                    run_id: Some(run_id.to_string()),
+                    worker_id: Some("main".to_string()),
+                    model: model.clone(),
+                    provider: provider_name.clone(),
+                    route_kind: Some(route.to_string()),
+                    input_tokens: *prompt_tokens as u64,
+                    output_tokens: *completion_tokens as u64,
+                    cached_input_tokens: *cached_prompt_tokens as u64,
+                    cache_creation_input_tokens: *cache_creation_prompt_tokens as u64,
+                    usage_reported: *usage_reported,
+                    system_prompt_hash: Some(sys_prompt_hash.to_string()),
+                    tools_schema_hash: Some(tools_hash.to_string()),
+                    cwd_hash: cwd_hash.clone(),
+                    worker_prompt_hash: None,
+                    created_at: chrono::Utc::now(),
+                };
+                let _ = store.insert_usage_record(&record);
+            }
             trace(
                 WorkerTraceEventKind::WorkerLlmUsage,
                 serde_json::json!({
