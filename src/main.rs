@@ -24,6 +24,28 @@ use clap::Parser;
 
 // ── 主入口 ─────────────────────────────────────────────────────
 
+/// Build a `TaskRuntimeStore` for headless (non-GUI) entry points (TUI / channels).
+///
+/// Opens the on-disk store (recovering any incomplete runs), falling back to an
+/// in-memory store if the db is unavailable. Returned as `Option<Arc<...>>`
+/// because `drive_chat` takes `Option<&TaskRuntimeStore>` (normal-only callers
+/// pass `None`). Headless modes support complex tasks (TUI/GUI parity,
+/// AGENTS.md), so they always provide a store.
+fn build_task_runtime_store_for_headless()
+-> Option<std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>> {
+    let store =
+        echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore::new().unwrap_or_else(|e| {
+            tracing::warn!("Failed to open task_runtime.db: {e}; in-memory fallback");
+            echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
+                .expect("in-memory task_runtime store should always init")
+        });
+    let recovered = store.recover_incomplete();
+    if recovered > 0 {
+        tracing::info!(recovered, "recovered incomplete task_runtime runs");
+    }
+    Some(std::sync::Arc::new(store))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // 加载 .env 文件
@@ -281,6 +303,15 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             "AgentPool initialized for TUI (background task isolation)"
         );
 
+        // TUI/GUI functional parity (AGENTS.md): TUI is a full Agent, not a
+        // lightweight chat — it gets the same TaskRuntimeStore as GUI so it can
+        // drive complex tasks (plan / worker / run lifecycle) via `drive_chat`.
+        let task_runtime_store = build_task_runtime_store_for_headless();
+
+        // LLM client for Auto/Task routing decisions (drive_chat → route_message_with_feedback).
+        let route_llm: Option<std::sync::Arc<dyn echo_agent::llm::LlmClient>> =
+            agent_handle.read(|a| a.llm_client().cloned()).await;
+
         // Start BackgroundTaskService with the pool so independent
         // background tasks can use distinct worker agents.
         let tui_task_service = {
@@ -290,7 +321,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                 task_store.clone(),
                 cancel,
                 None,
-                None, // task_runtime_store — TUI doesn't use the task runtime
+                task_runtime_store.clone(),
             )
             .await
             {
@@ -325,6 +356,8 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             &app_config.tui,
             "💬 通用",
             tui_pending,
+            task_runtime_store,
+            route_llm,
         )
         .await?;
 
@@ -384,7 +417,12 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                 "AgentPool initialized for channels (IM per-sender agents)"
             );
 
-            let channels_handle = tokio::spawn(cli::run_channels_mode(pool, app_config.clone()));
+            let channels_handle = tokio::spawn(cli::run_channels_mode(
+                pool,
+                app_config.clone(),
+                build_task_runtime_store_for_headless(),
+                agent_handle.read(|a| a.llm_client().cloned()).await,
+            ));
 
             if run_cli {
                 cli::run_cli_mode(

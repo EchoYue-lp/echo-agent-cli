@@ -16,15 +16,29 @@ use std::sync::Arc;
 use echo_agent_app_core::agent_pool::AgentPool;
 
 /// IM channel 消息处理器：持 `AgentPool`，每 `handle` 从 pool 取/复用 per-sender agent。
+///
+/// TUI/GUI functional parity (AGENTS.md): channels drive complex tasks through
+/// the shared `drive_chat` entry (not just `chat_stream`), so they hold a
+/// `TaskRuntimeStore` (complex runs) + an optional route LLM (Auto/Task routing).
 #[cfg(feature = "channels")]
 pub struct AppChannelMessageHandler {
     pool: Arc<AgentPool>,
+    store: Option<Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
+    route_llm: Option<Arc<dyn echo_agent::llm::LlmClient>>,
 }
 
 #[cfg(feature = "channels")]
 impl AppChannelMessageHandler {
-    pub fn new(pool: Arc<AgentPool>) -> Self {
-        Self { pool }
+    pub fn new(
+        pool: Arc<AgentPool>,
+        store: Option<Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
+        route_llm: Option<Arc<dyn echo_agent::llm::LlmClient>>,
+    ) -> Self {
+        Self {
+            pool,
+            store,
+            route_llm,
+        }
     }
 
     /// per-sender conversation_id（= pool key）。sender 维度隔离。
@@ -104,36 +118,49 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
             .write(|a| a.config_mut().set_cache_user_id(&cache_id))
             .await;
 
-        // 3. chat_stream。guard.chat_stream 返回的 BoxStream 借用 guard,且 &msg.text 借用 msg,
-        //    都不能进 'static spawn。解法(同 handle.rs RwLockAgentWrapper::chat_stream pattern):
-        //    把 inner Arc 和 msg.text(owned)移进 spawn,在 spawn 内取 read guard + chat_stream,
-        //    逐事件经 unbounded channel 转发;rx 转成 'static 流(与 'a 兼容)。
-        let inner = agent.inner().clone();
+        // 3. Drive through the shared `drive_chat` entry (TUI/GUI parity,
+        //    AGENTS.md): route the message (normal vs complex) and stream
+        //    AgentEvents to a channel sink; per-sender isolation means no
+        //    concurrency, so the read guard is held for the stream lifetime
+        //    inside `drive_chat` (same as TUI send_to_agent).
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<echo_agent::agent::AgentEvent>();
         let text = msg.text.clone();
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<
-            echo_core::error::Result<echo_core::agent::AgentEvent>,
-        >();
+        let store = self.store.clone();
+        let route_llm = self.route_llm.clone();
+        let agent_owned = agent.clone();
         tokio::spawn(async move {
-            use echo_agent::agent::Agent; // Agent trait 提供 chat_stream
-            use futures::StreamExt;
-            let guard = inner.read().await;
-            let event_stream = match guard.chat_stream(&text).await {
-                Ok(s) => s,
-                Err(e) => {
-                    let _ = tx.send(Err(e));
-                    return;
-                }
-            };
-            let mut s = event_stream;
-            while let Some(item) = s.next().await {
-                if tx.send(item).is_err() {
-                    break;
-                }
+            use echo_agent_app_core::chat_driver::{ChannelChatSink, drive_chat};
+            use echo_agent_app_core::tasks::task_runtime::router::route_message_with_feedback;
+            use echo_agent_app_core::tasks::task_runtime::types::InteractionMode;
+
+            // Route the message the same way GUI/TUI do. Default Auto so the
+            // router decides normal vs complex (channel complex tasks get a
+            // real run with plan/worker).
+            let decision =
+                route_message_with_feedback(route_llm, &text, InteractionMode::Auto, &[]).await;
+            let cancel = echo_agent::agent::CancellationToken::new();
+            let store_ref = store.as_deref();
+            let sink = ChannelChatSink::new(tx);
+            if let Err(e) = drive_chat(
+                &agent_owned,
+                &text,
+                &decision,
+                &sink,
+                cancel,
+                store_ref,
+                Some(&conv),
+            )
+            .await
+            {
+                tracing::warn!(error = %e, conv = %conv, "channel drive_chat failed");
             }
-            // guard 在此 drop,释放 read 锁
         });
+        // Wrap each AgentEvent as Ok(...) — drive_chat already handled stream
+        // errors internally (terminal status), so the aggregate stage sees only
+        // successful events. (Matches the old chat_stream contract where the
+        // final stream was Result<Item>.)
         let event_stream = futures::stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|item| (item, rx))
+            rx.recv().await.map(|item| (Ok(item), rx))
         })
         .boxed();
 

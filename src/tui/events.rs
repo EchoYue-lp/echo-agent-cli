@@ -19,6 +19,17 @@ use echo_agent_app_core::tasks::BackgroundTaskService;
 /// Poll interval for non-blocking event check.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Shared context for driving chat through the unified `drive_chat` entry.
+///
+/// TUI/GUI functional parity (AGENTS.md): TUI drives the same normal + complex
+/// routes as GUI. This bundles the pieces `drive_chat` needs beyond the agent:
+/// the TaskRuntimeStore (complex runs) and an optional LLM client (Auto/Task
+/// routing). `None` store ⇒ only normal chat is possible (graceful fallback).
+pub struct TuiChatCtx {
+    pub store: Option<std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
+    pub route_llm: Option<std::sync::Arc<dyn echo_agent::llm::LlmClient>>,
+}
+
 /// Handle keyboard input when an approval request is pending.
 /// Returns `true` if the key was consumed.
 async fn handle_approval_key(
@@ -241,6 +252,7 @@ pub async fn run_event_loop(
     app: &mut TuiApp,
     agent: AgentHandle,
     task_service: Option<Arc<BackgroundTaskService>>,
+    chat_ctx: TuiChatCtx,
 ) -> anyhow::Result<()> {
     let (agent_tx, mut agent_rx) = mpsc::unbounded_channel();
 
@@ -368,7 +380,9 @@ pub async fn run_event_loop(
         // propagate these as fatal errors — just skip the tick and retry.
         match event::poll(POLL_INTERVAL) {
             Ok(true) => match event::read() {
-                Ok(Event::Key(key)) => handle_key(app, key, &agent, agent_tx.clone()).await,
+                Ok(Event::Key(key)) => {
+                    handle_key(app, key, &agent, agent_tx.clone(), &chat_ctx).await
+                }
                 Ok(Event::Mouse(mouse)) => handle_mouse(app, &mouse),
                 Ok(Event::Resize(_, _)) => {} // ratatui handles resize automatically
                 Ok(_) => {}
@@ -465,6 +479,7 @@ async fn handle_key(
     key: KeyEvent,
     agent: &AgentHandle,
     agent_tx: mpsc::UnboundedSender<AgentEvent>,
+    chat_ctx: &TuiChatCtx,
 ) {
     // ── Approval mode takes priority over everything ──
     if let Some(pending_handle) = app.pending_approval.clone() {
@@ -491,7 +506,7 @@ async fn handle_key(
     {
         return;
     }
-    handle_normal_key(app, &key, agent, agent_tx).await;
+    handle_normal_key(app, &key, agent, agent_tx, chat_ctx).await;
 }
 
 // ── Command palette ────────────────────────────────────────────────────────
@@ -604,6 +619,7 @@ async fn handle_normal_key(
     key: &KeyEvent,
     agent: &AgentHandle,
     agent_tx: mpsc::UnboundedSender<AgentEvent>,
+    chat_ctx: &TuiChatCtx,
 ) {
     // Shift+Enter: newline
     if key.modifiers.contains(KeyModifiers::SHIFT) && key.code == KeyCode::Enter {
@@ -613,7 +629,7 @@ async fn handle_normal_key(
     }
 
     match key.code {
-        KeyCode::Enter => handle_enter(app, agent, agent_tx).await,
+        KeyCode::Enter => handle_enter(app, agent, agent_tx, chat_ctx).await,
         KeyCode::Char(c) => handle_char_input(app, c),
         KeyCode::Backspace => handle_backspace(app),
         KeyCode::Delete => handle_delete(app),
@@ -635,6 +651,7 @@ async fn handle_enter(
     app: &mut TuiApp,
     agent: &AgentHandle,
     agent_tx: mpsc::UnboundedSender<AgentEvent>,
+    chat_ctx: &TuiChatCtx,
 ) {
     if app.is_processing {
         // Can't send while processing; insert newline instead.
@@ -644,7 +661,7 @@ async fn handle_enter(
         if text.starts_with('/') {
             handle_slash_command(app, agent, &text).await;
         } else {
-            send_to_agent(agent, text, agent_tx.clone()).await;
+            send_to_agent(agent, text, agent_tx.clone(), chat_ctx).await;
         }
     }
 }
@@ -731,132 +748,111 @@ fn handle_esc(app: &mut TuiApp) {
 // ── Agent communication ─────────────────────────────────────────────────
 
 /// Send a message to the agent using streaming and forward events to the UI.
+/// `ChatSink` for the TUI: converts framework `AgentEvent`s into the TUI's
+/// simplified local `AgentEvent` and forwards them to the UI render loop.
+///
+/// TUI/GUI parity (AGENTS.md): this is the TUI's renderer for the shared
+/// `drive_chat` stream — the equivalent of GUI's `agent_event_to_chat_event`.
+struct TuiChatSink {
+    tx: mpsc::UnboundedSender<AgentEvent>,
+}
+
+impl TuiChatSink {
+    fn new(tx: mpsc::UnboundedSender<AgentEvent>) -> Self {
+        Self { tx }
+    }
+}
+
+impl echo_agent_app_core::chat_driver::ChatSink for TuiChatSink {
+    fn on_agent_event(&self, event: echo_agent::agent::AgentEvent) -> bool {
+        let mapped = match event {
+            echo_agent::agent::AgentEvent::Token(t) => AgentEvent::Token(t),
+            echo_agent::agent::AgentEvent::ThinkStart => AgentEvent::ThinkStart,
+            echo_agent::agent::AgentEvent::ThinkEnd {
+                prompt_tokens,
+                completion_tokens,
+            } => AgentEvent::ThinkEnd {
+                prompt_tokens,
+                completion_tokens,
+            },
+            echo_agent::agent::AgentEvent::ToolBatchStart { tool_count } => {
+                AgentEvent::ToolBatchStart { tool_count }
+            }
+            echo_agent::agent::AgentEvent::ToolBatchEnd => AgentEvent::ToolBatchEnd,
+            echo_agent::agent::AgentEvent::FinalAnswer(answer) => AgentEvent::FinalAnswer(answer),
+            echo_agent::agent::AgentEvent::ToolCall { name, args } => AgentEvent::ToolCall {
+                name,
+                args: args.to_string(),
+            },
+            echo_agent::agent::AgentEvent::ToolResult { name, output } => {
+                AgentEvent::ToolResult { name, output }
+            }
+            echo_agent::agent::AgentEvent::ContextCompressed {
+                before_count,
+                after_count,
+                before_tokens,
+                after_tokens,
+            } => AgentEvent::ContextCompressed {
+                before_count,
+                after_count,
+                before_tokens,
+                after_tokens,
+            },
+            echo_agent::agent::AgentEvent::Error { message, .. } => AgentEvent::Error(message),
+            // Other framework events (LlmUsage, GuardTriggered, MemoryRecalled,
+            // SafetyNotice, ParameterError, …) have no TUI rendering yet.
+            other => {
+                tracing::debug!(event = ?other, "TUI: unrendered agent event");
+                return true;
+            }
+        };
+        // If the UI dropped the receiver, stop streaming.
+        self.tx.send(mapped).is_ok()
+    }
+}
+
 async fn send_to_agent(
     agent: &AgentHandle,
     text: String,
     agent_tx: mpsc::UnboundedSender<AgentEvent>,
+    chat_ctx: &TuiChatCtx,
 ) {
-    use echo_agent::agent::Agent;
-    use futures::StreamExt;
-    use tokio::sync::oneshot;
+    use echo_agent_app_core::chat_driver::drive_chat;
+    use echo_agent_app_core::tasks::task_runtime::router::route_message_with_feedback;
 
-    let inner = agent.inner().clone();
-    let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+    // Route the message the same way GUI does. TUI/GUI parity (AGENTS.md):
+    // TUI supports complex tasks. Default to Auto so the router decides normal
+    // vs complex (matching GUI's default). TODO(5b): wire a /mode command to let
+    // the user force Chat / Task.
+    let mode = echo_agent_app_core::tasks::task_runtime::types::InteractionMode::Auto;
+    let decision = route_message_with_feedback(chat_ctx.route_llm.clone(), &text, mode, &[]).await;
+
+    let cancel = echo_agent::agent::CancellationToken::new();
+    let store = chat_ctx.store.clone();
+    let agent_owned = agent.clone();
 
     tokio::spawn(async move {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        let message = text;
-
-        // Inner task: runs the LLM stream with a cancellation signal so that
-        // when the outer forwarding loop exits (UI quit, channel error), the
-        // RwLock read guard is released promptly instead of being held until
-        // the LLM produces its next token.
-        tokio::spawn(async move {
-            let guard = inner.read().await;
-            match guard.chat_stream(&message).await {
-                Ok(mut stream) => {
-                    tokio::pin!(let cancel_rx = cancel_rx;);
-                    loop {
-                        tokio::select! {
-                            _ = &mut cancel_rx => {
-                                // Outer task dropped the oneshot sender —
-                                // UI is gone, release the lock immediately.
-                                break;
-                            }
-                            next = stream.next() => {
-                                match next {
-                                    Some(event) => {
-                                        if tx.send(event).is_err() {
-                                            break;
-                                        }
-                                    }
-                                    None => break,
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    let _ = tx.send(Err(e));
+        let sink = TuiChatSink::new(agent_tx);
+        let store_ref = store.as_deref();
+        match drive_chat(
+            &agent_owned,
+            &text,
+            &decision,
+            &sink,
+            cancel,
+            store_ref,
+            None,
+        )
+        .await
+        {
+            Ok(outcome) => {
+                if let Some(run_id) = outcome.run_id {
+                    tracing::info!(run_id = %run_id, "TUI complex run completed");
                 }
             }
-            // guard dropped here — RwLock released
-        });
-
-        // Forward events from inner task to UI
-        let mut got_final = false;
-        while let Some(event) = rx.recv().await {
-            match event {
-                Ok(echo_agent::agent::AgentEvent::Token(t)) => {
-                    if agent_tx.send(AgentEvent::Token(t)).is_err() {
-                        break;
-                    }
-                }
-                Ok(echo_agent::agent::AgentEvent::ThinkStart) => {
-                    let _ = agent_tx.send(AgentEvent::ThinkStart);
-                }
-                Ok(echo_agent::agent::AgentEvent::ThinkEnd {
-                    prompt_tokens,
-                    completion_tokens,
-                }) => {
-                    let _ = agent_tx.send(AgentEvent::ThinkEnd {
-                        prompt_tokens,
-                        completion_tokens,
-                    });
-                }
-                Ok(echo_agent::agent::AgentEvent::LlmUsage { .. }) => {}
-                Ok(echo_agent::agent::AgentEvent::ToolBatchStart { tool_count }) => {
-                    let _ = agent_tx.send(AgentEvent::ToolBatchStart { tool_count });
-                }
-                Ok(echo_agent::agent::AgentEvent::ToolBatchEnd) => {
-                    let _ = agent_tx.send(AgentEvent::ToolBatchEnd);
-                }
-                Ok(echo_agent::agent::AgentEvent::FinalAnswer(answer)) => {
-                    let _ = agent_tx.send(AgentEvent::FinalAnswer(answer));
-                    got_final = true;
-                    break;
-                }
-                Ok(echo_agent::agent::AgentEvent::ToolCall { name, args }) => {
-                    let _ = agent_tx.send(AgentEvent::ToolCall {
-                        name,
-                        args: args.to_string(),
-                    });
-                }
-                Ok(echo_agent::agent::AgentEvent::ToolResult { name, output }) => {
-                    let _ = agent_tx.send(AgentEvent::ToolResult { name, output });
-                }
-                Ok(echo_agent::agent::AgentEvent::ContextCompressed {
-                    before_count,
-                    after_count,
-                    before_tokens,
-                    after_tokens,
-                }) => {
-                    let _ = agent_tx.send(AgentEvent::ContextCompressed {
-                        before_count,
-                        after_count,
-                        before_tokens,
-                        after_tokens,
-                    });
-                }
-                Ok(_) => {} // Ignore other event types (GuardTriggered, MemoryRecalled, etc.)
-                Err(e) => {
-                    let _ = agent_tx.send(AgentEvent::Error(e.to_string()));
-                    got_final = true;
-                    break;
-                }
+            Err(e) => {
+                tracing::warn!(error = %e, "TUI drive_chat failed");
             }
-        }
-
-        // Signal the inner task to stop (drop the oneshot sender).
-        // If rx.recv() returned None (tx dropped), or agent_tx.send() failed,
-        // or we got a FinalAnswer/Error, the inner task should stop holding
-        // the agent lock.
-        drop(cancel_tx);
-
-        if !got_final {
-            let _ = agent_tx.send(AgentEvent::Error(
-                "Agent stream ended unexpectedly. Please try again.".to_string(),
-            ));
         }
     });
 }

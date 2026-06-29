@@ -1100,6 +1100,10 @@ pub async fn run_tui(
     tui_pending: std::sync::Arc<
         tokio::sync::Mutex<Option<echo_agent_app_core::hitl::PendingApproval>>,
     >,
+    task_runtime_store: Option<
+        std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
+    >,
+    route_llm: Option<std::sync::Arc<dyn echo_agent::llm::LlmClient>>,
 ) -> anyhow::Result<()> {
     // Use ColorTheme to generate Theme, unifying both theme systems.
     let color_theme = echo_agent_app_core::output::theme::ColorTheme::dark();
@@ -1128,7 +1132,12 @@ pub async fn run_tui(
     app.pending_approval = Some(tui_pending);
 
     // Main event loop.
-    let result = events::run_event_loop(&mut terminal, &mut app, agent, task_service).await;
+    let chat_ctx = events::TuiChatCtx {
+        store: task_runtime_store,
+        route_llm,
+    };
+    let result =
+        events::run_event_loop(&mut terminal, &mut app, agent, task_service, chat_ctx).await;
 
     // Guard drop will restore the terminal.
     result

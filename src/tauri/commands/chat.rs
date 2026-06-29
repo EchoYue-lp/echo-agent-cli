@@ -9,6 +9,7 @@ use chrono::Utc;
 use echo_agent::agent::{Agent, CancellationToken};
 use echo_agent::human_loop::{HumanLoopProvider, HumanLoopRequest, HumanLoopResponse};
 use echo_agent::prelude::AgentEvent;
+use echo_agent_app_core::chat_driver::{ChatSink, launch_unified_run_core};
 use echo_agent_app_core::observability::{TraceEvent, TraceKind};
 use echo_agent_app_core::tasks::conversation_runtime::ConversationRuntimeEvent;
 use echo_agent_app_core::tasks::task_runtime::{
@@ -1329,6 +1330,131 @@ async fn route_complex_task(
     }))
 }
 
+/// GUI `ChatSink`: bridges the shared `drive_chat`/`launch_unified_run_core`
+/// stream to the Tauri frontend by emitting `ChatEvent`s + worker trace events.
+///
+/// This is the TUI-equivalent of `agent_event_to_chat_event` + the GUI emit
+/// sequence, packaged as a `ChatSink` so the GUI complex run can drive through
+/// the same app-core core (`launch_unified_run_core`) as TUI/channel. Each
+/// method mirrors the exact emit the standalone `launch_unified_run` did
+/// before this refactor — behavior is preserved (AGENTS.md: 行为不变).
+struct TauriChatSink {
+    app: tauri::AppHandle,
+    message_key: String,
+    conversation_id: Option<String>,
+    trace_session_id: String,
+    trace_collector: std::sync::Arc<echo_agent_app_core::observability::TraceCollector>,
+    usage_store: Option<std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
+    run_id: String,
+    route: String,
+}
+
+impl echo_agent_app_core::chat_driver::ChatSink for TauriChatSink {
+    fn on_agent_event(&self, event: AgentEvent) -> bool {
+        let chat_event = agent_event_to_chat_event(
+            &self.app,
+            &event,
+            &self.message_key,
+            &self.conversation_id,
+            &self.trace_session_id,
+            &self.trace_collector,
+            self.usage_store.as_ref(),
+            &self.run_id,
+        );
+        if let Some(ce) = chat_event {
+            emit_chat_event(&self.app, &ce, &self.message_key, &self.conversation_id)
+        } else {
+            true
+        }
+    }
+
+    fn on_run_status(&self, status: &str) {
+        // Running → emit RunStatus + RunStarted trace (with conv/mode/run/route),
+        // matching the pre-refactor GUI sequence.
+        if status == "running" {
+            emit_chat_event(
+                &self.app,
+                &ChatEvent::RunStatus {
+                    status: "running".to_string(),
+                },
+                &self.message_key,
+                &self.conversation_id,
+            );
+            emit_worker_trace_event(
+                &self.app,
+                chat_trace_event(
+                    &self.message_key,
+                    WorkerTraceEventKind::RunStarted,
+                    serde_json::json!({
+                        "conversation_id": self.conversation_id,
+                        "mode": "unified_run",
+                        "run_id": self.run_id.clone(),
+                        "route": self.route.clone(),
+                    }),
+                ),
+            );
+            return;
+        }
+        // Terminal → RunCompleted/Cancelled/Failed trace + RunStatus + Done.
+        let kind = match status {
+            "completed" => WorkerTraceEventKind::RunCompleted,
+            "cancelled" => WorkerTraceEventKind::RunCancelled,
+            "failed" => WorkerTraceEventKind::RunFailed,
+            _ => WorkerTraceEventKind::RunStatusChanged,
+        };
+        emit_worker_trace_event(
+            &self.app,
+            chat_trace_event(
+                &self.message_key,
+                kind,
+                serde_json::json!({ "status": status.to_string() }),
+            ),
+        );
+        let _ = emit_chat_event(
+            &self.app,
+            &ChatEvent::RunStatus {
+                status: status.to_string(),
+            },
+            &self.message_key,
+            &self.conversation_id,
+        );
+        let _ = emit_chat_event(
+            &self.app,
+            &ChatEvent::Done,
+            &self.message_key,
+            &self.conversation_id,
+        );
+    }
+
+    fn worker_trace_sink(&self) -> Option<std::sync::Arc<dyn Fn(WorkerTraceEvent) + Send + Sync>> {
+        // Rewrite main-agent run_id (frontend filters by activeRun.run_id) +
+        // forward to the frontend, same as the pre-refactor trace_sink closure.
+        let app = self.app.clone();
+        let msg_key = self.message_key.clone();
+        let run_id = self.run_id.clone();
+        Some(std::sync::Arc::new(move |mut event: WorkerTraceEvent| {
+            if event.worker_id.as_deref() == Some("main") {
+                event.run_id = run_id.clone();
+            }
+            if event.message_id.is_none() {
+                event.message_id = Some(msg_key.clone());
+            }
+            let _ = emit_worker_trace_event(&app, event);
+        }))
+    }
+
+    fn trace_sink(&self) -> Option<echo_core::tools::TraceSinkFn> {
+        // Bridge the framework's Value-based external-context trace_sink to the
+        // worker_trace_sink above (worker emits Value, deserialize → forward).
+        let ws = self.worker_trace_sink()?;
+        Some(std::sync::Arc::new(move |value: serde_json::Value| {
+            if let Ok(ev) = serde_json::from_value::<WorkerTraceEvent>(value.clone()) {
+                ws(ev);
+            }
+        }) as echo_core::tools::TraceSinkFn)
+    }
+}
+
 /// 统一启动器:所有复杂路由(ParallelReadonlyDelegation/ComplexRuntime/PlanOnly)
 /// 都走这里。主 agent ReAct(pool 复用)+ execute_plan 工具(L1→L2)。
 /// 替代 launch_main_agent_react + launch_task_run_execution(spec §3.1.2)。
@@ -1378,196 +1504,47 @@ async fn launch_unified_run(
 
     tokio::spawn(async move {
         let start = std::time::Instant::now();
-        let mut terminal_status = "completed".to_string();
 
-        // Construct a trace_sink that forwards WorkerTraceEvent to the frontend.
-        // This reconnects the trace channel so execute_plan can send worker
-        // trace events through the task-local mechanism (F1 fix).
-        //
-        // G1 fix: rewrite run_id for "main" worker events. chat_trace_event
-        // hardcodes run_id=message_key, but the frontend filters workers by
-        // activeRun.run_id (the TaskRuntime run_id). Without this rewrite,
-        // the main agent's usage/token events are filtered out → the Token/Cache
-        // card only shows subagent data. By rewriting main-agent events to
-        // carry the TaskRuntime run_id, the frontend aggregator sees all agents.
-        let app_for_sink = app_handle.clone();
-        let msg_key_for_sink = event_message_key.clone();
-        let run_id_for_sink = run_id_owned.clone();
-        let trace_sink: Option<std::sync::Arc<dyn Fn(WorkerTraceEvent) + Send + Sync>> =
-            Some(std::sync::Arc::new(move |mut event| {
-                // Rewrite run_id for main-agent events so they land under the
-                // TaskRuntime run_id (frontend filters by activeRun.run_id).
-                if event.worker_id.as_deref() == Some("main") {
-                    event.run_id = run_id_for_sink.clone();
-                }
-                if event.message_id.is_none() {
-                    event.message_id = Some(msg_key_for_sink.clone());
-                }
-                let _ = emit_worker_trace_event(&app_for_sink, event);
-            }));
-
-        // 适配 trace_sink 为框架的 TraceSinkFn(Value-based),供主 agent 的
-        // external context 使用(跨 spawn 安全,worker 经 ToolContext 读取)。
-        // worker 的 emit_worker_trace 传 Value,这里反序列化成 WorkerTraceEvent
-        // 再转发到原 sink(发前端)。
-        let ext_trace_sink: Option<echo_core::tools::TraceSinkFn> = trace_sink.as_ref().map(|s| {
-            let s = s.clone();
-            std::sync::Arc::new(move |value: serde_json::Value| {
-                if let Ok(ev) = serde_json::from_value::<WorkerTraceEvent>(value.clone()) {
-                    s(ev);
-                }
-            }) as echo_core::tools::TraceSinkFn
-        });
-
-        // Set up task_local context so delegate_readonly + task_* tools work
-        // (F1: also scope trace_sink). (stage4 P4.1) cache_user_id read from
-        // single source — no longer threaded here.
-        let _ = echo_agent_app_core::tasks::task_runtime::task_tools::with_run_context(
-            run_id_owned.clone(),
-            child_cancel.clone(),
-            trace_sink,
-            async {
-                emit_chat_event(
-                    &app_handle,
-                    &ChatEvent::RunStatus {
-                        status: "running".to_string(),
-                    },
-                    &event_message_key,
-                    &event_conversation_id,
-                );
-                emit_worker_trace_event(
-                    &app_handle,
-                    chat_trace_event(
-                        &event_message_key,
-                        WorkerTraceEventKind::RunStarted,
-                        serde_json::json!({
-                            "conversation_id": event_conversation_id,
-                            "mode": "unified_run",
-                            "run_id": run_id_owned,
-                            "route": route.as_str(),
-                        }),
-                    ),
-                );
-
-                // Acquire agent and run ReAct
-                let agent_inner = primary_agent.inner().clone();
-                let agent = agent_inner.read().await;
-
-                // 把 run context 注入主 agent(跨 spawn 安全的值传递)。
-                // 主 agent 调 delegate_readonly/execute_plan 时,build_runtime_context
-                // 从这些 external_* 读取并透传给 worker——绕开会跨 spawn 断裂的
-                // task_local。worker 内的工具经 ToolContext 读到 run_id/cancel/...
-                use echo_agent::agent::Agent;
-                use echo_core::tools::ExternalRunContext;
-                agent.set_external_context(&ExternalRunContext {
-                    run_id: run_id_owned.clone(),
-                    cancel: Some(std::sync::Arc::new(child_cancel.clone())),
-                    trace_sink: ext_trace_sink.clone(),
-                });
-
-                // Multimodal: when the user attached images/files, run the
-                // pre-built Message (with ContentParts) via the message+cancel
-                // entry point (2A). Otherwise the plain `&str` path.
-                let stream_result = if let Some(msg) = multimodal_owned.as_ref() {
-                    agent
-                        .execute_stream_message_with_cancel(msg.clone(), child_cancel.clone())
-                        .await
-                } else {
-                    agent
-                        .execute_stream_with_cancel(&goal_owned, child_cancel.clone())
-                        .await
-                };
-
-                match stream_result {
-                    Ok(mut stream) => {
-                        while let Some(event_result) = stream.next().await {
-                            if child_cancel.is_cancelled() {
-                                terminal_status = "cancelled".to_string();
-                                break;
-                            }
-                            match event_result {
-                                Ok(event) => {
-                                    let chat_event = agent_event_to_chat_event(
-                                        &app_handle,
-                                        &event,
-                                        &event_message_key,
-                                        &event_conversation_id,
-                                        &trace_session_id,
-                                        &trace_collector,
-                                        usage_store.as_ref(),
-                                        &run_id_owned,
-                                    );
-                                    if let Some(ce) = chat_event
-                                        && !emit_chat_event(
-                                            &app_handle,
-                                            &ce,
-                                            &event_message_key,
-                                            &event_conversation_id,
-                                        )
-                                    {
-                                        break;
-                                    }
-                                }
-                                Err(e) => {
-                                    terminal_status = "failed".to_string();
-                                    let _ = emit_chat_event(
-                                        &app_handle,
-                                        &ChatEvent::Error {
-                                            message: e.to_string(),
-                                        },
-                                        &event_message_key,
-                                        &event_conversation_id,
-                                    );
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        terminal_status = "failed".to_string();
-                        let _ = emit_chat_event(
-                            &app_handle,
-                            &ChatEvent::Error {
-                                message: e.to_string(),
-                            },
-                            &event_message_key,
-                            &event_conversation_id,
-                        );
-                    }
-                }
-            },
-        )
-        .await;
-
-        // Emit terminal status
-        let terminal_trace_kind = match terminal_status.as_str() {
-            "completed" => WorkerTraceEventKind::RunCompleted,
-            "cancelled" => WorkerTraceEventKind::RunCancelled,
-            "failed" => WorkerTraceEventKind::RunFailed,
-            _ => WorkerTraceEventKind::RunStatusChanged,
+        // Build the GUI sink that bridges drive_chat/launch_unified_run_core
+        // events to the Tauri frontend (ChatEvent + worker trace). It packages
+        // the exact emit sequence the standalone driver used before this
+        // refactor — behavior is preserved (AGENTS.md: 行为不变).
+        let sink = TauriChatSink {
+            app: app_handle.clone(),
+            message_key: event_message_key.clone(),
+            conversation_id: event_conversation_id.clone(),
+            trace_session_id: trace_session_id.clone(),
+            trace_collector: trace_collector.clone(),
+            usage_store: usage_store.clone(),
+            run_id: run_id_owned.clone(),
+            route: route.as_str().to_string(),
         };
-        emit_worker_trace_event(
-            &app_handle,
-            chat_trace_event(
-                &event_message_key,
-                terminal_trace_kind,
-                serde_json::json!({ "status": terminal_status.clone() }),
-            ),
-        );
-        let _ = emit_chat_event(
-            &app_handle,
-            &ChatEvent::RunStatus {
-                status: terminal_status.clone(),
-            },
-            &event_message_key,
-            &event_conversation_id,
-        );
-        let _ = emit_chat_event(
-            &app_handle,
-            &ChatEvent::Done,
-            &event_message_key,
-            &event_conversation_id,
-        );
+
+        // Drive the run through the shared app-core core. launch_unified_run_core
+        // scopes with_run_context (task_local for task_tools/delegate_readonly),
+        // injects ExternalRunContext (worker inheritance), streams AgentEvents
+        // through sink.on_agent_event, and signals running→terminal via
+        // sink.on_run_status — which TauriChatSink turns into the exact GUI emit
+        // (RunStatus/RunStarted/RunCompleted/…/Done).
+        let terminal_status = match launch_unified_run_core(
+            &primary_agent,
+            &run_id_owned,
+            &goal_owned,
+            multimodal_owned.as_ref(),
+            &sink,
+            child_cancel.clone(),
+        )
+        .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                // Core failed before/during streaming — surface as a failed run
+                // (RunStatus failed + Done), matching the pre-refactor error path.
+                tracing::error!(error = %e, run_id = %run_id_owned, "launch_unified_run_core failed");
+                sink.on_run_status("failed");
+                "failed".to_string()
+            }
+        };
 
         // Update run status in store.
         // 注意:execute_plan 工具内部调 execute_run 时,execute_run 可能已把 run
