@@ -271,14 +271,29 @@ fn parse_kind(s: &str) -> PlanTaskKind {
 /// 只读 kind(read_only_review/investigation/test_plan/review/summary)委派给对应
 /// 只读 worker;变更 kind(implementation/debugging/verification)由主 agent 直接
 /// 执行(不委派 worker),用 "primary" 占位(run_readonly_worker 不会触及)。
+/// Map a plan-task kind to the registered subagent name that should run it.
+///
+/// SA-3 collapsed the old 13 specialized subagents (`project_explorer` /
+/// `code_reviewer` / `test_planner` / `summary_writer` / …) into 4 generic
+/// ones registered in `infra.rs`: `explorer`, `reviewer`, `planner`,
+/// `summarizer`. This mapping must stay aligned with those registered names —
+/// otherwise `run_readonly_worker` dispatches to a non-existent subagent and
+/// every read-only plan task fails with "Subagent 'X' not found".
+///
+/// Read-only kinds (read_only_review / investigation / test_plan / review /
+/// summary) delegate to the matching generic worker; mutating kinds
+/// (implementation / debugging / verification) are executed directly by the
+/// main agent (`executor.rs::run_main_agent_task`), so the role here is only
+/// a record label that `run_readonly_worker` never touches.
 fn role_for_kind(kind: PlanTaskKind) -> &'static str {
     match kind {
-        PlanTaskKind::ReadOnlyReview | PlanTaskKind::Investigation => "project_explorer",
-        PlanTaskKind::TestPlan => "test_planner",
-        PlanTaskKind::Review => "code_reviewer",
-        PlanTaskKind::Summary => "summary_writer",
-        // 变更类:主 agent 直接执行(executor.rs run_main_agent_task),不委派 worker。
-        // agent_role 仅作记录,不会被 run_readonly_worker 用到。
+        PlanTaskKind::ReadOnlyReview | PlanTaskKind::Investigation | PlanTaskKind::TestPlan => {
+            "explorer"
+        }
+        PlanTaskKind::Review => "reviewer",
+        PlanTaskKind::Summary => "summarizer",
+        // Mutating kinds: main agent executes directly; role is a record label
+        // only (run_readonly_worker does not touch it).
         PlanTaskKind::Implementation | PlanTaskKind::Debugging | PlanTaskKind::Verification => {
             "primary"
         }
