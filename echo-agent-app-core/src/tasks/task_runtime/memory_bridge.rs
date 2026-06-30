@@ -490,4 +490,113 @@ mod tests {
         )
         .await;
     }
+
+    /// Minimal no-op ChangeLog for the recall-closure test (echo-agent's
+    /// `NullChangeLog` is #[cfg(test)]-private there, so we declare our own).
+    struct NullChangeLog;
+    impl echo_agent::evolution::audit::ChangeLog for NullChangeLog {
+        fn record(
+            &self,
+            _entry: echo_agent::evolution::audit::ChangeEntry,
+        ) -> echo_agent::error::Result<()> {
+            Ok(())
+        }
+        fn query(
+            &self,
+            _filter: &echo_agent::evolution::audit::ChangeFilter,
+        ) -> echo_agent::error::Result<Vec<echo_agent::evolution::audit::ChangeEntry>> {
+            Ok(Vec::new())
+        }
+        fn latest_for(
+            &self,
+            _entity_type: echo_agent::evolution::audit::EntityType,
+            _entity_key: &str,
+        ) -> echo_agent::error::Result<Option<echo_agent::evolution::audit::ChangeEntry>> {
+            Ok(None)
+        }
+        fn len(&self) -> usize {
+            0
+        }
+    }
+
+    /// B5.5 recall-closure e2e: a Completed run's memory (written via the
+    /// Blocking path that `drive_run_async` uses) is durable + findable by
+    /// recall BEFORE the run returns — so a follow-up question can hit it.
+    ///
+    /// This is the closure that B5.1's `MemoryPolicy::Blocking` guarantees. It
+    /// exercises the real MemoryLayerManager + InMemoryStore (no LLM, no
+    /// Postgres, no embeddings — the write path only serializes+stores, and
+    /// recall falls back to keyword search). The precondition: the run must
+    /// have ≥1 Completed todo (else build_candidates returns nothing).
+    #[tokio::test]
+    async fn completed_run_memory_is_recallable_blocking() {
+        use echo_agent::evolution::{MemoryLayerManager, MemoryRecaller};
+        use echo_agent::workspace::state::memory::store::InMemoryStore;
+        use echo_core::memory::store::Store;
+
+        // Real backing store; keep a clone for direct recall.
+        let store: Arc<dyn Store> = Arc::new(InMemoryStore::new());
+        let dir = tempfile::tempdir().unwrap().keep();
+        let lm = Arc::new(MemoryLayerManager::new(
+            dir,
+            store.clone(),
+            Box::new(NullChangeLog),
+        ));
+
+        // Seeded TaskRuntimeStore: run "r1", goal "Review runtime", one
+        // Completed todo ("Review chat.rs" / "found gap").
+        let rt_store = seeded_store();
+
+        // The write the Blocking policy performs on Completion (the path
+        // drive_run_async → execute_run → write_memory_candidate_dispatch uses).
+        write_memory_candidate_blocking(
+            Some(&lm),
+            &rt_store,
+            MemoryEvent::RunCompleted {
+                run_id: "r1".into(),
+                goal: "Review runtime".into(),
+            },
+        )
+        .await;
+
+        // (1) Exact-key lookup — strongest, no ranking luck. The key the write
+        // path uses is `taskrun:completed:{run_id}`.
+        let located = lm.locate("taskrun:completed:r1").await;
+        assert!(
+            located.is_some(),
+            "RunCompleted memory must be located by exact key"
+        );
+        let (_, entry) = located.unwrap();
+        assert!(
+            entry.content.contains("Review runtime"),
+            "memory content must carry the goal; got: {}",
+            entry.content
+        );
+        assert!(
+            entry.content.contains("Review chat.rs"),
+            "memory content must summarize the completed todo title; got: {}",
+            entry.content
+        );
+
+        // (2) Keyword recall via the manager (exercises the layered search path
+        // the frontend/agent recall would use).
+        let hits = lm.search_layered("Review", 10).await.unwrap();
+        assert!(
+            hits.iter()
+                .any(|(_, e)| e.content.contains("Review runtime")),
+            "search_layered should find the completed-run memory by keyword"
+        );
+
+        // (3) True ReactAgent recall path over the same store (what a follow-up
+        // question actually does). Confirms the write landed in a recallable
+        // namespace, not just an internal log.
+        let recalled = MemoryRecaller::new(store.clone())
+            .recall("Review", 5)
+            .await
+            .unwrap();
+        assert!(
+            recalled.iter().any(|i| i.key == "taskrun:completed:r1"),
+            "MemoryRecaller (the real follow-up-question path) must find the completed-run memory"
+        );
+    }
 }
