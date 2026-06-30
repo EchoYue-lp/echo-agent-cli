@@ -41,7 +41,6 @@ import { ScratchpadPanel } from '../scratchpad/ScratchpadPanel';
 import { DecisionLogPanel } from '../decisions/DecisionLogPanel';
 import { WorktreePanel } from '../coding/WorktreePanel';
 import { ObservabilityPanel } from '../observability/ObservabilityPanel';
-import { RouteFeedbackPanel } from '../runtime/RouteFeedbackPanel';
 
 interface SettingsItem {
   id: SettingsTabId;
@@ -77,7 +76,6 @@ const settingsGroups: SettingsGroup[] = [
       { id: 'providers', label: '模型', icon: Cpu, maturity: 'core', description: '模型、供应商和默认模型' },
       { id: 'tools', label: '工具', icon: Wrench, maturity: 'core', description: 'Agent 可用工具与权限' },
       { id: 'mcp', label: 'MCP', icon: Globe, maturity: 'core', description: '本地扩展服务连接' },
-      { id: 'routeFeedback', label: '路由学习', icon: BrainCircuit, maturity: 'core', description: 'Chat/Task/Auto 反馈规则' },
       { id: 'observability', label: '运行观测', icon: Activity, maturity: 'core', description: 'Token、缓存、trace 与诊断' },
       { id: 'memory', label: '记忆', icon: Brain, maturity: 'live', description: '项目与用户记忆' },
     ],
@@ -139,7 +137,6 @@ const panels: Record<SettingsTabId, React.FC> = {
   scratchpad: ScratchpadPanel,
   decisions: DecisionLogPanel,
   observability: ObservabilityPanel,
-  routeFeedback: RouteFeedbackPanel,
   compress: CompressPanel,
   evolution: EvolutionPanel,
   plugins: PluginPanel,
@@ -158,7 +155,6 @@ function SettingsOverview() {
       title: '执行主链路',
       icon: BrainCircuit,
       items: [
-        settingsGroups[0].items.find((item) => item.id === 'routeFeedback') ?? overviewItem,
         settingsGroups[0].items.find((item) => item.id === 'observability') ?? overviewItem,
         settingsGroups[2].items.find((item) => item.id === 'audit') ?? overviewItem,
       ],

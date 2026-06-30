@@ -124,15 +124,6 @@ function App() {
         category: 'Settings',
       },
       {
-        id: 'settings-route-feedback',
-        label: 'Settings: Route Learning',
-        description: 'Manage Auto routing corrections',
-        action: () => {
-          setActiveSettingsTab('routeFeedback');
-        },
-        category: 'Settings',
-      },
-      {
         id: 'settings-evolution',
         label: 'Settings: Self-Evolution',
         description: 'Trajectory management, background review, and skill curation',

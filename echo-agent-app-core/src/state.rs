@@ -393,9 +393,6 @@ pub struct TaskState {
     /// the router; `Chat` forces normal chat; `Task` forces TaskRuntime.
     /// Toggleable at runtime via Tauri command.
     pub interaction_mode: std::sync::atomic::AtomicU8,
-    /// User-learned router corrections. Loaded from disk at startup and
-    /// applied only in Auto mode, after LLM routing and deterministic signals.
-    pub route_feedback: RwLock<Vec<crate::tasks::task_runtime::RouteFeedbackRule>>,
 }
 
 /// Webhook 状态
@@ -550,7 +547,6 @@ impl AppState {
                     Arc::new(store)
                 }),
                 interaction_mode: std::sync::atomic::AtomicU8::new(0), // 0 = Auto
-                route_feedback: RwLock::new(crate::tasks::task_runtime::load_route_feedback_rules()),
                 run_cancel_tokens: DashMap::new(),
             },
             webhook: WebhookState {

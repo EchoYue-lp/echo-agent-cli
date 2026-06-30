@@ -36,9 +36,7 @@
 //! The framework already re-exports a `TaskEvent` from `echo_agent::tasks`.
 //! To avoid shadowing, this module's event type is named `RuntimeTaskEvent`
 //! and its event-kind enum is `RuntimeEventKind`.
-pub mod classify;
 pub mod delegate_readonly_tool;
-pub mod delegation;
 pub mod event_rebuild;
 pub mod execute_plan_tool;
 pub mod executor;
@@ -52,14 +50,11 @@ pub mod policy;
 pub mod profiles;
 pub mod review;
 pub mod router;
-pub mod signals;
 pub mod store;
 pub mod task_tools;
 pub mod types;
 pub mod worktree;
 
-pub use classify::{Classification, Complexity, ComplexityLabel, HeuristicClassifier};
-pub use delegation::{DelegationPlanner, DelegationRequest, WorkerSpec};
 pub use execute_plan_tool::ExecutePlanTool;
 pub use executor::{
     ConcurrencyLimits, ExecError, PreflightRejection, RunOutcome, WorkerTraceSink,
@@ -79,12 +74,6 @@ pub use review::{
     BreakerAction, ReviewError, build_fix_task, circuit_breaker_action, requires_review,
     review_task,
 };
-pub use router::{
-    RouteDecisionRecord, RouteFeedbackAction, RouteFeedbackRule, TaskRouteDecision, TaskRouteKind,
-    append_route_record, compute_scored_rules, default_route_records_path,
-    load_route_feedback_rules, load_route_records, record_route_feedback_match,
-    record_route_feedback_pattern, route_feedback_matches, route_message,
-    route_message_with_feedback, save_route_feedback_rules,
-};
+pub use router::TaskRouteKind;
 pub use store::{StoreError, TaskRuntimeStore};
 pub use types::*;

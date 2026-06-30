@@ -88,19 +88,6 @@ export interface AutoMemoryExtractResult extends AutoMemoryPreview {
   message?: string;
 }
 
-export interface RouteFeedbackRule {
-  pattern: string;
-  route: string;
-  reason: string;
-  suggested_workers: string[];
-  hit_count: number;
-  last_matched_at?: string | null;
-  success_count?: number;
-  failure_count?: number;
-  score?: number;
-  last_failure_reason?: string | null;
-}
-
 export interface ExecutionPolicySnapshot {
   interaction_mode: string;
   interaction_mode_id: number;
@@ -634,35 +621,6 @@ export const taskRuntimeApi = {
     isTauri()
       ? apiInvoke<ExecutionPolicySnapshot>('get_execution_policy')
       : get<ExecutionPolicySnapshot>('/task_runtime/execution_policy'),
-  listRouteFeedbackRules: () =>
-    isTauri()
-      ? apiInvoke<RouteFeedbackRule[]>('list_route_feedback_rules')
-      : get<RouteFeedbackRule[]>('/task_runtime/route_feedback'),
-  upsertRouteFeedbackRule: (
-    pattern: string,
-    route: string,
-    reason: string,
-    suggestedWorkers?: string[]
-  ) =>
-    isTauri()
-      ? apiInvoke<RouteFeedbackRule[]>('upsert_route_feedback_rule', {
-          pattern,
-          route,
-          reason,
-          suggestedWorkers: suggestedWorkers ?? null,
-        })
-      : post<RouteFeedbackRule[]>('/task_runtime/route_feedback', {
-          pattern,
-          route,
-          reason,
-          suggested_workers: suggestedWorkers ?? [],
-        }),
-  deleteRouteFeedbackRule: (pattern: string) =>
-    isTauri()
-      ? apiInvoke<RouteFeedbackRule[]>('delete_route_feedback_rule', { pattern })
-      : del<RouteFeedbackRule[]>(
-          `/task_runtime/route_feedback?pattern=${encodeURIComponent(pattern)}`
-        ),
   // Usage trends
   queryUsageRecords: (filter: Record<string, unknown>) =>
     isTauri()
@@ -672,15 +630,6 @@ export const taskRuntimeApi = {
     isTauri()
       ? apiInvoke<Record<string, unknown> | null>('get_run_usage_summary', { runId })
       : get<Record<string, unknown> | null>(`/task_runtime/runs/${runId}/usage`),
-  // Route feedback learning
-  submitRouteFeedback: (messageHash: string, correction: string, note?: string) =>
-    isTauri()
-      ? apiInvoke<{ success: boolean; scored_rules: RouteFeedbackRule[] }>('submit_route_feedback', { messageHash, correction, note: note ?? null })
-      : post<{ success: boolean; scored_rules: RouteFeedbackRule[] }>('/task_runtime/route_feedback/submit', { message_hash: messageHash, correction, note }),
-  getScoredRouteFeedbackRules: () =>
-    isTauri()
-      ? apiInvoke<RouteFeedbackRule[]>('get_scored_route_feedback_rules')
-      : get<RouteFeedbackRule[]>('/task_runtime/route_feedback/scored'),
 };
 
 // ── Trace Events API ─────────────────────────────────────────────────

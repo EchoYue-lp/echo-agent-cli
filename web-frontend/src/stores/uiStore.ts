@@ -11,7 +11,6 @@ export type SettingsTabId =
   | 'sessions'
   | 'audit'
   | 'observability'
-  | 'routeFeedback'
   | 'scratchpad'
   | 'decisions'
   | 'compress'

@@ -54,7 +54,6 @@ export * from './StreamingEvent';
 export * from './TaskExecutionSummary';
 export * from './TaskPatch';
 export * from './TaskPlan';
-export * from './TaskRouteDecision';
 export * from './TaskRouteKind';
 export * from './TaskRun';
 export * from './TaskRunStatus';

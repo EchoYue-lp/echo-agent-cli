@@ -138,12 +138,6 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
             commands::task_runtime::set_interaction_mode,
             commands::task_runtime::get_interaction_mode,
             commands::task_runtime::get_execution_policy,
-            // TaskRuntime route feedback
-            commands::task_runtime::list_route_feedback_rules,
-            commands::task_runtime::upsert_route_feedback_rule,
-            commands::task_runtime::delete_route_feedback_rule,
-            commands::task_runtime::submit_route_feedback,
-            commands::task_runtime::get_scored_route_feedback_rules,
             commands::task_runtime::query_usage_records,
             commands::task_runtime::get_run_usage_summary,
             // Memory
