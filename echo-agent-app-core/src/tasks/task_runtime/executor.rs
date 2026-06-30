@@ -1071,19 +1071,28 @@ async fn execute_task(
     let prompt = build_task_prompt(&task, &dep_summaries);
     let prompt = format!("{ws_prefix}{prompt}");
 
-    // Dispatch the task. Two paths, by kind:
+    // Dispatch the task. Three paths, by kind:
     // - Read-only kinds (read_only_review, investigation, test_plan, review,
-    //   summary) → delegate to the registered subagent role via
-    //   delegate_to_agent_with_cancel. Fork mode runs the worker on an
-    //   isolated instance under the executor's own semaphore (NOT the primary
-    //   agent's execution_mutex), so read-only tasks parallelize. The child
-    //   cancel token propagates parent-run cancellation.
-    // - Mutating kinds (implementation, debugging, verification) → the MAIN
-    //   agent executes directly via Agent::execute. These are serialized by
-    //   the write_sem above; they are never delegated to a read-only worker
-    //   (workers can't write). The primary agent's execution_mutex serializes
-    //   them further, which is correct — mutating work must not race.
+    //   summary) → delegate to the registered readonly subagent role via Fork.
+    //   The child cancel token propagates parent-run cancellation.
+    // - Code-writer kinds (implementation, debugging) → Sprint 9: delegate to
+    //   the registered "implementer" Fork worker, which runs inside an isolated
+    //   git worktree (Sprint 8). Writers still serialize via write_sem
+    //   (max_concurrent_writes=1) — the worktree gives each its own checkout so
+    //   writes don't land in the main workspace; they don't run concurrently.
+    //   Falls back to run_main_agent_task (in-place) if the writer worker isn't
+    //   registered or its dispatch fails (keeps the run going; the worktree-
+    //   creation safety gate already hard-fails inside dispatch_fork when a
+    //   factory is present but can't create — this fallback only catches the
+    //   "no writer configured" case, e.g. a non-git repo with no factory).
+    // - Verification (shell/build/test) → MAIN agent executes directly. These
+    //   run against the workspace (testing just-written changes), so routing
+    //   them to a separate worktree checkout would detach them from the work.
     let is_read_only_task = task.kind.is_read_only();
+    let is_code_writer_task = matches!(
+        task.kind,
+        PlanTaskKind::Implementation | PlanTaskKind::Debugging
+    );
     let (result, readonly_usage) = if is_read_only_task {
         match run_readonly_worker(
             &primary_agent,
@@ -1096,6 +1105,46 @@ async fn execute_task(
         {
             Ok(sub_result) => (Ok(sub_result.output), sub_result.usage),
             Err(e) => (Err(e), None),
+        }
+    } else if is_code_writer_task {
+        // Sprint 9: route to the worktree-isolated writer worker.
+        match run_writer_worker(
+            &primary_agent,
+            store.clone(),
+            &run_id,
+            &task.agent_role,
+            &prompt,
+            task_cancel.clone(),
+            trace_sink.clone(),
+        )
+        .await
+        {
+            Ok(sub_result) => (Ok(sub_result.output), sub_result.usage),
+            Err(e) => {
+                // Fallback: run in-place on the primary agent. Logged so the
+                // loss-of-isolation is visible (the run continues rather than
+                // failing the whole DAG over a missing worker config).
+                tracing::warn!(
+                    run_id = %run_id,
+                    task_id = %task_id,
+                    role = %task.agent_role,
+                    error = %e,
+                    "writer worker dispatch failed; falling back to in-place main-agent execution"
+                );
+                (
+                    run_main_agent_task(
+                        &primary_agent,
+                        store.clone(),
+                        &run_id,
+                        &task,
+                        &prompt,
+                        task_cancel.clone(),
+                        trace_sink.clone(),
+                    )
+                    .await,
+                    None,
+                )
+            }
         }
     } else {
         (
@@ -1345,11 +1394,76 @@ async fn run_readonly_worker(
         .await
 }
 
-/// Run a MUTATING task (implementation / debugging / verification) directly on
-/// the PRIMARY agent via `Agent::execute`. These tasks are never delegated to a
-/// read-only subagent (workers can't write). The write_sem acquired by the
-/// caller serializes them, and the primary agent's execution_mutex serializes
-/// them further — correct, because mutating work must not race.
+/// Run a CODE-WRITER task (implementation / debugging) by delegating to the
+/// registered writer subagent role via Fork dispatch (Sprint 9).
+///
+/// Mirrors [`run_readonly_worker`] but with attachment-aware delegation: when
+/// the run carries user attachments (images/files), the multimodal variant
+/// `delegate_to_agent_with_parent_cancel_and_message` is used so the writer
+/// worker sees them (parity with the old in-place `run_main_agent_task` path).
+///
+/// The registered writer worker (built by `build_writer_worker_agent`) carries
+/// the full write tool set and declares `isolate_worktree: true`, so the
+/// framework's `dispatch_fork` runs it inside an isolated git worktree
+/// (eko-fork-<label>) — writes land in the worktree, not the main workspace.
+/// Writers still serialize via the caller's `write_sem`.
+async fn run_writer_worker(
+    primary_agent: &crate::agent_handle::AgentHandle,
+    store: Arc<TaskRuntimeStore>,
+    run_id: &str,
+    role: &str,
+    prompt: &str,
+    cancel: CancellationToken,
+    _trace_sink: Option<WorkerTraceSink>,
+) -> Result<echo_agent::agent::subagent::SubagentResult, String> {
+    // Rebuild a multimodal Message when the run carries user attachments, so
+    // the writer worker sees the same images/files as the primary agent would
+    // (parity with run_main_agent_task, executor.rs:1373-1380).
+    let run_message: Option<echo_core::llm::types::Message> =
+        store.get_run(run_id).ok().flatten().and_then(|r| {
+            if r.attachments.is_empty() {
+                None
+            } else {
+                crate::attachments::build_message_from_refs(prompt, &r.attachments).ok()
+            }
+        });
+
+    primary_agent
+        .read_async(|agent| {
+            let prompt = prompt.to_string();
+            let role = role.to_string();
+            let run_id = run_id.to_string();
+            let run_message = run_message.clone();
+            Box::pin(async move {
+                if let Some(msg) = run_message {
+                    agent
+                        .delegate_to_agent_with_parent_cancel_and_message(
+                            &role, &prompt, msg, &run_id, cancel, 0,
+                        )
+                        .await
+                } else {
+                    agent
+                        .delegate_to_agent_with_parent_and_cancel(
+                            &role, &prompt, &run_id, cancel, 0,
+                        )
+                        .await
+                }
+                .map_err(|e| format!("writer worker dispatch failed: {e}"))
+            })
+        })
+        .await
+    // The SubagentResult returned by delegation carries the writer's accumulated
+    // output, which already includes the appended worktree diff from dispatch_fork's
+    // finalize step (Sprint 8). trace_sink is accepted for signature parity with
+    // run_main_agent_task but unused here — subagent token/thinking events are
+    // emitted by the framework's executor event bus, not this caller.
+}
+
+/// Run a MUTATING task (verification) directly on the PRIMARY agent via
+/// `Agent::execute`. These tasks are never delegated to a read-only subagent
+/// (workers can't write). The write_sem acquired by the caller serializes them,
+/// and the primary agent's execution_mutex serializes them further — correct,
+/// because mutating work must not race.
 ///
 /// Cancellation: `Agent::execute` is not cancel-aware, so we race it against
 /// the cancel token. If the run is cancelled mid-task, we return an error and

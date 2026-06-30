@@ -292,11 +292,45 @@ fn role_for_kind(kind: PlanTaskKind) -> &'static str {
         }
         PlanTaskKind::Review => "reviewer",
         PlanTaskKind::Summary => "summarizer",
-        // Mutating kinds: main agent executes directly; role is a record label
-        // only (run_readonly_worker does not touch it).
-        PlanTaskKind::Implementation | PlanTaskKind::Debugging | PlanTaskKind::Verification => {
-            "primary"
-        }
+        // Sprint 9: code-writing kinds route to the registered "implementer"
+        // Fork worker (runs in an isolated worktree). The role string IS the
+        // registered subagent name (executor delegates by literal match).
+        PlanTaskKind::Implementation | PlanTaskKind::Debugging => "implementer",
+        // Verification (shell/build/test) stays on the primary agent: it runs
+        // read-only-ish shell commands against the workspace and routing it to
+        // a separate worktree checkout would detach it from the just-written
+        // changes. It takes the shell permit, not the writer path.
+        PlanTaskKind::Verification => "primary",
+    }
+}
+
+#[cfg(test)]
+mod role_routing_tests {
+    use super::*;
+
+    #[test]
+    fn readonly_kinds_route_to_explorer_reviewer_summarizer() {
+        assert_eq!(role_for_kind(PlanTaskKind::ReadOnlyReview), "explorer");
+        assert_eq!(role_for_kind(PlanTaskKind::Investigation), "explorer");
+        assert_eq!(role_for_kind(PlanTaskKind::TestPlan), "explorer");
+        assert_eq!(role_for_kind(PlanTaskKind::Review), "reviewer");
+        assert_eq!(role_for_kind(PlanTaskKind::Summary), "summarizer");
+    }
+
+    #[test]
+    fn code_writer_kinds_route_to_implementer() {
+        // Sprint 9: Implementation/Debugging dispatch to the registered writer
+        // worker (runs in an isolated worktree).
+        assert_eq!(role_for_kind(PlanTaskKind::Implementation), "implementer");
+        assert_eq!(role_for_kind(PlanTaskKind::Debugging), "implementer");
+    }
+
+    #[test]
+    fn verification_stays_on_primary() {
+        // Verification (shell/build/test) runs in-place on the primary agent —
+        // it tests just-written changes against the workspace, so routing it to
+        // a separate worktree would detach it.
+        assert_eq!(role_for_kind(PlanTaskKind::Verification), "primary");
     }
 }
 

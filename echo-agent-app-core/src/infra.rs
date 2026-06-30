@@ -431,39 +431,55 @@ async fn register_default_subagents(
         "Loaded subagent worker definitions from .md (project/user/builtin)"
     );
     for worker_def in &workers {
-        // Only readonly workers are registered via this path. A future writer
-        // role would route through a different (worktree-bound) builder.
-        if !worker_def.readonly {
-            tracing::debug!(
-                worker = %worker_def.name,
-                "Skipping non-readonly worker definition (writer registration not yet wired)"
-            );
-            continue;
-        }
-        match build_readonly_worker_agent(
-            &worker_def.name,
-            &worker_def.system_prompt,
-            model,
-            llm_config.clone(),
-            temperature,
-            max_tokens,
-            token_limit,
-            tool_timeout_ms,
-            cache_user_id,
-        ) {
+        // Sprint 9: register BOTH readonly and writer workers. Readonly workers
+        // get the readonly tool subset (physical no-write enforcement); writer
+        // workers get the full tool set (shell/file/git) and run inside an
+        // isolated git worktree when `isolate_worktree` is set (Sprint 8 wiring).
+        // Writers are still serialized at run time by `write_sem` (default 1);
+        // the worktree gives each its own checkout so writes don't land in the
+        // main workspace.
+        let build_result = if worker_def.readonly {
+            build_readonly_worker_agent(
+                &worker_def.name,
+                &worker_def.system_prompt,
+                model,
+                llm_config.clone(),
+                temperature,
+                max_tokens,
+                token_limit,
+                tool_timeout_ms,
+                cache_user_id,
+            )
+        } else {
+            build_writer_worker_agent(
+                &worker_def.name,
+                &worker_def.system_prompt,
+                model,
+                llm_config.clone(),
+                temperature,
+                max_tokens,
+                token_limit,
+                tool_timeout_ms,
+                cache_user_id,
+            )
+        };
+        match build_result {
             Ok(worker) => {
                 let worker_handle = crate::agent_handle::AgentHandle::new(worker);
+                // delegate_readonly is registered on both kinds — it lets a
+                // worker fan out to readonly peers; writers don't get a
+                // write-delegation tool (no recursive unbounded writes).
                 crate::tasks::task_runtime::delegate_readonly_tool::
                     register_delegate_readonly_on_handle(&worker_handle, None).await;
 
                 let mut builder = SubagentBuilder::new(&worker_def.name)
                     .description(&worker_def.description)
                     .fork_mode();
-                // Sprint 8: honor the frontmatter `worktree: true` flag (only
-                // set for non-readonly workers; readonly ones have it cleared
-                // by the loader). Today this path only registers readonly
-                // workers, so this is a no-op — it activates when writer
-                // registration is wired (Sprint 9 DAG writer routing).
+                // Sprint 8/9: honor the frontmatter `worktree: true` flag (only
+                // set for non-readonly writers; readonly workers have it cleared
+                // by the loader since they don't mutate files). This makes the
+                // framework's dispatch_fork create an isolated worktree for the
+                // writer (eko-fork-<label> branch).
                 if worker_def.isolate_worktree {
                     builder = builder.isolate_worktree();
                 }
@@ -475,11 +491,84 @@ async fn register_default_subagents(
             }
             Err(err) => tracing::warn!(
                 subagent = %worker_def.name,
+                readonly = worker_def.readonly,
                 error = %err,
-                "Failed to register default read-only subagent"
+                "Failed to register default subagent"
             ),
         }
     }
+}
+
+/// Build a **writer** worker agent (Sprint 9): same as the readonly worker
+/// but with full write tools (shell/file/git) instead of the readonly subset.
+/// Used for `Implementation`/`Debugging` tasks that route to Fork workers in
+/// isolated git worktrees. Writers are still serialized by `write_sem`
+/// (`max_concurrent_writes` = 1) — the worktree gives each its own checkout so
+/// writes don't land in the main workspace, but they don't run concurrently.
+#[allow(clippy::too_many_arguments)]
+fn build_writer_worker_agent(
+    name: &str,
+    prompt: &str,
+    model: &str,
+    llm_config: Option<LlmConfig>,
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
+    token_limit: usize,
+    tool_timeout_ms: u64,
+    cache_user_id: &str,
+) -> std::result::Result<ReactAgent, echo_agent::error::ReactError> {
+    // Mirror build_readonly_worker_agent, but OMIT `.readonly_tools()` → the
+    // default `readonly_tools: false` triggers `register_all_tools`, giving the
+    // writer shell/file/git write capability. Isolation is enforced physically
+    // by the worktree (Sprint 8): the worker's working_dir is bound to its own
+    // worktree checkout, so writes can't reach the main workspace even though
+    // the tools could.
+    let mut builder = ReactAgentBuilder::new()
+        .model(model)
+        .name(name)
+        .system_prompt(prompt)
+        .enable_tools()
+        // NO .readonly_tools() → full tool set (write capability).
+        .enable_memory()
+        .enable_cot()
+        .enable_subagent()
+        .max_iterations(0)
+        .token_limit(token_limit)
+        .max_tokens(max_tokens.or(Some(DEFAULT_MAX_TOKENS)))
+        .temperature(temperature)
+        .tool_execution(echo_agent::tools::ToolExecutionConfig {
+            timeout_ms: tool_timeout_ms,
+            ..Default::default()
+        });
+
+    let has_llm_config = llm_config.is_some();
+    if let Some(config) = llm_config {
+        tracing::info!(
+            worker_name = name,
+            model = %config.model,
+            has_auth = !config.api_key.is_empty(),
+            "writer worker: injecting LlmConfig"
+        );
+        builder = builder.llm_config(config);
+    } else {
+        tracing::warn!(
+            worker_name = name,
+            "writer worker: NO LlmConfig injected — will fall back to env vars / models.yaml"
+        );
+    }
+
+    let mut worker = builder.build()?;
+    let has_client = worker.llm_client().is_some();
+    tracing::info!(
+        worker_name = name,
+        has_llm_config,
+        has_llm_client = has_client,
+        model = %worker.model_name(),
+        "writer worker built: LLM client status (full write tools)"
+    );
+    worker.config_mut().set_cache_user_id(cache_user_id);
+    worker.set_plan_mode(true);
+    Ok(worker)
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -37,6 +37,13 @@ const BUILTIN_WORKER_FILES: &[(&str, &str)] = &[
     ("reviewer", include_str!("subagents/coding/reviewer.md")),
     ("planner", include_str!("subagents/coding/planner.md")),
     ("summarizer", include_str!("subagents/coding/summarizer.md")),
+    // Sprint 9: writer worker — gets write tools + worktree isolation
+    // (worktree:true && !readonly → isolate_worktree). Implementation/Debugging
+    // tasks route here instead of running in-place on the primary agent.
+    (
+        "implementer",
+        include_str!("subagents/coding/implementer.md"),
+    ),
 ];
 
 /// Maximum recursion depth when scanning a scope directory for `.md` files.
@@ -403,18 +410,39 @@ mod tests {
 
     #[test]
     fn builtin_defaults_parse_cleanly() {
-        // The 4 compiled-in defaults must all parse without error — guards
-        // against a corrupt source .md slipping through.
+        // The compiled-in defaults must all parse without error — guards
+        // against a corrupt source .md slipping through. Sprint 9 added a
+        // writer worker (implementer) alongside the 4 readonly roles.
         let defs = discover_subagents(None, None);
         let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
-        assert_eq!(names, ["explorer", "reviewer", "planner", "summarizer"]);
+        assert_eq!(
+            names,
+            [
+                "explorer",
+                "reviewer",
+                "planner",
+                "summarizer",
+                "implementer"
+            ]
+        );
         for d in &defs {
             assert!(!d.system_prompt.is_empty());
             assert!(!d.description.is_empty());
-            // All builtins are readonly.
-            assert!(d.readonly);
-            assert!(d.tags.contains(&"readonly".to_string()));
         }
+        // The 4 readonly roles are readonly + carry the readonly tag.
+        for name in ["explorer", "reviewer", "planner", "summarizer"] {
+            let d = defs.iter().find(|d| d.name == name).unwrap();
+            assert!(d.readonly, "{name} should be readonly");
+            assert!(d.tags.contains(&"readonly".to_string()));
+            assert!(!d.isolate_worktree, "{name} must not request worktree");
+        }
+        // Sprint 9: the writer worker is non-readonly + requests worktree isolation.
+        let implementer = defs.iter().find(|d| d.name == "implementer").unwrap();
+        assert!(!implementer.readonly);
+        assert!(
+            implementer.isolate_worktree,
+            "implementer must request worktree isolation (worktree:true && !readonly)"
+        );
     }
 
     #[test]
@@ -484,8 +512,9 @@ mod tests {
     #[test]
     fn nonexistent_scope_dirs_are_silently_skipped() {
         // Neither scope dir exists → only builtins returned, no panic.
+        // 4 readonly roles + 1 writer (implementer, Sprint 9) = 5 builtins.
         let fake_root = PathBuf::from("/nonexistent/definitely/not/here");
         let defs = discover_subagents(Some(&fake_root), Some(&fake_root));
-        assert_eq!(defs.len(), 4);
+        assert_eq!(defs.len(), 5);
     }
 }
