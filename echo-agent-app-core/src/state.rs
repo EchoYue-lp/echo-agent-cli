@@ -605,15 +605,18 @@ impl AppState {
             Some(b) => crate::scheduler::CronTaskStore::with_store(b),
             None => crate::scheduler::CronTaskStore::new(),
         };
-        // Cron tasks use the primary agent (scheduler fire_fn is sync).
-        // When a BackgroundTaskService is available, cron tasks are submitted
-        // to it (which uses the dedicated background agent from the pool).
+        // Phase C: pass the agent pool so each cron run acquires its OWN
+        // per-run agent (worktree working_dir binding is per-run, fixing the
+        // latent override bug where overlapping cron runs clobbered the shared
+        // agent's working_dir). Falls back to the shared primary agent when no
+        // pool is configured.
         let runner = crate::scheduler::new_scheduler_runner(
             store,
             self.scheduler.cancel_token.clone(),
             self.connection.agent.clone(),
             self.tasks.service.clone(),
             self.tasks.runtime.clone(),
+            self.connection.pool.clone(),
         );
         let runner = Arc::new(runner);
         runner.clone().spawn();

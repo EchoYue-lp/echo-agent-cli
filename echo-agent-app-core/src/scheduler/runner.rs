@@ -12,6 +12,7 @@
 //! called); complex prompts drive task_create + execute_plan.
 
 use crate::agent_handle::AgentHandle;
+use crate::agent_pool::AgentPool;
 use crate::tasks::service::BackgroundTaskService;
 use crate::tasks::task_runtime::{TaskRuntimeStore, launch_cron_run};
 use echo_agent::agent::CancellationToken;
@@ -38,14 +39,23 @@ const PLAN_MARKER: &str = "[plan]";
 /// Phase 3.5: the dead-in-practice `runtime_store=None` fallback (legacy
 /// `BackgroundTaskService::submit` + `execute_direct`) has been removed —
 /// `AppState` always constructs a `TaskRuntimeStore` at boot.
+///
+/// Phase C: cron now runs on a POOL-ACQUIRED per-run agent (not the shared
+/// primary chat agent). This fixes the latent `working_dir` override bug —
+/// each cron run's worktree binding lives on its own agent, so overlapping
+/// runs no longer clobber each other's working_dir (previously masked only by
+/// the agent's execution_mutex). When no pool is configured, falls back to the
+/// shared `agent` (the pre-C behavior, still correct for single-agent setups).
 pub fn build_fire_fn(
     agent: AgentHandle,
     _task_service: Option<Arc<BackgroundTaskService>>,
     task_runtime_store: Option<Arc<TaskRuntimeStore>>,
+    pool: Option<Arc<AgentPool>>,
 ) -> FireFn {
     Arc::new(move |task: CronTask| {
-        let agent = agent.clone();
+        let fallback_agent = agent.clone();
         let runtime_store = task_runtime_store.clone();
+        let pool = pool.clone();
         Box::pin(async move {
             let store = runtime_store.ok_or_else(|| {
                 echo_agent::error::ReactError::Other(
@@ -65,16 +75,41 @@ pub fn build_fire_fn(
             }
             let fire_id = uuid::Uuid::new_v4().to_string();
             let cancel = CancellationToken::new();
-            match launch_cron_run(
-                store.clone(),
-                agent.clone(),
-                &task.id,
-                &fire_id,
-                prompt,
-                cancel,
-            )
-            .await
-            {
+
+            // Phase C: acquire a per-run pool agent when available. The
+            // run-scoped key means each cron run gets its OWN agent (never
+            // reused), so the worktree working_dir binding in
+            // drive_unattended_run is per-run and can't be clobbered by an
+            // overlapping run. Pooled agents don't get ExecutePlanTool at
+            // construction (built for workers, §10.2), so register it here —
+            // a cron run's agent plays the primary role (drives task_create +
+            // execute_plan), not a worker role.
+            let run_agent: AgentHandle = match &pool {
+                Some(pool) => {
+                    let run_key = format!("__cron__:{}:{fire_id}", task.id);
+                    let acquired = pool.acquire(&run_key).await.map_err(|e| {
+                        echo_agent::error::ReactError::Other(format!(
+                            "cron pool acquire failed: {e}"
+                        ))
+                    })?;
+                    register_execute_plan_on_agent(&acquired, store.clone()).await;
+                    acquired
+                }
+                None => fallback_agent.clone(),
+            };
+
+            let result =
+                launch_cron_run(store.clone(), run_agent, &task.id, &fire_id, prompt, cancel).await;
+
+            // Release the per-run pool entry so it doesn't linger until the
+            // 5-min idle evictor reaps it (drive_run_async notably does NOT
+            // release — a pre-existing minor leak we don't repeat here).
+            if let Some(pool) = &pool {
+                pool.release(&format!("__cron__:{}:{fire_id}", task.id))
+                    .await;
+            }
+
+            match result {
                 Ok(run_id) => Ok(format!("cron run {run_id} finished for task {}", task.id)),
                 Err(e) => Err(echo_agent::error::ReactError::Other(format!(
                     "cron run failed: {e}"
@@ -84,19 +119,42 @@ pub fn build_fire_fn(
     })
 }
 
+/// Register the `execute_plan` tool on a cron run's pool-acquired agent
+/// (Phase C). Mirrors `desktop.rs`'s primary-agent registration. Pooled agents
+/// are built without it (worker stance, §10.2), but a cron run's agent drives
+/// task_create + execute_plan and needs it.
+async fn register_execute_plan_on_agent(agent_handle: &AgentHandle, store: Arc<TaskRuntimeStore>) {
+    use crate::tasks::task_runtime::ExecutePlanTool;
+    let tool = ExecutePlanTool::new(store, agent_handle.clone());
+    let added = agent_handle
+        .write(|agent| {
+            agent.add_tool(Box::new(tool));
+            true
+        })
+        .await;
+    if added {
+        tracing::debug!("Registered execute_plan tool on cron run agent");
+    } else {
+        tracing::warn!("Failed to register execute_plan on cron run agent (write lock poisoned)");
+    }
+}
+
 /// Convenience constructor: build a `SchedulerRunner` with the CLI's
 /// preferred wiring (agent + optional background task service).
 ///
 /// U1c phase-1 → Phase 3.1: `task_runtime_store` enables the unified
 /// cron→launch_cron_run path (all cron, not just `[plan]`).
+/// Phase C: `pool` enables per-run agent isolation (recommended when an
+/// `AgentPool` exists); falls back to the shared `agent` when `None`.
 pub fn new_scheduler_runner(
     store: CronTaskStore,
     cancel: echo_agent::agent::CancellationToken,
     agent: AgentHandle,
     task_service: Option<Arc<BackgroundTaskService>>,
     task_runtime_store: Option<Arc<TaskRuntimeStore>>,
+    pool: Option<Arc<AgentPool>>,
 ) -> SchedulerRunner {
-    let fire_fn = build_fire_fn(agent, task_service, task_runtime_store);
+    let fire_fn = build_fire_fn(agent, task_service, task_runtime_store, pool);
     SchedulerRunner::new(store, cancel, fire_fn)
 }
 
@@ -124,7 +182,7 @@ mod tests {
 
         // task_service=None:Phase 3.1 前会逼非-[plan] prompt 走 execute_direct;
         // 3.1 后 runtime_store(此处置 Some)接管所有 prompt → launch_cron_run。
-        let fire_fn = build_fire_fn(handle, None, Some(store.clone()));
+        let fire_fn = build_fire_fn(handle, None, Some(store.clone()), None);
 
         let task = CronTask::new("plain", "*/5 * * * *", "hello world");
         let result = fire_fn(task).await;
@@ -152,7 +210,7 @@ mod tests {
         let handle = AgentHandle::new(agent);
         let store =
             Arc::new(TaskRuntimeStore::new_in_memory().expect("in-memory store should init"));
-        let fire_fn = build_fire_fn(handle, None, Some(store.clone()));
+        let fire_fn = build_fire_fn(handle, None, Some(store.clone()), None);
 
         let task = CronTask::new("plan", "*/5 * * * *", "[plan] do the thing");
         let result = fire_fn(task).await;

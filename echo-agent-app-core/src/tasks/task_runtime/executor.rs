@@ -1867,14 +1867,15 @@ pub async fn drive_unattended_run(
             // Must happen before execute_stream_with_cancel (which triggers
             // tool calls). set_working_dir is &self and uses internal mutex.
             //
-            // TODO(latent bug, not fixed in B5): this mutates the SHARED
-            // `primary_agent` (cron's single shared chat agent, state.rs:612).
-            // Two overlapping cron runs on the same agent would clobber each
-            // other's working_dir. Today this is masked by the agent's
-            // execution_mutex serializing runs, but adopting pool-per-run here
-            // (per-run agent) is what would actually fix it — tracked for a
-            // future cron-isolation change. Do NOT remove this binding without
-            // a per-run agent, or cron writes would land in the main workspace.
+            // Phase C (fixed): the cron caller now acquires a per-run POOL
+            // agent (build_fire_fn → pool.acquire(run-scoped key)), so this
+            // binding mutates the run's OWN agent — overlapping cron runs no
+            // longer clobber each other's working_dir (the latent bug that was
+            // previously masked only by the agent's execution_mutex). The
+            // AgentChat path (submit_run) likewise passes its own pool-acquired
+            // agent, so this is isolated in all live callers. The only residual
+            // shared-agent caller is the no-pool fallback (single-agent setups),
+            // where there is no overlap to worry about.
             if let Some(ref wt_path) = wt_path_for_scope {
                 agent.set_working_dir(Some(wt_path.clone()));
             }
