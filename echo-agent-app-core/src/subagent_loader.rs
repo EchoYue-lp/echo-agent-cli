@@ -57,6 +57,11 @@ struct WorkerFrontmatter {
     description: String,
     #[serde(default)]
     readonly: bool,
+    /// Sprint 8: request worktree isolation for this Fork-dispatched worker
+    /// (Claude Code `isolation: worktree` equivalent). Only meaningful for
+    /// writer workers; requires a `WorktreeFactory` configured on the agent.
+    #[serde(default)]
+    worktree: bool,
     /// Optional tags; merged with the default readonly/parallel tags when
     /// `readonly` is true. Empty if unset.
     #[serde(default)]
@@ -70,6 +75,10 @@ pub struct WorkerDefinition {
     pub description: String,
     pub system_prompt: String,
     pub readonly: bool,
+    /// Sprint 8: whether Fork dispatch should isolate this worker in a git
+    /// worktree. Mapped from frontmatter `worktree: true`. Only meaningful for
+    /// writer workers (readonly workers don't mutate files).
+    pub isolate_worktree: bool,
     pub tags: Vec<String>,
 }
 
@@ -258,11 +267,16 @@ pub fn parse_worker_md(
         }
     }
 
+    // Sprint 8: `worktree: true` only makes sense for writer workers; if a
+    // readonly worker declares it, ignore (readonly workers don't mutate files).
+    let isolate_worktree = fm.worktree && !fm.readonly;
+
     Ok(WorkerDefinition {
         name,
         description: fm.description,
         system_prompt,
         readonly: fm.readonly,
+        isolate_worktree,
         tags,
     })
 }
@@ -356,6 +370,35 @@ mod tests {
     fn parse_empty_body_errors() {
         let md = "---\nname: x\ndescription: y\n---\n";
         assert!(parse_worker_md(md, None).is_err());
+    }
+
+    #[test]
+    fn parse_worktree_flag_for_writer_only() {
+        // Sprint 8: `worktree: true` sets isolate_worktree on a writer.
+        let md = "---\nname: refactorer\ndescription: \"writes code\"\nreadonly: false\nworktree: true\n---\nYou refactor code.";
+        let def = parse_worker_md(md, None).unwrap();
+        assert!(!def.readonly);
+        assert!(def.isolate_worktree, "writer with worktree:true → isolate");
+    }
+
+    #[test]
+    fn parse_worktree_flag_ignored_for_readonly() {
+        // Sprint 8: a readonly worker declaring worktree:true is ignored —
+        // readonly workers don't mutate files, so isolation is meaningless.
+        let md = "---\nname: explorer\ndescription: \"reads\"\nreadonly: true\nworktree: true\n---\nYou explore.";
+        let def = parse_worker_md(md, None).unwrap();
+        assert!(def.readonly);
+        assert!(
+            !def.isolate_worktree,
+            "readonly worker must not request worktree isolation"
+        );
+    }
+
+    #[test]
+    fn parse_worktree_defaults_false() {
+        let md = "---\nname: w\ndescription: \"d\"\nreadonly: false\n---\nbody";
+        let def = parse_worker_md(md, None).unwrap();
+        assert!(!def.isolate_worktree);
     }
 
     #[test]

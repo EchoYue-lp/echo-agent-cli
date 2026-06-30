@@ -299,6 +299,43 @@ pub async fn create_agent(
         }
     }
 
+    // Resolve the subagent .md scopes: project root (params.project → working_dir
+    // → auto-discover) and user home. Workers are hot-loaded from .md files
+    // (Sprint 6); builtin defaults compiled into the binary act as fallback.
+    // Sprint 8: the same project root also seeds the worktree factory below.
+    let subagent_project_root = params
+        .project
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .or_else(|| params.working_dir.clone())
+        .or_else(|| crate::project::context::discover_project_root(None));
+    let subagent_user_home = dirs::home_dir();
+
+    // Sprint 8: inject a worktree-isolation factory so Fork-dispatched writer
+    // workers (those declaring `isolate_worktree: true`) can run in isolated
+    // git worktrees. Resolve the git repo root best-effort from the project
+    // root; if it's not a git repo, no factory is injected (workers declaring
+    // isolation log a warning and run unisolated — the framework's default).
+    // No new permission gate: worktree is a user-driven isolation tool
+    // (AGENTS.md local-assistant positioning); factory failure still hard-fails
+    // the dispatch (data-loss guard, not a permission check).
+    let worktree_factory = subagent_project_root.as_ref().and_then(|root| {
+        crate::tasks::task_runtime::worktree::git_repo_root(root)
+            .ok()
+            .map(crate::tasks::task_runtime::worktree::EkoWorktreeFactory::new)
+            .map(|f| {
+                let arc: std::sync::Arc<
+                    dyn echo_agent::agent::subagent::worktree::WorktreeFactory,
+                > = std::sync::Arc::new(f);
+                arc
+            })
+    });
+    let builder = if let Some(factory) = worktree_factory {
+        builder.subagent_worktree_factory(factory)
+    } else {
+        builder
+    };
+
     let mut agent = builder.build().map_err(|e| {
         tracing::error!("Failed to build agent: {e}");
         format!("Failed to initialize agent: {e}. Please check your configuration and try again.")
@@ -312,16 +349,6 @@ pub async fn create_agent(
         "main agent: registering default subagents with llm_config={}",
         injected_llm_config.as_ref().map(|c| c.model.as_str()).unwrap_or("NONE")
     );
-    // Resolve the subagent .md scopes: project root (params.project → working_dir
-    // → auto-discover) and user home. Workers are hot-loaded from .md files
-    // (Sprint 6); builtin defaults compiled into the binary act as fallback.
-    let subagent_project_root = params
-        .project
-        .as_ref()
-        .map(std::path::PathBuf::from)
-        .or_else(|| params.working_dir.clone())
-        .or_else(|| crate::project::context::discover_project_root(None));
-    let subagent_user_home = dirs::home_dir();
     register_default_subagents(
         &mut agent,
         model,
@@ -432,6 +459,14 @@ async fn register_default_subagents(
                 let mut builder = SubagentBuilder::new(&worker_def.name)
                     .description(&worker_def.description)
                     .fork_mode();
+                // Sprint 8: honor the frontmatter `worktree: true` flag (only
+                // set for non-readonly workers; readonly ones have it cleared
+                // by the loader). Today this path only registers readonly
+                // workers, so this is a no-op — it activates when writer
+                // registration is wired (Sprint 9 DAG writer routing).
+                if worker_def.isolate_worktree {
+                    builder = builder.isolate_worktree();
+                }
                 for tag in &worker_def.tags {
                     builder = builder.tag(tag);
                 }

@@ -26,6 +26,11 @@ use std::process::Command;
 /// Branch-name prefix reserved for unattended-run worktrees.
 pub const BRANCH_PREFIX: &str = "eko-unattended-";
 
+/// Branch-name prefix reserved for Fork-dispatched worker worktrees (Sprint 8).
+/// Distinct from [`BRANCH_PREFIX`] so list/merge/discard can tell unattended-run
+/// worktrees apart from interactive Fork-worker worktrees.
+pub const FORK_BRANCH_PREFIX: &str = "eko-fork-";
+
 /// A worktree descriptor as surfaced by `git worktree list --porcelain`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeInfo {
@@ -272,7 +277,27 @@ impl RunWorktree {
     ///   cleanup (future `cleanupPeriodDays`-style sweeping) won't
     ///   interfere while the run is active.
     pub fn create(run_id: &str, repo_root: &Path) -> Result<Self, WorktreeError> {
-        let branch = format!("{BRANCH_PREFIX}{run_id}");
+        Self::create_with_prefix(BRANCH_PREFIX, run_id, repo_root, "unattended run")
+    }
+
+    /// Create a worktree for a Fork-dispatched worker (Sprint 8).
+    ///
+    /// Like [`create`](Self::create) but uses the [`FORK_BRANCH_PREFIX`]
+    /// namespace so Fork-worker worktrees stay distinct from unattended-run
+    /// worktrees in `git worktree list`. `label` identifies the dispatch
+    /// (e.g. `"{agent_name}-{run_id}"`).
+    pub fn create_fork(label: &str, repo_root: &Path) -> Result<Self, WorktreeError> {
+        Self::create_with_prefix(FORK_BRANCH_PREFIX, label, repo_root, "fork worker")
+    }
+
+    /// Shared core for [`create`] and [`create_fork`].
+    fn create_with_prefix(
+        prefix: &str,
+        id: &str,
+        repo_root: &Path,
+        kind: &str,
+    ) -> Result<Self, WorktreeError> {
+        let branch = format!("{prefix}{id}");
         validate_branch_name(repo_root, &branch)?;
         let path = default_worktree_path(repo_root, &branch)?;
         validate_worktree_target(repo_root, &path)?;
@@ -295,12 +320,12 @@ impl RunWorktree {
                 "lock",
                 path_str,
                 "--reason",
-                &format!("unattended run {run_id} in progress"),
+                &format!("{kind} {id} in progress"),
             ],
         )?;
 
         Ok(Self {
-            run_id: run_id.to_string(),
+            run_id: id.to_string(),
             path,
             branch,
             base: base.to_string(),
@@ -495,12 +520,90 @@ pub fn discard_unattended_worktree(repo_root: &Path, run_id: &str) -> Result<(),
     Ok(())
 }
 
+// ── Fork-worker worktree factory (Sprint 8) ──────────────────────────────
+
+/// EKO's application-layer implementation of the framework's
+/// `WorktreeFactory` trait. Constructs a git worktree per Fork-dispatched
+/// writer worker (via [`RunWorktree::create_fork`]) and finalizes with a
+/// `git diff` summary (kept for human review — no auto-merge, Q1 alignment
+/// with the unattended path and Claude Code).
+///
+/// Stored behind an `Arc` and injected into the framework's
+/// `AgentConfig.subagent_worktree_factory`, so the framework can create
+/// worktrees for workers declaring `isolate_worktree: true` without the
+/// framework itself depending on git or the application.
+#[derive(Debug, Clone)]
+pub struct EkoWorktreeFactory {
+    /// Repository root the worktrees branch from. Resolved by the application
+    /// (e.g. `git_repo_root(cwd)`); `None` makes `create` fail fast.
+    pub repo_root: PathBuf,
+}
+
+impl echo_agent::agent::subagent::worktree::WorktreeFactory for EkoWorktreeFactory {
+    fn create(
+        &self,
+        label: &str,
+    ) -> Result<
+        echo_agent::agent::subagent::worktree::WorktreeHandle,
+        echo_agent::agent::subagent::worktree::WorktreeError,
+    > {
+        // Build the worktree via the shared RunWorktree lifecycle. `create_fork`
+        // runs blocking git subprocesses; Fork dispatch is already inside a
+        // `tokio::spawn`, but the git ops themselves are short and synchronous
+        // — acceptable. (If they ever block the runtime, wrap in
+        // spawn_blocking inside the factory.)
+        let wt = RunWorktree::create_fork(label, &self.repo_root)
+            .map_err(|e| echo_agent::agent::subagent::worktree::WorktreeError::new(e.message))?;
+        let path = wt.path.clone();
+        tracing::info!(
+            worker_label = label,
+            worktree = %path.display(),
+            branch = %wt.branch,
+            "Created Fork-worker worktree"
+        );
+        // `finalize` owns `wt`: generates the diff summary (kept for review —
+        // no remove). The worktree stays on disk for the user to merge/discard
+        // via the Tauri list/merge/discard flow (to be extended to the
+        // `eko-fork-` prefix).
+        Ok(echo_agent::agent::subagent::worktree::WorktreeHandle {
+            path,
+            finalize: Box::new(move || {
+                wt.diff_summary().map_err(|e| {
+                    echo_agent::agent::subagent::worktree::WorktreeError::new(e.message)
+                })
+            }),
+        })
+    }
+}
+
+impl EkoWorktreeFactory {
+    /// Construct a factory bound to the given repo root. The caller resolves
+    /// the root (typically `git_repo_root(cwd)`); pass `None` up-front by not
+    /// constructing a factory at all if isolation is unavailable.
+    pub fn new(repo_root: PathBuf) -> Self {
+        Self { repo_root }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // ── Pure-logic tests (no git subprocess needed) ──
 
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn eko_worktree_factory_create_fails_outside_git_repo() {
+        // Sprint 8: EkoWorktreeFactory implements the framework trait; on a
+        // non-git directory, create() must surface an error (RunWorktree::create_fork
+        // → git rev-parse fails). This guards the trait wiring without needing
+        // a real git repo (which CI/sandbox may not have).
+        let tmp = std::env::temp_dir();
+        let factory = EkoWorktreeFactory::new(tmp.clone());
+        let res =
+            echo_agent::agent::subagent::worktree::WorktreeFactory::create(&factory, "writer-run1");
+        assert!(res.is_err(), "expected error outside a git repo");
+    }
 
     #[test]
     fn parse_worktree_list_round_trips_sample_output() {
