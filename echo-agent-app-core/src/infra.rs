@@ -703,7 +703,7 @@ pub fn spawn_dreaming_task(
     });
 }
 
-/// 创建对话持久化 Store（SQLite），失败时返回 None（禁用持久化）
+/// 创建对话持久化 Store（文件），失败时返回 None（禁用持久化）
 pub fn create_conversation_store() -> Option<Arc<dyn ConversationStore>> {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     let base = std::path::PathBuf::from(home).join(".echo-agent");
@@ -730,7 +730,7 @@ pub fn inject_conversation_store(agent: &AgentHandle, store: &Option<Arc<dyn Con
     }
 }
 
-/// 创建运行时状态 Store（SQLite），失败时返回 None（禁用 checkpoint）
+/// 创建运行时状态 Store（文件），失败时返回 None（禁用 checkpoint）
 ///
 /// Persists `AgentCheckpoint`s (full messages + plan + active_skills + blocked_reason)
 /// and the TaskNode DAG so a conversation can be resumed across process restarts.
