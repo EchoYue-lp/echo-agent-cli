@@ -90,6 +90,12 @@ pub async fn drive_run_async(payload: RunPayload) -> Result<RunOutcome, String> 
     // the map doesn't accumulate stale entries. No-op if `cancel_run` already
     // removed it (spec §5.5 cleanup).
     payload.store.unregister_run_cancel_token(&payload.run_id);
+    // Phase C: release the per-run pool entry so it doesn't linger until the
+    // 5-min idle evictor reaps it (a pre-existing minor leak this driver had
+    // since B2). `acquire(run_id)` always creates a fresh entry (run_id is a
+    // fresh UUID per run, never reused), so release here is the defensive
+    // choice — matches the cron path. No-op semantics if already evicted.
+    payload.pool.release(&payload.run_id).await;
     result.map_err(|e| format!("execute_run failed for run {}: {e}", payload.run_id))
 }
 

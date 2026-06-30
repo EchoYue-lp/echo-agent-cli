@@ -670,6 +670,21 @@ impl BackgroundTaskService {
             .map_err(|e| anyhow::anyhow!("acquire agent: {e}"))?;
         let agent = lease.agent();
         install_background_hitl_provider(&agent, self.hitl_provider.clone()).await;
+        // Phase C: pooled agents are built without ExecutePlanTool (worker
+        // stance, §10.2), but a submit_run's agent drives task_create +
+        // execute_plan (primary role). Register it, mirroring the cron path's
+        // register_execute_plan_on_agent. Without this a complex AgentChat
+        // prompt can't execute its plan via execute_plan (silent degrade).
+        {
+            use super::task_runtime::ExecutePlanTool;
+            let tool = ExecutePlanTool::new(store.clone(), agent.clone());
+            agent
+                .write(|a| {
+                    a.add_tool(Box::new(tool));
+                    true
+                })
+                .await;
+        }
 
         let fire_id = uuid::Uuid::new_v4().to_string();
         let run_id = uuid::Uuid::new_v4().to_string();

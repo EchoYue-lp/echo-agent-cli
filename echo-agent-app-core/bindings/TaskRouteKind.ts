@@ -3,4 +3,4 @@
 /**
  * Runtime path persisted on a run.
  */
-export type TaskRouteKind = "normal_chat" | "plan_only" | "complex_runtime" | "parallel_readonly_delegation" | "background_task" | "direct_edit";
+export type TaskRouteKind = "complex_runtime" | "parallel_readonly_delegation";
