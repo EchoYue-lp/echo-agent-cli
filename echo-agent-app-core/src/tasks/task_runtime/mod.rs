@@ -68,7 +68,10 @@ pub use memory_bridge::{
     MemoryEvent, MemoryPolicy, write_memory_candidate, write_memory_candidate_blocking,
     write_memory_candidate_dispatch,
 };
-pub use planner::validate_plan_deps;
+pub use planner::{
+    FileOverlapPair, OwnershipReport, analyze_file_ownership, has_writer_file_overlap,
+    validate_plan_deps,
+};
 pub use policy::{ExecutionPolicy, ExecutionPolicySnapshot, PermissionMode, RuntimeLaunchPolicy};
 pub use profiles::ProfileTemplate;
 pub use register::register_task_tools_on_agent;

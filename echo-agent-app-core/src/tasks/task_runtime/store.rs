@@ -393,6 +393,23 @@ impl TaskRuntimeStore {
             return Err(StoreError::InvalidPlan(errs.join("; ")));
         }
 
+        // Sprint 7: plan-time file-overlap advisory. Non-blocking — the write
+        // semaphore already serializes all writers, so this is a scheduling
+        // hint for when parallel writes are enabled (Sprint 8/9), surfaced
+        // early so the user sees the plan risk at edit time.
+        let report = super::planner::analyze_file_ownership(&new_tasks);
+        if report.has_overlap() {
+            for pair in &report.overlap_pairs {
+                tracing::warn!(
+                    run_id,
+                    task_a = %pair.task_a,
+                    task_b = %pair.task_b,
+                    shared = ?pair.shared,
+                    "plan: writer tasks share files (will serialize; disjoint files enable parallel worktrees)"
+                );
+            }
+        }
+
         self.shadow.append_event_line(
             run_id,
             None,
@@ -501,6 +518,19 @@ impl TaskRuntimeStore {
             }
             if let Err(errs) = super::planner::validate_plan_deps(&tasks) {
                 return Err(StoreError::InvalidPlan(errs.join("; ")));
+            }
+            // Sprint 7: plan-time file-overlap advisory (non-blocking; see insert_task).
+            let report = super::planner::analyze_file_ownership(&tasks);
+            if report.has_overlap() {
+                for pair in &report.overlap_pairs {
+                    tracing::warn!(
+                        run_id,
+                        task_a = %pair.task_a,
+                        task_b = %pair.task_b,
+                        shared = ?pair.shared,
+                        "plan: writer tasks share files (will serialize; disjoint files enable parallel worktrees)"
+                    );
+                }
             }
         }
 
