@@ -312,6 +312,16 @@ pub async fn create_agent(
         "main agent: registering default subagents with llm_config={}",
         injected_llm_config.as_ref().map(|c| c.model.as_str()).unwrap_or("NONE")
     );
+    // Resolve the subagent .md scopes: project root (params.project → working_dir
+    // → auto-discover) and user home. Workers are hot-loaded from .md files
+    // (Sprint 6); builtin defaults compiled into the binary act as fallback.
+    let subagent_project_root = params
+        .project
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .or_else(|| params.working_dir.clone())
+        .or_else(|| crate::project::context::discover_project_root(None));
+    let subagent_user_home = dirs::home_dir();
     register_default_subagents(
         &mut agent,
         model,
@@ -321,6 +331,8 @@ pub async fn create_agent(
         token_limit,
         app_config.agent.tool_timeout_ms,
         &cache_user_id,
+        subagent_project_root.as_deref(),
+        subagent_user_home.as_deref(),
     )
     .await;
 
@@ -359,96 +371,20 @@ pub async fn create_agent(
     Ok(agent)
 }
 
-/// Readonly worker role definitions for subagent delegation (L2 and L3 nesting).
-///
-/// Each entry is (name, description, system_prompt). Used by both the main agent
-/// (L2 delegation) and worker agents (L3 delegation via spec §3.3).
-/// SA-4: 13 domain-specific workers → 4 generic capability roles.
-///
-/// The domain specialization (medical/academic/data/coding) is now achieved
-/// via skill/profile injection into these generic agents, not via separate
-/// agent definitions. This aligns with industry consensus (Claude Code ~3
-/// subagents, OpenHands microagents, Devin single-agent): specialization
-/// belongs in the context layer, not the agent layer.
-const WORKER_DEFINITIONS: &[(&str, &str, &str)] = &[
-    (
-        "explorer",
-        "只读探索：项目结构、代码库、数据源、学术/医学文献、配置和文档，输出关键发现和不确定点。",
-        r#"你是 EKO 的只读探索 worker（Explorer）。
-
-任务：快速建立目标领域的地图——无论是代码库、数据集、学术文献还是医学资料。
-识别关键入口、结构、配置、核心内容和测试/验证布局；记录不确定点。
-
-边界：只读；不要修改文件；不要运行 shell；不要做最终综合结论。
-
-方法：
-- 代码库：读目录结构、README/manifest、主入口、核心模块、测试布局
-- 数据集：识别来源、schema、字段语义、样本范围、缺失/异常值
-- 学术文献：提出检索策略、关键词、数据库、候选资料、证据缺口
-- 医学资料：优先指南/系统综述/RCT，记录 PICO、来源、证据缺口
-
-输出：按"定位 / 关键内容 / 结构 / 重要事实 / 不确定点"组织，引用使用 path:line 或来源标识。"#,
-    ),
-    (
-        "reviewer",
-        "只读审查：代码 bug、分析方法、证据质量、临床适用性、安全边界和测试缺口。",
-        r#"你是 EKO 的只读审查 worker（Reviewer）。
-
-任务：寻找真实问题——无论是代码 bug、统计方法缺陷、证据质量不足、临床指南
-不一致还是安全边界越界。区分确定问题、可疑问题和设计建议。
-
-边界：只读；不要修改文件；不要运行 shell；不要输出泛泛建议。
-
-方法：
-- 代码审查：从调用链和状态流入手，找 bug/架构风险/重复/并发问题/缺失测试
-- 分析审查：审查指标定义、统计假设、图表表达、因果表述
-- 证据审查：评估研究类型、方法质量、样本限制、引用可靠性
-- 临床审查：审查证据等级、适用人群、指南一致性、风险收益
-- 安全审查：检查是否越界（诊断/治疗建议）、禁忌遗漏、紧急风险
-
-输出：按严重程度排序；每条包含引用(path:line/来源)、风险、原因、建议验证方式。"#,
-    ),
-    (
-        "planner",
-        "只读规划：验证方案、测试计划、可复现路径、综述结构和研究交付物。",
-        r#"你是 EKO 的只读规划 worker（Planner）。
-
-任务：设计最小但有力的方案——无论是验证测试、数据复现路径、综述结构
-还是研究交付物。根据目标领域决定规划重点。
-
-边界：只读；不要修改文件；不要运行 shell；不要假设检查已经通过。
-
-方法：
-- 验证规划：覆盖编译/单测/集成/GUI/回归，决定验证层级和优先级
-- 复现规划：从原始数据到结论的完整路径，包括环境/输入/脚本/检查点
-- 综述规划：章节结构、证据矩阵字段、论证链、引用组织、局限性
-- 研究规划：交付物清单、写作步骤、验证检查点
-
-输出：按优先级列出步骤、命令/入口、预期信号、失败时下一步。"#,
-    ),
-    (
-        "summarizer",
-        "汇总多个 worker 的发现，压缩成清晰结论、计划或交付说明。",
-        r#"你是 EKO 的综合汇总 worker（Summarizer）。
-
-任务：合并多个 worker 的发现，去重、消解冲突、提炼结论、给出可执行下一步。
-
-边界：只读；不要修改文件；不要运行 shell；不要发明 worker 没有提供的事实。
-
-方法：优先保留有证据的发现；把推断和确定事实分开；指出剩余不确定性。
-
-输出：先给综合结论，再给关键证据、风险排序、建议行动计划。"#,
-    ),
-];
-
 /// Register readonly worker subagents on the given agent.
 ///
-/// Builds and registers all 13 readonly subagent definitions and agents.
-/// Used by the main agent for L2 delegation, and called on each worker
-/// agent for L3 nesting (spec §3.3).
+/// Worker definitions are **hot-loaded from `.md` files** (Sprint 6): project
+/// scope `<root>/.echo-agent/subagents/**/*.md` overrides user scope
+/// `~/.echo-agent/subagents/**/*.md`, which overrides the builtin defaults
+/// compiled into the binary (`src/subagents/coding/*.md`). Editing a `.md`
+/// prompt therefore takes effect on next agent build without recompiling.
+///
+/// Only `readonly` workers are registered here (the 4 generic capability
+/// roles: explorer/reviewer/planner/summarizer). Domain specialization lives
+/// in the context/skill layer, not separate agent definitions — aligns with
+/// industry consensus (Claude Code ~3 subagents, OpenHands microagents,
+/// Devin single-agent). Used by the main agent for L2 delegation.
 #[allow(clippy::too_many_arguments)]
-// register_worker_subagents removed (SA-3): was 13×13 L3 nesting registration
-// = 182 agent instances. Workers almost never recursively fan out 13 ways.
 async fn register_default_subagents(
     agent: &mut ReactAgent,
     model: &str,
@@ -458,11 +394,28 @@ async fn register_default_subagents(
     token_limit: usize,
     tool_timeout_ms: u64,
     cache_user_id: &str,
+    project_root: Option<&std::path::Path>,
+    user_home: Option<&std::path::Path>,
 ) {
-    for &(name, description, prompt) in WORKER_DEFINITIONS {
+    let workers = crate::subagent_loader::discover_subagents(project_root, user_home);
+    tracing::info!(
+        count = workers.len(),
+        names = ?workers.iter().map(|w| w.name.as_str()).collect::<Vec<_>>(),
+        "Loaded subagent worker definitions from .md (project/user/builtin)"
+    );
+    for worker_def in &workers {
+        // Only readonly workers are registered via this path. A future writer
+        // role would route through a different (worktree-bound) builder.
+        if !worker_def.readonly {
+            tracing::debug!(
+                worker = %worker_def.name,
+                "Skipping non-readonly worker definition (writer registration not yet wired)"
+            );
+            continue;
+        }
         match build_readonly_worker_agent(
-            name,
-            prompt,
+            &worker_def.name,
+            &worker_def.system_prompt,
             model,
             llm_config.clone(),
             temperature,
@@ -472,31 +425,21 @@ async fn register_default_subagents(
             cache_user_id,
         ) {
             Ok(worker) => {
-                // SA-3: REMOVED register_worker_subagents (13×13 L3 nesting).
-                // Previously each of the 13 workers had all 13 re-registered
-                // as L3 sub-workers = 182 agent instances per top-level agent.
-                // Workers almost never recursively fan out 13 ways; the cost
-                // (182 LLM clients + tool managers) vastly exceeded the value.
-                // L3 nesting is still supported via delegate_readonly on the
-                // main agent if a future need arises — just not pre-built.
-
-                // Register delegate_readonly on the worker so it can still
-                // delegate if needed (the registry is empty by default; the
-                // framework returns "no subagents registered" gracefully).
                 let worker_handle = crate::agent_handle::AgentHandle::new(worker);
                 crate::tasks::task_runtime::delegate_readonly_tool::
                     register_delegate_readonly_on_handle(&worker_handle, None).await;
 
-                let def = SubagentBuilder::new(name)
-                    .description(description)
-                    .fork_mode()
-                    .tag("readonly")
-                    .tag("parallel")
-                    .build();
+                let mut builder = SubagentBuilder::new(&worker_def.name)
+                    .description(&worker_def.description)
+                    .fork_mode();
+                for tag in &worker_def.tags {
+                    builder = builder.tag(tag);
+                }
+                let def = builder.build();
                 agent.register_subagent_with_definition(def, worker_handle.to_boxed_agent().await);
             }
             Err(err) => tracing::warn!(
-                subagent = name,
+                subagent = %worker_def.name,
                 error = %err,
                 "Failed to register default read-only subagent"
             ),
