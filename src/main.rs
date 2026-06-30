@@ -308,6 +308,20 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
         // drive complex tasks (plan / worker / run lifecycle) via `drive_chat`.
         let task_runtime_store = build_task_runtime_store_for_headless();
 
+        // TUI/GUI functional parity (AGENTS.md): register the task-management
+        // tools (create_complex_task / execute_plan / task_create… / cancel_run)
+        // on the primary agent so TUI can drive complex tasks just like GUI
+        // (desktop.rs). The store-less delegate_readonly from bootstrap is also
+        // re-registered WITH the store here, making the plan-exists
+        // "refuse → use execute_plan" interception effective.
+        if let Some(store) = task_runtime_store.clone() {
+            echo_agent_app_core::tasks::task_runtime::register_task_tools_on_agent(
+                &agent_handle,
+                store,
+            )
+            .await;
+        }
+
         // Start BackgroundTaskService with the pool so independent
         // background tasks can use distinct worker agents.
         let tui_task_service = {
@@ -354,6 +368,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             tui_pending,
             pool,
             task_runtime_store,
+            runtime.review_integration.clone(),
         )
         .await?;
 

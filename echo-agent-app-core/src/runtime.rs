@@ -127,10 +127,12 @@ impl AgentRuntime {
                 .await;
         }
 
-        // ── NOTE: ExecutePlanTool is NOT registered here. In GUI mode the
-        // TaskRuntimeStore doesn't exist yet (AppState creates it later), so
-        // registration happens in desktop.rs::register_task_tools_on_agent().
-        // TUI/CLI mode doesn't use the task runtime at all.
+        // ── NOTE: ExecutePlanTool + the task-management tools are NOT registered
+        // here. The TaskRuntimeStore doesn't exist yet at primary-agent build
+        // time (GUI: AppState creates it later; TUI: built in main.rs after
+        // bootstrap), so BOTH entry points call `register_task_tools_on_agent`
+        // (in app-core `tasks/task_runtime/register.rs`) post-hoc once the store
+        // is ready. TUI/GUI functional parity (AGENTS.md).
         // ── 4. HITL dispatcher ──
         let hitl_dispatcher = {
             let dispatcher = Arc::new(HitlDispatcher::new());

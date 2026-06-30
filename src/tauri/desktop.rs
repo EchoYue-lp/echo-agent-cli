@@ -211,7 +211,11 @@ async fn run_desktop() -> anyhow::Result<()> {
         } else {
             tracing::warn!("Could not inject TaskRuntimeStore into pool (Arc not unique)");
         }
-        register_task_tools_on_agent(&agent_handle, task_store).await;
+        echo_agent_app_core::tasks::task_runtime::register_task_tools_on_agent(
+            &agent_handle,
+            task_store,
+        )
+        .await;
     }
 
     state_inner.set_pool(pool);
@@ -246,98 +250,4 @@ async fn run_desktop() -> anyhow::Result<()> {
     cancel_token.cancel();
 
     Ok(())
-}
-
-/// Register the 5 task-management tools (task_create/update/complete/skip/list)
-/// and the execute_plan tool on an existing agent via its handle's write lock.
-/// Used for the primary agent, which is created before the TaskRuntimeStore
-/// exists and thus can't receive the tools at construction time (unlike pooled
-/// agents, which get them via SharedResources.task_runtime_store).
-async fn register_task_tools_on_agent(
-    agent_handle: &echo_agent_app_core::agent_handle::AgentHandle,
-    store: std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
-) {
-    use echo_agent_app_core::tasks::task_runtime::task_tools::{
-        CancelRunTool, CheckRunStatusTool, CreateComplexTaskTool, TaskCompleteTool, TaskCreateTool,
-        TaskListTool, TaskSkipTool, TaskUpdateTool,
-    };
-    let added = agent_handle
-        .write(|agent| {
-            agent.add_tool(Box::new(TaskCreateTool {
-                store: store.clone(),
-            }));
-            agent.add_tool(Box::new(TaskUpdateTool {
-                store: store.clone(),
-            }));
-            agent.add_tool(Box::new(TaskCompleteTool {
-                store: store.clone(),
-            }));
-            agent.add_tool(Box::new(TaskSkipTool {
-                store: store.clone(),
-            }));
-            agent.add_tool(Box::new(TaskListTool {
-                store: store.clone(),
-            }));
-            // Phase B3: agent-autonomous complex-task tools. These read
-            // pool/store/sink from the chat turn's task_local
-            // (current_chat_resources), so no store injection is needed.
-            agent.add_tool(Box::new(CreateComplexTaskTool));
-            agent.add_tool(Box::new(CheckRunStatusTool));
-            agent.add_tool(Box::new(CancelRunTool));
-            true
-        })
-        .await;
-    if added {
-        tracing::info!("Registered 8 task-management tools on primary agent");
-    } else {
-        tracing::warn!(
-            "Failed to register task-management tools on primary agent (write lock poisoned)"
-        );
-    }
-
-    // Also register execute_plan tool (only on main agent per §10.2).
-    // Use ParallelReadonlyDelegation as the default route; the route is
-    // resolved per-run by the router at the orchestration layer.
-    use echo_agent_app_core::tasks::task_runtime::ExecutePlanTool;
-    let tool = ExecutePlanTool::new(store.clone(), agent_handle.clone());
-    let ep_added = agent_handle
-        .write(|agent| {
-            agent.add_tool(Box::new(tool));
-            true
-        })
-        .await;
-    if ep_added {
-        tracing::info!("Registered execute_plan tool on primary agent");
-    } else {
-        tracing::warn!(
-            "Failed to register execute_plan tool on primary agent (write lock poisoned)"
-        );
-    }
-
-    // Re-register delegate_readonly WITH the store. At bootstrap (runtime.rs:126)
-    // the store didn't exist yet, so delegate_readonly was registered with
-    // store=None — which disables the "plan exists → refuse, tell LLM to use
-    // execute_plan" interception (delegate_readonly_tool.rs:123). Replacing it
-    // here (after the store exists) makes the interception effective, so the
-    // main agent is forced down the execute_plan path when it has a plan.
-    // (根因①修复)
-    use echo_agent_app_core::tasks::task_runtime::delegate_readonly_tool::DelegateReadonlyTool;
-    let removed = agent_handle
-        .write(|agent| agent.remove_tool("delegate_readonly").is_some())
-        .await;
-    if removed {
-        tracing::debug!("Removed store-less delegate_readonly from primary agent");
-    }
-    let dr_tool = DelegateReadonlyTool::new(agent_handle.clone()).with_store(store.clone());
-    let dr_added = agent_handle
-        .write(|agent| {
-            agent.add_tool(Box::new(dr_tool));
-            true
-        })
-        .await;
-    if dr_added {
-        tracing::info!("Re-registered delegate_readonly WITH store on primary agent");
-    } else {
-        tracing::warn!("Failed to re-register delegate_readonly with store");
-    }
 }

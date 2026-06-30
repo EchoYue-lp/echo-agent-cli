@@ -26,6 +26,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use echo_agent_app_core::evolution::ReviewIntegration;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -248,6 +249,15 @@ pub struct TuiApp {
     /// `drive_chat(multimodal=Some)`, then drains the buffer. Empty = plain
     /// text turn.
     pub pending_attachments: Vec<echo_agent_app_core::attachments::AttachmentRef>,
+    /// ReviewIntegration for memory-layer access (TUI/GUI parity, AGENTS.md):
+    /// when `Some`, `handle_enter` builds a `layer_manager` per turn so
+    /// autonomous runs block-write their completion memory (`taskrun:completed`).
+    /// `None` = no review/memory subsystem (writes become no-ops). Set by `run_tui`.
+    pub review_integration: Option<std::sync::Arc<ReviewIntegration>>,
+    /// Conversation id for this TUI session (TUI/GUI parity). Binds chat turns
+    /// and TaskRuntime runs to one conversation; enables transcript projection.
+    /// Generated once per session in `run_tui`.
+    pub conversation_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -361,6 +371,8 @@ impl TuiApp {
             pool: None,
             task_runtime_store: None,
             pending_attachments: Vec::new(),
+            review_integration: None,
+            conversation_id: None,
         }
     }
 
@@ -1114,6 +1126,7 @@ impl Drop for TerminalGuard {
 ///
 /// This function handles all terminal setup/teardown via [`TerminalGuard`],
 /// so the terminal is always restored even on panic or early return.
+#[allow(clippy::too_many_arguments)] // startup entry: agent + services + config + pool + store + review_integration all wired here
 pub async fn run_tui(
     agent: AgentHandle,
     task_service: Option<std::sync::Arc<echo_agent_app_core::tasks::BackgroundTaskService>>,
@@ -1126,6 +1139,7 @@ pub async fn run_tui(
     task_runtime_store: Option<
         std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
     >,
+    review_integration: Option<std::sync::Arc<ReviewIntegration>>,
 ) -> anyhow::Result<()> {
     // Use ColorTheme to generate Theme, unifying both theme systems.
     let color_theme = echo_agent_app_core::output::theme::ColorTheme::dark();
@@ -1154,6 +1168,10 @@ pub async fn run_tui(
     app.pending_approval = Some(tui_pending);
     app.pool = Some(pool);
     app.task_runtime_store = task_runtime_store;
+    app.review_integration = review_integration;
+    // One conversation id per TUI session (parity with GUI's per-conversation id):
+    // binds this session's chat turns + TaskRuntime runs + transcript projection.
+    app.conversation_id = Some(uuid::Uuid::new_v4().to_string());
 
     // Main event loop.
     let result = events::run_event_loop(&mut terminal, &mut app, agent, task_service).await;

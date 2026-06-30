@@ -15,6 +15,7 @@ use tokio::sync::{broadcast, mpsc};
 
 use echo_agent::tasks::TaskEvent;
 use echo_agent_app_core::tasks::BackgroundTaskService;
+use echo_agent_app_core::tasks::task_runtime::InteractionMode;
 
 /// Poll interval for non-blocking event check.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -662,21 +663,43 @@ async fn handle_enter(
             let cancel = echo_agent::agent::CancellationToken::new();
             let sink: std::sync::Arc<dyn echo_agent_app_core::chat_driver::ChatSink> =
                 std::sync::Arc::new(TuiChatSink::new(agent_tx.clone()));
+            // B4.3 (spec §8): per-turn mode hint, mirroring GUI's chat.rs —
+            // Chat → forbid create_complex_task; Task → lean towards it;
+            // Auto → no hint (pure agent autonomy). Pure prompt, no code route.
+            let mode_hint = match app.interaction_mode {
+                InteractionMode::Chat => Some(
+                    "Chat — this is a simple conversation. Do NOT call \
+                     create_complex_task; reply directly in this turn."
+                        .to_string(),
+                ),
+                InteractionMode::Task => Some(
+                    "Task — the user expects involved work. When the request is \
+                     genuinely complex (multi-step / multi-file / long research), \
+                     prefer create_complex_task over a single inline reply."
+                        .to_string(),
+                ),
+                InteractionMode::Auto => None,
+            };
             let res = std::sync::Arc::new(echo_agent_app_core::chat_resources::ChatResources {
                 pool: app.pool.clone(),
                 store: app.task_runtime_store.clone(),
                 sink,
-                conv_id: None,
+                // TUI/GUI parity (AGENTS.md): bind this turn to the session's
+                // conversation id so TaskRuntime runs + transcript projection work.
+                conv_id: app.conversation_id.clone(),
                 root_message_id: uuid::Uuid::new_v4().to_string(),
                 // Bind staged refs so workers in an autonomous run see them too.
                 attachments: staged,
                 cancel,
-                // B4.3 mode hint wired for GUI; TUI parity (honoring
-                // app.interaction_mode) is a follow-up — Auto autonomy here.
-                mode_hint: None,
-                // B5.1: TUI has no review/memory subsystem today; autonomous
-                // run memory writes are no-ops until wired (recall closure off).
-                layer_manager: None,
+                mode_hint,
+                // B5.1 (TUI/GUI parity): build a layer_manager per turn from
+                // review_integration so autonomous runs block-write their
+                // completion memory (`taskrun:completed`). None = no review/memory
+                // subsystem (writes become no-ops).
+                layer_manager: app
+                    .review_integration
+                    .as_ref()
+                    .map(|ri| std::sync::Arc::new(ri.create_layer_manager())),
             });
             send_to_agent(agent, text, multimodal, res).await;
         }
@@ -816,7 +839,26 @@ impl echo_agent_app_core::chat_driver::ChatSink for TuiChatSink {
                 after_tokens,
             },
             echo_agent::agent::AgentEvent::Error { message, .. } => AgentEvent::Error(message),
-            // Other framework events (LlmUsage, GuardTriggered, MemoryRecalled,
+            // LlmUsage: not rendered in TUI (token totals come from ThinkEnd),
+            // but trace cache stats so they're not silently dropped (TUI/GUI
+            // observability parity). Full usage rendering is a follow-up.
+            echo_agent::agent::AgentEvent::LlmUsage {
+                prompt_tokens,
+                cached_prompt_tokens,
+                cache_creation_prompt_tokens,
+                usage_reported,
+                ..
+            } => {
+                tracing::debug!(
+                    prompt_tokens,
+                    cached_prompt_tokens,
+                    cache_creation_prompt_tokens,
+                    usage_reported,
+                    "TUI: LLM usage reported (cache stats; not rendered)"
+                );
+                return true;
+            }
+            // Other framework events (GuardTriggered, MemoryRecalled,
             // SafetyNotice, ParameterError, …) have no TUI rendering yet.
             other => {
                 tracing::debug!(event = ?other, "TUI: unrendered agent event");

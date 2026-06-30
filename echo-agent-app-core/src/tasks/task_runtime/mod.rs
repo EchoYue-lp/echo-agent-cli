@@ -48,6 +48,7 @@ pub mod memory_bridge;
 pub mod planner;
 pub mod policy;
 pub mod profiles;
+pub mod register;
 pub mod review;
 pub mod router;
 pub mod store;
@@ -70,6 +71,7 @@ pub use memory_bridge::{
 pub use planner::validate_plan_deps;
 pub use policy::{ExecutionPolicy, ExecutionPolicySnapshot, PermissionMode, RuntimeLaunchPolicy};
 pub use profiles::ProfileTemplate;
+pub use register::register_task_tools_on_agent;
 pub use review::{
     BreakerAction, ReviewError, build_fix_task, circuit_breaker_action, requires_review,
     review_task,
