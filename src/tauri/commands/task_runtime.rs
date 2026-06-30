@@ -789,21 +789,6 @@ pub async fn get_scored_route_feedback_rules(
         .collect())
 }
 
-// ── Conversation event replay ─────────────────────────────────────────
-
-#[tauri::command]
-pub async fn list_conversation_events(
-    state: tauri::State<'_, TauriState>,
-    conversation_id: String,
-    since_seq: Option<String>,
-) -> Result<Vec<serde_json::Value>, IpcError> {
-    let store = store(&state)?;
-    let since = since_seq.and_then(|s| s.parse::<i64>().ok());
-    store
-        .list_conversation_events(&conversation_id, since)
-        .map_err(internal)
-}
-
 // ── Usage trend queries ───────────────────────────────────────────────
 
 #[tauri::command]

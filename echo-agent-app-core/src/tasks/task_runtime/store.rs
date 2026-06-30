@@ -65,23 +65,6 @@ pub struct TaskRuntimeStore {
     /// In-memory LLM usage records (token spend per worker call). Not persisted
     /// —重启清零,符合 EKO 本地工具定位(usage 是参考指标,非账本)。
     usage_records: std::sync::Mutex<Vec<super::types::UsageRecord>>,
-    /// In-memory conversation-replay events, with a per-store autoincrement seq.
-    conv_events: std::sync::Mutex<ConvEventLog>,
-}
-
-/// In-memory conversation-event log: events + a monotonic seq counter.
-struct ConvEventLog {
-    next_seq: i64,
-    events: Vec<ConvEventEntry>,
-}
-
-/// One conversation-replay event entry (replaces `tr_conversation_events` row).
-struct ConvEventEntry {
-    seq: i64,
-    conversation_id: String,
-    event_type: String,
-    payload: String,
-    timestamp: chrono::DateTime<chrono::Utc>,
 }
 
 impl TaskRuntimeStore {
@@ -106,10 +89,6 @@ impl TaskRuntimeStore {
             run_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
             shadow,
             usage_records: std::sync::Mutex::new(Vec::new()),
-            conv_events: std::sync::Mutex::new(ConvEventLog {
-                next_seq: 1,
-                events: Vec::new(),
-            }),
         })
     }
 
@@ -135,10 +114,6 @@ impl TaskRuntimeStore {
             run_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
             shadow,
             usage_records: std::sync::Mutex::new(Vec::new()),
-            conv_events: std::sync::Mutex::new(ConvEventLog {
-                next_seq: 1,
-                events: Vec::new(),
-            }),
         })
     }
 
@@ -1016,57 +991,6 @@ impl TaskRuntimeStore {
             records.push(record);
         }
         Ok(())
-    }
-
-    // ── Conversation events (replay support, in-memory) ────────────────
-    // Held in memory: conversation replay is scoped to a live session and need
-    // not survive a restart (EKO local-tool stance). Replaces the old
-    // `tr_conversation_events` SQL table.
-
-    pub fn append_conversation_event(
-        &self,
-        conversation_id: &str,
-        event_type: &str,
-        payload: &str,
-    ) -> Result<(), StoreError> {
-        if let Ok(mut log) = self.conv_events.lock() {
-            let seq = log.next_seq;
-            log.next_seq = log.next_seq.saturating_add(1);
-            log.events.push(ConvEventEntry {
-                seq,
-                conversation_id: conversation_id.to_string(),
-                event_type: event_type.to_string(),
-                payload: payload.to_string(),
-                timestamp: Utc::now(),
-            });
-        }
-        Ok(())
-    }
-
-    pub fn list_conversation_events(
-        &self,
-        conversation_id: &str,
-        since_seq: Option<i64>,
-    ) -> Result<Vec<serde_json::Value>, StoreError> {
-        let log = self
-            .conv_events
-            .lock()
-            .map_err(|_| StoreError::LockPoisoned)?;
-        let events: Vec<serde_json::Value> = log
-            .events
-            .iter()
-            .filter(|e| e.conversation_id == conversation_id)
-            .filter(|e| since_seq.is_none_or(|s| e.seq > s))
-            .map(|e| {
-                serde_json::json!({
-                    "seq": e.seq,
-                    "event_type": e.event_type,
-                    "payload": e.payload,
-                    "timestamp": e.timestamp.to_rfc3339(),
-                })
-            })
-            .collect();
-        Ok(events)
     }
 }
 

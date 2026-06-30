@@ -681,11 +681,6 @@ export const taskRuntimeApi = {
     isTauri()
       ? apiInvoke<RouteFeedbackRule[]>('get_scored_route_feedback_rules')
       : get<RouteFeedbackRule[]>('/task_runtime/route_feedback/scored'),
-  // Conversation events replay
-  listConversationEvents: (conversationId: string, sinceSeq?: string) =>
-    isTauri()
-      ? apiInvoke<Record<string, unknown>[]>('list_conversation_events', { conversationId, sinceSeq: sinceSeq ?? null })
-      : get<Record<string, unknown>[]>(`/task_runtime/conversations/${conversationId}/events${sinceSeq ? `?since_seq=${sinceSeq}` : ''}`),
 };
 
 // ── Trace Events API ─────────────────────────────────────────────────

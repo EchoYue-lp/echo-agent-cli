@@ -11,7 +11,6 @@ use echo_agent::human_loop::{HumanLoopProvider, HumanLoopRequest, HumanLoopRespo
 use echo_agent::prelude::AgentEvent;
 use echo_agent_app_core::chat_driver::ChatSink;
 use echo_agent_app_core::observability::{TraceEvent, TraceKind};
-use echo_agent_app_core::tasks::conversation_runtime::ConversationRuntimeEvent;
 use echo_agent_app_core::tasks::task_runtime::{WorkerTraceEvent, WorkerTraceEventKind};
 use futures::future::BoxFuture;
 use serde::Serialize;
@@ -27,49 +26,6 @@ fn compute_content_hash(content: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
     hex::encode(&hasher.finalize()[..8])
-}
-
-/// Emit a unified conversation runtime event to the frontend.
-///
-/// NOTE (B4): the only callers were the (now-removed) complex-path functions
-/// (`route_complex_task` / inline normal match). The unified `drive_chat` flow
-/// surfaces worker/run events via the `TauriChatSink` worker-trace + chat-event
-/// paths instead. This is kept (not deleted) because the frontend's
-/// `conversation://event` listener + history-replay still reference these event
-/// kinds; re-wiring it into the unified path (or confirming it's safe to drop)
-/// is tracked for B5. Marked dead_code to keep the build clean meanwhile.
-#[allow(dead_code)]
-fn emit_conversation_event(
-    app: &tauri::AppHandle,
-    event: &echo_agent_app_core::tasks::conversation_runtime::ConversationRuntimeEvent,
-    conversation_id: &str,
-    store: Option<&std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
-) {
-    let payload = serde_json::json!({
-        "conversation_id": conversation_id,
-        "event": event,
-    });
-    let _ = app.emit("conversation://event", payload);
-
-    // Persist for replay on history refresh
-    if let Some(store) = store {
-        let event_type = match event {
-            ConversationRuntimeEvent::RouteDecision { .. } => "route_decision",
-            ConversationRuntimeEvent::InitialThinking { .. } => "initial_thinking",
-            ConversationRuntimeEvent::WorkerStarted { .. } => "worker_started",
-            ConversationRuntimeEvent::WorkerToolCall { .. } => "worker_tool_call",
-            ConversationRuntimeEvent::WorkerResult { .. } => "worker_result",
-            ConversationRuntimeEvent::LlmUsage { .. } => "llm_usage",
-            ConversationRuntimeEvent::FinalAnswer { .. } => "final_answer",
-            ConversationRuntimeEvent::ApprovalRequest { .. } => "approval_request",
-            ConversationRuntimeEvent::Error { .. } => "error",
-        };
-        let _ = store.append_conversation_event(
-            conversation_id,
-            event_type,
-            &serde_json::to_string(event).unwrap_or_default(),
-        );
-    }
 }
 
 /// Event payload emitted to the frontend via `app.emit("chat://event", ...)`.

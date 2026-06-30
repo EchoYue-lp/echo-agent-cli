@@ -3,7 +3,6 @@ import { useChatStore } from '../stores/chatStore';
 import { useConversationStore } from '../stores/conversationStore';
 import { useSubagentStore, type SubagentEventPayload } from '../stores/subagentStore';
 import { useWorkerTraceStore, type WorkerTraceEvent } from '../stores/workerTraceStore';
-import { useConversationRuntimeStore, type ConversationRuntimeEventData } from '../stores/conversationRuntimeStore';
 import { isTauri, apiInvoke, errorMessage } from '../lib/tauri-bridge';
 import { handleChatEvent } from './chatEventHandler';
 import type { Attachment, ChatRunStatus } from '../types/api';
@@ -110,21 +109,11 @@ export function useTauriChat() {
           useWorkerTraceStore.getState().append(event.payload);
         }
       });
-      // Unified conversation runtime events (Phase 4: ConversationTimeline)
-      const unlistenConv = await listen<{ conversation_id: string; event: ConversationRuntimeEventData }>(
-        'conversation://event',
-        (event) => {
-          if (mounted) {
-            useConversationRuntimeStore.getState().appendEvent(event.payload.event);
-          }
-        }
-      );
       const origUnlisten = unlisten;
       unlistenRef.current = () => {
         origUnlisten();
         unlistenSub();
         unlistenWorkerTrace();
-        unlistenConv();
       };
     };
 

@@ -1,7 +1,6 @@
 import { create } from 'zustand';
 import { useChatStore } from './chatStore';
-import { useConversationRuntimeStore, type ConversationRuntimeEventData } from './conversationRuntimeStore';
-import { sessionApi, conversationApi, taskRuntimeApi } from '../api/endpoints';
+import { sessionApi, conversationApi } from '../api/endpoints';
 import type { ChatMessage } from '../types/api';
 
 // ── Types ──
@@ -159,23 +158,6 @@ function chatMessagesToSaved(messages: ChatMessage[]) {
   }
 
   return saved;
-}
-
-function decodeConversationRuntimeEvents(rows: Record<string, unknown>[]): ConversationRuntimeEventData[] {
-  const events: ConversationRuntimeEventData[] = [];
-  for (const row of rows) {
-    const payload = row.payload;
-    if (typeof payload === 'string') {
-      try {
-        events.push(JSON.parse(payload) as ConversationRuntimeEventData);
-      } catch (error) {
-        console.warn('[conversationStore] failed to parse conversation runtime event:', error);
-      }
-    } else if (payload && typeof payload === 'object') {
-      events.push(payload as ConversationRuntimeEventData);
-    }
-  }
-  return events;
 }
 
 // ── Store ──
@@ -362,16 +344,6 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
       chatStore.replaceMessages(chatMessages);
       chatStore.setHistoryView(false); // Agent has context, can continue chatting
 
-      try {
-        const rows = await taskRuntimeApi.listConversationEvents(id);
-        useConversationRuntimeStore
-          .getState()
-          .replayFromEvents(decodeConversationRuntimeEvents(rows));
-      } catch (error) {
-        console.error('Failed to replay conversation runtime events:', error);
-        useConversationRuntimeStore.getState().clear();
-      }
-
       set({ activeId: id, isLoading: false });
     } catch (e) {
       console.error('Failed to load conversation:', e);
@@ -429,7 +401,6 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
 
     // Always clear — this is the user's expected outcome
     useChatStore.getState().clearMessages();
-    useConversationRuntimeStore.getState().clear();
     set({ activeId: null });
   },
 

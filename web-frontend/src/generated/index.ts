@@ -11,7 +11,6 @@ export * from './ClientMessage';
 export * from './ComplexityLabel';
 export * from './ConnectMcpRequest';
 export * from './ContextStats';
-export * from './ConversationRuntimeEvent';
 export * from './DomainProfile';
 export * from './ExecutionMode';
 export * from './ExecutionPolicySnapshot';
