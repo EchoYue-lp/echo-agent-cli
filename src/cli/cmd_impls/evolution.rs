@@ -1224,16 +1224,7 @@ async fn cmd_skill_patch(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
                         "{}. {} ({})",
                         i + 1,
                         patch.skill_name,
-                        match &patch.patch_type {
-                            echo_agent::evolution::PatchType::ErrorHandling { .. } =>
-                                "Error handling",
-                            echo_agent::evolution::PatchType::PrerequisiteCheck { .. } =>
-                                "Prerequisite check",
-                            echo_agent::evolution::PatchType::FallbackStrategy { .. } =>
-                                "Fallback strategy",
-                            echo_agent::evolution::PatchType::InstructionEnhancement { .. } =>
-                                "Instruction enhancement",
-                        }
+                        patch.patch_type.label()
                     );
                     println!(
                         "   Confidence: {:.2} | Priority: {}",
@@ -1242,6 +1233,7 @@ async fn cmd_skill_patch(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
                     println!("   {}\n", patch.rationale);
                 }
                 println!("Run /skill-patch <name> to see patches for a specific skill.");
+                println!("Run /skill-patch <name> apply <index> to apply a specific patch.");
             }
             Ok(_) => {
                 println!("No patch opportunities found. All skills are performing well.");
@@ -1250,28 +1242,110 @@ async fn cmd_skill_patch(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
                 println!("Error analyzing skills: {e}");
             }
         }
-    } else {
-        // Show patches for specific skill
-        let skill_name = args[0];
-        println!("Analyzing '{}' for patch opportunities...", skill_name);
+        return CommandOutcome::Continue;
+    }
 
-        match patcher.analyze_and_propose(skill_name).await {
-            Ok(patches) if !patches.is_empty() => {
-                println!("\n=== Patches for {} ===", skill_name);
-                for (i, patch) in patches.iter().enumerate() {
-                    println!("\n{}. {}", i + 1, patch.summary());
-                }
-                println!(
-                    "\nNote: These are proposals. To apply them, manually update the SKILL.md file."
-                );
-                println!("Future versions may support automatic patch application.");
+    let skill_name = args[0];
+
+    // Sub-command: apply <index>
+    if args.len() >= 3 && args[1] == "apply" {
+        let idx: usize = match args[2].parse() {
+            Ok(n) => n,
+            Err(_) => {
+                println!("Invalid index '{}'. Must be a number.", args[2]);
+                return CommandOutcome::Continue;
             }
-            Ok(_) => {
-                println!("No patch opportunities found for '{}'.", skill_name);
-            }
+        };
+        if idx == 0 {
+            println!("Index must be >= 1.");
+            return CommandOutcome::Continue;
+        }
+
+        // Get patches for the skill.
+        let patches = match patcher.analyze_and_propose(skill_name).await {
+            Ok(p) => p,
             Err(e) => {
                 println!("Error analyzing skill: {e}");
+                return CommandOutcome::Continue;
             }
+        };
+        if patches.is_empty() {
+            println!("No patch opportunities found for '{}'.", skill_name);
+            return CommandOutcome::Continue;
+        }
+        if idx > patches.len() {
+            println!("Index {} out of range (1-{}).", idx, patches.len());
+            return CommandOutcome::Continue;
+        }
+
+        let patch = &patches[idx - 1];
+
+        // Get the SkillDescriptor (provides .location = SKILL.md path).
+        // Clone the full descriptor — we only need .location for apply_patch.
+        let descriptor_opt = ctx
+            .agent
+            .read(|a| a.skill_registry().get_descriptor(skill_name).cloned())
+            .await;
+
+        let Some(descriptor) = descriptor_opt else {
+            println!(
+                "Skill '{}' not found in registry. Activate it first or check the name.",
+                skill_name
+            );
+            return CommandOutcome::Continue;
+        };
+
+        // Create change log.
+        let echo_agent_dir = echo_agent_app_core::evolution::discover_echo_agent_dir();
+        let log_path = echo_agent_dir.join("evolution").join("change-log.jsonl");
+        if let Some(parent) = log_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let change_log = echo_agent::evolution::JsonlChangeLog::new(log_path);
+
+        println!(
+            "Applying patch #{} ({}) to '{}'...",
+            idx,
+            patch.patch_type.label(),
+            skill_name
+        );
+        match patcher.apply_patch(patch, &descriptor, &change_log).await {
+            Ok(()) => {
+                println!("✓ Patch applied to {}", descriptor.location.display());
+                // Fire SkillPatchApplied hook.
+                echo_agent_app_core::evolution::fire_evolution_hook(
+                    &ctx.agent,
+                    echo_core::hooks::HookEvent::SkillPatchApplied,
+                    skill_name,
+                )
+                .await;
+            }
+            Err(e) => {
+                println!("✗ Failed to apply patch: {e}");
+            }
+        }
+        return CommandOutcome::Continue;
+    }
+
+    // Default: show patches for a specific skill.
+    println!("Analyzing '{}' for patch opportunities...", skill_name);
+
+    match patcher.analyze_and_propose(skill_name).await {
+        Ok(patches) if !patches.is_empty() => {
+            println!("\n=== Patches for {} ===", skill_name);
+            for (i, patch) in patches.iter().enumerate() {
+                println!("\n{}. {}", i + 1, patch.summary());
+            }
+            println!(
+                "\nTo apply a patch: /skill-patch {} apply <index>",
+                skill_name
+            );
+        }
+        Ok(_) => {
+            println!("No patch opportunities found for '{}'.", skill_name);
+        }
+        Err(e) => {
+            println!("Error analyzing skill: {e}");
         }
     }
 
@@ -1281,7 +1355,7 @@ cmd!(
     SkillPatchCommand,
     "skill-patch",
     CommandCategory::Advanced,
-    "Generate patch proposals to improve skills",
+    "Generate and apply patches to improve skills based on telemetry",
     cmd_skill_patch
 );
 

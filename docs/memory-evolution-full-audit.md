@@ -4,6 +4,7 @@
 > **范围**: echo-agent (框架) + echo-agent-cli (EKO 应用) 的全部记忆/进化/改善代码
 > **对比参考**: Hermes Agent (Nous Research)
 > **修订记录**:
+> - 2026-07-01 v1.4: 阶段 5（Critic 默认策略）、SkillPatcher apply_patch 已实施完成。阶段 4（Embedding/RAG）已决策：暂不支持（对标 Claude Code/Codex/Cursor/OpenClaw 均无 RAG）。迭代计划阶段 1-6 全部完成。
 > - 2026-07-01 v1.3: 阶段 1（SkillTelemetry 写入端）、阶段 2（Dreaming 多模式对等）、阶段 3（Evolution hook fire 点）、阶段 6（技能来源 curator 边界）已实施完成
 > - 2026-07-01 v1.2: 修正 EmbeddingStore 状态表述（框架自动检测可能在 `OPENAI_API_KEY` 存在时激活）；补充 Hermes bundled + `prune_builtins` 细节；Critic 修复方向补充架构约束说明；陷阱 #3/#4 标记为已过时；Evolution hook fire 点描述精确化
 > - 2026-07-01 v1.1: 修正 SQLite/ConversationStore（EKO 使用 FileConversationStore 而非 SQLite，符合 AGENTS.md 硬约束）；RulePromoter namespace 死链已修；Dashboard 前端已接入；规则晋升已有 review gate；技能候选可视化已接入
@@ -624,10 +625,10 @@ CLI: `/self-review` → `cmd_impls/eval.rs:106`
 
 1. **✅ ~~SkillTelemetry 生产写入端~~**（已完成）：在 `execution.rs::execute_with_pipeline` 的 4 个分支（成功/失败 soften/失败不 soften/pipeline 错误）中插入 `record_skill_telemetry` 调用，fire-and-forget 写入 `SkillTelemetryStore`。同时桥接 `curator.touch_skill` 刷新 `last_used_at`（阶段 6.1）。
 2. **✅ ~~Dreaming 多模式对等~~**（已完成）：CLI REPL（`repl.rs` banner 后 spawn、session 结束前 cancel）、TUI（`tui/mod.rs` event loop 前 spawn、返回后 cancel）均已接入 `spawn_dreaming_task`。`run_cli_mode` 签名增加 `review_integration` 参数，`ReplConfig` 增加对应字段。
-3. **✅ ~~Evolution hook fire 点~~**（已完成）：新增 `echo-agent-app-core/src/evolution/hook_fire.rs` 的 `fire_evolution_hook` helper。CLI `cmd_rule_promote` / `cmd_skill_merge` + Tauri `promote_rule` 成功后 fire 对应事件。`SkillPatchApplied` 待 `apply_patch` 实现后补。
-4. **🟡 Embedding/RAG 是否产品化**：能力选型问题，不一定 P0。框架有能力，应用层默认不工作。如需语义检索，需显式接入 `HttpEmbedder` + `EmbeddingStore`。
-5. **🟡 Critic 默认策略**：是否给 EKO 默认启用 `verify_answer`，需要单独判断成本（额外 LLM 调用）和打扰性（频繁拒绝回答可能影响体验）。
-6. **✅ ~~技能来源 curator 边界~~**（已完成）：`SkillMeta.agent_created` 字段 + `apply_transitions` 的 `!agent_created { continue }` 已天然提供边界。新增 `/skill-register`（标记 `agent_created=false`）、`/skill-pin`、`/skill-unpin` CLI 命令。telemetry → curator `last_used_at` 桥接已补。
+3. **✅ ~~Evolution hook fire 点~~**（已完成）：新增 `echo-agent-app-core/src/evolution/hook_fire.rs` 的 `fire_evolution_hook` helper。CLI `cmd_rule_promote` / `cmd_skill_merge` / `cmd_skill_patch` + Tauri `promote_rule` 成功后 fire 对应事件（RulePromoted / SkillMergeApplied / SkillPatchApplied）。`SkillPatchApplied` 在 SkillPatcher apply_patch 实现后已补齐。
+4. **✅ ~~Embedding/RAG 产品化决策~~**（已决策：暂不支持）。EKO 定位为个人本地 Cowork agent，同类产品（Claude Code、Codex、Cursor、OpenClaw 等）均未使用 RAG。框架保留 EmbeddingStore/HttpEmbedder/RAG 能力供其他复用方，EKO 应用层不接入，保持纯关键词检索。
+5. **✅ ~~Critic 默认策略~~**（已完成）：在 `infra.rs::create_agent` 中注入 `LlmCritic::new(model).with_pass_threshold(7.0)` + `config_mut().set_verifier_enabled(true)`。框架 `config.rs` 新增 `set_verifier_enabled/min_score/max_retries` 三个 setter。Critic 的 LLM 调用复用主 agent 的同一 model 配置，出错时 fail-open 不阻塞主流程。
+6. **✅ ~~技能来源 curator 边界~~**（已完成）：`SkillMeta.agent_created` 字段 + `apply_transitions` 的 `!agent_created { continue }` 已天然提供边界。新增 `/skill-register`（标记 `agent_created=false`）、`/skill-pin`、`/skill-unpin` CLI 命令。telemetry → curator `last_used_at` 桥接已补。`SkillPatcher::apply_patch` 已实现 + `/skill-patch <name> apply <idx>` 命令已接入。
 
 ---
 
@@ -730,7 +731,7 @@ CLI: `/self-review` → `cmd_impls/eval.rs:106`
 ```
 用户开启会话 (REPL/TUI/GUI)
   │
-  ├─ ⚠️ infra.rs:771 → spawn_dreaming_task() [仅桌面端！CLI/TUI 不运行]
+  ├─ spawn_dreaming_task() → 每日定时自进化（三端均已接入）
   │
   ├─ UnifiedMemory::load() → 加载 user.md/project.md/local.md → system prompt
   │
@@ -738,16 +739,19 @@ CLI: `/self-review` → `cmd_impls/eval.rs:106`
   │
   ├─ [每轮 ReAct]
   │   ├─ record_trigger_data() → 记录工具成功/失败
+  │   ├─ record_skill_telemetry() → 遥测写入 + curator touch_skill [框架自动]
   │   ├─ detect_and_write_memory_triggers() → 触发器检测 + 自动持久化
   │   ├─ ContextManager::prepare() → 压缩判断 + MemoryPromoter
   │   ├─ auto_snapshot() → SnapshotManager::capture()
-  │   └─ tool_error_feedback → 工具失败反馈给 LLM 自修正
-  │       [Critic/verify_answer 未配置]
+  │   ├─ tool_error_feedback → 工具失败反馈给 LLM 自修正
+  │   └─ verify_answer → LlmCritic 自检 (score≥7.0 通过, 最多重试2次, fail-open)
   │
   └─ [会话结束]
       ├─ run_auto_memory_on_exit() → 关键词提取 → typed memory + project.md
       ├─ run_reflection_on_exit() → LLM 轻量反思 → memory 文件
       ├─ run_memory_review_on_exit() → MemoryReview (过期/冲突/合并/归档)
+      │   └─ 复用 bootstrap 的 ReviewIntegration (不再临时重建)
+      ├─ cancel dreaming_task → 停止后台自进化
       ├─ save_transcript_projection() → ConversationStore
       └─ TrajectorySaver → JSONL (feature improve)
 ```

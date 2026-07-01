@@ -365,6 +365,19 @@ pub async fn create_agent(
     let cache_user_id = load_or_create_cache_user_id();
     agent.config_mut().set_cache_user_id(&cache_user_id);
 
+    // Inject LlmCritic for self-verification. The critic scores the agent's
+    // final_answer; if below threshold (7.0), feedback is injected and the
+    // agent retries (up to verifier_max_retries=2).
+    // LlmCritic uses llm::chat → Config::get_model, the same config source
+    // as the main agent, so it reuses the already-configured model.
+    // Fail-open on errors (verify.rs:91-93) ensures the main flow is never
+    // blocked if the critic LLM call fails.
+    agent.set_critic(std::sync::Arc::new(
+        echo_agent::agent::critic::LlmCritic::new(model).with_pass_threshold(7.0),
+    ));
+    agent.config_mut().set_verifier_enabled(true);
+    tracing::info!("main agent: Critic self-verification enabled (threshold=7.0, max_retries=2)");
+
     tracing::info!(
         has_llm_config = injected_llm_config.is_some(),
         model = %model,
