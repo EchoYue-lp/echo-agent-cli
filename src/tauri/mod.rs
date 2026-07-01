@@ -254,6 +254,8 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
             commands::panels::review_trajectory,
             commands::panels::curator_action,
             commands::panels::get_evolution_dashboard,
+            commands::panels::scan_rule_proposals,
+            commands::panels::promote_rule,
             commands::panels::list_worktrees,
             commands::panels::create_worktree,
             commands::panels::remove_worktree,

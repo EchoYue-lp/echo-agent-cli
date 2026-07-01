@@ -533,6 +533,17 @@ export interface DashboardMetrics {
   generated_at: string;
 }
 
+/** 规则晋升候选(镜像 app-core RuleProposal)。用户在 EvolutionPanel 审阅后采纳。 */
+export interface RuleProposal {
+  memory_key: string;
+  namespace: string[];
+  rule_text: string;
+  confidence: number;
+  memory_type: string;
+  proposed_at: string;
+  reason: string;
+}
+
 // ── Provider types ──────────────────────────────────────────────────────────
 
 export interface ProviderTemplate {

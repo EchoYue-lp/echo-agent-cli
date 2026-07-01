@@ -1611,6 +1611,76 @@ pub async fn get_evolution_dashboard(
     Ok(json!({ "metrics": metrics }))
 }
 
+/// 返回「记忆 → AGENTS.md 规则」的晋升候选列表(高置信 + 满足 age/type 门槛)。
+///
+/// 这是 review gate 的「展示」侧:用户在 EvolutionPanel 看到候选(置信度/
+/// 类型/规则文本),决定是否采纳。采纳走 `promote_rule` —— 只有用户点按钮
+/// 才会写 AGENTS.md,agent 不会静默改规则。复刻 CLI 的两步式
+/// (src/cli/cmd_impls/evolution.rs:1297 scan)。
+#[tauri::command]
+pub async fn scan_rule_proposals(
+    state: tauri::State<'_, TauriState>,
+) -> Result<serde_json::Value, IpcError> {
+    let agent = state.app_state.connection.primary_agent();
+    let store = agent
+        .read(|a| a.store().cloned())
+        .await
+        .ok_or_else(|| IpcError::Internal("No memory store configured".into()))?;
+
+    let promoter = echo_agent_app_core::evolution::RulePromoter::new(store);
+    let proposals = promoter.scan_for_proposals().await;
+
+    Ok(json!({ "proposals": proposals, "count": proposals.len() }))
+}
+
+/// 采纳一条规则候选:按 memory_key 找到候选,写 AGENTS.md `## Rules` 段,
+/// 并在原记忆打 `<!-- PROMOTED_TO_RULE -->` 标记防重复。
+///
+/// review gate 的「执行」侧 —— 由用户在前端点「采纳」触发,不经此路径
+/// 不会改 AGENTS.md。复刻 CLI (evolution.rs:1338 promote_rule)。
+#[tauri::command]
+pub async fn promote_rule(
+    state: tauri::State<'_, TauriState>,
+    memory_key: String,
+) -> Result<serde_json::Value, IpcError> {
+    let agent = state.app_state.connection.primary_agent();
+    let store = agent
+        .read(|a| a.store().cloned())
+        .await
+        .ok_or_else(|| IpcError::Internal("No memory store configured".into()))?;
+
+    let promoter = echo_agent_app_core::evolution::RulePromoter::new(store);
+
+    // 找到对应候选(scan 已过置信度/age/type 门槛)
+    let proposal = promoter
+        .scan_for_proposals()
+        .await
+        .into_iter()
+        .find(|p| p.memory_key == memory_key)
+        .ok_or_else(|| {
+            IpcError::NotFound(format!(
+                "Memory '{memory_key}' not found or does not meet promotion criteria"
+            ))
+        })?;
+
+    let change_log = echo_agent::evolution::JsonlChangeLog::new(
+        echo_agent_app_core::evolution::discover_echo_agent_dir()
+            .join("evolution")
+            .join("changelog.jsonl"),
+    );
+
+    promoter
+        .promote_rule(&proposal, &change_log)
+        .await
+        .map_err(|e| IpcError::Internal(format!("Failed to promote rule: {e}")))?;
+
+    Ok(json!({
+        "success": true,
+        "memory_key": memory_key,
+        "rule_text": proposal.rule_text,
+    }))
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Worktree
 // ════════════════════════════════════════════════════════════════════════════

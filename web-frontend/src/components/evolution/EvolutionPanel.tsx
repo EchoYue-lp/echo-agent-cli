@@ -13,20 +13,30 @@ import {
   Activity,
   Database,
   Heart,
+  Gift,
 } from 'lucide-react';
 import { evolutionApi } from '../../api/endpoints';
+import { useToastStore } from '../../stores/toastStore';
 import type {
   TrajectoryEntry,
   TrajectoryStats,
   CuratorStatus,
   CuratorTransition,
   DashboardMetrics,
+  RuleProposal,
 } from '../../types/api';
 
 export function EvolutionPanel() {
+  const addToast = useToastStore((s) => s.addToast);
+
   // ── Dashboard state(进化概览:分层记忆统计 + 技能健康 + 变更活动)
   const [dashboard, setDashboard] = useState<DashboardMetrics | null>(null);
   const [loadingDashboard, setLoadingDashboard] = useState(false);
+
+  // ── Rule proposals state(规则候选:用户审阅 → 采纳才写 AGENTS.md)
+  const [proposals, setProposals] = useState<RuleProposal[]>([]);
+  const [loadingProposals, setLoadingProposals] = useState(false);
+  const [promotingKey, setPromotingKey] = useState<string | null>(null);
 
   // ── Trajectory state
   const [stats, setStats] = useState<TrajectoryStats | null>(null);
@@ -63,6 +73,31 @@ export function EvolutionPanel() {
     setLoadingDashboard(false);
   };
 
+  const loadProposals = async () => {
+    setLoadingProposals(true);
+    try {
+      const data = await evolutionApi.scanProposals();
+      setProposals(data.proposals);
+    } catch (e) {
+      console.error('Failed to load rule proposals:', e);
+    }
+    setLoadingProposals(false);
+  };
+
+  // review gate:用户点「采纳」才写 AGENTS.md。采纳后 toast 提示 + 刷新候选 +
+  // 刷新 dashboard(晋升会改 memory 状态 + 写变更日志)。
+  const handlePromote = async (memoryKey: string) => {
+    setPromotingKey(memoryKey);
+    try {
+      await evolutionApi.promoteRule(memoryKey);
+      addToast('success', `已采纳规则并写入 AGENTS.md`);
+      await Promise.all([loadProposals(), loadDashboard()]);
+    } catch (e) {
+      addToast('error', `采纳失败: ${e instanceof Error ? e.message : '未知错误'}`);
+    }
+    setPromotingKey(null);
+  };
+
   const loadStats = async () => {
     setLoadingStats(true);
     try {
@@ -96,6 +131,7 @@ export function EvolutionPanel() {
 
   useEffect(() => {
     loadDashboard();
+    loadProposals();
     loadStats();
     loadTrajectories();
     loadCuratorStatus();
@@ -290,6 +326,119 @@ export function EvolutionPanel() {
               <Database size={20} className="mx-auto mb-1" />
             )}
             {loadingDashboard ? '加载中...' : '尚无进化数据。运行对话后将自动积累。'}
+          </div>
+        )}
+      </section>
+
+      {/* ── Section 0b: Rule Promotion Candidates (review gate) ── */}
+      <section>
+        <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center gap-2">
+            <Gift size={14} style={{ color: 'var(--accent)' }} />
+            <h3 className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>
+              规则候选
+            </h3>
+            {proposals.length > 0 && (
+              <span
+                className="rounded-full px-1.5 py-0.5 text-[9px] font-medium"
+                style={{ background: 'var(--accent-bg)', color: 'var(--accent)' }}
+              >
+                {proposals.length}
+              </span>
+            )}
+          </div>
+          <button
+            onClick={loadProposals}
+            disabled={loadingProposals}
+            className="flex items-center gap-1 text-[10px] font-medium transition-colors"
+            style={{ color: 'var(--accent)' }}
+          >
+            <RefreshCw size={10} className={loadingProposals ? 'animate-spin' : ''} />
+            刷新
+          </button>
+        </div>
+
+        <p className="text-xs mb-3" style={{ color: 'var(--text-secondary)' }}>
+          高置信记忆可晋升为 AGENTS.md 永久规则。采纳才会写入,agent 不会自动改规则。
+        </p>
+
+        {proposals.length > 0 ? (
+          <div className="space-y-2">
+            {proposals.map((p) => (
+              <div
+                key={p.memory_key}
+                className="rounded-lg border p-3"
+                style={{ borderColor: 'var(--border-primary)' }}
+              >
+                <div className="flex items-center justify-between mb-1.5">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span
+                      className="rounded px-1.5 py-0.5 text-[9px] shrink-0"
+                      style={{ background: 'var(--bg-hover)', color: 'var(--text-tertiary)' }}
+                    >
+                      {p.memory_type}
+                    </span>
+                    <span
+                      className="font-mono text-[10px] truncate"
+                      style={{ color: 'var(--text-tertiary)' }}
+                    >
+                      {p.memory_key}
+                    </span>
+                  </div>
+                  <span
+                    className="font-mono text-[10px] shrink-0"
+                    style={{ color: 'var(--accent)' }}
+                    title="置信度"
+                  >
+                    {p.confidence.toFixed(2)}
+                  </span>
+                </div>
+                <p className="text-xs mb-2" style={{ color: 'var(--text-primary)' }}>
+                  {p.rule_text}
+                </p>
+                <div className="flex items-center justify-between">
+                  <span className="text-[10px]" style={{ color: 'var(--text-tertiary)' }}>
+                    {p.reason}
+                  </span>
+                  <button
+                    onClick={() => handlePromote(p.memory_key)}
+                    disabled={promotingKey !== null}
+                    className="flex items-center gap-1 rounded px-2 py-1 text-[10px] font-medium transition-colors shrink-0"
+                    style={{
+                      background:
+                        promotingKey === p.memory_key
+                          ? 'var(--border-primary)'
+                          : 'var(--action-run)',
+                      color:
+                        promotingKey === p.memory_key
+                          ? 'var(--text-tertiary)'
+                          : 'var(--text-on-run)',
+                    }}
+                  >
+                    {promotingKey === p.memory_key ? (
+                      <>
+                        <RefreshCw size={9} className="animate-spin" /> 采纳中...
+                      </>
+                    ) : (
+                      <>
+                        <CheckCircle size={9} /> 采纳
+                      </>
+                    )}
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="py-4 text-center text-xs" style={{ color: 'var(--text-tertiary)' }}>
+            {loadingProposals ? (
+              <RefreshCw size={16} className="mx-auto mb-1 animate-spin" />
+            ) : (
+              <Gift size={20} className="mx-auto mb-1" />
+            )}
+            {loadingProposals
+              ? '加载中...'
+              : '暂无规则候选。记忆置信度 ≥ 0.95 且存续 ≥ 7 天后会出现在此。'}
           </div>
         )}
       </section>

@@ -35,6 +35,7 @@ import type {
   CuratorStatus,
   CuratorTransition,
   DashboardMetrics,
+  RuleProposal,
   ConfiguredModelListResponse,
   ProviderTemplate,
   TestConnectionResponse,
@@ -1068,6 +1069,19 @@ export const evolutionApi = {
     isTauri()
       ? apiInvoke<{ metrics: DashboardMetrics }>('get_evolution_dashboard')
       : get<{ metrics: DashboardMetrics }>('/evolution/dashboard'),
+  scanProposals: () =>
+    isTauri()
+      ? apiInvoke<{ proposals: RuleProposal[]; count: number }>('scan_rule_proposals')
+      : get<{ proposals: RuleProposal[]; count: number }>('/evolution/rule-proposals'),
+  promoteRule: (memoryKey: string) =>
+    isTauri()
+      ? apiInvoke<{ success: boolean; memory_key: string; rule_text: string }>('promote_rule', {
+          memory_key: memoryKey,
+        })
+      : post<{ success: boolean; memory_key: string; rule_text: string }>(
+          '/evolution/rule-proposals/promote',
+          { memory_key: memoryKey }
+        ),
 };
 
 // ── Provider API ──────────────────────────────────────────────────────────
