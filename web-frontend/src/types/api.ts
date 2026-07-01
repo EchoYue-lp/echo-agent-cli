@@ -499,6 +499,62 @@ export interface CuratorTransition {
   to: string;
 }
 
+// ── Evolution Dashboard types (镜像 app-core DashboardMetrics) ──────────────
+
+export interface MemoryStats {
+  count: number;
+  avg_confidence: number;
+  active_count: number;
+  archived_count: number;
+}
+
+export interface SkillHealthOverview {
+  total_skills: number;
+  healthy_skills: number;
+  unhealthy_skills: number;
+  needs_attention: number;
+  avg_success_rate: number;
+}
+
+export interface ActivityEntry {
+  activity_type: string;
+  description: string;
+  timestamp: string;
+}
+
+export interface DashboardMetrics {
+  /** key = MemoryType 字符串(UserPreference/ProjectFact/...),后端 HashMap 序列化 */
+  memory_by_type: Record<string, MemoryStats>;
+  /** key = MemoryStatus 字符串(Active/Archived/...) */
+  memory_by_status: Record<string, number>;
+  total_memories: number;
+  skill_health: SkillHealthOverview;
+  recent_activities: ActivityEntry[];
+  generated_at: string;
+}
+
+/** 规则晋升候选(镜像 app-core RuleProposal)。用户在 EvolutionPanel 审阅后采纳。 */
+export interface RuleProposal {
+  memory_key: string;
+  namespace: string[];
+  rule_text: string;
+  confidence: number;
+  memory_type: string;
+  proposed_at: string;
+  reason: string;
+}
+
+/** 技能候选(SkillCandidateDetector 从重复模式/调试经验中检测出)。 */
+export interface SkillCandidateInfo {
+  name: string;
+  description: string;
+  sample_count: number;
+  source_type: string;
+  has_draft: boolean;
+  activated: boolean;
+  confidence: number;
+}
+
 // ── Provider types ──────────────────────────────────────────────────────────
 
 export interface ProviderTemplate {

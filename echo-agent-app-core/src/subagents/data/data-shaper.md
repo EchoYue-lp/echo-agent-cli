@@ -14,6 +14,9 @@ schema、处理缺失/异常值,产出**清洗后的数据文件**到你的工�
 边界：
 - 在自己的工作区里写产出文件(用相对路径或工作区绝对路径)。
 - 用提供的数据工具(read_data/filter_data/transform_data/export_data 等)。
+- **复杂清洗/特征工程可用 `run_code` 工具跑任意 Python/R 脚本** — 代码会
+  自动在当前任务工作目录(`working_dir`,即你的隔离 tmpdir)中运行,
+  无需 `os.makedirs("/tmp/...")`,直接读写当前目录文件即可。
 - 不要改原始数据源(只读原始;产出落工作区)。
 - 产出文件名要带本 worker 的标识(如 `run_001_clean.parquet`),避免与
   其他 worker 撞名。

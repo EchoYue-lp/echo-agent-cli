@@ -34,6 +34,9 @@ import type {
   TrajectoryStats,
   CuratorStatus,
   CuratorTransition,
+  DashboardMetrics,
+  RuleProposal,
+  SkillCandidateInfo,
   ConfiguredModelListResponse,
   ProviderTemplate,
   TestConnectionResponse,
@@ -1063,6 +1066,45 @@ export const evolutionApi = {
           unpinned?: string;
           error?: string;
         }>('/evolution/curator', { action, skill_name: skillName }),
+  dashboard: () =>
+    isTauri()
+      ? apiInvoke<{ metrics: DashboardMetrics }>('get_evolution_dashboard')
+      : get<{ metrics: DashboardMetrics }>('/evolution/dashboard'),
+  scanProposals: () =>
+    isTauri()
+      ? apiInvoke<{ proposals: RuleProposal[]; count: number }>('scan_rule_proposals')
+      : get<{ proposals: RuleProposal[]; count: number }>('/evolution/rule-proposals'),
+  promoteRule: (memoryKey: string) =>
+    isTauri()
+      ? apiInvoke<{ success: boolean; memory_key: string; rule_text: string }>('promote_rule', {
+          memory_key: memoryKey,
+        })
+      : post<{ success: boolean; memory_key: string; rule_text: string }>(
+          '/evolution/rule-proposals/promote',
+          { memory_key: memoryKey }
+        ),
+  scanSkillCandidates: () =>
+    isTauri()
+      ? apiInvoke<{ candidates: SkillCandidateInfo[]; count: number }>('scan_skill_candidates')
+      : get<{ candidates: SkillCandidateInfo[]; count: number }>('/evolution/skill-candidates'),
+  generateSkillDraft: (name: string) =>
+    isTauri()
+      ? apiInvoke<{ success: boolean; name: string; path: string }>('generate_skill_draft', {
+          name,
+        })
+      : post<{ success: boolean; name: string; path: string }>(
+          '/evolution/skill-candidates/draft',
+          { name }
+        ),
+  activateSkillDraft: (name: string) =>
+    isTauri()
+      ? apiInvoke<{ success: boolean; name: string; path: string }>('activate_skill_draft', {
+          name,
+        })
+      : post<{ success: boolean; name: string; path: string }>(
+          '/evolution/skill-candidates/activate',
+          { name }
+        ),
 };
 
 // ── Provider API ──────────────────────────────────────────────────────────

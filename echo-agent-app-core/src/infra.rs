@@ -346,6 +346,18 @@ pub async fn create_agent(
     > = std::sync::Arc::new(crate::tasks::task_runtime::worktree::EkoDataWorkspaceFactory::new());
     let builder = builder.subagent_data_workspace_factory(data_workspace_factory);
 
+    // Sprint 11: inject a RuntimeStateStore for team-mode checkpoint/resume.
+    // `dispatch_team` plumbs it into TeamAgent so a timed-out team run can
+    // resume by skipping completed plan/worker/synthesis phases (DAG
+    // skip-on-resume). Reuses the same FileRuntimeStateStore the runtime
+    // checkpoint path uses. None if the store couldn't be constructed (teams
+    // then run in-memory).
+    let builder = if let Some(state_store) = create_runtime_state_store() {
+        builder.subagent_runtime_state_store(state_store)
+    } else {
+        builder
+    };
+
     let mut agent = builder.build().map_err(|e| {
         tracing::error!("Failed to build agent: {e}");
         format!("Failed to initialize agent: {e}. Please check your configuration and try again.")
@@ -498,6 +510,13 @@ async fn register_default_subagents(
                 // Loader clears it when worktree is active (mutually exclusive).
                 if worker_def.isolate_workspace {
                     builder = builder.isolate_workspace();
+                }
+                // Sprint 11: if this .md declares a team (team_strategy +
+                // manager + workers), override execution_mode to Team and
+                // attach the TeamSpec. dispatch_team resolves the named
+                // manager/workers from the registry at dispatch time.
+                if let Some(spec) = worker_def.team.clone() {
+                    builder = builder.team(spec);
                 }
                 for tag in &worker_def.tags {
                     builder = builder.tag(tag);

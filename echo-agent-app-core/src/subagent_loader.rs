@@ -83,6 +83,19 @@ struct WorkerFrontmatter {
     /// `readonly` is true. Empty if unset.
     #[serde(default)]
     tags: Vec<String>,
+    /// Sprint 11: declare this subagent as a team-mode dispatcher. Only
+    /// `"manager-worker"` is supported via frontmatter (other strategies are
+    /// programmatic-only — they carry inline agent-name data).
+    #[serde(default)]
+    team_strategy: Option<String>,
+    /// Sprint 11: the manager/leader subagent name (must be separately
+    /// registered). Required when `team_strategy` is set.
+    #[serde(default)]
+    team_manager: Option<String>,
+    /// Sprint 11: worker subagent names (each must be separately registered).
+    /// Required (non-empty) when `team_strategy` is set.
+    #[serde(default)]
+    team_workers: Vec<String>,
 }
 
 /// A resolved worker definition ready for registration.
@@ -100,6 +113,10 @@ pub struct WorkerDefinition {
     /// data workspace (tmpdir). Mapped from frontmatter `workspace: true`.
     /// Mutually exclusive with isolate_worktree (worktree wins if both).
     pub isolate_workspace: bool,
+    /// Sprint 11: if Some, this subagent is a team-mode dispatcher (not a
+    /// normal worker). The registration path sets `execution_mode = Team` and
+    /// attaches this TeamSpec. manager + workers are name-references.
+    pub team: Option<echo_agent::agent::subagent::types::TeamSpec>,
     pub tags: Vec<String>,
 }
 
@@ -298,6 +315,32 @@ pub fn parse_worker_md(
     // worktree is active to avoid double-isolation at registration.
     let isolate_workspace = fm.workspace && !isolate_worktree;
 
+    // Sprint 11: parse team frontmatter into a TeamSpec (only manager-worker
+    // strategy is declarable). Validate that manager + non-empty workers given.
+    let team = if let Some(strategy) = fm.team_strategy.as_deref() {
+        if strategy != "manager-worker" {
+            return Err(format!(
+                "worker `{name}`: team_strategy '{strategy}' unsupported via frontmatter (only 'manager-worker')"
+            ));
+        }
+        let manager = fm.team_manager.clone().ok_or_else(|| {
+            format!("worker `{name}`: team_strategy set but team_manager missing")
+        })?;
+        if fm.team_workers.is_empty() {
+            return Err(format!(
+                "worker `{name}`: team_strategy set but team_workers empty"
+            ));
+        }
+        Some(echo_agent::agent::subagent::types::TeamSpec {
+            strategy: echo_agent::agent::subagent::team::strategy::TeamStrategy::ManagerWorker,
+            manager,
+            workers: fm.team_workers.clone(),
+            config: echo_agent::agent::subagent::team::TeamConfig::default(),
+        })
+    } else {
+        None
+    };
+
     Ok(WorkerDefinition {
         name,
         description: fm.description,
@@ -305,6 +348,7 @@ pub fn parse_worker_md(
         readonly: fm.readonly,
         isolate_worktree,
         isolate_workspace,
+        team,
         tags,
     })
 }
@@ -501,6 +545,58 @@ mod tests {
             !def.isolate_workspace,
             "workspace must be cleared when worktree is active"
         );
+    }
+
+    #[test]
+    fn parse_team_frontmatter_builds_team_spec() {
+        // Sprint 11: team_strategy + team_manager + team_workers → TeamSpec.
+        let md = "---\n\
+name: team-research\n\
+description: \"team dispatcher\"\n\
+team_strategy: manager-worker\n\
+team_manager: planner\n\
+team_workers: [\"explorer\", \"summarizer\"]\n\
+---\nbody";
+        let def = parse_worker_md(md, None).unwrap();
+        let spec = def.team.expect("team spec should be built");
+        assert_eq!(spec.manager, "planner");
+        assert_eq!(
+            spec.workers,
+            vec!["explorer".to_string(), "summarizer".to_string()]
+        );
+        assert_eq!(
+            spec.strategy,
+            echo_agent::agent::subagent::team::strategy::TeamStrategy::ManagerWorker
+        );
+    }
+
+    #[test]
+    fn parse_team_frontmatter_rejects_missing_manager() {
+        let md = "---\nname: t\ndescription: \"d\"\nteam_strategy: manager-worker\nteam_workers: [\"w\"]\n---\nbody";
+        let err = parse_worker_md(md, None).unwrap_err();
+        assert!(err.contains("team_manager missing"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_team_frontmatter_rejects_empty_workers() {
+        let md = "---\nname: t\ndescription: \"d\"\nteam_strategy: manager-worker\nteam_manager: m\n---\nbody";
+        let err = parse_worker_md(md, None).unwrap_err();
+        assert!(err.contains("team_workers empty"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_team_frontmatter_rejects_unsupported_strategy() {
+        let md = "---\nname: t\ndescription: \"d\"\nteam_strategy: swarm\nteam_manager: m\nteam_workers: [\"w\"]\n---\nbody";
+        let err = parse_worker_md(md, None).unwrap_err();
+        assert!(err.contains("only 'manager-worker'"), "got: {err}");
+    }
+
+    #[test]
+    fn parse_team_frontmatter_absent_yields_no_team() {
+        // Normal worker without team_strategy → team is None.
+        let md = "---\nname: w\ndescription: \"d\"\nreadonly: true\n---\nbody";
+        let def = parse_worker_md(md, None).unwrap();
+        assert!(def.team.is_none());
     }
 
     #[test]

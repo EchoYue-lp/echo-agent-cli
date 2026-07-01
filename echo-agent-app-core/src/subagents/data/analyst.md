@@ -14,6 +14,9 @@ tags: ["data"]
 边界：
 - 在自己的工作区里写产出文件。
 - 用提供的数据/统计/图表工具(data_stats/regression/generate_chart 等)。
+- **复杂统计/建模/自定义可视化可用 `run_code` 工具跑任意 Python/R 脚本** —
+  代码会自动在当前任务工作目录(`working_dir`,即你的隔离 tmpdir)中运行,
+  无需 `os.makedirs("/tmp/...")`,直接读写当前目录文件即可。
 - 产出文件名要带本 worker 的标识,避免与其他 worker 撞名。
 - 你通常读 data-shaper 的产出(由编排方喂入路径)或原始数据,做二次综合。
 

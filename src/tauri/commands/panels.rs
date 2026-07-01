@@ -1579,6 +1579,266 @@ pub async fn curator_action(
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// Evolution Dashboard
+// ════════════════════════════════════════════════════════════════════════════
+
+/// 返回自进化系统的概览指标:分层记忆统计(按 type/status)、技能健康度、
+/// 最近变更活动。复用 app-core 的 `Dashboard`(扫 WARM_NAMESPACE,与写入/召回
+/// 同源),让用户第一次能"看见"系统学到了什么。
+///
+/// 这是阶段 1(Dashboard 接线)的后端入口;前端 `EvolutionPanel` 据此渲染
+/// "进化概览"段。构造 pattern 复刻自 `cmd_evolution_dashboard`
+/// (src/cli/cmd_impls/evolution.rs:1373)。
+#[tauri::command]
+pub async fn get_evolution_dashboard(
+    state: tauri::State<'_, TauriState>,
+) -> Result<serde_json::Value, IpcError> {
+    let agent = state.app_state.connection.primary_agent();
+    let store = agent
+        .read(|a| a.store().cloned())
+        .await
+        .ok_or_else(|| IpcError::Internal("No memory store configured".into()))?;
+
+    let change_log = echo_agent::evolution::JsonlChangeLog::new(
+        echo_agent_app_core::evolution::discover_echo_agent_dir()
+            .join("evolution")
+            .join("changelog.jsonl"),
+    );
+
+    let dashboard = echo_agent_app_core::evolution::Dashboard::new(store, change_log);
+    let metrics = dashboard.generate_metrics().await;
+
+    Ok(json!({ "metrics": metrics }))
+}
+
+/// 返回「记忆 → AGENTS.md 规则」的晋升候选列表(高置信 + 满足 age/type 门槛)。
+///
+/// 这是 review gate 的「展示」侧:用户在 EvolutionPanel 看到候选(置信度/
+/// 类型/规则文本),决定是否采纳。采纳走 `promote_rule` —— 只有用户点按钮
+/// 才会写 AGENTS.md,agent 不会静默改规则。复刻 CLI 的两步式
+/// (src/cli/cmd_impls/evolution.rs:1297 scan)。
+#[tauri::command]
+pub async fn scan_rule_proposals(
+    state: tauri::State<'_, TauriState>,
+) -> Result<serde_json::Value, IpcError> {
+    let agent = state.app_state.connection.primary_agent();
+    let store = agent
+        .read(|a| a.store().cloned())
+        .await
+        .ok_or_else(|| IpcError::Internal("No memory store configured".into()))?;
+
+    let promoter = echo_agent_app_core::evolution::RulePromoter::new(store);
+    let proposals = promoter.scan_for_proposals().await;
+
+    Ok(json!({ "proposals": proposals, "count": proposals.len() }))
+}
+
+/// 采纳一条规则候选:按 memory_key 找到候选,写 AGENTS.md `## Rules` 段,
+/// 并在原记忆打 `<!-- PROMOTED_TO_RULE -->` 标记防重复。
+///
+/// review gate 的「执行」侧 —— 由用户在前端点「采纳」触发,不经此路径
+/// 不会改 AGENTS.md。复刻 CLI (evolution.rs:1338 promote_rule)。
+#[tauri::command]
+pub async fn promote_rule(
+    state: tauri::State<'_, TauriState>,
+    memory_key: String,
+) -> Result<serde_json::Value, IpcError> {
+    let agent = state.app_state.connection.primary_agent();
+    let store = agent
+        .read(|a| a.store().cloned())
+        .await
+        .ok_or_else(|| IpcError::Internal("No memory store configured".into()))?;
+
+    let promoter = echo_agent_app_core::evolution::RulePromoter::new(store);
+
+    // 找到对应候选(scan 已过置信度/age/type 门槛)
+    let proposal = promoter
+        .scan_for_proposals()
+        .await
+        .into_iter()
+        .find(|p| p.memory_key == memory_key)
+        .ok_or_else(|| {
+            IpcError::NotFound(format!(
+                "Memory '{memory_key}' not found or does not meet promotion criteria"
+            ))
+        })?;
+
+    let change_log = echo_agent::evolution::JsonlChangeLog::new(
+        echo_agent_app_core::evolution::discover_echo_agent_dir()
+            .join("evolution")
+            .join("changelog.jsonl"),
+    );
+
+    promoter
+        .promote_rule(&proposal, &change_log)
+        .await
+        .map_err(|e| IpcError::Internal(format!("Failed to promote rule: {e}")))?;
+
+    Ok(json!({
+        "success": true,
+        "memory_key": memory_key,
+        "rule_text": proposal.rule_text,
+    }))
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Skill Candidates(技能自动创建闭环的可见可控出口)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// 列出已检测到的技能候选(来自 SkillCandidateDetector,存在 CANDIDATE_NAMESPACE)。
+///
+/// 闭环已存在:review 时 SkillCandidateDetector 扫描 WorkflowPattern/
+/// DebuggingLesson 记忆,超阈值(≥3)的进 CANDIDATE_NAMESPACE。本 command 只是把
+/// 它们暴露给前端,让用户看见「系统发现了哪些可复用模式」。
+#[tauri::command]
+pub async fn scan_skill_candidates(
+    state: tauri::State<'_, TauriState>,
+) -> Result<serde_json::Value, IpcError> {
+    let agent = state.app_state.connection.primary_agent();
+    let store = agent
+        .read(|a| a.store().cloned())
+        .await
+        .ok_or_else(|| IpcError::Internal("No memory store configured".into()))?;
+
+    let typed = echo_agent::memory::TypedMemoryStore::new(store);
+    let entries = typed
+        .list_typed(
+            echo_agent::evolution::candidate::CANDIDATE_NAMESPACE,
+            &echo_agent::memory::MemoryFilter::new(),
+        )
+        .await
+        .map_err(|e| IpcError::Internal(format!("Failed to list candidates: {e}")))?;
+
+    let echo_agent_dir = echo_agent_app_core::evolution::discover_echo_agent_dir();
+    let candidates: Vec<serde_json::Value> = entries
+        .into_iter()
+        .map(|e| {
+            let name = e.key.clone();
+            // 草稿是否已生成(_drafts/<name>/SKILL.md)
+            let draft_path = echo_agent_dir
+                .join("skills")
+                .join("_drafts")
+                .join(&name)
+                .join("SKILL.md");
+            let activated = echo_agent_dir
+                .join("skills")
+                .join(&name)
+                .join("SKILL.md")
+                .exists();
+            // 尝试解析 content 为 SkillCandidate(JSON),取 description/sample_count;
+            // 解析失败则 fallback 到截断的原始 content(UTF-8 安全:chars().take)。
+            let (description, sample_count, source_type) =
+                serde_json::from_str::<echo_agent::evolution::SkillCandidate>(&e.content)
+                    .ok()
+                    .map(|c| {
+                        (
+                            c.description,
+                            c.sample_count,
+                            format!("{:?}", c.source_type),
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        (
+                            e.content.chars().take(80).collect::<String>(),
+                            0,
+                            "unknown".to_string(),
+                        )
+                    });
+            json!({
+                "name": name,
+                "description": description,
+                "sample_count": sample_count,
+                "source_type": source_type,
+                "has_draft": draft_path.exists(),
+                "activated": activated,
+                "confidence": e.meta.confidence,
+            })
+        })
+        .collect();
+
+    Ok(json!({ "candidates": candidates, "count": candidates.len() }))
+}
+
+/// 为一个候选生成草稿 SKILL.md(review gate:用户触发才生成)。
+///
+/// ReviewConfig.auto_generate_drafts 默认 false —— 草稿不会自动生成。本 command
+/// 让用户显式触发:点「生成草稿」→ SkillDraftGenerator 写 _drafts/<name>/SKILL.md
+/// + curator 状态 Candidate→Draft。
+#[tauri::command]
+pub async fn generate_skill_draft(
+    state: tauri::State<'_, TauriState>,
+    name: String,
+) -> Result<serde_json::Value, IpcError> {
+    let agent = state.app_state.connection.primary_agent();
+    let store = agent
+        .read(|a| a.store().cloned())
+        .await
+        .ok_or_else(|| IpcError::Internal("No memory store configured".into()))?;
+
+    let echo_agent_dir = echo_agent_app_core::evolution::discover_echo_agent_dir();
+    let change_log = echo_agent::evolution::JsonlChangeLog::new(
+        echo_agent_dir.join("evolution").join("changelog.jsonl"),
+    );
+    let typed = echo_agent::memory::TypedMemoryStore::new(store);
+
+    let generator = echo_agent::evolution::SkillDraftGenerator::new(echo_agent_dir, &change_log);
+    let result = generator
+        .generate(&name, &typed)
+        .await
+        .map_err(|e| IpcError::Internal(format!("Failed to generate draft: {e}")))?;
+
+    Ok(json!({
+        "success": true,
+        "name": result.name,
+        "path": result.skill_md_path.to_string_lossy(),
+    }))
+}
+
+/// 激活一个草稿技能:复制 _drafts/<name>/ → skills/<name>/,并 curator
+/// 状态 Draft→Active。激活后技能进入 DiscoveryScope::Project 扫描路径,下次
+/// agent 启动/技能重载时自动加载。review gate:用户显式触发才激活。
+#[tauri::command]
+pub async fn activate_skill_draft(
+    _state: tauri::State<'_, TauriState>,
+    name: String,
+) -> Result<serde_json::Value, IpcError> {
+    let echo_agent_dir = echo_agent_app_core::evolution::discover_echo_agent_dir();
+    let draft_dir = echo_agent_dir.join("skills").join("_drafts").join(&name);
+    let target_dir = echo_agent_dir.join("skills").join(&name);
+
+    if !draft_dir.join("SKILL.md").exists() {
+        return Err(IpcError::NotFound(format!(
+            "Draft for '{name}' not found at {}",
+            draft_dir.display()
+        )));
+    }
+
+    // 复制 _drafts/<name>/SKILL.md → skills/<name>/SKILL.md
+    // (草稿目录目前只含 SKILL.md;若将来有附属资源,扩成递归复制即可)
+    std::fs::create_dir_all(&target_dir)
+        .map_err(|e| IpcError::Internal(format!("Failed to create target dir: {e}")))?;
+    std::fs::copy(draft_dir.join("SKILL.md"), target_dir.join("SKILL.md"))
+        .map_err(|e| IpcError::Internal(format!("Failed to copy draft SKILL.md: {e}")))?;
+
+    // curator 状态 Draft→Active(feature gate:improve)
+    #[cfg(feature = "improve")]
+    {
+        let curator = echo_agent::improve::Curator::default_path(
+            echo_agent::improve::CuratorConfig::default(),
+        );
+        if let Err(e) = curator.promote_to_active(&name) {
+            tracing::warn!(name = %name, error = %e, "Failed to promote '{}' to active", name);
+        }
+    }
+
+    Ok(json!({
+        "success": true,
+        "name": name,
+        "path": target_dir.to_string_lossy(),
+    }))
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // Worktree
 // ════════════════════════════════════════════════════════════════════════════
 
