@@ -34,7 +34,7 @@ use std::sync::Arc;
 
 use echo_agent::agent::{Agent, AgentEvent, CancellationToken};
 use futures::StreamExt;
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard, Semaphore};
 
 use super::store::{StoreError, TaskRuntimeStore};
 use super::types::*;
@@ -60,7 +60,7 @@ impl Default for ConcurrencyLimits {
     fn default() -> Self {
         Self {
             max_concurrent_workers: 4,
-            max_concurrent_writes: 1,
+            max_concurrent_writes: 4,
             max_concurrent_shells: 1,
             max_parallel_llm_calls: 3,
         }
@@ -358,7 +358,7 @@ pub trait TaskWorker: Send + Sync {
         write_sem: Arc<Semaphore>,
         shell_sem: Arc<Semaphore>,
         llm_sem: Arc<Semaphore>,
-        file_write_locks: Arc<std::sync::Mutex<HashSet<String>>>,
+        file_write_locks: Arc<std::sync::Mutex<HashMap<String, Arc<TokioMutex<()>>>>>,
         trace_sink: Option<WorkerTraceSink>,
     ) -> std::pin::Pin<
         Box<
@@ -388,7 +388,7 @@ impl TaskWorker for RealTaskWorker {
         write_sem: Arc<Semaphore>,
         shell_sem: Arc<Semaphore>,
         llm_sem: Arc<Semaphore>,
-        file_write_locks: Arc<std::sync::Mutex<HashSet<String>>>,
+        file_write_locks: Arc<std::sync::Mutex<HashMap<String, Arc<TokioMutex<()>>>>>,
         trace_sink: Option<WorkerTraceSink>,
     ) -> std::pin::Pin<
         Box<
@@ -475,8 +475,8 @@ async fn run_dag<W: TaskWorker + 'static>(
     // targeting the SAME file don't run concurrently even if write_sem has
     // multiple permits in the future. Currently write_sem=1 serializes all
     // writes, but this guard prevents file-level races if that ever changes.
-    let file_write_locks: Arc<std::sync::Mutex<HashSet<String>>> =
-        Arc::new(std::sync::Mutex::new(HashSet::new()));
+    let file_write_locks: Arc<std::sync::Mutex<HashMap<String, Arc<TokioMutex<()>>>>> =
+        Arc::new(std::sync::Mutex::new(HashMap::new()));
 
     // Loop until every task is resolved or the run aborts.
     loop {
@@ -841,7 +841,7 @@ async fn execute_task(
     write_sem: Arc<Semaphore>,
     shell_sem: Arc<Semaphore>,
     llm_sem: Arc<Semaphore>,
-    file_write_locks: Arc<std::sync::Mutex<HashSet<String>>>,
+    file_write_locks: Arc<std::sync::Mutex<HashMap<String, Arc<TokioMutex<()>>>>>,
     trace_sink: Option<WorkerTraceSink>,
     run_id: String,
     task: PlanTask,
@@ -974,28 +974,35 @@ async fn execute_task(
     };
 
     // G5: File-level write lock — claim the task's target files so two write
-    // tasks targeting the same file don't run concurrently. Uses a non-blocking
-    // check: if a file is already locked, it's a plan-graph bug (two write
-    // tasks with the same file in the same wave without a depends_on edge).
-    // We log a warning and proceed rather than deadlocking, since write_sem=1
-    // already serializes all writes.
+    // tasks targeting the same file don't run concurrently. Uses per-file
+    // async mutexes: non-overlapping files run in parallel, overlapping files
+    // serialize (block on the same per-file mutex).
+    //
+    // Two-layer concurrency:
+    // - write_sem: global writer count cap (max_concurrent_writes=4)
+    // - per-file TokioMutex: file-level mutual exclusion (1 permit per file)
     let _file_lock_guard = if is_write && !task.files.is_empty() {
-        let mut locks = file_write_locks.lock().unwrap_or_else(|e| e.into_inner());
-        let conflict = task.files.iter().find(|f| locks.contains(*f));
-        if let Some(f) = conflict {
-            tracing::warn!(
-                task_id = %task_id,
-                file = %f,
-                "file already locked by another write task; proceeding (write_sem serializes)"
-            );
+        // Step 1: get-or-create per-file mutexes (outer lock held briefly).
+        let per_file_mutexes: Vec<Arc<TokioMutex<()>>> = {
+            let mut locks = file_write_locks.lock().unwrap_or_else(|e| e.into_inner());
+            task.files
+                .iter()
+                .map(|f| {
+                    locks
+                        .entry(f.clone())
+                        .or_insert_with(|| Arc::new(TokioMutex::new(())))
+                        .clone()
+                })
+                .collect()
+        }; // outer lock released here — brief, never held across awaits.
+
+        // Step 2: acquire all per-file locks asynchronously. Overlapping files
+        // block here until the previous writer releases its guard.
+        let mut guards: Vec<OwnedMutexGuard<()>> = Vec::with_capacity(per_file_mutexes.len());
+        for mtx in per_file_mutexes {
+            guards.push(mtx.lock_owned().await);
         }
-        for f in &task.files {
-            locks.insert(f.clone());
-        }
-        Some(FileLockGuard {
-            locks: file_write_locks.clone(),
-            files: task.files.clone(),
-        })
+        Some(FileLockGuard { _guards: guards })
     } else {
         None
     };
@@ -1721,18 +1728,8 @@ fn emit_worker_trace(sink: Option<&WorkerTraceSink>, event: WorkerTraceEvent) {
 
 /// RAII guard that releases file write locks when dropped (G5).
 struct FileLockGuard {
-    locks: Arc<std::sync::Mutex<HashSet<String>>>,
-    files: Vec<String>,
-}
-
-impl Drop for FileLockGuard {
-    fn drop(&mut self) {
-        if let Ok(mut locks) = self.locks.lock() {
-            for f in &self.files {
-                locks.remove(f);
-            }
-        }
-    }
+    /// Per-file async mutex guards. Dropping releases all per-file locks.
+    _guards: Vec<OwnedMutexGuard<()>>,
 }
 
 /// Write a terminal Run record to the trace store when available.
@@ -2729,7 +2726,7 @@ mod tests {
             _write_sem: Arc<Semaphore>,
             _shell_sem: Arc<Semaphore>,
             _llm_sem: Arc<Semaphore>,
-            _file_write_locks: Arc<std::sync::Mutex<HashSet<String>>>,
+            _file_write_locks: Arc<std::sync::Mutex<HashMap<String, Arc<TokioMutex<()>>>>>,
             _trace_sink: Option<WorkerTraceSink>,
         ) -> std::pin::Pin<
             Box<
