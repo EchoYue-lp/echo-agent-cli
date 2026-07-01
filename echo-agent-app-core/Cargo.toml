@@ -49,6 +49,7 @@ syntect = { version = "5", default-features = false, features = ["parsing", "reg
 pulldown-cmark = "0.11"
 indicatif = "0.17"
 terminal_size = "0.3"
+tempfile = "3"  # Sprint 10: EkoDataWorkspaceFactory per-worker tmpdir (was dev-only)
 
 [features]
 telemetry = ["echo-agent/telemetry"]
@@ -57,5 +58,4 @@ telemetry = ["echo-agent/telemetry"]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("__ts_rs"))'] }
 
 [dev-dependencies]
-tempfile = "3"
 echo-agent = { version = "0.2", package = "echo_agent", path = "../../echo-agent", features = ["testing"] }

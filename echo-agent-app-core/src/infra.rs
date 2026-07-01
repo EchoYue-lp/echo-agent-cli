@@ -336,6 +336,16 @@ pub async fn create_agent(
         builder
     };
 
+    // Sprint 10: always inject a data-workspace factory (no git dependency —
+    // unlike worktree, tmpdir works anywhere). Fork-dispatched data/research
+    // workers declaring `isolate_workspace: true` get a per-worker tmpdir so
+    // parallel runs emit disjoint output files. Optional base_dir keeps them
+    // debuggable under a known parent; fall back to OS temp.
+    let data_workspace_factory: std::sync::Arc<
+        dyn echo_agent::agent::subagent::workspace::DataWorkspaceFactory,
+    > = std::sync::Arc::new(crate::tasks::task_runtime::worktree::EkoDataWorkspaceFactory::new());
+    let builder = builder.subagent_data_workspace_factory(data_workspace_factory);
+
     let mut agent = builder.build().map_err(|e| {
         tracing::error!("Failed to build agent: {e}");
         format!("Failed to initialize agent: {e}. Please check your configuration and try again.")
@@ -482,6 +492,12 @@ async fn register_default_subagents(
                 // writer (eko-fork-<label> branch).
                 if worker_def.isolate_worktree {
                     builder = builder.isolate_worktree();
+                }
+                // Sprint 10: honor the frontmatter `workspace: true` flag for
+                // data/research workers (per-worker tmpdir, disjoint outputs).
+                // Loader clears it when worktree is active (mutually exclusive).
+                if worker_def.isolate_workspace {
+                    builder = builder.isolate_workspace();
                 }
                 for tag in &worker_def.tags {
                     builder = builder.tag(tag);

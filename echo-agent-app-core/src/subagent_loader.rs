@@ -44,6 +44,10 @@ const BUILTIN_WORKER_FILES: &[(&str, &str)] = &[
         "implementer",
         include_str!("subagents/coding/implementer.md"),
     ),
+    // Sprint 10: data/research workers — per-worker tmpdir workspace
+    // (workspace:true → isolate_workspace) for disjoint output artifacts.
+    ("data-shaper", include_str!("subagents/data/data-shaper.md")),
+    ("analyst", include_str!("subagents/data/analyst.md")),
 ];
 
 /// Maximum recursion depth when scanning a scope directory for `.md` files.
@@ -69,6 +73,12 @@ struct WorkerFrontmatter {
     /// writer workers; requires a `WorktreeFactory` configured on the agent.
     #[serde(default)]
     worktree: bool,
+    /// Sprint 10: request a per-worker data workspace (tmpdir) for this
+    /// Fork-dispatched data/research worker — disjoint output dir, no git
+    /// coupling. Mutually exclusive with `worktree` (worktree wins if both).
+    /// Requires a `DataWorkspaceFactory` configured on the agent.
+    #[serde(default)]
+    workspace: bool,
     /// Optional tags; merged with the default readonly/parallel tags when
     /// `readonly` is true. Empty if unset.
     #[serde(default)]
@@ -86,6 +96,10 @@ pub struct WorkerDefinition {
     /// worktree. Mapped from frontmatter `worktree: true`. Only meaningful for
     /// writer workers (readonly workers don't mutate files).
     pub isolate_worktree: bool,
+    /// Sprint 10: whether Fork dispatch should give this worker a per-worker
+    /// data workspace (tmpdir). Mapped from frontmatter `workspace: true`.
+    /// Mutually exclusive with isolate_worktree (worktree wins if both).
+    pub isolate_workspace: bool,
     pub tags: Vec<String>,
 }
 
@@ -277,6 +291,12 @@ pub fn parse_worker_md(
     // Sprint 8: `worktree: true` only makes sense for writer workers; if a
     // readonly worker declares it, ignore (readonly workers don't mutate files).
     let isolate_worktree = fm.worktree && !fm.readonly;
+    // Sprint 10: `workspace: true` requests a per-worker data tmpdir. It's
+    // meaningful for ANY worker (data workers emit artifacts regardless of
+    // readonly), but mutually exclusive with worktree — if both are set,
+    // worktree wins (it also provides disjoint FS). Clear workspace when
+    // worktree is active to avoid double-isolation at registration.
+    let isolate_workspace = fm.workspace && !isolate_worktree;
 
     Ok(WorkerDefinition {
         name,
@@ -284,6 +304,7 @@ pub fn parse_worker_md(
         system_prompt,
         readonly: fm.readonly,
         isolate_worktree,
+        isolate_workspace,
         tags,
     })
 }
@@ -412,7 +433,8 @@ mod tests {
     fn builtin_defaults_parse_cleanly() {
         // The compiled-in defaults must all parse without error — guards
         // against a corrupt source .md slipping through. Sprint 9 added a
-        // writer worker (implementer) alongside the 4 readonly roles.
+        // writer worker (implementer); Sprint 10 added data workers
+        // (data-shaper, analyst).
         let defs = discover_subagents(None, None);
         let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(
@@ -422,7 +444,9 @@ mod tests {
                 "reviewer",
                 "planner",
                 "summarizer",
-                "implementer"
+                "implementer",
+                "data-shaper",
+                "analyst"
             ]
         );
         for d in &defs {
@@ -435,6 +459,7 @@ mod tests {
             assert!(d.readonly, "{name} should be readonly");
             assert!(d.tags.contains(&"readonly".to_string()));
             assert!(!d.isolate_worktree, "{name} must not request worktree");
+            assert!(!d.isolate_workspace, "{name} must not request workspace");
         }
         // Sprint 9: the writer worker is non-readonly + requests worktree isolation.
         let implementer = defs.iter().find(|d| d.name == "implementer").unwrap();
@@ -442,6 +467,39 @@ mod tests {
         assert!(
             implementer.isolate_worktree,
             "implementer must request worktree isolation (worktree:true && !readonly)"
+        );
+        // Sprint 10: data workers request a per-worker workspace (tmpdir).
+        for name in ["data-shaper", "analyst"] {
+            let d = defs.iter().find(|d| d.name == name).unwrap();
+            assert!(
+                d.isolate_workspace,
+                "{name} must request a data workspace (workspace:true)"
+            );
+            // Worktree NOT requested (mutually exclusive; worktree is for writers).
+            assert!(!d.isolate_worktree, "{name} must not request worktree");
+        }
+    }
+
+    #[test]
+    fn parse_workspace_flag() {
+        // Sprint 10: `workspace: true` sets isolate_workspace.
+        let md = "---\nname: data-shaper\ndescription: \"d\"\nworkspace: true\n---\nbody";
+        let def = parse_worker_md(md, None).unwrap();
+        assert!(def.isolate_workspace);
+        assert!(!def.isolate_worktree);
+    }
+
+    #[test]
+    fn parse_workspace_cleared_when_worktree_active() {
+        // Sprint 10: if BOTH worktree and workspace are set, worktree wins and
+        // workspace is cleared (mutually exclusive — worktree also provides
+        // disjoint FS, avoid double-isolation).
+        let md = "---\nname: w\ndescription: \"d\"\nreadonly: false\nworktree: true\nworkspace: true\n---\nbody";
+        let def = parse_worker_md(md, None).unwrap();
+        assert!(def.isolate_worktree);
+        assert!(
+            !def.isolate_workspace,
+            "workspace must be cleared when worktree is active"
         );
     }
 
@@ -512,9 +570,9 @@ mod tests {
     #[test]
     fn nonexistent_scope_dirs_are_silently_skipped() {
         // Neither scope dir exists → only builtins returned, no panic.
-        // 4 readonly roles + 1 writer (implementer, Sprint 9) = 5 builtins.
+        // 4 readonly + 1 writer (Sprint 9) + 2 data (Sprint 10) = 7 builtins.
         let fake_root = PathBuf::from("/nonexistent/definitely/not/here");
         let defs = discover_subagents(Some(&fake_root), Some(&fake_root));
-        assert_eq!(defs.len(), 5);
+        assert_eq!(defs.len(), 7);
     }
 }

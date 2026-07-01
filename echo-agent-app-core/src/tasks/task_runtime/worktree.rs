@@ -585,6 +585,131 @@ impl EkoWorktreeFactory {
     }
 }
 
+// ── Data-worker workspace factory (Sprint 10) ────────────────────────────
+
+/// EKO's application-layer implementation of the framework's
+/// `DataWorkspaceFactory` trait. Creates a per-worker `tempfile::TempDir`
+/// (disjoint working directory, NO git coupling) for Fork-dispatched
+/// data/research workers emitting generated artifacts (CSVs/parquet/charts).
+///
+/// Unlike `EkoWorktreeFactory` (git-coupled, diff-finalize), this gives each
+/// worker an isolated tmpdir whose lifecycle is: create → worker writes
+/// disjoint output files into it → finalize lists those files (so the
+/// orchestrator/analyst can concat+synthesize). The TempDir is KEPT across
+/// the run (not auto-cleaned on finalize) so a downstream analyst worker can
+/// read the shards; it is dropped (cleaned) only when the handle itself is
+/// dropped, which happens after finalize returns.
+///
+/// Stored behind an `Arc` and injected into the framework's
+/// `AgentConfig.subagent_data_workspace_factory`.
+#[derive(Debug, Clone)]
+pub struct EkoDataWorkspaceFactory {
+    /// Optional parent dir under which worker tmpdirs are created. `None`
+    /// uses the OS temp dir (`std::env::temp_dir()`). Keeping workspaces under
+    /// a known parent aids debugging/cleanup.
+    pub base_dir: Option<PathBuf>,
+}
+
+impl echo_agent::agent::subagent::workspace::DataWorkspaceFactory for EkoDataWorkspaceFactory {
+    fn create(
+        &self,
+        label: &str,
+    ) -> Result<
+        echo_agent::agent::subagent::workspace::DataWorkspaceHandle,
+        echo_agent::agent::subagent::workspace::WorkspaceError,
+    > {
+        // Sanitize the label into a directory-name prefix (TempDir appends a
+        // random suffix, so collisions are impossible and the prefix just aids
+        // debuggability when listing /tmp).
+        let safe_label: String = label
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let prefix = format!("eko-data-{safe_label}-");
+
+        // Create the tmpdir (under base_dir if given, else OS temp).
+        let dir = match &self.base_dir {
+            Some(base) => tempfile::Builder::new().prefix(&prefix).tempdir_in(base),
+            None => tempfile::Builder::new().prefix(&prefix).tempdir(),
+        }
+        .map_err(|e| {
+            echo_agent::agent::subagent::workspace::WorkspaceError::new(format!(
+                "failed to create data workspace tmpdir ({prefix}): {e}"
+            ))
+        })?;
+
+        // KEEP the tmpdir from auto-cleanup: a downstream analyst worker may
+        // need to read this worker's output shards after this dispatch returns.
+        // `keep()` consumes the TempDir without removing it; cleanup is then
+        // the application/user's responsibility (or a future sweep).
+        let final_path = dir.keep();
+
+        tracing::info!(
+            worker_label = label,
+            workspace = %final_path.display(),
+            "Created Fork-data-worker workspace (tmpdir, kept for collect)"
+        );
+
+        let path_for_finalize = final_path.clone();
+        Ok(
+            echo_agent::agent::subagent::workspace::DataWorkspaceHandle {
+                path: final_path,
+                finalize: Box::new(move || {
+                    // List the files the worker generated (non-recursive top-level
+                    // entries; data tools typically write flat outputs). The
+                    // orchestrator/analyst reads this to find each worker's shards
+                    // for concat+synthesize.
+                    let mut entries: Vec<String> = std::fs::read_dir(&path_for_finalize)
+                        .map_err(|e| {
+                            echo_agent::agent::subagent::workspace::WorkspaceError::new(format!(
+                                "workspace finalize read_dir failed: {e}"
+                            ))
+                        })?
+                        .filter_map(|e| e.ok())
+                        .filter_map(|e| {
+                            let name = e.file_name().to_string_lossy().to_string();
+                            if name.is_empty() { None } else { Some(name) }
+                        })
+                        .collect();
+                    entries.sort();
+                    if entries.is_empty() {
+                        Ok("(no output files generated)".to_string())
+                    } else {
+                        Ok(entries.join("\n"))
+                    }
+                }),
+            },
+        )
+    }
+}
+
+impl EkoDataWorkspaceFactory {
+    /// Construct a factory that creates worker tmpdirs under the OS temp dir.
+    pub fn new() -> Self {
+        Self { base_dir: None }
+    }
+
+    /// Create worker tmpdirs under the given base directory (for debuggable
+    /// placement / consolidated cleanup).
+    pub fn with_base_dir(base_dir: PathBuf) -> Self {
+        Self {
+            base_dir: Some(base_dir),
+        }
+    }
+}
+
+impl Default for EkoDataWorkspaceFactory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // ── Pure-logic tests (no git subprocess needed) ──
@@ -603,6 +728,50 @@ mod tests {
         let res =
             echo_agent::agent::subagent::worktree::WorktreeFactory::create(&factory, "writer-run1");
         assert!(res.is_err(), "expected error outside a git repo");
+    }
+
+    #[test]
+    fn eko_data_workspace_factory_create_and_finalize() {
+        // Sprint 10: EkoDataWorkspaceFactory creates a real tmpdir, the worker
+        // writes a file into it, and finalize lists the generated files.
+        use std::io::Write;
+        let factory = EkoDataWorkspaceFactory::new();
+        let handle = echo_agent::agent::subagent::workspace::DataWorkspaceFactory::create(
+            &factory,
+            "analyst-run1",
+        )
+        .expect("tmpdir create should succeed");
+        assert!(handle.path.exists(), "workspace dir should exist");
+        assert!(
+            handle
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().starts_with("eko-data-analyst-run1-"))
+                .unwrap_or(false),
+            "workspace dir should carry the label-derived prefix"
+        );
+        // Simulate the worker writing a disjoint output file.
+        let out = handle.path.join("run_001_clean.parquet");
+        std::fs::File::create(&out)
+            .unwrap()
+            .write_all(b"data")
+            .unwrap();
+        // Finalize lists the generated files.
+        let listing = (handle.finalize)().expect("finalize should succeed");
+        assert!(listing.contains("run_001_clean.parquet"), "got: {listing}");
+    }
+
+    #[test]
+    fn eko_data_workspace_factory_empty_finalize_reports_nothing() {
+        // No files written → finalize reports "(no output files generated)".
+        let factory = EkoDataWorkspaceFactory::new();
+        let handle = echo_agent::agent::subagent::workspace::DataWorkspaceFactory::create(
+            &factory,
+            "empty-run",
+        )
+        .unwrap();
+        let listing = (handle.finalize)().unwrap();
+        assert_eq!(listing, "(no output files generated)");
     }
 
     #[test]
