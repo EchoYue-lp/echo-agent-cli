@@ -1682,6 +1682,163 @@ pub async fn promote_rule(
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// Skill Candidates(技能自动创建闭环的可见可控出口)
+// ════════════════════════════════════════════════════════════════════════════
+
+/// 列出已检测到的技能候选(来自 SkillCandidateDetector,存在 CANDIDATE_NAMESPACE)。
+///
+/// 闭环已存在:review 时 SkillCandidateDetector 扫描 WorkflowPattern/
+/// DebuggingLesson 记忆,超阈值(≥3)的进 CANDIDATE_NAMESPACE。本 command 只是把
+/// 它们暴露给前端,让用户看见「系统发现了哪些可复用模式」。
+#[tauri::command]
+pub async fn scan_skill_candidates(
+    state: tauri::State<'_, TauriState>,
+) -> Result<serde_json::Value, IpcError> {
+    let agent = state.app_state.connection.primary_agent();
+    let store = agent
+        .read(|a| a.store().cloned())
+        .await
+        .ok_or_else(|| IpcError::Internal("No memory store configured".into()))?;
+
+    let typed = echo_agent::memory::TypedMemoryStore::new(store);
+    let entries = typed
+        .list_typed(
+            echo_agent::evolution::candidate::CANDIDATE_NAMESPACE,
+            &echo_agent::memory::MemoryFilter::new(),
+        )
+        .await
+        .map_err(|e| IpcError::Internal(format!("Failed to list candidates: {e}")))?;
+
+    let echo_agent_dir = echo_agent_app_core::evolution::discover_echo_agent_dir();
+    let candidates: Vec<serde_json::Value> = entries
+        .into_iter()
+        .map(|e| {
+            let name = e.key.clone();
+            // 草稿是否已生成(_drafts/<name>/SKILL.md)
+            let draft_path = echo_agent_dir
+                .join("skills")
+                .join("_drafts")
+                .join(&name)
+                .join("SKILL.md");
+            let activated = echo_agent_dir
+                .join("skills")
+                .join(&name)
+                .join("SKILL.md")
+                .exists();
+            // 尝试解析 content 为 SkillCandidate(JSON),取 description/sample_count;
+            // 解析失败则 fallback 到截断的原始 content(UTF-8 安全:chars().take)。
+            let (description, sample_count, source_type) =
+                serde_json::from_str::<echo_agent::evolution::SkillCandidate>(&e.content)
+                    .ok()
+                    .map(|c| {
+                        (
+                            c.description,
+                            c.sample_count,
+                            format!("{:?}", c.source_type),
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        (
+                            e.content.chars().take(80).collect::<String>(),
+                            0,
+                            "unknown".to_string(),
+                        )
+                    });
+            json!({
+                "name": name,
+                "description": description,
+                "sample_count": sample_count,
+                "source_type": source_type,
+                "has_draft": draft_path.exists(),
+                "activated": activated,
+                "confidence": e.meta.confidence,
+            })
+        })
+        .collect();
+
+    Ok(json!({ "candidates": candidates, "count": candidates.len() }))
+}
+
+/// 为一个候选生成草稿 SKILL.md(review gate:用户触发才生成)。
+///
+/// ReviewConfig.auto_generate_drafts 默认 false —— 草稿不会自动生成。本 command
+/// 让用户显式触发:点「生成草稿」→ SkillDraftGenerator 写 _drafts/<name>/SKILL.md
+/// + curator 状态 Candidate→Draft。
+#[tauri::command]
+pub async fn generate_skill_draft(
+    state: tauri::State<'_, TauriState>,
+    name: String,
+) -> Result<serde_json::Value, IpcError> {
+    let agent = state.app_state.connection.primary_agent();
+    let store = agent
+        .read(|a| a.store().cloned())
+        .await
+        .ok_or_else(|| IpcError::Internal("No memory store configured".into()))?;
+
+    let echo_agent_dir = echo_agent_app_core::evolution::discover_echo_agent_dir();
+    let change_log = echo_agent::evolution::JsonlChangeLog::new(
+        echo_agent_dir.join("evolution").join("changelog.jsonl"),
+    );
+    let typed = echo_agent::memory::TypedMemoryStore::new(store);
+
+    let generator = echo_agent::evolution::SkillDraftGenerator::new(echo_agent_dir, &change_log);
+    let result = generator
+        .generate(&name, &typed)
+        .await
+        .map_err(|e| IpcError::Internal(format!("Failed to generate draft: {e}")))?;
+
+    Ok(json!({
+        "success": true,
+        "name": result.name,
+        "path": result.skill_md_path.to_string_lossy(),
+    }))
+}
+
+/// 激活一个草稿技能:复制 _drafts/<name>/ → skills/<name>/,并 curator
+/// 状态 Draft→Active。激活后技能进入 DiscoveryScope::Project 扫描路径,下次
+/// agent 启动/技能重载时自动加载。review gate:用户显式触发才激活。
+#[tauri::command]
+pub async fn activate_skill_draft(
+    _state: tauri::State<'_, TauriState>,
+    name: String,
+) -> Result<serde_json::Value, IpcError> {
+    let echo_agent_dir = echo_agent_app_core::evolution::discover_echo_agent_dir();
+    let draft_dir = echo_agent_dir.join("skills").join("_drafts").join(&name);
+    let target_dir = echo_agent_dir.join("skills").join(&name);
+
+    if !draft_dir.join("SKILL.md").exists() {
+        return Err(IpcError::NotFound(format!(
+            "Draft for '{name}' not found at {}",
+            draft_dir.display()
+        )));
+    }
+
+    // 复制 _drafts/<name>/SKILL.md → skills/<name>/SKILL.md
+    // (草稿目录目前只含 SKILL.md;若将来有附属资源,扩成递归复制即可)
+    std::fs::create_dir_all(&target_dir)
+        .map_err(|e| IpcError::Internal(format!("Failed to create target dir: {e}")))?;
+    std::fs::copy(draft_dir.join("SKILL.md"), target_dir.join("SKILL.md"))
+        .map_err(|e| IpcError::Internal(format!("Failed to copy draft SKILL.md: {e}")))?;
+
+    // curator 状态 Draft→Active(feature gate:improve)
+    #[cfg(feature = "improve")]
+    {
+        let curator = echo_agent::improve::Curator::default_path(
+            echo_agent::improve::CuratorConfig::default(),
+        );
+        if let Err(e) = curator.promote_to_active(&name) {
+            tracing::warn!(name = %name, error = %e, "Failed to promote '{}' to active", name);
+        }
+    }
+
+    Ok(json!({
+        "success": true,
+        "name": name,
+        "path": target_dir.to_string_lossy(),
+    }))
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // Worktree
 // ════════════════════════════════════════════════════════════════════════════
 

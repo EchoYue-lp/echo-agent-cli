@@ -544,6 +544,17 @@ export interface RuleProposal {
   reason: string;
 }
 
+/** 技能候选(SkillCandidateDetector 从重复模式/调试经验中检测出)。 */
+export interface SkillCandidateInfo {
+  name: string;
+  description: string;
+  sample_count: number;
+  source_type: string;
+  has_draft: boolean;
+  activated: boolean;
+  confidence: number;
+}
+
 // ── Provider types ──────────────────────────────────────────────────────────
 
 export interface ProviderTemplate {

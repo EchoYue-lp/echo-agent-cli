@@ -14,6 +14,8 @@ import {
   Database,
   Heart,
   Gift,
+  Wand2,
+  Zap,
 } from 'lucide-react';
 import { evolutionApi } from '../../api/endpoints';
 import { useToastStore } from '../../stores/toastStore';
@@ -24,6 +26,7 @@ import type {
   CuratorTransition,
   DashboardMetrics,
   RuleProposal,
+  SkillCandidateInfo,
 } from '../../types/api';
 
 export function EvolutionPanel() {
@@ -37,6 +40,11 @@ export function EvolutionPanel() {
   const [proposals, setProposals] = useState<RuleProposal[]>([]);
   const [loadingProposals, setLoadingProposals] = useState(false);
   const [promotingKey, setPromotingKey] = useState<string | null>(null);
+
+  // ── Skill candidates state(技能自动创建:检测 → 草稿 → 激活)
+  const [skillCandidates, setSkillCandidates] = useState<SkillCandidateInfo[]>([]);
+  const [loadingCandidates, setLoadingCandidates] = useState(false);
+  const [actingOnSkill, setActingOnSkill] = useState<string | null>(null);
 
   // ── Trajectory state
   const [stats, setStats] = useState<TrajectoryStats | null>(null);
@@ -98,6 +106,44 @@ export function EvolutionPanel() {
     setPromotingKey(null);
   };
 
+  // ── Skill candidates(技能自动创建闭环)
+  const loadSkillCandidates = async () => {
+    setLoadingCandidates(true);
+    try {
+      const data = await evolutionApi.scanSkillCandidates();
+      setSkillCandidates(data.candidates);
+    } catch (e) {
+      console.error('Failed to load skill candidates:', e);
+    }
+    setLoadingCandidates(false);
+  };
+
+  // review gate:用户点「生成草稿」才写 _drafts/<name>/SKILL.md
+  const handleGenerateDraft = async (name: string) => {
+    setActingOnSkill(name);
+    try {
+      await evolutionApi.generateSkillDraft(name);
+      addToast('success', `已为「${name}」生成草稿 SKILL.md`);
+      await loadSkillCandidates();
+    } catch (e) {
+      addToast('error', `生成草稿失败: ${e instanceof Error ? e.message : '未知错误'}`);
+    }
+    setActingOnSkill(null);
+  };
+
+  // review gate:用户点「激活」才把草稿复制到正式 skills/ + curator Draft→Active
+  const handleActivateSkill = async (name: string) => {
+    setActingOnSkill(name);
+    try {
+      await evolutionApi.activateSkillDraft(name);
+      addToast('success', `技能「${name}」已激活,下次加载时生效`);
+      await loadSkillCandidates();
+    } catch (e) {
+      addToast('error', `激活失败: ${e instanceof Error ? e.message : '未知错误'}`);
+    }
+    setActingOnSkill(null);
+  };
+
   const loadStats = async () => {
     setLoadingStats(true);
     try {
@@ -132,6 +178,7 @@ export function EvolutionPanel() {
   useEffect(() => {
     loadDashboard();
     loadProposals();
+    loadSkillCandidates();
     loadStats();
     loadTrajectories();
     loadCuratorStatus();
@@ -439,6 +486,135 @@ export function EvolutionPanel() {
             {loadingProposals
               ? '加载中...'
               : '暂无规则候选。记忆置信度 ≥ 0.95 且存续 ≥ 7 天后会出现在此。'}
+          </div>
+        )}
+      </section>
+
+      {/* ── Section 0c: Skill Candidates (技能自动创建闭环) ── */}
+      <section>
+        <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center gap-2">
+            <Wand2 size={14} style={{ color: 'var(--accent)' }} />
+            <h3 className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>
+              技能候选
+            </h3>
+            {skillCandidates.length > 0 && (
+              <span
+                className="rounded-full px-1.5 py-0.5 text-[9px] font-medium"
+                style={{ background: 'var(--accent-bg)', color: 'var(--accent)' }}
+              >
+                {skillCandidates.length}
+              </span>
+            )}
+          </div>
+          <button
+            onClick={loadSkillCandidates}
+            disabled={loadingCandidates}
+            className="flex items-center gap-1 text-[10px] font-medium transition-colors"
+            style={{ color: 'var(--accent)' }}
+          >
+            <RefreshCw size={10} className={loadingCandidates ? 'animate-spin' : ''} />
+            刷新
+          </button>
+        </div>
+
+        <p className="text-xs mb-3" style={{ color: 'var(--text-secondary)' }}>
+          系统从重复工作流/调试经验中检测出可复用模式。生成草稿 → 审阅 → 激活后,
+          技能进入正式 skills 目录,下次加载时自动生效。
+        </p>
+
+        {skillCandidates.length > 0 ? (
+          <div className="space-y-2">
+            {skillCandidates.map((c) => (
+              <div
+                key={c.name}
+                className="rounded-lg border p-3"
+                style={{ borderColor: 'var(--border-primary)' }}
+              >
+                <div className="flex items-center justify-between mb-1.5">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span className="text-xs font-medium truncate" style={{ color: 'var(--text-primary)' }}>
+                      {c.name}
+                    </span>
+                    {c.activated && (
+                      <span
+                        className="flex items-center gap-0.5 rounded px-1 py-0.5 text-[9px] shrink-0"
+                        style={{ background: 'var(--color-success-bg, rgba(34,197,94,0.1))', color: 'var(--color-success)' }}
+                      >
+                        <CheckCircle size={8} /> 已激活
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0 text-[10px]" style={{ color: 'var(--text-tertiary)' }}>
+                    <span title="观测样本数">{c.sample_count} 次</span>
+                    <span
+                      className="rounded px-1 py-0.5"
+                      style={{ background: 'var(--bg-hover)' }}
+                    >
+                      {c.source_type}
+                    </span>
+                  </div>
+                </div>
+                <p className="text-xs mb-2" style={{ color: 'var(--text-secondary)' }}>
+                  {c.description}
+                </p>
+                <div className="flex items-center justify-end gap-2">
+                  {/* 草稿状态决定按钮:未生成→生成草稿;已生成未激活→激活;已激活→禁用 */}
+                  {!c.has_draft && !c.activated && (
+                    <button
+                      onClick={() => handleGenerateDraft(c.name)}
+                      disabled={actingOnSkill !== null}
+                      className="flex items-center gap-1 rounded px-2 py-1 text-[10px] font-medium transition-colors"
+                      style={{
+                        background: actingOnSkill === c.name ? 'var(--border-primary)' : 'var(--bg-hover)',
+                        color: actingOnSkill === c.name ? 'var(--text-tertiary)' : 'var(--text-primary)',
+                      }}
+                    >
+                      {actingOnSkill === c.name ? (
+                        <RefreshCw size={9} className="animate-spin" />
+                      ) : (
+                        <Wand2 size={9} />
+                      )}
+                      生成草稿
+                    </button>
+                  )}
+                  {c.has_draft && !c.activated && (
+                    <button
+                      onClick={() => handleActivateSkill(c.name)}
+                      disabled={actingOnSkill !== null}
+                      className="flex items-center gap-1 rounded px-2 py-1 text-[10px] font-medium transition-colors"
+                      style={{
+                        background: actingOnSkill === c.name ? 'var(--border-primary)' : 'var(--action-run)',
+                        color: actingOnSkill === c.name ? 'var(--text-tertiary)' : 'var(--text-on-run)',
+                      }}
+                    >
+                      {actingOnSkill === c.name ? (
+                        <RefreshCw size={9} className="animate-spin" />
+                      ) : (
+                        <Zap size={9} />
+                      )}
+                      激活
+                    </button>
+                  )}
+                  {c.activated && (
+                    <span className="text-[10px]" style={{ color: 'var(--text-tertiary)' }}>
+                      下次加载生效
+                    </span>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="py-4 text-center text-xs" style={{ color: 'var(--text-tertiary)' }}>
+            {loadingCandidates ? (
+              <RefreshCw size={16} className="mx-auto mb-1 animate-spin" />
+            ) : (
+              <Wand2 size={20} className="mx-auto mb-1" />
+            )}
+            {loadingCandidates
+              ? '加载中...'
+              : '暂无技能候选。重复工作流/调试经验积累 ≥ 3 次后,经 review 会出现在此。'}
           </div>
         )}
       </section>

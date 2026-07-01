@@ -36,6 +36,7 @@ import type {
   CuratorTransition,
   DashboardMetrics,
   RuleProposal,
+  SkillCandidateInfo,
   ConfiguredModelListResponse,
   ProviderTemplate,
   TestConnectionResponse,
@@ -1081,6 +1082,28 @@ export const evolutionApi = {
       : post<{ success: boolean; memory_key: string; rule_text: string }>(
           '/evolution/rule-proposals/promote',
           { memory_key: memoryKey }
+        ),
+  scanSkillCandidates: () =>
+    isTauri()
+      ? apiInvoke<{ candidates: SkillCandidateInfo[]; count: number }>('scan_skill_candidates')
+      : get<{ candidates: SkillCandidateInfo[]; count: number }>('/evolution/skill-candidates'),
+  generateSkillDraft: (name: string) =>
+    isTauri()
+      ? apiInvoke<{ success: boolean; name: string; path: string }>('generate_skill_draft', {
+          name,
+        })
+      : post<{ success: boolean; name: string; path: string }>(
+          '/evolution/skill-candidates/draft',
+          { name }
+        ),
+  activateSkillDraft: (name: string) =>
+    isTauri()
+      ? apiInvoke<{ success: boolean; name: string; path: string }>('activate_skill_draft', {
+          name,
+        })
+      : post<{ success: boolean; name: string; path: string }>(
+          '/evolution/skill-candidates/activate',
+          { name }
         ),
 };
 
