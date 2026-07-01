@@ -47,7 +47,8 @@ pub type WorkerTraceSink = Arc<dyn Fn(WorkerTraceEvent) + Send + Sync>;
 pub struct ConcurrencyLimits {
     /// Max simultaneous worker agents (read-only fan-out).
     pub max_concurrent_workers: usize,
-    /// Max simultaneous mutating tasks. Default 1 — writes serialize.
+    /// Max simultaneous mutating tasks. Default 4 — gated by per-file locks
+    /// (non-overlapping files run in parallel, overlapping files serialize).
     pub max_concurrent_writes: usize,
     /// Max simultaneous shell/verification tasks.
     pub max_concurrent_shells: usize,
@@ -471,10 +472,10 @@ async fn run_dag<W: TaskWorker + 'static>(
     let write_sem = Arc::new(Semaphore::new(limits.max_concurrent_writes));
     let shell_sem = Arc::new(Semaphore::new(limits.max_concurrent_shells));
     let llm_sem = Arc::new(Semaphore::new(limits.max_parallel_llm_calls));
-    // G5: Track which files are currently being written, so two write tasks
-    // targeting the SAME file don't run concurrently even if write_sem has
-    // multiple permits in the future. Currently write_sem=1 serializes all
-    // writes, but this guard prevents file-level races if that ever changes.
+    // G5: Per-file async mutex map. Non-overlapping files run in parallel
+    // (max_concurrent_writes=4), overlapping files serialize on the same
+    // per-file TokioMutex. Files are sorted before locking (see execute_task)
+    // to prevent lock-ordering deadlocks.
     let file_write_locks: Arc<std::sync::Mutex<HashMap<String, Arc<TokioMutex<()>>>>> =
         Arc::new(std::sync::Mutex::new(HashMap::new()));
 
@@ -982,10 +983,19 @@ async fn execute_task(
     // - write_sem: global writer count cap (max_concurrent_writes=4)
     // - per-file TokioMutex: file-level mutual exclusion (1 permit per file)
     let _file_lock_guard = if is_write && !task.files.is_empty() {
+        // CRITICAL: sort files before acquiring locks to prevent classic
+        // lock-ordering deadlock. Without this, two tasks declaring the same
+        // files in different orders (e.g. [A,B] vs [B,A]) would deadlock when
+        // both reach Step 2 concurrently (A waits for B while B waits for A).
+        // Sorting guarantees all tasks acquire per-file locks in the same
+        // canonical order, breaking any potential wait-for cycle.
+        let mut sorted_files = task.files.clone();
+        sorted_files.sort();
+
         // Step 1: get-or-create per-file mutexes (outer lock held briefly).
         let per_file_mutexes: Vec<Arc<TokioMutex<()>>> = {
             let mut locks = file_write_locks.lock().unwrap_or_else(|e| e.into_inner());
-            task.files
+            sorted_files
                 .iter()
                 .map(|f| {
                     locks
