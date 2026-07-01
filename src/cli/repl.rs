@@ -51,6 +51,10 @@ pub struct ReplConfig {
     pub project: Option<String>,
     pub task_service: Option<Arc<echo_agent_app_core::tasks::BackgroundTaskService>>,
     pub scheduler_runner: Option<Arc<echo_agent_app_core::scheduler::SchedulerRunner>>,
+    /// Shared ReviewIntegration (from bootstrap) — enables Dreaming + reuse
+    /// in session-end memory review. When `None`, review functions fall back
+    /// to building a temporary instance (legacy behavior).
+    pub review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
 }
 
 impl Default for ReplConfig {
@@ -62,6 +66,7 @@ impl Default for ReplConfig {
             project: None,
             task_service: None,
             scheduler_runner: None,
+            review_integration: None,
         }
     }
 }
@@ -71,6 +76,17 @@ pub async fn run_repl(agent: AgentHandle, config: ReplConfig) -> anyhow::Result<
     let output = OutputRenderer::default();
 
     output.print_banner(env!("CARGO_PKG_VERSION"));
+
+    // ── Dreaming: daily self-evolution pass (mode parity with GUI) ────
+    // Spawn background Dreaming task so CLI sessions also get recall-
+    // frequency-driven memory promotion/demotion (AGENTS.md: TUI/CLI must
+    // be feature-equivalent with GUI). Cancelled on session exit.
+    let dreaming_cancel = config.review_integration.as_ref().map(|ri| {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        echo_agent_app_core::infra::spawn_dreaming_task(ri.clone(), cancel.clone());
+        tracing::info!("Dreaming task spawned for CLI session");
+        cancel
+    });
 
     let model_name = agent.read(|a| a.model_name().to_string()).await;
 
@@ -184,7 +200,12 @@ pub async fn run_repl(agent: AgentHandle, config: ReplConfig) -> anyhow::Result<
     run_reflection_on_exit(&agent).await;
 
     // ── Memory review: staleness scoring, conflict detection, GC ────
-    run_memory_review_on_exit(&agent).await;
+    run_memory_review_on_exit(&agent, &config.review_integration).await;
+
+    // ── Stop Dreaming background task ──────────────────────────────
+    if let Some(cancel) = dreaming_cancel {
+        cancel.cancel();
+    }
 
     Ok(())
 }
@@ -348,7 +369,40 @@ async fn run_reflection_on_exit(agent: &AgentHandle) {
 /// Performs staleness scoring, conflict detection, merge, and archival
 /// on typed memories. Non-blocking: errors are silently ignored to avoid
 /// disrupting exit flow.
-async fn run_memory_review_on_exit(agent: &AgentHandle) {
+///
+/// When `shared_ri` is provided, reuses the bootstrap-time ReviewIntegration
+/// (same shared store + layer manager as Dreaming). Otherwise falls back to
+/// building a temporary instance from the agent's store (legacy behavior).
+async fn run_memory_review_on_exit(
+    agent: &AgentHandle,
+    shared_ri: &Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
+) {
+    // Prefer the shared ReviewIntegration (same store Dreaming uses).
+    if let Some(ri) = shared_ri {
+        if let Some(review_result) = ri.on_session_end().await {
+            match review_result {
+                Ok(report) => {
+                    let count = report.total_scanned;
+                    if count > 0 {
+                        println!(
+                            "  📋 Memory review: {} scanned, {} stale, {} conflicts, {} merged, {} archived",
+                            count,
+                            report.stale_count,
+                            report.conflict_groups,
+                            report.merges_applied,
+                            report.archives_applied
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("  ⚠ Memory review failed: {e}");
+                }
+            }
+        }
+        return;
+    }
+
+    // Fallback: build a temporary ReviewIntegration from the agent's store.
     let store = agent.read(|a| a.store().cloned()).await;
     let Some(store) = store else {
         return;

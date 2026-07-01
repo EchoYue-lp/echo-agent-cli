@@ -441,6 +441,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                     &args,
                     &app_config,
                     task_store.clone(),
+                    runtime.review_integration.clone(),
                 )
                 .await?;
             } else {
@@ -464,6 +465,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             &args,
             &app_config,
             task_store.clone(),
+            runtime.review_integration.clone(),
         )
         .await?;
     } else {

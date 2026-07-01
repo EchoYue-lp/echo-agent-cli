@@ -1674,6 +1674,14 @@ pub async fn promote_rule(
         .await
         .map_err(|e| IpcError::Internal(format!("Failed to promote rule: {e}")))?;
 
+    // Fire RulePromoted hook so registered hooks are notified.
+    echo_agent_app_core::evolution::fire_evolution_hook(
+        &agent,
+        echo_core::hooks::HookEvent::RulePromoted,
+        &memory_key,
+    )
+    .await;
+
     Ok(json!({
         "success": true,
         "memory_key": memory_key,

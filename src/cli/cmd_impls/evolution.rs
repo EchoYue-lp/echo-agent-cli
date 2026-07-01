@@ -1020,6 +1020,14 @@ async fn cmd_skill_merge(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
                             "  Secondary skill '{}' has been deprecated.",
                             proposal.deprecated_skill
                         );
+                        // Fire SkillMergeApplied hook so registered hooks
+                        // are notified of the skill merge.
+                        echo_agent_app_core::evolution::fire_evolution_hook(
+                            &ctx.agent,
+                            echo_core::hooks::HookEvent::SkillMergeApplied,
+                            &proposal.primary_skill,
+                        )
+                        .await;
                         println!(
                             "\nNote: The updated skill descriptor needs to be written back to the registry."
                         );
@@ -1341,6 +1349,14 @@ async fn cmd_rule_promote(ctx: &CommandContext, args: &[&str]) -> CommandOutcome
                                 "✓ Successfully promoted memory '{}' to AGENTS.md",
                                 memory_key
                             );
+                            // Fire RulePromoted hook so registered hooks
+                            // (e.g. config-reload, dashboard refresh) are notified.
+                            echo_agent_app_core::evolution::fire_evolution_hook(
+                                &ctx.agent,
+                                echo_core::hooks::HookEvent::RulePromoted,
+                                memory_key,
+                            )
+                            .await;
                         }
                         Err(e) => {
                             println!("✗ Failed to promote rule: {}", e);
@@ -1407,6 +1423,116 @@ cmd!(
 
 // ── Register ────────────────────────────────────────────────────────
 
+// ── SkillRegisterCommand ──────────────────────────────────────────
+
+/// Register a manually-created SKILL.md as a user-owned skill.
+/// The curator will never auto-transition (archive/deprecate) it because
+/// `agent_created` is set to `false` (curator.rs:467 skips non-agent skills).
+async fn cmd_skill_register(_ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
+    let name = match args.first() {
+        Some(n) => *n,
+        None => {
+            println!("Usage: /skill-register <name>");
+            println!("Register an existing SKILL.md as user-created.");
+            println!("The curator will not auto-archive or deprecate user-created skills.");
+            return CommandOutcome::Continue;
+        }
+    };
+
+    let curator =
+        echo_agent::improve::Curator::default_path(echo_agent::improve::CuratorConfig::default());
+
+    match curator.touch_skill(name, false) {
+        Ok(()) => {
+            println!(
+                "✓ Skill '{}' registered as user-created (agent_created=false).",
+                name
+            );
+            println!("  The curator will not auto-transition this skill.");
+            println!("  Use /skill-pin <name> for additional protection.");
+        }
+        Err(e) => {
+            println!("Error registering skill: {e}");
+        }
+    }
+
+    CommandOutcome::Continue
+}
+cmd!(
+    SkillRegisterCommand,
+    "skill-register",
+    CommandCategory::Advanced,
+    "Register a manually-created SKILL.md as user-created (curator won't auto-manage)",
+    cmd_skill_register
+);
+
+// ── SkillPinCommand ───────────────────────────────────────────────
+
+/// Pin a skill so it is exempt from all curator auto-transitions.
+async fn cmd_skill_pin(_ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
+    let name = match args.first() {
+        Some(n) => *n,
+        None => {
+            println!("Usage: /skill-pin <name>");
+            println!("Pin a skill — exempt from auto-archival/deprecation.");
+            return CommandOutcome::Continue;
+        }
+    };
+
+    let curator =
+        echo_agent::improve::Curator::default_path(echo_agent::improve::CuratorConfig::default());
+
+    match curator.pin_skill(name) {
+        Ok(()) => println!("✓ Skill '{}' pinned — exempt from auto-transitions.", name),
+        Err(e) => println!("Error pinning skill: {e}"),
+    }
+
+    CommandOutcome::Continue
+}
+cmd!(
+    SkillPinCommand,
+    "skill-pin",
+    CommandCategory::Advanced,
+    "Pin a skill — exempt from curator auto-transitions",
+    cmd_skill_pin
+);
+
+// ── SkillUnpinCommand ─────────────────────────────────────────────
+
+/// Unpin a skill, restoring curator auto-transition eligibility.
+async fn cmd_skill_unpin(_ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
+    let name = match args.first() {
+        Some(n) => *n,
+        None => {
+            println!("Usage: /skill-unpin <name>");
+            println!("Unpin a skill — restore curator auto-transition eligibility.");
+            return CommandOutcome::Continue;
+        }
+    };
+
+    let curator =
+        echo_agent::improve::Curator::default_path(echo_agent::improve::CuratorConfig::default());
+
+    match curator.unpin_skill(name) {
+        Ok(()) => println!(
+            "✓ Skill '{}' unpinned — curator may auto-transition it.",
+            name
+        ),
+        Err(e) => println!("Error unpinning skill: {e}"),
+    }
+
+    CommandOutcome::Continue
+}
+cmd!(
+    SkillUnpinCommand,
+    "skill-unpin",
+    CommandCategory::Advanced,
+    "Unpin a skill — restore curator auto-transition eligibility",
+    cmd_skill_unpin
+);
+
+// ── Register ────────────────────────────────────────────────────────
+
 pub fn register_all(registry: &mut crate::cli::command::CommandRegistry) {
     registry.register(Arc::new(TrajectoriesCommand));
     registry.register(Arc::new(ReviewCommand));
@@ -1423,4 +1549,7 @@ pub fn register_all(registry: &mut crate::cli::command::CommandRegistry) {
     registry.register(Arc::new(SkillPatchCommand));
     registry.register(Arc::new(RulePromoteCommand));
     registry.register(Arc::new(EvolutionDashboardCommand));
+    registry.register(Arc::new(SkillRegisterCommand));
+    registry.register(Arc::new(SkillPinCommand));
+    registry.register(Arc::new(SkillUnpinCommand));
 }

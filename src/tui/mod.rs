@@ -1173,8 +1173,21 @@ pub async fn run_tui(
     // binds this session's chat turns + TaskRuntime runs + transcript projection.
     app.conversation_id = Some(uuid::Uuid::new_v4().to_string());
 
+    // ── Dreaming: daily self-evolution pass (mode parity with GUI) ────
+    let dreaming_cancel = app.review_integration.as_ref().map(|ri| {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        echo_agent_app_core::infra::spawn_dreaming_task(ri.clone(), cancel.clone());
+        tracing::info!("Dreaming task spawned for TUI session");
+        cancel
+    });
+
     // Main event loop.
     let result = events::run_event_loop(&mut terminal, &mut app, agent, task_service).await;
+
+    // Stop Dreaming when the TUI session ends.
+    if let Some(cancel) = dreaming_cancel {
+        cancel.cancel();
+    }
 
     // Guard drop will restore the terminal.
     result

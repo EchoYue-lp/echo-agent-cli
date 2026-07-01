@@ -17,6 +17,7 @@ fn repl_config_for(args: &Args) -> crate::cli::ReplConfig {
         project: args.project.clone(),
         task_service: None,
         scheduler_runner: None,
+        review_integration: None,
     }
 }
 
@@ -27,6 +28,7 @@ pub async fn run_cli_mode(
     args: &Args,
     app_config: &AppConfig,
     task_store: std::sync::Arc<dyn echo_agent::memory::Store>,
+    review_integration: Option<std::sync::Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
 ) -> Result<()> {
     // Start BackgroundTaskService for CLI mode
     let (task_service, scheduler_runner) = {
@@ -45,6 +47,7 @@ pub async fn run_cli_mode(
     let mut repl_config = repl_config_for(args);
     repl_config.task_service = task_service;
     repl_config.scheduler_runner = scheduler_runner;
+    repl_config.review_integration = review_integration;
 
     crate::cli::run_repl(agent, repl_config).await
 }
