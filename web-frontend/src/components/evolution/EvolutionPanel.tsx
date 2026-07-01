@@ -11,6 +11,8 @@ import {
   Archive,
   Clock,
   Activity,
+  Database,
+  Heart,
 } from 'lucide-react';
 import { evolutionApi } from '../../api/endpoints';
 import type {
@@ -18,9 +20,14 @@ import type {
   TrajectoryStats,
   CuratorStatus,
   CuratorTransition,
+  DashboardMetrics,
 } from '../../types/api';
 
 export function EvolutionPanel() {
+  // ── Dashboard state(进化概览:分层记忆统计 + 技能健康 + 变更活动)
+  const [dashboard, setDashboard] = useState<DashboardMetrics | null>(null);
+  const [loadingDashboard, setLoadingDashboard] = useState(false);
+
   // ── Trajectory state
   const [stats, setStats] = useState<TrajectoryStats | null>(null);
   const [trajectories, setTrajectories] = useState<TrajectoryEntry[]>([]);
@@ -45,6 +52,17 @@ export function EvolutionPanel() {
   const [curatorMsg, setCuratorMsg] = useState<string | null>(null);
 
   // ── Load data
+  const loadDashboard = async () => {
+    setLoadingDashboard(true);
+    try {
+      const data = await evolutionApi.dashboard();
+      setDashboard(data.metrics);
+    } catch (e) {
+      console.error('Failed to load evolution dashboard:', e);
+    }
+    setLoadingDashboard(false);
+  };
+
   const loadStats = async () => {
     setLoadingStats(true);
     try {
@@ -77,6 +95,7 @@ export function EvolutionPanel() {
   };
 
   useEffect(() => {
+    loadDashboard();
     loadStats();
     loadTrajectories();
     loadCuratorStatus();
@@ -121,6 +140,160 @@ export function EvolutionPanel() {
 
   return (
     <div className="space-y-6">
+      {/* ── Section 0: Evolution Overview (Dashboard) ── */}
+      <section>
+        <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center gap-2">
+            <Database size={14} style={{ color: 'var(--accent)' }} />
+            <h3 className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>
+              进化概览
+            </h3>
+          </div>
+          <button
+            onClick={loadDashboard}
+            disabled={loadingDashboard}
+            className="flex items-center gap-1 text-[10px] font-medium transition-colors"
+            style={{ color: 'var(--accent)' }}
+          >
+            <RefreshCw size={10} className={loadingDashboard ? 'animate-spin' : ''} />
+            刷新
+          </button>
+        </div>
+
+        {dashboard ? (
+          <>
+            {/* 总记忆数 + 技能健康概览 */}
+            <div className="grid grid-cols-3 gap-2 mb-3">
+              <StatCard label="总记忆" value={dashboard.total_memories} icon={<Database size={10} />} />
+              <StatCard
+                label="健康技能"
+                value={dashboard.skill_health.healthy_skills}
+                color="var(--color-success)"
+                icon={<Heart size={10} />}
+              />
+              <StatCard
+                label="需关注"
+                value={dashboard.skill_health.needs_attention}
+                color="var(--color-warning, orange)"
+              />
+            </div>
+
+            {/* 按记忆类型分布 */}
+            {Object.keys(dashboard.memory_by_type).length > 0 && (
+              <div
+                className="rounded-lg border mb-2"
+                style={{ borderColor: 'var(--border-primary)' }}
+              >
+                <div
+                  className="border-b px-3 py-2"
+                  style={{ borderColor: 'var(--border-primary)' }}
+                >
+                  <span
+                    className="text-[11px] font-medium"
+                    style={{ color: 'var(--text-secondary)' }}
+                  >
+                    按类型分布
+                  </span>
+                </div>
+                <div
+                  className="max-h-40 overflow-y-auto divide-y"
+                  style={{ borderColor: 'var(--border-primary)' }}
+                >
+                  {Object.entries(dashboard.memory_by_type)
+                    .sort(([, a], [, b]) => b.count - a.count)
+                    .map(([type, s]) => (
+                      <div
+                        key={type}
+                        className="flex items-center justify-between px-3 py-1.5 text-xs"
+                        style={{ color: 'var(--text-secondary)' }}
+                      >
+                        <span className="truncate" style={{ maxWidth: '140px' }}>
+                          {type}
+                        </span>
+                        <div className="flex items-center gap-3 shrink-0">
+                          <span>{s.count} 条</span>
+                          <span title="活跃 / 归档" style={{ color: 'var(--text-tertiary)' }}>
+                            {s.active_count}/{s.archived_count}
+                          </span>
+                          <span
+                            title="平均置信度"
+                            className="font-mono"
+                            style={{ color: 'var(--accent)' }}
+                          >
+                            {s.avg_confidence.toFixed(2)}
+                          </span>
+                        </div>
+                      </div>
+                    ))}
+                </div>
+              </div>
+            )}
+
+            {/* 最近变更活动 */}
+            {dashboard.recent_activities.length > 0 && (
+              <div
+                className="rounded-lg border"
+                style={{ borderColor: 'var(--border-primary)' }}
+              >
+                <div
+                  className="border-b px-3 py-2"
+                  style={{ borderColor: 'var(--border-primary)' }}
+                >
+                  <span
+                    className="text-[11px] font-medium"
+                    style={{ color: 'var(--text-secondary)' }}
+                  >
+                    最近变更
+                  </span>
+                </div>
+                <div
+                  className="max-h-32 overflow-y-auto divide-y"
+                  style={{ borderColor: 'var(--border-primary)' }}
+                >
+                  {dashboard.recent_activities.slice(0, 6).map((a, i) => (
+                    <div
+                      key={i}
+                      className="flex items-center gap-2 px-3 py-1.5 text-xs"
+                      style={{ color: 'var(--text-secondary)' }}
+                    >
+                      <span
+                        className="rounded px-1.5 py-0.5 text-[9px] shrink-0"
+                        style={{
+                          background: 'var(--bg-hover)',
+                          color: 'var(--text-tertiary)',
+                        }}
+                      >
+                        {a.activity_type}
+                      </span>
+                      <span className="truncate">{a.description || '—'}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {dashboard.generated_at && (
+              <div
+                className="flex items-center gap-1.5 mt-1 text-[10px]"
+                style={{ color: 'var(--text-tertiary)' }}
+              >
+                <Clock size={10} />
+                生成于 {new Date(dashboard.generated_at).toLocaleString()}
+              </div>
+            )}
+          </>
+        ) : (
+          <div className="py-4 text-center text-xs" style={{ color: 'var(--text-tertiary)' }}>
+            {loadingDashboard ? (
+              <RefreshCw size={16} className="mx-auto mb-1 animate-spin" />
+            ) : (
+              <Database size={20} className="mx-auto mb-1" />
+            )}
+            {loadingDashboard ? '加载中...' : '尚无进化数据。运行对话后将自动积累。'}
+          </div>
+        )}
+      </section>
+
       {/* ── Section 1: Trajectory Stats ── */}
       <section>
         <div className="flex items-center justify-between mb-3">

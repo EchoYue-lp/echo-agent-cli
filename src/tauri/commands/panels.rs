@@ -1579,6 +1579,39 @@ pub async fn curator_action(
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// Evolution Dashboard
+// ════════════════════════════════════════════════════════════════════════════
+
+/// 返回自进化系统的概览指标:分层记忆统计(按 type/status)、技能健康度、
+/// 最近变更活动。复用 app-core 的 `Dashboard`(扫 WARM_NAMESPACE,与写入/召回
+/// 同源),让用户第一次能"看见"系统学到了什么。
+///
+/// 这是阶段 1(Dashboard 接线)的后端入口;前端 `EvolutionPanel` 据此渲染
+/// "进化概览"段。构造 pattern 复刻自 `cmd_evolution_dashboard`
+/// (src/cli/cmd_impls/evolution.rs:1373)。
+#[tauri::command]
+pub async fn get_evolution_dashboard(
+    state: tauri::State<'_, TauriState>,
+) -> Result<serde_json::Value, IpcError> {
+    let agent = state.app_state.connection.primary_agent();
+    let store = agent
+        .read(|a| a.store().cloned())
+        .await
+        .ok_or_else(|| IpcError::Internal("No memory store configured".into()))?;
+
+    let change_log = echo_agent::evolution::JsonlChangeLog::new(
+        echo_agent_app_core::evolution::discover_echo_agent_dir()
+            .join("evolution")
+            .join("changelog.jsonl"),
+    );
+
+    let dashboard = echo_agent_app_core::evolution::Dashboard::new(store, change_log);
+    let metrics = dashboard.generate_metrics().await;
+
+    Ok(json!({ "metrics": metrics }))
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // Worktree
 // ════════════════════════════════════════════════════════════════════════════
 

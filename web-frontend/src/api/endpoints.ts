@@ -34,6 +34,7 @@ import type {
   TrajectoryStats,
   CuratorStatus,
   CuratorTransition,
+  DashboardMetrics,
   ConfiguredModelListResponse,
   ProviderTemplate,
   TestConnectionResponse,
@@ -1063,6 +1064,10 @@ export const evolutionApi = {
           unpinned?: string;
           error?: string;
         }>('/evolution/curator', { action, skill_name: skillName }),
+  dashboard: () =>
+    isTauri()
+      ? apiInvoke<{ metrics: DashboardMetrics }>('get_evolution_dashboard')
+      : get<{ metrics: DashboardMetrics }>('/evolution/dashboard'),
 };
 
 // ── Provider API ──────────────────────────────────────────────────────────
