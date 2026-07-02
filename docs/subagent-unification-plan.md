@@ -383,7 +383,7 @@ cd echo-agent-cli/web-frontend && npx tsc -b && npm run build
 
 | 阶段 | 状态 | commit | 说明 |
 |---|---|---|---|
-| 阶段 1:SubagentRun + 稳定 identity | ⏳ 待执行 | — | 纯新增,零破坏 |
+| 阶段 1:SubagentRun + 稳定 identity | ✅ 完成 | echo-agent `b17b323` + echo-agent-cli `ef08911`(2026-07-02) | 纯新增,零破坏。框架 SubagentEvent 9 个 Dispatch* 变体加 execution_id/run_id + executor 11 处 emit/6 处调用点透传;应用层新增 SubagentRun/SubagentRunStatus/SubagentRunUsage + execute_task 生成 `{task_id}:{attempt}` + bridge 10 arm 加 `..`(GUI feature 补漏)。验证:框架逐 crate 1396 test + CLI 381 test + GUI target + 前端全绿 |
 | 阶段 2:全量事件源(双发灰度) | ⏳ 待执行 | — | worker bridge 仍在 |
 | 阶段 3:前端切源 + 合并 store | ⏳ 待执行 | — | UI 无 worker |
 | 阶段 4:删 worker 协议和 bridge | ⏳ 待执行 | — | 最高风险,新鲜上下文 |
