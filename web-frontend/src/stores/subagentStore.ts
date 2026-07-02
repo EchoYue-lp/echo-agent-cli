@@ -3,6 +3,7 @@ import { create } from 'zustand';
 export type SubagentStatus = 'running' | 'completed' | 'failed' | 'cancelled';
 
 export interface SubagentState {
+  id: string;
   agent: string;
   parent: string;
   task: string;
@@ -26,6 +27,7 @@ export interface SubagentEventPayload {
   type: 'subagent_started' | 'subagent_completed' | 'subagent_failed' | 'subagent_cancelled';
   parent: string;
   agent: string;
+  dispatch_id?: string;
   mode?: string;
   task?: string;
   duration_ms?: number;
@@ -39,9 +41,24 @@ export const useSubagentStore = create<SubagentStore>((set) => ({
 
   upsert: (ev) => {
     set((s) => {
-      const key = `${ev.parent}:${ev.agent}`;
+      const sameDispatch = Object.entries(s.subagents).filter(([, subagent]) =>
+        ev.dispatch_id
+          ? subagent.id === ev.dispatch_id
+          : subagent.parent === ev.parent && subagent.agent === ev.agent
+      );
+      const runningDispatch = sameDispatch
+        .filter(([, subagent]) => subagent.status === 'running')
+        .sort(([, a], [, b]) => a.startedAt - b.startedAt)[0];
+      const key =
+        ev.dispatch_id ??
+        (ev.type === 'subagent_started'
+          ? `${ev.parent}:${ev.agent}:${Date.now()}:${Math.random().toString(36).slice(2)}`
+          : (runningDispatch?.[0] ??
+            sameDispatch[sameDispatch.length - 1]?.[0] ??
+            `${ev.parent}:${ev.agent}`));
       const prev = s.subagents[key];
       const next: SubagentState = {
+        id: prev?.id ?? key,
         agent: ev.agent,
         parent: ev.parent,
         task: ev.task ?? prev?.task ?? '',
@@ -50,10 +67,10 @@ export const useSubagentStore = create<SubagentStore>((set) => ({
           ev.type === 'subagent_started'
             ? 'running'
             : ev.type === 'subagent_completed'
-            ? 'completed'
-            : ev.type === 'subagent_failed'
-            ? 'failed'
-            : 'cancelled',
+              ? 'completed'
+              : ev.type === 'subagent_failed'
+                ? 'failed'
+                : 'cancelled',
         startedAt: prev?.startedAt ?? Date.now(),
         durationMs: ev.duration_ms ?? prev?.durationMs,
         error: ev.error ?? prev?.error,

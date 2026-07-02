@@ -6,6 +6,9 @@ import { ChatInput } from './ChatInput';
 import { WelcomeScreen } from './WelcomeScreen';
 import { useTauriChat } from '../../hooks/useTauriChat';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
+import { useWorkerTraceStore } from '../../stores/workerTraceStore';
+import { useWorkerDetailStore } from '../../stores/workerDetailStore';
+import { WorkerDetailView } from '../task/WorkerDetailView';
 import { FailureToast } from './FailureToast';
 import type { Attachment } from '../../types/api';
 
@@ -25,6 +28,15 @@ export function ChatPanel() {
   const isCancelled = useChatStore((s) => s.isCancelled);
   const runStatus = useChatStore((s) => s.runStatus);
   const currentWorkspace = useWorkspaceStore((s) => s.current);
+  const traceWorkers = useWorkerTraceStore((s) => s.workers);
+  const selectedWorkerRef = useWorkerDetailStore((s) => s.selected);
+  const closeWorkerDetail = useWorkerDetailStore((s) => s.close);
+  const selectedWorker = selectedWorkerRef
+    ? traceWorkers[`${selectedWorkerRef.runId}::${selectedWorkerRef.workerId}`]
+    : undefined;
+  const selectedRunWorkers = selectedWorker
+    ? Object.values(traceWorkers).filter((worker) => worker.runId === selectedWorker.runId)
+    : [];
 
   // ── 按需卡片状态 ──
   const [failureToastDismissed, setFailureToastDismissed] = useState(false);
@@ -36,8 +48,7 @@ export function ChatPanel() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const isNearBottomRef = useRef(true);
-  const { sendMessage, sendApproval, sendInput, sendSelection, cancel } =
-    useChatTransport();
+  const { sendMessage, sendApproval, sendInput, sendSelection, cancel } = useChatTransport();
 
   const handleRegenerate = () => {
     // Cancel any in-flight run before regenerating — otherwise late-arriving
@@ -92,152 +103,161 @@ export function ChatPanel() {
           <span>{runStatusLabel(runStatus, isStreaming)}</span>
         </div>
       </div>
-      {/* Messages area */}
-      <div
-        ref={scrollRef}
-        className="flex-1 overflow-y-auto min-h-0"
-        onScroll={handleScroll}
-        role="log"
-        aria-live="polite"
-        aria-label="消息列表"
-      >
-        {messages.length === 0 ? (
-          <WelcomeScreen onSuggestionClick={handleSuggestionClick} />
-        ) : (
-          <div className="mx-auto w-full max-w-[920px] px-5 sm:px-8">
-            <div className="space-y-1 pb-4 pt-4">
-              {messages.map((msg, idx) => {
-                const prevMsg = idx > 0 ? messages[idx - 1] : null;
-                const showSeparator =
-                  idx === 0 ||
-                  (prevMsg &&
-                    msg.timestamp &&
-                    prevMsg.timestamp &&
-                    msg.timestamp - prevMsg.timestamp > 300000);
+      {selectedWorker ? (
+        <div className="min-h-0 flex-1">
+          <WorkerDetailView
+            worker={selectedWorker}
+            allWorkers={selectedRunWorkers}
+            onBack={closeWorkerDetail}
+          />
+        </div>
+      ) : (
+        <div
+          ref={scrollRef}
+          className="flex-1 overflow-y-auto min-h-0"
+          onScroll={handleScroll}
+          role="log"
+          aria-live="polite"
+          aria-label="消息列表"
+        >
+          {messages.length === 0 ? (
+            <WelcomeScreen onSuggestionClick={handleSuggestionClick} />
+          ) : (
+            <div className="mx-auto w-full max-w-[920px] px-5 sm:px-8">
+              <div className="space-y-1 pb-4 pt-4">
+                {messages.map((msg, idx) => {
+                  const prevMsg = idx > 0 ? messages[idx - 1] : null;
+                  const showSeparator =
+                    idx === 0 ||
+                    (prevMsg &&
+                      msg.timestamp &&
+                      prevMsg.timestamp &&
+                      msg.timestamp - prevMsg.timestamp > 300000);
 
-                return (
-                  <div key={msg.id}>
-                    {showSeparator && idx > 0 && (
-                      <div className="flex items-center gap-3 py-4">
-                        <div
-                          className="h-px flex-1"
-                          style={{
-                            background:
-                              'linear-gradient(to right, transparent, var(--border-primary), transparent)',
-                          }}
-                        />
-                        <span
-                          className="text-xs text-[var(--text-tertiary)]"
-                          style={{ fontVariantNumeric: 'tabular-nums' }}
-                        >
-                          {new Date(msg.timestamp).toLocaleTimeString([], {
-                            hour: '2-digit',
-                            minute: '2-digit',
-                          })}
-                        </span>
-                        <div
-                          className="h-px flex-1"
-                          style={{
-                            background:
-                              'linear-gradient(to right, transparent, var(--border-primary), transparent)',
-                          }}
-                        />
-                      </div>
-                    )}
-                    <MessageBubble
-                      message={msg}
-                      onRegenerate={handleRegenerate}
-                      onEditAndResend={handleEditAndResend}
-                    />
-                  </div>
-                );
-              })}
-
-              {isStreaming &&
-                !messages.some(
-                  (m) =>
-                    m.isStreaming &&
-                    (m.content || (m.thinkingSegments && m.thinkingSegments.length > 0))
-                ) && (
-                  <div className="flex items-center gap-3 px-1 py-3">
-                    <div className="spinner" />
-                    <div className="flex items-center gap-1.5">
-                      <span className="text-xs text-[var(--text-tertiary)] animate-breathe">
-                        {runStatusLabel(runStatus, true)}
-                      </span>
-                      <span className="flex gap-0.5">
-                        <span
-                          className="h-1 w-1 rounded-full bg-[var(--text-tertiary)] animate-bounce"
-                          style={{ animationDelay: '0ms' }}
-                        />
-                        <span
-                          className="h-1 w-1 rounded-full bg-[var(--text-tertiary)] animate-bounce"
-                          style={{ animationDelay: '150ms' }}
-                        />
-                        <span
-                          className="h-1 w-1 rounded-full bg-[var(--text-tertiary)] animate-bounce"
-                          style={{ animationDelay: '300ms' }}
-                        />
-                      </span>
+                  return (
+                    <div key={msg.id}>
+                      {showSeparator && idx > 0 && (
+                        <div className="flex items-center gap-3 py-4">
+                          <div
+                            className="h-px flex-1"
+                            style={{
+                              background:
+                                'linear-gradient(to right, transparent, var(--border-primary), transparent)',
+                            }}
+                          />
+                          <span
+                            className="text-xs text-[var(--text-tertiary)]"
+                            style={{ fontVariantNumeric: 'tabular-nums' }}
+                          >
+                            {new Date(msg.timestamp).toLocaleTimeString([], {
+                              hour: '2-digit',
+                              minute: '2-digit',
+                            })}
+                          </span>
+                          <div
+                            className="h-px flex-1"
+                            style={{
+                              background:
+                                'linear-gradient(to right, transparent, var(--border-primary), transparent)',
+                            }}
+                          />
+                        </div>
+                      )}
+                      <MessageBubble
+                        message={msg}
+                        onRegenerate={handleRegenerate}
+                        onEditAndResend={handleEditAndResend}
+                      />
                     </div>
+                  );
+                })}
+
+                {isStreaming &&
+                  !messages.some(
+                    (m) =>
+                      m.isStreaming &&
+                      (m.content || (m.thinkingSegments && m.thinkingSegments.length > 0))
+                  ) && (
+                    <div className="flex items-center gap-3 px-1 py-3">
+                      <div className="spinner" />
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-xs text-[var(--text-tertiary)] animate-breathe">
+                          {runStatusLabel(runStatus, true)}
+                        </span>
+                        <span className="flex gap-0.5">
+                          <span
+                            className="h-1 w-1 rounded-full bg-[var(--text-tertiary)] animate-bounce"
+                            style={{ animationDelay: '0ms' }}
+                          />
+                          <span
+                            className="h-1 w-1 rounded-full bg-[var(--text-tertiary)] animate-bounce"
+                            style={{ animationDelay: '150ms' }}
+                          />
+                          <span
+                            className="h-1 w-1 rounded-full bg-[var(--text-tertiary)] animate-bounce"
+                            style={{ animationDelay: '300ms' }}
+                          />
+                        </span>
+                      </div>
+                    </div>
+                  )}
+
+                {isCancelled && (
+                  <div className="flex items-center gap-3 py-3">
+                    <div
+                      className="h-px flex-1"
+                      style={{
+                        background:
+                          'linear-gradient(to right, transparent, var(--border-primary), transparent)',
+                      }}
+                    />
+                    <span className="text-xs text-[var(--text-tertiary)] italic">已停止响应</span>
+                    <div
+                      className="h-px flex-1"
+                      style={{
+                        background:
+                          'linear-gradient(to right, transparent, var(--border-primary), transparent)',
+                      }}
+                    />
                   </div>
                 )}
 
-              {isCancelled && (
-                <div className="flex items-center gap-3 py-3">
-                  <div
-                    className="h-px flex-1"
-                    style={{
-                      background:
-                        'linear-gradient(to right, transparent, var(--border-primary), transparent)',
-                    }}
-                  />
-                  <span className="text-xs text-[var(--text-tertiary)] italic">已停止响应</span>
-                  <div
-                    className="h-px flex-1"
-                    style={{
-                      background:
-                        'linear-gradient(to right, transparent, var(--border-primary), transparent)',
-                    }}
-                  />
-                </div>
-              )}
+                {inputRequest && (
+                  <div className="py-2">
+                    <InputCard
+                      prompt={inputRequest.prompt}
+                      onSubmit={(text) => sendInput(inputRequest.requestId, text)}
+                    />
+                  </div>
+                )}
 
-              {inputRequest && (
-                <div className="py-2">
-                  <InputCard
-                    prompt={inputRequest.prompt}
-                    onSubmit={(text) => sendInput(inputRequest.requestId, text)}
-                  />
-                </div>
-              )}
+                {selectionRequest && (
+                  <div className="py-2">
+                    <SelectionCard
+                      prompt={selectionRequest.prompt}
+                      options={selectionRequest.options}
+                      taskId={selectionRequest.taskId}
+                      phase={selectionRequest.phase}
+                      context={selectionRequest.context}
+                      onSelect={(selection, instructions) =>
+                        sendSelection(selectionRequest.requestId, selection, instructions)
+                      }
+                    />
+                  </div>
+                )}
 
-              {selectionRequest && (
-                <div className="py-2">
-                  <SelectionCard
-                    prompt={selectionRequest.prompt}
-                    options={selectionRequest.options}
-                    taskId={selectionRequest.taskId}
-                    phase={selectionRequest.phase}
-                    context={selectionRequest.context}
-                    onSelect={(selection, instructions) =>
-                      sendSelection(selectionRequest.requestId, selection, instructions)
-                    }
-                  />
-                </div>
-              )}
-
-              {/* Failure toast (spec §3.4) */}
-              {!failureToastDismissed && (
-                <div className="py-1">
-                  <FailureToast onDismiss={() => setFailureToastDismissed(true)} />
-                </div>
-              )}
+                {/* Failure toast (spec §3.4) */}
+                {!failureToastDismissed && (
+                  <div className="py-1">
+                    <FailureToast onDismiss={() => setFailureToastDismissed(true)} />
+                  </div>
+                )}
+              </div>
+              <div ref={bottomRef} className="h-1" />
             </div>
-            <div ref={bottomRef} className="h-1" />
-          </div>
-        )}
-      </div>
+          )}
+        </div>
+      )}
 
       <div>
         {approvalRequest && (

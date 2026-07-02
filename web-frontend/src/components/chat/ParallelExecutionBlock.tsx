@@ -1,6 +1,7 @@
 import { useMemo, memo } from 'react';
 import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
 import { useWorkerTraceStore } from '../../stores/workerTraceStore';
+import { useChatStore } from '../../stores/chatStore';
 import { WorkerStreamBlock } from './WorkerStreamBlock';
 
 /**
@@ -15,22 +16,31 @@ interface ParallelExecutionBlockProps {
   messageId: string;
 }
 
-export const ParallelExecutionBlock = memo(function ParallelExecutionBlock({ messageId }: ParallelExecutionBlockProps) {
+export const ParallelExecutionBlock = memo(function ParallelExecutionBlock({
+  messageId,
+}: ParallelExecutionBlockProps) {
   const activeRun = useTaskRuntimeStore((s) => s.activeRun);
   const workers = useWorkerTraceStore((s) => s.workers);
+  const lastAssistantMessageId = useChatStore((s) => {
+    for (let i = s.messages.length - 1; i >= 0; i -= 1) {
+      if (s.messages[i]?.role === 'assistant') return s.messages[i]?.id ?? null;
+    }
+    return null;
+  });
 
   const visibleWorkers = useMemo(() => {
-    if (!activeRun) return [];
-    return Object.values(workers)
+    const isLatestAssistant = messageId === lastAssistantMessageId;
+    const allWorkers = Object.values(workers);
+    return allWorkers
       .filter(
         (w) =>
-          w.runId === activeRun.run_id &&
-          w.messageId === messageId &&
+          (!activeRun || w.runId === activeRun.run_id) &&
+          (w.messageId === messageId || (!w.messageId && isLatestAssistant)) &&
           // Top-level workers: parentWorkerId is empty OR equals the run_id.
-          !w.parentWorkerId || w.parentWorkerId === activeRun.run_id
+          (!w.parentWorkerId || w.parentWorkerId === w.runId)
       )
       .sort((a, b) => (a.startedAt ?? '').localeCompare(b.startedAt ?? ''));
-  }, [activeRun, workers, messageId]);
+  }, [activeRun, workers, messageId, lastAssistantMessageId]);
 
   if (visibleWorkers.length === 0) return null;
 
@@ -40,7 +50,7 @@ export const ParallelExecutionBlock = memo(function ParallelExecutionBlock({ mes
         <WorkerStreamBlock
           key={w.workerId}
           worker={w}
-          allWorkers={Object.values(workers).filter((x) => x.runId === activeRun!.run_id)}
+          allWorkers={Object.values(workers).filter((x) => x.runId === w.runId)}
         />
       ))}
     </>

@@ -21,7 +21,10 @@ use echo_agent::tools::{Tool, ToolResult};
 use tokio::sync::Notify;
 
 use super::store::TaskRuntimeStore;
-use super::types::{PlanTask, PlanTaskKind, TaskPatch, TodoStatus, WorkerTraceEvent};
+use super::types::{
+    AttendedMode, DomainProfile, PlanTask, PlanTaskKind, TaskPatch, TaskRunStatus, TodoStatus,
+    WorkerTraceEvent, WorkerTraceEventKind,
+};
 
 /// Convenience alias for a trace-sink callback that forwards worker trace
 /// events out of the task-runtime executor.
@@ -65,7 +68,7 @@ tokio::task_local! {
     /// [`with_run_context`] around the worker dispatch so tools can read it.
     pub static CURRENT_RUN_ID: String;
     /// The cancel token for the currently executing task run. Set alongside
-    /// CURRENT_RUN_ID so delegate_readonly and other tools can read it.
+    /// CURRENT_RUN_ID so execute_plan and other tools can read it.
     pub static CURRENT_CANCEL: tokio_util::sync::CancellationToken;
     /// Delegate nesting depth — incremented each time a subagent is delegated
     /// during tool execution. Used by Task 6 (L3 nesting) to prevent runaway
@@ -161,7 +164,7 @@ pub(crate) fn run_id_from_ctx_or_local(
         .ok_or_else(|| ToolResult::error("no active run — run_id not in ToolContext or task_local"))
 }
 
-/// 在 ToolContext.run_id(若有)的 task_local 覆盖作用域内执行 f。
+/// 在 ToolContext.run_id/trace_sink(若有)的 task_local 覆盖作用域内执行 f。
 ///
 /// 这样工具既有的 `execute`(读 task_local 的 require_run_id)无需改动即可在
 /// worker 场景工作:execute_with_context 调本函数包住原 execute,ctx.run_id 被
@@ -177,15 +180,27 @@ where
 {
     match &ctx.run_id {
         Some(rid) => {
-            // 同时覆盖 run_id 和 cancel(若有),让 require_run_id / CURRENT_CANCEL
-            // 在 worker 场景读到 ToolContext 的值(跨 spawn 安全)。
+            // 同时覆盖 run_id / cancel / trace_sink(若有),让 require_run_id /
+            // CURRENT_CANCEL / CURRENT_TRACE_SINK 在 worker 或工具批处理场景读到
+            // ToolContext 的值(跨 spawn 安全)。
             let cancel = ctx
                 .cancel
                 .as_ref()
                 .map(|c| (**c).clone())
                 .unwrap_or_default();
+            let trace_sink = ctx.trace_sink.as_ref().map(|sink| {
+                let sink = sink.clone();
+                Arc::new(move |event: WorkerTraceEvent| {
+                    if let Ok(value) = serde_json::to_value(event) {
+                        sink(value);
+                    }
+                }) as TraceSink
+            });
             CURRENT_CANCEL
-                .scope(cancel, CURRENT_RUN_ID.scope(rid.clone(), f()))
+                .scope(
+                    cancel,
+                    CURRENT_RUN_ID.scope(rid.clone(), CURRENT_TRACE_SINK.scope(trace_sink, f())),
+                )
                 .await
         }
         None => f().await,
@@ -439,7 +454,11 @@ impl TaskCreateTool {
             .and_then(|v| v.as_str())
             .map(String::from);
 
-        let task_id = format!("task_{}", chrono::Utc::now().timestamp_millis());
+        if let Err(e) = self.ensure_run_exists(&run_id, &title, &description) {
+            return Ok(e);
+        }
+
+        let task_id = format!("task_{}", uuid::Uuid::new_v4().as_simple());
         let kind = parse_kind(kind_str);
         let task = PlanTask {
             id: task_id.clone(),
@@ -457,6 +476,140 @@ impl TaskCreateTool {
             ))),
             Err(e) => Ok(ToolResult::error(format!("Failed to create task: {e}"))),
         }
+    }
+
+    #[allow(clippy::result_large_err)] // ToolResult is the framework error type used by Tool::execute
+    fn ensure_run_exists(
+        &self,
+        run_id: &str,
+        title: &str,
+        description: &str,
+    ) -> std::result::Result<(), ToolResult> {
+        match self.store.get_run(run_id) {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => {}
+            Err(e) => {
+                return Err(ToolResult::error(format!(
+                    "Failed to inspect task run before creating task: {e}"
+                )));
+            }
+        }
+
+        let (conversation_id, root_message_id, attachments, trace_sink) =
+            match crate::chat_resources::current_chat_resources() {
+                Some(res) => (
+                    res.conv_id.clone(),
+                    res.root_message_id.clone(),
+                    res.attachments.clone(),
+                    res.sink.worker_trace_sink(),
+                ),
+                None => (None, run_id.to_string(), Vec::new(), None),
+            };
+        let conversation_id = conversation_id.unwrap_or_else(|| format!("message:{run_id}"));
+        let goal = task_goal(title, description);
+
+        if let Err(e) = self.store.create_run(
+            run_id,
+            "default",
+            &conversation_id,
+            &root_message_id,
+            DomainProfile::General,
+            &goal,
+            "agent_task_plan",
+            AttendedMode::Attended,
+        ) {
+            return Err(ToolResult::error(format!(
+                "Failed to create task run before creating task: {e}"
+            )));
+        }
+        if !attachments.is_empty() {
+            if let Err(e) = self.store.set_run_attachments(run_id, &attachments) {
+                tracing::warn!(run_id, error = %e, "failed to bind attachments to task run");
+            }
+        }
+        if let Err(e) = self.store.transition_run(run_id, TaskRunStatus::Running) {
+            return Err(ToolResult::error(format!(
+                "Failed to start task run before creating task: {e}"
+            )));
+        }
+        if let Some(sink) = trace_sink {
+            sink(WorkerTraceEvent::new(
+                run_id.to_string(),
+                WorkerTraceEventKind::RunStarted,
+                serde_json::json!({
+                    "goal": goal,
+                    "route": "agent_task_plan",
+                    "source": "task_create",
+                }),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn task_goal(title: &str, description: &str) -> String {
+    if !description.trim().is_empty() {
+        description.to_string()
+    } else if !title.trim().is_empty() {
+        title.to_string()
+    } else {
+        "Agent task plan".to_string()
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)] // complex-task tool impls below are production code; moving them is churn
+mod task_create_tests {
+    use super::super::types::RuntimeEventKind;
+    use super::*;
+
+    #[tokio::test]
+    async fn task_create_bootstraps_run_before_plan_events() -> std::result::Result<(), String> {
+        let shadow_root = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let store = Arc::new(
+            TaskRuntimeStore::new_in_memory_with_shadow_root(shadow_root.path())
+                .map_err(|e| e.to_string())?,
+        );
+        let tool = TaskCreateTool {
+            store: store.clone(),
+        };
+        let run_id = "run_task_create_bootstrap";
+        let mut params = ToolParameters::new();
+        params.insert(
+            "title".to_string(),
+            serde_json::Value::String("分析当前项目架构".to_string()),
+        );
+        params.insert(
+            "description".to_string(),
+            serde_json::Value::String("并行分析当前项目架构并汇总结果".to_string()),
+        );
+        params.insert(
+            "kind".to_string(),
+            serde_json::Value::String("read_only_review".to_string()),
+        );
+
+        let result = with_run_id(run_id.to_string(), tool.execute(params))
+            .await
+            .map_err(|e| e.to_string())?;
+        if !result.success {
+            return Err(format!("task_create failed: {:?}", result.error));
+        }
+
+        let events = store.list_events(run_id, 0).map_err(|e| e.to_string())?;
+        let first = events
+            .first()
+            .ok_or_else(|| "expected at least one runtime event".to_string())?;
+        assert_eq!(first.event_type, RuntimeEventKind::RunCreated);
+
+        let run = store.get_run(run_id).map_err(|e| e.to_string())?;
+        assert!(run.is_some());
+        let plan = store
+            .get_plan(run_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "expected bootstrapped plan".to_string())?;
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].agent_role, "explorer");
+        Ok(())
     }
 }
 

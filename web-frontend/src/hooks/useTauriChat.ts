@@ -14,47 +14,62 @@ type ChatEventBase = {
 
 type ChatEvent = ChatEventBase &
   (
-  | { type: 'token'; data: string }
-  | { type: 'thinking_start' }
-  | { type: 'thinking_end'; prompt_tokens: number; completion_tokens: number }
-  | {
-      type: 'llm_usage';
-      model: string;
-      prompt_tokens: number;
-      completion_tokens: number;
-      total_tokens: number;
-      cached_prompt_tokens: number;
-      cache_creation_prompt_tokens: number;
-      usage_reported: boolean;
-    }
-  | { type: 'tool_start'; name: string; args: unknown }
-  | { type: 'tool_result'; name: string; result: string; success: boolean }
-  | { type: 'chart'; spec: unknown }
-  | { type: 'final_answer'; data: string }
-  | { type: 'cancelled' }
-  | { type: 'error'; message: string }
-  | { type: 'run_status'; status: ChatRunStatus }
-  | {
-      type: 'approval_request';
-      request_id: string;
-      tool_name: string;
-      args: unknown;
-      prompt: string;
-    }
-  | { type: 'input_request'; request_id: string; prompt: string }
-  | {
-      type: 'selection_request';
-      request_id: string;
-      prompt: string;
-      options: string[];
-      task_id?: string | null;
-      context?: unknown;
-      phase?: string | null;
-    }
-  | { type: 'tool_batch_start'; tool_count: number }
-  | { type: 'tool_batch_end' }
-  | { type: 'done' }
+    | { type: 'token'; data: string }
+    | { type: 'thinking_start' }
+    | { type: 'thinking_end'; prompt_tokens: number; completion_tokens: number }
+    | {
+        type: 'llm_usage';
+        model: string;
+        prompt_tokens: number;
+        completion_tokens: number;
+        total_tokens: number;
+        cached_prompt_tokens: number;
+        cache_creation_prompt_tokens: number;
+        usage_reported: boolean;
+      }
+    | { type: 'tool_start'; name: string; args: unknown }
+    | { type: 'tool_result'; name: string; result: string; success: boolean }
+    | { type: 'chart'; spec: unknown }
+    | { type: 'final_answer'; data: string }
+    | { type: 'cancelled' }
+    | { type: 'error'; message: string }
+    | { type: 'run_status'; status: ChatRunStatus }
+    | {
+        type: 'approval_request';
+        request_id: string;
+        tool_name: string;
+        args: unknown;
+        prompt: string;
+      }
+    | { type: 'input_request'; request_id: string; prompt: string }
+    | {
+        type: 'selection_request';
+        request_id: string;
+        prompt: string;
+        options: string[];
+        task_id?: string | null;
+        context?: unknown;
+        phase?: string | null;
+      }
+    | { type: 'tool_batch_start'; tool_count: number }
+    | { type: 'tool_batch_end' }
+    | { type: 'done' }
   );
+
+function normalizeWorkerTraceEvent(event: WorkerTraceEvent): WorkerTraceEvent {
+  if (!event.payload || typeof event.payload !== 'object' || Array.isArray(event.payload)) {
+    return event;
+  }
+  const payloadRunId = (event.payload as Record<string, unknown>).run_id;
+  if (
+    typeof payloadRunId === 'string' &&
+    payloadRunId.length > 0 &&
+    payloadRunId !== event.run_id
+  ) {
+    return { ...event, run_id: payloadRunId };
+  }
+  return event;
+}
 
 export function useTauriChat() {
   const assistantIdRef = useRef<string | null>(null);
@@ -106,7 +121,27 @@ export function useTauriChat() {
       });
       const unlistenWorkerTrace = await listen<WorkerTraceEvent>('worker://trace', (event) => {
         if (mounted) {
-          useWorkerTraceStore.getState().append(event.payload);
+          const traceEvent = normalizeWorkerTraceEvent(event.payload);
+          useWorkerTraceStore.getState().append(traceEvent);
+          // inline task / 自主 run 通过 RunStarted 事件激活右侧面板。
+          // send_chat_message 返回值不带 run_id（run 在 agent ReAct 循环内异步建），
+          // 故靠此事件驱动 loadByConversation → 激活 activeRun，
+          // 否则 worker 卡片 / 任务进度 / Token 面板全空。
+          if (traceEvent.event_type === 'run_started') {
+            const payload = traceEvent.payload as Record<string, unknown> | undefined;
+            const convId =
+              (payload?.conversation_id as string | undefined) ??
+              useConversationStore.getState().activeId;
+            if (convId) {
+              import('../stores/taskRuntimeStore')
+                .then(({ useTaskRuntimeStore }) => {
+                  useTaskRuntimeStore.getState().loadByConversation(convId);
+                })
+                .catch((e) =>
+                  console.warn('[TauriChat] Failed to load task run on run_started:', e)
+                );
+            }
+          }
         }
       });
       const origUnlisten = unlisten;
@@ -183,17 +218,24 @@ export function useTauriChat() {
       // event handler deleted in the 13→6 state machine migration).
       const createdRunId = chatResult?.run_id ?? chatResult?.runId;
       if (createdRunId && conversation_id) {
-        import('../stores/taskRuntimeStore').then(({ useTaskRuntimeStore }) => {
-          useTaskRuntimeStore.getState().loadByConversation(conversation_id!)
-            .then(() => {
-              const store = useTaskRuntimeStore.getState();
-              const run = store.activeRun;
-              if (run && (run.status === 'pending' || run.status === 'running' || run.status === 'paused')) {
-                store.startPolling(run.run_id);
-              }
-            })
-            .catch((e) => console.warn('[TauriChat] Failed to load task runtime:', e));
-        }).catch((e) => console.warn('[TauriChat] Failed to import taskRuntimeStore:', e));
+        import('../stores/taskRuntimeStore')
+          .then(({ useTaskRuntimeStore }) => {
+            useTaskRuntimeStore
+              .getState()
+              .loadByConversation(conversation_id!)
+              .then(() => {
+                const store = useTaskRuntimeStore.getState();
+                const run = store.activeRun;
+                if (
+                  run &&
+                  (run.status === 'pending' || run.status === 'running' || run.status === 'paused')
+                ) {
+                  store.startPolling(run.run_id);
+                }
+              })
+              .catch((e) => console.warn('[TauriChat] Failed to load task runtime:', e));
+          })
+          .catch((e) => console.warn('[TauriChat] Failed to import taskRuntimeStore:', e));
       }
     } catch (e) {
       console.error('[TauriChat] Failed to send message:', e);

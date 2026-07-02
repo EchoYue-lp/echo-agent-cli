@@ -23,7 +23,6 @@ import type {
   RuntimeArtifact,
   TaskRunStatus,
 } from '../generated';
-import { useWorkerTraceStore, type WorkerTraceEvent } from './workerTraceStore';
 
 export interface RouteExplanation {
   runId: string;
@@ -87,41 +86,6 @@ export interface TaskRuntimeState {
   reset: () => void;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value && typeof value === 'object' && !Array.isArray(value));
-}
-
-function stringField(record: Record<string, unknown>, key: string): string | undefined {
-  const value = record[key];
-  return typeof value === 'string' && value.length > 0 ? value : undefined;
-}
-
-function replayPersistedWorkerUsage(events: RuntimeTaskEvent[]) {
-  const append = useWorkerTraceStore.getState().append;
-  for (const event of events) {
-    if (event.event_type !== 'worker_llm_usage' || !isRecord(event.payload)) continue;
-
-    const usage = isRecord(event.payload.usage) ? event.payload.usage : event.payload;
-    const workerId =
-      stringField(event.payload, 'worker_id') ?? event.step_id ?? event.task_id ?? undefined;
-    if (!workerId) continue;
-
-    const workerEvent: WorkerTraceEvent = {
-      event_id: `runtime:${event.run_id}:${event.seq}`,
-      run_id: event.run_id,
-      worker_id: workerId,
-      parent_worker_id: null,
-      agent_name: stringField(event.payload, 'agent_name') ?? null,
-      title: stringField(event.payload, 'title') ?? null,
-      task: null,
-      event_type: 'worker_llm_usage',
-      payload: usage,
-      timestamp: event.timestamp,
-    };
-    append(workerEvent);
-  }
-}
-
 export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
   activeRun: null,
   plan: null,
@@ -140,14 +104,17 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
     const { pollingInterval } = get();
     if (pollingInterval !== null) return; // already polling
     const interval = setInterval(() => {
-      get().refresh(runId).then(() => {
-        const status = get().activeRun?.status;
-        if (status && !running.includes(status as typeof running[number])) {
-          get().stopPolling();
-        }
-      }).catch(() => {
-        // refresh errors are handled inside refresh()
-      });
+      get()
+        .refresh(runId)
+        .then(() => {
+          const status = get().activeRun?.status;
+          if (status && !running.includes(status as (typeof running)[number])) {
+            get().stopPolling();
+          }
+        })
+        .catch(() => {
+          // refresh errors are handled inside refresh()
+        });
     }, 2000);
     set({ pollingInterval: interval });
   },
@@ -169,10 +136,7 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
         taskRuntimeApi.listEvents(runId, get().lastSeq),
         taskRuntimeApi.listArtifacts(runId),
       ]);
-      const lastSeq = events.length
-        ? events[events.length - 1].seq
-        : get().lastSeq;
-      replayPersistedWorkerUsage(events);
+      const lastSeq = events.length ? events[events.length - 1].seq : get().lastSeq;
       if (!run) {
         set({
           activeRun: null,
@@ -209,14 +173,20 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
         set({ events: [], lastSeq: '0', routeExplanation: null });
         await get().refresh(run.run_id);
       } else {
-        set({ activeRun: null, plan: null, todos: [], events: [], artifacts: [], lastSeq: '0', routeExplanation: null });
+        set({
+          activeRun: null,
+          plan: null,
+          todos: [],
+          events: [],
+          artifacts: [],
+          lastSeq: '0',
+          routeExplanation: null,
+        });
       }
     } catch (e) {
       set({ error: e instanceof Error ? e.message : String(e) });
     }
   },
-
-
 
   execute: async (runId: string) => {
     try {
@@ -252,7 +222,11 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
   insertTask: async (afterTaskId, task) => {
     const runId = get().activeRun?.run_id;
     if (!runId) return;
-    await taskRuntimeApi.insertTask(runId, afterTaskId, task as unknown as import('../generated').PlanTask);
+    await taskRuntimeApi.insertTask(
+      runId,
+      afterTaskId,
+      task as unknown as import('../generated').PlanTask
+    );
     await get().refresh(runId);
   },
   removeTask: async (taskId) => {

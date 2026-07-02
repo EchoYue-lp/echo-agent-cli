@@ -3,7 +3,7 @@
 //! Renders the structured state of a complex-task run from the canonical
 //! SQLite store (via taskRuntimeStore), NOT from regex-scanned chat messages.
 //! Shows: run header, plan + approval actions (when AwaitingPlanApproval),
-//! todo list with live status, parallel worker view, and artifacts.
+//! todo list with live status, and artifacts.
 //!
 //! The compact panel is mounted inside RightRail; the full detail panel is
 //! mounted in the main chat/work area.
@@ -31,7 +31,6 @@ import {
   useWorkerTraceStore,
   type WorkerTraceEvent,
   type WorkerTraceState,
-  type WorkerTraceStatus,
 } from '../../stores/workerTraceStore';
 import type { TodoStatus } from '../../generated';
 
@@ -57,8 +56,7 @@ function statusColor(status: string): string {
   if (['completed'].includes(status)) return 'var(--color-success)';
   if (['running'].includes(status)) return 'var(--color-info)';
   if (['failed', 'cancelled'].includes(status)) return 'var(--color-error)';
-  if (['paused', 'blocked'].includes(status))
-    return 'var(--color-warning)';
+  if (['paused', 'blocked'].includes(status)) return 'var(--color-warning)';
   return 'var(--text-tertiary)';
 }
 
@@ -94,17 +92,6 @@ function kindLabel(kind: string): string {
 
 function uniqueValues(values: Array<string | null | undefined>): string[] {
   return [...new Set(values.filter((value): value is string => Boolean(value && value.trim())))];
-}
-
-function workerStatusLabel(status: WorkerTraceStatus): string {
-  const map: Record<WorkerTraceStatus, string> = {
-    planned: '已规划',
-    running: '运行中',
-    completed: '已完成',
-    failed: '失败',
-    cancelled: '已取消',
-  };
-  return map[status];
 }
 
 function payloadValue(event: WorkerTraceEvent, key: string): string | undefined {
@@ -155,20 +142,47 @@ interface CacheDiagnostic {
   detail: string;
 }
 
+function isUsageEvent(event: WorkerTraceEvent): boolean {
+  return event.event_type === 'worker_llm_usage' || event.event_type === 'worker_thinking_end';
+}
+
+function workerUsageKey(event: WorkerTraceEvent): string {
+  return `${event.run_id}::${event.worker_id ?? 'main'}`;
+}
+
+function cacheUsageEvents(events: WorkerTraceEvent[]): WorkerTraceEvent[] {
+  const providerUsageWorkers = new Set(
+    events.filter((event) => event.event_type === 'worker_llm_usage').map(workerUsageKey)
+  );
+
+  return events.filter((event) => {
+    if (event.event_type === 'worker_llm_usage') return true;
+    if (event.event_type !== 'worker_thinking_end') return false;
+    if (providerUsageWorkers.has(workerUsageKey(event))) return false;
+    return (
+      payloadNumber(event, 'prompt_tokens') > 0 || payloadNumber(event, 'completion_tokens') > 0
+    );
+  });
+}
+
 function cacheUsageFromEvents(events: WorkerTraceEvent[]): CacheUsageSummary {
-  const usageEvents = events.filter((event) => event.event_type === 'worker_llm_usage');
+  const usageEvents = cacheUsageEvents(events.filter(isUsageEvent));
   const models = uniqueValues(usageEvents.map((event) => payloadValue(event, 'model')));
   return usageEvents.reduce<CacheUsageSummary>(
     (summary, event) => {
-      const reported = payloadBool(event, 'usage_reported');
+      const reported =
+        event.event_type === 'worker_llm_usage' ? payloadBool(event, 'usage_reported') : false;
       summary.calls += 1;
       if (!reported) {
         // Unreported usage: count but don't pollute main token statistics.
         summary.missingUsage += 1;
       } else {
-        summary.inputTokens += payloadNumber(event, 'prompt_tokens');
-        summary.outputTokens += payloadNumber(event, 'completion_tokens');
-        summary.totalTokens += payloadNumber(event, 'total_tokens');
+        const inputTokens = payloadNumber(event, 'prompt_tokens');
+        const outputTokens = payloadNumber(event, 'completion_tokens');
+        const totalTokens = payloadNumber(event, 'total_tokens') || inputTokens + outputTokens;
+        summary.inputTokens += inputTokens;
+        summary.outputTokens += outputTokens;
+        summary.totalTokens += totalTokens;
         summary.cachedPromptTokens += payloadNumber(event, 'cached_prompt_tokens');
         summary.cacheCreationPromptTokens += payloadNumber(event, 'cache_creation_prompt_tokens');
       }
@@ -217,11 +231,17 @@ function cacheDiagnostics(summary: CacheUsageSummary): CacheDiagnostic[] {
     });
   }
 
-  if (rate != null && summary.inputTokens > 0 && summary.cachedPromptTokens === 0 && summary.missingUsage < summary.calls) {
+  if (
+    rate != null &&
+    summary.inputTokens > 0 &&
+    summary.cachedPromptTokens === 0 &&
+    summary.missingUsage < summary.calls
+  ) {
     diagnostics.push({
       severity: 'warn',
       label: '没有 cache read',
-      detail: 'provider 已返回 usage，但 cached prompt tokens 为 0。优先检查 system prefix、tools 定义、worker prompt 和动态上下文是否每轮变化。',
+      detail:
+        'provider 已返回 usage，但 cached prompt tokens 为 0。优先检查 system prefix、tools 定义、worker prompt 和动态上下文是否每轮变化。',
     });
   } else if (rate != null && rate < 0.2 && summary.inputTokens >= 1000) {
     diagnostics.push({
@@ -237,11 +257,15 @@ function cacheDiagnostics(summary: CacheUsageSummary): CacheDiagnostic[] {
     });
   }
 
-  if (summary.cacheCreationPromptTokens > summary.cachedPromptTokens && summary.cacheCreationPromptTokens > 0) {
+  if (
+    summary.cacheCreationPromptTokens > summary.cachedPromptTokens &&
+    summary.cacheCreationPromptTokens > 0
+  ) {
     diagnostics.push({
       severity: 'info',
       label: 'cache write 高于 read',
-      detail: '本轮更多是在创建缓存而非读取缓存。连续重复同类任务时，如果 read 仍不升高，再检查前缀稳定性。',
+      detail:
+        '本轮更多是在创建缓存而非读取缓存。连续重复同类任务时，如果 read 仍不升高，再检查前缀稳定性。',
     });
   }
 
@@ -249,7 +273,8 @@ function cacheDiagnostics(summary: CacheUsageSummary): CacheDiagnostic[] {
     diagnostics.push({
       severity: 'info',
       label: '数据不足',
-      detail: '当前 usage 数据不足以判断命中低的原因。重复同模型同提示词任务后再观察 cached tokens 和 read rate。',
+      detail:
+        '当前 usage 数据不足以判断命中低的原因。重复同模型同提示词任务后再观察 cached tokens 和 read rate。',
     });
   }
 
@@ -283,30 +308,64 @@ export function CacheUsageCard({
       <div className="mb-2 flex items-center justify-between gap-2">
         <div className="flex min-w-0 items-center gap-1.5">
           <Gauge size={compact ? 12 : 14} style={{ color: 'var(--accent)' }} />
-          <span className={compact ? 'text-[10px] font-medium' : 'text-[12px] font-medium'} style={{ color: 'var(--text-primary)' }}>
+          <span
+            className={compact ? 'text-[10px] font-medium' : 'text-[12px] font-medium'}
+            style={{ color: 'var(--text-primary)' }}
+          >
             Token / Cache
           </span>
         </div>
         <span className="shrink-0 text-[9px]" style={{ color: 'var(--text-tertiary)' }}>
           {summary.calls} LLM call{summary.calls > 1 ? 's' : ''}
           {summary.missingUsage > 0 && (
-            <span style={{ color: 'var(--color-warning)' }}>
-              {' '}
-              ({summary.missingUsage} 未上报)
-            </span>
+            <span style={{ color: 'var(--color-warning)' }}> ({summary.missingUsage} 未上报)</span>
           )}
         </span>
       </div>
       <div className="grid grid-cols-3 gap-1.5">
-        <MetricCell label="Input" value={summary.inputTokens.toLocaleString()} valueClass={valueClass} labelClass={labelClass} />
-        <MetricCell label="Output" value={summary.outputTokens.toLocaleString()} valueClass={valueClass} labelClass={labelClass} />
-        <MetricCell label="Cached" value={summary.cachedPromptTokens.toLocaleString()} valueClass={valueClass} labelClass={labelClass} />
-        <MetricCell label="Cache write" value={summary.cacheCreationPromptTokens.toLocaleString()} valueClass={valueClass} labelClass={labelClass} />
-        <MetricCell label="Read rate" value={rate == null ? 'unknown' : `${(rate * 100).toFixed(1)}%`} valueClass={valueClass} labelClass={labelClass} />
-        <MetricCell label="Missing usage" value={summary.missingUsage.toLocaleString()} valueClass={valueClass} labelClass={labelClass} />
+        <MetricCell
+          label="Input"
+          value={summary.inputTokens.toLocaleString()}
+          valueClass={valueClass}
+          labelClass={labelClass}
+        />
+        <MetricCell
+          label="Output"
+          value={summary.outputTokens.toLocaleString()}
+          valueClass={valueClass}
+          labelClass={labelClass}
+        />
+        <MetricCell
+          label="Cached"
+          value={summary.cachedPromptTokens.toLocaleString()}
+          valueClass={valueClass}
+          labelClass={labelClass}
+        />
+        <MetricCell
+          label="Cache write"
+          value={summary.cacheCreationPromptTokens.toLocaleString()}
+          valueClass={valueClass}
+          labelClass={labelClass}
+        />
+        <MetricCell
+          label="Read rate"
+          value={rate == null ? 'unknown' : `${(rate * 100).toFixed(1)}%`}
+          valueClass={valueClass}
+          labelClass={labelClass}
+        />
+        <MetricCell
+          label="Missing usage"
+          value={summary.missingUsage.toLocaleString()}
+          valueClass={valueClass}
+          labelClass={labelClass}
+        />
       </div>
       {summary.models.length > 0 && (
-        <div className="mt-2 truncate text-[9px]" style={{ color: 'var(--text-tertiary)' }} title={summary.models.join(', ')}>
+        <div
+          className="mt-2 truncate text-[9px]"
+          style={{ color: 'var(--text-tertiary)' }}
+          title={summary.models.join(', ')}
+        >
           model: {summary.models.join(', ')}
         </div>
       )}
@@ -317,7 +376,10 @@ export function CacheUsageCard({
       )}
       {!compact && diagnostics.length > 0 && (
         <div className="mt-3 space-y-1.5">
-          <div className="flex items-center gap-1 text-[10px] font-medium" style={{ color: 'var(--text-secondary)' }}>
+          <div
+            className="flex items-center gap-1 text-[10px] font-medium"
+            style={{ color: 'var(--text-secondary)' }}
+          >
             <AlertTriangle size={11} />
             缓存诊断
           </div>
@@ -327,7 +389,10 @@ export function CacheUsageCard({
               className="rounded-md px-2 py-1.5 text-[10px] leading-snug"
               style={{ background: 'var(--bg-hover)', color: 'var(--text-secondary)' }}
             >
-              <div className="mb-0.5 font-medium" style={{ color: diagnosticColor(diagnostic.severity) }}>
+              <div
+                className="mb-0.5 font-medium"
+                style={{ color: diagnosticColor(diagnostic.severity) }}
+              >
                 {diagnostic.label}
               </div>
               <div>{diagnostic.detail}</div>
@@ -367,7 +432,10 @@ function traceWorkerForTodo(todo: { owner_agent: string | null }, workers: Worke
   return workers.find((worker) => worker.agentName === todo.owner_agent);
 }
 
-function displayedTodoStatus(todo: { status: TodoStatus; owner_agent: string | null }, workers: WorkerTraceState[]): TodoStatus {
+function displayedTodoStatus(
+  todo: { status: TodoStatus; owner_agent: string | null },
+  workers: WorkerTraceState[]
+): TodoStatus {
   const worker = traceWorkerForTodo(todo, workers);
   if (!worker) return todo.status;
   if (worker.status === 'completed' && todo.status !== ('completed' as TodoStatus)) {
@@ -428,7 +496,7 @@ export function TaskRuntimePanel() {
             background: 'var(--bg-hover)',
           }}
         >
-          {activeRun ? STATUS_LABEL[activeRun.status] ?? activeRun.status : '连接中'}
+          {activeRun ? (STATUS_LABEL[activeRun.status] ?? activeRun.status) : '连接中'}
         </span>
       </div>
 
@@ -481,11 +549,22 @@ export function TaskRuntimePanel() {
                     <TodoIcon status={status} />
                   </div>
                   <div className="min-w-0 flex-1">
-                    <div className="truncate text-[11px]" style={{ color: 'var(--text-primary)' }} title={todo.title}>
+                    <div
+                      className="truncate text-[11px]"
+                      style={{ color: 'var(--text-primary)' }}
+                      title={todo.title}
+                    >
                       {todo.title}
                     </div>
-                    <div className="flex min-w-0 items-center gap-1 text-[9px]" style={{ color: 'var(--text-tertiary)' }}>
-                      {task && <span className="rounded px-1" style={{ background: 'var(--bg-hover)' }}>{kindLabel(task.kind)}</span>}
+                    <div
+                      className="flex min-w-0 items-center gap-1 text-[9px]"
+                      style={{ color: 'var(--text-tertiary)' }}
+                    >
+                      {task && (
+                        <span className="rounded px-1" style={{ background: 'var(--bg-hover)' }}>
+                          {kindLabel(task.kind)}
+                        </span>
+                      )}
                       {todo.owner_agent && <span className="truncate">· {todo.owner_agent}</span>}
                       <span>· {TODO_LABEL[status] ?? status}</span>
                     </div>
@@ -499,7 +578,9 @@ export function TaskRuntimePanel() {
                         onClick={() => {
                           const newTitle = prompt('新标题', todo.title);
                           if (newTitle && newTitle !== todo.title) {
-                            useTaskRuntimeStore.getState().updateTask(todo.task_id, { title: newTitle });
+                            useTaskRuntimeStore
+                              .getState()
+                              .updateTask(todo.task_id, { title: newTitle });
                           }
                         }}
                       >
@@ -550,42 +631,6 @@ export function TaskRuntimePanel() {
           >
             <Plus size={10} /> 新增任务
           </button>
-        </div>
-      )}
-
-      {visibleTraceWorkers.length > 0 && (
-        <div className="mb-2">
-          <div className="mb-1 flex items-center justify-between">
-            <span className="text-[10px] font-medium" style={{ color: 'var(--text-tertiary)' }}>
-              Worker 状态
-            </span>
-            <span className="text-[10px]" style={{ color: 'var(--text-tertiary)' }}>
-              {visibleTraceWorkers.filter((w) => w.status === 'running').length} 运行中
-            </span>
-          </div>
-          <div className="space-y-0.5">
-            {visibleTraceWorkers.map((worker) => (
-              <div
-                key={`${worker.runId}:${worker.workerId}`}
-                className="flex items-center gap-1.5 rounded px-1.5 py-1 text-[10px]"
-                style={{ background: 'var(--bg-secondary)', color: 'var(--text-secondary)' }}
-              >
-                {worker.status === 'running' ? (
-                  <Loader2 size={11} className="animate-spin" style={{ color: 'var(--color-info)' }} />
-                ) : worker.status === 'completed' ? (
-                  <CheckCircle2 size={11} style={{ color: 'var(--color-success)' }} />
-                ) : worker.status === 'failed' ? (
-                  <AlertCircle size={11} style={{ color: 'var(--color-error)' }} />
-                ) : (
-                  <Circle size={11} style={{ color: 'var(--text-tertiary)' }} />
-                )}
-                <span className="min-w-0 flex-1 truncate">{worker.title || worker.workerId}</span>
-                <span className="shrink-0" style={{ color: 'var(--text-tertiary)' }}>
-                  {workerStatusLabel(worker.status)}
-                </span>
-              </div>
-            ))}
-          </div>
         </div>
       )}
 

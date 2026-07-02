@@ -1,17 +1,26 @@
 import { useState, memo, useMemo } from 'react';
-import { Loader2, CheckCircle2, AlertCircle, Circle, ChevronDown, ChevronRight, Brain } from 'lucide-react';
+import {
+  Loader2,
+  CheckCircle2,
+  AlertCircle,
+  Circle,
+  ChevronDown,
+  ChevronRight,
+  Brain,
+} from 'lucide-react';
 import type { WorkerTraceState, WorkerTraceEvent } from '../../stores/workerTraceStore';
+import { useWorkerDetailStore } from '../../stores/workerDetailStore';
 import MarkdownContent from '../common/MarkdownContent';
 import { InlineToolCall } from './InlineToolCall';
 import { computeWorkerProgress, progressSummary, statusLabel } from '../../utils/workerProgress';
 
 interface WorkerStreamBlockProps {
   worker: WorkerTraceState;
-  /** All workers in this run (for recursive child lookup via parentWorkerId) */
+  /** All execution traces in this run (for recursive child lookup). */
   allWorkers: WorkerTraceState[];
 }
 
-/** Reconstruct worker's thinking+tool loop from raw events. */
+/** Reconstruct a subagent's thinking+tool loop from raw events. */
 interface WorkerStep {
   type: 'thinking' | 'tool';
   content?: string;
@@ -19,7 +28,10 @@ interface WorkerStep {
   toolResult?: WorkerTraceEvent;
 }
 
-function reconstructSteps(events: WorkerTraceEvent[]): { steps: WorkerStep[]; thinkingTotal: number } {
+function reconstructSteps(events: WorkerTraceEvent[]): {
+  steps: WorkerStep[];
+  thinkingTotal: number;
+} {
   const steps: WorkerStep[] = [];
   let thinkingTotal = 0;
   const currentThinking: string[] = [];
@@ -88,8 +100,12 @@ function workerResult(worker: WorkerTraceState): string {
     .trim();
 }
 
-export const WorkerStreamBlock = memo(function WorkerStreamBlock({ worker, allWorkers }: WorkerStreamBlockProps) {
+export const WorkerStreamBlock = memo(function WorkerStreamBlock({
+  worker,
+  allWorkers,
+}: WorkerStreamBlockProps) {
   const [expanded, setExpanded] = useState(worker.status === 'running');
+  const selectWorker = useWorkerDetailStore((state) => state.selectWorker);
   const [sectionExpanded, setSectionExpanded] = useState({
     prompt: false,
     process: true,
@@ -120,19 +136,30 @@ export const WorkerStreamBlock = memo(function WorkerStreamBlock({ worker, allWo
   return (
     <div className="my-0.5 rounded-sm px-2 py-1 hover:bg-[var(--bg-hover)] transition-colors">
       {/* Header (always visible): title + status + progress summary */}
-      <button
-        onClick={() => setExpanded((e) => !e)}
-        className="flex w-full items-center gap-1.5 text-left text-[11px]"
-      >
-        {expanded ? <ChevronDown size={10} className="text-[var(--text-tertiary)]" /> : <ChevronRight size={10} className="text-[var(--text-tertiary)]" />}
-        {statusIcon}
-        <span className="truncate font-medium text-[var(--text-primary)]">
-          {worker.title || worker.agentName || worker.workerId}
-        </span>
-        <span className="ml-auto shrink-0 text-[10px] text-[var(--text-tertiary)]">
-          {statusLabel(progress.status)}{summary ? ` · ${summary}` : ''}
-        </span>
-      </button>
+      <div className="flex w-full items-center gap-1.5 text-[11px]">
+        <button
+          type="button"
+          onClick={() => setExpanded((e) => !e)}
+          className="shrink-0 text-[var(--text-tertiary)] transition-colors hover:text-[var(--text-primary)]"
+          aria-label={expanded ? '折叠 subagent' : '展开 subagent'}
+        >
+          {expanded ? <ChevronDown size={10} /> : <ChevronRight size={10} />}
+        </button>
+        <button
+          type="button"
+          onClick={() => selectWorker(worker.runId, worker.workerId)}
+          className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
+        >
+          {statusIcon}
+          <span className="truncate font-medium text-[var(--text-primary)]">
+            {worker.title || worker.agentName || worker.workerId}
+          </span>
+          <span className="ml-auto shrink-0 text-[10px] text-[var(--text-tertiary)]">
+            {statusLabel(progress.status)}
+            {summary ? ` · ${summary}` : ''}
+          </span>
+        </button>
+      </div>
 
       {expanded && (
         <div className="mt-1.5 space-y-1.5 pl-1">
@@ -170,21 +197,31 @@ export const WorkerStreamBlock = memo(function WorkerStreamBlock({ worker, allWo
                   if (step.type === 'thinking') {
                     // Flat thinking: small label + markdown inline, no nested
                     // bordered box. Matches the one-stream layout where every
-                    // item (thinking/tool/worker) is a peer in the flow.
+                    // item (thinking/tool/subagent) is a peer in the flow.
                     return (
                       <div key={i}>
                         <div className="mb-0.5 flex items-center gap-1">
                           <Brain size={9} className="text-[var(--color-purple)]" />
-                          <span className="text-[9px] font-medium text-[var(--color-purple)]">思考</span>
+                          <span className="text-[9px] font-medium text-[var(--color-purple)]">
+                            思考
+                          </span>
                         </div>
                         <MarkdownContent content={step.content || ''} className="text-sm" />
                       </div>
                     );
                   }
-                  const name = String((step.toolStart?.payload as Record<string, unknown> | null)?.name ?? 'tool');
-                  const args = (step.toolStart?.payload as Record<string, unknown> | null)?.args ?? {};
-                  const resultStr = String((step.toolResult?.payload as Record<string, unknown> | null)?.result ?? '');
-                  const success = String((step.toolResult?.payload as Record<string, unknown> | null)?.success) !== 'false';
+                  const name = String(
+                    (step.toolStart?.payload as Record<string, unknown> | null)?.name ?? 'tool'
+                  );
+                  const args =
+                    (step.toolStart?.payload as Record<string, unknown> | null)?.args ?? {};
+                  const resultStr = String(
+                    (step.toolResult?.payload as Record<string, unknown> | null)?.result ?? ''
+                  );
+                  const success =
+                    String(
+                      (step.toolResult?.payload as Record<string, unknown> | null)?.success
+                    ) !== 'false';
                   return (
                     <InlineToolCall
                       key={i}
@@ -197,7 +234,11 @@ export const WorkerStreamBlock = memo(function WorkerStreamBlock({ worker, allWo
                 {children.length > 0 && (
                   <div className="ml-2 border-l border-[var(--border-primary)] pl-2">
                     {children.map((child) => (
-                      <WorkerStreamBlock key={child.workerId} worker={child} allWorkers={allWorkers} />
+                      <WorkerStreamBlock
+                        key={child.workerId}
+                        worker={child}
+                        allWorkers={allWorkers}
+                      />
                     ))}
                   </div>
                 )}

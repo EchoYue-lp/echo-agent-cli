@@ -23,7 +23,9 @@ const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
 const DEFAULT_MAX_TOKENS: u32 = 8192;
 
 /// Guide appended to the system prompt when task management tools are
-/// available. Instructs the agent to actively manage its task plan.
+/// available. Instructs the agent to actively manage its task plan and
+/// proactively dispatch readonly workers for investigation-heavy work
+/// (对齐 Claude Code 的 subagent:轻量派发是工具,正式并行是 runtime).
 const TASK_MANAGEMENT_GUIDE: &str = r#"
 
 ## Task Management
@@ -34,17 +36,24 @@ You have tools to manage your task plan: task_create, task_update, task_complete
 - Use task_list to review current plan state.
 Update your plan frequently as your understanding deepens.
 
-## 复杂任务编排(主 agent 职责)
-当用户任务涉及多步调研/分析/实现时,你是编排者:
-1. **拆分计划**:用 task_create 把任务拆成可独立执行的子任务(每个有清晰 title/description/kind),用 depends_on 表达依赖(并行任务无依赖,串行任务 A depends_on B)。title 不能为空。
-2. **统一执行**:拆完计划后,调 execute_plan 把整个计划交给并行执行引擎。引擎(run_dag)按依赖自动并行调度多个 worker,并收集它们的产出摘要。**不要自己逐个 delegate_readonly 派 worker**——那样会串行执行且丢失 token 统计。
-3. **收口**:execute_plan 返回结果(含各 worker 产出摘要)后,基于结果写最终答案给用户。
-4. **写任务**:如果子任务需要修改文件(implementation/debugging/verification),在 task_create 时用对应 kind,execute_plan 会安排主 agent 自己执行(不经 worker)。
+## 派 worker 执行任务(execute_plan)
+execute_plan 是统一的派发入口,两种用法(对齐 Claude Code:轻量 subagent 是工具,正式并行是 runtime,收敛成一个工具的两种形态):
+
+### 1. 单步派发(传 task 参数)——适合临时调研/分析/审查
+直接派一个只读 worker(explorer/reviewer/planner/summarizer)在独立上下文跑 ReAct,只回传结论摘要给你。
+**对高噪声任务要主动用**:大范围代码库检索、多文件架构梳理、冗长日志分析、多源调研综合。worker 在独立上下文里跑,不污染你的主会话(防 context 污染)。
+- 适合:架构分析、bug 排查的代码侧调研、文档/配置检索、审查验证。
+- 不适合:单文件小改、简单问答、一次性查询(直接做即可)。
+
+### 2. 多 worker 编排(不传 task,先用 task_create 拆 plan)——适合有依赖的多步任务
+1. **拆分计划**:task_create 拆成可独立执行的子任务(每个有清晰 title/description/kind),depends_on 表达依赖(并行无依赖,串行 A depends_on B)。title 不能为空。
+2. **统一执行**:拆完调 execute_plan,引擎(run_dag)按依赖自动并行调度多个 worker,收集产出摘要。
+3. **收口**:execute_plan 返回结果后,基于结果写最终答案。
+4. **写任务**:需改文件的子任务用对应 kind(implementation/debugging/verification),execute_plan 安排主 agent 自己执行。
+
+两种用法不互斥:ad-hoc 探索、补充调研、单点验证用单步(传 task);正式多 worker 编排用 task_create + execute_plan。
 
 你是长生命周期的主 agent:跨多个对话 turn 保持上下文。用户可能中途插话改计划——用 task_update/task_complete/task_skip 调整。
-
-## 重要:delegate_readonly 工具
-delegate_readonly 是给 **worker 内部** 委派子任务用的(L3 嵌套),**主 agent 不要直接使用 delegate_readonly 派 worker**。如果你已经有 plan(调过 task_create),直接调 execute_plan 即可。如果你在 plan 之外用了 delegate_readonly,系统会拒绝并提示你改用 execute_plan。
 
 ## 自主创建复杂任务(create_complex_task)
 create_complex_task 让你为复杂任务创建后台 Run(独立 agent + plan/worker 编排,与当前对话解耦)。**仅在任务满足以下任一时使用**:
@@ -373,7 +382,9 @@ pub async fn create_agent(
     // Fail-open on errors (verify.rs:91-93) ensures the main flow is never
     // blocked if the critic LLM call fails.
     agent.set_critic(std::sync::Arc::new(
-        echo_agent::agent::critic::LlmCritic::new(model).with_pass_threshold(7.0),
+        echo_agent::agent::critic::LlmCritic::new(model)
+            .with_pass_threshold(7.0)
+            .with_cache_user_id(cache_user_id.clone()),
     ));
     agent.config_mut().set_verifier_enabled(true);
     tracing::info!("main agent: Critic self-verification enabled (threshold=7.0, max_retries=2)");
@@ -501,11 +512,8 @@ async fn register_default_subagents(
         match build_result {
             Ok(worker) => {
                 let worker_handle = crate::agent_handle::AgentHandle::new(worker);
-                // delegate_readonly is registered on both kinds — it lets a
-                // worker fan out to readonly peers; writers don't get a
-                // write-delegation tool (no recursive unbounded writes).
-                crate::tasks::task_runtime::delegate_readonly_tool::
-                    register_delegate_readonly_on_handle(&worker_handle, None).await;
+                // (delegate_readonly 工具已删除:worker 不再注册派发工具。
+                // 原 L3 嵌套委派能力丧失,worker 需子任务时自己用文件工具完成。)
 
                 let mut builder = SubagentBuilder::new(&worker_def.name)
                     .description(&worker_def.description)
@@ -536,6 +544,15 @@ async fn register_default_subagents(
                 }
                 let def = builder.build();
                 agent.register_subagent_with_definition(def, worker_handle.to_boxed_agent().await);
+                tracing::info!(
+                    subagent = %worker_def.name,
+                    readonly = worker_def.readonly,
+                    isolate_worktree = worker_def.isolate_worktree,
+                    isolate_workspace = worker_def.isolate_workspace,
+                    has_team = worker_def.team.is_some(),
+                    tags = ?worker_def.tags,
+                    "registered default subagent"
+                );
             }
             Err(err) => tracing::warn!(
                 subagent = %worker_def.name,

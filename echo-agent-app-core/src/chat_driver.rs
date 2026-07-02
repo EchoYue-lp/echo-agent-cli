@@ -3,11 +3,10 @@
 //! `drive_chat` is the single, thin entry for a chat turn across TUI / CLI
 //! channel / GUI: it wraps the user input into one `Message`, streams the
 //! agent's ReAct reply through a per-mode `ChatSink`, and stops. It does NOT
-//! pre-judge normal vs complex and does NOT create a TaskRuntime run — the
-//! agent itself decides whether to spin up a background run by calling the
-//! `create_complex_task` tool (Phase B3+). Run lifecycle events flow back
-//! through `sink.on_run_status` / `on_worker_trace`, never through this
-//! entry's return value.
+//! pre-judge normal vs complex. The per-turn TaskRuntime run is created only
+//! to give task tools and forked subagents one canonical run/trace context;
+//! the agent still decides whether to call `task_create`, `execute_plan`, or
+//! `create_complex_task` (Phase B3+).
 //!
 //! Multimodal is passed through (`Option<&Message>`) so TUI / channel can
 //! attach images/files the same way GUI already does.
@@ -42,7 +41,7 @@ pub trait ChatSink: Send + Sync + 'static {
         None
     }
     /// Trace sink scoped into the task_local run context (`with_run_context`)
-    /// so the **main agent's** task_tools (`execute_plan` / `delegate_readonly`)
+    /// so the **main agent's** task_tools (`execute_plan`)
     /// can emit `WorkerTraceEvent`s during a complex run. GUI provides a closure
     /// that rewrites the main-agent run_id + emits to the frontend; non-GUI modes
     /// return `None` (trace events dropped, functionality unaffected).
@@ -54,14 +53,98 @@ pub trait ChatSink: Send + Sync + 'static {
 /// Drive a chat turn through the single shared path (极简入口).
 ///
 /// Wraps `message` (plus optional `multimodal`) into one `Message`, streams the
-/// agent's reply through `sink`, and returns. No route pre-judgment, no
-/// TaskRuntime run creation — the agent decides whether a complex run is
-/// warranted and triggers it itself via the `create_complex_task` tool.
+/// agent's reply through `sink`, and returns. No route pre-judgment; the
+/// per-turn TaskRuntime run is only the shared context anchor for task tools
+/// and forked subagents. The agent still decides whether a complex run is
+/// warranted by calling `task_create`, `execute_plan`, or
+/// `create_complex_task`.
+///
+/// ## run_id scoping (防"真空区"死结)
+///
+/// 普通 chat 轮次也包一层 `with_run_context`,用 `res.root_message_id` 作
+/// run_id。这样主 agent 在 ReAct 循环里调
+/// `task_create` / `execute_plan` / `create_complex_task` 等依赖
+/// `require_run_id()` 的工具时,能从 task_local 读到 run_id,不再被
+/// `"no active run — run_id not set in context"` 提前拒绝(对齐 Claude Code
+/// 的无门槛只读 dispatch)。
+///
+/// 该 run_id 同时写入 TaskRuntimeStore 和 Agent ExternalRunContext,作为
+/// 本轮 task/subagent trace 的统一锚点。`create_complex_task` 仍会 new 一个
+/// Uuid 作背景 run id,不与这个前台 chat run 冲突。
 pub async fn drive_chat(
     agent: &AgentHandle,
     message: &str,
     multimodal: Option<&Message>,
     res: std::sync::Arc<crate::chat_resources::ChatResources>,
+) -> Result<(), String> {
+    // Scope a per-turn run_id so task tools (task_create /
+    // execute_plan / create_complex_task) can read it via require_run_id().
+    // Use root_message_id (unique per turn, set by all 3 callers); fall back to
+    // a fresh uuid if a caller forgot to set it (defensive, never panics).
+    let run_id = if res.root_message_id.trim().is_empty() {
+        tracing::warn!("drive_chat: root_message_id empty — using fallback uuid as run_id");
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        res.root_message_id.clone()
+    };
+
+    // Ensure the TaskRuntimeStore has a run record for this turn's run_id.
+    // drive_chat scopes run_id=root_message_id into task_local so task_* tools
+    // can read it, but without a create_run the store has no record → every
+    // task_create write becomes an orphan (no RunCreated event ancestor) and
+    // rebuild_plan_from_events discards them → task_list returns empty.
+    // Idempotent: skips if the run already exists (create_complex_task / a
+    // resumed turn may have created it).
+    if let Some(store) = res.store.as_ref() {
+        let already_exists = store.get_run(&run_id).ok().flatten().is_some();
+        if !already_exists {
+            let conv = res
+                .conv_id
+                .clone()
+                .unwrap_or_else(|| format!("message:{run_id}"));
+            if let Err(e) = store.create_run(
+                &run_id,
+                "default",
+                &conv,
+                &run_id,
+                crate::tasks::task_runtime::types::DomainProfile::General,
+                message,
+                "chat_turn",
+                crate::tasks::task_runtime::types::AttendedMode::Attended,
+            ) {
+                tracing::warn!(
+                    error = %e,
+                    run_id = %run_id,
+                    "drive_chat: ad-hoc create_run failed (task tools may not persist)"
+                );
+            } else {
+                let _ = store.transition_run(
+                    &run_id,
+                    crate::tasks::task_runtime::types::TaskRunStatus::Running,
+                );
+            }
+        }
+    }
+
+    let cancel = res.cancel.clone();
+    let trace_sink = res.sink.worker_trace_sink();
+    let run_id_for_inner = run_id.clone();
+    crate::tasks::task_runtime::task_tools::with_run_context(
+        run_id,
+        cancel,
+        trace_sink,
+        drive_chat_inner(agent, message, multimodal, res, run_id_for_inner),
+    )
+    .await
+}
+
+/// Inner ReAct-streaming body of [`drive_chat`], run inside the run_id scope.
+async fn drive_chat_inner(
+    agent: &AgentHandle,
+    message: &str,
+    multimodal: Option<&Message>,
+    res: std::sync::Arc<crate::chat_resources::ChatResources>,
+    run_id: String,
 ) -> Result<(), String> {
     let msg: Message = match multimodal {
         Some(m) => m.clone(),
@@ -88,24 +171,44 @@ pub async fn drive_chat(
         // stream borrows the agent (same pattern as the GUI's normal chat path).
         let inner = agent.inner().clone();
         let guard = inner.read().await;
-        let mut stream = guard
-            .execute_stream_message_with_cancel(msg, cancel)
-            .await
-            .map_err(|e| e.to_string())?;
-        while let Some(event_result) = stream.next().await {
-            match event_result {
-                Ok(event) => {
-                    if !sink.on_agent_event(event) {
+
+        // `with_run_context` is task-local and does not cross the framework's
+        // forked subagent `tokio::spawn`; ExternalRunContext is the value-carried
+        // channel that keeps worker tools and trace events on this same run.
+        guard.set_external_context(&echo_core::tools::ExternalRunContext {
+            run_id,
+            execution_id: None,
+            cancel: Some(std::sync::Arc::new(cancel.clone())),
+            trace_sink: sink.trace_sink(),
+        });
+
+        let stream_result = guard.execute_stream_message_with_cancel(msg, cancel).await;
+        let mut stream = match stream_result {
+            Ok(stream) => stream,
+            Err(e) => {
+                guard.clear_external_context();
+                return Err(e.to_string());
+            }
+        };
+        let result = async {
+            while let Some(event_result) = stream.next().await {
+                match event_result {
+                    Ok(event) => {
+                        if !sink.on_agent_event(event) {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "agent stream error during chat");
                         break;
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, "agent stream error during chat");
-                    break;
-                }
             }
+            Ok::<(), String>(())
         }
-        Ok::<(), String>(())
+        .await;
+        guard.clear_external_context();
+        result
     })
     .await
 }

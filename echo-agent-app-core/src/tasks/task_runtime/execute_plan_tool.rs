@@ -16,20 +16,33 @@
 //! - **§10.5**: ComplexRuntime 路径下, 首次调用先 transition `Paused` 并 await
 //!   `Notify` (由 resume_run 触发), 恢复后才调用 `execute_run`。
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 
+use dashmap::DashMap;
 use echo_agent::error;
 use echo_agent::tools::{Tool, ToolParameters, ToolResult};
 use futures::future::BoxFuture;
+use tokio::sync::Mutex as TokioMutex;
 
 use super::executor::{RunOutcome, execute_run, preflight_unattended_plan};
 use super::router::TaskRouteKind;
 use super::store::TaskRuntimeStore;
 use super::types::{
-    AttendedMode, DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, TaskPlan, TaskRunStatus,
-    UnattendedWriteMode,
+    AttendedMode, DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, TaskExecutionSummary,
+    TaskPlan, TaskRunStatus, TodoItem, TodoStatus, UnattendedWriteMode, WorkerTraceEvent,
+    WorkerTraceEventKind,
 };
 use crate::agent_handle::AgentHandle;
+
+/// One active execute_run driver per run_id.
+///
+/// Inline execute_plan calls can be emitted by the model as a parallel tool
+/// batch. Without this guard, every call appends one task and then starts a
+/// full DAG driver over the same run, so earlier tasks are dispatched multiple
+/// times. Serializing per run lets the first call execute what is ready; later
+/// calls re-read the persisted plan and skip tasks already marked Completed.
+static RUN_EXECUTION_LOCKS: LazyLock<DashMap<String, Arc<TokioMutex<()>>>> =
+    LazyLock::new(DashMap::new);
 
 /// L1→L2 桥接工具: 把 plan 提交给 run_dag 并行调度器。
 ///
@@ -86,70 +99,231 @@ impl Tool for ExecutePlanTool {
     }
 
     fn description(&self) -> &str {
-        "把你用 task_create 拆好的计划交给并行执行引擎 (run_dag) 执行。\
-         引擎会按任务的依赖关系 (depends_on) 自动并行/串行调度。\
-         调用此工具后, 等待返回的执行结果, 再据此写最终答案给用户。"
+        "派 worker 执行任务并返回结果。两种用法:\n\
+         \n\
+         1. 单步派发 (传 task): 临时调研/分析/审查,直接派一个只读 worker。\
+         worker 在独立上下文跑 ReAct,只回传结论摘要,保持主会话干净 (防 context 污染)。\n\
+         可用 agent_role: explorer(探索代码库/数据/文档)、reviewer(审查 bug/方法/证据)、\
+         planner(规划验证/测试路径)、summarizer(汇总多源发现)。\n\
+         \n\
+         2. 多 worker 编排 (不传 task,先用 task_create 拆 plan): 有依赖关系的多步任务,\
+         先 task_create 拆成带 depends_on 的子任务,再调本工具。\
+         引擎 (run_dag) 按依赖自动并行/串行调度,统一收集 token 统计。\n\
+         \n\
+         适用场景: 大范围代码库检索、多文件架构梳理、冗长日志分析、多源调研综合等高噪声任务。\
+         简单问答/单文件小改直接回复即可,不要调用本工具。"
+    }
+
+    /// execute_plan 派 worker 跑独立 ReAct(延迟远高于普通文件/shell 工具)。
+    /// 豁免并行批次总超时,避免它占满批次预算导致同批其他工具被提前取消;
+    /// execute_run 内部有信号量 + worker 600s per-dispatch 超时兜底。
+    fn exempt_from_batch_timeout(&self) -> bool {
+        true
     }
 
     fn parameters(&self) -> serde_json::Value {
-        serde_json::json!({ "type": "object", "properties": {} })
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "object",
+                    "description": "可选: 内联单步只读任务。提供时直接派一个 worker (无需先 task_create),不提供时走原有 plan 编排。",
+                    "properties": {
+                        "agent_role": {
+                            "type": "string",
+                            "enum": ["explorer", "reviewer", "planner", "summarizer"],
+                            "description": "worker 角色名,必须从 enum 中精确选择。"
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "给 worker 的任务 prompt,含相关路径/范围/约束/需要的结果格式。"
+                        }
+                    },
+                    "required": ["agent_role", "description"]
+                }
+            }
+        })
     }
 
-    fn execute<'a>(&'a self, _params: ToolParameters) -> BoxFuture<'a, error::Result<ToolResult>> {
+    fn execute<'a>(&'a self, params: ToolParameters) -> BoxFuture<'a, error::Result<ToolResult>> {
         Box::pin(async move {
             // ── 从 task_local 读取 run_id (§10.1) ──
+            // drive_chat 已为普通 chat 轮次 scope 了 run_id (用 root_message_id),
+            // 故这里总能拿到值。
             let run_id = match super::task_tools::require_run_id() {
                 Ok(id) => id,
                 Err(e) => return Ok(e),
             };
+            tracing::info!(
+                run_id = %run_id,
+                has_inline_task = params.get("task").is_some(),
+                "execute_plan: start"
+            );
 
             // ── §10.1: cancel 透传 ──
             let cancel = super::task_tools::CURRENT_CANCEL
                 .try_with(|c| c.clone())
                 .unwrap_or_else(|_| tokio_util::sync::CancellationToken::new());
 
-            // ── 兜底: 若主 agent 跳过了 task_create 直接调 execute_plan ──
-            // LLM 可能不遵守 system prompt 的两阶段顺序。若 plan 为空,
-            // 从 run goal 动态生成一个单 task plan,保证执行始终经过 run_dag
-            // (有 wave 调度 + 信号量限流 + 失败传播保护),不会退化成裸 delegate_readonly。
-            let plan_exists = self
-                .store
-                .get_plan(&run_id)
-                .ok()
-                .flatten()
-                .map(|p| !p.tasks.is_empty())
-                .unwrap_or(false);
-            if !plan_exists {
-                let goal = self
-                    .store
-                    .get_run(&run_id)
-                    .ok()
-                    .flatten()
-                    .map(|r| r.goal)
-                    .unwrap_or_default();
-                let task_id = format!("auto_{}", uuid::Uuid::new_v4().as_simple());
+            // ── inline task 路径 (吸收原 delegate_readonly 语义) ──
+            // 当 LLM 传入 task 对象时,组装单任务 plan 直接走 execute_run,
+            // 继承全部可见性 (WorkerStarted/Completed/LlmUsage) + 调度 + 统计。
+            // 普通 chat 轮次的 run_id (root_message_id) 没在 store 建过 run,
+            // 故需先建 ad-hoc run (create_run + transition Running)。
+            if params.get("task").is_some() {
+                let (role, task_desc) = match parse_inline_task_params(&params) {
+                    Ok(task) => task,
+                    Err(reason) => {
+                        tracing::warn!(
+                            run_id = %run_id,
+                            reason = %reason,
+                            param_keys = ?params.keys().cloned().collect::<Vec<_>>(),
+                            "execute_plan: invalid inline task params"
+                        );
+                        return Ok(ToolResult::error(reason));
+                    }
+                };
+                if role.is_empty() || task_desc.is_empty() {
+                    tracing::warn!(
+                        run_id = %run_id,
+                        role_empty = role.is_empty(),
+                        description_empty = task_desc.is_empty(),
+                        "execute_plan: inline task missing required fields"
+                    );
+                    return Ok(ToolResult::error(
+                        "inline task 的 agent_role 和 description 不能为空",
+                    ));
+                }
+                // conv_id 既用于建 run,也用于 RunStarted 事件通知前端激活面板,
+                // 故提到 if 外层(事件发射处也要用)。
+                let conv = crate::chat_resources::current_chat_resources()
+                    .and_then(|r| r.conv_id.clone())
+                    .unwrap_or_else(|| format!("message:{run_id}"));
+                // 建 ad-hoc run (若已存在则跳过,兼容 task_create 已建过的情况)。
+                let run_already_exists = self.store.get_run(&run_id).ok().flatten().is_some();
+                if !run_already_exists {
+                    if let Err(e) = self.store.create_run(
+                        &run_id,
+                        "default",
+                        &conv,
+                        &run_id,
+                        DomainProfile::General,
+                        &task_desc,
+                        "agent_inline_task",
+                        AttendedMode::Attended,
+                    ) {
+                        tracing::warn!(
+                            run_id = %run_id,
+                            error = %e,
+                            "execute_plan: failed to create ad-hoc inline run"
+                        );
+                        return Ok(ToolResult::error(format!(
+                            "execute_plan: 建 ad-hoc run 失败: {e}"
+                        )));
+                    }
+                    if let Err(e) = self.store.transition_run(&run_id, TaskRunStatus::Running) {
+                        tracing::warn!(
+                            run_id = %run_id,
+                            error = %e,
+                            "execute_plan: failed to transition ad-hoc inline run to Running"
+                        );
+                        return Ok(ToolResult::error(format!(
+                            "execute_plan: run 转 Running 失败: {e}"
+                        )));
+                    }
+                }
+                // 组装单任务 (用 LLM 传入的 role/desc,kind=ReadOnlyReview)。
+                // 用 insert_task(追加语义)而非 attach_plan(覆盖语义):
+                // 多次 inline 调用时 attach_plan 的 PlanGenerated 会覆盖整个
+                // task 列表(event_rebuild.rs 赋值非追加),导致前面的 inline
+                // task 在重建后丢失 → execute_task 报 task not found。
+                // insert_task 追加到现有 plan,每个 inline task 都存活。
+                let task_id = format!("inline_{}", uuid::Uuid::new_v4().as_simple());
+                let title: String = task_desc.chars().take(80).collect();
                 let task = PlanTask {
                     id: task_id.clone(),
-                    title: goal.chars().take(80).collect(),
-                    description: goal.clone(),
+                    title,
+                    description: task_desc.to_string(),
                     kind: PlanTaskKind::ReadOnlyReview,
-                    agent_role: "project_explorer".to_string(),
+                    agent_role: role.to_string(),
                     ..Default::default()
                 };
-                let plan = TaskPlan {
-                    plan_id: uuid::Uuid::new_v4().to_string(),
-                    run_id: run_id.clone(),
-                    domain_profile: DomainProfile::General,
-                    goal: goal.clone(),
-                    assumptions: Vec::new(),
-                    risks: Vec::new(),
-                    execution_mode: ExecutionMode::Parallel,
-                    tasks: vec![task],
-                };
-                if let Err(e) = self.store.attach_plan(&plan) {
+                if let Err(e) = self.store.insert_task(&run_id, None, task) {
+                    tracing::warn!(
+                        run_id = %run_id,
+                        role = %role,
+                        error = %e,
+                        "execute_plan: failed to insert inline task"
+                    );
                     return Ok(ToolResult::error(format!(
-                        "execute_plan: 自动生成 plan 失败: {e}"
+                        "execute_plan: insert inline task 失败: {e}"
                     )));
+                }
+                // 通知前端 run 已激活(send_chat_message 返回值不带 run_id,
+                // 前端靠此 RunStarted 事件触发 loadByConversation → 激活
+                // activeRun,否则 worker 卡片/任务进度/Token 面板全空)。
+                let inline_trace_sink = super::task_tools::CURRENT_TRACE_SINK
+                    .try_with(|s| s.clone())
+                    .ok()
+                    .flatten();
+                if let Some(sink) = inline_trace_sink.as_ref() {
+                    sink(WorkerTraceEvent::new(
+                        run_id.clone(),
+                        WorkerTraceEventKind::RunStarted,
+                        serde_json::json!({
+                            "conversation_id": conv,
+                            "mode": "inline_task",
+                            "run_id": run_id.clone(),
+                            "route": "inline",
+                            "goal": task_desc,
+                        }),
+                    ));
+                }
+                // plan 已就绪,落到下面的公共 execute_run 路径。
+            } else {
+                // ── 兜底: 若主 agent 跳过了 task_create 直接调 execute_plan ──
+                // LLM 可能不遵守 system prompt 的两阶段顺序。若 plan 为空,
+                // 从 run goal 动态生成一个单 task plan,保证执行始终经过 run_dag
+                // (有 wave 调度 + 信号量限流 + 失败传播保护)。
+                let plan_exists = self
+                    .store
+                    .get_plan(&run_id)
+                    .ok()
+                    .flatten()
+                    .map(|p| !p.tasks.is_empty())
+                    .unwrap_or(false);
+                if !plan_exists {
+                    let goal = self
+                        .store
+                        .get_run(&run_id)
+                        .ok()
+                        .flatten()
+                        .map(|r| r.goal)
+                        .unwrap_or_default();
+                    let task_id = format!("auto_{}", uuid::Uuid::new_v4().as_simple());
+                    let task = PlanTask {
+                        id: task_id.clone(),
+                        title: goal.chars().take(80).collect(),
+                        description: goal.clone(),
+                        kind: PlanTaskKind::ReadOnlyReview,
+                        agent_role: "explorer".to_string(),
+                        ..Default::default()
+                    };
+                    let plan = TaskPlan {
+                        plan_id: uuid::Uuid::new_v4().to_string(),
+                        run_id: run_id.clone(),
+                        domain_profile: DomainProfile::General,
+                        goal: goal.clone(),
+                        assumptions: Vec::new(),
+                        risks: Vec::new(),
+                        execution_mode: ExecutionMode::Parallel,
+                        tasks: vec![task],
+                    };
+                    if let Err(e) = self.store.attach_plan(&plan) {
+                        return Ok(ToolResult::error(format!(
+                            "execute_plan: 自动生成 plan 失败: {e}"
+                        )));
+                    }
                 }
             }
 
@@ -227,6 +401,47 @@ impl Tool for ExecutePlanTool {
                 .try_with(|s| s.clone())
                 .ok()
                 .flatten();
+            let plan_task_count = self
+                .store
+                .get_plan(&run_id)
+                .ok()
+                .flatten()
+                .map(|p| p.tasks.len())
+                .unwrap_or(0);
+            tracing::info!(
+                run_id = %run_id,
+                task_count = plan_task_count,
+                route = %route_str,
+                attended_mode = %attended_mode.as_str(),
+                has_trace_sink = trace_sink.is_some(),
+                write_mode = ?self.write_mode,
+                "execute_plan: dispatching run_dag"
+            );
+            let run_lock = RUN_EXECUTION_LOCKS
+                .entry(run_id.clone())
+                .or_insert_with(|| Arc::new(TokioMutex::new(())))
+                .clone();
+            tracing::info!(run_id = %run_id, "execute_plan: waiting for run execution lock");
+            let _run_guard = run_lock.lock().await;
+            tracing::info!(run_id = %run_id, "execute_plan: acquired run execution lock");
+            if self
+                .store
+                .get_run(&run_id)
+                .ok()
+                .flatten()
+                .is_some_and(|run| run.status == TaskRunStatus::Completed)
+                && !has_unresolved_tasks(&self.store, &run_id)
+            {
+                let summaries = build_run_summaries(&self.store, &run_id);
+                tracing::info!(
+                    run_id = %run_id,
+                    summary_chars = summaries.chars().count(),
+                    "execute_plan: run already completed after waiting for lock"
+                );
+                return Ok(ToolResult::success(format!(
+                    "计划执行完成。各 worker 的产出如下,请基于这些内容撰写最终答案:\n\n{summaries}"
+                )));
+            }
 
             // ── §10.1: 必须 await RunOutcome, 不得 fire-and-forget ──
             // G3 fix: read run_store from the primary agent instead of passing
@@ -262,43 +477,56 @@ impl Tool for ExecutePlanTool {
                 Ok(RunOutcome::Completed) => {
                     // 把各 worker 的 summary 拼进返回文本,给主 agent 写最终答案的
                     // 素材(否则主 agent 只拿到一句"计划执行完成",无法产出实质答案)。
-                    let summaries = self
-                        .store
-                        .list_todos(&run_id)
-                        .map(|todos| {
-                            todos
-                                .into_iter()
-                                .filter(|t| t.summary.as_deref().is_some_and(|s| !s.is_empty()))
-                                .map(|t| {
-                                    format!(
-                                        "## {} ({})\n{}",
-                                        t.title,
-                                        t.owner_agent.as_deref().unwrap_or("worker"),
-                                        t.summary.as_deref().unwrap_or("")
-                                    )
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n\n")
-                        })
-                        .unwrap_or_default();
+                    let summaries = build_run_summaries(&self.store, &run_id);
+                    tracing::info!(
+                        run_id = %run_id,
+                        summary_chars = summaries.chars().count(),
+                        "execute_plan: completed"
+                    );
                     Ok(ToolResult::success(format!(
                         "计划执行完成。各 worker 的产出如下,请基于这些内容撰写最终答案:\n\n{summaries}"
                     )))
                 }
-                Ok(RunOutcome::Cancelled) => Ok(ToolResult::success("计划执行被取消。")),
+                Ok(RunOutcome::Cancelled) => {
+                    tracing::info!(run_id = %run_id, "execute_plan: cancelled");
+                    Ok(ToolResult::success("计划执行被取消。"))
+                }
                 Ok(RunOutcome::Failed {
                     failed_task_id,
                     error,
-                }) => Ok(ToolResult::success(format!(
-                    "计划执行失败 (任务 {failed_task_id}): {error}。可调整计划后重试。"
-                ))),
+                }) => {
+                    tracing::warn!(
+                        run_id = %run_id,
+                        failed_task_id = %failed_task_id,
+                        error = %error,
+                        "execute_plan: failed"
+                    );
+                    Ok(ToolResult::success(format!(
+                        "计划执行失败 (任务 {failed_task_id}): {error}。可调整计划后重试。"
+                    )))
+                }
                 Ok(RunOutcome::Paused {
                     failed_task_id,
                     error,
-                }) => Ok(ToolResult::success(format!(
-                    "计划因任务 {failed_task_id} 失败而暂停: {error}。"
-                ))),
-                Err(e) => Ok(ToolResult::error(format!("execute_plan 失败: {e}"))),
+                }) => {
+                    tracing::warn!(
+                        run_id = %run_id,
+                        failed_task_id = %failed_task_id,
+                        error = %error,
+                        "execute_plan: paused"
+                    );
+                    Ok(ToolResult::success(format!(
+                        "计划因任务 {failed_task_id} 失败而暂停: {error}。"
+                    )))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        run_id = %run_id,
+                        error = %e,
+                        "execute_plan: executor error"
+                    );
+                    Ok(ToolResult::error(format!("execute_plan 失败: {e}")))
+                }
             }
         })
     }
@@ -312,6 +540,151 @@ impl Tool for ExecutePlanTool {
             super::task_tools::scoped_with_ctx_run_id(ctx, || self.execute(params)).await
         })
     }
+}
+
+fn build_run_summaries(store: &TaskRuntimeStore, run_id: &str) -> String {
+    let todos = store.list_todos(run_id).unwrap_or_default();
+    let tasks = store
+        .get_plan(run_id)
+        .ok()
+        .flatten()
+        .map(|p| p.tasks)
+        .unwrap_or_default();
+
+    let mut sections = Vec::new();
+    for task in tasks {
+        let todo = todos.iter().find(|t| t.task_id == task.id);
+        let owner = todo
+            .and_then(|t| t.owner_agent.as_deref())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(task.agent_role.as_str());
+        let body = store
+            .get_summary(run_id, &task.id)
+            .ok()
+            .flatten()
+            .map(|summary| format_execution_summary(&summary))
+            .or_else(|| todo.and_then(todo_summary))
+            .unwrap_or_else(|| "worker completed but no summary was recorded".to_string());
+        sections.push(format!("## {} ({})\n{}", task.title, owner, body));
+    }
+
+    if sections.is_empty() {
+        return "未找到已执行的 worker 产出。".to_string();
+    }
+    sections.join("\n\n")
+}
+
+fn has_unresolved_tasks(store: &TaskRuntimeStore, run_id: &str) -> bool {
+    store
+        .get_plan(run_id)
+        .ok()
+        .flatten()
+        .map(|plan| {
+            plan.tasks.iter().any(|task| {
+                !matches!(
+                    task.status,
+                    TodoStatus::Completed | TodoStatus::Failed | TodoStatus::Skipped
+                )
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn todo_summary(todo: &TodoItem) -> Option<String> {
+    todo.summary
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string)
+}
+
+fn format_execution_summary(summary: &TaskExecutionSummary) -> String {
+    let mut parts = Vec::new();
+    if !summary.completed_work.is_empty() {
+        parts.push(format!("完成: {}", summary.completed_work.join("; ")));
+    }
+    if !summary.files_read.is_empty() {
+        parts.push(format!("读取: {}", summary.files_read.join(", ")));
+    }
+    if !summary.files_changed.is_empty() {
+        parts.push(format!("修改: {}", summary.files_changed.join(", ")));
+    }
+    if !summary.decisions.is_empty() {
+        parts.push(format!("决策: {}", summary.decisions.join("; ")));
+    }
+    if !summary.failures.is_empty() {
+        parts.push(format!("问题: {}", summary.failures.join("; ")));
+    }
+    if !summary.verification.is_empty() {
+        parts.push(format!("验证: {}", summary.verification.join("; ")));
+    }
+    if !summary.next_implications.is_empty() {
+        parts.push(format!(
+            "后续影响: {}",
+            summary.next_implications.join("; ")
+        ));
+    }
+    if parts.is_empty() {
+        "worker summary persisted without details".to_string()
+    } else {
+        parts.join("\n")
+    }
+}
+
+fn parse_inline_task_params(
+    params: &ToolParameters,
+) -> std::result::Result<(String, String), String> {
+    let task_value = params
+        .get("task")
+        .ok_or_else(|| "inline task 参数缺少 task 字段".to_string())?;
+
+    let task_json = if let Some(s) = task_value.as_str() {
+        serde_json::from_str::<serde_json::Value>(s)
+            .ok()
+            .filter(|v| v.is_object())
+            .unwrap_or_else(|| serde_json::json!({ "description": s }))
+    } else {
+        task_value.clone()
+    };
+
+    let role = string_field(&task_json, &["agent_role", "role", "agent"])
+        .or_else(|| string_param(params, &["agent_role", "role", "agent"]))
+        .unwrap_or_else(|| "explorer".to_string());
+    let description = string_field(
+        &task_json,
+        &["description", "prompt", "task", "query", "goal"],
+    )
+    .or_else(|| string_param(params, &["description", "prompt", "query", "goal"]))
+    .unwrap_or_default();
+
+    let description = description.trim().to_string();
+    if description.is_empty() {
+        return Err("inline task 的 description/prompt/task/query/goal 不能为空".to_string());
+    }
+    Ok((role.trim().to_string(), description))
+}
+
+fn string_field(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Some(s) = value.get(*key).and_then(|v| v.as_str()) {
+            let s = s.trim();
+            if !s.is_empty() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn string_param(params: &ToolParameters, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Some(s) = params.get(*key).and_then(|v| v.as_str()) {
+            let s = s.trim();
+            if !s.is_empty() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -337,6 +710,111 @@ mod tests {
             "expected error but got success: {}",
             result.output
         );
+    }
+
+    #[test]
+    fn build_run_summaries_uses_persisted_task_summary() -> std::result::Result<(), String> {
+        let store = TaskRuntimeStore::new_in_memory().map_err(|e| e.to_string())?;
+        store
+            .create_run(
+                "r1",
+                "default",
+                "c1",
+                "m1",
+                DomainProfile::General,
+                "分析项目架构",
+                "chat_turn",
+                AttendedMode::Attended,
+            )
+            .map_err(|e| e.to_string())?;
+        let task = PlanTask {
+            id: "t1".to_string(),
+            title: "核心运行时".to_string(),
+            kind: PlanTaskKind::ReadOnlyReview,
+            agent_role: "explorer".to_string(),
+            ..Default::default()
+        };
+        store
+            .attach_plan(&TaskPlan {
+                plan_id: "p1".to_string(),
+                run_id: "r1".to_string(),
+                domain_profile: DomainProfile::General,
+                goal: "分析项目架构".to_string(),
+                assumptions: Vec::new(),
+                risks: Vec::new(),
+                execution_mode: ExecutionMode::Parallel,
+                tasks: vec![task],
+            })
+            .map_err(|e| e.to_string())?;
+        store
+            .put_summary(&TaskExecutionSummary {
+                run_id: "r1".to_string(),
+                task_id: "t1".to_string(),
+                worker_agent: "explorer".to_string(),
+                completed_work: vec!["梳理 runtime、agent_pool、task_runtime 的职责".to_string()],
+                files_read: vec!["echo-agent-app-core/src/runtime.rs".to_string()],
+                files_changed: Vec::new(),
+                decisions: vec!["core 层负责应用编排, framework 层负责 agent 能力".to_string()],
+                failures: Vec::new(),
+                verification: Vec::new(),
+                next_implications: Vec::new(),
+                created_at: chrono::Utc::now(),
+            })
+            .map_err(|e| e.to_string())?;
+
+        let text = build_run_summaries(&store, "r1");
+        assert!(text.contains("核心运行时"));
+        assert!(text.contains("梳理 runtime"));
+        assert!(text.contains("runtime.rs"));
+        Ok(())
+    }
+
+    #[test]
+    fn parse_inline_task_accepts_object_task() -> std::result::Result<(), String> {
+        let mut params = ToolParameters::new();
+        params.insert(
+            "task".to_string(),
+            serde_json::json!({
+                "agent_role": "reviewer",
+                "description": "审查 subagent 执行链路"
+            }),
+        );
+        let (role, desc) = parse_inline_task_params(&params)?;
+        assert_eq!(role, "reviewer");
+        assert_eq!(desc, "审查 subagent 执行链路");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_inline_task_accepts_string_task_with_root_role() -> std::result::Result<(), String> {
+        let mut params = ToolParameters::new();
+        params.insert(
+            "task".to_string(),
+            serde_json::Value::String("分析当前项目架构".to_string()),
+        );
+        params.insert(
+            "agent_role".to_string(),
+            serde_json::Value::String("planner".to_string()),
+        );
+        let (role, desc) = parse_inline_task_params(&params)?;
+        assert_eq!(role, "planner");
+        assert_eq!(desc, "分析当前项目架构");
+        Ok(())
+    }
+
+    #[test]
+    fn parse_inline_task_defaults_role_to_explorer() -> std::result::Result<(), String> {
+        let mut params = ToolParameters::new();
+        params.insert(
+            "task".to_string(),
+            serde_json::json!({
+                "prompt": "梳理仓库模块边界"
+            }),
+        );
+        let (role, desc) = parse_inline_task_params(&params)?;
+        assert_eq!(role, "explorer");
+        assert_eq!(desc, "梳理仓库模块边界");
+        Ok(())
     }
 
     /// 验证 tool 的 name/description/parameters 基本属性。

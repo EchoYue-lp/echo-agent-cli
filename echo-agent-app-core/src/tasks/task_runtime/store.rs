@@ -345,6 +345,9 @@ impl TaskRuntimeStore {
         // U1c phase-0/0bc step-2: file authority. Read the current plan from
         // the file (bootstrapping an empty plan if none exists), validate deps,
         // then append PlanEdited{insert} + rewrite plan.json. No SQL write.
+        let run = self
+            .get_run(run_id)?
+            .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
         // Load current plan/tasks from the file (None if no plan yet).
         let current_plan = self.get_plan(run_id)?;
         let existing_tasks: Vec<PlanTask> = current_plan
@@ -356,8 +359,6 @@ impl TaskRuntimeStore {
         // (matching the SQL path that creates an empty plan row). The run
         // goal comes from the run header (already on file via create_run).
         if current_plan.is_none() {
-            let run = self.get_run(run_id)?;
-            let goal = run.as_ref().map(|r| r.goal.clone()).unwrap_or_default();
             let new_plan_id = uuid::Uuid::new_v4().to_string();
             self.shadow.append_event_line(
                 run_id,
@@ -368,8 +369,8 @@ impl TaskRuntimeStore {
                     "plan_id": new_plan_id,
                     "task_count": 0,
                     "bootstrapped": true,
-                    "domain_profile": DomainProfile::General.as_str(),
-                    "goal": goal,
+                    "domain_profile": run.domain_profile.as_str(),
+                    "goal": run.goal,
                     "assumptions": Vec::<String>::new(),
                     "risks": Vec::<String>::new(),
                     "execution_mode": "parallel",
@@ -598,6 +599,9 @@ impl TaskRuntimeStore {
     /// transition the run to `AwaitingPlanApproval` (from `Planning`).
     /// All plan tasks and their todo rows are inserted in the same tx.
     pub fn attach_plan(&self, plan: &TaskPlan) -> Result<(), StoreError> {
+        self.get_run(&plan.run_id)?
+            .ok_or_else(|| StoreError::RunNotFound(plan.run_id.clone()))?;
+
         // U1c phase-0/0bc step-2: file authority. PlanGenerated carries the
         // full plan envelope + task bodies; the rebuilder reconstructs the
         // plan from it. No SQL write.
@@ -1352,6 +1356,27 @@ mod tests {
             evs.iter()
                 .any(|e| e.event_type == RuntimeEventKind::PlanEdited)
         );
+    }
+
+    #[test]
+    fn insert_task_rejects_missing_run() -> std::result::Result<(), String> {
+        let s = TaskRuntimeStore::new_in_memory().map_err(|e| e.to_string())?;
+        let task = PlanTask {
+            id: "t1".into(),
+            title: "orphan task".into(),
+            kind: PlanTaskKind::Investigation,
+            ..Default::default()
+        };
+
+        let err = s
+            .insert_task("missing-run", None, task)
+            .err()
+            .ok_or_else(|| "insert_task unexpectedly succeeded without a run".to_string())?;
+        assert!(matches!(err, StoreError::RunNotFound(run_id) if run_id == "missing-run"));
+
+        let events = s.list_events("missing-run", 0).map_err(|e| e.to_string())?;
+        assert!(events.is_empty());
+        Ok(())
     }
 
     #[test]

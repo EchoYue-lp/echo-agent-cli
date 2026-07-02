@@ -52,8 +52,8 @@ pub struct ConcurrencyLimits {
     pub max_concurrent_writes: usize,
     /// Max simultaneous shell/verification tasks.
     pub max_concurrent_shells: usize,
-    /// Max simultaneous LLM calls across all workers (plan §704:
-    /// max_parallel_llm_calls = 3). Prevents rate-limit hits and cost spikes.
+    /// Max simultaneous LLM calls across all workers. Keep this aligned with
+    /// `max_concurrent_workers` so a ready read-only wave actually fans out.
     pub max_parallel_llm_calls: usize,
 }
 
@@ -63,7 +63,7 @@ impl Default for ConcurrencyLimits {
             max_concurrent_workers: 4,
             max_concurrent_writes: 4,
             max_concurrent_shells: 1,
-            max_parallel_llm_calls: 3,
+            max_parallel_llm_calls: 4,
         }
     }
 }
@@ -167,6 +167,13 @@ pub async fn execute_run(
     let plan = store
         .get_plan(run_id)?
         .ok_or(ExecError::NoPlan(run_id.to_string()))?;
+    tracing::info!(
+        run_id = %run_id,
+        task_count = plan.tasks.len(),
+        status = %run.status.as_str(),
+        route = %run.route,
+        "task_runtime: execute_run start"
+    );
     emit_worker_trace(
         trace_sink.as_ref(),
         WorkerTraceEvent::new(
@@ -201,6 +208,13 @@ pub async fn execute_run(
     // Run record when a RunStore is available.
     match &outcome {
         Ok(RunOutcome::Completed) => {
+            if has_unresolved_tasks(&store, run_id) {
+                tracing::info!(
+                    run_id = %run_id,
+                    "task_runtime: completed snapshot but run has pending appended tasks"
+                );
+                return outcome;
+            }
             emit_worker_trace(
                 trace_sink.as_ref(),
                 WorkerTraceEvent::new(
@@ -335,6 +349,22 @@ pub async fn execute_run(
     outcome
 }
 
+fn has_unresolved_tasks(store: &TaskRuntimeStore, run_id: &str) -> bool {
+    store
+        .get_plan(run_id)
+        .ok()
+        .flatten()
+        .map(|plan| {
+            plan.tasks.iter().any(|task| {
+                !matches!(
+                    task.status,
+                    TodoStatus::Completed | TodoStatus::Failed | TodoStatus::Skipped
+                )
+            })
+        })
+        .unwrap_or(false)
+}
+
 /// Abstraction over how a single ready task is executed on a worker.
 ///
 /// `run_dag` depends on this trait (not on `execute_task` directly) so the
@@ -400,7 +430,7 @@ impl TaskWorker for RealTaskWorker {
         let primary_agent = self.primary_agent.clone();
         Box::pin(async move {
             // Scope run_id + cancel + trace_sink into task-local so worker-internal
-            // tools (task_*/delegate_readonly, and their execute_with_context
+            // tools (task_*/execute_plan, and their execute_with_context
             // fallback path) and L3 nested sub-workers can read them.
             // NOTE: trace_sink/cancel are also passed as explicit params to
             // execute_task (which uses them directly, not via task_local) — but
@@ -558,6 +588,15 @@ async fn run_dag<W: TaskWorker + 'static>(
                 error: "DAG stalled with unfinished tasks (cycle or blocked)".into(),
             });
         }
+        let ready_ids: Vec<String> = ready.iter().map(|t| t.id.clone()).collect();
+        tracing::info!(
+            run_id = %run_id,
+            ready_count = ready_ids.len(),
+            ready_tasks = ?ready_ids,
+            completed_count = completed.len(),
+            total_count = all_ids.len(),
+            "task_runtime: dispatching DAG wave"
+        );
 
         // Dispatch each ready task. We run them concurrently up to the
         // semaphores; join all before recomputing the frontier.
@@ -907,11 +946,16 @@ async fn execute_task(
         task_id: task_id.clone(),
     };
 
-    let worker_trace_id = if task.kind.is_read_only() {
-        format!("{run_id}:{}", task.agent_role)
-    } else {
-        task_id.clone()
-    };
+    let worker_trace_id = task_id.clone();
+    tracing::info!(
+        run_id = %run_id,
+        task_id = %task_id,
+        kind = %task.kind.as_str(),
+        agent_role = %task.agent_role,
+        read_only = task.kind.is_read_only(),
+        prompt_chars = task.description.chars().count(),
+        "task_runtime: task dispatch start"
+    );
 
     // Mark the task running + emit TaskStarted (transactional with the todo
     // projection update).
@@ -947,30 +991,74 @@ async fn execute_task(
     //   permit (default 1, plan §678-680 shell_concurrency = 1).
     let is_shell = matches!(task.kind, PlanTaskKind::Verification);
     let (_worker_permit, _write_permit, _shell_permit) = if is_shell {
+        tracing::info!(
+            run_id = %run_id,
+            task_id = %task_id,
+            available = write_sem.available_permits(),
+            "task_runtime: waiting for write permit"
+        );
         let wp = tokio::select! {
             biased;
             _ = task_cancel.cancelled() => return Err((task_id.clone(), "cancelled while waiting for write permit".to_string())),
             p = write_sem.acquire() => p.map_err(|e| (task_id.clone(), e.to_string()))?,
         };
+        tracing::info!(
+            run_id = %run_id,
+            task_id = %task_id,
+            "task_runtime: acquired write permit"
+        );
+        tracing::info!(
+            run_id = %run_id,
+            task_id = %task_id,
+            available = shell_sem.available_permits(),
+            "task_runtime: waiting for shell permit"
+        );
         let sp = tokio::select! {
             biased;
             _ = task_cancel.cancelled() => return Err((task_id.clone(), "cancelled while waiting for shell permit".to_string())),
             p = shell_sem.acquire() => p.map_err(|e| (task_id.clone(), e.to_string()))?,
         };
+        tracing::info!(
+            run_id = %run_id,
+            task_id = %task_id,
+            "task_runtime: acquired shell permit"
+        );
         (None, Some(wp), Some(sp))
     } else if is_write {
+        tracing::info!(
+            run_id = %run_id,
+            task_id = %task_id,
+            available = write_sem.available_permits(),
+            "task_runtime: waiting for write permit"
+        );
         let wp = tokio::select! {
             biased;
             _ = task_cancel.cancelled() => return Err((task_id.clone(), "cancelled while waiting for write permit".to_string())),
             p = write_sem.acquire() => p.map_err(|e| (task_id.clone(), e.to_string()))?,
         };
+        tracing::info!(
+            run_id = %run_id,
+            task_id = %task_id,
+            "task_runtime: acquired write permit"
+        );
         (None, Some(wp), None)
     } else {
+        tracing::info!(
+            run_id = %run_id,
+            task_id = %task_id,
+            available = worker_sem.available_permits(),
+            "task_runtime: waiting for worker permit"
+        );
         let wp = tokio::select! {
             biased;
             _ = task_cancel.cancelled() => return Err((task_id.clone(), "cancelled while waiting for worker permit".to_string())),
             p = worker_sem.acquire() => p.map_err(|e| (task_id.clone(), e.to_string()))?,
         };
+        tracing::info!(
+            run_id = %run_id,
+            task_id = %task_id,
+            "task_runtime: acquired worker permit"
+        );
         (Some(wp), None, None)
     };
 
@@ -1019,11 +1107,22 @@ async fn execute_task(
 
     // G4: LLM rate-limit permit — caps concurrent LLM calls to prevent
     // provider rate-limit hits and cost spikes (plan §704).
+    tracing::info!(
+        run_id = %run_id,
+        task_id = %task_id,
+        available = llm_sem.available_permits(),
+        "task_runtime: waiting for llm permit"
+    );
     let _llm_permit = tokio::select! {
         biased;
         _ = cancel.cancelled() => return Err((task_id.clone(), "cancelled while waiting for LLM permit".to_string())),
         p = llm_sem.acquire() => p.map_err(|e| (task_id.clone(), e.to_string()))?,
     };
+    tracing::info!(
+        run_id = %run_id,
+        task_id = %task_id,
+        "task_runtime: acquired llm permit"
+    );
 
     // G10+G11: Pre-execution safety check — verify the task's tool calls
     // are covered by an approval scope AND pass the high-risk arg check.
@@ -1111,24 +1210,17 @@ async fn execute_task(
         PlanTaskKind::Implementation | PlanTaskKind::Debugging
     );
     let (result, readonly_usage) = if is_read_only_task {
+        tracing::info!(
+            run_id = %run_id,
+            task_id = %task_id,
+            agent_role = %task.agent_role,
+            prompt_chars = prompt.chars().count(),
+            "task_runtime: delegating read-only task to subagent"
+        );
         match run_readonly_worker(
             &primary_agent,
             &run_id,
-            &task.agent_role,
-            &prompt,
-            task_cancel.clone(),
-        )
-        .await
-        {
-            Ok(sub_result) => (Ok(sub_result.output), sub_result.usage),
-            Err(e) => (Err(e), None),
-        }
-    } else if is_code_writer_task {
-        // Sprint 9: route to the worktree-isolated writer worker.
-        match run_writer_worker(
-            &primary_agent,
-            store.clone(),
-            &run_id,
+            &task_id,
             &task.agent_role,
             &prompt,
             task_cancel.clone(),
@@ -1136,7 +1228,62 @@ async fn execute_task(
         )
         .await
         {
-            Ok(sub_result) => (Ok(sub_result.output), sub_result.usage),
+            Ok(sub_result) => {
+                tracing::info!(
+                    run_id = %run_id,
+                    task_id = %task_id,
+                    agent_role = %task.agent_role,
+                    output_chars = sub_result.output.chars().count(),
+                    iterations = sub_result.iterations,
+                    usage_reported = sub_result.usage.is_some(),
+                    "task_runtime: read-only subagent completed"
+                );
+                (Ok(sub_result.output), sub_result.usage)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    run_id = %run_id,
+                    task_id = %task_id,
+                    agent_role = %task.agent_role,
+                    error = %e,
+                    "task_runtime: read-only subagent failed"
+                );
+                (Err(e), None)
+            }
+        }
+    } else if is_code_writer_task {
+        // Sprint 9: route to the worktree-isolated writer worker.
+        tracing::info!(
+            run_id = %run_id,
+            task_id = %task_id,
+            agent_role = %task.agent_role,
+            prompt_chars = prompt.chars().count(),
+            "task_runtime: delegating writer task to subagent"
+        );
+        match run_writer_worker(
+            &primary_agent,
+            store.clone(),
+            &run_id,
+            &task_id,
+            &task.agent_role,
+            &prompt,
+            task_cancel.clone(),
+            trace_sink.clone(),
+        )
+        .await
+        {
+            Ok(sub_result) => {
+                tracing::info!(
+                    run_id = %run_id,
+                    task_id = %task_id,
+                    agent_role = %task.agent_role,
+                    output_chars = sub_result.output.chars().count(),
+                    iterations = sub_result.iterations,
+                    usage_reported = sub_result.usage.is_some(),
+                    "task_runtime: writer subagent completed"
+                );
+                (Ok(sub_result.output), sub_result.usage)
+            }
             Err(e) => {
                 // Fallback: run in-place on the primary agent. Logged so the
                 // loss-of-isolation is visible (the run continues rather than
@@ -1215,6 +1362,14 @@ async fn execute_task(
     match result {
         Ok(text) => {
             let summary = summarize_output(&text);
+            tracing::info!(
+                run_id = %run_id,
+                task_id = %task_id,
+                agent_role = %task.agent_role,
+                output_chars = text.chars().count(),
+                summary_chars = summary.chars().count(),
+                "task_runtime: task completed"
+            );
             super::ledger::archive_trace(&run_id, &task_id, &text, None);
             let _ = super::ledger::write_progress(&store, &run_id, None);
             if let Err(e) = store.put_summary(&TaskExecutionSummary {
@@ -1238,7 +1393,10 @@ async fn execute_task(
                     run_id.clone(),
                     worker_trace_id.clone(),
                     WorkerTraceEventKind::WorkerCompleted,
-                    serde_json::json!({ "summary": &summary }),
+                    serde_json::json!({
+                        "summary": &summary,
+                        "output": &text,
+                    }),
                 )
                 .with_agent(task.agent_role.clone())
                 .with_title(task.title.clone()),
@@ -1246,6 +1404,13 @@ async fn execute_task(
             Ok((task_id, Some(summary)))
         }
         Err(e) => {
+            tracing::warn!(
+                run_id = %run_id,
+                task_id = %task_id,
+                agent_role = %task.agent_role,
+                error = %e,
+                "task_runtime: task failed"
+            );
             emit_worker_trace(
                 trace_sink.as_ref(),
                 WorkerTraceEvent::for_worker(
@@ -1392,23 +1557,47 @@ fn build_task_prompt(task: &PlanTask, dep_summaries: &[(String, String)]) -> Str
 async fn run_readonly_worker(
     primary_agent: &crate::agent_handle::AgentHandle,
     run_id: &str,
+    execution_id: &str,
     role: &str,
     prompt: &str,
     cancel: CancellationToken,
+    trace_sink: Option<WorkerTraceSink>,
 ) -> Result<echo_agent::agent::subagent::SubagentResult, String> {
     primary_agent
         .read_async(|agent| {
             let prompt = prompt.to_string();
             let role = role.to_string();
             let run_id = run_id.to_string();
+            let execution_id = execution_id.to_string();
+            let core_trace_sink = worker_trace_sink_to_core(trace_sink);
             Box::pin(async move {
-                agent
+                agent.set_external_context(&echo_core::tools::ExternalRunContext {
+                    run_id: run_id.clone(),
+                    execution_id: Some(execution_id),
+                    cancel: Some(Arc::new(cancel.clone())),
+                    trace_sink: core_trace_sink,
+                });
+                let result = agent
                     .delegate_to_agent_with_parent_and_cancel(&role, &prompt, &run_id, cancel, 0)
                     .await
-                    .map_err(|e| format!("subagent dispatch failed: {e}"))
+                    .map_err(|e| format!("subagent dispatch failed: {e}"));
+                agent.clear_external_context();
+                result
             })
         })
         .await
+}
+
+fn worker_trace_sink_to_core(
+    trace_sink: Option<WorkerTraceSink>,
+) -> Option<echo_core::tools::TraceSinkFn> {
+    trace_sink.map(|sink| {
+        Arc::new(move |event: serde_json::Value| {
+            if let Ok(worker_event) = serde_json::from_value::<WorkerTraceEvent>(event) {
+                sink(worker_event);
+            }
+        }) as echo_core::tools::TraceSinkFn
+    })
 }
 
 /// Run a CODE-WRITER task (implementation / debugging) by delegating to the
@@ -1428,10 +1617,11 @@ async fn run_writer_worker(
     primary_agent: &crate::agent_handle::AgentHandle,
     store: Arc<TaskRuntimeStore>,
     run_id: &str,
+    execution_id: &str,
     role: &str,
     prompt: &str,
     cancel: CancellationToken,
-    _trace_sink: Option<WorkerTraceSink>,
+    trace_sink: Option<WorkerTraceSink>,
 ) -> Result<echo_agent::agent::subagent::SubagentResult, String> {
     // Rebuild a multimodal Message when the run carries user attachments, so
     // the writer worker sees the same images/files as the primary agent would
@@ -1450,9 +1640,17 @@ async fn run_writer_worker(
             let prompt = prompt.to_string();
             let role = role.to_string();
             let run_id = run_id.to_string();
+            let execution_id = execution_id.to_string();
             let run_message = run_message.clone();
+            let core_trace_sink = worker_trace_sink_to_core(trace_sink);
             Box::pin(async move {
-                if let Some(msg) = run_message {
+                agent.set_external_context(&echo_core::tools::ExternalRunContext {
+                    run_id: run_id.clone(),
+                    execution_id: Some(execution_id),
+                    cancel: Some(Arc::new(cancel.clone())),
+                    trace_sink: core_trace_sink,
+                });
+                let result = if let Some(msg) = run_message {
                     agent
                         .delegate_to_agent_with_parent_cancel_and_message(
                             &role, &prompt, msg, &run_id, cancel, 0,
@@ -1465,7 +1663,9 @@ async fn run_writer_worker(
                         )
                         .await
                 }
-                .map_err(|e| format!("writer worker dispatch failed: {e}"))
+                .map_err(|e| format!("writer worker dispatch failed: {e}"));
+                agent.clear_external_context();
+                result
             })
         })
         .await
@@ -1979,6 +2179,7 @@ pub async fn drive_unattended_run(
             let agent = agent_inner.read().await;
             agent.set_external_context(&ExternalRunContext {
                 run_id: run_id_for_scope.clone(),
+                execution_id: None,
                 cancel: Some(std::sync::Arc::new(cancel_for_scope.clone())),
                 trace_sink: None,
             });

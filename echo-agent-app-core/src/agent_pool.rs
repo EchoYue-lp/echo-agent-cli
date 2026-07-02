@@ -737,12 +737,9 @@ impl AgentPool {
         // 4. Wrap in AgentHandle
         let handle = AgentHandle::new(agent);
 
-        // 4a. Register delegate_readonly tool (lets main agent dispatch readonly workers)
-        {
-            use crate::tasks::task_runtime::delegate_readonly_tool::register_delegate_readonly_on_handle;
-            register_delegate_readonly_on_handle(&handle, self.shared.task_runtime_store.clone())
-                .await;
-        }
+        // (delegate_readonly 工具已删除:单步派发内联进 execute_plan。
+        // worker 不再注册 execute_plan——§10.2 防死锁;故 worker 无派发工具,
+        // 需要子任务时自己用文件工具完成。)
 
         // 5. Configure HITL for this agent.
         // Use an empty HitlDispatcher (no REPL provider!) so that if the caller
