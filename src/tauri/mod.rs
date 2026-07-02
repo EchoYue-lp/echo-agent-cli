@@ -448,6 +448,11 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                         agent: name,
                                         mode,
                                         task,
+                                        // execution_id/run_id are now carried by the event
+                                        // (framework透传); the bridge still temp-allocates
+                                        // dispatch_id for backward compat. The double-ledger
+                                        // is dissolved in Phase 4 when this bridge is deleted.
+                                        ..
                                     } => {
                                         let worker_id = allocate_dispatch_id(
                                             &mut active_dispatches,
@@ -485,6 +490,7 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                         tokens_used,
                                         iterations,
                                         output,
+                                        ..
                                     } => {
                                         let worker_id = finish_dispatch_id(
                                             &mut active_dispatches,
@@ -523,6 +529,7 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                         parent,
                                         agent: name,
                                         error,
+                                        ..
                                     } => {
                                         let worker_id = finish_dispatch_id(
                                             &mut active_dispatches,
@@ -553,6 +560,7 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                     SubagentEvent::DispatchCancelled {
                                         parent,
                                         agent: name,
+                                        ..
                                     } => {
                                         let worker_id = finish_dispatch_id(
                                             &mut active_dispatches,
@@ -579,6 +587,7 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                     SubagentEvent::DispatchThinkingStarted {
                                         parent,
                                         agent: name,
+                                        ..
                                     } => {
                                         let worker_id =
                                             current_dispatch_id(&active_dispatches, parent, name);
@@ -598,6 +607,7 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                         parent,
                                         agent: name,
                                         content,
+                                        ..
                                     } => {
                                         let worker_id =
                                             current_dispatch_id(&active_dispatches, parent, name);
@@ -621,6 +631,7 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                         agent: name,
                                         prompt_tokens,
                                         completion_tokens,
+                                        ..
                                     } => {
                                         let worker_id =
                                             current_dispatch_id(&active_dispatches, parent, name);
@@ -644,6 +655,7 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                         parent,
                                         agent: name,
                                         content,
+                                        ..
                                     } => {
                                         let worker_id =
                                             current_dispatch_id(&active_dispatches, parent, name);
@@ -667,6 +679,7 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                         agent: name,
                                         name: tool_name,
                                         args,
+                                        ..
                                     } => {
                                         let worker_id =
                                             current_dispatch_id(&active_dispatches, parent, name);
@@ -692,6 +705,7 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                         name: tool_name,
                                         result,
                                         success,
+                                        ..
                                     } => {
                                         let worker_id =
                                             current_dispatch_id(&active_dispatches, parent, name);

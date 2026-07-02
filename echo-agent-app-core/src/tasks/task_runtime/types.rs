@@ -893,6 +893,122 @@ pub struct Artifact {
     pub metadata: serde_json::Value,
 }
 
+// ── SubagentRun(执行实例,原 Worker 概念的归一化载体)──────────────────────
+//
+// Subagent 统一重构(spec: docs/subagent-unification-plan.md):一次 subagent
+// 派发的运行实例。Task → SubagentRun 关联通过 task_id 查询投影得到,PlanTask
+// 不持有 executions 字段(避免污染 plan artifact)。
+//
+// `subagent_run_id` 与框架 SubagentEvent.execution_id 对齐(格式
+// "{task_id}:{attempt}"),由 TaskRuntime 派发时生成并经 ExternalRunContext
+// 透传,不再由 tauri bridge 临时分配(消除双账本)。
+
+/// Lifecycle status of a [`SubagentRun`]. Mirrors the coarse states the
+/// frontend already renders for the legacy "worker" concept, minus the
+/// pending state (a SubagentRun only exists once dispatch has started).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename = "SubagentRunStatus")]
+pub enum SubagentRunStatus {
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+impl SubagentRunStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SubagentRunStatus::Running => "running",
+            SubagentRunStatus::Completed => "completed",
+            SubagentRunStatus::Failed => "failed",
+            SubagentRunStatus::Cancelled => "cancelled",
+        }
+    }
+
+    #[allow(clippy::should_implement_trait)] // inherent helper returning Option; not the FromStr trait
+    pub fn from_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "running" => SubagentRunStatus::Running,
+            "completed" => SubagentRunStatus::Completed,
+            "failed" => SubagentRunStatus::Failed,
+            "cancelled" => SubagentRunStatus::Cancelled,
+            _ => return None,
+        })
+    }
+}
+
+/// Aggregate cost/usage for a single [`SubagentRun`].
+///
+/// All fields are `Option` because they are populated progressively: a run
+/// that just started has no usage yet. `duration_ms` is finalized on
+/// completion.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, rename = "SubagentRunUsage")]
+pub struct SubagentRunUsage {
+    /// Total wall-clock duration in milliseconds (None while running).
+    pub duration_ms: Option<u64>,
+    /// Total tokens consumed (input + output), if reported by the framework.
+    pub tokens_used: Option<u64>,
+    /// Number of ReAct iterations executed, if reported.
+    pub iterations: Option<u64>,
+}
+
+/// One subagent dispatch execution instance.
+///
+/// Created when the TaskRuntime dispatches a subagent role to execute a
+/// [`PlanTask`]. `subagent_run_id` is the stable identity shared with the
+/// framework `SubagentEvent::execution_id`, so the tauri bridge / frontend
+/// can route thinking/tool/token streams without temporary id allocation.
+///
+/// Thinking/tool/token streams are NOT persisted here (they remain an
+/// in-memory + realtime stream, matching the legacy Worker behavior). Only
+/// lifecycle + usage + result are durable.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, rename = "SubagentRun")]
+pub struct SubagentRun {
+    /// Stable execution id, format "{task_id}:{attempt}". Aligns with
+    /// `SubagentEvent::execution_id`. Was the legacy "worker_id".
+    pub subagent_run_id: String,
+    /// Parent [`TaskRun`] id.
+    pub run_id: String,
+    /// Parent [`PlanTask`] id. Task → SubagentRun association is projected
+    /// via this field (PlanTask itself holds no executions list).
+    pub task_id: String,
+    /// Role name: explorer / reviewer / implementer / ...
+    pub subagent_name: String,
+    /// Retry ordinal (1-based; first attempt = 1).
+    pub attempt: u32,
+    /// Current lifecycle status.
+    pub status: SubagentRunStatus,
+    /// Aggregate cost. Populated progressively; finalized on completion.
+    pub usage: SubagentRunUsage,
+    /// Output returned to the Task on success (None while running).
+    pub result: Option<String>,
+}
+
+impl SubagentRun {
+    /// Construct a freshly-started SubagentRun (status = Running, no usage).
+    pub fn new(
+        subagent_run_id: impl Into<String>,
+        run_id: impl Into<String>,
+        task_id: impl Into<String>,
+        subagent_name: impl Into<String>,
+        attempt: u32,
+    ) -> Self {
+        Self {
+            subagent_run_id: subagent_run_id.into(),
+            run_id: run_id.into(),
+            task_id: task_id.into(),
+            subagent_name: subagent_name.into(),
+            attempt,
+            status: SubagentRunStatus::Running,
+            usage: SubagentRunUsage::default(),
+            result: None,
+        }
+    }
+}
+
 /// Result of a review gate over a task. When `outcome == NeedsFix`, the
 /// runtime (PR 4) creates a new fix task and links it via
 /// `created_fix_task_id`.

@@ -1209,6 +1209,13 @@ async fn execute_task(
         task.kind,
         PlanTaskKind::Implementation | PlanTaskKind::Debugging
     );
+    // Stable execution id for this dispatch: "{task_id}:{attempt}". Aligns
+    // with SubagentRun.subagent_run_id and the framework's
+    // SubagentEvent.execution_id (via ExternalRunContext). Including the
+    // attempt ordinal (= retry_count + 1) keeps retries of the same task
+    // distinguishable, so the bridge/frontend never has to temp-allocate ids.
+    let attempt = task.retry_count.saturating_add(1);
+    let execution_id = format!("{task_id}:{attempt}");
     let (result, readonly_usage) = if is_read_only_task {
         tracing::info!(
             run_id = %run_id,
@@ -1220,7 +1227,7 @@ async fn execute_task(
         match run_readonly_worker(
             &primary_agent,
             &run_id,
-            &task_id,
+            &execution_id,
             &task.agent_role,
             &prompt,
             task_cancel.clone(),
@@ -1264,7 +1271,7 @@ async fn execute_task(
             &primary_agent,
             store.clone(),
             &run_id,
-            &task_id,
+            &execution_id,
             &task.agent_role,
             &prompt,
             task_cancel.clone(),
