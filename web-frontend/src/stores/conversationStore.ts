@@ -263,7 +263,10 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
       // Include tool messages to show the full thinking chain (tool calls + results).
       const chatMessages: ChatMessage[] = record.messages.map((m, idx) => {
         const base: ChatMessage = {
-          id: `loaded-${Date.now()}-${idx}`,
+          // P2-7: 此前用 `loaded-${Date.now()}-${idx}`, 每次加载产生不同 id,
+          // React key 变化导致消息列表全量重渲染。改用会话 id + 索引, 同一会话
+          // 每次加载产生确定性 id, key 稳定。timestamp 仍用 now (无服务端时间)。
+          id: `loaded-${id}-${idx}`,
           role: (m.role === 'tool' ? 'assistant' : m.role) as 'user' | 'assistant',
           content: m.content || '',
           isStreaming: false,

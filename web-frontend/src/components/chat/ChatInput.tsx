@@ -20,6 +20,7 @@ import {
   type ExecutionPolicySnapshot,
 } from '../../api/endpoints';
 import { useUiStore } from '../../stores/uiStore';
+import { useToastStore } from '../../stores/toastStore';
 import type { Attachment, ConfiguredModel } from '../../types/api';
 import {
   filterCommands,
@@ -505,14 +506,25 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
       }
     }
 
-    const attachmentData: Attachment[] = await Promise.all(
-      pendingFiles.map(async (pf) => ({
-        name: pf.name,
-        mime_type: pf.mime_type,
-        data: await fileToBase64(pf.file),
-        size: pf.size,
-      }))
-    );
+    // F1-1: 此前 Promise.all(fileToBase64) 无 catch, 文件编码失败时成为
+    // unhandled rejection, 用户无错误提示 (虽不丢输入, 但卡住无反馈)。改为
+    // try/catch: 失败时 toast 提示 + return (保留输入和文件让用户重试)。
+    let attachmentData: Attachment[];
+    try {
+      attachmentData = await Promise.all(
+        pendingFiles.map(async (pf) => ({
+          name: pf.name,
+          mime_type: pf.mime_type,
+          data: await fileToBase64(pf.file),
+          size: pf.size,
+        }))
+      );
+    } catch (e) {
+      useToastStore
+        .getState()
+        .addToast('error', `附件处理失败：${e instanceof Error ? e.message : String(e)}`);
+      return;
+    }
 
     // Release preview URLs
     pendingFiles.forEach((pf) => {

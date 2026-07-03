@@ -14,20 +14,23 @@ declare global {
 
 // Detect Tauri environment. In dev mode the app is served from Vite over http,
 // so protocol-only checks are not enough.
-const isTauri = (): boolean => {
+// P2-8: 环境在运行期不变, 一次性 memoize。此前每次调用重算 5 个检测, isTauri()
+// 在 endpoints.ts 每个 API 方法里内联调用 (20+ 处), 属热路径反复重算。
+const IS_TAURI: boolean = (() => {
   if (typeof window === 'undefined') return false;
-
   const hasTauriGlobals =
     typeof window.__TAURI_INTERNALS__ !== 'undefined' || typeof window.__TAURI__ !== 'undefined';
   const hasTauriProtocol = window.location.protocol === 'tauri:';
   const hasTauriUserAgent = navigator.userAgent.toLowerCase().includes('tauri');
   const hasTauriDevFlag = new URLSearchParams(window.location.search).has('tauri');
   const hasTauriViteMode = import.meta.env.VITE_EKO_TAURI === '1';
-
   return (
     hasTauriGlobals || hasTauriProtocol || hasTauriUserAgent || hasTauriDevFlag || hasTauriViteMode
   );
-};
+})();
+
+// 保留 isTauri() 函数形式以兼容现有调用点 (大量 `isTauri() ?` 内联)。
+const isTauri = (): boolean => IS_TAURI;
 
 // Dynamic import for Tauri invoke
 async function invoke<T>(cmd: string, args?: Record<string, unknown>): Promise<T> {

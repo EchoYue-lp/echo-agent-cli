@@ -13,6 +13,9 @@
 /// on long-running complex tasks without impacting the user-facing UI.
 const MAX_EVENTS = 500;
 
+/// P1-7: 防止 polling 的 refresh 重叠。模块级而非 state 字段, 避免触发渲染。
+let refreshInFlight = false;
+
 import { create } from 'zustand';
 import { taskRuntimeApi } from '../api/endpoints';
 import type {
@@ -104,6 +107,10 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
     const { pollingInterval } = get();
     if (pollingInterval !== null) return; // already polling
     const interval = setInterval(() => {
+      // P1-7: refresh 含 5 个并行 API 的 Promise.all, 慢网络下可能 >2s。
+      // 若上一次未完成, 跳过本次 tick 防止请求堆积 + 乱序 set 覆盖。
+      // (用模块级 flag 而非 state, 避免触发多余渲染。)
+      if (refreshInFlight) return;
       get()
         .refresh(runId)
         .then(() => {
@@ -128,6 +135,8 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
   },
 
   refresh: async (runId: string) => {
+    // P1-7: refreshInFlight 防止 polling 重叠; finally 确保异常时也清除。
+    refreshInFlight = true;
     try {
       const [run, plan, todos, events, artifacts] = await Promise.all([
         taskRuntimeApi.getRun(runId),
@@ -162,6 +171,8 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
       });
     } catch (e) {
       set({ error: e instanceof Error ? e.message : String(e) });
+    } finally {
+      refreshInFlight = false;
     }
   },
 
