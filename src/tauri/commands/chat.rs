@@ -138,19 +138,44 @@ fn emit_chat_event(
     app.emit("chat://event", payload).is_ok()
 }
 
-fn emit_worker_trace_event(app: &tauri::AppHandle, event: WorkerTraceEvent) -> bool {
-    app.emit("worker://trace", event).is_ok()
+/// Emit an event on the unified `execution://event` channel. `kind` is either
+/// "run" (TaskRun lifecycle: RunStarted/Completed/Failed/Cancelled/StatusChanged)
+/// or "subagent" (main-agent execution flow: Thinking/Tool/Token/Usage — the
+/// main agent is treated as a synthetic subagent run with id "main" so the
+/// frontend renders it with the same WorkerStreamBlock component).
+fn emit_execution_event(
+    app: &tauri::AppHandle,
+    run_id: &str,
+    kind: &str,
+    event: &str,
+    agent: &str,
+    payload: serde_json::Value,
+) {
+    let mut map = serde_json::Map::new();
+    map.insert("kind".into(), kind.into());
+    if kind == "subagent" {
+        map.insert("subagent_run_id".into(), "main".into());
+        map.insert("agent".into(), agent.into());
+    }
+    map.insert("run_id".into(), run_id.into());
+    map.insert("event".into(), event.into());
+    if let serde_json::Value::Object(fields) = payload {
+        for (k, v) in fields {
+            map.insert(k, v);
+        }
+    }
+    let _ = app.emit("execution://event", serde_json::Value::Object(map));
 }
 
-fn chat_trace_event(
-    message_key: &str,
-    event_type: WorkerTraceEventKind,
+/// Shorthand for main-agent execution-flow events (kind="subagent",
+/// subagent_run_id="main").
+fn emit_main_agent_event(
+    app: &tauri::AppHandle,
+    run_id: &str,
+    event: &str,
     payload: serde_json::Value,
-) -> WorkerTraceEvent {
-    WorkerTraceEvent::for_worker(message_key, "main", event_type, payload)
-        .with_agent("echo-assistant")
-        .with_title("Assistant")
-        .with_message_id(message_key)
+) {
+    emit_execution_event(app, run_id, "subagent", event, "echo-assistant", payload);
 }
 
 /// Global pending map for approval/input responses.
@@ -814,35 +839,35 @@ impl echo_agent_app_core::chat_driver::ChatSink for TauriChatSink {
                 &self.message_key,
                 &self.conversation_id,
             );
-            emit_worker_trace_event(
+            emit_execution_event(
                 &self.app,
-                chat_trace_event(
-                    &self.message_key,
-                    WorkerTraceEventKind::RunStarted,
-                    serde_json::json!({
-                        "conversation_id": self.conversation_id,
-                        "mode": "unified_run",
-                        "run_id": self.run_id.clone(),
-                        "route": self.route.clone(),
-                    }),
-                ),
+                &self.run_id,
+                "run",
+                "run_started",
+                "",
+                serde_json::json!({
+                    "conversation_id": self.conversation_id,
+                    "mode": "unified_run",
+                    "run_id": self.run_id.clone(),
+                    "route": self.route.clone(),
+                }),
             );
             return;
         }
-        // Terminal → RunCompleted/Cancelled/Failed trace + RunStatus + Done.
-        let kind = match status {
-            "completed" => WorkerTraceEventKind::RunCompleted,
-            "cancelled" => WorkerTraceEventKind::RunCancelled,
-            "failed" => WorkerTraceEventKind::RunFailed,
-            _ => WorkerTraceEventKind::RunStatusChanged,
+        // Terminal → run_completed/cancelled/failed + RunStatus + Done.
+        let event_name = match status {
+            "completed" => "run_completed",
+            "cancelled" => "run_cancelled",
+            "failed" => "run_failed",
+            _ => "run_status_changed",
         };
-        emit_worker_trace_event(
+        emit_execution_event(
             &self.app,
-            chat_trace_event(
-                &self.message_key,
-                kind,
-                serde_json::json!({ "status": status.to_string() }),
-            ),
+            &self.run_id,
+            "run",
+            event_name,
+            "",
+            serde_json::json!({ "status": status.to_string() }),
         );
         let _ = emit_chat_event(
             &self.app,
@@ -860,26 +885,35 @@ impl echo_agent_app_core::chat_driver::ChatSink for TauriChatSink {
         );
     }
 
-    fn worker_trace_sink(&self) -> Option<std::sync::Arc<dyn Fn(WorkerTraceEvent) + Send + Sync>> {
-        // Rewrite main-agent run_id (frontend filters by activeRun.run_id) +
-        // forward to the frontend, same as the pre-refactor trace_sink closure.
+    fn worker_trace_sink(&self) -> Option<crate::tasks::task_runtime::task_tools::TraceSink> {
+        // Forward main-agent execution-flow events to execution://event.
+        // The framework still emits these as WorkerTraceEvent (via the
+        // trace_sink closure); we re-emit each as kind="subagent" on
+        // execution://event so the frontend can read it from the unified
+        // channel. The legacy worker://trace is no longer emitted from here.
         let app = self.app.clone();
-        let msg_key = self.message_key.clone();
         let run_id = self.run_id.clone();
-        Some(std::sync::Arc::new(move |mut event: WorkerTraceEvent| {
-            if event.worker_id.as_deref() == Some("main") {
-                event.run_id = run_id.clone();
-            }
-            if event.message_id.is_none() {
-                event.message_id = Some(msg_key.clone());
-            }
-            let _ = emit_worker_trace_event(&app, event);
+        Some(std::sync::Arc::new(move |event: WorkerTraceEvent| {
+            let event_name = match event.event_type {
+                WorkerTraceEventKind::WorkerTokenDelta => "token_delta",
+                WorkerTraceEventKind::WorkerThinkingStart => "thinking_started",
+                WorkerTraceEventKind::WorkerThinkingEnd | WorkerTraceEventKind::WorkerLlmUsage => {
+                    "usage"
+                }
+                WorkerTraceEventKind::WorkerToolStart => "tool_started",
+                WorkerTraceEventKind::WorkerToolResult => "tool_completed",
+                WorkerTraceEventKind::WorkerCompleted => "completed",
+                WorkerTraceEventKind::WorkerCancelled => "cancelled",
+                WorkerTraceEventKind::WorkerFailed => "failed",
+                WorkerTraceEventKind::WorkerStarted => "started",
+                _ => return,
+            };
+            emit_main_agent_event(&app, &run_id, event_name, event.payload);
         }))
     }
 
     fn trace_sink(&self) -> Option<echo_core::tools::TraceSinkFn> {
-        // Bridge the framework's Value-based external-context trace_sink to the
-        // worker_trace_sink above (worker emits Value, deserialize → forward).
+        // Bridge the framework's Value-based trace_sink to worker_trace_sink.
         let ws = self.worker_trace_sink()?;
         Some(std::sync::Arc::new(move |value: serde_json::Value| {
             if let Ok(ev) = serde_json::from_value::<WorkerTraceEvent>(value.clone()) {
@@ -919,23 +953,14 @@ fn agent_event_to_chat_event(
     provider_name: &Option<String>,
     route: &str,
 ) -> Option<ChatEvent> {
-    // Local helper: like chat_trace_event but uses the TaskRuntime run_id
-    // so main-agent events land under the correct run in the frontend.
-    let trace = |event_type, payload| {
-        emit_worker_trace_event(
-            app,
-            WorkerTraceEvent::for_worker(run_id, "main", event_type, payload)
-                .with_agent("echo-assistant")
-                .with_title("Assistant")
-                .with_message_id(message_key),
-        )
+    // Local helper: emit a main-agent execution-flow event on
+    // execution://event (kind="subagent", subagent_run_id="main").
+    let trace = |event_name: &str, payload: serde_json::Value| {
+        emit_main_agent_event(app, run_id, event_name, payload);
     };
     match event {
         AgentEvent::Token(data) => {
-            trace(
-                WorkerTraceEventKind::WorkerTokenDelta,
-                serde_json::json!({ "content": data }),
-            );
+            trace("token_delta", serde_json::json!({ "content": data }));
             Some(ChatEvent::Token { data: data.clone() })
         }
         AgentEvent::ThinkStart => {
@@ -947,10 +972,7 @@ fn agent_event_to_chat_event(
                 message_key,
                 conversation_id,
             );
-            trace(
-                WorkerTraceEventKind::WorkerThinkingStart,
-                serde_json::json!({}),
-            );
+            trace("thinking_started", serde_json::json!({}));
             Some(ChatEvent::ThinkingStart)
         }
         AgentEvent::ThinkEnd {
@@ -958,7 +980,7 @@ fn agent_event_to_chat_event(
             completion_tokens,
         } => {
             trace(
-                WorkerTraceEventKind::WorkerThinkingEnd,
+                "usage",
                 serde_json::json!({
                     "prompt_tokens": prompt_tokens,
                     "completion_tokens": completion_tokens
@@ -1031,7 +1053,7 @@ fn agent_event_to_chat_event(
                 let _ = store.insert_usage_record(&record);
             }
             trace(
-                WorkerTraceEventKind::WorkerLlmUsage,
+                "usage",
                 serde_json::json!({
                 "model": model.clone(),
                     "prompt_tokens": prompt_tokens,
@@ -1062,7 +1084,7 @@ fn agent_event_to_chat_event(
                 conversation_id,
             );
             trace(
-                WorkerTraceEventKind::WorkerToolStart,
+                "tool_started",
                 serde_json::json!({ "name": name, "args": args }),
             );
             Some(ChatEvent::ToolStart {
@@ -1072,7 +1094,7 @@ fn agent_event_to_chat_event(
         }
         AgentEvent::ToolResult { name, output } => {
             trace(
-                WorkerTraceEventKind::WorkerToolResult,
+                "tool_completed",
                 serde_json::json!({
                     "name": name,
                     "result": output,
@@ -1087,7 +1109,7 @@ fn agent_event_to_chat_event(
         }
         AgentEvent::ToolError { name, error } => {
             trace(
-                WorkerTraceEventKind::WorkerToolResult,
+                "tool_completed",
                 serde_json::json!({
                     "name": name,
                     "result": error,
@@ -1106,38 +1128,22 @@ fn agent_event_to_chat_event(
         AgentEvent::ToolBatchEnd => Some(ChatEvent::ToolBatchEnd),
         AgentEvent::Chart { spec } => Some(ChatEvent::Chart { spec: spec.clone() }),
         AgentEvent::FinalAnswer(data) => {
-            emit_worker_trace_event(
-                app,
-                chat_trace_event(
-                    message_key,
-                    WorkerTraceEventKind::WorkerCompleted,
-                    serde_json::json!({}),
-                ),
-            );
+            emit_main_agent_event(app, run_id, "completed", serde_json::json!({}));
             Some(ChatEvent::FinalAnswer { data: data.clone() })
         }
         AgentEvent::Cancelled => {
-            emit_worker_trace_event(
-                app,
-                chat_trace_event(
-                    message_key,
-                    WorkerTraceEventKind::WorkerCancelled,
-                    serde_json::json!({}),
-                ),
-            );
+            emit_main_agent_event(app, run_id, "cancelled", serde_json::json!({}));
             Some(ChatEvent::Cancelled)
         }
         AgentEvent::Error { source, message } => {
-            emit_worker_trace_event(
+            emit_main_agent_event(
                 app,
-                chat_trace_event(
-                    message_key,
-                    WorkerTraceEventKind::WorkerFailed,
-                    serde_json::json!({
-                        "source": source,
-                        "message": message
-                    }),
-                ),
+                run_id,
+                "failed",
+                serde_json::json!({
+                    "source": source,
+                    "message": message
+                }),
             );
             Some(ChatEvent::Error {
                 message: format!("{source}: {message}"),

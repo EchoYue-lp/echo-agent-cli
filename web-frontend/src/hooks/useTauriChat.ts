@@ -1,9 +1,7 @@
 import { useRef, useCallback, useEffect } from 'react';
 import { useChatStore } from '../stores/chatStore';
 import { useConversationStore } from '../stores/conversationStore';
-import { useSubagentStore, type SubagentEventPayload } from '../stores/subagentStore';
 import { useSubagentRunStore, type ExecutionEvent } from '../stores/subagentRunStore';
-import { useWorkerTraceStore, type WorkerTraceEvent } from '../stores/workerTraceStore';
 import { isTauri, apiInvoke, errorMessage } from '../lib/tauri-bridge';
 import { handleChatEvent } from './chatEventHandler';
 import type { Attachment, ChatRunStatus } from '../types/api';
@@ -57,21 +55,6 @@ type ChatEvent = ChatEventBase &
     | { type: 'done' }
   );
 
-function normalizeWorkerTraceEvent(event: WorkerTraceEvent): WorkerTraceEvent {
-  if (!event.payload || typeof event.payload !== 'object' || Array.isArray(event.payload)) {
-    return event;
-  }
-  const payloadRunId = (event.payload as Record<string, unknown>).run_id;
-  if (
-    typeof payloadRunId === 'string' &&
-    payloadRunId.length > 0 &&
-    payloadRunId !== event.run_id
-  ) {
-    return { ...event, run_id: payloadRunId };
-  }
-  return event;
-}
-
 export function useTauriChat() {
   const assistantIdRef = useRef<string | null>(null);
   const isCancelledRef = useRef(false);
@@ -114,52 +97,35 @@ export function useTauriChat() {
           handleEvent(event.payload);
         }
       });
-      // Subagent lifecycle events (Phase 5: Subagent visualization)
-      const unlistenSub = await listen<SubagentEventPayload>('subagent://event', (event) => {
-        if (mounted) {
-          useSubagentStore.getState().upsert(event.payload);
-        }
-      });
-      const unlistenWorkerTrace = await listen<WorkerTraceEvent>('worker://trace', (event) => {
-        if (mounted) {
-          const traceEvent = normalizeWorkerTraceEvent(event.payload);
-          useWorkerTraceStore.getState().append(traceEvent);
-          // inline task / 自主 run 通过 RunStarted 事件激活右侧面板。
-          // send_chat_message 返回值不带 run_id（run 在 agent ReAct 循环内异步建），
-          // 故靠此事件驱动 loadByConversation → 激活 activeRun，
-          // 否则 worker 卡片 / 任务进度 / Token 面板全空。
-          if (traceEvent.event_type === 'run_started') {
-            const payload = traceEvent.payload as Record<string, unknown> | undefined;
-            const convId =
-              (payload?.conversation_id as string | undefined) ??
-              useConversationStore.getState().activeId;
-            if (convId) {
-              import('../stores/taskRuntimeStore')
-                .then(({ useTaskRuntimeStore }) => {
-                  useTaskRuntimeStore.getState().loadByConversation(convId);
-                })
-                .catch((e) =>
-                  console.warn('[TauriChat] Failed to load task run on run_started:', e)
-                );
-            }
+      // Unified execution://event channel (Subagent unification Phase 4).
+      // Replaces the legacy worker://trace + subagent://event channels.
+      // kind="subagent" → subagentRunStore (thinking/tool/token/usage flows);
+      // kind="run" → run lifecycle (run_started triggers loadByConversation).
+      const unlistenExec = await listen<Record<string, unknown>>('execution://event', (event) => {
+        if (!mounted) return;
+        const payload = event.payload;
+        const kind = payload.kind as string | undefined;
+        if (kind === 'subagent') {
+          useSubagentRunStore.getState().ingest(payload as unknown as ExecutionEvent);
+        } else if (kind === 'run' && payload.event === 'run_started') {
+          // inline task / 自主 run 通过 run_started 事件激活右侧面板。
+          const convId =
+            (payload.conversation_id as string | undefined) ??
+            useConversationStore.getState().activeId;
+          if (convId) {
+            import('../stores/taskRuntimeStore')
+              .then(({ useTaskRuntimeStore }) => {
+                useTaskRuntimeStore.getState().loadByConversation(convId);
+              })
+              .catch((e) =>
+                console.warn('[TauriChat] Failed to load task run on run_started:', e)
+              );
           }
-        }
-      });
-      // Phase 2 (Subagent unification): unified execution://event channel.
-      // The bridge double-emits every Dispatch* event (incl. thinking/tool/
-      // token deltas) here, keyed by the STABLE subagent_run_id. This store
-      // runs in parallel with the legacy workerTraceStore/subagentStore
-      // (灰度); Phase 3 switches the UI to read exclusively from here.
-      const unlistenExec = await listen<ExecutionEvent>('execution://event', (event) => {
-        if (mounted && event.payload.kind === 'subagent') {
-          useSubagentRunStore.getState().ingest(event.payload);
         }
       });
       const origUnlisten = unlisten;
       unlistenRef.current = () => {
         origUnlisten();
-        unlistenSub();
-        unlistenWorkerTrace();
         unlistenExec();
       };
     };
