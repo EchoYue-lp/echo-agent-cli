@@ -220,15 +220,56 @@ subagent: {
 **产出**:`execution://event` 成为全量事件源,前端新 store 有数据。
 
 ### 🟠 阶段 3:前端切数据源,合并 store
-> 前端从双源切到单源。
+> 前端从双源切到单源。**状态:后端已就绪(3a),前端组件切源待续**。
 
-**前端**(`web-frontend/`):
-1. `useWorkerTraceStore`(151 行)并入升级后的 `subagentRunStore`(原 `subagentStore` 110 行),数据结构采用 workerTraceStore 的丰富版。
-2. UI 渲染(嵌套树 + inline 执行流)全部改读 `subagentRunStore`。
-3. `RightRail.tsx` 去掉 `useWorkerTraceStore` 消费,只留单 store。
-4. `WorkerStreamBlock`(268 行)/ `WorkerDetailView`(343 行)改造为 `SubagentStreamBlock` / `SubagentDetailView`,数据源切换。
+#### 后端(3a,已完成,commits `6ebc2e6`+`a5ffe7a`)
+- `ExternalRunContext.message_id`(echo-core)+ `SubagentEvent::DispatchLlmUsage`(完整 cache 诊断)+ `DispatchStarted.message_id`
+- bridge 双发:`started` 事件带 `message_id`,`usage` 事件带 model/cached/cache_creation/total/usage_reported
+- 前端 `subagentRunStore.ts` 已升级(加 messageId/usageEvents/cache 字段)+ `workerProgress.ts` 已重写适配 ExecutionEvent(**已 stash,组件未切源时 tsc 红**)
 
-**验证**:UI 上已完全无 "worker" 字样,功能正常(thinking/tool/token 流显示正常)。
+#### 前端组件切源(3b,待续 — 新窗口接续)
+**关键决策(已与用户确认)**:message_id 和 cache 字段都由后端补齐(3a 已完成),不降级、不混用旧 store。
+
+**字段映射(WorkerTraceState → SubagentRunState)**:
+| 旧 | 新 | 备注 |
+|---|---|---|
+| `workerId` | `subagentRunId` | store key 也变:旧 `${runId}::${workerId}` → 新 `subagentRunId`(单 id) |
+| `agentName?` | `agent`(非 opt) | |
+| `parentWorkerId?` | `parent?` | |
+| `title?` | 无 | UI 降级:`agent \|\| subagentRunId` |
+| `startedAt: string`(ISO) | `startedAt: number`(epoch ms) | 时间格式变了 |
+| `completedAt?` | 无(用 durationMs) | |
+| `status`(含 planned) | `status`(无 planned) | 去掉 planned |
+| `messageId?` | `messageId?` | 3a 已补 |
+| `events: WorkerTraceEvent[]` | `events: ExecutionEvent[]` | 类型变(见下) |
+
+**事件映射(WorkerTraceEvent → ExecutionEvent)**:
+| 旧 `event_type` | 新 `event` | 字段 `payload.*` → 顶层 |
+|---|---|---|
+| `worker_started` | `started` | — |
+| `worker_thinking_start/delta/end` | `thinking_started/delta/usage` | `content` 顶层 |
+| `worker_tool_start` | `tool_started` | `name`/`args` 顶层(非 `payload.name`) |
+| `worker_tool_result` | `tool_completed` | `name`/`result`/`success` 顶层 |
+| `worker_token_delta` | `token_delta` | `content` 顶层 |
+| `worker_llm_usage` | `usage`(DispatchLlmUsage) | model/cached/cache_creation/total 顶层(3a 补) |
+| `worker_completed/failed/cancelled` | `completed/failed/cancelled` | — |
+| `worker_planned`/`run_*` | 无 | 不迁移(run 级另走 task://event) |
+
+**待改文件清单(8 组件 + 1 hook + 1 util)**:
+1. `hooks/useTauriChat.ts` — 删 `normalizeWorkerTraceEvent`(:60)+ worker://trace/subagent://event 监听(留 execution://event)。**注意**:`run_started` 副作用(:131 触发 loadByConversation)迁移到 execution 事件或保留(它来自 chat.rs 路径,不在 SubagentEvent,需另查)。
+2. `utils/workerProgress.ts` — ✅ 已重写(stash 里)
+3. `components/chat/WorkerStreamBlock.tsx`(268 行)— props 类型改 `SubagentRunState`/`ExecutionEvent`;`reconstructSteps`(:31)、`workerResult`(:76)重写(event 字符串 + 顶层字段);`selectWorker(runId, workerId)` 改单 id;children 过滤 `parentWorkerId`→`parent`;`worker.title||agentName` 降级
+4. `components/chat/ParallelExecutionBlock.tsx`(58 行)— `useWorkerTraceStore`→`useSubagentRunStore`;`w.messageId===messageId` 现在用 `run.messageId`(3a 已补);顶层过滤 `parentWorkerId`→`parent`
+5. `components/task/WorkerDetailView.tsx`(344 行)— 同 WorkerStreamBlock,`reconstructSteps`(:53,含 text/usage step);`usageLine`(:146)改读 usageEvents 的 cache 字段;`cacheUsageForWorkers` 入参类型变
+6. `components/task/TaskRuntimePanel.tsx` — `cacheUsageFromEvents`(:168)/`isUsageEvent`(:145)改读 ExecutionEvent 的 `usage` 事件 + 顶层 cache 字段;`traceWorkerForTodo`(:430 按 agentName 匹配改 agent)
+7. `components/subagent/SubagentCard.tsx`(189 行)— 类型 `SubagentState`→`SubagentRunState`;`s.id`→`s.subagentRunId`;`selectWorker(s.parent, s.id)` 改单 id。**最简单,机械**
+8. `components/layout/RightRail.tsx`(205 行)— 删 `useWorkerTraceStore`+`useSubagentStore`(行 6-7),换 `useSubagentRunStore`;`visibleWorkers`(:57)key 变 + `startedAt` 类型变;`<SubagentPanel subagents>` 数据源换 runs
+9. `components/chat/ChatPanel.tsx` — `traceWorkers["runId::workerId"]`(:35 双 key)改单 key `runs[subagentRunId]`
+10. `stores/workerDetailStore.ts`(18 行)— `selected:{runId,workerId}`→`{subagentRunId}`;`selectWorker` 签名单参
+
+**建议顺序**:先 workerDetailStore + SubagentCard(机械)→ RightRail + ChatPanel(数据源/key)→ WorkerStreamBlock + ParallelExecutionBlock(重放逻辑)→ WorkerDetailView + TaskRuntimePanel(cache)→ useTauriChat(删旧监听)。每个改完跑 `npx tsc -b` 渐进消错。
+
+**验证**:`npx tsc -b` + `npm run build`(零 error)+ UI 手动跑复杂任务确认 thinking/tool/token 流 + Token/Cache 面板正常。
 **产出**:前端单 store、单数据源,UI 无 worker。
 
 ### 🔴 阶段 4:最后才删 worker 协议和 bridge
@@ -385,7 +426,7 @@ cd echo-agent-cli/web-frontend && npx tsc -b && npm run build
 |---|---|---|---|
 | 阶段 1:SubagentRun + 稳定 identity | ✅ 完成 | echo-agent `b17b323` + echo-agent-cli `ef08911`(2026-07-02) | 纯新增,零破坏。框架 SubagentEvent 9 个 Dispatch* 变体加 execution_id/run_id + executor 11 处 emit/6 处调用点透传;应用层新增 SubagentRun/SubagentRunStatus/SubagentRunUsage + execute_task 生成 `{task_id}:{attempt}` + bridge 10 arm 加 `..`(GUI feature 补漏)。验证:框架逐 crate 1396 test + CLI 381 test + GUI target + 前端全绿 |
 | 阶段 2:全量事件源(双发灰度) | ✅ 完成 | echo-agent-cli `e6e5cb9`(2026-07-03) | 后端 bridge 10 arm 双发 execution://event(带稳定 subagent_run_id)+ 前端新增 subagentRunStore 消费。worker trace/subagent 通道保留(灰度并存)。验证:CLI test 381 + GUI target + 前端 tsc/build 全绿 |
-| 阶段 3:前端切源 + 合并 store | ⏳ 待执行 | — | UI 无 worker |
+| 阶段 3:前端切源 + 合并 store | 🟡 进行中(后端就绪) | 后端:echo-agent `6ebc2e6` + echo-agent-cli `a5ffe7a`(2026-07-03);前端:subagentRunStore 升级 + workerProgress 重写已 stash,组件切源待续 | **后端已完成**:ExternalRunContext.message_id + DispatchLlmUsage(完整 cache 诊断)+ bridge 双发。**前端 WIP**:`subagentRunStore.ts`(加 messageId/usageEvents/cache 字段)+ `workerProgress.ts`(适配 ExecutionEvent)已改完但 stash(组件未切源,tsc 红)。**待续**:8 个组件切源(SubagentCard/RightRail/ParallelExecution/WorkerStreamBlock/WorkerDetailView/ChatPanel/TaskRuntimePanel/workerDetailStore)+ 重写 reconstructSteps/workerResult ×2 + 删 normalizeWorkerTraceEvent。详见 spec §6 阶段 3 + 调研报告字段映射表 |
 | 阶段 4:删 worker 协议和 bridge | ⏳ 待执行 | — | 最高风险,新鲜上下文 |
 | 阶段 5:文档 | ⏳ 待执行 | — | 删旧文档 + 更新 deep-dive |
 
