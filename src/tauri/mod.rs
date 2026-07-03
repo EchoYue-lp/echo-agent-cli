@@ -370,69 +370,17 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                 });
             }
 
-            // Spawn subagent event emitter — bridges SubagentEventBus to Tauri events
-            // (Phase 5: Subagent visualization).
+            // Subagent execution event bridge — forward every SubagentEventBus
+            // event onto the unified `execution://event` Tauri channel. The
+            // legacy `worker://trace` + `subagent://event` channels and the
+            // temp-id HashMap were removed in Phase 4 of the Subagent
+            // unification; the frontend now reads exclusively from
+            // `execution://event` (keyed by the stable `execution_id` carried
+            // on the event itself, no bridge-side allocation).
             {
                 let app_handle = app.handle().clone();
                 let agent = app.state::<TauriState>().app_state.connection.agent.clone();
                 tokio::spawn(async move {
-                    use std::collections::{HashMap, VecDeque};
-
-                    type DispatchKey = (String, String);
-
-                    fn dispatch_key(parent: &str, agent: &str) -> DispatchKey {
-                        (parent.to_string(), agent.to_string())
-                    }
-
-                    fn allocate_dispatch_id(
-                        active: &mut HashMap<DispatchKey, VecDeque<String>>,
-                        next_seq: &mut u64,
-                        parent: &str,
-                        agent: &str,
-                    ) -> String {
-                        *next_seq = next_seq.saturating_add(1);
-                        let dispatch_id = format!("{parent}:{agent}:{}", *next_seq);
-                        active
-                            .entry(dispatch_key(parent, agent))
-                            .or_default()
-                            .push_back(dispatch_id.clone());
-                        dispatch_id
-                    }
-
-                    fn current_dispatch_id(
-                        active: &HashMap<DispatchKey, VecDeque<String>>,
-                        parent: &str,
-                        agent: &str,
-                    ) -> String {
-                        active
-                            .get(&dispatch_key(parent, agent))
-                            .and_then(|ids| ids.back())
-                            .cloned()
-                            .unwrap_or_else(|| format!("{parent}:{agent}"))
-                    }
-
-                    fn finish_dispatch_id(
-                        active: &mut HashMap<DispatchKey, VecDeque<String>>,
-                        parent: &str,
-                        agent: &str,
-                    ) -> String {
-                        let key = dispatch_key(parent, agent);
-                        if let Some(ids) = active.get_mut(&key) {
-                            let dispatch_id = ids
-                                .pop_front()
-                                .unwrap_or_else(|| format!("{parent}:{agent}"));
-                            if ids.is_empty() {
-                                active.remove(&key);
-                            }
-                            dispatch_id
-                        } else {
-                            format!("{parent}:{agent}")
-                        }
-                    }
-
-                    let mut active_dispatches: HashMap<DispatchKey, VecDeque<String>> =
-                        HashMap::new();
-                    let mut next_dispatch_seq = 0_u64;
                     let mut rx = agent
                         .read_async(|a| {
                             Box::pin(async move { a.subagent_registry().event_bus().subscribe() })
@@ -442,134 +390,42 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                         match rx.recv().await {
                             Ok(event) => {
                                 use echo_agent::agent::subagent::SubagentEvent;
-                                // Phase 2 double-emit: forward every Dispatch* event
-                                // (including thinking/tool/token deltas the legacy
-                                // bridge used to swallow with `continue`) onto a
-                                // unified `execution://event` channel keyed by the
-                                // STABLE execution_id carried by the event itself.
-                                // The legacy `worker://trace` + `subagent://event`
-                                // channels keep flowing unchanged (灰度) and are
-                                // removed in Phase 4 once the frontend fully
-                                // switches to `execution://event`.
-                                let emit_exec =
-                                    |event_type: &str,
-                                     execution_id: &Option<String>,
-                                     run_id: &Option<String>,
-                                     agent: &str,
-                                     extra: serde_json::Value| {
-                                        let mut payload = serde_json::Map::new();
-                                        payload.insert("kind".into(), "subagent".into());
-                                        payload.insert(
-                                            "subagent_run_id".into(),
-                                            execution_id
-                                                .clone()
-                                                .unwrap_or_else(|| format!("{agent}:unknown"))
-                                                .into(),
-                                        );
-                                        payload.insert(
-                                            "run_id".into(),
-                                            run_id.clone().unwrap_or_default().into(),
-                                        );
-                                        payload.insert("agent".into(), agent.into());
-                                        payload.insert("event".into(), event_type.into());
-                                        if let serde_json::Value::Object(map) = extra {
-                                            for (k, v) in map {
-                                                payload.insert(k, v);
-                                            }
-                                        }
-                                        let _ = app_handle.emit(
-                                            "execution://event",
-                                            serde_json::Value::Object(payload),
-                                        );
-                                    };
-                                let payload = match event.as_ref() {
-                                    SubagentEvent::DispatchStarted {
-                                        parent,
-                                        agent: name,
-                                        mode,
-                                        task,
-                                        execution_id,
-                                        run_id,
-                                        message_id,
-                                    } => {
-                                        let worker_id = allocate_dispatch_id(
-                                            &mut active_dispatches,
-                                            &mut next_dispatch_seq,
+                                let (event_type, execution_id, run_id, agent_name, extra) =
+                                    match event.as_ref() {
+                                        SubagentEvent::DispatchStarted {
                                             parent,
-                                            name,
-                                        );
-                                        let trace = WorkerTraceEvent::for_worker(
-                                            parent.clone(),
-                                            worker_id.clone(),
-                                            WorkerTraceEventKind::WorkerStarted,
-                                            serde_json::json!({
-                                                "mode": format!("{:?}", mode),
-                                                "dispatch_id": worker_id,
-                                            }),
-                                        )
-                                        .with_agent(name.clone())
-                                        .with_parent_worker(parent.clone())
-                                        .with_title(name.clone())
-                                        .with_task(task.clone());
-                                        let _ = app_handle.emit("worker://trace", &trace);
-                                        emit_exec(
-                                            "started",
+                                            agent,
+                                            mode,
+                                            task,
                                             execution_id,
                                             run_id,
-                                            name,
+                                            message_id,
+                                        } => (
+                                            "started",
+                                            execution_id.clone(),
+                                            run_id.clone(),
+                                            agent.clone(),
                                             serde_json::json!({
                                                 "parent": parent.clone(),
                                                 "mode": format!("{:?}", mode),
                                                 "task": task.clone(),
                                                 "message_id": message_id.clone(),
                                             }),
-                                        );
-                                        serde_json::json!({
-                                            "type": "subagent_started",
-                                            "parent": parent,
-                                            "agent": name,
-                                            "dispatch_id": worker_id,
-                                            "mode": format!("{:?}", mode),
-                                            "task": task,
-                                        })
-                                    }
-                                    SubagentEvent::DispatchCompleted {
-                                        parent,
-                                        agent: name,
-                                        duration_ms,
-                                        tokens_used,
-                                        iterations,
-                                        output,
-                                        execution_id,
-                                        run_id,
-                                    } => {
-                                        let worker_id = finish_dispatch_id(
-                                            &mut active_dispatches,
+                                        ),
+                                        SubagentEvent::DispatchCompleted {
                                             parent,
-                                            name,
-                                        );
-                                        let trace = WorkerTraceEvent::for_worker(
-                                            parent.clone(),
-                                            worker_id.clone(),
-                                            WorkerTraceEventKind::WorkerCompleted,
-                                            serde_json::json!({
-                                                "duration_ms": duration_ms,
-                                                "tokens_used": tokens_used,
-                                                "iteration_count": iterations,
-                                                "output": output.clone(),
-                                                "summary": output.clone(),
-                                                "dispatch_id": worker_id,
-                                            }),
-                                        )
-                                        .with_agent(name.clone())
-                                        .with_parent_worker(parent.clone())
-                                        .with_title(name.clone());
-                                        let _ = app_handle.emit("worker://trace", &trace);
-                                        emit_exec(
-                                            "completed",
+                                            agent,
+                                            duration_ms,
+                                            tokens_used,
+                                            iterations,
+                                            output,
                                             execution_id,
                                             run_id,
-                                            name,
+                                        } => (
+                                            "completed",
+                                            execution_id.clone(),
+                                            run_id.clone(),
+                                            agent.clone(),
                                             serde_json::json!({
                                                 "parent": parent.clone(),
                                                 "duration_ms": duration_ms,
@@ -577,318 +433,145 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                                 "iteration_count": iterations,
                                                 "output": output.clone(),
                                             }),
-                                        );
-                                        serde_json::json!({
-                                            "type": "subagent_completed",
-                                            "parent": parent,
-                                            "agent": name,
-                                            "dispatch_id": worker_id,
-                                            "duration_ms": duration_ms,
-                                            "tokens_used": tokens_used,
-                                            "iteration_count": iterations,
-                                            "output": output.clone(),
-                                        })
-                                    }
-                                    SubagentEvent::DispatchFailed {
-                                        parent,
-                                        agent: name,
-                                        error,
-                                        execution_id,
-                                        run_id,
-                                    } => {
-                                        let worker_id = finish_dispatch_id(
-                                            &mut active_dispatches,
+                                        ),
+                                        SubagentEvent::DispatchFailed {
                                             parent,
-                                            name,
-                                        );
-                                        let trace = WorkerTraceEvent::for_worker(
-                                            parent.clone(),
-                                            worker_id.clone(),
-                                            WorkerTraceEventKind::WorkerFailed,
-                                            serde_json::json!({
-                                                "error": error,
-                                                "dispatch_id": worker_id,
-                                            }),
-                                        )
-                                        .with_agent(name.clone())
-                                        .with_parent_worker(parent.clone())
-                                        .with_title(name.clone());
-                                        let _ = app_handle.emit("worker://trace", &trace);
-                                        emit_exec(
-                                            "failed",
+                                            agent,
+                                            error,
                                             execution_id,
                                             run_id,
-                                            name,
+                                        } => (
+                                            "failed",
+                                            execution_id.clone(),
+                                            run_id.clone(),
+                                            agent.clone(),
                                             serde_json::json!({
                                                 "parent": parent.clone(),
                                                 "error": error.clone(),
                                             }),
-                                        );
-                                        serde_json::json!({
-                                            "type": "subagent_failed",
-                                            "parent": parent,
-                                            "agent": name,
-                                            "dispatch_id": worker_id,
-                                            "error": error,
-                                        })
-                                    }
-                                    SubagentEvent::DispatchCancelled {
-                                        parent,
-                                        agent: name,
-                                        execution_id,
-                                        run_id,
-                                    } => {
-                                        let worker_id = finish_dispatch_id(
-                                            &mut active_dispatches,
+                                        ),
+                                        SubagentEvent::DispatchCancelled {
                                             parent,
-                                            name,
-                                        );
-                                        let trace = WorkerTraceEvent::for_worker(
-                                            parent.clone(),
-                                            worker_id.clone(),
-                                            WorkerTraceEventKind::WorkerCancelled,
-                                            serde_json::json!({ "dispatch_id": worker_id }),
-                                        )
-                                        .with_agent(name.clone())
-                                        .with_parent_worker(parent.clone())
-                                        .with_title(name.clone());
-                                        let _ = app_handle.emit("worker://trace", &trace);
-                                        emit_exec(
+                                            agent,
+                                            execution_id,
+                                            run_id,
+                                        } => (
                                             "cancelled",
-                                            execution_id,
-                                            run_id,
-                                            name,
+                                            execution_id.clone(),
+                                            run_id.clone(),
+                                            agent.clone(),
                                             serde_json::json!({ "parent": parent.clone() }),
-                                        );
-                                        serde_json::json!({
-                                            "type": "subagent_cancelled",
-                                            "parent": parent,
-                                            "agent": name,
-                                            "dispatch_id": worker_id,
-                                        })
-                                    }
-                                    SubagentEvent::DispatchThinkingStarted {
-                                        parent,
-                                        agent: name,
-                                        execution_id,
-                                        run_id,
-                                    } => {
-                                        let worker_id =
-                                            current_dispatch_id(&active_dispatches, parent, name);
-                                        let trace = WorkerTraceEvent::for_worker(
-                                            parent.clone(),
-                                            worker_id.clone(),
-                                            WorkerTraceEventKind::WorkerThinkingStart,
-                                            serde_json::json!({ "dispatch_id": worker_id }),
-                                        )
-                                        .with_agent(name.clone())
-                                        .with_parent_worker(parent.clone())
-                                        .with_title(name.clone());
-                                        let _ = app_handle.emit("worker://trace", &trace);
-                                        emit_exec(
+                                        ),
+                                        SubagentEvent::DispatchThinkingStarted {
+                                            parent,
+                                            agent,
+                                            execution_id,
+                                            run_id,
+                                        } => (
                                             "thinking_started",
-                                            execution_id,
-                                            run_id,
-                                            name,
+                                            execution_id.clone(),
+                                            run_id.clone(),
+                                            agent.clone(),
                                             serde_json::json!({}),
-                                        );
-                                        continue;
-                                    }
-                                    SubagentEvent::DispatchThinkingDelta {
-                                        parent,
-                                        agent: name,
-                                        content,
-                                        execution_id,
-                                        run_id,
-                                    } => {
-                                        let worker_id =
-                                            current_dispatch_id(&active_dispatches, parent, name);
-                                        let trace = WorkerTraceEvent::for_worker(
-                                            parent.clone(),
-                                            worker_id.clone(),
-                                            WorkerTraceEventKind::WorkerThinkingDelta,
-                                            serde_json::json!({
-                                                "content": content,
-                                                "dispatch_id": worker_id,
-                                            }),
-                                        )
-                                        .with_agent(name.clone())
-                                        .with_parent_worker(parent.clone())
-                                        .with_title(name.clone());
-                                        let _ = app_handle.emit("worker://trace", &trace);
-                                        emit_exec(
+                                        ),
+                                        SubagentEvent::DispatchThinkingDelta {
+                                            parent,
+                                            agent,
+                                            content,
+                                            execution_id,
+                                            run_id,
+                                        } => (
                                             "thinking_delta",
-                                            execution_id,
-                                            run_id,
-                                            name,
-                                            serde_json::json!({ "content": content }),
-                                        );
-                                        continue;
-                                    }
-                                    SubagentEvent::DispatchThinkingEnded {
-                                        parent,
-                                        agent: name,
-                                        prompt_tokens,
-                                        completion_tokens,
-                                        execution_id,
-                                        run_id,
-                                    } => {
-                                        let worker_id =
-                                            current_dispatch_id(&active_dispatches, parent, name);
-                                        let trace = WorkerTraceEvent::for_worker(
-                                            parent.clone(),
-                                            worker_id.clone(),
-                                            WorkerTraceEventKind::WorkerThinkingEnd,
-                                            serde_json::json!({
-                                                "prompt_tokens": prompt_tokens,
-                                                "completion_tokens": completion_tokens,
-                                                "dispatch_id": worker_id,
-                                            }),
-                                        )
-                                        .with_agent(name.clone())
-                                        .with_parent_worker(parent.clone())
-                                        .with_title(name.clone());
-                                        let _ = app_handle.emit("worker://trace", &trace);
-                                        emit_exec(
-                                            "usage",
-                                            execution_id,
-                                            run_id,
-                                            name,
-                                            serde_json::json!({
-                                                "prompt_tokens": prompt_tokens,
-                                                "completion_tokens": completion_tokens,
-                                            }),
-                                        );
-                                        continue;
-                                    }
-                                    SubagentEvent::DispatchTokenDelta {
-                                        parent,
-                                        agent: name,
-                                        content,
-                                        execution_id,
-                                        run_id,
-                                    } => {
-                                        let worker_id =
-                                            current_dispatch_id(&active_dispatches, parent, name);
-                                        let trace = WorkerTraceEvent::for_worker(
-                                            parent.clone(),
-                                            worker_id.clone(),
-                                            WorkerTraceEventKind::WorkerTokenDelta,
+                                            execution_id.clone(),
+                                            run_id.clone(),
+                                            agent.clone(),
                                             serde_json::json!({
                                                 "content": content,
-                                                "dispatch_id": worker_id,
                                             }),
-                                        )
-                                        .with_agent(name.clone())
-                                        .with_parent_worker(parent.clone())
-                                        .with_title(name.clone());
-                                        let _ = app_handle.emit("worker://trace", &trace);
-                                        emit_exec(
-                                            "token_delta",
+                                        ),
+                                        SubagentEvent::DispatchThinkingEnded {
+                                            parent,
+                                            agent,
+                                            prompt_tokens,
+                                            completion_tokens,
                                             execution_id,
                                             run_id,
-                                            name,
-                                            serde_json::json!({ "content": content }),
-                                        );
-                                        continue;
-                                    }
-                                    SubagentEvent::DispatchToolStarted {
-                                        parent,
-                                        agent: name,
-                                        name: tool_name,
-                                        args,
-                                        execution_id,
-                                        run_id,
-                                    } => {
-                                        let worker_id =
-                                            current_dispatch_id(&active_dispatches, parent, name);
-                                        let trace = WorkerTraceEvent::for_worker(
-                                            parent.clone(),
-                                            worker_id.clone(),
-                                            WorkerTraceEventKind::WorkerToolStart,
-                                            serde_json::json!({
-                                                "name": tool_name,
-                                                "args": args,
-                                                "dispatch_id": worker_id,
-                                            }),
-                                        )
-                                        .with_agent(name.clone())
-                                        .with_parent_worker(parent.clone())
-                                        .with_title(name.clone());
-                                        let _ = app_handle.emit("worker://trace", &trace);
-                                        emit_exec(
-                                            "tool_started",
-                                            execution_id,
-                                            run_id,
-                                            name,
-                                            serde_json::json!({
-                                                "name": tool_name,
-                                                "args": args,
-                                            }),
-                                        );
-                                        continue;
-                                    }
-                                    SubagentEvent::DispatchToolCompleted {
-                                        parent,
-                                        agent: name,
-                                        name: tool_name,
-                                        result,
-                                        success,
-                                        execution_id,
-                                        run_id,
-                                    } => {
-                                        let worker_id =
-                                            current_dispatch_id(&active_dispatches, parent, name);
-                                        let trace = WorkerTraceEvent::for_worker(
-                                            parent.clone(),
-                                            worker_id.clone(),
-                                            WorkerTraceEventKind::WorkerToolResult,
-                                            serde_json::json!({
-                                                "name": tool_name,
-                                                "result": result,
-                                                "success": success,
-                                                "dispatch_id": worker_id,
-                                            }),
-                                        )
-                                        .with_agent(name.clone())
-                                        .with_parent_worker(parent.clone())
-                                        .with_title(name.clone());
-                                        let _ = app_handle.emit("worker://trace", &trace);
-                                        emit_exec(
-                                            "tool_completed",
-                                            execution_id,
-                                            run_id,
-                                            name,
-                                            serde_json::json!({
-                                                "name": tool_name,
-                                                "result": result,
-                                                "success": success,
-                                            }),
-                                        );
-                                        continue;
-                                    }
-                                    SubagentEvent::DispatchLlmUsage {
-                                        parent,
-                                        agent: name,
-                                        model,
-                                        prompt_tokens,
-                                        completion_tokens,
-                                        total_tokens,
-                                        cached_prompt_tokens,
-                                        cache_creation_prompt_tokens,
-                                        usage_reported,
-                                        execution_id,
-                                        run_id,
-                                    } => {
-                                        // No legacy worker trace equivalent for the
-                                        // full cache breakdown; forward straight to
-                                        // execution://event so the frontend Token/Cache
-                                        // panel keeps its diagnostics post-migration.
-                                        emit_exec(
+                                        } => (
                                             "usage",
+                                            execution_id.clone(),
+                                            run_id.clone(),
+                                            agent.clone(),
+                                            serde_json::json!({
+                                                "prompt_tokens": prompt_tokens,
+                                                "completion_tokens": completion_tokens,
+                                            }),
+                                        ),
+                                        SubagentEvent::DispatchTokenDelta {
+                                            parent,
+                                            agent,
+                                            content,
                                             execution_id,
                                             run_id,
-                                            name,
+                                        } => (
+                                            "token_delta",
+                                            execution_id.clone(),
+                                            run_id.clone(),
+                                            agent.clone(),
+                                            serde_json::json!({ "content": content }),
+                                        ),
+                                        SubagentEvent::DispatchToolStarted {
+                                            parent,
+                                            agent,
+                                            name: tool_name,
+                                            args,
+                                            execution_id,
+                                            run_id,
+                                        } => (
+                                            "tool_started",
+                                            execution_id.clone(),
+                                            run_id.clone(),
+                                            agent.clone(),
+                                            serde_json::json!({
+                                                "name": tool_name,
+                                                "args": args,
+                                            }),
+                                        ),
+                                        SubagentEvent::DispatchToolCompleted {
+                                            parent,
+                                            agent,
+                                            name: tool_name,
+                                            result,
+                                            success,
+                                            execution_id,
+                                            run_id,
+                                        } => (
+                                            "tool_completed",
+                                            execution_id.clone(),
+                                            run_id.clone(),
+                                            agent.clone(),
+                                            serde_json::json!({
+                                                "name": tool_name,
+                                                "result": result,
+                                                "success": success,
+                                            }),
+                                        ),
+                                        SubagentEvent::DispatchLlmUsage {
+                                            parent,
+                                            agent,
+                                            model,
+                                            prompt_tokens,
+                                            completion_tokens,
+                                            total_tokens,
+                                            cached_prompt_tokens,
+                                            cache_creation_prompt_tokens,
+                                            usage_reported,
+                                            execution_id,
+                                            run_id,
+                                        } => (
+                                            "usage",
+                                            execution_id.clone(),
+                                            run_id.clone(),
+                                            agent.clone(),
                                             serde_json::json!({
                                                 "parent": parent.clone(),
                                                 "model": model.clone(),
@@ -900,12 +583,29 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                                     cache_creation_prompt_tokens,
                                                 "usage_reported": usage_reported,
                                             }),
-                                        );
-                                        continue;
+                                        ),
+                                        // Registered/Unregistered/Team* are not
+                                        // execution-flow events; skip them.
+                                        _ => continue,
+                                    };
+                                let mut payload = serde_json::Map::new();
+                                payload.insert("kind".into(), "subagent".into());
+                                payload.insert(
+                                    "subagent_run_id".into(),
+                                    execution_id
+                                        .unwrap_or_else(|| format!("{agent_name}:unknown"))
+                                        .into(),
+                                );
+                                payload.insert("run_id".into(), run_id.unwrap_or_default().into());
+                                payload.insert("agent".into(), agent_name.into());
+                                payload.insert("event".into(), event_type.into());
+                                if let serde_json::Value::Object(map) = extra {
+                                    for (k, v) in map {
+                                        payload.insert(k, v);
                                     }
-                                    _ => continue,
-                                };
-                                let _ = app_handle.emit("subagent://event", &payload);
+                                }
+                                let _ = app_handle
+                                    .emit("execution://event", serde_json::Value::Object(payload));
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                                 tracing::warn!("Subagent event receiver lagged by {} events", n);
