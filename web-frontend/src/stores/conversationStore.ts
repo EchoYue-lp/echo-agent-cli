@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { useChatStore } from './chatStore';
 import { sessionApi, conversationApi } from '../api/endpoints';
+import { useToastStore } from './toastStore';
 import type { ChatMessage } from '../types/api';
 
 // ── Types ──
@@ -170,7 +171,8 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
   init: async () => {
     try {
       const items = await conversationApi.list();
-      if (import.meta.env.DEV) console.debug('[conversationStore] init: loaded', items.length, 'conversations');
+      if (import.meta.env.DEV)
+        console.debug('[conversationStore] init: loaded', items.length, 'conversations');
       const metas: ConversationMeta[] = items
         .map((item) => ({
           id: item.conversation_id,
@@ -196,7 +198,8 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
     const title = firstUserMsg?.content?.slice(0, 50) || 'New Chat';
     const savedMessages = chatMessagesToSaved(messages);
 
-    if (import.meta.env.DEV) console.debug('[saveCurrent] activeId:', activeId, 'msgCount:', messages.length);
+    if (import.meta.env.DEV)
+      console.debug('[saveCurrent] activeId:', activeId, 'msgCount:', messages.length);
 
     try {
       if (activeId) {
@@ -225,7 +228,8 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
     // Refresh list (best-effort, must not throw)
     try {
       const items = await conversationApi.list();
-      if (import.meta.env.DEV) console.debug('[saveCurrent] refreshed list:', items.length, 'conversations');
+      if (import.meta.env.DEV)
+        console.debug('[saveCurrent] refreshed list:', items.length, 'conversations');
       const metas: ConversationMeta[] = items
         .map((item) => ({
           id: item.conversation_id,
@@ -282,19 +286,26 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
         // Restore execution rounds (round-based model).
         // Typed via the SavedMessage shape instead of `any` (P1-40).
         if (m.execution_rounds && m.execution_rounds.length > 0) {
-          type ExecutionRoundTool = { name: string; args: unknown; result: string; success: boolean };
+          type ExecutionRoundTool = {
+            name: string;
+            args: unknown;
+            result: string;
+            success: boolean;
+          };
           type ExecutionRound = {
             thinking?: { content: string };
             tools: ExecutionRoundTool[];
           };
           base.executionRounds = (m.execution_rounds as ExecutionRound[]).map((r) => ({
             thinking: r.thinking ? { content: r.thinking.content } : undefined,
-            tools: (r.tools || []).map((t): ExecutionRoundTool => ({
-              name: t.name,
-              args: t.args || {},
-              result: t.result || '',
-              success: t.success ?? true,
-            })),
+            tools: (r.tools || []).map(
+              (t): ExecutionRoundTool => ({
+                name: t.name,
+                args: t.args || {},
+                result: t.result || '',
+                success: t.success ?? true,
+              })
+            ),
           }));
         }
 
@@ -352,13 +363,16 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
   },
 
   deleteConversation: async (id: string) => {
+    // P1-12: 此前 catch 吞错后仍执行本地删除 → 后端还在但前端已移除,
+    // 刷新后数据"恢复"又"丢失", 体验混乱。改为 API 失败则不更新本地 + 报错。
     try {
       await conversationApi.delete(id);
     } catch (e) {
       console.error('Failed to delete conversation:', e);
+      useToastStore.getState().addToast('error', '删除会话失败，请重试');
+      return;
     }
 
-    // Refresh list
     set((s) => {
       const conversations = s.conversations.filter((c) => c.id !== id);
       return {
@@ -369,13 +383,15 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
   },
 
   renameConversation: async (id: string, title: string) => {
+    // P1-12: 同 deleteConversation, API 失败则不更新本地 + 报错。
     try {
       await conversationApi.update(id, { title });
     } catch (e) {
       console.error('Failed to rename conversation:', e);
+      useToastStore.getState().addToast('error', '重命名会话失败，请重试');
+      return;
     }
 
-    // Update local state
     set((s) => ({
       conversations: s.conversations.map((c) => (c.id === id ? { ...c, title } : c)),
     }));

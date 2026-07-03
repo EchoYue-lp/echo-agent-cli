@@ -111,7 +111,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   addUserMessage: (content, attachments) => {
     set((s) => {
-      const newMsg: ChatMessage = { id: nextId(), role: 'user', content, attachments, timestamp: Date.now() };
+      const newMsg: ChatMessage = {
+        id: nextId(),
+        role: 'user',
+        content,
+        attachments,
+        timestamp: Date.now(),
+      };
       const msgs = trimToMax([...s.messages, newMsg]);
       return { isCancelled: false, runStatus: 'running', messages: msgs };
     });
@@ -329,7 +335,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   setApprovalRequest: (r) =>
     set({ approvalRequest: r, runStatus: r ? 'waiting_approval' : get().runStatus }),
-  setInputRequest: (r) => set({ inputRequest: r, runStatus: r ? 'waiting_input' : get().runStatus }),
+  setInputRequest: (r) =>
+    set({ inputRequest: r, runStatus: r ? 'waiting_input' : get().runStatus }),
   setSelectionRequest: (r) =>
     set({ selectionRequest: r, runStatus: r ? 'waiting_input' : get().runStatus }),
 
@@ -394,6 +401,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
     // Remove everything from the last user message onwards
     set({ messages: messages.slice(0, lastUserIdx) });
+    // P1-11: 这两个 prepare* 方法改了 messages 后未保存, 刷新/崩溃会丢失修改。
+    scheduleAutoSave();
     return userContent;
   },
 
@@ -410,6 +419,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
       timestamp: Date.now(),
     });
     set({ messages: updated });
+    // P1-11: 同 prepareRegenerate, 改完要保存。
+    scheduleAutoSave();
     return newContent;
   },
 }));
