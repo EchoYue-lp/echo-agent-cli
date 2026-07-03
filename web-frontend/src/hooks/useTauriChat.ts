@@ -2,6 +2,7 @@ import { useRef, useCallback, useEffect } from 'react';
 import { useChatStore } from '../stores/chatStore';
 import { useConversationStore } from '../stores/conversationStore';
 import { useSubagentStore, type SubagentEventPayload } from '../stores/subagentStore';
+import { useSubagentRunStore, type ExecutionEvent } from '../stores/subagentRunStore';
 import { useWorkerTraceStore, type WorkerTraceEvent } from '../stores/workerTraceStore';
 import { isTauri, apiInvoke, errorMessage } from '../lib/tauri-bridge';
 import { handleChatEvent } from './chatEventHandler';
@@ -144,11 +145,22 @@ export function useTauriChat() {
           }
         }
       });
+      // Phase 2 (Subagent unification): unified execution://event channel.
+      // The bridge double-emits every Dispatch* event (incl. thinking/tool/
+      // token deltas) here, keyed by the STABLE subagent_run_id. This store
+      // runs in parallel with the legacy workerTraceStore/subagentStore
+      // (灰度); Phase 3 switches the UI to read exclusively from here.
+      const unlistenExec = await listen<ExecutionEvent>('execution://event', (event) => {
+        if (mounted && event.payload.kind === 'subagent') {
+          useSubagentRunStore.getState().ingest(event.payload);
+        }
+      });
       const origUnlisten = unlisten;
       unlistenRef.current = () => {
         origUnlisten();
         unlistenSub();
         unlistenWorkerTrace();
+        unlistenExec();
       };
     };
 

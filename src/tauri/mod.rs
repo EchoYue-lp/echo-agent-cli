@@ -442,17 +442,54 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                         match rx.recv().await {
                             Ok(event) => {
                                 use echo_agent::agent::subagent::SubagentEvent;
+                                // Phase 2 double-emit: forward every Dispatch* event
+                                // (including thinking/tool/token deltas the legacy
+                                // bridge used to swallow with `continue`) onto a
+                                // unified `execution://event` channel keyed by the
+                                // STABLE execution_id carried by the event itself.
+                                // The legacy `worker://trace` + `subagent://event`
+                                // channels keep flowing unchanged (灰度) and are
+                                // removed in Phase 4 once the frontend fully
+                                // switches to `execution://event`.
+                                let emit_exec =
+                                    |event_type: &str,
+                                     execution_id: &Option<String>,
+                                     run_id: &Option<String>,
+                                     agent: &str,
+                                     extra: serde_json::Value| {
+                                        let mut payload = serde_json::Map::new();
+                                        payload.insert("kind".into(), "subagent".into());
+                                        payload.insert(
+                                            "subagent_run_id".into(),
+                                            execution_id
+                                                .clone()
+                                                .unwrap_or_else(|| format!("{agent}:unknown"))
+                                                .into(),
+                                        );
+                                        payload.insert(
+                                            "run_id".into(),
+                                            run_id.clone().unwrap_or_default().into(),
+                                        );
+                                        payload.insert("agent".into(), agent.into());
+                                        payload.insert("event".into(), event_type.into());
+                                        if let serde_json::Value::Object(map) = extra {
+                                            for (k, v) in map {
+                                                payload.insert(k, v);
+                                            }
+                                        }
+                                        let _ = app_handle.emit(
+                                            "execution://event",
+                                            serde_json::Value::Object(payload),
+                                        );
+                                    };
                                 let payload = match event.as_ref() {
                                     SubagentEvent::DispatchStarted {
                                         parent,
                                         agent: name,
                                         mode,
                                         task,
-                                        // execution_id/run_id are now carried by the event
-                                        // (framework透传); the bridge still temp-allocates
-                                        // dispatch_id for backward compat. The double-ledger
-                                        // is dissolved in Phase 4 when this bridge is deleted.
-                                        ..
+                                        execution_id,
+                                        run_id,
                                     } => {
                                         let worker_id = allocate_dispatch_id(
                                             &mut active_dispatches,
@@ -474,6 +511,17 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                         .with_title(name.clone())
                                         .with_task(task.clone());
                                         let _ = app_handle.emit("worker://trace", &trace);
+                                        emit_exec(
+                                            "started",
+                                            execution_id,
+                                            run_id,
+                                            name,
+                                            serde_json::json!({
+                                                "parent": parent.clone(),
+                                                "mode": format!("{:?}", mode),
+                                                "task": task.clone(),
+                                            }),
+                                        );
                                         serde_json::json!({
                                             "type": "subagent_started",
                                             "parent": parent,
@@ -490,7 +538,8 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                         tokens_used,
                                         iterations,
                                         output,
-                                        ..
+                                        execution_id,
+                                        run_id,
                                     } => {
                                         let worker_id = finish_dispatch_id(
                                             &mut active_dispatches,
@@ -514,6 +563,19 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                         .with_parent_worker(parent.clone())
                                         .with_title(name.clone());
                                         let _ = app_handle.emit("worker://trace", &trace);
+                                        emit_exec(
+                                            "completed",
+                                            execution_id,
+                                            run_id,
+                                            name,
+                                            serde_json::json!({
+                                                "parent": parent.clone(),
+                                                "duration_ms": duration_ms,
+                                                "tokens_used": tokens_used,
+                                                "iteration_count": iterations,
+                                                "output": output.clone(),
+                                            }),
+                                        );
                                         serde_json::json!({
                                             "type": "subagent_completed",
                                             "parent": parent,
@@ -529,7 +591,8 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                         parent,
                                         agent: name,
                                         error,
-                                        ..
+                                        execution_id,
+                                        run_id,
                                     } => {
                                         let worker_id = finish_dispatch_id(
                                             &mut active_dispatches,
@@ -549,6 +612,16 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                         .with_parent_worker(parent.clone())
                                         .with_title(name.clone());
                                         let _ = app_handle.emit("worker://trace", &trace);
+                                        emit_exec(
+                                            "failed",
+                                            execution_id,
+                                            run_id,
+                                            name,
+                                            serde_json::json!({
+                                                "parent": parent.clone(),
+                                                "error": error.clone(),
+                                            }),
+                                        );
                                         serde_json::json!({
                                             "type": "subagent_failed",
                                             "parent": parent,
@@ -560,7 +633,8 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                     SubagentEvent::DispatchCancelled {
                                         parent,
                                         agent: name,
-                                        ..
+                                        execution_id,
+                                        run_id,
                                     } => {
                                         let worker_id = finish_dispatch_id(
                                             &mut active_dispatches,
@@ -577,6 +651,13 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                         .with_parent_worker(parent.clone())
                                         .with_title(name.clone());
                                         let _ = app_handle.emit("worker://trace", &trace);
+                                        emit_exec(
+                                            "cancelled",
+                                            execution_id,
+                                            run_id,
+                                            name,
+                                            serde_json::json!({ "parent": parent.clone() }),
+                                        );
                                         serde_json::json!({
                                             "type": "subagent_cancelled",
                                             "parent": parent,
@@ -587,7 +668,8 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                     SubagentEvent::DispatchThinkingStarted {
                                         parent,
                                         agent: name,
-                                        ..
+                                        execution_id,
+                                        run_id,
                                     } => {
                                         let worker_id =
                                             current_dispatch_id(&active_dispatches, parent, name);
@@ -601,13 +683,21 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                         .with_parent_worker(parent.clone())
                                         .with_title(name.clone());
                                         let _ = app_handle.emit("worker://trace", &trace);
+                                        emit_exec(
+                                            "thinking_started",
+                                            execution_id,
+                                            run_id,
+                                            name,
+                                            serde_json::json!({}),
+                                        );
                                         continue;
                                     }
                                     SubagentEvent::DispatchThinkingDelta {
                                         parent,
                                         agent: name,
                                         content,
-                                        ..
+                                        execution_id,
+                                        run_id,
                                     } => {
                                         let worker_id =
                                             current_dispatch_id(&active_dispatches, parent, name);
@@ -624,6 +714,13 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                         .with_parent_worker(parent.clone())
                                         .with_title(name.clone());
                                         let _ = app_handle.emit("worker://trace", &trace);
+                                        emit_exec(
+                                            "thinking_delta",
+                                            execution_id,
+                                            run_id,
+                                            name,
+                                            serde_json::json!({ "content": content }),
+                                        );
                                         continue;
                                     }
                                     SubagentEvent::DispatchThinkingEnded {
@@ -631,7 +728,8 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                         agent: name,
                                         prompt_tokens,
                                         completion_tokens,
-                                        ..
+                                        execution_id,
+                                        run_id,
                                     } => {
                                         let worker_id =
                                             current_dispatch_id(&active_dispatches, parent, name);
@@ -649,13 +747,24 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                         .with_parent_worker(parent.clone())
                                         .with_title(name.clone());
                                         let _ = app_handle.emit("worker://trace", &trace);
+                                        emit_exec(
+                                            "usage",
+                                            execution_id,
+                                            run_id,
+                                            name,
+                                            serde_json::json!({
+                                                "prompt_tokens": prompt_tokens,
+                                                "completion_tokens": completion_tokens,
+                                            }),
+                                        );
                                         continue;
                                     }
                                     SubagentEvent::DispatchTokenDelta {
                                         parent,
                                         agent: name,
                                         content,
-                                        ..
+                                        execution_id,
+                                        run_id,
                                     } => {
                                         let worker_id =
                                             current_dispatch_id(&active_dispatches, parent, name);
@@ -672,6 +781,13 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                         .with_parent_worker(parent.clone())
                                         .with_title(name.clone());
                                         let _ = app_handle.emit("worker://trace", &trace);
+                                        emit_exec(
+                                            "token_delta",
+                                            execution_id,
+                                            run_id,
+                                            name,
+                                            serde_json::json!({ "content": content }),
+                                        );
                                         continue;
                                     }
                                     SubagentEvent::DispatchToolStarted {
@@ -679,7 +795,8 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                         agent: name,
                                         name: tool_name,
                                         args,
-                                        ..
+                                        execution_id,
+                                        run_id,
                                     } => {
                                         let worker_id =
                                             current_dispatch_id(&active_dispatches, parent, name);
@@ -697,6 +814,16 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                         .with_parent_worker(parent.clone())
                                         .with_title(name.clone());
                                         let _ = app_handle.emit("worker://trace", &trace);
+                                        emit_exec(
+                                            "tool_started",
+                                            execution_id,
+                                            run_id,
+                                            name,
+                                            serde_json::json!({
+                                                "name": tool_name,
+                                                "args": args,
+                                            }),
+                                        );
                                         continue;
                                     }
                                     SubagentEvent::DispatchToolCompleted {
@@ -705,7 +832,8 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                         name: tool_name,
                                         result,
                                         success,
-                                        ..
+                                        execution_id,
+                                        run_id,
                                     } => {
                                         let worker_id =
                                             current_dispatch_id(&active_dispatches, parent, name);
@@ -724,6 +852,17 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                         .with_parent_worker(parent.clone())
                                         .with_title(name.clone());
                                         let _ = app_handle.emit("worker://trace", &trace);
+                                        emit_exec(
+                                            "tool_completed",
+                                            execution_id,
+                                            run_id,
+                                            name,
+                                            serde_json::json!({
+                                                "name": tool_name,
+                                                "result": result,
+                                                "success": success,
+                                            }),
+                                        );
                                         continue;
                                     }
                                     _ => continue,
