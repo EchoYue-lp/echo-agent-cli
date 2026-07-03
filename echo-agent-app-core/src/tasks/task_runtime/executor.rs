@@ -1537,13 +1537,16 @@ async fn execute_task(
 
     match result {
         Ok(text) => {
-            let summary = summarize_output(&text);
+            // The worker's full output is stored in TaskExecutionSummary.completed_work
+            // (read by build_run_summaries → main agent's execute_plan ToolResult) and
+            // returned as the task summary (used by the review gate for write tasks and
+            // stored on todo.summary for archival). No truncation: the main agent needs
+            // the complete material to write its final answer.
             tracing::info!(
                 run_id = %run_id,
                 task_id = %task_id,
                 agent_role = %task.agent_role,
                 output_chars = text.chars().count(),
-                summary_chars = summary.chars().count(),
                 "task_runtime: task completed"
             );
             super::ledger::archive_trace(&run_id, &task_id, &text, None);
@@ -1552,7 +1555,7 @@ async fn execute_task(
                 run_id: run_id.clone(),
                 task_id: task_id.clone(),
                 worker_agent: task.agent_role.clone(),
-                completed_work: vec![summary.clone()],
+                completed_work: vec![text.trim().to_string()],
                 files_read: vec![],
                 files_changed: if is_write { task.files.clone() } else { vec![] },
                 decisions: vec![],
@@ -1570,14 +1573,13 @@ async fn execute_task(
                     worker_trace_id.clone(),
                     "completed",
                     serde_json::json!({
-                        "summary": &summary,
                         "output": &text,
                     }),
                 )
                 .with_agent(task.agent_role.clone())
                 .with_title(task.title.clone()),
             );
-            Ok((task_id, Some(summary)))
+            Ok((task_id, Some(text.trim().to_string())))
         }
         Err(e) => {
             tracing::warn!(
@@ -2172,18 +2174,6 @@ fn save_trace(
             tracing::debug!(run_id = %log_id, "trace Run saved");
         }
     });
-}
-
-/// Compress a worker's raw output into a compact summary line for the todo
-/// projection. Full output is archived as an artifact in PR 4/5; here we keep
-/// the first ~280 chars so the GUI has something to show.
-fn summarize_output(text: &str) -> String {
-    let trimmed = text.trim();
-    if trimmed.chars().count() <= 280 {
-        return trimmed.to_string();
-    }
-    let head: String = trimmed.chars().take(277).collect();
-    format!("{head}...")
 }
 
 // ── Unattended run adapter (cron / background AgentChat) ────────────────
@@ -2895,15 +2885,6 @@ mod tests {
         let p = build_task_prompt(&task, &[]);
         assert!(!p.contains("READ-ONLY"));
         assert!(p.contains("scoped change"));
-    }
-
-    #[test]
-    fn summarize_output_truncates_long_text() {
-        let long = "x".repeat(500);
-        let s = summarize_output(&long);
-        assert!(s.ends_with("..."));
-        assert!(s.chars().count() <= 280);
-        assert_eq!(summarize_output("short"), "short");
     }
 
     #[test]
