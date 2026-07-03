@@ -1216,6 +1216,14 @@ async fn execute_task(
     // distinguishable, so the bridge/frontend never has to temp-allocate ids.
     let attempt = task.retry_count.saturating_add(1);
     let execution_id = format!("{task_id}:{attempt}");
+    // Resolve the run's root_message_id so the framework can carry it on
+    // SubagentEvent::DispatchStarted → execution://event, letting the frontend
+    // pin the subagent stream to the right chat message block.
+    let root_message_id = store
+        .get_run(&run_id)
+        .ok()
+        .flatten()
+        .map(|r| r.root_message_id);
     let (result, readonly_usage) = if is_read_only_task {
         tracing::info!(
             run_id = %run_id,
@@ -1228,6 +1236,7 @@ async fn execute_task(
             &primary_agent,
             &run_id,
             &execution_id,
+            root_message_id.as_deref(),
             &task.agent_role,
             &prompt,
             task_cancel.clone(),
@@ -1565,6 +1574,7 @@ async fn run_readonly_worker(
     primary_agent: &crate::agent_handle::AgentHandle,
     run_id: &str,
     execution_id: &str,
+    message_id: Option<&str>,
     role: &str,
     prompt: &str,
     cancel: CancellationToken,
@@ -1576,11 +1586,13 @@ async fn run_readonly_worker(
             let role = role.to_string();
             let run_id = run_id.to_string();
             let execution_id = execution_id.to_string();
+            let message_id = message_id.map(|s| s.to_string());
             let core_trace_sink = worker_trace_sink_to_core(trace_sink);
             Box::pin(async move {
                 agent.set_external_context(&echo_core::tools::ExternalRunContext {
                     run_id: run_id.clone(),
                     execution_id: Some(execution_id),
+                    message_id,
                     cancel: Some(Arc::new(cancel.clone())),
                     trace_sink: core_trace_sink,
                 });
@@ -1633,14 +1645,15 @@ async fn run_writer_worker(
     // Rebuild a multimodal Message when the run carries user attachments, so
     // the writer worker sees the same images/files as the primary agent would
     // (parity with run_main_agent_task, executor.rs:1373-1380).
-    let run_message: Option<echo_core::llm::types::Message> =
-        store.get_run(run_id).ok().flatten().and_then(|r| {
-            if r.attachments.is_empty() {
-                None
-            } else {
-                crate::attachments::build_message_from_refs(prompt, &r.attachments).ok()
-            }
-        });
+    let run_record = store.get_run(run_id).ok().flatten();
+    let root_message_id = run_record.as_ref().map(|r| r.root_message_id.clone());
+    let run_message: Option<echo_core::llm::types::Message> = run_record.and_then(|r| {
+        if r.attachments.is_empty() {
+            None
+        } else {
+            crate::attachments::build_message_from_refs(prompt, &r.attachments).ok()
+        }
+    });
 
     primary_agent
         .read_async(|agent| {
@@ -1654,6 +1667,7 @@ async fn run_writer_worker(
                 agent.set_external_context(&echo_core::tools::ExternalRunContext {
                     run_id: run_id.clone(),
                     execution_id: Some(execution_id),
+                    message_id: root_message_id,
                     cancel: Some(Arc::new(cancel.clone())),
                     trace_sink: core_trace_sink,
                 });
@@ -2187,6 +2201,7 @@ pub async fn drive_unattended_run(
             agent.set_external_context(&ExternalRunContext {
                 run_id: run_id_for_scope.clone(),
                 execution_id: None,
+                message_id: None, // unattended/cron path has no chat message
                 cancel: Some(std::sync::Arc::new(cancel_for_scope.clone())),
                 trace_sink: None,
             });

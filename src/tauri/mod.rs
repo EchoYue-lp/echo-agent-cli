@@ -490,6 +490,7 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                         task,
                                         execution_id,
                                         run_id,
+                                        message_id,
                                     } => {
                                         let worker_id = allocate_dispatch_id(
                                             &mut active_dispatches,
@@ -520,6 +521,7 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                                 "parent": parent.clone(),
                                                 "mode": format!("{:?}", mode),
                                                 "task": task.clone(),
+                                                "message_id": message_id.clone(),
                                             }),
                                         );
                                         serde_json::json!({
@@ -861,6 +863,42 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                                 "name": tool_name,
                                                 "result": result,
                                                 "success": success,
+                                            }),
+                                        );
+                                        continue;
+                                    }
+                                    SubagentEvent::DispatchLlmUsage {
+                                        parent,
+                                        agent: name,
+                                        model,
+                                        prompt_tokens,
+                                        completion_tokens,
+                                        total_tokens,
+                                        cached_prompt_tokens,
+                                        cache_creation_prompt_tokens,
+                                        usage_reported,
+                                        execution_id,
+                                        run_id,
+                                    } => {
+                                        // No legacy worker trace equivalent for the
+                                        // full cache breakdown; forward straight to
+                                        // execution://event so the frontend Token/Cache
+                                        // panel keeps its diagnostics post-migration.
+                                        emit_exec(
+                                            "usage",
+                                            execution_id,
+                                            run_id,
+                                            name,
+                                            serde_json::json!({
+                                                "parent": parent.clone(),
+                                                "model": model.clone(),
+                                                "prompt_tokens": prompt_tokens,
+                                                "completion_tokens": completion_tokens,
+                                                "total_tokens": total_tokens,
+                                                "cached_prompt_tokens": cached_prompt_tokens,
+                                                "cache_creation_prompt_tokens":
+                                                    cache_creation_prompt_tokens,
+                                                "usage_reported": usage_reported,
                                             }),
                                         );
                                         continue;

@@ -176,8 +176,11 @@ async fn drive_chat_inner(
         // forked subagent `tokio::spawn`; ExternalRunContext is the value-carried
         // channel that keeps worker tools and trace events on this same run.
         guard.set_external_context(&echo_core::tools::ExternalRunContext {
-            run_id,
+            run_id: run_id.clone(),
             execution_id: None,
+            // Chat path: run_id == root_message_id (set in drive_chat), so the
+            // subagent stream can be pinned to this turn's message block.
+            message_id: Some(run_id),
             cancel: Some(std::sync::Arc::new(cancel.clone())),
             trace_sink: sink.trace_sink(),
         });
