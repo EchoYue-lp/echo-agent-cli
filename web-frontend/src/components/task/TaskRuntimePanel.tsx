@@ -152,7 +152,7 @@ function cacheUsageFromEvents(events: ExecutionEvent[]): CacheUsageSummary {
   );
 }
 
-export function cacheUsageForWorkers(workers: SubagentRunState[]): CacheUsageSummary {
+export function cacheUsageForRuns(workers: SubagentRunState[]): CacheUsageSummary {
   return cacheUsageFromEvents(workers.flatMap((worker) => worker.events));
 }
 
@@ -378,7 +378,7 @@ function MetricCell({
   );
 }
 
-function traceWorkerForTodo(todo: { owner_agent: string | null }, workers: SubagentRunState[]) {
+function traceRunForTodo(todo: { owner_agent: string | null }, workers: SubagentRunState[]) {
   if (!todo.owner_agent) return undefined;
   return workers.find((worker) => worker.agent === todo.owner_agent);
 }
@@ -387,7 +387,7 @@ function displayedTodoStatus(
   todo: { status: TodoStatus; owner_agent: string | null },
   workers: SubagentRunState[]
 ): TodoStatus {
-  const worker = traceWorkerForTodo(todo, workers);
+  const worker = traceRunForTodo(todo, workers);
   if (!worker) return todo.status;
   if (worker.status === 'completed' && todo.status !== ('completed' as TodoStatus)) {
     return 'completed' as TodoStatus;
@@ -403,7 +403,7 @@ function displayedTodoStatus(
 
 export function TaskRuntimePanel() {
   const activeId = useConversationStore((s) => s.activeId);
-  const traceWorkers = useSubagentRunStore((s) => s.runs);
+  const traceRuns = useSubagentRunStore((s) => s.runs);
   const { activeRun, plan, todos, routeExplanation, loadByConversation, refresh, resumeTaskRun } =
     useTaskRuntimeStore();
 
@@ -411,14 +411,14 @@ export function TaskRuntimePanel() {
     if (activeId) loadByConversation(activeId);
   }, [activeId, loadByConversation]);
 
-  const visibleTraceWorkers = useMemo(
+  const visibleTraceRuns = useMemo(
     () =>
       activeRun
-        ? Object.values(traceWorkers)
+        ? Object.values(traceRuns)
             .filter((worker) => worker.runId === activeRun.run_id)
             .sort((a, b) => a.startedAt - b.startedAt)
         : [],
-    [activeRun, traceWorkers]
+    [activeRun, traceRuns]
   );
 
   if (!activeRun && !routeExplanation) return null;
@@ -426,9 +426,9 @@ export function TaskRuntimePanel() {
   // Detailed execution timeline is now in ConversationTimeline (main panel).
   // This right-rail panel serves as a compact status summary only.
   const runId = activeRun?.run_id ?? routeExplanation?.runId;
-  const usageSummary = cacheUsageForWorkers(visibleTraceWorkers);
+  const usageSummary = cacheUsageForRuns(visibleTraceRuns);
   const completedCount = todos.filter(
-    (t) => displayedTodoStatus(t, visibleTraceWorkers) === ('completed' as TodoStatus)
+    (t) => displayedTodoStatus(t, visibleTraceRuns) === ('completed' as TodoStatus)
   ).length;
 
   return (
@@ -488,7 +488,7 @@ export function TaskRuntimePanel() {
           <div className="space-y-0.5">
             {todos.map((todo) => {
               const task = plan?.tasks.find((t) => t.id === todo.task_id);
-              const status = displayedTodoStatus(todo, visibleTraceWorkers);
+              const status = displayedTodoStatus(todo, visibleTraceRuns);
               const isEditable = status === 'pending' || status === 'blocked';
               return (
                 <div

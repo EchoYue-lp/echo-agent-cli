@@ -11,19 +11,23 @@ import {
   ClipboardList,
 } from 'lucide-react';
 import type { ExecutionEvent, SubagentRunState } from '../../stores/subagentRunStore';
-import { useWorkerDetailStore } from '../../stores/workerDetailStore';
-import { CacheUsageCard, cacheUsageForWorkers } from './TaskRuntimePanel';
+import { useSubagentDetailStore } from '../../stores/subagentDetailStore';
+import { CacheUsageCard, cacheUsageForRuns } from './TaskRuntimePanel';
 import MarkdownContent from '../common/MarkdownContent';
 import { InlineToolCall } from '../chat/InlineToolCall';
-import { computeWorkerProgress, progressSummary, statusLabel } from '../../utils/workerProgress';
+import {
+  computeSubagentProgress,
+  progressSummary,
+  statusLabel,
+} from '../../utils/subagentProgress';
 
-interface WorkerDetailViewProps {
-  worker: SubagentRunState;
-  allWorkers: SubagentRunState[];
+interface SubagentDetailViewProps {
+  run: SubagentRunState;
+  allRuns: SubagentRunState[];
   onBack: () => void;
 }
 
-interface WorkerStep {
+interface SubagentStep {
   type: 'thinking' | 'tool' | 'text' | 'usage';
   content?: string;
   toolStart?: ExecutionEvent;
@@ -31,8 +35,8 @@ interface WorkerStep {
   event?: ExecutionEvent;
 }
 
-function reconstructSteps(events: ExecutionEvent[]): WorkerStep[] {
-  const steps: WorkerStep[] = [];
+function reconstructSteps(events: ExecutionEvent[]): SubagentStep[] {
+  const steps: SubagentStep[] = [];
   const thinking: string[] = [];
   const pendingTools: ExecutionEvent[] = [];
 
@@ -81,25 +85,25 @@ function reconstructSteps(events: ExecutionEvent[]): WorkerStep[] {
   return steps;
 }
 
-function workerResult(worker: SubagentRunState): string {
+function subagentResult(run: SubagentRunState): string {
   // SubagentRunState carries the final output directly (and error on failure).
-  if (worker.status === 'failed' && worker.error) return worker.error;
-  if (worker.output) return worker.output;
-  return worker.events
+  if (run.status === 'failed' && run.error) return run.error;
+  if (run.output) return run.output;
+  return run.events
     .filter((event) => event.event === 'token_delta')
     .map((event) => String(event.content ?? ''))
     .join('')
     .trim();
 }
 
-function statusIcon(worker: SubagentRunState) {
-  if (worker.status === 'running') {
+function statusIcon(run: SubagentRunState) {
+  if (run.status === 'running') {
     return <Loader2 size={16} className="animate-spin" style={{ color: 'var(--color-info)' }} />;
   }
-  if (worker.status === 'completed') {
+  if (run.status === 'completed') {
     return <CheckCircle2 size={16} style={{ color: 'var(--color-success)' }} />;
   }
-  if (worker.status === 'failed') {
+  if (run.status === 'failed') {
     return <AlertCircle size={16} style={{ color: 'var(--color-error)' }} />;
   }
   return <Circle size={16} style={{ color: 'var(--text-tertiary)' }} />;
@@ -119,24 +123,21 @@ function usageLine(event: ExecutionEvent): string {
   return `input ${prompt.toLocaleString()} / output ${completion.toLocaleString()} / cached ${cached.toLocaleString()}`;
 }
 
-export function WorkerDetailView({ worker, allWorkers, onBack }: WorkerDetailViewProps) {
+export function SubagentDetailView({ run, allRuns, onBack }: SubagentDetailViewProps) {
   const [activeTab, setActiveTab] = useState<'process' | 'prompt' | 'result'>('process');
-  const selectWorker = useWorkerDetailStore((state) => state.selectWorker);
-  const progress = useMemo(() => computeWorkerProgress(worker), [worker.events, worker.status]);
-  const steps = useMemo(() => reconstructSteps(worker.events), [worker.events]);
+  const selectSubagent = useSubagentDetailStore((state) => state.selectSubagent);
+  const progress = useMemo(() => computeSubagentProgress(run), [run.events, run.status]);
+  const steps = useMemo(() => reconstructSteps(run.events), [run.events]);
   const result = useMemo(
-    () => workerResult(worker),
-    [worker.events, worker.output, worker.error, worker.status]
+    () => subagentResult(run),
+    [run.events, run.output, run.error, run.status]
   );
-  const childWorkers = useMemo(
-    () => allWorkers.filter((candidate) => candidate.parent === worker.subagentRunId),
-    [allWorkers, worker.subagentRunId]
+  const childRuns = useMemo(
+    () => allRuns.filter((candidate) => candidate.parent === run.subagentRunId),
+    [allRuns, run.subagentRunId]
   );
-  const cacheSummary = useMemo(
-    () => cacheUsageForWorkers([worker, ...childWorkers]),
-    [worker, childWorkers]
-  );
-  const title = worker.agent || worker.subagentRunId;
+  const cacheSummary = useMemo(() => cacheUsageForRuns([run, ...childRuns]), [run, childRuns]);
+  const title = run.agent || run.subagentRunId;
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-[var(--bg-primary)]">
@@ -153,14 +154,14 @@ export function WorkerDetailView({ worker, allWorkers, onBack }: WorkerDetailVie
         <div className="flex min-w-0 items-start justify-between gap-4">
           <div className="min-w-0">
             <div className="flex min-w-0 items-center gap-2">
-              {statusIcon(worker)}
+              {statusIcon(run)}
               <h2 className="truncate text-lg font-semibold text-[var(--text-primary)]">{title}</h2>
             </div>
             <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-[var(--text-tertiary)]">
-              <span>{worker.agent || 'subagent'}</span>
+              <span>{run.agent || 'subagent'}</span>
               <span>{statusLabel(progress.status)}</span>
               {progressSummary(progress) && <span>{progressSummary(progress)}</span>}
-              <span>started {formatTime(worker.startedAt)}</span>
+              <span>started {formatTime(run.startedAt)}</span>
             </div>
           </div>
           <div className="hidden w-72 shrink-0 md:block">
@@ -195,8 +196,8 @@ export function WorkerDetailView({ worker, allWorkers, onBack }: WorkerDetailVie
         {activeTab === 'prompt' && (
           <div className="mx-auto max-w-[880px]">
             <SectionTitle title="提示词" subtitle="这个 subagent 收到的任务输入" />
-            {worker.task ? (
-              <MarkdownContent content={worker.task} className="text-sm" />
+            {run.task ? (
+              <MarkdownContent content={run.task} className="text-sm" />
             ) : (
               <EmptyState text="这个 subagent 暂时没有记录提示词。" />
             )}
@@ -270,15 +271,15 @@ export function WorkerDetailView({ worker, allWorkers, onBack }: WorkerDetailVie
               </div>
             )}
 
-            {childWorkers.length > 0 && (
+            {childRuns.length > 0 && (
               <div className="space-y-2 pt-2">
                 <SectionTitle title="子 subagent" subtitle="由当前 subagent 派生的下级执行" />
-                {childWorkers.map((child) => (
+                {childRuns.map((child) => (
                   <button
                     key={child.subagentRunId}
                     type="button"
                     className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-sm transition-colors hover:bg-[var(--bg-hover)]"
-                    onClick={() => selectWorker(child.subagentRunId)}
+                    onClick={() => selectSubagent(child.subagentRunId)}
                   >
                     {statusIcon(child)}
                     <span className="truncate text-[var(--text-primary)]">

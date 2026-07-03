@@ -26,7 +26,7 @@ const READ_TOOL_NAMES = new Set([
   'tail',
 ]);
 
-export interface WorkerProgress {
+export interface SubagentProgress {
   status: 'running' | 'completed' | 'failed' | 'cancelled';
   toolCount: number;
   readCount: number;
@@ -40,7 +40,7 @@ function countReadTools(events: ExecutionEvent[]): number {
   ).length;
 }
 
-export function computeWorkerProgress(run: SubagentRunState): WorkerProgress {
+export function computeSubagentProgress(run: SubagentRunState): SubagentProgress {
   const events = run.events;
   const toolCount = events.filter((e) => e.event === 'tool_started').length;
   const readCount = countReadTools(events);
@@ -56,7 +56,7 @@ export function computeWorkerProgress(run: SubagentRunState): WorkerProgress {
   };
 }
 
-export function progressSummary(p: WorkerProgress): string {
+export function progressSummary(p: SubagentProgress): string {
   if (p.status === 'failed' || p.status === 'cancelled') {
     return p.status === 'failed' ? '失败' : '已取消';
   }
@@ -67,7 +67,7 @@ export function progressSummary(p: WorkerProgress): string {
   return parts.join(' · ');
 }
 
-export function statusLabel(status: WorkerProgress['status']): string {
+export function statusLabel(status: SubagentProgress['status']): string {
   switch (status) {
     case 'running':
       return '运行中';

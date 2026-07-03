@@ -7,8 +7,8 @@ import { WelcomeScreen } from './WelcomeScreen';
 import { useTauriChat } from '../../hooks/useTauriChat';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
 import { useSubagentRunStore } from '../../stores/subagentRunStore';
-import { useWorkerDetailStore } from '../../stores/workerDetailStore';
-import { WorkerDetailView } from '../task/WorkerDetailView';
+import { useSubagentDetailStore } from '../../stores/subagentDetailStore';
+import { SubagentDetailView } from '../task/SubagentDetailView';
 import { FailureToast } from './FailureToast';
 import type { Attachment } from '../../types/api';
 
@@ -29,13 +29,13 @@ export function ChatPanel() {
   const runStatus = useChatStore((s) => s.runStatus);
   const currentWorkspace = useWorkspaceStore((s) => s.current);
   const subagentRuns = useSubagentRunStore((s) => s.runs);
-  const selectedWorkerRef = useWorkerDetailStore((s) => s.selected);
-  const closeWorkerDetail = useWorkerDetailStore((s) => s.close);
-  const selectedWorker = selectedWorkerRef
-    ? subagentRuns[selectedWorkerRef.subagentRunId]
+  const selectedSubagentRef = useSubagentDetailStore((s) => s.selected);
+  const closeSubagentDetail = useSubagentDetailStore((s) => s.close);
+  const selectedSubagent = selectedSubagentRef
+    ? subagentRuns[selectedSubagentRef.subagentRunId]
     : undefined;
-  const selectedRunWorkers = selectedWorker
-    ? Object.values(subagentRuns).filter((run) => run.runId === selectedWorker.runId)
+  const selectedRunSubagents = selectedSubagent
+    ? Object.values(subagentRuns).filter((run) => run.runId === selectedSubagent.runId)
     : [];
 
   // ── 按需卡片状态 ──
@@ -103,12 +103,12 @@ export function ChatPanel() {
           <span>{runStatusLabel(runStatus, isStreaming)}</span>
         </div>
       </div>
-      {selectedWorker ? (
+      {selectedSubagent ? (
         <div className="min-h-0 flex-1">
-          <WorkerDetailView
-            worker={selectedWorker}
-            allWorkers={selectedRunWorkers}
-            onBack={closeWorkerDetail}
+          <SubagentDetailView
+            run={selectedSubagent}
+            allRuns={selectedRunSubagents}
+            onBack={closeSubagentDetail}
           />
         </div>
       ) : (

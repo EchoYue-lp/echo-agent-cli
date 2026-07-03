@@ -7,7 +7,7 @@ import { useSubagentRunStore } from '../../stores/subagentRunStore';
 import { deriveChangedFiles } from '../../utils/deriveChangedFiles';
 import { useChatStore } from '../../stores/chatStore';
 import { ChangesDrawer } from '../changes/ChangesDrawer';
-import { TaskRuntimePanel, CacheUsageCard, cacheUsageForWorkers } from '../task/TaskRuntimePanel';
+import { TaskRuntimePanel, CacheUsageCard, cacheUsageForRuns } from '../task/TaskRuntimePanel';
 import { SubagentPanel } from '../subagent/SubagentCard';
 
 const STATUS_LABEL: Record<string, string> = {
@@ -52,14 +52,14 @@ export function RightRail() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [toolCallCount]);
 
-  const visibleWorkers = useMemo(() => {
+  const visibleRuns = useMemo(() => {
     return Object.values(subagentRuns)
       .filter((w) => !activeRun || w.runId === activeRun.run_id)
       .sort((a, b) => a.startedAt - b.startedAt);
   }, [activeRun, subagentRuns]);
 
   const displayedChanges = changesFiles.slice(0, 12);
-  const usageSummary = cacheUsageForWorkers(visibleWorkers);
+  const usageSummary = cacheUsageForRuns(visibleRuns);
 
   return (
     <aside className="hidden h-full w-[300px] shrink-0 border-l border-[var(--border-primary)] bg-[var(--bg-rail)] px-4 py-5 xl:block">

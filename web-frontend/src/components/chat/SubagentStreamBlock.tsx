@@ -9,19 +9,23 @@ import {
   Brain,
 } from 'lucide-react';
 import type { SubagentRunState, ExecutionEvent } from '../../stores/subagentRunStore';
-import { useWorkerDetailStore } from '../../stores/workerDetailStore';
+import { useSubagentDetailStore } from '../../stores/subagentDetailStore';
 import MarkdownContent from '../common/MarkdownContent';
 import { InlineToolCall } from './InlineToolCall';
-import { computeWorkerProgress, progressSummary, statusLabel } from '../../utils/workerProgress';
+import {
+  computeSubagentProgress,
+  progressSummary,
+  statusLabel,
+} from '../../utils/subagentProgress';
 
-interface WorkerStreamBlockProps {
-  worker: SubagentRunState;
+interface SubagentStreamBlockProps {
+  run: SubagentRunState;
   /** All execution traces in this run (for recursive child lookup). */
-  allWorkers: SubagentRunState[];
+  allRuns: SubagentRunState[];
 }
 
 /** Reconstruct a subagent's thinking+tool loop from raw events. */
-interface WorkerStep {
+interface SubagentStep {
   type: 'thinking' | 'tool';
   content?: string;
   toolStart?: ExecutionEvent;
@@ -29,10 +33,10 @@ interface WorkerStep {
 }
 
 function reconstructSteps(events: ExecutionEvent[]): {
-  steps: WorkerStep[];
+  steps: SubagentStep[];
   thinkingTotal: number;
 } {
-  const steps: WorkerStep[] = [];
+  const steps: SubagentStep[] = [];
   let thinkingTotal = 0;
   const currentThinking: string[] = [];
   const pendingTools: ExecutionEvent[] = [];
@@ -71,45 +75,45 @@ function reconstructSteps(events: ExecutionEvent[]): {
   return { steps, thinkingTotal };
 }
 
-function workerResult(worker: SubagentRunState): string {
+function subagentResult(run: SubagentRunState): string {
   // SubagentRunState carries the final output directly (no need to dig it out
   // of a `worker_completed` event payload like the legacy store did).
-  if (worker.output) return worker.output;
-  return worker.events
+  if (run.output) return run.output;
+  return run.events
     .filter((e) => e.event === 'token_delta')
     .map((e) => String(e.content ?? ''))
     .join('')
     .trim();
 }
 
-export const WorkerStreamBlock = memo(function WorkerStreamBlock({
-  worker,
-  allWorkers,
-}: WorkerStreamBlockProps) {
-  const [expanded, setExpanded] = useState(worker.status === 'running');
-  const selectWorker = useWorkerDetailStore((state) => state.selectWorker);
+export const SubagentStreamBlock = memo(function SubagentStreamBlock({
+  run,
+  allRuns,
+}: SubagentStreamBlockProps) {
+  const [expanded, setExpanded] = useState(run.status === 'running');
+  const selectSubagent = useSubagentDetailStore((state) => state.selectSubagent);
   const [sectionExpanded, setSectionExpanded] = useState({
     prompt: false,
     process: true,
     result: true,
   });
 
-  const progress = useMemo(() => computeWorkerProgress(worker), [worker.events, worker.status]);
+  const progress = useMemo(() => computeSubagentProgress(run), [run.events, run.status]);
   const summary = progressSummary(progress);
-  const { steps } = useMemo(() => reconstructSteps(worker.events), [worker.events]);
-  const result = useMemo(() => workerResult(worker), [worker.events, worker.output]);
+  const { steps } = useMemo(() => reconstructSteps(run.events), [run.events]);
+  const result = useMemo(() => subagentResult(run), [run.events, run.output]);
 
   const children = useMemo(
-    () => allWorkers.filter((w) => w.parent === worker.subagentRunId),
-    [allWorkers, worker.subagentRunId]
+    () => allRuns.filter((w) => w.parent === run.subagentRunId),
+    [allRuns, run.subagentRunId]
   );
 
   const statusIcon =
-    worker.status === 'running' ? (
+    run.status === 'running' ? (
       <Loader2 size={11} className="animate-spin" style={{ color: 'var(--color-info)' }} />
-    ) : worker.status === 'completed' ? (
+    ) : run.status === 'completed' ? (
       <CheckCircle2 size={11} style={{ color: 'var(--color-success)' }} />
-    ) : worker.status === 'failed' ? (
+    ) : run.status === 'failed' ? (
       <AlertCircle size={11} style={{ color: 'var(--color-error)' }} />
     ) : (
       <Circle size={11} style={{ color: 'var(--text-tertiary)' }} />
@@ -129,12 +133,12 @@ export const WorkerStreamBlock = memo(function WorkerStreamBlock({
         </button>
         <button
           type="button"
-          onClick={() => selectWorker(worker.subagentRunId)}
+          onClick={() => selectSubagent(run.subagentRunId)}
           className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
         >
           {statusIcon}
           <span className="truncate font-medium text-[var(--text-primary)]">
-            {worker.agent || worker.subagentRunId}
+            {run.agent || run.subagentRunId}
           </span>
           <span className="ml-auto shrink-0 text-[10px] text-[var(--text-tertiary)]">
             {statusLabel(progress.status)}
@@ -146,7 +150,7 @@ export const WorkerStreamBlock = memo(function WorkerStreamBlock({
       {expanded && (
         <div className="mt-1.5 space-y-1.5 pl-1">
           {/* Prompt */}
-          {worker.task && (
+          {run.task && (
             <div>
               <button
                 onClick={() => setSectionExpanded((s) => ({ ...s, prompt: !s.prompt }))}
@@ -155,9 +159,7 @@ export const WorkerStreamBlock = memo(function WorkerStreamBlock({
                 {sectionExpanded.prompt ? <ChevronDown size={9} /> : <ChevronRight size={9} />}
                 提示词
               </button>
-              {sectionExpanded.prompt && (
-                <MarkdownContent content={worker.task} className="text-sm" />
-              )}
+              {sectionExpanded.prompt && <MarkdownContent content={run.task} className="text-sm" />}
             </div>
           )}
 
@@ -208,10 +210,10 @@ export const WorkerStreamBlock = memo(function WorkerStreamBlock({
                 {children.length > 0 && (
                   <div className="ml-2 border-l border-[var(--border-primary)] pl-2">
                     {children.map((child) => (
-                      <WorkerStreamBlock
+                      <SubagentStreamBlock
                         key={child.subagentRunId}
-                        worker={child}
-                        allWorkers={allWorkers}
+                        run={child}
+                        allRuns={allRuns}
                       />
                     ))}
                   </div>

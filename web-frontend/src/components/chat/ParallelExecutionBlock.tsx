@@ -2,7 +2,7 @@ import { useMemo, memo } from 'react';
 import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
 import { useSubagentRunStore } from '../../stores/subagentRunStore';
 import { useChatStore } from '../../stores/chatStore';
-import { WorkerStreamBlock } from './WorkerStreamBlock';
+import { SubagentStreamBlock } from './SubagentStreamBlock';
 
 /**
  * The "并行执行" segment in the one-stream layout.
@@ -32,7 +32,7 @@ export const ParallelExecutionBlock = memo(function ParallelExecutionBlock({
     return null;
   });
 
-  const visibleWorkers = useMemo(() => {
+  const visibleRuns = useMemo(() => {
     const isLatestAssistant = messageId === lastAssistantMessageId;
     const allRuns = Object.values(runs);
     return allRuns
@@ -46,15 +46,15 @@ export const ParallelExecutionBlock = memo(function ParallelExecutionBlock({
       .sort((a, b) => a.startedAt - b.startedAt);
   }, [activeRun, runs, messageId, lastAssistantMessageId]);
 
-  if (visibleWorkers.length === 0) return null;
+  if (visibleRuns.length === 0) return null;
 
   return (
     <>
-      {visibleWorkers.map((w) => (
-        <WorkerStreamBlock
+      {visibleRuns.map((w) => (
+        <SubagentStreamBlock
           key={w.subagentRunId}
-          worker={w}
-          allWorkers={Object.values(runs).filter((x) => x.runId === w.runId)}
+          run={w}
+          allRuns={Object.values(runs).filter((x) => x.runId === w.runId)}
         />
       ))}
     </>

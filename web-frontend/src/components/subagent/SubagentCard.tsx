@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { Bot, CheckCircle, XCircle, X, Loader2, ChevronDown, ChevronRight } from 'lucide-react';
 import type { SubagentRunState } from '../../stores/subagentRunStore';
-import { useWorkerDetailStore } from '../../stores/workerDetailStore';
+import { useSubagentDetailStore } from '../../stores/subagentDetailStore';
 
 interface Props {
   subagent: SubagentRunState;
@@ -36,7 +36,7 @@ function ElapsedTimer({ startedAt }: { startedAt: number }) {
 
 export function SubagentCard({ subagent: s }: Props) {
   const [expanded, setExpanded] = useState(false);
-  const selectWorker = useWorkerDetailStore((state) => state.selectWorker);
+  const selectSubagent = useSubagentDetailStore((state) => state.selectSubagent);
 
   const Icon =
     s.status === 'running' ? (
@@ -64,7 +64,7 @@ export function SubagentCard({ subagent: s }: Props) {
         <button
           type="button"
           className="flex min-w-0 flex-1 items-center gap-2 text-left"
-          onClick={() => selectWorker(s.subagentRunId)}
+          onClick={() => selectSubagent(s.subagentRunId)}
         >
           <span className="font-medium text-[var(--text-primary)] truncate flex-1">{s.agent}</span>
           {s.tokensUsed != null && (
