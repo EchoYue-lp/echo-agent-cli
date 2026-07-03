@@ -484,9 +484,21 @@ async fn run_dag<W: TaskWorker + 'static>(
     // Pre-populate with tasks already marked Completed — this is the resume
     // path: the executor re-reads the plan from the store and skips tasks
     // that finished in the previous run.
+    //
+    // CRITICAL: also include `Running` tasks. When the model emits several
+    // `execute_plan` calls as a parallel tool batch (each appending a task),
+    // `RUN_EXECUTION_LOCKS` serializes them, so the 2nd..Nth call enters
+    // `run_dag` while earlier tasks are still `Running` (dispatched by the
+    // previous run_dag instance and not yet finished). Without this guard,
+    // the `ready` filter below would re-dispatch those in-flight tasks,
+    // causing duplicate subagent work (observed: same task running 2-3×,
+    // 3× token waste). Treating `Running` as "handled by another instance"
+    // prevents re-dispatch; the `has_unresolved_tasks` check in `execute_run`
+    // then keeps the run in `Running` state so a follow-up `execute_plan`
+    // picks them up once they finish.
     let mut completed: HashSet<String> = tasks
         .iter()
-        .filter(|t| t.status == TodoStatus::Completed)
+        .filter(|t| matches!(t.status, TodoStatus::Completed | TodoStatus::Running))
         .map(|t| t.id.clone())
         .collect();
     let mut failed_id: Option<String> = None;
@@ -3194,6 +3206,50 @@ mod tests {
         }
         // Nothing should have been dispatched.
         assert!(worker.order().is_empty(), "worker ran on a cyclic plan");
+    }
+
+    #[tokio::test]
+    async fn run_dag_does_not_redispatch_in_flight_running_tasks() {
+        // Regression: when the model emits several `execute_plan` calls as a
+        // parallel tool batch, `RUN_EXECUTION_LOCKS` serializes them. The 2nd
+        // call enters run_dag while an earlier task is still `Running`
+        // (dispatched by the previous run_dag instance). Without treating
+        // `Running` as "handled", the ready filter would re-dispatch it,
+        // causing duplicate subagent work. Verify a `Running` task is left
+        // alone and only the genuinely-pending sibling is dispatched.
+        let mut in_flight = solo_readonly_task("in_flight");
+        in_flight.status = TodoStatus::Running;
+        let pending = solo_readonly_task("pending");
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().unwrap());
+        let run_id = seed_run(&store, vec![in_flight.clone(), pending.clone()]);
+        let worker = ScriptedWorker::new();
+        worker.succeed("pending", "done");
+
+        let outcome = run_dag(
+            store.clone(),
+            worker.clone(),
+            None,
+            &run_id,
+            vec![in_flight, pending],
+            ConcurrencyLimits::default(),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // `in_flight` (Running) must NOT have been re-dispatched; only
+        // `pending` should appear in the dispatch order.
+        let order = worker.order();
+        assert!(
+            !order.contains(&"in_flight".to_string()),
+            "Running task was re-dispatched (regression): {order:?}"
+        );
+        assert_eq!(order, vec!["pending".to_string()]);
+        // run_dag returns Completed for its own snapshot view (both tasks
+        // counted as handled); the caller's has_unresolved_tasks check is the
+        // safety net that keeps the run in Running state externally.
+        assert!(matches!(outcome, RunOutcome::Completed));
     }
 
     #[tokio::test]
