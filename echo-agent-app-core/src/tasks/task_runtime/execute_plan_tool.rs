@@ -43,6 +43,48 @@ use crate::agent_handle::AgentHandle;
 static RUN_EXECUTION_LOCKS: LazyLock<DashMap<String, Arc<TokioMutex<()>>>> =
     LazyLock::new(DashMap::new);
 
+/// RAII guard: 持有 run 的执行锁, Drop 时同时从 `RUN_EXECUTION_LOCKS` 删除该 entry。
+///
+/// 修复 P1-1: 此前 entry 只 insert 不 remove, 每个唯一 run_id 永久占内存,
+/// Tauri 长期运行数月后累积数千无用 entry。用 guard 封装保证无论从哪条路径
+/// 返回 (提前 ? / 正常 return), lock 释放的同时 entry 被清理。
+///
+/// 用 `OwnedMutexGuard` (来自 `Arc<TokioMutex>::lock_owned`) 而非 `MutexGuard`,
+/// 这样 guard 不借用任何外部引用, 可自由移动、放入结构体, 无自引用 / 生命周期问题。
+/// Drop 顺序由字段声明顺序保证: Rust 按声明逆序 drop, 即先 drop `_guard` (释放锁),
+/// 再 drop `_lock_owned`(map 删除由显式 Drop impl 完成)。
+struct RunExecutionGuard {
+    /// Owned guard 不借外部引用, 持有它即持有锁。Option 包裹以便 Drop 里 take。
+    _guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    run_id: String,
+}
+
+impl Drop for RunExecutionGuard {
+    fn drop(&mut self) {
+        // 必须先释放锁再删 entry, 否则在"entry 已删 + 锁仍持有"的窗口内,
+        // 另一个 acquire 会建新 lock 并进入临界区, 破坏 per-run 互斥语义。
+        // take() 出 guard 显式 drop → 释放锁, 然后才删 map entry。
+        if let Some(g) = self._guard.take() {
+            drop(g);
+        }
+        let _ = RUN_EXECUTION_LOCKS.remove(&self.run_id);
+    }
+}
+
+/// 获取 (并等待) 某个 run 的执行锁, 返回 RAII guard 负责释放锁 + 清理 entry。
+async fn acquire_run_execution_lock(run_id: &str) -> RunExecutionGuard {
+    let lock = RUN_EXECUTION_LOCKS
+        .entry(run_id.to_string())
+        .or_insert_with(|| Arc::new(TokioMutex::new(())))
+        .clone();
+    // lock_owned 需要 Arc<TokioMutex>, 返回 OwnedMutexGuard (不绑引用, 可自由移动)。
+    let guard = lock.lock_owned().await;
+    RunExecutionGuard {
+        _guard: Some(guard),
+        run_id: run_id.to_string(),
+    }
+}
+
 /// ComplexRuntime plan-approval gate 的最长等待时间。
 ///
 /// 设计依据(调研 Claude Code / Codex / Cursor / Devin, 2026-07-03):
@@ -467,12 +509,9 @@ impl Tool for ExecutePlanTool {
                 write_mode = ?self.write_mode,
                 "execute_plan: dispatching run_dag"
             );
-            let run_lock = RUN_EXECUTION_LOCKS
-                .entry(run_id.clone())
-                .or_insert_with(|| Arc::new(TokioMutex::new(())))
-                .clone();
             tracing::info!(run_id = %run_id, "execute_plan: waiting for run execution lock");
-            let _run_guard = run_lock.lock().await;
+            // RAII guard: 持锁 + Drop 时清理 RUN_EXECUTION_LOCKS entry (P1-1 修复)。
+            let _run_guard = acquire_run_execution_lock(&run_id).await;
             tracing::info!(run_id = %run_id, "execute_plan: acquired run execution lock");
             if self
                 .store
