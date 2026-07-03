@@ -167,7 +167,6 @@ fn emit_execution_event(
     let _ = app.emit("execution://event", serde_json::Value::Object(map));
 }
 
-
 /// Global pending map for approval/input responses.
 #[allow(clippy::type_complexity)]
 static PENDING_RESPONSES: LazyLock<Arc<Mutex<HashMap<String, PendingRequest>>>> =
@@ -889,7 +888,11 @@ impl echo_agent_app_core::chat_driver::ChatSink for TauriChatSink {
         let run_id = self.run_id.clone();
         Some(std::sync::Arc::new(move |ev: ExecEvent| {
             let agent = ev.agent.as_deref().unwrap_or("echo-assistant");
-            let kind = if ev.task_id.is_some() { "subagent" } else { "run" };
+            let kind = if ev.task_id.is_some() {
+                "subagent"
+            } else {
+                "run"
+            };
             emit_execution_event(&app, &run_id, kind, &ev.event, agent, ev.payload);
         }))
     }
@@ -945,9 +948,7 @@ fn agent_event_to_chat_event(
     // cache diagnostics go through `trace_collector` + SQLite via
     // `get_cache_diagnostics`, not through the execution://event store.
     match event {
-        AgentEvent::Token(data) => {
-            Some(ChatEvent::Token { data: data.clone() })
-        }
+        AgentEvent::Token(data) => Some(ChatEvent::Token { data: data.clone() }),
         AgentEvent::ThinkStart => {
             let _ = emit_chat_event(
                 app,
@@ -962,12 +963,10 @@ fn agent_event_to_chat_event(
         AgentEvent::ThinkEnd {
             prompt_tokens,
             completion_tokens,
-        } => {
-            Some(ChatEvent::ThinkingEnd {
-                prompt_tokens: *prompt_tokens,
-                completion_tokens: *completion_tokens,
-            })
-        }
+        } => Some(ChatEvent::ThinkingEnd {
+            prompt_tokens: *prompt_tokens,
+            completion_tokens: *completion_tokens,
+        }),
         AgentEvent::LlmUsage {
             model,
             prompt_tokens,
@@ -1053,36 +1052,26 @@ fn agent_event_to_chat_event(
                 args: args.clone(),
             })
         }
-        AgentEvent::ToolResult { name, output } => {
-            Some(ChatEvent::ToolResult {
-                name: name.clone(),
-                result: output.clone(),
-                success: true,
-            })
-        }
-        AgentEvent::ToolError { name, error } => {
-            Some(ChatEvent::ToolResult {
-                name: name.clone(),
-                result: error.clone(),
-                success: false,
-            })
-        }
+        AgentEvent::ToolResult { name, output } => Some(ChatEvent::ToolResult {
+            name: name.clone(),
+            result: output.clone(),
+            success: true,
+        }),
+        AgentEvent::ToolError { name, error } => Some(ChatEvent::ToolResult {
+            name: name.clone(),
+            result: error.clone(),
+            success: false,
+        }),
         AgentEvent::ToolBatchStart { tool_count } => Some(ChatEvent::ToolBatchStart {
             tool_count: *tool_count,
         }),
         AgentEvent::ToolBatchEnd => Some(ChatEvent::ToolBatchEnd),
         AgentEvent::Chart { spec } => Some(ChatEvent::Chart { spec: spec.clone() }),
-        AgentEvent::FinalAnswer(data) => {
-            Some(ChatEvent::FinalAnswer { data: data.clone() })
-        }
-        AgentEvent::Cancelled => {
-            Some(ChatEvent::Cancelled)
-        }
-        AgentEvent::Error { source, message } => {
-            Some(ChatEvent::Error {
-                message: format!("{source}: {message}"),
-            })
-        }
+        AgentEvent::FinalAnswer(data) => Some(ChatEvent::FinalAnswer { data: data.clone() }),
+        AgentEvent::Cancelled => Some(ChatEvent::Cancelled),
+        AgentEvent::Error { source, message } => Some(ChatEvent::Error {
+            message: format!("{source}: {message}"),
+        }),
         _ => None,
     }
 }
