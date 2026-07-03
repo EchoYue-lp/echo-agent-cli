@@ -1,18 +1,17 @@
 import { create } from 'zustand';
 
 interface WorkerDetailSelection {
-  runId: string;
-  workerId: string;
+  subagentRunId: string;
 }
 
 interface WorkerDetailStore {
   selected: WorkerDetailSelection | null;
-  selectWorker: (runId: string, workerId: string) => void;
+  selectWorker: (subagentRunId: string) => void;
   close: () => void;
 }
 
 export const useWorkerDetailStore = create<WorkerDetailStore>((set) => ({
   selected: null,
-  selectWorker: (runId, workerId) => set({ selected: { runId, workerId } }),
+  selectWorker: (subagentRunId) => set({ selected: { subagentRunId } }),
   close: () => set({ selected: null }),
 }));

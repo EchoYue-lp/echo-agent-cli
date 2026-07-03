@@ -6,7 +6,7 @@ import { ChatInput } from './ChatInput';
 import { WelcomeScreen } from './WelcomeScreen';
 import { useTauriChat } from '../../hooks/useTauriChat';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
-import { useWorkerTraceStore } from '../../stores/workerTraceStore';
+import { useSubagentRunStore } from '../../stores/subagentRunStore';
 import { useWorkerDetailStore } from '../../stores/workerDetailStore';
 import { WorkerDetailView } from '../task/WorkerDetailView';
 import { FailureToast } from './FailureToast';
@@ -28,14 +28,14 @@ export function ChatPanel() {
   const isCancelled = useChatStore((s) => s.isCancelled);
   const runStatus = useChatStore((s) => s.runStatus);
   const currentWorkspace = useWorkspaceStore((s) => s.current);
-  const traceWorkers = useWorkerTraceStore((s) => s.workers);
+  const subagentRuns = useSubagentRunStore((s) => s.runs);
   const selectedWorkerRef = useWorkerDetailStore((s) => s.selected);
   const closeWorkerDetail = useWorkerDetailStore((s) => s.close);
   const selectedWorker = selectedWorkerRef
-    ? traceWorkers[`${selectedWorkerRef.runId}::${selectedWorkerRef.workerId}`]
+    ? subagentRuns[selectedWorkerRef.subagentRunId]
     : undefined;
   const selectedRunWorkers = selectedWorker
-    ? Object.values(traceWorkers).filter((worker) => worker.runId === selectedWorker.runId)
+    ? Object.values(subagentRuns).filter((run) => run.runId === selectedWorker.runId)
     : [];
 
   // ── 按需卡片状态 ──

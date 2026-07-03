@@ -10,7 +10,7 @@ import {
   Gauge,
   ClipboardList,
 } from 'lucide-react';
-import type { WorkerTraceEvent, WorkerTraceState } from '../../stores/workerTraceStore';
+import type { ExecutionEvent, SubagentRunState } from '../../stores/subagentRunStore';
 import { useWorkerDetailStore } from '../../stores/workerDetailStore';
 import { CacheUsageCard, cacheUsageForWorkers } from './TaskRuntimePanel';
 import MarkdownContent from '../common/MarkdownContent';
@@ -18,42 +18,23 @@ import { InlineToolCall } from '../chat/InlineToolCall';
 import { computeWorkerProgress, progressSummary, statusLabel } from '../../utils/workerProgress';
 
 interface WorkerDetailViewProps {
-  worker: WorkerTraceState;
-  allWorkers: WorkerTraceState[];
+  worker: SubagentRunState;
+  allWorkers: SubagentRunState[];
   onBack: () => void;
 }
 
 interface WorkerStep {
   type: 'thinking' | 'tool' | 'text' | 'usage';
   content?: string;
-  toolStart?: WorkerTraceEvent;
-  toolResult?: WorkerTraceEvent;
-  event?: WorkerTraceEvent;
+  toolStart?: ExecutionEvent;
+  toolResult?: ExecutionEvent;
+  event?: ExecutionEvent;
 }
 
-function payloadRecord(event?: WorkerTraceEvent): Record<string, unknown> {
-  return event?.payload && typeof event.payload === 'object' && !Array.isArray(event.payload)
-    ? (event.payload as Record<string, unknown>)
-    : {};
-}
-
-function payloadText(event: WorkerTraceEvent | undefined, ...keys: string[]): string {
-  const payload = payloadRecord(event);
-  for (const key of keys) {
-    const value = payload[key];
-    if (typeof value === 'string' && value.trim()) return value;
-  }
-  return '';
-}
-
-function toolName(event?: WorkerTraceEvent): string {
-  return payloadText(event, 'name') || 'tool';
-}
-
-function reconstructSteps(events: WorkerTraceEvent[]): WorkerStep[] {
+function reconstructSteps(events: ExecutionEvent[]): WorkerStep[] {
   const steps: WorkerStep[] = [];
   const thinking: string[] = [];
-  const pendingTools: WorkerTraceEvent[] = [];
+  const pendingTools: ExecutionEvent[] = [];
 
   const flushThinking = () => {
     const content = thinking.join('').trim();
@@ -62,41 +43,36 @@ function reconstructSteps(events: WorkerTraceEvent[]): WorkerStep[] {
   };
 
   for (const event of events) {
-    if (event.event_type === 'worker_thinking_delta') {
-      const content = payloadText(event, 'content', 'text', 'delta');
-      if (content) thinking.push(content);
+    if (event.event === 'thinking_delta') {
+      if (event.content) thinking.push(event.content);
       continue;
     }
 
-    if (event.event_type === 'worker_thinking_end') {
+    if (event.event === 'usage') {
+      // thinking_ended maps to `usage`; flush accumulated thinking and emit a
+      // usage step (carries token / cache diagnostics on the top level).
       flushThinking();
       steps.push({ type: 'usage', event });
       continue;
     }
 
-    if (event.event_type === 'worker_tool_start') {
+    if (event.event === 'tool_started') {
       flushThinking();
       pendingTools.push(event);
       continue;
     }
 
-    if (event.event_type === 'worker_tool_result') {
+    if (event.event === 'tool_completed') {
       flushThinking();
-      const name = toolName(event);
-      const idx = pendingTools.findIndex((candidate) => toolName(candidate) === name);
+      const name = String(event.name ?? '');
+      const idx = pendingTools.findIndex((c) => String(c.name ?? '') === name);
       const start = idx >= 0 ? pendingTools.splice(idx, 1)[0] : undefined;
       steps.push({ type: 'tool', toolStart: start, toolResult: event });
       continue;
     }
 
-    if (event.event_type === 'worker_token_delta') {
-      const content = payloadText(event, 'content', 'text', 'delta');
-      if (content) steps.push({ type: 'text', content });
-      continue;
-    }
-
-    if (event.event_type === 'worker_llm_usage') {
-      steps.push({ type: 'usage', event });
+    if (event.event === 'token_delta') {
+      if (event.content) steps.push({ type: 'text', content: event.content });
     }
   }
 
@@ -105,25 +81,18 @@ function reconstructSteps(events: WorkerTraceEvent[]): WorkerStep[] {
   return steps;
 }
 
-function workerResult(worker: WorkerTraceState): string {
-  const terminal = [...worker.events]
-    .reverse()
-    .find(
-      (event) => event.event_type === 'worker_completed' || event.event_type === 'worker_failed'
-    );
-  const fromTerminal = terminal
-    ? payloadText(terminal, 'summary', 'output', 'text', 'content', 'error')
-    : '';
-  if (fromTerminal) return fromTerminal;
-
+function workerResult(worker: SubagentRunState): string {
+  // SubagentRunState carries the final output directly (and error on failure).
+  if (worker.status === 'failed' && worker.error) return worker.error;
+  if (worker.output) return worker.output;
   return worker.events
-    .filter((event) => event.event_type === 'worker_token_delta')
-    .map((event) => payloadText(event, 'content', 'text', 'delta'))
+    .filter((event) => event.event === 'token_delta')
+    .map((event) => String(event.content ?? ''))
     .join('')
     .trim();
 }
 
-function statusIcon(worker: WorkerTraceState) {
+function statusIcon(worker: SubagentRunState) {
   if (worker.status === 'running') {
     return <Loader2 size={16} className="animate-spin" style={{ color: 'var(--color-info)' }} />;
   }
@@ -136,18 +105,16 @@ function statusIcon(worker: WorkerTraceState) {
   return <Circle size={16} style={{ color: 'var(--text-tertiary)' }} />;
 }
 
-function formatTime(value?: string): string {
-  if (!value) return 'unknown';
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
+function formatTime(epochMs: number): string {
+  const date = new Date(epochMs);
+  if (Number.isNaN(date.getTime())) return 'unknown';
   return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
-function usageLine(event: WorkerTraceEvent): string {
-  const payload = payloadRecord(event);
-  const prompt = Number(payload.prompt_tokens ?? 0);
-  const completion = Number(payload.completion_tokens ?? 0);
-  const cached = Number(payload.cached_prompt_tokens ?? 0);
+function usageLine(event: ExecutionEvent): string {
+  const prompt = Number(event.prompt_tokens ?? 0);
+  const completion = Number(event.completion_tokens ?? 0);
+  const cached = Number(event.cached_prompt_tokens ?? 0);
   if (!prompt && !completion && !cached) return 'usage metadata';
   return `input ${prompt.toLocaleString()} / output ${completion.toLocaleString()} / cached ${cached.toLocaleString()}`;
 }
@@ -157,16 +124,19 @@ export function WorkerDetailView({ worker, allWorkers, onBack }: WorkerDetailVie
   const selectWorker = useWorkerDetailStore((state) => state.selectWorker);
   const progress = useMemo(() => computeWorkerProgress(worker), [worker.events, worker.status]);
   const steps = useMemo(() => reconstructSteps(worker.events), [worker.events]);
-  const result = useMemo(() => workerResult(worker), [worker.events]);
+  const result = useMemo(
+    () => workerResult(worker),
+    [worker.events, worker.output, worker.error, worker.status]
+  );
   const childWorkers = useMemo(
-    () => allWorkers.filter((candidate) => candidate.parentWorkerId === worker.workerId),
-    [allWorkers, worker.workerId]
+    () => allWorkers.filter((candidate) => candidate.parent === worker.subagentRunId),
+    [allWorkers, worker.subagentRunId]
   );
   const cacheSummary = useMemo(
     () => cacheUsageForWorkers([worker, ...childWorkers]),
     [worker, childWorkers]
   );
-  const title = worker.title || worker.agentName || worker.workerId;
+  const title = worker.agent || worker.subagentRunId;
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-[var(--bg-primary)]">
@@ -187,7 +157,7 @@ export function WorkerDetailView({ worker, allWorkers, onBack }: WorkerDetailVie
               <h2 className="truncate text-lg font-semibold text-[var(--text-primary)]">{title}</h2>
             </div>
             <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-[var(--text-tertiary)]">
-              <span>{worker.agentName || 'subagent'}</span>
+              <span>{worker.agent || 'subagent'}</span>
               <span>{statusLabel(progress.status)}</span>
               {progressSummary(progress) && <span>{progressSummary(progress)}</span>}
               <span>started {formatTime(worker.startedAt)}</span>
@@ -285,10 +255,10 @@ export function WorkerDetailView({ worker, allWorkers, onBack }: WorkerDetailVie
                     );
                   }
 
-                  const name = toolName(step.toolStart || step.toolResult);
-                  const args = payloadRecord(step.toolStart).args ?? {};
-                  const resultText = payloadText(step.toolResult, 'result');
-                  const success = String(payloadRecord(step.toolResult).success) !== 'false';
+                  const name = String(step.toolStart?.name ?? step.toolResult?.name ?? 'tool');
+                  const args = step.toolStart?.args ?? {};
+                  const resultText = String(step.toolResult?.result ?? '');
+                  const success = step.toolResult?.success !== false;
                   return (
                     <InlineToolCall
                       key={index}
@@ -305,14 +275,14 @@ export function WorkerDetailView({ worker, allWorkers, onBack }: WorkerDetailVie
                 <SectionTitle title="子 subagent" subtitle="由当前 subagent 派生的下级执行" />
                 {childWorkers.map((child) => (
                   <button
-                    key={child.workerId}
+                    key={child.subagentRunId}
                     type="button"
                     className="flex w-full items-center gap-2 rounded-md px-3 py-2 text-left text-sm transition-colors hover:bg-[var(--bg-hover)]"
-                    onClick={() => selectWorker(child.runId, child.workerId)}
+                    onClick={() => selectWorker(child.subagentRunId)}
                   >
                     {statusIcon(child)}
                     <span className="truncate text-[var(--text-primary)]">
-                      {child.title || child.agentName || child.workerId}
+                      {child.agent || child.subagentRunId}
                     </span>
                   </button>
                 ))}

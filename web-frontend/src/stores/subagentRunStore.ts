@@ -52,6 +52,13 @@ export interface ExecutionEvent {
   iteration_count?: number;
   output?: string;
   error?: string;
+  // LLM cache diagnostics (present on `usage` events, emitted per model call)
+  message_id?: string;
+  model?: string;
+  total_tokens?: number;
+  cached_prompt_tokens?: number;
+  cache_creation_prompt_tokens?: number;
+  usage_reported?: boolean;
   [key: string]: unknown;
 }
 
@@ -71,6 +78,11 @@ export interface SubagentRunState {
   iterationCount?: number;
   output?: string;
   error?: string;
+  /** Message id that triggered the run (chat message_key); pins this run to a
+   * chat message block. Absent for non-chat paths (cron). */
+  messageId?: string;
+  /** Accumulated LLM usage across all model calls in this run (for cache diagnostics). */
+  usageEvents?: ExecutionEvent[];
   /** Append-only event log (thinking/tool/token deltas). Capped to bound memory. */
   events: ExecutionEvent[];
 }
@@ -120,12 +132,16 @@ export const useSubagentRunStore = create<SubagentRunStore>((set) => ({
         status: 'running',
         startedAt: Date.now(),
         events: [],
+        usageEvents: [],
       };
       // Append the event, capping the log.
       const events =
         run.events.length >= MAX_EVENTS_PER_RUN
           ? [...run.events.slice(run.events.length - MAX_EVENTS_PER_RUN + 1), ev]
           : [...run.events, ev];
+      // Accumulate LLM usage events separately (uncapped, but bounded by the
+      // number of model calls — typically small) for cache-diagnostics panels.
+      const usageEvents = ev.event === 'usage' ? [...(run.usageEvents ?? []), ev] : run.usageEvents;
       const next: SubagentRunState = {
         ...run,
         // Preserve any field present on the event (overwrites prev).
@@ -138,6 +154,8 @@ export const useSubagentRunStore = create<SubagentRunStore>((set) => ({
         iterationCount: ev.iteration_count ?? run.iterationCount,
         output: ev.output ?? run.output,
         error: ev.error ?? run.error,
+        messageId: ev.message_id ?? run.messageId,
+        usageEvents,
         events,
       };
       return { runs: { ...s.runs, [id]: next } };

@@ -1,10 +1,10 @@
 import { useState, useEffect } from 'react';
 import { Bot, CheckCircle, XCircle, X, Loader2, ChevronDown, ChevronRight } from 'lucide-react';
-import type { SubagentState } from '../../stores/subagentStore';
+import type { SubagentRunState } from '../../stores/subagentRunStore';
 import { useWorkerDetailStore } from '../../stores/workerDetailStore';
 
 interface Props {
-  subagent: SubagentState;
+  subagent: SubagentRunState;
 }
 
 function formatDuration(ms: number): string {
@@ -64,7 +64,7 @@ export function SubagentCard({ subagent: s }: Props) {
         <button
           type="button"
           className="flex min-w-0 flex-1 items-center gap-2 text-left"
-          onClick={() => selectWorker(s.parent, s.id)}
+          onClick={() => selectWorker(s.subagentRunId)}
         >
           <span className="font-medium text-[var(--text-primary)] truncate flex-1">{s.agent}</span>
           {s.tokensUsed != null && (
@@ -125,7 +125,7 @@ export function SubagentCard({ subagent: s }: Props) {
   );
 }
 
-export function SubagentPanel({ subagents }: { subagents: Record<string, SubagentState> }) {
+export function SubagentPanel({ subagents }: { subagents: Record<string, SubagentRunState> }) {
   const entries = Object.values(subagents);
   const [showDone, setShowDone] = useState(true);
   if (entries.length === 0) return null;
@@ -159,7 +159,7 @@ export function SubagentPanel({ subagents }: { subagents: Record<string, Subagen
 
       {/* Running subagents (always visible) */}
       {running.map((s) => (
-        <SubagentCard key={s.id} subagent={s} />
+        <SubagentCard key={s.subagentRunId} subagent={s} />
       ))}
 
       {/* Completed/failed subagents (collapsible) */}
@@ -175,10 +175,10 @@ export function SubagentPanel({ subagents }: { subagents: Record<string, Subagen
           {showDone && (
             <div className="space-y-1 opacity-60">
               {completed.map((s) => (
-                <SubagentCard key={s.id} subagent={s} />
+                <SubagentCard key={s.subagentRunId} subagent={s} />
               ))}
               {failed.map((s) => (
-                <SubagentCard key={s.id} subagent={s} />
+                <SubagentCard key={s.subagentRunId} subagent={s} />
               ))}
             </div>
           )}

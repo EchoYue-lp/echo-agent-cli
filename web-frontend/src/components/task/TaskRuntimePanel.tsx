@@ -28,10 +28,10 @@ import {
 import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
 import { useConversationStore } from '../../stores/conversationStore';
 import {
-  useWorkerTraceStore,
-  type WorkerTraceEvent,
-  type WorkerTraceState,
-} from '../../stores/workerTraceStore';
+  useSubagentRunStore,
+  type ExecutionEvent,
+  type SubagentRunState,
+} from '../../stores/subagentRunStore';
 import type { TodoStatus } from '../../generated';
 
 const STATUS_LABEL: Record<string, string> = {
@@ -94,35 +94,8 @@ function uniqueValues(values: Array<string | null | undefined>): string[] {
   return [...new Set(values.filter((value): value is string => Boolean(value && value.trim())))];
 }
 
-function payloadValue(event: WorkerTraceEvent, key: string): string | undefined {
-  if (!event.payload || typeof event.payload !== 'object' || Array.isArray(event.payload)) {
-    return undefined;
-  }
-  const value = (event.payload as Record<string, unknown>)[key];
-  if (typeof value === 'string') return value;
-  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
-  return undefined;
-}
-
-function payloadBool(event: WorkerTraceEvent, key: string): boolean | undefined {
-  if (!event.payload || typeof event.payload !== 'object' || Array.isArray(event.payload)) {
-    return undefined;
-  }
-  const value = (event.payload as Record<string, unknown>)[key];
-  return typeof value === 'boolean' ? value : undefined;
-}
-
-function payloadNumber(event: WorkerTraceEvent, key: string): number {
-  if (!event.payload || typeof event.payload !== 'object' || Array.isArray(event.payload)) {
-    return 0;
-  }
-  const value = (event.payload as Record<string, unknown>)[key];
-  if (typeof value === 'number' && Number.isFinite(value)) return value;
-  if (typeof value === 'string') {
-    const parsed = Number(value);
-    return Number.isFinite(parsed) ? parsed : 0;
-  }
-  return 0;
+function num(value: number | undefined): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
 }
 
 interface CacheUsageSummary {
@@ -142,49 +115,27 @@ interface CacheDiagnostic {
   detail: string;
 }
 
-function isUsageEvent(event: WorkerTraceEvent): boolean {
-  return event.event_type === 'worker_llm_usage' || event.event_type === 'worker_thinking_end';
-}
-
-function workerUsageKey(event: WorkerTraceEvent): string {
-  return `${event.run_id}::${event.worker_id ?? 'main'}`;
-}
-
-function cacheUsageEvents(events: WorkerTraceEvent[]): WorkerTraceEvent[] {
-  const providerUsageWorkers = new Set(
-    events.filter((event) => event.event_type === 'worker_llm_usage').map(workerUsageKey)
-  );
-
-  return events.filter((event) => {
-    if (event.event_type === 'worker_llm_usage') return true;
-    if (event.event_type !== 'worker_thinking_end') return false;
-    if (providerUsageWorkers.has(workerUsageKey(event))) return false;
-    return (
-      payloadNumber(event, 'prompt_tokens') > 0 || payloadNumber(event, 'completion_tokens') > 0
-    );
-  });
-}
-
-function cacheUsageFromEvents(events: WorkerTraceEvent[]): CacheUsageSummary {
-  const usageEvents = cacheUsageEvents(events.filter(isUsageEvent));
-  const models = uniqueValues(usageEvents.map((event) => payloadValue(event, 'model')));
+// Cache diagnostics now read from `usage` events emitted by the framework's
+// DispatchLlmUsage (Phase 3a). These carry the full breakdown on the event
+// top level — no more payload digging, and no thinking_end fallback needed
+// (LlmUsage covers every model call).
+function cacheUsageFromEvents(events: ExecutionEvent[]): CacheUsageSummary {
+  const usageEvents = events.filter((e) => e.event === 'usage');
+  const models = uniqueValues(usageEvents.map((e) => e.model));
   return usageEvents.reduce<CacheUsageSummary>(
     (summary, event) => {
-      const reported =
-        event.event_type === 'worker_llm_usage' ? payloadBool(event, 'usage_reported') : false;
       summary.calls += 1;
-      if (!reported) {
-        // Unreported usage: count but don't pollute main token statistics.
+      if (event.usage_reported === false) {
         summary.missingUsage += 1;
       } else {
-        const inputTokens = payloadNumber(event, 'prompt_tokens');
-        const outputTokens = payloadNumber(event, 'completion_tokens');
-        const totalTokens = payloadNumber(event, 'total_tokens') || inputTokens + outputTokens;
+        const inputTokens = num(event.prompt_tokens);
+        const outputTokens = num(event.completion_tokens);
+        const totalTokens = num(event.total_tokens) || inputTokens + outputTokens;
         summary.inputTokens += inputTokens;
         summary.outputTokens += outputTokens;
         summary.totalTokens += totalTokens;
-        summary.cachedPromptTokens += payloadNumber(event, 'cached_prompt_tokens');
-        summary.cacheCreationPromptTokens += payloadNumber(event, 'cache_creation_prompt_tokens');
+        summary.cachedPromptTokens += num(event.cached_prompt_tokens);
+        summary.cacheCreationPromptTokens += num(event.cache_creation_prompt_tokens);
       }
       return summary;
     },
@@ -201,7 +152,7 @@ function cacheUsageFromEvents(events: WorkerTraceEvent[]): CacheUsageSummary {
   );
 }
 
-export function cacheUsageForWorkers(workers: WorkerTraceState[]): CacheUsageSummary {
+export function cacheUsageForWorkers(workers: SubagentRunState[]): CacheUsageSummary {
   return cacheUsageFromEvents(workers.flatMap((worker) => worker.events));
 }
 
@@ -427,14 +378,14 @@ function MetricCell({
   );
 }
 
-function traceWorkerForTodo(todo: { owner_agent: string | null }, workers: WorkerTraceState[]) {
+function traceWorkerForTodo(todo: { owner_agent: string | null }, workers: SubagentRunState[]) {
   if (!todo.owner_agent) return undefined;
-  return workers.find((worker) => worker.agentName === todo.owner_agent);
+  return workers.find((worker) => worker.agent === todo.owner_agent);
 }
 
 function displayedTodoStatus(
   todo: { status: TodoStatus; owner_agent: string | null },
-  workers: WorkerTraceState[]
+  workers: SubagentRunState[]
 ): TodoStatus {
   const worker = traceWorkerForTodo(todo, workers);
   if (!worker) return todo.status;
@@ -452,7 +403,7 @@ function displayedTodoStatus(
 
 export function TaskRuntimePanel() {
   const activeId = useConversationStore((s) => s.activeId);
-  const traceWorkers = useWorkerTraceStore((s) => s.workers);
+  const traceWorkers = useSubagentRunStore((s) => s.runs);
   const { activeRun, plan, todos, routeExplanation, loadByConversation, refresh, resumeTaskRun } =
     useTaskRuntimeStore();
 
@@ -465,7 +416,7 @@ export function TaskRuntimePanel() {
       activeRun
         ? Object.values(traceWorkers)
             .filter((worker) => worker.runId === activeRun.run_id)
-            .sort((a, b) => (a.startedAt ?? '').localeCompare(b.startedAt ?? ''))
+            .sort((a, b) => a.startedAt - b.startedAt)
         : [],
     [activeRun, traceWorkers]
   );

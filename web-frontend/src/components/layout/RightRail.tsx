@@ -3,8 +3,7 @@ import { RefreshCw, ListTodo, FileText, Gauge } from 'lucide-react';
 import { useConversationStore } from '../../stores/conversationStore';
 import { useChangesStore } from '../../stores/changesStore';
 import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
-import { useWorkerTraceStore } from '../../stores/workerTraceStore';
-import { useSubagentStore } from '../../stores/subagentStore';
+import { useSubagentRunStore } from '../../stores/subagentRunStore';
 import { deriveChangedFiles } from '../../utils/deriveChangedFiles';
 import { useChatStore } from '../../stores/chatStore';
 import { ChangesDrawer } from '../changes/ChangesDrawer';
@@ -32,8 +31,7 @@ export function RightRail() {
   const activeId = useConversationStore((s) => s.activeId);
   const messages = useChatStore((s) => s.messages);
   const { activeRun, todos: _todos, artifacts, refresh } = useTaskRuntimeStore();
-  const traceWorkers = useWorkerTraceStore((s) => s.workers);
-  const subagents = useSubagentStore((s) => s.subagents);
+  const subagentRuns = useSubagentRunStore((s) => s.runs);
 
   const changesFiles = useChangesStore((s) => s.files);
   const setSelected = useChangesStore((s) => s.setSelected);
@@ -55,10 +53,10 @@ export function RightRail() {
   }, [toolCallCount]);
 
   const visibleWorkers = useMemo(() => {
-    return Object.values(traceWorkers)
+    return Object.values(subagentRuns)
       .filter((w) => !activeRun || w.runId === activeRun.run_id)
-      .sort((a, b) => (a.startedAt ?? '').localeCompare(b.startedAt ?? ''));
-  }, [activeRun, traceWorkers]);
+      .sort((a, b) => a.startedAt - b.startedAt);
+  }, [activeRun, subagentRuns]);
 
   const displayedChanges = changesFiles.slice(0, 12);
   const usageSummary = cacheUsageForWorkers(visibleWorkers);
@@ -69,9 +67,9 @@ export function RightRail() {
         {/* ── 任务运行(TaskRuntimePanel: todos + cache) ── */}
         <TaskRuntimePanel />
 
-        {Object.keys(subagents).length > 0 && (
+        {Object.keys(subagentRuns).length > 0 && (
           <section>
-            <SubagentPanel subagents={subagents} />
+            <SubagentPanel subagents={subagentRuns} />
           </section>
         )}
 

@@ -1,37 +1,55 @@
-// Worker progress summary computation (spec §3.3.4)
-import type { WorkerTraceState, WorkerTraceEvent } from '../stores/workerTraceStore';
+// Subagent progress summary computation (spec §3.3.4).
+//
+// Originally computed from WorkerTraceState/WorkerTraceEvent; Phase 3 of the
+// Subagent unification rewires it onto SubagentRunState/ExecutionEvent. The
+// event-type strings dropped their `worker_` prefix (`tool_started` not
+// `worker_tool_start`) and fields moved from `payload.*` to the event top
+// level (`e.name` not `e.payload.name`).
+import type { SubagentRunState, ExecutionEvent } from '../stores/subagentRunStore';
 
 /** Tool names considered "read" operations (exploration). Frontend heuristic set. */
 const READ_TOOL_NAMES = new Set([
-  'read_file', 'read', 'read_files',
-  'glob', 'grep', 'rg', 'search',
-  'list', 'list_files', 'ls', 'list_dir',
-  'view', 'cat', 'head', 'tail',
+  'read_file',
+  'read',
+  'read_files',
+  'glob',
+  'grep',
+  'rg',
+  'search',
+  'list',
+  'list_files',
+  'ls',
+  'list_dir',
+  'view',
+  'cat',
+  'head',
+  'tail',
 ]);
 
 export interface WorkerProgress {
-  status: 'running' | 'completed' | 'failed' | 'cancelled' | 'planned';
+  status: 'running' | 'completed' | 'failed' | 'cancelled';
   toolCount: number;
   readCount: number;
   thinkingRounds: number;
 }
 
-/** Count `worker_tool_start` events with a read-like tool name. */
-function countReadTools(events: WorkerTraceEvent[]): number {
+/** Count `tool_started` events with a read-like tool name. */
+function countReadTools(events: ExecutionEvent[]): number {
   return events.filter(
-    (e) =>
-      e.event_type === 'worker_tool_start' &&
-      READ_TOOL_NAMES.has(String((e.payload as Record<string, unknown> | null)?.name ?? '').toLowerCase())
+    (e) => e.event === 'tool_started' && READ_TOOL_NAMES.has(String(e.name ?? '').toLowerCase())
   ).length;
 }
 
-export function computeWorkerProgress(worker: WorkerTraceState): WorkerProgress {
-  const events = worker.events;
-  const toolCount = events.filter((e) => e.event_type === 'worker_tool_start').length;
+export function computeWorkerProgress(run: SubagentRunState): WorkerProgress {
+  const events = run.events;
+  const toolCount = events.filter((e) => e.event === 'tool_started').length;
   const readCount = countReadTools(events);
-  const thinkingRounds = events.filter((e) => e.event_type === 'worker_thinking_end').length;
+  // `usage` events correspond to thinking_ended (one round of thinking per
+  // model call). thinking_ended itself also maps to `usage`, so this counts
+  // completed thinking rounds.
+  const thinkingRounds = events.filter((e) => e.event === 'usage').length;
   return {
-    status: worker.status,
+    status: run.status,
     toolCount,
     readCount,
     thinkingRounds,
@@ -51,10 +69,13 @@ export function progressSummary(p: WorkerProgress): string {
 
 export function statusLabel(status: WorkerProgress['status']): string {
   switch (status) {
-    case 'running': return '运行中';
-    case 'completed': return '已完成';
-    case 'failed': return '失败';
-    case 'cancelled': return '已取消';
-    case 'planned': return '已规划';
+    case 'running':
+      return '运行中';
+    case 'completed':
+      return '已完成';
+    case 'failed':
+      return '失败';
+    case 'cancelled':
+      return '已取消';
   }
 }

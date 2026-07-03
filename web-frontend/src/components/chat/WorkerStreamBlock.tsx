@@ -8,34 +8,34 @@ import {
   ChevronRight,
   Brain,
 } from 'lucide-react';
-import type { WorkerTraceState, WorkerTraceEvent } from '../../stores/workerTraceStore';
+import type { SubagentRunState, ExecutionEvent } from '../../stores/subagentRunStore';
 import { useWorkerDetailStore } from '../../stores/workerDetailStore';
 import MarkdownContent from '../common/MarkdownContent';
 import { InlineToolCall } from './InlineToolCall';
 import { computeWorkerProgress, progressSummary, statusLabel } from '../../utils/workerProgress';
 
 interface WorkerStreamBlockProps {
-  worker: WorkerTraceState;
+  worker: SubagentRunState;
   /** All execution traces in this run (for recursive child lookup). */
-  allWorkers: WorkerTraceState[];
+  allWorkers: SubagentRunState[];
 }
 
 /** Reconstruct a subagent's thinking+tool loop from raw events. */
 interface WorkerStep {
   type: 'thinking' | 'tool';
   content?: string;
-  toolStart?: WorkerTraceEvent;
-  toolResult?: WorkerTraceEvent;
+  toolStart?: ExecutionEvent;
+  toolResult?: ExecutionEvent;
 }
 
-function reconstructSteps(events: WorkerTraceEvent[]): {
+function reconstructSteps(events: ExecutionEvent[]): {
   steps: WorkerStep[];
   thinkingTotal: number;
 } {
   const steps: WorkerStep[] = [];
   let thinkingTotal = 0;
   const currentThinking: string[] = [];
-  const pendingTools: WorkerTraceEvent[] = [];
+  const pendingTools: ExecutionEvent[] = [];
 
   const flushThinking = () => {
     if (currentThinking.length > 0) {
@@ -49,19 +49,17 @@ function reconstructSteps(events: WorkerTraceEvent[]): {
   };
 
   for (const e of events) {
-    if (e.event_type === 'worker_thinking_delta') {
-      const c = String((e.payload as Record<string, unknown> | null)?.content ?? '');
-      if (c) currentThinking.push(c);
-    } else if (e.event_type === 'worker_thinking_end') {
+    if (e.event === 'thinking_delta') {
+      if (e.content) currentThinking.push(e.content);
+    } else if (e.event === 'usage') {
+      // thinking_ended maps to `usage`; flush the accumulated thinking.
       flushThinking();
-    } else if (e.event_type === 'worker_tool_start') {
+    } else if (e.event === 'tool_started') {
       flushThinking();
       pendingTools.push(e);
-    } else if (e.event_type === 'worker_tool_result') {
-      const name = String((e.payload as Record<string, unknown> | null)?.name ?? '');
-      const idx = pendingTools.findIndex(
-        (p) => String((p.payload as Record<string, unknown> | null)?.name ?? '') === name
-      );
+    } else if (e.event === 'tool_completed') {
+      const name = String(e.name ?? '');
+      const idx = pendingTools.findIndex((p) => String(p.name ?? '') === name);
       const start = idx >= 0 ? pendingTools.splice(idx, 1)[0] : undefined;
       steps.push({ type: 'tool', toolStart: start, toolResult: e });
     }
@@ -73,29 +71,13 @@ function reconstructSteps(events: WorkerTraceEvent[]): {
   return { steps, thinkingTotal };
 }
 
-function workerResult(worker: WorkerTraceState): string {
-  const completed = [...worker.events].reverse().find((e) => e.event_type === 'worker_completed');
-  // 多字段兜底:summary / output / text / content
-  const summary = completed
-    ? String(
-        (completed.payload as Record<string, unknown> | null)?.summary ??
-          (completed.payload as Record<string, unknown> | null)?.output ??
-          (completed.payload as Record<string, unknown> | null)?.text ??
-          (completed.payload as Record<string, unknown> | null)?.content ??
-          ''
-      )
-    : '';
-  if (summary) return summary;
+function workerResult(worker: SubagentRunState): string {
+  // SubagentRunState carries the final output directly (no need to dig it out
+  // of a `worker_completed` event payload like the legacy store did).
+  if (worker.output) return worker.output;
   return worker.events
-    .filter((e) => e.event_type === 'worker_token_delta')
-    .map((e) =>
-      String(
-        (e.payload as Record<string, unknown> | null)?.content ??
-          (e.payload as Record<string, unknown> | null)?.text ??
-          (e.payload as Record<string, unknown> | null)?.delta ??
-          ''
-      )
-    )
+    .filter((e) => e.event === 'token_delta')
+    .map((e) => String(e.content ?? ''))
     .join('')
     .trim();
 }
@@ -115,11 +97,11 @@ export const WorkerStreamBlock = memo(function WorkerStreamBlock({
   const progress = useMemo(() => computeWorkerProgress(worker), [worker.events, worker.status]);
   const summary = progressSummary(progress);
   const { steps } = useMemo(() => reconstructSteps(worker.events), [worker.events]);
-  const result = useMemo(() => workerResult(worker), [worker.events]);
+  const result = useMemo(() => workerResult(worker), [worker.events, worker.output]);
 
   const children = useMemo(
-    () => allWorkers.filter((w) => w.parentWorkerId === worker.workerId),
-    [allWorkers, worker.workerId]
+    () => allWorkers.filter((w) => w.parent === worker.subagentRunId),
+    [allWorkers, worker.subagentRunId]
   );
 
   const statusIcon =
@@ -147,12 +129,12 @@ export const WorkerStreamBlock = memo(function WorkerStreamBlock({
         </button>
         <button
           type="button"
-          onClick={() => selectWorker(worker.runId, worker.workerId)}
+          onClick={() => selectWorker(worker.subagentRunId)}
           className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
         >
           {statusIcon}
           <span className="truncate font-medium text-[var(--text-primary)]">
-            {worker.title || worker.agentName || worker.workerId}
+            {worker.agent || worker.subagentRunId}
           </span>
           <span className="ml-auto shrink-0 text-[10px] text-[var(--text-tertiary)]">
             {statusLabel(progress.status)}
@@ -210,18 +192,10 @@ export const WorkerStreamBlock = memo(function WorkerStreamBlock({
                       </div>
                     );
                   }
-                  const name = String(
-                    (step.toolStart?.payload as Record<string, unknown> | null)?.name ?? 'tool'
-                  );
-                  const args =
-                    (step.toolStart?.payload as Record<string, unknown> | null)?.args ?? {};
-                  const resultStr = String(
-                    (step.toolResult?.payload as Record<string, unknown> | null)?.result ?? ''
-                  );
-                  const success =
-                    String(
-                      (step.toolResult?.payload as Record<string, unknown> | null)?.success
-                    ) !== 'false';
+                  const name = String(step.toolStart?.name ?? 'tool');
+                  const args = step.toolStart?.args ?? {};
+                  const resultStr = String(step.toolResult?.result ?? '');
+                  const success = step.toolResult?.success !== false;
                   return (
                     <InlineToolCall
                       key={i}
@@ -235,7 +209,7 @@ export const WorkerStreamBlock = memo(function WorkerStreamBlock({
                   <div className="ml-2 border-l border-[var(--border-primary)] pl-2">
                     {children.map((child) => (
                       <WorkerStreamBlock
-                        key={child.workerId}
+                        key={child.subagentRunId}
                         worker={child}
                         allWorkers={allWorkers}
                       />
