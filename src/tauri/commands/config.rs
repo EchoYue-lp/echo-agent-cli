@@ -2,7 +2,7 @@
 
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
-use echo_agent::agent::Agent;
+use echo_agent::agent::{Agent, ReactAgent};
 use echo_agent_app_core::model_config;
 use echo_agent_app_core::types::{
     AgentConfigResponse, ChannelsConfigResponse, FeishuConfigResponse, FullConfigResponse,
@@ -69,6 +69,24 @@ fn full_config_response(cfg: &echo_agent::config::AppConfig) -> FullConfigRespon
     }
 }
 
+/// 从 agent 读取配置字段构造 AgentConfigResponse (P2-3 去重)。
+/// get_config 与 update_config 此前各内联一遍相同构造, 抽出统一函数。
+fn build_agent_config_response(
+    agent: &ReactAgent,
+    available_models: Vec<String>,
+) -> AgentConfigResponse {
+    AgentConfigResponse {
+        model: agent.model_name().to_string(),
+        system_prompt: agent.system_prompt().to_string(),
+        max_iterations: agent.config().get_max_iterations(),
+        token_limit: agent.config().get_token_limit(),
+        enable_memory: agent.config().is_memory_enabled(),
+        enable_human_loop: agent.config().is_human_in_loop_enabled(),
+        session_id: agent.config().get_session_id().map(|s| s.to_string()),
+        available_models,
+    }
+}
+
 #[tauri::command]
 pub async fn get_config(
     state: tauri::State<'_, TauriState>,
@@ -81,16 +99,7 @@ pub async fn get_config(
         .app_state
         .connection
         .agent
-        .read(|agent| AgentConfigResponse {
-            model: agent.model_name().to_string(),
-            system_prompt: agent.system_prompt().to_string(),
-            max_iterations: agent.config().get_max_iterations(),
-            token_limit: agent.config().get_token_limit(),
-            enable_memory: agent.config().is_memory_enabled(),
-            enable_human_loop: agent.config().is_human_in_loop_enabled(),
-            session_id: agent.config().get_session_id().map(|s| s.to_string()),
-            available_models,
-        })
+        .read(|agent| build_agent_config_response(agent, available_models))
         .await)
 }
 
@@ -139,16 +148,7 @@ pub async fn update_config(
         .app_state
         .connection
         .agent
-        .read(|agent| AgentConfigResponse {
-            model: agent.model_name().to_string(),
-            system_prompt: agent.system_prompt().to_string(),
-            max_iterations: agent.config().get_max_iterations(),
-            token_limit: agent.config().get_token_limit(),
-            enable_memory: agent.config().is_memory_enabled(),
-            enable_human_loop: agent.config().is_human_in_loop_enabled(),
-            session_id: agent.config().get_session_id().map(|s| s.to_string()),
-            available_models,
-        })
+        .read(|agent| build_agent_config_response(agent, available_models))
         .await)
 }
 

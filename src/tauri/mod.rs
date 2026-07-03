@@ -292,7 +292,10 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                         }
                     }
                 })
-                .ok();
+                .unwrap_or_else(|e| {
+                    // P2-1: 此前 .ok() 静默吞错, 快捷键被占用时用户无感知 (toggle 失效)。
+                    tracing::warn!(error = %e, "Global shortcut CmdOrCtrl+Shift+E registration failed (likely held by another app)");
+                });
 
             // Spawn task event emitter — bridges TaskEventBus to Tauri events
             let tauri_state = app.state::<TauriState>();

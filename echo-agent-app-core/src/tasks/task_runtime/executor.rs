@@ -2280,35 +2280,61 @@ pub async fn drive_unattended_run(
         == UnattendedWriteMode::Worktree
     {
         if let Some(ref root) = repo_root {
-            match super::worktree::RunWorktree::create(run_id, root) {
-                Ok(wt) => {
-                    tracing::info!(
-                        run_id = %run_id,
-                        branch = %wt.branch,
-                        path = %wt.path.display(),
-                        "U1c stage 2: unattended worktree provisioned"
-                    );
-                    Some(wt)
-                }
-                Err(e) => {
-                    // SAFETY (D7 stage 2): worktree creation failed under
-                    // Worktree mode. We must NOT silently continue — that
-                    // would allow writes to land in the main workspace
-                    // without isolation (the preflight loosens its write
-                    // ban under Worktree mode, expecting isolation to
-                    // provide safety). Fail the run hard so the user sees
-                    // the problem, rather than silently risking their
-                    // uncommitted work.
+            // P1-14: RunWorktree::create 内部用 std::process::Command 同步执行
+            // `git worktree add`(worktree.rs:84), 在 async 上下文里直接调用会阻塞
+            // tokio worker 线程。包进 spawn_blocking 把它丢到阻塞线程池。
+            let wt_run_id = run_id.to_string();
+            let wt_root = root.clone();
+            match tokio::task::spawn_blocking(move || {
+                super::worktree::RunWorktree::create(&wt_run_id, &wt_root)
+            })
+            .await
+            {
+                Ok(create_result) => match create_result {
+                    Ok(wt) => {
+                        tracing::info!(
+                            run_id = %run_id,
+                            branch = %wt.branch,
+                            path = %wt.path.display(),
+                            "U1c stage 2: unattended worktree provisioned"
+                        );
+                        Some(wt)
+                    }
+                    Err(e) => {
+                        // SAFETY (D7 stage 2): worktree creation failed under
+                        // Worktree mode. We must NOT silently continue — that
+                        // would allow writes to land in the main workspace
+                        // without isolation (the preflight loosens its write
+                        // ban under Worktree mode, expecting isolation to
+                        // provide safety). Fail the run hard so the user sees
+                        // the problem, rather than silently risking their
+                        // uncommitted work.
+                        let msg = format!(
+                            "Unattended worktree creation failed (mode=Worktree): {}. \
+                             Refusing to run without isolation — fix the git state \
+                             or set unattended_write_mode=disabled/in_place.",
+                            e.message
+                        );
+                        tracing::error!(
+                            run_id = %run_id,
+                            error = %e.message,
+                            "U1c stage 2: worktree creation failed — failing run (no silent fallback)"
+                        );
+                        let _ = store.transition_run(run_id, TaskRunStatus::Failed);
+                        let _ = store.note(run_id, None, &msg);
+                        return Err(ExecError::Other(msg));
+                    }
+                },
+                Err(join_err) => {
+                    // spawn_blocking 任务 panic (JoinError)。同等 fail-hard 处理。
                     let msg = format!(
-                        "Unattended worktree creation failed (mode=Worktree): {}. \
-                         Refusing to run without isolation — fix the git state \
-                         or set unattended_write_mode=disabled/in_place.",
-                        e.message
+                        "Unattended worktree creation panicked: {join_err}. \
+                         Refusing to run without isolation."
                     );
                     tracing::error!(
                         run_id = %run_id,
-                        error = %e.message,
-                        "U1c stage 2: worktree creation failed — failing run (no silent fallback)"
+                        error = %join_err,
+                        "U1c stage 2: spawn_blocking join error"
                     );
                     let _ = store.transition_run(run_id, TaskRunStatus::Failed);
                     let _ = store.note(run_id, None, &msg);

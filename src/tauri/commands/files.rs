@@ -179,7 +179,10 @@ pub async fn diff_file(
         .map_err(IpcError::Validation)?;
 
     let new_content = if target.exists() {
-        std::fs::read_to_string(&target).unwrap_or_default()
+        // P2-2: 此前 unwrap_or_default() 在二进制/非 UTF-8 文件上静默返空,
+        // diff 输出误导 (看起来像"全新增")。改为显式报错让前端提示。
+        std::fs::read_to_string(&target)
+            .map_err(|e| IpcError::Internal(format!("无法读取文件 (可能为二进制): {e}")))?
     } else {
         String::new()
     };

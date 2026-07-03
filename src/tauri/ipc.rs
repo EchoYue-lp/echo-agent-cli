@@ -106,9 +106,12 @@ pub struct SystemInfo {
 }
 
 fn dirs_home() -> String {
+    // P2-10: 此前 fallback 返回字面量 "~", 若被下游用于路径拼接会得到未展开的
+    // 无效路径。HOME 在 macOS 几乎必存在, 但保险起见返回空串 (显示无害, 拼接
+    // 也不会产生假路径)。
     std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| "~".to_string())
+        .unwrap_or_default()
 }
 
 /// Open a path in the system file explorer / default application.
