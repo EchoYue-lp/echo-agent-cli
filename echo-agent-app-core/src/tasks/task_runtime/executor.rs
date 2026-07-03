@@ -209,6 +209,15 @@ pub async fn execute_run(
     match &outcome {
         Ok(RunOutcome::Completed) => {
             if has_unresolved_tasks(&store, run_id) {
+                // run_dag waits for in_flight (sibling-dispatched) tasks to
+                // finish before returning Completed, so reaching here with
+                // unresolved tasks means tasks were appended to the store
+                // AFTER run_dag's entry snapshot and no instance picked them
+                // up. Defensive: surface the partial state rather than
+                // declaring the run fully done (a follow-up execute_plan call
+                // will pick them up). Under normal tool-batch behavior the
+                // sibling run_dag instances each wait for the full frontier,
+                // so this branch is rarely hit.
                 tracing::info!(
                     run_id = %run_id,
                     "task_runtime: completed snapshot but run has pending appended tasks"
@@ -484,21 +493,20 @@ async fn run_dag<W: TaskWorker + 'static>(
     // Pre-populate with tasks already marked Completed — this is the resume
     // path: the executor re-reads the plan from the store and skips tasks
     // that finished in the previous run.
-    //
-    // CRITICAL: also include `Running` tasks. When the model emits several
-    // `execute_plan` calls as a parallel tool batch (each appending a task),
-    // `RUN_EXECUTION_LOCKS` serializes them, so the 2nd..Nth call enters
-    // `run_dag` while earlier tasks are still `Running` (dispatched by the
-    // previous run_dag instance and not yet finished). Without this guard,
-    // the `ready` filter below would re-dispatch those in-flight tasks,
-    // causing duplicate subagent work (observed: same task running 2-3×,
-    // 3× token waste). Treating `Running` as "handled by another instance"
-    // prevents re-dispatch; the `has_unresolved_tasks` check in `execute_run`
-    // then keeps the run in `Running` state so a follow-up `execute_plan`
-    // picks them up once they finish.
     let mut completed: HashSet<String> = tasks
         .iter()
-        .filter(|t| matches!(t.status, TodoStatus::Completed | TodoStatus::Running))
+        .filter(|t| t.status == TodoStatus::Completed)
+        .map(|t| t.id.clone())
+        .collect();
+    // Tasks that were already `Running` when run_dag entered (dispatched by a
+    // sibling run_dag instance spawned by a concurrent `execute_plan` tool
+    // batch). These must NOT be re-dispatched (causes duplicate subagent work
+    // — observed 2-3× token waste) NOR counted as completed (the primary agent
+    // would get a partial result). They are tracked here and polled from the
+    // store each loop iteration until they reach a terminal state.
+    let mut in_flight: HashSet<String> = tasks
+        .iter()
+        .filter(|t| t.status == TodoStatus::Running)
         .map(|t| t.id.clone())
         .collect();
     let mut failed_id: Option<String> = None;
@@ -572,12 +580,60 @@ async fn run_dag<W: TaskWorker + 'static>(
             return Ok(RunOutcome::Completed);
         }
 
-        // Find ready tasks: not yet completed/failed, all deps completed.
-        // Prefer the fix-task variant when a review produced one (carries the
-        // bumped retry_count + review-informed brief).
+        // Refresh in_flight tasks from the store: any that reached a terminal
+        // state (Completed/Failed/Skipped) while we were away are no longer
+        // in-flight. Completed ones move into `completed`; Failed/Skipped are
+        // treated as resolved (count toward the all_ids check). This is what
+        // lets a sibling run_dag instance finish a task and this instance
+        // observe it without re-dispatching.
+        if !in_flight.is_empty() {
+            let live_plan = store.get_plan(run_id).ok().flatten();
+            if let Some(plan) = live_plan {
+                let resolved: Vec<String> = in_flight
+                    .iter()
+                    .filter_map(|id| {
+                        plan.tasks.iter().find(|t| &t.id == id).and_then(|t| {
+                            if t.status == TodoStatus::Completed {
+                                Some(id.clone())
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                    .collect();
+                for id in &resolved {
+                    in_flight.remove(id);
+                    completed.insert(id.clone());
+                }
+                // Drop tasks that failed/skipped from in_flight (they are
+                // resolved, just not completed).
+                let terminal: Vec<String> = in_flight
+                    .iter()
+                    .filter_map(|id| {
+                        plan.tasks.iter().find(|t| &t.id == id).and_then(|t| {
+                            if matches!(t.status, TodoStatus::Failed | TodoStatus::Skipped) {
+                                Some(id.clone())
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                    .collect();
+                for id in &terminal {
+                    in_flight.remove(id);
+                }
+            }
+            if completed.len() == all_ids.len() {
+                return Ok(RunOutcome::Completed);
+            }
+        }
+
+        // Find ready tasks: not completed, not in_flight, all deps completed.
+        // in_flight tasks are excluded so they aren't re-dispatched (they are
+        // being driven by a sibling run_dag instance).
         let ready: Vec<PlanTask> = tasks
             .iter()
-            .filter(|t| !completed.contains(&t.id))
+            .filter(|t| !completed.contains(&t.id) && !in_flight.contains(&t.id))
             .filter(|t| t.depends_on.iter().all(|d| completed.contains(d)))
             .map(|t| {
                 tasks_with_fixes
@@ -588,8 +644,16 @@ async fn run_dag<W: TaskWorker + 'static>(
             .collect();
 
         if ready.is_empty() {
-            // Nothing ready and not all done → deadlock (cycle or all
-            // remaining are blocked by the failed one). Break out.
+            if !in_flight.is_empty() {
+                // Nothing ready but sibling run_dag instances are still
+                // driving tasks. Wait briefly for them to make progress, then
+                // loop back to re-check the store. Without this wait the loop
+                // would spin hot.
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                continue;
+            }
+            // Nothing ready, nothing in-flight, and not all done → deadlock
+            // (cycle or all remaining are blocked by the failed one).
             if completed.len() + (if failed_id.is_some() { 1 } else { 0 }) >= all_ids.len() {
                 continue;
             }
@@ -3213,10 +3277,12 @@ mod tests {
         // Regression: when the model emits several `execute_plan` calls as a
         // parallel tool batch, `RUN_EXECUTION_LOCKS` serializes them. The 2nd
         // call enters run_dag while an earlier task is still `Running`
-        // (dispatched by the previous run_dag instance). Without treating
-        // `Running` as "handled", the ready filter would re-dispatch it,
-        // causing duplicate subagent work. Verify a `Running` task is left
-        // alone and only the genuinely-pending sibling is dispatched.
+        // (dispatched by the previous run_dag instance). Without the in_flight
+        // guard, the ready filter would re-dispatch the Running task, causing
+        // duplicate subagent work. Verify the Running task is left alone, the
+        // genuinely-pending sibling is dispatched, and run_dag WAITS for the
+        // in_flight task to reach Completed in the store (simulating the
+        // sibling instance finishing it) before returning Completed.
         let mut in_flight = solo_readonly_task("in_flight");
         in_flight.status = TodoStatus::Running;
         let pending = solo_readonly_task("pending");
@@ -3225,17 +3291,38 @@ mod tests {
         let worker = ScriptedWorker::new();
         worker.succeed("pending", "done");
 
-        let outcome = run_dag(
-            store.clone(),
-            worker.clone(),
-            None,
-            &run_id,
-            vec![in_flight, pending],
-            ConcurrencyLimits::default(),
-            CancellationToken::new(),
-            None,
+        // Simulate the sibling run_dag instance finishing `in_flight` shortly
+        // after `pending` is dispatched. Without this, run_dag's in_flight
+        // wait loop would never observe Completed and the test would time out
+        // (correctly — it means the task really is still in-flight).
+        let store_bg = store.clone();
+        let run_id_bg = run_id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let _ = store_bg.set_task_status(
+                &run_id_bg,
+                "in_flight",
+                TodoStatus::Completed,
+                Some("explorer"),
+                Some("sibling done"),
+            );
+        });
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            run_dag(
+                store.clone(),
+                worker.clone(),
+                None,
+                &run_id,
+                vec![in_flight, pending],
+                ConcurrencyLimits::default(),
+                CancellationToken::new(),
+                None,
+            ),
         )
         .await
+        .expect("run_dag did not complete within 10s (in_flight wait loop stuck)")
         .unwrap();
 
         // `in_flight` (Running) must NOT have been re-dispatched; only
@@ -3246,10 +3333,12 @@ mod tests {
             "Running task was re-dispatched (regression): {order:?}"
         );
         assert_eq!(order, vec!["pending".to_string()]);
-        // run_dag returns Completed for its own snapshot view (both tasks
-        // counted as handled); the caller's has_unresolved_tasks check is the
-        // safety net that keeps the run in Running state externally.
+        // run_dag waited for the sibling instance to finish `in_flight`, so
+        // both tasks are now Completed and the run returns Completed.
         assert!(matches!(outcome, RunOutcome::Completed));
+        let todos = store.list_todos(&run_id).unwrap();
+        let in_flight_todo = todos.iter().find(|t| t.task_id == "in_flight").unwrap();
+        assert_eq!(in_flight_todo.status, TodoStatus::Completed);
     }
 
     #[tokio::test]
