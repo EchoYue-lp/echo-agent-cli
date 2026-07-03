@@ -259,6 +259,14 @@ impl AgentPool {
     /// `last_used` timestamp). Otherwise, a new agent is created and added
     /// to the pool.
     ///
+    /// Pool 容量计数 (`max_agents`) 只计**对话 agent**, 不计 task worker
+    /// (`__task__:` 前缀) 和 `__background__` (P1-13 修复)。否则后台任务多了
+    /// 会挤占用户交互 agent 的并发槽位, 导致用户发消息被拒。
+    fn is_conversation_agent(key: &str) -> bool {
+        key != "__background__" && !key.starts_with("__task__:")
+    }
+
+    ///
     /// The write lock is held across the entire operation (including async
     /// agent creation) to prevent TOCTOU races between concurrent acquirers.
     pub async fn acquire(&self, conversation_id: &str) -> Result<AgentHandle, PoolError> {
@@ -271,15 +279,16 @@ impl AgentPool {
         }
 
         // Enforce pool limit — evict oldest idle agent that is NOT executing
+        // P1-13: 只计对话 agent, 排除 __background__ 和 __task__ worker。
         let active_count = agents
             .keys()
-            .filter(|k| k.as_str() != "__background__")
+            .filter(|k| Self::is_conversation_agent(k))
             .count();
         if active_count >= self.config.max_agents {
-            // Find oldest non-background, non-executing agent
+            // Find oldest non-background, non-executing conversation agent
             let mut candidates: Vec<(String, Instant)> = agents
                 .iter()
-                .filter(|(id, _)| id.as_str() != "__background__")
+                .filter(|(id, _)| Self::is_conversation_agent(id))
                 .map(|(id, agent)| (id.clone(), agent.last_used))
                 .collect();
             candidates.sort_by_key(|(_, ts)| *ts);

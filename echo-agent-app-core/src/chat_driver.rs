@@ -192,6 +192,13 @@ async fn drive_chat_inner(
         let mut stream = match stream_result {
             Ok(stream) => stream,
             Err(e) => {
+                // F1-5: 此前只 return Err 字符串, 不经 sink 发 Error 事件 →
+                // 前端 assistant 消息卡在 streaming。发 Error 让前端终止流式状态。
+                tracing::warn!(error = %e, "agent stream setup failed during chat");
+                let _ = sink.on_agent_event(AgentEvent::Error {
+                    source: "chat_driver".into(),
+                    message: e.to_string(),
+                });
                 guard.clear_external_context();
                 return Err(e.to_string());
             }
@@ -205,7 +212,13 @@ async fn drive_chat_inner(
                         }
                     }
                     Err(e) => {
+                        // F1-4: 此前只 tracing::warn + break, 不发 Error 事件 →
+                        // 前端不知道流已异常终止, 消息卡 streaming。发 Error 兜底。
                         tracing::warn!(error = %e, "agent stream error during chat");
+                        let _ = sink.on_agent_event(AgentEvent::Error {
+                            source: "chat_driver".into(),
+                            message: e.to_string(),
+                        });
                         break;
                     }
                 }
