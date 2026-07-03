@@ -27,7 +27,7 @@ use echo_agent::evolution::MemoryLayerManager;
 use echo_agent::llm::LlmClient;
 
 use crate::agent_pool::AgentPool;
-use crate::tasks::task_runtime::executor::{RunOutcome, WorkerTraceSink, execute_run};
+use crate::tasks::task_runtime::executor::{ExecSink, RunOutcome, execute_run};
 use crate::tasks::task_runtime::store::TaskRuntimeStore;
 
 /// Fully-owned payload for driving a Run in the background or foreground.
@@ -46,10 +46,11 @@ pub struct RunPayload {
     pub cancel: CancellationToken,
     pub reviewer_llm: Option<Arc<dyn LlmClient>>,
     pub layer_manager: Option<Arc<MemoryLayerManager>>,
-    /// Worker-trace sink forwarded into `execute_run` so worker events reach
-    /// the frontend. `Some` for foreground (inline streaming to the chat sink);
-    /// `None` for background (events go via Tauri emit from the trace path).
-    pub trace_sink: Option<WorkerTraceSink>,
+    /// Execution-flow sink forwarded into `execute_run` so the main agent's
+    /// thinking/tool/token events reach the frontend's `execution://event`
+    /// channel. `Some` for foreground (inline streaming to the chat sink);
+    /// `None` for background (events go via Tauri emit from the run path).
+    pub trace_sink: Option<ExecSink>,
 }
 
 /// Drive an already-created TaskRuntime run to completion on an isolated pool

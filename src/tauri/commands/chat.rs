@@ -11,7 +11,7 @@ use echo_agent::human_loop::{HumanLoopProvider, HumanLoopRequest, HumanLoopRespo
 use echo_agent::prelude::AgentEvent;
 use echo_agent_app_core::chat_driver::ChatSink;
 use echo_agent_app_core::observability::{TraceEvent, TraceKind};
-use echo_agent_app_core::tasks::task_runtime::{WorkerTraceEvent, WorkerTraceEventKind};
+use echo_agent_app_core::tasks::task_runtime::executor::ExecEvent;
 use futures::future::BoxFuture;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -886,40 +886,18 @@ impl echo_agent_app_core::chat_driver::ChatSink for TauriChatSink {
     }
 
     fn worker_trace_sink(&self) -> Option<crate::tasks::task_runtime::task_tools::TraceSink> {
-        // Forward main-agent execution-flow events to execution://event.
-        // The framework still emits these as WorkerTraceEvent (via the
-        // trace_sink closure); we re-emit each as kind="subagent" on
-        // execution://event so the frontend can read it from the unified
-        // channel. The legacy worker://trace is no longer emitted from here.
+        // Forward main-agent execution-flow events to the unified
+        // `execution://event` Tauri channel (kind="subagent",
+        // subagent_run_id="main"). The executor emits [`ExecEvent`]s through
+        // this sink during a complex run; each is re-emitted as a
+        // kind="subagent" execution event so the frontend renders the main
+        // agent with the same SubagentStreamBlock component as real subagents.
         let app = self.app.clone();
         let run_id = self.run_id.clone();
-        Some(std::sync::Arc::new(move |event: WorkerTraceEvent| {
-            let event_name = match event.event_type {
-                WorkerTraceEventKind::WorkerTokenDelta => "token_delta",
-                WorkerTraceEventKind::WorkerThinkingStart => "thinking_started",
-                WorkerTraceEventKind::WorkerThinkingEnd | WorkerTraceEventKind::WorkerLlmUsage => {
-                    "usage"
-                }
-                WorkerTraceEventKind::WorkerToolStart => "tool_started",
-                WorkerTraceEventKind::WorkerToolResult => "tool_completed",
-                WorkerTraceEventKind::WorkerCompleted => "completed",
-                WorkerTraceEventKind::WorkerCancelled => "cancelled",
-                WorkerTraceEventKind::WorkerFailed => "failed",
-                WorkerTraceEventKind::WorkerStarted => "started",
-                _ => return,
-            };
-            emit_main_agent_event(&app, &run_id, event_name, event.payload);
+        Some(std::sync::Arc::new(move |ev: ExecEvent| {
+            let agent = ev.agent.as_deref().unwrap_or("echo-assistant");
+            emit_execution_event(&app, &run_id, "subagent", ev.event, agent, ev.payload);
         }))
-    }
-
-    fn trace_sink(&self) -> Option<echo_core::tools::TraceSinkFn> {
-        // Bridge the framework's Value-based trace_sink to worker_trace_sink.
-        let ws = self.worker_trace_sink()?;
-        Some(std::sync::Arc::new(move |value: serde_json::Value| {
-            if let Ok(ev) = serde_json::from_value::<WorkerTraceEvent>(value.clone()) {
-                ws(ev);
-            }
-        }) as echo_core::tools::TraceSinkFn)
     }
 }
 

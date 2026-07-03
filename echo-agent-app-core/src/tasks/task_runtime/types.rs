@@ -15,7 +15,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
-use uuid::Uuid;
 
 // ── Domain profile ──────────────────────────────────────────────────────
 
@@ -537,116 +536,6 @@ pub enum RuntimeEventKind {
     CircuitBreakerTripped,
     RunCancelled,
     Note,
-}
-
-/// Realtime trace events for GUI-visible run/worker execution.
-///
-/// `RuntimeTaskEvent` is the persisted TaskRuntime ledger. This type is the
-/// lightweight realtime protocol used by Chat, TaskRuntime, Auto routing, and
-/// subagents so the frontend can render one coherent "run with workers" view.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "snake_case")]
-#[ts(export, rename = "WorkerTraceEventKind")]
-pub enum WorkerTraceEventKind {
-    RunStarted,
-    RunStatusChanged,
-    RunCompleted,
-    RunFailed,
-    RunCancelled,
-    WorkerPlanned,
-    WorkerStarted,
-    WorkerThinkingStart,
-    WorkerThinkingDelta,
-    WorkerThinkingEnd,
-    WorkerLlmUsage,
-    WorkerToolStart,
-    WorkerToolResult,
-    WorkerTokenDelta,
-    WorkerArtifact,
-    WorkerCompleted,
-    WorkerFailed,
-    WorkerCancelled,
-    ApprovalRequested,
-    ApprovalResolved,
-    Note,
-}
-
-/// A realtime event scoped to a top-level run and, optionally, a child worker.
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export, rename = "WorkerTraceEvent")]
-pub struct WorkerTraceEvent {
-    pub event_id: String,
-    pub run_id: String,
-    pub worker_id: Option<String>,
-    pub parent_worker_id: Option<String>,
-    pub agent_name: Option<String>,
-    pub title: Option<String>,
-    pub task: Option<String>,
-    /// 关联触发该 worker 的 assistant message id(用于前端按 message 过滤 worker)。
-    /// 可空:兼容旧事件或不适用场景。
-    pub message_id: Option<String>,
-    pub event_type: WorkerTraceEventKind,
-    pub payload: serde_json::Value,
-    pub timestamp: DateTime<Utc>,
-}
-
-impl WorkerTraceEvent {
-    pub fn new(
-        run_id: impl Into<String>,
-        event_type: WorkerTraceEventKind,
-        payload: serde_json::Value,
-    ) -> Self {
-        Self {
-            event_id: Uuid::new_v4().to_string(),
-            run_id: run_id.into(),
-            worker_id: None,
-            parent_worker_id: None,
-            agent_name: None,
-            title: None,
-            task: None,
-            message_id: None,
-            event_type,
-            payload,
-            timestamp: Utc::now(),
-        }
-    }
-
-    pub fn for_worker(
-        run_id: impl Into<String>,
-        worker_id: impl Into<String>,
-        event_type: WorkerTraceEventKind,
-        payload: serde_json::Value,
-    ) -> Self {
-        Self {
-            worker_id: Some(worker_id.into()),
-            ..Self::new(run_id, event_type, payload)
-        }
-    }
-
-    pub fn with_parent_worker(mut self, parent_worker_id: impl Into<String>) -> Self {
-        self.parent_worker_id = Some(parent_worker_id.into());
-        self
-    }
-
-    pub fn with_agent(mut self, agent_name: impl Into<String>) -> Self {
-        self.agent_name = Some(agent_name.into());
-        self
-    }
-
-    pub fn with_title(mut self, title: impl Into<String>) -> Self {
-        self.title = Some(title.into());
-        self
-    }
-
-    pub fn with_task(mut self, task: impl Into<String>) -> Self {
-        self.task = Some(task.into());
-        self
-    }
-
-    pub fn with_message_id(mut self, message_id: impl Into<String>) -> Self {
-        self.message_id = Some(message_id.into());
-        self
-    }
 }
 
 impl RuntimeEventKind {

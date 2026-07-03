@@ -57,9 +57,9 @@ pub mod worktree;
 
 pub use execute_plan_tool::ExecutePlanTool;
 pub use executor::{
-    ConcurrencyLimits, ExecError, PreflightRejection, RunOutcome, WorkerTraceSink,
-    drive_unattended_run, execute_run, launch_cron_run, launch_unattended_run,
-    preflight_unattended_plan, preflight_unattended_task,
+    ConcurrencyLimits, ExecError, ExecSink, PreflightRejection, RunOutcome, drive_unattended_run,
+    execute_run, launch_cron_run, launch_unattended_run, preflight_unattended_plan,
+    preflight_unattended_task,
 };
 pub use hitrisk::{HighRiskMatch, check as check_high_risk, requires_fresh_approval};
 pub use ledger::{export_path, render_progress, write_progress};

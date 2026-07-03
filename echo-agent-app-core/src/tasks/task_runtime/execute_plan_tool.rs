@@ -24,13 +24,12 @@ use echo_agent::tools::{Tool, ToolParameters, ToolResult};
 use futures::future::BoxFuture;
 use tokio::sync::Mutex as TokioMutex;
 
-use super::executor::{RunOutcome, execute_run, preflight_unattended_plan};
+use super::executor::{ExecEvent, RunOutcome, execute_run, preflight_unattended_plan};
 use super::router::TaskRouteKind;
 use super::store::TaskRuntimeStore;
 use super::types::{
     AttendedMode, DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, TaskExecutionSummary,
-    TaskPlan, TaskRunStatus, TodoItem, TodoStatus, UnattendedWriteMode, WorkerTraceEvent,
-    WorkerTraceEventKind,
+    TaskPlan, TaskRunStatus, TodoItem, TodoStatus, UnattendedWriteMode,
 };
 use crate::agent_handle::AgentHandle;
 
@@ -156,7 +155,7 @@ impl Tool for ExecutePlanTool {
             };
             tracing::info!(
                 run_id = %run_id,
-                has_inline_task = params.get("task").is_some(),
+                has_inline_task = params.contains_key("task"),
                 "execute_plan: start"
             );
 
@@ -170,7 +169,7 @@ impl Tool for ExecutePlanTool {
             // 继承全部可见性 (WorkerStarted/Completed/LlmUsage) + 调度 + 统计。
             // 普通 chat 轮次的 run_id (root_message_id) 没在 store 建过 run,
             // 故需先建 ad-hoc run (create_run + transition Running)。
-            if params.get("task").is_some() {
+            if params.contains_key("task") {
                 let (role, task_desc) = match parse_inline_task_params(&params) {
                     Ok(task) => task,
                     Err(reason) => {
@@ -267,9 +266,9 @@ impl Tool for ExecutePlanTool {
                     .ok()
                     .flatten();
                 if let Some(sink) = inline_trace_sink.as_ref() {
-                    sink(WorkerTraceEvent::new(
+                    sink(ExecEvent::run(
                         run_id.clone(),
-                        WorkerTraceEventKind::RunStarted,
+                        "run_started",
                         serde_json::json!({
                             "conversation_id": conv,
                             "mode": "inline_task",

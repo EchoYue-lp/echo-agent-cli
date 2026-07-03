@@ -1,15 +1,15 @@
 /**
- * SubagentRun store — Phase 2 of the Subagent unification
+ * SubagentRun store — Phase 4c of the Subagent unification
  * (spec: docs/subagent-unification-plan.md §6).
  *
- * Consumes the unified `execution://event` channel (kind="subagent") that the
- * Rust bridge now double-emits alongside the legacy `worker://trace` /
- * `subagent://event` channels. The legacy stores (`workerTraceStore`,
- * `subagentStore`) are untouched during the 灰度 period; Phase 3 switches the
- * UI to read exclusively from this store, Phase 4 deletes the legacy bridge.
+ * Consumes the unified `execution://event` channel (kind="subagent"). The
+ * legacy `worker://trace` / `subagent://event` channels and their stores
+ * (`workerTraceStore`, `subagentStore`) were deleted in Phase 4c; this is now
+ * the single source of truth for subagent execution-flow events.
  *
  * Aggregation key is `subagent_run_id` (= framework execution_id, format
- * "{task_id}:{attempt}"), which the bridge reads straight off the event — no
+ * "{task_id}:{attempt}" for real subagents, "main" for the main-agent
+ * synthetic run), which the bridge reads straight off the event — no
  * more temp-allocated dispatch ids.
  */
 

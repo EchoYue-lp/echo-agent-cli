@@ -287,10 +287,21 @@ pub async fn resume_task_run(
         .run_cancel_tokens
         .insert(run_key.clone(), cancel.clone());
     let run_cancel_tokens = state.app_state.tasks.run_cancel_tokens.clone();
-    let trace_sink: echo_agent_app_core::tasks::task_runtime::WorkerTraceSink =
-        Arc::new(move |event| {
-            let _ = app.emit("worker://trace", event);
-        });
+    let trace_sink: echo_agent_app_core::tasks::task_runtime::ExecSink = Arc::new(move |ev| {
+        // Forward run-level lifecycle events to the unified
+        // `execution://event` channel (kind="run"). The frontend reads
+        // these to track run start/complete/fail/cancel transitions.
+        let mut payload = serde_json::Map::new();
+        payload.insert("kind".into(), "run".into());
+        payload.insert("run_id".into(), ev.run_id.into());
+        payload.insert("event".into(), ev.event.into());
+        if let serde_json::Value::Object(fields) = ev.payload {
+            for (k, v) in fields {
+                payload.insert(k, v);
+            }
+        }
+        let _ = app.emit("execution://event", serde_json::Value::Object(payload));
+    });
     let run_id_for_task = run_id.clone();
 
     tokio::spawn(async move {
@@ -447,10 +458,21 @@ pub async fn execute_task_run(
         .run_cancel_tokens
         .insert(run_key.clone(), cancel.clone());
     let run_cancel_tokens = state.app_state.tasks.run_cancel_tokens.clone();
-    let trace_sink: echo_agent_app_core::tasks::task_runtime::WorkerTraceSink =
-        Arc::new(move |event| {
-            let _ = app.emit("worker://trace", event);
-        });
+    let trace_sink: echo_agent_app_core::tasks::task_runtime::ExecSink = Arc::new(move |ev| {
+        // Forward run-level lifecycle events to the unified
+        // `execution://event` channel (kind="run"). The frontend reads
+        // these to track run start/complete/fail/cancel transitions.
+        let mut payload = serde_json::Map::new();
+        payload.insert("kind".into(), "run".into());
+        payload.insert("run_id".into(), ev.run_id.into());
+        payload.insert("event".into(), ev.event.into());
+        if let serde_json::Value::Object(fields) = ev.payload {
+            for (k, v) in fields {
+                payload.insert(k, v);
+            }
+        }
+        let _ = app.emit("execution://event", serde_json::Value::Object(payload));
+    });
 
     tokio::spawn(async move {
         let outcome = echo_agent_app_core::tasks::task_runtime::execute_run(

@@ -70,5 +70,3 @@ export * from './UsageAggregationFilter';
 export * from './UsageGroupBy';
 export * from './UsageQueryFilter';
 export * from './UsageRecord';
-export * from './WorkerTraceEvent';
-export * from './WorkerTraceEventKind';

@@ -39,7 +39,91 @@ use tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard, Semaphore};
 use super::store::{StoreError, TaskRuntimeStore};
 use super::types::*;
 
-pub type WorkerTraceSink = Arc<dyn Fn(WorkerTraceEvent) + Send + Sync>;
+/// A lightweight execution-flow event emitted to the frontend via the unified
+/// `execution://event` Tauri channel (kind="subagent" for the main agent's
+/// thinking/tool/token stream, kind="run" for run lifecycle).
+///
+/// Replaces the old `WorkerTraceEvent`/`WorkerTraceEventKind` pair (Phase 4c of
+/// the Subagent unification). The `event` field is a `&'static str` (e.g.
+/// `"tool_started"`, `"run_completed"`) matching the frontend's
+/// `SubagentRunEventKind`; `payload` carries event-specific fields
+/// (`content`/`name`/`args`/...) as a flat JSON object.
+#[derive(Debug, Clone)]
+pub struct ExecEvent {
+    pub run_id: String,
+    /// `None` for run-level events (RunStarted/Completed/...), `Some(task_id)`
+    /// for task-scoped events (the main agent's thinking/tool/token stream).
+    pub task_id: Option<String>,
+    pub event: &'static str,
+    pub agent: Option<String>,
+    pub payload: serde_json::Value,
+}
+
+impl ExecEvent {
+    /// Construct a run-level event (no task_id).
+    pub fn run(run_id: impl Into<String>, event: &'static str, payload: serde_json::Value) -> Self {
+        Self {
+            run_id: run_id.into(),
+            task_id: None,
+            event,
+            agent: None,
+            payload,
+        }
+    }
+
+    /// Construct a task-scoped event (carries task_id as the synthetic
+    /// subagent_run_id for the main agent's execution flow).
+    pub fn for_task(
+        run_id: impl Into<String>,
+        task_id: impl Into<String>,
+        event: &'static str,
+        payload: serde_json::Value,
+    ) -> Self {
+        Self {
+            run_id: run_id.into(),
+            task_id: Some(task_id.into()),
+            event,
+            agent: None,
+            payload,
+        }
+    }
+
+    /// Attach the agent/role name. Builder-style for call-site readability.
+    pub fn with_agent(mut self, agent: impl Into<String>) -> Self {
+        self.agent = Some(agent.into());
+        self
+    }
+
+    /// No-op kept for call-site compatibility with the old
+    /// `WorkerTraceEvent::with_title` chain. The frontend derives a display
+    /// label from `agent` (falling back to subagent_run_id), so a separate
+    /// title field is no longer needed on the wire.
+    #[allow(clippy::unused_self)]
+    pub fn with_title(self, _title: impl Into<String>) -> Self {
+        self
+    }
+
+    /// No-op kept for call-site compatibility (the old `WorkerTraceEvent`
+    /// carried a separate `task` field; the frontend now reads the task brief
+    /// from the run's plan, so this field is dropped on the wire).
+    #[allow(clippy::unused_self)]
+    pub fn with_task(self, _task: impl Into<String>) -> Self {
+        self
+    }
+}
+
+/// Sink closure that receives [`ExecEvent`]s. The GUI's `TauriChatSink` provides
+/// one that re-emits each event onto `execution://event`; non-GUI modes return
+/// `None` (events dropped, functionality unaffected).
+pub type ExecSink = Arc<dyn Fn(ExecEvent) + Send + Sync>;
+
+/// Emit `ev` to `sink` if present. Single chokepoint so every emit site is
+/// uniform and grep-friendly.
+fn emit_exec(sink: Option<&ExecSink>, ev: ExecEvent) {
+    if let Some(sink) = sink {
+        sink(ev);
+    }
+}
 
 /// Concurrency caps. Sourced from the AgentPool when available, else defaults
 /// from the plan's "Initial limits" (max 3–4 workers, writes serialized).
@@ -121,7 +205,7 @@ pub async fn execute_run(
     reviewer_llm: Option<Arc<dyn echo_agent::llm::LlmClient>>,
     layer_manager: Option<Arc<echo_agent::evolution::MemoryLayerManager>>,
     run_store: Option<Arc<dyn echo_agent::trace::RunStore>>,
-    trace_sink: Option<WorkerTraceSink>,
+    trace_sink: Option<ExecSink>,
     run_id: &str,
     parent_cancel: CancellationToken,
     memory_policy: super::memory_bridge::MemoryPolicy,
@@ -174,11 +258,11 @@ pub async fn execute_run(
         route = %run.route,
         "task_runtime: execute_run start"
     );
-    emit_worker_trace(
+    emit_exec(
         trace_sink.as_ref(),
-        WorkerTraceEvent::new(
+        ExecEvent::run(
             run_id.to_string(),
-            WorkerTraceEventKind::RunStarted,
+            "run_started",
             serde_json::json!({
                 "goal": &run.goal,
                 "conversation_id": &run.conversation_id,
@@ -224,11 +308,11 @@ pub async fn execute_run(
                 );
                 return outcome;
             }
-            emit_worker_trace(
+            emit_exec(
                 trace_sink.as_ref(),
-                WorkerTraceEvent::new(
+                ExecEvent::run(
                     run_id.to_string(),
-                    WorkerTraceEventKind::RunCompleted,
+                    "run_completed",
                     serde_json::json!({ "status": "completed" }),
                 ),
             );
@@ -255,11 +339,11 @@ pub async fn execute_run(
             failed_task_id,
             error,
         }) => {
-            emit_worker_trace(
+            emit_exec(
                 trace_sink.as_ref(),
-                WorkerTraceEvent::new(
+                ExecEvent::run(
                     run_id.to_string(),
-                    WorkerTraceEventKind::RunFailed,
+                    "run_failed",
                     serde_json::json!({
                         "failed_task_id": failed_task_id,
                         "error": error,
@@ -284,11 +368,11 @@ pub async fn execute_run(
             );
         }
         Ok(RunOutcome::Cancelled) => {
-            emit_worker_trace(
+            emit_exec(
                 trace_sink.as_ref(),
-                WorkerTraceEvent::new(
+                ExecEvent::run(
                     run_id.to_string(),
-                    WorkerTraceEventKind::RunCancelled,
+                    "run_cancelled",
                     serde_json::json!({ "status": "cancelled" }),
                 ),
             );
@@ -315,11 +399,11 @@ pub async fn execute_run(
             failed_task_id,
             error,
         }) => {
-            emit_worker_trace(
+            emit_exec(
                 trace_sink.as_ref(),
-                WorkerTraceEvent::new(
+                ExecEvent::run(
                     run_id.to_string(),
-                    WorkerTraceEventKind::RunStatusChanged,
+                    "run_status_changed",
                     serde_json::json!({
                         "status": "paused",
                         "failed_task_id": failed_task_id,
@@ -342,11 +426,11 @@ pub async fn execute_run(
             );
         }
         Err(e) => {
-            emit_worker_trace(
+            emit_exec(
                 trace_sink.as_ref(),
-                WorkerTraceEvent::new(
+                ExecEvent::run(
                     run_id.to_string(),
-                    WorkerTraceEventKind::RunFailed,
+                    "run_failed",
                     serde_json::json!({ "error": e.to_string() }),
                 ),
             );
@@ -399,7 +483,7 @@ pub trait TaskWorker: Send + Sync {
         shell_sem: Arc<Semaphore>,
         llm_sem: Arc<Semaphore>,
         file_write_locks: Arc<std::sync::Mutex<HashMap<String, Arc<TokioMutex<()>>>>>,
-        trace_sink: Option<WorkerTraceSink>,
+        trace_sink: Option<ExecSink>,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<Output = Result<(String, Option<String>), (String, String)>>
@@ -429,7 +513,7 @@ impl TaskWorker for RealTaskWorker {
         shell_sem: Arc<Semaphore>,
         llm_sem: Arc<Semaphore>,
         file_write_locks: Arc<std::sync::Mutex<HashMap<String, Arc<TokioMutex<()>>>>>,
-        trace_sink: Option<WorkerTraceSink>,
+        trace_sink: Option<ExecSink>,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<Output = Result<(String, Option<String>), (String, String)>>
@@ -480,7 +564,7 @@ async fn run_dag<W: TaskWorker + 'static>(
     tasks: Vec<PlanTask>,
     limits: ConcurrencyLimits,
     parent_cancel: CancellationToken,
-    trace_sink: Option<WorkerTraceSink>,
+    trace_sink: Option<ExecSink>,
 ) -> Result<RunOutcome, ExecError> {
     // Wrap the worker in an Arc so each spawned task can clone the handle.
     let worker = Arc::new(worker);
@@ -958,7 +1042,7 @@ async fn execute_task(
     shell_sem: Arc<Semaphore>,
     llm_sem: Arc<Semaphore>,
     file_write_locks: Arc<std::sync::Mutex<HashMap<String, Arc<TokioMutex<()>>>>>,
-    trace_sink: Option<WorkerTraceSink>,
+    trace_sink: Option<ExecSink>,
     run_id: String,
     task: PlanTask,
     cancel: CancellationToken,
@@ -1044,12 +1128,12 @@ async fn execute_task(
     ) {
         tracing::warn!(task_id = %task_id, error = %e, "failed to mark task running");
     }
-    emit_worker_trace(
+    emit_exec(
         trace_sink.as_ref(),
-        WorkerTraceEvent::for_worker(
+        ExecEvent::for_task(
             run_id.clone(),
             worker_trace_id.clone(),
-            WorkerTraceEventKind::WorkerStarted,
+            "started",
             serde_json::json!({
                 "kind": task.kind.as_str(),
                 "agent_role": &task.agent_role,
@@ -1438,12 +1522,12 @@ async fn execute_task(
                 "failed to persist read-only worker LLM usage"
             );
         }
-        emit_worker_trace(
+        emit_exec(
             trace_sink.as_ref(),
-            WorkerTraceEvent::for_worker(
+            ExecEvent::for_task(
                 run_id.clone(),
                 worker_trace_id.clone(),
-                WorkerTraceEventKind::WorkerLlmUsage,
+                "usage",
                 usage_payload,
             )
             .with_agent(task.agent_role.clone())
@@ -1479,12 +1563,12 @@ async fn execute_task(
             }) {
                 tracing::warn!(task_id = %task_id, error = %e, "failed to persist TaskExecutionSummary");
             }
-            emit_worker_trace(
+            emit_exec(
                 trace_sink.as_ref(),
-                WorkerTraceEvent::for_worker(
+                ExecEvent::for_task(
                     run_id.clone(),
                     worker_trace_id.clone(),
-                    WorkerTraceEventKind::WorkerCompleted,
+                    "completed",
                     serde_json::json!({
                         "summary": &summary,
                         "output": &text,
@@ -1503,12 +1587,12 @@ async fn execute_task(
                 error = %e,
                 "task_runtime: task failed"
             );
-            emit_worker_trace(
+            emit_exec(
                 trace_sink.as_ref(),
-                WorkerTraceEvent::for_worker(
+                ExecEvent::for_task(
                     run_id,
                     worker_trace_id,
-                    WorkerTraceEventKind::WorkerFailed,
+                    "failed",
                     serde_json::json!({ "error": &e }),
                 )
                 .with_agent(task.agent_role.clone())
@@ -1646,6 +1730,7 @@ fn build_task_prompt(task: &PlanTask, dep_summaries: &[(String, String)]) -> Str
 /// on an isolated agent instance under the executor's own semaphore (not the
 /// primary agent's execution_mutex), so multiple read-only workers run in
 /// parallel. The child cancel token propagates parent-run cancellation.
+#[allow(clippy::too_many_arguments)] // handles + cancel + sink thread through; matches framework dispatch style
 async fn run_readonly_worker(
     primary_agent: &crate::agent_handle::AgentHandle,
     run_id: &str,
@@ -1654,7 +1739,7 @@ async fn run_readonly_worker(
     role: &str,
     prompt: &str,
     cancel: CancellationToken,
-    trace_sink: Option<WorkerTraceSink>,
+    trace_sink: Option<ExecSink>,
 ) -> Result<echo_agent::agent::subagent::SubagentResult, String> {
     primary_agent
         .read_async(|agent| {
@@ -1684,15 +1769,15 @@ async fn run_readonly_worker(
 }
 
 fn worker_trace_sink_to_core(
-    trace_sink: Option<WorkerTraceSink>,
+    _trace_sink: Option<ExecSink>,
 ) -> Option<echo_core::tools::TraceSinkFn> {
-    trace_sink.map(|sink| {
-        Arc::new(move |event: serde_json::Value| {
-            if let Ok(worker_event) = serde_json::from_value::<WorkerTraceEvent>(event) {
-                sink(worker_event);
-            }
-        }) as echo_core::tools::TraceSinkFn
-    })
+    // Phase 4c: the framework's `ExternalRunContext.trace_sink` (Value-based)
+    // is injected but never actually invoked by the framework — subagent
+    // dispatch flows go through `SubagentEventBus` instead. Returning `None`
+    // here drops the (dead) injection; `run_readonly_worker` /
+    // `run_writer_worker` still accept the `trace_sink` param for signature
+    // parity with `run_main_agent_task` (which DOES use it).
+    None
 }
 
 /// Run a CODE-WRITER task (implementation / debugging) by delegating to the
@@ -1708,6 +1793,7 @@ fn worker_trace_sink_to_core(
 /// framework's `dispatch_fork` runs it inside an isolated git worktree
 /// (eko-fork-<label>) — writes land in the worktree, not the main workspace.
 /// Writers still serialize via the caller's `write_sem`.
+#[allow(clippy::too_many_arguments)] // handles + cancel + sink thread through; matches framework dispatch style
 async fn run_writer_worker(
     primary_agent: &crate::agent_handle::AgentHandle,
     store: Arc<TaskRuntimeStore>,
@@ -1716,7 +1802,7 @@ async fn run_writer_worker(
     role: &str,
     prompt: &str,
     cancel: CancellationToken,
-    trace_sink: Option<WorkerTraceSink>,
+    trace_sink: Option<ExecSink>,
 ) -> Result<echo_agent::agent::subagent::SubagentResult, String> {
     // Rebuild a multimodal Message when the run carries user attachments, so
     // the writer worker sees the same images/files as the primary agent would
@@ -1789,7 +1875,7 @@ async fn run_main_agent_task(
     task: &PlanTask,
     prompt: &str,
     cancel: CancellationToken,
-    trace_sink: Option<WorkerTraceSink>,
+    trace_sink: Option<ExecSink>,
 ) -> Result<String, String> {
     let run_id = run_id.to_string();
     let task_id = task.id.clone();
@@ -1833,12 +1919,12 @@ async fn run_main_agent_task(
                     match event {
                         AgentEvent::Token(content) => {
                             if in_thinking {
-                                emit_worker_trace(
+                                emit_exec(
                                     trace_sink.as_ref(),
-                                    WorkerTraceEvent::for_worker(
+                                    ExecEvent::for_task(
                                         run_id.clone(),
                                         task_id.clone(),
-                                        WorkerTraceEventKind::WorkerThinkingDelta,
+                                        "thinking_delta",
                                         serde_json::json!({ "content": content }),
                                     )
                                     .with_agent(agent_role.clone())
@@ -1846,12 +1932,12 @@ async fn run_main_agent_task(
                                 );
                             } else {
                                 output.push_str(&content);
-                                emit_worker_trace(
+                                emit_exec(
                                     trace_sink.as_ref(),
-                                    WorkerTraceEvent::for_worker(
+                                    ExecEvent::for_task(
                                         run_id.clone(),
                                         task_id.clone(),
-                                        WorkerTraceEventKind::WorkerTokenDelta,
+                                        "token_delta",
                                         serde_json::json!({ "content": content }),
                                     )
                                     .with_agent(agent_role.clone())
@@ -1861,12 +1947,12 @@ async fn run_main_agent_task(
                         }
                         AgentEvent::ThinkStart => {
                             in_thinking = true;
-                            emit_worker_trace(
+                            emit_exec(
                                 trace_sink.as_ref(),
-                                WorkerTraceEvent::for_worker(
+                                ExecEvent::for_task(
                                     run_id.clone(),
                                     task_id.clone(),
-                                    WorkerTraceEventKind::WorkerThinkingStart,
+                                    "thinking_started",
                                     serde_json::json!({}),
                                 )
                                 .with_agent(agent_role.clone())
@@ -1878,12 +1964,12 @@ async fn run_main_agent_task(
                             completion_tokens,
                         } => {
                             in_thinking = false;
-                            emit_worker_trace(
+                            emit_exec(
                                 trace_sink.as_ref(),
-                                WorkerTraceEvent::for_worker(
+                                ExecEvent::for_task(
                                     run_id.clone(),
                                     task_id.clone(),
-                                    WorkerTraceEventKind::WorkerThinkingEnd,
+                                    "thinking_ended",
                                     serde_json::json!({
                                         "prompt_tokens": prompt_tokens,
                                         "completion_tokens": completion_tokens,
@@ -1926,12 +2012,12 @@ async fn run_main_agent_task(
                                     "failed to persist worker LLM usage"
                                 );
                             }
-                            emit_worker_trace(
+                            emit_exec(
                                 trace_sink.as_ref(),
-                                WorkerTraceEvent::for_worker(
+                                ExecEvent::for_task(
                                     run_id.clone(),
                                     task_id.clone(),
-                                    WorkerTraceEventKind::WorkerLlmUsage,
+                                    "usage",
                                     usage_payload,
                                 )
                                 .with_agent(agent_role.clone())
@@ -1939,12 +2025,12 @@ async fn run_main_agent_task(
                             );
                         }
                         AgentEvent::ToolCall { name, args } => {
-                            emit_worker_trace(
+                            emit_exec(
                                 trace_sink.as_ref(),
-                                WorkerTraceEvent::for_worker(
+                                ExecEvent::for_task(
                                     run_id.clone(),
                                     task_id.clone(),
-                                    WorkerTraceEventKind::WorkerToolStart,
+                                    "tool_started",
                                     serde_json::json!({
                                         "name": name,
                                         "args": args,
@@ -1958,12 +2044,12 @@ async fn run_main_agent_task(
                             name,
                             output: result,
                         } => {
-                            emit_worker_trace(
+                            emit_exec(
                                 trace_sink.as_ref(),
-                                WorkerTraceEvent::for_worker(
+                                ExecEvent::for_task(
                                     run_id.clone(),
                                     task_id.clone(),
-                                    WorkerTraceEventKind::WorkerToolResult,
+                                    "tool_completed",
                                     serde_json::json!({
                                         "name": name,
                                         "result": result,
@@ -1975,12 +2061,12 @@ async fn run_main_agent_task(
                             );
                         }
                         AgentEvent::ToolError { name, error } => {
-                            emit_worker_trace(
+                            emit_exec(
                                 trace_sink.as_ref(),
-                                WorkerTraceEvent::for_worker(
+                                ExecEvent::for_task(
                                     run_id.clone(),
                                     task_id.clone(),
-                                    WorkerTraceEventKind::WorkerToolResult,
+                                    "tool_completed",
                                     serde_json::json!({
                                         "name": name,
                                         "result": error,
@@ -2025,12 +2111,6 @@ fn unavailable_llm_usage_payload(reason: &'static str) -> serde_json::Value {
         "usage_reported": false,
         "reason": reason,
     })
-}
-
-fn emit_worker_trace(sink: Option<&WorkerTraceSink>, event: WorkerTraceEvent) {
-    if let Some(sink) = sink {
-        sink(event);
-    }
 }
 
 /// RAII guard that releases file write locks when dropped (G5).
@@ -3036,7 +3116,7 @@ mod tests {
             _shell_sem: Arc<Semaphore>,
             _llm_sem: Arc<Semaphore>,
             _file_write_locks: Arc<std::sync::Mutex<HashMap<String, Arc<TokioMutex<()>>>>>,
-            _trace_sink: Option<WorkerTraceSink>,
+            _trace_sink: Option<ExecSink>,
         ) -> std::pin::Pin<
             Box<
                 dyn std::future::Future<Output = Result<(String, Option<String>), (String, String)>>
@@ -3369,7 +3449,7 @@ mod tests {
         };
         let events = Arc::new(Mutex::new(Vec::new()));
         let captured = events.clone();
-        let sink: WorkerTraceSink = Arc::new(move |event| {
+        let sink: ExecSink = Arc::new(move |event| {
             if let Ok(mut guard) = captured.lock() {
                 guard.push(event);
             }
@@ -3398,16 +3478,16 @@ mod tests {
             .clone();
         assert!(
             events.iter().any(|event| {
-                event.event_type == WorkerTraceEventKind::WorkerToolStart
-                    && event.worker_id.as_deref() == Some("implementation-a")
+                event.event == "tool_started"
+                    && event.task_id.as_deref() == Some("implementation-a")
                     && event.payload.get("name").and_then(|v| v.as_str()) == Some("mock_calc")
             }),
-            "expected WorkerToolStart for mock_calc, got {events:?}"
+            "expected tool_started for mock_calc, got {events:?}"
         );
         assert!(
             events.iter().any(|event| {
-                event.event_type == WorkerTraceEventKind::WorkerToolResult
-                    && event.worker_id.as_deref() == Some("implementation-a")
+                event.event == "tool_completed"
+                    && event.task_id.as_deref() == Some("implementation-a")
                     && event.payload.get("success").and_then(|v| v.as_bool()) == Some(true)
                     && event
                         .payload
@@ -3415,7 +3495,7 @@ mod tests {
                         .and_then(|v| v.as_str())
                         .is_some_and(|text| text.contains("42"))
             }),
-            "expected successful WorkerToolResult with tool output, got {events:?}"
+            "expected successful tool_completed with tool output, got {events:?}"
         );
         Ok(())
     }

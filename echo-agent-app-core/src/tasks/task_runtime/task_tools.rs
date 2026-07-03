@@ -20,15 +20,18 @@ use echo_agent::prelude::*;
 use echo_agent::tools::{Tool, ToolResult};
 use tokio::sync::Notify;
 
+use super::executor::ExecEvent;
 use super::store::TaskRuntimeStore;
 use super::types::{
     AttendedMode, DomainProfile, PlanTask, PlanTaskKind, TaskPatch, TaskRunStatus, TodoStatus,
-    WorkerTraceEvent, WorkerTraceEventKind,
 };
 
-/// Convenience alias for a trace-sink callback that forwards worker trace
-/// events out of the task-runtime executor.
-pub type TraceSink = Arc<dyn Fn(WorkerTraceEvent) + Send + Sync>;
+/// Convenience alias for a trace-sink callback that forwards execution-flow
+/// events out of the task-runtime executor. Same shape as
+/// [`super::executor::ExecSink`]; kept as a distinct alias because the
+/// `CURRENT_TRACE_SINK` task_local predates the `ExecSink` name and several
+/// call sites still spell it as `TraceSink`.
+pub type TraceSink = Arc<dyn Fn(ExecEvent) + Send + Sync>;
 
 // ── Approval-signal registry (spec §10.5 ComplexRuntime) ──────────────────
 
@@ -74,8 +77,8 @@ tokio::task_local! {
     /// during tool execution. Used by Task 6 (L3 nesting) to prevent runaway
     /// recursion and to route subagent tool calls correctly.
     pub static CURRENT_DELEGATE_DEPTH: std::cell::Cell<u32>;
-    /// An optional trace-sink that forwards `WorkerTraceEvent` items out of the
-    /// executor so the frontend can render real-time worker trace views. Set
+    /// An optional trace-sink that forwards [`ExecEvent`] items out of the
+    /// executor so the frontend can render real-time execution-flow views. Set
     /// alongside `CURRENT_RUN_ID` by [`with_run_context`].
     pub static CURRENT_TRACE_SINK: Option<TraceSink>;
     /// The unattended write mode for the currently executing run (D7 stage 2).
@@ -164,12 +167,18 @@ pub(crate) fn run_id_from_ctx_or_local(
         .ok_or_else(|| ToolResult::error("no active run — run_id not in ToolContext or task_local"))
 }
 
-/// 在 ToolContext.run_id/trace_sink(若有)的 task_local 覆盖作用域内执行 f。
+/// 在 ToolContext.run_id 的 task_local 覆盖作用域内执行 f。
 ///
 /// 这样工具既有的 `execute`(读 task_local 的 require_run_id)无需改动即可在
 /// worker 场景工作:execute_with_context 调本函数包住原 execute,ctx.run_id 被
 /// 临时注入 task_local,require_run_id 读到的是 ToolContext 的值(跨 spawn 安全)。
 /// ctx.run_id 为 None 时直接执行 f(回退原 task_local,主 agent 场景)。
+///
+/// Phase 4c: 不再从 `ctx.trace_sink` 回灌 `CURRENT_TRACE_SINK` —— 框架的
+/// `ExternalRunContext.trace_sink` 字段被注入但框架从不调用(subagent 走
+/// `SubagentEventBus`),回灌它是一条死回路。`CURRENT_TRACE_SINK` 现在只由
+/// `with_run_context` 的显式参数设置(drive_chat 已 scope)。这里只覆盖 run_id +
+/// cancel,trace_sink 沿用外层 `with_run_context` 已经建立的 scope。
 pub(crate) async fn scoped_with_ctx_run_id<F, Fut, R>(
     ctx: &echo_core::tools::ToolContext,
     f: F,
@@ -180,27 +189,13 @@ where
 {
     match &ctx.run_id {
         Some(rid) => {
-            // 同时覆盖 run_id / cancel / trace_sink(若有),让 require_run_id /
-            // CURRENT_CANCEL / CURRENT_TRACE_SINK 在 worker 或工具批处理场景读到
-            // ToolContext 的值(跨 spawn 安全)。
             let cancel = ctx
                 .cancel
                 .as_ref()
                 .map(|c| (**c).clone())
                 .unwrap_or_default();
-            let trace_sink = ctx.trace_sink.as_ref().map(|sink| {
-                let sink = sink.clone();
-                Arc::new(move |event: WorkerTraceEvent| {
-                    if let Ok(value) = serde_json::to_value(event) {
-                        sink(value);
-                    }
-                }) as TraceSink
-            });
             CURRENT_CANCEL
-                .scope(
-                    cancel,
-                    CURRENT_RUN_ID.scope(rid.clone(), CURRENT_TRACE_SINK.scope(trace_sink, f())),
-                )
+                .scope(cancel, CURRENT_RUN_ID.scope(rid.clone(), f()))
                 .await
         }
         None => f().await,
@@ -522,6 +517,8 @@ impl TaskCreateTool {
                 "Failed to create task run before creating task: {e}"
             )));
         }
+        #[allow(clippy::collapsible_if)]
+        // outer guard + inner if-let-Err reads clearer than a let-chain
         if !attachments.is_empty() {
             if let Err(e) = self.store.set_run_attachments(run_id, &attachments) {
                 tracing::warn!(run_id, error = %e, "failed to bind attachments to task run");
@@ -533,9 +530,9 @@ impl TaskCreateTool {
             )));
         }
         if let Some(sink) = trace_sink {
-            sink(WorkerTraceEvent::new(
+            sink(ExecEvent::run(
                 run_id.to_string(),
-                WorkerTraceEventKind::RunStarted,
+                "run_started",
                 serde_json::json!({
                     "goal": goal,
                     "route": "agent_task_plan",
