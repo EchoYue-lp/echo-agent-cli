@@ -72,7 +72,14 @@ function buildChartHtml(spec: unknown): string {
     vegaEmbed('#vis', spec, {
       actions: { export: true, source: false, compiled: false, editor: false }
     }).catch(function(err) {
-      document.body.innerHTML = '<p style="color:red;padding:1rem">Chart render error: ' + err.message + '</p>';
+      // err.message 可能含用户可控数据(spec 内容回显)。虽然此 iframe 已是
+      // sandboxed null-origin (无 allow-same-origin, 爆炸半径为零), 仍用
+      // textContent 而非 innerHTML 让纵深防御一致 — 不依赖单一沙箱兜底。
+      document.body.innerHTML = '';
+      var p = document.createElement('p');
+      p.style.cssText = 'color:red;padding:1rem';
+      p.textContent = 'Chart render error: ' + (err && err.message ? err.message : String(err));
+      document.body.appendChild(p);
     });
   </script>
 </body>

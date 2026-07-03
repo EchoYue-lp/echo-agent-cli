@@ -58,7 +58,6 @@ type ChatEvent = ChatEventBase &
 export function useTauriChat() {
   const assistantIdRef = useRef<string | null>(null);
   const isCancelledRef = useRef(false);
-  const unlistenRef = useRef<(() => void) | null>(null);
   const currentMessageKeyRef = useRef<string | null>(null);
   const currentConversationIdRef = useRef<string | null>(null);
   const thinkingIdRef = useRef<string | null>(null);
@@ -84,25 +83,42 @@ export function useTauriChat() {
     });
   }, []);
 
-  // Set up event listener on mount
+  // Set up event listener on mount.
+  //
+  // P0-4 修复: 此前 cleanup 只在 setupListener 跑完 (unlistenRef.current 赋值后)
+  // 才生效。若组件在 `await import()` / `await listen()` 之间卸载, cleanup 执行时
+  // unlistenRef.current 仍是 null → 空操作; 但 setupListener 稍后 resolve 并注册了
+  // 监听器, 该 unlisten 句柄永远没人调用 → 监听器泄漏 (内存 + 幽灵事件)。
+  //
+  // 修法: 用 `aborted` 标志 + `pendingCleanup` 数组收集 unlisten 函数, cleanup 时
+  // 既设标志 (让后续 callback 短路) 又遍历清理已注册的监听器; setupListener resolve
+  // 时若已 aborted, 立即注销刚拿到的监听器。
   useEffect(() => {
     if (!isTauri()) return;
 
-    let mounted = true;
+    let aborted = false;
+    const pendingCleanup: Array<() => void> = [];
 
     const setupListener = async () => {
       const { listen } = await import('@tauri-apps/api/event');
+      if (aborted) return; // 卸载发生在 import 期间, 不再注册
       const unlisten = await listen<ChatEvent>('chat://event', (event) => {
-        if (mounted) {
+        if (!aborted) {
           handleEvent(event.payload);
         }
       });
+      // 卸载发生在两个 listen 之间: 立即注销刚注册的第一个, 不再注册第二个。
+      if (aborted) {
+        unlisten();
+        return;
+      }
+      pendingCleanup.push(unlisten);
       // Unified execution://event channel (Subagent unification Phase 4).
       // Replaces the legacy worker://trace + subagent://event channels.
       // kind="subagent" → subagentRunStore (thinking/tool/token/usage flows);
       // kind="run" → run lifecycle (run_started triggers loadByConversation).
       const unlistenExec = await listen<Record<string, unknown>>('execution://event', (event) => {
-        if (!mounted) return;
+        if (aborted) return;
         const payload = event.payload;
         const kind = payload.kind as string | undefined;
         if (kind === 'subagent') {
@@ -117,25 +133,25 @@ export function useTauriChat() {
               .then(({ useTaskRuntimeStore }) => {
                 useTaskRuntimeStore.getState().loadByConversation(convId);
               })
-              .catch((e) =>
-                console.warn('[TauriChat] Failed to load task run on run_started:', e)
-              );
+              .catch((e) => console.warn('[TauriChat] Failed to load task run on run_started:', e));
           }
         }
       });
-      const origUnlisten = unlisten;
-      unlistenRef.current = () => {
-        origUnlisten();
+      // 卸载发生在第二个 listen 之后、push 之前: 立即注销。
+      if (aborted) {
         unlistenExec();
-      };
+        return;
+      }
+      pendingCleanup.push(unlistenExec);
     };
 
     setupListener();
 
     return () => {
-      mounted = false;
-      unlistenRef.current?.();
-      unlistenRef.current = null;
+      aborted = true;
+      // 清理所有已注册的监听器 (覆盖三种竞态窗口)。
+      pendingCleanup.forEach((fn) => fn());
+      pendingCleanup.length = 0;
     };
   }, [handleEvent]);
 
