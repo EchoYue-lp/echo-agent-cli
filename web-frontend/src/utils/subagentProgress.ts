@@ -58,7 +58,10 @@ export function computeSubagentProgress(run: SubagentRunState): SubagentProgress
 
 export function progressSummary(p: SubagentProgress): string {
   if (p.status === 'failed' || p.status === 'cancelled') {
-    return p.status === 'failed' ? '失败' : '已取消';
+    // Status text is already shown by `statusLabel` next to this summary;
+    // returning it here too would render "失败 · 失败". Return empty so only
+    // the tool/read/thinking counts appear (or nothing for failed/cancelled).
+    return '';
   }
   const parts: string[] = [];
   if (p.toolCount > 0) parts.push(`${p.toolCount} 工具`);

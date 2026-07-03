@@ -13,6 +13,7 @@
 
 use echo_agent::agent::{Agent, AgentEvent, AgentHandle};
 use echo_agent::prelude::Message;
+use echo_core::tools::TraceSinkFn;
 use futures::StreamExt;
 
 /// Per-mode event consumer for the shared chat driver.
@@ -28,6 +29,16 @@ pub trait ChatSink: Send + Sync + 'static {
     fn on_agent_event(&self, event: AgentEvent) -> bool;
     fn on_run_status(&self, _status: &str) {}
     fn on_interrupt(&self, _run_id: &str, _goal: &str, _new_message: &str) {}
+    /// Trace sink forwarded into the framework's external run context
+    /// (`ExternalRunContext.trace_sink`) so tools running inside a spawned
+    /// task executor (e.g. `execute_plan`) can still reach
+    /// `CURRENT_TRACE_SINK` via `scoped_with_ctx_run_id`. The framework
+    /// carries `serde_json::Value` (not the app's `ExecEvent`) to stay
+    /// decoupled; the app re-deserializes on the way back out. GUI provides a
+    /// Tauri-emitting closure, non-GUI modes return `None`.
+    fn trace_sink(&self) -> Option<TraceSinkFn> {
+        None
+    }
     /// Trace sink scoped into the task_local run context (`with_run_context`)
     /// so the **main agent's** task_tools (`execute_plan`) can emit
     /// [`crate::tasks::task_runtime::executor::ExecEvent`]s during a complex run.
@@ -163,11 +174,10 @@ async fn drive_chat_inner(
 
         // `with_run_context` is task-local and does not cross the framework's
         // forked subagent `tokio::spawn`; ExternalRunContext is the value-carried
-        // channel that keeps worker tools and run_id on this same run.
-        // (Phase 4c: `trace_sink` is None — the framework never invokes this
-        // field; main-agent execution flow goes through the `worker_trace_sink`
-        // closure + `CURRENT_TRACE_SINK` task_local scoped by `with_run_context`
-        // above, not through ExternalRunContext.)
+        // channel that keeps worker tools and run_id on this same run. The
+        // `trace_sink` here is the framework-Value form; `scoped_with_ctx_run_id`
+        // re-scopes it into `CURRENT_TRACE_SINK` for tools (e.g. execute_plan)
+        // running inside the framework's spawned tool executor.
         guard.set_external_context(&echo_core::tools::ExternalRunContext {
             run_id: run_id.clone(),
             execution_id: None,
@@ -175,7 +185,7 @@ async fn drive_chat_inner(
             // subagent stream can be pinned to this turn's message block.
             message_id: Some(run_id),
             cancel: Some(std::sync::Arc::new(cancel.clone())),
-            trace_sink: None,
+            trace_sink: sink.trace_sink(),
         });
 
         let stream_result = guard.execute_stream_message_with_cancel(msg, cancel).await;

@@ -38,6 +38,11 @@ export const ParallelExecutionBlock = memo(function ParallelExecutionBlock({
     return allRuns
       .filter(
         (w) =>
+          // Skip the synthetic "main" run — the main agent's thinking/tool
+          // stream is already rendered via `chat://event` (ChatPanel), so
+          // showing it again as a SubagentStreamBlock would duplicate. The
+          // "main" entry is still kept in the store for cache diagnostics.
+          w.subagentRunId !== 'main' &&
           (!activeRun || w.runId === activeRun.run_id) &&
           (w.messageId === messageId || (!w.messageId && isLatestAssistant)) &&
           // Top-level subagents: parent is empty OR equals the run_id.

@@ -167,16 +167,6 @@ fn emit_execution_event(
     let _ = app.emit("execution://event", serde_json::Value::Object(map));
 }
 
-/// Shorthand for main-agent execution-flow events (kind="subagent",
-/// subagent_run_id="main").
-fn emit_main_agent_event(
-    app: &tauri::AppHandle,
-    run_id: &str,
-    event: &str,
-    payload: serde_json::Value,
-) {
-    emit_execution_event(app, run_id, "subagent", event, "echo-assistant", payload);
-}
 
 /// Global pending map for approval/input responses.
 #[allow(clippy::type_complexity)]
@@ -886,18 +876,34 @@ impl echo_agent_app_core::chat_driver::ChatSink for TauriChatSink {
     }
 
     fn worker_trace_sink(&self) -> Option<crate::tasks::task_runtime::task_tools::TraceSink> {
-        // Forward main-agent execution-flow events to the unified
-        // `execution://event` Tauri channel (kind="subagent",
-        // subagent_run_id="main"). The executor emits [`ExecEvent`]s through
-        // this sink during a complex run; each is re-emitted as a
-        // kind="subagent" execution event so the frontend renders the main
-        // agent with the same SubagentStreamBlock component as real subagents.
+        // Forward execution-flow events from `execute_run` (run lifecycle +
+        // main-agent task stream) to the unified `execution://event` channel.
+        // Run-level events (task_id None) → kind="run"; task-level events
+        // (task_id Some) → kind="subagent" with subagent_run_id="main" so the
+        // frontend renders the main agent's verification-task stream. Note:
+        // the normal chat-turn thinking/tool stream does NOT go through this
+        // sink — it goes through `chat://event` via `agent_event_to_chat_event`.
+        // This sink only fires for events emitted by `execute_run` /
+        // `run_main_agent_task` (verification tasks run on the primary agent).
         let app = self.app.clone();
         let run_id = self.run_id.clone();
         Some(std::sync::Arc::new(move |ev: ExecEvent| {
             let agent = ev.agent.as_deref().unwrap_or("echo-assistant");
-            emit_execution_event(&app, &run_id, "subagent", ev.event, agent, ev.payload);
+            let kind = if ev.task_id.is_some() { "subagent" } else { "run" };
+            emit_execution_event(&app, &run_id, kind, &ev.event, agent, ev.payload);
         }))
+    }
+
+    fn trace_sink(&self) -> Option<echo_core::tools::TraceSinkFn> {
+        // Bridge the framework's Value-based trace_sink to worker_trace_sink
+        // so tools running inside a spawned task executor (e.g. execute_plan)
+        // can reach CURRENT_TRACE_SINK via scoped_with_ctx_run_id.
+        let ws = self.worker_trace_sink()?;
+        Some(std::sync::Arc::new(move |value: serde_json::Value| {
+            if let Ok(ev) = serde_json::from_value::<ExecEvent>(value) {
+                ws(ev);
+            }
+        }) as echo_core::tools::TraceSinkFn)
     }
 }
 
@@ -931,14 +937,15 @@ fn agent_event_to_chat_event(
     provider_name: &Option<String>,
     route: &str,
 ) -> Option<ChatEvent> {
-    // Local helper: emit a main-agent execution-flow event on
-    // execution://event (kind="subagent", subagent_run_id="main").
-    let trace = |event_name: &str, payload: serde_json::Value| {
-        emit_main_agent_event(app, run_id, event_name, payload);
-    };
+    // Local helper removed (Phase 4c follow-up): the main agent's execution
+    // flow is already rendered via `chat://event` (ChatPanel). Emitting the
+    // same events onto `execution://event` (kind="subagent", id="main") caused
+    // duplicate rendering in SubagentStreamBlock AND a stale "running" card
+    // (main run had no `started`/`completed` lifecycle pairing). Main-agent
+    // cache diagnostics go through `trace_collector` + SQLite via
+    // `get_cache_diagnostics`, not through the execution://event store.
     match event {
         AgentEvent::Token(data) => {
-            trace("token_delta", serde_json::json!({ "content": data }));
             Some(ChatEvent::Token { data: data.clone() })
         }
         AgentEvent::ThinkStart => {
@@ -950,20 +957,12 @@ fn agent_event_to_chat_event(
                 message_key,
                 conversation_id,
             );
-            trace("thinking_started", serde_json::json!({}));
             Some(ChatEvent::ThinkingStart)
         }
         AgentEvent::ThinkEnd {
             prompt_tokens,
             completion_tokens,
         } => {
-            trace(
-                "usage",
-                serde_json::json!({
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": completion_tokens
-                }),
-            );
             Some(ChatEvent::ThinkingEnd {
                 prompt_tokens: *prompt_tokens,
                 completion_tokens: *completion_tokens,
@@ -1030,18 +1029,6 @@ fn agent_event_to_chat_event(
                 };
                 let _ = store.insert_usage_record(&record);
             }
-            trace(
-                "usage",
-                serde_json::json!({
-                "model": model.clone(),
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": completion_tokens,
-                    "total_tokens": total_tokens,
-                    "cached_prompt_tokens": cached_prompt_tokens,
-                    "cache_creation_prompt_tokens": cache_creation_prompt_tokens,
-                    "usage_reported": usage_reported
-                }),
-            );
             Some(ChatEvent::LlmUsage {
                 model: model.clone(),
                 prompt_tokens: *prompt_tokens,
@@ -1061,24 +1048,12 @@ fn agent_event_to_chat_event(
                 message_key,
                 conversation_id,
             );
-            trace(
-                "tool_started",
-                serde_json::json!({ "name": name, "args": args }),
-            );
             Some(ChatEvent::ToolStart {
                 name: name.clone(),
                 args: args.clone(),
             })
         }
         AgentEvent::ToolResult { name, output } => {
-            trace(
-                "tool_completed",
-                serde_json::json!({
-                    "name": name,
-                    "result": output,
-                    "success": true
-                }),
-            );
             Some(ChatEvent::ToolResult {
                 name: name.clone(),
                 result: output.clone(),
@@ -1086,14 +1061,6 @@ fn agent_event_to_chat_event(
             })
         }
         AgentEvent::ToolError { name, error } => {
-            trace(
-                "tool_completed",
-                serde_json::json!({
-                    "name": name,
-                    "result": error,
-                    "success": false
-                }),
-            );
             Some(ChatEvent::ToolResult {
                 name: name.clone(),
                 result: error.clone(),
@@ -1106,23 +1073,12 @@ fn agent_event_to_chat_event(
         AgentEvent::ToolBatchEnd => Some(ChatEvent::ToolBatchEnd),
         AgentEvent::Chart { spec } => Some(ChatEvent::Chart { spec: spec.clone() }),
         AgentEvent::FinalAnswer(data) => {
-            emit_main_agent_event(app, run_id, "completed", serde_json::json!({}));
             Some(ChatEvent::FinalAnswer { data: data.clone() })
         }
         AgentEvent::Cancelled => {
-            emit_main_agent_event(app, run_id, "cancelled", serde_json::json!({}));
             Some(ChatEvent::Cancelled)
         }
         AgentEvent::Error { source, message } => {
-            emit_main_agent_event(
-                app,
-                run_id,
-                "failed",
-                serde_json::json!({
-                    "source": source,
-                    "message": message
-                }),
-            );
             Some(ChatEvent::Error {
                 message: format!("{source}: {message}"),
             })

@@ -167,18 +167,17 @@ pub(crate) fn run_id_from_ctx_or_local(
         .ok_or_else(|| ToolResult::error("no active run — run_id not in ToolContext or task_local"))
 }
 
-/// 在 ToolContext.run_id 的 task_local 覆盖作用域内执行 f。
+/// 在 ToolContext.run_id/trace_sink(若有)的 task_local 覆盖作用域内执行 f。
 ///
 /// 这样工具既有的 `execute`(读 task_local 的 require_run_id)无需改动即可在
 /// worker 场景工作:execute_with_context 调本函数包住原 execute,ctx.run_id 被
 /// 临时注入 task_local,require_run_id 读到的是 ToolContext 的值(跨 spawn 安全)。
 /// ctx.run_id 为 None 时直接执行 f(回退原 task_local,主 agent 场景)。
 ///
-/// Phase 4c: 不再从 `ctx.trace_sink` 回灌 `CURRENT_TRACE_SINK` —— 框架的
-/// `ExternalRunContext.trace_sink` 字段被注入但框架从不调用(subagent 走
-/// `SubagentEventBus`),回灌它是一条死回路。`CURRENT_TRACE_SINK` 现在只由
-/// `with_run_context` 的显式参数设置(drive_chat 已 scope)。这里只覆盖 run_id +
-/// cancel,trace_sink 沿用外层 `with_run_context` 已经建立的 scope。
+/// 同时覆盖 run_id / cancel / trace_sink(若有),让 require_run_id /
+/// CURRENT_CANCEL / CURRENT_TRACE_SINK 在框架 spawn 的工具执行场景读到
+/// ToolContext 的值(跨 spawn 安全)。`ctx.trace_sink` 是框架 Value 形式,
+/// 这里反序列化回 `ExecEvent` 包装成 `TraceSink` 注入 task_local。
 pub(crate) async fn scoped_with_ctx_run_id<F, Fut, R>(
     ctx: &echo_core::tools::ToolContext,
     f: F,
@@ -194,8 +193,19 @@ where
                 .as_ref()
                 .map(|c| (**c).clone())
                 .unwrap_or_default();
+            let trace_sink = ctx.trace_sink.as_ref().map(|sink| {
+                let sink = sink.clone();
+                Arc::new(move |event: ExecEvent| {
+                    if let Ok(value) = serde_json::to_value(event) {
+                        sink(value);
+                    }
+                }) as TraceSink
+            });
             CURRENT_CANCEL
-                .scope(cancel, CURRENT_RUN_ID.scope(rid.clone(), f()))
+                .scope(
+                    cancel,
+                    CURRENT_RUN_ID.scope(rid.clone(), CURRENT_TRACE_SINK.scope(trace_sink, f())),
+                )
                 .await
         }
         None => f().await,

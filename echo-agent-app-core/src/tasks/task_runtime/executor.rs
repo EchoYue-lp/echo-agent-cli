@@ -44,17 +44,17 @@ use super::types::*;
 /// thinking/tool/token stream, kind="run" for run lifecycle).
 ///
 /// Replaces the old `WorkerTraceEvent`/`WorkerTraceEventKind` pair (Phase 4c of
-/// the Subagent unification). The `event` field is a `&'static str` (e.g.
+/// the Subagent unification). The `event` field is a string (e.g.
 /// `"tool_started"`, `"run_completed"`) matching the frontend's
 /// `SubagentRunEventKind`; `payload` carries event-specific fields
 /// (`content`/`name`/`args`/...) as a flat JSON object.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ExecEvent {
     pub run_id: String,
     /// `None` for run-level events (RunStarted/Completed/...), `Some(task_id)`
     /// for task-scoped events (the main agent's thinking/tool/token stream).
     pub task_id: Option<String>,
-    pub event: &'static str,
+    pub event: String,
     pub agent: Option<String>,
     pub payload: serde_json::Value,
 }
@@ -65,7 +65,7 @@ impl ExecEvent {
         Self {
             run_id: run_id.into(),
             task_id: None,
-            event,
+            event: event.to_string(),
             agent: None,
             payload,
         }
@@ -82,7 +82,7 @@ impl ExecEvent {
         Self {
             run_id: run_id.into(),
             task_id: Some(task_id.into()),
-            event,
+            event: event.to_string(),
             agent: None,
             payload,
         }
@@ -1769,15 +1769,26 @@ async fn run_readonly_worker(
 }
 
 fn worker_trace_sink_to_core(
-    _trace_sink: Option<ExecSink>,
+    trace_sink: Option<ExecSink>,
 ) -> Option<echo_core::tools::TraceSinkFn> {
-    // Phase 4c: the framework's `ExternalRunContext.trace_sink` (Value-based)
-    // is injected but never actually invoked by the framework — subagent
-    // dispatch flows go through `SubagentEventBus` instead. Returning `None`
-    // here drops the (dead) injection; `run_readonly_worker` /
-    // `run_writer_worker` still accept the `trace_sink` param for signature
-    // parity with `run_main_agent_task` (which DOES use it).
-    None
+    // Wrap an app-layer `ExecSink` into the framework's `TraceSinkFn`
+    // (Value-based) so it can be carried across `tokio::spawn` boundaries via
+    // `ExternalRunContext.trace_sink`. The app's `scoped_with_ctx_run_id`
+    // (task_tools.rs) reads `ctx.trace_sink` back and re-scopes it into
+    // `CURRENT_TRACE_SINK` so tools running inside a spawned task (e.g.
+    // `execute_plan`) can emit execution-flow events.
+    //
+    // Subagent dispatch itself does NOT use this path — it goes through
+    // `SubagentEventBus`. This conversion is only for the main-agent tool path
+    // (execute_plan / task_create) that runs inside the framework's spawned
+    // tool executor and needs to reach the trace_sink.
+    trace_sink.map(|sink| {
+        Arc::new(move |value: serde_json::Value| {
+            if let Ok(ev) = serde_json::from_value::<ExecEvent>(value) {
+                sink(ev);
+            }
+        }) as echo_core::tools::TraceSinkFn
+    })
 }
 
 /// Run a CODE-WRITER task (implementation / debugging) by delegating to the
