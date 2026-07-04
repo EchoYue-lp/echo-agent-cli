@@ -317,6 +317,32 @@ impl PlanTaskKind {
             _ => return None,
         })
     }
+
+    pub fn to_runtime_kind(self) -> echo_agent::tasks::RuntimeTaskKind {
+        match self {
+            PlanTaskKind::ReadOnlyReview => echo_agent::tasks::RuntimeTaskKind::ReadOnlyReview,
+            PlanTaskKind::Investigation => echo_agent::tasks::RuntimeTaskKind::Investigation,
+            PlanTaskKind::TestPlan => echo_agent::tasks::RuntimeTaskKind::TestPlan,
+            PlanTaskKind::Implementation => echo_agent::tasks::RuntimeTaskKind::Implementation,
+            PlanTaskKind::Debugging => echo_agent::tasks::RuntimeTaskKind::Debugging,
+            PlanTaskKind::Review => echo_agent::tasks::RuntimeTaskKind::Review,
+            PlanTaskKind::Summary => echo_agent::tasks::RuntimeTaskKind::Summary,
+            PlanTaskKind::Verification => echo_agent::tasks::RuntimeTaskKind::Verification,
+        }
+    }
+
+    pub fn from_runtime_kind(kind: echo_agent::tasks::RuntimeTaskKind) -> Self {
+        match kind {
+            echo_agent::tasks::RuntimeTaskKind::ReadOnlyReview => PlanTaskKind::ReadOnlyReview,
+            echo_agent::tasks::RuntimeTaskKind::Investigation => PlanTaskKind::Investigation,
+            echo_agent::tasks::RuntimeTaskKind::TestPlan => PlanTaskKind::TestPlan,
+            echo_agent::tasks::RuntimeTaskKind::Implementation => PlanTaskKind::Implementation,
+            echo_agent::tasks::RuntimeTaskKind::Debugging => PlanTaskKind::Debugging,
+            echo_agent::tasks::RuntimeTaskKind::Review => PlanTaskKind::Review,
+            echo_agent::tasks::RuntimeTaskKind::Summary => PlanTaskKind::Summary,
+            echo_agent::tasks::RuntimeTaskKind::Verification => PlanTaskKind::Verification,
+        }
+    }
 }
 
 // ── Todo status ─────────────────────────────────────────────────────────
@@ -358,6 +384,29 @@ impl TodoStatus {
             "skipped" => TodoStatus::Skipped,
             _ => return None,
         })
+    }
+
+    pub fn to_runtime_status(self) -> echo_agent::tasks::RuntimeTaskStatus {
+        match self {
+            TodoStatus::Pending => echo_agent::tasks::RuntimeTaskStatus::Pending,
+            TodoStatus::Running => echo_agent::tasks::RuntimeTaskStatus::Running,
+            TodoStatus::Blocked => echo_agent::tasks::RuntimeTaskStatus::Blocked,
+            TodoStatus::Completed => echo_agent::tasks::RuntimeTaskStatus::Completed,
+            TodoStatus::Failed => echo_agent::tasks::RuntimeTaskStatus::Failed,
+            TodoStatus::Skipped => echo_agent::tasks::RuntimeTaskStatus::Skipped,
+        }
+    }
+
+    pub fn from_runtime_status(status: echo_agent::tasks::RuntimeTaskStatus) -> Self {
+        match status {
+            echo_agent::tasks::RuntimeTaskStatus::Pending => TodoStatus::Pending,
+            echo_agent::tasks::RuntimeTaskStatus::Running => TodoStatus::Running,
+            echo_agent::tasks::RuntimeTaskStatus::Blocked => TodoStatus::Blocked,
+            echo_agent::tasks::RuntimeTaskStatus::Completed => TodoStatus::Completed,
+            echo_agent::tasks::RuntimeTaskStatus::Failed => TodoStatus::Failed,
+            echo_agent::tasks::RuntimeTaskStatus::Skipped
+            | echo_agent::tasks::RuntimeTaskStatus::Cancelled => TodoStatus::Skipped,
+        }
     }
 }
 
@@ -699,6 +748,26 @@ impl Default for PlanTask {
     }
 }
 
+impl PlanTask {
+    /// Convert to the framework's product-neutral runtime task view.
+    pub fn to_runtime_task(&self) -> echo_agent::tasks::RuntimeTask {
+        echo_agent::tasks::RuntimeTask {
+            id: self.id.clone(),
+            title: self.title.clone(),
+            description: self.description.clone(),
+            kind: self.kind.to_runtime_kind(),
+            agent_role: self.agent_role.clone(),
+            depends_on: self.depends_on.clone(),
+            files: self.files.clone(),
+            allowed_tools: self.allowed_tools.clone(),
+            verification: self.verification.clone(),
+            retry_count: self.retry_count,
+            max_retries: self.max_retries,
+            status: self.status.to_runtime_status(),
+        }
+    }
+}
+
 /// Partial update patch for a [`PlanTask`]. Only non-`None` fields are applied.
 /// Used by [`TaskRuntimeStore::update_task`] for in-flight plan edits.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
@@ -975,6 +1044,30 @@ pub struct TaskExecutionSummary {
     pub created_at: DateTime<Utc>,
 }
 
+impl TaskExecutionSummary {
+    /// Convert to the framework's product-neutral task summary.
+    pub fn to_runtime_summary(&self) -> echo_agent::tasks::TaskExecutionSummary {
+        echo_agent::tasks::TaskExecutionSummary {
+            run_id: self.run_id.clone(),
+            task_id: self.task_id.clone(),
+            worker_agent: self.worker_agent.clone(),
+            completed_work: self.completed_work.clone(),
+            files_read: self.files_read.clone(),
+            files_changed: self.files_changed.clone(),
+            decisions: self.decisions.clone(),
+            failures: self.failures.clone(),
+            verification: self.verification.clone(),
+            next_implications: self.next_implications.clone(),
+            suggested_tasks: self
+                .suggested_tasks
+                .iter()
+                .map(SuggestedTask::to_runtime_suggested_task)
+                .collect(),
+            created_at: self.created_at,
+        }
+    }
+}
+
 /// A bounded follow-up task proposed by a worker. Workers may suggest new work,
 /// but only the TaskRuntime appends it to the canonical plan.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -988,6 +1081,34 @@ pub struct SuggestedTask {
     pub dependencies: Vec<String>,
     pub why_needed: String,
     pub risk: String,
+}
+
+impl SuggestedTask {
+    /// Convert to the framework's product-neutral suggested task.
+    pub fn to_runtime_suggested_task(&self) -> echo_agent::tasks::SuggestedTask {
+        echo_agent::tasks::SuggestedTask {
+            title: self.title.clone(),
+            description: self.description.clone(),
+            kind: self.kind.to_runtime_kind(),
+            agent_role: self.agent_role.clone(),
+            dependencies: self.dependencies.clone(),
+            why_needed: self.why_needed.clone(),
+            risk: self.risk.clone(),
+        }
+    }
+
+    /// Convert a framework suggestion into the EKO app type.
+    pub fn from_runtime_suggested_task(task: echo_agent::tasks::SuggestedTask) -> Self {
+        Self {
+            title: task.title,
+            description: task.description,
+            kind: PlanTaskKind::from_runtime_kind(task.kind),
+            agent_role: task.agent_role,
+            dependencies: task.dependencies,
+            why_needed: task.why_needed,
+            risk: task.risk,
+        }
+    }
 }
 
 // ── Usage trend persistence ────────────────────────────────────────────
@@ -1152,6 +1273,77 @@ mod tests {
         assert!(PlanTaskKind::Review.is_read_only());
         assert!(!PlanTaskKind::Implementation.is_read_only());
         assert!(!PlanTaskKind::Verification.is_read_only());
+    }
+
+    #[test]
+    fn plan_task_converts_to_framework_runtime_task() {
+        let task = PlanTask {
+            id: "t1".to_string(),
+            title: "Inspect runtime".to_string(),
+            description: "Read task runtime code".to_string(),
+            kind: PlanTaskKind::Investigation,
+            agent_role: "explorer".to_string(),
+            domain_profile: DomainProfile::AiCoding,
+            depends_on: vec!["t0".to_string()],
+            parallel_group: Some("g1".to_string()),
+            files: vec!["src/lib.rs".to_string()],
+            allowed_tools: vec!["read_file".to_string()],
+            verification: vec!["cargo check".to_string()],
+            retry_count: 1,
+            max_retries: 2,
+            failure_fingerprint: None,
+            status: TodoStatus::Running,
+            sort_order: 10,
+        };
+
+        let runtime = task.to_runtime_task();
+
+        assert_eq!(runtime.id, "t1");
+        assert_eq!(
+            runtime.kind,
+            echo_agent::tasks::RuntimeTaskKind::Investigation
+        );
+        assert_eq!(
+            runtime.status,
+            echo_agent::tasks::RuntimeTaskStatus::Running
+        );
+        assert_eq!(runtime.depends_on, vec!["t0".to_string()]);
+        assert_eq!(runtime.max_retries, 2);
+    }
+
+    #[test]
+    fn task_execution_summary_converts_suggestions_to_framework() {
+        let summary = TaskExecutionSummary {
+            run_id: "r1".to_string(),
+            task_id: "t1".to_string(),
+            worker_agent: "explorer".to_string(),
+            completed_work: vec!["Read runtime".to_string()],
+            files_read: vec!["runtime.rs".to_string()],
+            files_changed: Vec::new(),
+            decisions: Vec::new(),
+            failures: Vec::new(),
+            verification: Vec::new(),
+            next_implications: Vec::new(),
+            suggested_tasks: vec![SuggestedTask {
+                title: "Extract DAG kernel".to_string(),
+                description: "Move pure scheduling next".to_string(),
+                kind: PlanTaskKind::Implementation,
+                agent_role: "implementer".to_string(),
+                dependencies: vec!["t1".to_string()],
+                why_needed: "Scheduling is reusable".to_string(),
+                risk: "Adapter mismatch".to_string(),
+            }],
+            created_at: Utc::now(),
+        };
+
+        let runtime = summary.to_runtime_summary();
+
+        assert_eq!(runtime.task_id, "t1");
+        assert_eq!(runtime.suggested_tasks.len(), 1);
+        assert_eq!(
+            runtime.suggested_tasks.first().map(|task| task.kind),
+            Some(echo_agent::tasks::RuntimeTaskKind::Implementation)
+        );
     }
 
     #[test]
