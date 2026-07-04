@@ -31,14 +31,25 @@ use clap::Parser;
 /// because `drive_chat` takes `Option<&TaskRuntimeStore>` (normal-only callers
 /// pass `None`). Headless modes support complex tasks (TUI/GUI parity,
 /// AGENTS.md), so they always provide a store.
+#[cfg(any(feature = "tui", feature = "channels"))]
+#[cfg_attr(test, allow(dead_code))]
 fn build_task_runtime_store_for_headless()
 -> Option<std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>> {
-    let store =
-        echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore::new().unwrap_or_else(|e| {
+    let store = match echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore::new() {
+        Ok(store) => store,
+        Err(e) => {
             tracing::warn!("Failed to open task_runtime.db: {e}; in-memory fallback");
-            echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
-                .expect("in-memory task_runtime store should always init")
-        });
+            match echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore::new_in_memory() {
+                Ok(store) => store,
+                Err(memory_error) => {
+                    tracing::error!(
+                        "Failed to initialize in-memory task_runtime store: {memory_error}"
+                    );
+                    return None;
+                }
+            }
+        }
+    };
     let recovered = store.recover_incomplete();
     if recovered > 0 {
         tracing::info!(recovered, "recovered incomplete task_runtime runs");

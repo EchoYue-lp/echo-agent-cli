@@ -34,6 +34,7 @@ gui = [
 channels = ["echo-agent/channels"]
 telemetry = ["echo-agent/telemetry"]
 eval = ["echo-agent/eval"]
+improve = ["echo-agent/improve"]
 devtools = ["tauri?/devtools"]
 
 [[bin]]

@@ -476,6 +476,18 @@ async fn register_default_subagents(
         names = ?workers.iter().map(|w| w.name.as_str()).collect::<Vec<_>>(),
         "Loaded subagent worker definitions from .md (project/user/builtin)"
     );
+
+    struct BuiltWorker {
+        definition: echo_agent::agent::subagent::SubagentDefinition,
+        handle: crate::agent_handle::AgentHandle,
+        readonly: bool,
+        isolate_worktree: bool,
+        isolate_workspace: bool,
+        has_team: bool,
+        tags: Vec<String>,
+    }
+
+    let mut built_workers: Vec<BuiltWorker> = Vec::with_capacity(workers.len());
     for worker_def in &workers {
         // Sprint 9: register BOTH readonly and writer workers. Readonly workers
         // get the readonly tool subset (physical no-write enforcement); writer
@@ -495,6 +507,7 @@ async fn register_default_subagents(
                 token_limit,
                 tool_timeout_ms,
                 cache_user_id,
+                worker_def.can_delegate,
             )
         } else {
             build_writer_worker_agent(
@@ -507,17 +520,19 @@ async fn register_default_subagents(
                 token_limit,
                 tool_timeout_ms,
                 cache_user_id,
+                worker_def.can_delegate,
             )
         };
         match build_result {
             Ok(worker) => {
                 let worker_handle = crate::agent_handle::AgentHandle::new(worker);
-                // (delegate_readonly 工具已删除:worker 不再注册派发工具。
-                // 原 L3 嵌套委派能力丧失,worker 需子任务时自己用文件工具完成。)
 
                 let mut builder = SubagentBuilder::new(&worker_def.name)
                     .description(&worker_def.description)
                     .fork_mode();
+                if worker_def.can_delegate {
+                    builder = builder.can_delegate();
+                }
                 // Sprint 8/9: honor the frontmatter `worktree: true` flag (only
                 // set for non-readonly writers; readonly workers have it cleared
                 // by the loader since they don't mutate files). This makes the
@@ -543,24 +558,75 @@ async fn register_default_subagents(
                     builder = builder.tag(tag);
                 }
                 let def = builder.build();
-                agent.register_subagent_with_definition(def, worker_handle.to_boxed_agent().await);
-                tracing::info!(
-                    subagent = %worker_def.name,
-                    readonly = worker_def.readonly,
-                    isolate_worktree = worker_def.isolate_worktree,
-                    isolate_workspace = worker_def.isolate_workspace,
-                    has_team = worker_def.team.is_some(),
-                    tags = ?worker_def.tags,
-                    "registered default subagent"
-                );
+                built_workers.push(BuiltWorker {
+                    definition: def,
+                    handle: worker_handle,
+                    readonly: worker_def.readonly,
+                    isolate_worktree: worker_def.isolate_worktree,
+                    isolate_workspace: worker_def.isolate_workspace,
+                    has_team: worker_def.team.is_some(),
+                    tags: worker_def.tags.clone(),
+                });
             }
             Err(err) => tracing::warn!(
                 subagent = %worker_def.name,
                 readonly = worker_def.readonly,
                 error = %err,
-                "Failed to register default subagent"
+                "Failed to build default subagent"
             ),
         }
+    }
+
+    // Register every worker on the primary agent.
+    for built in &built_workers {
+        agent.register_subagent_with_definition(
+            built.definition.clone(),
+            built.handle.to_boxed_agent().await,
+        );
+        tracing::info!(
+            subagent = %built.definition.name,
+            readonly = built.readonly,
+            can_delegate = built.definition.can_delegate,
+            isolate_worktree = built.isolate_worktree,
+            isolate_workspace = built.isolate_workspace,
+            has_team = built.has_team,
+            tags = ?built.tags,
+            "registered default subagent"
+        );
+    }
+
+    // Optional nested delegation: only roles that explicitly declare
+    // `can_delegate: true` receive a child registry. Defaults stay flat, so
+    // ordinary workers can complete their current task or suggest follow-ups
+    // without becoming recursive planners.
+    //
+    // Until the framework `agent_tool` carries NestedDelegationPolicy through
+    // ToolContext, only expose leaf workers as children. This prevents two
+    // delegate-capable roles from recursively calling each other while still
+    // allowing a manager-style role to fan out to normal workers.
+    for parent in built_workers
+        .iter()
+        .filter(|worker| worker.definition.can_delegate)
+    {
+        for child in built_workers.iter().filter(|child| {
+            child.definition.name != parent.definition.name && !child.definition.can_delegate
+        }) {
+            let child_agent = child.handle.to_boxed_agent().await;
+            parent
+                .handle
+                .write(|worker| {
+                    worker.register_subagent_with_definition(child.definition.clone(), child_agent);
+                })
+                .await;
+        }
+        tracing::info!(
+            subagent = %parent.definition.name,
+            child_count = built_workers
+                .iter()
+                .filter(|child| child.definition.name != parent.definition.name && !child.definition.can_delegate)
+                .count(),
+            "registered nested-delegation child subagents"
+        );
     }
 }
 
@@ -581,6 +647,7 @@ fn build_writer_worker_agent(
     token_limit: usize,
     tool_timeout_ms: u64,
     cache_user_id: &str,
+    can_delegate: bool,
 ) -> std::result::Result<ReactAgent, echo_agent::error::ReactError> {
     // Mirror build_readonly_worker_agent, but OMIT `.readonly_tools()` → the
     // default `readonly_tools: false` triggers `register_all_tools`, giving the
@@ -605,6 +672,9 @@ fn build_writer_worker_agent(
             timeout_ms: tool_timeout_ms,
             ..Default::default()
         });
+    if can_delegate {
+        builder = builder.register_agent_dispatch_tool();
+    }
 
     let has_llm_config = llm_config.is_some();
     if let Some(config) = llm_config {
@@ -647,6 +717,7 @@ fn build_readonly_worker_agent(
     token_limit: usize,
     tool_timeout_ms: u64,
     cache_user_id: &str,
+    can_delegate: bool,
 ) -> std::result::Result<ReactAgent, echo_agent::error::ReactError> {
     let mut builder = ReactAgentBuilder::new()
         .model(model)
@@ -665,6 +736,9 @@ fn build_readonly_worker_agent(
             timeout_ms: tool_timeout_ms,
             ..Default::default()
         });
+    if can_delegate {
+        builder = builder.register_agent_dispatch_tool();
+    }
 
     let has_llm_config = llm_config.is_some();
     if let Some(config) = llm_config {

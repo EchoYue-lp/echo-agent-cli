@@ -1,7 +1,7 @@
 # Framework / App Boundary Migration Plan
 
-> Status: Phase 1-3 complete; Phase 4 audit complete with nested delegation
-> policy unification in progress.
+> Status: Phase 1-3 complete; Phase 4 tool audit complete; app role-capability
+> registration in progress.
 > Scope: `echo-agent` is the reusable framework; `echo-agent-cli` is the EKO app.
 > Rule of thumb: extract framework kernels and traits, not EKO product state.
 
@@ -258,11 +258,18 @@ Findings:
 - EKO-specific concrete tools (`task_create/update/complete/skip/list`,
   `create_complex_task`, `execute_plan`, `cancel_run`, `check_run_status`) stay
   in `echo-agent-cli`.
+- EKO worker `.md` frontmatter supports `can_delegate: true`. Default workers
+  do not receive `agent_tool`; only explicitly marked roles get it and receive
+  a leaf child-subagent registry. This keeps normal workers flat and prevents
+  recursive delegate-capable role cycles until `NestedDelegationPolicy` is
+  propagated through the framework `agent_tool` ToolContext path.
 
 Commit:
 
 - `2b2c958` (`echo-agent`): subagent dispatch uses
   `NestedDelegationPolicy` instead of a separate `delegate_depth` field.
+- `echo-agent-cli`: role-capability registration for nested delegation via
+  `can_delegate`.
 
 Goal: make tool placement match product/framework boundary.
 

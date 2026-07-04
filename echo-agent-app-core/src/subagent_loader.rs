@@ -83,6 +83,11 @@ struct WorkerFrontmatter {
     /// `readonly` is true. Empty if unset.
     #[serde(default)]
     tags: Vec<String>,
+    /// Optional nested delegation capability. Defaults false: workers execute
+    /// the assigned task and may suggest follow-up tasks, but cannot spawn
+    /// child subagents unless explicitly granted this capability.
+    #[serde(default)]
+    can_delegate: bool,
     /// Sprint 11: declare this subagent as a team-mode dispatcher. Only
     /// `"manager-worker"` is supported via frontmatter (other strategies are
     /// programmatic-only — they carry inline agent-name data).
@@ -117,6 +122,9 @@ pub struct WorkerDefinition {
     /// normal worker). The registration path sets `execution_mode = Team` and
     /// attaches this TeamSpec. manager + workers are name-references.
     pub team: Option<echo_agent::agent::subagent::types::TeamSpec>,
+    /// Whether this worker may receive the framework `agent_tool` and spawn
+    /// child subagents. Defaults false.
+    pub can_delegate: bool,
     pub tags: Vec<String>,
 }
 
@@ -349,6 +357,7 @@ pub fn parse_worker_md(
         isolate_worktree,
         isolate_workspace,
         team,
+        can_delegate: fm.can_delegate,
         tags,
     })
 }
@@ -597,6 +606,20 @@ team_workers: [\"explorer\", \"summarizer\"]\n\
         let md = "---\nname: w\ndescription: \"d\"\nreadonly: true\n---\nbody";
         let def = parse_worker_md(md, None).unwrap();
         assert!(def.team.is_none());
+    }
+
+    #[test]
+    fn parse_can_delegate_defaults_false() {
+        let md = "---\nname: w\ndescription: \"d\"\nreadonly: true\n---\nbody";
+        let def = parse_worker_md(md, None).unwrap();
+        assert!(!def.can_delegate);
+    }
+
+    #[test]
+    fn parse_can_delegate_frontmatter() {
+        let md = "---\nname: manager\ndescription: \"d\"\ncan_delegate: true\n---\nbody";
+        let def = parse_worker_md(md, None).unwrap();
+        assert!(def.can_delegate);
     }
 
     #[test]
