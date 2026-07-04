@@ -478,9 +478,8 @@ pub trait TaskDispatcher: Send + Sync {
     fn dispatch(
         &self,
         store: Arc<TaskRuntimeStore>,
-        run_id: String,
+        context: echo_agent::tasks::TaskWorkerContext,
         task: PlanTask,
-        cancel: CancellationToken,
         worker_sem: Arc<Semaphore>,
         write_sem: Arc<Semaphore>,
         shell_sem: Arc<Semaphore>,
@@ -508,9 +507,8 @@ impl TaskDispatcher for RealTaskDispatcher {
     fn dispatch(
         &self,
         store: Arc<TaskRuntimeStore>,
-        run_id: String,
+        context: echo_agent::tasks::TaskWorkerContext,
         task: PlanTask,
-        cancel: CancellationToken,
         worker_sem: Arc<Semaphore>,
         write_sem: Arc<Semaphore>,
         shell_sem: Arc<Semaphore>,
@@ -525,6 +523,8 @@ impl TaskDispatcher for RealTaskDispatcher {
     > {
         let primary_agent = self.primary_agent.clone();
         Box::pin(async move {
+            let run_id = context.run_id;
+            let cancel = context.cancel;
             // Scope run_id + cancel + trace_sink into task-local so worker-internal
             // tools (task_*/execute_plan, and their execute_with_context
             // fallback path) and L3 nested sub-workers can read them.
@@ -729,15 +729,15 @@ async fn run_dag<W: TaskDispatcher + 'static>(
             let file_write_locks = file_write_locks.clone();
             let trace_sink = trace_sink.clone();
             // clone shares the same cancellation tree — parent cancel fires here.
-            let cancel = parent_cancel.clone();
-            let run_id_owned = run_id.to_string();
+            let context = echo_agent::tasks::TaskWorkerContext::new(run_id.to_string())
+                .with_cancel(parent_cancel.clone())
+                .with_concurrency_limits(limits);
             handles.push(tokio::spawn(async move {
                 worker
                     .dispatch(
                         store,
-                        run_id_owned,
+                        context,
                         task,
-                        cancel,
                         worker_sem,
                         write_sem,
                         shell_sem,
@@ -3270,9 +3270,8 @@ Read the runtime path and found one missing branch.
         fn dispatch(
             &self,
             _store: Arc<TaskRuntimeStore>,
-            _run_id: String,
+            context: echo_agent::tasks::TaskWorkerContext,
             task: PlanTask,
-            cancel: CancellationToken,
             _worker_sem: Arc<Semaphore>,
             _write_sem: Arc<Semaphore>,
             _shell_sem: Arc<Semaphore>,
@@ -3290,7 +3289,7 @@ Read the runtime path and found one missing branch.
             let task_id = task.id.clone();
             Box::pin(async move {
                 // Honor cancellation even in the mock.
-                if cancel.is_cancelled() {
+                if context.cancel.is_cancelled() {
                     return Err((task_id, "cancelled".into()));
                 }
                 match results {
