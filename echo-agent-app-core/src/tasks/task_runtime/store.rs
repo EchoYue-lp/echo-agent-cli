@@ -65,6 +65,14 @@ pub struct TaskRuntimeStore {
     /// In-memory LLM usage records (token spend per worker call). Not persisted
     /// —重启清零,符合 EKO 本地工具定位(usage 是参考指标,非账本)。
     usage_records: std::sync::Mutex<Vec<super::types::UsageRecord>>,
+    /// Per-run plan/state 写互斥锁 (F2-1 / F3-3 / F3-4)。
+    ///
+    /// insert_task / attach_plan / update_plan_task / transition_run 都是
+    /// "读文件 → 改 → 重写文件"三步, 此前无锁 → EKO 写工具默认并行执行
+    /// (react_loop.rs:415, 仅 approval 工具串行), task_create + execute_plan
+    /// 可能并发覆写 plan.json。加 per-run Mutex 串行化同一 run 的所有 plan/run
+    /// 变更 (对标调研结论: 进程内 Mutex 兜底, 同时防崩溃中态)。不同 run 互不影响。
+    plan_locks: dashmap::DashMap<String, std::sync::Arc<std::sync::Mutex<()>>>,
 }
 
 impl TaskRuntimeStore {
@@ -89,6 +97,7 @@ impl TaskRuntimeStore {
             run_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
             shadow,
             usage_records: std::sync::Mutex::new(Vec::new()),
+            plan_locks: dashmap::DashMap::new(),
         })
     }
 
@@ -114,7 +123,26 @@ impl TaskRuntimeStore {
             run_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
             shadow,
             usage_records: std::sync::Mutex::new(Vec::new()),
+            plan_locks: dashmap::DashMap::new(),
         })
+    }
+
+    /// 在持有某 run 的 plan/state 写锁期间执行闭包 (F2-1 / F3-3 / F3-4)。
+    ///
+    /// 用 closure 模式而非返回 Guard: std::sync::MutexGuard 借自 &Mutex, 而
+    /// Mutex 在 Arc 内, Arc 作为局部变量时 Guard 跨函数返回即悬垂 (自引用
+    /// struct 在 Rust 里无法直接表达)。closure 把锁的获取与释放封装在内部,
+    /// 闭包体内是临界区。insert_task / attach_plan / update_plan_task /
+    /// transition_run 用它包裹"读改写"全程。
+    fn with_run_lock<R, E>(&self, run_id: &str, f: impl FnOnce() -> Result<R, E>) -> Result<R, E> {
+        let arc = self
+            .plan_locks
+            .entry(run_id.to_string())
+            .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(())))
+            .clone();
+        // 持锁调用闭包; poison 时恢复 (与 working_dir 同款 into_inner, 不 panic)。
+        let _guard = arc.lock().unwrap_or_else(|e| e.into_inner());
+        f()
     }
 
     /// Build a `FileTaskStore` over the shadow, for read delegation.
@@ -205,42 +233,46 @@ impl TaskRuntimeStore {
     /// Atomically transition a run to `next` and append `RunStatusChanged`.
     /// Rejects illegal transitions (see [`TaskRunStatus::can_transition_to`]).
     pub fn transition_run(&self, run_id: &str, next: TaskRunStatus) -> Result<TaskRun, StoreError> {
-        // U1c phase-0/0bc step-2: file is the read/write authority. Read the
-        // current run from the file to validate the transition, then append the
-        // status-changed event + rewrite plan.json. No SQL write.
-        let run = self
-            .get_run(run_id)?
-            .ok_or(StoreError::RunNotFound(run_id.to_string()))?;
-        let current = run.status;
-        if !current.can_transition_to(next) {
-            return Err(StoreError::IllegalTransition {
-                run_id: run_id.to_string(),
-                from: current.as_str().to_string(),
-                to: next.as_str().to_string(),
-            });
-        }
-        let now = Utc::now();
-        self.shadow.append_event_line(
-            run_id,
-            None,
-            None,
-            RuntimeEventKind::RunStatusChanged,
-            serde_json::json!({ "from": current.as_str(), "to": next.as_str() }),
-        )?;
-        if next == TaskRunStatus::Cancelled {
+        // F3-3/F3-4: 串行化"读→验证→写", 防并发 transition 丢更新 + 崩溃中态。
+        // 用 closure 包裹临界区 (见 with_run_lock 说明)。
+        self.with_run_lock(run_id, || {
+            // U1c phase-0/0bc step-2: file is the read/write authority. Read the
+            // current run from the file to validate the transition, then append the
+            // status-changed event + rewrite plan.json. No SQL write.
+            let run = self
+                .get_run(run_id)?
+                .ok_or(StoreError::RunNotFound(run_id.to_string()))?;
+            let current = run.status;
+            if !current.can_transition_to(next) {
+                return Err(StoreError::IllegalTransition {
+                    run_id: run_id.to_string(),
+                    from: current.as_str().to_string(),
+                    to: next.as_str().to_string(),
+                });
+            }
+            let now = Utc::now();
             self.shadow.append_event_line(
                 run_id,
                 None,
                 None,
-                RuntimeEventKind::RunCancelled,
-                serde_json::json!({}),
+                RuntimeEventKind::RunStatusChanged,
+                serde_json::json!({ "from": current.as_str(), "to": next.as_str() }),
             )?;
-        }
-        self.shadow.rewrite_plan(run_id)?;
-        let mut run = run;
-        run.status = next;
-        run.updated_at = now;
-        Ok(run)
+            if next == TaskRunStatus::Cancelled {
+                self.shadow.append_event_line(
+                    run_id,
+                    None,
+                    None,
+                    RuntimeEventKind::RunCancelled,
+                    serde_json::json!({}),
+                )?;
+            }
+            self.shadow.rewrite_plan(run_id)?;
+            let mut run = run;
+            run.status = next;
+            run.updated_at = now;
+            Ok(run)
+        })
     }
 
     /// Resume a paused run: `Paused → Running`.
@@ -342,90 +374,93 @@ impl TaskRuntimeStore {
         after_task_id: Option<String>,
         task: PlanTask,
     ) -> Result<(), StoreError> {
-        // U1c phase-0/0bc step-2: file authority. Read the current plan from
-        // the file (bootstrapping an empty plan if none exists), validate deps,
-        // then append PlanEdited{insert} + rewrite plan.json. No SQL write.
-        let run = self
-            .get_run(run_id)?
-            .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
-        // Load current plan/tasks from the file (None if no plan yet).
-        let current_plan = self.get_plan(run_id)?;
-        let existing_tasks: Vec<PlanTask> = current_plan
-            .as_ref()
-            .map(|p| p.tasks.clone())
-            .unwrap_or_default();
+        // F2-1: 串行化该 run 的 plan 变更, 防 task_create 并发覆写 plan.json。
+        self.with_run_lock(run_id, || {
+            // U1c phase-0/0bc step-2: file authority. Read the current plan from
+            // the file (bootstrapping an empty plan if none exists), validate deps,
+            // then append PlanEdited{insert} + rewrite plan.json. No SQL write.
+            let run = self
+                .get_run(run_id)?
+                .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+            // Load current plan/tasks from the file (None if no plan yet).
+            let current_plan = self.get_plan(run_id)?;
+            let existing_tasks: Vec<PlanTask> = current_plan
+                .as_ref()
+                .map(|p| p.tasks.clone())
+                .unwrap_or_default();
 
-        // Lazy bootstrap: if no plan exists, emit a PlanGenerated first
-        // (matching the SQL path that creates an empty plan row). The run
-        // goal comes from the run header (already on file via create_run).
-        if current_plan.is_none() {
-            let new_plan_id = uuid::Uuid::new_v4().to_string();
+            // Lazy bootstrap: if no plan exists, emit a PlanGenerated first
+            // (matching the SQL path that creates an empty plan row). The run
+            // goal comes from the run header (already on file via create_run).
+            if current_plan.is_none() {
+                let new_plan_id = uuid::Uuid::new_v4().to_string();
+                self.shadow.append_event_line(
+                    run_id,
+                    None,
+                    None,
+                    RuntimeEventKind::PlanGenerated,
+                    serde_json::json!({
+                        "plan_id": new_plan_id,
+                        "task_count": 0,
+                        "bootstrapped": true,
+                        "domain_profile": run.domain_profile.as_str(),
+                        "goal": run.goal,
+                        "assumptions": Vec::<String>::new(),
+                        "risks": Vec::<String>::new(),
+                        "execution_mode": "parallel",
+                    }),
+                )?;
+            }
+
+            // Build the new task list: insert after `after_task_id` (or front).
+            let mut new_tasks = existing_tasks.clone();
+            let insert_pos = after_task_id
+                .as_ref()
+                .and_then(|id| new_tasks.iter().position(|t| &t.id == id))
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            let mut task_with_order = task.clone();
+            task_with_order.sort_order = insert_pos as i64;
+            new_tasks.insert(insert_pos, task_with_order.clone());
+
+            // Validate deps (dangling refs + cycle detection).
+            if let Err(errs) = super::planner::validate_plan_deps(&new_tasks) {
+                return Err(StoreError::InvalidPlan(errs.join("; ")));
+            }
+
+            // Sprint 7: plan-time file-overlap advisory. Non-blocking — the write
+            // semaphore already serializes all writers, so this is a scheduling
+            // hint for when parallel writes are enabled (Sprint 8/9), surfaced
+            // early so the user sees the plan risk at edit time.
+            let report = super::planner::analyze_file_ownership(&new_tasks);
+            if report.has_overlap() {
+                for pair in &report.overlap_pairs {
+                    tracing::warn!(
+                        run_id,
+                        task_a = %pair.task_a,
+                        task_b = %pair.task_b,
+                        shared = ?pair.shared,
+                        "plan: writer tasks share files (will serialize; disjoint files enable parallel worktrees)"
+                    );
+                }
+            }
+
             self.shadow.append_event_line(
                 run_id,
                 None,
                 None,
-                RuntimeEventKind::PlanGenerated,
+                RuntimeEventKind::PlanEdited,
                 serde_json::json!({
-                    "plan_id": new_plan_id,
-                    "task_count": 0,
-                    "bootstrapped": true,
-                    "domain_profile": run.domain_profile.as_str(),
-                    "goal": run.goal,
-                    "assumptions": Vec::<String>::new(),
-                    "risks": Vec::<String>::new(),
-                    "execution_mode": "parallel",
+                    "action": "insert",
+                    "task_id": task_with_order.id,
+                    "after_task_id": after_task_id,
+                    // Full PlanTask body so events.jsonl can rebuild plan.json.
+                    "task": task_with_order,
                 }),
             )?;
-        }
-
-        // Build the new task list: insert after `after_task_id` (or front).
-        let mut new_tasks = existing_tasks.clone();
-        let insert_pos = after_task_id
-            .as_ref()
-            .and_then(|id| new_tasks.iter().position(|t| &t.id == id))
-            .map(|i| i + 1)
-            .unwrap_or(0);
-        let mut task_with_order = task.clone();
-        task_with_order.sort_order = insert_pos as i64;
-        new_tasks.insert(insert_pos, task_with_order.clone());
-
-        // Validate deps (dangling refs + cycle detection).
-        if let Err(errs) = super::planner::validate_plan_deps(&new_tasks) {
-            return Err(StoreError::InvalidPlan(errs.join("; ")));
-        }
-
-        // Sprint 7: plan-time file-overlap advisory. Non-blocking — the write
-        // semaphore already serializes all writers, so this is a scheduling
-        // hint for when parallel writes are enabled (Sprint 8/9), surfaced
-        // early so the user sees the plan risk at edit time.
-        let report = super::planner::analyze_file_ownership(&new_tasks);
-        if report.has_overlap() {
-            for pair in &report.overlap_pairs {
-                tracing::warn!(
-                    run_id,
-                    task_a = %pair.task_a,
-                    task_b = %pair.task_b,
-                    shared = ?pair.shared,
-                    "plan: writer tasks share files (will serialize; disjoint files enable parallel worktrees)"
-                );
-            }
-        }
-
-        self.shadow.append_event_line(
-            run_id,
-            None,
-            None,
-            RuntimeEventKind::PlanEdited,
-            serde_json::json!({
-                "action": "insert",
-                "task_id": task_with_order.id,
-                "after_task_id": after_task_id,
-                // Full PlanTask body so events.jsonl can rebuild plan.json.
-                "task": task_with_order,
-            }),
-        )?;
-        self.shadow.rewrite_plan(run_id)?;
-        Ok(())
+            self.shadow.rewrite_plan(run_id)?;
+            Ok(())
+        })
     }
 
     /// Soft-delete a task: set its status to `Skipped`. The task remains in
@@ -599,32 +634,35 @@ impl TaskRuntimeStore {
     /// transition the run to `AwaitingPlanApproval` (from `Planning`).
     /// All plan tasks and their todo rows are inserted in the same tx.
     pub fn attach_plan(&self, plan: &TaskPlan) -> Result<(), StoreError> {
-        self.get_run(&plan.run_id)?
-            .ok_or_else(|| StoreError::RunNotFound(plan.run_id.clone()))?;
+        // F2-1: 串行化 plan 变更。
+        self.with_run_lock(&plan.run_id, || {
+            self.get_run(&plan.run_id)?
+                .ok_or_else(|| StoreError::RunNotFound(plan.run_id.clone()))?;
 
-        // U1c phase-0/0bc step-2: file authority. PlanGenerated carries the
-        // full plan envelope + task bodies; the rebuilder reconstructs the
-        // plan from it. No SQL write.
-        self.shadow.append_event_line(
-            plan.run_id.as_str(),
-            None,
-            None,
-            RuntimeEventKind::PlanGenerated,
-            serde_json::json!({
-                "plan_id": plan.plan_id,
-                "task_count": plan.tasks.len(),
-                "domain_profile": plan.domain_profile.as_str(),
-                "goal": plan.goal,
-                "assumptions": plan.assumptions,
-                "risks": plan.risks,
-                "execution_mode": plan.execution_mode,
-                // Full task bodies: attach_plan is the authoritative plan-creation path
-                // so PlanGenerated must carry the tasks for events.jsonl to rebuild plan.json.
-                "tasks": plan.tasks,
-            }),
-        )?;
-        self.shadow.rewrite_plan(&plan.run_id)?;
-        Ok(())
+            // U1c phase-0/0bc step-2: file authority. PlanGenerated carries the
+            // full plan envelope + task bodies; the rebuilder reconstructs the
+            // plan from it. No SQL write.
+            self.shadow.append_event_line(
+                plan.run_id.as_str(),
+                None,
+                None,
+                RuntimeEventKind::PlanGenerated,
+                serde_json::json!({
+                    "plan_id": plan.plan_id,
+                    "task_count": plan.tasks.len(),
+                    "domain_profile": plan.domain_profile.as_str(),
+                    "goal": plan.goal,
+                    "assumptions": plan.assumptions,
+                    "risks": plan.risks,
+                    "execution_mode": plan.execution_mode,
+                    // Full task bodies: attach_plan is the authoritative plan-creation path
+                    // so PlanGenerated must carry the tasks for events.jsonl to rebuild plan.json.
+                    "tasks": plan.tasks,
+                }),
+            )?;
+            self.shadow.rewrite_plan(&plan.run_id)?;
+            Ok(())
+        })
     }
 
     // ── Task / todo mutations ───────────────────────────────────────────
@@ -689,31 +727,34 @@ impl TaskRuntimeStore {
     /// review-informed brief. The task id is unchanged so downstream
     /// depends_on keeps resolving. Emits a `Note` event for traceability.
     pub fn update_plan_task(&self, run_id: &str, task: &PlanTask) -> Result<(), StoreError> {
-        // U1c phase-0/0bc step-2: file authority. Validate the task exists, then
-        // emit Note{fix_task_persisted} carrying the full task body so the
-        // rebuilder can replace the task (see event_rebuild Note handler). No SQL.
-        let plan = self
-            .get_plan(run_id)?
-            .ok_or(StoreError::PlanNotFound(run_id.to_string()))?;
-        if !plan.tasks.iter().any(|t| t.id == task.id) {
-            return Err(StoreError::TaskNotFound(task.id.clone()));
-        }
-        self.shadow.append_event_line(
-            run_id,
-            Some(task.id.as_str()),
-            None,
-            RuntimeEventKind::Note,
-            serde_json::json!({
-                "kind": "fix_task_persisted",
-                "retry_count": task.retry_count,
-                "failure_fingerprint": task.failure_fingerprint,
-                // Full task body so events.jsonl can rebuild plan.json
-                // (the rebuilder replaces the matching task).
-                "task": task,
-            }),
-        )?;
-        self.shadow.rewrite_plan(run_id)?;
-        Ok(())
+        // F2-1: 串行化 plan 变更。
+        self.with_run_lock(run_id, || {
+            // U1c phase-0/0bc step-2: file authority. Validate the task exists, then
+            // emit Note{fix_task_persisted} carrying the full task body so the
+            // rebuilder can replace the task (see event_rebuild Note handler). No SQL.
+            let plan = self
+                .get_plan(run_id)?
+                .ok_or(StoreError::PlanNotFound(run_id.to_string()))?;
+            if !plan.tasks.iter().any(|t| t.id == task.id) {
+                return Err(StoreError::TaskNotFound(task.id.clone()));
+            }
+            self.shadow.append_event_line(
+                run_id,
+                Some(task.id.as_str()),
+                None,
+                RuntimeEventKind::Note,
+                serde_json::json!({
+                    "kind": "fix_task_persisted",
+                    "retry_count": task.retry_count,
+                    "failure_fingerprint": task.failure_fingerprint,
+                    // Full task body so events.jsonl can rebuild plan.json
+                    // (the rebuilder replaces the matching task).
+                    "task": task,
+                }),
+            )?;
+            self.shadow.rewrite_plan(run_id)?;
+            Ok(())
+        })
     }
 
     // ── Reviews, artifacts, summaries ───────────────────────────────────

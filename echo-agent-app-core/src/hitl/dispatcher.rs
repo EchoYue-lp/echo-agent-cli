@@ -75,36 +75,63 @@ impl HumanLoopProvider for HitlDispatcher {
                 });
             }
 
-            // Try each provider in order — first to respond wins
-            // with a 5-minute timeout per provider
+            // F5-2: 此前是串行 for 循环 + 每 provider 独立 5min 超时 → N 个 provider
+            // 最坏 N×5min。文件头注释本就写"First responder wins", 现在补齐实现。
+            //
+            // 改为并行广播 + first-response-wins(对标 GitHub "any approve"、HITL
+            // 多渠道冗余、Temporal first-input-wins):所有 provider 同时收到请求,
+            // 第一个**实质性响应**(Ok, 含 approve/reject/modify)即采纳并取消其余;
+            // 单个 provider 报 Err(连接断开等)不立即 reject, 继续等其余;
+            // 全部 Err/超时才 reject(default deny)。总超时上限 = 1×5min 而非 N×5min。
             const TIMEOUT_DURATION: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
-            for named in providers.iter() {
-                let provider_result =
-                    tokio::time::timeout(TIMEOUT_DURATION, named.provider.request(req.clone()))
-                        .await;
+            use futures::stream::{FuturesUnordered, StreamExt};
+            let mut pending: FuturesUnordered<_> = providers
+                .iter()
+                .map(|named| {
+                    let fut = named.provider.request(req.clone());
+                    let name = named.name.clone();
+                    async move {
+                        let result = tokio::time::timeout(TIMEOUT_DURATION, fut).await;
+                        (name, result)
+                    }
+                })
+                .collect();
 
-                match provider_result {
-                    Ok(Ok(response)) => return Ok(response),
+            let mut failures: Vec<String> = Vec::new();
+            while let Some((name, outcome)) = pending.next().await {
+                match outcome {
+                    Ok(Ok(response)) => {
+                        tracing::info!(
+                            provider = %name,
+                            "HITL request resolved by first responder"
+                        );
+                        return Ok(response);
+                    }
                     Ok(Err(e)) => {
                         tracing::debug!(
-                            provider = %named.name,
+                            provider = %name,
                             error = %e,
-                            "HITL provider failed, trying next"
+                            "HITL provider failed, waiting on others"
                         );
+                        failures.push(format!("{name}: {e}"));
                     }
                     Err(_) => {
                         tracing::warn!(
-                            provider = %named.name,
-                            "HITL provider timed out after 5 minutes, trying next"
+                            provider = %name,
+                            "HITL provider timed out after 5 minutes, waiting on others"
                         );
+                        failures.push(format!("{name}: timeout"));
                     }
                 }
             }
 
-            // All providers failed or timed out
+            // All providers failed or timed out — fail-closed (default deny).
             Ok(HumanLoopResponse::Rejected {
-                reason: Some("All HITL providers failed or timed out".to_string()),
+                reason: Some(format!(
+                    "All HITL providers failed or timed out ({})",
+                    failures.join("; ")
+                )),
             })
         })
     }
