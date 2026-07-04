@@ -277,7 +277,7 @@ pub async fn execute_run(
 
         let outcome = run_dag(
             store.clone(),
-            RealTaskWorker {
+            RealTaskDispatcher {
                 primary_agent: primary_agent.clone(),
             },
             reviewer_llm.clone(),
@@ -461,17 +461,17 @@ fn has_unresolved_tasks(store: &TaskRuntimeStore, run_id: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Abstraction over how a single ready task is executed on a worker.
+/// Abstraction over how a single ready task is dispatched in the EKO runtime.
 ///
 /// `run_dag` depends on this trait (not on `execute_task` directly) so the
 /// scheduling core — frontier computation, dependency resolution, failure
 /// propagation, cancellation, stall detection — can be unit-tested with a
-/// deterministic mock worker instead of a real LLM-backed agent. The
-/// production implementation ([`RealTaskWorker`]) wraps `execute_task`.
+/// deterministic mock dispatcher instead of a real LLM-backed agent. The
+/// production implementation ([`RealTaskDispatcher`]) wraps `execute_task`.
 ///
-/// The worker is given the semaphores + file locks so it can honor the same
+/// The dispatcher is given the semaphores + file locks so it can honor the same
 /// concurrency limits as the real path; mocks usually ignore them.
-pub trait TaskWorker: Send + Sync {
+pub trait TaskDispatcher: Send + Sync {
     /// Execute `task` for `run_id`. Returns `(task_id, summary)` on success or
     /// `(task_id, error)` on failure (matching `execute_task`'s contract).
     #[allow(clippy::too_many_arguments, clippy::type_complexity)] // semaphores/locks passed so mocks honor the same limits; boxed-future return is the worker contract
@@ -499,12 +499,12 @@ pub trait TaskWorker: Send + Sync {
 ///
 /// Note: the reviewer LLM is NOT held here — it is owned by `run_dag` itself
 /// (the review gate runs at the `run_dag` level, after a worker returns). The
-/// worker only needs the agent + concurrency primitives.
-pub struct RealTaskWorker {
+/// dispatcher only needs the agent + concurrency primitives.
+pub struct RealTaskDispatcher {
     pub primary_agent: crate::agent_handle::AgentHandle,
 }
 
-impl TaskWorker for RealTaskWorker {
+impl TaskDispatcher for RealTaskDispatcher {
     fn dispatch(
         &self,
         store: Arc<TaskRuntimeStore>,
@@ -559,7 +559,7 @@ impl TaskWorker for RealTaskWorker {
 /// under the concurrency semaphores until all are done, the run is cancelled,
 /// or a task fails.
 #[allow(clippy::too_many_arguments)] // semaphores + stores + sinks all thread through; matches framework TaskExecutor style
-async fn run_dag<W: TaskWorker + 'static>(
+async fn run_dag<W: TaskDispatcher + 'static>(
     store: Arc<TaskRuntimeStore>,
     worker: W,
     reviewer_llm: Option<Arc<dyn echo_agent::llm::LlmClient>>,
@@ -3225,22 +3225,22 @@ Read the runtime path and found one missing branch.
     // ── run_dag integration tests with a scripted (mock) worker ──
     // These exercise the scheduling core — frontier computation, dependency
     // resolution, failure propagation, cancellation, stall detection — without
-    // a real LLM. The worker returns scripted results keyed by task id.
+    // a real LLM. The dispatcher returns scripted results keyed by task id.
 
     use std::collections::HashMap as StdHashMap;
     use std::sync::Mutex as StdMutex;
 
-    /// A worker that returns scripted results per task id and records the
+    /// A dispatcher that returns scripted results per task id and records the
     /// order tasks were dispatched. Semaphores/locks are ignored (the mock
     /// answers instantly).
-    struct ScriptedWorker {
+    struct ScriptedDispatcher {
         /// task_id → result to return. Missing id → generic success.
         results: StdMutex<StdHashMap<String, Result<String, String>>>,
         /// Dispatch order, appended as tasks are picked up.
         order: StdMutex<Vec<String>>,
     }
 
-    impl ScriptedWorker {
+    impl ScriptedDispatcher {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 results: StdMutex::new(StdHashMap::new()),
@@ -3266,7 +3266,7 @@ Read the runtime path and found one missing branch.
         }
     }
 
-    impl TaskWorker for Arc<ScriptedWorker> {
+    impl TaskDispatcher for Arc<ScriptedDispatcher> {
         fn dispatch(
             &self,
             _store: Arc<TaskRuntimeStore>,
@@ -3304,7 +3304,7 @@ Read the runtime path and found one missing branch.
     }
 
     /// Helper: a single-task plan (read-only, no review needed) that the
-    /// scripted worker can complete.
+    /// scripted dispatcher can complete.
     fn solo_readonly_task(id: &str) -> PlanTask {
         PlanTask {
             id: id.into(),
@@ -3355,7 +3355,7 @@ Read the runtime path and found one missing branch.
     async fn run_dag_completes_single_task() {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().unwrap());
         let run_id = seed_run(&store, vec![solo_readonly_task("a")]);
-        let worker = ScriptedWorker::new();
+        let worker = ScriptedDispatcher::new();
         worker.succeed("a", "reviewed");
 
         let outcome = run_dag(
@@ -3385,7 +3385,7 @@ Read the runtime path and found one missing branch.
         let _ = &mut a; // silence unused_mut
         let store = Arc::new(TaskRuntimeStore::new_in_memory().unwrap());
         let run_id = seed_run(&store, vec![a.clone(), b.clone()]);
-        let worker = ScriptedWorker::new();
+        let worker = ScriptedDispatcher::new();
         worker.succeed("a", "done a");
         worker.succeed("b", "done b");
 
@@ -3419,7 +3419,7 @@ Read the runtime path and found one missing branch.
         b.depends_on = vec!["a".into()];
         let store = Arc::new(TaskRuntimeStore::new_in_memory().unwrap());
         let run_id = seed_run(&store, vec![a.clone(), b.clone()]);
-        let worker = ScriptedWorker::new();
+        let worker = ScriptedDispatcher::new();
         worker.fail("a", "boom");
 
         let outcome = run_dag(
@@ -3453,7 +3453,7 @@ Read the runtime path and found one missing branch.
         // top of its loop and return Cancelled without running any task.
         let store = Arc::new(TaskRuntimeStore::new_in_memory().unwrap());
         let run_id = seed_run(&store, vec![solo_readonly_task("a")]);
-        let worker = ScriptedWorker::new();
+        let worker = ScriptedDispatcher::new();
         let cancel = CancellationToken::new();
         cancel.cancel();
 
@@ -3486,7 +3486,7 @@ Read the runtime path and found one missing branch.
         b.depends_on = vec!["a".into()];
         let store = Arc::new(TaskRuntimeStore::new_in_memory().unwrap());
         let run_id = seed_run(&store, vec![a.clone(), b.clone()]);
-        let worker = ScriptedWorker::new();
+        let worker = ScriptedDispatcher::new();
 
         let outcome = run_dag(
             store.clone(),
@@ -3530,7 +3530,7 @@ Read the runtime path and found one missing branch.
         let pending = solo_readonly_task("pending");
         let store = Arc::new(TaskRuntimeStore::new_in_memory().unwrap());
         let run_id = seed_run(&store, vec![in_flight.clone(), pending.clone()]);
-        let worker = ScriptedWorker::new();
+        let worker = ScriptedDispatcher::new();
         worker.succeed("pending", "done");
 
         // Simulate the sibling run_dag instance finishing `in_flight` shortly
