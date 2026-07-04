@@ -599,32 +599,13 @@ async fn run_dag<W: TaskWorker + 'static>(
     // Index tasks by id.
     let mut by_id: HashMap<String, PlanTask> =
         tasks.iter().map(|t| (t.id.clone(), t.clone())).collect();
-    let all_ids: HashSet<String> = by_id.keys().cloned().collect();
+    let runtime_tasks: Vec<echo_agent::tasks::RuntimeTask> =
+        tasks.iter().map(PlanTask::to_runtime_task).collect();
 
-    // Track completion state per task id.
-    // Pre-populate with tasks already marked Completed — this is the resume
-    // path: the executor re-reads the plan from the store and skips tasks
-    // that finished in the previous run.
-    let mut completed: HashSet<String> = tasks
-        .iter()
-        .filter(|t| t.status == TodoStatus::Completed)
-        .map(|t| t.id.clone())
-        .collect();
-    // Tasks that were already `Running` when run_dag entered (dispatched by a
-    // sibling run_dag instance spawned by a concurrent `execute_plan` tool
-    // batch). These must NOT be re-dispatched (causes duplicate subagent work
-    // — observed 2-3× token waste) NOR counted as completed (the primary agent
-    // would get a partial result). They are tracked here and polled from the
-    // store each loop iteration until they reach a terminal state.
-    let mut in_flight: HashSet<String> = tasks
-        .iter()
-        .filter(|t| t.status == TodoStatus::Running)
-        .map(|t| t.id.clone())
-        .collect();
+    // Generic DAG bookkeeping lives in the framework. App-core still owns
+    // store writes, review gates, event emission, and worker dispatch.
+    let mut dag_state = echo_agent::tasks::DagExecutionState::from_tasks(&runtime_tasks);
     let mut failed_id: Option<String> = None;
-    // All tasks that have been marked Failed across waves. The skip logic
-    // (top of loop) uses this to avoid overwriting a Failed todo to Skipped.
-    let mut failed_set: HashSet<String> = HashSet::new();
     // Fix-task overrides produced by review gates, keyed by task id. A task
     // that fails review gets re-queued here with a bumped retry_count; the
     // next wave picks it up and re-runs it (possibly with a richer brief).
@@ -649,11 +630,8 @@ async fn run_dag<W: TaskWorker + 'static>(
         if let Some(id) = &failed_id {
             // A task failed: propagate Blocked to downstream dependents
             // (but NEVER overwrite a task that's already Failed).
-            for t in &tasks {
-                if !completed.contains(&t.id)
-                    && !failed_set.contains(&t.id)
-                    && t.depends_on.iter().any(|d| failed_set.contains(d))
-                {
+            for task_id in dag_state.blocked_by_failures(&runtime_tasks) {
+                if let Some(t) = by_id.get(&task_id) {
                     let _ = store.set_task_status(
                         run_id,
                         &t.id,
@@ -666,11 +644,7 @@ async fn run_dag<W: TaskWorker + 'static>(
             // Check if ALL non-terminal tasks are Failed or Blocked — if so,
             // the run is unrecoverable and should fail outright. Otherwise,
             // pause for user/agent decision.
-            let all_dead = tasks.iter().all(|t| {
-                completed.contains(&t.id)
-                    || failed_set.contains(&t.id)
-                    || t.depends_on.iter().any(|d| failed_set.contains(d))
-            });
+            let all_dead = dag_state.all_unfinished_failed_or_blocked(&runtime_tasks);
             let failed = by_id.get(id).cloned();
             let error = failed
                 .map(|t| format!("task '{}' failed", t.title))
@@ -688,7 +662,7 @@ async fn run_dag<W: TaskWorker + 'static>(
                 error,
             });
         }
-        if completed.len() == all_ids.len() {
+        if dag_state.all_completed(&runtime_tasks) {
             return Ok(RunOutcome::Completed);
         }
 
@@ -698,44 +672,19 @@ async fn run_dag<W: TaskWorker + 'static>(
         // treated as resolved (count toward the all_ids check). This is what
         // lets a sibling run_dag instance finish a task and this instance
         // observe it without re-dispatching.
-        if !in_flight.is_empty() {
+        if !dag_state.in_flight.is_empty() {
             let live_plan = store.get_plan(run_id).ok().flatten();
             if let Some(plan) = live_plan {
-                let resolved: Vec<String> = in_flight
-                    .iter()
-                    .filter_map(|id| {
-                        plan.tasks.iter().find(|t| &t.id == id).and_then(|t| {
-                            if t.status == TodoStatus::Completed {
-                                Some(id.clone())
-                            } else {
-                                None
-                            }
-                        })
-                    })
-                    .collect();
-                for id in &resolved {
-                    in_flight.remove(id);
-                    completed.insert(id.clone());
-                }
-                // Drop tasks that failed/skipped from in_flight (they are
-                // resolved, just not completed).
-                let terminal: Vec<String> = in_flight
-                    .iter()
-                    .filter_map(|id| {
-                        plan.tasks.iter().find(|t| &t.id == id).and_then(|t| {
-                            if matches!(t.status, TodoStatus::Failed | TodoStatus::Skipped) {
-                                Some(id.clone())
-                            } else {
-                                None
-                            }
-                        })
-                    })
-                    .collect();
-                for id in &terminal {
-                    in_flight.remove(id);
+                let live_runtime_tasks: Vec<echo_agent::tasks::RuntimeTask> =
+                    plan.tasks.iter().map(PlanTask::to_runtime_task).collect();
+                let refresh = dag_state.refresh_in_flight(&live_runtime_tasks);
+                for id in refresh.failed {
+                    if failed_id.is_none() {
+                        failed_id = Some(id);
+                    }
                 }
             }
-            if completed.len() == all_ids.len() {
+            if dag_state.all_completed(&runtime_tasks) {
                 return Ok(RunOutcome::Completed);
             }
         }
@@ -743,20 +692,19 @@ async fn run_dag<W: TaskWorker + 'static>(
         // Find ready tasks: not completed, not in_flight, all deps completed.
         // in_flight tasks are excluded so they aren't re-dispatched (they are
         // being driven by a sibling run_dag instance).
-        let ready: Vec<PlanTask> = tasks
-            .iter()
-            .filter(|t| !completed.contains(&t.id) && !in_flight.contains(&t.id))
-            .filter(|t| t.depends_on.iter().all(|d| completed.contains(d)))
-            .map(|t| {
+        let ready: Vec<PlanTask> = dag_state
+            .ready_task_ids(&runtime_tasks)
+            .into_iter()
+            .filter_map(|id| {
                 tasks_with_fixes
-                    .get(&t.id)
+                    .get(&id)
                     .cloned()
-                    .unwrap_or_else(|| t.clone())
+                    .or_else(|| by_id.get(&id).cloned())
             })
             .collect();
 
         if ready.is_empty() {
-            if !in_flight.is_empty() {
+            if !dag_state.in_flight.is_empty() {
                 // Nothing ready but sibling run_dag instances are still
                 // driving tasks. Wait briefly for them to make progress, then
                 // loop back to re-check the store. Without this wait the loop
@@ -766,7 +714,7 @@ async fn run_dag<W: TaskWorker + 'static>(
             }
             // Nothing ready, nothing in-flight, and not all done → deadlock
             // (cycle or all remaining are blocked by the failed one).
-            if completed.len() + (if failed_id.is_some() { 1 } else { 0 }) >= all_ids.len() {
+            if dag_state.completed.len() + dag_state.failed.len() >= runtime_tasks.len() {
                 continue;
             }
             // Genuine stall: record and fail.
@@ -781,8 +729,8 @@ async fn run_dag<W: TaskWorker + 'static>(
             run_id = %run_id,
             ready_count = ready_ids.len(),
             ready_tasks = ?ready_ids,
-            completed_count = completed.len(),
-            total_count = all_ids.len(),
+            completed_count = dag_state.completed.len(),
+            total_count = runtime_tasks.len(),
             "task_runtime: dispatching DAG wave"
         );
 
@@ -882,7 +830,7 @@ async fn run_dag<W: TaskWorker + 'static>(
                                 Some(&task.agent_role),
                                 summary.as_deref(),
                             );
-                            completed.insert(id);
+                            dag_state.completed.insert(id);
                         }
                         ReviewGateOutcome::NeedsFix(fix_task) => {
                             if let Err(e) = store.update_plan_task(run_id, &fix_task) {
@@ -932,7 +880,7 @@ async fn run_dag<W: TaskWorker + 'static>(
                                 Some(&task.agent_role),
                                 summary.as_deref(),
                             );
-                            completed.insert(id);
+                            dag_state.completed.insert(id);
                         }
                     }
                 }
@@ -966,7 +914,7 @@ async fn run_dag<W: TaskWorker + 'static>(
                         Some(&format!("error: {err}")),
                     );
                     wave_failed.push(id.clone());
-                    failed_set.insert(id.clone());
+                    dag_state.failed.insert(id.clone());
                     if failed_id.is_none() {
                         failed_id = Some(id);
                     }
