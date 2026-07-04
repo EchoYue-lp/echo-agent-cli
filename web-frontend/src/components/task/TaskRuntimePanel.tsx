@@ -378,13 +378,14 @@ function MetricCell({
   );
 }
 
-function traceRunForTodo(todo: { owner_agent: string | null }, workers: SubagentRunState[]) {
-  if (!todo.owner_agent) return undefined;
-  return workers.find((worker) => worker.agent === todo.owner_agent);
+function traceRunForTodo(todo: { task_id: string }, workers: SubagentRunState[]) {
+  return workers
+    .filter((worker) => worker.taskId === todo.task_id)
+    .sort((a, b) => b.startedAt - a.startedAt)[0];
 }
 
 function displayedTodoStatus(
-  todo: { status: TodoStatus; owner_agent: string | null },
+  todo: { status: TodoStatus; task_id: string },
   workers: SubagentRunState[]
 ): TodoStatus {
   const worker = traceRunForTodo(todo, workers);

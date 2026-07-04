@@ -67,9 +67,11 @@ export function RightRail() {
         {/* ── 任务运行(TaskRuntimePanel: todos + cache) ── */}
         <TaskRuntimePanel />
 
-        {Object.keys(subagentRuns).length > 0 && (
+        {visibleRuns.length > 0 && (
           <section>
-            <SubagentPanel subagents={subagentRuns} />
+            <SubagentPanel
+              subagents={Object.fromEntries(visibleRuns.map((run) => [run.subagentRunId, run]))}
+            />
           </section>
         )}
 

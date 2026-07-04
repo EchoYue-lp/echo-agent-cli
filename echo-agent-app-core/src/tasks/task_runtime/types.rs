@@ -970,7 +970,24 @@ pub struct TaskExecutionSummary {
     pub failures: Vec<String>,
     pub verification: Vec<String>,
     pub next_implications: Vec<String>,
+    #[serde(default)]
+    pub suggested_tasks: Vec<SuggestedTask>,
     pub created_at: DateTime<Utc>,
+}
+
+/// A bounded follow-up task proposed by a worker. Workers may suggest new work,
+/// but only the TaskRuntime appends it to the canonical plan.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, rename = "SuggestedTask")]
+pub struct SuggestedTask {
+    pub title: String,
+    pub description: String,
+    pub kind: PlanTaskKind,
+    pub agent_role: String,
+    #[serde(default)]
+    pub dependencies: Vec<String>,
+    pub why_needed: String,
+    pub risk: String,
 }
 
 // ── Usage trend persistence ────────────────────────────────────────────

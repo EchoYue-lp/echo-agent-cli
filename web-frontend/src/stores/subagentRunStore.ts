@@ -36,6 +36,7 @@ export interface ExecutionEvent {
   run_id: string;
   agent: string;
   event: SubagentRunEventKind;
+  task_id?: string;
   // event-specific fields (any of the below may be absent depending on `event`)
   parent?: string;
   task?: string;
@@ -67,6 +68,7 @@ export type SubagentRunStatus = 'running' | 'completed' | 'failed' | 'cancelled'
 export interface SubagentRunState {
   subagentRunId: string;
   runId: string;
+  taskId?: string;
   agent: string;
   parent?: string;
   task?: string;
@@ -125,6 +127,7 @@ export const useSubagentRunStore = create<SubagentRunStore>((set) => ({
       const run: SubagentRunState = prev ?? {
         subagentRunId: id,
         runId: ev.run_id,
+        taskId: ev.task_id,
         agent: ev.agent,
         parent: ev.parent,
         task: ev.task,
@@ -145,6 +148,7 @@ export const useSubagentRunStore = create<SubagentRunStore>((set) => ({
       const next: SubagentRunState = {
         ...run,
         // Preserve any field present on the event (overwrites prev).
+        taskId: ev.task_id ?? run.taskId,
         parent: ev.parent ?? run.parent,
         task: ev.task ?? run.task,
         mode: ev.mode ?? run.mode,

@@ -887,13 +887,14 @@ impl echo_agent_app_core::chat_driver::ChatSink for TauriChatSink {
         let app = self.app.clone();
         let run_id = self.run_id.clone();
         Some(std::sync::Arc::new(move |ev: ExecEvent| {
+            let task_id = ev.task_id.clone();
             let agent = ev.agent.as_deref().unwrap_or("echo-assistant");
-            let kind = if ev.task_id.is_some() {
-                "subagent"
-            } else {
-                "run"
-            };
-            emit_execution_event(&app, &run_id, kind, &ev.event, agent, ev.payload);
+            let kind = if task_id.is_some() { "subagent" } else { "run" };
+            let mut payload = ev.payload;
+            if let (Some(task_id), serde_json::Value::Object(fields)) = (task_id, &mut payload) {
+                fields.insert("task_id".into(), task_id.into());
+            }
+            emit_execution_event(&app, &run_id, kind, &ev.event, agent, payload);
         }))
     }
 

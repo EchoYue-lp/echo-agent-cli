@@ -248,12 +248,12 @@ pub async fn execute_run(
     if run.status != TaskRunStatus::Running {
         return Err(ExecError::NotRunning(run_id.to_string(), run.status));
     }
-    let plan = store
+    let initial_plan = store
         .get_plan(run_id)?
         .ok_or(ExecError::NoPlan(run_id.to_string()))?;
     tracing::info!(
         run_id = %run_id,
-        task_count = plan.tasks.len(),
+        task_count = initial_plan.tasks.len(),
         status = %run.status.as_str(),
         route = %run.route,
         "task_runtime: execute_run start"
@@ -274,40 +274,68 @@ pub async fn execute_run(
     let primary_agent = primary_agent.ok_or(ExecError::NoAgent)?;
     let limits = ConcurrencyLimits::default();
 
-    let outcome = run_dag(
-        store.clone(),
-        RealTaskWorker {
-            primary_agent: primary_agent.clone(),
-        },
-        reviewer_llm,
-        run_id,
-        plan.tasks,
-        limits,
-        parent_cancel,
-        trace_sink.clone(),
-    )
-    .await;
+    let mut drain_cycle = 0usize;
+    let outcome = loop {
+        let plan = store
+            .get_plan(run_id)?
+            .ok_or(ExecError::NoPlan(run_id.to_string()))?;
+        let unresolved_count = plan
+            .tasks
+            .iter()
+            .filter(|task| {
+                !matches!(
+                    task.status,
+                    TodoStatus::Completed | TodoStatus::Failed | TodoStatus::Skipped
+                )
+            })
+            .count();
+        if unresolved_count == 0 {
+            break Ok(RunOutcome::Completed);
+        }
+        tracing::info!(
+            run_id = %run_id,
+            drain_cycle,
+            task_count = plan.tasks.len(),
+            unresolved_count,
+            "task_runtime: drain plan snapshot"
+        );
+
+        let outcome = run_dag(
+            store.clone(),
+            RealTaskWorker {
+                primary_agent: primary_agent.clone(),
+            },
+            reviewer_llm.clone(),
+            run_id,
+            plan.tasks,
+            limits.clone(),
+            parent_cancel.clone(),
+            trace_sink.clone(),
+        )
+        .await;
+
+        if matches!(outcome, Ok(RunOutcome::Completed)) && has_unresolved_tasks(&store, run_id) {
+            // Inline execute_plan calls in the same LLM tool batch can append
+            // tasks while this executor is already running. The holder of the
+            // per-run execution lock is the authoritative drainer, so it must
+            // re-read the plan and keep going instead of handing the tail to a
+            // later execute_plan call.
+            drain_cycle = drain_cycle.saturating_add(1);
+            tracing::info!(
+                run_id = %run_id,
+                drain_cycle,
+                "task_runtime: appended tasks detected after completed snapshot; continuing drain"
+            );
+            continue;
+        }
+
+        break outcome;
+    };
 
     // Reflect the outcome on the run state. Each branch also writes a trace
     // Run record when a RunStore is available.
     match &outcome {
         Ok(RunOutcome::Completed) => {
-            if has_unresolved_tasks(&store, run_id) {
-                // run_dag waits for in_flight (sibling-dispatched) tasks to
-                // finish before returning Completed, so reaching here with
-                // unresolved tasks means tasks were appended to the store
-                // AFTER run_dag's entry snapshot and no instance picked them
-                // up. Defensive: surface the partial state rather than
-                // declaring the run fully done (a follow-up execute_plan call
-                // will pick them up). Under normal tool-batch behavior the
-                // sibling run_dag instances each wait for the full frontier,
-                // so this branch is rarely hit.
-                tracing::info!(
-                    run_id = %run_id,
-                    "task_runtime: completed snapshot but run has pending appended tasks"
-                );
-                return outcome;
-            }
             emit_exec(
                 trace_sink.as_ref(),
                 ExecEvent::run(
@@ -1537,6 +1565,7 @@ async fn execute_task(
 
     match result {
         Ok(text) => {
+            let suggested_tasks = extract_suggested_tasks_from_worker_output(&text);
             // The worker's full output is stored in TaskExecutionSummary.completed_work
             // (read by build_run_summaries → main agent's execute_plan ToolResult) and
             // returned as the task summary (used by the review gate for write tasks and
@@ -1562,10 +1591,12 @@ async fn execute_task(
                 failures: vec![],
                 verification: task.verification.clone(),
                 next_implications: vec![],
+                suggested_tasks: suggested_tasks.clone(),
                 created_at: chrono::Utc::now(),
             }) {
                 tracing::warn!(task_id = %task_id, error = %e, "failed to persist TaskExecutionSummary");
             }
+            append_suggested_tasks_to_plan(&store, &run_id, &task, &suggested_tasks);
             emit_exec(
                 trace_sink.as_ref(),
                 ExecEvent::for_task(
@@ -1601,6 +1632,152 @@ async fn execute_task(
                 .with_title(task.title.clone()),
             );
             Err((task_id, e))
+        }
+    }
+}
+
+const MAX_SUGGESTED_TASKS_PER_WORKER: usize = 5;
+
+#[derive(Debug, serde::Deserialize)]
+struct SuggestedTaskEnvelope {
+    #[serde(default)]
+    suggested_tasks: Vec<RawSuggestedTask>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RawSuggestedTask {
+    title: Option<String>,
+    description: Option<String>,
+    kind: Option<PlanTaskKind>,
+    agent_role: Option<String>,
+    #[serde(default)]
+    dependencies: Vec<String>,
+    why_needed: Option<String>,
+    risk: Option<String>,
+}
+
+fn extract_suggested_tasks_from_worker_output(text: &str) -> Vec<SuggestedTask> {
+    let mut out = Vec::new();
+    for candidate in suggested_task_json_candidates(text) {
+        let Ok(envelope) = serde_json::from_str::<SuggestedTaskEnvelope>(&candidate) else {
+            continue;
+        };
+        for raw in envelope.suggested_tasks {
+            if out.len() >= MAX_SUGGESTED_TASKS_PER_WORKER {
+                return out;
+            }
+            let Some(task) = normalize_suggested_task(raw) else {
+                continue;
+            };
+            out.push(task);
+        }
+        if !out.is_empty() {
+            break;
+        }
+    }
+    out
+}
+
+fn suggested_task_json_candidates(text: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    for block in text.split("```json").skip(1) {
+        if let Some(json) = block.split("```").next() {
+            candidates.push(json.trim().to_string());
+        }
+    }
+    let trimmed = text.trim();
+    if trimmed.starts_with('{') {
+        candidates.push(trimmed.to_string());
+    }
+    candidates
+}
+
+fn normalize_suggested_task(raw: RawSuggestedTask) -> Option<SuggestedTask> {
+    let title = raw.title.unwrap_or_default().trim().to_string();
+    let description = raw.description.unwrap_or_default().trim().to_string();
+    if title.is_empty() || description.is_empty() {
+        return None;
+    }
+    Some(SuggestedTask {
+        title: title.chars().take(120).collect(),
+        description,
+        kind: raw.kind.unwrap_or(PlanTaskKind::Investigation),
+        agent_role: raw
+            .agent_role
+            .filter(|role| !role.trim().is_empty())
+            .unwrap_or_else(|| "explorer".to_string()),
+        dependencies: raw
+            .dependencies
+            .into_iter()
+            .map(|dep| dep.trim().to_string())
+            .filter(|dep| !dep.is_empty())
+            .take(8)
+            .collect(),
+        why_needed: raw.why_needed.unwrap_or_default().trim().to_string(),
+        risk: raw
+            .risk
+            .filter(|risk| !risk.trim().is_empty())
+            .unwrap_or_else(|| "medium".to_string()),
+    })
+}
+
+fn append_suggested_tasks_to_plan(
+    store: &Arc<TaskRuntimeStore>,
+    run_id: &str,
+    parent: &PlanTask,
+    suggestions: &[SuggestedTask],
+) {
+    if suggestions.is_empty() {
+        return;
+    }
+    let existing_ids: HashSet<String> = store
+        .get_plan(run_id)
+        .ok()
+        .flatten()
+        .map(|plan| plan.tasks.into_iter().map(|task| task.id).collect())
+        .unwrap_or_default();
+    let mut after_task_id = Some(parent.id.clone());
+    for suggestion in suggestions.iter().take(MAX_SUGGESTED_TASKS_PER_WORKER) {
+        let mut depends_on: Vec<String> = suggestion
+            .dependencies
+            .iter()
+            .filter(|dep| existing_ids.contains(dep.as_str()))
+            .cloned()
+            .collect();
+        if !depends_on.iter().any(|dep| dep == &parent.id) {
+            depends_on.push(parent.id.clone());
+        }
+        let new_task_id = format!("suggested_{}", uuid::Uuid::new_v4().as_simple());
+        let task = PlanTask {
+            id: new_task_id.clone(),
+            title: suggestion.title.clone(),
+            description: format!(
+                "{}\n\nWhy needed: {}\nRisk: {}",
+                suggestion.description, suggestion.why_needed, suggestion.risk
+            ),
+            kind: suggestion.kind,
+            agent_role: suggestion.agent_role.clone(),
+            depends_on,
+            ..Default::default()
+        };
+        match store.insert_task(run_id, after_task_id.clone(), task) {
+            Ok(()) => {
+                tracing::info!(
+                    run_id = %run_id,
+                    parent_task_id = %parent.id,
+                    suggested_task_id = %new_task_id,
+                    "task_runtime: appended worker-suggested task"
+                );
+                after_task_id = Some(new_task_id);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    run_id = %run_id,
+                    parent_task_id = %parent.id,
+                    error = %e,
+                    "task_runtime: failed to append worker-suggested task"
+                );
+            }
         }
     }
 }
@@ -1723,6 +1900,17 @@ fn build_task_prompt(task: &PlanTask, dep_summaries: &[(String, String)]) -> Str
              Run the listed verification when done.\n",
         );
     }
+    s.push_str(
+        "\nYou may plan your own steps internally, but do not modify the global plan and do not \
+         delegate this task to other agents. If this task reveals follow-up work that should be \
+         scheduled by the main TaskRuntime, include an optional fenced JSON block exactly like:\n\
+         ```json\n\
+         {\"suggested_tasks\":[{\"title\":\"short title\",\"description\":\"specific follow-up\",\
+         \"kind\":\"investigation\",\"agent_role\":\"explorer\",\"dependencies\":[],\
+         \"why_needed\":\"why this is needed\",\"risk\":\"low|medium|high\"}]}\n\
+         ```\n\
+         Only suggest tasks that are genuinely needed and scoped enough to execute independently.\n",
+    );
     s.push_str("\nReturn a concise summary of what you did and found.");
     s
 }
@@ -2739,6 +2927,39 @@ mod tests {
             reason.contains("implementation"),
             "reason should mention 'implementation', got {reason:?}"
         );
+    }
+
+    #[test]
+    fn worker_output_can_suggest_followup_tasks() -> Result<(), String> {
+        let output = r#"
+Read the runtime path and found one missing branch.
+
+```json
+{
+  "suggested_tasks": [
+    {
+      "title": "Verify resume branch",
+      "description": "Trace resume_task_run through the runtime store.",
+      "kind": "investigation",
+      "agent_role": "explorer",
+      "dependencies": ["t1"],
+      "why_needed": "The current task found an unverified resume path.",
+      "risk": "low"
+    }
+  ]
+}
+```
+"#;
+        let tasks = extract_suggested_tasks_from_worker_output(output);
+        assert_eq!(tasks.len(), 1);
+        let task = tasks
+            .first()
+            .ok_or_else(|| "expected one suggested task".to_string())?;
+        assert_eq!(task.title, "Verify resume branch");
+        assert_eq!(task.kind, PlanTaskKind::Investigation);
+        assert_eq!(task.agent_role, "explorer");
+        assert_eq!(task.dependencies, vec!["t1".to_string()]);
+        Ok(())
     }
 
     #[test]

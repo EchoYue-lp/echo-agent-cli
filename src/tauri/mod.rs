@@ -599,6 +599,14 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                     };
                                 let mut payload = serde_json::Map::new();
                                 payload.insert("kind".into(), "subagent".into());
+                                let task_id = execution_id.as_deref().and_then(|id| {
+                                    id.split_once(':')
+                                        .map(|(task_id, _)| task_id)
+                                        .filter(|task_id| !task_id.is_empty())
+                                });
+                                if let Some(task_id) = task_id {
+                                    payload.insert("task_id".into(), task_id.into());
+                                }
                                 payload.insert(
                                     "subagent_run_id".into(),
                                     execution_id

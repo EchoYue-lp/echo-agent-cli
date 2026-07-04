@@ -153,7 +153,7 @@ impl TaskRuntimeStore {
     // ── Runs ────────────────────────────────────────────────────────────
 
     /// Create a new run in `Pending` and emit `RunCreated`. Returns the
-    /// created run.
+    /// existing run when `run_id` is already present.
     #[allow(clippy::too_many_arguments)] // run identity + routing fields all thread through
     pub fn create_run(
         &self,
@@ -166,44 +166,50 @@ impl TaskRuntimeStore {
         route: &str,
         attended_mode: AttendedMode,
     ) -> Result<TaskRun, StoreError> {
-        let now = Utc::now();
-        let run = TaskRun {
-            run_id: run_id.to_string(),
-            workspace_id: workspace_id.to_string(),
-            conversation_id: conversation_id.to_string(),
-            root_message_id: root_message_id.to_string(),
-            domain_profile,
-            status: TaskRunStatus::Pending,
-            goal: goal.to_string(),
-            plan_id: None,
-            route: route.to_string(),
-            attended_mode,
-            attachments: Vec::new(),
-            created_at: now,
-            updated_at: now,
-        };
+        self.with_run_lock(run_id, || {
+            if let Some(existing) = self.get_run(run_id)? {
+                return Ok(existing);
+            }
 
-        // U1c phase-0/0bc step-2: file is the write authority. Append the
-        // RunCreated event to events.jsonl and rebuild plan.json — no SQL
-        // write.
-        self.shadow.append_event_line(
-            run.run_id.as_str(),
-            None,
-            None,
-            RuntimeEventKind::RunCreated,
-            serde_json::json!({
-                "goal": goal,
-                "domain_profile": domain_profile.as_str(),
-                "workspace_id": run.workspace_id,
-                "conversation_id": run.conversation_id,
-                "root_message_id": run.root_message_id,
-                "route": run.route,
-                "attended_mode": attended_mode.as_str(),
-                "created_at": run.created_at.to_rfc3339(),
-            }),
-        )?;
-        self.shadow.rewrite_plan(&run.run_id)?;
-        Ok(run)
+            let now = Utc::now();
+            let run = TaskRun {
+                run_id: run_id.to_string(),
+                workspace_id: workspace_id.to_string(),
+                conversation_id: conversation_id.to_string(),
+                root_message_id: root_message_id.to_string(),
+                domain_profile,
+                status: TaskRunStatus::Pending,
+                goal: goal.to_string(),
+                plan_id: None,
+                route: route.to_string(),
+                attended_mode,
+                attachments: Vec::new(),
+                created_at: now,
+                updated_at: now,
+            };
+
+            // U1c phase-0/0bc step-2: file is the write authority. Append the
+            // RunCreated event to events.jsonl and rebuild plan.json — no SQL
+            // write.
+            self.shadow.append_event_line(
+                run.run_id.as_str(),
+                None,
+                None,
+                RuntimeEventKind::RunCreated,
+                serde_json::json!({
+                    "goal": goal,
+                    "domain_profile": domain_profile.as_str(),
+                    "workspace_id": run.workspace_id,
+                    "conversation_id": run.conversation_id,
+                    "root_message_id": run.root_message_id,
+                    "route": run.route,
+                    "attended_mode": attended_mode.as_str(),
+                    "created_at": run.created_at.to_rfc3339(),
+                }),
+            )?;
+            self.shadow.rewrite_plan(&run.run_id)?;
+            Ok(run)
+        })
     }
 
     /// Bind user-uploaded attachments to a run so plan-level workers see the
@@ -216,18 +222,20 @@ impl TaskRuntimeStore {
         run_id: &str,
         attachments: &[crate::attachments::AttachmentRef],
     ) -> Result<(), StoreError> {
-        // Validate the run exists (mirrors set_task_status / transition_run).
-        self.get_run(run_id)?
-            .ok_or(StoreError::RunNotFound(run_id.to_string()))?;
-        self.shadow.append_event_line(
-            run_id,
-            None,
-            None,
-            RuntimeEventKind::RunAttachmentsUpdated,
-            serde_json::json!({ "attachments": attachments }),
-        )?;
-        self.shadow.rewrite_plan(run_id)?;
-        Ok(())
+        self.with_run_lock(run_id, || {
+            // Validate the run exists (mirrors set_task_status / transition_run).
+            self.get_run(run_id)?
+                .ok_or(StoreError::RunNotFound(run_id.to_string()))?;
+            self.shadow.append_event_line(
+                run_id,
+                None,
+                None,
+                RuntimeEventKind::RunAttachmentsUpdated,
+                serde_json::json!({ "attachments": attachments }),
+            )?;
+            self.shadow.rewrite_plan(run_id)?;
+            Ok(())
+        })
     }
 
     /// Atomically transition a run to `next` and append `RunStatusChanged`.
@@ -512,6 +520,7 @@ impl TaskRuntimeStore {
         task_id: &str,
         patch: TaskPatch,
     ) -> Result<(), StoreError> {
+        self.with_run_lock(run_id, || {
         // U1c phase-0/0bc step-2: file authority. Read the task status + plan
         // from the file, validate (state guard + cycle on deps change), then
         // append PlanEdited{update} + rewrite plan.json. No SQL write.
@@ -584,50 +593,53 @@ impl TaskRuntimeStore {
         )?;
         self.shadow.rewrite_plan(run_id)?;
         Ok(())
+        })
     }
 
     /// Reorder non-terminal tasks. `new_order` must be a permutation of all
     /// task ids that are not in a terminal state (Completed/Failed/Skipped).
     /// Emits `PlanEdited`.
     pub fn reorder_tasks(&self, run_id: &str, new_order: Vec<String>) -> Result<(), StoreError> {
-        // U1c phase-0/0bc step-2: file authority. Read tasks from file,
-        // validate new_order is a permutation of non-terminal task ids, then
-        // append PlanEdited{reorder} + rewrite plan.json. No SQL write.
-        let plan = self
-            .get_plan(run_id)?
-            .ok_or(StoreError::PlanNotFound(run_id.to_string()))?;
-        let non_terminal: std::collections::HashSet<String> = plan
-            .tasks
-            .iter()
-            .filter(|t| {
-                !matches!(
-                    t.status,
-                    TodoStatus::Completed | TodoStatus::Failed | TodoStatus::Skipped
-                )
-            })
-            .map(|t| t.id.clone())
-            .collect();
-        let new_set: std::collections::HashSet<String> = new_order.iter().cloned().collect();
+        self.with_run_lock(run_id, || {
+            // U1c phase-0/0bc step-2: file authority. Read tasks from file,
+            // validate new_order is a permutation of non-terminal task ids, then
+            // append PlanEdited{reorder} + rewrite plan.json. No SQL write.
+            let plan = self
+                .get_plan(run_id)?
+                .ok_or(StoreError::PlanNotFound(run_id.to_string()))?;
+            let non_terminal: std::collections::HashSet<String> = plan
+                .tasks
+                .iter()
+                .filter(|t| {
+                    !matches!(
+                        t.status,
+                        TodoStatus::Completed | TodoStatus::Failed | TodoStatus::Skipped
+                    )
+                })
+                .map(|t| t.id.clone())
+                .collect();
+            let new_set: std::collections::HashSet<String> = new_order.iter().cloned().collect();
 
-        if non_terminal != new_set {
-            return Err(StoreError::InvalidPlan(
-                "new_order must be a permutation of all non-terminal task ids".into(),
-            ));
-        }
+            if non_terminal != new_set {
+                return Err(StoreError::InvalidPlan(
+                    "new_order must be a permutation of all non-terminal task ids".into(),
+                ));
+            }
 
-        self.shadow.append_event_line(
-            run_id,
-            None,
-            None,
-            RuntimeEventKind::PlanEdited,
-            serde_json::json!({
-                "action": "reorder",
-                // Full new ordering (task ids) so events.jsonl can rebuild plan.json.
-                "new_order": new_order,
-            }),
-        )?;
-        self.shadow.rewrite_plan(run_id)?;
-        Ok(())
+            self.shadow.append_event_line(
+                run_id,
+                None,
+                None,
+                RuntimeEventKind::PlanEdited,
+                serde_json::json!({
+                    "action": "reorder",
+                    // Full new ordering (task ids) so events.jsonl can rebuild plan.json.
+                    "new_order": new_order,
+                }),
+            )?;
+            self.shadow.rewrite_plan(run_id)?;
+            Ok(())
+        })
     }
 
     /// Attach a generated plan to a run, replacing any prior plan, and
@@ -678,46 +690,48 @@ impl TaskRuntimeStore {
         owner_agent: Option<&str>,
         summary: Option<&str>,
     ) -> Result<(), StoreError> {
-        // U1c phase-0/0bc step-2: file authority. Validate the task exists
-        // (read plan from file), then append the Task*/TodoUpdated event with
-        // explicit started_at/completed_at and rewrite plan.json. No SQL write.
-        let plan = self
-            .get_plan(run_id)?
-            .ok_or(StoreError::PlanNotFound(run_id.to_string()))?;
-        if !plan.tasks.iter().any(|t| t.id == task_id) {
-            return Err(StoreError::TaskNotFound(task_id.to_string()));
-        }
-        let now = Utc::now().to_rfc3339();
-        let started = matches!(status, TodoStatus::Running);
-        let finished = matches!(
-            status,
-            TodoStatus::Completed | TodoStatus::Failed | TodoStatus::Skipped
-        );
-        let kind = match status {
-            TodoStatus::Running => RuntimeEventKind::TaskStarted,
-            TodoStatus::Completed => RuntimeEventKind::TaskCompleted,
-            TodoStatus::Failed => RuntimeEventKind::TaskFailed,
-            TodoStatus::Skipped => RuntimeEventKind::TaskSkipped,
-            TodoStatus::Blocked => RuntimeEventKind::TaskBlocked,
-            TodoStatus::Pending => RuntimeEventKind::TodoUpdated,
-        };
-        self.shadow.append_event_line(
-            run_id,
-            Some(task_id),
-            None,
-            kind,
-            serde_json::json!({
-                "status": status.as_str(),
-                "owner_agent": owner_agent,
-                "summary": summary,
-                // Explicit timestamps so events.jsonl can rebuild todo runtime fields
-                // without relying on the event `timestamp` as a proxy.
-                "started_at": if started { Some(now.as_str()) } else { None },
-                "completed_at": if finished { Some(now.as_str()) } else { None },
-            }),
-        )?;
-        self.shadow.rewrite_plan(run_id)?;
-        Ok(())
+        self.with_run_lock(run_id, || {
+            // U1c phase-0/0bc step-2: file authority. Validate the task exists
+            // (read plan from file), then append the Task*/TodoUpdated event with
+            // explicit started_at/completed_at and rewrite plan.json. No SQL write.
+            let plan = self
+                .get_plan(run_id)?
+                .ok_or(StoreError::PlanNotFound(run_id.to_string()))?;
+            if !plan.tasks.iter().any(|t| t.id == task_id) {
+                return Err(StoreError::TaskNotFound(task_id.to_string()));
+            }
+            let now = Utc::now().to_rfc3339();
+            let started = matches!(status, TodoStatus::Running);
+            let finished = matches!(
+                status,
+                TodoStatus::Completed | TodoStatus::Failed | TodoStatus::Skipped
+            );
+            let kind = match status {
+                TodoStatus::Running => RuntimeEventKind::TaskStarted,
+                TodoStatus::Completed => RuntimeEventKind::TaskCompleted,
+                TodoStatus::Failed => RuntimeEventKind::TaskFailed,
+                TodoStatus::Skipped => RuntimeEventKind::TaskSkipped,
+                TodoStatus::Blocked => RuntimeEventKind::TaskBlocked,
+                TodoStatus::Pending => RuntimeEventKind::TodoUpdated,
+            };
+            self.shadow.append_event_line(
+                run_id,
+                Some(task_id),
+                None,
+                kind,
+                serde_json::json!({
+                    "status": status.as_str(),
+                    "owner_agent": owner_agent,
+                    "summary": summary,
+                    // Explicit timestamps so events.jsonl can rebuild todo runtime fields
+                    // without relying on the event `timestamp` as a proxy.
+                    "started_at": if started { Some(now.as_str()) } else { None },
+                    "completed_at": if finished { Some(now.as_str()) } else { None },
+                }),
+            )?;
+            self.shadow.rewrite_plan(run_id)?;
+            Ok(())
+        })
     }
 
     /// Update a plan task's mutable fields (title, description, retry_count,
@@ -760,49 +774,53 @@ impl TaskRuntimeStore {
     // ── Reviews, artifacts, summaries ───────────────────────────────────
 
     pub fn add_review(&self, r: &ReviewResult) -> Result<(), StoreError> {
-        // U1c phase-0/0bc step-2: file authority. Review* carries the full
-        // review so FileTaskStore.list_reviews can derive it. No SQL.
-        let kind = match r.outcome {
-            ReviewOutcome::Pass => RuntimeEventKind::ReviewPassed,
-            ReviewOutcome::NeedsFix => RuntimeEventKind::ReviewNeedsFix,
-            ReviewOutcome::Blocked => RuntimeEventKind::ReviewBlocked,
-        };
-        self.shadow.append_event_line(
-            r.run_id.as_str(),
-            Some(r.task_id.as_str()),
-            None,
-            kind,
-            serde_json::json!({
-                "review_id": r.id,
-                "reviewer": r.reviewer_agent,
-                "outcome": r.outcome.as_str(),
-                "issues": r.issues,
-                "failure_fingerprint": r.failure_fingerprint,
-                "created_fix_task_id": r.created_fix_task_id,
-                "created_at": r.created_at.to_rfc3339(),
-            }),
-        )?;
-        self.shadow.rewrite_plan(&r.run_id)?;
-        Ok(())
+        self.with_run_lock(&r.run_id, || {
+            // U1c phase-0/0bc step-2: file authority. Review* carries the full
+            // review so FileTaskStore.list_reviews can derive it. No SQL.
+            let kind = match r.outcome {
+                ReviewOutcome::Pass => RuntimeEventKind::ReviewPassed,
+                ReviewOutcome::NeedsFix => RuntimeEventKind::ReviewNeedsFix,
+                ReviewOutcome::Blocked => RuntimeEventKind::ReviewBlocked,
+            };
+            self.shadow.append_event_line(
+                r.run_id.as_str(),
+                Some(r.task_id.as_str()),
+                None,
+                kind,
+                serde_json::json!({
+                    "review_id": r.id,
+                    "reviewer": r.reviewer_agent,
+                    "outcome": r.outcome.as_str(),
+                    "issues": r.issues,
+                    "failure_fingerprint": r.failure_fingerprint,
+                    "created_fix_task_id": r.created_fix_task_id,
+                    "created_at": r.created_at.to_rfc3339(),
+                }),
+            )?;
+            self.shadow.rewrite_plan(&r.run_id)?;
+            Ok(())
+        })
     }
 
     pub fn add_artifact(&self, a: &Artifact) -> Result<(), StoreError> {
-        // U1c phase-0/0bc step-2: file authority. ArtifactProduced carries the
-        // full artifact so FileTaskStore.list_artifacts can derive it. No SQL.
-        self.shadow.append_event_line(
-            a.run_id.as_str(),
-            a.task_id.as_deref(),
-            None,
-            RuntimeEventKind::ArtifactProduced,
-            serde_json::json!({
-                "artifact_id": a.id,
-                "kind": a.kind.as_str(),
-                "title": a.title,
-                "task_id": a.task_id,
-            }),
-        )?;
-        self.shadow.rewrite_plan(&a.run_id)?;
-        Ok(())
+        self.with_run_lock(&a.run_id, || {
+            // U1c phase-0/0bc step-2: file authority. ArtifactProduced carries the
+            // full artifact so FileTaskStore.list_artifacts can derive it. No SQL.
+            self.shadow.append_event_line(
+                a.run_id.as_str(),
+                a.task_id.as_deref(),
+                None,
+                RuntimeEventKind::ArtifactProduced,
+                serde_json::json!({
+                    "artifact_id": a.id,
+                    "kind": a.kind.as_str(),
+                    "title": a.title,
+                    "task_id": a.task_id,
+                }),
+            )?;
+            self.shadow.rewrite_plan(&a.run_id)?;
+            Ok(())
+        })
     }
 
     /// Persist or overwrite the per-task execution summary. Primary key is
@@ -811,21 +829,23 @@ impl TaskRuntimeStore {
     /// recovery path can tell when a summary was updated (consistent with the
     /// "every state-relevant change writes a TaskEvent" invariant).
     pub fn put_summary(&self, s: &TaskExecutionSummary) -> Result<(), StoreError> {
-        // U1c phase-0/0bc step-2: file authority. Note{summary_persisted}
-        // carries the full summary so FileTaskStore.get_summary can derive it.
-        self.shadow.append_event_line(
-            s.run_id.as_str(),
-            Some(s.task_id.as_str()),
-            None,
-            RuntimeEventKind::Note,
-            serde_json::json!({
-                "kind": "summary_persisted",
-                // Full summary so events.jsonl can rebuild plan.json task summaries.
-                "summary": s,
-            }),
-        )?;
-        self.shadow.rewrite_plan(&s.run_id)?;
-        Ok(())
+        self.with_run_lock(&s.run_id, || {
+            // U1c phase-0/0bc step-2: file authority. Note{summary_persisted}
+            // carries the full summary so FileTaskStore.get_summary can derive it.
+            self.shadow.append_event_line(
+                s.run_id.as_str(),
+                Some(s.task_id.as_str()),
+                None,
+                RuntimeEventKind::Note,
+                serde_json::json!({
+                    "kind": "summary_persisted",
+                    // Full summary so events.jsonl can rebuild plan.json task summaries.
+                    "summary": s,
+                }),
+            )?;
+            self.shadow.rewrite_plan(&s.run_id)?;
+            Ok(())
+        })
     }
 
     // ── Read paths (used by Tauri query commands + recovery) ────────────
@@ -1250,6 +1270,7 @@ mod tests {
             failures: vec![],
             verification: vec!["cargo check".into()],
             next_implications: vec!["implement router".into()],
+            suggested_tasks: vec![],
             created_at: Utc::now(),
         };
         s.put_summary(&sum).unwrap();

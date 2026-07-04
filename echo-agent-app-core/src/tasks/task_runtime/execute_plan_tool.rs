@@ -269,19 +269,20 @@ impl Tool for ExecutePlanTool {
                 let conv = crate::chat_resources::current_chat_resources()
                     .and_then(|r| r.conv_id.clone())
                     .unwrap_or_else(|| format!("message:{run_id}"));
-                // 建 ad-hoc run (若已存在则跳过,兼容 task_create 已建过的情况)。
-                let run_already_exists = self.store.get_run(&run_id).ok().flatten().is_some();
-                if !run_already_exists {
-                    if let Err(e) = self.store.create_run(
-                        &run_id,
-                        "default",
-                        &conv,
-                        &run_id,
-                        DomainProfile::General,
-                        &task_desc,
-                        "agent_inline_task",
-                        AttendedMode::Attended,
-                    ) {
+                // 建 ad-hoc run。create_run 是幂等的:并发 inline task 共享同一
+                // run_id 时,只有第一个调用写 RunCreated,后续直接返回现有 run。
+                let run = match self.store.create_run(
+                    &run_id,
+                    "default",
+                    &conv,
+                    &run_id,
+                    DomainProfile::General,
+                    &task_desc,
+                    "agent_inline_task",
+                    AttendedMode::Attended,
+                ) {
+                    Ok(run) => run,
+                    Err(e) => {
                         tracing::warn!(
                             run_id = %run_id,
                             error = %e,
@@ -291,6 +292,8 @@ impl Tool for ExecutePlanTool {
                             "execute_plan: 建 ad-hoc run 失败: {e}"
                         )));
                     }
+                };
+                if run.status == TaskRunStatus::Pending {
                     if let Err(e) = self.store.transition_run(&run_id, TaskRunStatus::Running) {
                         tracing::warn!(
                             run_id = %run_id,
@@ -712,6 +715,15 @@ fn format_execution_summary(summary: &TaskExecutionSummary) -> String {
             summary.next_implications.join("; ")
         ));
     }
+    if !summary.suggested_tasks.is_empty() {
+        let titles = summary
+            .suggested_tasks
+            .iter()
+            .map(|task| task.title.as_str())
+            .collect::<Vec<_>>()
+            .join("; ");
+        parts.push(format!("建议新增任务: {titles}"));
+    }
     if parts.is_empty() {
         "worker summary persisted without details".to_string()
     } else {
@@ -847,6 +859,7 @@ mod tests {
                 failures: Vec::new(),
                 verification: Vec::new(),
                 next_implications: Vec::new(),
+                suggested_tasks: Vec::new(),
                 created_at: chrono::Utc::now(),
             })
             .map_err(|e| e.to_string())?;

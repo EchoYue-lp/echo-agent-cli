@@ -96,31 +96,33 @@ pub async fn drive_chat(
     // Idempotent: skips if the run already exists (create_complex_task / a
     // resumed turn may have created it).
     if let Some(store) = res.store.as_ref() {
-        let already_exists = store.get_run(&run_id).ok().flatten().is_some();
-        if !already_exists {
-            let conv = res
-                .conv_id
-                .clone()
-                .unwrap_or_else(|| format!("message:{run_id}"));
-            if let Err(e) = store.create_run(
-                &run_id,
-                "default",
-                &conv,
-                &run_id,
-                crate::tasks::task_runtime::types::DomainProfile::General,
-                message,
-                "chat_turn",
-                crate::tasks::task_runtime::types::AttendedMode::Attended,
-            ) {
+        let conv = res
+            .conv_id
+            .clone()
+            .unwrap_or_else(|| format!("message:{run_id}"));
+        match store.create_run(
+            &run_id,
+            "default",
+            &conv,
+            &run_id,
+            crate::tasks::task_runtime::types::DomainProfile::General,
+            message,
+            "chat_turn",
+            crate::tasks::task_runtime::types::AttendedMode::Attended,
+        ) {
+            Ok(run) => {
+                if run.status == crate::tasks::task_runtime::types::TaskRunStatus::Pending {
+                    let _ = store.transition_run(
+                        &run_id,
+                        crate::tasks::task_runtime::types::TaskRunStatus::Running,
+                    );
+                }
+            }
+            Err(e) => {
                 tracing::warn!(
                     error = %e,
                     run_id = %run_id,
                     "drive_chat: ad-hoc create_run failed (task tools may not persist)"
-                );
-            } else {
-                let _ = store.transition_run(
-                    &run_id,
-                    crate::tasks::task_runtime::types::TaskRunStatus::Running,
                 );
             }
         }
