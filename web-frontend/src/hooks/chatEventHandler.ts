@@ -9,34 +9,7 @@
 
 import { useChatStore } from '../stores/chatStore';
 import { useTaskRuntimeStore } from '../stores/taskRuntimeStore';
-
-interface ChatEventLike {
-  type: string;
-  data?: string;
-  name?: string;
-  args?: unknown;
-  result?: string;
-  success?: boolean;
-  spec?: unknown;
-  status?: string;
-  message_key?: string;
-  conversation_id?: string | null;
-  run_id?: string;
-  goal?: string;
-  domain_profile?: string;
-  route?: string;
-  interaction_mode?: string;
-  permission_mode?: string;
-  approval_policy?: string;
-  route_reason?: string;
-  confidence?: number;
-  auto_execute?: boolean;
-  planned_workers?: string[];
-  suggested_workers?: string[];
-  active_skills?: string[];
-  route_signals?: string[];
-  classification_signals?: string[];
-}
+import type { ChatEvent } from '../types/api';
 
 interface EventContext {
   assistantIdRef: React.MutableRefObject<string | null>;
@@ -46,10 +19,7 @@ interface EventContext {
   currentThinkingIdRef: React.MutableRefObject<string | null>;
 }
 
-export function handleChatEvent(
-  event: ChatEventLike,
-  ctx: EventContext,
-): void {
+export function handleChatEvent(event: ChatEvent, ctx: EventContext): void {
   const store = useChatStore.getState();
 
   switch (event.type) {
@@ -125,7 +95,7 @@ export function handleChatEvent(
       ctx.currentThinkingIdRef.current = null;
       const id = ctx.assistantIdRef.current;
       if (id) {
-        store.finalizeAssistantMessage(id, (event.data || event.result || '') as string);
+        store.finalizeAssistantMessage(id, event.data);
       }
       ctx.assistantIdRef.current = null;
       ctx.currentMessageKeyRef.current = null;
@@ -134,40 +104,39 @@ export function handleChatEvent(
     }
     case 'approval_request': {
       if (ctx.isCancelledRef.current) break;
-      // Map snake_case event fields to the camelCase ApprovalRequest shape.
+      // P2-5: 用精确 union 后无需强转, 字段名直接可查。
       store.setApprovalRequest({
-        requestId: (event as { request_id?: string }).request_id ?? '',
-        toolName: (event as { tool_name?: string }).tool_name ?? '',
+        requestId: event.request_id,
+        toolName: event.tool_name,
         args: event.args,
-        prompt: (event as { prompt?: string }).prompt,
+        prompt: event.prompt,
       });
       break;
     }
     case 'input_request': {
       if (ctx.isCancelledRef.current) break;
       store.setInputRequest({
-        requestId: (event as { request_id?: string }).request_id ?? '',
-        prompt: (event as { prompt?: string }).prompt,
+        requestId: event.request_id,
+        prompt: event.prompt,
       });
       break;
     }
     case 'selection_request': {
       if (ctx.isCancelledRef.current) break;
       store.setSelectionRequest({
-        requestId: (event as { request_id?: string }).request_id ?? '',
-        prompt: (event as { prompt?: string }).prompt ?? '',
-        options: (event as { options?: string[] }).options ?? [],
-        taskId: (event as { task_id?: string }).task_id,
-        context: event.spec,
+        requestId: event.request_id,
+        prompt: event.prompt,
+        options: event.options,
+        taskId: event.task_id ?? undefined,
+        context: event.context,
       });
       break;
     }
     case 'error': {
       ctx.isCancelledRef.current = true;
       store.setRunStatus('failed');
-      const message = (event as { message?: string }).message ?? '请求失败';
       if (ctx.assistantIdRef.current) {
-        store.finalizeAssistantMessage(ctx.assistantIdRef.current, `[Error] ${message}`);
+        store.finalizeAssistantMessage(ctx.assistantIdRef.current, `[Error] ${event.message}`);
       }
       ctx.assistantIdRef.current = null;
       ctx.currentMessageKeyRef.current = null;
@@ -187,9 +156,15 @@ export function handleChatEvent(
       if (!ctx.isCancelledRef.current) {
         const status = (event.status ?? 'idle') as string;
         const VALID_STATUSES = [
-          'idle', 'running', 'thinking', 'using_tool',
-          'waiting_approval', 'waiting_input',
-          'completed', 'failed', 'cancelled',
+          'idle',
+          'running',
+          'thinking',
+          'using_tool',
+          'waiting_approval',
+          'waiting_input',
+          'completed',
+          'failed',
+          'cancelled',
         ] as const;
         const validated = VALID_STATUSES.includes(status as (typeof VALID_STATUSES)[number])
           ? (status as (typeof VALID_STATUSES)[number])
@@ -199,27 +174,24 @@ export function handleChatEvent(
         // status. Without 'completed'/'failed'/'cancelled' in the allowlist,
         // updateRunStatus would never see a terminal state and polling
         // would never stop.
-        import('../stores/taskRuntimeStore').then(({ useTaskRuntimeStore }) => {
-          const taskStore = useTaskRuntimeStore.getState();
-          if (taskStore.activeRun) {
-            taskStore.updateRunStatus(validated);
-          }
-        }).catch(() => {});
+        import('../stores/taskRuntimeStore')
+          .then(({ useTaskRuntimeStore }) => {
+            const taskStore = useTaskRuntimeStore.getState();
+            if (taskStore.activeRun) {
+              taskStore.updateRunStatus(validated);
+            }
+          })
+          .catch(() => {});
       }
       break;
     }
     case 'interrupt_prompt': {
       // An in-progress run was detected — the GUI should show a dialog
       // letting the user choose: resume / edit-and-resume / abandon.
-      const { run_id, goal, new_message } = event as unknown as {
-        run_id: string;
-        goal: string;
-        new_message: string;
-      };
       useTaskRuntimeStore.getState().openInterruptPrompt({
-        runId: run_id,
-        goal: goal ?? '',
-        newMessage: new_message ?? '',
+        runId: event.run_id,
+        goal: event.goal,
+        newMessage: event.new_message,
       });
       break;
     }

@@ -4,56 +4,7 @@ import { useConversationStore } from '../stores/conversationStore';
 import { useSubagentRunStore, type ExecutionEvent } from '../stores/subagentRunStore';
 import { isTauri, apiInvoke, errorMessage } from '../lib/tauri-bridge';
 import { handleChatEvent } from './chatEventHandler';
-import type { Attachment, ChatRunStatus } from '../types/api';
-
-type ChatEventBase = {
-  message_key?: string;
-  conversation_id?: string | null;
-};
-
-type ChatEvent = ChatEventBase &
-  (
-    | { type: 'token'; data: string }
-    | { type: 'thinking_start' }
-    | { type: 'thinking_end'; prompt_tokens: number; completion_tokens: number }
-    | {
-        type: 'llm_usage';
-        model: string;
-        prompt_tokens: number;
-        completion_tokens: number;
-        total_tokens: number;
-        cached_prompt_tokens: number;
-        cache_creation_prompt_tokens: number;
-        usage_reported: boolean;
-      }
-    | { type: 'tool_start'; name: string; args: unknown }
-    | { type: 'tool_result'; name: string; result: string; success: boolean }
-    | { type: 'chart'; spec: unknown }
-    | { type: 'final_answer'; data: string }
-    | { type: 'cancelled' }
-    | { type: 'error'; message: string }
-    | { type: 'run_status'; status: ChatRunStatus }
-    | {
-        type: 'approval_request';
-        request_id: string;
-        tool_name: string;
-        args: unknown;
-        prompt: string;
-      }
-    | { type: 'input_request'; request_id: string; prompt: string }
-    | {
-        type: 'selection_request';
-        request_id: string;
-        prompt: string;
-        options: string[];
-        task_id?: string | null;
-        context?: unknown;
-        phase?: string | null;
-      }
-    | { type: 'tool_batch_start'; tool_count: number }
-    | { type: 'tool_batch_end' }
-    | { type: 'done' }
-  );
+import type { Attachment, ChatEvent } from '../types/api';
 
 export function useTauriChat() {
   const assistantIdRef = useRef<string | null>(null);
@@ -74,7 +25,7 @@ export function useTauriChat() {
 
   const handleEvent = useCallback((event: ChatEvent) => {
     if (!isCurrentRunEvent(event)) return;
-    handleChatEvent(event as any, {
+    handleChatEvent(event, {
       assistantIdRef,
       currentMessageKeyRef,
       currentMessageIdRef: currentMessageKeyRef,

@@ -9,7 +9,13 @@
 // Consumers importing from `types/api` still work; new code should import
 // from `generated/` directly.
 import type { ToolCallInfo } from '../generated';
-export type { ChatRequest, ChatResponse, ToolCallInfo, ContextStats, SessionInfo } from '../generated';
+export type {
+  ChatRequest,
+  ChatResponse,
+  ToolCallInfo,
+  ContextStats,
+  SessionInfo,
+} from '../generated';
 // covered by ts-rs, or (c) represent frontend-only state.  When adding
 // or changing a type, prefer updating the Rust-side serde derives and
 // re-generating over hand-writing here.
@@ -40,6 +46,60 @@ export type ChatRunStatus =
   | 'completed'
   | 'failed'
   | 'cancelled';
+
+/**
+ * ChatEvent — 后端推给前端的聊天事件 (P2-5 discriminated union)。
+ *
+ * 此前定义在 useTauriChat.ts 且未导出, chatEventHandler 只好用宽接口
+ * ChatEventLike + 调用方 `as any` 强转, 失去编译期类型安全。提取为公共类型,
+ * 让 handleChatEvent 直接接收 ChatEvent, 每种 type 的 payload 字段精确可查。
+ */
+export type ChatEvent = {
+  message_key?: string;
+  conversation_id?: string | null;
+} & (
+  | { type: 'token'; data: string }
+  | { type: 'thinking_start' }
+  | { type: 'thinking_end'; prompt_tokens: number; completion_tokens: number }
+  | {
+      type: 'llm_usage';
+      model: string;
+      prompt_tokens: number;
+      completion_tokens: number;
+      total_tokens: number;
+      cached_prompt_tokens: number;
+      cache_creation_prompt_tokens: number;
+      usage_reported: boolean;
+    }
+  | { type: 'tool_start'; name: string; args: unknown }
+  | { type: 'tool_result'; name: string; result: string; success: boolean }
+  | { type: 'chart'; spec: unknown }
+  | { type: 'final_answer'; data: string }
+  | { type: 'cancelled' }
+  | { type: 'error'; message: string }
+  | { type: 'run_status'; status: ChatRunStatus }
+  | {
+      type: 'approval_request';
+      request_id: string;
+      tool_name: string;
+      args: unknown;
+      prompt: string;
+    }
+  | { type: 'input_request'; request_id: string; prompt: string }
+  | {
+      type: 'selection_request';
+      request_id: string;
+      prompt: string;
+      options: string[];
+      task_id?: string | null;
+      context?: unknown;
+      phase?: string | null;
+    }
+  | { type: 'tool_batch_start'; tool_count: number }
+  | { type: 'tool_batch_end' }
+  | { type: 'interrupt_prompt'; run_id: string; goal: string; new_message: string }
+  | { type: 'done' }
+);
 
 export interface ToolInfo {
   name: string;
