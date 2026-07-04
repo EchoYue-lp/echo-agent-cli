@@ -39,6 +39,8 @@ use tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard, Semaphore};
 use super::store::{StoreError, TaskRuntimeStore};
 use super::types::*;
 
+pub use echo_agent::tasks::ConcurrencyLimits;
+
 /// A lightweight execution-flow event emitted to the frontend via the unified
 /// `execution://event` Tauri channel (kind="subagent" for the main agent's
 /// thinking/tool/token stream, kind="run" for run lifecycle).
@@ -122,33 +124,6 @@ pub type ExecSink = Arc<dyn Fn(ExecEvent) + Send + Sync>;
 fn emit_exec(sink: Option<&ExecSink>, ev: ExecEvent) {
     if let Some(sink) = sink {
         sink(ev);
-    }
-}
-
-/// Concurrency caps. Sourced from the AgentPool when available, else defaults
-/// from the plan's "Initial limits" (max 3–4 workers, writes serialized).
-#[derive(Debug, Clone)]
-pub struct ConcurrencyLimits {
-    /// Max simultaneous worker agents (read-only fan-out).
-    pub max_concurrent_workers: usize,
-    /// Max simultaneous mutating tasks. Default 4 — gated by per-file locks
-    /// (non-overlapping files run in parallel, overlapping files serialize).
-    pub max_concurrent_writes: usize,
-    /// Max simultaneous shell/verification tasks.
-    pub max_concurrent_shells: usize,
-    /// Max simultaneous LLM calls across all workers. Keep this aligned with
-    /// `max_concurrent_workers` so a ready read-only wave actually fans out.
-    pub max_parallel_llm_calls: usize,
-}
-
-impl Default for ConcurrencyLimits {
-    fn default() -> Self {
-        Self {
-            max_concurrent_workers: 4,
-            max_concurrent_writes: 4,
-            max_concurrent_shells: 1,
-            max_parallel_llm_calls: 4,
-        }
     }
 }
 
