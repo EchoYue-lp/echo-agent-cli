@@ -1,6 +1,7 @@
 # Framework / App Boundary Migration Plan
 
-> Status: Phase 0 boundary spec.
+> Status: Phase 1-3 complete; Phase 4 audit complete with nested delegation
+> policy unification in progress.
 > Scope: `echo-agent` is the reusable framework; `echo-agent-cli` is the EKO app.
 > Rule of thumb: extract framework kernels and traits, not EKO product state.
 
@@ -39,6 +40,12 @@ EKO adopts a hybrid:
 2. Subagents may return structured `suggested_tasks`.
 3. Optional nested delegation can later be enabled per role with an explicit
    capability bit and a depth limit.
+
+Implementation note: nested delegation depth has one authority:
+`echo_agent::tasks::NestedDelegationPolicy`. The older subagent executor
+`delegate_depth` integer was replaced in `DispatchRequest` by this policy; old
+helper APIs may still accept a depth parameter, but they immediately convert it
+to `NestedDelegationPolicy`.
 
 ## Hard Boundaries
 
@@ -134,6 +141,15 @@ into EKO storage and UI projections.
 
 ### Phase 1: Extract Type Kernel
 
+Status: complete.
+
+Commits:
+
+- `701f1f6` (`echo-agent`): generic runtime primitives.
+- `a530875` (`echo-agent-cli`): EKO-to-framework conversions.
+- `00acb40` (`echo-agent-cli`): reuse framework concurrency limits.
+- `ef8f02d` (`echo-agent`): `TaskWorkerContext`.
+
 Goal: add framework types without changing runtime behavior.
 
 Move or duplicate-then-adapt into `echo-agent`:
@@ -160,6 +176,12 @@ npx --prefix web-frontend tsc -b
 ```
 
 ### Phase 2: Extract DAG Scheduling Kernel
+
+Status: complete.
+
+Commits:
+
+- `d3f7183` (`echo-agent`): DAG runtime kernel.
 
 Goal: move pure graph scheduling to framework, still driven by CLI store.
 
@@ -200,6 +222,15 @@ questions; CLI performs app-specific reads/writes.
 
 ### Phase 3: Rewire EKO Executor To Framework Kernel
 
+Status: mostly complete.
+
+Commits:
+
+- `2c74839` (`echo-agent-cli`): app runtime uses framework DAG kernel.
+- `4c33fa9` (`echo-agent-cli`): dispatcher naming cleanup.
+- `fb44e35` (`echo-agent-cli`): dispatcher receives framework
+  `TaskWorkerContext`.
+
 Goal: app-core `executor.rs` becomes an adapter around framework runtime.
 
 Expected app-core responsibilities after this phase:
@@ -213,6 +244,25 @@ Expected app-core responsibilities after this phase:
 Delete duplicated scheduling code from app-core only after the adapter is green.
 
 ### Phase 4: Tool Boundary Cleanup
+
+Status: audit complete; no tool move needed yet.
+
+Findings:
+
+- `spawn_background_task` / `check_task_status` remain generic framework
+  background-task tools.
+- `todo_write` remains a generic scratch planning artifact, separate from EKO
+  `task_*` tools and TaskRuntime UI state.
+- `agent_tool` remains the generic framework delegate tool. EKO decides whether
+  a role receives it via capability / registration policy.
+- EKO-specific concrete tools (`task_create/update/complete/skip/list`,
+  `create_complex_task`, `execute_plan`, `cancel_run`, `check_run_status`) stay
+  in `echo-agent-cli`.
+
+Commit:
+
+- `2b2c958` (`echo-agent`): subagent dispatch uses
+  `NestedDelegationPolicy` instead of a separate `delegate_depth` field.
 
 Goal: make tool placement match product/framework boundary.
 
