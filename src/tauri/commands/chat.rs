@@ -142,7 +142,7 @@ fn emit_chat_event(
 /// "run" (TaskRun lifecycle: RunStarted/Completed/Failed/Cancelled/StatusChanged)
 /// or "subagent" (main-agent execution flow: Thinking/Tool/Token/Usage — the
 /// main agent is treated as a synthetic subagent run with id "main" so the
-/// frontend renders it with the same WorkerStreamBlock component).
+/// frontend renders it with the same SubagentStreamBlock component).
 fn emit_execution_event(
     app: &tauri::AppHandle,
     run_id: &str,
@@ -911,10 +911,10 @@ impl echo_agent_app_core::chat_driver::ChatSink for TauriChatSink {
     }
 }
 
-/// Map an AgentEvent to a ChatEvent, also emitting worker://trace side effects.
+/// Map an AgentEvent to a ChatEvent, also emitting execution trace side effects.
 /// Returns None for events that should be silently ignored.
 ///
-/// G1 fix: `run_id` is the TaskRuntime run_id. Worker trace events for the
+/// G1 fix: `run_id` is the TaskRuntime run_id. Subagent execution events for the
 /// main agent carry this run_id (not message_key) so the frontend aggregator
 /// (which filters by activeRun.run_id) sees the main agent's token/usage data.
 ///

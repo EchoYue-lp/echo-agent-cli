@@ -65,7 +65,7 @@ export function useTauriChat() {
       }
       pendingCleanup.push(unlisten);
       // Unified execution://event channel (Subagent unification Phase 4).
-      // Replaces the legacy worker://trace + subagent://event channels.
+      // Replaces the legacy worker trace + subagent event channels.
       // kind="subagent" → subagentRunStore (thinking/tool/token/usage flows);
       // kind="run" → run lifecycle (run_started triggers loadByConversation).
       const unlistenExec = await listen<Record<string, unknown>>('execution://event', (event) => {

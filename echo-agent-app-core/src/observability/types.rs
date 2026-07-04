@@ -23,7 +23,7 @@ pub struct TraceEvent {
 ///
 /// Each hash covers the canonical content of one dimension that affects
 /// prompt-cache hit rate: system prompt, tools schema, working-directory,
-/// and worker prompt. When the hash changes between calls, the provider
+/// and subagent prompt. When the hash changes between calls, the provider
 /// cannot reuse the prior cache entry.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ContentFingerprint {
@@ -61,7 +61,7 @@ pub enum TraceKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd_hash: Option<String>,
         /// SHA-256 hash of the worker/sub-agent prompt template.
-        /// None for main-agent calls; changes when worker prompts vary.
+        /// None for main-agent calls; changes when subagent prompts vary.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         worker_prompt_hash: Option<String>,
         /// Provider ID string (e.g. "deepseek", "openai", "anthropic").

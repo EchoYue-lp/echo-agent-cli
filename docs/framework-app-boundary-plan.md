@@ -1,7 +1,7 @@
 # Framework / App Boundary Migration Plan
 
-> Status: Phase 1-3 complete; Phase 4 tool audit complete; app role-capability
-> registration in progress.
+> Status: Phase 1-4 complete; app role-capability registration and
+> policy-gated nested delegation are wired.
 > Scope: `echo-agent` is the reusable framework; `echo-agent-cli` is the EKO app.
 > Rule of thumb: extract framework kernels and traits, not EKO product state.
 
@@ -38,14 +38,16 @@ EKO adopts a hybrid:
 
 1. Default subagents execute the current `PlanTask`.
 2. Subagents may return structured `suggested_tasks`.
-3. Optional nested delegation can later be enabled per role with an explicit
-   capability bit and a depth limit.
+3. Optional nested delegation is enabled per role with an explicit capability
+   bit and a depth limit.
 
 Implementation note: nested delegation depth has one authority:
-`echo_agent::tasks::NestedDelegationPolicy`. The older subagent executor
-`delegate_depth` integer was replaced in `DispatchRequest` by this policy; old
-helper APIs may still accept a depth parameter, but they immediately convert it
-to `NestedDelegationPolicy`.
+`echo_agent::tasks::NestedDelegationPolicy` (re-exported from
+`echo_core::tools`). The policy flows through `ExternalRunContext` into
+`ToolContext`, and `agent_tool` derives a child policy before dispatching a
+nested subagent. The older subagent executor `delegate_depth` integer was
+replaced in `DispatchRequest` by this policy; old helper APIs may still accept a
+depth parameter, but they immediately convert it to `NestedDelegationPolicy`.
 
 ## Hard Boundaries
 
@@ -258,11 +260,11 @@ Findings:
 - EKO-specific concrete tools (`task_create/update/complete/skip/list`,
   `create_complex_task`, `execute_plan`, `cancel_run`, `check_run_status`) stay
   in `echo-agent-cli`.
-- EKO worker `.md` frontmatter supports `can_delegate: true`. Default workers
-  do not receive `agent_tool`; only explicitly marked roles get it and receive
-  a leaf child-subagent registry. This keeps normal workers flat and prevents
-  recursive delegate-capable role cycles until `NestedDelegationPolicy` is
-  propagated through the framework `agent_tool` ToolContext path.
+- EKO subagent `.md` frontmatter supports `can_delegate: true`. Default
+  subagents do not receive `agent_tool`; only explicitly marked roles get it.
+  Delegate-capable roles receive every non-self child subagent, including other
+  delegate-capable roles. Recursion is bounded by `NestedDelegationPolicy`
+  flowing through `ExternalRunContext` -> `ToolContext` -> `agent_tool`.
 
 Commit:
 
@@ -270,6 +272,10 @@ Commit:
   `NestedDelegationPolicy` instead of a separate `delegate_depth` field.
 - `echo-agent-cli`: role-capability registration for nested delegation via
   `can_delegate`.
+- `echo-agent`: `NestedDelegationPolicy` is now available in framework
+  `ToolContext`.
+- `echo-agent-cli`: delegate-capable child registry is open to all non-self
+  roles and remains policy-gated by max depth.
 
 Goal: make tool placement match product/framework boundary.
 

@@ -1795,6 +1795,13 @@ pub async fn generate_skill_draft(
         .await
         .map_err(|e| IpcError::Internal(format!("Failed to generate draft: {e}")))?;
 
+    echo_agent_app_core::evolution::fire_evolution_hook(
+        &agent,
+        echo_core::hooks::HookEvent::SkillLifecycleTransition,
+        &result.name,
+    )
+    .await;
+
     Ok(json!({
         "success": true,
         "name": result.name,
@@ -1807,9 +1814,10 @@ pub async fn generate_skill_draft(
 /// agent 启动/技能重载时自动加载。review gate:用户显式触发才激活。
 #[tauri::command]
 pub async fn activate_skill_draft(
-    _state: tauri::State<'_, TauriState>,
+    state: tauri::State<'_, TauriState>,
     name: String,
 ) -> Result<serde_json::Value, IpcError> {
+    let agent = state.app_state.connection.primary_agent();
     let echo_agent_dir = echo_agent_app_core::evolution::discover_echo_agent_dir();
     let draft_dir = echo_agent_dir.join("skills").join("_drafts").join(&name);
     let target_dir = echo_agent_dir.join("skills").join(&name);
@@ -1838,6 +1846,13 @@ pub async fn activate_skill_draft(
             tracing::warn!(name = %name, error = %e, "Failed to promote '{}' to active", name);
         }
     }
+
+    echo_agent_app_core::evolution::fire_evolution_hook(
+        &agent,
+        echo_core::hooks::HookEvent::SkillLifecycleTransition,
+        &name,
+    )
+    .await;
 
     Ok(json!({
         "success": true,

@@ -86,7 +86,7 @@ function diagnosticMessages(total: UsageAggregate, models: ModelAggregate[]): st
     messages.push(`时间窗口内出现 ${models.length} 个模型；不同模型通常不会共享 prompt cache。`);
   }
   if (rate != null && rate < 0.2 && total.input >= 1000) {
-    messages.push('cache read rate 偏低。优先检查 system prefix、tools 定义、cwd/记忆/hook 注入和 worker prompt 是否稳定。');
+    messages.push('cache read rate 偏低。优先检查 system prefix、tools 定义、cwd/记忆/hook 注入和 subagent prompt 是否稳定。');
   }
   if (total.cacheWrite > total.cached && total.cacheWrite > 0) {
     messages.push('cache write 高于 cache read，说明更多是在创建缓存；重复同类任务后 read 仍不上升才需要继续排查前缀稳定性。');

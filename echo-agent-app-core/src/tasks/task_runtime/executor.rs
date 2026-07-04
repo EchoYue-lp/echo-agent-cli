@@ -525,6 +525,7 @@ impl TaskDispatcher for RealTaskDispatcher {
         Box::pin(async move {
             let run_id = context.run_id;
             let cancel = context.cancel;
+            let delegation_policy = context.delegation_policy;
             // Scope run_id + cancel + trace_sink into task-local so worker-internal
             // tools (task_*/execute_plan, and their execute_with_context
             // fallback path) and L3 nested sub-workers can read them.
@@ -547,6 +548,7 @@ impl TaskDispatcher for RealTaskDispatcher {
                     run_id,
                     task,
                     cancel,
+                    delegation_policy,
                 )
                 .await
             })
@@ -731,7 +733,12 @@ async fn run_dag<W: TaskDispatcher + 'static>(
             // clone shares the same cancellation tree — parent cancel fires here.
             let context = echo_agent::tasks::TaskWorkerContext::new(run_id.to_string())
                 .with_cancel(parent_cancel.clone())
-                .with_concurrency_limits(limits);
+                .with_concurrency_limits(limits)
+                .with_delegation_policy(echo_agent::tasks::NestedDelegationPolicy {
+                    can_spawn_subagents: true,
+                    delegate_depth: 0,
+                    max_delegate_depth: 2,
+                });
             handles.push(tokio::spawn(async move {
                 worker
                     .dispatch(
@@ -997,6 +1004,7 @@ async fn execute_task(
     run_id: String,
     task: PlanTask,
     cancel: CancellationToken,
+    delegation_policy: echo_agent::tasks::NestedDelegationPolicy,
 ) -> Result<(String, Option<String>), (String, String)> {
     let task_id = task.id.clone();
     let is_write = !task.kind.is_read_only();
@@ -1351,6 +1359,7 @@ async fn execute_task(
             &task.agent_role,
             &prompt,
             task_cancel.clone(),
+            delegation_policy,
             trace_sink.clone(),
         )
         .await
@@ -1395,6 +1404,7 @@ async fn execute_task(
             &task.agent_role,
             &prompt,
             task_cancel.clone(),
+            delegation_policy,
             trace_sink.clone(),
         )
         .await
@@ -1852,6 +1862,7 @@ async fn run_readonly_worker(
     role: &str,
     prompt: &str,
     cancel: CancellationToken,
+    delegation_policy: echo_agent::tasks::NestedDelegationPolicy,
     trace_sink: Option<ExecSink>,
 ) -> Result<echo_agent::agent::subagent::SubagentResult, String> {
     primary_agent
@@ -1869,6 +1880,7 @@ async fn run_readonly_worker(
                     message_id,
                     cancel: Some(Arc::new(cancel.clone())),
                     trace_sink: core_trace_sink,
+                    delegation_policy: Some(delegation_policy),
                 });
                 let result = agent
                     .delegate_to_agent_with_parent_and_cancel(&role, &prompt, &run_id, cancel, 0)
@@ -1926,6 +1938,7 @@ async fn run_writer_worker(
     role: &str,
     prompt: &str,
     cancel: CancellationToken,
+    delegation_policy: echo_agent::tasks::NestedDelegationPolicy,
     trace_sink: Option<ExecSink>,
 ) -> Result<echo_agent::agent::subagent::SubagentResult, String> {
     // Rebuild a multimodal Message when the run carries user attachments, so
@@ -1956,6 +1969,7 @@ async fn run_writer_worker(
                     message_id: root_message_id,
                     cancel: Some(Arc::new(cancel.clone())),
                     trace_sink: core_trace_sink,
+                    delegation_policy: Some(delegation_policy),
                 });
                 let result = if let Some(msg) = run_message {
                     agent
@@ -2498,6 +2512,7 @@ pub async fn drive_unattended_run(
                 message_id: None, // unattended/cron path has no chat message
                 cancel: Some(std::sync::Arc::new(cancel_for_scope.clone())),
                 trace_sink: None,
+                delegation_policy: None,
             });
 
             // D7 stage 2: bind the agent's working_dir to the worktree path

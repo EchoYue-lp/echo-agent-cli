@@ -188,6 +188,7 @@ async fn drive_chat_inner(
             message_id: Some(run_id),
             cancel: Some(std::sync::Arc::new(cancel.clone())),
             trace_sink: sink.trace_sink(),
+            delegation_policy: None,
         });
 
         let stream_result = guard.execute_stream_message_with_cancel(msg, cancel).await;

@@ -2,7 +2,7 @@
 
 > **跨上下文执行文档**。本文件是「Task + Subagent 二元化、Worker 从领域/协议/UI 消失」这件事的单一事实源。
 > 新窗口读本文件 + `docs/system-deep-dive/03-subagent.md` 即可恢复全局,不靠会话记忆。
-> **创建**:2026-07-02。**状态**:方案已定稿(经三方 review 整合 + 代码核实),待执行。
+> **创建**:2026-07-02。**状态**:阶段 1-5 已完成;本文作为历史设计与状态归档保留。
 
 ---
 
@@ -288,9 +288,9 @@ subagent: {
 **产出**:Rust 侧 `Worker*` 领域类型全部消失(仅保留 `TaskWorker` trait 内部调度名)。
 
 ### 🔵 阶段 5:文档
-1. 删 `docs/worker-runtime-redesign-plan.md`(过时设计,AGENTS.md 允许直接删)。
-2. 更新 `docs/system-deep-dive/03-subagent.md`,加「执行流事件与 execution_id」节。
-3. 更新 `docs/system-deep-dive/README.md` 待跟进列表(若涉及)。
+1. ✅ 删 `docs/worker-runtime-redesign-plan.md`(过时设计,AGENTS.md 允许直接删)。
+2. ✅ 更新 `docs/system-deep-dive/03-subagent.md`,记录 Task/Subagent 二元模型、`execution://event`、`SubagentRun`、`NestedDelegationPolicy`。
+3. ✅ 前端组件命名已完成:使用 `SubagentStreamBlock` / `SubagentDetailView` / `subagentRunStore`。
 
 ---
 
@@ -428,6 +428,6 @@ cd echo-agent-cli/web-frontend && npx tsc -b && npm run build
 | 阶段 2:全量事件源(双发灰度) | ✅ 完成 | echo-agent-cli `e6e5cb9`(2026-07-03) | 后端 bridge 10 arm 双发 execution://event(带稳定 subagent_run_id)+ 前端新增 subagentRunStore 消费。worker trace/subagent 通道保留(灰度并存)。验证:CLI test 381 + GUI target + 前端 tsc/build 全绿 |
 | 阶段 3:前端切源 + 合并 store | ✅ 完成 | 后端 echo-agent `6ebc2e6` + echo-agent-cli `a5ffe7a`(3a: message_id + DispatchLlmUsage);前端 `546fe9d`(3b: 8 组件全切 subagentRunStore,2026-07-03) | 后端补 message_id + cache 诊断字段;前端 8 组件 + workerDetailStore + workerProgress 全部从 workerTraceStore/subagentStore 切到 subagentRunStore,reconstructSteps/workerResult 重写(event 字符串 + 顶层字段),cacheUsageFromEvents 重写。useTauriChat 仍保留旧监听(灰度,只写旧 store 无 UI 读,阶段 4 删)。验证:cargo test 381 + 前端 tsc 0 错 + build + prettier 全绿 |
 | 阶段 4:删 worker 协议和 bridge | ✅ 完成 | `1eb512b`(4a bridge 瘦身)+ `6ab3f31`(4b chat.rs 迁移 + 前端删旧监听,2026-07-03)+ `46d2c1f`(4c 删 WorkerTrace 类型 + 改 TraceSink 签名,2026-07-03)+ `50badb5`(4c 修复:main agent 重复渲染 + trace_sink 断流,2026-07-03) | **4a**:bridge 瘦身(删 worker://trace 翻译 350 行,保留 execution://event)。**4b**:chat.rs main agent 路径迁到 execution://event(kind=\"run\" + kind=\"subagent\" subagent_run_id=\"main\"),前端删 worker://trace/subagent://event 监听 + normalizeWorkerTraceEvent。**4c**:彻底删 WorkerTraceEvent/WorkerTraceEventKind 类型 + WorkerTraceSink/trace_sink 链路。新增轻量 ExecEvent + ExecSink(Fn(ExecEvent)),executor 69 处 emit 改 emit_exec + 字符串字面量;task_tools TraceSink 改 Fn(ExecEvent);chat_driver 删 on_worker_trace/trace_sink 方法;chat.rs sink 闭包改接收 ExecEvent;task_runtime.rs 两处 worker://trace 改 execution://event(kind=run);前端删 workerTraceStore/subagentStore + 生成代码。**4c 修复**(`50badb5`):测试发现 4b 把 main agent chat-turn 事件同时发 chat://event + execution://event 导致重复渲染 → 删 agent_event_to_chat_event 里所有 main agent emit;4c 误删 scoped_with_ctx_run_id 的 ctx.trace_sink 回灌导致 execute_plan 读不到 trace_sink(has_trace_sink=false)→ 恢复回灌 + drive_chat_inner 注入 + worker_trace_sink_to_core 真实转换 + ChatSink::trace_sink() 方法;ExecEvent event 字段 &'static str→String(反序列化要求);progressSummary failed/cancelled 返回空串(修复'失败·失败'重复);ParallelExecutionBlock 过滤 subagentRunId==='main'。验证:cargo test 410 passed + GUI + clippy 零错误 + 前端 tsc/build 全绿 |
-| 阶段 5:文档 | ⏳ 待执行 | — | 删旧文档 + 更新 deep-dive |
+| 阶段 5:文档 | ✅ 完成 | pending | 删旧 `worker-runtime-redesign-plan.md`,更新 `03-subagent.md`,清理旧 WorkerTrace 生成绑定和前端显示层 worker 命名 |
 
 > 每阶段完成 + 提交后,更新本表 + MASTER-PLAN.md §五。

@@ -186,7 +186,7 @@ cmd!(
 
 // ── CuratorCommand ─────────────────────────────────────────────────
 
-async fn cmd_curator(_ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
+async fn cmd_curator(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     let sub = args.first().copied().unwrap_or("status");
     let curator =
         echo_agent::improve::Curator::default_path(echo_agent::improve::CuratorConfig::default());
@@ -209,6 +209,12 @@ async fn cmd_curator(_ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 println!("Applied {} transition(s):", transitions.len());
                 for (name, from, to) in &transitions {
                     println!("  {name}: {from:?} → {to:?}");
+                    echo_agent_app_core::evolution::fire_evolution_hook(
+                        &ctx.agent,
+                        echo_core::hooks::HookEvent::SkillLifecycleTransition,
+                        name,
+                    )
+                    .await;
                 }
             }
             Ok(_) => println!("No transitions needed."),

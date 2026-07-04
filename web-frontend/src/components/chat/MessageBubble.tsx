@@ -227,7 +227,7 @@ export const MessageBubble = memo(function MessageBubble({
           </div>
         )}
 
-        {/* One unified stream: thinking + tools + workers + final text.
+        {/* One unified stream: thinking + tools + subagents + final text.
             All peers in a single space-y container — no separate bordered
             sections. This is what makes it read as one continuous flow. */}
         {!isUser && (
@@ -259,7 +259,7 @@ export const MessageBubble = memo(function MessageBubble({
               </div>
             )}
 
-            {/* Parallel execution segment (run-level workers) — inline, no wrapper */}
+            {/* Parallel execution segment (run-level subagents) — inline, no wrapper */}
             <ParallelExecutionBlock messageId={message.id} />
 
             {/* Final text — no left border, plain markdown flow */}

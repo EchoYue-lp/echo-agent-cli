@@ -38,7 +38,7 @@ function App() {
   }, [initWorkspaces, initConversations]);
 
   // Load the active conversation's TaskRuntime run so the main-window
-  // ParallelExecutionBlock and the RightRail can render worker state.
+  // ParallelExecutionBlock and the RightRail can render subagent state.
   // (Previously this was triggered by the now-removed TaskRuntimePanel.)
   useEffect(() => {
     if (activeId) loadTaskRun(activeId);

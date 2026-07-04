@@ -813,7 +813,7 @@ impl BackgroundTaskService {
                 None, // reviewer_llm — background run has no GUI review gate
                 None, // layer_manager — no memory-layer evolution off a background run
                 None, // run_store — no trace persistence (mirrors legacy execute_composite)
-                None, // trace_sink — no worker://trace event stream
+                None, // trace_sink — no execution event stream
                 &run_id_owned,
                 cancel,
                 // B5.1: no memory write for background DAG runs (layer_manager is

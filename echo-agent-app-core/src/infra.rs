@@ -600,17 +600,14 @@ async fn register_default_subagents(
     // ordinary workers can complete their current task or suggest follow-ups
     // without becoming recursive planners.
     //
-    // Until the framework `agent_tool` carries NestedDelegationPolicy through
-    // ToolContext, only expose leaf workers as children. This prevents two
-    // delegate-capable roles from recursively calling each other while still
-    // allowing a manager-style role to fan out to normal workers.
     for parent in built_workers
         .iter()
         .filter(|worker| worker.definition.can_delegate)
     {
-        for child in built_workers.iter().filter(|child| {
-            child.definition.name != parent.definition.name && !child.definition.can_delegate
-        }) {
+        for child in built_workers
+            .iter()
+            .filter(|child| child.definition.name != parent.definition.name)
+        {
             let child_agent = child.handle.to_boxed_agent().await;
             parent
                 .handle
@@ -623,7 +620,7 @@ async fn register_default_subagents(
             subagent = %parent.definition.name,
             child_count = built_workers
                 .iter()
-                .filter(|child| child.definition.name != parent.definition.name && !child.definition.can_delegate)
+                .filter(|child| child.definition.name != parent.definition.name)
                 .count(),
             "registered nested-delegation child subagents"
         );

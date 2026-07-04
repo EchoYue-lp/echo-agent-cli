@@ -152,8 +152,8 @@ function cacheUsageFromEvents(events: ExecutionEvent[]): CacheUsageSummary {
   );
 }
 
-export function cacheUsageForRuns(workers: SubagentRunState[]): CacheUsageSummary {
-  return cacheUsageFromEvents(workers.flatMap((worker) => worker.events));
+export function cacheUsageForRuns(runs: SubagentRunState[]): CacheUsageSummary {
+  return cacheUsageFromEvents(runs.flatMap((run) => run.events));
 }
 
 function cacheReadRate(summary: CacheUsageSummary): number | null {
@@ -192,7 +192,7 @@ function cacheDiagnostics(summary: CacheUsageSummary): CacheDiagnostic[] {
       severity: 'warn',
       label: '没有 cache read',
       detail:
-        'provider 已返回 usage，但 cached prompt tokens 为 0。优先检查 system prefix、tools 定义、worker prompt 和动态上下文是否每轮变化。',
+        'provider 已返回 usage，但 cached prompt tokens 为 0。优先检查 system prefix、tools 定义、subagent prompt 和动态上下文是否每轮变化。',
     });
   } else if (rate != null && rate < 0.2 && summary.inputTokens >= 1000) {
     diagnostics.push({
@@ -378,25 +378,25 @@ function MetricCell({
   );
 }
 
-function traceRunForTodo(todo: { task_id: string }, workers: SubagentRunState[]) {
-  return workers
-    .filter((worker) => worker.taskId === todo.task_id)
+function traceRunForTodo(todo: { task_id: string }, runs: SubagentRunState[]) {
+  return runs
+    .filter((run) => run.taskId === todo.task_id)
     .sort((a, b) => b.startedAt - a.startedAt)[0];
 }
 
 function displayedTodoStatus(
   todo: { status: TodoStatus; task_id: string },
-  workers: SubagentRunState[]
+  runs: SubagentRunState[]
 ): TodoStatus {
-  const worker = traceRunForTodo(todo, workers);
-  if (!worker) return todo.status;
-  if (worker.status === 'completed' && todo.status !== ('completed' as TodoStatus)) {
+  const run = traceRunForTodo(todo, runs);
+  if (!run) return todo.status;
+  if (run.status === 'completed' && todo.status !== ('completed' as TodoStatus)) {
     return 'completed' as TodoStatus;
   }
-  if (worker.status === 'failed' && todo.status !== ('failed' as TodoStatus)) {
+  if (run.status === 'failed' && todo.status !== ('failed' as TodoStatus)) {
     return 'failed' as TodoStatus;
   }
-  if (worker.status === 'cancelled' && todo.status !== ('skipped' as TodoStatus)) {
+  if (run.status === 'cancelled' && todo.status !== ('skipped' as TodoStatus)) {
     return 'skipped' as TodoStatus;
   }
   return todo.status;
@@ -416,7 +416,7 @@ export function TaskRuntimePanel() {
     () =>
       activeRun
         ? Object.values(traceRuns)
-            .filter((worker) => worker.runId === activeRun.run_id)
+            .filter((run) => run.runId === activeRun.run_id)
             .sort((a, b) => a.startedAt - b.startedAt)
         : [],
     [activeRun, traceRuns]

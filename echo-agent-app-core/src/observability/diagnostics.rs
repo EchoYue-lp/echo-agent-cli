@@ -40,7 +40,7 @@ pub struct CacheFingerprintChanges {
     pub tools_schema_hash_changes: usize,
     /// How many times the cwd hash changed.
     pub cwd_hash_changes: usize,
-    /// How many times the worker prompt hash changed.
+    /// How many times the subagent prompt hash changed.
     pub worker_prompt_hash_changes: usize,
     /// How many distinct providers were used.
     pub distinct_providers: usize,
@@ -256,15 +256,15 @@ pub fn compute_cache_diagnostics(events: &[TraceEvent]) -> CacheDiagnostics {
         );
     }
 
-    // Worker prompt variation
+    // Subagent prompt variation
     let worker_variation = worker_hashes.len().saturating_sub(1);
     if worker_variation > 0 && calls_with_worker_prompt > 1 {
         issues.push(CacheIssue {
             kind: CacheIssueKind::WorkerPromptVariation,
             severity: IssueSeverity::Info,
             message: format!(
-                "Worker prompt 在 {calls_with_worker_prompt} 次调用中出现了 \
-                 {worker_variation} 种变化。不同的 worker prompt 无法共享 cache。"
+                "Subagent prompt 在 {calls_with_worker_prompt} 次调用中出现了 \
+                 {worker_variation} 种变化。不同的 subagent prompt 无法共享 cache。"
             ),
             affected_calls: calls_with_worker_prompt,
         });
