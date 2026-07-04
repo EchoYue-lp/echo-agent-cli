@@ -494,6 +494,12 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
   // ── Send ──
 
   const handleSend = async () => {
+    // P1-5: streaming 期间拒绝再次发送。业界(ChatGPT/Claude.ai)统一不允许多条
+    // 消息并发 streaming — 本地 agent 后端本就串行生成, 前端并发只会让第二条
+    // 覆盖第一条的 streaming 状态 ref (assistantIdRef/currentMessageKeyRef/thinkingIdRef),
+    // 导致第一条的 token 错误路由到第二条。UI 上发送按钮在 streaming 时已变 Stop,
+    // 这里挡住 Enter 键 / 程序化调用等旁路。
+    if (isStreaming) return;
     const trimmed = text.trim();
     if (!trimmed && pendingFiles.length === 0) return;
 
