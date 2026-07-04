@@ -1303,7 +1303,7 @@ async fn execute_task(
             String::new()
         }
     };
-    let prompt = build_task_prompt(&task, &dep_summaries);
+    let prompt = build_task_prompt(&task, &dep_summaries, delegation_policy);
     let prompt = format!("{ws_prefix}{prompt}");
 
     // Dispatch the task. Three paths, by kind:
@@ -1791,7 +1791,11 @@ fn collect_dependency_summaries(
 /// Build the prompt handed to a task's worker. Combines the task brief with
 /// its verification criteria, the Summary Chain from completed dependencies,
 /// and a read-only reminder for non-mutating kinds.
-fn build_task_prompt(task: &PlanTask, dep_summaries: &[(String, String)]) -> String {
+fn build_task_prompt(
+    task: &PlanTask,
+    dep_summaries: &[(String, String)],
+    delegation_policy: echo_agent::tasks::NestedDelegationPolicy,
+) -> String {
     let mut s = String::new();
     // [task_context] marker: all content below is dynamic per-task information.
     // Worker system prompts are fixed templates — dynamic task descriptions,
@@ -1833,10 +1837,19 @@ fn build_task_prompt(task: &PlanTask, dep_summaries: &[(String, String)]) -> Str
              Run the listed verification when done.\n",
         );
     }
+    s.push_str("\nYou may plan your own steps internally, but do not modify the global plan. ");
+    if delegation_policy.can_delegate() {
+        s.push_str(
+            "This role may use agent_tool for tightly scoped child subagent help within this \
+             PlanTask only. Child results must be summarized back into your answer; do not let \
+             child subagents create or execute the global plan. ",
+        );
+    } else {
+        s.push_str("Do not delegate this task to other agents. ");
+    }
     s.push_str(
-        "\nYou may plan your own steps internally, but do not modify the global plan and do not \
-         delegate this task to other agents. If this task reveals follow-up work that should be \
-         scheduled by the main TaskRuntime, include an optional fenced JSON block exactly like:\n\
+        "If this task reveals follow-up work that should be scheduled by the main TaskRuntime, \
+         include an optional fenced JSON block exactly like:\n\
          ```json\n\
          {\"suggested_tasks\":[{\"title\":\"short title\",\"description\":\"specific follow-up\",\
          \"kind\":\"investigation\",\"agent_role\":\"explorer\",\"dependencies\":[],\
@@ -3052,10 +3065,15 @@ Read the runtime path and found one missing branch.
             verification: vec!["report root cause".into()],
             ..Default::default()
         };
-        let p = build_task_prompt(&task, &[]);
+        let p = build_task_prompt(
+            &task,
+            &[],
+            echo_agent::tasks::NestedDelegationPolicy::default(),
+        );
         assert!(p.contains("READ-ONLY"));
         assert!(p.contains("chat.rs"));
         assert!(p.contains("report root cause"));
+        assert!(p.contains("Do not delegate this task to other agents"));
     }
 
     #[test]
@@ -3067,9 +3085,37 @@ Read the runtime path and found one missing branch.
             kind: PlanTaskKind::Implementation,
             ..Default::default()
         };
-        let p = build_task_prompt(&task, &[]);
+        let p = build_task_prompt(
+            &task,
+            &[],
+            echo_agent::tasks::NestedDelegationPolicy::default(),
+        );
         assert!(!p.contains("READ-ONLY"));
         assert!(p.contains("scoped change"));
+    }
+
+    #[test]
+    fn task_prompt_allows_nested_delegation_when_policy_allows() {
+        let task = PlanTask {
+            id: "t2_delegate".into(),
+            title: "Coordinate review".into(),
+            description: "split investigation across specialists".into(),
+            kind: PlanTaskKind::Investigation,
+            ..Default::default()
+        };
+        let p = build_task_prompt(
+            &task,
+            &[],
+            echo_agent::tasks::NestedDelegationPolicy {
+                can_spawn_subagents: true,
+                delegate_depth: 0,
+                max_delegate_depth: 2,
+            },
+        );
+        assert!(p.contains("may use agent_tool"));
+        assert!(p.contains("within this PlanTask only"));
+        assert!(p.contains("do not modify the global plan"));
+        assert!(!p.contains("Do not delegate this task to other agents"));
     }
 
     #[test]
