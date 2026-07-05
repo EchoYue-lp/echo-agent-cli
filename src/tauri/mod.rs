@@ -599,21 +599,46 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                     };
                                 let mut payload = serde_json::Map::new();
                                 payload.insert("kind".into(), "subagent".into());
-                                let task_id = execution_id.as_deref().and_then(|id| {
-                                    id.split_once(':')
-                                        .map(|(task_id, _)| task_id)
-                                        .filter(|task_id| !task_id.is_empty())
-                                });
+                                // Extract the bare task_id from the framework's
+                                // execution_id (format "{task_id}:{attempt}").
+                                // We emit the bare task_id as BOTH `task_id` and
+                                // `subagent_run_id` — the attempt suffix is dropped
+                                // from subagent_run_id so retry attempts fold into
+                                // one frontend card (matches Claude Code/Codex
+                                // subagent display), and so the TaskRuntime bridge
+                                // (chat.rs worker_trace_sink, which only has the
+                                // bare task_id) emits the SAME key. P0.5 fix for the
+                                // identity split bug (Q4): both bridges must agree
+                                // on the key or the frontend splits one worker into
+                                // two store records.
+                                let task_id_owned: Option<String> = execution_id
+                                    .as_deref()
+                                    .and_then(|id| {
+                                        id.split_once(':')
+                                            .map(|(task_id, _)| task_id.to_string())
+                                            .filter(|task_id| !task_id.is_empty())
+                                    });
+                                // subagent_run_id = bare task_id; fall back to the
+                                // full execution_id only when it has no ':' (rare,
+                                // e.g. a synthetic id without attempt).
+                                let subagent_run_id_owned: String = task_id_owned
+                                    .clone()
+                                    .or_else(|| execution_id.clone())
+                                    .unwrap_or_else(|| format!("{agent_name}:unknown"));
+                                // P0-DIAG B8a: capture for logging (post-fix, this
+                                // should equal the TaskRuntime bridge's key).
+                                let p0_run_id = run_id.clone().unwrap_or_default();
+                                let p0_agent_name = agent_name.clone();
+                                let p0_event_type = event_type.to_string();
+                                let task_id = task_id_owned.as_deref();
                                 if let Some(task_id) = task_id {
                                     payload.insert("task_id".into(), task_id.into());
                                 }
                                 payload.insert(
                                     "subagent_run_id".into(),
-                                    execution_id
-                                        .unwrap_or_else(|| format!("{agent_name}:unknown"))
-                                        .into(),
+                                    subagent_run_id_owned.clone().into(),
                                 );
-                                payload.insert("run_id".into(), run_id.unwrap_or_default().into());
+                                payload.insert("run_id".into(), p0_run_id.clone().into());
                                 payload.insert("agent".into(), agent_name.into());
                                 payload.insert("event".into(), event_type.into());
                                 if let serde_json::Value::Object(map) = extra {
@@ -621,6 +646,18 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                         payload.insert(k, v);
                                     }
                                 }
+                                tracing::info!(
+                                    // P0-DIAG B8a (post-fix: should match B8b)
+                                    p0_diag = "B8a",
+                                    bridge = "framework",
+                                    kind = "subagent",
+                                    run_id = %p0_run_id,
+                                    subagent_run_id = %subagent_run_id_owned,
+                                    task_id = ?task_id,
+                                    event = %p0_event_type,
+                                    agent = %p0_agent_name,
+                                    "bridge-framework emit execution://event"
+                                );
                                 let _ = app_handle
                                     .emit("execution://event", serde_json::Value::Object(payload));
                             }

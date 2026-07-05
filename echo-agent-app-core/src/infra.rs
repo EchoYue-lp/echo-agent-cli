@@ -1147,8 +1147,13 @@ pub fn init_logging_with_target(level: &str, target: LogTarget) {
         #[cfg(not(feature = "telemetry"))]
         {
             use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-            let default_filter =
-                format!("echo_agent_cli={level},echo_agent={level},tower_http=info");
+            // Include echo_agent_app_core so the task_runtime module's traces
+            // (execute_plan/execute_run/drain loop) are visible by default.
+            // Previously this crate was omitted, silently hiding all B1-B7
+            // instrumentation unless RUST_LOG was set explicitly.
+            let default_filter = format!(
+                "echo_agent_cli={level},echo_agent={level},echo_agent_app_core={level},tower_http=info"
+            );
             let env_filter = || {
                 tracing_subscriber::EnvFilter::try_from_default_env()
                     .unwrap_or_else(|_| tracing_subscriber::filter::EnvFilter::new(&default_filter))

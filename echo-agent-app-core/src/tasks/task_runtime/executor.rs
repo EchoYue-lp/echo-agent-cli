@@ -221,6 +221,26 @@ pub async fn execute_run(
     // The caller must have transitioned Pending → Running before spawning
     // the executor. Here we only accept Running.
     if run.status != TaskRunStatus::Running {
+        // P0-DIAG B5: this is the rejection the lock-waiter would hit if the
+        // lock holder transitioned the run to Completed (or any terminal state)
+        // before we got scheduled. Captures Q3 directly: was execute_run
+        // refused because the run was already Completed while tasks remained?
+        let p0_unresolved = has_unresolved_tasks(&store, run_id);
+        let p0_task_count = store
+            .get_plan(run_id)
+            .ok()
+            .flatten()
+            .map(|p| p.tasks.len())
+            .unwrap_or(0);
+        tracing::warn!(
+            // P0-DIAG B5
+            p0_diag = "B5",
+            run_id = %run_id,
+            run_status = ?run.status,
+            unresolved_count = p0_unresolved,
+            task_count = p0_task_count,
+            "execute_run: rejected — run not Running (NotRunning)"
+        );
         return Err(ExecError::NotRunning(run_id.to_string(), run.status));
     }
     let initial_plan = store
@@ -296,13 +316,49 @@ pub async fn execute_run(
             // re-read the plan and keep going instead of handing the tail to a
             // later execute_plan call.
             drain_cycle = drain_cycle.saturating_add(1);
+            // P0-DIAG B6 (drain_continue): the holder observed new unresolved
+            // tasks after run_dag reported Completed and is re-entering the
+            // loop. This is the drain loop actually working — if we never see
+            // this line but DO see B7, the drain missed appended tasks.
+            let p0_drain_snapshot = store
+                .get_plan(run_id)
+                .ok()
+                .flatten()
+                .map(|p| {
+                    (
+                        p.tasks.len(),
+                        p.tasks
+                            .iter()
+                            .filter(|t| matches!(t.status, TodoStatus::Completed))
+                            .count(),
+                    )
+                })
+                .unwrap_or((0, 0));
             tracing::info!(
+                // P0-DIAG B6
+                p0_diag = "B6",
+                drain_branch = "drain_continue",
                 run_id = %run_id,
                 drain_cycle,
+                unresolved_count = true,
+                task_count = p0_drain_snapshot.0,
+                completed_task_count = p0_drain_snapshot.1,
                 "task_runtime: appended tasks detected after completed snapshot; continuing drain"
             );
             continue;
         }
+        // P0-DIAG B6 (drain_break): the holder did NOT detect appended tasks
+        // after this run_dag pass — it will break and (if Completed) fall into
+        // the terminal-transition match below (where B7 fires).
+        tracing::info!(
+            // P0-DIAG B6
+            p0_diag = "B6",
+            drain_branch = "drain_break",
+            run_id = %run_id,
+            drain_cycle,
+            outcome_completed = matches!(outcome, Ok(RunOutcome::Completed)),
+            "task_runtime: drain loop exiting (no appended tasks detected)"
+        );
 
         break outcome;
     };
@@ -318,6 +374,42 @@ pub async fn execute_run(
                     "run_completed",
                     serde_json::json!({ "status": "completed" }),
                 ),
+            );
+            // P0-DIAG B7: the drain holder is about to flip the run to
+            // terminal Completed. If unresolved_count > 0 here, that means
+            // tasks were left un-executed — the root of the "only 1 of 4
+            // workers ran" symptom. Cross-check against B4 inserts that
+            // happened *after* this transition for the Q2 race.
+            let p0_pre_transition = store
+                .get_plan(run_id)
+                .ok()
+                .flatten()
+                .map(|p| {
+                    (
+                        p.tasks.len(),
+                        p.tasks
+                            .iter()
+                            .filter(|t| {
+                                !matches!(
+                                    t.status,
+                                    TodoStatus::Completed
+                                        | TodoStatus::Failed
+                                        | TodoStatus::Skipped
+                                )
+                            })
+                            .count(),
+                    )
+                })
+                .unwrap_or((0, 0));
+            tracing::warn!(
+                // P0-DIAG B7
+                p0_diag = "B7",
+                run_id = %run_id,
+                who = "drain_holder",
+                outcome = "Completed",
+                task_count = p0_pre_transition.0,
+                unresolved_count_before_transition = p0_pre_transition.1,
+                "task_runtime: about to transition run to Completed"
             );
             let _ = store.transition_run(run_id, TaskRunStatus::Completed);
             save_trace(

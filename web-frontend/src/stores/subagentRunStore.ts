@@ -7,10 +7,14 @@
  * (`workerTraceStore`, `subagentStore`) were deleted in Phase 4c; this is now
  * the single source of truth for subagent execution-flow events.
  *
- * Aggregation key is `subagent_run_id` (= framework execution_id, format
- * "{task_id}:{attempt}" for real subagents, "main" for the main-agent
- * synthetic run), which the bridge reads straight off the event — no
- * more temp-allocated dispatch ids.
+ * Aggregation key is `subagent_run_id`. Both bridges emit the **bare task_id**
+ * (NOT "{task_id}:{attempt}" — the attempt suffix was dropped in the P0.5
+ * identity-unification fix so retry attempts fold into one card, and so the
+ * framework bridge `src/tauri/mod.rs` and the TaskRuntime bridge
+ * `src/tauri/commands/chat.rs::worker_trace_sink` agree on the key). "main" is
+ * used only for run-level events with no owning task. The todo join
+ * (`traceRunForTodo`) matches on `run.taskId === todo.task_id`, which comes from
+ * the `task_id` field — independent of `subagent_run_id`.
  */
 
 import { create } from 'zustand';
@@ -118,6 +122,20 @@ export const useSubagentRunStore = create<SubagentRunStore>((set) => ({
   runs: {},
 
   ingest: (ev) => {
+    // P0-DIAG F1: log every event at the ingestion boundary. Confirms Q4 on
+    // the frontend side: whether events for the same logical worker land under
+    // two different `subagent_run_id` keys (one "{task_id}:{attempt}" from the
+    // framework bridge, one "main" from the TaskRuntime bridge), and whether
+    // `task_id` is present. Open DevTools Console and filter `[P0-DIAG]`.
+    const _p0Prev = !!useSubagentRunStore.getState().runs[ev.subagent_run_id];
+    // eslint-disable-next-line no-console
+    console.debug('[P0-DIAG F1] ingest', {
+      event: ev.event,
+      subagent_run_id: ev.subagent_run_id,
+      task_id: ev.task_id,
+      agent: ev.agent,
+      hadPrev: _p0Prev,
+    });
     set((s) => {
       const id = ev.subagent_run_id;
       const prev = s.runs[id];

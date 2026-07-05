@@ -140,21 +140,35 @@ fn emit_chat_event(
 
 /// Emit an event on the unified `execution://event` channel. `kind` is either
 /// "run" (TaskRun lifecycle: RunStarted/Completed/Failed/Cancelled/StatusChanged)
-/// or "subagent" (main-agent execution flow: Thinking/Tool/Token/Usage — the
-/// main agent is treated as a synthetic subagent run with id "main" so the
-/// frontend renders it with the same SubagentStreamBlock component).
+/// or "subagent" (task-scoped execution flow: Thinking/Tool/Token/Usage).
+///
+/// `subagent_run_id` is the aggregation key the frontend store uses to group a
+/// worker's events into one card. It MUST match the framework bridge
+/// (`src/tauri/mod.rs`), which emits the bare `task_id` (NOT `"{task_id}:{attempt}"`
+/// — the attempt suffix was dropped so retry attempts fold into one card, matching
+/// how Claude Code/Codex display subagents). For `kind == "run"` (run-level
+/// events with no owning task), pass `""`; this function only attaches the field
+/// for `kind == "subagent"`.
 fn emit_execution_event(
     app: &tauri::AppHandle,
     run_id: &str,
     kind: &str,
     event: &str,
     agent: &str,
+    subagent_run_id: &str,
     payload: serde_json::Value,
 ) {
     let mut map = serde_json::Map::new();
     map.insert("kind".into(), kind.into());
     if kind == "subagent" {
-        map.insert("subagent_run_id".into(), "main".into());
+        // Fall back to "main" only when a caller genuinely has no task_id
+        // (shouldn't happen for kind="subagent", but guards against empty string).
+        let id = if subagent_run_id.is_empty() {
+            "main"
+        } else {
+            subagent_run_id
+        };
+        map.insert("subagent_run_id".into(), id.into());
         map.insert("agent".into(), agent.into());
     }
     map.insert("run_id".into(), run_id.into());
@@ -164,6 +178,28 @@ fn emit_execution_event(
             map.insert(k, v);
         }
     }
+    // P0-DIAG B8b: TaskRuntime bridge emit. Note the subagent_run_id here is
+    // the LITERAL "main" for kind="subagent" (hardcoded above at line ~157),
+    // NOT the "{task_id}:{attempt}" that the framework bridge (B8a) uses.
+    // If both bridges fire for the same worker, the frontend store splits it
+    // into two records keyed "main" and "{task_id}:{attempt}" (Q4).
+    let p0_subagent_run_id = map
+        .get("subagent_run_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("<none>");
+    let p0_task_id = map.get("task_id").and_then(|v| v.as_str());
+    tracing::info!(
+        // P0-DIAG B8b
+        p0_diag = "B8b",
+        bridge = "taskruntime",
+        kind = %kind,
+        run_id = %run_id,
+        subagent_run_id = %p0_subagent_run_id,
+        task_id = ?p0_task_id,
+        event = %event,
+        agent = %agent,
+        "bridge-taskruntime emit execution://event"
+    );
     let _ = app.emit("execution://event", serde_json::Value::Object(map));
 }
 
@@ -834,6 +870,7 @@ impl echo_agent_app_core::chat_driver::ChatSink for TauriChatSink {
                 "run",
                 "run_started",
                 "",
+                "",
                 serde_json::json!({
                     "conversation_id": self.conversation_id,
                     "mode": "unified_run",
@@ -855,6 +892,7 @@ impl echo_agent_app_core::chat_driver::ChatSink for TauriChatSink {
             &self.run_id,
             "run",
             event_name,
+            "",
             "",
             serde_json::json!({ "status": status.to_string() }),
         );
@@ -878,10 +916,13 @@ impl echo_agent_app_core::chat_driver::ChatSink for TauriChatSink {
         // Forward execution-flow events from `execute_run` (run lifecycle +
         // main-agent task stream) to the unified `execution://event` channel.
         // Run-level events (task_id None) → kind="run"; task-level events
-        // (task_id Some) → kind="subagent" with subagent_run_id="main" so the
-        // frontend renders the main agent's verification-task stream. Note:
-        // the normal chat-turn thinking/tool stream does NOT go through this
-        // sink — it goes through `chat://event` via `agent_event_to_chat_event`.
+        // (task_id Some) → kind="subagent" keyed by the task_id (NOT a hardcoded
+        // "main"), so each worker's lifecycle events aggregate with its own
+        // thinking/tool/usage stream (which the framework bridge emits under
+        // the same bare task_id). The old code hardcoded "main" here, which
+        // collided all workers into one store record and broke the todo join.
+        // Note: the normal chat-turn thinking/tool stream does NOT go through
+        // this sink — it goes through `chat://event` via agent_event_to_chat_event.
         // This sink only fires for events emitted by `execute_run` /
         // `run_main_agent_task` (verification tasks run on the primary agent).
         let app = self.app.clone();
@@ -889,12 +930,23 @@ impl echo_agent_app_core::chat_driver::ChatSink for TauriChatSink {
         Some(std::sync::Arc::new(move |ev: ExecEvent| {
             let task_id = ev.task_id.clone();
             let agent = ev.agent.as_deref().unwrap_or("echo-assistant");
+            // subagent_run_id = bare task_id (matches framework bridge);
+            // "main" only for genuine run-level events (task_id None).
+            let subagent_run_id = task_id.as_deref().unwrap_or("main");
             let kind = if task_id.is_some() { "subagent" } else { "run" };
             let mut payload = ev.payload;
-            if let (Some(task_id), serde_json::Value::Object(fields)) = (task_id, &mut payload) {
-                fields.insert("task_id".into(), task_id.into());
+            if let (Some(task_id), serde_json::Value::Object(fields)) = (&task_id, &mut payload) {
+                fields.insert("task_id".into(), task_id.clone().into());
             }
-            emit_execution_event(&app, &run_id, kind, &ev.event, agent, payload);
+            emit_execution_event(
+                &app,
+                &run_id,
+                kind,
+                &ev.event,
+                agent,
+                subagent_run_id,
+                payload,
+            );
         }))
     }
 
