@@ -692,6 +692,7 @@ async fn handle_enter(
                 attachments: staged,
                 cancel,
                 mode_hint,
+                interaction_mode: app.interaction_mode,
                 // B5.1 (TUI/GUI parity): build a layer_manager per turn from
                 // review_integration so autonomous runs block-write their
                 // completion memory (`taskrun:completed`). None = no review/memory

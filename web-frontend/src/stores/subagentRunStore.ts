@@ -77,6 +77,11 @@ export interface SubagentRunState {
   parent?: string;
   task?: string;
   mode?: string;
+  /** Conversation this run belongs to (captured from run_started's
+   * conversation_id). Used by TaskRuntimePanel to show ALL inline worker runs
+   * in the current conversation, not just the single activeRun (P1.0: each
+   * inline worker now has its own run_id). */
+  conversationId?: string;
   status: SubagentRunStatus;
   startedAt: number;
   durationMs?: number;
@@ -122,24 +127,14 @@ export const useSubagentRunStore = create<SubagentRunStore>((set) => ({
   runs: {},
 
   ingest: (ev) => {
-    // P0-DIAG F1: log every event at the ingestion boundary. Confirms Q4 on
-    // the frontend side: whether events for the same logical worker land under
-    // two different `subagent_run_id` keys (one "{task_id}:{attempt}" from the
-    // framework bridge, one "main" from the TaskRuntime bridge), and whether
-    // `task_id` is present. Open DevTools Console and filter `[P0-DIAG]`.
-    const _p0Prev = !!useSubagentRunStore.getState().runs[ev.subagent_run_id];
-    // eslint-disable-next-line no-console
-    console.debug('[P0-DIAG F1] ingest', {
-      event: ev.event,
-      subagent_run_id: ev.subagent_run_id,
-      task_id: ev.task_id,
-      agent: ev.agent,
-      hadPrev: _p0Prev,
-    });
     set((s) => {
       const id = ev.subagent_run_id;
       const prev = s.runs[id];
       const newStatus = statusFromEvent(ev.event);
+      // P1.0: capture conversation_id (present on run_started; carried via the
+      // ExecutionEvent's index signature). Persists on the run record so
+      // TaskRuntimePanel can group all inline worker runs per conversation.
+      const evConvId = ev.conversation_id as string | undefined;
       // Lazily create the run on first sight (any event may arrive first in
       // principle, though `started` normally does).
       const run: SubagentRunState = prev ?? {
@@ -150,6 +145,7 @@ export const useSubagentRunStore = create<SubagentRunStore>((set) => ({
         parent: ev.parent,
         task: ev.task,
         mode: ev.mode,
+        conversationId: evConvId,
         status: 'running',
         startedAt: Date.now(),
         events: [],
@@ -170,6 +166,7 @@ export const useSubagentRunStore = create<SubagentRunStore>((set) => ({
         parent: ev.parent ?? run.parent,
         task: ev.task ?? run.task,
         mode: ev.mode ?? run.mode,
+        conversationId: evConvId ?? run.conversationId,
         status: newStatus ?? run.status,
         durationMs: ev.duration_ms ?? run.durationMs,
         tokensUsed: ev.tokens_used ?? run.tokensUsed,

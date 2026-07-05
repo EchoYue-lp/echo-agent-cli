@@ -165,6 +165,10 @@ async fn drive_chat_inner(
     };
     let cancel = res.cancel.clone();
     let sink: std::sync::Arc<dyn ChatSink> = res.sink.clone();
+    // P1.1: capture interaction mode before `res` is moved into the chat
+    // resources scope, so we can apply Chat-mode tool hiding after acquiring
+    // the agent read guard.
+    let interaction_mode = res.interaction_mode;
     // Scope the chat resources into a task_local so tools the agent calls
     // mid-ReAct (create_complex_task / check_run_status / cancel_run, Phase B3)
     // can reach pool/store/sink via `current_chat_resources()`.
@@ -173,6 +177,31 @@ async fn drive_chat_inner(
         // stream borrows the agent (same pattern as the GUI's normal chat path).
         let inner = agent.inner().clone();
         let guard = inner.read().await;
+        // P1.1: Chat 模式下,物理隐藏任务管理工具(不只是 prompt hint)。对标
+        // Claude Code plan mode = 工具子集 + 权限,非运行时状态机。
+        // set_disabled_tools 接收 &self(改的是 Arc<RwLock> 内部),所以 read guard
+        // 足够。Task/Auto 清除可能残留的 disabled 集(同一 pooled agent 上一轮
+        // Chat 设过)。
+        use crate::tasks::task_runtime::InteractionMode;
+        if interaction_mode == InteractionMode::Chat {
+            let hidden: std::collections::HashSet<String> = [
+                "task_create",
+                "task_update",
+                "task_complete",
+                "task_skip",
+                "task_list",
+                "execute_plan",
+                "create_complex_task",
+                "check_run_status",
+                "cancel_run",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+            guard.set_disabled_tools(Some(hidden));
+        } else {
+            guard.set_disabled_tools(None);
+        }
 
         // `with_run_context` is task-local and does not cross the framework's
         // forked subagent `tokio::spawn`; ExternalRunContext is the value-carried
@@ -332,6 +361,7 @@ mod tests {
             attachments: vec![],
             cancel,
             mode_hint: None,
+            interaction_mode: crate::tasks::task_runtime::InteractionMode::Auto,
             layer_manager: None,
         });
         drive_chat(&agent, "hi", None, res)
@@ -380,6 +410,7 @@ mod tests {
             attachments: vec![],
             cancel,
             mode_hint: Some("Chat — do not spawn tasks".to_string()),
+            interaction_mode: crate::tasks::task_runtime::InteractionMode::Chat,
             layer_manager: None,
         });
         drive_chat(&agent, "hi there", None, res)

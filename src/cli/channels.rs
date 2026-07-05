@@ -149,6 +149,7 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                 cancel,
                 // IM channels are always Auto (no mode selector); pure autonomy.
                 mode_hint: None,
+                interaction_mode: echo_agent_app_core::tasks::task_runtime::InteractionMode::Auto,
                 // B5.1: channels have no review/memory subsystem; autonomous run
                 // memory writes are no-ops (recall closure off).
                 layer_manager: None,

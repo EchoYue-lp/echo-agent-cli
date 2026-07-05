@@ -224,19 +224,9 @@ impl Tool for ExecutePlanTool {
                 Ok(id) => id,
                 Err(e) => return Ok(e),
             };
-            // P0-DIAG B1: per-invocation id so we can tell apart concurrent
-            // execute_plan calls sharing one turn_id (Q1: does the model fire
-            // multiple inline execute_plan in a single LLM turn?). The framework
-            // does not surface the real tool_call_id to tools, so allocate one.
-            let p0_tool_call_id = format!("p0-{}", uuid::Uuid::new_v4().as_simple());
             tracing::info!(
-                // P0-DIAG B1
-                p0_diag = "B1",
-                turn_id = %run_id,
                 run_id = %run_id,
-                tool_call_id = %p0_tool_call_id,
                 has_inline_task = params.contains_key("task"),
-                params_keys = ?params.keys().cloned().collect::<Vec<_>>(),
                 "execute_plan: start"
             );
 
@@ -279,8 +269,16 @@ impl Tool for ExecutePlanTool {
                 let conv = crate::chat_resources::current_chat_resources()
                     .and_then(|r| r.conv_id.clone())
                     .unwrap_or_else(|| format!("message:{run_id}"));
-                // 建 ad-hoc run。create_run 是幂等的:并发 inline task 共享同一
-                // run_id 时,只有第一个调用写 RunCreated,后续直接返回现有 run。
+                // P1.0: 每个 inline 派发用**独立 run_id**,不共享本轮 root_message_id。
+                // 原因:模型在同 turn 并发发多个 inline execute_plan(ReAct join_all),
+                // 若共享 run_id,第 1 个跑完把 run 推到 Completed(terminal,不可复活),
+                // 后续 inline 的 task 虽 insert 成功但 execute_run 被 NotRunning 拒绝
+                // (日志已确认此死锁)。独立 run_id 让每个 inline worker 有
+                // 自己的生命周期(started/running/completed 各自闭合),对标 Claude Code
+                // 的"独立 subagent 实例"。下游所有 run_id 引用(insert/lock/execute_run/
+                // summary)都用 shadow 后的这个值。
+                let run_id = format!("inline_{}", uuid::Uuid::new_v4().as_simple());
+                // 建 ad-hoc run(create_run 幂等性在此不再关键,因 run_id 已唯一)。
                 let run = match self.store.create_run(
                     &run_id,
                     "default",
@@ -342,28 +340,6 @@ impl Tool for ExecutePlanTool {
                         "execute_plan: insert inline task 失败: {e}"
                     )));
                 }
-                // P0-DIAG B4: did this inline insert happen, and how big is the
-                // plan now? Cross-checked against B7 (transition Completed) to
-                // answer Q2: are unresolved tasks still being inserted after the
-                // run already reached Completed?
-                let p0_plan_count_after = self
-                    .store
-                    .get_plan(&run_id)
-                    .ok()
-                    .flatten()
-                    .map(|p| p.tasks.len())
-                    .unwrap_or(0);
-                tracing::info!(
-                    // P0-DIAG B4
-                    p0_diag = "B4",
-                    turn_id = %run_id,
-                    run_id = %run_id,
-                    tool_call_id = %p0_tool_call_id,
-                    inserted_task_id = %task_id,
-                    is_inline = true,
-                    plan_task_count_after = p0_plan_count_after,
-                    "execute_plan: inline insert_task succeeded"
-                );
                 // 通知前端 run 已激活(send_chat_message 返回值不带 run_id,
                 // 前端靠此 RunStarted 事件触发 loadByConversation → 激活
                 // activeRun,否则 worker 卡片/任务进度/Token 面板全空)。
@@ -545,32 +521,9 @@ impl Tool for ExecutePlanTool {
                 "execute_plan: dispatching run_dag"
             );
             tracing::info!(run_id = %run_id, "execute_plan: waiting for run execution lock");
-            // P0-DIAG B2: capture wall-clock wait + the run state at the moment
-            // we acquire the per-run execution lock. Tells us whether lock
-            // waiters wake up to a Completed run (Q3 path) and how long they
-            // were blocked (signals contention among concurrent inline calls).
-            let p0_lock_wait_start = std::time::Instant::now();
             // RAII guard: 持锁 + Drop 时清理 RUN_EXECUTION_LOCKS entry (P1-1 修复)。
             let _run_guard = acquire_run_execution_lock(&run_id).await;
-            let p0_lock_wait_ms = p0_lock_wait_start.elapsed().as_millis();
-            let p0_state_at_acquire = self
-                .store
-                .get_run(&run_id)
-                .ok()
-                .flatten()
-                .map(|r| (r.status, has_unresolved_tasks(&self.store, &run_id)))
-                .unwrap_or((TaskRunStatus::Pending, false));
-            tracing::info!(
-                // P0-DIAG B2
-                p0_diag = "B2",
-                turn_id = %run_id,
-                run_id = %run_id,
-                tool_call_id = %p0_tool_call_id,
-                waited_ms = p0_lock_wait_ms,
-                run_status_at_acquire = ?p0_state_at_acquire.0,
-                unresolved_count_at_acquire = p0_state_at_acquire.1,
-                "execute_plan: acquired run execution lock"
-            );
+            tracing::info!(run_id = %run_id, "execute_plan: acquired run execution lock");
             if self
                 .store
                 .get_run(&run_id)
@@ -581,13 +534,7 @@ impl Tool for ExecutePlanTool {
             {
                 let summaries = build_run_summaries(&self.store, &run_id);
                 tracing::info!(
-                    // P0-DIAG B3 (true branch: lock waiter took the success early-out)
-                    p0_diag = "B3",
-                    turn_id = %run_id,
                     run_id = %run_id,
-                    tool_call_id = %p0_tool_call_id,
-                    completed_check = true,
-                    unresolved_count = false,
                     summary_chars = summaries.chars().count(),
                     "execute_plan: run already completed after waiting for lock"
                 );
@@ -595,20 +542,6 @@ impl Tool for ExecutePlanTool {
                     "计划执行完成。各 worker 的产出如下,请基于这些内容撰写最终答案:\n\n{summaries}"
                 )));
             }
-            // P0-DIAG B3 (false branch: did NOT take the success early-out, will
-            // fall through into execute_run — this is where Q3's NotRunning
-            // rejection would be observed via B5).
-            tracing::info!(
-                // P0-DIAG B3
-                p0_diag = "B3",
-                turn_id = %run_id,
-                run_id = %run_id,
-                tool_call_id = %p0_tool_call_id,
-                completed_check = false,
-                run_status_at_acquire = ?p0_state_at_acquire.0,
-                unresolved_count_at_acquire = p0_state_at_acquire.1,
-                "execute_plan: did NOT take completed early-out, proceeding to execute_run"
-            );
 
             // ── §10.1: 必须 await RunOutcome, 不得 fire-and-forget ──
             // G3 fix: read run_store from the primary agent instead of passing

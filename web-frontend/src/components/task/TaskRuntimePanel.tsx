@@ -416,7 +416,16 @@ export function TaskRuntimePanel() {
     () =>
       activeRun
         ? Object.values(traceRuns)
-            .filter((run) => run.runId === activeRun.run_id)
+            // P1.0: each inline worker now has its own run_id (independent of
+            // the chat turn's root_message_id). Show ALL worker runs that belong
+            // to this conversation, not just the single activeRun. Falls back to
+            // exact run_id match for non-inline (DAG) runs that don't carry a
+            // conversationId.
+            .filter(
+              (run) =>
+                run.runId === activeRun.run_id ||
+                run.conversationId === activeRun.conversation_id
+            )
             .sort((a, b) => a.startedAt - b.startedAt)
         : [],
     [activeRun, traceRuns]

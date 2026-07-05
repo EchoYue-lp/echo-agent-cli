@@ -178,28 +178,6 @@ fn emit_execution_event(
             map.insert(k, v);
         }
     }
-    // P0-DIAG B8b: TaskRuntime bridge emit. Note the subagent_run_id here is
-    // the LITERAL "main" for kind="subagent" (hardcoded above at line ~157),
-    // NOT the "{task_id}:{attempt}" that the framework bridge (B8a) uses.
-    // If both bridges fire for the same worker, the frontend store splits it
-    // into two records keyed "main" and "{task_id}:{attempt}" (Q4).
-    let p0_subagent_run_id = map
-        .get("subagent_run_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("<none>");
-    let p0_task_id = map.get("task_id").and_then(|v| v.as_str());
-    tracing::info!(
-        // P0-DIAG B8b
-        p0_diag = "B8b",
-        bridge = "taskruntime",
-        kind = %kind,
-        run_id = %run_id,
-        subagent_run_id = %p0_subagent_run_id,
-        task_id = ?p0_task_id,
-        event = %event,
-        agent = %agent,
-        "bridge-taskruntime emit execution://event"
-    );
     let _ = app.emit("execution://event", serde_json::Value::Object(map));
 }
 
@@ -594,27 +572,28 @@ pub async fn send_chat_message(
     // B4.3 (spec §8): per-turn mode hint. Chat → forbid create_complex_task;
     // Task → lean towards it; Auto → no hint (pure agent autonomy). Pure
     // prompt (prepended to the user text by drive_chat) — no code route branch.
-    let mode_hint = {
-        use echo_agent_app_core::tasks::task_runtime::InteractionMode;
-        let raw = state
-            .app_state
-            .tasks
-            .interaction_mode
-            .load(std::sync::atomic::Ordering::Relaxed);
-        match InteractionMode::from_u8(raw) {
-            InteractionMode::Chat => Some(
-                "Chat — this is a simple conversation. Do NOT call \
-                 create_complex_task; reply directly in this turn."
-                    .to_string(),
-            ),
-            InteractionMode::Task => Some(
-                "Task — the user expects involved work. When the request is \
-                 genuinely complex (multi-step / multi-file / long research), \
-                 prefer create_complex_task over a single inline reply."
-                    .to_string(),
-            ),
-            InteractionMode::Auto => None,
-        }
+    // P1.1: also resolve the InteractionMode itself so ChatResources can carry
+    // it for the tool-hiding logic in drive_chat.
+    use echo_agent_app_core::tasks::task_runtime::InteractionMode;
+    let raw = state
+        .app_state
+        .tasks
+        .interaction_mode
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let interaction_mode = InteractionMode::from_u8(raw);
+    let mode_hint = match interaction_mode {
+        InteractionMode::Chat => Some(
+            "Chat — this is a simple conversation. Do NOT call \
+             create_complex_task; reply directly in this turn."
+                .to_string(),
+        ),
+        InteractionMode::Task => Some(
+            "Task — the user expects involved work. When the request is \
+             genuinely complex (multi-step / multi-file / long research), \
+             prefer create_complex_task over a single inline reply."
+                .to_string(),
+        ),
+        InteractionMode::Auto => None,
     };
 
     let res = std::sync::Arc::new(echo_agent_app_core::chat_resources::ChatResources {
@@ -626,6 +605,7 @@ pub async fn send_chat_message(
         attachments: attachment_refs.clone(),
         cancel: cancel_token.clone(),
         mode_hint,
+        interaction_mode,
         // B5.1: wire the memory layer so create_complex_task's autonomous runs
         // block-write their completion memory (recall closure). None when the
         // review/memory subsystem isn't initialized (write becomes a no-op).
