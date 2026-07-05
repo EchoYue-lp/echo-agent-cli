@@ -5,7 +5,7 @@
 //! agent's ReAct reply through a per-mode `ChatSink`, and stops. It does NOT
 //! pre-judge normal vs complex. The per-turn TaskRuntime run is created only
 //! to give task tools and forked subagents one canonical run/trace context;
-//! the agent still decides whether to call `task_create`, `execute_plan`, or
+//! the agent still decides whether to call `plan_create`, `plan_execute`, or
 //! `create_complex_task` (Phase B3+).
 //!
 //! Multimodal is passed through (`Option<&Message>`) so TUI / channel can
@@ -31,7 +31,7 @@ pub trait ChatSink: Send + Sync + 'static {
     fn on_interrupt(&self, _run_id: &str, _goal: &str, _new_message: &str) {}
     /// Trace sink forwarded into the framework's external run context
     /// (`ExternalRunContext.trace_sink`) so tools running inside a spawned
-    /// task executor (e.g. `execute_plan`) can still reach
+    /// task executor (e.g. `plan_execute`) can still reach
     /// `CURRENT_TRACE_SINK` via `scoped_with_ctx_run_id`. The framework
     /// carries `serde_json::Value` (not the app's `ExecEvent`) to stay
     /// decoupled; the app re-deserializes on the way back out. GUI provides a
@@ -40,7 +40,7 @@ pub trait ChatSink: Send + Sync + 'static {
         None
     }
     /// Trace sink scoped into the task_local run context (`with_run_context`)
-    /// so the **main agent's** task_tools (`execute_plan`) can emit
+    /// so the **main agent's** task_tools (`plan_execute`) can emit
     /// [`crate::tasks::task_runtime::executor::ExecEvent`]s during a complex run.
     /// GUI provides a closure that rewrites the main-agent run_id + emits to
     /// the frontend's unified `execution://event` channel; non-GUI modes
@@ -56,14 +56,14 @@ pub trait ChatSink: Send + Sync + 'static {
 /// agent's reply through `sink`, and returns. No route pre-judgment; the
 /// per-turn TaskRuntime run is only the shared context anchor for task tools
 /// and forked subagents. The agent still decides whether a complex run is
-/// warranted by calling `task_create`, `execute_plan`, or
+/// warranted by calling `plan_create`, `plan_execute`, or
 /// `create_complex_task`.
 ///
 /// ## run_id scoping (防"真空区"死结)
 ///
 /// 普通 chat 轮次也包一层 `with_run_context`,用 `res.root_message_id` 作
 /// run_id。这样主 agent 在 ReAct 循环里调
-/// `task_create` / `execute_plan` / `create_complex_task` 等依赖
+/// `plan_create` / `plan_execute` / `create_complex_task` 等依赖
 /// `require_run_id()` 的工具时,能从 task_local 读到 run_id,不再被
 /// `"no active run — run_id not set in context"` 提前拒绝(对齐 Claude Code
 /// 的无门槛只读 dispatch)。
@@ -77,8 +77,8 @@ pub async fn drive_chat(
     multimodal: Option<&Message>,
     res: std::sync::Arc<crate::chat_resources::ChatResources>,
 ) -> Result<(), String> {
-    // Scope a per-turn run_id so task tools (task_create /
-    // execute_plan / create_complex_task) can read it via require_run_id().
+    // Scope a per-turn run_id so task tools (plan_create /
+    // plan_execute / create_complex_task) can read it via require_run_id().
     // Use root_message_id (unique per turn, set by all 3 callers); fall back to
     // a fresh uuid if a caller forgot to set it (defensive, never panics).
     let run_id = if res.root_message_id.trim().is_empty() {
@@ -91,7 +91,7 @@ pub async fn drive_chat(
     // Ensure the TaskRuntimeStore has a run record for this turn's run_id.
     // drive_chat scopes run_id=root_message_id into task_local so task_* tools
     // can read it, but without a create_run the store has no record → every
-    // task_create write becomes an orphan (no RunCreated event ancestor) and
+    // plan_create write becomes an orphan (no RunCreated event ancestor) and
     // rebuild_plan_from_events discards them → task_list returns empty.
     // Idempotent: skips if the run already exists (create_complex_task / a
     // resumed turn may have created it).
@@ -185,12 +185,12 @@ async fn drive_chat_inner(
         use crate::tasks::task_runtime::InteractionMode;
         if interaction_mode == InteractionMode::Chat {
             let hidden: std::collections::HashSet<String> = [
-                "task_create",
+                "plan_create",
                 "task_update",
                 "task_complete",
                 "task_skip",
                 "task_list",
-                "execute_plan",
+                "plan_execute",
                 "create_complex_task",
                 "check_run_status",
                 "cancel_run",
@@ -207,7 +207,7 @@ async fn drive_chat_inner(
         // forked subagent `tokio::spawn`; ExternalRunContext is the value-carried
         // channel that keeps worker tools and run_id on this same run. The
         // `trace_sink` here is the framework-Value form; `scoped_with_ctx_run_id`
-        // re-scopes it into `CURRENT_TRACE_SINK` for tools (e.g. execute_plan)
+        // re-scopes it into `CURRENT_TRACE_SINK` for tools (e.g. plan_execute)
         // running inside the framework's spawned tool executor.
         guard.set_external_context(&echo_core::tools::ExternalRunContext {
             run_id: run_id.clone(),

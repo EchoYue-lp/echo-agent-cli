@@ -8,8 +8,8 @@
 //! Phase 3.1: ALL cron tasks route through the unified TaskRuntime executor
 //! (`launch_cron_run`). The legacy `[plan]` prefix is stripped for backward
 //! compatibility but no longer selects a separate path — simple prompts are
-//! answered directly by the agent (auto-Completed when execute_plan isn't
-//! called); complex prompts drive task_create + execute_plan.
+//! answered directly by the agent (auto-Completed when plan_execute isn't
+//! called); complex prompts drive plan_create + plan_execute.
 
 use crate::agent_handle::AgentHandle;
 use crate::agent_pool::AgentPool;
@@ -34,7 +34,7 @@ const PLAN_MARKER: &str = "[plan]";
 /// Phase 3.1+: ALL cron prompts route through `launch_cron_run` (unified
 /// TaskRuntime executor, `Unattended`). The `[plan]` prefix is stripped for
 /// backward compatibility. Simple prompts are answered directly by the agent
-/// (auto-Completed); complex prompts drive task_create + execute_plan.
+/// (auto-Completed); complex prompts drive plan_create + plan_execute.
 ///
 /// Phase 3.5: the dead-in-practice `runtime_store=None` fallback (legacy
 /// `BackgroundTaskService::submit` + `execute_direct`) has been removed —
@@ -82,8 +82,8 @@ pub fn build_fire_fn(
             // drive_unattended_run is per-run and can't be clobbered by an
             // overlapping run. Pooled agents don't get ExecutePlanTool at
             // construction (built for workers, §10.2), so register it here —
-            // a cron run's agent plays the primary role (drives task_create +
-            // execute_plan), not a worker role.
+            // a cron run's agent plays the primary role (drives plan_create +
+            // plan_execute), not a worker role.
             let run_agent: AgentHandle = match &pool {
                 Some(pool) => {
                     let run_key = format!("__cron__:{}:{fire_id}", task.id);
@@ -92,7 +92,7 @@ pub fn build_fire_fn(
                             "cron pool acquire failed: {e}"
                         ))
                     })?;
-                    register_execute_plan_on_agent(&acquired, store.clone()).await;
+                    register_plan_execute_on_agent(&acquired, store.clone()).await;
                     acquired
                 }
                 None => fallback_agent.clone(),
@@ -119,11 +119,11 @@ pub fn build_fire_fn(
     })
 }
 
-/// Register the `execute_plan` tool on a cron run's pool-acquired agent
+/// Register the `plan_execute` tool on a cron run's pool-acquired agent
 /// (Phase C). Mirrors `desktop.rs`'s primary-agent registration. Pooled agents
 /// are built without it (worker stance, §10.2), but a cron run's agent drives
-/// task_create + execute_plan and needs it.
-async fn register_execute_plan_on_agent(agent_handle: &AgentHandle, store: Arc<TaskRuntimeStore>) {
+/// plan_create + plan_execute and needs it.
+async fn register_plan_execute_on_agent(agent_handle: &AgentHandle, store: Arc<TaskRuntimeStore>) {
     use crate::tasks::task_runtime::ExecutePlanTool;
     let tool = ExecutePlanTool::new(store, agent_handle.clone());
     let added = agent_handle
@@ -133,9 +133,9 @@ async fn register_execute_plan_on_agent(agent_handle: &AgentHandle, store: Arc<T
         })
         .await;
     if added {
-        tracing::debug!("Registered execute_plan tool on cron run agent");
+        tracing::debug!("Registered plan_execute tool on cron run agent");
     } else {
-        tracing::warn!("Failed to register execute_plan on cron run agent (write lock poisoned)");
+        tracing::warn!("Failed to register plan_execute on cron run agent (write lock poisoned)");
     }
 }
 

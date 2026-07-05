@@ -54,7 +54,12 @@ export function RightRail() {
 
   const visibleRuns = useMemo(() => {
     return Object.values(subagentRuns)
-      .filter((w) => !activeRun || w.runId === activeRun.run_id)
+      .filter(
+        (w) =>
+          !activeRun ||
+          w.runId === activeRun.run_id ||
+          w.conversationId === activeRun.conversation_id
+      )
       .sort((a, b) => a.startedAt - b.startedAt);
   }, [activeRun, subagentRuns]);
 

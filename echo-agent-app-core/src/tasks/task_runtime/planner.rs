@@ -13,7 +13,7 @@
 //!
 //! Previous plan generation functions (`generate_parallel_readonly_plan`,
 //! `generate_plan`) have been removed as part of the L1 path cleanup. Plans
-//! are now produced by the main agent ReAct loop via `task_create`.
+//! are now produced by the main agent ReAct loop via `plan_create`.
 
 use super::types::PlanTask;
 

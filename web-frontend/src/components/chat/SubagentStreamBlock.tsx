@@ -77,7 +77,7 @@ function reconstructSteps(events: ExecutionEvent[]): {
 
 function subagentResult(run: SubagentRunState): string {
   // SubagentRunState carries the final output directly (no need to dig it out
-  // of a `worker_completed` event payload like the legacy store did).
+  // of a completed subagent event payload like the legacy store did).
   if (run.output) return run.output;
   return run.events
     .filter((e) => e.event === 'token_delta')

@@ -105,7 +105,7 @@ pub struct SharedResources {
         Option<Arc<echo_agent::agent::react::run::pipeline::ToolExecutionPipeline>>,
     pub review_integration: Option<Arc<crate::evolution::ReviewIntegration>>,
     /// TaskRuntime store handle. When present, pool agents get the task
-    /// management tools (task_create/update/complete/skip/list) registered so
+    /// management tools (plan_create/update/complete/skip/list) registered so
     /// the main agent can autonomously manage its plan during execution.
     pub task_runtime_store: Option<Arc<crate::tasks::task_runtime::TaskRuntimeStore>>,
 }
@@ -198,7 +198,7 @@ pub struct AgentPool {
 
 impl AgentPool {
     /// Inject the TaskRuntimeStore so subsequently-created pool agents get
-    /// the task-management tools (task_create/update/complete/skip/list)
+    /// the task-management tools (plan_create/update/complete/skip/list)
     /// registered. Must be called before any pool agent is created (i.e. right
     /// after AppState builds the store). Existing pool agents are unaffected.
     pub fn set_task_runtime_store(
@@ -654,7 +654,7 @@ impl AgentPool {
             // Thread the TaskRuntimeStore so pooled agents get task-management
             // tools registered (matches the primary agent wiring).
             // route is intentionally None for pooled agents (workers never get
-            // execute_plan per §10.2).
+            // plan_execute per §10.2).
             task_runtime_store: self.shared.task_runtime_store.clone(),
             route: None,
         };
@@ -746,8 +746,8 @@ impl AgentPool {
         // 4. Wrap in AgentHandle
         let handle = AgentHandle::new(agent);
 
-        // (delegate_readonly 工具已删除:单步派发内联进 execute_plan。
-        // worker 不再注册 execute_plan——§10.2 防死锁;故 worker 无派发工具,
+        // (delegate_readonly 工具已删除:单步派发内联进 plan_execute。
+        // worker 不再注册 plan_execute——§10.2 防死锁;故 worker 无派发工具,
         // 需要子任务时自己用文件工具完成。)
 
         // 5. Configure HITL for this agent.
@@ -1079,7 +1079,7 @@ mod tests {
 
         assert!(
             !Arc::ptr_eq(task_a.inner(), task_b.inner()),
-            "parallel background tasks must use distinct worker agents"
+            "parallel background tasks must use distinct subagent agents"
         );
 
         let task_a_has_memory = task_a.read(|agent| agent.has_memory_layer_manager()).await;
@@ -1101,7 +1101,7 @@ mod tests {
         let task_b = pool.acquire("__task__:task-b").await;
         assert!(
             task_b.is_ok(),
-            "released task worker should free capacity for a later task"
+            "released task subagent should free capacity for a later task"
         );
         assert_eq!(pool.pool_size().await, 1);
     }

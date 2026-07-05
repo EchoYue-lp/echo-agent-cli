@@ -155,13 +155,13 @@ pub enum ExecError {
     NoPlan(String),
     #[error("run {0} is in state {1:?}, expected Running")]
     NotRunning(String, TaskRunStatus),
-    #[error("primary agent required to dispatch subagent workers")]
+    #[error("primary agent required to dispatch subagents")]
     NoAgent,
     #[error("store: {0}")]
     Store(#[from] StoreError),
     #[error("subagent dispatch failed: {0}")]
     Delegate(String),
-    #[error("worker execution failed: {0}")]
+    #[error("subagent execution failed: {0}")]
     Worker(String),
     #[error("{0}")]
     Other(String),
@@ -290,11 +290,11 @@ pub async fn execute_run(
         .await;
 
         if matches!(outcome, Ok(RunOutcome::Completed)) && has_unresolved_tasks(&store, run_id) {
-            // Inline execute_plan calls in the same LLM tool batch can append
+            // Inline plan_execute calls in the same LLM tool batch can append
             // tasks while this executor is already running. The holder of the
             // per-run execution lock is the authoritative drainer, so it must
             // re-read the plan and keep going instead of handing the tail to a
-            // later execute_plan call.
+            // later plan_execute call.
             drain_cycle = drain_cycle.saturating_add(1);
             tracing::info!(
                 run_id = %run_id,
@@ -527,7 +527,7 @@ impl TaskDispatcher for RealTaskDispatcher {
             let cancel = context.cancel;
             let delegation_policy = context.delegation_policy;
             // Scope run_id + cancel + trace_sink into task-local so worker-internal
-            // tools (task_*/execute_plan, and their execute_with_context
+            // tools (task_*/plan_execute, and their execute_with_context
             // fallback path) and L3 nested sub-workers can read them.
             // NOTE: trace_sink/cancel are also passed as explicit params to
             // execute_task (which uses them directly, not via task_local) — but
@@ -769,7 +769,7 @@ async fn run_dag<W: TaskDispatcher + 'static>(
                 Err(join_err) => {
                     wave_results.push(Err((
                         "<join>".to_string(),
-                        format!("worker task panicked: {join_err}"),
+                        format!("subagent task panicked: {join_err}"),
                     )));
                 }
             }
@@ -1166,17 +1166,17 @@ async fn execute_task(
             run_id = %run_id,
             task_id = %task_id,
             available = worker_sem.available_permits(),
-            "task_runtime: waiting for worker permit"
+            "task_runtime: waiting for subagent permit"
         );
         let wp = tokio::select! {
             biased;
-            _ = task_cancel.cancelled() => return Err((task_id.clone(), "cancelled while waiting for worker permit".to_string())),
+            _ = task_cancel.cancelled() => return Err((task_id.clone(), "cancelled while waiting for subagent permit".to_string())),
             p = worker_sem.acquire() => p.map_err(|e| (task_id.clone(), e.to_string()))?,
         };
         tracing::info!(
             run_id = %run_id,
             task_id = %task_id,
-            "task_runtime: acquired worker permit"
+            "task_runtime: acquired subagent permit"
         );
         (Some(wp), None, None)
     };
@@ -1430,7 +1430,7 @@ async fn execute_task(
                     task_id = %task_id,
                     role = %task.agent_role,
                     error = %e,
-                    "writer worker dispatch failed; falling back to in-place main-agent execution"
+                    "writer subagent dispatch failed; falling back to in-place main-agent execution"
                 );
                 (
                     run_main_agent_task(
@@ -1466,7 +1466,9 @@ async fn execute_task(
     if is_read_only_task && result.is_ok() {
         let usage_payload = match &readonly_usage {
             Some(stats) => stats.to_payload(&run_id),
-            None => unavailable_llm_usage_payload("provider_returned_no_usage_for_readonly_worker"),
+            None => {
+                unavailable_llm_usage_payload("provider_returned_no_usage_for_readonly_subagent")
+            }
         };
         if let Err(error) = store.record_worker_llm_usage(
             &run_id,
@@ -1480,7 +1482,7 @@ async fn execute_task(
                 run_id = %run_id,
                 task_id = %task_id,
                 error = %error,
-                "failed to persist read-only worker LLM usage"
+                "failed to persist read-only subagent LLM usage"
             );
         }
         emit_exec(
@@ -1500,7 +1502,7 @@ async fn execute_task(
         Ok(text) => {
             let suggested_tasks = extract_suggested_tasks_from_worker_output(&text);
             // The worker's full output is stored in TaskExecutionSummary.completed_work
-            // (read by build_run_summaries → main agent's execute_plan ToolResult) and
+            // (read by build_run_summaries → main agent's plan_execute ToolResult) and
             // returned as the task summary (used by the review gate for write tasks and
             // stored on todo.summary for archival). No truncation: the main agent needs
             // the complete material to write its final answer.
@@ -1654,6 +1656,86 @@ fn normalize_suggested_task(raw: RawSuggestedTask) -> Option<SuggestedTask> {
     })
 }
 
+fn normalized_task_title_tokens(title: &str) -> HashSet<String> {
+    const STOP_WORDS: &[&str] = &[
+        "the",
+        "and",
+        "for",
+        "with",
+        "this",
+        "that",
+        "current",
+        "project",
+        "echo",
+        "agent",
+        "analyze",
+        "analysis",
+        "focus",
+        "architecture",
+    ];
+
+    let mut normalized = String::new();
+    let mut last_was_space = false;
+    for ch in title.chars() {
+        for lower in ch.to_lowercase() {
+            if lower.is_alphanumeric() {
+                normalized.push(lower);
+                last_was_space = false;
+            } else if !last_was_space {
+                normalized.push(' ');
+                last_was_space = true;
+            }
+        }
+    }
+
+    normalized
+        .split_whitespace()
+        .filter(|token| token.chars().count() >= 3)
+        .filter(|token| !STOP_WORDS.contains(token))
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn normalized_task_title_text(title: &str) -> String {
+    let mut normalized = String::new();
+    let mut last_was_space = false;
+    for ch in title.chars() {
+        for lower in ch.to_lowercase() {
+            if lower.is_alphanumeric() {
+                normalized.push(lower);
+                last_was_space = false;
+            } else if !last_was_space {
+                normalized.push(' ');
+                last_was_space = true;
+            }
+        }
+    }
+    normalized.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn task_titles_look_duplicate(candidate: &str, existing: &str) -> bool {
+    let candidate_text = normalized_task_title_text(candidate);
+    let existing_text = normalized_task_title_text(existing);
+    if candidate_text.is_empty() || existing_text.is_empty() {
+        return false;
+    }
+    if candidate_text == existing_text
+        || candidate_text.contains(&existing_text)
+        || existing_text.contains(&candidate_text)
+    {
+        return true;
+    }
+
+    let candidate_tokens = normalized_task_title_tokens(candidate);
+    let existing_tokens = normalized_task_title_tokens(existing);
+    let min_tokens = candidate_tokens.len().min(existing_tokens.len());
+    if min_tokens < 2 {
+        return false;
+    }
+    let overlap = candidate_tokens.intersection(&existing_tokens).count();
+    overlap.saturating_mul(100) >= min_tokens.saturating_mul(60)
+}
+
 fn append_suggested_tasks_to_plan(
     store: &Arc<TaskRuntimeStore>,
     run_id: &str,
@@ -1663,14 +1745,32 @@ fn append_suggested_tasks_to_plan(
     if suggestions.is_empty() {
         return;
     }
-    let existing_ids: HashSet<String> = store
+    let existing_tasks = store
         .get_plan(run_id)
         .ok()
         .flatten()
-        .map(|plan| plan.tasks.into_iter().map(|task| task.id).collect())
+        .map(|plan| plan.tasks)
         .unwrap_or_default();
+    let existing_ids: HashSet<String> = existing_tasks.iter().map(|task| task.id.clone()).collect();
+    let mut seen_titles: Vec<String> = existing_tasks
+        .iter()
+        .map(|task| task.title.clone())
+        .collect();
     let mut after_task_id = Some(parent.id.clone());
     for suggestion in suggestions.iter().take(MAX_SUGGESTED_TASKS_PER_WORKER) {
+        if seen_titles
+            .iter()
+            .any(|title| task_titles_look_duplicate(&suggestion.title, title))
+        {
+            tracing::info!(
+                run_id = %run_id,
+                parent_task_id = %parent.id,
+                suggested_title = %suggestion.title,
+                "task_runtime: skipped duplicate subagent-suggested task"
+            );
+            continue;
+        }
+
         let mut depends_on: Vec<String> = suggestion
             .dependencies
             .iter()
@@ -1699,16 +1799,17 @@ fn append_suggested_tasks_to_plan(
                     run_id = %run_id,
                     parent_task_id = %parent.id,
                     suggested_task_id = %new_task_id,
-                    "task_runtime: appended worker-suggested task"
+                    "task_runtime: appended subagent-suggested task"
                 );
                 after_task_id = Some(new_task_id);
+                seen_titles.push(suggestion.title.clone());
             }
             Err(e) => {
                 tracing::warn!(
                     run_id = %run_id,
                     parent_task_id = %parent.id,
                     error = %e,
-                    "task_runtime: failed to append worker-suggested task"
+                    "task_runtime: failed to append subagent-suggested task"
                 );
             }
         }
@@ -1828,7 +1929,7 @@ fn build_task_prompt(
     }
     if task.kind.is_read_only() {
         s.push_str(
-            "You are a READ-ONLY worker. Do NOT modify files or run mutating shell commands. \
+            "You are a READ-ONLY subagent. Do NOT modify files or run mutating shell commands. \
              Report findings concretely with file paths.\n",
         );
     } else {
@@ -1887,7 +1988,7 @@ async fn run_readonly_worker(
             let message_id = message_id.map(|s| s.to_string());
             let core_trace_sink = worker_trace_sink_to_core(trace_sink);
             Box::pin(async move {
-                agent.set_external_context(&echo_core::tools::ExternalRunContext {
+                let runtime_context = Some(echo_core::tools::ExternalRunContext {
                     run_id: run_id.clone(),
                     execution_id: Some(execution_id),
                     message_id,
@@ -1895,12 +1996,17 @@ async fn run_readonly_worker(
                     trace_sink: core_trace_sink,
                     delegation_policy: Some(delegation_policy),
                 });
-                let result = agent
-                    .delegate_to_agent_with_parent_and_cancel(&role, &prompt, &run_id, cancel, 0)
+                agent
+                    .delegate_to_agent_with_parent_context_and_cancel(
+                        &role,
+                        &prompt,
+                        &run_id,
+                        cancel,
+                        0,
+                        runtime_context,
+                    )
                     .await
-                    .map_err(|e| format!("subagent dispatch failed: {e}"));
-                agent.clear_external_context();
-                result
+                    .map_err(|e| format!("subagent dispatch failed: {e}"))
             })
         })
         .await
@@ -1914,11 +2020,11 @@ fn worker_trace_sink_to_core(
     // `ExternalRunContext.trace_sink`. The app's `scoped_with_ctx_run_id`
     // (task_tools.rs) reads `ctx.trace_sink` back and re-scopes it into
     // `CURRENT_TRACE_SINK` so tools running inside a spawned task (e.g.
-    // `execute_plan`) can emit execution-flow events.
+    // `plan_execute`) can emit execution-flow events.
     //
     // Subagent dispatch itself does NOT use this path — it goes through
     // `SubagentEventBus`. This conversion is only for the main-agent tool path
-    // (execute_plan / task_create) that runs inside the framework's spawned
+    // (plan_execute / plan_create) that runs inside the framework's spawned
     // tool executor and needs to reach the trace_sink.
     trace_sink.map(|sink| {
         Arc::new(move |value: serde_json::Value| {
@@ -1976,7 +2082,7 @@ async fn run_writer_worker(
             let run_message = run_message.clone();
             let core_trace_sink = worker_trace_sink_to_core(trace_sink);
             Box::pin(async move {
-                agent.set_external_context(&echo_core::tools::ExternalRunContext {
+                let runtime_context = Some(echo_core::tools::ExternalRunContext {
                     run_id: run_id.clone(),
                     execution_id: Some(execution_id),
                     message_id: root_message_id,
@@ -1984,22 +2090,31 @@ async fn run_writer_worker(
                     trace_sink: core_trace_sink,
                     delegation_policy: Some(delegation_policy),
                 });
-                let result = if let Some(msg) = run_message {
+                if let Some(msg) = run_message {
                     agent
-                        .delegate_to_agent_with_parent_cancel_and_message(
-                            &role, &prompt, msg, &run_id, cancel, 0,
+                        .delegate_to_agent_with_parent_context_cancel_and_message(
+                            &role,
+                            &prompt,
+                            msg,
+                            &run_id,
+                            cancel,
+                            0,
+                            runtime_context,
                         )
                         .await
                 } else {
                     agent
-                        .delegate_to_agent_with_parent_and_cancel(
-                            &role, &prompt, &run_id, cancel, 0,
+                        .delegate_to_agent_with_parent_context_and_cancel(
+                            &role,
+                            &prompt,
+                            &run_id,
+                            cancel,
+                            0,
+                            runtime_context,
                         )
                         .await
                 }
-                .map_err(|e| format!("writer worker dispatch failed: {e}"));
-                agent.clear_external_context();
-                result
+                .map_err(|e| format!("writer subagent dispatch failed: {e}"))
             })
         })
         .await
@@ -2160,7 +2275,7 @@ async fn run_main_agent_task(
                                     run_id = %run_id,
                                     task_id = %task_id,
                                     error = %error,
-                                    "failed to persist worker LLM usage"
+                                    "failed to persist subagent LLM usage"
                                 );
                             }
                             emit_exec(
@@ -2321,18 +2436,18 @@ fn save_trace(
 /// background AgentChat) and route.
 ///
 /// Creates a run, then drives the agent's ReAct loop in the run's context so
-/// the agent itself calls `task_create` (to materialise the plan) and
-/// `execute_plan` (which internally calls `execute_run`). Simple prompts that
-/// the agent answers directly (without `execute_plan`) auto-Complete.
+/// the agent itself calls `plan_create` (to materialise the plan) and
+/// `plan_execute` (which internally calls `execute_run`). Simple prompts that
+/// the agent answers directly (without `plan_execute`) auto-Complete.
 ///
 /// **Why not call `execute_run` directly?** `execute_run` requires a plan to
 /// already exist (`store.get_plan → NoPlan` if absent). The plan is created
-/// by the agent during its ReAct loop via the `task_create` tool. Skipping
+/// by the agent during its ReAct loop via the `plan_create` tool. Skipping
 /// the agent loop would leave the plan empty and the run would fail
 /// immediately. This mirrors how `launch_unified_run` (chat path) works.
 ///
 /// The run is created with `attended_mode = Unattended` so the preflight
-/// checks (CP A/B) and approval-gate skip activate inside `execute_plan` /
+/// checks (CP A/B) and approval-gate skip activate inside `plan_execute` /
 /// `execute_task`.
 #[allow(clippy::too_many_arguments)] // run identity + agent + cancel + route all thread through; matches run_dag style
 pub async fn launch_unattended_run(
@@ -2386,7 +2501,7 @@ pub async fn launch_unattended_run(
 /// finalize its status from the store. Phase 3.4: extracted from
 /// `launch_unattended_run` so the caller can own the run_id (create_run +
 /// transition_run happen in the caller). This fn only drives the agent's
-/// ReAct loop (which may call task_create + execute_plan) and finalizes the
+/// ReAct loop (which may call plan_create + plan_execute) and finalizes the
 /// run status (auto-Complete a direct answer, auto-Fail an unexpected Paused).
 ///
 /// U1c stage 2 (D7): when `write_mode == Worktree` and `repo_root` is given,
@@ -2500,7 +2615,7 @@ pub async fn drive_unattended_run(
     };
 
     // Drive the agent's ReAct loop in the run's context. The agent will call
-    // task_create (to build the plan) and execute_plan (which internally calls
+    // plan_create (to build the plan) and plan_execute (which internally calls
     // execute_run). The Unattended attended_mode (set by the caller at
     // create_run) ensures preflight checks and approval-gate skip activate.
     let run_id_for_scope = run_id.to_string();
@@ -2547,7 +2662,7 @@ pub async fn drive_unattended_run(
             }
 
             // Execute the prompt. The agent's ReAct loop will call
-            // task_create + execute_plan, which runs the plan through
+            // plan_create + plan_execute, which runs the plan through
             // execute_run with all safety gates (preflight, approval skip).
             match agent
                 .execute_stream_with_cancel(&prompt_owned, cancel_for_scope.clone())
@@ -2588,7 +2703,7 @@ pub async fn drive_unattended_run(
     )
     .await;
 
-    // Determine final outcome from the store (execute_plan/execute_run
+    // Determine final outcome from the store (plan_execute/execute_run
     // may have already transitioned the run to a terminal state).
     let final_status = store.get_run(run_id).ok().flatten().map(|r| r.status);
 
@@ -2688,9 +2803,9 @@ pub async fn drive_unattended_run(
         }
         _ => {
             // Still Running or unknown — the agent finished its stream
-            // without execute_plan transitioning the run to a terminal
+            // without plan_execute transitioning the run to a terminal
             // state (e.g. agent returned a direct answer without calling
-            // execute_plan). Mark as Completed or Cancelled.
+            // plan_execute). Mark as Completed or Cancelled.
             if child_cancel.is_cancelled() {
                 let _ = store.transition_run(run_id, TaskRunStatus::Cancelled);
             } else {
@@ -2755,9 +2870,9 @@ const UNATTENDED_READONLY_TOOLS: &[&str] = &[
     "glob",
     "code_search",
     "task_list",
-    "task_create", // plan construction only (not execution)
+    "plan_create", // plan construction only (not execution)
     "task_update",
-    "execute_plan", // plan materialisation trigger
+    "plan_execute", // plan materialisation trigger
     // Read-only network (§A = A2)
     "web_search",
     "web_fetch",
@@ -2914,6 +3029,90 @@ Read the runtime path and found one missing branch.
     }
 
     #[test]
+    fn suggested_task_title_duplicate_detects_project_word_variation() {
+        assert!(task_titles_look_duplicate(
+            "Analyze the **task system** of echo-agent project. Focus on runtime todos.",
+            "Analyze the **task system** of echo-agent. Focus on task runtime."
+        ));
+        assert!(task_titles_look_duplicate(
+            "Analyze the **configuration and skills system** of echo-agent project.",
+            "Analyze the **configuration and skills system** of echo-agent."
+        ));
+        assert!(!task_titles_look_duplicate(
+            "Analyze the frontend runtime state.",
+            "Analyze the configuration and skills system."
+        ));
+    }
+
+    #[test]
+    fn append_suggested_tasks_skips_existing_plan_titles() -> Result<(), String> {
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|e| e.to_string())?);
+        store
+            .create_run(
+                "r-dedupe",
+                "ws",
+                "c1",
+                "m1",
+                DomainProfile::General,
+                "analyze project",
+                "",
+                AttendedMode::Attended,
+            )
+            .map_err(|e| e.to_string())?;
+
+        let parent = PlanTask {
+            id: "t-parent".into(),
+            title: "Analyze backend runtime".into(),
+            description: "Inspect runtime architecture.".into(),
+            kind: PlanTaskKind::Investigation,
+            agent_role: "explorer".into(),
+            ..Default::default()
+        };
+        let existing = PlanTask {
+            id: "t-task-system".into(),
+            title: "Analyze the **task system** of echo-agent. Focus on task runtime.".into(),
+            description: "Inspect plan creation and execution.".into(),
+            kind: PlanTaskKind::Investigation,
+            agent_role: "explorer".into(),
+            ..Default::default()
+        };
+        store
+            .attach_plan(&TaskPlan {
+                plan_id: "p-dedupe".into(),
+                run_id: "r-dedupe".into(),
+                domain_profile: DomainProfile::General,
+                goal: "analyze project".into(),
+                assumptions: vec![],
+                risks: vec![],
+                execution_mode: ExecutionMode::Parallel,
+                tasks: vec![parent.clone(), existing],
+            })
+            .map_err(|e| e.to_string())?;
+
+        append_suggested_tasks_to_plan(
+            &store,
+            "r-dedupe",
+            &parent,
+            &[SuggestedTask {
+                title: "Analyze the **task system** of echo-agent project. Focus on todos.".into(),
+                description: "Duplicate of an existing task-system analysis task.".into(),
+                kind: PlanTaskKind::Investigation,
+                agent_role: "explorer".into(),
+                dependencies: vec!["t-parent".into()],
+                why_needed: "Subagent thinks this is still needed.".into(),
+                risk: "low".into(),
+            }],
+        );
+
+        let plan = store
+            .get_plan("r-dedupe")
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "expected plan after append".to_string())?;
+        assert_eq!(plan.tasks.len(), 2);
+        Ok(())
+    }
+
+    #[test]
     fn preflight_disabled_rejects_write_tools() {
         // B1: under Disabled, tools outside the readonly allowlist are rejected.
         let task = preflight_task("t1", PlanTaskKind::Investigation, &["write_file"], &[]);
@@ -3001,7 +3200,7 @@ Read the runtime path and found one missing branch.
     async fn launch_unattended_run_returns_run_id() {
         // Phase 3.4-1: launch_unattended_run must return the run_id so callers
         // (submit) can hand it to the Tauri layer. A simple prompt (mock returns
-        // "ok", agent never calls execute_plan) auto-Completes (Q5).
+        // "ok", agent never calls plan_execute) auto-Completes (Q5).
         use echo_agent::testing::MockLlmClient;
         use std::sync::Arc;
         let store = Arc::new(TaskRuntimeStore::new_in_memory().expect("in-memory store"));
@@ -3033,7 +3232,7 @@ Read the runtime path and found one missing branch.
         .await
         .expect("unattended run should succeed");
         // The returned id must key a real run that auto-Completed (the mock
-        // returns a direct answer, so execute_plan never runs and the finalize
+        // returns a direct answer, so plan_execute never runs and the finalize
         // branch auto-Completes — this verifies the contract survived the
         // extraction: a non-empty id that maps to a Completed run).
         let run = store
@@ -3571,12 +3770,12 @@ Read the runtime path and found one missing branch.
             other => panic!("expected Failed (stall), got {:?}", other),
         }
         // Nothing should have been dispatched.
-        assert!(worker.order().is_empty(), "worker ran on a cyclic plan");
+        assert!(worker.order().is_empty(), "subagent ran on a cyclic plan");
     }
 
     #[tokio::test]
     async fn run_dag_does_not_redispatch_in_flight_running_tasks() {
-        // Regression: when the model emits several `execute_plan` calls as a
+        // Regression: when the model emits several `plan_execute` calls as a
         // parallel tool batch, `RUN_EXECUTION_LOCKS` serializes them. The 2nd
         // call enters run_dag while an earlier task is still `Running`
         // (dispatched by the previous run_dag instance). Without the in_flight

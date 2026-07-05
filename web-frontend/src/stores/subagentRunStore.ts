@@ -78,9 +78,9 @@ export interface SubagentRunState {
   task?: string;
   mode?: string;
   /** Conversation this run belongs to (captured from run_started's
-   * conversation_id). Used by TaskRuntimePanel to show ALL inline worker runs
+   * conversation_id). Used by TaskRuntimePanel to show ALL inline subagent runs
    * in the current conversation, not just the single activeRun (P1.0: each
-   * inline worker now has its own run_id). */
+   * inline subagent now has its own run_id). */
   conversationId?: string;
   status: SubagentRunStatus;
   startedAt: number;
@@ -133,7 +133,7 @@ export const useSubagentRunStore = create<SubagentRunStore>((set) => ({
       const newStatus = statusFromEvent(ev.event);
       // P1.0: capture conversation_id (present on run_started; carried via the
       // ExecutionEvent's index signature). Persists on the run record so
-      // TaskRuntimePanel can group all inline worker runs per conversation.
+      // TaskRuntimePanel can group all inline subagent runs per conversation.
       const evConvId = ev.conversation_id as string | undefined;
       // Lazily create the run on first sight (any event may arrive first in
       // principle, though `started` normally does).

@@ -1,7 +1,7 @@
 //! Domain profile templates.
 //!
 //! Each profile customizes the universal task methodology (plan templates,
-//! seed worker roles, plan-prompt suffix, review checklist) for a domain.
+//! seed subagent roles, plan-prompt suffix, review checklist) for a domain.
 //! The profile does NOT replace the methodology — it specializes it.
 //!
 //! See the plan's "Domain Profiles" section. These templates are consumed by
@@ -16,8 +16,8 @@ pub struct ProfileTemplate {
     pub key: &'static str,
     /// Human-readable label.
     pub label: &'static str,
-    /// Seed worker roles for this domain. These are defaults, not hard
-    /// boundaries; real tasks may blend workers from every capability area.
+    /// Seed subagent roles for this domain. These are defaults, not hard
+    /// boundaries; real tasks may blend subagents from every capability area.
     pub default_worker_roles: &'static [&'static str],
     /// Extra instructions appended to the plan-generation prompt to steer the
     /// LLM toward domain-appropriate tasks, artifacts, and verification.
@@ -93,7 +93,7 @@ pub const WORKER_CAPABILITY_CATALOG: &[(&str, &str)] = &[
     ),
     (
         "summarizer",
-        "cross-worker synthesis into conclusions, plan, or delivery notes",
+        "cross-subagent synthesis into conclusions, plan, or delivery notes",
     ),
 ];
 
@@ -135,11 +135,11 @@ This is a software-engineering workspace. Split work into read-only review / \
 investigation tasks (parallelizable) and implementation tasks (serialized). \
 Every implementation task must list concrete file paths and a verification \
 step (cargo check / npm build / relevant tests). Read-only work is delegated \
-to registered capability workers; implementation/debugging tasks are NOT \
-delegated to a worker — the main agent performs writes directly, serially and \
+to registered capability subagents; implementation/debugging tasks are NOT \
+delegated to a subagent — the main agent performs writes directly, serially and \
 approval-gated. So only assign read-only kinds (read_only_review, \
-investigation, test_plan, review, summary) a worker role from the registered \
-set. Coding tasks can still use data, research, or medical workers when the \
+investigation, test_plan, review, summary) a subagent role from the registered \
+set. Coding tasks can still use data, research, or medical subagents when the \
 actual goal crosses those boundaries.",
     workflows: CODING_WORKFLOWS,
     review_checklist: &[
@@ -162,9 +162,9 @@ This is a data-analysis task. Make data provenance explicit. Split work into \
 profiling, cleaning, analysis, and reproducibility checks. Every \
 transformation must be reproducible from a script or notebook artifact. \
 Flag missing values, outliers, and metric-definition inconsistencies. Avoid \
-conclusions overfit to a convenient subset of the data. Use coding workers \
+conclusions overfit to a convenient subset of the data. Use coding subagents \
 when the analysis depends on scripts/notebooks/packages, and research or \
-medical workers when the data question depends on external evidence.",
+medical subagents when the data question depends on external evidence.",
     workflows: UNIVERSAL_WORKFLOWS,
     review_checklist: &[
         "Data source and provenance are clear?",
@@ -186,8 +186,8 @@ This is an academic-research task. Make the search strategy explicit. Every \
 claim must cite a real, verifiable source. Distinguish study types and state \
 evidence level where possible. Include disagreements and limitations. Do not \
 let claims exceed the strength of the underlying evidence. Output an evidence \
-table and a bibliography artifact. Use data-analysis workers when papers, \
-datasets, statistics, or plots need scrutiny; use coding workers when the \
+table and a bibliography artifact. Use data-analysis subagents when papers, \
+datasets, statistics, or plots need scrutiny; use coding subagents when the \
 research includes reproducible code, tools, notebooks, or implementation.",
     workflows: UNIVERSAL_WORKFLOWS,
     review_checklist: &[
@@ -212,8 +212,8 @@ Distinguish guideline / systematic-review / trial types and state evidence \
 level. Make uncertainty explicit. NEVER present a diagnosis or treatment as \
 medical advice — include a non-diagnostic disclaimer where appropriate. \
 Every clinical statement must be directly supported by a reliable citation. \
-Use data-analysis workers for cohorts, datasets, statistics, or biomedical \
-tables, and coding workers for notebooks, scripts, pipelines, or tool review.",
+Use data-analysis subagents for cohorts, datasets, statistics, or biomedical \
+tables, and coding subagents for notebooks, scripts, pipelines, or tool review.",
     workflows: UNIVERSAL_WORKFLOWS,
     review_checklist: &[
         "Authoritative sources prioritized?",
@@ -260,7 +260,7 @@ mod tests {
             for required in t.default_worker_roles {
                 assert!(
                     ALL_WORKER_ROLES.iter().any(|r| r == required),
-                    "{profile:?} profile references unregistered worker {required}"
+                    "{profile:?} profile references unregistered subagent {required}"
                 );
             }
             assert!(
@@ -277,7 +277,7 @@ mod tests {
                 .iter()
                 .filter(|(catalog_role, _)| catalog_role == role)
                 .count();
-            assert_eq!(matches, 1, "worker {role} must be described exactly once");
+            assert_eq!(matches, 1, "subagent {role} must be described exactly once");
         }
     }
 }

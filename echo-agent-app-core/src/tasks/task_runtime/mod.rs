@@ -17,13 +17,13 @@
 //!   `RuntimeTaskEvent`, `Artifact`, `ReviewResult`, `TaskExecutionSummary`).
 //! - [`store`] — `TaskRuntimeStore`, the SQLite-backed canonical store. Every
 //!   state mutation appends a `RuntimeTaskEvent` inside the same transaction.
-//! - [`profiles`] — per-domain plan templates (worker roles, prompt suffix,
+//! - [`profiles`] — per-domain plan templates (subagent roles, prompt suffix,
 //!   review checklist).
 //! - [`classify`] — input classifier (simple vs complex) + domain inference.
 //! - [`planner`] — structured plan generation via a JSON-mode LLM call, with
 //!   plan-quality validation.
 //! - [`executor`] — DAG scheduler that runs an approved plan on pooled
-//!   workers with concurrency limits, write serialization, and cancellation.
+//!   subagents with concurrency limits, write serialization, and cancellation.
 //! - [`review`] — review gates (spec + code quality) + retry circuit breaker.
 //! - [`ledger`] — progress.md export, derived from the canonical SQLite state.
 //! - [`hitrisk`] — high-risk argument re-checker (forces fresh approval even

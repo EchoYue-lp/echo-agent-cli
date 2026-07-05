@@ -26,9 +26,9 @@ use std::process::Command;
 /// Branch-name prefix reserved for unattended-run worktrees.
 pub const BRANCH_PREFIX: &str = "eko-unattended-";
 
-/// Branch-name prefix reserved for Fork-dispatched worker worktrees (Sprint 8).
+/// Branch-name prefix reserved for Fork-dispatched subagent worktrees (Sprint 8).
 /// Distinct from [`BRANCH_PREFIX`] so list/merge/discard can tell unattended-run
-/// worktrees apart from interactive Fork-worker worktrees.
+/// worktrees apart from interactive Fork-subagent worktrees.
 pub const FORK_BRANCH_PREFIX: &str = "eko-fork-";
 
 /// A worktree descriptor as surfaced by `git worktree list --porcelain`.
@@ -280,14 +280,14 @@ impl RunWorktree {
         Self::create_with_prefix(BRANCH_PREFIX, run_id, repo_root, "unattended run")
     }
 
-    /// Create a worktree for a Fork-dispatched worker (Sprint 8).
+    /// Create a worktree for a Fork-dispatched subagent (Sprint 8).
     ///
     /// Like [`create`](Self::create) but uses the [`FORK_BRANCH_PREFIX`]
-    /// namespace so Fork-worker worktrees stay distinct from unattended-run
+    /// namespace so Fork-subagent worktrees stay distinct from unattended-run
     /// worktrees in `git worktree list`. `label` identifies the dispatch
     /// (e.g. `"{agent_name}-{run_id}"`).
     pub fn create_fork(label: &str, repo_root: &Path) -> Result<Self, WorktreeError> {
-        Self::create_with_prefix(FORK_BRANCH_PREFIX, label, repo_root, "fork worker")
+        Self::create_with_prefix(FORK_BRANCH_PREFIX, label, repo_root, "fork subagent")
     }
 
     /// Shared core for [`create`] and [`create_fork`].
@@ -520,17 +520,17 @@ pub fn discard_unattended_worktree(repo_root: &Path, run_id: &str) -> Result<(),
     Ok(())
 }
 
-// ── Fork-worker worktree factory (Sprint 8) ──────────────────────────────
+// ── Fork-subagent worktree factory (Sprint 8) ────────────────────────────
 
 /// EKO's application-layer implementation of the framework's
 /// `WorktreeFactory` trait. Constructs a git worktree per Fork-dispatched
-/// writer worker (via [`RunWorktree::create_fork`]) and finalizes with a
+/// writer subagent (via [`RunWorktree::create_fork`]) and finalizes with a
 /// `git diff` summary (kept for human review — no auto-merge, Q1 alignment
 /// with the unattended path and Claude Code).
 ///
 /// Stored behind an `Arc` and injected into the framework's
 /// `AgentConfig.subagent_worktree_factory`, so the framework can create
-/// worktrees for workers declaring `isolate_worktree: true` without the
+/// worktrees for subagents declaring `isolate_worktree: true` without the
 /// framework itself depending on git or the application.
 #[derive(Debug, Clone)]
 pub struct EkoWorktreeFactory {
@@ -559,7 +559,7 @@ impl echo_agent::agent::subagent::worktree::WorktreeFactory for EkoWorktreeFacto
             worker_label = label,
             worktree = %path.display(),
             branch = %wt.branch,
-            "Created Fork-worker worktree"
+            "Created Fork-subagent worktree"
         );
         // `finalize` owns `wt`: generates the diff summary (kept for review —
         // no remove). The worktree stays on disk for the user to merge/discard
@@ -585,18 +585,18 @@ impl EkoWorktreeFactory {
     }
 }
 
-// ── Data-worker workspace factory (Sprint 10) ────────────────────────────
+// ── Data-subagent workspace factory (Sprint 10) ──────────────────────────
 
 /// EKO's application-layer implementation of the framework's
-/// `DataWorkspaceFactory` trait. Creates a per-worker `tempfile::TempDir`
+/// `DataWorkspaceFactory` trait. Creates a per-subagent `tempfile::TempDir`
 /// (disjoint working directory, NO git coupling) for Fork-dispatched
-/// data/research workers emitting generated artifacts (CSVs/parquet/charts).
+/// data/research subagents emitting generated artifacts (CSVs/parquet/charts).
 ///
 /// Unlike `EkoWorktreeFactory` (git-coupled, diff-finalize), this gives each
-/// worker an isolated tmpdir whose lifecycle is: create → worker writes
+/// subagent an isolated tmpdir whose lifecycle is: create → subagent writes
 /// disjoint output files into it → finalize lists those files (so the
 /// orchestrator/analyst can concat+synthesize). The TempDir is KEPT across
-/// the run (not auto-cleaned on finalize) so a downstream analyst worker can
+/// the run (not auto-cleaned on finalize) so a downstream analyst subagent can
 /// read the shards; it is dropped (cleaned) only when the handle itself is
 /// dropped, which happens after finalize returns.
 ///
@@ -604,7 +604,7 @@ impl EkoWorktreeFactory {
 /// `AgentConfig.subagent_data_workspace_factory`.
 #[derive(Debug, Clone)]
 pub struct EkoDataWorkspaceFactory {
-    /// Optional parent dir under which worker tmpdirs are created. `None`
+    /// Optional parent dir under which subagent tmpdirs are created. `None`
     /// uses the OS temp dir (`std::env::temp_dir()`). Keeping workspaces under
     /// a known parent aids debugging/cleanup.
     pub base_dir: Option<PathBuf>,
@@ -644,8 +644,8 @@ impl echo_agent::agent::subagent::workspace::DataWorkspaceFactory for EkoDataWor
             ))
         })?;
 
-        // KEEP the tmpdir from auto-cleanup: a downstream analyst worker may
-        // need to read this worker's output shards after this dispatch returns.
+        // KEEP the tmpdir from auto-cleanup: a downstream analyst subagent may
+        // need to read this subagent's output shards after this dispatch returns.
         // `keep()` consumes the TempDir without removing it; cleanup is then
         // the application/user's responsibility (or a future sweep).
         let final_path = dir.keep();
@@ -653,7 +653,7 @@ impl echo_agent::agent::subagent::workspace::DataWorkspaceFactory for EkoDataWor
         tracing::info!(
             worker_label = label,
             workspace = %final_path.display(),
-            "Created Fork-data-worker workspace (tmpdir, kept for collect)"
+            "Created Fork-data-subagent workspace (tmpdir, kept for collect)"
         );
 
         let path_for_finalize = final_path.clone();

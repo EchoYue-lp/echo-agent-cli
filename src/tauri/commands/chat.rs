@@ -143,7 +143,7 @@ fn emit_chat_event(
 /// or "subagent" (task-scoped execution flow: Thinking/Tool/Token/Usage).
 ///
 /// `subagent_run_id` is the aggregation key the frontend store uses to group a
-/// worker's events into one card. It MUST match the framework bridge
+/// subagent's events into one card. It MUST match the framework bridge
 /// (`src/tauri/mod.rs`), which emits the bare `task_id` (NOT `"{task_id}:{attempt}"`
 /// — the attempt suffix was dropped so retry attempts fold into one card, matching
 /// how Claude Code/Codex display subagents). For `kind == "run"` (run-level
@@ -416,7 +416,7 @@ pub async fn send_chat_message(
         let saved =
             echo_agent_app_core::attachments::save_attachments(&saved_attachments, &uploads_dir);
         // Build refs (path + name + mime) for binding to the run so plan-level
-        // workers can rebuild the multimodal message later.
+        // subagents can rebuild the multimodal message later.
         let refs: Vec<_> = saved
             .iter()
             .map(|(path, att)| {
@@ -569,9 +569,9 @@ pub async fn send_chat_message(
     // the spinner / terminal badge for the chat reply itself.
     sink.on_run_status("running");
 
-    // B4.3 (spec §8): per-turn mode hint. Chat → forbid create_complex_task;
-    // Task → lean towards it; Auto → no hint (pure agent autonomy). Pure
-    // prompt (prepended to the user text by drive_chat) — no code route branch.
+    // B4.3 / P1.2: per-turn mode hint. Tool availability is still enforced by
+    // drive_chat / plan_execute; this prompt gives the model the matching
+    // behavior contract without introducing a runtime planning state machine.
     // P1.1: also resolve the InteractionMode itself so ChatResources can carry
     // it for the tool-hiding logic in drive_chat.
     use echo_agent_app_core::tasks::task_runtime::InteractionMode;
@@ -583,17 +583,23 @@ pub async fn send_chat_message(
     let interaction_mode = InteractionMode::from_u8(raw);
     let mode_hint = match interaction_mode {
         InteractionMode::Chat => Some(
-            "Chat — this is a simple conversation. Do NOT call \
-             create_complex_task; reply directly in this turn."
+            "Chat mode — task runtime tools are unavailable in this turn. \
+             Reply directly with ordinary chat/tool usage; do not create or execute a task plan."
                 .to_string(),
         ),
         InteractionMode::Task => Some(
-            "Task — the user expects involved work. When the request is \
-             genuinely complex (multi-step / multi-file / long research), \
-             prefer create_complex_task over a single inline reply."
+            "Task mode — use formal plan execution. First create explicit PlanTask items with \
+             plan_create, then call plan_execute() with no task argument to run the DAG. \
+             Do not use plan_execute({task}) inline single-subagent dispatch in Task mode."
                 .to_string(),
         ),
-        InteractionMode::Auto => None,
+        InteractionMode::Auto => Some(
+            "Auto mode — classify the request yourself. For simple chat, answer directly. \
+             For high-noise research or broad codebase inspection, you may use inline \
+             plan_execute({task}) subagents. For multi-step / multi-file / long-running work, \
+             create a formal plan with plan_create and then plan_execute()."
+                .to_string(),
+        ),
     };
 
     let res = std::sync::Arc::new(echo_agent_app_core::chat_resources::ChatResources {
@@ -783,7 +789,7 @@ pub async fn send_selection_response(
 }
 
 /// GUI `ChatSink`: bridges the shared `drive_chat` stream to the Tauri frontend
-/// by emitting `ChatEvent`s + worker trace events.
+/// by emitting `ChatEvent`s + subagent trace events.
 ///
 /// This is the GUI equivalent of the TUI/channel `ChatSink`: the whole chat
 /// turn (normal reply + any complex runs the agent autonomously spins up via
@@ -897,10 +903,10 @@ impl echo_agent_app_core::chat_driver::ChatSink for TauriChatSink {
         // main-agent task stream) to the unified `execution://event` channel.
         // Run-level events (task_id None) → kind="run"; task-level events
         // (task_id Some) → kind="subagent" keyed by the task_id (NOT a hardcoded
-        // "main"), so each worker's lifecycle events aggregate with its own
+        // "main"), so each subagent's lifecycle events aggregate with its own
         // thinking/tool/usage stream (which the framework bridge emits under
         // the same bare task_id). The old code hardcoded "main" here, which
-        // collided all workers into one store record and broke the todo join.
+        // collided all subagents into one store record and broke the todo join.
         // Note: the normal chat-turn thinking/tool stream does NOT go through
         // this sink — it goes through `chat://event` via agent_event_to_chat_event.
         // This sink only fires for events emitted by `execute_run` /
@@ -932,7 +938,7 @@ impl echo_agent_app_core::chat_driver::ChatSink for TauriChatSink {
 
     fn trace_sink(&self) -> Option<echo_core::tools::TraceSinkFn> {
         // Bridge the framework's Value-based trace_sink to worker_trace_sink
-        // so tools running inside a spawned task executor (e.g. execute_plan)
+        // so tools running inside a spawned task executor (e.g. plan_execute)
         // can reach CURRENT_TRACE_SINK via scoped_with_ctx_run_id.
         let ws = self.worker_trace_sink()?;
         Some(std::sync::Arc::new(move |value: serde_json::Value| {

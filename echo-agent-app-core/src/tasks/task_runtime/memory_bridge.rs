@@ -27,7 +27,7 @@ use super::types::*;
 ///
 /// `execute_run` takes one of these so each caller can pick the delivery
 /// guarantee that matches its UX:
-/// - `None` — never write (cron / DAG / execute_plan tool: no recall closure
+/// - `None` — never write (cron / DAG / plan_execute tool: no recall closure
 ///   needed today; their results surface via other channels).
 /// - `FireAndForget` — write in a detached task, return immediately (the two
 ///   GUI Tauri commands `resume_task_run` / `execute_task_run`: behavior

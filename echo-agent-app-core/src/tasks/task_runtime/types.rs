@@ -18,7 +18,7 @@ use ts_rs::TS;
 
 // ── Domain profile ──────────────────────────────────────────────────────
 
-/// Cross-domain profile that customizes plan templates, worker roles,
+/// Cross-domain profile that customizes plan templates, subagent roles,
 /// allowed tools, review checklists, and verification standards.
 ///
 /// Selection order (resolved by the planning runtime, PR 2):
@@ -562,7 +562,7 @@ pub enum RuntimeEventKind {
     RunCreated,
     RunStatusChanged,
     /// User-uploaded attachments were bound to this run (so plan-level
-    /// workers can see the same images/files as the main agent).
+    /// subagents can see the same images/files as the main agent).
     RunAttachmentsUpdated,
     PlanGenerated,
     PlanEdited,
@@ -667,11 +667,11 @@ pub struct TaskRun {
     pub plan_id: Option<String>,
     pub route: String,
     /// Whether a human is present (Attended) or this is a cron/IM trigger
-    /// (Unattended). Drives safety-gate behaviour in execute_plan /
+    /// (Unattended). Drives safety-gate behaviour in plan_execute /
     /// executor.  Default: Attended (chat behaviours unchanged).
     pub attended_mode: AttendedMode,
-    /// User-uploaded attachments shared across all workers in this run (so
-    /// plan-level workers see the same images/files as the main agent).
+    /// User-uploaded attachments shared across all subagents in this run (so
+    /// plan-level subagents see the same images/files as the main agent).
     /// Empty for text-only runs. `#[serde(default)]` keeps old run files
     /// readable. TS-skipped — this is backend-only state (paths on disk),
     /// not consumed by the frontend.
@@ -851,7 +851,7 @@ pub struct Artifact {
     pub metadata: serde_json::Value,
 }
 
-// ── SubagentRun(执行实例,原 Worker 概念的归一化载体)──────────────────────
+// ── SubagentRun(执行实例,原执行体概念的归一化载体)──────────────────────
 //
 // Subagent 统一重构(spec: docs/subagent-unification-plan.md):一次 subagent
 // 派发的运行实例。Task → SubagentRun 关联通过 task_id 查询投影得到,PlanTask
@@ -862,7 +862,7 @@ pub struct Artifact {
 // 透传,不再由 tauri bridge 临时分配(消除双账本)。
 
 /// Lifecycle status of a [`SubagentRun`]. Mirrors the coarse states the
-/// frontend already renders for the legacy "worker" concept, minus the
+/// frontend already renders for the unified subagent concept, minus the
 /// pending state (a SubagentRun only exists once dispatch has started).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
@@ -920,7 +920,7 @@ pub struct SubagentRunUsage {
 /// can route thinking/tool/token streams without temporary id allocation.
 ///
 /// Thinking/tool/token streams are NOT persisted here (they remain an
-/// in-memory + realtime stream, matching the legacy Worker behavior). Only
+/// in-memory + realtime stream, matching the legacy execution behavior). Only
 /// lifecycle + usage + result are durable.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, rename = "SubagentRun")]
@@ -1024,7 +1024,7 @@ impl IssueSeverity {
 }
 
 /// Compact per-task summary produced at every task boundary. Downstream
-/// workers consume this instead of the full raw conversation — see the
+/// subagents consume this instead of the full raw conversation — see the
 /// "Summary Chain" section of the plan.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, rename = "TaskExecutionSummary")]
@@ -1068,7 +1068,7 @@ impl TaskExecutionSummary {
     }
 }
 
-/// A bounded follow-up task proposed by a worker. Workers may suggest new work,
+/// A bounded follow-up task proposed by a subagent. Subagents may suggest new work,
 /// but only the TaskRuntime appends it to the canonical plan.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, rename = "SuggestedTask")]

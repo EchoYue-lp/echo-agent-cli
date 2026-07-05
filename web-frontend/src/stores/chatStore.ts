@@ -37,7 +37,7 @@ interface ChatState {
   currentRound: CurrentRound | null;
 
   addUserMessage: (content: string, attachments?: ChatMessage['attachments']) => void;
-  startAssistantMessage: () => string;
+  startAssistantMessage: (idOverride?: string) => string;
   appendToken: (id: string, token: string) => void;
   appendThinking: (id: string, token: string) => void;
   startThinkingSegment: (id: string) => void;
@@ -124,8 +124,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
     scheduleAutoSave();
   },
 
-  startAssistantMessage: () => {
-    const id = nextId();
+  startAssistantMessage: (idOverride) => {
+    const id = idOverride || nextId();
     set((s) => ({
       messages: trimToMax([
         ...s.messages,

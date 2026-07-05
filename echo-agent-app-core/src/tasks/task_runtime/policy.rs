@@ -142,7 +142,7 @@ impl ExecutionPolicy {
     fn router_behavior(&self) -> &'static str {
         match self.interaction_mode {
             InteractionMode::Chat => "强制普通对话，不进入 TaskRuntime。",
-            InteractionMode::Task => "强制进入 TaskRuntime；只读大任务会优先并行 worker。",
+            InteractionMode::Task => "强制进入 TaskRuntime；只读大任务会优先并行 subagent。",
             InteractionMode::Auto => {
                 "由语义路由、确定性信号和历史反馈共同决定 Chat 或 TaskRuntime。"
             }
@@ -151,8 +151,8 @@ impl ExecutionPolicy {
 
     fn parallel_behavior(&self) -> &'static str {
         match self.interaction_mode {
-            InteractionMode::Chat => "Chat 模式不会自动派生 worker。",
-            InteractionMode::Task => "Task 模式会为可并行只读任务生成 runtime-owned worker。",
+            InteractionMode::Chat => "Chat 模式不会自动派生 subagent。",
+            InteractionMode::Task => "Task 模式会为可并行只读任务生成 runtime-owned subagent。",
             InteractionMode::Auto => {
                 "Auto 模式会在项目分析、代码审查、研究综述、数据画像等只读大任务上自动并行。"
             }

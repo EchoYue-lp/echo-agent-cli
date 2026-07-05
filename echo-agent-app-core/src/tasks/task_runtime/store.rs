@@ -50,7 +50,7 @@ pub struct TaskRuntimeStore {
     /// Per-task cancellation tokens (in-memory runtime state, not persisted).
     /// Key = `"{run_id}::{task_id}"`. `execute_task` registers a token when a
     /// task starts and removes it on completion; `remove_task` cancels the
-    /// token of a running task so its worker stops promptly (rather than the
+    /// token of a running task so its subagent stops promptly (rather than the
     /// status flipping to Skipped while execution continues).
     task_cancel_tokens:
         std::sync::Mutex<std::collections::HashMap<String, echo_agent::agent::CancellationToken>>,
@@ -62,14 +62,14 @@ pub struct TaskRuntimeStore {
         std::sync::Mutex<std::collections::HashMap<String, echo_agent::agent::CancellationToken>>,
     /// File shadow (U1c phase-0/0bc). The read/write authority for all task data.
     shadow: std::sync::Arc<super::file_shadow::FileTaskShadow>,
-    /// In-memory LLM usage records (token spend per worker call). Not persisted
+    /// In-memory LLM usage records (token spend per subagent call). Not persisted
     /// —重启清零,符合 EKO 本地工具定位(usage 是参考指标,非账本)。
     usage_records: std::sync::Mutex<Vec<super::types::UsageRecord>>,
     /// Per-run plan/state 写互斥锁 (F2-1 / F3-3 / F3-4)。
     ///
     /// insert_task / attach_plan / update_plan_task / transition_run 都是
     /// "读文件 → 改 → 重写文件"三步, 此前无锁 → EKO 写工具默认并行执行
-    /// (react_loop.rs:415, 仅 approval 工具串行), task_create + execute_plan
+    /// (react_loop.rs:415, 仅 approval 工具串行), plan_create + plan_execute
     /// 可能并发覆写 plan.json。加 per-run Mutex 串行化同一 run 的所有 plan/run
     /// 变更 (对标调研结论: 进程内 Mutex 兜底, 同时防崩溃中态)。不同 run 互不影响。
     plan_locks: dashmap::DashMap<String, std::sync::Arc<std::sync::Mutex<()>>>,
@@ -212,7 +212,7 @@ impl TaskRuntimeStore {
         })
     }
 
-    /// Bind user-uploaded attachments to a run so plan-level workers see the
+    /// Bind user-uploaded attachments to a run so plan-level subagents see the
     /// same images/files as the main agent.
     ///
     /// Follows the event-sourcing pattern: append a `RunAttachmentsUpdated`
@@ -293,11 +293,11 @@ impl TaskRuntimeStore {
 
     // ── Task-level cancellation (gap-2 fix) ───────────────────────────────
     // These are in-memory runtime tokens, NOT persisted. They let remove_task
-    // stop a running task's worker promptly instead of leaving it executing
+    // stop a running task's subagent promptly instead of leaving it executing
     // after the status has flipped to Skipped.
 
     /// Register a cancellation token for a task that is about to start running.
-    /// Called by the executor before dispatching the worker. The token is a
+    /// Called by the executor before dispatching the subagent. The token is a
     /// child of the run-level cancel, so run cancel still propagates.
     pub fn register_task_cancel_token(
         &self,
@@ -320,7 +320,7 @@ impl TaskRuntimeStore {
         }
     }
 
-    /// Cancel a specific task's worker (if running). Called by remove_task /
+    /// Cancel a specific task's subagent (if running). Called by remove_task /
     /// update_task when a running task is being skipped or fundamentally
     /// changed. No-op if the task isn't currently running (no token registered).
     pub fn cancel_task(&self, run_id: &str, task_id: &str) {
@@ -382,7 +382,7 @@ impl TaskRuntimeStore {
         after_task_id: Option<String>,
         task: PlanTask,
     ) -> Result<(), StoreError> {
-        // F2-1: 串行化该 run 的 plan 变更, 防 task_create 并发覆写 plan.json。
+        // F2-1: 串行化该 run 的 plan 变更, 防 plan_create 并发覆写 plan.json。
         self.with_run_lock(run_id, || {
             // U1c phase-0/0bc step-2: file authority. Read the current plan from
             // the file (bootstrapping an empty plan if none exists), validate deps,
@@ -1031,7 +1031,7 @@ impl TaskRuntimeStore {
         Ok(())
     }
 
-    /// Persist a provider-reported LLM usage event for a worker.
+    /// Persist a provider-reported LLM usage event for a subagent.
     ///
     /// This is intentionally a low-frequency structured event rather than raw
     /// token streaming. The event goes to the file authority (events.jsonl) for

@@ -320,9 +320,9 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
         let task_runtime_store = build_task_runtime_store_for_headless();
 
         // TUI/GUI functional parity (AGENTS.md): register the task-management
-        // tools (create_complex_task / execute_plan / task_create… / cancel_run)
+        // tools (create_complex_task / plan_execute / plan_create… / cancel_run)
         // on the primary agent so TUI can drive complex tasks just like GUI
-        // (desktop.rs). execute_plan absorbs the single-step dispatch semantics
+        // (desktop.rs). plan_execute absorbs the single-step dispatch semantics
         // via its inline `task` parameter (delegate_readonly tool removed).
         if let Some(store) = task_runtime_store.clone() {
             echo_agent_app_core::tasks::task_runtime::register_task_tools_on_agent(

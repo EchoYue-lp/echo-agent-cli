@@ -37,7 +37,7 @@ pub type TraceSink = Arc<dyn Fn(ExecEvent) + Send + Sync>;
 
 /// Shared map of approval signals for ComplexRuntime runs (spec §10.5).
 /// Stores `Arc<Notify>` handles keyed by `run_id` so the Tauri
-/// `resume_task_run` command can wake the waiting `execute_plan` tool instead
+/// `resume_task_run` command can wake the waiting `plan_execute` tool instead
 /// of bypassing it (which would cause TWO concurrent execute_run calls).
 pub(crate) static APPROVAL_NOTIFIES: LazyLock<DashMap<String, Arc<Notify>>> =
     LazyLock::new(DashMap::new);
@@ -47,12 +47,12 @@ pub fn register_approval_signal(run_id: &str, signal: Arc<Notify>) {
     APPROVAL_NOTIFIES.insert(run_id.to_string(), signal);
 }
 
-/// Remove an approval signal after the execute_plan tool has been woken.
+/// Remove an approval signal after the plan_execute tool has been woken.
 pub fn remove_approval_signal(run_id: &str) {
     APPROVAL_NOTIFIES.remove(run_id);
 }
 
-/// Notify a waiting `execute_plan` tool to resume. Returns `true` if a signal
+/// Notify a waiting `plan_execute` tool to resume. Returns `true` if a signal
 /// was found and notified, `false` if the run_id has no registered signal
 /// (the caller should fall back to a direct execution path).
 pub fn notify_approval_signal(run_id: &str) -> bool {
@@ -68,10 +68,10 @@ pub fn notify_approval_signal(run_id: &str) -> bool {
 
 tokio::task_local! {
     /// The run_id of the currently executing task run. Set by the executor via
-    /// [`with_run_context`] around the worker dispatch so tools can read it.
+    /// [`with_run_context`] around the subagent dispatch so tools can read it.
     pub static CURRENT_RUN_ID: String;
     /// The cancel token for the currently executing task run. Set alongside
-    /// CURRENT_RUN_ID so execute_plan and other tools can read it.
+    /// CURRENT_RUN_ID so plan_execute and other tools can read it.
     pub static CURRENT_CANCEL: tokio_util::sync::CancellationToken;
     /// Delegate nesting depth — incremented each time a subagent is delegated
     /// during tool execution. Used by Task 6 (L3 nesting) to prevent runaway
@@ -153,10 +153,10 @@ pub(crate) fn require_run_id() -> std::result::Result<String, ToolResult> {
 
 /// 从 ToolContext 优先读 run_id(跨 spawn 安全),回退 task_local(主 agent scope)。
 ///
-/// 这是根治 task_local 跨 tokio::spawn 断裂的关键:worker 在框架层 dispatch_fork
+/// 这是根治 task_local 跨 tokio::spawn 断裂的关键:subagent 在框架层 dispatch_fork
 /// 的 spawn 里执行,task_local 全部丢失;但 ToolContext 是值传递(经 dispatch_fork
 /// → set_external_context → pipeline 填入),跨 spawn 安全。工具 override
-/// `execute_with_context` 后用此 helper 读 run_id,主 agent 和 worker 都能拿到。
+/// `execute_with_context` 后用此 helper 读 run_id,主 agent 和 subagent 都能拿到。
 #[allow(clippy::result_large_err)] // ToolResult is the framework error type; boxing would touch every caller
 pub(crate) fn run_id_from_ctx_or_local(
     ctx: &echo_core::tools::ToolContext,
@@ -170,7 +170,7 @@ pub(crate) fn run_id_from_ctx_or_local(
 /// 在 ToolContext.run_id/trace_sink(若有)的 task_local 覆盖作用域内执行 f。
 ///
 /// 这样工具既有的 `execute`(读 task_local 的 require_run_id)无需改动即可在
-/// worker 场景工作:execute_with_context 调本函数包住原 execute,ctx.run_id 被
+/// subagent 场景工作:execute_with_context 调本函数包住原 execute,ctx.run_id 被
 /// 临时注入 task_local,require_run_id 读到的是 ToolContext 的值(跨 spawn 安全)。
 /// ctx.run_id 为 None 时直接执行 f(回退原 task_local,主 agent 场景)。
 ///
@@ -284,13 +284,13 @@ fn parse_kind(s: &str) -> PlanTaskKind {
     }
 }
 
-/// 按 task kind 推导默认 agent_role(映射到 infra.rs 注册的 worker 角色)。
+/// 按 task kind 推导默认 agent_role(映射到 infra.rs 注册的 subagent 角色)。
 ///
 /// 必要性:PlanTask 的 agent_role 默认是 "general",但框架只注册了 13 个具体角色
 /// (project_explorer/code_reviewer/...),委派 "general" 必然 "Subagent not found"。
 /// 只读 kind(read_only_review/investigation/test_plan/review/summary)委派给对应
-/// 只读 worker;变更 kind(implementation/debugging/verification)由主 agent 直接
-/// 执行(不委派 worker),用 "primary" 占位(run_readonly_worker 不会触及)。
+/// 只读 subagent;变更 kind(implementation/debugging/verification)由主 agent 直接
+/// 执行(不委派 subagent),用 "primary" 占位(run_readonly_worker 不会触及)。
 /// Map a plan-task kind to the registered subagent name that should run it.
 ///
 /// SA-3 collapsed the old 13 specialized subagents (`project_explorer` /
@@ -301,7 +301,7 @@ fn parse_kind(s: &str) -> PlanTaskKind {
 /// every read-only plan task fails with "Subagent 'X' not found".
 ///
 /// Read-only kinds (read_only_review / investigation / test_plan / review /
-/// summary) delegate to the matching generic worker; mutating kinds
+/// summary) delegate to the matching generic subagent; mutating kinds
 /// (implementation / debugging / verification) are executed directly by the
 /// main agent (`executor.rs::run_main_agent_task`), so the role here is only
 /// a record label that `run_readonly_worker` never touches.
@@ -313,7 +313,7 @@ fn role_for_kind(kind: PlanTaskKind) -> &'static str {
         PlanTaskKind::Review => "reviewer",
         PlanTaskKind::Summary => "summarizer",
         // Sprint 9: code-writing kinds route to the registered "implementer"
-        // Fork worker (runs in an isolated worktree). The role string IS the
+        // Fork subagent (runs in an isolated worktree). The role string IS the
         // registered subagent name (executor delegates by literal match).
         PlanTaskKind::Implementation | PlanTaskKind::Debugging => "implementer",
         // Verification (shell/build/test) stays on the primary agent: it runs
@@ -340,7 +340,7 @@ mod role_routing_tests {
     #[test]
     fn code_writer_kinds_route_to_implementer() {
         // Sprint 9: Implementation/Debugging dispatch to the registered writer
-        // worker (runs in an isolated worktree).
+        // subagent (runs in an isolated worktree).
         assert_eq!(role_for_kind(PlanTaskKind::Implementation), "implementer");
         assert_eq!(role_for_kind(PlanTaskKind::Debugging), "implementer");
     }
@@ -354,7 +354,7 @@ mod role_routing_tests {
     }
 }
 
-// ── task_create ───────────────────────────────────────────────────────────
+// ── plan_create ───────────────────────────────────────────────────────────
 
 pub struct TaskCreateTool {
     pub store: Arc<TaskRuntimeStore>,
@@ -362,12 +362,12 @@ pub struct TaskCreateTool {
 
 impl Tool for TaskCreateTool {
     fn name(&self) -> &str {
-        "task_create"
+        "plan_create"
     }
 
     fn description(&self) -> &str {
-        "Create a new task in the current plan. Use when you discover \
-         additional work is needed during execution."
+        "Create or append a PlanTask in the current formal plan. Use this to \
+         materialize a task plan before calling plan_execute."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -546,7 +546,7 @@ impl TaskCreateTool {
                 serde_json::json!({
                     "goal": goal,
                     "route": "agent_task_plan",
-                    "source": "task_create",
+                    "source": "plan_create",
                 }),
             ));
         }
@@ -566,12 +566,12 @@ fn task_goal(title: &str, description: &str) -> String {
 
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)] // complex-task tool impls below are production code; moving them is churn
-mod task_create_tests {
+mod plan_create_tests {
     use super::super::types::RuntimeEventKind;
     use super::*;
 
     #[tokio::test]
-    async fn task_create_bootstraps_run_before_plan_events() -> std::result::Result<(), String> {
+    async fn plan_create_bootstraps_run_before_plan_events() -> std::result::Result<(), String> {
         let shadow_root = tempfile::tempdir().map_err(|e| e.to_string())?;
         let store = Arc::new(
             TaskRuntimeStore::new_in_memory_with_shadow_root(shadow_root.path())
@@ -580,7 +580,7 @@ mod task_create_tests {
         let tool = TaskCreateTool {
             store: store.clone(),
         };
-        let run_id = "run_task_create_bootstrap";
+        let run_id = "run_plan_create_bootstrap";
         let mut params = ToolParameters::new();
         params.insert(
             "title".to_string(),
@@ -599,7 +599,7 @@ mod task_create_tests {
             .await
             .map_err(|e| e.to_string())?;
         if !result.success {
-            return Err(format!("task_create failed: {:?}", result.error));
+            return Err(format!("plan_create failed: {:?}", result.error));
         }
 
         let events = store.list_events(run_id, 0).map_err(|e| e.to_string())?;
@@ -626,7 +626,7 @@ mod task_create_tests {
 // Run when it judges a task complex. Reads pool/store/sink from the chat
 // turn's task_local (`current_chat_resources`, scoped by `drive_chat`), so it
 // only works during an active chat turn. `reason` is required as a CoT
-// anti-misfire gate (spec §4.2). foreground blocks the turn + streams worker
+// anti-misfire gate (spec §4.2). foreground blocks the turn + streams subagent
 // events (Claude Code Task style); background spawns + returns run_id (spec §6
 // 主从异步). Default background (spec §4.1 Priority Trap).
 
@@ -649,9 +649,9 @@ impl Tool for CreateComplexTaskTool {
             "properties": {
                 "user_goal": { "type": "string", "description": "The user's full goal (verbatim or distilled), as the Run's goal." },
                 "reason": { "type": "string", "description": "Why this is complex. List the complexity signals hit: multi_step / needs_research / needs_code_gen / long_running / multi_file. Anti-abuse audit." },
-                "domain_profile": { "type": "string", "enum": ["general","ai_coding","data_analysis","academic_research","medical_research"], "description": "Domain. Determines worker roles / review checklist." },
-                "plan_mode": { "type": "string", "enum": ["plan_then_execute","direct_execute"], "description": "plan_then_execute = task_create a plan first (reviewable) then execute_plan; direct_execute = agent ReActs autonomously in the Run." },
-                "initial_plan": { "type": "array", "items": { "type": "object", "properties": { "step_name": {"type":"string"}, "expected_outcome": {"type":"string"} }, "required": ["step_name"] }, "description": "Optional coarse decomposition (>=2 steps) as a brief. Not the PlanTask DAG — the Run's agent refines via task_create." },
+                "domain_profile": { "type": "string", "enum": ["general","ai_coding","data_analysis","academic_research","medical_research"], "description": "Domain. Determines subagent roles / review checklist." },
+                "plan_mode": { "type": "string", "enum": ["plan_then_execute","direct_execute"], "description": "plan_then_execute = plan_create a plan first (reviewable) then plan_execute; direct_execute = agent ReActs autonomously in the Run." },
+                "initial_plan": { "type": "array", "items": { "type": "object", "properties": { "step_name": {"type":"string"}, "expected_outcome": {"type":"string"} }, "required": ["step_name"] }, "description": "Optional coarse decomposition (>=2 steps) as a brief. Not the PlanTask DAG — the Run's agent refines via plan_create." },
                 "priority": { "type": "string", "enum": ["foreground","background"], "default": "background", "description": "Default background (returns run_id immediately, non-blocking). foreground only for <1min tasks where you need the result in this turn (blocks the UI until done)." }
             }
         })
@@ -815,7 +815,7 @@ impl CreateComplexTaskTool {
         };
 
         if priority == "foreground" {
-            // Block the turn: drive_run_async streams worker events to the chat
+            // Block the turn: drive_run_async streams subagent events to the chat
             // sink (via trace_sink), returns the terminal RunOutcome so the
             // agent can use the result in-turn (Claude Code Task style).
             match crate::run_driver::drive_run_async(payload).await {

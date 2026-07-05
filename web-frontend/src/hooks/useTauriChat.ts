@@ -107,19 +107,24 @@ export function useTauriChat() {
   }, [handleEvent]);
 
   const sendMessage = useCallback(async (text: string, attachments?: Attachment[]) => {
-    const store = useChatStore.getState();
-    const displayAttachments = attachments?.map((a) => ({
-      name: a.name,
-      mime_type: a.mime_type,
-      url: `data:${a.mime_type};base64,${a.data}`,
-      size: a.size,
-    }));
-    store.addUserMessage(text || '(附件)', displayAttachments);
+      const store = useChatStore.getState();
+      const displayAttachments = attachments?.map((a) => ({
+        name: a.name,
+        mime_type: a.mime_type,
+        url: `data:${a.mime_type};base64,${a.data}`,
+        size: a.size,
+      }));
+      store.addUserMessage(text || '(附件)', displayAttachments);
 
-    try {
-      isCancelledRef.current = false;
-      thinkingIdRef.current = null;
-      assistantIdRef.current = store.startAssistantMessage();
+      try {
+        isCancelledRef.current = false;
+        thinkingIdRef.current = null;
+        const message_key =
+          typeof crypto !== 'undefined' && 'randomUUID' in crypto
+            ? crypto.randomUUID()
+            : `chat-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        currentMessageKeyRef.current = message_key;
+        assistantIdRef.current = store.startAssistantMessage(message_key);
 
       // TaskRuntime runs are keyed by conversation_id. On the first turn there
       // is no active conversation yet, so create it before routing; otherwise
@@ -135,11 +140,6 @@ export function useTauriChat() {
       if (!conversation_id) {
         throw new Error('创建会话失败，无法启动 TaskRuntime。');
       }
-      const message_key =
-        typeof crypto !== 'undefined' && 'randomUUID' in crypto
-          ? crypto.randomUUID()
-          : `chat-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-      currentMessageKeyRef.current = message_key;
       currentConversationIdRef.current = conversation_id ?? null;
       const chatResult = await apiInvoke<{
         success: boolean;
@@ -159,7 +159,7 @@ export function useTauriChat() {
         message_key,
       });
       // If the backend created a TaskRuntime run, load it so the right rail
-      // panel can show plan/todos/workers/tokens (replaces the old plan_ready
+      // panel can show plan/todos/subagents/tokens (replaces the old plan_ready
       // event handler deleted in the 13→6 state machine migration).
       const createdRunId = chatResult?.run_id ?? chatResult?.runId;
       if (createdRunId && conversation_id) {

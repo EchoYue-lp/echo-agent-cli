@@ -252,17 +252,17 @@ pub async fn resume_task_run(
 
     // spec §10.5: ComplexRuntime 审批闭环 — instead of directly transitioning to
     // Running + spawning execute_run (which would cause TWO concurrent execute_run
-    // calls), we notify the approval_signal that the waiting execute_plan tool is
-    // listening on. The awakened execute_plan handles Paused→Running + execute_run.
+    // calls), we notify the approval_signal that the waiting plan_execute tool is
+    // listening on. The awakened plan_execute handles Paused→Running + execute_run.
     if echo_agent_app_core::tasks::task_runtime::task_tools::notify_approval_signal(&run_id) {
-        tracing::info!(run_id = %run_id, "notified approval_signal -> execute_plan will resume");
+        tracing::info!(run_id = %run_id, "notified approval_signal -> plan_execute will resume");
         return Ok(serde_json::json!({
             "kind": "resumed",
             "run_id": run_id,
         }));
     }
 
-    // Fallback: no execute_plan tool is waiting. Do the direct path:
+    // Fallback: no plan_execute tool is waiting. Do the direct path:
     // transition Paused -> Running + spawn executor.
     store.resume_task_run(&run_id).map_err(internal)?;
     tracing::info!(run_id = %run_id, "direct resume (no approval_signal) -> Running");

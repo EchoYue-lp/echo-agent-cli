@@ -1,9 +1,9 @@
 // Subagent progress summary computation (spec §3.3.4).
 //
-// Originally computed from WorkerTraceState/WorkerTraceEvent; Phase 3 of the
+// Originally computed from the legacy trace state; Phase 3 of the
 // Subagent unification rewires it onto SubagentRunState/ExecutionEvent. The
-// event-type strings dropped their `worker_` prefix (`tool_started` not
-// `worker_tool_start`) and fields moved from `payload.*` to the event top
+// event-type strings dropped their legacy prefix (`tool_started` not the old
+// prefixed variant) and fields moved from `payload.*` to the event top
 // level (`e.name` not `e.payload.name`).
 import type { SubagentRunState, ExecutionEvent } from '../stores/subagentRunStore';
 

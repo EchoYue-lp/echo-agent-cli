@@ -186,7 +186,7 @@ pub fn build_message(
 /// A persisted attachment reference (no base64 body — just enough to rebuild a
 /// multimodal message by re-reading the file from disk).
 ///
-/// Stored on `TaskRun` so every worker in a complex-task run can see the same
+/// Stored on `TaskRun` so every subagent in a complex-task run can see the same
 /// user-uploaded images/files without re-sending them through plan JSON.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AttachmentRef {
@@ -212,7 +212,7 @@ impl AttachmentRef {
 /// Build a multimodal user [`Message`] from text + attachment refs.
 ///
 /// Unlike [`build_message`], this re-reads each file from disk (the refs carry
-/// no base64 body), so it is suitable for workers that reconstruct the message
+/// no base64 body), so it is suitable for subagents that reconstruct the message
 /// long after the original upload. Returns a plain text `Message` when there
 /// are no refs.
 pub fn build_message_from_refs(

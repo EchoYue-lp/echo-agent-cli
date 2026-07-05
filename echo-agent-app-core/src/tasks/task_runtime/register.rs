@@ -7,11 +7,11 @@
 //! store is ready. Pooled agents instead get the tools via
 //! `SharedResources.task_runtime_store`.
 //!
-//! Registers: TaskCreate/Update/Complete/Skip/List + CreateComplexTask /
-//! CheckRunStatus / CancelRun (8 task tools) + `ExecutePlanTool`.
+//! Registers: PlanCreate + TaskUpdate/Complete/Skip/List + CreateComplexTask /
+//! CheckRunStatus / CancelRun (8 task tools) + `plan_execute`.
 //!
 //! TUI/GUI functional parity (AGENTS.md): both entry points call this so the
-//! primary agent can drive complex tasks (plan / worker / run lifecycle) via
+//! primary agent can drive complex tasks (plan / subagent / run lifecycle) via
 //! `drive_chat` — TUI is a full Agent, not a lightweight chat.
 
 use std::sync::Arc;
@@ -24,7 +24,7 @@ use crate::tasks::task_runtime::task_tools::{
     TaskListTool, TaskSkipTool, TaskUpdateTool,
 };
 
-/// Register the task-management tools + `execute_plan` (with store) on
+/// Register the task-management tools + `plan_execute` (with store) on
 /// `agent_handle`. See module docs for why this is post-hoc.
 pub async fn register_task_tools_on_agent(
     agent_handle: &AgentHandle,
@@ -64,7 +64,7 @@ pub async fn register_task_tools_on_agent(
         );
     }
 
-    // Also register execute_plan tool (only on main agent per §10.2).
+    // Also register plan_execute tool (only on main agent per §10.2).
     // Use ParallelReadonlyDelegation as the default route; the route is
     // resolved per-run by the router at the orchestration layer.
     let tool = ExecutePlanTool::new(store.clone(), agent_handle.clone());
@@ -75,13 +75,13 @@ pub async fn register_task_tools_on_agent(
         })
         .await;
     if ep_added {
-        tracing::info!("Registered execute_plan tool on primary agent");
+        tracing::info!("Registered plan_execute tool on primary agent");
     } else {
         tracing::warn!(
-            "Failed to register execute_plan tool on primary agent (write lock poisoned)"
+            "Failed to register plan_execute tool on primary agent (write lock poisoned)"
         );
     }
 
-    // (delegate_readonly 工具已删除,其单步派发能力由 execute_plan 的 inline task
+    // (delegate_readonly 工具已删除,其单步派发能力由 plan_execute 的 inline task
     // 参数吸收。无需在此 re-register。)
 }

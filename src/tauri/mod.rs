@@ -381,7 +381,9 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
             // on the event itself, no bridge-side allocation).
             {
                 let app_handle = app.handle().clone();
-                let agent = app.state::<TauriState>().app_state.connection.agent.clone();
+                let state = app.state::<TauriState>();
+                let agent = state.app_state.connection.agent.clone();
+                let task_runtime_store = state.app_state.tasks.runtime.clone();
                 tokio::spawn(async move {
                     let mut rx = agent
                         .read_async(|a| {
@@ -633,10 +635,23 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                     "subagent_run_id".into(),
                                     subagent_run_id_owned.clone().into(),
                                 );
-                                payload.insert(
-                                    "run_id".into(),
-                                    run_id.clone().unwrap_or_default().into(),
-                                );
+                                if let Some(run_id) = run_id.as_deref() {
+                                    payload.insert("run_id".into(), run_id.into());
+                                    if let Some(store) = task_runtime_store.as_ref()
+                                        && let Ok(Some(run)) = store.get_run(run_id)
+                                    {
+                                        payload.insert(
+                                            "conversation_id".into(),
+                                            run.conversation_id.into(),
+                                        );
+                                        payload.insert(
+                                            "message_id".into(),
+                                            run.root_message_id.into(),
+                                        );
+                                    }
+                                } else {
+                                    payload.insert("run_id".into(), String::new().into());
+                                }
                                 payload.insert("agent".into(), agent_name.into());
                                 payload.insert("event".into(), event_type.into());
                                 if let serde_json::Value::Object(map) = extra {

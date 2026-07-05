@@ -642,8 +642,8 @@ impl BackgroundTaskService {
     ///
     /// Creates the run synchronously (so the id is returnable to the caller),
     /// then spawns a driver that calls `drive_unattended_run`. Returns the
-    /// `run_id` immediately. The agent's ReAct loop may call `task_create` +
-    /// `execute_plan`; a simple prompt auto-Completes (Q5).
+    /// `run_id` immediately. The agent's ReAct loop may call `plan_create` +
+    /// `plan_execute`; a simple prompt auto-Completes (Q5).
     ///
     /// Per-run `CancellationToken` registration lives on `AppState.tasks
     /// .run_cancel_tokens` (keyed `__run__:{run_id}`), which this service does
@@ -671,10 +671,10 @@ impl BackgroundTaskService {
         let agent = lease.agent();
         install_background_hitl_provider(&agent, self.hitl_provider.clone()).await;
         // Phase C: pooled agents are built without ExecutePlanTool (worker
-        // stance, §10.2), but a submit_run's agent drives task_create +
-        // execute_plan (primary role). Register it, mirroring the cron path's
-        // register_execute_plan_on_agent. Without this a complex AgentChat
-        // prompt can't execute its plan via execute_plan (silent degrade).
+        // stance, §10.2), but a submit_run's agent drives plan_create +
+        // plan_execute (primary role). Register it, mirroring the cron path's
+        // register_plan_execute_on_agent. Without this a complex AgentChat
+        // prompt can't execute its plan via plan_execute (silent degrade).
         {
             use super::task_runtime::ExecutePlanTool;
             let tool = ExecutePlanTool::new(store.clone(), agent.clone());

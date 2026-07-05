@@ -24,39 +24,41 @@ const DEFAULT_MAX_TOKENS: u32 = 8192;
 
 /// Guide appended to the system prompt when task management tools are
 /// available. Instructs the agent to actively manage its task plan and
-/// proactively dispatch readonly workers for investigation-heavy work
+/// proactively dispatch readonly subagents for investigation-heavy work
 /// (对齐 Claude Code 的 subagent:轻量派发是工具,正式并行是 runtime).
 const TASK_MANAGEMENT_GUIDE: &str = r#"
 
 ## Task Management
-You have tools to manage your task plan: task_create, task_update, task_complete, task_skip, task_list.
-- When you discover additional work is needed, use task_create to add it.
+When task-management tools are available in the current turn, use them to manage a formal task plan:
+plan_create, task_update, task_complete, task_skip, task_list.
+- When task-management tools are hidden/unavailable (for example Chat mode), answer directly and do not claim you can create or execute a task plan.
+- When you discover additional work is needed, use plan_create to add it.
 - When a task is no longer relevant (e.g., you found it's unnecessary), use task_skip.
 - When you complete a task, use task_complete to mark it done.
 - Use task_list to review current plan state.
-Update your plan frequently as your understanding deepens.
+Update your plan frequently as your understanding deepens when a formal plan is active.
 
-## 派 worker 执行任务(execute_plan)
-execute_plan 是统一的派发入口,两种用法(对齐 Claude Code:轻量 subagent 是工具,正式并行是 runtime,收敛成一个工具的两种形态):
+## 派 subagent 执行任务(plan_execute)
+plan_execute 是统一的派发入口。它的可用参数由当前模式决定:
 
-### 1. 单步派发(传 task 参数)——适合临时调研/分析/审查
-直接派一个只读 worker(explorer/reviewer/planner/summarizer)在独立上下文跑 ReAct,只回传结论摘要给你。
-**对高噪声任务要主动用**:大范围代码库检索、多文件架构梳理、冗长日志分析、多源调研综合。worker 在独立上下文里跑,不污染你的主会话(防 context 污染)。
+### 1. 单步派发(传 task 参数)——仅当当前 schema 暴露 task 字段时使用
+直接派一个只读 subagent(explorer/reviewer/planner/summarizer)在独立上下文跑 ReAct,只回传结论摘要给你。
+**对高噪声任务要主动用**:大范围代码库检索、多文件架构梳理、冗长日志分析、多源调研综合。subagent 在独立上下文里跑,不污染你的主会话(防 context 污染)。
 - 适合:架构分析、bug 排查的代码侧调研、文档/配置检索、审查验证。
-- 不适合:单文件小改、简单问答、一次性查询(直接做即可)。
+- 不适合:Task 模式、单文件小改、简单问答、一次性查询(直接做即可)。
 
-### 2. 多 worker 编排(不传 task,先用 task_create 拆 plan)——适合有依赖的多步任务
-1. **拆分计划**:task_create 拆成可独立执行的子任务(每个有清晰 title/description/kind),depends_on 表达依赖(并行无依赖,串行 A depends_on B)。title 不能为空。
-2. **统一执行**:拆完调 execute_plan,引擎(run_dag)按依赖自动并行调度多个 worker,收集产出摘要。
-3. **收口**:execute_plan 返回结果后,基于结果写最终答案。
-4. **写任务**:需改文件的子任务用对应 kind(implementation/debugging/verification),execute_plan 安排主 agent 自己执行。
+### 2. 多 subagent 编排(不传 task,先用 plan_create 拆 plan)——Task 模式和正式多步任务使用
+1. **拆分计划**:plan_create 拆成可独立执行的子任务(每个有清晰 title/description/kind),depends_on 表达依赖(并行无依赖,串行 A depends_on B)。title 不能为空。
+2. **统一执行**:拆完调 plan_execute,引擎(run_dag)按依赖自动并行调度多个 subagent,收集产出摘要。
+3. **收口**:plan_execute 返回结果后,基于结果写最终答案。
+4. **写任务**:需改文件的子任务用对应 kind(implementation/debugging/verification),plan_execute 安排主 agent 自己执行。
 
-两种用法不互斥:ad-hoc 探索、补充调研、单点验证用单步(传 task);正式多 worker 编排用 task_create + execute_plan。
+正式多 subagent 编排必须用 plan_create + plan_execute()。不要在 Task 模式里调用 plan_execute({task})。
 
 你是长生命周期的主 agent:跨多个对话 turn 保持上下文。用户可能中途插话改计划——用 task_update/task_complete/task_skip 调整。
 
 ## 自主创建复杂任务(create_complex_task)
-create_complex_task 让你为复杂任务创建后台 Run(独立 agent + plan/worker 编排,与当前对话解耦)。**仅在任务满足以下任一时使用**:
+create_complex_task 让你为复杂任务创建后台 Run(独立 agent + plan/subagent 编排,与当前对话解耦)。**仅在任务满足以下任一时使用**:
 1. 多步耗时(>3 步且单步耗 token/时间);
 2. 复杂代码生成(多文件/架构级);
 3. 需长期保持的状态(跨多轮/持久化);
@@ -99,11 +101,11 @@ pub struct AgentCreateParams {
     /// isolated checkout. None = use process cwd (backward compatible).
     pub working_dir: Option<std::path::PathBuf>,
     /// TaskRuntime store handle. When supplied, `create_agent` registers the
-    /// task-management tools (task_create/update/complete/skip/list) so the
+    /// task-management tools (plan_create/update/complete/skip/list) so the
     /// main agent can autonomously manage its plan during execution.
     pub task_runtime_store: Option<Arc<crate::tasks::task_runtime::TaskRuntimeStore>>,
-    /// Route kind for execute_plan tool registration. When Some, the
-    /// `execute_plan` tool is registered on the agent (never on workers,
+    /// Route kind for plan_execute tool registration. When Some, the
+    /// `plan_execute` tool is registered on the agent (never on subagents,
     /// per §10.2). The route determines whether ComplexRuntime approval
     /// gating is active (§10.5).
     pub route: Option<TaskRouteKind>,
@@ -120,7 +122,7 @@ pub fn default_primary_conversation_id() -> String {
 
 /// Load or create the stable machine-scoped cache user id used by provider KV caches.
 ///
-/// This id is shared by the primary agent and built-in worker agents so repeated
+/// This id is shared by the primary agent and built-in subagents so repeated
 /// project prompts land in the same provider cache partition across sessions.
 pub fn load_or_create_cache_user_id() -> String {
     let path = {
@@ -309,7 +311,7 @@ pub async fn create_agent(
     }
 
     // Resolve the subagent .md scopes: project root (params.project → working_dir
-    // → auto-discover) and user home. Workers are hot-loaded from .md files
+    // → auto-discover) and user home. Subagents are hot-loaded from .md files
     // (Sprint 6); builtin defaults compiled into the binary act as fallback.
     // Sprint 8: the same project root also seeds the worktree factory below.
     let subagent_project_root = params
@@ -321,9 +323,9 @@ pub async fn create_agent(
     let subagent_user_home = dirs::home_dir();
 
     // Sprint 8: inject a worktree-isolation factory so Fork-dispatched writer
-    // workers (those declaring `isolate_worktree: true`) can run in isolated
+    // subagents (those declaring `isolate_worktree: true`) can run in isolated
     // git worktrees. Resolve the git repo root best-effort from the project
-    // root; if it's not a git repo, no factory is injected (workers declaring
+    // root; if it's not a git repo, no factory is injected (subagents declaring
     // isolation log a warning and run unisolated — the framework's default).
     // No new permission gate: worktree is a user-driven isolation tool
     // (AGENTS.md local-assistant positioning); factory failure still hard-fails
@@ -347,7 +349,7 @@ pub async fn create_agent(
 
     // Sprint 10: always inject a data-workspace factory (no git dependency —
     // unlike worktree, tmpdir works anywhere). Fork-dispatched data/research
-    // workers declaring `isolate_workspace: true` get a per-worker tmpdir so
+    // subagents declaring `isolate_workspace: true` get a per-subagent tmpdir so
     // parallel runs emit disjoint output files. Optional base_dir keeps them
     // debuggable under a known parent; fall back to OS temp.
     let data_workspace_factory: std::sync::Arc<
@@ -357,7 +359,7 @@ pub async fn create_agent(
 
     // Sprint 11: inject a RuntimeStateStore for team-mode checkpoint/resume.
     // `dispatch_team` plumbs it into TeamAgent so a timed-out team run can
-    // resume by skipping completed plan/worker/synthesis phases (DAG
+    // resume by skipping completed plan/subagent/synthesis phases (DAG
     // skip-on-resume). Reuses the same FileRuntimeStateStore the runtime
     // checkpoint path uses. None if the store couldn't be constructed (teams
     // then run in-memory).
@@ -437,22 +439,22 @@ pub async fn create_agent(
             store: Arc::clone(&store),
         }));
         tracing::info!(
-            "Registered 5 task-management tools (task_create/update/complete/skip/list)"
+            "Registered 5 task-management tools (plan_create/task_update/task_complete/task_skip/task_list)"
         );
     }
 
     Ok(agent)
 }
 
-/// Register readonly worker subagents on the given agent.
+/// Register readonly subagents on the given agent.
 ///
-/// Worker definitions are **hot-loaded from `.md` files** (Sprint 6): project
+/// Subagent definitions are **hot-loaded from `.md` files** (Sprint 6): project
 /// scope `<root>/.echo-agent/subagents/**/*.md` overrides user scope
 /// `~/.echo-agent/subagents/**/*.md`, which overrides the builtin defaults
 /// compiled into the binary (`src/subagents/coding/*.md`). Editing a `.md`
 /// prompt therefore takes effect on next agent build without recompiling.
 ///
-/// Only `readonly` workers are registered here (the 4 generic capability
+/// Only `readonly` subagents are registered here (the 4 generic capability
 /// roles: explorer/reviewer/planner/summarizer). Domain specialization lives
 /// in the context/skill layer, not separate agent definitions — aligns with
 /// industry consensus (Claude Code ~3 subagents, OpenHands microagents,
@@ -474,7 +476,7 @@ async fn register_default_subagents(
     tracing::info!(
         count = workers.len(),
         names = ?workers.iter().map(|w| w.name.as_str()).collect::<Vec<_>>(),
-        "Loaded subagent worker definitions from .md (project/user/builtin)"
+        "Loaded subagent definitions from .md (project/user/builtin)"
     );
 
     struct BuiltWorker {
@@ -489,9 +491,9 @@ async fn register_default_subagents(
 
     let mut built_workers: Vec<BuiltWorker> = Vec::with_capacity(workers.len());
     for worker_def in &workers {
-        // Sprint 9: register BOTH readonly and writer workers. Readonly workers
+        // Sprint 9: register BOTH readonly and writer subagents. Readonly subagents
         // get the readonly tool subset (physical no-write enforcement); writer
-        // workers get the full tool set (shell/file/git) and run inside an
+        // subagents get the full tool set (shell/file/git) and run inside an
         // isolated git worktree when `isolate_worktree` is set (Sprint 8 wiring).
         // Writers are still serialized at run time by `write_sem` (default 1);
         // the worktree gives each its own checkout so writes don't land in the
@@ -534,7 +536,7 @@ async fn register_default_subagents(
                     builder = builder.can_delegate();
                 }
                 // Sprint 8/9: honor the frontmatter `worktree: true` flag (only
-                // set for non-readonly writers; readonly workers have it cleared
+                // set for non-readonly writers; readonly subagents have it cleared
                 // by the loader since they don't mutate files). This makes the
                 // framework's dispatch_fork create an isolated worktree for the
                 // writer (eko-fork-<label> branch).
@@ -542,15 +544,15 @@ async fn register_default_subagents(
                     builder = builder.isolate_worktree();
                 }
                 // Sprint 10: honor the frontmatter `workspace: true` flag for
-                // data/research workers (per-worker tmpdir, disjoint outputs).
+                // data/research subagents (per-subagent tmpdir, disjoint outputs).
                 // Loader clears it when worktree is active (mutually exclusive).
                 if worker_def.isolate_workspace {
                     builder = builder.isolate_workspace();
                 }
                 // Sprint 11: if this .md declares a team (team_strategy +
-                // manager + workers), override execution_mode to Team and
+                // manager + subagent team members), override execution_mode to Team and
                 // attach the TeamSpec. dispatch_team resolves the named
-                // manager/workers from the registry at dispatch time.
+                // manager/subagents from the registry at dispatch time.
                 if let Some(spec) = worker_def.team.clone() {
                     builder = builder.team(spec);
                 }
@@ -577,7 +579,7 @@ async fn register_default_subagents(
         }
     }
 
-    // Register every worker on the primary agent.
+    // Register every subagent on the primary agent.
     for built in &built_workers {
         agent.register_subagent_with_definition(
             built.definition.clone(),
@@ -597,7 +599,7 @@ async fn register_default_subagents(
 
     // Optional nested delegation: only roles that explicitly declare
     // `can_delegate: true` receive a child registry. Defaults stay flat, so
-    // ordinary workers can complete their current task or suggest follow-ups
+    // ordinary subagents can complete their current task or suggest follow-ups
     // without becoming recursive planners.
     //
     for parent in built_workers
@@ -627,9 +629,9 @@ async fn register_default_subagents(
     }
 }
 
-/// Build a **writer** worker agent (Sprint 9): same as the readonly worker
+/// Build a **writer** subagent (Sprint 9): same as the readonly subagent
 /// but with full write tools (shell/file/git) instead of the readonly subset.
-/// Used for `Implementation`/`Debugging` tasks that route to Fork workers in
+/// Used for `Implementation`/`Debugging` tasks that route to Fork subagents in
 /// isolated git worktrees. Writers are still serialized by `write_sem`
 /// (`max_concurrent_writes` = 1) — the worktree gives each its own checkout so
 /// writes don't land in the main workspace, but they don't run concurrently.
@@ -649,7 +651,7 @@ fn build_writer_worker_agent(
     // Mirror build_readonly_worker_agent, but OMIT `.readonly_tools()` → the
     // default `readonly_tools: false` triggers `register_all_tools`, giving the
     // writer shell/file/git write capability. Isolation is enforced physically
-    // by the worktree (Sprint 8): the worker's working_dir is bound to its own
+    // by the worktree (Sprint 8): the subagent's working_dir is bound to its own
     // worktree checkout, so writes can't reach the main workspace even though
     // the tools could.
     let mut builder = ReactAgentBuilder::new()
@@ -679,13 +681,13 @@ fn build_writer_worker_agent(
             worker_name = name,
             model = %config.model,
             has_auth = !config.api_key.is_empty(),
-            "writer worker: injecting LlmConfig"
+            "writer subagent: injecting LlmConfig"
         );
         builder = builder.llm_config(config);
     } else {
         tracing::warn!(
             worker_name = name,
-            "writer worker: NO LlmConfig injected — will fall back to env vars / models.yaml"
+            "writer subagent: NO LlmConfig injected — will fall back to env vars / models.yaml"
         );
     }
 
@@ -696,7 +698,7 @@ fn build_writer_worker_agent(
         has_llm_config,
         has_llm_client = has_client,
         model = %worker.model_name(),
-        "writer worker built: LLM client status (full write tools)"
+        "writer subagent built: LLM client status (full write tools)"
     );
     worker.config_mut().set_cache_user_id(cache_user_id);
     worker.set_plan_mode(true);
@@ -743,13 +745,13 @@ fn build_readonly_worker_agent(
             worker_name = name,
             model = %config.model,
             has_auth = !config.api_key.is_empty(),
-            "worker: injecting LlmConfig"
+            "subagent: injecting LlmConfig"
         );
         builder = builder.llm_config(config);
     } else {
         tracing::warn!(
             worker_name = name,
-            "worker: NO LlmConfig injected — will fall back to env vars / models.yaml"
+            "subagent: NO LlmConfig injected — will fall back to env vars / models.yaml"
         );
     }
 
@@ -760,7 +762,7 @@ fn build_readonly_worker_agent(
         has_llm_config,
         has_llm_client = has_client,
         model = %worker.model_name(),
-        "worker built: LLM client status"
+        "subagent built: LLM client status"
     );
     worker.config_mut().set_cache_user_id(cache_user_id);
     worker.set_plan_mode(true);
@@ -1148,7 +1150,7 @@ pub fn init_logging_with_target(level: &str, target: LogTarget) {
         {
             use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
             // Include echo_agent_app_core so the task_runtime module's traces
-            // (execute_plan/execute_run/drain loop) are visible by default.
+            // (plan_execute/execute_run/drain loop) are visible by default.
             // Previously this crate was omitted, silently hiding all B1-B7
             // instrumentation unless RUST_LOG was set explicitly.
             let default_filter = format!(

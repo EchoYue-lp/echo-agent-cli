@@ -663,22 +663,28 @@ async fn handle_enter(
             let cancel = echo_agent::agent::CancellationToken::new();
             let sink: std::sync::Arc<dyn echo_agent_app_core::chat_driver::ChatSink> =
                 std::sync::Arc::new(TuiChatSink::new(agent_tx.clone()));
-            // B4.3 (spec §8): per-turn mode hint, mirroring GUI's chat.rs —
-            // Chat → forbid create_complex_task; Task → lean towards it;
-            // Auto → no hint (pure agent autonomy). Pure prompt, no code route.
+            // B4.3 / P1.2: per-turn mode hint, mirroring GUI's chat.rs.
+            // Tool availability is enforced separately; this prompt gives the
+            // model the matching behavior contract without a runtime state machine.
             let mode_hint = match app.interaction_mode {
                 InteractionMode::Chat => Some(
-                    "Chat — this is a simple conversation. Do NOT call \
-                     create_complex_task; reply directly in this turn."
+                    "Chat mode — task runtime tools are unavailable in this turn. \
+                     Reply directly with ordinary chat/tool usage; do not create or execute a task plan."
                         .to_string(),
                 ),
                 InteractionMode::Task => Some(
-                    "Task — the user expects involved work. When the request is \
-                     genuinely complex (multi-step / multi-file / long research), \
-                     prefer create_complex_task over a single inline reply."
+                    "Task mode — use formal plan execution. First create explicit PlanTask items with \
+                     plan_create, then call plan_execute() with no task argument to run the DAG. \
+                     Do not use plan_execute({task}) inline single-subagent dispatch in Task mode."
                         .to_string(),
                 ),
-                InteractionMode::Auto => None,
+                InteractionMode::Auto => Some(
+                    "Auto mode — classify the request yourself. For simple chat, answer directly. \
+                     For high-noise research or broad codebase inspection, you may use inline \
+                     plan_execute({task}) subagents. For multi-step / multi-file / long-running work, \
+                     create a formal plan with plan_create and then plan_execute()."
+                        .to_string(),
+                ),
             };
             let res = std::sync::Arc::new(echo_agent_app_core::chat_resources::ChatResources {
                 pool: app.pool.clone(),
@@ -688,7 +694,7 @@ async fn handle_enter(
                 // conversation id so TaskRuntime runs + transcript projection work.
                 conv_id: app.conversation_id.clone(),
                 root_message_id: uuid::Uuid::new_v4().to_string(),
-                // Bind staged refs so workers in an autonomous run see them too.
+                // Bind staged refs so subagents in an autonomous run see them too.
                 attachments: staged,
                 cancel,
                 mode_hint,
@@ -916,7 +922,7 @@ fn stage_attachment(
     let bytes = std::fs::read(path)?;
     let mime = infer_mime(&name);
     // Persist under the global uploads dir so the ref's path stays valid for
-    // workers that re-read it later (matches the GUI's per-workspace uploads,
+    // subagents that re-read it later (matches the GUI's per-workspace uploads,
     // just global here).
     let uploads_dir = resolve_uploads_dir(None);
     std::fs::create_dir_all(&uploads_dir)?;

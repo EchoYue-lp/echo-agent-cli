@@ -43,7 +43,9 @@ export const ParallelExecutionBlock = memo(function ParallelExecutionBlock({
           // showing it again as a SubagentStreamBlock would duplicate. The
           // "main" entry is still kept in the store for cache diagnostics.
           w.subagentRunId !== 'main' &&
-          (!activeRun || w.runId === activeRun.run_id) &&
+          (!activeRun ||
+            w.runId === activeRun.run_id ||
+            w.conversationId === activeRun.conversation_id) &&
           (w.messageId === messageId || (!w.messageId && isLatestAssistant)) &&
           // Top-level subagents: parent is empty OR equals the run_id.
           (!w.parent || w.parent === w.runId)

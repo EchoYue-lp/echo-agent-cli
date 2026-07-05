@@ -58,7 +58,7 @@ export function handleChatEvent(event: ChatEvent, ctx: EventContext): void {
       break;
     }
     case 'llm_usage': {
-      // Observability-only event. Worker trace / trace panels consume the same
+      // Observability-only event. Subagent trace panels consume the same
       // facts; the chat transcript should not render cache telemetry as text.
       break;
     }
@@ -78,10 +78,12 @@ export function handleChatEvent(event: ChatEvent, ctx: EventContext): void {
     }
     case 'tool_batch_start': {
       if (ctx.isCancelledRef.current) break;
+      store.startToolBatch(event.tool_count ?? 0);
       break;
     }
     case 'tool_batch_end': {
       if (ctx.isCancelledRef.current) break;
+      store.endToolBatch();
       break;
     }
     case 'chart': {

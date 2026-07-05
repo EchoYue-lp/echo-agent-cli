@@ -1,6 +1,6 @@
-//! Subagent worker `.md` hot-loader (Sprint 6).
+//! Subagent `.md` hot-loader (Sprint 6).
 //!
-//! Replaces the hardcoded `WORKER_DEFINITIONS` array in `infra.rs`. Worker
+//! Replaces the hardcoded `WORKER_DEFINITIONS` array in `infra.rs`. Subagent
 //! prompts now live in `.md` files (frontmatter + markdown body) and can be
 //! edited without recompiling.
 //!
@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-/// Builtin default worker definitions (compiled into the binary).
+/// Builtin default subagent definitions (compiled into the binary).
 ///
 /// Sourced from `src/subagents/coding/*.md`. These are the fallback used when
 /// no project/user `.md` files override them. Order matters: this defines the
@@ -37,14 +37,14 @@ const BUILTIN_WORKER_FILES: &[(&str, &str)] = &[
     ("reviewer", include_str!("subagents/coding/reviewer.md")),
     ("planner", include_str!("subagents/coding/planner.md")),
     ("summarizer", include_str!("subagents/coding/summarizer.md")),
-    // Sprint 9: writer worker — gets write tools + worktree isolation
+    // Sprint 9: writer subagent — gets write tools + worktree isolation
     // (worktree:true && !readonly → isolate_worktree). Implementation/Debugging
     // tasks route here instead of running in-place on the primary agent.
     (
         "implementer",
         include_str!("subagents/coding/implementer.md"),
     ),
-    // Sprint 10: data/research workers — per-worker tmpdir workspace
+    // Sprint 10: data/research subagents — per-subagent tmpdir workspace
     // (workspace:true → isolate_workspace) for disjoint output artifacts.
     ("data-shaper", include_str!("subagents/data/data-shaper.md")),
     ("analyst", include_str!("subagents/data/analyst.md")),
@@ -56,7 +56,7 @@ const MAX_SCAN_DEPTH: usize = 4;
 /// Directories skipped during scope scanning (avoid descending into these).
 const SKIP_DIRS: &[&str] = &[".git", "node_modules", "target", ".worktrees"];
 
-/// Raw frontmatter deserialized from a worker `.md` file.
+/// Raw frontmatter deserialized from a subagent `.md` file.
 ///
 /// Field names mirror `SubagentDefinition` semantics. `name` is optional here
 /// (a fallback name from the filename can fill it); `description` is required.
@@ -68,13 +68,13 @@ struct WorkerFrontmatter {
     description: String,
     #[serde(default)]
     readonly: bool,
-    /// Sprint 8: request worktree isolation for this Fork-dispatched worker
+    /// Sprint 8: request worktree isolation for this Fork-dispatched subagent
     /// (Claude Code `isolation: worktree` equivalent). Only meaningful for
-    /// writer workers; requires a `WorktreeFactory` configured on the agent.
+    /// writer subagents; requires a `WorktreeFactory` configured on the agent.
     #[serde(default)]
     worktree: bool,
-    /// Sprint 10: request a per-worker data workspace (tmpdir) for this
-    /// Fork-dispatched data/research worker — disjoint output dir, no git
+    /// Sprint 10: request a per-subagent data workspace (tmpdir) for this
+    /// Fork-dispatched data/research subagent — disjoint output dir, no git
     /// coupling. Mutually exclusive with `worktree` (worktree wins if both).
     /// Requires a `DataWorkspaceFactory` configured on the agent.
     #[serde(default)]
@@ -83,13 +83,13 @@ struct WorkerFrontmatter {
     /// `readonly` is true. Empty if unset.
     #[serde(default)]
     tags: Vec<String>,
-    /// Optional nested delegation capability. Defaults false: workers execute
+    /// Optional nested delegation capability. Defaults false: subagents execute
     /// the assigned task and may suggest follow-up tasks, but cannot spawn
     /// child subagents unless explicitly granted this capability.
     #[serde(default)]
     can_delegate: bool,
     /// Sprint 11: declare this subagent as a team-mode dispatcher. Only
-    /// `"manager-worker"` is supported via frontmatter (other strategies are
+    /// `"manager-worker"` is the compatibility wire value via frontmatter (other strategies are
     /// programmatic-only — they carry inline agent-name data).
     #[serde(default)]
     team_strategy: Option<String>,
@@ -97,45 +97,45 @@ struct WorkerFrontmatter {
     /// registered). Required when `team_strategy` is set.
     #[serde(default)]
     team_manager: Option<String>,
-    /// Sprint 11: worker subagent names (each must be separately registered).
+    /// Sprint 11: subagent team member names (each must be separately registered).
     /// Required (non-empty) when `team_strategy` is set.
     #[serde(default)]
     team_workers: Vec<String>,
 }
 
-/// A resolved worker definition ready for registration.
+/// A resolved subagent definition ready for registration.
 #[derive(Debug, Clone)]
 pub struct WorkerDefinition {
     pub name: String,
     pub description: String,
     pub system_prompt: String,
     pub readonly: bool,
-    /// Sprint 8: whether Fork dispatch should isolate this worker in a git
+    /// Sprint 8: whether Fork dispatch should isolate this subagent in a git
     /// worktree. Mapped from frontmatter `worktree: true`. Only meaningful for
-    /// writer workers (readonly workers don't mutate files).
+    /// writer subagents (readonly subagents don't mutate files).
     pub isolate_worktree: bool,
-    /// Sprint 10: whether Fork dispatch should give this worker a per-worker
+    /// Sprint 10: whether Fork dispatch should give this subagent a per-subagent
     /// data workspace (tmpdir). Mapped from frontmatter `workspace: true`.
     /// Mutually exclusive with isolate_worktree (worktree wins if both).
     pub isolate_workspace: bool,
     /// Sprint 11: if Some, this subagent is a team-mode dispatcher (not a
-    /// normal worker). The registration path sets `execution_mode = Team` and
-    /// attaches this TeamSpec. manager + workers are name-references.
+    /// normal subagent). The registration path sets `execution_mode = Team` and
+    /// attaches this TeamSpec. manager + subagent team members are name-references.
     pub team: Option<echo_agent::agent::subagent::types::TeamSpec>,
-    /// Whether this worker may receive the framework `agent_tool` and spawn
+    /// Whether this subagent may receive the framework `agent_tool` and spawn
     /// child subagents. Defaults false.
     pub can_delegate: bool,
     pub tags: Vec<String>,
 }
 
-/// Discover worker definitions across scopes + builtin fallback.
+/// Discover subagent definitions across scopes + builtin fallback.
 ///
 /// `project_root` is the cwd or detected project root; `user_home` is the
 /// user's home directory (`~`). Either may be `None` if undetectable, in which
 /// case that scope is skipped.
 ///
 /// Returns at least the builtin defaults (so the app always has the 4 default
-/// workers), with project/user overrides layered on top by name.
+/// subagents), with project/user overrides layered on top by name.
 pub fn discover_subagents(
     project_root: Option<&Path>,
     user_home: Option<&Path>,
@@ -152,7 +152,7 @@ pub fn discover_subagents(
             }
             Err(e) => {
                 tracing::error!(
-                    worker = *builtin_name,
+                    subagent = *builtin_name,
                     error = %e,
                     "Builtin subagent .md failed to parse (this is a bug — source file is corrupt)"
                 );
@@ -173,7 +173,7 @@ pub fn discover_subagents(
     }
 
     // Preserve builtin order for stable registration, then append any
-    // extra (user/project-only) workers at the end.
+    // extra (user/project-only) subagents at the end.
     let mut result: Vec<WorkerDefinition> = Vec::with_capacity(by_name.len());
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (builtin_name, _) in BUILTIN_WORKER_FILES {
@@ -193,7 +193,7 @@ pub fn discover_subagents(
     result
 }
 
-/// Scan a scope directory and merge its parsed workers into `by_name`,
+/// Scan a scope directory and merge its parsed subagents into `by_name`,
 /// **overwriting** any same-named entry. Higher-priority scopes are merged
 /// later (builtins first → user → project), so the last write wins, giving
 /// project > user > builtin precedence.
@@ -256,7 +256,7 @@ fn scan_directory(dir: &Path, depth: usize, out: &mut Vec<(PathBuf, String)>) {
     }
 }
 
-/// Parse a worker `.md` file into a [`WorkerDefinition`].
+/// Parse a subagent `.md` file into a [`WorkerDefinition`].
 ///
 /// Format:
 /// ```text
@@ -291,18 +291,18 @@ pub fn parse_worker_md(
         .or_else(|| fallback_name.map(|s| s.to_string()))
         .ok_or_else(|| "frontmatter missing required `name` field".to_string())?;
     if fm.description.trim().is_empty() {
-        return Err(format!("worker `{name}` missing `description`"));
+        return Err(format!("subagent `{name}` missing `description`"));
     }
 
     let system_prompt = body.trim().to_string();
     if system_prompt.is_empty() {
         return Err(format!(
-            "worker `{name}` has empty system prompt (markdown body after frontmatter)"
+            "subagent `{name}` has empty system prompt (markdown body after frontmatter)"
         ));
     }
 
-    // Ensure readonly workers carry the physical-enforcement tags the
-    // registration path expects. Non-readonly workers keep their declared tags.
+    // Ensure readonly subagents carry the physical-enforcement tags the
+    // registration path expects. Non-readonly subagents keep their declared tags.
     let mut tags = fm.tags;
     if fm.readonly {
         if !tags.iter().any(|t| t == "readonly") {
@@ -313,30 +313,31 @@ pub fn parse_worker_md(
         }
     }
 
-    // Sprint 8: `worktree: true` only makes sense for writer workers; if a
-    // readonly worker declares it, ignore (readonly workers don't mutate files).
+    // Sprint 8: `worktree: true` only makes sense for writer subagents; if a
+    // readonly subagent declares it, ignore (readonly subagents don't mutate files).
     let isolate_worktree = fm.worktree && !fm.readonly;
-    // Sprint 10: `workspace: true` requests a per-worker data tmpdir. It's
-    // meaningful for ANY worker (data workers emit artifacts regardless of
+    // Sprint 10: `workspace: true` requests a per-subagent data tmpdir. It's
+    // meaningful for ANY subagent (data subagents emit artifacts regardless of
     // readonly), but mutually exclusive with worktree — if both are set,
     // worktree wins (it also provides disjoint FS). Clear workspace when
     // worktree is active to avoid double-isolation at registration.
     let isolate_workspace = fm.workspace && !isolate_worktree;
 
-    // Sprint 11: parse team frontmatter into a TeamSpec (only manager-worker
-    // strategy is declarable). Validate that manager + non-empty workers given.
+    // Sprint 11: parse team frontmatter into a TeamSpec (the wire value
+    // remains `manager-worker` for compatibility). Validate that manager +
+    // non-empty subagent team members are given.
     let team = if let Some(strategy) = fm.team_strategy.as_deref() {
         if strategy != "manager-worker" {
             return Err(format!(
-                "worker `{name}`: team_strategy '{strategy}' unsupported via frontmatter (only 'manager-worker')"
+                "subagent `{name}`: team_strategy '{strategy}' unsupported via frontmatter (only 'manager-worker')"
             ));
         }
         let manager = fm.team_manager.clone().ok_or_else(|| {
-            format!("worker `{name}`: team_strategy set but team_manager missing")
+            format!("subagent `{name}`: team_strategy set but team_manager missing")
         })?;
         if fm.team_workers.is_empty() {
             return Err(format!(
-                "worker `{name}`: team_strategy set but team_workers empty"
+                "subagent `{name}`: team_strategy set but team_workers empty"
             ));
         }
         Some(echo_agent::agent::subagent::types::TeamSpec {
@@ -368,7 +369,7 @@ pub fn parse_worker_md(
 /// - Requires a leading `---` on the first line.
 /// - The closing `\n---` (on its own line) ends the frontmatter.
 /// - Returns `(frontmatter_str, body_str)`. If there is no frontmatter block,
-///   returns an error (workers must declare name/description).
+///   returns an error (subagents must declare name/description).
 fn split_frontmatter(content: &str) -> Result<(&str, &str), String> {
     let content = content.strip_prefix('\u{feff}').unwrap_or(content);
     let after_open = content
@@ -412,10 +413,10 @@ mod tests {
 
     #[test]
     fn parse_minimal_md_with_fallback_name() {
-        let md = "---\ndescription: \"a worker\"\n---\nDo the thing.";
+        let md = "---\ndescription: \"a subagent\"\n---\nDo the thing.";
         let def = parse_worker_md(md, Some("worker1")).unwrap();
         assert_eq!(def.name, "worker1");
-        assert_eq!(def.description, "a worker");
+        assert_eq!(def.description, "a subagent");
         assert_eq!(def.system_prompt, "Do the thing.");
         assert!(!def.readonly);
     }
@@ -464,14 +465,14 @@ mod tests {
 
     #[test]
     fn parse_worktree_flag_ignored_for_readonly() {
-        // Sprint 8: a readonly worker declaring worktree:true is ignored —
-        // readonly workers don't mutate files, so isolation is meaningless.
+        // Sprint 8: a readonly subagent declaring worktree:true is ignored —
+        // readonly subagents don't mutate files, so isolation is meaningless.
         let md = "---\nname: explorer\ndescription: \"reads\"\nreadonly: true\nworktree: true\n---\nYou explore.";
         let def = parse_worker_md(md, None).unwrap();
         assert!(def.readonly);
         assert!(
             !def.isolate_worktree,
-            "readonly worker must not request worktree isolation"
+            "readonly subagent must not request worktree isolation"
         );
     }
 
@@ -486,7 +487,7 @@ mod tests {
     fn builtin_defaults_parse_cleanly() {
         // The compiled-in defaults must all parse without error — guards
         // against a corrupt source .md slipping through. Sprint 9 added a
-        // writer worker (implementer); Sprint 10 added data workers
+        // writer subagent (implementer); Sprint 10 added data subagents
         // (data-shaper, analyst).
         let defs = discover_subagents(None, None);
         let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
@@ -514,14 +515,14 @@ mod tests {
             assert!(!d.isolate_worktree, "{name} must not request worktree");
             assert!(!d.isolate_workspace, "{name} must not request workspace");
         }
-        // Sprint 9: the writer worker is non-readonly + requests worktree isolation.
+        // Sprint 9: the writer subagent is non-readonly + requests worktree isolation.
         let implementer = defs.iter().find(|d| d.name == "implementer").unwrap();
         assert!(!implementer.readonly);
         assert!(
             implementer.isolate_worktree,
             "implementer must request worktree isolation (worktree:true && !readonly)"
         );
-        // Sprint 10: data workers request a per-worker workspace (tmpdir).
+        // Sprint 10: data subagents request a per-subagent workspace (tmpdir).
         for name in ["data-shaper", "analyst"] {
             let d = defs.iter().find(|d| d.name == name).unwrap();
             assert!(
@@ -602,7 +603,7 @@ team_workers: [\"explorer\", \"summarizer\"]\n\
 
     #[test]
     fn parse_team_frontmatter_absent_yields_no_team() {
-        // Normal worker without team_strategy → team is None.
+        // Normal subagent without team_strategy → team is None.
         let md = "---\nname: w\ndescription: \"d\"\nreadonly: true\n---\nbody";
         let def = parse_worker_md(md, None).unwrap();
         assert!(def.team.is_none());

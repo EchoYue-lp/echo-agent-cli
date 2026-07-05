@@ -27,6 +27,54 @@ import type {
   TaskRunStatus,
 } from '../generated';
 
+type RunSnapshot = {
+  run: TaskRun;
+  plan: TaskPlan | null;
+  todos: TodoItem[];
+  artifacts: RuntimeArtifact[];
+};
+
+function runTime(value: string): number {
+  const time = Date.parse(value);
+  return Number.isFinite(time) ? time : 0;
+}
+
+async function loadRunSnapshot(run: TaskRun): Promise<RunSnapshot> {
+  const [plan, todos, artifacts] = await Promise.all([
+    taskRuntimeApi.getPlan(run.run_id),
+    taskRuntimeApi.listTodos(run.run_id),
+    taskRuntimeApi.listArtifacts(run.run_id),
+  ]);
+  return { run, plan, todos, artifacts };
+}
+
+async function loadConversationRunGroup(conversationId: string, focusedRun: TaskRun) {
+  const allRuns = await taskRuntimeApi.listRuns();
+  const groupRuns = allRuns
+    .filter(
+      (run) =>
+        run.conversation_id === conversationId &&
+        run.root_message_id === focusedRun.root_message_id
+    )
+    .sort((a, b) => runTime(a.created_at) - runTime(b.created_at));
+  const runs = groupRuns.length ? groupRuns : [focusedRun];
+  const snapshots = await Promise.all(runs.map(loadRunSnapshot));
+  const basePlan = snapshots.find((snapshot) => snapshot.plan)?.plan ?? null;
+  const plan = basePlan
+    ? {
+        ...basePlan,
+        run_id: focusedRun.run_id,
+        goal: focusedRun.goal,
+        tasks: snapshots.flatMap((snapshot) => snapshot.plan?.tasks ?? []),
+      }
+    : null;
+  return {
+    plan,
+    todos: snapshots.flatMap((snapshot) => snapshot.todos),
+    artifacts: snapshots.flatMap((snapshot) => snapshot.artifacts),
+  };
+}
+
 export interface RouteExplanation {
   runId: string;
   goal?: string;
@@ -138,26 +186,24 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
     // P1-7: refreshInFlight 防止 polling 重叠; finally 确保异常时也清除。
     refreshInFlight = true;
     try {
-      const [run, plan, todos, events, artifacts] = await Promise.all([
+      const [run, events] = await Promise.all([
         taskRuntimeApi.getRun(runId),
-        taskRuntimeApi.getPlan(runId),
-        taskRuntimeApi.listTodos(runId),
         taskRuntimeApi.listEvents(runId, get().lastSeq),
-        taskRuntimeApi.listArtifacts(runId),
       ]);
       const lastSeq = events.length ? events[events.length - 1].seq : get().lastSeq;
       if (!run) {
         set({
           activeRun: null,
-          plan,
-          todos,
+          plan: null,
+          todos: [],
           events: [...get().events, ...events].slice(-MAX_EVENTS),
-          artifacts,
+          artifacts: [],
           lastSeq,
           error: `TaskRuntime run ${runId} 暂时不可用`,
         });
         return;
       }
+      const { plan, todos, artifacts } = await loadConversationRunGroup(run.conversation_id, run);
       set({
         activeRun: run,
         plan,
@@ -182,7 +228,16 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
       if (run) {
         // Reset event cursor when switching runs so we don't cross streams.
         set({ events: [], lastSeq: '0', routeExplanation: null });
-        await get().refresh(run.run_id);
+        const { plan, todos, artifacts } = await loadConversationRunGroup(conversationId, run);
+        set({
+          activeRun: run,
+          plan,
+          todos,
+          events: [],
+          artifacts,
+          lastSeq: '0',
+          error: null,
+        });
       } else {
         set({
           activeRun: null,
