@@ -10,7 +10,7 @@ import type { TaskRunStatus } from "./TaskRunStatus";
 export type TaskRun = { run_id: string, workspace_id: string, conversation_id: string, root_message_id: string, domain_profile: DomainProfile, status: TaskRunStatus, goal: string, plan_id: string | null, route: string, 
 /**
  * Whether a human is present (Attended) or this is a cron/IM trigger
- * (Unattended). Drives safety-gate behaviour in execute_plan /
+ * (Unattended). Drives safety-gate behaviour in plan_execute /
  * executor.  Default: Attended (chat behaviours unchanged).
  */
 attended_mode: AttendedMode, created_at: string, updated_at: string, };

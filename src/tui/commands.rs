@@ -57,7 +57,7 @@ impl Category {
 #[strum(serialize_all = "kebab-case")]
 pub enum SlashCommand {
     // -- Session --
-    Reset,
+    Clear,
     History,
     Stats,
     Status,
@@ -112,7 +112,7 @@ impl SlashCommand {
     /// Short human-readable description.
     pub fn description(self) -> &'static str {
         match self {
-            Self::Reset => "Reset conversation history",
+            Self::Clear => "Clear conversation and start fresh",
             Self::History => "Show session history",
             Self::Stats => "Show session statistics",
             Self::Status => "Show agent status",
@@ -158,7 +158,7 @@ impl SlashCommand {
     /// Which category this command belongs to.
     pub fn category(self) -> Category {
         match self {
-            Self::Reset
+            Self::Clear
             | Self::History
             | Self::Stats
             | Self::Status

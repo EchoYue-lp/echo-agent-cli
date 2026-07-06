@@ -17,11 +17,11 @@ export interface SlashCommand {
 export const SLASH_COMMANDS: SlashCommand[] = [
   // Session
   {
-    name: '/reset',
-    aliases: [],
-    description: 'Reset conversation',
+    name: '/clear',
+    aliases: ['/cls'],
+    description: 'Clear current chat',
     category: 'Session',
-    action: 'send',
+    action: 'api',
   },
   {
     name: '/history',

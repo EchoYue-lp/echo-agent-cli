@@ -8,7 +8,7 @@
 //! The compact panel is mounted inside RightRail; the full detail panel is
 //! mounted in the main chat/work area.
 
-import { useEffect, useMemo } from 'react';
+import { useMemo } from 'react';
 import {
   CheckCircle2,
   Circle,
@@ -26,7 +26,6 @@ import {
   AlertTriangle,
 } from 'lucide-react';
 import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
-import { useConversationStore } from '../../stores/conversationStore';
 import {
   useSubagentRunStore,
   type ExecutionEvent,
@@ -403,14 +402,9 @@ function displayedTodoStatus(
 }
 
 export function TaskRuntimePanel() {
-  const activeId = useConversationStore((s) => s.activeId);
   const traceRuns = useSubagentRunStore((s) => s.runs);
-  const { activeRun, plan, todos, routeExplanation, loadByConversation, refresh, resumeTaskRun } =
+  const { activeRun, plan, todos, routeExplanation, refresh, resumeTaskRun } =
     useTaskRuntimeStore();
-
-  useEffect(() => {
-    if (activeId) loadByConversation(activeId);
-  }, [activeId, loadByConversation]);
 
   const visibleTraceRuns = useMemo(
     () =>
@@ -423,8 +417,7 @@ export function TaskRuntimePanel() {
             // conversationId.
             .filter(
               (run) =>
-                run.runId === activeRun.run_id ||
-                run.conversationId === activeRun.conversation_id
+                run.runId === activeRun.run_id || run.conversationId === activeRun.conversation_id
             )
             .sort((a, b) => a.startedAt - b.startedAt)
         : [],

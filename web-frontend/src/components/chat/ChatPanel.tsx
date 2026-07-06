@@ -6,8 +6,10 @@ import { ChatInput } from './ChatInput';
 import { WelcomeScreen } from './WelcomeScreen';
 import { useTauriChat } from '../../hooks/useTauriChat';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
+import { useConversationStore } from '../../stores/conversationStore';
 import { useSubagentRunStore } from '../../stores/subagentRunStore';
 import { useSubagentDetailStore } from '../../stores/subagentDetailStore';
+import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
 import { SubagentDetailView } from '../task/SubagentDetailView';
 import { FailureToast } from './FailureToast';
 import type { Attachment } from '../../types/api';
@@ -50,6 +52,14 @@ export function ChatPanel() {
   const isNearBottomRef = useRef(true);
   const { sendMessage, sendApproval, sendInput, sendSelection, cancel } = useChatTransport();
 
+  const clearCurrentChat = useCallback(async () => {
+    cancel();
+    await useConversationStore.getState().clearCurrent();
+    useTaskRuntimeStore.getState().reset();
+    useSubagentRunStore.getState().clear();
+    closeSubagentDetail();
+  }, [cancel, closeSubagentDetail]);
+
   const handleRegenerate = () => {
     // Cancel any in-flight run before regenerating — otherwise late-arriving
     // token events from the old run land on a deleted message (orphan).
@@ -84,6 +94,11 @@ export function ChatPanel() {
   };
 
   const handleSend = (text: string, attachments?: Attachment[]) => {
+    const command = text.trim().toLowerCase();
+    if (!attachments?.length && (command === '/clear' || command === '/cls')) {
+      void clearCurrentChat();
+      return;
+    }
     sendMessage(text, attachments);
   };
 
@@ -123,7 +138,7 @@ export function ChatPanel() {
           {messages.length === 0 ? (
             <WelcomeScreen onSuggestionClick={handleSuggestionClick} />
           ) : (
-            <div className="mx-auto w-full max-w-[920px] px-5 sm:px-8">
+            <div className="mx-auto w-full max-w-[1180px] px-5 sm:px-8">
               <div className="space-y-1 pb-4 pt-4">
                 {messages.map((msg, idx) => {
                   const prevMsg = idx > 0 ? messages[idx - 1] : null;
@@ -261,7 +276,7 @@ export function ChatPanel() {
 
       <div>
         {approvalRequest && (
-          <div className="mx-auto w-full max-w-[920px] px-5 pb-2 sm:px-8">
+          <div className="mx-auto w-full max-w-[1180px] px-5 pb-2 sm:px-8">
             <ApprovalCard
               request={approvalRequest}
               onApprove={() => sendApproval(approvalRequest.requestId, true)}

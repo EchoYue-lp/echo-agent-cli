@@ -1,5 +1,6 @@
-import { useEffect, useMemo } from 'react';
-import { RefreshCw, ListTodo, FileText, Gauge } from 'lucide-react';
+import { useEffect, useMemo, useState } from 'react';
+import type { ReactNode } from 'react';
+import { Bot, ChevronLeft, ChevronRight, FileText, ListTodo, RefreshCw } from 'lucide-react';
 import { useConversationStore } from '../../stores/conversationStore';
 import { useChangesStore } from '../../stores/changesStore';
 import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
@@ -7,7 +8,7 @@ import { useSubagentRunStore } from '../../stores/subagentRunStore';
 import { deriveChangedFiles } from '../../utils/deriveChangedFiles';
 import { useChatStore } from '../../stores/chatStore';
 import { ChangesDrawer } from '../changes/ChangesDrawer';
-import { TaskRuntimePanel, CacheUsageCard, cacheUsageForRuns } from '../task/TaskRuntimePanel';
+import { TaskRuntimePanel } from '../task/TaskRuntimePanel';
 import { SubagentPanel } from '../subagent/SubagentCard';
 
 const STATUS_LABEL: Record<string, string> = {
@@ -27,10 +28,49 @@ function runStatusColor(status: string): string {
   return 'var(--text-tertiary)';
 }
 
+function Section({
+  icon,
+  title,
+  count,
+  children,
+}: {
+  icon: ReactNode;
+  title: string;
+  count?: string;
+  children: ReactNode;
+}) {
+  return (
+    <section className="border-t border-[var(--border-primary)] pt-4">
+      <div className="mb-2 flex items-center gap-2">
+        <span className="text-[var(--text-tertiary)]">{icon}</span>
+        <h2 className="min-w-0 flex-1 truncate text-xs font-semibold uppercase text-[var(--text-secondary)]">
+          {title}
+        </h2>
+        {count && (
+          <span className="text-[10px] tabular-nums text-[var(--text-tertiary)]">{count}</span>
+        )}
+      </div>
+      {children}
+    </section>
+  );
+}
+
+function RailMetric({ icon, value }: { icon: ReactNode; value: number }) {
+  return (
+    <span className="flex flex-col items-center gap-1">
+      {icon}
+      <span className="text-[10px] font-medium tabular-nums text-[var(--text-secondary)]">
+        {value}
+      </span>
+    </span>
+  );
+}
+
 export function RightRail() {
+  const [collapsed, setCollapsed] = useState(true);
   const activeId = useConversationStore((s) => s.activeId);
   const messages = useChatStore((s) => s.messages);
-  const { activeRun, todos: _todos, artifacts, refresh } = useTaskRuntimeStore();
+  const { activeRun, todos, artifacts, refresh } = useTaskRuntimeStore();
   const subagentRuns = useSubagentRunStore((s) => s.runs);
 
   const changesFiles = useChangesStore((s) => s.files);
@@ -64,146 +104,204 @@ export function RightRail() {
   }, [activeRun, subagentRuns]);
 
   const displayedChanges = changesFiles.slice(0, 12);
-  const usageSummary = cacheUsageForRuns(visibleRuns);
+  const runningSubagents = visibleRuns.filter((run) => run.status === 'running').length;
+  const completedTodos = todos.filter((todo) => todo.status === 'completed').length;
+  const outputCount = changesFiles.length + artifacts.length;
+  const hasActivity = Boolean(
+    activeRun || visibleRuns.length > 0 || changesFiles.length > 0 || artifacts.length > 0
+  );
 
   return (
-    <aside className="hidden h-full w-[300px] shrink-0 border-l border-[var(--border-primary)] bg-[var(--bg-rail)] px-4 py-5 xl:block">
-      <div className="flex h-full flex-col gap-5 overflow-y-auto">
-        {/* ── 任务运行(TaskRuntimePanel: todos + cache) ── */}
-        <TaskRuntimePanel />
-
-        {visibleRuns.length > 0 && (
-          <section>
-            <SubagentPanel
-              subagents={Object.fromEntries(visibleRuns.map((run) => [run.subagentRunId, run]))}
+    <aside
+      className={`relative hidden h-full shrink-0 overflow-visible xl:block ${
+        collapsed ? 'w-0' : 'w-[316px] border-l border-[var(--border-primary)] bg-[var(--bg-rail)]'
+      }`}
+    >
+      {collapsed && (
+        <div className="absolute right-3 top-4 z-30">
+          <button
+            onClick={() => setCollapsed(false)}
+            className="flex flex-col items-center gap-2 rounded-full border border-[var(--border-primary)] bg-[var(--bg-primary)]/95 px-2 py-2 text-[var(--text-tertiary)] shadow-[var(--shadow-md)] backdrop-blur transition-colors hover:border-[var(--accent)] hover:text-[var(--text-primary)]"
+            title="展开工作台"
+            aria-label="展开工作台"
+          >
+            <ChevronLeft size={13} />
+            <span
+              className="h-1.5 w-1.5 rounded-full"
+              style={{
+                background: activeRun ? runStatusColor(activeRun.status) : 'var(--text-tertiary)',
+              }}
             />
-          </section>
-        )}
+            <RailMetric icon={<ListTodo size={12} />} value={todos.length} />
+            <RailMetric icon={<Bot size={12} />} value={visibleRuns.length} />
+            <RailMetric icon={<FileText size={12} />} value={outputCount} />
+          </button>
+        </div>
+      )}
 
-        {/* ── 任务执行进度(审批等) ── */}
-        <section>
-          <div className="mb-3 flex items-center justify-between">
-            <div className="flex items-center gap-1.5">
-              <ListTodo size={13} style={{ color: 'var(--accent)' }} />
-              <h2 className="text-sm font-semibold text-[var(--text-primary)]">任务执行进度</h2>
-            </div>
-            {activeRun && (
+      {!collapsed && (
+        <div className="flex h-full flex-col overflow-y-auto px-4 py-4">
+          <header className="pb-4">
+            <div className="mb-3 flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <h2 className="truncate text-sm font-semibold text-[var(--text-primary)]">
+                  工作台
+                </h2>
+                <p className="mt-0.5 truncate text-[11px] text-[var(--text-tertiary)]">
+                  当前会话的任务、子代理和输出
+                </p>
+              </div>
               <button
-                onClick={() => refresh(activeRun.run_id)}
-                className="text-[var(--text-tertiary)]"
+                onClick={() => setCollapsed(true)}
+                className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                title="收起工作台"
+                aria-label="收起工作台"
               >
-                <RefreshCw size={11} />
+                <ChevronRight size={14} />
               </button>
-            )}
-          </div>
-          {activeRun ? (
-            <>
-              <div
-                className="mb-2 truncate rounded-md px-2 py-1.5 text-[11px]"
-                style={{ background: 'var(--bg-secondary)', color: 'var(--text-secondary)' }}
-                title={activeRun.goal}
-              >
-                {activeRun.goal}
-              </div>
-              <div className="mb-2">
-                <span
-                  className="rounded px-1.5 py-0.5 text-[10px] font-medium"
-                  style={{ color: runStatusColor(activeRun.status), background: 'var(--bg-hover)' }}
+              {activeRun && (
+                <button
+                  onClick={() => refresh(activeRun.run_id)}
+                  className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                  title="刷新任务状态"
                 >
-                  {STATUS_LABEL[activeRun.status] ?? activeRun.status}
-                </span>
-              </div>
-            </>
-          ) : (
-            <div className="rounded-lg border border-dashed border-[var(--border-primary)] px-3 py-3 text-xs text-[var(--text-tertiary)]">
-              暂无运行中的任务
+                  <RefreshCw size={13} />
+                </button>
+              )}
             </div>
-          )}
-        </section>
 
-        {/* ── 输出产物 ── */}
-        <section>
-          <div className="mb-3 flex items-center gap-1.5">
-            <FileText size={13} style={{ color: 'var(--accent)' }} />
-            <h2 className="text-sm font-semibold text-[var(--text-primary)]">输出产物</h2>
-            <span className="ml-auto text-xs text-[var(--text-tertiary)]">
-              {changesFiles.length || artifacts.length
-                ? `${changesFiles.length} 改动 / ${artifacts.length} 产物`
-                : ''}
-            </span>
-          </div>
-          <div className="space-y-1">
-            {displayedChanges.length === 0 && artifacts.length === 0 ? (
-              <div className="rounded-lg border border-dashed border-[var(--border-primary)] px-3 py-3 text-xs text-[var(--text-tertiary)]">
-                本会话暂无输出产物
+            {activeRun ? (
+              <div className="space-y-2">
+                <div className="flex items-center gap-2">
+                  <span
+                    className="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium"
+                    style={{
+                      color: runStatusColor(activeRun.status),
+                      background: 'var(--bg-hover)',
+                    }}
+                  >
+                    {STATUS_LABEL[activeRun.status] ?? activeRun.status}
+                  </span>
+                  <span
+                    className="min-w-0 flex-1 truncate text-xs text-[var(--text-secondary)]"
+                    title={activeRun.goal}
+                  >
+                    {activeRun.goal}
+                  </span>
+                </div>
+                <div className="grid grid-cols-3 gap-2">
+                  <div className="rounded-md bg-[var(--bg-secondary)] px-2 py-1.5">
+                    <div className="text-[10px] text-[var(--text-tertiary)]">任务</div>
+                    <div className="text-xs font-medium tabular-nums text-[var(--text-primary)]">
+                      {completedTodos}/{todos.length}
+                    </div>
+                  </div>
+                  <div className="rounded-md bg-[var(--bg-secondary)] px-2 py-1.5">
+                    <div className="text-[10px] text-[var(--text-tertiary)]">子代理</div>
+                    <div className="text-xs font-medium tabular-nums text-[var(--text-primary)]">
+                      {runningSubagents}/{visibleRuns.length}
+                    </div>
+                  </div>
+                  <div className="rounded-md bg-[var(--bg-secondary)] px-2 py-1.5">
+                    <div className="text-[10px] text-[var(--text-tertiary)]">输出</div>
+                    <div className="text-xs font-medium tabular-nums text-[var(--text-primary)]">
+                      {outputCount}
+                    </div>
+                  </div>
+                </div>
               </div>
             ) : (
-              displayedChanges.map((file) => {
-                const meta =
-                  file.status === 'added'
-                    ? { label: 'A', color: 'var(--color-success, #22c55e)' }
-                    : file.status === 'deleted'
-                      ? { label: 'D', color: 'var(--color-error, #ef4444)' }
-                      : { label: 'M', color: 'var(--color-warning, #f59e0b)' };
-                return (
-                  <button
-                    key={file.path}
-                    onClick={() => setSelected(file.path)}
-                    className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-[var(--bg-hover)]"
-                    title={file.path}
-                  >
-                    <span
-                      className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded text-[9px] font-bold"
-                      style={{
-                        background: `color-mix(in srgb, ${meta.color} 18%, transparent)`,
-                        color: meta.color,
-                      }}
-                    >
-                      {meta.label}
-                    </span>
-                    <span className="min-w-0 flex-1 truncate text-xs text-[var(--text-secondary)]">
-                      <span className="text-[var(--text-primary)]">{file.basename}</span>
-                      {file.dir && (
-                        <span className="text-[var(--text-tertiary)]"> · {file.dir}</span>
-                      )}
-                    </span>
-                  </button>
-                );
-              })
+              <p className="rounded-md border border-dashed border-[var(--border-primary)] px-3 py-2 text-xs text-[var(--text-tertiary)]">
+                {hasActivity ? '当前没有正在执行的任务' : '开始对话后，这里会显示任务状态和输出。'}
+              </p>
             )}
-            {/* Artifacts */}
-            {artifacts.length > 0 && (
-              <div className="mt-2 space-y-0.5">
-                {artifacts.map((a) => (
-                  <div
-                    key={a.id}
-                    className="flex items-center gap-1 truncate px-1 py-0.5 text-[10px] text-[var(--text-secondary)]"
-                    title={a.path ?? a.title}
-                  >
-                    <FileText size={10} className="text-[var(--text-tertiary)]" />
-                    <span className="truncate">{a.title}</span>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        </section>
+          </header>
 
-        {/* ── Token / Cache ── */}
-        <section>
-          <div className="mb-3 flex items-center gap-1.5">
-            <Gauge size={13} style={{ color: 'var(--accent)' }} />
-            <h2 className="text-sm font-semibold text-[var(--text-primary)]">Token / Cache</h2>
+          <div className="space-y-4">
+            <TaskRuntimePanel />
+
+            {visibleRuns.length > 0 && (
+              <Section
+                icon={<Bot size={13} />}
+                title="子代理"
+                count={
+                  runningSubagents > 0 ? `${runningSubagents} 运行中` : `${visibleRuns.length}`
+                }
+              >
+                <SubagentPanel
+                  subagents={Object.fromEntries(visibleRuns.map((run) => [run.subagentRunId, run]))}
+                />
+              </Section>
+            )}
+
+            <Section
+              icon={<FileText size={13} />}
+              title="输出"
+              count={
+                changesFiles.length || artifacts.length
+                  ? `${changesFiles.length} 改动 / ${artifacts.length} 产物`
+                  : undefined
+              }
+            >
+              <div className="space-y-1">
+                {displayedChanges.length === 0 && artifacts.length === 0 ? (
+                  <p className="rounded-md border border-dashed border-[var(--border-primary)] px-3 py-2 text-xs text-[var(--text-tertiary)]">
+                    暂无文件改动或产物
+                  </p>
+                ) : (
+                  displayedChanges.map((file) => {
+                    const meta =
+                      file.status === 'added'
+                        ? { label: 'A', color: 'var(--color-success, #22c55e)' }
+                        : file.status === 'deleted'
+                          ? { label: 'D', color: 'var(--color-error, #ef4444)' }
+                          : { label: 'M', color: 'var(--color-warning, #f59e0b)' };
+                    return (
+                      <button
+                        key={file.path}
+                        onClick={() => setSelected(file.path)}
+                        className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-[var(--bg-hover)]"
+                        title={file.path}
+                      >
+                        <span
+                          className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded text-[9px] font-bold"
+                          style={{
+                            background: `color-mix(in srgb, ${meta.color} 18%, transparent)`,
+                            color: meta.color,
+                          }}
+                        >
+                          {meta.label}
+                        </span>
+                        <span className="min-w-0 flex-1 truncate text-xs text-[var(--text-secondary)]">
+                          <span className="text-[var(--text-primary)]">{file.basename}</span>
+                          {file.dir && (
+                            <span className="text-[var(--text-tertiary)]"> · {file.dir}</span>
+                          )}
+                        </span>
+                      </button>
+                    );
+                  })
+                )}
+                {artifacts.length > 0 && (
+                  <div className="mt-2 space-y-0.5">
+                    {artifacts.map((a) => (
+                      <div
+                        key={a.id}
+                        className="flex items-center gap-1 truncate px-1 py-0.5 text-[10px] text-[var(--text-secondary)]"
+                        title={a.path ?? a.title}
+                      >
+                        <FileText size={10} className="text-[var(--text-tertiary)]" />
+                        <span className="truncate">{a.title}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </Section>
           </div>
-          {usageSummary.calls > 0 ? (
-            <CacheUsageCard summary={usageSummary} compact />
-          ) : (
-            <div className="rounded-lg border border-dashed border-[var(--border-primary)] px-3 py-3 text-xs text-[var(--text-tertiary)]">
-              暂无 LLM 调用数据
-            </div>
-          )}
-        </section>
-      </div>
+        </div>
+      )}
+
       <ChangesDrawer />
     </aside>
   );

@@ -654,7 +654,7 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
       onDrop={handleDrop}
     >
       {/* Relative container so the absolute-positioned palette anchors here */}
-      <div className="relative mx-auto max-w-[920px]">
+      <div className="relative mx-auto max-w-[1180px]">
         {/* ── Slash Command Palette ── */}
         {showPalette && (
           <CommandPalette

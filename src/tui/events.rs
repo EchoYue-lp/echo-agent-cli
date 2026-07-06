@@ -1016,9 +1016,16 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &AgentHandle, cmd: &str) 
                 });
             }
         }
-        Some(SlashCommand::Reset) => {
+        Some(SlashCommand::Clear) => {
             app.messages.clear();
             app.tokens = (0, 0, 0);
+            app.streaming_text.clear();
+            app.pending_stream.clear();
+            app.pending_attachments.clear();
+            app.is_processing = false;
+            app.chat_scroll = 0;
+            app.conversation_id = Some(uuid::Uuid::new_v4().to_string());
+            app.clear_selection();
             agent
                 .read_async(|a| {
                     Box::pin(async move {
@@ -1029,7 +1036,7 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &AgentHandle, cmd: &str) 
                 .await;
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
-                content: "Conversation reset.".to_string(),
+                content: "Conversation cleared.".to_string(),
             });
         }
         Some(SlashCommand::Stats) => {

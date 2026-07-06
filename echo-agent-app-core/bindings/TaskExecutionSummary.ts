@@ -3,7 +3,7 @@ import type { SuggestedTask } from "./SuggestedTask";
 
 /**
  * Compact per-task summary produced at every task boundary. Downstream
- * workers consume this instead of the full raw conversation — see the
+ * subagents consume this instead of the full raw conversation — see the
  * "Summary Chain" section of the plan.
  */
 export type TaskExecutionSummary = { run_id: string, task_id: string, worker_agent: string, completed_work: Array<string>, files_read: Array<string>, files_changed: Array<string>, decisions: Array<string>, failures: Array<string>, verification: Array<string>, next_implications: Array<string>, suggested_tasks: Array<SuggestedTask>, created_at: string, };

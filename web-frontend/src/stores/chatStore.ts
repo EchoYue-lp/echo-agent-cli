@@ -353,10 +353,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
       messages: [],
       isStreaming: false,
       isCancelled: false,
+      isThinking: false,
       isHistoryView: false,
       approvalRequest: null,
       inputRequest: null,
       selectionRequest: null,
+      pendingToolCalls: [],
+      currentRound: null,
       runStatus: 'idle',
     }),
 

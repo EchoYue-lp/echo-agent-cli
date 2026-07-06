@@ -273,8 +273,7 @@ echo-agent-cli 启用以下 echo-agent 框架 features：
 
 | 命令 | 别名 | 描述 |
 |------|------|------|
-| `/reset` | `r` | 重置对话历史 |
-| `/clear` | `cls` | 清屏 |
+| `/clear` | `cls` | 清空当前对话并重置 Agent 上下文 |
 | `/history` | `hist` | 查看会话历史 |
 | `/stats` | `st` | 显示会话统计 |
 | `/status` | | 显示 Agent 状态 |

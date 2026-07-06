@@ -127,7 +127,7 @@ export function SubagentCard({ subagent: s }: Props) {
 
 export function SubagentPanel({ subagents }: { subagents: Record<string, SubagentRunState> }) {
   const entries = Object.values(subagents);
-  const [showDone, setShowDone] = useState(true);
+  const [showDone, setShowDone] = useState(false);
   if (entries.length === 0) return null;
 
   const running = entries.filter((s) => s.status === 'running');

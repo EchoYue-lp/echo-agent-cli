@@ -37,6 +37,8 @@ interface ConversationState {
   renameConversation: (id: string, title: string) => void;
   /** Start a brand new chat */
   startNew: () => Promise<void>;
+  /** Clear current chat immediately without saving it */
+  clearCurrent: () => Promise<void>;
   /** Get all conversations grouped by date */
   getGroupedConversations: () => ConversationGroup[];
 }
@@ -419,6 +421,17 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
     }
 
     // Always clear — this is the user's expected outcome
+    useChatStore.getState().clearMessages();
+    set({ activeId: null });
+  },
+
+  clearCurrent: async () => {
+    try {
+      await sessionApi.reset();
+    } catch (e) {
+      console.error('Failed to reset session while clearing chat:', e);
+    }
+
     useChatStore.getState().clearMessages();
     set({ activeId: null });
   },
