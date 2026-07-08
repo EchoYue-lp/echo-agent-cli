@@ -194,7 +194,7 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
 
       {/* Dialog */}
       <div
-        className="fixed left-1/2 top-1/2 z-50 flex w-[540px] -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-2xl border shadow-2xl"
+        className="fixed left-1/2 top-1/2 z-50 flex w-[540px] -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-xl border shadow-[var(--shadow-xl)]"
         style={{
           background: 'var(--bg-primary)',
           borderColor: 'var(--border-primary)',
@@ -216,7 +216,7 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
                   setView('list');
                   setError('');
                 }}
-                className="text-xs px-2 py-1 rounded hover:opacity-80"
+                className="text-xs px-2 py-1 rounded-md hover:opacity-80"
                 style={{ color: 'var(--text-secondary)' }}
               >
                 ← 返回
@@ -236,7 +236,7 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
         {error && (
           <div
             className="mx-5 mt-3 rounded-lg px-3 py-2 text-xs"
-            style={{ background: '#fee2e2', color: '#dc2626' }}
+            style={{ background: 'var(--color-error-bg)', color: 'var(--color-error-text)' }}
           >
             {error}
           </div>
@@ -252,7 +252,7 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
                   className="rounded-lg border p-3"
                   style={{
                     borderColor: 'var(--accent)',
-                    background: 'var(--bg-sidebar-active, rgba(99,102,241,0.05))',
+                    background: 'var(--bg-sidebar-active)',
                   }}
                 >
                   <div
@@ -267,7 +267,7 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
                       {current.name}
                     </span>
                     <span
-                      className="text-[11px] px-1.5 py-0.5 rounded"
+                      className="text-[11px] px-1.5 py-0.5 rounded-md"
                       style={{ background: 'var(--bg-secondary)', color: 'var(--text-tertiary)' }}
                     >
                       {current.kind.type}
@@ -346,7 +346,7 @@ export default function NewTaskDialog({ isOpen, onClose }: Props) {
                         )}
                         <button
                           onClick={(e) => handleDelete(ws.id, e)}
-                          className="ml-1 rounded p-1 transition-colors hover:text-red-500"
+                          className="ml-1 rounded-md p-1 transition-colors hover:text-red-500"
                           style={{ color: 'var(--text-tertiary)' }}
                           title="删除"
                         >

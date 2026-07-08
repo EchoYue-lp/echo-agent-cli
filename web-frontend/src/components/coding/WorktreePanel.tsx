@@ -98,7 +98,7 @@ export function WorktreePanel() {
           <span>{error}</span>
           <button
             onClick={() => setError(null)}
-            className="ml-auto rounded p-1 hover:bg-[var(--color-error)]/10"
+            className="ml-auto rounded-md p-1 hover:bg-[var(--color-error)]/10"
           >
             <X size={12} />
           </button>
@@ -237,7 +237,7 @@ export function WorktreePanel() {
                         <button
                           onClick={() => handleRemove(wt.path)}
                           disabled={removing === wt.path}
-                          className="rounded bg-[var(--color-error)] px-2 py-1 text-[11px] font-medium text-white hover:opacity-90 disabled:opacity-50"
+                          className="rounded-md bg-[var(--color-error)] px-2 py-1 text-[11px] font-medium text-white hover:opacity-90 disabled:opacity-50"
                         >
                           {removing === wt.path ? (
                             <Loader2 size={11} className="animate-spin" />
@@ -247,7 +247,7 @@ export function WorktreePanel() {
                         </button>
                         <button
                           onClick={() => setConfirmDelete(null)}
-                          className="rounded px-2 py-1 text-[11px] text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
+                          className="rounded-md px-2 py-1 text-[11px] text-[var(--text-secondary)] hover:text-[var(--text-primary)]"
                         >
                           Cancel
                         </button>
@@ -255,7 +255,7 @@ export function WorktreePanel() {
                     ) : (
                       <button
                         onClick={() => setConfirmDelete(wt.path)}
-                        className="rounded p-1.5 text-[var(--text-tertiary)] transition-colors hover:bg-[var(--color-error)]/10 hover:text-[var(--color-error)]"
+                        className="rounded-md p-1.5 text-[var(--text-tertiary)] transition-colors hover:bg-[var(--color-error)]/10 hover:text-[var(--color-error)]"
                         title="Remove worktree"
                       >
                         <Trash2 size={13} />

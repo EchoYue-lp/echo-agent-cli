@@ -190,7 +190,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
               </button>
               <button
                 onClick={(e) => handleOpenFolder(e, current)}
-                className="rounded p-1 text-[var(--text-tertiary)] transition-colors hover:text-[var(--text-primary)]"
+                className="rounded-md p-1 text-[var(--text-tertiary)] transition-colors hover:text-[var(--text-primary)]"
                 title="在文件管理器中打开"
               >
                 <FolderOpen size={13} />
@@ -233,7 +233,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
                   setSearchQuery('');
                   searchInputRef.current?.focus();
                 }}
-                className="shrink-0 rounded p-0.5 text-[var(--text-tertiary)] hover:text-[var(--text-primary)]"
+                className="shrink-0 rounded-md p-0.5 text-[var(--text-tertiary)] hover:text-[var(--text-primary)]"
               >
                 <X size={12} />
               </button>
@@ -345,21 +345,21 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
                   <div className="flex shrink-0 items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
                     <button
                       onClick={(e) => handleNewConversation(e, ws)}
-                      className="rounded p-1 text-[var(--text-tertiary)] transition-colors hover:text-[var(--accent)]"
+                      className="rounded-md p-1 text-[var(--text-tertiary)] transition-colors hover:text-[var(--accent)]"
                       title="新建会话"
                     >
                       <Plus size={12} />
                     </button>
                     <button
                       onClick={(e) => handleOpenFolder(e, ws)}
-                      className="rounded p-1 text-[var(--text-tertiary)] transition-colors hover:text-[var(--text-primary)]"
+                      className="rounded-md p-1 text-[var(--text-tertiary)] transition-colors hover:text-[var(--text-primary)]"
                       title="打开文件夹"
                     >
                       <FolderOpen size={12} />
                     </button>
                     <button
                       onClick={(e) => handleDelete(ws.id, e)}
-                      className="rounded p-1 text-[var(--text-tertiary)] transition-colors hover:text-[var(--color-error)]"
+                      className="rounded-md p-1 text-[var(--text-tertiary)] transition-colors hover:text-[var(--color-error)]"
                       title="删除"
                     >
                       <Trash2 size={12} />

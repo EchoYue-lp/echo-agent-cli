@@ -174,7 +174,7 @@ export function RightRail() {
               <div className="space-y-2">
                 <div className="flex items-center gap-2">
                   <span
-                    className="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium"
+                    className="shrink-0 rounded-md px-1.5 py-0.5 text-[10px] font-medium"
                     style={{
                       color: runStatusColor(activeRun.status),
                       background: 'var(--bg-hover)',
@@ -264,7 +264,7 @@ export function RightRail() {
                         title={file.path}
                       >
                         <span
-                          className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded text-[9px] font-bold"
+                          className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-md text-[9px] font-bold"
                           style={{
                             background: `color-mix(in srgb, ${meta.color} 18%, transparent)`,
                             color: meta.color,

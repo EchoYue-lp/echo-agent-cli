@@ -258,14 +258,14 @@ export function TasksPanel() {
             onClick={() => {
               fetchTasks();
             }}
-            className="rounded p-1 transition-colors"
+            className="rounded-md p-1 transition-colors"
             style={{ color: s.textTer }}
           >
             <RefreshCw size={14} />
           </button>
           <button
             onClick={() => setShowSubmit(!showSubmit)}
-            className="rounded p-1 transition-colors"
+            className="rounded-md p-1 transition-colors"
             style={{ color: s.textTer }}
           >
             <Plus size={14} />
@@ -281,7 +281,7 @@ export function TasksPanel() {
           <select
             value={submitKind}
             onChange={(e) => setSubmitKind(e.target.value)}
-            className="w-full rounded border px-2 py-1 text-xs"
+            className="w-full rounded-md border px-2 py-1 text-xs"
             style={{ borderColor: s.border, background: s.bg, color: s.text }}
           >
             <option value="agent_chat">对话任务</option>
@@ -294,7 +294,7 @@ export function TasksPanel() {
             value={submitDesc}
             onChange={(e) => setSubmitDesc(e.target.value)}
             placeholder="任务描述 / 研究主题 / 对话内容"
-            className="w-full rounded border px-2 py-1 text-xs"
+            className="w-full rounded-md border px-2 py-1 text-xs"
             style={{ borderColor: s.border, background: s.bg, color: s.text }}
             onKeyDown={(e) => e.key === 'Enter' && handleSubmit()}
           />
@@ -303,14 +303,14 @@ export function TasksPanel() {
               value={submitParams}
               onChange={(e) => setSubmitParams(e.target.value)}
               placeholder='参数 (JSON): {"topic": "...", "max_papers": 20}'
-              className="w-full rounded border px-2 py-1 text-xs"
+              className="w-full rounded-md border px-2 py-1 text-xs"
               rows={2}
               style={{ borderColor: s.border, background: s.bg, color: s.text }}
             />
           )}
           <button
             onClick={handleSubmit}
-            className="flex items-center gap-1 rounded px-2 py-1 text-xs font-medium transition-colors"
+            className="flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium transition-colors"
             style={{ background: 'var(--color-primary)', color: '#fff' }}
           >
             <Play size={12} /> 提交任务
@@ -356,7 +356,7 @@ export function TasksPanel() {
                   )}
                   {task.kind && (
                     <span
-                      className="text-[10px] px-1.5 py-0.5 rounded flex-shrink-0"
+                      className="text-[10px] px-1.5 py-0.5 rounded-md flex-shrink-0"
                       style={{ background: s.bgHover, color: s.textSec }}
                     >
                       {KIND_LABELS[task.kind] || task.kind}
@@ -455,7 +455,7 @@ export function TasksPanel() {
                     </div>
                     {task.result && (
                       <div
-                        className="rounded p-2 text-xs"
+                        className="rounded-md p-2 text-xs"
                         style={{ background: s.bgCard, color: s.text }}
                       >
                         <p className="font-medium mb-1">结果:</p>
@@ -470,7 +470,7 @@ export function TasksPanel() {
                     )}
                     {task.error && (
                       <div
-                        className="rounded p-2 text-xs"
+                        className="rounded-md p-2 text-xs"
                         style={{ background: 'rgba(239,68,68,0.1)', color: 'var(--color-error)' }}
                       >
                         <p className="font-medium mb-1">错误:</p>
@@ -480,7 +480,7 @@ export function TasksPanel() {
                     {!['completed', 'failed', 'cancelled', 'timed_out'].includes(task.status) && (
                       <button
                         onClick={() => handleCancel(task.id)}
-                        className="flex items-center gap-1 rounded px-2 py-1 text-xs transition-colors"
+                        className="flex items-center gap-1 rounded-md px-2 py-1 text-xs transition-colors"
                         style={{ background: 'rgba(239,68,68,0.1)', color: 'var(--color-error)' }}
                       >
                         <XCircle size={12} /> 取消任务

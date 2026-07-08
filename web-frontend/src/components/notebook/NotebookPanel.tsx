@@ -92,14 +92,14 @@ export default function NotebookPanel() {
       >
         <button
           onClick={() => addCell('code')}
-          className="flex items-center gap-1 px-2 py-1 rounded text-sm hover:opacity-80"
+          className="flex items-center gap-1 px-2 py-1 rounded-md text-sm hover:opacity-80"
           style={{ background: 'var(--bg-secondary)', color: 'var(--text-primary)' }}
         >
           <Plus size={14} /> Code
         </button>
         <button
           onClick={() => addCell('markdown')}
-          className="flex items-center gap-1 px-2 py-1 rounded text-sm hover:opacity-80"
+          className="flex items-center gap-1 px-2 py-1 rounded-md text-sm hover:opacity-80"
           style={{ background: 'var(--bg-secondary)', color: 'var(--text-primary)' }}
         >
           <Plus size={14} /> Markdown
@@ -126,7 +126,7 @@ export default function NotebookPanel() {
               {cell.type === 'code' && (
                 <button
                   onClick={() => runCell(cell.id)}
-                  className="p-1 rounded"
+                  className="p-1 rounded-md"
                   style={{ background: 'var(--action-run)', color: 'var(--text-on-run)' }}
                   title="Run"
                 >
@@ -135,7 +135,7 @@ export default function NotebookPanel() {
               )}
               <button
                 onClick={() => deleteCell(cell.id)}
-                className="p-1 rounded bg-red-600 text-white hover:bg-red-700"
+                className="p-1 rounded-md bg-red-600 text-white hover:bg-red-700"
                 title="Delete"
               >
                 <Trash2 size={12} />

@@ -77,7 +77,7 @@ export function ScratchpadPanel() {
             Scratchpad
           </span>
           {dirty && (
-            <span className="text-xs px-1.5 py-0.5 rounded bg-yellow-500/20 text-yellow-500">
+            <span className="text-xs px-1.5 py-0.5 rounded-md bg-yellow-500/20 text-yellow-500">
               unsaved
             </span>
           )}
@@ -99,7 +99,7 @@ export function ScratchpadPanel() {
           )}
           <button
             onClick={() => setPreview(!preview)}
-            className="p-1.5 rounded transition-colors hover:bg-[var(--bg-hover)]"
+            className="p-1.5 rounded-md transition-colors hover:bg-[var(--bg-hover)]"
             style={{ color: preview ? 'var(--accent)' : 'var(--text-secondary)' }}
             title={preview ? 'Edit' : 'Preview'}
           >
@@ -107,7 +107,7 @@ export function ScratchpadPanel() {
           </button>
           <button
             onClick={() => save(content)}
-            className="p-1.5 rounded transition-colors hover:bg-[var(--bg-hover)]"
+            className="p-1.5 rounded-md transition-colors hover:bg-[var(--bg-hover)]"
             style={{ color: 'var(--text-secondary)' }}
             title="Save now"
           >

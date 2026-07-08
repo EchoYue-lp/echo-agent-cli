@@ -219,7 +219,7 @@ function SettingsOverview() {
                     <span className="truncate text-sm font-medium text-[var(--text-primary)]">
                       {label}
                     </span>
-                    <span className="shrink-0 rounded bg-[var(--bg-hover)] px-1.5 py-0.5 text-[9px] text-[var(--text-tertiary)]">
+                    <span className="shrink-0 rounded-md bg-[var(--bg-hover)] px-1.5 py-0.5 text-[9px] text-[var(--text-tertiary)]">
                       {maturityLabel[maturity]}
                     </span>
                   </span>
@@ -274,7 +274,7 @@ export function SettingsDialog() {
 
       {/* Dialog */}
       <div
-        className="settings-dialog animate-scale-in fixed left-1/2 top-1/2 z-50 flex h-[85vh] w-[92vw] max-w-6xl -translate-x-1/2 -translate-y-1/2 overflow-hidden rounded-2xl border border-[var(--border-primary)] bg-[var(--settings-dialog-bg)] shadow-[var(--shadow-xl)] max-sm:h-screen max-sm:w-screen max-sm:max-w-none max-sm:rounded-none"
+        className="settings-dialog animate-scale-in fixed left-1/2 top-1/2 z-50 flex h-[85vh] w-[92vw] max-w-6xl -translate-x-1/2 -translate-y-1/2 overflow-hidden rounded-xl border border-[var(--border-primary)] bg-[var(--settings-dialog-bg)] shadow-[var(--shadow-xl)] max-sm:h-screen max-sm:w-screen max-sm:max-w-none max-sm:rounded-none"
         style={
           {
             '--accent': 'var(--settings-accent)',
@@ -360,7 +360,7 @@ export function SettingsDialog() {
                     <span className="min-w-0 flex-1">
                       <span className="flex min-w-0 items-center gap-2">
                         <span className="truncate text-[13px] font-medium">{label}</span>
-                        <span className="shrink-0 rounded bg-[var(--bg-hover)] px-1.5 py-0.5 text-[9px] text-[var(--text-tertiary)]">
+                        <span className="shrink-0 rounded-md bg-[var(--bg-hover)] px-1.5 py-0.5 text-[9px] text-[var(--text-tertiary)]">
                           {maturityLabel[maturity]}
                         </span>
                       </span>
@@ -384,7 +384,7 @@ export function SettingsDialog() {
                   {effectiveItem?.label}
                 </span>
                 {effectiveItem && (
-                  <span className="rounded bg-[var(--bg-hover)] px-1.5 py-0.5 text-[10px] text-[var(--text-tertiary)]">
+                  <span className="rounded-md bg-[var(--bg-hover)] px-1.5 py-0.5 text-[10px] text-[var(--text-tertiary)]">
                     {maturityLabel[effectiveItem.maturity]}
                   </span>
                 )}

@@ -23,7 +23,7 @@ export function Toggle({ checked, onChange, label, disabled = false }: TogglePro
     >
       {label && <span className="sr-only">{label}</span>}
       <span
-        className="absolute top-0.5 rounded-full bg-white shadow-sm transition-transform duration-200"
+        className="absolute top-0.5 rounded-full bg-white shadow-[var(--shadow-sm)] transition-transform duration-200"
         style={{
           width: 16,
           height: 16,

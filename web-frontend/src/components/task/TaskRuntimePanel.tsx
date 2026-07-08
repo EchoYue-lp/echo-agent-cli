@@ -444,7 +444,7 @@ export function TaskRuntimePanel() {
           </span>
         </div>
         <span
-          className="rounded px-1.5 py-0.5 text-[10px] font-medium"
+          className="rounded-md px-1.5 py-0.5 text-[10px] font-medium"
           style={{
             color: activeRun ? statusColor(activeRun.status) : 'var(--text-tertiary)',
             background: 'var(--bg-hover)',
@@ -466,7 +466,7 @@ export function TaskRuntimePanel() {
         <div className="mb-2">
           <button
             onClick={() => resumeTaskRun()}
-            className="w-full rounded px-3 py-1.5 text-[11px] font-medium"
+            className="w-full rounded-md px-3 py-1.5 text-[11px] font-medium"
             style={{ background: 'var(--accent)', color: 'var(--text-on-accent)' }}
           >
             开始执行
@@ -496,7 +496,7 @@ export function TaskRuntimePanel() {
               return (
                 <div
                   key={todo.id}
-                  className="group/task flex items-start gap-1.5 rounded px-1.5 py-1 hover:bg-[var(--bg-hover)]"
+                  className="group/task flex items-start gap-1.5 rounded-md px-1.5 py-1 hover:bg-[var(--bg-hover)]"
                   style={{ background: 'var(--bg-secondary)' }}
                 >
                   <div className="mt-0.5">
@@ -515,7 +515,7 @@ export function TaskRuntimePanel() {
                       style={{ color: 'var(--text-tertiary)' }}
                     >
                       {task && (
-                        <span className="rounded px-1" style={{ background: 'var(--bg-hover)' }}>
+                        <span className="rounded-md px-1" style={{ background: 'var(--bg-hover)' }}>
                           {kindLabel(task.kind)}
                         </span>
                       )}
@@ -527,7 +527,7 @@ export function TaskRuntimePanel() {
                   {isEditable && (
                     <div className="flex gap-0.5">
                       <button
-                        className="rounded p-0.5 hover:bg-[var(--bg-active)]"
+                        className="rounded-md p-0.5 hover:bg-[var(--bg-active)]"
                         title="编辑"
                         onClick={() => {
                           const newTitle = prompt('新标题', todo.title);
@@ -541,7 +541,7 @@ export function TaskRuntimePanel() {
                         <Pencil size={10} style={{ color: 'var(--text-tertiary)' }} />
                       </button>
                       <button
-                        className="rounded p-0.5 hover:bg-[var(--bg-active)]"
+                        className="rounded-md p-0.5 hover:bg-[var(--bg-active)]"
                         title="删除"
                         onClick={() => {
                           if (confirm(`确定删除任务「${todo.title}」？`)) {
@@ -559,7 +559,7 @@ export function TaskRuntimePanel() {
           </div>
           {/* Add task button */}
           <button
-            className="mt-1 flex w-full items-center justify-center gap-1 rounded px-2 py-1 text-[10px] hover:bg-[var(--bg-hover)]"
+            className="mt-1 flex w-full items-center justify-center gap-1 rounded-md px-2 py-1 text-[10px] hover:bg-[var(--bg-hover)]"
             style={{ color: 'var(--text-tertiary)', border: '1px dashed var(--border-secondary)' }}
             onClick={() => {
               const title = prompt('新任务标题');
@@ -618,14 +618,14 @@ export function InterruptPromptDialog() {
       style={{ background: 'rgba(0,0,0,0.4)' }}
     >
       <div
-        className="mx-4 w-full max-w-sm rounded-lg p-4 shadow-lg"
+        className="mx-4 w-full max-w-sm rounded-lg p-4 shadow-[var(--shadow-lg)]"
         style={{ background: 'var(--bg-primary)', border: '1px solid var(--border-primary)' }}
       >
         <div className="mb-3 flex items-center justify-between">
           <span className="text-sm font-medium" style={{ color: 'var(--text-primary)' }}>
             任务正在执行中
           </span>
-          <button onClick={dismiss} className="rounded p-1 hover:bg-[var(--bg-hover)]">
+          <button onClick={dismiss} className="rounded-md p-1 hover:bg-[var(--bg-hover)]">
             <X size={14} style={{ color: 'var(--text-tertiary)' }} />
           </button>
         </div>
@@ -640,7 +640,7 @@ export function InterruptPromptDialog() {
         </p>
         <div className="flex flex-col gap-2">
           <button
-            className="flex items-center gap-2 rounded px-3 py-2 text-xs hover:bg-[var(--bg-hover)]"
+            className="flex items-center gap-2 rounded-md px-3 py-2 text-xs hover:bg-[var(--bg-hover)]"
             style={{ border: '1px solid var(--border-primary)', color: 'var(--text-primary)' }}
             onClick={() => {
               resume();
@@ -649,7 +649,7 @@ export function InterruptPromptDialog() {
             <Play size={12} /> 继续执行旧计划
           </button>
           <button
-            className="flex items-center gap-2 rounded px-3 py-2 text-xs hover:bg-[var(--bg-hover)]"
+            className="flex items-center gap-2 rounded-md px-3 py-2 text-xs hover:bg-[var(--bg-hover)]"
             style={{ border: '1px solid var(--border-primary)', color: 'var(--text-primary)' }}
             onClick={async () => {
               // Just dismiss the prompt — the user will be able to edit and re-run.
@@ -659,7 +659,7 @@ export function InterruptPromptDialog() {
             <Edit3 size={12} /> 编辑计划后继续
           </button>
           <button
-            className="flex items-center gap-2 rounded px-3 py-2 text-xs hover:bg-[var(--bg-hover)]"
+            className="flex items-center gap-2 rounded-md px-3 py-2 text-xs hover:bg-[var(--bg-hover)]"
             style={{ border: '1px solid var(--border-primary)', color: 'var(--color-error)' }}
             onClick={async () => {
               const runId = interruptPrompt.runId;

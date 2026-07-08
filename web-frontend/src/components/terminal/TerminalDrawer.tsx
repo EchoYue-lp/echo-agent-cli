@@ -139,7 +139,7 @@ export function TerminalDrawer() {
                   e.stopPropagation();
                   closeTab(tab.id);
                 }}
-                className="ml-1 rounded p-0.5 opacity-0 group-hover:opacity-100 hover:bg-[var(--bg-hover)] transition-opacity"
+                className="ml-1 rounded-md p-0.5 opacity-0 group-hover:opacity-100 hover:bg-[var(--bg-hover)] transition-opacity"
               >
                 <X size={10} />
               </button>
@@ -147,7 +147,7 @@ export function TerminalDrawer() {
           ))}
           <button
             onClick={createNewTerminal}
-            className="rounded p-1 text-[var(--text-tertiary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-sidebar-hover)] transition-colors"
+            className="rounded-md p-1 text-[var(--text-tertiary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-sidebar-hover)] transition-colors"
             title="New terminal"
           >
             <Plus size={12} />
@@ -156,14 +156,14 @@ export function TerminalDrawer() {
         <div className="flex items-center gap-1">
           <button
             onClick={() => setHeight((h) => Math.max(150, h - 50))}
-            className="rounded p-1 text-[var(--text-tertiary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-sidebar-hover)] transition-colors"
+            className="rounded-md p-1 text-[var(--text-tertiary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-sidebar-hover)] transition-colors"
             title="Shrink"
           >
             <Minimize2 size={12} />
           </button>
           <button
             onClick={closeTerminal}
-            className="rounded p-1 text-[var(--text-tertiary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-sidebar-hover)] transition-colors"
+            className="rounded-md p-1 text-[var(--text-tertiary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-sidebar-hover)] transition-colors"
             title="Close terminal"
           >
             <X size={14} />

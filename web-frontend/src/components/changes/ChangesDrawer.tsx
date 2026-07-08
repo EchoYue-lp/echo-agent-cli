@@ -11,9 +11,9 @@ const STATUS_LABEL: Record<string, string> = {
   deleted: '删除',
 };
 const STATUS_COLOR: Record<string, string> = {
-  modified: 'var(--color-warning, #f59e0b)',
-  added: 'var(--color-success, #22c55e)',
-  deleted: 'var(--color-error, #ef4444)',
+  modified: 'var(--color-warning)',
+  added: 'var(--color-success)',
+  deleted: 'var(--color-error)',
 };
 
 /** 从 args 里取出可展示的兜底内容(写入类工具的 content/new_string) */
@@ -63,15 +63,12 @@ export function ChangesDrawer() {
   const fallbackContent = extractFallbackContent(file.lastWriteArgs);
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex justify-end"
-      onClick={() => setSelected(null)}
-    >
+    <div className="fixed inset-0 z-50 flex justify-end" onClick={() => setSelected(null)}>
       {/* 遮罩 */}
       <div className="absolute inset-0 bg-black/40" />
       {/* 抽屉 */}
       <div
-        className="relative flex h-full w-[640px] max-w-[90vw] flex-col border-l border-[var(--border-primary)] bg-[var(--bg-primary)] shadow-2xl"
+        className="relative flex h-full w-[640px] max-w-[90vw] flex-col border-l border-[var(--border-primary)] bg-[var(--bg-primary)] shadow-[var(--shadow-xl)]"
         onClick={(e) => e.stopPropagation()}
       >
         {/* 头部 */}
@@ -92,9 +89,7 @@ export function ChangesDrawer() {
               </span>
             </div>
             {file.dir && (
-              <div className="mt-0.5 truncate text-xs text-[var(--text-tertiary)]">
-                {file.dir}
-              </div>
+              <div className="mt-0.5 truncate text-xs text-[var(--text-tertiary)]">{file.dir}</div>
             )}
           </div>
           <button
@@ -108,7 +103,7 @@ export function ChangesDrawer() {
 
         {/* 历史视图提示 */}
         {isHistoryView && (
-          <div className="flex items-center gap-2 border-b border-[var(--border-primary)] px-4 py-2 text-xs text-[var(--color-warning, #f59e0b)]">
+          <div className="flex items-center gap-2 border-b border-[var(--border-primary)] px-4 py-2 text-xs text-[var(--color-warning)]">
             <FileWarning size={13} className="shrink-0" />
             <span>显示的是当前工作区状态,非此历史会话发生时刻</span>
           </div>
@@ -152,7 +147,7 @@ function FallbackView({
           : '无法获取 git diff(可能为非 git 仓库)。以下为工具写入内容:'}
         <button
           onClick={onRetryGit}
-          className="ml-3 rounded px-1.5 py-0.5 text-[var(--accent)] hover:underline"
+          className="ml-3 rounded-md px-1.5 py-0.5 text-[var(--accent)] hover:underline"
         >
           重试 git diff
         </button>

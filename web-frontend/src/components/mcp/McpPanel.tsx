@@ -111,7 +111,7 @@ export function McpPanel() {
         </h3>
         <button
           onClick={loadData}
-          className="rounded p-1 transition-colors"
+          className="rounded-md p-1 transition-colors"
           style={{ color: s.textTer }}
         >
           <RefreshCw size={16} />
@@ -289,7 +289,7 @@ export function McpPanel() {
                   <button
                     onClick={() => toggle(srv.name, isEnabled)}
                     title={isEnabled ? '禁用' : '启用'}
-                    className="rounded p-1 transition-colors"
+                    className="rounded-md p-1 transition-colors"
                     style={{ color: isEnabled ? 'var(--color-success)' : 'var(--text-tertiary)' }}
                   >
                     <Power size={12} />

@@ -212,7 +212,7 @@ export function SchedulerPanel() {
           <button
             onClick={fetchTasks}
             disabled={refreshing}
-            className="rounded p-1.5 transition-colors hover:opacity-80"
+            className="rounded-md p-1.5 transition-colors hover:opacity-80"
             style={{ color: s.textTer }}
             title="刷新"
           >
@@ -220,7 +220,7 @@ export function SchedulerPanel() {
           </button>
           <button
             onClick={() => setShowAdd(!showAdd)}
-            className="rounded p-1.5 transition-colors hover:opacity-80"
+            className="rounded-md p-1.5 transition-colors hover:opacity-80"
             style={{ color: showAdd ? s.accent : s.textTer }}
             title="添加任务"
           >
@@ -268,7 +268,7 @@ export function SchedulerPanel() {
             {/* Human readable description */}
             {form.cron_expr.trim() && (
               <div
-                className="flex items-center gap-1.5 rounded px-2 py-1 text-[11px]"
+                className="flex items-center gap-1.5 rounded-md px-2 py-1 text-[11px]"
                 style={{
                   background: cronError ? 'rgba(239,68,68,0.08)' : s.bgHover,
                   color: cronError ? 'var(--color-error, #ef4444)' : s.textSec,
@@ -349,7 +349,7 @@ export function SchedulerPanel() {
                 {/* Row 2: cron + description */}
                 <div className="flex items-center gap-2 text-[11px]" style={{ color: s.textSec }}>
                   <code
-                    className="rounded px-1.5 py-0.5 font-mono"
+                    className="rounded-md px-1.5 py-0.5 font-mono"
                     style={{ background: s.bgHover, color: s.text }}
                   >
                     {task.cron_expr}
@@ -390,7 +390,7 @@ export function SchedulerPanel() {
                   <button
                     onClick={() => handleRun(task.id)}
                     disabled={busyTaskId === task.id}
-                    className="flex items-center gap-1 rounded px-2 py-1 text-[11px] font-medium transition-colors"
+                    className="flex items-center gap-1 rounded-md px-2 py-1 text-[11px] font-medium transition-colors"
                     style={{
                       background: 'var(--action-run-bg)',
                       color: 'var(--action-run)',
@@ -417,14 +417,14 @@ export function SchedulerPanel() {
                       <button
                         onClick={() => handleDelete(task.id)}
                         disabled={busyTaskId === task.id}
-                        className="rounded p-1 transition-colors"
+                        className="rounded-md p-1 transition-colors"
                         style={{ color: 'var(--color-error, #ef4444)' }}
                       >
                         <CheckCircle2 size={12} />
                       </button>
                       <button
                         onClick={() => setConfirmDelete(null)}
-                        className="rounded p-1 transition-colors"
+                        className="rounded-md p-1 transition-colors"
                         style={{ color: s.textTer }}
                       >
                         <X size={12} />
@@ -434,7 +434,7 @@ export function SchedulerPanel() {
                     <button
                       onClick={() => setConfirmDelete(task.id)}
                       disabled={busyTaskId === task.id}
-                      className="flex items-center gap-1 rounded px-2 py-1 text-[11px] transition-colors"
+                      className="flex items-center gap-1 rounded-md px-2 py-1 text-[11px] transition-colors"
                       style={{ color: 'var(--color-error, #ef4444)' }}
                     >
                       <Trash2 size={11} /> 删除
@@ -492,7 +492,7 @@ export function SchedulerPanel() {
                       上次运行结果
                     </summary>
                     <pre
-                      className="mt-1 whitespace-pre-wrap rounded p-2 text-[10px]"
+                      className="mt-1 whitespace-pre-wrap rounded-md p-2 text-[10px]"
                       style={{ background: s.bgCard, color: s.textSec }}
                     >
                       {task.last_result.slice(0, 500)}

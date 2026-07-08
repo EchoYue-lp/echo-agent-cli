@@ -24,7 +24,7 @@ export function LoginForm() {
       <div className="pointer-events-none fixed inset-0 bg-[var(--bg-chat)]/60" />
 
       {/* Card */}
-      <div className="glass animate-fade-up relative z-10 w-full max-w-sm rounded-2xl p-8 shadow-[var(--shadow-xl)]">
+      <div className="glass animate-fade-up relative z-10 w-full max-w-sm rounded-xl p-8 shadow-[var(--shadow-xl)]">
         {/* Brand */}
         <div className="mb-8 flex flex-col items-center">
           <div
@@ -112,7 +112,7 @@ export function LoginForm() {
           <p className="text-xs text-[var(--text-tertiary)] leading-relaxed">
             认证默认禁用。如需启用，请设置环境变量{' '}
             <code
-              className="rounded px-1 py-0.5 text-[11px]"
+              className="rounded-md px-1 py-0.5 text-[11px]"
               style={{
                 background: 'var(--bg-primary)',
                 color: 'var(--accent)',

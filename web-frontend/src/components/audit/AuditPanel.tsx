@@ -48,7 +48,7 @@ export function AuditPanel() {
         </h3>
         <button
           onClick={clear}
-          className="rounded p-1 transition-colors"
+          className="rounded-md p-1 transition-colors"
           style={{ color: s.textTer }}
         >
           <Trash2 size={14} />

@@ -76,16 +76,16 @@ export default function CommandPalette({ isOpen, onClose, commands }: Props) {
     <div className="fixed inset-0 z-50 flex items-start justify-center pt-20" onClick={onClose}>
       <div className="absolute inset-0 bg-black/50" />
       <div
-        className="relative w-full max-w-lg rounded-xl shadow-2xl overflow-hidden"
-        style={{ background: 'var(--bg-primary, #1e1e1e)' }}
+        className="relative w-full max-w-lg rounded-xl shadow-[var(--shadow-xl)] overflow-hidden"
+        style={{ background: 'var(--bg-primary)' }}
         onClick={(e) => e.stopPropagation()}
       >
         {/* Search input */}
         <div
           className="flex items-center gap-2 px-4 py-3 border-b"
-          style={{ borderColor: 'var(--border-primary, #333)' }}
+          style={{ borderColor: 'var(--border-primary)' }}
         >
-          <Search size={16} style={{ color: 'var(--text-secondary, #888)' }} />
+          <Search size={16} style={{ color: 'var(--text-secondary)' }} />
           <input
             ref={inputRef}
             type="text"
@@ -94,13 +94,13 @@ export default function CommandPalette({ isOpen, onClose, commands }: Props) {
             onKeyDown={handleKeyDown}
             placeholder="Type a command..."
             className="flex-1 bg-transparent outline-none text-sm"
-            style={{ color: 'var(--text-primary, #eee)' }}
+            style={{ color: 'var(--text-primary)' }}
           />
           <kbd
-            className="text-xs px-1.5 py-0.5 rounded"
+            className="text-xs px-1.5 py-0.5 rounded-md"
             style={{
-              background: 'var(--bg-secondary, #2a2a2a)',
-              color: 'var(--text-secondary, #888)',
+              background: 'var(--bg-secondary)',
+              color: 'var(--text-secondary)',
             }}
           >
             ESC
@@ -112,7 +112,7 @@ export default function CommandPalette({ isOpen, onClose, commands }: Props) {
           {filtered.length === 0 ? (
             <div
               className="px-4 py-8 text-center text-sm"
-              style={{ color: 'var(--text-secondary, #888)' }}
+              style={{ color: 'var(--text-secondary)' }}
             >
               No results found
             </div>
@@ -121,7 +121,7 @@ export default function CommandPalette({ isOpen, onClose, commands }: Props) {
               <div key={category}>
                 <div
                   className="px-4 py-1 text-xs font-medium uppercase tracking-wider"
-                  style={{ color: 'var(--text-tertiary, #666)' }}
+                  style={{ color: 'var(--text-tertiary)' }}
                 >
                   {category}
                 </div>
@@ -133,20 +133,20 @@ export default function CommandPalette({ isOpen, onClose, commands }: Props) {
                       className={`w-full flex items-center gap-3 px-4 py-2 text-left text-sm transition-colors ${
                         idx === selectedIndex ? 'bg-[var(--accent)]/10' : ''
                       }`}
-                      style={{ color: 'var(--text-primary, #eee)' }}
+                      style={{ color: 'var(--text-primary)' }}
                       onClick={() => {
                         cmd.action();
                         onClose();
                       }}
                       onMouseEnter={() => setSelectedIndex(idx)}
                     >
-                      <Command size={14} style={{ color: 'var(--text-secondary, #888)' }} />
+                      <Command size={14} style={{ color: 'var(--text-secondary)' }} />
                       <div className="flex-1 min-w-0">
                         <div className="truncate">{cmd.label}</div>
                         {cmd.description && (
                           <div
                             className="text-xs truncate"
-                            style={{ color: 'var(--text-secondary, #888)' }}
+                            style={{ color: 'var(--text-secondary)' }}
                           >
                             {cmd.description}
                           </div>
@@ -154,7 +154,7 @@ export default function CommandPalette({ isOpen, onClose, commands }: Props) {
                       </div>
                       <span
                         className="ml-auto text-xs shrink-0"
-                        style={{ color: 'var(--text-tertiary, #666)' }}
+                        style={{ color: 'var(--text-tertiary)' }}
                       >
                         {cmd.category}
                       </span>

@@ -20,7 +20,7 @@ interface GitLogPanelProps {
  */
 export function GitLogPanel({ commits, branch = 'main', onCommitClick }: GitLogPanelProps) {
   return (
-    <div className="rounded-xl border border-[var(--border-primary)] bg-[var(--bg-primary)] overflow-hidden shadow-sm">
+    <div className="rounded-xl border border-[var(--border-primary)] bg-[var(--bg-primary)] overflow-hidden shadow-[var(--shadow-sm)]">
       {/* Branch Header */}
       <div className="flex items-center gap-3 px-5 py-3 bg-[var(--bg-secondary)] border-b border-[var(--border-primary)]">
         <div className="flex items-center gap-2">
@@ -67,7 +67,7 @@ export function GitLogPanel({ commits, branch = 'main', onCommitClick }: GitLogP
                   {commit.message}
                 </p>
                 <div className="flex items-center gap-3 text-xs text-[var(--text-tertiary)]">
-                  <span className="font-mono text-[var(--accent)] bg-[var(--accent-bg)] px-1.5 py-0.5 rounded">
+                  <span className="font-mono text-[var(--accent)] bg-[var(--accent-bg)] px-1.5 py-0.5 rounded-md">
                     {commit.hash.slice(0, 7)}
                   </span>
                   <span>{commit.author}</span>

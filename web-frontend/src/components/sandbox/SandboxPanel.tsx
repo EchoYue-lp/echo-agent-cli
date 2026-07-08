@@ -112,7 +112,7 @@ export function SandboxPanel() {
             <select
               value={config.security_level}
               onChange={(e) => updateConfig('security_level', e.target.value)}
-              className="rounded border px-1.5 py-0.5 text-xs"
+              className="rounded-md border px-1.5 py-0.5 text-xs"
               style={{
                 background: 'var(--bg-input)',
                 borderColor: 'var(--border-primary)',
@@ -133,7 +133,7 @@ export function SandboxPanel() {
               type="number"
               value={config.max_memory_mb ?? 512}
               onChange={(e) => updateConfig('max_memory_mb', parseInt(e.target.value) || 512)}
-              className="w-20 rounded border px-1.5 py-0.5 text-xs"
+              className="w-20 rounded-md border px-1.5 py-0.5 text-xs"
               style={{
                 background: 'var(--bg-input)',
                 borderColor: 'var(--border-primary)',
@@ -150,7 +150,7 @@ export function SandboxPanel() {
               type="number"
               value={config.max_cpu_seconds ?? 30}
               onChange={(e) => updateConfig('max_cpu_seconds', parseInt(e.target.value) || 30)}
-              className="w-20 rounded border px-1.5 py-0.5 text-xs"
+              className="w-20 rounded-md border px-1.5 py-0.5 text-xs"
               style={{
                 background: 'var(--bg-input)',
                 borderColor: 'var(--border-primary)',
@@ -252,11 +252,11 @@ export function SandboxPanel() {
             </span>
           </div>
           <div className="flex flex-wrap gap-2 text-[10px]" style={{ color: 'var(--text-tertiary)' }}>
-            <span className="rounded bg-[var(--bg-hover)] px-1.5 py-0.5">
+            <span className="rounded-md bg-[var(--bg-hover)] px-1.5 py-0.5">
               {result.sandbox_type}
             </span>
             {result.timed_out && (
-              <span className="rounded bg-[var(--color-error-bg)] px-1.5 py-0.5 text-[var(--color-error)]">
+              <span className="rounded-md bg-[var(--color-error-bg)] px-1.5 py-0.5 text-[var(--color-error)]">
                 超时
               </span>
             )}

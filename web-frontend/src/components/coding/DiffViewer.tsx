@@ -29,7 +29,7 @@ export function DiffViewer({ diff, oldFileName = 'old', newFileName = 'new' }: D
   });
 
   return (
-    <div className="rounded-xl border border-[var(--border-primary)] bg-[var(--bg-primary)] overflow-hidden shadow-sm">
+    <div className="rounded-xl border border-[var(--border-primary)] bg-[var(--bg-primary)] overflow-hidden shadow-[var(--shadow-sm)]">
       <div className="flex items-center gap-3 px-4 py-3 bg-[var(--bg-secondary)] border-b border-[var(--border-primary)]">
         <div className="flex items-center gap-2 text-sm">
           <span className="font-medium text-[var(--text-secondary)]">{oldFileName}</span>

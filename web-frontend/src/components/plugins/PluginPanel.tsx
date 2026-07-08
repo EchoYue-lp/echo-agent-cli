@@ -206,7 +206,7 @@ export function PluginPanel() {
             placeholder="Local path or git URL..."
             value={installSource}
             onChange={(e) => setInstallSource(e.target.value)}
-            className="w-full px-3 py-2 border rounded text-sm focus:outline-none focus:border-[var(--accent)]"
+            className="w-full px-3 py-2 border rounded-md text-sm focus:outline-none focus:border-[var(--accent)]"
             style={{
               background: 'var(--bg-input)',
               borderColor: 'var(--border-primary)',
@@ -217,7 +217,7 @@ export function PluginPanel() {
             <select
               value={installScope}
               onChange={(e) => setInstallScope(e.target.value)}
-              className="px-3 py-2 border rounded text-sm focus:outline-none"
+              className="px-3 py-2 border rounded-md text-sm focus:outline-none"
               style={{
                 background: 'var(--bg-input)',
                 borderColor: 'var(--border-primary)',
@@ -231,7 +231,7 @@ export function PluginPanel() {
             <button
               onClick={handleInstall}
               disabled={installing || !installSource.trim()}
-              className="flex items-center gap-1 px-4 py-2 text-[var(--text-on-accent)] rounded text-sm transition-colors disabled:opacity-50 hover:opacity-90"
+              className="flex items-center gap-1 px-4 py-2 text-[var(--text-on-accent)] rounded-md text-sm transition-colors disabled:opacity-50 hover:opacity-90"
               style={{ background: 'var(--accent)' }}
             >
               {installing ? (
@@ -355,7 +355,7 @@ function PluginCard({
             </span>
             {plugin.license && (
               <span
-                className="text-xs px-1.5 py-0.5 rounded"
+                className="text-xs px-1.5 py-0.5 rounded-md"
                 style={{ background: 'var(--bg-tertiary)', color: 'var(--text-tertiary)' }}
               >
                 {plugin.license}
@@ -372,7 +372,7 @@ function PluginCard({
         <div className="flex items-center gap-1">
           <button
             onClick={onToggle}
-            className="p-1.5 rounded transition-colors hover:bg-[var(--bg-hover)]"
+            className="p-1.5 rounded-md transition-colors hover:bg-[var(--bg-hover)]"
             style={{
               color: plugin.enabled ? 'var(--color-success, #22c55e)' : 'var(--text-tertiary)',
             }}
@@ -382,7 +382,7 @@ function PluginCard({
           </button>
           <button
             onClick={onUninstall}
-            className="p-1.5 rounded transition-colors hover:bg-[var(--bg-hover)]"
+            className="p-1.5 rounded-md transition-colors hover:bg-[var(--bg-hover)]"
             style={{ color: 'var(--text-tertiary)' }}
             title="Uninstall"
           >
@@ -401,7 +401,7 @@ function PluginCard({
               {plugin.capabilities.map((cap) => (
                 <span
                   key={cap}
-                  className="text-xs px-2 py-0.5 rounded"
+                  className="text-xs px-2 py-0.5 rounded-md"
                   style={{ background: 'rgba(139, 92, 246, 0.1)', color: 'var(--accent)' }}
                 >
                   {cap}
@@ -429,7 +429,7 @@ function PluginCard({
               {plugin.keywords.map((kw) => (
                 <span
                   key={kw}
-                  className="text-xs px-1.5 py-0.5 rounded"
+                  className="text-xs px-1.5 py-0.5 rounded-md"
                   style={{ background: 'var(--bg-tertiary)', color: 'var(--text-secondary)' }}
                 >
                   {kw}

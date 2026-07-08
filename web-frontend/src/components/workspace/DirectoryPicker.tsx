@@ -79,7 +79,7 @@ export default function DirectoryPicker({
 
       {/* Dialog */}
       <div
-        className="fixed left-1/2 top-1/2 z-[60] flex w-[500px] -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-xl border shadow-2xl"
+        className="fixed left-1/2 top-1/2 z-[60] flex w-[500px] -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-xl border shadow-[var(--shadow-xl)]"
         style={{
           background: 'var(--bg-primary)',
           borderColor: 'var(--border-primary)',
@@ -99,7 +99,7 @@ export default function DirectoryPicker({
           </div>
           <button
             onClick={onClose}
-            className="rounded p-1 transition-colors hover:bg-[var(--bg-hover)]"
+            className="rounded-md p-1 transition-colors hover:bg-[var(--bg-hover)]"
           >
             <X size={14} style={{ color: 'var(--text-tertiary)' }} />
           </button>
@@ -113,7 +113,7 @@ export default function DirectoryPicker({
           <button
             onClick={handleGoUp}
             disabled={!parentPath || loading}
-            className="flex items-center gap-1 rounded px-2 py-1 text-xs font-medium transition-colors hover:bg-[var(--bg-hover)] disabled:opacity-30"
+            className="flex items-center gap-1 rounded-md px-2 py-1 text-xs font-medium transition-colors hover:bg-[var(--bg-hover)] disabled:opacity-30"
             style={{ color: 'var(--text-secondary)' }}
           >
             <ArrowUp size={12} />

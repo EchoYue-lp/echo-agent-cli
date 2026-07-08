@@ -65,7 +65,7 @@ function TreeItem({
     <div>
       <button
         onClick={handleClick}
-        className="flex w-full items-center gap-1.5 rounded px-2 py-1 text-left text-sm transition-colors"
+        className="flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-left text-sm transition-colors"
         style={{
           paddingLeft: `${depth * 16 + 8}px`,
           background: isSelected ? 'var(--bg-sidebar-active)' : 'transparent',

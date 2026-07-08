@@ -28,7 +28,7 @@ export function TestRunnerPanel({
   const failRate = totalTests > 0 ? Math.round((failedTests / totalTests) * 100) : 0;
 
   return (
-    <div className="rounded-xl border border-[var(--border-primary)] bg-[var(--bg-primary)] overflow-hidden shadow-sm">
+    <div className="rounded-xl border border-[var(--border-primary)] bg-[var(--bg-primary)] overflow-hidden shadow-[var(--shadow-sm)]">
       {/* Summary Header */}
       <div className="px-5 py-4 bg-[var(--bg-secondary)] border-b border-[var(--border-primary)]">
         <div className="flex items-center justify-between mb-3">

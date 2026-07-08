@@ -98,7 +98,7 @@ export function DecisionLogPanel() {
         <div className="flex items-center gap-1">
           <button
             onClick={() => setShowForm(!showForm)}
-            className="p-1.5 rounded transition-colors hover:bg-[var(--bg-hover)]"
+            className="p-1.5 rounded-md transition-colors hover:bg-[var(--bg-hover)]"
             style={{ color: showForm ? 'var(--accent)' : 'var(--text-secondary)' }}
             title="Add decision"
           >
@@ -107,7 +107,7 @@ export function DecisionLogPanel() {
           {decisions.length > 0 && (
             <button
               onClick={handleClear}
-              className="p-1.5 rounded transition-colors hover:bg-[var(--bg-hover)]"
+              className="p-1.5 rounded-md transition-colors hover:bg-[var(--bg-hover)]"
               style={{ color: 'var(--text-secondary)' }}
               title="Clear all"
             >
@@ -128,7 +128,7 @@ export function DecisionLogPanel() {
             value={decision}
             onChange={(e) => setDecision(e.target.value)}
             placeholder="Decision (what was decided)"
-            className="w-full px-3 py-1.5 rounded text-sm outline-none border bg-transparent"
+            className="w-full px-3 py-1.5 rounded-md text-sm outline-none border bg-transparent"
             style={{
               color: 'var(--text-primary)',
               borderColor: 'var(--border-primary)',
@@ -139,7 +139,7 @@ export function DecisionLogPanel() {
             onChange={(e) => setRationale(e.target.value)}
             placeholder="Rationale (why)"
             rows={2}
-            className="w-full px-3 py-1.5 rounded text-sm outline-none border bg-transparent resize-none"
+            className="w-full px-3 py-1.5 rounded-md text-sm outline-none border bg-transparent resize-none"
             style={{
               color: 'var(--text-primary)',
               borderColor: 'var(--border-primary)',
@@ -150,7 +150,7 @@ export function DecisionLogPanel() {
             onChange={(e) => setAlternatives(e.target.value)}
             placeholder="Alternatives considered (one per line)"
             rows={2}
-            className="w-full px-3 py-1.5 rounded text-sm outline-none border bg-transparent resize-none"
+            className="w-full px-3 py-1.5 rounded-md text-sm outline-none border bg-transparent resize-none"
             style={{
               color: 'var(--text-primary)',
               borderColor: 'var(--border-primary)',
@@ -161,7 +161,7 @@ export function DecisionLogPanel() {
             value={context}
             onChange={(e) => setContext(e.target.value)}
             placeholder="Context (optional)"
-            className="w-full px-3 py-1.5 rounded text-sm outline-none border bg-transparent"
+            className="w-full px-3 py-1.5 rounded-md text-sm outline-none border bg-transparent"
             style={{
               color: 'var(--text-primary)',
               borderColor: 'var(--border-primary)',
@@ -170,7 +170,7 @@ export function DecisionLogPanel() {
           <div className="flex justify-end gap-2 pt-1">
             <button
               onClick={() => setShowForm(false)}
-              className="px-3 py-1 rounded text-sm transition-colors hover:bg-[var(--bg-hover)]"
+              className="px-3 py-1 rounded-md text-sm transition-colors hover:bg-[var(--bg-hover)]"
               style={{ color: 'var(--text-secondary)' }}
             >
               Cancel
@@ -178,7 +178,7 @@ export function DecisionLogPanel() {
             <button
               onClick={handleAdd}
               disabled={saving || !decision.trim() || !rationale.trim()}
-              className="px-3 py-1 rounded text-sm text-white transition-colors disabled:opacity-50"
+              className="px-3 py-1 rounded-md text-sm text-white transition-colors disabled:opacity-50"
               style={{ background: 'var(--accent, #3b82f6)' }}
             >
               {saving ? 'Saving...' : 'Add Decision'}

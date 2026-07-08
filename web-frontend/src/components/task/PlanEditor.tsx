@@ -86,7 +86,7 @@ export function PlanEditor({ initialTasks, onSave, onClose }: PlanEditorProps) {
               {tasks.map((t) => (
                 <div
                   key={t.id}
-                  className="space-y-1 rounded p-2"
+                  className="space-y-1 rounded-md p-2"
                   style={{ border: '1px solid var(--border-secondary)' }}
                 >
                   <input
@@ -110,7 +110,7 @@ export function PlanEditor({ initialTasks, onSave, onClose }: PlanEditorProps) {
           ) : (
             <div className="space-y-2">
               <textarea
-                className="w-full font-mono text-xs p-2 rounded min-h-[300px]"
+                className="w-full font-mono text-xs p-2 rounded-md min-h-[300px]"
                 style={{
                   color: 'var(--text-primary)',
                   background: 'var(--bg-secondary)',
@@ -121,7 +121,7 @@ export function PlanEditor({ initialTasks, onSave, onClose }: PlanEditorProps) {
               />
               <button
                 onClick={applyJson}
-                className="text-xs px-2 py-1 rounded"
+                className="text-xs px-2 py-1 rounded-md"
                 style={{ background: 'var(--bg-hover)', color: 'var(--text-secondary)', border: '1px solid var(--border-secondary)' }}
               >
                 应用 JSON
@@ -136,14 +136,14 @@ export function PlanEditor({ initialTasks, onSave, onClose }: PlanEditorProps) {
         >
           <button
             onClick={onClose}
-            className="px-3 py-1 text-xs rounded"
+            className="px-3 py-1 text-xs rounded-md"
             style={{ background: 'var(--bg-hover)', color: 'var(--text-secondary)', border: '1px solid var(--border-secondary)' }}
           >
             取消
           </button>
           <button
             onClick={handleSave}
-            className="px-3 py-1 text-xs rounded font-medium"
+            className="px-3 py-1 text-xs rounded-md font-medium"
             style={{ background: 'var(--accent)', color: 'var(--text-on-accent)' }}
           >
             保存

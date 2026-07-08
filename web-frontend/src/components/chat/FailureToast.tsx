@@ -49,7 +49,7 @@ export function FailureToast({ onDismiss }: FailureToastProps) {
       </span>
       <button
         onClick={onDismiss}
-        className="flex items-center gap-1 rounded px-2 py-0.5 text-[11px] transition-colors"
+        className="flex items-center gap-1 rounded-md px-2 py-0.5 text-[11px] transition-colors"
         style={{ color: 'var(--text-secondary)' }}
       >
         <X size={12} />

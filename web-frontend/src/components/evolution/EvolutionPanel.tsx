@@ -340,7 +340,7 @@ export function EvolutionPanel() {
                       style={{ color: 'var(--text-secondary)' }}
                     >
                       <span
-                        className="rounded px-1.5 py-0.5 text-[9px] shrink-0"
+                        className="rounded-md px-1.5 py-0.5 text-[9px] shrink-0"
                         style={{
                           background: 'var(--bg-hover)',
                           color: 'var(--text-tertiary)',
@@ -420,7 +420,7 @@ export function EvolutionPanel() {
                 <div className="flex items-center justify-between mb-1.5">
                   <div className="flex items-center gap-2 min-w-0">
                     <span
-                      className="rounded px-1.5 py-0.5 text-[9px] shrink-0"
+                      className="rounded-md px-1.5 py-0.5 text-[9px] shrink-0"
                       style={{ background: 'var(--bg-hover)', color: 'var(--text-tertiary)' }}
                     >
                       {p.memory_type}
@@ -450,7 +450,7 @@ export function EvolutionPanel() {
                   <button
                     onClick={() => handlePromote(p.memory_key)}
                     disabled={promotingKey !== null}
-                    className="flex items-center gap-1 rounded px-2 py-1 text-[10px] font-medium transition-colors shrink-0"
+                    className="flex items-center gap-1 rounded-md px-2 py-1 text-[10px] font-medium transition-colors shrink-0"
                     style={{
                       background:
                         promotingKey === p.memory_key
@@ -538,7 +538,7 @@ export function EvolutionPanel() {
                     </span>
                     {c.activated && (
                       <span
-                        className="flex items-center gap-0.5 rounded px-1 py-0.5 text-[9px] shrink-0"
+                        className="flex items-center gap-0.5 rounded-md px-1 py-0.5 text-[9px] shrink-0"
                         style={{ background: 'var(--color-success-bg, rgba(34,197,94,0.1))', color: 'var(--color-success)' }}
                       >
                         <CheckCircle size={8} /> 已激活
@@ -548,7 +548,7 @@ export function EvolutionPanel() {
                   <div className="flex items-center gap-2 shrink-0 text-[10px]" style={{ color: 'var(--text-tertiary)' }}>
                     <span title="观测样本数">{c.sample_count} 次</span>
                     <span
-                      className="rounded px-1 py-0.5"
+                      className="rounded-md px-1 py-0.5"
                       style={{ background: 'var(--bg-hover)' }}
                     >
                       {c.source_type}
@@ -564,7 +564,7 @@ export function EvolutionPanel() {
                     <button
                       onClick={() => handleGenerateDraft(c.name)}
                       disabled={actingOnSkill !== null}
-                      className="flex items-center gap-1 rounded px-2 py-1 text-[10px] font-medium transition-colors"
+                      className="flex items-center gap-1 rounded-md px-2 py-1 text-[10px] font-medium transition-colors"
                       style={{
                         background: actingOnSkill === c.name ? 'var(--border-primary)' : 'var(--bg-hover)',
                         color: actingOnSkill === c.name ? 'var(--text-tertiary)' : 'var(--text-primary)',
@@ -582,7 +582,7 @@ export function EvolutionPanel() {
                     <button
                       onClick={() => handleActivateSkill(c.name)}
                       disabled={actingOnSkill !== null}
-                      className="flex items-center gap-1 rounded px-2 py-1 text-[10px] font-medium transition-colors"
+                      className="flex items-center gap-1 rounded-md px-2 py-1 text-[10px] font-medium transition-colors"
                       style={{
                         background: actingOnSkill === c.name ? 'var(--border-primary)' : 'var(--action-run)',
                         color: actingOnSkill === c.name ? 'var(--text-tertiary)' : 'var(--text-on-run)',
@@ -688,7 +688,7 @@ export function EvolutionPanel() {
                       {t.id.slice(0, 8)}
                     </span>
                     <span
-                      className="rounded px-1.5 py-0.5 text-[10px]"
+                      className="rounded-md px-1.5 py-0.5 text-[10px]"
                       style={{ background: 'var(--bg-hover)', color: 'var(--text-secondary)' }}
                     >
                       {t.model || 'unknown'}

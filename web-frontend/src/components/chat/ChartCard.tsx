@@ -115,7 +115,7 @@ export function ChartCard({ spec }: ChartCardProps) {
         <span className="text-xs font-medium text-[var(--text-secondary)]">Chart</span>
         <button
           onClick={() => setExpanded(!expanded)}
-          className="p-1 rounded hover:bg-[var(--bg-hover)] text-[var(--text-tertiary)] transition-colors"
+          className="p-1 rounded-md hover:bg-[var(--bg-hover)] text-[var(--text-tertiary)] transition-colors"
           title={expanded ? 'Collapse' : 'Expand'}
         >
           {expanded ? <Minimize2 size={14} /> : <Maximize2 size={14} />}

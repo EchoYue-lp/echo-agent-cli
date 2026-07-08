@@ -91,7 +91,7 @@ export const InlineToolCall = memo(function InlineToolCall({ toolCall, index: _i
                 {copied === 'args' ? '已复制' : '复制'}
               </button>
             </div>
-            <pre className="max-h-32 overflow-auto rounded bg-[var(--bg-code)] p-2 text-[10px] leading-relaxed text-[var(--color-code-text)]">
+            <pre className="max-h-32 overflow-auto rounded-md bg-[var(--bg-code)] p-2 text-[10px] leading-relaxed text-[var(--color-code-text)]">
               {JSON.stringify(toolCall.args ?? {}, null, 2)}
             </pre>
           </div>
@@ -112,7 +112,7 @@ export const InlineToolCall = memo(function InlineToolCall({ toolCall, index: _i
                   {copied === 'result' ? '已复制' : '复制'}
                 </button>
               </div>
-              <pre className="max-h-40 overflow-auto rounded bg-[var(--bg-code)] p-2 text-[10px] leading-relaxed text-[var(--color-code-text)]">
+              <pre className="max-h-40 overflow-auto rounded-md bg-[var(--bg-code)] p-2 text-[10px] leading-relaxed text-[var(--color-code-text)]">
                 {(toolCall.result ?? '').length > 2000
                   ? (toolCall.result ?? '').slice(0, 2000) + '\n...'
                   : (toolCall.result ?? '')}

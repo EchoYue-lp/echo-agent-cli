@@ -169,7 +169,7 @@ export function UsageTrendsPanel() {
               {s.model_breakdown.length > 1 && (
                 <div className="mt-2 flex flex-wrap gap-1">
                   {s.model_breakdown.map((m, j) => (
-                    <span key={j} className="rounded px-1.5 py-0.5 text-[10px] font-mono" style={{ background: 'var(--bg-hover)', color: 'var(--text-secondary)' }}>
+                    <span key={j} className="rounded-md px-1.5 py-0.5 text-[10px] font-mono" style={{ background: 'var(--bg-hover)', color: 'var(--text-secondary)' }}>
                       {m.model}: {m.llm_calls} calls
                     </span>
                   ))}

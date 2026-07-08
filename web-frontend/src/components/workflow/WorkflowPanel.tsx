@@ -80,7 +80,7 @@ export function WorkflowPanel() {
             <div className="ml-auto flex gap-1">
               <button
                 onClick={() => execute(wf.id)}
-                className="rounded p-1 transition-colors"
+                className="rounded-md p-1 transition-colors"
                 style={{ background: 'var(--action-run-bg)' }}
                 title="执行"
               >
@@ -88,7 +88,7 @@ export function WorkflowPanel() {
               </button>
               <button
                 onClick={() => remove(wf.id)}
-                className="rounded p-1 transition-colors hover:bg-[var(--bg-hover)]"
+                className="rounded-md p-1 transition-colors hover:bg-[var(--bg-hover)]"
                 title="删除"
               >
                 <Trash2 size={12} className="text-[var(--text-tertiary)] hover:text-red-500" />

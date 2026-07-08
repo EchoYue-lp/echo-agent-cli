@@ -118,7 +118,7 @@ export function PaperPanel() {
           {/* View mode toggle */}
           <button
             onClick={() => setViewMode('list')}
-            className="rounded p-1.5 transition-colors"
+            className="rounded-md p-1.5 transition-colors"
             style={{ color: viewMode === 'list' ? 'var(--color-primary)' : s.textTer }}
             title="List view"
           >
@@ -126,7 +126,7 @@ export function PaperPanel() {
           </button>
           <button
             onClick={() => setViewMode('matrix')}
-            className="rounded p-1.5 transition-colors"
+            className="rounded-md p-1.5 transition-colors"
             style={{ color: viewMode === 'matrix' ? 'var(--color-primary)' : s.textTer }}
             title="Matrix view"
           >
@@ -134,7 +134,7 @@ export function PaperPanel() {
           </button>
           <button
             onClick={() => setShowAddForm(true)}
-            className="rounded p-1.5 transition-colors"
+            className="rounded-md p-1.5 transition-colors"
             style={{ color: s.textTer }}
             title="Add paper"
           >
@@ -155,7 +155,7 @@ export function PaperPanel() {
             </span>
             <button
               onClick={() => setShowAddForm(false)}
-              className="rounded p-1"
+              className="rounded-md p-1"
               style={{ color: s.textTer }}
             >
               <X size={12} />
@@ -166,7 +166,7 @@ export function PaperPanel() {
             value={addTitle}
             onChange={(e) => setAddTitle(e.target.value)}
             placeholder="Title *"
-            className="w-full rounded border px-2 py-1 text-xs"
+            className="w-full rounded-md border px-2 py-1 text-xs"
             style={{ borderColor: s.border, background: s.bg, color: s.text }}
           />
           <input
@@ -174,7 +174,7 @@ export function PaperPanel() {
             value={addAuthors}
             onChange={(e) => setAddAuthors(e.target.value)}
             placeholder="Authors (comma-separated)"
-            className="w-full rounded border px-2 py-1 text-xs"
+            className="w-full rounded-md border px-2 py-1 text-xs"
             style={{ borderColor: s.border, background: s.bg, color: s.text }}
           />
           <div className="grid grid-cols-2 gap-2">
@@ -183,7 +183,7 @@ export function PaperPanel() {
               value={addYear}
               onChange={(e) => setAddYear(e.target.value)}
               placeholder="Year"
-              className="rounded border px-2 py-1 text-xs"
+              className="rounded-md border px-2 py-1 text-xs"
               style={{ borderColor: s.border, background: s.bg, color: s.text }}
             />
             <input
@@ -191,7 +191,7 @@ export function PaperPanel() {
               value={addVenue}
               onChange={(e) => setAddVenue(e.target.value)}
               placeholder="Venue"
-              className="rounded border px-2 py-1 text-xs"
+              className="rounded-md border px-2 py-1 text-xs"
               style={{ borderColor: s.border, background: s.bg, color: s.text }}
             />
           </div>
@@ -200,7 +200,7 @@ export function PaperPanel() {
             value={addArxiv}
             onChange={(e) => setAddArxiv(e.target.value)}
             placeholder="arXiv ID (e.g. 2301.12345)"
-            className="w-full rounded border px-2 py-1 text-xs"
+            className="w-full rounded-md border px-2 py-1 text-xs"
             style={{ borderColor: s.border, background: s.bg, color: s.text }}
           />
           <input
@@ -208,21 +208,21 @@ export function PaperPanel() {
             value={addTags}
             onChange={(e) => setAddTags(e.target.value)}
             placeholder="Tags (comma-separated)"
-            className="w-full rounded border px-2 py-1 text-xs"
+            className="w-full rounded-md border px-2 py-1 text-xs"
             style={{ borderColor: s.border, background: s.bg, color: s.text }}
           />
           <textarea
             value={addAbstract}
             onChange={(e) => setAddAbstract(e.target.value)}
             placeholder="Abstract (optional)"
-            className="w-full rounded border px-2 py-1 text-xs"
+            className="w-full rounded-md border px-2 py-1 text-xs"
             style={{ borderColor: s.border, background: s.bg, color: s.text }}
             rows={3}
           />
           <button
             onClick={handleAddPaper}
             disabled={!addTitle.trim() || saving}
-            className="w-full rounded px-3 py-1.5 text-xs font-medium transition-colors"
+            className="w-full rounded-md px-3 py-1.5 text-xs font-medium transition-colors"
             style={{
               background: addTitle.trim() ? 'var(--color-primary)' : s.bgHover,
               color: addTitle.trim() ? '#fff' : s.textTer,

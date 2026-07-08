@@ -118,7 +118,8 @@ export function WelcomeScreen({
             onMouseEnter={(e) => {
               if (!resumeLoading) {
                 e.currentTarget.style.borderColor = 'var(--accent)';
-                e.currentTarget.style.boxShadow = '0 8px 28px -4px rgba(99, 102, 241, 0.2)';
+                e.currentTarget.style.boxShadow =
+                  '0 8px 28px -4px color-mix(in srgb, var(--accent) 35%, transparent)';
               }
             }}
             onMouseLeave={(e) => {

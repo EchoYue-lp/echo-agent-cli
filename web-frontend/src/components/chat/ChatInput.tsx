@@ -13,6 +13,7 @@ import {
   ChevronDown,
   Check,
 } from 'lucide-react';
+import { Card } from '../common/Card';
 import {
   permissionsApi,
   providerApi,
@@ -183,7 +184,7 @@ function CommandPalette({ commands, selectedIndex, onSelect }: CommandPalettePro
                       }`}
                     >
                       <code
-                        className={`shrink-0 rounded px-1.5 py-0.5 text-xs font-semibold ${
+                        className={`shrink-0 rounded-md px-1.5 py-0.5 text-xs font-semibold ${
                           isSelected
                             ? 'bg-[var(--accent)]/15 text-[var(--accent)]'
                             : 'bg-[var(--bg-secondary)] text-[var(--text-secondary)]'
@@ -664,10 +665,10 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
           />
         )}
 
-        <div className="relative flex flex-col rounded-[20px] border border-[var(--border-primary)] bg-[var(--bg-input)] shadow-[var(--shadow-md)] transition-shadow focus-within:shadow-[var(--shadow-lg)]">
+        <div className="relative flex flex-col rounded-xl border border-[var(--border-primary)] bg-[var(--bg-input)] shadow-[var(--shadow-md)] transition-shadow focus-within:shadow-[var(--shadow-lg)]">
           {/* Drag overlay */}
           {isDragging && (
-            <div className="absolute inset-0 z-10 flex items-center justify-center rounded-2xl border-2 border-dashed border-[var(--accent)] bg-[var(--accent)]/5">
+            <div className="absolute inset-0 z-10 flex items-center justify-center rounded-xl border-2 border-dashed border-[var(--accent)] bg-[var(--accent)]/5">
               <span className="text-sm font-medium text-[var(--accent)]">
                 Drop files here to upload
               </span>
@@ -778,10 +779,7 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
                   <ChevronDown size={12} />
                 </button>
                 {permissionMenuOpen && (
-                  <div className="absolute bottom-full left-0 z-50 mb-2 w-64 overflow-hidden rounded-lg border border-[var(--border-primary)] bg-[var(--bg-primary)] shadow-[var(--shadow-md)]">
-                    <div className="border-b border-[var(--border-secondary)] px-3 py-2 text-[10px] font-medium text-[var(--text-tertiary)]">
-                      审批模式
-                    </div>
+                  <MenuOverlay title="审批模式" width="w-64">
                     <div className="p-1">
                       {PERMISSION_MODES.map((mode) => (
                         <button
@@ -805,7 +803,7 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
                         </button>
                       ))}
                     </div>
-                  </div>
+                  </MenuOverlay>
                 )}
               </div>
               <div className="relative hidden sm:block">
@@ -830,10 +828,7 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
                   {visibleModels.length > 0 && <ChevronDown size={12} />}
                 </button>
                 {modelMenuOpen && visibleModels.length > 0 && (
-                  <div className="absolute bottom-full left-0 z-50 mb-2 w-64 overflow-hidden rounded-lg border border-[var(--border-primary)] bg-[var(--bg-primary)] shadow-[var(--shadow-md)]">
-                    <div className="border-b border-[var(--border-secondary)] px-3 py-2 text-[10px] font-medium text-[var(--text-tertiary)]">
-                      默认模型
-                    </div>
+                  <MenuOverlay title="默认模型" width="w-64">
                     <div className="max-h-64 overflow-y-auto p-1">
                       {visibleModels.map((model) => (
                         <button
@@ -859,7 +854,7 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
                     >
                       管理模型
                     </button>
-                  </div>
+                  </MenuOverlay>
                 )}
               </div>
               <div
@@ -874,7 +869,7 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
                     onClick={() => switchInteractionMode(mode.id)}
                     disabled={switchingInteractionMode !== null}
                     title={mode.description}
-                    className={`h-6 rounded px-2 text-[10px] transition-colors disabled:cursor-wait ${
+                    className={`h-6 rounded-md px-2 text-[10px] transition-colors disabled:cursor-wait ${
                       interactionMode === mode.id
                         ? 'bg-[var(--accent)] text-[var(--text-on-accent)]'
                         : 'text-[var(--text-tertiary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
@@ -904,10 +899,7 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
                   <ChevronDown size={12} />
                 </button>
                 {thinkingMenuOpen && (
-                  <div className="absolute bottom-full left-0 z-50 mb-2 w-56 overflow-hidden rounded-lg border border-[var(--border-primary)] bg-[var(--bg-primary)] shadow-[var(--shadow-md)]">
-                    <div className="border-b border-[var(--border-secondary)] px-3 py-2 text-[10px] font-medium text-[var(--text-tertiary)]">
-                      思考深度
-                    </div>
+                  <MenuOverlay title="思考深度" width="w-56">
                     <div className="p-1">
                       {THINKING_LEVELS.map((lvl) => (
                         <button
@@ -930,7 +922,7 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
                         </button>
                       ))}
                     </div>
-                  </div>
+                  </MenuOverlay>
                 )}
               </div>
             </div>
@@ -955,5 +947,34 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
         </div>
       </div>
     </div>
+  );
+}
+
+/**
+ * MenuOverlay — local dropdown/popover shell reused by the permission / model /
+ * thinking menus in the composer footer. Collapses the three previously
+ * hand-rolled `rounded-lg border bg-primary shadow-md` blocks into one source
+ * of truth (built on the Card overlay variant). Children are the menu body
+ * (callers control their own padding / scrolling / footer).
+ */
+function MenuOverlay({
+  title,
+  width = 'w-64',
+  children,
+}: {
+  title: string;
+  width?: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <Card
+      variant="overlay"
+      className={`absolute bottom-full left-0 z-50 mb-2 overflow-hidden ${width}`}
+    >
+      <div className="border-b border-[var(--border-secondary)] px-3 py-2 text-[10px] font-medium text-[var(--text-tertiary)]">
+        {title}
+      </div>
+      {children}
+    </Card>
   );
 }

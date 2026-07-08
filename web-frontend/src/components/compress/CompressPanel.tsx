@@ -112,7 +112,7 @@ export function CompressPanel() {
             </div>
             {stats.needs_compression && (
               <div
-                className="mt-1 rounded px-2 py-1 text-[10px] font-medium"
+                className="mt-1 rounded-md px-2 py-1 text-[10px] font-medium"
                 style={{ background: 'var(--color-warning-bg)', color: 'var(--color-warning)' }}
               >
                 建议压缩

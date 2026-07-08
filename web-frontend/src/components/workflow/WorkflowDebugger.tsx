@@ -77,7 +77,7 @@ export function WorkflowDebugger({
   const failureCount = nodes.filter((n) => n.status === 'failure').length;
 
   return (
-    <div className="h-full flex flex-col rounded-xl border border-[var(--border-primary)] bg-[var(--bg-primary)] overflow-hidden shadow-sm">
+    <div className="h-full flex flex-col rounded-xl border border-[var(--border-primary)] bg-[var(--bg-primary)] overflow-hidden shadow-[var(--shadow-sm)]">
       {/* Toolbar */}
       <div className="flex items-center justify-between px-5 py-3 bg-[var(--bg-secondary)] border-b border-[var(--border-primary)]">
         <div className="flex items-center gap-2">
@@ -218,7 +218,7 @@ export function WorkflowDebugger({
                 onClick={() => handleNodeClick(node)}
               >
                 <div
-                  className={`rounded-xl border-2 ${config.border} bg-[var(--bg-primary)] shadow-sm hover:shadow-md transition-all p-3`}
+                  className={`rounded-xl border-2 ${config.border} bg-[var(--bg-primary)] shadow-[var(--shadow-sm)] hover:shadow-[var(--shadow-md)] transition-all p-3`}
                 >
                   <div className="flex items-center gap-2 mb-1.5">
                     <span
@@ -247,7 +247,7 @@ export function WorkflowDebugger({
 
       {/* Inspector */}
       {selectedNode && (
-        <div className="absolute bottom-4 right-4 w-80 rounded-xl border border-[var(--border-primary)] bg-[var(--bg-primary)] shadow-lg p-4 animate-scale-in">
+        <div className="absolute bottom-4 right-4 w-80 rounded-xl border border-[var(--border-primary)] bg-[var(--bg-primary)] shadow-[var(--shadow-lg)] p-4 animate-scale-in">
           <div className="flex items-center justify-between mb-3">
             <h4 className="text-sm font-semibold text-[var(--text-primary)]">
               {selectedNode.label}

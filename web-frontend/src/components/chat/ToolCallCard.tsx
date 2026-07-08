@@ -121,7 +121,7 @@ function CopyBtn({
         e.stopPropagation();
         onCopy(text, label);
       }}
-      className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] text-[var(--text-tertiary)] transition-colors"
+      className="flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] text-[var(--text-tertiary)] transition-colors"
     >
       {copied === label ? <Check size={10} /> : <Copy size={10} />}
       {copied === label ? '已复制' : '复制'}

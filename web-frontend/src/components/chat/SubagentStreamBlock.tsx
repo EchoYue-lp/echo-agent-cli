@@ -120,7 +120,7 @@ export const SubagentStreamBlock = memo(function SubagentStreamBlock({
     );
 
   return (
-    <div className="my-0.5 rounded-sm px-2 py-1 hover:bg-[var(--bg-hover)] transition-colors">
+    <div className="my-0.5 rounded-md px-2 py-1 hover:bg-[var(--bg-hover)] transition-colors">
       {/* Header (always visible): title + status + progress summary */}
       <div className="flex w-full items-center gap-1.5 text-[11px]">
         <button

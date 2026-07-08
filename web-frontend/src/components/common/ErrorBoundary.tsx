@@ -39,9 +39,9 @@ export class ErrorBoundary extends Component<Props, State> {
             justifyContent: 'center',
             height: '100vh',
             width: '100vw',
-            background: 'var(--bg-chat, #f1f5f9)',
-            color: 'var(--text-primary, #0f172a)',
-            fontFamily: "-apple-system, BlinkMacSystemFont, 'SF Pro Text', sans-serif",
+            background: 'var(--bg-chat)',
+            color: 'var(--text-primary)',
+            fontFamily: 'var(--font-sans, sans-serif)',
             padding: '2rem',
           }}
         >
@@ -53,17 +53,17 @@ export class ErrorBoundary extends Component<Props, State> {
               width: 56,
               height: 56,
               borderRadius: 14,
-              background: 'var(--color-error-bg, #fee2e2)',
+              background: 'var(--color-error-bg)',
               marginBottom: 20,
             }}
           >
-            <AlertTriangle size={24} style={{ color: 'var(--color-error, #ef4444)' }} />
+            <AlertTriangle size={24} style={{ color: 'var(--color-error)' }} />
           </div>
           <h1 style={{ fontSize: 18, fontWeight: 600, marginBottom: 8 }}>出了一些问题</h1>
           <p
             style={{
               fontSize: 13,
-              color: 'var(--text-secondary, #475569)',
+              color: 'var(--text-secondary)',
               maxWidth: 400,
               textAlign: 'center',
               lineHeight: 1.6,
@@ -76,9 +76,9 @@ export class ErrorBoundary extends Component<Props, State> {
             <pre
               style={{
                 fontSize: 11,
-                fontFamily: "'SF Mono', Menlo, monospace",
-                background: 'var(--bg-code, #0f172a)',
-                color: 'var(--color-code-text, #e2e8f0)',
+                fontFamily: 'var(--font-mono, monospace)',
+                background: 'var(--bg-code)',
+                color: 'var(--color-code-text)',
                 padding: '12px 16px',
                 borderRadius: 8,
                 maxWidth: 500,
@@ -100,8 +100,8 @@ export class ErrorBoundary extends Component<Props, State> {
                 padding: '8px 18px',
                 borderRadius: 8,
                 border: 'none',
-                background: 'var(--accent, #6366f1)',
-                color: 'white',
+                background: 'var(--accent)',
+                color: 'var(--text-on-accent)',
                 fontSize: 13,
                 fontWeight: 500,
                 cursor: 'pointer',
@@ -114,9 +114,9 @@ export class ErrorBoundary extends Component<Props, State> {
               style={{
                 padding: '8px 18px',
                 borderRadius: 8,
-                border: '1px solid var(--border-primary, #e2e8f0)',
-                background: 'var(--bg-primary, #fff)',
-                color: 'var(--text-primary, #0f172a)',
+                border: '1px solid var(--border-primary)',
+                background: 'var(--bg-primary)',
+                color: 'var(--text-primary)',
                 fontSize: 13,
                 fontWeight: 500,
                 cursor: 'pointer',

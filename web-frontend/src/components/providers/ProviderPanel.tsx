@@ -250,7 +250,7 @@ export function ProviderPanel() {
             className={`flex items-center gap-3 rounded-lg border p-3 text-left transition-all
               ${
                 selectedId === p.id
-                  ? 'border-[var(--accent)] bg-[var(--accent)]/5 shadow-sm'
+                  ? 'border-[var(--accent)] bg-[var(--accent)]/5 shadow-[var(--shadow-sm)]'
                   : 'border-[var(--border-primary)] bg-[var(--bg-primary)] hover:border-[var(--border-focus)] hover:bg-[var(--bg-hover)]'
               }`}
           >

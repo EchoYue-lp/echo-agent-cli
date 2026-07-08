@@ -162,7 +162,7 @@ export function MemoryPanel() {
         </h3>
         <button
           onClick={() => setShowAdd(!showAdd)}
-          className="rounded p-1 transition-colors"
+          className="rounded-md p-1 transition-colors"
           style={{ color: s.textTer }}
         >
           <Plus size={16} />

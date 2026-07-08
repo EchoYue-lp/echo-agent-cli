@@ -229,7 +229,7 @@ function FileContentView({
       {/* Info bar */}
       <div className="flex items-center gap-3 border-b border-[var(--border-primary)] px-4 py-1.5 text-[10px] text-[var(--text-tertiary)]">
         {content.language && (
-          <span className="rounded bg-[var(--bg-hover)] px-1.5 py-0.5 font-medium uppercase">
+          <span className="rounded-md bg-[var(--bg-hover)] px-1.5 py-0.5 font-medium uppercase">
             {content.language}
           </span>
         )}

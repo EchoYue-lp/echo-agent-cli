@@ -296,7 +296,7 @@ export function SkillsPanel() {
                       </span>
                       {sk.is_baseline && (
                         <span
-                          className="shrink-0 rounded px-1 py-0.5 text-[8px] font-medium"
+                          className="shrink-0 rounded-md px-1 py-0.5 text-[8px] font-medium"
                           style={{ background: '#eab30820', color: '#eab308' }}
                         >
                           baseline
@@ -308,7 +308,7 @@ export function SkillsPanel() {
                         </span>
                       )}
                       <span
-                        className="shrink-0 rounded px-1.5 py-0.5 text-[9px]"
+                        className="shrink-0 rounded-md px-1.5 py-0.5 text-[9px]"
                         style={{
                           background: sk.loaded ? 'var(--accent-muted)' : 'var(--bg-hover)',
                           color: sk.loaded ? s.accent : s.textTer,
@@ -343,7 +343,7 @@ export function SkillsPanel() {
                     {sk.tags.map((tag) => (
                       <span
                         key={tag}
-                        className="rounded px-1.5 py-0.5 text-[9px]"
+                        className="rounded-md px-1.5 py-0.5 text-[9px]"
                         style={{ background: 'var(--bg-hover)', color: s.textTer }}
                       >
                         {tag}

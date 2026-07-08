@@ -91,21 +91,21 @@ export function TokenUsageChart({ events }: TokenUsageChartProps) {
       <div className="flex items-center gap-4 px-1">
         <span className="flex items-center gap-1 text-[10px]" style={{ color: s.textSec }}>
           <span
-            className="inline-block w-2.5 h-2.5 rounded-sm"
+            className="inline-block w-2.5 h-2.5 rounded-md"
             style={{ background: inputColor }}
           />
           Input
         </span>
         <span className="flex items-center gap-1 text-[10px]" style={{ color: s.textSec }}>
           <span
-            className="inline-block w-2.5 h-2.5 rounded-sm"
+            className="inline-block w-2.5 h-2.5 rounded-md"
             style={{ background: outputColor }}
           />
           Output
         </span>
         <span className="flex items-center gap-1 text-[10px]" style={{ color: s.textSec }}>
           <span
-            className="inline-block w-2.5 h-2.5 rounded-sm"
+            className="inline-block w-2.5 h-2.5 rounded-md"
             style={{ background: cachedColor }}
           />
           Cached input

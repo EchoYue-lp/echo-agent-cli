@@ -56,7 +56,7 @@ export function ApprovalCard({
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
             <p className="text-xs font-semibold text-[var(--text-primary)]">需要审批</p>
-            <code className="rounded bg-[var(--bg-secondary)] px-1.5 py-0.5 font-mono text-[11px] text-[var(--text-secondary)]">
+            <code className="rounded-md bg-[var(--bg-secondary)] px-1.5 py-0.5 font-mono text-[11px] text-[var(--text-secondary)]">
               {request.toolName}
             </code>
             {request.prompt && (

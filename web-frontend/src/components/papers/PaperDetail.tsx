@@ -98,7 +98,7 @@ export function PaperDetail({ paper, onClose, onUpdated }: PaperDetailProps) {
         <div className="flex items-center gap-1 ml-3 flex-shrink-0">
           <button
             onClick={handleDelete}
-            className="rounded p-1.5 transition-colors"
+            className="rounded-md p-1.5 transition-colors"
             style={{ color: 'var(--color-error)' }}
             title="Delete paper"
           >
@@ -174,7 +174,7 @@ export function PaperDetail({ paper, onClose, onUpdated }: PaperDetailProps) {
                 value={newTag}
                 onChange={(e) => setNewTag(e.target.value)}
                 placeholder="Add tag"
-                className="rounded border px-2 py-0.5 text-[10px] w-20"
+                className="rounded-md border px-2 py-0.5 text-[10px] w-20"
                 style={{ borderColor: s.border, background: s.bg, color: s.text }}
                 onKeyDown={(e) => e.key === 'Enter' && handleAddTag()}
               />
@@ -195,7 +195,7 @@ export function PaperDetail({ paper, onClose, onUpdated }: PaperDetailProps) {
             {!editingNotes ? (
               <button
                 onClick={() => setEditingNotes(true)}
-                className="text-[10px] px-2 py-0.5 rounded transition-colors"
+                className="text-[10px] px-2 py-0.5 rounded-md transition-colors"
                 style={{ color: 'var(--color-primary)', background: 'rgba(99,102,241,0.1)' }}
               >
                 Edit
@@ -204,7 +204,7 @@ export function PaperDetail({ paper, onClose, onUpdated }: PaperDetailProps) {
               <button
                 onClick={handleSaveNotes}
                 disabled={saving}
-                className="flex items-center gap-1 text-[10px] px-2 py-0.5 rounded transition-colors"
+                className="flex items-center gap-1 text-[10px] px-2 py-0.5 rounded-md transition-colors"
                 style={{ background: 'var(--color-primary)', color: '#fff' }}
               >
                 <Save size={10} />

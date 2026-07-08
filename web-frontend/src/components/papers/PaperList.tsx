@@ -68,7 +68,7 @@ export function PaperList({ papers, selectedId, onSelect }: PaperListProps) {
                   {paper.tags.map((tag) => (
                     <span
                       key={tag}
-                      className="text-[10px] px-1.5 py-0.5 rounded"
+                      className="text-[10px] px-1.5 py-0.5 rounded-md"
                       style={{ background: 'var(--bg-secondary)', color: 'var(--text-tertiary)' }}
                     >
                       {tag}

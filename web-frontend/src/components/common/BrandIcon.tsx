@@ -14,7 +14,7 @@ export function BrandIcon({ size = 'md' }: BrandIconProps) {
     <div
       className={`${s.container} flex shrink-0 items-center justify-center rounded-lg border border-[var(--border-primary)] bg-[var(--bg-primary)] text-[var(--text-primary)]`}
       style={{
-        boxShadow: 'var(--shadow-sm)',
+        boxShadow: 'var(--shadow-[var(--shadow-sm)])',
       }}
     >
       <svg width={s.icon} height={s.icon} viewBox="0 0 32 32" fill="none" aria-hidden="true">
