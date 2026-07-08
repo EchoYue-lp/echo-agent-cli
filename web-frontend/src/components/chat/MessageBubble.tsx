@@ -1,18 +1,7 @@
 import { useState, memo } from 'react';
 import type { ChatMessage, ExecutionRound } from '../../types/api';
 import type { ToolCallInfo } from '../../generated';
-import {
-  User,
-  Bot,
-  Copy,
-  Check,
-  RefreshCw,
-  Pencil,
-  X,
-  ArrowUp,
-  File,
-  Download,
-} from 'lucide-react';
+import { Bot, Copy, Check, RefreshCw, Pencil, X, ArrowUp, File, Download } from 'lucide-react';
 import MarkdownContent from '../common/MarkdownContent';
 import { ThinkingSegment } from './ThinkingSegment';
 import { InlineToolCall } from './InlineToolCall';
@@ -144,27 +133,31 @@ export const MessageBubble = memo(function MessageBubble({
   let thinkingIndex = 0;
 
   return (
-    <div className={`flex gap-3 py-3.5 ${isUser ? 'flex-row-reverse' : ''}`}>
-      {/* Avatar */}
-      <div
-        className={`flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-xs font-semibold
-          ${
-            isUser
-              ? 'bg-[var(--bg-user-msg)] text-[var(--text-user-msg)]'
-              : 'border border-[var(--border-primary)] bg-[var(--bg-secondary)] text-[var(--text-secondary)]'
-          }`}
-      >
-        {isUser ? <User size={14} /> : <Bot size={14} />}
-      </div>
+    <div className={`flex gap-3 py-3.5`}>
+      {/* Avatar — assistant only; user messages are full-width rows (no bubble) */}
+      {!isUser && (
+        <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-[var(--border-primary)] bg-[var(--bg-secondary)] text-xs font-semibold text-[var(--text-secondary)]">
+          <Bot size={14} />
+        </div>
+      )}
 
-      {/* Content — one stream */}
-      <div className={`min-w-0 space-y-2 ${isUser ? 'max-w-[72%] items-end' : 'w-full max-w-[92%]'}`}>
+      {/* Content */}
+      <div className="min-w-0 flex-1 space-y-2">
         {/* Images */}
         {images.length > 0 && (
           <div className={`grid gap-2 ${images.length === 1 ? 'grid-cols-1' : 'grid-cols-2'}`}>
             {images.map((img, i) => (
-              <div key={i} className="overflow-hidden rounded-xl border border-[var(--border-primary)] bg-[var(--bg-secondary)]">
-                <img src={img.url} alt={img.name} className="w-full object-cover" style={{ maxHeight: '300px' }} onClick={() => window.open(img.url, '_blank')} />
+              <div
+                key={i}
+                className="overflow-hidden rounded-lg border border-[var(--border-primary)] bg-[var(--bg-secondary)]"
+              >
+                <img
+                  src={img.url}
+                  alt={img.name}
+                  className="w-full object-cover"
+                  style={{ maxHeight: '300px' }}
+                  onClick={() => window.open(img.url, '_blank')}
+                />
               </div>
             ))}
           </div>
@@ -174,13 +167,22 @@ export const MessageBubble = memo(function MessageBubble({
         {files.length > 0 && (
           <div className="space-y-1.5">
             {files.map((file, i) => (
-              <a key={i} href={file.url} download={file.name} className="flex items-center gap-3 rounded-lg border border-[var(--border-primary)] bg-[var(--bg-secondary)] p-3 transition-colors hover:bg-[var(--bg-hover)]">
+              <a
+                key={i}
+                href={file.url}
+                download={file.name}
+                className="flex items-center gap-3 rounded-lg border border-[var(--border-primary)] bg-[var(--bg-secondary)] p-3 transition-colors hover:bg-[var(--bg-hover)]"
+              >
                 <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-[var(--bg-primary)]">
                   <File size={16} className="text-[var(--text-tertiary)]" />
                 </div>
                 <div className="min-w-0 flex-1">
-                  <div className="truncate text-xs font-medium text-[var(--text-primary)]">{file.name}</div>
-                  <div className="text-[10px] text-[var(--text-tertiary)]">{formatFileSize(file.size)}</div>
+                  <div className="truncate text-xs font-medium text-[var(--text-primary)]">
+                    {file.name}
+                  </div>
+                  <div className="text-[10px] text-[var(--text-tertiary)]">
+                    {formatFileSize(file.size)}
+                  </div>
                 </div>
                 <Download size={14} className="shrink-0 text-[var(--text-tertiary)]" />
               </a>
@@ -188,22 +190,32 @@ export const MessageBubble = memo(function MessageBubble({
           </div>
         )}
 
-        {/* User message text — separate from the assistant one-stream block */}
+        {/* User message text — full-width row with a coral left rail (no bubble).
+         * Distinguishes user from assistant by background tint + accent border,
+         * the way Claude / ChatGPT / Cursor do (bubbles signal "messenger"). */}
         {isUser && message.content && (
-          <div className="group/msg relative max-w-[72%]">
+          <div className="group/msg relative w-full">
             {!editing && (
-              <div className="absolute -top-3 left-0 z-10 flex gap-0.5 rounded-lg border border-[var(--border-primary)] bg-[var(--bg-primary)] px-1 py-0.5 opacity-0 shadow-[var(--shadow-md)] transition-all duration-200 group-hover/msg:opacity-100 group-hover/msg:-translate-y-0.5">
-                <ActionButton icon={<Copy size={13} />} label="复制" onClick={() => copyToClipboard(message.content)} copyMode />
+              <div className="absolute -top-3 right-0 z-10 flex gap-0.5 rounded-lg border border-[var(--border-primary)] bg-[var(--bg-primary)] px-1 py-0.5 opacity-0 shadow-[var(--shadow-md)] transition-all duration-200 group-hover/msg:opacity-100 group-hover/msg:-translate-y-0.5">
+                <ActionButton
+                  icon={<Copy size={13} />}
+                  label="复制"
+                  onClick={() => copyToClipboard(message.content)}
+                  copyMode
+                />
                 <ActionButton icon={<Pencil size={13} />} label="编辑" onClick={startEdit} />
               </div>
             )}
             {editing ? (
-              <div className="rounded-2xl border-2 border-[var(--accent)] bg-[var(--bg-primary)] px-4 py-3 shadow-[var(--shadow-md)]">
+              <div className="rounded-lg border-2 border-[var(--accent)] bg-[var(--bg-primary)] px-4 py-3 shadow-[var(--shadow-md)]">
                 <textarea
                   value={editText}
                   onChange={(e) => setEditText(e.target.value)}
                   onKeyDown={(e) => {
-                    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submitEdit(); }
+                    if (e.key === 'Enter' && !e.shiftKey) {
+                      e.preventDefault();
+                      submitEdit();
+                    }
                     if (e.key === 'Escape') cancelEdit();
                   }}
                   rows={3}
@@ -211,16 +223,24 @@ export const MessageBubble = memo(function MessageBubble({
                   autoFocus
                 />
                 <div className="mt-3 flex items-center justify-end gap-1.5">
-                  <button onClick={cancelEdit} className="flex items-center gap-1 rounded-md px-2.5 py-1 text-xs text-[var(--text-secondary)]">
+                  <button
+                    onClick={cancelEdit}
+                    className="flex items-center gap-1 rounded-md px-2.5 py-1 text-xs text-[var(--text-secondary)]"
+                  >
                     <X size={12} /> 取消
                   </button>
-                  <button onClick={submitEdit} disabled={!editText.trim()} className="flex items-center gap-1 rounded-md px-2.5 py-1 text-xs text-[var(--text-on-accent)]" style={{ background: 'var(--accent)' }}>
+                  <button
+                    onClick={submitEdit}
+                    disabled={!editText.trim()}
+                    className="flex items-center gap-1 rounded-md px-2.5 py-1 text-xs text-[var(--text-on-accent)]"
+                    style={{ background: 'var(--accent)' }}
+                  >
                     <ArrowUp size={12} /> 发送
                   </button>
                 </div>
               </div>
             ) : (
-              <div className="rounded-2xl bg-[var(--bg-user-msg)] px-4 py-2.5 text-sm leading-relaxed text-[var(--text-user-msg)]">
+              <div className="rounded-lg border-l-[3px] border-l-[var(--accent)] bg-[var(--accent-bg)] px-4 py-2.5 text-sm leading-relaxed text-[var(--text-primary)]">
                 <div className="whitespace-pre-wrap break-words">{message.content}</div>
               </div>
             )}
@@ -231,7 +251,7 @@ export const MessageBubble = memo(function MessageBubble({
             All peers in a single space-y container — no separate bordered
             sections. This is what makes it read as one continuous flow. */}
         {!isUser && (
-          <div className="w-full max-w-[92%] space-y-2">
+          <div className="w-full space-y-2">
             {/* Thinking + tools */}
             {steps.length > 0 && (
               <div className="space-y-1">
@@ -267,17 +287,31 @@ export const MessageBubble = memo(function MessageBubble({
               <div className="group/msg relative">
                 {!message.isStreaming && !editing && (
                   <div className="absolute -top-3 right-0 z-10 flex gap-0.5 rounded-lg border border-[var(--border-primary)] bg-[var(--bg-primary)] px-1 py-0.5 opacity-0 shadow-[var(--shadow-md)] transition-all duration-200 group-hover/msg:opacity-100 group-hover/msg:-translate-y-0.5">
-                    <ActionButton icon={<Copy size={13} />} label="复制" onClick={() => copyToClipboard(message.content)} copyMode />
-                    {onRegenerate && <ActionButton icon={<RefreshCw size={13} />} label="重新生成" onClick={onRegenerate} />}
+                    <ActionButton
+                      icon={<Copy size={13} />}
+                      label="复制"
+                      onClick={() => copyToClipboard(message.content)}
+                      copyMode
+                    />
+                    {onRegenerate && (
+                      <ActionButton
+                        icon={<RefreshCw size={13} />}
+                        label="重新生成"
+                        onClick={onRegenerate}
+                      />
+                    )}
                   </div>
                 )}
                 {editing ? (
-                  <div className="rounded-2xl border-2 border-[var(--accent)] bg-[var(--bg-primary)] px-4 py-3 shadow-[var(--shadow-md)]">
+                  <div className="rounded-lg border-2 border-[var(--accent)] bg-[var(--bg-primary)] px-4 py-3 shadow-[var(--shadow-md)]">
                     <textarea
                       value={editText}
                       onChange={(e) => setEditText(e.target.value)}
                       onKeyDown={(e) => {
-                        if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submitEdit(); }
+                        if (e.key === 'Enter' && !e.shiftKey) {
+                          e.preventDefault();
+                          submitEdit();
+                        }
                         if (e.key === 'Escape') cancelEdit();
                       }}
                       rows={3}
@@ -285,10 +319,18 @@ export const MessageBubble = memo(function MessageBubble({
                       autoFocus
                     />
                     <div className="mt-3 flex items-center justify-end gap-1.5">
-                      <button onClick={cancelEdit} className="flex items-center gap-1 rounded-md px-2.5 py-1 text-xs text-[var(--text-secondary)]">
+                      <button
+                        onClick={cancelEdit}
+                        className="flex items-center gap-1 rounded-md px-2.5 py-1 text-xs text-[var(--text-secondary)]"
+                      >
                         <X size={12} /> 取消
                       </button>
-                      <button onClick={submitEdit} disabled={!editText.trim()} className="flex items-center gap-1 rounded-md px-2.5 py-1 text-xs text-[var(--text-on-accent)]" style={{ background: 'var(--accent)' }}>
+                      <button
+                        onClick={submitEdit}
+                        disabled={!editText.trim()}
+                        className="flex items-center gap-1 rounded-md px-2.5 py-1 text-xs text-[var(--text-on-accent)]"
+                        style={{ background: 'var(--accent)' }}
+                      >
                         <ArrowUp size={12} /> 发送
                       </button>
                     </div>
@@ -310,15 +352,32 @@ export const MessageBubble = memo(function MessageBubble({
   );
 });
 
-function ActionButton({ icon, label, onClick, copyMode }: { icon: React.ReactNode; label: string; onClick: () => void; copyMode?: boolean; }) {
+function ActionButton({
+  icon,
+  label,
+  onClick,
+  copyMode,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  onClick: () => void;
+  copyMode?: boolean;
+}) {
   const [done, setDone] = useState(false);
   const handleClick = (e: React.MouseEvent) => {
     e.stopPropagation();
     onClick();
-    if (copyMode) { setDone(true); setTimeout(() => setDone(false), 2000); }
+    if (copyMode) {
+      setDone(true);
+      setTimeout(() => setDone(false), 2000);
+    }
   };
   return (
-    <button onClick={handleClick} className={`flex items-center gap-1 rounded-md px-1.5 py-1 text-[11px] transition-colors ${done ? 'text-[var(--color-success)]' : 'text-[var(--text-tertiary)] hover:text-[var(--text-primary)]'}`} title={label}>
+    <button
+      onClick={handleClick}
+      className={`flex items-center gap-1 rounded-md px-1.5 py-1 text-[11px] transition-colors ${done ? 'text-[var(--color-success)]' : 'text-[var(--text-tertiary)] hover:text-[var(--text-primary)]'}`}
+      title={label}
+    >
       {done ? <Check size={13} /> : icon}
     </button>
   );

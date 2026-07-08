@@ -1,156 +1,186 @@
 @import 'tailwindcss';
 
+/* Design tokens registered with Tailwind v4. Components mostly consume the
+ * :root / .dark CSS variables via arbitrary value syntax (bg-[var(--bg-*)]),
+ * so this @theme block primarily registers the radius / font scales. */
 @theme {
-  --color-primary: #18181b;
-  --color-primary-light: #3f3f46;
-  --color-primary-dark: #09090b;
-  --color-surface: #ffffff;
-  --color-surface-dark: #141414;
-  --color-border: #e7e5e4;
-  --color-border-dark: #303030;
+  --color-primary: #cc785c;
+  --color-primary-light: #d68b72;
+  --color-primary-dark: #a9583e;
+  --color-surface: #faf9f5;
+  --color-surface-dark: #08090a;
+  --color-border: #e6dfd8;
+  --color-border-dark: #23252a;
+
+  /* Radius scale — only 3 values used across the app */
+  --radius-sm: 6px;
+  --radius: 8px;
+  --radius-lg: 12px;
+  --radius-full: 9999px;
+
+  /* Typography */
+  --font-sans:
+    'Inter', -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Roboto, 'Helvetica Neue',
+    sans-serif;
+  --font-mono: 'JetBrains Mono', 'SF Mono', 'Fira Code', 'Cascadia Code', Menlo, monospace;
 }
 
+/* ============================================================================
+ * LIGHT THEME — warm cream (Claude / Cursor lineage)
+ * Canvas is cream, not white. Hairlines are warm-toned, never neutral gray.
+ * One signature accent: coral #cc785c, deployed like a scalpel.
+ * ========================================================================== */
 :root {
-  --bg-primary: #ffffff;
-  --bg-secondary: #fafafa;
-  --bg-chat: #f7f7f5;
-  --bg-hover: #f0f0ee;
-  --bg-input: #ffffff;
-  --bg-user-msg: #18181b;
-  --bg-assistant-msg: #ffffff;
-  --bg-code: #151515;
-  --bg-code-header: #202020;
-  --bg-sidebar: #fbfbfa;
-  --bg-sidebar-hover: #efefed;
-  --bg-sidebar-active: #ececea;
-  --bg-rail: #ffffff;
-  --bg-overlay: rgba(0, 0, 0, 0.5);
+  --bg-primary: #faf9f5; /* canvas — Claude's signature cream */
+  --bg-secondary: #f3f1ea; /* surface — cards/panels, visible step from canvas */
+  --bg-chat: #f5f3ed; /* main chat canvas, between primary and secondary */
+  --bg-hover: #efece3; /* hover state */
+  --bg-input: #ffffff; /* inputs stay bright (focus zone) */
+  --bg-user-msg: #cc785c; /* user message fill — coral */
+  --bg-assistant-msg: transparent;
+  --bg-code: #1a1816; /* warm-tinted dark code block */
+  --bg-code-header: #252320;
+  --bg-sidebar: #f3f1ea; /* sidebar = surface layer (clear separation from chat) */
+  --bg-sidebar-hover: #ebe8df;
+  --bg-sidebar-active: #e3dfd3;
+  --bg-rail: #f3f1ea; /* right rail = surface layer */
+  --bg-overlay: rgba(38, 37, 30, 0.4);
 
-  --text-primary: #18181b;
-  --text-secondary: #52525b;
-  --text-tertiary: #a1a1aa;
-  --text-inverse: #ffffff;
+  --text-primary: #26251e; /* warm near-black (not cold zinc) */
+  --text-secondary: #5c5a52;
+  --text-tertiary: #8d8a80;
+  --text-inverse: #faf9f5;
   --text-on-accent: #ffffff;
-  --text-on-soft-action: #18181b;
+  --text-on-soft-action: #26251e;
   --text-user-msg: #ffffff;
-  --text-assistant-msg: #18181b;
-  --text-link: #18181b;
+  --text-assistant-msg: #26251e;
+  --text-link: #a9583e; /* links use the accent, underlined */
 
-  --border-primary: #e7e5e4;
-  --border-secondary: #f0eeeb;
-  --border-focus: #18181b;
+  --border-primary: #e6dfd8; /* warm hairline (never cold gray) */
+  --border-secondary: #efece3;
+  --border-focus: #cc785c;
 
-  --accent: #18181b;
-  --accent-light: #3f3f46;
-  --accent-bg: #efefed;
-  --action-soft: #f0f0ee;
-  --action-soft-hover: #e7e5e4;
-  --action-run: #16a34a;
-  --action-run-hover: #15803d;
-  --action-run-bg: #dcfce7;
+  --accent: #cc785c; /* signature coral */
+  --accent-light: #d68b72;
+  --accent-bg: #f7ede5; /* coral tint for badges / focus rings */
+  --action-soft: #f0ede4;
+  --action-soft-hover: #e6e1d4;
+  --action-run: #5db872; /* run = success green */
+  --action-run-hover: #4aa35f;
+  --action-run-bg: #e8f3ea;
   --text-on-run: #ffffff;
 
-  --settings-dialog-bg: #f5f5f4;
-  --settings-sidebar-bg: #f8f7f5;
-  --settings-content-bg: #fafafa;
-  --settings-panel-bg: #ffffff;
-  --settings-active-bg: #e7e5e4;
-  --settings-accent: #78716c;
-  --settings-accent-bg: #eeeae6;
+  --settings-dialog-bg: #f5f3ed;
+  --settings-sidebar-bg: #efede4;
+  --settings-content-bg: #f8f6f0;
+  --settings-panel-bg: #faf9f5;
+  --settings-active-bg: #e6dfd8;
+  --settings-accent: #a9583e; /* settings keeps a muted coral accent */
+  --settings-accent-bg: #f0e4da;
   --settings-text-on-accent: #ffffff;
 
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.03);
-  --shadow-md: 0 8px 24px rgba(24, 24, 27, 0.06);
-  --shadow-lg: 0 16px 40px rgba(24, 24, 27, 0.08);
-  --shadow-xl: 0 20px 60px rgba(24, 24, 27, 0.1);
-  --shadow-glow: 0 0 18px rgba(24, 24, 27, 0.14);
+  /* Shadows — Vercel-style "shadow as border": whisper-light, layered.
+   * Card elevation comes from the surface-color ladder + hairline, not drop shadows. */
+  --shadow-sm: 0 1px 2px rgba(38, 37, 30, 0.04);
+  --shadow-md: 0 1px 2px rgba(38, 37, 30, 0.04), 0 0 0 1px rgba(38, 37, 30, 0.06);
+  --shadow-lg: 0 4px 12px rgba(38, 37, 30, 0.06), 0 0 0 1px rgba(38, 37, 30, 0.06);
+  --shadow-xl: 0 12px 32px rgba(38, 37, 30, 0.08), 0 0 0 1px rgba(38, 37, 30, 0.06);
+  --shadow-glow: 0 0 0 3px var(--accent-bg);
 
-  --color-success: #52525b;
-  --color-success-bg: #f4f4f5;
-  --color-success-text: #27272a;
-  --color-error: #ef4444;
-  --color-error-bg: #fee2e2;
-  --color-error-text: #991b1b;
-  --color-warning: #f59e0b;
-  --color-warning-bg: #fef3c7;
-  --color-warning-text: #92400e;
-  --color-info: #52525b;
-  --color-info-bg: #f4f4f5;
-  --color-info-text: #27272a;
-  --color-purple: #71717a;
-  --color-purple-bg: #f4f4f5;
+  /* Semantic colors — real chroma, not grays */
+  --color-success: #5db872;
+  --color-success-bg: #e8f3ea;
+  --color-success-text: #2d6e3f;
+  --color-error: #c64545;
+  --color-error-bg: #f7e3e3;
+  --color-error-text: #8b2c2c;
+  --color-warning: #d4a017;
+  --color-warning-bg: #f7eecb;
+  --color-warning-text: #7a5c0a;
+  --color-info: #5db8a6;
+  --color-info-bg: #e3f2ef;
+  --color-info-text: #2d6b62;
+  --color-purple: #8b5cf6; /* thinking segments now show real violet */
+  --color-purple-bg: #ede7fd;
   --color-code-text: #e2e8f0;
 }
 
+/* ============================================================================
+ * DARK THEME — cool precision instrument (Linear / Raycast lineage)
+ * Near-black canvas, blue-tinted neutrals, coral accent kept for brand parity.
+ * Elevation via surface ladder + 0.5–1px hairlines, not drop shadows.
+ * ========================================================================== */
 .dark {
-  --bg-primary: #18181b;
-  --bg-secondary: #141414;
-  --bg-chat: #101010;
-  --bg-hover: #242424;
-  --bg-input: #18181b;
-  --bg-user-msg: #e5e7eb;
-  --bg-assistant-msg: #18181b;
-  --bg-code: #0a0a0a;
-  --bg-code-header: #18181b;
-  --bg-sidebar: #222222;
-  --bg-sidebar-hover: #303030;
-  --bg-sidebar-active: #303030;
-  --bg-rail: #1c1c1f;
-  --bg-overlay: rgba(0, 0, 0, 0.75);
+  --bg-primary: #141517; /* surface */
+  --bg-secondary: #0f1011; /* Carbon — cards sink below canvas */
+  --bg-chat: #08090a; /* Void — main canvas (darkest) */
+  --bg-hover: #1a1c1f;
+  --bg-input: #141517;
+  --bg-user-msg: #cc785c; /* coral stays — brand consistency */
+  --bg-assistant-msg: transparent;
+  --bg-code: #07080a;
+  --bg-code-header: #111315;
+  --bg-sidebar: #0f1011;
+  --bg-sidebar-hover: #1a1c1f;
+  --bg-sidebar-active: #23252a;
+  --bg-rail: #0f1011;
+  --bg-overlay: rgba(0, 0, 0, 0.7);
 
-  --text-primary: #e7e5e4;
-  --text-secondary: #a1a1aa;
-  --text-tertiary: #71717a;
-  --text-inverse: #18181b;
-  --text-on-accent: #18181b;
-  --text-on-soft-action: #e4e4e7;
-  --text-user-msg: #18181b;
-  --text-assistant-msg: #e7e5e4;
-  --text-link: #e4e4e7;
+  --text-primary: #f3f4f6; /* Paper */
+  --text-secondary: #a8adb8; /* Mist */
+  --text-tertiary: #6b7079; /* Fog */
+  --text-inverse: #08090a;
+  --text-on-accent: #ffffff;
+  --text-on-soft-action: #f3f4f6;
+  --text-user-msg: #ffffff;
+  --text-assistant-msg: #f3f4f6;
+  --text-link: #d68b72; /* coral-tinted link */
 
-  --border-primary: #303030;
-  --border-secondary: #242424;
-  --border-focus: #e4e4e7;
+  --border-primary: #23252a; /* hairline */
+  --border-secondary: #1a1c1f;
+  --border-focus: #cc785c;
 
-  --accent: #e4e4e7;
-  --accent-light: #fafafa;
-  --accent-bg: #27272a;
-  --action-soft: #27272a;
-  --action-soft-hover: #303030;
-  --action-run: #22c55e;
-  --action-run-hover: #4ade80;
-  --action-run-bg: #052e16;
-  --text-on-run: #052e16;
+  --accent: #cc785c; /* coral — same as light, brand parity */
+  --accent-light: #d68b72;
+  --accent-bg: #3a2418; /* deep coral tint on dark */
+  --action-soft: #1a1c1f;
+  --action-soft-hover: #23252a;
+  --action-run: #5db872;
+  --action-run-hover: #6dc980;
+  --action-run-bg: #0f2818;
+  --text-on-run: #ffffff;
 
-  --settings-dialog-bg: #18181b;
-  --settings-sidebar-bg: #202020;
-  --settings-content-bg: #141414;
-  --settings-panel-bg: #1f1f22;
-  --settings-active-bg: #303030;
-  --settings-accent: #a8a29e;
-  --settings-accent-bg: #303030;
-  --settings-text-on-accent: #18181b;
+  --settings-dialog-bg: #0f1011;
+  --settings-sidebar-bg: #0a0b0c;
+  --settings-content-bg: #111315;
+  --settings-panel-bg: #141517;
+  --settings-active-bg: #23252a;
+  --settings-accent: #d68b72;
+  --settings-accent-bg: #3a2418;
+  --settings-text-on-accent: #08090a;
 
-  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.2);
-  --shadow-md: 0 2px 8px rgba(0, 0, 0, 0.3);
-  --shadow-lg: 0 4px 16px rgba(0, 0, 0, 0.35);
-  --shadow-xl: 0 8px 24px rgba(0, 0, 0, 0.45);
-  --shadow-glow: 0 0 20px rgba(228, 228, 231, 0.1);
+  /* Shadows — near-zero (Linear philosophy: borders carry elevation, not shadows) */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-md: 0 1px 2px rgba(0, 0, 0, 0.3), 0 0 0 1px rgba(255, 255, 255, 0.04);
+  --shadow-lg: 0 4px 12px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(255, 255, 255, 0.05);
+  --shadow-xl: 0 12px 32px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(255, 255, 255, 0.06);
+  --shadow-glow: 0 0 0 3px var(--accent-bg);
 
-  --color-success: #a1a1aa;
-  --color-success-bg: #27272a;
-  --color-success-text: #e4e4e7;
+  /* Semantic colors — real chroma in dark */
+  --color-success: #5db872;
+  --color-success-bg: #0f2818;
+  --color-success-text: #a8e0b5;
   --color-error: #f87171;
-  --color-error-bg: #7f1d1d30;
-  --color-error-text: #fecaca;
+  --color-error-bg: #3a1414;
+  --color-error-text: #fca5a5;
   --color-warning: #fbbf24;
-  --color-warning-bg: #78350f30;
+  --color-warning-bg: #3a2a08;
   --color-warning-text: #fde68a;
-  --color-info: #a1a1aa;
-  --color-info-bg: #27272a;
-  --color-info-text: #e4e4e7;
-  --color-purple: #a1a1aa;
-  --color-purple-bg: #27272a;
+  --color-info: #5db8a6;
+  --color-info-bg: #0f2622;
+  --color-info-text: #a5e0d6;
+  --color-purple: #a78bfa;
+  --color-purple-bg: #241a3a;
   --color-code-text: #e2e8f0;
 }
 
@@ -160,14 +190,15 @@
 
 body {
   margin: 0;
-  font-family:
-    -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', Inter, Roboto, 'Helvetica Neue',
-    sans-serif;
+  font-family: var(--font-sans);
   background: var(--bg-chat);
   color: var(--text-primary);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11';
+  /* Tighten tracking at body sizes (Inter shines with slight negative ls).
+   * ss03 = single-story g (Linear/Raycast signature). */
+  letter-spacing: -0.011em;
+  font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11', 'ss03', 'zero';
 }
 
 #root {
@@ -287,7 +318,7 @@ body {
     box-shadow: var(--shadow-glow);
   }
   50% {
-    box-shadow: 0 0 32px rgba(99, 102, 241, 0.18);
+    box-shadow: 0 0 32px color-mix(in srgb, var(--accent) 28%, transparent);
   }
 }
 @keyframes scaleIn {
@@ -374,26 +405,26 @@ body {
 
 /* Glass morphism - refined */
 .glass {
-  background: rgba(255, 255, 255, 0.6);
+  background: rgba(250, 249, 245, 0.7);
   backdrop-filter: blur(16px);
   -webkit-backdrop-filter: blur(16px);
-  border: 1px solid rgba(255, 255, 255, 0.3);
+  border: 1px solid var(--border-primary);
 }
 .dark .glass {
-  background: rgba(15, 23, 42, 0.6);
-  border: 1px solid rgba(255, 255, 255, 0.06);
+  background: rgba(15, 16, 17, 0.7);
+  border: 1px solid var(--border-primary);
 }
 
 /* Stronger glass */
 .glass-strong {
-  background: rgba(255, 255, 255, 0.85);
+  background: rgba(250, 249, 245, 0.9);
   backdrop-filter: blur(20px);
   -webkit-backdrop-filter: blur(20px);
-  border: 1px solid rgba(255, 255, 255, 0.4);
+  border: 1px solid var(--border-primary);
 }
 .dark .glass-strong {
-  background: rgba(15, 23, 42, 0.85);
-  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(15, 16, 17, 0.92);
+  border: 1px solid var(--border-primary);
 }
 
 /* Subtle noise texture */
@@ -414,17 +445,20 @@ body {
 /* Markdown content */
 .md-content h1 {
   font-size: 1.5em;
-  font-weight: 700;
+  font-weight: 600; /* no 700 — weight discipline (Linear/Vercel) */
+  letter-spacing: -0.022em;
   margin: 0.6em 0 0.3em;
 }
 .md-content h2 {
   font-size: 1.3em;
   font-weight: 600;
+  letter-spacing: -0.016em;
   margin: 0.5em 0 0.25em;
 }
 .md-content h3 {
   font-size: 1.1em;
   font-weight: 600;
+  letter-spacing: -0.011em;
   margin: 0.4em 0 0.2em;
 }
 .md-content p {
@@ -489,28 +523,42 @@ body {
 }
 
 /* Runtime story card dots */
-.story-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
-.story-dot--done { background: #10b981; }
-.story-dot--active { background: #3b82f6; }
-.story-dot--pending { background: #9ca3af; }
-.story-dot--error { background: #ef4444; }
+.story-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+  flex-shrink: 0;
+}
+.story-dot--done {
+  background: #10b981;
+}
+.story-dot--active {
+  background: #3b82f6;
+}
+.story-dot--pending {
+  background: #9ca3af;
+}
+.story-dot--error {
+  background: #ef4444;
+}
 
 /* Code blocks */
 .md-inline-code {
   background: var(--bg-code);
   color: var(--color-code-text);
   padding: 0.12em 0.4em;
-  border-radius: 4px;
-  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', Menlo, monospace;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
   font-size: 0.88em;
 }
 .md-pre-wrap {
   position: relative;
   margin: 0.6em 0;
-  border-radius: 10px;
+  border-radius: var(--radius);
   overflow: hidden;
   background: var(--bg-code);
-  border: 1px solid rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--border-primary);
 }
 .md-pre-header {
   display: flex;
@@ -524,7 +572,7 @@ body {
 .md-pre-copy {
   cursor: pointer;
   padding: 2px 8px;
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   border: 1px solid var(--text-secondary);
   background: transparent;
   color: var(--text-tertiary);
@@ -542,14 +590,14 @@ body {
   color: var(--color-code-text);
   font-size: 13px;
   line-height: 1.6;
-  font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', Menlo, monospace;
+  font-family: var(--font-mono);
 }
 .md-content code:not(pre code) {
   background: var(--bg-hover);
   padding: 2px 6px;
-  border-radius: 4px;
+  border-radius: var(--radius-sm);
   font-size: 0.88em;
-  font-family: 'SF Mono', 'Fira Code', Menlo, monospace;
+  font-family: var(--font-mono);
   color: var(--accent);
 }
 
@@ -567,7 +615,7 @@ body {
 .card {
   background: var(--bg-primary);
   border: 1px solid var(--border-primary);
-  border-radius: 8px;
+  border-radius: var(--radius);
   transition: border-color 0.2s ease;
 }
 
@@ -580,7 +628,7 @@ body {
   align-items: center;
   justify-content: center;
   gap: 6px;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   font-weight: 500;
   font-size: 13px;
   padding: 8px 16px;
@@ -624,7 +672,7 @@ body {
 .input {
   background: var(--bg-input);
   border: 1px solid var(--border-primary);
-  border-radius: 8px;
+  border-radius: var(--radius);
   padding: 9px 13px;
   font-size: 13px;
   color: var(--text-primary);
@@ -651,7 +699,7 @@ textarea.input {
   display: inline-flex;
   align-items: center;
   padding: 2px 8px;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   font-size: 11px;
   font-weight: 500;
   background: var(--accent-bg);

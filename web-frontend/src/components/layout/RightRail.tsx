@@ -67,7 +67,7 @@ function RailMetric({ icon, value }: { icon: ReactNode; value: number }) {
 }
 
 export function RightRail() {
-  const [collapsed, setCollapsed] = useState(true);
+  const [collapsed, setCollapsed] = useState(false);
   const activeId = useConversationStore((s) => s.activeId);
   const messages = useChatStore((s) => s.messages);
   const { activeRun, todos, artifacts, refresh } = useTaskRuntimeStore();
@@ -113,7 +113,7 @@ export function RightRail() {
 
   return (
     <aside
-      className={`relative hidden h-full shrink-0 overflow-visible xl:block ${
+      className={`relative hidden h-full shrink-0 overflow-visible lg:block ${
         collapsed ? 'w-0' : 'w-[316px] border-l border-[var(--border-primary)] bg-[var(--bg-rail)]'
       }`}
     >

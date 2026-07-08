@@ -138,7 +138,7 @@ export function ChatPanel() {
           {messages.length === 0 ? (
             <WelcomeScreen onSuggestionClick={handleSuggestionClick} />
           ) : (
-            <div className="mx-auto w-full max-w-[1180px] px-5 sm:px-8">
+            <div className="mx-auto w-full max-w-[768px] px-5 sm:px-8">
               <div className="space-y-1 pb-4 pt-4">
                 {messages.map((msg, idx) => {
                   const prevMsg = idx > 0 ? messages[idx - 1] : null;
@@ -201,15 +201,15 @@ export function ChatPanel() {
                         </span>
                         <span className="flex gap-0.5">
                           <span
-                            className="h-1 w-1 rounded-full bg-[var(--text-tertiary)] animate-bounce"
+                            className="h-1 w-1 rounded-full bg-[var(--accent)] animate-bounce"
                             style={{ animationDelay: '0ms' }}
                           />
                           <span
-                            className="h-1 w-1 rounded-full bg-[var(--text-tertiary)] animate-bounce"
+                            className="h-1 w-1 rounded-full bg-[var(--accent)] animate-bounce"
                             style={{ animationDelay: '150ms' }}
                           />
                           <span
-                            className="h-1 w-1 rounded-full bg-[var(--text-tertiary)] animate-bounce"
+                            className="h-1 w-1 rounded-full bg-[var(--accent)] animate-bounce"
                             style={{ animationDelay: '300ms' }}
                           />
                         </span>
@@ -276,7 +276,7 @@ export function ChatPanel() {
 
       <div>
         {approvalRequest && (
-          <div className="mx-auto w-full max-w-[1180px] px-5 pb-2 sm:px-8">
+          <div className="mx-auto w-full max-w-[768px] px-5 pb-2 sm:px-8">
             <ApprovalCard
               request={approvalRequest}
               onApprove={() => sendApproval(approvalRequest.requestId, true)}
