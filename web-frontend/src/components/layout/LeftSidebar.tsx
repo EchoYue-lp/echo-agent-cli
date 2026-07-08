@@ -7,9 +7,6 @@ import {
   FolderOpen,
   Terminal,
   Settings,
-  Code,
-  BarChart3,
-  GraduationCap,
   MessageSquare,
   Search,
   X,
@@ -24,14 +21,7 @@ import { useConversationStore } from '../../stores/conversationStore';
 import { conversationApi } from '../../api/endpoints';
 import type { Workspace } from '../../api/endpoints';
 import type { ConversationListItem } from '../../types/api';
-
-const KIND_ICONS: Record<string, { icon: typeof Code; color: string }> = {
-  code: { icon: Code, color: '#6366f1' },
-  data: { icon: BarChart3, color: '#f59e0b' },
-  data_analysis: { icon: BarChart3, color: '#f59e0b' },
-  research: { icon: GraduationCap, color: '#10b981' },
-  general: { icon: MessageSquare, color: '#6b7280' },
-};
+import { getWorkspaceKind } from '../../lib/workspaceKinds';
 
 const MAX_RECENT_CONVERSATIONS = 5;
 
@@ -158,7 +148,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
   };
 
   const getKindIcon = (kind: { type: string }) => {
-    const k = KIND_ICONS[kind.type] || KIND_ICONS['general'];
+    const k = getWorkspaceKind(kind.type);
     const Icon = k.icon;
     return <Icon size={14} style={{ color: k.color }} />;
   };

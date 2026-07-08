@@ -25,6 +25,7 @@ import {
   X,
   AlertTriangle,
 } from 'lucide-react';
+import { Card } from '../common/Card';
 import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
 import {
   useSubagentRunStore,
@@ -251,10 +252,7 @@ export function CacheUsageCard({
   const labelClass = compact ? 'text-[9px]' : 'text-[10px]';
 
   return (
-    <div
-      className={`rounded-lg border ${compact ? 'p-2' : 'p-3'}`}
-      style={{ borderColor: 'var(--border-primary)', background: 'var(--bg-secondary)' }}
-    >
+    <Card variant="elevated" className={`bg-[var(--bg-secondary)] ${compact ? 'p-2' : 'p-3'}`}>
       <div className="mb-2 flex items-center justify-between gap-2">
         <div className="flex min-w-0 items-center gap-1.5">
           <Gauge size={compact ? 12 : 14} style={{ color: 'var(--accent)' }} />
@@ -350,7 +348,7 @@ export function CacheUsageCard({
           ))}
         </div>
       )}
-    </div>
+    </Card>
   );
 }
 

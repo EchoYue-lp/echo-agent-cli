@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { providerApi } from '../../api/endpoints';
 import type { ConfiguredModel, ProviderTemplate } from '../../types/api';
+import { Card } from '../common/Card';
 
 const MODELS_CHANGED_EVENT = 'eko:models-changed';
 
@@ -195,7 +196,7 @@ export function ProviderPanel() {
         </div>
       </div>
 
-      <div className="rounded-lg border border-[var(--border-primary)] bg-[var(--bg-primary)]">
+      <Card variant="elevated">
         <div className="flex items-center justify-between border-b border-[var(--border-secondary)] px-3 py-2">
           <h4 className="text-xs font-semibold text-[var(--text-primary)]">已添加模型</h4>
           <span className="text-[10px] text-[var(--text-tertiary)]">
@@ -239,7 +240,7 @@ export function ProviderPanel() {
             ))}
           </div>
         )}
-      </div>
+      </Card>
 
       {/* Provider grid */}
       <div className="grid grid-cols-2 gap-2">
@@ -283,7 +284,7 @@ export function ProviderPanel() {
 
       {/* Selected provider config */}
       {selected && (
-        <div className="rounded-lg border border-[var(--border-primary)] p-4 space-y-3">
+        <Card variant="elevated" className="p-4 space-y-3">
           <div className="flex items-center gap-2">
             <span className="flex h-7 w-7 items-center justify-center rounded-md bg-[var(--bg-secondary)] text-xs font-semibold text-[var(--text-secondary)]">
               {selected.name.slice(0, 1).toUpperCase()}
@@ -536,7 +537,7 @@ export function ProviderPanel() {
               {switchResult.message}
             </div>
           )}
-        </div>
+        </Card>
       )}
     </div>
   );

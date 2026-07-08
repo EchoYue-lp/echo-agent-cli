@@ -44,11 +44,11 @@ export function TestRunnerPanel({
           </div>
           <div className="flex items-center gap-4 text-xs">
             <div className="flex items-center gap-1.5">
-              <div className="w-2 h-2 rounded-full bg-green-500" />
+              <div className="w-2 h-2 rounded-full bg-[var(--color-success)]" />
               <span className="text-[var(--text-secondary)]">{passedTests} passed</span>
             </div>
             <div className="flex items-center gap-1.5">
-              <div className="w-2 h-2 rounded-full bg-red-500" />
+              <div className="w-2 h-2 rounded-full bg-[var(--color-error)]" />
               <span className="text-[var(--text-secondary)]">{failedTests} failed</span>
             </div>
           </div>
@@ -57,13 +57,13 @@ export function TestRunnerPanel({
         <div className="flex h-2 rounded-full overflow-hidden bg-[var(--bg-hover)]">
           {passedTests > 0 && (
             <div
-              className="bg-green-500 transition-all duration-500"
+              className="bg-[var(--color-success)] transition-all duration-500"
               style={{ width: `${passRate}%` }}
             />
           )}
           {failedTests > 0 && (
             <div
-              className="bg-red-500 transition-all duration-500"
+              className="bg-[var(--color-error)] transition-all duration-500"
               style={{ width: `${failRate}%` }}
             />
           )}
@@ -84,9 +84,9 @@ export function TestRunnerPanel({
             >
               <div className="mt-0.5">
                 {result.status === 'passed' ? (
-                  <div className="w-5 h-5 rounded-full bg-green-100 dark:bg-green-900/30 flex items-center justify-center">
+                  <div className="w-5 h-5 rounded-full bg-[var(--color-success-bg)] flex items-center justify-center">
                     <svg
-                      className="w-3 h-3 text-green-600 dark:text-green-400"
+                      className="w-3 h-3 text-[var(--color-success-text)]"
                       fill="none"
                       viewBox="0 0 24 24"
                       stroke="currentColor"
@@ -100,9 +100,9 @@ export function TestRunnerPanel({
                     </svg>
                   </div>
                 ) : result.status === 'failed' ? (
-                  <div className="w-5 h-5 rounded-full bg-red-100 dark:bg-red-900/30 flex items-center justify-center">
+                  <div className="w-5 h-5 rounded-full bg-[var(--color-error-bg)] flex items-center justify-center">
                     <svg
-                      className="w-3 h-3 text-red-600 dark:text-red-400"
+                      className="w-3 h-3 text-[var(--color-error-text)]"
                       fill="none"
                       viewBox="0 0 24 24"
                       stroke="currentColor"
@@ -116,8 +116,8 @@ export function TestRunnerPanel({
                     </svg>
                   </div>
                 ) : (
-                  <div className="w-5 h-5 rounded-full bg-gray-100 dark:bg-gray-800 flex items-center justify-center">
-                    <span className="text-xs text-gray-500 dark:text-gray-400">⊘</span>
+                  <div className="w-5 h-5 rounded-full bg-[var(--bg-hover)] flex items-center justify-center">
+                    <span className="text-xs text-[var(--text-tertiary)]">⊘</span>
                   </div>
                 )}
               </div>
@@ -129,10 +129,10 @@ export function TestRunnerPanel({
                   <span
                     className={`text-xs px-1.5 py-0.5 rounded-md font-medium ${
                       result.status === 'passed'
-                        ? 'bg-green-50 text-green-700 dark:bg-green-900/20 dark:text-green-400'
+                        ? 'bg-[var(--color-success-bg)] text-[var(--color-success-text)]'
                         : result.status === 'failed'
-                          ? 'bg-red-50 text-red-700 dark:bg-red-900/20 dark:text-red-400'
-                          : 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400'
+                          ? 'bg-[var(--color-error-bg)] text-[var(--color-error-text)]'
+                          : 'bg-[var(--bg-hover)] text-[var(--text-secondary)] dark:text-[var(--text-tertiary)]'
                     }`}
                   >
                     {result.status}
@@ -144,8 +144,8 @@ export function TestRunnerPanel({
                   </span>
                 )}
                 {result.error && (
-                  <div className="mt-2 p-2.5 rounded-lg bg-red-50 dark:bg-red-900/10 border border-red-100 dark:border-red-900/20">
-                    <p className="text-xs text-red-700 dark:text-red-300 font-mono leading-relaxed">
+                  <div className="mt-2 p-2.5 rounded-lg bg-[var(--color-error-bg)] border border-[var(--color-error-bg)]">
+                    <p className="text-xs text-[var(--color-error-text)] font-mono leading-relaxed">
                       {result.error}
                     </p>
                   </div>

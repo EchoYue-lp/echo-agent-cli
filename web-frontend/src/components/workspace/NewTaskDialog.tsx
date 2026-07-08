@@ -2,10 +2,6 @@ import { useState, useEffect, useCallback } from 'react';
 import {
   X,
   FolderPlus,
-  Code,
-  BarChart3,
-  GraduationCap,
-  HeartPulse,
   MoreHorizontal,
   ArrowRight,
   Trash2,
@@ -16,50 +12,13 @@ import {
 import { useWorkspaceStore } from '../../stores/workspaceStore';
 import { workspaceApi } from '../../api/endpoints';
 import { fileSystem, isTauri } from '../../lib/tauri-bridge';
+import { WORKSPACE_KINDS as WORKSPACE_KIND } from '../../lib/workspaceKinds';
 import DirectoryPicker from './DirectoryPicker';
 
 interface Props {
   isOpen: boolean;
   onClose: () => void;
 }
-
-const WORKSPACE_KIND = [
-  {
-    value: 'code',
-    label: '代码项目',
-    icon: Code,
-    desc: '自动激活 coding、git-workflow 技能',
-    color: '#6366f1',
-  },
-  {
-    value: 'data_analysis',
-    label: '数据分析',
-    icon: BarChart3,
-    desc: '自动激活 data-wrangling、statistical-analysis、data-visualization 技能',
-    color: '#f59e0b',
-  },
-  {
-    value: 'research',
-    label: '学术研究',
-    icon: GraduationCap,
-    desc: '自动激活 paper-search、paper-reader、doc-writing 技能',
-    color: '#10b981',
-  },
-  {
-    value: 'medical',
-    label: '医学研究',
-    icon: HeartPulse,
-    desc: '自动激活 evidence-medicine、paper-search、paper-reader 技能',
-    color: '#ef4444',
-  },
-  {
-    value: 'general',
-    label: '其他',
-    icon: MoreHorizontal,
-    desc: '不自动激活特定技能，所有工具可用',
-    color: '#6b7280',
-  },
-];
 
 export default function NewTaskDialog({ isOpen, onClose }: Props) {
   const workspaces = useWorkspaceStore((s) => s.workspaces);

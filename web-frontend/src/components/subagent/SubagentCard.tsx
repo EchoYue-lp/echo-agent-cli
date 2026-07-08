@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { Bot, CheckCircle, XCircle, X, Loader2, ChevronDown, ChevronRight } from 'lucide-react';
 import type { SubagentRunState } from '../../stores/subagentRunStore';
 import { useSubagentDetailStore } from '../../stores/subagentDetailStore';
+import { Card } from '../common/Card';
 
 interface Props {
   subagent: SubagentRunState;
@@ -40,17 +41,17 @@ export function SubagentCard({ subagent: s }: Props) {
 
   const Icon =
     s.status === 'running' ? (
-      <Loader2 size={14} className="animate-spin text-blue-400" />
+      <Loader2 size={14} className="animate-spin text-[var(--color-info)]" />
     ) : s.status === 'completed' ? (
-      <CheckCircle size={14} className="text-green-400" />
+      <CheckCircle size={14} className="text-[var(--color-success)]" />
     ) : s.status === 'failed' ? (
-      <XCircle size={14} className="text-red-400" />
+      <XCircle size={14} className="text-[var(--color-error)]" />
     ) : (
-      <X size={14} className="text-gray-400" />
+      <X size={14} className="text-[var(--text-tertiary)]" />
     );
 
   return (
-    <div className="rounded-lg border border-[var(--border-primary)] bg-[var(--bg-secondary)] px-3 py-2 text-xs">
+    <Card variant="elevated" className="bg-[var(--bg-secondary)] px-3 py-2 text-xs">
       <div className="flex w-full items-center gap-2 text-left">
         <button
           type="button"
@@ -98,11 +99,11 @@ export function SubagentCard({ subagent: s }: Props) {
             <span
               className={
                 s.status === 'completed'
-                  ? 'text-green-400'
+                  ? 'text-[var(--color-success)]'
                   : s.status === 'failed'
-                    ? 'text-red-400'
+                    ? 'text-[var(--color-error)]'
                     : s.status === 'running'
-                      ? 'text-blue-400'
+                      ? 'text-[var(--color-info)]'
                       : ''
               }
             >
@@ -115,13 +116,13 @@ export function SubagentCard({ subagent: s }: Props) {
             </div>
           )}
           {s.error && (
-            <div className="text-red-400 break-all">
+            <div className="text-[var(--color-error)] break-all">
               <span className="font-medium">Error:</span> {s.error}
             </div>
           )}
         </div>
       )}
-    </div>
+    </Card>
   );
 }
 
@@ -142,7 +143,9 @@ export function SubagentPanel({ subagents }: { subagents: Record<string, Subagen
       <div className="flex items-center gap-2 px-1">
         <span className="text-xs font-medium text-[var(--text-secondary)]">Subagents</span>
         {running.length > 0 && (
-          <span className="text-[10px] text-blue-400 animate-pulse">{running.length} active</span>
+          <span className="text-[10px] text-[var(--color-info)] animate-pulse">
+            {running.length} active
+          </span>
         )}
         <span className="text-[10px] text-[var(--text-tertiary)] flex-1 text-right">
           {done}/{total} done
@@ -151,7 +154,7 @@ export function SubagentPanel({ subagents }: { subagents: Record<string, Subagen
       {total > 1 && (
         <div className="h-1 w-full rounded-full bg-[var(--border-primary)] overflow-hidden">
           <div
-            className="h-full rounded-full bg-green-500 transition-all duration-500"
+            className="h-full rounded-full bg-[var(--color-success)] transition-all duration-500"
             style={{ width: `${total > 0 ? (done / total) * 100 : 0}%` }}
           />
         </div>

@@ -192,7 +192,7 @@ export function McpManagerPanel({
                       <div className="flex items-start gap-3">
                         {/* Status indicator */}
                         <div
-                          className={`mt-1 w-2.5 h-2.5 rounded-full flex-shrink-0 ${server.enabled ? 'bg-green-500' : 'bg-gray-300 dark:bg-gray-600'}`}
+                          className={`mt-1 w-2.5 h-2.5 rounded-full flex-shrink-0 ${server.enabled ? 'bg-[var(--color-success)]' : 'bg-[var(--text-tertiary)]'}`}
                         />
                         <div>
                           <div className="flex items-center gap-2 mb-1">
@@ -202,8 +202,8 @@ export function McpManagerPanel({
                             <span
                               className={`text-xs px-2 py-0.5 rounded-md font-medium ${
                                 server.enabled
-                                  ? 'bg-green-50 text-green-700 dark:bg-green-900/20 dark:text-green-400'
-                                  : 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400'
+                                  ? 'bg-[var(--color-success-bg)] text-[var(--color-success-text)]'
+                                  : 'bg-[var(--bg-hover)] text-[var(--text-secondary)] dark:text-[var(--text-tertiary)]'
                               }`}
                             >
                               {server.enabled ? 'Active' : 'Inactive'}
@@ -231,8 +231,8 @@ export function McpManagerPanel({
                           onClick={() => onToggleServer(server.name)}
                           className={`p-2 rounded-lg transition-colors ${
                             server.enabled
-                              ? 'text-green-600 hover:bg-green-50 dark:hover:bg-green-900/20'
-                              : 'text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800'
+                              ? 'text-[var(--color-success-text)] hover:bg-[var(--color-success-bg)]'
+                              : 'text-[var(--text-tertiary)] hover:bg-[var(--bg-hover)]'
                           }`}
                           title={server.enabled ? 'Disable' : 'Enable'}
                         >
@@ -293,7 +293,7 @@ export function McpManagerPanel({
                         </button>
                         <button
                           onClick={() => onRemoveServer(server.name)}
-                          className="p-2 rounded-lg text-[var(--text-tertiary)] hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors"
+                          className="p-2 rounded-lg text-[var(--text-tertiary)] hover:text-[var(--color-error)] hover:bg-[var(--color-error-bg)] transition-colors"
                           title="Remove"
                         >
                           <svg
@@ -318,8 +318,8 @@ export function McpManagerPanel({
                       <div
                         className={`mt-3 p-3 rounded-lg text-xs ${
                           testResults[server.name].success
-                            ? 'bg-green-50 dark:bg-green-900/10 border border-green-100 dark:border-green-900/20 text-green-700 dark:text-green-300'
-                            : 'bg-red-50 dark:bg-red-900/10 border border-red-100 dark:border-red-900/20 text-red-700 dark:text-red-300'
+                            ? 'bg-[var(--color-success-bg)] border border-[var(--color-success-bg)] text-[var(--color-success-text)]'
+                            : 'bg-[var(--color-error-bg)] border border-[var(--color-error-bg)] text-[var(--color-error-text)]'
                         }`}
                       >
                         {testResults[server.name].message}

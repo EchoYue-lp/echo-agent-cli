@@ -28,28 +28,28 @@ interface WorkflowDebuggerProps {
 
 const statusConfig = {
   success: {
-    color: 'bg-green-500',
-    border: 'border-green-500',
-    text: 'text-green-600 dark:text-green-400',
-    bg: 'bg-green-50 dark:bg-green-900/20',
+    color: 'bg-[var(--color-success)]',
+    border: 'border-[var(--color-success)]',
+    text: 'text-[var(--color-success)]',
+    bg: 'bg-[var(--color-success-bg)]',
   },
   failure: {
-    color: 'bg-red-500',
-    border: 'border-red-500',
-    text: 'text-red-600 dark:text-red-400',
-    bg: 'bg-red-50 dark:bg-red-900/20',
+    color: 'bg-[var(--color-error)]',
+    border: 'border-[var(--color-error)]',
+    text: 'text-[var(--color-error)]',
+    bg: 'bg-[var(--color-error-bg)]',
   },
   running: {
-    color: 'bg-amber-500',
-    border: 'border-amber-500',
-    text: 'text-amber-600 dark:text-amber-400',
-    bg: 'bg-amber-50 dark:bg-amber-900/20',
+    color: 'bg-[var(--color-warning)]',
+    border: 'border-[var(--color-warning)]',
+    text: 'text-[var(--color-warning)]',
+    bg: 'bg-[var(--color-warning-bg)]',
   },
   pending: {
-    color: 'bg-gray-300 dark:bg-gray-700',
-    border: 'border-gray-300 dark:border-gray-700',
-    text: 'text-gray-500 dark:text-gray-400',
-    bg: 'bg-gray-50 dark:bg-gray-800/50',
+    color: 'bg-[var(--text-tertiary)]',
+    border: 'border-[var(--border-primary)]',
+    text: 'text-[var(--text-tertiary)]',
+    bg: 'bg-[var(--bg-hover)]',
   },
 };
 
@@ -84,16 +84,16 @@ export function WorkflowDebugger({
           <span className="text-sm font-semibold text-[var(--text-primary)]">Workflow</span>
           <div className="flex items-center gap-3 text-xs">
             <span className="flex items-center gap-1">
-              <span className="w-2 h-2 rounded-full bg-green-500" />
+              <span className="w-2 h-2 rounded-full bg-[var(--color-success)]" />
               {successCount}
             </span>
             <span className="flex items-center gap-1">
-              <span className="w-2 h-2 rounded-full bg-red-500" />
+              <span className="w-2 h-2 rounded-full bg-[var(--color-error)]" />
               {failureCount}
             </span>
             {runningCount > 0 && (
               <span className="flex items-center gap-1">
-                <span className="w-2 h-2 rounded-full bg-amber-500 animate-pulse" />
+                <span className="w-2 h-2 rounded-full bg-[var(--color-warning)] animate-pulse" />
                 {runningCount} running
               </span>
             )}
