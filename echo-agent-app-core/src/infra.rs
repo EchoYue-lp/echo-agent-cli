@@ -240,6 +240,9 @@ pub async fn create_agent(
             timeout_ms: app_config.agent.tool_timeout_ms,
             ..Default::default()
         })
+        .sandbox_manager(Arc::new(
+            echo_agent::sandbox::SandboxManager::local_sandbox(),
+        ))
         .enable_cot();
 
     // ── Pass the resolved configured model to the LLM client ──

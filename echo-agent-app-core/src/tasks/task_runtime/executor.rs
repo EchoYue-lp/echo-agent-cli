@@ -283,7 +283,7 @@ pub async fn execute_run(
             reviewer_llm.clone(),
             run_id,
             plan.tasks,
-            limits.clone(),
+            limits,
             parent_cancel.clone(),
             trace_sink.clone(),
         )

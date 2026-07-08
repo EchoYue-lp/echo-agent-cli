@@ -323,17 +323,17 @@ impl Tool for ExecutePlanTool {
                         )));
                     }
                 };
-                if run.status == TaskRunStatus::Pending {
-                    if let Err(e) = self.store.transition_run(&run_id, TaskRunStatus::Running) {
-                        tracing::warn!(
-                            run_id = %run_id,
-                            error = %e,
-                            "plan_execute: failed to transition ad-hoc inline run to Running"
-                        );
-                        return Ok(ToolResult::error(format!(
-                            "plan_execute: run 转 Running 失败: {e}"
-                        )));
-                    }
+                if run.status == TaskRunStatus::Pending
+                    && let Err(e) = self.store.transition_run(&run_id, TaskRunStatus::Running)
+                {
+                    tracing::warn!(
+                        run_id = %run_id,
+                        error = %e,
+                        "plan_execute: failed to transition ad-hoc inline run to Running"
+                    );
+                    return Ok(ToolResult::error(format!(
+                        "plan_execute: run 转 Running 失败: {e}"
+                    )));
                 }
                 // 组装单任务 (用 LLM 传入的 role/desc,kind=ReadOnlyReview)。
                 // 用 insert_task(追加语义)而非 attach_plan(覆盖语义):

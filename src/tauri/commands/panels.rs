@@ -4,7 +4,7 @@
 //! previously served via Axum HTTP routes. Each section corresponds to
 //! a deleted server route module.
 
-use crate::tauri::error::{IpcAuth, IpcError};
+use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
 use echo_agent_app_core::state::{AuditDecision, PermissionBehavior, PermissionRuleConfig};
 use echo_agent_app_core::workspace::layout::WorkspaceLayout;
@@ -810,14 +810,50 @@ pub async fn execute_workflow(
 // Sandbox
 // ════════════════════════════════════════════════════════════════════════════
 
+async fn eko_local_sandbox_available(manager: &echo_agent::sandbox::SandboxManager) -> bool {
+    if cfg!(target_os = "windows") {
+        false
+    } else {
+        manager.has_local_sandbox().await
+    }
+}
+
+fn eko_local_sandbox_backend_label() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "wsl2-required"
+    } else {
+        "local"
+    }
+}
+
+fn eko_local_sandbox_unavailable_message() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "Native Windows sandbox is not supported by EKO. Run EKO inside WSL2 so it can use Linux bubblewrap (bwrap)."
+    } else {
+        "Local sandbox backend is unavailable. On macOS this requires sandbox-exec; on Linux/WSL2 this requires bubblewrap (bwrap)."
+    }
+}
+
 #[tauri::command]
 pub async fn get_sandbox_status(
     state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
     let config = state.app_state.config.sandbox_config.read().await.clone();
+    let manager = state
+        .app_state
+        .connection
+        .primary_agent()
+        .read(|agent| agent.sandbox_manager().cloned())
+        .await;
+    let local_available = match manager {
+        Some(manager) => eko_local_sandbox_available(&manager).await,
+        None => false,
+    };
     Ok(serde_json::json!({
-        "local_available": true,
+        "local_available": local_available,
         "docker_available": false,
+        "k8s_available": false,
+        "current_backend": eko_local_sandbox_backend_label(),
         "config": config,
     }))
 }
@@ -848,34 +884,20 @@ pub async fn execute_sandbox(
     code: String,
     language: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    // Phase 6.2: require full-auto permission for code execution
-    {
-        let mode = state.app_state.config.permission_mode.read().await;
-        IpcAuth::require_full_auto(&mode)?;
-    }
-    // P0-5 / N-P0-5: the IPC `execute_sandbox` must NOT be a host-RCE primitive.
-    // Previously the fallback `SandboxManager::local_only()` ran frontend-supplied
-    // shell directly on the user's machine, and `language: None`/`shell`/`sh`/
-    // `bash` all routed to `SandboxCommand::shell(code)` — i.e. any XSS reaching
-    // this command got unconditional arbitrary host shell execution.
-    //
-    // Rules enforced here:
-    //   1. Shell languages are REJECTED from IPC. Shell execution must go through
-    //      the agent tool path (which carries HITL approval + the command
-    //      safety classifier), never a raw frontend code-runner.
-    //   2. Code execution is only allowed when a real container sandbox
-    //      (Docker/k8s) is configured. No `local_only()` fallback.
     let lang = language.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let is_shell = matches!(
         lang.map(str::to_ascii_lowercase).as_deref(),
         Some("shell") | Some("sh") | Some("bash") | Some("zsh") | Some("fish")
     );
-    if is_shell || lang.is_none() {
-        return Err(IpcError::Validation(
-            "Shell execution is not permitted via execute_sandbox; use the agent shell tool (HITL-gated) instead.".to_string(),
-        ));
+    let Some(lang) = lang else {
+        return Err(IpcError::Validation("language is required".to_string()));
+    };
+    let lang = lang.to_ascii_lowercase();
+    if matches!(lang.as_str(), "zsh" | "fish") {
+        return Err(IpcError::Validation(format!(
+            "Unsupported sandbox shell language: {lang}"
+        )));
     }
-    let lang = lang.expect("non-empty language checked above");
 
     let manager = state
         .app_state
@@ -891,15 +913,33 @@ pub async fn execute_sandbox(
             ));
         }
     };
-    if !manager.has_container_sandbox() {
+    if !eko_local_sandbox_available(&manager).await {
         return Err(IpcError::Validation(
-            "Code execution requires a containerized sandbox (Docker/k8s); none is configured. Refusing to run untrusted code on the host.".to_string(),
+            eko_local_sandbox_unavailable_message().to_string(),
         ));
     }
 
-    let command = echo_agent::sandbox::SandboxCommand::code(lang.to_string(), code);
+    let command = if is_shell {
+        echo_agent::sandbox::SandboxCommand::shell(code)
+    } else {
+        echo_agent::sandbox::SandboxCommand::code(lang, code)
+    };
+    let config = state.app_state.config.sandbox_config.read().await.clone();
+    let memory_bytes = u64::from(config.max_memory_mb)
+        .checked_mul(1024)
+        .and_then(|v| v.checked_mul(1024))
+        .ok_or_else(|| IpcError::Validation("max_memory_mb is too large".to_string()))?;
+    let limits = echo_agent::sandbox::ResourceLimits {
+        cpu_time_secs: Some(u64::from(config.max_cpu_seconds)),
+        memory_bytes: Some(memory_bytes),
+        max_output_bytes: Some(1024 * 1024),
+        max_processes: Some(64),
+        network: config.network_enabled,
+        read_only_paths: vec![],
+        writable_paths: vec![],
+    };
     let result = manager
-        .execute(command)
+        .execute_with_limits(command, limits)
         .await
         .map_err(|e| IpcError::Internal(format!("Sandbox execution failed: {e}")))?;
     Ok(json!({

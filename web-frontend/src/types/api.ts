@@ -395,6 +395,8 @@ export interface SandboxExecuteResult {
   stderr: string;
   exit_code: number | null;
   duration_ms: number;
+  sandbox_type: string;
+  timed_out: boolean;
 }
 
 // ── Context info ── (reuses ContextStats)

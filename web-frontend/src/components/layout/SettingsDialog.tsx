@@ -41,6 +41,7 @@ import { ScratchpadPanel } from '../scratchpad/ScratchpadPanel';
 import { DecisionLogPanel } from '../decisions/DecisionLogPanel';
 import { WorktreePanel } from '../coding/WorktreePanel';
 import { ObservabilityPanel } from '../observability/ObservabilityPanel';
+import { SandboxPanel } from '../sandbox/SandboxPanel';
 
 interface SettingsItem {
   id: SettingsTabId;
@@ -97,6 +98,7 @@ const settingsGroups: SettingsGroup[] = [
     defaultOpen: true,
     items: [
       { id: 'audit', label: '审计', icon: ShieldCheck, maturity: 'live', description: '审批、工具与风险日志' },
+      { id: 'sandbox', label: '沙箱', icon: ShieldCheck, maturity: 'live', description: '本地代码执行与隔离验证' },
     ],
   },
   {
@@ -134,6 +136,7 @@ const panels: Record<SettingsTabId, React.FC> = {
   providers: ProviderPanel,
   sessions: SessionsPanel,
   audit: AuditPanel,
+  sandbox: SandboxPanel,
   scratchpad: ScratchpadPanel,
   decisions: DecisionLogPanel,
   observability: ObservabilityPanel,
@@ -157,6 +160,7 @@ function SettingsOverview() {
       items: [
         settingsGroups[0].items.find((item) => item.id === 'observability') ?? overviewItem,
         settingsGroups[2].items.find((item) => item.id === 'audit') ?? overviewItem,
+        settingsGroups[2].items.find((item) => item.id === 'sandbox') ?? overviewItem,
       ],
     },
     {

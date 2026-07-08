@@ -10,6 +10,7 @@ export type SettingsTabId =
   | 'providers'
   | 'sessions'
   | 'audit'
+  | 'sandbox'
   | 'observability'
   | 'scratchpad'
   | 'decisions'

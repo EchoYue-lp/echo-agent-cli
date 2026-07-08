@@ -251,6 +251,16 @@ export function SandboxPanel() {
               {result.duration_ms}ms | Exit: {result.exit_code ?? 'N/A'}
             </span>
           </div>
+          <div className="flex flex-wrap gap-2 text-[10px]" style={{ color: 'var(--text-tertiary)' }}>
+            <span className="rounded bg-[var(--bg-hover)] px-1.5 py-0.5">
+              {result.sandbox_type}
+            </span>
+            {result.timed_out && (
+              <span className="rounded bg-[var(--color-error-bg)] px-1.5 py-0.5 text-[var(--color-error)]">
+                超时
+              </span>
+            )}
+          </div>
           {result.stdout && (
             <div>
               <span
