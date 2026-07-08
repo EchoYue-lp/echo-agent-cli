@@ -4,7 +4,6 @@
 //! writing, and research-to-writing continuous workflow.
 
 pub mod data;
-pub mod loader;
 pub mod quality;
 pub mod research;
 pub mod research_to_writing;
@@ -12,9 +11,6 @@ pub mod writing;
 
 pub use data::{
     DataPipelineConfig, build_data_graph, run_data_pipeline, run_data_pipeline_with_config,
-};
-pub use loader::{
-    PipelineDefinition, PipelineLoader, default_pipeline_dir, load_builtin_pipelines,
 };
 pub use quality::{
     QualityAssessment, extract_json_block, extract_quality_assessment, extract_quality_score,
