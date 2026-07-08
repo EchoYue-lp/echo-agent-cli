@@ -14,6 +14,18 @@ interface CurrentRound {
   tools: { name: string; args: unknown; result?: string; success?: boolean }[];
 }
 
+/** 当前上下文窗口占用快照（对齐 Claude Code statusline 语义）。 */
+export interface ContextWindowUsage {
+  /** 本次请求的实际输入 token（= 当前上下文主体），已含 cache 部分。 */
+  inputTokens: number;
+  /** 其中命中缓存的部分。 */
+  cachedTokens: number;
+  /** 写入缓存的部分。 */
+  cacheCreationTokens: number;
+  /** 本次生成 token（不计入占用，仅参考）。 */
+  outputTokens: number;
+}
+
 interface ChatState {
   messages: ChatMessage[];
   isStreaming: boolean;
@@ -35,6 +47,8 @@ interface ChatState {
   isHistoryView: boolean;
   /** Current round being built during streaming */
   currentRound: CurrentRound | null;
+  /** 当前上下文窗口占用（来自最近一次 llm_usage 事件的真实 prompt_tokens）。null = 首次响应前。 */
+  contextWindow: ContextWindowUsage | null;
 
   addUserMessage: (content: string, attachments?: ChatMessage['attachments']) => void;
   startAssistantMessage: (idOverride?: string) => string;
@@ -62,6 +76,9 @@ interface ChatState {
   prepareRegenerate: () => string | null;
   /** Edit a user message, delete all messages after it, return new content for resend */
   prepareEditAndResend: (messageId: string, newContent: string) => string | null;
+  /** 更新上下文窗口占用快照（由 llm_usage 事件驱动）。会话清空/加载历史时由
+   *  clearMessages / replaceMessages 内联重置为 null，无需单独 action。 */
+  setContextWindow: (usage: ContextWindowUsage) => void;
 }
 
 /// Maximum number of messages retained in-memory. Beyond this, oldest messages
@@ -108,6 +125,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   pendingToolCalls: [],
   isHistoryView: false,
   currentRound: null,
+  contextWindow: null,
 
   addUserMessage: (content, attachments) => {
     set((s) => {
@@ -360,6 +378,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       selectionRequest: null,
       pendingToolCalls: [],
       currentRound: null,
+      contextWindow: null,
       runStatus: 'idle',
     }),
 
@@ -372,10 +391,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
       approvalRequest: null,
       inputRequest: null,
       selectionRequest: null,
+      // 加载历史会话时清空实时上下文占用（历史视图无 live llm_usage，显示旧值会误导）。
+      contextWindow: null,
       runStatus: 'idle',
     }),
 
   setHistoryView: (v) => set({ isHistoryView: v }),
+
+  setContextWindow: (usage) => set({ contextWindow: usage }),
 
   prepareRegenerate: () => {
     const { messages } = get();

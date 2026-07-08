@@ -58,8 +58,14 @@ export function handleChatEvent(event: ChatEvent, ctx: EventContext): void {
       break;
     }
     case 'llm_usage': {
-      // Observability-only event. Subagent trace panels consume the same
-      // facts; the chat transcript should not render cache telemetry as text.
+      // 更新上下文窗口占用快照（不作为聊天消息渲染，仅驱动 footer 指示器）。
+      // 对齐 Claude Code statusline：用真实 prompt_tokens 表示当前上下文长度。
+      store.setContextWindow({
+        inputTokens: event.prompt_tokens,
+        cachedTokens: event.cached_prompt_tokens,
+        cacheCreationTokens: event.cache_creation_prompt_tokens,
+        outputTokens: event.completion_tokens,
+      });
       break;
     }
     case 'tool_start': {

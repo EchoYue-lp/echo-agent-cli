@@ -22,6 +22,7 @@ import {
 } from '../../api/endpoints';
 import { useUiStore } from '../../stores/uiStore';
 import { useToastStore } from '../../stores/toastStore';
+import { useChatStore } from '../../stores/chatStore';
 import type { Attachment, ConfiguredModel } from '../../types/api';
 import {
   filterCommands,
@@ -220,6 +221,15 @@ function notifyModelsChanged() {
   window.dispatchEvent(new Event(MODELS_CHANGED_EVENT));
 }
 
+/** token 数格式化：≥1000 用 k 单位（128000 → 128k，1500 → 1.5k，1999 → 2k）。
+ *  与 Rust 侧 format_token_count 保持一致：先四舍五入到 1 位小数，整 k 时省略小数。 */
+function formatTokens(n: number): string {
+  if (n < 1000) return String(n);
+  // 先固定 1 位小数，再去掉末尾 ".0"（2.0k → 2k，但保留 1.5k）。镜像 Rust 实现。
+  const formatted = (n / 1000).toFixed(1);
+  return formatted.endsWith('.0') ? `${Math.round(n / 1000)}k` : `${formatted}k`;
+}
+
 export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
   const [text, setText] = useState('');
   const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
@@ -242,6 +252,10 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
   const activeModel = configuredModels.find((model) => model.is_default);
   const visibleModels = configuredModels.filter((model) => model.enabled);
   const displayModel = activeModel ?? visibleModels[0] ?? null;
+  // 上下文窗口占用（来自 llm_usage 事件 → chatStore）。
+  const contextWindow = useChatStore((s) => s.contextWindow);
+  // 当前默认模型的 context_window 上限（ConfiguredModel 已有该字段）。
+  const contextWindowSize = activeModel?.context_window ?? null;
   const activePermissionMode =
     PERMISSION_MODES.find((mode) => mode.id === permissionMode) ?? PERMISSION_MODES[0];
   const activeInteractionMode =
@@ -647,6 +661,31 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
 
   const hasContent = text.trim().length > 0 || pendingFiles.length > 0;
 
+  // 计算上下文占用展示（对齐 Claude Code：真实 prompt_tokens / window_size）。
+  const ctxUsage = (() => {
+    if (!contextWindow) return null;
+    const used = contextWindow.inputTokens;
+    const win = contextWindowSize;
+    if (win == null || win <= 0) {
+      // window 上限未知：只显示绝对数。
+      return {
+        bar: null as string | null,
+        pct: null as number | null,
+        used,
+        win: null as number | null,
+        tier: 'unknown' as const,
+      };
+    }
+    // 用 floor（而非 round）对齐 Rust used_percentage 的整数除法语义，
+    // 确保 TUI/Web 在 70%/90% 阈值边界颜色分级完全一致。
+    const pct = Math.min(100, Math.floor((used / win) * 100));
+    const filled = Math.ceil(pct / 10);
+    const bar = '▓'.repeat(filled) + '░'.repeat(10 - filled);
+    const tier =
+      pct >= 90 ? ('critical' as const) : pct >= 70 ? ('high' as const) : ('normal' as const);
+    return { bar, pct, used, win, tier };
+  })();
+
   return (
     <div
       className="px-5 pb-5 pt-2"
@@ -927,6 +966,34 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
               </div>
             </div>
             <div className="flex items-center gap-3">
+              {ctxUsage && (
+                <span
+                  className="font-mono text-[11px]"
+                  style={{
+                    color:
+                      ctxUsage.tier === 'critical'
+                        ? 'var(--color-error)'
+                        : ctxUsage.tier === 'high'
+                          ? 'var(--color-warning)'
+                          : 'var(--text-tertiary)',
+                  }}
+                  title={
+                    ctxUsage.win
+                      ? `上下文窗口: ${ctxUsage.used} / ${ctxUsage.win} tokens (${ctxUsage.pct}%)`
+                      : `上下文: ${ctxUsage.used} tokens`
+                  }
+                >
+                  {ctxUsage.bar ? (
+                    <>
+                      <span className="mr-1">{ctxUsage.bar}</span>
+                      {formatTokens(ctxUsage.used)}/{formatTokens(ctxUsage.win as number)} ·{' '}
+                      {ctxUsage.pct}%
+                    </>
+                  ) : (
+                    <>{formatTokens(ctxUsage.used)} tokens</>
+                  )}
+                </span>
+              )}
               <span>Enter 发送</span>
               {text.length > 0 && <span>{text.length} 字</span>}
             </div>

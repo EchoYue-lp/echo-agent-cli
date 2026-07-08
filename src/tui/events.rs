@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
 
 use echo_agent::tasks::TaskEvent;
+use echo_agent_app_core::context_window::ContextWindowSnapshot;
 use echo_agent_app_core::tasks::BackgroundTaskService;
 use echo_agent_app_core::tasks::task_runtime::InteractionMode;
 
@@ -234,6 +235,13 @@ enum AgentEvent {
         before_tokens: usize,
         after_tokens: usize,
     },
+    /// Provider-reported LLM usage（透传框架事件，用于上下文窗口占用展示）。
+    LlmUsage {
+        prompt_tokens: usize,
+        completion_tokens: usize,
+        cached_prompt_tokens: usize,
+        cache_creation_prompt_tokens: usize,
+    },
 }
 
 /// Run the main event loop.
@@ -289,6 +297,23 @@ pub async fn run_event_loop(
                     app.tokens.0 = app.tokens.0.saturating_add(prompt_tokens as u32);
                     app.tokens.1 = app.tokens.1.saturating_add(completion_tokens as u32);
                     app.tokens.2 += 1; // request count
+                }
+                AgentEvent::LlmUsage {
+                    prompt_tokens,
+                    completion_tokens,
+                    cached_prompt_tokens,
+                    cache_creation_prompt_tokens,
+                } => {
+                    // 更新"当前上下文占用"快照（覆盖式，对齐 Claude Code 语义）。
+                    // prompt_tokens 是本次请求的真实输入 token（已含 cache 部分）。
+                    app.context_snapshot = ContextWindowSnapshot {
+                        input_tokens: prompt_tokens as u32,
+                        cached_tokens: cached_prompt_tokens as u32,
+                        cache_creation_tokens: cache_creation_prompt_tokens as u32,
+                        output_tokens: completion_tokens as u32,
+                        context_window_size: app.context_window_size,
+                        updated_at: Some(std::time::Instant::now()),
+                    };
                 }
                 AgentEvent::ToolBatchStart { tool_count } => {
                     tracing::debug!(tool_count, "TUI tool batch started");
@@ -846,24 +871,27 @@ impl echo_agent_app_core::chat_driver::ChatSink for TuiChatSink {
                 after_tokens,
             },
             echo_agent::agent::AgentEvent::Error { message, .. } => AgentEvent::Error(message),
-            // LlmUsage: not rendered in TUI (token totals come from ThinkEnd),
-            // but trace cache stats so they're not silently dropped (TUI/GUI
-            // observability parity). Full usage rendering is a follow-up.
             echo_agent::agent::AgentEvent::LlmUsage {
                 prompt_tokens,
+                completion_tokens,
                 cached_prompt_tokens,
                 cache_creation_prompt_tokens,
-                usage_reported,
                 ..
             } => {
+                // 透传给主循环：snapshot 更新需要 &mut TuiApp，主循环才拿得到。
+                // （sink 这里只有 &self，无法更新 app 状态。）
                 tracing::debug!(
                     prompt_tokens,
                     cached_prompt_tokens,
                     cache_creation_prompt_tokens,
-                    usage_reported,
-                    "TUI: LLM usage reported (cache stats; not rendered)"
+                    "TUI: LLM usage reported — forwarding to main loop for context snapshot"
                 );
-                return true;
+                AgentEvent::LlmUsage {
+                    prompt_tokens,
+                    completion_tokens,
+                    cached_prompt_tokens,
+                    cache_creation_prompt_tokens,
+                }
             }
             // Other framework events (GuardTriggered, MemoryRecalled,
             // SafetyNotice, ParameterError, …) have no TUI rendering yet.

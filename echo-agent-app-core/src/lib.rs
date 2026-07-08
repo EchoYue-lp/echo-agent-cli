@@ -7,6 +7,7 @@ pub mod chat_resources;
 pub mod config;
 pub mod config_discovery;
 pub mod config_watcher;
+pub mod context_window;
 pub mod conversation_file;
 pub mod diff;
 pub mod embedded_server;

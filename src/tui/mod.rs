@@ -26,6 +26,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use echo_agent_app_core::context_window::ContextWindowSnapshot;
 use echo_agent_app_core::evolution::ReviewIntegration;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -184,8 +185,14 @@ pub struct TuiApp {
     /// `/mode`. TUI/GUI parity (AGENTS.md): mirrors the GUI's
     /// `app_state.tasks.interaction_mode` and feeds `drive_chat` the same way.
     pub interaction_mode: InteractionMode,
-    /// Token usage (prompt, completion, total).
+    /// Token usage 累计 (prompt, completion, request_count)。
+    /// 注意：prompt/completion 是累计历史值；request_count 用于统计调用次数。
+    /// "当前上下文占用"由 context_snapshot 单独维持，见下。
     pub tokens: (u32, u32, u32),
+    /// 模型上下文窗口上限（启动时从 agent token_limit 读一次；0 表示未知）。
+    pub context_window_size: u32,
+    /// 当前上下文窗口占用快照（每次 LlmUsage 后覆盖）。
+    pub context_snapshot: ContextWindowSnapshot,
     /// Tool count.
     pub tool_count: usize,
     /// Current ReAct iteration count (incremented on each ThinkStart).
@@ -343,6 +350,8 @@ impl TuiApp {
             mode,
             interaction_mode: InteractionMode::default(),
             tokens: (0, 0, 0),
+            context_window_size: 0,
+            context_snapshot: ContextWindowSnapshot::default(),
             tool_count: 0,
             iteration_count: 0,
             active_task: None,
@@ -1163,6 +1172,9 @@ pub async fn run_tui(
     let mode = mode_display.to_string();
 
     let mut app = TuiApp::new(model, mode, theme);
+    // 读取当前模型的上下文窗口上限（与 GUI panels.rs 同样走 agent.config().get_token_limit()）。
+    app.context_window_size = agent.read(|a| a.config().get_token_limit() as u32).await;
+    app.context_snapshot.context_window_size = app.context_window_size;
     app.tool_count = 24; // Default estimate, updated dynamically.
     app.max_display_chars = tui_config.max_display_chars;
     app.pending_approval = Some(tui_pending);
