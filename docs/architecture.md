@@ -172,8 +172,8 @@ pub struct Session {
 ```rust
 pub enum InstructionTier {
     User,    // ~/.echo-agent/user.md
-    Project, // <project>/.echo-agent/project.md
-    Local,   // <cwd>/.echo-agent/local.md
+    Project, // <project>/.eko/project.md
+    Local,   // <cwd>/.eko/local.md
 }
 
 pub struct UnifiedMemory { ... }

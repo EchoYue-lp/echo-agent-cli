@@ -286,12 +286,13 @@ Tool 成功/失败记录在 `execution.rs:45-99` 的 `record_trigger_data` 中�
 
 ```
 ┌──────────────────────────────────────────────────┐
-│  Hot 层: .echo-agent/MEMORY.md                   │
+│  Hot 层: .eko/MEMORY.md                          │
 │  YAML frontmatter + markdown body                │
 │  最大 2000 tokens，始终加载到 context             │
 ├──────────────────────────────────────────────────┤
 │  Warm 层: Store KV, namespace ["agent","memories"]│
-│  按需搜索召回                                     │
+│  落点 {workspace.root}/.eko/memory/store.json     │
+│  按需搜索召回（按 workspace 物理隔离）            │
 │  Archived 状态也在此 (stage4 移除 Cold 层)        │
 └──────────────────────────────────────────────────┘
 ```

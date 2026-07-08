@@ -11,7 +11,7 @@
 
 EKO 的可派发角色由 `.md` frontmatter 热加载:
 
-- 项目级:`<project>/.echo-agent/subagents/**/*.md`
+- 项目级:`<project>/.eko/subagents/**/*.md`
 - 用户级:`~/.echo-agent/subagents/**/*.md`
 - 内置:`echo-agent-app-core/src/subagents/**`
 

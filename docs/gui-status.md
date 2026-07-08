@@ -39,7 +39,7 @@ These GUI surfaces are visible and backed by real Tauri IPC or runtime state:
 | Human-loop approval/input/selection | Connected |
 | Conversations and sessions | Connected |
 | Memory panel | Connected |
-| Auto Memory GUI controls | Connected to session toggle, preview, and `.echo-agent/project.md` extraction |
+| Auto Memory GUI controls | Connected to session toggle, preview, and `.eko/project.md` extraction |
 | Tools panel | Connected |
 | MCP panel | Connected |
 | Skills panel | Connected to local directory loading |

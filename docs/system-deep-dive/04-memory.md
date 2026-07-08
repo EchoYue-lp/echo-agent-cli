@@ -201,6 +201,8 @@ pub fn with_memory_tools(mut self, store: Arc<dyn Store>) -> Self {
 
 `enable_memory=true` 但**没**显式调 `with_memory_tools` 时，`setup_memory_store`（`react/mod.rs:505-535`）会自动开一个 `FileStore::new(&config.memory_path)`（默认 `~/.echo-agent/store.json`），同样注册 4 个工具。
 
+> **EKO 应用层覆盖**：`infra::create_agent` 用 `builder.store(...)` 注入了项目级 FileStore（`{workspace.root}/.eko/memory/store.json`），覆盖了上面的框架默认全局路径。动态记忆按 workspace 物理隔离，workspace 切换时热重载 Store + MemoryLayerManager（见 `infra.rs` 的 `resolve_memory_store_paths` / `create_memory_store_for_workspace` 与 `state.rs` 的 `switch_workspace`/`exit_workspace`）。
+
 ---
 
 ## §6 `SnapshotManager` —— 内存回滚 ≠ 持久化
@@ -360,14 +362,14 @@ pub struct InstructionProvider {
 | Tier | 路径 | 加载逻辑 |
 |------|------|---------|
 | `User` | `~/.echo-agent/user.md` | `instruction_provider.rs:68-73` |
-| `Project` | `<project_root>/.echo-agent/project.md` | 找 root：从 `current_dir` 往上找 `.git` 或 `.echo-agent` 父目录（`L85-94`） |
-| `Local` | `<cwd>/.echo-agent/local.md` | 直接看 `current_dir`（`L76-82`） |
+| `Project` | `<project_root>/.eko/project.md` | 找 root：从 `current_dir` 往上找 `.git` 或 `.eko` 父目录（`L85-94`） |
+| `Local` | `<cwd>/.eko/local.md` | 直接看 `current_dir`（`L76-82`） |
 
 `get_system_prompt_suffix()` 输出顺序：User → Project → Local，每段拼 `## *-level instructions\n{...}`，整体前缀 `\n\n`（如非空）。
 
 ### §8.1 ⚠️ Save/Load 路径不对称
 
-加载 project tier 时找 project root（往上爬）；保存 project tier (`save_project_instructions`) 时却写到 `<cwd>/.echo-agent/project.md` —— 即如果用户在子目录跑，加载/保存指向不同文件。这是当前实现细节，使用时若依赖 cwd 与 project root 重合，是隐性约定。
+加载 project tier 时找 project root（往上爬）；保存 project tier (`save_project_instructions`) 时却写到 `<cwd>/.eko/project.md` —— 即如果用户在子目录跑，加载/保存指向不同文件。这是当前实现细节，使用时若依赖 cwd 与 project root 重合，是隐性约定。
 
 ---
 
@@ -402,7 +404,7 @@ pub enum ObservationCategory {
 
 `deduplicate_observations` (`mod.rs:262-282`) 按 category + 文本长度倒序排，丢弃"短的（≤20 字符）是别人前缀"的项。
 
-`append_to_project_memory(observations)` (`mod.rs:326-364`)：写到 `<project_root>/.echo-agent/project.md`。如果文件已含 `## Auto-extracted observations`，从该 marker 开始截断后追加新版（语义是**替换**该段而非累加）。
+`append_to_project_memory(observations)` (`mod.rs:326-364`)：写到 `<project_root>/.eko/project.md`。如果文件已含 `## Auto-extracted observations`，从该 marker 开始截断后追加新版（语义是**替换**该段而非累加）。
 
 #### 触发点
 
