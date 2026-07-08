@@ -7,12 +7,12 @@ use std::path::{Path, PathBuf};
 
 /// Find the project root by walking up from the given directory.
 ///
-/// Looks for `.echo-agent` or `.git` markers — the same logic used by
+/// Looks for `.eko` or `.git` markers — the same logic used by
 /// both `UnifiedMemory` and `InstructionProvider`.
 pub fn find_project_root(start: &Path) -> Option<PathBuf> {
     let mut dir = start;
     loop {
-        if dir.join(".echo-agent").exists() || dir.join(".git").exists() {
+        if dir.join(".eko").exists() || dir.join(".git").exists() {
             return Some(dir.to_path_buf());
         }
         dir = dir.parent()?;

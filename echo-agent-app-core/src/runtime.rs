@@ -240,15 +240,20 @@ impl AgentRuntime {
 
         // ── 8b. Review integration — create when Store is available so
         //       /memory-review and session-end hooks can access it. ──
+        // The `echo_agent_dir` MUST be the same root the memory store was
+        // built from (see infra::create_agent), so hot-layer `MEMORY.md` and
+        // warm-layer `store.json` land in the same project directory and never
+        // diverge. We resolve it from `params.working_dir` (workspace root) —
+        // identical to the store path resolution done in `create_agent`.
+        let (_, review_echo_agent_dir) =
+            infra::resolve_memory_store_paths(params.working_dir.as_deref());
         let review_integration = agent_handle
             .read(|a| a.store().cloned())
             .await
             .map(|store| {
-                let echo_agent_dir =
-                    crate::evolution::review_integration::discover_echo_agent_dir();
                 Arc::new(ReviewIntegration::new(
                     ReviewConfig::default(),
-                    echo_agent_dir,
+                    review_echo_agent_dir.clone(),
                     store,
                 ))
             });
@@ -332,7 +337,6 @@ impl AgentRuntime {
                     confidence_threshold: 0.7,
                     enable_direct_answer: true,
                     enable_skill_routing: true,
-                    enable_workflow_routing: false,
                 },
             );
             agent_handle
@@ -456,7 +460,7 @@ impl AgentRuntime {
         // Write to project memory
         let memory_dir = std::env::current_dir()
             .unwrap_or_else(|_| std::path::PathBuf::from("."))
-            .join(".echo-agent")
+            .join(".eko")
             .join("memory");
         let _ = std::fs::create_dir_all(&memory_dir);
         let memory_file = memory_dir.join("PROJECT.md");

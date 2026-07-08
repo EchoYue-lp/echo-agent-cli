@@ -52,6 +52,17 @@ impl WorkspaceLayout {
         Self::state_dir(root).join("memory")
     }
 
+    /// 动态记忆 store 文件：`{root}/.eko/memory/store.json`
+    ///
+    /// Warm-layer KV store for agent-learned dynamic memories (remember /
+    /// AutoMemory / L3 promotion / TaskRuntime memory_bridge writes).
+    /// Physically isolated per workspace/project so memories don't leak
+    /// across projects (mirrors how hot-layer `MEMORY.md` already follows
+    /// the project root).
+    pub fn memory_store(root: &Path) -> PathBuf {
+        Self::memory(root).join("store.json")
+    }
+
     /// 数据集目录（数据分析工作区）：`{root}/.eko/data/`
     pub fn data(root: &Path) -> PathBuf {
         Self::state_dir(root).join("data")

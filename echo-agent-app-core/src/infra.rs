@@ -283,6 +283,24 @@ pub async fn create_agent(
         builder = builder.working_dir(wd.clone());
     }
 
+    // Inject a workspace/project-scoped memory Store (FileStore). This OVERRIDES
+    // the framework's default global `~/.echo-agent/store.json` — dynamic
+    // memories (remember / AutoMemory / L3 promotion / TaskRuntime bridge) are
+    // physically isolated per project so they don't leak across projects,
+    // mirroring how hot-layer `MEMORY.md` already follows the project root.
+    // `params.working_dir` (workspace root) takes priority; otherwise we walk
+    // up from cwd to find a project root; falling back to the global store.
+    //
+    // On success, `.store()` makes the builder flip `enable_memory(false)` and
+    // inject our store instead of the auto-FileStore (see ReactAgentBuilder::build).
+    // On failure we leave `.enable_memory()` in effect so the framework still
+    // wires its default store — memory stays usable, just not project-scoped.
+    let memory_workspace_root = params.working_dir.as_deref().map(std::path::Path::new);
+    let (memory_store_path, _) = resolve_memory_store_paths(memory_workspace_root);
+    if let Some(store) = create_memory_store_at(&memory_store_path) {
+        builder = builder.store(store);
+    }
+
     // Inject the shared runtime state store. When the product layer supplies a
     // store and a conversation_id, every iteration of `run_core_loop` writes an
     // `AgentCheckpoint` so the conversation can be resumed across restarts.
@@ -452,7 +470,7 @@ pub async fn create_agent(
 /// Register readonly subagents on the given agent.
 ///
 /// Subagent definitions are **hot-loaded from `.md` files** (Sprint 6): project
-/// scope `<root>/.echo-agent/subagents/**/*.md` overrides user scope
+/// scope `<root>/.eko/subagents/**/*.md` overrides user scope
 /// `~/.echo-agent/subagents/**/*.md`, which overrides the builtin defaults
 /// compiled into the binary (`src/subagents/coding/*.md`). Editing a `.md`
 /// prompt therefore takes effect on next agent build without recompiling.
@@ -966,6 +984,107 @@ pub fn create_runtime_state_store_in(
             None
         }
     }
+}
+
+/// 动态记忆 store 的全局默认路径：`~/.echo-agent/store.json`。
+///
+/// 当无 workspace/project 时使用（CLI 在非项目目录启动、GUI 未进入 workspace）。
+/// 与历史行为一致——框架默认就是这里。返回 (store_path, echo_agent_dir)：
+/// `echo_agent_dir` 是 hot 层 MEMORY.md 的落点（`.echo-agent/`），与 store 同根。
+pub fn global_memory_paths() -> (std::path::PathBuf, std::path::PathBuf) {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let echo_agent_dir = std::path::PathBuf::from(home).join(".echo-agent");
+    let store_path = echo_agent_dir.join("store.json");
+    (store_path, echo_agent_dir)
+}
+
+/// 解析当前应当使用的 memory store 路径与 echo_agent_dir。
+///
+/// 优先级（与 hot 层 MEMORY.md 的 discover 逻辑一致）：
+/// 1. 给定 `workspace_root` → `{root}/.eko/memory/store.json`，echo_agent_dir = `{root}/.eko`
+/// 2. 从 `cwd` 向上发现项目根（含 `.git`/`.echo-agent`）→ `{root}/.eko/memory/store.json`
+/// 3. 回退全局 `~/.echo-agent/store.json`
+///
+/// `workspace_root` 用于已切换 workspace 的场景；CLI/TUI 启动时传 None 走 cwd discover。
+pub fn resolve_memory_store_paths(
+    workspace_root: Option<&std::path::Path>,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    use crate::workspace::layout::WorkspaceLayout;
+
+    // (1) 显式 workspace 根优先
+    if let Some(root) = workspace_root
+        && root.exists()
+    {
+        let store_path = WorkspaceLayout::memory_store(root);
+        let echo_agent_dir = WorkspaceLayout::state_dir(root); // {root}/.eko
+        return (store_path, echo_agent_dir);
+    }
+
+    // (2) 从 cwd 向上找项目根（与 discover_echo_agent_dir 同语义）
+    if let Ok(cwd) = std::env::current_dir()
+        && let Some(root) = crate::utils::find_project_root(&cwd)
+    {
+        let store_path = WorkspaceLayout::memory_store(&root);
+        let echo_agent_dir = WorkspaceLayout::state_dir(&root); // {root}/.eko
+        return (store_path, echo_agent_dir);
+    }
+
+    // (3) 全局兜底
+    global_memory_paths()
+}
+
+/// 在指定路径创建 memory store（FileStore）。
+///
+/// 调用方负责保证 `store_path` 的父目录存在（`create_memory_store_for_workspace`
+/// 会建目录；此函数只建文件）。失败时返回 None（框架随后会禁用记忆）。
+pub fn create_memory_store_at(
+    store_path: &std::path::Path,
+) -> Option<Arc<dyn echo_agent::memory::Store>> {
+    if let Some(parent) = store_path.parent()
+        && let Err(e) = std::fs::create_dir_all(parent)
+    {
+        tracing::warn!(
+            path = %store_path.display(),
+            error = %e,
+            "Failed to create memory store dir; memory disabled"
+        );
+        return None;
+    }
+    match echo_agent::memory::FileStore::new(store_path) {
+        Ok(store) => {
+            tracing::info!(
+                path = %store_path.display(),
+                "Memory store (file) 初始化"
+            );
+            Some(Arc::new(store))
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %store_path.display(),
+                error = %e,
+                "FileStore 初始化失败，禁用动态记忆"
+            );
+            None
+        }
+    }
+}
+
+/// 为 workspace/project 根创建 memory store（物理隔离）。
+///
+/// 落点：`{root}/.eko/memory/store.json`。workspace 切换时调用以重载 store。
+pub fn create_memory_store_for_workspace(
+    workspace_root: &std::path::Path,
+) -> Option<Arc<dyn echo_agent::memory::Store>> {
+    let store_path = crate::workspace::layout::WorkspaceLayout::memory_store(workspace_root);
+    create_memory_store_at(&store_path)
+}
+
+/// 全局兜底 memory store（`~/.echo-agent/store.json`）。
+///
+/// 用于无 workspace 时的 bootstrap，以及 exit_workspace 后的重置。
+pub fn create_global_memory_store() -> Option<Arc<dyn echo_agent::memory::Store>> {
+    let (store_path, _) = global_memory_paths();
+    create_memory_store_at(&store_path)
 }
 
 /// 优雅关闭信号

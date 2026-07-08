@@ -194,6 +194,11 @@ pub struct AgentPool {
     skill_descriptors: RwLock<Vec<echo_agent::skills::external::SkillDescriptor>>,
     /// Cancellation token for the cleanup monitor task.
     cleanup_cancel: CancellationToken,
+    /// Workspace-scoped memory store override. Set by `apply_memory_store`
+    /// on workspace switch so newly-created pool agents also bind to the
+    /// current workspace's memory store (not the stale shared.store captured
+    /// at bootstrap). `None` means "use shared.store" (pre-switch behavior).
+    memory_store_override: RwLock<Option<Arc<dyn echo_agent::memory::Store>>>,
 }
 
 impl AgentPool {
@@ -231,6 +236,7 @@ impl AgentPool {
             permission_mode: RwLock::new("default".to_string()),
             skill_descriptors: RwLock::new(skill_descriptors),
             cleanup_cancel: CancellationToken::new(),
+            memory_store_override: RwLock::new(None),
         };
 
         // Pre-create background agent if enabled
@@ -519,6 +525,91 @@ impl AgentPool {
         tracing::info!(?path, pooled_agents, "AgentPool: working_dir applied");
     }
 
+    /// Rebind all pooled agents to a workspace-scoped memory store.
+    ///
+    /// Called after `switch_workspace` so that pooled agents (background +
+    /// multi-session) read/write memories from the new workspace's store
+    /// (`{root}/.eko/memory/store.json`), not the stale bootstrap store.
+    /// Also sets the `memory_store_override` so *future* pool agents created
+    /// post-switch bind to the same store.
+    ///
+    /// Mirrors the primary-agent store swap done in `AppState::switch_workspace`.
+    /// `ReviewIntegration` is expected to have been `rebind`-ed by the caller
+    /// already — `create_layer_manager` reads the rebound dir/store.
+    pub async fn apply_memory_store(&self, workspace_root: &std::path::Path) {
+        let store = match crate::infra::create_memory_store_for_workspace(workspace_root) {
+            Some(s) => s,
+            None => {
+                tracing::warn!(
+                    root = %workspace_root.display(),
+                    "AgentPool: failed to create workspace memory store; pool unchanged"
+                );
+                return;
+            }
+        };
+        let echo_agent_dir = crate::workspace::layout::WorkspaceLayout::state_dir(workspace_root);
+        self.apply_memory_store_inner(store, echo_agent_dir).await;
+    }
+
+    /// Rebind all pooled agents to the global memory store (post-`exit_workspace`).
+    pub async fn apply_memory_store_global(&self) {
+        let store = match crate::infra::create_global_memory_store() {
+            Some(s) => s,
+            None => {
+                tracing::warn!("AgentPool: failed to create global memory store; pool unchanged");
+                return;
+            }
+        };
+        let (_, echo_agent_dir) = crate::infra::global_memory_paths();
+        self.apply_memory_store_inner(store, echo_agent_dir).await;
+    }
+
+    /// Shared implementation: swap store + rebuild layer manager on every
+    /// pooled agent, and record the override for future pool agents.
+    async fn apply_memory_store_inner(
+        &self,
+        store: Arc<dyn echo_agent::memory::Store>,
+        echo_agent_dir: std::path::PathBuf,
+    ) {
+        // (1) Record override so future create_agent calls in the pool bind
+        //     to this store instead of the stale `shared.store`.
+        {
+            let mut ovr = self.memory_store_override.write().await;
+            *ovr = Some(store.clone());
+        }
+        // (2) Hot-swap every existing pooled agent's store + layer manager.
+        let agents: Vec<AgentHandle> = self
+            .agents
+            .read()
+            .await
+            .values()
+            .map(|pa| pa.handle.clone())
+            .collect();
+        for handle in agents {
+            let store_clone = store.clone();
+            let dir_clone = echo_agent_dir.clone();
+            handle
+                .write_async(|agent| {
+                    Box::pin(async move {
+                        agent.install_memory_store(store_clone.clone()).await;
+                        let mgr = echo_agent::evolution::MemoryRuntimeIntegrationBuilder::new(
+                            dir_clone,
+                            store_clone,
+                        )
+                        .build_layer_manager();
+                        agent.install_memory_layer_manager(Arc::new(mgr));
+                    })
+                })
+                .await;
+        }
+        let pooled_agents = self.agents.read().await.len();
+        tracing::info!(
+            dir = %echo_agent_dir.display(),
+            pooled_agents,
+            "AgentPool: memory store applied"
+        );
+    }
+
     /// Current number of agents in the pool (including background).
     pub async fn pool_size(&self) -> usize {
         self.agents.read().await.len()
@@ -711,7 +802,15 @@ impl AgentPool {
         if let Some(ref cs) = self.shared.conversation_store {
             agent.set_conversation_store(cs.clone());
         }
-        if let Some(ref st) = self.shared.store {
+        // Prefer the workspace-scoped override (set by apply_memory_store after
+        // a workspace switch) over the stale shared.store captured at bootstrap.
+        let effective_store = self
+            .memory_store_override
+            .read()
+            .await
+            .clone()
+            .or_else(|| self.shared.store.clone());
+        if let Some(ref st) = effective_store {
             agent.install_store(st.clone()).await;
         }
         if let Some(ref review_integration) = self.shared.review_integration {
@@ -1023,6 +1122,7 @@ mod tests {
             permission_mode: RwLock::new("default".to_string()),
             skill_descriptors: RwLock::new(vec![]),
             cleanup_cancel: CancellationToken::new(),
+            memory_store_override: RwLock::new(None),
         }
     }
 
@@ -1055,6 +1155,7 @@ mod tests {
             permission_mode: RwLock::new("default".to_string()),
             skill_descriptors: RwLock::new(vec![]),
             cleanup_cancel: CancellationToken::new(),
+            memory_store_override: RwLock::new(None),
         }
     }
 

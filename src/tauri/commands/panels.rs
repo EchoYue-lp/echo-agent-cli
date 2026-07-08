@@ -242,7 +242,7 @@ async fn auto_memory_config_status(
     let messages = current_agent_messages(state).await;
     let observations = echo_agent_app_core::auto_memory::extract_observations(&messages, &config);
     let root = workspace_project_root(state).await?;
-    let memory_path = root.join(".echo-agent").join("project.md");
+    let memory_path = root.join(".eko").join("project.md");
     Ok((config, observations.len(), memory_path))
 }
 
@@ -347,7 +347,7 @@ pub async fn extract_auto_memory(
     let messages = current_agent_messages(&state).await;
     let observations = echo_agent_app_core::auto_memory::extract_observations(&messages, &config);
     let root = workspace_project_root(&state).await?;
-    let memory_path = root.join(".echo-agent").join("project.md");
+    let memory_path = root.join(".eko").join("project.md");
     persist_auto_memory_observations(&memory_path, &observations)?;
     let typed_written = write_auto_memory_observations(&state, &observations).await?;
     let count = observations.len();

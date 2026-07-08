@@ -272,9 +272,9 @@ impl ConfigDiscovery {
             accessible: global.exists(),
         });
 
-        // Project: <root>/.echo-agent/hooks.yaml
+        // Project: <root>/.eko/hooks.yaml
         if let Some(ref root) = self.project_root {
-            let project = root.join(".echo-agent").join("hooks.yaml");
+            let project = root.join(".eko").join("hooks.yaml");
             inv.hooks_configs.push(ConfigFile {
                 name: "hooks.yaml (project)".into(),
                 path: project.clone(),
@@ -296,9 +296,9 @@ impl ConfigDiscovery {
             accessible: user.exists(),
         });
 
-        // Project-level: <root>/.echo-agent/project.md
+        // Project-level: <root>/.eko/project.md
         if let Some(ref root) = self.project_root {
-            let project = root.join(".echo-agent").join("project.md");
+            let project = root.join(".eko").join("project.md");
             inv.instructions.push(ConfigFile {
                 name: "project.md".into(),
                 path: project.clone(),
@@ -308,8 +308,8 @@ impl ConfigDiscovery {
             });
         }
 
-        // Local: <cwd>/.echo-agent/local.md
-        let local = self.cwd.join(".echo-agent").join("local.md");
+        // Local: <cwd>/.eko/local.md
+        let local = self.cwd.join(".eko").join("local.md");
         inv.instructions.push(ConfigFile {
             name: "local.md".into(),
             path: local.clone(),
@@ -330,7 +330,7 @@ impl ConfigDiscovery {
                 ConfigScope::Project,
                 self.project_root
                     .as_ref()
-                    .map(|r| r.join(".echo-agent").join("plugins"))
+                    .map(|r| r.join(".eko").join("plugins"))
                     .unwrap_or_default(),
             ),
         ];

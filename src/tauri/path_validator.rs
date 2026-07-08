@@ -156,7 +156,7 @@ mod tests {
         assert!(is_denied_secret_path(".aws/credentials"));
         assert!(is_denied_secret_path(".zsh_history"));
         assert!(!is_denied_secret_path("projects/myapp/src/main.rs"));
-        assert!(!is_denied_secret_path(".echo-agent/memory.md"));
+        assert!(!is_denied_secret_path(".eko/memory.md"));
     }
 
     #[test]

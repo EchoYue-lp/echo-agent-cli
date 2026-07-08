@@ -156,16 +156,16 @@ async fn cmd_memory(_: &CommandContext, args: &[&str]) -> CommandOutcome {
                 .unwrap_or_default();
             print_memory_tier("User", &user_path);
 
-            // Project-level: <project-root>/.echo-agent/project.md
+            // Project-level: <project-root>/.eko/project.md
             let project_path = find_project_root()
-                .map(|r| r.join(".echo-agent").join("project.md"))
+                .map(|r| r.join(".eko").join("project.md"))
                 .unwrap_or_default();
             print_memory_tier("Project", &project_path);
 
-            // Reflection memory: .echo-agent/memory/PROJECT.md
+            // Reflection memory: .eko/memory/PROJECT.md
             let reflection_path = std::env::current_dir()
                 .unwrap_or_default()
-                .join(".echo-agent")
+                .join(".eko")
                 .join("memory")
                 .join("PROJECT.md");
             print_memory_tier("Reflection", &reflection_path);
@@ -205,7 +205,7 @@ fn print_memory_tier(label: &str, path: &std::path::Path) {
 fn find_project_root() -> Option<std::path::PathBuf> {
     let mut dir = std::env::current_dir().ok()?;
     loop {
-        if dir.join(".git").exists() || dir.join(".echo-agent").exists() {
+        if dir.join(".git").exists() || dir.join(".eko").exists() {
             return Some(dir);
         }
         if !dir.pop() {
@@ -257,10 +257,10 @@ async fn cmd_reflect(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
         }
     };
 
-    // Write to .echo-agent/memory/PROJECT.md
+    // Write to .eko/memory/PROJECT.md
     let memory_dir = std::env::current_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from("."))
-        .join(".echo-agent")
+        .join(".eko")
         .join("memory");
     let _ = std::fs::create_dir_all(&memory_dir);
     let memory_file = memory_dir.join("PROJECT.md");

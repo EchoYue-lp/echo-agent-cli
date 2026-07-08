@@ -892,6 +892,52 @@ impl AppState {
             }
         }
 
+        // 重新初始化 memory store 到工作区的存储目录（物理隔离：动态记忆
+        // 跟 workspace 走，不再共享全局 ~/.echo-agent/store.json）。
+        // hot 层 MEMORY.md 的 echo_agent_dir 与 warm 层 store.json 同根，
+        // 都落在 {workspace.root}/.eko/，保证两层一致。
+        let mem_root = workspace.root.clone();
+        if let Some(store) = crate::infra::create_memory_store_for_workspace(&mem_root) {
+            let echo_agent_dir = crate::workspace::layout::WorkspaceLayout::state_dir(&mem_root); // {root}/.eko
+            // (a) 主 agent：替换 warm 层 store（重新注册 remember/recall/search_memory/
+            //     forget 工具）+ 重建 hot 层 MemoryLayerManager。
+            let store_for_mgr = store.clone();
+            let echo_dir_for_mgr = echo_agent_dir.clone();
+            self.connection
+                .agent
+                .write_async(|a| {
+                    Box::pin(async move {
+                        a.install_memory_store(store_for_mgr.clone()).await;
+                        let mgr = echo_agent::evolution::MemoryRuntimeIntegrationBuilder::new(
+                            echo_dir_for_mgr,
+                            store_for_mgr,
+                        )
+                        .build_layer_manager();
+                        a.install_memory_layer_manager(std::sync::Arc::new(mgr));
+                    })
+                })
+                .await;
+            // (b) ReviewIntegration：rebind 到新 dir/store（后续 /memory-review、
+            //     dreaming、session-end 都用新 workspace 的记忆）。
+            if let Some(ref ri) = self.review_integration {
+                ri.rebind(echo_agent_dir.clone(), store.clone());
+            }
+            tracing::info!(
+                workspace = %workspace.id,
+                dir = %echo_agent_dir.display(),
+                "Switched memory store to workspace"
+            );
+            // (c) 池 agent 同步重载（仿 apply_working_dir pattern）。
+            if let Some(ref pool) = self.connection.pool {
+                pool.apply_memory_store(&mem_root).await;
+            }
+        } else {
+            tracing::warn!(
+                workspace = %workspace.id,
+                "Failed to create workspace memory store; keeping previous store"
+            );
+        }
+
         tracing::info!(
             workspace = %workspace.id,
             root = %workspace.root.display(),
@@ -946,6 +992,40 @@ impl AppState {
             self.connection
                 .agent
                 .try_write(|a| a.set_state_store(runtime_store));
+        }
+
+        // 重置 memory store 到全局默认路径（~/.echo-agent/store.json）。
+        // 与 switch_workspace 的 memory 重载对称：exit 后动态记忆回到全局 store，
+        // 不再读已退出 workspace 的 .eko/memory/。
+        if let Some(store) = crate::infra::create_global_memory_store() {
+            let (global_store_path, global_echo_dir) = crate::infra::global_memory_paths();
+            // 主 agent：替换 store + 重建 layer manager。
+            let store_for_mgr = store.clone();
+            let echo_dir_for_mgr = global_echo_dir.clone();
+            self.connection
+                .agent
+                .write_async(|a| {
+                    Box::pin(async move {
+                        a.install_memory_store(store_for_mgr.clone()).await;
+                        let mgr = echo_agent::evolution::MemoryRuntimeIntegrationBuilder::new(
+                            echo_dir_for_mgr,
+                            store_for_mgr,
+                        )
+                        .build_layer_manager();
+                        a.install_memory_layer_manager(std::sync::Arc::new(mgr));
+                    })
+                })
+                .await;
+            if let Some(ref ri) = self.review_integration {
+                ri.rebind(global_echo_dir.clone(), store.clone());
+            }
+            tracing::info!(
+                path = %global_store_path.display(),
+                "Memory store reset to global"
+            );
+            if let Some(ref pool) = self.connection.pool {
+                pool.apply_memory_store_global().await;
+            }
         }
 
         // Reset pooled agents' working_dir so background tasks don't keep

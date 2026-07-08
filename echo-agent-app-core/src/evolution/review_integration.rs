@@ -22,6 +22,7 @@ use echo_agent::memory::Store;
 use echo_agent::memory::TypedMemoryStore;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Bridges the framework's review system into the product lifecycle.
@@ -33,10 +34,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub struct ReviewIntegration {
     config: ReviewConfig,
     write_counter: Arc<AtomicU64>,
-    /// Path to the `.echo-agent/` directory for the change log and MEMORY.md.
-    echo_agent_dir: PathBuf,
+    /// Path to the `.echo-agent/` (or `.eko/`) directory for the change log
+    /// and MEMORY.md. Wrapped in `RwLock` so a workspace switch can rebind
+    /// this and the `store` atomically without recreating the whole
+    /// `ReviewIntegration` (which is shared via `Arc` across many callers).
+    echo_agent_dir: RwLock<PathBuf>,
     /// The underlying Store for creating TypedMemoryStore on demand.
-    store: Arc<dyn Store>,
+    store: RwLock<Arc<dyn Store>>,
 }
 
 impl ReviewIntegration {
@@ -45,9 +49,24 @@ impl ReviewIntegration {
         Self {
             config,
             write_counter: Arc::new(AtomicU64::new(0)),
-            echo_agent_dir,
-            store,
+            echo_agent_dir: RwLock::new(echo_agent_dir),
+            store: RwLock::new(store),
         }
+    }
+
+    /// Rebind to a new project directory + Store (used on workspace switch).
+    ///
+    /// After this call, subsequent review passes, `create_layer_manager`,
+    /// and dreaming all use the new `echo_agent_dir` and `store`. The shared
+    /// `Arc<ReviewIntegration>` held across the app picks this up automatically.
+    pub fn rebind(&self, echo_agent_dir: PathBuf, store: Arc<dyn Store>) {
+        if let Ok(mut dir) = self.echo_agent_dir.write() {
+            *dir = echo_agent_dir;
+        }
+        if let Ok(mut s) = self.store.write() {
+            *s = store;
+        }
+        tracing::info!("ReviewIntegration rebound to new workspace memory store");
     }
 
     /// Get the current review config.
@@ -103,10 +122,29 @@ impl ReviewIntegration {
     /// each call. Reviews are infrequent enough (session end, every 50 writes,
     /// or manual) that this overhead is negligible.
     async fn run_review_inner(&self) -> Result<ReviewReport, String> {
-        let typed_store = TypedMemoryStore::new(self.store.clone());
-        let runtime_builder = self.runtime_builder();
+        // Snapshot the current (echo_agent_dir, store) once per review pass.
+        // `rebind` may fire between passes (workspace switch), but within a
+        // single review we want a consistent pair. Briefly holding the read
+        // lock to clone is fine — reviews are infrequent.
+        let (echo_agent_dir, store) = {
+            let dir = self
+                .echo_agent_dir
+                .read()
+                .map_err(|e| format!("echo_agent_dir lock poisoned: {e}"))?
+                .clone();
+            let st = self
+                .store
+                .read()
+                .map_err(|e| format!("store lock poisoned: {e}"))?
+                .clone();
+            (dir, st)
+        };
+        let typed_store = TypedMemoryStore::new(store.clone());
+        let runtime_builder = MemoryRuntimeIntegrationBuilder::new(echo_agent_dir.clone(), store)
+            .write_counter(self.write_counter.clone())
+            .review_every_n_writes(self.config.review_every_n_writes);
         let change_log = runtime_builder.create_change_log();
-        let layer_manager = self.create_layer_manager();
+        let layer_manager = runtime_builder.build_layer_manager();
         let reviewer = MemoryReviewer::new();
         let mut report = reviewer
             .review(
@@ -135,10 +173,8 @@ impl ReviewIntegration {
                     if self.config.auto_generate_drafts
                         && !candidate_report.new_candidates.is_empty()
                     {
-                        let generator = SkillDraftGenerator::new(
-                            self.echo_agent_dir.clone(),
-                            change_log.as_ref(),
-                        );
+                        let generator =
+                            SkillDraftGenerator::new(echo_agent_dir.clone(), change_log.as_ref());
                         for candidate in &candidate_report.new_candidates {
                             match generator.generate_from_candidate(candidate).await {
                                 Ok(draft_result) => {
@@ -171,18 +207,33 @@ impl ReviewIntegration {
         Ok(report)
     }
 
-    /// Create a `MemoryLayerManager` for the current review pass.
+    /// Create a `MemoryLayerManager` for the current workspace's memory store.
     ///
     /// Wires the shared write counter so that every memory write through this
     /// layer manager increments the counter, and `on_memory_write()` can trigger
-    /// periodic reviews without an explicit caller.
+    /// periodic reviews without an explicit caller. Reads the current
+    /// `(echo_agent_dir, store)` from the inner locks — so after a workspace
+    /// `rebind`, this produces a manager bound to the new store/dir.
     pub fn create_layer_manager(&self) -> MemoryLayerManager {
         self.runtime_builder().build_layer_manager()
     }
 
     /// Create framework runtime wiring without owning product lifecycle policy.
     fn runtime_builder(&self) -> MemoryRuntimeIntegrationBuilder {
-        MemoryRuntimeIntegrationBuilder::new(self.echo_agent_dir.clone(), self.store.clone())
+        // Read current values; on lock poisoning fall back to whatever we can
+        // get (empty path / clone-of-poisoned-err). Lock poisoning only happens
+        // on panic, so this is a best-effort degradation path.
+        let echo_agent_dir = self
+            .echo_agent_dir
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        let store = self
+            .store
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_else(|e| e.into_inner().clone());
+        MemoryRuntimeIntegrationBuilder::new(echo_agent_dir, store)
             .write_counter(self.write_counter.clone())
             .review_every_n_writes(self.config.review_every_n_writes)
     }
@@ -196,11 +247,10 @@ impl MemoryWriteObserver for ReviewIntegration {
     }
 }
 
-/// Discover the `.echo-agent/` directory for the current project.
+/// Discover the `.eko/` directory for the current project.
 ///
 /// Walks up from the current working directory to find a directory containing
-/// `.echo-agent/` or `.git/`. Falls back to `$HOME/.echo-agent/` if no
-/// project root is found.
+/// `.eko/` or `.git/`. Falls back to `$HOME/.eko/` if no project root is found.
 pub fn discover_echo_agent_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     let home_dir = PathBuf::from(&home);
@@ -209,8 +259,8 @@ pub fn discover_echo_agent_dir() -> PathBuf {
     if let Ok(cwd) = std::env::current_dir() {
         let mut dir = cwd.as_path();
         loop {
-            if dir.join(".echo-agent").is_dir() || dir.join(".git").is_dir() {
-                return dir.join(".echo-agent");
+            if dir.join(".eko").is_dir() || dir.join(".git").is_dir() {
+                return dir.join(".eko");
             }
             dir = match dir.parent() {
                 Some(p) => p,
@@ -220,7 +270,7 @@ pub fn discover_echo_agent_dir() -> PathBuf {
     }
 
     // Fallback to global directory
-    home_dir.join(".echo-agent")
+    home_dir.join(".eko")
 }
 
 /// Format a [`ReviewReport`] for display to the user.
@@ -318,8 +368,8 @@ mod tests {
     #[test]
     fn test_discover_echo_agent_dir_returns_path() {
         let dir = discover_echo_agent_dir();
-        // Should return a non-empty path ending in .echo-agent
-        assert!(dir.to_string_lossy().ends_with(".echo-agent"));
+        // Should return a non-empty path ending in .eko
+        assert!(dir.to_string_lossy().ends_with(".eko"));
     }
 
     #[test]

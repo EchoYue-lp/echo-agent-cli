@@ -339,10 +339,10 @@ async fn run_reflection_on_exit(agent: &AgentHandle) {
         Ok(Err(_)) | Err(_) => return, // Silently skip on failure
     };
 
-    // Write to .echo-agent/memory/PROJECT.md
+    // Write to .eko/memory/PROJECT.md
     let memory_dir = std::env::current_dir()
         .unwrap_or_else(|_| std::path::PathBuf::from("."))
-        .join(".echo-agent")
+        .join(".eko")
         .join("memory");
     let _ = std::fs::create_dir_all(&memory_dir);
     let memory_file = memory_dir.join("PROJECT.md");

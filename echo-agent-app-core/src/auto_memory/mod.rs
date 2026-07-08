@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 /// Append auto-extracted observations to the project memory file.
 ///
-/// This is an application concern: the framework writes durable typed memory,
-/// while the product also maintains `.echo-agent/project.md` as prompt context.
+/// An application concern: the framework writes durable typed memory,
+/// while the product also maintains `.eko/project.md` as prompt context.
 pub fn append_to_project_memory(observations: &[Observation]) -> Result<(), String> {
     if observations.is_empty() {
         return Ok(());
@@ -22,7 +22,7 @@ pub fn append_to_project_memory(observations: &[Observation]) -> Result<(), Stri
     let formatted = format_observations_for_memory(observations);
     let cwd = std::env::current_dir().map_err(|e| format!("Failed to get cwd: {e}"))?;
     let root = crate::utils::find_project_root(&cwd).unwrap_or(cwd);
-    let memory_path = root.join(".echo-agent").join("project.md");
+    let memory_path = root.join(".eko").join("project.md");
 
     if let Some(parent) = memory_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create directory: {e}"))?;

@@ -3,11 +3,11 @@
 //! Loads four tiers of instruction Markdown files and
 //! concatenates them as a system-prompt suffix:
 //! - `~/.echo-agent/user.md`              — user-level (cross-project)
-//! - `<project-root>/.echo-agent/project.md` — project-level
-//! - `<project-root>/.echo-agent/AGENTS.md` — auto-promoted rules (evolution)
-//! - `<cwd>/.echo-agent/local.md`         — local directory
+//! - `<project-root>/.eko/project.md` — project-level
+//! - `<project-root>/.eko/AGENTS.md` — auto-promoted rules (evolution)
+//! - `<cwd>/.eko/local.md`         — local directory
 //!
-//! Also loads hot-layer memory from `.echo-agent/MEMORY.md`.
+//! Also loads hot-layer memory from `.eko/MEMORY.md`.
 //!
 //! Static, file-only loader: no DB, no embeddings, no recall. Agent-learned
 //! dynamic memories are handled separately by `UnifiedMemory.memories`
@@ -71,12 +71,12 @@ impl InstructionProvider {
         }
     }
 
-    /// Load project-level instructions from `<project-root>/.echo-agent/project.md`.
+    /// Load project-level instructions from `<project-root>/.eko/project.md`.
     fn load_project_instructions() -> Option<String> {
         std::env::current_dir()
             .ok()
             .and_then(|pwd| crate::utils::find_project_root(&pwd))
-            .map(|root| root.join(".echo-agent").join("project.md"))
+            .map(|root| root.join(".eko").join("project.md"))
             .filter(|path| path.exists())
             .and_then(|path| std::fs::read_to_string(path).ok())
     }
@@ -89,16 +89,16 @@ impl InstructionProvider {
             .and_then(|path| std::fs::read_to_string(path).ok())
     }
 
-    /// Load local-directory instructions from `<cwd>/.echo-agent/local.md`.
+    /// Load local-directory instructions from `<cwd>/.eko/local.md`.
     fn load_local_instructions() -> Option<String> {
         std::env::current_dir()
             .ok()
-            .map(|pwd| pwd.join(".echo-agent").join("local.md"))
+            .map(|pwd| pwd.join(".eko").join("local.md"))
             .filter(|path| path.exists())
             .and_then(|path| std::fs::read_to_string(path).ok())
     }
 
-    /// Save project-level instructions to `<cwd>/.echo-agent/project.md`.
+    /// Save project-level instructions to `<cwd>/.eko/project.md`.
     pub fn save_project_instructions(content: &str) -> std::io::Result<()> {
         let path = Self::project_instructions_path();
         if let Some(parent) = path.parent() {
@@ -120,7 +120,7 @@ impl InstructionProvider {
     fn project_instructions_path() -> PathBuf {
         std::env::current_dir()
             .unwrap_or_else(|_| std::path::PathBuf::from("."))
-            .join(".echo-agent")
+            .join(".eko")
             .join("project.md")
     }
 
@@ -132,21 +132,21 @@ impl InstructionProvider {
             .join("user.md")
     }
 
-    /// Load hot-layer memory content from `.echo-agent/MEMORY.md`.
+    /// Load hot-layer memory content from `.eko/MEMORY.md`.
     ///
     /// Returns the body (frontmatter stripped) so it can be included in the system prompt.
     fn load_hot_memory() -> Option<String> {
         let raw = std::env::current_dir()
             .ok()
             .and_then(|pwd| crate::utils::find_project_root(&pwd))
-            .map(|root| root.join(".echo-agent").join("MEMORY.md"))
+            .map(|root| root.join(".eko").join("MEMORY.md"))
             .filter(|path| path.exists())
             .and_then(|path| std::fs::read_to_string(path).ok())?;
 
         Some(crate::utils::strip_yaml_frontmatter(&raw))
     }
 
-    /// Load auto-promoted rules from `<project-root>/.echo-agent/AGENTS.md`.
+    /// Load auto-promoted rules from `<project-root>/.eko/AGENTS.md`.
     ///
     /// This is the fourth instruction tier — between project-level and local-level.
     /// Contains rules that were automatically promoted from high-confidence memories
@@ -155,7 +155,7 @@ impl InstructionProvider {
         std::env::current_dir()
             .ok()
             .and_then(|pwd| crate::utils::find_project_root(&pwd))
-            .map(|root| root.join(".echo-agent").join("AGENTS.md"))
+            .map(|root| root.join(".eko").join("AGENTS.md"))
             .filter(|path| path.exists())
             .and_then(|path| std::fs::read_to_string(path).ok())
             .map(|raw| crate::utils::strip_yaml_frontmatter(&raw))
@@ -166,8 +166,8 @@ impl InstructionProvider {
         std::env::current_dir()
             .ok()
             .and_then(|pwd| crate::utils::find_project_root(&pwd))
-            .map(|root| root.join(".echo-agent").join("AGENTS.md"))
-            .unwrap_or_else(|| std::path::PathBuf::from(".echo-agent/AGENTS.md"))
+            .map(|root| root.join(".eko").join("AGENTS.md"))
+            .unwrap_or_else(|| std::path::PathBuf::from(".eko/AGENTS.md"))
     }
 
     /// Save content to the AGENTS.md file.

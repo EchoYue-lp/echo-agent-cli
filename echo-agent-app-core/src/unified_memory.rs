@@ -149,11 +149,11 @@ impl UnifiedMemory {
                 let pwd = std::env::current_dir().map_err(|e| format!("Failed to get cwd: {e}"))?;
                 let root =
                     crate::utils::find_project_root(&pwd).ok_or("Not in a project directory")?;
-                Ok(root.join(".echo-agent").join("project.md"))
+                Ok(root.join(".eko").join("project.md"))
             }
             InstructionTier::Local => {
                 let pwd = std::env::current_dir().map_err(|e| format!("Failed to get cwd: {e}"))?;
-                Ok(pwd.join(".echo-agent").join("local.md"))
+                Ok(pwd.join(".eko").join("local.md"))
             }
         }
     }
@@ -183,13 +183,13 @@ impl UnifiedMemory {
 
 /// Load the hot layer content from MEMORY.md (body only, frontmatter stripped).
 ///
-/// Tries project-level `.echo-agent/MEMORY.md` first, then user-level `~/.echo-agent/MEMORY.md`.
+/// Tries project-level `.eko/MEMORY.md` first, then user-level `~/.eko/MEMORY.md`.
 fn load_hot_content() -> Option<String> {
     // Project-level
     if let Ok(pwd) = std::env::current_dir()
         && let Some(root) = crate::utils::find_project_root(&pwd)
     {
-        let path = root.join(".echo-agent").join("MEMORY.md");
+        let path = root.join(".eko").join("MEMORY.md");
         if path.exists()
             && let Ok(raw) = std::fs::read_to_string(&path)
         {
@@ -199,7 +199,7 @@ fn load_hot_content() -> Option<String> {
 
     // User-level
     if let Some(home) = dirs::home_dir() {
-        let path = home.join(".echo-agent").join("MEMORY.md");
+        let path = home.join(".eko").join("MEMORY.md");
         if path.exists()
             && let Ok(raw) = std::fs::read_to_string(&path)
         {

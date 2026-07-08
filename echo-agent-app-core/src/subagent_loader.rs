@@ -6,7 +6,7 @@
 //!
 //! ## Resolution order (highest priority first)
 //!
-//! 1. **Project scope**: `<project_root>/.echo-agent/subagents/**/*.md`
+//! 1. **Project scope**: `<project_root>/.eko/subagents/**/*.md`
 //! 2. **User scope**: `~/.echo-agent/subagents/**/*.md`
 //! 3. **Builtin defaults**: compiled-in `.md` files via `include_str!`
 //!
@@ -20,7 +20,7 @@
 //! The framework's `SubagentKind::Custom { path }` is an inert placeholder
 //! (kept as a published capability). Per deep-iteration-plan §六, the loader
 //! lives in the app layer because the `.md` directory layout and EKO's
-//! `.echo-agent/` convention are product-form-specific. The loader emits plain
+//! `.eko/` convention are product-form-specific. The loader emits plain
 //! `WorkerDefinition` values consumed by `register_default_subagents`.
 
 use std::path::{Path, PathBuf};
@@ -166,9 +166,9 @@ pub fn discover_subagents(
         merge_scope(&mut by_name, &user_dir);
     }
 
-    // 3. Project scope (<root>/.echo-agent/subagents/) — highest priority, last.
+    // 3. Project scope (<root>/.eko/subagents/) — highest priority, last.
     if let Some(root) = project_root {
-        let project_dir = root.join(".echo-agent").join("subagents");
+        let project_dir = root.join(".eko").join("subagents");
         merge_scope(&mut by_name, &project_dir);
     }
 
@@ -627,7 +627,7 @@ team_workers: [\"explorer\", \"summarizer\"]\n\
     fn project_scope_overrides_builtin() {
         // A project-scoped .md with the same name as a builtin overrides it.
         let dir = tempdir().unwrap();
-        let sub = dir.path().join(".echo-agent").join("subagents");
+        let sub = dir.path().join(".eko").join("subagents");
         fs::create_dir_all(&sub).unwrap();
         fs::write(
             sub.join("explorer.md"),
@@ -674,7 +674,7 @@ team_workers: [\"explorer\", \"summarizer\"]\n\
         .unwrap();
 
         let proj = tempdir().unwrap();
-        let proj_sub = proj.path().join(".echo-agent").join("subagents");
+        let proj_sub = proj.path().join(".eko").join("subagents");
         fs::create_dir_all(&proj_sub).unwrap();
         fs::write(
             proj_sub.join("explorer.md"),

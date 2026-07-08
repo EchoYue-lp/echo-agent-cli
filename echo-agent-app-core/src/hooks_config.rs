@@ -35,9 +35,9 @@ pub fn load_hooks_files() -> HooksLoadResult {
         }
     }
 
-    // Project-local hooks: .echo-agent/hooks.yaml
+    // Project-local hooks: .eko/hooks.yaml
     if let Ok(cwd) = std::env::current_dir() {
-        let project_path = cwd.join(".echo-agent").join("hooks.yaml");
+        let project_path = cwd.join(".eko").join("hooks.yaml");
         if let Some(def) = try_load_yaml(&project_path) {
             definition.merge(def);
             loaded_from.push(project_path);

@@ -11,7 +11,7 @@ fn detect_project_root() -> Option<PathBuf> {
     let cwd = std::env::current_dir().ok()?;
     let mut dir = cwd.as_path();
     loop {
-        if dir.join(".echo-agent").exists() || dir.join(".git").exists() {
+        if dir.join(".eko").exists() || dir.join(".git").exists() {
             return Some(dir.to_path_buf());
         }
         dir = dir.parent()?;
