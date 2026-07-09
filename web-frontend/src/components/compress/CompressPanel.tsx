@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { Minimize2, BarChart3, Zap } from 'lucide-react';
 import { compressApi } from '../../api/endpoints';
 import type { CompressionStats, CompressResponse } from '../../types/api';
+import { useChatStore } from '../../stores/chatStore';
 
 export function CompressPanel() {
   const [stats, setStats] = useState<CompressionStats | null>(null);
@@ -29,6 +30,11 @@ export function CompressPanel() {
       const res = await compressApi.trigger();
       if (res.success) {
         setLastCompress(res);
+        // 与后端 emit context_compressed 对齐：Snapshot 置空（Accumulator 保留）。
+        // 有实际压缩时才清；"No messages to compress" 时 before/after 均为 0。
+        if (res.messages_before > 0 || res.messages_after > 0) {
+          useChatStore.getState().clearContextWindow();
+        }
         setMsg(
           `已压缩：${res.messages_before} → ${res.messages_after} 条消息，节省 ${res.tokens_saved} 个令牌`
         );

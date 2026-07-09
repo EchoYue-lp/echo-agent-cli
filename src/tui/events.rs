@@ -241,6 +241,8 @@ enum AgentEvent {
         completion_tokens: usize,
         cached_prompt_tokens: usize,
         cache_creation_prompt_tokens: usize,
+        /// false = provider 未报 usage，勿更新 snapshot / accumulator。
+        usage_reported: bool,
     },
 }
 
@@ -303,17 +305,30 @@ pub async fn run_event_loop(
                     completion_tokens,
                     cached_prompt_tokens,
                     cache_creation_prompt_tokens,
+                    usage_reported,
                 } => {
-                    // 更新"当前上下文占用"快照（覆盖式，对齐 Claude Code 语义）。
-                    // prompt_tokens 是本次请求的真实输入 token（已含 cache 部分）。
-                    app.context_snapshot = ContextWindowSnapshot {
-                        input_tokens: prompt_tokens as u32,
-                        cached_tokens: cached_prompt_tokens as u32,
-                        cache_creation_tokens: cache_creation_prompt_tokens as u32,
-                        output_tokens: completion_tokens as u32,
-                        context_window_size: app.context_window_size,
-                        updated_at: Some(std::time::Instant::now()),
-                    };
+                    if !usage_reported {
+                        tracing::warn!(
+                            prompt_tokens,
+                            "TUI: LLM usage not reported by provider — skipping snapshot/accumulator update"
+                        );
+                    } else {
+                        // 更新"当前上下文占用"快照（覆盖式，对齐 Claude Code 语义）。
+                        // prompt_tokens 是本次请求的真实输入 token（已含 cache 部分）。
+                        app.context_snapshot = ContextWindowSnapshot {
+                            input_tokens: prompt_tokens as u32,
+                            cached_tokens: cached_prompt_tokens as u32,
+                            cache_creation_tokens: cache_creation_prompt_tokens as u32,
+                            output_tokens: completion_tokens as u32,
+                            context_window_size: app.context_window_size,
+                            updated_at: Some(std::time::Instant::now()),
+                        };
+                        app.usage_accumulator.record(
+                            prompt_tokens as u64,
+                            cached_prompt_tokens as u64,
+                            true,
+                        );
+                    }
                 }
                 AgentEvent::ToolBatchStart { tool_count } => {
                     tracing::debug!(tool_count, "TUI tool batch started");
@@ -374,6 +389,8 @@ pub async fn run_event_loop(
                     before_tokens,
                     after_tokens,
                 } => {
+                    // 方案 A：压缩后 Snapshot 置空，等下一轮 LlmUsage；Accumulator 保留。
+                    app.context_snapshot.clear_usage();
                     let saved = before_tokens.saturating_sub(after_tokens);
                     app.messages.push(ChatMessage {
                         role: MessageRole::System,
@@ -876,6 +893,7 @@ impl echo_agent_app_core::chat_driver::ChatSink for TuiChatSink {
                 completion_tokens,
                 cached_prompt_tokens,
                 cache_creation_prompt_tokens,
+                usage_reported,
                 ..
             } => {
                 // 透传给主循环：snapshot 更新需要 &mut TuiApp，主循环才拿得到。
@@ -884,13 +902,15 @@ impl echo_agent_app_core::chat_driver::ChatSink for TuiChatSink {
                     prompt_tokens,
                     cached_prompt_tokens,
                     cache_creation_prompt_tokens,
-                    "TUI: LLM usage reported — forwarding to main loop for context snapshot"
+                    usage_reported,
+                    "TUI: LLM usage — forwarding to main loop for context snapshot"
                 );
                 AgentEvent::LlmUsage {
                     prompt_tokens,
                     completion_tokens,
                     cached_prompt_tokens,
                     cache_creation_prompt_tokens,
+                    usage_reported,
                 }
             }
             // Other framework events (GuardTriggered, MemoryRecalled,
@@ -1054,6 +1074,9 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &AgentHandle, cmd: &str) 
             app.chat_scroll = 0;
             app.conversation_id = Some(uuid::Uuid::new_v4().to_string());
             app.clear_selection();
+            // conversation 边界：Snapshot + Accumulator 双清（与 Web clearMessages 对等）。
+            app.context_snapshot.clear_usage();
+            app.usage_accumulator.reset();
             agent
                 .read_async(|a| {
                     Box::pin(async move {
@@ -1089,6 +1112,9 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &AgentHandle, cmd: &str) 
                 .await;
             match result {
                 Ok((stats, _checkpoint)) => {
+                    // 手动 /compact 不走 run_compact，不会发 ContextCompressed；
+                    // 成功路径显式 clear_usage，与 auto-compact 效果一致。
+                    app.context_snapshot.clear_usage();
                     let saved = stats.before_tokens.saturating_sub(stats.after_tokens);
                     app.messages.push(ChatMessage {
                         role: MessageRole::System,

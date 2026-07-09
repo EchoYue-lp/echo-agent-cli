@@ -60,12 +60,23 @@ export function handleChatEvent(event: ChatEvent, ctx: EventContext): void {
     case 'llm_usage': {
       // 更新上下文窗口占用快照（不作为聊天消息渲染，仅驱动 footer 指示器）。
       // 对齐 Claude Code statusline：用真实 prompt_tokens 表示当前上下文长度。
+      // usage_reported=false 时不更新（避免闪 0 / 污染命中率）。
+      if (event.usage_reported === false) {
+        break;
+      }
       store.setContextWindow({
         inputTokens: event.prompt_tokens,
         cachedTokens: event.cached_prompt_tokens,
         cacheCreationTokens: event.cache_creation_prompt_tokens,
         outputTokens: event.completion_tokens,
+        usageReported: true,
       });
+      store.recordUsage(event.prompt_tokens, event.cached_prompt_tokens);
+      break;
+    }
+    case 'context_compressed': {
+      // 方案 A：压缩后 Snapshot 置空，Accumulator 保留（会话级缓存率跨压缩）。
+      store.clearContextWindow();
       break;
     }
     case 'tool_start': {

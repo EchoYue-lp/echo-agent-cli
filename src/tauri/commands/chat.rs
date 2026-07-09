@@ -51,6 +51,14 @@ pub enum ChatEvent {
         cache_creation_prompt_tokens: usize,
         usage_reported: bool,
     },
+    /// Auto-compact 后通知前端：Snapshot 置空，Accumulator 保留。
+    #[serde(rename = "context_compressed")]
+    ContextCompressed {
+        before_count: usize,
+        after_count: usize,
+        before_tokens: usize,
+        after_tokens: usize,
+    },
     #[serde(rename = "tool_start")]
     ToolStart {
         name: String,
@@ -1077,6 +1085,17 @@ fn agent_event_to_chat_event(
                 usage_reported: *usage_reported,
             })
         }
+        AgentEvent::ContextCompressed {
+            before_count,
+            after_count,
+            before_tokens,
+            after_tokens,
+        } => Some(ChatEvent::ContextCompressed {
+            before_count: *before_count,
+            after_count: *after_count,
+            before_tokens: *before_tokens,
+            after_tokens: *after_tokens,
+        }),
         AgentEvent::ToolCall { name, args } => {
             let _ = emit_chat_event(
                 app,

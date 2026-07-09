@@ -71,6 +71,13 @@ export type ChatEvent = {
       cache_creation_prompt_tokens: number;
       usage_reported: boolean;
     }
+  | {
+      type: 'context_compressed';
+      before_count: number;
+      after_count: number;
+      before_tokens: number;
+      after_tokens: number;
+    }
   | { type: 'tool_start'; name: string; args: unknown }
   | { type: 'tool_result'; name: string; result: string; success: boolean }
   | { type: 'chart'; spec: unknown }

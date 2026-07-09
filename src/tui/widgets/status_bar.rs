@@ -29,15 +29,26 @@ impl Widget for StatusBar {
             "ready"
         };
         let state_color = if app.is_processing { t.yellow } else { t.green };
-        // 上下文窗口占用（对齐 Claude Code statusline）。
+        // 上下文窗口占用（对齐 Claude Code statusline）+ 会话缓存命中率。
         let ctx = &app.context_snapshot;
-        let pct = ctx.used_percentage();
-        let bar = echo_agent_app_core::context_window::render_progress_bar(pct);
+        let pct = if ctx.is_available() {
+            ctx.used_percentage()
+        } else {
+            None
+        };
+        let ring = echo_agent_app_core::context_window::render_ring_char(pct);
         let tier = echo_agent_app_core::context_window::usage_tier(pct);
         let ctx_color = match tier {
             echo_agent_app_core::context_window::UsageTier::Critical => t.red,
             echo_agent_app_core::context_window::UsageTier::High => t.yellow,
             _ => t.subtext,
+        };
+        let cache_span = match app.usage_accumulator.cache_hit_rate() {
+            Some(rate) => {
+                let pct_i = (rate * 100.0).round().clamp(0.0, 100.0) as u16;
+                format!(" · cache {}%", pct_i)
+            }
+            None => " · cache --".to_string(),
         };
         let context_span = if ctx.is_available() {
             let used_str =
@@ -45,14 +56,14 @@ impl Widget for StatusBar {
             let win_str =
                 echo_agent_app_core::context_window::format_token_count(ctx.context_window_size);
             match pct {
-                Some(p) => format!("  {} {}/{} {}%", bar, used_str, win_str, p),
-                None => format!("  {} {}", bar, used_str),
+                Some(p) => format!("  {} {}/{} {}%{}", ring, used_str, win_str, p, cache_span),
+                None => format!("  {} {}{}", ring, used_str, cache_span),
             }
         } else {
-            // 首次响应前：显示占位（不显示 0%，避免误导）。
+            // 首次响应前 / 刚压缩后：占用占位；cache 率可能仍有值（压缩不清 Accumulator）。
             let win_str =
                 echo_agent_app_core::context_window::format_token_count(ctx.context_window_size);
-            format!("  · --/{}", win_str)
+            format!("  {} --/{}{}", ring, win_str, cache_span)
         };
         let sidebar_hint = if app.sidebar_visible {
             "side"

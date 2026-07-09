@@ -22,8 +22,9 @@ import {
 } from '../../api/endpoints';
 import { useUiStore } from '../../stores/uiStore';
 import { useToastStore } from '../../stores/toastStore';
-import { useChatStore } from '../../stores/chatStore';
+import { useChatStore, cacheHitRate } from '../../stores/chatStore';
 import type { Attachment, ConfiguredModel } from '../../types/api';
+import { CONTEXT_RING_CIRCUMFERENCE, ringDashOffset } from './contextRing';
 import {
   filterCommands,
   groupByCategory,
@@ -230,6 +231,90 @@ function formatTokens(n: number): string {
   return formatted.endsWith('.0') ? `${Math.round(n / 1000)}k` : `${formatted}k`;
 }
 
+function ContextRingIndicator({
+  pct,
+  used,
+  win,
+  tier,
+  cacheRate,
+}: {
+  pct: number | null;
+  used: number | null;
+  win: number | null;
+  tier: 'normal' | 'high' | 'critical' | 'unknown';
+  cacheRate: number | null;
+}) {
+  const [hover, setHover] = useState(false);
+  const color =
+    tier === 'critical'
+      ? 'var(--color-error)'
+      : tier === 'high'
+        ? 'var(--color-warning)'
+        : 'var(--text-tertiary)';
+  const ratio = pct != null ? pct / 100 : null;
+  const offset = ringDashOffset(ratio);
+  const centerLabel = pct != null ? `${pct}%` : '--';
+  const cacheLabel =
+    cacheRate != null ? `${Math.round(cacheRate * 1000) / 10}%` : '--';
+  const capacityLine =
+    used != null && win != null && pct != null
+      ? `上下文容量：${formatTokens(used)} / ${formatTokens(win)} (${pct}%)`
+      : used != null
+        ? `上下文容量：${formatTokens(used)} tokens`
+        : '上下文容量：--';
+
+  return (
+    <span
+      className="relative inline-flex items-center"
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+    >
+      <svg width="28" height="28" viewBox="0 0 28 28" aria-hidden="true">
+        <circle
+          cx="14"
+          cy="14"
+          r="10"
+          fill="none"
+          stroke="var(--border-primary)"
+          strokeWidth="2.5"
+        />
+        <circle
+          cx="14"
+          cy="14"
+          r="10"
+          fill="none"
+          stroke={color}
+          strokeWidth="2.5"
+          strokeLinecap="round"
+          strokeDasharray={CONTEXT_RING_CIRCUMFERENCE}
+          strokeDashoffset={offset}
+          transform="rotate(-90 14 14)"
+        />
+        <text
+          x="14"
+          y="14"
+          textAnchor="middle"
+          dominantBaseline="central"
+          fill={color}
+          fontSize="7"
+          fontFamily="ui-monospace, SFMono-Regular, Menlo, monospace"
+        >
+          {centerLabel}
+        </text>
+      </svg>
+      {hover && (
+        <span
+          className="absolute bottom-full left-1/2 z-50 mb-2 -translate-x-1/2 whitespace-nowrap rounded-md border border-[var(--border-primary)] bg-[var(--bg-primary)] px-2.5 py-1.5 text-[11px] leading-relaxed text-[var(--text-secondary)] shadow-[var(--shadow-md)]"
+          role="tooltip"
+        >
+          <span className="block">{capacityLine}</span>
+          <span className="block">平均缓存命中率：{cacheLabel}</span>
+        </span>
+      )}
+    </span>
+  );
+}
+
 export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
   const [text, setText] = useState('');
   const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
@@ -254,6 +339,7 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
   const displayModel = activeModel ?? visibleModels[0] ?? null;
   // 上下文窗口占用（来自 llm_usage 事件 → chatStore）。
   const contextWindow = useChatStore((s) => s.contextWindow);
+  const usageAccumulator = useChatStore((s) => s.usageAccumulator);
   // 当前默认模型的 context_window 上限（ConfiguredModel 已有该字段）。
   const contextWindowSize = activeModel?.context_window ?? null;
   const activePermissionMode =
@@ -662,28 +748,35 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
   const hasContent = text.trim().length > 0 || pendingFiles.length > 0;
 
   // 计算上下文占用展示（对齐 Claude Code：真实 prompt_tokens / window_size）。
+  // contextWindow=null → 首条响应前或刚压缩后：仍渲染空环 + tooltip。
   const ctxUsage = (() => {
-    if (!contextWindow) return null;
+    const cacheRate = cacheHitRate(usageAccumulator);
+    if (!contextWindow) {
+      return {
+        pct: null as number | null,
+        used: null as number | null,
+        win: contextWindowSize,
+        tier: 'unknown' as const,
+        cacheRate,
+      };
+    }
     const used = contextWindow.inputTokens;
     const win = contextWindowSize;
     if (win == null || win <= 0) {
-      // window 上限未知：只显示绝对数。
       return {
-        bar: null as string | null,
         pct: null as number | null,
         used,
         win: null as number | null,
         tier: 'unknown' as const,
+        cacheRate,
       };
     }
     // 用 floor（而非 round）对齐 Rust used_percentage 的整数除法语义，
     // 确保 TUI/Web 在 70%/90% 阈值边界颜色分级完全一致。
     const pct = Math.min(100, Math.floor((used / win) * 100));
-    const filled = Math.ceil(pct / 10);
-    const bar = '▓'.repeat(filled) + '░'.repeat(10 - filled);
     const tier =
       pct >= 90 ? ('critical' as const) : pct >= 70 ? ('high' as const) : ('normal' as const);
-    return { bar, pct, used, win, tier };
+    return { pct, used, win, tier, cacheRate };
   })();
 
   return (
@@ -966,34 +1059,13 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
               </div>
             </div>
             <div className="flex items-center gap-3">
-              {ctxUsage && (
-                <span
-                  className="font-mono text-[11px]"
-                  style={{
-                    color:
-                      ctxUsage.tier === 'critical'
-                        ? 'var(--color-error)'
-                        : ctxUsage.tier === 'high'
-                          ? 'var(--color-warning)'
-                          : 'var(--text-tertiary)',
-                  }}
-                  title={
-                    ctxUsage.win
-                      ? `上下文窗口: ${ctxUsage.used} / ${ctxUsage.win} tokens (${ctxUsage.pct}%)`
-                      : `上下文: ${ctxUsage.used} tokens`
-                  }
-                >
-                  {ctxUsage.bar ? (
-                    <>
-                      <span className="mr-1">{ctxUsage.bar}</span>
-                      {formatTokens(ctxUsage.used)}/{formatTokens(ctxUsage.win as number)} ·{' '}
-                      {ctxUsage.pct}%
-                    </>
-                  ) : (
-                    <>{formatTokens(ctxUsage.used)} tokens</>
-                  )}
-                </span>
-              )}
+              <ContextRingIndicator
+                pct={ctxUsage.pct}
+                used={ctxUsage.used}
+                win={ctxUsage.win}
+                tier={ctxUsage.tier}
+                cacheRate={ctxUsage.cacheRate}
+              />
               <span>Enter 发送</span>
               {text.length > 0 && <span>{text.length} 字</span>}
             </div>

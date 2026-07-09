@@ -26,7 +26,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use echo_agent_app_core::context_window::ContextWindowSnapshot;
+use echo_agent_app_core::context_window::{ContextUsageAccumulator, ContextWindowSnapshot};
 use echo_agent_app_core::evolution::ReviewIntegration;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -191,8 +191,10 @@ pub struct TuiApp {
     pub tokens: (u32, u32, u32),
     /// 模型上下文窗口上限（启动时从 agent token_limit 读一次；0 表示未知）。
     pub context_window_size: u32,
-    /// 当前上下文窗口占用快照（每次 LlmUsage 后覆盖）。
+    /// 当前上下文窗口占用快照（每次 LlmUsage 后覆盖；压缩后 clear_usage）。
     pub context_snapshot: ContextWindowSnapshot,
+    /// 会话级 LLM 用量累计（缓存命中率）；压缩不清，/clear 清零。
+    pub usage_accumulator: ContextUsageAccumulator,
     /// Tool count.
     pub tool_count: usize,
     /// Current ReAct iteration count (incremented on each ThinkStart).
@@ -352,6 +354,7 @@ impl TuiApp {
             tokens: (0, 0, 0),
             context_window_size: 0,
             context_snapshot: ContextWindowSnapshot::default(),
+            usage_accumulator: ContextUsageAccumulator::default(),
             tool_count: 0,
             iteration_count: 0,
             active_task: None,

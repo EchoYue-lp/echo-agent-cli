@@ -11,6 +11,7 @@ use serde::Serialize;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use tauri::Emitter;
 
 // ════════════════════════════════════════════════════════════════════════════
 // Permissions
@@ -957,6 +958,7 @@ pub async fn execute_sandbox(
 
 #[tauri::command]
 pub async fn compress_context(
+    app: tauri::AppHandle,
     state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
     let (messages_before, messages_after, tokens_before, tokens_after) = state
@@ -990,6 +992,18 @@ pub async fn compress_context(
             "tokens_saved": 0,
         }))
     } else {
+        // 手动压缩不走 run_compact，不会发 AgentEvent::ContextCompressed；
+        // 显式 emit，与 auto-compact 对齐（前端 Snapshot 置空、Accumulator 保留）。
+        let payload = serde_json::json!({
+            "type": "context_compressed",
+            "before_count": messages_before,
+            "after_count": messages_after,
+            "before_tokens": tokens_before,
+            "after_tokens": tokens_after,
+        });
+        if let Err(e) = app.emit("chat://event", payload) {
+            tracing::warn!(error = %e, "failed to emit context_compressed after manual compress");
+        }
         Ok(serde_json::json!({
             "success": true,
             "message": format!("Compressed: {messages_before} → {messages_after} messages"),

@@ -24,6 +24,19 @@ export interface ContextWindowUsage {
   cacheCreationTokens: number;
   /** 本次生成 token（不计入占用，仅参考）。 */
   outputTokens: number;
+  /** provider 是否上报了 usage；false 时不应写入 store。 */
+  usageReported: boolean;
+}
+
+/** 会话级 LLM 用量累计（缓存命中率）；压缩不清，会话重置时清零。 */
+export interface ContextUsageAccumulator {
+  totalInput: number;
+  totalCached: number;
+}
+
+export function cacheHitRate(acc: ContextUsageAccumulator): number | null {
+  if (acc.totalInput <= 0) return null;
+  return acc.totalCached / acc.totalInput;
 }
 
 interface ChatState {
@@ -47,8 +60,10 @@ interface ChatState {
   isHistoryView: boolean;
   /** Current round being built during streaming */
   currentRound: CurrentRound | null;
-  /** 当前上下文窗口占用（来自最近一次 llm_usage 事件的真实 prompt_tokens）。null = 首次响应前。 */
+  /** 当前上下文窗口占用（来自最近一次 llm_usage 事件的真实 prompt_tokens）。null = 首次响应前 / 刚压缩后。 */
   contextWindow: ContextWindowUsage | null;
+  /** 会话级缓存命中率累加器（压缩保留，clear/replace 清零）。 */
+  usageAccumulator: ContextUsageAccumulator;
 
   addUserMessage: (content: string, attachments?: ChatMessage['attachments']) => void;
   startAssistantMessage: (idOverride?: string) => string;
@@ -76,9 +91,12 @@ interface ChatState {
   prepareRegenerate: () => string | null;
   /** Edit a user message, delete all messages after it, return new content for resend */
   prepareEditAndResend: (messageId: string, newContent: string) => string | null;
-  /** 更新上下文窗口占用快照（由 llm_usage 事件驱动）。会话清空/加载历史时由
-   *  clearMessages / replaceMessages 内联重置为 null，无需单独 action。 */
+  /** 更新上下文窗口占用快照（由 llm_usage 事件驱动，仅 usageReported=true）。 */
   setContextWindow: (usage: ContextWindowUsage) => void;
+  /** 压缩边界：只清 Snapshot，保留 Accumulator。 */
+  clearContextWindow: () => void;
+  /** 累加一次 usage（仅 usageReported=true 时由 handler 调用）。 */
+  recordUsage: (input: number, cached: number) => void;
 }
 
 /// Maximum number of messages retained in-memory. Beyond this, oldest messages
@@ -126,6 +144,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   isHistoryView: false,
   currentRound: null,
   contextWindow: null,
+  usageAccumulator: { totalInput: 0, totalCached: 0 },
 
   addUserMessage: (content, attachments) => {
     set((s) => {
@@ -379,6 +398,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       pendingToolCalls: [],
       currentRound: null,
       contextWindow: null,
+      usageAccumulator: { totalInput: 0, totalCached: 0 },
       runStatus: 'idle',
     }),
 
@@ -393,12 +413,23 @@ export const useChatStore = create<ChatState>((set, get) => ({
       selectionRequest: null,
       // 加载历史会话时清空实时上下文占用（历史视图无 live llm_usage，显示旧值会误导）。
       contextWindow: null,
+      usageAccumulator: { totalInput: 0, totalCached: 0 },
       runStatus: 'idle',
     }),
 
   setHistoryView: (v) => set({ isHistoryView: v }),
 
   setContextWindow: (usage) => set({ contextWindow: usage }),
+
+  clearContextWindow: () => set({ contextWindow: null }),
+
+  recordUsage: (input, cached) =>
+    set((s) => ({
+      usageAccumulator: {
+        totalInput: s.usageAccumulator.totalInput + input,
+        totalCached: s.usageAccumulator.totalCached + cached,
+      },
+    })),
 
   prepareRegenerate: () => {
     const { messages } = get();
