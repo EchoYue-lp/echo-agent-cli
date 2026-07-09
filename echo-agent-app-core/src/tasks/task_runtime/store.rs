@@ -204,7 +204,7 @@ impl TaskRuntimeStore {
                     "root_message_id": run.root_message_id,
                     "route": run.route,
                     "attended_mode": attended_mode.as_str(),
-                    "created_at": run.created_at.to_rfc3339(),
+                    "created_at": echo_agent::utils::time::to_local(run.created_at).to_rfc3339(),
                 }),
             )?;
             self.shadow.rewrite_plan(&run.run_id)?;
@@ -700,7 +700,7 @@ impl TaskRuntimeStore {
             if !plan.tasks.iter().any(|t| t.id == task_id) {
                 return Err(StoreError::TaskNotFound(task_id.to_string()));
             }
-            let now = Utc::now().to_rfc3339();
+            let now = echo_agent::utils::time::now_local().to_rfc3339();
             let started = matches!(status, TodoStatus::Running);
             let finished = matches!(
                 status,
@@ -794,7 +794,7 @@ impl TaskRuntimeStore {
                     "issues": r.issues,
                     "failure_fingerprint": r.failure_fingerprint,
                     "created_fix_task_id": r.created_fix_task_id,
-                    "created_at": r.created_at.to_rfc3339(),
+                    "created_at": echo_agent::utils::time::to_local(r.created_at).to_rfc3339(),
                 }),
             )?;
             self.shadow.rewrite_plan(&r.run_id)?;

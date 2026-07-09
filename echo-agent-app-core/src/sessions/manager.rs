@@ -5,8 +5,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use chrono::Utc;
-
 use super::export::SessionExporter;
 use super::types::{Session, SessionDiff, SessionSummary};
 
@@ -75,7 +73,7 @@ impl SessionManager {
     /// 保存会话
     pub fn save(&self, session: &Session) -> anyhow::Result<()> {
         let mut s = session.clone();
-        s.updated_at = Utc::now().to_rfc3339();
+        s.updated_at = echo_agent::utils::time::now_local().to_rfc3339();
         s.message_count = s.messages.len();
         let path = self.session_path(&s.id);
         if let Some(parent) = path.parent() {

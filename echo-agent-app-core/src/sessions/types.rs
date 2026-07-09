@@ -1,6 +1,5 @@
 //! 会话管理类型定义
 
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 /// 增强的会话记录
@@ -117,7 +116,7 @@ pub enum DiffLine {
 impl Session {
     /// 创建新会话
     pub fn new(name: &str, model: &str) -> Self {
-        let now = Utc::now().to_rfc3339();
+        let now = echo_agent::utils::time::now_local().to_rfc3339();
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             name: name.to_string(),
@@ -137,7 +136,7 @@ impl Session {
 
     /// 从已存在的会话创建分支
     pub fn branch_from(parent: &Session, branch_name: &str) -> Self {
-        let now = Utc::now().to_rfc3339();
+        let now = echo_agent::utils::time::now_local().to_rfc3339();
         Self {
             id: uuid::Uuid::new_v4().to_string(),
             name: format!("{}/{}", parent.name, branch_name),

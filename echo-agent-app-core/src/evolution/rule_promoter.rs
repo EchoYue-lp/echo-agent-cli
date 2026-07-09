@@ -53,6 +53,7 @@ pub struct RuleProposal {
     /// Memory type of the source.
     pub memory_type: MemoryType,
     /// When this proposal was created.
+    #[serde(with = "echo_agent::utils::time::local_rfc3339")]
     pub proposed_at: DateTime<Utc>,
     /// Reason for promotion.
     pub reason: String,
@@ -232,7 +233,7 @@ impl RulePromoter {
         let updated_content = format!(
             "{}\n\n<!-- PROMOTED_TO_RULE: {} -->",
             entry.content.trim_end(),
-            Utc::now().to_rfc3339()
+            echo_agent::utils::time::now_local().to_rfc3339()
         );
 
         // Update the memory with the marker

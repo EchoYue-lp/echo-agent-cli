@@ -678,7 +678,11 @@ pub struct TaskRun {
     #[serde(default)]
     #[ts(skip)]
     pub attachments: Vec<crate::attachments::AttachmentRef>,
+    #[serde(with = "echo_agent::utils::time::local_rfc3339")]
+    #[ts(as = "String")]
     pub created_at: DateTime<Utc>,
+    #[serde(with = "echo_agent::utils::time::local_rfc3339")]
+    #[ts(as = "String")]
     pub updated_at: DateTime<Utc>,
 }
 
@@ -793,7 +797,11 @@ pub struct TodoItem {
     pub title: String,
     pub status: TodoStatus,
     pub owner_agent: Option<String>,
+    #[serde(with = "echo_agent::utils::time::option_local_rfc3339")]
+    #[ts(as = "Option<String>")]
     pub started_at: Option<DateTime<Utc>>,
+    #[serde(with = "echo_agent::utils::time::option_local_rfc3339")]
+    #[ts(as = "Option<String>")]
     pub completed_at: Option<DateTime<Utc>>,
     pub summary: Option<String>,
 }
@@ -816,6 +824,8 @@ pub struct RuntimeTaskEvent {
     pub step_id: Option<String>,
     pub event_type: RuntimeEventKind,
     pub payload: serde_json::Value,
+    #[serde(with = "echo_agent::utils::time::local_rfc3339")]
+    #[ts(as = "String")]
     pub timestamp: DateTime<Utc>,
 }
 
@@ -981,6 +991,8 @@ pub struct ReviewResult {
     pub issues: Vec<ReviewIssue>,
     pub failure_fingerprint: Option<String>,
     pub created_fix_task_id: Option<String>,
+    #[serde(with = "echo_agent::utils::time::local_rfc3339")]
+    #[ts(as = "String")]
     pub created_at: DateTime<Utc>,
 }
 
@@ -1041,6 +1053,8 @@ pub struct TaskExecutionSummary {
     pub next_implications: Vec<String>,
     #[serde(default)]
     pub suggested_tasks: Vec<SuggestedTask>,
+    #[serde(with = "echo_agent::utils::time::local_rfc3339")]
+    #[ts(as = "String")]
     pub created_at: DateTime<Utc>,
 }
 
@@ -1133,6 +1147,8 @@ pub struct UsageRecord {
     pub tools_schema_hash: Option<String>,
     pub cwd_hash: Option<String>,
     pub worker_prompt_hash: Option<String>,
+    #[serde(with = "echo_agent::utils::time::local_rfc3339")]
+    #[ts(as = "String")]
     pub created_at: DateTime<Utc>,
 }
 
@@ -1146,7 +1162,11 @@ pub struct UsageQueryFilter {
     pub model: Option<String>,
     pub provider: Option<String>,
     pub route_kind: Option<String>,
+    #[serde(with = "echo_agent::utils::time::option_local_rfc3339")]
+    #[ts(as = "Option<String>")]
     pub created_after: Option<DateTime<Utc>>,
+    #[serde(with = "echo_agent::utils::time::option_local_rfc3339")]
+    #[ts(as = "Option<String>")]
     pub created_before: Option<DateTime<Utc>>,
     pub limit: Option<u32>,
     pub offset: Option<u32>,
@@ -1169,7 +1189,11 @@ pub enum UsageGroupBy {
 #[ts(export, rename = "UsageAggregationFilter")]
 pub struct UsageAggregationFilter {
     pub group_by: Vec<UsageGroupBy>,
+    #[serde(with = "echo_agent::utils::time::option_local_rfc3339")]
+    #[ts(as = "Option<String>")]
     pub created_after: Option<DateTime<Utc>>,
+    #[serde(with = "echo_agent::utils::time::option_local_rfc3339")]
+    #[ts(as = "Option<String>")]
     pub created_before: Option<DateTime<Utc>>,
     pub model: Option<String>,
     pub provider: Option<String>,

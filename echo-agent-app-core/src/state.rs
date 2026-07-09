@@ -281,6 +281,7 @@ impl Default for SandboxConfigData {
 pub struct McpHealthStatus {
     pub name: String,
     pub healthy: bool,
+    #[serde(with = "echo_agent::utils::time::option_local_rfc3339")]
     pub last_check: Option<DateTime<Utc>>,
     pub error: Option<String>,
 }

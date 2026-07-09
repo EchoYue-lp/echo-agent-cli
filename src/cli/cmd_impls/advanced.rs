@@ -29,7 +29,7 @@ async fn cmd_save(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             }).collect();
             serde_json::json!({
                 "name": name,
-                "saved_at": chrono::Utc::now().to_rfc3339(),
+                "saved_at": echo_agent::utils::time::now_local().to_rfc3339(),
                 "messages": messages,
                 "plan_mode": a.is_plan_mode(),
             })

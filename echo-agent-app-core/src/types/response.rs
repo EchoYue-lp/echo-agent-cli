@@ -62,6 +62,8 @@ pub struct McpServerInfo {
     pub transport: String,
     pub tool_count: usize,
     pub tools: Vec<McpToolInfo>,
+    #[serde(with = "echo_agent::utils::time::option_local_rfc3339")]
+    #[ts(as = "Option<String>")]
     pub connected_at: Option<DateTime<Utc>>,
     pub error: Option<String>,
 }

@@ -1,6 +1,5 @@
 //! 配置档案类型定义
 
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 /// 命名配置档案
@@ -55,7 +54,7 @@ fn default_max_iterations() -> usize {
 impl Profile {
     /// 创建新档案
     pub fn new(name: &str, model: &str) -> Self {
-        let now = Utc::now().to_rfc3339();
+        let now = echo_agent::utils::time::now_local().to_rfc3339();
         Self {
             name: name.to_string(),
             model: model.to_string(),

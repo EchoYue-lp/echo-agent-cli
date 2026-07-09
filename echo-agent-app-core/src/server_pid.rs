@@ -31,7 +31,7 @@ pub fn write_pid(port: u16) -> anyhow::Result<()> {
     let info = ServerPid {
         pid: std::process::id(),
         port,
-        started_at: chrono::Utc::now().to_rfc3339(),
+        started_at: echo_agent::utils::time::now_local().to_rfc3339(),
     };
     let json = serde_json::to_string_pretty(&info)?;
     std::fs::write(&path, json)?;

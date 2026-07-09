@@ -102,7 +102,7 @@ pub async fn list_files(
             let size = metadata.as_ref().map(|m| m.len()).unwrap_or(0);
             let modified = metadata.and_then(|m| m.modified().ok()).map(|t| {
                 let datetime: chrono::DateTime<chrono::Utc> = t.into();
-                datetime.to_rfc3339()
+                echo_agent::utils::time::to_local(datetime).to_rfc3339()
             });
             let extension = path.extension().map(|e| e.to_string_lossy().to_string());
             let relative = path

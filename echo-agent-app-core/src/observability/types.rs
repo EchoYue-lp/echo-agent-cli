@@ -8,6 +8,7 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceEvent {
     /// 事件时间戳。
+    #[serde(with = "echo_agent::utils::time::local_rfc3339")]
     pub timestamp: DateTime<Utc>,
     /// 事件类型。
     pub kind: TraceKind,

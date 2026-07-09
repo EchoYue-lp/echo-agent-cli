@@ -98,7 +98,7 @@ pub async fn save_conversation(
                 attachments_json,
                 tool_calls_json: m.tool_calls.and_then(|tc| serde_json::to_string(&tc).ok()),
                 tool_result_json: m.tool_result,
-                created_at: chrono::Utc::now().to_rfc3339(),
+                created_at: echo_agent::utils::time::now_local().to_rfc3339(),
             }
         })
         .collect();
@@ -239,7 +239,7 @@ pub async fn update_conversation(
                     attachments_json,
                     tool_calls_json: m.tool_calls.and_then(|tc| serde_json::to_string(&tc).ok()),
                     tool_result_json: m.tool_result,
-                    created_at: chrono::Utc::now().to_rfc3339(),
+                    created_at: echo_agent::utils::time::now_local().to_rfc3339(),
                 }
             })
             .collect();

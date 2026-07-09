@@ -49,6 +49,7 @@ impl WebhookEvent {
 #[derive(Debug, Serialize)]
 pub struct WebhookPayload {
     pub event: String,
+    #[serde(with = "echo_agent::utils::time::local_rfc3339")]
     pub timestamp: DateTime<Utc>,
     pub data: WebhookEvent,
 }

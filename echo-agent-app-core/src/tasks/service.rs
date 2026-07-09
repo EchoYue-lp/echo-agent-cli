@@ -858,10 +858,10 @@ fn task_to_unified(t: &Task, source: &'static str) -> UnifiedTaskInfo {
     let (status, error) = status_to_str(&t.status);
     // Task.created_at/updated_at are u64 unix seconds.
     let created_at = chrono::DateTime::from_timestamp(t.created_at as i64, 0)
-        .map(|d| d.to_rfc3339())
+        .map(|d| echo_agent::utils::time::to_local(d).to_rfc3339())
         .unwrap_or_default();
     let updated_at = chrono::DateTime::from_timestamp(t.updated_at as i64, 0)
-        .map(|d| d.to_rfc3339())
+        .map(|d| echo_agent::utils::time::to_local(d).to_rfc3339())
         .unwrap_or_default();
     UnifiedTaskInfo {
         id: t.id.clone(),
@@ -897,8 +897,8 @@ fn run_to_unified(r: &super::task_runtime::TaskRun, source: &'static str) -> Uni
         id: r.run_id.clone(),
         description: r.goal.clone(),
         status,
-        created_at: r.created_at.to_rfc3339(),
-        updated_at: r.updated_at.to_rfc3339(),
+        created_at: echo_agent::utils::time::to_local(r.created_at).to_rfc3339(),
+        updated_at: echo_agent::utils::time::to_local(r.updated_at).to_rfc3339(),
         result: None,
         error: None,
         kind,

@@ -10,7 +10,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use chrono::Utc;
 use echo_agent::prelude::Message;
 use serde::{Deserialize, Serialize};
 
@@ -186,8 +185,8 @@ impl Persistence {
             model: model.to_string(),
             system_prompt: system_prompt.to_string(),
             messages: messages.iter().map(Self::convert_message).collect(),
-            created_at: Utc::now().to_rfc3339(),
-            updated_at: Utc::now().to_rfc3339(),
+            created_at: echo_agent::utils::time::now_local().to_rfc3339(),
+            updated_at: echo_agent::utils::time::now_local().to_rfc3339(),
             message_count: messages.len(),
         };
 

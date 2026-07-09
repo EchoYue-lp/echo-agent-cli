@@ -217,8 +217,10 @@ pub struct Workspace {
     #[serde(default)]
     pub metadata: WorkspaceMetadata,
     /// 创建时间。
+    #[serde(with = "echo_agent::utils::time::local_rfc3339")]
     pub created_at: DateTime<Utc>,
     /// 最后活跃时间。
+    #[serde(with = "echo_agent::utils::time::local_rfc3339")]
     pub last_active: DateTime<Utc>,
 }
 

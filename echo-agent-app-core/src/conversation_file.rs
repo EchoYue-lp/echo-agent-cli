@@ -367,7 +367,7 @@ impl ConversationStore for FileConversationStore {
 }
 
 fn now_rfc3339() -> String {
-    chrono::Utc::now().to_rfc3339()
+    echo_agent::utils::time::now_local().to_rfc3339()
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {

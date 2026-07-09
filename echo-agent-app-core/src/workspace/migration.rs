@@ -6,7 +6,6 @@
 use std::fs;
 use std::path::PathBuf;
 
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use super::WorkspaceKind;
@@ -151,7 +150,7 @@ impl LegacyMigrator {
             sessions_migrated: 0,
             conversations_migrated: 0,
             errors: vec![],
-            completed_at: Utc::now().to_rfc3339(),
+            completed_at: echo_agent::utils::time::now_local().to_rfc3339(),
         };
 
         let sessions_dir = self.legacy_base.join("sessions");

@@ -293,7 +293,7 @@ impl BackgroundTaskMeta {
             kind,
             progress: 0,
             progress_message: None,
-            submitted_at: chrono::Utc::now().to_rfc3339(),
+            submitted_at: echo_agent::utils::time::now_local().to_rfc3339(),
             submitted_via,
             priority: default_priority(),
             depends_on: Vec::new(),

@@ -28,6 +28,7 @@ pub struct DashboardMetrics {
     /// Recent evolution activities (last 10).
     pub recent_activities: Vec<ActivityEntry>,
     /// Timestamp when metrics were generated.
+    #[serde(with = "echo_agent::utils::time::local_rfc3339")]
     pub generated_at: DateTime<Utc>,
 }
 
@@ -67,6 +68,7 @@ pub struct ActivityEntry {
     /// Description of the activity.
     pub description: String,
     /// When the activity occurred.
+    #[serde(with = "echo_agent::utils::time::local_rfc3339")]
     pub timestamp: DateTime<Utc>,
 }
 

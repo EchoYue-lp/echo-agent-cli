@@ -2,7 +2,6 @@
 //!
 //! 在详细模式下记录和展示 Agent 与 LLM 之间的完整通信。
 
-use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 
@@ -152,7 +151,7 @@ pub fn create_record(
     error: Option<String>,
 ) -> LlmCallRecord {
     LlmCallRecord {
-        timestamp: Utc::now().to_rfc3339(),
+        timestamp: echo_agent::utils::time::now_local().to_rfc3339(),
         call_id: uuid::Uuid::new_v4().to_string(),
         model: model.to_string(),
         request_body: request.to_string(),

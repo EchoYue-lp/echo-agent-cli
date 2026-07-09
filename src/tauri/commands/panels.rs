@@ -734,7 +734,7 @@ pub async fn create_workflow(
 ) -> Result<serde_json::Value, IpcError> {
     use echo_agent_app_core::state::StoredWorkflow;
     let id = uuid::Uuid::new_v4().to_string();
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = echo_agent::utils::time::now_local().to_rfc3339();
     let workflow = StoredWorkflow {
         id: id.clone(),
         name,

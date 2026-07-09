@@ -1236,6 +1236,24 @@ pub fn init_logging(level: &str) {
     init_logging_with_target(level, LogTarget::Stderr);
 }
 
+/// 本地时区的日志时间格式化器。
+///
+/// tracing-subscriber 默认用 UTC（RFC3339 带 `Z` 后缀）。本格式器改用
+/// `chrono::Local` 输出机器当前时区时间（如 `2026-07-09T09:50:48.876+08:00`），
+/// 便于本地排查问题。chrono::Local 读取系统时区（`TZ` 环境变量或系统配置）。
+struct LocalTimer;
+
+impl tracing_subscriber::fmt::time::FormatTime for LocalTimer {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        // RFC3339 + 本地时区偏移，保留毫秒精度（与默认 SystemTime 精度一致）。
+        write!(
+            w,
+            "{}",
+            chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.3f%:z")
+        )
+    }
+}
+
 /// 初始化日志系统（线程安全，仅执行一次）
 ///
 /// When the `telemetry` feature is enabled, this delegates to
@@ -1291,7 +1309,8 @@ pub fn init_logging_with_target(level: &str, target: LogTarget) {
                             .with(
                                 tracing_subscriber::fmt::layer()
                                     .with_writer(std::sync::Mutex::new(file))
-                                    .with_ansi(false),
+                                    .with_ansi(false)
+                                    .with_timer(LocalTimer),
                             )
                             .try_init();
                     }
@@ -1308,14 +1327,19 @@ pub fn init_logging_with_target(level: &str, target: LogTarget) {
                         tracing_subscriber::fmt::layer()
                             .with_writer(std::sync::Mutex::new(file))
                             .with_ansi(false)
+                            .with_timer(LocalTimer)
                     });
                     if let Some(file_layer) = file_layer {
                         let _ = registry
-                            .with(tracing_subscriber::fmt::layer())
+                            .with(
+                                tracing_subscriber::fmt::layer().with_timer(LocalTimer),
+                            )
                             .with(file_layer)
                             .try_init();
                     } else {
-                        let _ = registry.with(tracing_subscriber::fmt::layer()).try_init();
+                        let _ = registry
+                            .with(tracing_subscriber::fmt::layer().with_timer(LocalTimer))
+                            .try_init();
                     }
                 }
             }

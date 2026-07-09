@@ -5,8 +5,6 @@
 use std::fs;
 use std::path::PathBuf;
 
-use chrono::Utc;
-
 use super::types::{Profile, ProfileSummary};
 
 /// 档案持久化管理器
@@ -69,12 +67,12 @@ impl ProfileManager {
     pub fn save(&self, profile: &Profile) -> anyhow::Result<()> {
         let path = self.profile_path(&profile.name);
         let mut updated = profile.clone();
-        updated.updated_at = Utc::now().to_rfc3339();
+        updated.updated_at = echo_agent::utils::time::now_local().to_rfc3339();
 
         // 如果是新文件，设置 created_at
         if !path.exists() {
             if updated.created_at.is_empty() {
-                updated.created_at = Utc::now().to_rfc3339();
+                updated.created_at = echo_agent::utils::time::now_local().to_rfc3339();
             }
         } else if let Ok(existing) = self.get(&profile.name) {
             updated.created_at = existing.created_at;
