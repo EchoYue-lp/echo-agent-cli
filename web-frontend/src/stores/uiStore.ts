@@ -12,8 +12,6 @@ export type SettingsTabId =
   | 'audit'
   | 'sandbox'
   | 'observability'
-  | 'scratchpad'
-  | 'decisions'
   | 'compress'
   | 'evolution'
   | 'plugins'

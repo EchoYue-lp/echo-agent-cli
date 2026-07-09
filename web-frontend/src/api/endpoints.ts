@@ -901,62 +901,6 @@ export const papersApi = {
       : post<Paper>(`/papers/${id}/tags`, { tags }),
 };
 
-// ── Scratchpad API ──────────────────────────────────────────────────
-
-export interface ScratchpadContent {
-  content: string;
-  modified_at: string;
-}
-
-export const scratchpadApi = {
-  get: () =>
-    isTauri()
-      ? apiInvoke<ScratchpadContent>('get_scratchpad')
-      : get<ScratchpadContent>('/scratchpad'),
-  update: (content: string) =>
-    isTauri()
-      ? apiInvoke<ScratchpadContent>('update_scratchpad', { content })
-      : put<ScratchpadContent>('/scratchpad', { content }),
-};
-
-// ── Decisions API ───────────────────────────────────────────────────
-
-export interface Decision {
-  id: string;
-  decision: string;
-  rationale: string;
-  alternatives: string[];
-  context?: string;
-  timestamp: string;
-}
-
-export interface CreateDecisionRequest {
-  decision: string;
-  rationale: string;
-  alternatives?: string[];
-  context?: string;
-}
-
-export const decisionsApi = {
-  list: (limit?: number) =>
-    isTauri()
-      ? apiInvoke<Decision[]>('list_decisions')
-      : get<Decision[]>(`/decisions${limit ? `?limit=${limit}` : ''}`),
-  create: (req: CreateDecisionRequest) =>
-    isTauri()
-      ? apiInvoke<Decision>('create_decision', {
-          title: req.decision,
-          rationale: req.rationale,
-          alternatives: req.alternatives,
-          context: req.context,
-        })
-      : post<Decision>('/decisions', req),
-  clear: () =>
-    isTauri()
-      ? apiInvoke<{ cleared: boolean }>('clear_decisions')
-      : del<{ cleared: boolean }>('/decisions'),
-};
-
 // ── Workspace API ──
 
 export interface Workspace {

@@ -17,9 +17,7 @@ import {
   Sparkles,
   Package,
   Timer,
-  FileEdit,
   GitBranch,
-  Scale,
   LayoutDashboard,
   ChevronDown,
   ChevronRight,
@@ -37,8 +35,6 @@ import { EvolutionPanel } from '../evolution/EvolutionPanel';
 import { ProviderPanel } from '../providers/ProviderPanel';
 import { PluginPanel } from '../plugins/PluginPanel';
 import { SchedulerPanel } from '../scheduler/SchedulerPanel';
-import { ScratchpadPanel } from '../scratchpad/ScratchpadPanel';
-import { DecisionLogPanel } from '../decisions/DecisionLogPanel';
 import { WorktreePanel } from '../coding/WorktreePanel';
 import { ObservabilityPanel } from '../observability/ObservabilityPanel';
 import { SandboxPanel } from '../sandbox/SandboxPanel';
@@ -88,7 +84,6 @@ const settingsGroups: SettingsGroup[] = [
     defaultOpen: true,
     items: [
       { id: 'sessions', label: '会话', icon: Save, maturity: 'live', description: '会话历史与恢复' },
-      { id: 'decisions', label: '决策', icon: Scale, maturity: 'live', description: '关键决策记录' },
     ],
   },
   {
@@ -106,7 +101,6 @@ const settingsGroups: SettingsGroup[] = [
     icon: Sparkles,
     tier: 'advanced',
     items: [
-      { id: 'scratchpad', label: '草稿', icon: FileEdit, maturity: 'advanced', description: '临时笔记与中间材料' },
       { id: 'compress', label: '压缩', icon: Minimize2, maturity: 'advanced', description: '上下文压缩与摘要' },
       { id: 'config', label: '配置', icon: Settings, maturity: 'advanced', description: '底层应用配置' },
       { id: 'worktree', label: 'Worktree', icon: GitBranch, maturity: 'advanced', description: '并行开发工作区' },
@@ -137,8 +131,6 @@ const panels: Record<SettingsTabId, React.FC> = {
   sessions: SessionsPanel,
   audit: AuditPanel,
   sandbox: SandboxPanel,
-  scratchpad: ScratchpadPanel,
-  decisions: DecisionLogPanel,
   observability: ObservabilityPanel,
   compress: CompressPanel,
   evolution: EvolutionPanel,

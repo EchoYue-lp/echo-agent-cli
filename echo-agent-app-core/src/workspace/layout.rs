@@ -115,16 +115,6 @@ impl WorkspaceLayout {
         }
     }
 
-    /// 共享草稿文件：`{root}/.eko/scratchpad.md`
-    pub fn scratchpad(root: &Path) -> PathBuf {
-        Self::state_dir(root).join("scratchpad.md")
-    }
-
-    /// 决策日志文件：`{root}/.eko/decisions.jsonl`
-    pub fn decisions(root: &Path) -> PathBuf {
-        Self::state_dir(root).join("decisions.jsonl")
-    }
-
     /// 上传文件临时目录：`{root}/.eko/uploads/`
     pub fn uploads(root: &Path) -> PathBuf {
         Self::state_dir(root).join("uploads")
@@ -149,12 +139,6 @@ impl WorkspaceLayout {
 
         for dir in &dirs {
             fs::create_dir_all(dir)?;
-        }
-
-        // 创建空的 scratchpad.md（如果不存在）
-        let scratchpad = Self::scratchpad(root);
-        if !scratchpad.exists() {
-            fs::write(&scratchpad, "# Scratchpad\n\nShared workspace notes.\n")?;
         }
 
         Ok(())
@@ -213,6 +197,5 @@ mod tests {
         assert!(WorkspaceLayout::traces(root).exists());
         assert!(WorkspaceLayout::uploads(root).exists());
         assert!(WorkspaceLayout::logs(root).exists());
-        assert!(WorkspaceLayout::scratchpad(root).exists());
     }
 }

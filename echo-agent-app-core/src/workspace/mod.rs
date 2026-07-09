@@ -15,11 +15,9 @@
 //!     ├── tasks/             # 后台任务 SQLite DB
 //!     ├── traces/            # 执行轨迹 JSONL
 //!     ├── uploads/           # 上传临时文件
-//!     ├── decisions.jsonl    # 决策日志
 //!     ├── data/              # 数据集（数据分析工作区）
 //!     ├── papers/            # PDF、参考文献、阅读笔记
 //!     ├── artifacts/         # 生成的报告、论文、图表
-//!     └── scratchpad.md      # 共享草稿
 //! ```
 
 pub mod layout;

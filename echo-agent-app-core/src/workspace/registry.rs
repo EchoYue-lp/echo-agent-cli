@@ -321,10 +321,6 @@ impl WorkspaceRegistry {
                     fs::remove_dir_all(&dir).ok();
                 }
             }
-            let old_decisions = root.join("decisions.jsonl");
-            if old_decisions.exists() {
-                fs::remove_file(&old_decisions).ok();
-            }
         }
 
         // 更新索引
