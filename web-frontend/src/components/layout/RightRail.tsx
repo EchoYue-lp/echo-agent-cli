@@ -1,87 +1,55 @@
 import { useEffect, useMemo, useState } from 'react';
-import type { ReactNode } from 'react';
-import { Bot, ChevronLeft, ChevronRight, FileText, ListTodo, RefreshCw } from 'lucide-react';
+import { CheckCircle2, Circle, Loader2, AlertCircle, ListTodo, ChevronLeft } from 'lucide-react';
 import { useConversationStore } from '../../stores/conversationStore';
 import { useChangesStore } from '../../stores/changesStore';
 import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
-import { useSubagentRunStore } from '../../stores/subagentRunStore';
 import { deriveChangedFiles } from '../../utils/deriveChangedFiles';
 import { useChatStore } from '../../stores/chatStore';
 import { ChangesDrawer } from '../changes/ChangesDrawer';
-import { TaskRuntimePanel } from '../task/TaskRuntimePanel';
-import { SubagentPanel } from '../subagent/SubagentCard';
 
-const STATUS_LABEL: Record<string, string> = {
+const TODO_LABEL: Record<string, string> = {
   pending: '待处理',
   running: '执行中',
-  paused: '已暂停',
-  cancelled: '已取消',
-  failed: '失败',
+  blocked: '阻塞',
   completed: '已完成',
+  failed: '失败',
+  skipped: '已跳过',
 };
 
-function runStatusColor(status: string): string {
-  if (['completed'].includes(status)) return 'var(--color-success)';
-  if (['running'].includes(status)) return 'var(--color-info)';
-  if (['failed', 'cancelled'].includes(status)) return 'var(--color-error)';
-  if (['paused', 'blocked'].includes(status)) return 'var(--color-warning)';
-  return 'var(--text-tertiary)';
+/** Status icon for a todo, driven by the store's raw status (no subagent derivation). */
+function TodoIcon({ status }: { status: string }) {
+  switch (status) {
+    case 'completed':
+      return <CheckCircle2 size={13} style={{ color: 'var(--color-success)' }} />;
+    case 'running':
+      return <Loader2 size={13} className="animate-spin" style={{ color: 'var(--color-info)' }} />;
+    case 'failed':
+      return <AlertCircle size={13} style={{ color: 'var(--color-error)' }} />;
+    default:
+      return <Circle size={13} style={{ color: 'var(--text-tertiary)' }} />;
+  }
 }
 
-function Section({
-  icon,
-  title,
-  count,
-  children,
-}: {
-  icon: ReactNode;
-  title: string;
-  count?: string;
-  children: ReactNode;
-}) {
-  return (
-    <section className="border-t border-[var(--border-primary)] pt-4">
-      <div className="mb-2 flex items-center gap-2">
-        <span className="text-[var(--text-tertiary)]">{icon}</span>
-        <h2 className="min-w-0 flex-1 truncate text-xs font-semibold uppercase text-[var(--text-secondary)]">
-          {title}
-        </h2>
-        {count && (
-          <span className="text-[10px] tabular-nums text-[var(--text-tertiary)]">{count}</span>
-        )}
-      </div>
-      {children}
-    </section>
-  );
-}
-
-function RailMetric({ icon, value }: { icon: ReactNode; value: number }) {
-  return (
-    <span className="flex flex-col items-center gap-1">
-      {icon}
-      <span className="text-[10px] font-medium tabular-nums text-[var(--text-secondary)]">
-        {value}
-      </span>
-    </span>
-  );
-}
-
+/**
+ * RightRail — a compact task-todo capsule.
+ *
+ * Collapsed (default): a small floating pill in the top-right corner showing
+ * the live todo progress (e.g. "2/5"). Expanded: a narrow panel with just the
+ * todo list. Everything else the old "工作台" showed (run header, cache usage,
+ * subagents, changed-files output) was removed — those are available elsewhere
+ * (main timeline / changes drawer) and made the rail a heavy 316px card.
+ */
 export function RightRail() {
-  const [collapsed, setCollapsed] = useState(false);
+  const [expanded, setExpanded] = useState(false);
   const activeId = useConversationStore((s) => s.activeId);
   const messages = useChatStore((s) => s.messages);
-  const { activeRun, todos, artifacts, refresh } = useTaskRuntimeStore();
-  const subagentRuns = useSubagentRunStore((s) => s.runs);
+  const { todos } = useTaskRuntimeStore();
 
-  const changesFiles = useChangesStore((s) => s.files);
-  const setSelected = useChangesStore((s) => s.setSelected);
-
-  // Session change detection
+  // Changed-files derivation feeds the ChangesDrawer (opened from the main
+  // panel); the rail itself no longer lists them.
   useEffect(() => {
     useChangesStore.getState().checkSessionChange(activeId);
   }, [activeId]);
-
-  // Derive changed files from messages on tool-call fingerprint
   const toolCallCount = useMemo(() => {
     let n = 0;
     for (const m of messages) n += (m.toolCalls ?? []).length;
@@ -92,212 +60,75 @@ export function RightRail() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [toolCallCount]);
 
-  const visibleRuns = useMemo(() => {
-    return Object.values(subagentRuns)
-      .filter(
-        (w) =>
-          !activeRun ||
-          w.runId === activeRun.run_id ||
-          w.conversationId === activeRun.conversation_id
-      )
-      .sort((a, b) => a.startedAt - b.startedAt);
-  }, [activeRun, subagentRuns]);
+  const completedCount = todos.filter((t) => t.status === 'completed').length;
+  const hasTodos = todos.length > 0;
 
-  const displayedChanges = changesFiles.slice(0, 12);
-  const runningSubagents = visibleRuns.filter((run) => run.status === 'running').length;
-  const completedTodos = todos.filter((todo) => todo.status === 'completed').length;
-  const outputCount = changesFiles.length + artifacts.length;
-  const hasActivity = Boolean(
-    activeRun || visibleRuns.length > 0 || changesFiles.length > 0 || artifacts.length > 0
-  );
+  // No todos and nothing to track → don't render the rail at all.
+  if (!hasTodos) {
+    return <ChangesDrawer />;
+  }
 
   return (
-    <aside
-      className={`relative hidden h-full shrink-0 overflow-visible lg:block ${
-        collapsed ? 'w-0' : 'w-[316px] border-l border-[var(--border-primary)] bg-[var(--bg-rail)]'
-      }`}
-    >
-      {collapsed && (
-        <div className="absolute right-3 top-4 z-30">
-          <button
-            onClick={() => setCollapsed(false)}
-            className="flex flex-col items-center gap-2 rounded-full border border-[var(--border-primary)] bg-[var(--bg-primary)]/95 px-2 py-2 text-[var(--text-tertiary)] shadow-[var(--shadow-md)] backdrop-blur transition-colors hover:border-[var(--accent)] hover:text-[var(--text-primary)]"
-            title="展开工作台"
-            aria-label="展开工作台"
-          >
-            <ChevronLeft size={13} />
-            <span
-              className="h-1.5 w-1.5 rounded-full"
-              style={{
-                background: activeRun ? runStatusColor(activeRun.status) : 'var(--text-tertiary)',
-              }}
-            />
-            <RailMetric icon={<ListTodo size={12} />} value={todos.length} />
-            <RailMetric icon={<Bot size={12} />} value={visibleRuns.length} />
-            <RailMetric icon={<FileText size={12} />} value={outputCount} />
-          </button>
-        </div>
+    <aside className="relative hidden h-full shrink-0 overflow-visible lg:block">
+      {/* Collapsed: small floating capsule */}
+      {!expanded && (
+        <button
+          onClick={() => setExpanded(true)}
+          className="absolute right-3 top-4 z-30 flex items-center gap-1.5 rounded-full border border-[var(--border-primary)] bg-[var(--bg-primary)]/95 px-2.5 py-1.5 text-xs font-medium tabular-nums text-[var(--text-secondary)] shadow-[var(--shadow-sm)] backdrop-blur transition-colors hover:border-[var(--accent)] hover:text-[var(--text-primary)]"
+          title="展开任务列表"
+          aria-label="展开任务列表"
+        >
+          <ListTodo size={13} />
+          <span>
+            {completedCount}/{todos.length}
+          </span>
+          <ChevronLeft size={12} className="text-[var(--text-tertiary)]" />
+        </button>
       )}
 
-      {!collapsed && (
-        <div className="flex h-full flex-col overflow-y-auto px-4 py-4">
-          <header className="pb-4">
-            <div className="mb-3 flex items-center justify-between gap-3">
-              <div className="min-w-0">
-                <h2 className="truncate text-sm font-semibold text-[var(--text-primary)]">
-                  工作台
-                </h2>
-                <p className="mt-0.5 truncate text-[11px] text-[var(--text-tertiary)]">
-                  当前会话的任务、子代理和输出
-                </p>
-              </div>
-              <button
-                onClick={() => setCollapsed(true)}
-                className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
-                title="收起工作台"
-                aria-label="收起工作台"
-              >
-                <ChevronRight size={14} />
-              </button>
-              {activeRun && (
-                <button
-                  onClick={() => refresh(activeRun.run_id)}
-                  className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
-                  title="刷新任务状态"
-                >
-                  <RefreshCw size={13} />
-                </button>
-              )}
+      {/* Expanded: narrow todo-only panel */}
+      {expanded && (
+        <div className="flex h-full w-[240px] flex-col border-l border-[var(--border-primary)] bg-[var(--bg-rail)]">
+          <header className="flex shrink-0 items-center justify-between gap-2 px-3 py-2.5">
+            <div className="flex min-w-0 items-center gap-1.5">
+              <ListTodo size={13} style={{ color: 'var(--accent)' }} />
+              <span className="text-xs font-medium text-[var(--text-primary)]">任务</span>
+              <span className="text-[10px] tabular-nums text-[var(--text-tertiary)]">
+                {completedCount}/{todos.length}
+              </span>
             </div>
-
-            {activeRun ? (
-              <div className="space-y-2">
-                <div className="flex items-center gap-2">
-                  <span
-                    className="shrink-0 rounded-md px-1.5 py-0.5 text-[10px] font-medium"
-                    style={{
-                      color: runStatusColor(activeRun.status),
-                      background: 'var(--bg-hover)',
-                    }}
-                  >
-                    {STATUS_LABEL[activeRun.status] ?? activeRun.status}
-                  </span>
-                  <span
-                    className="min-w-0 flex-1 truncate text-xs text-[var(--text-secondary)]"
-                    title={activeRun.goal}
-                  >
-                    {activeRun.goal}
-                  </span>
-                </div>
-                <div className="grid grid-cols-3 gap-2">
-                  <div className="rounded-md bg-[var(--bg-secondary)] px-2 py-1.5">
-                    <div className="text-[10px] text-[var(--text-tertiary)]">任务</div>
-                    <div className="text-xs font-medium tabular-nums text-[var(--text-primary)]">
-                      {completedTodos}/{todos.length}
-                    </div>
-                  </div>
-                  <div className="rounded-md bg-[var(--bg-secondary)] px-2 py-1.5">
-                    <div className="text-[10px] text-[var(--text-tertiary)]">子代理</div>
-                    <div className="text-xs font-medium tabular-nums text-[var(--text-primary)]">
-                      {runningSubagents}/{visibleRuns.length}
-                    </div>
-                  </div>
-                  <div className="rounded-md bg-[var(--bg-secondary)] px-2 py-1.5">
-                    <div className="text-[10px] text-[var(--text-tertiary)]">输出</div>
-                    <div className="text-xs font-medium tabular-nums text-[var(--text-primary)]">
-                      {outputCount}
-                    </div>
-                  </div>
-                </div>
-              </div>
-            ) : (
-              <p className="rounded-md border border-dashed border-[var(--border-primary)] px-3 py-2 text-xs text-[var(--text-tertiary)]">
-                {hasActivity ? '当前没有正在执行的任务' : '开始对话后，这里会显示任务状态和输出。'}
-              </p>
-            )}
+            <button
+              onClick={() => setExpanded(false)}
+              className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+              title="收起"
+              aria-label="收起"
+            >
+              <ChevronLeft size={14} className="rotate-180" />
+            </button>
           </header>
 
-          <div className="space-y-4">
-            <TaskRuntimePanel />
-
-            {visibleRuns.length > 0 && (
-              <Section
-                icon={<Bot size={13} />}
-                title="子代理"
-                count={
-                  runningSubagents > 0 ? `${runningSubagents} 运行中` : `${visibleRuns.length}`
-                }
+          <div className="min-h-0 flex-1 space-y-0.5 overflow-y-auto px-2 pb-3">
+            {todos.map((todo) => (
+              <div
+                key={todo.id}
+                className="flex items-start gap-1.5 rounded-md px-1.5 py-1 hover:bg-[var(--bg-hover)]"
               >
-                <SubagentPanel
-                  subagents={Object.fromEntries(visibleRuns.map((run) => [run.subagentRunId, run]))}
-                />
-              </Section>
-            )}
-
-            <Section
-              icon={<FileText size={13} />}
-              title="输出"
-              count={
-                changesFiles.length || artifacts.length
-                  ? `${changesFiles.length} 改动 / ${artifacts.length} 产物`
-                  : undefined
-              }
-            >
-              <div className="space-y-1">
-                {displayedChanges.length === 0 && artifacts.length === 0 ? (
-                  <p className="rounded-md border border-dashed border-[var(--border-primary)] px-3 py-2 text-xs text-[var(--text-tertiary)]">
-                    暂无文件改动或产物
-                  </p>
-                ) : (
-                  displayedChanges.map((file) => {
-                    const meta =
-                      file.status === 'added'
-                        ? { label: 'A', color: 'var(--color-success, #22c55e)' }
-                        : file.status === 'deleted'
-                          ? { label: 'D', color: 'var(--color-error, #ef4444)' }
-                          : { label: 'M', color: 'var(--color-warning, #f59e0b)' };
-                    return (
-                      <button
-                        key={file.path}
-                        onClick={() => setSelected(file.path)}
-                        className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-[var(--bg-hover)]"
-                        title={file.path}
-                      >
-                        <span
-                          className="inline-flex h-4 w-4 shrink-0 items-center justify-center rounded-md text-[9px] font-bold"
-                          style={{
-                            background: `color-mix(in srgb, ${meta.color} 18%, transparent)`,
-                            color: meta.color,
-                          }}
-                        >
-                          {meta.label}
-                        </span>
-                        <span className="min-w-0 flex-1 truncate text-xs text-[var(--text-secondary)]">
-                          <span className="text-[var(--text-primary)]">{file.basename}</span>
-                          {file.dir && (
-                            <span className="text-[var(--text-tertiary)]"> · {file.dir}</span>
-                          )}
-                        </span>
-                      </button>
-                    );
-                  })
-                )}
-                {artifacts.length > 0 && (
-                  <div className="mt-2 space-y-0.5">
-                    {artifacts.map((a) => (
-                      <div
-                        key={a.id}
-                        className="flex items-center gap-1 truncate px-1 py-0.5 text-[10px] text-[var(--text-secondary)]"
-                        title={a.path ?? a.title}
-                      >
-                        <FileText size={10} className="text-[var(--text-tertiary)]" />
-                        <span className="truncate">{a.title}</span>
-                      </div>
-                    ))}
+                <div className="mt-0.5 shrink-0">
+                  <TodoIcon status={todo.status} />
+                </div>
+                <div className="min-w-0 flex-1">
+                  <div
+                    className="truncate text-[11px] text-[var(--text-primary)]"
+                    title={todo.title}
+                  >
+                    {todo.title}
                   </div>
-                )}
+                  <div className="text-[9px] text-[var(--text-tertiary)]">
+                    {TODO_LABEL[todo.status] ?? todo.status}
+                  </div>
+                </div>
               </div>
-            </Section>
+            ))}
           </div>
         </div>
       )}
