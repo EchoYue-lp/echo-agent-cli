@@ -38,20 +38,25 @@ plan_create, task_update, task_complete, task_skip, task_list.
 - Use task_list to review current plan state.
 Update your plan frequently as your understanding deepens when a formal plan is active.
 
-## 派 subagent 执行任务(plan_execute)
-plan_execute 是统一的派发入口。它的可用参数由当前模式决定:
+## 即时委派（agent_tool）
+对高噪声、边界清晰的副作用任务，直接用 agent_tool(agent_name, task) 派到独立上下文。
+默认 fresh 上下文（不继承本会话历史）；需要共享对话背景时再设 mode=fork。
+角色列表见下方 Available subagents。
+**对高噪声任务要主动用**:大范围代码库检索、多文件架构梳理、冗长日志分析、多源调研综合。
+- 适合:架构分析、bug 排查的代码侧调研、文档/配置检索、审查验证。
+- 不适合:单文件小改、简单问答、一次性查询(直接做即可)。
+
+## 多步编排（plan_create + plan_execute）
+plan_execute 是统一的 DAG 派发入口。它的可用参数由当前模式决定:
 
 ### 1. 单步派发(传 task 参数)——仅当当前 schema 暴露 task 字段时使用
-直接派一个只读 subagent(explorer/reviewer/planner/summarizer)在独立上下文跑 ReAct,只回传结论摘要给你。
-**对高噪声任务要主动用**:大范围代码库检索、多文件架构梳理、冗长日志分析、多源调研综合。subagent 在独立上下文里跑,不污染你的主会话(防 context 污染)。
-- 适合:架构分析、bug 排查的代码侧调研、文档/配置检索、审查验证。
-- 不适合:Task 模式、单文件小改、简单问答、一次性查询(直接做即可)。
+直接派一个只读 subagent 在独立上下文跑 ReAct,只回传结论摘要给你。
 
 ### 2. 多 subagent 编排(不传 task,先用 plan_create 拆 plan)——Task 模式和正式多步任务使用
 1. **拆分计划**:plan_create 拆成可独立执行的子任务(每个有清晰 title/description/kind),depends_on 表达依赖(并行无依赖,串行 A depends_on B)。title 不能为空。
 2. **统一执行**:拆完调 plan_execute,引擎(run_dag)按依赖自动并行调度多个 subagent,收集产出摘要。
 3. **收口**:plan_execute 返回结果后,基于结果写最终答案。
-4. **写任务**:需改文件的子任务用对应 kind(implementation/debugging/verification),plan_execute 安排主 agent 自己执行。
+4. **写任务**:需改文件的子任务用对应 kind(implementation/debugging/verification),plan_execute 安排对应 writer 角色。
 
 正式多 subagent 编排必须用 plan_create + plan_execute()。不要在 Task 模式里调用 plan_execute({task})。
 
@@ -214,6 +219,23 @@ pub async fn create_agent(
     // Inject task management guide when the agent has task tools available.
     system_prompt.push_str(TASK_MANAGEMENT_GUIDE);
 
+    // Resolve subagent .md scopes early so the role catalog can be injected
+    // into the system prompt before build (same defs used by register_default_subagents).
+    let subagent_project_root = params
+        .project
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .or_else(|| params.working_dir.clone())
+        .or_else(|| crate::project::context::discover_project_root(None));
+    let subagent_user_home = dirs::home_dir();
+    let discovered_subagents = crate::subagent_loader::discover_subagents(
+        subagent_project_root.as_deref(),
+        subagent_user_home.as_deref(),
+    );
+    system_prompt.push_str(&crate::subagent_loader::format_subagent_catalog(
+        &discovered_subagents,
+    ));
+
     // Determine config values from AppConfig
     let token_limit = if app_config.agent.token_limit > 0 {
         app_config.agent.token_limit
@@ -231,6 +253,7 @@ pub async fn create_agent(
         .enable_memory()
         .enable_planning()
         .enable_subagent()
+        .register_agent_dispatch_tool() // Phase 0: ad-hoc agent_tool alongside plan_execute
         .enable_human_in_loop()
         .max_iterations(app_config.agent.max_iterations)
         .token_limit(token_limit)
@@ -332,16 +355,10 @@ pub async fn create_agent(
     }
 
     // Resolve the subagent .md scopes: project root (params.project → working_dir
-    // → auto-discover) and user home. Subagents are hot-loaded from .md files
-    // (Sprint 6); builtin defaults compiled into the binary act as fallback.
+    // → auto-discover) and user home. Already resolved above for the prompt
+    // catalog; reused here for worktree factory + registration.
     // Sprint 8: the same project root also seeds the worktree factory below.
-    let subagent_project_root = params
-        .project
-        .as_ref()
-        .map(std::path::PathBuf::from)
-        .or_else(|| params.working_dir.clone())
-        .or_else(|| crate::project::context::discover_project_root(None));
-    let subagent_user_home = dirs::home_dir();
+    // (subagent_project_root / subagent_user_home computed before builder)
 
     // Sprint 8: inject a worktree-isolation factory so Fork-dispatched writer
     // subagents (those declaring `isolate_worktree: true`) can run in isolated

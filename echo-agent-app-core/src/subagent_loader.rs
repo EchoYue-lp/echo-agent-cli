@@ -196,6 +196,35 @@ pub fn discover_subagents(
     result
 }
 
+/// Format discovered subagent roles for injection into the main agent system prompt.
+///
+/// Drives description-based auto-delegation via `agent_tool` (Claude/Cursor pattern).
+pub fn format_subagent_catalog(defs: &[WorkerDefinition]) -> String {
+    let mut out = String::from(
+        "\n## Available subagents (agent_tool)\n\
+         Use agent_tool for noisy/bounded side work. Prefer plan_execute for multi-step DAGs.\n\
+         Default context is fresh; set mode=fork only when the worker needs shared session background.\n",
+    );
+    for d in defs {
+        let flags = [
+            d.readonly.then_some("readonly"),
+            d.isolate_worktree.then_some("worktree"),
+            d.isolate_workspace.then_some("workspace"),
+            d.can_delegate.then_some("can_delegate"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(",");
+        if flags.is_empty() {
+            out.push_str(&format!("- `{}`: {}\n", d.name, d.description));
+        } else {
+            out.push_str(&format!("- `{}`: {} [{}]\n", d.name, d.description, flags));
+        }
+    }
+    out
+}
+
 /// Scan a scope directory and merge its parsed subagents into `by_name`,
 /// **overwriting** any same-named entry. Higher-priority scopes are merged
 /// later (builtins first → user → project), so the last write wins, giving
@@ -705,5 +734,20 @@ team_workers: [\"explorer\", \"summarizer\"]\n\
         let fake_root = PathBuf::from("/nonexistent/definitely/not/here");
         let defs = discover_subagents(Some(&fake_root), Some(&fake_root));
         assert_eq!(defs.len(), 7);
+    }
+
+    #[test]
+    fn catalog_lists_builtin_names_and_descriptions() {
+        let defs = discover_subagents(None, None);
+        let text = format_subagent_catalog(&defs);
+        assert!(text.contains("`explorer`"));
+        assert!(text.contains("`implementer`"));
+        assert!(text.contains("agent_tool"));
+        assert!(
+            text.contains("探索") || text.contains("只读") || text.contains("Read"),
+            "catalog should include explorer description text, got: {text}"
+        );
+        assert!(text.contains("[readonly]") || text.contains("readonly"));
+        assert!(text.contains("[worktree]") || text.contains("worktree"));
     }
 }
