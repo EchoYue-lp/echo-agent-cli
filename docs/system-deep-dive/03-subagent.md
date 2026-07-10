@@ -38,6 +38,9 @@ EKO 的可派发角色由 `.md` frontmatter 热加载:
 name: explorer
 description: Read-only repository investigation
 readonly: true
+model: fast          # omit | inherit | fast | concrete model id
+max_turns: 30        # optional; omit = unlimited (builder default 0)
+is_background: false # true → agent_tool 默认走 background dispatch
 worktree: false
 workspace: false
 can_delegate: false
@@ -47,9 +50,16 @@ can_delegate: false
 语义:
 
 - `readonly: true`:应用层用 readonly builder 注册,工具集物理只读。
+- `model`: `inherit`/缺省 → 父模型；`fast` → `EKO_FAST_MODEL`（未设则回退父模型）；其它字符串 → 具体 model id。
+- `max_turns`:写入 `SubagentDefinition.max_iterations` 与 worker ReactAgent builder。
+- `is_background`:写入 `SubagentDefinition.is_background`。为 true 时（或 `agent_tool` 传 `background: true`）走框架 `dispatch_background`：立即返回 `{status:"started", execution_id, agent_name}`，worker 在后台跑；`DispatchStarted.background=true` 经 `execution://event` 到 GUI 卡片；完成后向主会话插入 `[subagent {name} finished]\n{summary}` 注记（不打断父 ReAct 当前 turn）。TUI 回灌延期。
 - `worktree: true`:writer role 通过框架 Fork worktree 隔离写入。
 - `workspace: true`:data/research role 使用无 git 的隔离数据工作区。
 - `can_delegate: true`:该 role 显式获得 `agent_tool`,并注册 child subagent registry。
+
+内置 8 个角色：`explorer`（默认 `model: fast`）、`reviewer`、`planner`、`summarizer`、`implementer`、`general-purpose`、`data-shaper`、`analyst`。
+
+父 LLM 回传：`SubagentResult.summary`（从 `## Summary` 提取，缺省 UTF-8 安全截断 output）；`agent_tool` / TaskRuntime 父上下文优先吃 summary，全文保留在 `output` 供 UI。
 
 默认 subagent 只能完成当前 PlanTask,或在结果里返回结构化 `suggested_tasks`。这些 suggested tasks 只能由主 TaskRuntime 统一 append 到全局 plan。
 
@@ -78,6 +88,13 @@ EKO **不**把 `agent_tool` 默认发给所有 subagent。只有 `.md` 显式 `c
 - 省略 / `sync` → fresh inheritance（推荐）
 - `fork` → fork inheritance（需要共享会话背景时）
 - 目标 role 声明 `worktree`/`workspace` 时，执行路径自动升为 `ExecutionMode::Fork`（与 inheritance 解耦）
+
+`background` 参数（可选 bool）:
+
+- `true` **或** 目标 role `is_background: true` → `dispatch_background`（非阻塞）
+- 否则 → 阻塞 `dispatch`，工具结果为 summary
+
+`worktree: true` 的 writer（如 builtin `implementer`）在无 `WorktreeFactory` 时 **硬失败**，不会静默共写主树。
 
 嵌套深度由同一套 `NestedDelegationPolicy` 管:
 

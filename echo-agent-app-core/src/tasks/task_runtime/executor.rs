@@ -1373,7 +1373,17 @@ async fn execute_task(
                     usage_reported = sub_result.usage.is_some(),
                     "task_runtime: read-only subagent completed"
                 );
-                (Ok(sub_result.output), sub_result.usage)
+                (
+                    Ok((
+                        if sub_result.summary.trim().is_empty() {
+                            sub_result.output.clone()
+                        } else {
+                            sub_result.summary.clone()
+                        },
+                        sub_result.output.clone(),
+                    )),
+                    sub_result.usage,
+                )
             }
             Err(e) => {
                 tracing::warn!(
@@ -1414,11 +1424,22 @@ async fn execute_task(
                     task_id = %task_id,
                     agent_role = %task.agent_role,
                     output_chars = sub_result.output.chars().count(),
+                    summary_chars = sub_result.summary.chars().count(),
                     iterations = sub_result.iterations,
                     usage_reported = sub_result.usage.is_some(),
                     "task_runtime: writer subagent completed"
                 );
-                (Ok(sub_result.output), sub_result.usage)
+                (
+                    Ok((
+                        if sub_result.summary.trim().is_empty() {
+                            sub_result.output.clone()
+                        } else {
+                            sub_result.summary.clone()
+                        },
+                        sub_result.output.clone(),
+                    )),
+                    sub_result.usage,
+                )
             }
             Err(e) => {
                 // Fallback: run in-place on the primary agent. Logged so the
@@ -1449,7 +1470,8 @@ async fn execute_task(
                         task_cancel.clone(),
                         trace_sink.clone(),
                     )
-                    .await,
+                    .await
+                    .map(|text| (text.clone(), text)),
                     None,
                 )
             }
@@ -1473,7 +1495,8 @@ async fn execute_task(
                 task_cancel.clone(),
                 trace_sink.clone(),
             )
-            .await,
+            .await
+            .map(|text| (text.clone(), text)),
             None,
         )
     };
@@ -1514,28 +1537,27 @@ async fn execute_task(
     }
 
     match result {
-        Ok(text) => {
-            let suggested_tasks = extract_suggested_tasks_from_worker_output(&text);
-            let evidence_files = extract_evidence_paths_from_worker_output(&text);
-            // The worker's full output is stored in TaskExecutionSummary.completed_work
-            // (read by build_run_summaries → main agent's plan_execute ToolResult) and
-            // returned as the task summary (used by the review gate for write tasks and
-            // stored on todo.summary for archival). No truncation: the main agent needs
-            // the complete material to write its final answer.
+        Ok((parent_facing, full_output)) => {
+            // Parent LLM / completed_work get the structured summary; extract
+            // suggested_tasks + evidence from the full output so JSON blocks
+            // outside ## Summary are not lost.
+            let suggested_tasks = extract_suggested_tasks_from_worker_output(&full_output);
+            let evidence_files = extract_evidence_paths_from_worker_output(&full_output);
             tracing::info!(
                 run_id = %run_id,
                 task_id = %task_id,
                 agent_role = %task.agent_role,
-                output_chars = text.chars().count(),
+                summary_chars = parent_facing.chars().count(),
+                output_chars = full_output.chars().count(),
                 "task_runtime: task completed"
             );
-            super::ledger::archive_trace(&run_id, &task_id, &text, None);
+            super::ledger::archive_trace(&run_id, &task_id, &full_output, None);
             let _ = super::ledger::write_progress(&store, &run_id, None);
             if let Err(e) = store.put_summary(&TaskExecutionSummary {
                 run_id: run_id.clone(),
                 task_id: task_id.clone(),
                 worker_agent: task.agent_role.clone(),
-                completed_work: vec![text.trim().to_string()],
+                completed_work: vec![parent_facing.trim().to_string()],
                 files_read: evidence_files,
                 files_changed: if is_write { task.files.clone() } else { vec![] },
                 decisions: vec![],
@@ -1555,13 +1577,13 @@ async fn execute_task(
                     worker_trace_id.clone(),
                     "completed",
                     serde_json::json!({
-                        "output": &text,
+                        "output": &parent_facing,
                     }),
                 )
                 .with_agent(task.agent_role.clone())
                 .with_title(task.title.clone()),
             );
-            Ok((task_id, Some(text.trim().to_string())))
+            Ok((task_id, Some(parent_facing.trim().to_string())))
         }
         Err(e) => {
             tracing::warn!(
@@ -2299,13 +2321,15 @@ fn build_task_prompt(
          Only suggest tasks that are genuinely needed and scoped enough to execute independently.\n",
     );
     s.push_str(
-        "\nReturn contract for the main agent:\n\
-         - Completed work: concise, evidence-backed findings or changes.\n\
-         - Evidence: include file paths with line numbers when applicable (path:line).\n\
-         - Decisions: list any concrete design/analysis decisions you made.\n\
-         - Failures/blockers: name failed commands, missing data, or uncertainty.\n\
-         - Verification: say exactly what you ran or why you could not run it.\n\
-         - Next implications: what the main agent should do with your result.\n",
+        "\nReturn format for the main agent:\n\
+         1) Write a short SUMMARY (≤ 1200 chars) under heading `## Summary`\n\
+         2) Optionally `## Artifacts` as bullet file paths\n\
+         3) Optionally the suggested_tasks JSON block above\n\
+         Everything else may be detailed notes; the parent only receives Summary \
+         (+ suggested_tasks / artifacts).\n\
+         Also cover when relevant:\n\
+         - Evidence: file paths with line numbers (path:line)\n\
+         - Decisions / failures / verification / next implications\n",
     );
     s
 }
@@ -2395,6 +2419,8 @@ fn worker_trace_sink_to_core(
 /// the full write tool set and declares `isolate_worktree: true`, so the
 /// framework's `dispatch_fork` runs it inside an isolated git worktree
 /// (eko-fork-<label>) — writes land in the worktree, not the main workspace.
+/// If no WorktreeFactory is configured, dispatch **hard-fails** (Phase 2 Task 13)
+/// rather than silently sharing the main tree.
 /// Writers still serialize via the caller's `write_sem`.
 #[allow(clippy::too_many_arguments)] // handles + cancel + sink thread through; matches framework dispatch style
 async fn run_writer_worker(
@@ -3851,7 +3877,8 @@ Read the runtime path and found one missing branch.
         assert!(p.contains("chat.rs"));
         assert!(p.contains("report root cause"));
         assert!(p.contains("Do not delegate this task to other agents"));
-        assert!(p.contains("Return contract for the main agent"));
+        assert!(p.contains("Return format for the main agent"));
+        assert!(p.contains("## Summary"));
     }
 
     #[test]

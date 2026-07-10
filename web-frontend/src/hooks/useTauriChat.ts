@@ -73,7 +73,25 @@ export function useTauriChat() {
         const payload = event.payload;
         const kind = payload.kind as string | undefined;
         if (kind === 'subagent') {
+          const runId = String(payload.subagent_run_id ?? '');
+          const prevStatus = runId
+            ? useSubagentRunStore.getState().runs[runId]?.status
+            : undefined;
           useSubagentRunStore.getState().ingest(payload as unknown as ExecutionEvent);
+          // Background subagent finished → inject a non-streaming chat note
+          // (Cursor/Claude Code style: don't interrupt the parent ReAct turn).
+          if (runId && payload.event === 'completed') {
+            const run = useSubagentRunStore.getState().runs[runId];
+            if (run?.background && prevStatus !== 'completed') {
+              const summary =
+                (typeof payload.summary === 'string' && payload.summary.trim()) ||
+                (run.summary && run.summary.trim()) ||
+                (run.output && run.output.trim()) ||
+                '(no summary)';
+              const note = `[subagent ${run.agent || runId} finished]\n${summary}`;
+              useChatStore.getState().appendLocalAssistantNote(note);
+            }
+          }
         } else if (kind === 'run' && payload.event === 'run_started') {
           // inline task / 自主 run 通过 run_started 事件激活右侧面板。
           const convId =

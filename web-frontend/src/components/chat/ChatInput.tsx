@@ -629,7 +629,12 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
     // 覆盖第一条的 streaming 状态 ref (assistantIdRef/currentMessageKeyRef/thinkingIdRef),
     // 导致第一条的 token 错误路由到第二条。UI 上发送按钮在 streaming 时已变 Stop,
     // 这里挡住 Enter 键 / 程序化调用等旁路。
-    if (isStreaming) return;
+    //
+    // 例外：/clear|/cls 是会话控制，不是并发消息。clearCurrentChat 会先 cancel
+    // 再清会话；若这里直接 return，执行中按 Enter 发 /clear 会「没反应」。
+    const trimmedEarly = text.trim().toLowerCase();
+    const isSessionClear = trimmedEarly === '/clear' || trimmedEarly === '/cls';
+    if (isStreaming && !isSessionClear) return;
     const trimmed = text.trim();
     if (!trimmed && pendingFiles.length === 0) return;
 

@@ -489,6 +489,23 @@ pub async fn create_agent(
     Ok(agent)
 }
 
+/// Resolve a worker model frontmatter value to a concrete model id.
+///
+/// - `None` / omitted → parent model
+/// - `"fast"` → `EKO_FAST_MODEL` env if set, else parent model
+/// - any other string → used as-is
+pub fn resolve_worker_model(spec: Option<&str>, parent_model: &str) -> String {
+    match spec {
+        None => parent_model.to_string(),
+        Some("fast") => std::env::var("EKO_FAST_MODEL")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| parent_model.to_string()),
+        Some(other) => other.to_string(),
+    }
+}
+
 /// Register readonly subagents on the given agent.
 ///
 /// Subagent definitions are **hot-loaded from `.md` files** (Sprint 6): project
@@ -541,31 +558,39 @@ async fn register_default_subagents(
         // Writers are still serialized at run time by `write_sem` (default 1);
         // the worktree gives each its own checkout so writes don't land in the
         // main workspace.
+        let worker_model = resolve_worker_model(worker_def.model.as_deref(), model);
+        let worker_llm = llm_config.clone().map(|mut cfg| {
+            cfg.model = worker_model.clone();
+            cfg
+        });
+        let max_iterations = worker_def.max_turns.unwrap_or(0);
         let build_result = if worker_def.readonly {
             build_readonly_worker_agent(
                 &worker_def.name,
                 &worker_def.system_prompt,
-                model,
-                llm_config.clone(),
+                &worker_model,
+                worker_llm,
                 temperature,
                 max_tokens,
                 token_limit,
                 tool_timeout_ms,
                 cache_user_id,
                 worker_def.can_delegate,
+                max_iterations,
             )
         } else {
             build_writer_worker_agent(
                 &worker_def.name,
                 &worker_def.system_prompt,
-                model,
-                llm_config.clone(),
+                &worker_model,
+                worker_llm,
                 temperature,
                 max_tokens,
                 token_limit,
                 tool_timeout_ms,
                 cache_user_id,
                 worker_def.can_delegate,
+                max_iterations,
             )
         };
         match build_result {
@@ -609,6 +634,15 @@ async fn register_default_subagents(
                 // manager/subagents from the registry at dispatch time.
                 if let Some(spec) = worker_def.team.clone() {
                     builder = builder.team(spec);
+                }
+                if let Some(ref m) = worker_def.model {
+                    builder = builder.model(m);
+                }
+                if let Some(max_turns) = worker_def.max_turns {
+                    builder = builder.max_iterations(max_turns);
+                }
+                if worker_def.is_background {
+                    builder = builder.background().tag("background");
                 }
                 builder = builder.tag(format!("prompt_source:{}", worker_def.source));
                 builder = builder.tag(if worker_def.readonly {
@@ -714,6 +748,7 @@ fn build_writer_worker_agent(
     tool_timeout_ms: u64,
     cache_user_id: &str,
     can_delegate: bool,
+    max_iterations: usize,
 ) -> std::result::Result<ReactAgent, echo_agent::error::ReactError> {
     // Mirror build_readonly_worker_agent, but OMIT `.readonly_tools()` → the
     // default `readonly_tools: false` triggers `register_all_tools`, giving the
@@ -730,7 +765,7 @@ fn build_writer_worker_agent(
         .enable_memory()
         .enable_cot()
         .enable_subagent()
-        .max_iterations(0)
+        .max_iterations(max_iterations)
         .token_limit(token_limit)
         .max_tokens(max_tokens.or(Some(DEFAULT_MAX_TOKENS)))
         .temperature(temperature)
@@ -784,6 +819,7 @@ fn build_readonly_worker_agent(
     tool_timeout_ms: u64,
     cache_user_id: &str,
     can_delegate: bool,
+    max_iterations: usize,
 ) -> std::result::Result<ReactAgent, echo_agent::error::ReactError> {
     let mut builder = ReactAgentBuilder::new()
         .model(model)
@@ -794,7 +830,7 @@ fn build_readonly_worker_agent(
         .enable_memory()
         .enable_cot()
         .enable_subagent()
-        .max_iterations(0)
+        .max_iterations(max_iterations)
         .token_limit(token_limit)
         .max_tokens(max_tokens.or(Some(DEFAULT_MAX_TOKENS)))
         .temperature(temperature)
@@ -1771,4 +1807,37 @@ pub fn build_llm_config(
         config.provider_name = Some(provider.to_string());
     }
     config
+}
+
+#[cfg(test)]
+mod resolve_worker_model_tests {
+    use super::resolve_worker_model;
+
+    #[test]
+    fn none_inherits_parent() {
+        assert_eq!(resolve_worker_model(None, "parent-model"), "parent-model");
+    }
+
+    #[test]
+    fn fast_falls_back_to_parent_without_env() {
+        // Do not assert env-dependent path; only the no-env fallback.
+        let got = resolve_worker_model(Some("fast"), "parent-model");
+        // If EKO_FAST_MODEL is set in the environment, honor it; otherwise parent.
+        if let Ok(fast) = std::env::var("EKO_FAST_MODEL") {
+            let trimmed = fast.trim();
+            if !trimmed.is_empty() {
+                assert_eq!(got, trimmed);
+                return;
+            }
+        }
+        assert_eq!(got, "parent-model");
+    }
+
+    #[test]
+    fn concrete_model_passthrough() {
+        assert_eq!(
+            resolve_worker_model(Some("claude-haiku"), "parent"),
+            "claude-haiku"
+        );
+    }
 }

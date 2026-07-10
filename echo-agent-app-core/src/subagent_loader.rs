@@ -44,6 +44,10 @@ const BUILTIN_WORKER_FILES: &[(&str, &str)] = &[
         "implementer",
         include_str!("subagents/coding/implementer.md"),
     ),
+    (
+        "general-purpose",
+        include_str!("subagents/coding/general-purpose.md"),
+    ),
     // Sprint 10: data/research subagents — per-subagent tmpdir workspace
     // (workspace:true → isolate_workspace) for disjoint output artifacts.
     ("data-shaper", include_str!("subagents/data/data-shaper.md")),
@@ -88,6 +92,16 @@ struct WorkerFrontmatter {
     /// child subagents unless explicitly granted this capability.
     #[serde(default)]
     can_delegate: bool,
+    /// Model override: omit / `inherit` → parent model; `fast` → resolved at
+    /// registration; any other string → concrete model id.
+    #[serde(default)]
+    model: Option<String>,
+    /// Max ReAct turns for this role (`None` = unlimited / builder default).
+    #[serde(default)]
+    max_turns: Option<usize>,
+    /// Prefer background dispatch (Phase 1: parse+store only; Phase 2 schedules).
+    #[serde(default)]
+    is_background: bool,
     /// Sprint 11: declare this subagent as a team-mode dispatcher. Only
     /// `"manager-worker"` is the compatibility wire value via frontmatter (other strategies are
     /// programmatic-only — they carry inline agent-name data).
@@ -128,6 +142,12 @@ pub struct WorkerDefinition {
     /// Whether this subagent may receive the framework `agent_tool` and spawn
     /// child subagents. Defaults false.
     pub can_delegate: bool,
+    /// Model override after frontmatter normalize (`None` = inherit parent).
+    pub model: Option<String>,
+    /// Max ReAct turns (`None` = unlimited / builder default of 0).
+    pub max_turns: Option<usize>,
+    /// Prefer background dispatch (stored for Phase 2).
+    pub is_background: bool,
     pub tags: Vec<String>,
 }
 
@@ -387,6 +407,12 @@ pub fn parse_worker_md(
         None
     };
 
+    // `inherit` / empty → None (parent model). Keep `fast` and concrete ids.
+    let model = fm
+        .model
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty() && m != "inherit");
+
     Ok(WorkerDefinition {
         source: fallback_name
             .map(|name| format!("builtin:{name}"))
@@ -399,6 +425,9 @@ pub fn parse_worker_md(
         isolate_workspace,
         team,
         can_delegate: fm.can_delegate,
+        model,
+        max_turns: fm.max_turns,
+        is_background: fm.is_background,
         tags,
     })
 }
@@ -476,6 +505,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_model_max_turns_is_background() {
+        let md = "---\nname: explorer\ndescription: \"x\"\nreadonly: true\nmodel: fast\nmax_turns: 30\nis_background: true\n---\nbody";
+        let def = parse_worker_md(md, None).unwrap();
+        assert_eq!(def.model.as_deref(), Some("fast"));
+        assert_eq!(def.max_turns, Some(30));
+        assert!(def.is_background);
+    }
+
+    #[test]
+    fn parse_model_inherit_becomes_none() {
+        let md = "---\nname: explorer\ndescription: \"x\"\nmodel: inherit\n---\nbody";
+        let def = parse_worker_md(md, None).unwrap();
+        assert!(def.model.is_none());
+        assert!(!def.is_background);
+        assert!(def.max_turns.is_none());
+    }
+
+    #[test]
     fn parse_missing_name_without_fallback_errors() {
         let md = "---\ndescription: \"x\"\n---\nbody";
         let err = parse_worker_md(md, None).unwrap_err();
@@ -528,7 +575,7 @@ mod tests {
         // The compiled-in defaults must all parse without error — guards
         // against a corrupt source .md slipping through. Sprint 9 added a
         // writer subagent (implementer); Sprint 10 added data subagents
-        // (data-shaper, analyst).
+        // (data-shaper, analyst); Phase 1 added general-purpose.
         let defs = discover_subagents(None, None);
         let names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(
@@ -539,6 +586,7 @@ mod tests {
                 "planner",
                 "summarizer",
                 "implementer",
+                "general-purpose",
                 "data-shaper",
                 "analyst"
             ]
@@ -547,6 +595,8 @@ mod tests {
             assert!(!d.system_prompt.is_empty());
             assert!(!d.description.is_empty());
         }
+        let explorer = defs.iter().find(|d| d.name == "explorer").unwrap();
+        assert_eq!(explorer.model.as_deref(), Some("fast"));
         // The 4 readonly roles are readonly + carry the readonly tag.
         for name in ["explorer", "reviewer", "planner", "summarizer"] {
             let d = defs.iter().find(|d| d.name == name).unwrap();
@@ -556,11 +606,28 @@ mod tests {
             assert!(!d.isolate_workspace, "{name} must not request workspace");
         }
         // Sprint 9: the writer subagent is non-readonly + requests worktree isolation.
+        // Phase 2 Task 13: hard-gate — builtin implementer.md must keep worktree: true
+        // so multi-implementer dispatches never share the main tree.
+        let implementer_md = BUILTIN_WORKER_FILES
+            .iter()
+            .find(|(name, _)| *name == "implementer")
+            .map(|(_, content)| *content)
+            .expect("builtin implementer.md");
+        assert!(
+            implementer_md.contains("worktree: true"),
+            "builtin implementer.md must declare worktree: true"
+        );
         let implementer = defs.iter().find(|d| d.name == "implementer").unwrap();
         assert!(!implementer.readonly);
         assert!(
             implementer.isolate_worktree,
             "implementer must request worktree isolation (worktree:true && !readonly)"
+        );
+        let gp = defs.iter().find(|d| d.name == "general-purpose").unwrap();
+        assert!(!gp.readonly);
+        assert!(
+            !gp.isolate_worktree,
+            "general-purpose stays in-workspace by default; use implementer for worktree"
         );
         // Sprint 10: data subagents request a per-subagent workspace (tmpdir).
         for name in ["data-shaper", "analyst"] {
@@ -730,10 +797,10 @@ team_workers: [\"explorer\", \"summarizer\"]\n\
     #[test]
     fn nonexistent_scope_dirs_are_silently_skipped() {
         // Neither scope dir exists → only builtins returned, no panic.
-        // 4 readonly + 1 writer (Sprint 9) + 2 data (Sprint 10) = 7 builtins.
+        // 4 readonly + 1 writer + 1 general-purpose + 2 data = 8 builtins.
         let fake_root = PathBuf::from("/nonexistent/definitely/not/here");
         let defs = discover_subagents(Some(&fake_root), Some(&fake_root));
-        assert_eq!(defs.len(), 7);
+        assert_eq!(defs.len(), 8);
     }
 
     #[test]
@@ -742,6 +809,7 @@ team_workers: [\"explorer\", \"summarizer\"]\n\
         let text = format_subagent_catalog(&defs);
         assert!(text.contains("`explorer`"));
         assert!(text.contains("`implementer`"));
+        assert!(text.contains("`general-purpose`"));
         assert!(text.contains("agent_tool"));
         assert!(
             text.contains("探索") || text.contains("只读") || text.contains("Read"),

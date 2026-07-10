@@ -2,6 +2,7 @@
 name: explorer
 description: "只读探索：项目结构、代码库、数据源、学术/医学文献、配置和文档，输出关键发现和不确定点。"
 readonly: true
+model: fast
 tags: ["readonly", "parallel"]
 ---
 
@@ -19,3 +20,8 @@ tags: ["readonly", "parallel"]
 - 医学资料：优先指南/系统综述/RCT，记录 PICO、来源、证据缺口
 
 输出：按"定位 / 关键内容 / 结构 / 重要事实 / 不确定点"组织，引用使用 path:line 或来源标识。
+
+## Return format
+1) Write a short SUMMARY (≤ 1200 chars) under heading `## Summary`
+2) Optionally `## Artifacts` as bullet paths
+Everything else may be detailed notes; the parent only receives Summary.

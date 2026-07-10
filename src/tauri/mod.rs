@@ -386,6 +386,11 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
             // unification; the frontend now reads exclusively from
             // `execution://event` (keyed by the stable `execution_id` carried
             // on the event itself, no bridge-side allocation).
+            //
+            // Do NOT forward framework `parent` (parent agent *name*) as the
+            // frontend `parent` field — that field means parent subagent_run_id
+            // for nesting. Agent-name parent would fail ParallelExecutionBlock's
+            // top-level filter and hide agent_tool cards.
             {
                 let app_handle = app.handle().clone();
                 let state = app.state::<TauriState>();
@@ -407,27 +412,28 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                 let (event_type, execution_id, run_id, agent_name, extra) =
                                     match event.as_ref() {
                                         SubagentEvent::DispatchStarted {
-                                            parent,
+                                            parent: _,
                                             agent,
                                             mode,
                                             task,
                                             execution_id,
                                             run_id,
                                             message_id,
+                                            background,
                                         } => (
                                             "started",
                                             execution_id.clone(),
                                             run_id.clone(),
                                             agent.clone(),
                                             serde_json::json!({
-                                                "parent": parent.clone(),
                                                 "mode": format!("{:?}", mode),
                                                 "task": task.clone(),
                                                 "message_id": message_id.clone(),
+                                                "background": background,
                                             }),
                                         ),
                                         SubagentEvent::DispatchIsolationObserved {
-                                            parent,
+                                            parent: _,
                                             agent,
                                             isolation,
                                             execution_id,
@@ -438,12 +444,11 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                             run_id.clone(),
                                             agent.clone(),
                                             serde_json::json!({
-                                                "parent": parent.clone(),
                                                 "isolation_observed": isolation.as_str(),
                                             }),
                                         ),
                                         SubagentEvent::DispatchCompleted {
-                                            parent,
+                                            parent: _,
                                             agent,
                                             duration_ms,
                                             tokens_used,
@@ -451,21 +456,27 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                             output,
                                             execution_id,
                                             run_id,
-                                        } => (
-                                            "completed",
-                                            execution_id.clone(),
-                                            run_id.clone(),
-                                            agent.clone(),
-                                            serde_json::json!({
-                                                "parent": parent.clone(),
-                                                "duration_ms": duration_ms,
-                                                "tokens_used": tokens_used,
-                                                "iteration_count": iterations,
-                                                "output": output.clone(),
-                                            }),
-                                        ),
+                                        } => {
+                                            let (summary, _) =
+                                                echo_agent::agent::subagent::split_subagent_output(
+                                                    output,
+                                                );
+                                            (
+                                                "completed",
+                                                execution_id.clone(),
+                                                run_id.clone(),
+                                                agent.clone(),
+                                                serde_json::json!({
+                                                    "duration_ms": duration_ms,
+                                                    "tokens_used": tokens_used,
+                                                    "iteration_count": iterations,
+                                                    "output": output.clone(),
+                                                    "summary": summary,
+                                                }),
+                                            )
+                                        },
                                         SubagentEvent::DispatchFailed {
-                                            parent,
+                                            parent: _,
                                             agent,
                                             error,
                                             execution_id,
@@ -476,12 +487,11 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                             run_id.clone(),
                                             agent.clone(),
                                             serde_json::json!({
-                                                "parent": parent.clone(),
                                                 "error": error.clone(),
                                             }),
                                         ),
                                         SubagentEvent::DispatchCancelled {
-                                            parent,
+                                            parent: _,
                                             agent,
                                             execution_id,
                                             run_id,
@@ -490,10 +500,10 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                             execution_id.clone(),
                                             run_id.clone(),
                                             agent.clone(),
-                                            serde_json::json!({ "parent": parent.clone() }),
+                                            serde_json::json!({}),
                                         ),
                                         SubagentEvent::DispatchThinkingStarted {
-                                            parent,
+                                            parent: _,
                                             agent,
                                             execution_id,
                                             run_id,
@@ -502,10 +512,10 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                             execution_id.clone(),
                                             run_id.clone(),
                                             agent.clone(),
-                                            serde_json::json!({ "parent": parent.clone() }),
+                                            serde_json::json!({}),
                                         ),
                                         SubagentEvent::DispatchThinkingDelta {
-                                            parent,
+                                            parent: _,
                                             agent,
                                             content,
                                             execution_id,
@@ -516,12 +526,11 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                             run_id.clone(),
                                             agent.clone(),
                                             serde_json::json!({
-                                                "parent": parent.clone(),
                                                 "content": content,
                                             }),
                                         ),
                                         SubagentEvent::DispatchThinkingEnded {
-                                            parent,
+                                            parent: _,
                                             agent,
                                             prompt_tokens,
                                             completion_tokens,
@@ -533,13 +542,12 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                             run_id.clone(),
                                             agent.clone(),
                                             serde_json::json!({
-                                                "parent": parent.clone(),
                                                 "prompt_tokens": prompt_tokens,
                                                 "completion_tokens": completion_tokens,
                                             }),
                                         ),
                                         SubagentEvent::DispatchTokenDelta {
-                                            parent,
+                                            parent: _,
                                             agent,
                                             content,
                                             execution_id,
@@ -550,12 +558,11 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                             run_id.clone(),
                                             agent.clone(),
                                             serde_json::json!({
-                                                "parent": parent.clone(),
                                                 "content": content,
                                             }),
                                         ),
                                         SubagentEvent::DispatchToolStarted {
-                                            parent,
+                                            parent: _,
                                             agent,
                                             name: tool_name,
                                             args,
@@ -567,13 +574,12 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                             run_id.clone(),
                                             agent.clone(),
                                             serde_json::json!({
-                                                "parent": parent.clone(),
                                                 "name": tool_name,
                                                 "args": args,
                                             }),
                                         ),
                                         SubagentEvent::DispatchToolCompleted {
-                                            parent,
+                                            parent: _,
                                             agent,
                                             name: tool_name,
                                             result,
@@ -586,14 +592,13 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                             run_id.clone(),
                                             agent.clone(),
                                             serde_json::json!({
-                                                "parent": parent.clone(),
                                                 "name": tool_name,
                                                 "result": result,
                                                 "success": success,
                                             }),
                                         ),
                                         SubagentEvent::DispatchLlmUsage {
-                                            parent,
+                                            parent: _,
                                             agent,
                                             model,
                                             prompt_tokens,
@@ -624,7 +629,6 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                                 run_id.clone(),
                                                 agent.clone(),
                                                 serde_json::json!({
-                                                    "parent": parent.clone(),
                                                     "model": model.clone(),
                                                     "prompt_tokens": prompt_tokens,
                                                     "completion_tokens": completion_tokens,

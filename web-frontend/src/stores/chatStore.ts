@@ -76,6 +76,8 @@ interface ChatState {
   endToolBatch: () => void;
   finalizeAssistantMessage: (id: string, content: string) => void;
   handoffToTaskRuntime: (id: string, content: string, isRunning: boolean) => void;
+  /** Insert a non-streaming assistant note (e.g. background subagent finished). */
+  appendLocalAssistantNote: (content: string) => void;
   setStreaming: (v: boolean) => void;
   setThinking: (v: boolean) => void;
   setRunStatus: (status: ChatRunStatus) => void;
@@ -343,6 +345,22 @@ export const useChatStore = create<ChatState>((set, get) => ({
       isThinking: false,
       runStatus: isRunning ? 'running' : 'waiting_approval',
       messages: s.messages.map((m) => (m.id === id ? { ...m, content, isStreaming: false } : m)),
+    }));
+    scheduleAutoSave();
+  },
+
+  appendLocalAssistantNote: (content) => {
+    set((s) => ({
+      messages: trimToMax([
+        ...s.messages,
+        {
+          id: nextId(),
+          role: 'assistant',
+          content,
+          isStreaming: false,
+          timestamp: Date.now(),
+        },
+      ]),
     }));
     scheduleAutoSave();
   },

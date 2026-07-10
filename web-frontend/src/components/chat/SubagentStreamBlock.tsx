@@ -139,6 +139,14 @@ export const SubagentStreamBlock = memo(function SubagentStreamBlock({
           <span className="truncate font-medium text-[var(--text-primary)]">
             {run.agent || run.subagentRunId}
           </span>
+          {run.background ? (
+            <span
+              className="shrink-0 rounded px-1 text-[9px] font-medium uppercase tracking-wide"
+              style={{ color: 'var(--text-tertiary)', border: '1px solid var(--border-primary)' }}
+            >
+              bg
+            </span>
+          ) : null}
           <span className="ml-auto shrink-0 text-[10px] text-[var(--text-tertiary)]">
             {statusLabel(progress.status)}
             {summary ? ` · ${summary}` : ''}

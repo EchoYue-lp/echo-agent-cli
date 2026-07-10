@@ -72,6 +72,10 @@ export interface ExecutionEvent {
   cache_creation_prompt_tokens?: number;
   usage_reported?: boolean;
   usage_event_id?: string;
+  /** Background dispatch flag (from DispatchStarted). */
+  background?: boolean;
+  /** Parent-facing summary on completed events. */
+  summary?: string;
   [key: string]: unknown;
 }
 
@@ -105,6 +109,11 @@ export interface SubagentRunState {
   /** Message id that triggered the run (chat message_key); pins this run to a
    * chat message block. Absent for non-chat paths (cron). */
   messageId?: string;
+  /** True when started via background dispatch (agent_tool background=true or
+   * role is_background). Completion injects a finished note into chat. */
+  background?: boolean;
+  /** Parent-facing summary from completed event (## Summary or truncated output). */
+  summary?: string;
   /** Accumulated LLM usage across all model calls in this run (for cache diagnostics). */
   usageEvents?: ExecutionEvent[];
   /** Append-only event log (thinking/tool/token deltas). Capped to bound memory. */
@@ -194,6 +203,9 @@ export const useSubagentRunStore = create<SubagentRunStore>((set) => ({
         contextIn: ev.context_in ?? run.contextIn,
         returns: ev.returns ?? run.returns,
         messageId: ev.message_id ?? run.messageId,
+        background:
+          typeof ev.background === 'boolean' ? ev.background : run.background,
+        summary: typeof ev.summary === 'string' ? ev.summary : run.summary,
         usageEvents,
         events,
       };

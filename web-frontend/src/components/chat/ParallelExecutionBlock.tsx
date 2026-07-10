@@ -15,6 +15,9 @@ import { SubagentStreamBlock } from './SubagentStreamBlock';
  * Message association: each SubagentRun carries a `messageId` (populated from
  * the run's root_message_id by the Phase 3a backend). If a run has no
  * messageId (non-chat path), it falls back to the latest assistant message.
+ *
+ * `parent` means parent **subagent_run_id** (nested worker), NOT the parent
+ * agent name. Top-level agent_tool / plan_execute workers omit parent.
  */
 interface ParallelExecutionBlockProps {
   messageId: string;
