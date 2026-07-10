@@ -17,8 +17,7 @@ interface InlineToolCallProps {
 
 /**
  * One tool call rendered as a lightweight inline collapsible row in the
- * one-stream layout. Not a standalone bordered card — just a left-bordered
- * row with a one-line summary, expandable to show args/result.
+ * one-stream layout: a one-line event that can expand for args/result.
  */
 export const InlineToolCall = memo(function InlineToolCall({ toolCall, index: _index }: InlineToolCallProps) {
   const [expanded, setExpanded] = useState(false);
@@ -51,10 +50,7 @@ export const InlineToolCall = memo(function InlineToolCall({ toolCall, index: _i
   };
 
   return (
-    <div
-      className="my-0.5 border-l-2 pl-2"
-      style={{ borderColor: 'var(--border-primary)' }}
-    >
+    <div className="my-0.5 pl-3">
       <button
         onClick={() => setExpanded((e) => !e)}
         className="flex w-full items-center gap-1.5 py-0.5 text-left text-[11px]"
@@ -77,7 +73,7 @@ export const InlineToolCall = memo(function InlineToolCall({ toolCall, index: _i
         <div className="mt-1 space-y-2 pb-1">
           <div>
             <div className="mb-0.5 flex items-center justify-between">
-              <span className="text-[9px] font-medium uppercase tracking-wider text-[var(--text-tertiary)]">
+              <span className="text-[9px] font-medium uppercase text-[var(--text-tertiary)]">
                 参数
               </span>
               <button
@@ -98,7 +94,7 @@ export const InlineToolCall = memo(function InlineToolCall({ toolCall, index: _i
           {toolCall.result !== undefined && (
             <div>
               <div className="mb-0.5 flex items-center justify-between">
-                <span className="text-[9px] font-medium uppercase tracking-wider text-[var(--text-tertiary)]">
+                <span className="text-[9px] font-medium uppercase text-[var(--text-tertiary)]">
                   结果
                 </span>
                 <button

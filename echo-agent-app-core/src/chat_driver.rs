@@ -131,6 +131,10 @@ pub async fn drive_chat(
     let cancel = res.cancel.clone();
     let trace_sink = res.sink.worker_trace_sink();
     let run_id_for_inner = run_id.clone();
+    let _projection_registration = res.store.as_ref().map(|store| {
+        crate::tasks::task_runtime::compact_context::task_runtime_projection_registry()
+            .register(run_id.clone(), std::sync::Arc::clone(store))
+    });
     crate::tasks::task_runtime::task_tools::with_run_context(
         run_id,
         cancel,
@@ -209,18 +213,23 @@ async fn drive_chat_inner(
         // `trace_sink` here is the framework-Value form; `scoped_with_ctx_run_id`
         // re-scopes it into `CURRENT_TRACE_SINK` for tools (e.g. plan_execute)
         // running inside the framework's spawned tool executor.
-        guard.set_external_context(&echo_core::tools::ExternalRunContext {
-            run_id: run_id.clone(),
-            execution_id: None,
-            // Chat path: run_id == root_message_id (set in drive_chat), so the
-            // subagent stream can be pinned to this turn's message block.
-            message_id: Some(run_id),
-            cancel: Some(std::sync::Arc::new(cancel.clone())),
-            trace_sink: sink.trace_sink(),
-            delegation_policy: None,
-        });
-
-        let stream_result = guard.execute_stream_message_with_cancel(msg, cancel).await;
+        let invocation = echo_core::agent::AgentInvocationContext {
+            runtime: Some(echo_core::tools::ExternalRunContext {
+                run_id: run_id.clone(),
+                execution_id: None,
+                // Chat path: run_id == root_message_id (set in drive_chat), so the
+                // subagent stream can be pinned to this turn's message block.
+                message_id: Some(run_id),
+                cancel: Some(std::sync::Arc::new(cancel.clone())),
+                trace_sink: sink.trace_sink(),
+                delegation_policy: None,
+            }),
+            working_dir: None,
+            cancel: None,
+        };
+        let stream_result = guard
+            .execute_stream_message_with_invocation_context(msg, cancel, invocation)
+            .await;
         let mut stream = match stream_result {
             Ok(stream) => stream,
             Err(e) => {
@@ -231,11 +240,10 @@ async fn drive_chat_inner(
                     source: "chat_driver".into(),
                     message: e.to_string(),
                 });
-                guard.clear_external_context();
                 return Err(e.to_string());
             }
         };
-        let result = async {
+        async {
             while let Some(event_result) = stream.next().await {
                 match event_result {
                     Ok(event) => {
@@ -257,9 +265,7 @@ async fn drive_chat_inner(
             }
             Ok::<(), String>(())
         }
-        .await;
-        guard.clear_external_context();
-        result
+        .await
     })
     .await
 }
@@ -373,6 +379,104 @@ mod tests {
             "drive_chat should stream FinalAnswer to sink; events recorded: {}",
             chat_sink.event_count()
         );
+    }
+
+    #[tokio::test]
+    async fn drive_chat_projection_survives_snapshot_spawn_and_unregisters() -> Result<(), String> {
+        use crate::tasks::task_runtime::compact_context::{
+            RUNTIME_RECOVERY_MARKER, TaskRuntimeContextProjector, task_runtime_projection_registry,
+        };
+        use crate::tasks::task_runtime::types::{
+            AttendedMode, DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, TaskPlan,
+        };
+        use echo_agent::agent::CancellationToken;
+        use std::sync::Arc;
+
+        let run_id = "projection-spawn-boundary";
+        let mock = Arc::new(
+            echo_agent::testing::MockLlmClient::new()
+                .with_model_name("t")
+                .with_response("ok"),
+        );
+        let react_agent = echo_agent::agent::ReactAgentBuilder::new()
+            .model("t")
+            .llm_client(mock.clone())
+            .build()
+            .map_err(|error| error.to_string())?;
+        react_agent.set_pre_model_context_projector(Some(Arc::new(
+            TaskRuntimeContextProjector::new(task_runtime_projection_registry()),
+        )));
+        let agent = AgentHandle::new(react_agent);
+        let store = Arc::new(
+            crate::tasks::task_runtime::store::TaskRuntimeStore::new_in_memory()
+                .map_err(|error| error.to_string())?,
+        );
+        store
+            .create_run(
+                run_id,
+                "default",
+                "c1",
+                run_id,
+                DomainProfile::General,
+                "boundary goal",
+                "complex_runtime",
+                AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .attach_plan(&TaskPlan {
+                plan_id: "boundary-plan".to_string(),
+                run_id: run_id.to_string(),
+                domain_profile: DomainProfile::General,
+                goal: "boundary goal".to_string(),
+                assumptions: Vec::new(),
+                risks: Vec::new(),
+                execution_mode: ExecutionMode::Sequential,
+                tasks: vec![PlanTask {
+                    id: "boundary-task".to_string(),
+                    title: "visible after spawn".to_string(),
+                    kind: PlanTaskKind::Investigation,
+                    agent_role: "explorer".to_string(),
+                    ..PlanTask::default()
+                }],
+            })
+            .map_err(|error| error.to_string())?;
+        let chat_sink = Arc::new(MockChatSink::default());
+        let sink: Arc<dyn ChatSink> = chat_sink;
+        let res = Arc::new(crate::chat_resources::ChatResources {
+            pool: None,
+            store: Some(Arc::clone(&store)),
+            sink,
+            conv_id: Some("c1".to_string()),
+            root_message_id: run_id.to_string(),
+            attachments: Vec::new(),
+            cancel: CancellationToken::new(),
+            mode_hint: None,
+            interaction_mode: crate::tasks::task_runtime::InteractionMode::Auto,
+            layer_manager: None,
+        });
+
+        drive_chat(&agent, "continue", None, res).await?;
+
+        let messages = mock
+            .last_messages()
+            .ok_or_else(|| "spawned model call did not receive messages".to_string())?;
+        let projected = messages
+            .iter()
+            .filter_map(|message| message.content.as_text());
+        if !projected
+            .clone()
+            .any(|text| text.contains(RUNTIME_RECOVERY_MARKER))
+            || !projected
+                .clone()
+                .any(|text| text.contains("visible after spawn"))
+        {
+            return Err("runtime projection did not cross snapshot/spawn boundary".to_string());
+        }
+        if task_runtime_projection_registry().contains(run_id) {
+            return Err("drive_chat did not unregister projection on exit".to_string());
+        }
+        Ok(())
     }
 
     #[tokio::test]

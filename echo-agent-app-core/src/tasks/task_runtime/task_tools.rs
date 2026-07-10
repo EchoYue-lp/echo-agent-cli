@@ -131,7 +131,7 @@ where
     with_run_context(run_id, cancel, None, f).await
 }
 
-fn current_run_id() -> Option<String> {
+pub(crate) fn current_run_id() -> Option<String> {
     CURRENT_RUN_ID.try_with(|cell| cell.clone()).ok()
 }
 
@@ -600,6 +600,14 @@ mod plan_create_tests {
             .map_err(|e| e.to_string())?;
         if !result.success {
             return Err(format!("plan_create failed: {:?}", result.error));
+        }
+        if result
+            .output
+            .contains(super::super::compact_context::RUNTIME_RECOVERY_MARKER)
+        {
+            return Err(
+                "plan_create result must not embed the runtime recovery capsule".to_string(),
+            );
         }
 
         let events = store.list_events(run_id, 0).map_err(|e| e.to_string())?;

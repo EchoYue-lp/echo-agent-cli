@@ -74,7 +74,7 @@ export function RightRail() {
       {!expanded && (
         <button
           onClick={() => setExpanded(true)}
-          className="absolute right-3 top-4 z-30 flex items-center gap-1.5 rounded-full border border-[var(--border-primary)] bg-[var(--bg-primary)]/95 px-2.5 py-1.5 text-xs font-medium tabular-nums text-[var(--text-secondary)] shadow-[var(--shadow-sm)] backdrop-blur transition-colors hover:border-[var(--accent)] hover:text-[var(--text-primary)]"
+          className="absolute right-3 top-14 z-30 flex items-center gap-1.5 rounded-full border border-[var(--border-primary)] bg-[var(--bg-primary)]/95 px-2.5 py-1.5 text-xs font-medium tabular-nums text-[var(--text-secondary)] shadow-[var(--shadow-sm)] backdrop-blur transition-colors hover:border-[var(--accent)] hover:text-[var(--text-primary)]"
           title="展开任务列表"
           aria-label="展开任务列表"
         >

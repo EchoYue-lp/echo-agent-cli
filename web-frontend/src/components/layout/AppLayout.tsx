@@ -21,7 +21,7 @@ export function AppLayout({
   };
 
   return (
-    <div className="flex h-screen w-screen bg-[var(--bg-chat)]">
+    <div className="flex h-screen w-screen overflow-hidden bg-[var(--bg-chat)]">
       {/* Left Sidebar - Mobile overlay with blur */}
       {leftSidebarOpen && (
         <div
@@ -34,9 +34,9 @@ export function AppLayout({
         className={`shrink-0 overflow-hidden transition-all duration-300 ease-in-out
           max-md:fixed max-md:inset-y-0 max-md:left-0 max-md:z-50
           ${leftSidebarOpen ? 'border-r border-[var(--border-primary)] bg-[var(--bg-sidebar)]' : ''}`}
-        style={{ width: leftSidebarOpen ? '300px' : '0px' }}
+        style={{ width: leftSidebarOpen ? '272px' : '0px' }}
       >
-        <div className="h-full w-[300px]">{left}</div>
+        <div className="h-full w-[272px]">{left}</div>
       </div>
 
       {/* Center + Terminal drawer */}
@@ -44,7 +44,7 @@ export function AppLayout({
         {/* Left toggle */}
         <button
           onClick={toggleLeftSidebar}
-          className="absolute left-3 top-3 z-20 flex h-7 w-7 items-center justify-center rounded-lg text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+          className="absolute left-3 top-3 z-20 flex h-7 w-7 items-center justify-center rounded-md text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
           title={leftSidebarOpen ? '关闭侧边栏' : '打开侧边栏'}
         >
           {leftSidebarOpen ? <PanelLeftClose size={14} /> : <PanelLeftOpen size={14} />}

@@ -25,6 +25,7 @@ import { useToastStore } from '../../stores/toastStore';
 import { useChatStore, cacheHitRate } from '../../stores/chatStore';
 import type { Attachment, ConfiguredModel } from '../../types/api';
 import { CONTEXT_RING_CIRCUMFERENCE, ringDashOffset } from './contextRing';
+import { computeContextUsage, estimateDraftTokens, type ContextUsageSource } from './contextUsage';
 import {
   filterCommands,
   groupByCategory,
@@ -166,7 +167,7 @@ function CommandPalette({ commands, selectedIndex, onSelect }: CommandPalettePro
             const meta = CATEGORY_META[category];
             return (
               <div key={category} className="mb-1">
-                <div className="flex items-center gap-1.5 px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-[var(--text-tertiary)]">
+                <div className="flex items-center gap-1.5 px-2 py-1 text-[10px] font-semibold uppercase text-[var(--text-tertiary)]">
                   <span>{meta?.icon ?? '📌'}</span>
                   <span>{category}</span>
                 </div>
@@ -231,18 +232,26 @@ function formatTokens(n: number): string {
   return formatted.endsWith('.0') ? `${Math.round(n / 1000)}k` : `${formatted}k`;
 }
 
+function formatPercent(pct: number): string {
+  if (pct > 0 && pct < 1) return '<1%';
+  if (pct < 10) return `${Math.round(pct * 10) / 10}%`;
+  return `${Math.round(pct)}%`;
+}
+
 function ContextRingIndicator({
   pct,
   used,
   win,
   tier,
   cacheRate,
+  source,
 }: {
   pct: number | null;
   used: number | null;
   win: number | null;
   tier: 'normal' | 'high' | 'critical' | 'unknown';
   cacheRate: number | null;
+  source: ContextUsageSource;
 }) {
   const [hover, setHover] = useState(false);
   const color =
@@ -250,22 +259,30 @@ function ContextRingIndicator({
       ? 'var(--color-error)'
       : tier === 'high'
         ? 'var(--color-warning)'
-        : 'var(--text-tertiary)';
+        : tier === 'normal'
+          ? 'var(--accent)'
+          : 'var(--text-tertiary)';
   const ratio = pct != null ? pct / 100 : null;
-  const offset = ringDashOffset(ratio);
-  const centerLabel = pct != null ? `${pct}%` : '--';
-  const cacheLabel =
-    cacheRate != null ? `${Math.round(cacheRate * 1000) / 10}%` : '--';
+  const visualRatio = ratio != null && ratio > 0 ? Math.max(ratio, 0.045) : ratio;
+  const offset = ringDashOffset(visualRatio);
+  const centerLabel = pct != null ? formatPercent(pct) : '--';
+  const cacheLabel = cacheRate != null ? `${Math.round(cacheRate * 1000) / 10}%` : '--';
+  const sourceLabel =
+    source === 'reported'
+      ? '模型回填 + 草稿'
+      : source === 'draft-only'
+        ? '仅未发送内容'
+        : '等待首轮';
   const capacityLine =
     used != null && win != null && pct != null
-      ? `上下文容量：${formatTokens(used)} / ${formatTokens(win)} (${pct}%)`
+      ? `上下文容量：${formatTokens(used)} / ${formatTokens(win)} (${formatPercent(pct)})`
       : used != null
         ? `上下文容量：${formatTokens(used)} tokens`
         : '上下文容量：--';
 
   return (
     <span
-      className="relative inline-flex items-center"
+      className="relative inline-flex h-7 w-7 items-center justify-center"
       onMouseEnter={() => setHover(true)}
       onMouseLeave={() => setHover(false)}
     >
@@ -275,8 +292,12 @@ function ContextRingIndicator({
           cy="14"
           r="10"
           fill="none"
-          stroke="var(--border-primary)"
-          strokeWidth="2.5"
+          stroke={
+            source === 'unknown'
+              ? 'var(--border-primary)'
+              : `color-mix(in srgb, ${color} 22%, var(--border-primary))`
+          }
+          strokeWidth="3"
         />
         <circle
           cx="14"
@@ -284,11 +305,17 @@ function ContextRingIndicator({
           r="10"
           fill="none"
           stroke={color}
-          strokeWidth="2.5"
+          strokeWidth="3.4"
           strokeLinecap="round"
           strokeDasharray={CONTEXT_RING_CIRCUMFERENCE}
           strokeDashoffset={offset}
           transform="rotate(-90 14 14)"
+          style={{
+            filter:
+              source === 'unknown'
+                ? undefined
+                : `drop-shadow(0 0 2px color-mix(in srgb, ${color} 70%, transparent))`,
+          }}
         />
         <text
           x="14"
@@ -296,7 +323,8 @@ function ContextRingIndicator({
           textAnchor="middle"
           dominantBaseline="central"
           fill={color}
-          fontSize="7"
+          fontSize="7.2"
+          fontWeight="700"
           fontFamily="ui-monospace, SFMono-Regular, Menlo, monospace"
         >
           {centerLabel}
@@ -308,6 +336,7 @@ function ContextRingIndicator({
           role="tooltip"
         >
           <span className="block">{capacityLine}</span>
+          <span className="block">来源：{sourceLabel}</span>
           <span className="block">平均缓存命中率：{cacheLabel}</span>
         </span>
       )}
@@ -329,7 +358,7 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
   const [thinkingMenuOpen, setThinkingMenuOpen] = useState(false);
   const [switchingThinking, setSwitchingThinking] = useState(false);
   const [interactionMode, setInteractionMode] = useState<number>(0);
-  const [executionPolicy, setExecutionPolicy] = useState<ExecutionPolicySnapshot | null>(null);
+  const [, setExecutionPolicy] = useState<ExecutionPolicySnapshot | null>(null);
   const [switchingInteractionMode, setSwitchingInteractionMode] = useState<number | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -746,48 +775,27 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
   );
 
   const hasContent = text.trim().length > 0 || pendingFiles.length > 0;
-
-  // 计算上下文占用展示（对齐 Claude Code：真实 prompt_tokens / window_size）。
-  // contextWindow=null → 首条响应前或刚压缩后：仍渲染空环 + tooltip。
-  const ctxUsage = (() => {
-    const cacheRate = cacheHitRate(usageAccumulator);
-    if (!contextWindow) {
-      return {
-        pct: null as number | null,
-        used: null as number | null,
-        win: contextWindowSize,
-        tier: 'unknown' as const,
-        cacheRate,
-      };
-    }
-    const used = contextWindow.inputTokens;
-    const win = contextWindowSize;
-    if (win == null || win <= 0) {
-      return {
-        pct: null as number | null,
-        used,
-        win: null as number | null,
-        tier: 'unknown' as const,
-        cacheRate,
-      };
-    }
-    // 用 floor（而非 round）对齐 Rust used_percentage 的整数除法语义，
-    // 确保 TUI/Web 在 70%/90% 阈值边界颜色分级完全一致。
-    const pct = Math.min(100, Math.floor((used / win) * 100));
-    const tier =
-      pct >= 90 ? ('critical' as const) : pct >= 70 ? ('high' as const) : ('normal' as const);
-    return { pct, used, win, tier, cacheRate };
-  })();
+  const draftTokens = useMemo(() => estimateDraftTokens(text, pendingFiles), [text, pendingFiles]);
+  const contextUsage = computeContextUsage(
+    contextWindow?.inputTokens ?? null,
+    draftTokens,
+    contextWindowSize
+  );
+  const ctxUsage = {
+    ...contextUsage,
+    win: contextWindowSize,
+    cacheRate: cacheHitRate(usageAccumulator),
+  };
 
   return (
     <div
-      className="px-5 pb-5 pt-2"
+      className="px-4 pb-4 pt-2 sm:px-6"
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
     >
       {/* Relative container so the absolute-positioned palette anchors here */}
-      <div className="relative mx-auto max-w-[1180px]">
+      <div className="relative mx-auto max-w-[980px]">
         {/* ── Slash Command Palette ── */}
         {showPalette && (
           <CommandPalette
@@ -797,10 +805,10 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
           />
         )}
 
-        <div className="relative flex flex-col rounded-xl border border-[var(--border-primary)] bg-[var(--bg-input)] shadow-[var(--shadow-md)] transition-shadow focus-within:shadow-[var(--shadow-lg)]">
+        <div className="relative space-y-2">
           {/* Drag overlay */}
           {isDragging && (
-            <div className="absolute inset-0 z-10 flex items-center justify-center rounded-xl border-2 border-dashed border-[var(--accent)] bg-[var(--accent)]/5">
+            <div className="absolute inset-0 z-10 flex items-center justify-center rounded-[22px] border-2 border-dashed border-[var(--accent)] bg-[var(--accent)]/5">
               <span className="text-sm font-medium text-[var(--accent)]">
                 Drop files here to upload
               </span>
@@ -808,7 +816,7 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
           )}
           {/* Attachment previews */}
           {pendingFiles.length > 0 && (
-            <div className="flex flex-wrap gap-2 px-4 pt-3">
+            <div className="flex flex-wrap gap-2 px-1">
               {pendingFiles.map((pf) => (
                 <div
                   key={pf.id}
@@ -847,11 +855,11 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
           )}
 
           {/* Input row */}
-          <div className="flex items-end px-4 pt-3 pb-2">
+          <div className="flex items-end rounded-[22px] border border-[var(--border-primary)] bg-[var(--bg-input)] px-3 py-2 shadow-[var(--shadow-sm)] transition-colors focus-within:border-[var(--border-focus)] sm:px-4">
             {/* Attachment button */}
             <button
               onClick={() => fileInputRef.current?.click()}
-              className="mr-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+              className="mr-1 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[var(--bg-secondary)] text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
               title="Upload attachment"
             >
               <Paperclip size={16} />
@@ -872,13 +880,13 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
               onKeyDown={handleKeyDown}
               onPaste={handlePaste}
               rows={1}
-              placeholder="继续输入以排队后续修改，或输入 / 查看命令"
+              placeholder="Send follow-up"
               className="max-h-[200px] min-h-[24px] flex-1 resize-none bg-transparent text-sm leading-relaxed text-[var(--text-primary)] outline-none placeholder:text-[var(--text-tertiary)]"
             />
             {isStreaming ? (
               <button
                 onClick={onCancel}
-                className="ml-2 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-[var(--text-secondary)] text-white transition-all hover:bg-[var(--text-primary)]"
+                className="ml-2 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[var(--text-secondary)] text-white transition-all hover:bg-[var(--text-primary)]"
                 title="Stop generating"
               >
                 <Square size={14} fill="white" color="white" />
@@ -887,14 +895,14 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
               <button
                 onClick={handleSend}
                 disabled={!hasContent}
-                className="ml-2 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-[var(--accent)] text-[var(--text-on-accent)] transition-all hover:shadow-[var(--shadow-glow)] disabled:opacity-20 disabled:hover:shadow-none"
+                className="ml-2 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[var(--accent)] text-[var(--text-on-accent)] transition-all hover:shadow-[var(--shadow-glow)] disabled:opacity-20 disabled:hover:shadow-none"
               >
                 <ArrowUp size={16} strokeWidth={2.5} />
               </button>
             )}
           </div>
-          <div className="flex items-center justify-between border-t border-[var(--border-secondary)] px-4 py-2 text-[11px] text-[var(--text-tertiary)]">
-            <div className="flex min-w-0 items-center gap-3">
+          <div className="flex flex-wrap items-center justify-between gap-2 px-2 text-[11px] text-[var(--text-tertiary)]">
+            <div className="flex min-w-0 flex-wrap items-center gap-1.5 sm:gap-2">
               <div className="relative">
                 <button
                   type="button"
@@ -903,7 +911,7 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
                     setModelMenuOpen(false);
                     setThinkingMenuOpen(false);
                   }}
-                  className="flex max-w-[180px] items-center gap-1.5 rounded-md px-1.5 py-1 text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                  className="flex max-w-[180px] items-center gap-1.5 rounded-full px-2 py-1 text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
                   title="切换审批模式"
                 >
                   <ShieldCheck size={13} />
@@ -950,7 +958,7 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
                       setModelMenuOpen((open) => !open);
                     }
                   }}
-                  className="flex max-w-[220px] items-center gap-1.5 rounded-md px-1.5 py-1 text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                  className="flex max-w-[220px] items-center gap-1.5 rounded-full px-2 py-1 text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
                   title="切换默认模型"
                 >
                   <Cpu size={13} />
@@ -990,7 +998,7 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
                 )}
               </div>
               <div
-                className="flex shrink-0 items-center rounded-md border border-[var(--border-secondary)] p-0.5"
+                className="flex shrink-0 items-center rounded-full border border-[var(--border-secondary)] bg-[var(--bg-secondary)] p-0.5"
                 title={`运行模式: ${activeInteractionMode.description}`}
               >
                 <Workflow size={12} className="mx-1 text-[var(--text-tertiary)]" />
@@ -1001,7 +1009,7 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
                     onClick={() => switchInteractionMode(mode.id)}
                     disabled={switchingInteractionMode !== null}
                     title={mode.description}
-                    className={`h-6 rounded-md px-2 text-[10px] transition-colors disabled:cursor-wait ${
+                    className={`h-6 rounded-full px-2 text-[10px] transition-colors disabled:cursor-wait ${
                       interactionMode === mode.id
                         ? 'bg-[var(--accent)] text-[var(--text-on-accent)]'
                         : 'text-[var(--text-tertiary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
@@ -1021,7 +1029,7 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
                     setModelMenuOpen(false);
                     setThinkingMenuOpen((open) => !open);
                   }}
-                  className="flex max-w-[140px] items-center gap-1.5 rounded-md px-1.5 py-1 text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+                  className="flex max-w-[140px] items-center gap-1.5 rounded-full px-2 py-1 text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
                   title="切换思考深度"
                 >
                   <Brain size={13} />
@@ -1058,31 +1066,18 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
                 )}
               </div>
             </div>
-            <div className="flex items-center gap-3">
+            <div className="ml-auto flex shrink-0 items-center gap-2">
               <ContextRingIndicator
                 pct={ctxUsage.pct}
                 used={ctxUsage.used}
                 win={ctxUsage.win}
                 tier={ctxUsage.tier}
                 cacheRate={ctxUsage.cacheRate}
+                source={ctxUsage.source}
               />
-              <span>Enter 发送</span>
               {text.length > 0 && <span>{text.length} 字</span>}
             </div>
           </div>
-          {executionPolicy && (
-            <div className="border-t border-[var(--border-secondary)] px-4 py-2 text-[10px] leading-relaxed text-[var(--text-tertiary)]">
-              <span className="font-medium text-[var(--text-secondary)]">
-                {executionPolicy.interaction_mode_label} · {executionPolicy.permission_mode_label}
-              </span>
-              <span className="mx-1">·</span>
-              <span>{executionPolicy.router_behavior}</span>
-              <span className="mx-1">·</span>
-              <span>{executionPolicy.approval_behavior}</span>
-              <span className="mx-1">·</span>
-              <span>{executionPolicy.parallel_behavior}</span>
-            </div>
-          )}
         </div>
       </div>
     </div>

@@ -4,10 +4,10 @@
  * :root / .dark CSS variables via arbitrary value syntax (bg-[var(--bg-*)]),
  * so this @theme block primarily registers the radius / font scales. */
 @theme {
-  --color-primary: #cc785c;
-  --color-primary-light: #d68b72;
-  --color-primary-dark: #a9583e;
-  --color-surface: #faf9f5;
+  --color-primary: #2563eb;
+  --color-primary-light: #60a5fa;
+  --color-primary-dark: #1d4ed8;
+  --color-surface: #f8fafc;
   --color-surface-dark: #08090a;
   --color-border: #e6dfd8;
   --color-border-dark: #23252a;
@@ -26,65 +26,64 @@
 }
 
 /* ============================================================================
- * LIGHT THEME — warm cream (Claude / Cursor lineage)
- * Canvas is cream, not white. Hairlines are warm-toned, never neutral gray.
- * One signature accent: coral #cc785c, deployed like a scalpel.
+ * LIGHT THEME — calm desktop agent
+ * Near-white work canvas, mist-blue side chrome, quiet blue accent.
  * ========================================================================== */
 :root {
-  --bg-primary: #faf9f5; /* canvas — Claude's signature cream */
-  --bg-secondary: #f3f1ea; /* surface — cards/panels, visible step from canvas */
-  --bg-chat: #f5f3ed; /* main chat canvas, between primary and secondary */
-  --bg-hover: #efece3; /* hover state */
-  --bg-input: #ffffff; /* inputs stay bright (focus zone) */
-  --bg-user-msg: #cc785c; /* user message fill — coral */
+  --bg-primary: #ffffff;
+  --bg-secondary: #f4f7f8;
+  --bg-chat: #fbfcfd;
+  --bg-hover: #edf3f5;
+  --bg-input: #ffffff;
+  --bg-user-msg: #2563eb;
   --bg-assistant-msg: transparent;
-  --bg-code: #1a1816; /* warm-tinted dark code block */
-  --bg-code-header: #252320;
-  --bg-sidebar: #f3f1ea; /* sidebar = surface layer (clear separation from chat) */
-  --bg-sidebar-hover: #ebe8df;
-  --bg-sidebar-active: #e3dfd3;
-  --bg-rail: #f3f1ea; /* right rail = surface layer */
-  --bg-overlay: rgba(38, 37, 30, 0.4);
+  --bg-code: #111827;
+  --bg-code-header: #1f2937;
+  --bg-sidebar: #e9f3f5;
+  --bg-sidebar-hover: #dfecef;
+  --bg-sidebar-active: #d5e4e8;
+  --bg-rail: #fbfcfd;
+  --bg-overlay: rgba(15, 23, 42, 0.42);
 
-  --text-primary: #26251e; /* warm near-black (not cold zinc) */
-  --text-secondary: #5c5a52;
-  --text-tertiary: #8d8a80;
-  --text-inverse: #faf9f5;
+  --text-primary: #20252b;
+  --text-secondary: #5d6670;
+  --text-tertiary: #9099a4;
+  --text-inverse: #ffffff;
   --text-on-accent: #ffffff;
-  --text-on-soft-action: #26251e;
+  --text-on-soft-action: #20252b;
   --text-user-msg: #ffffff;
-  --text-assistant-msg: #26251e;
-  --text-link: #a9583e; /* links use the accent, underlined */
+  --text-assistant-msg: #20252b;
+  --text-link: #1d4ed8;
 
-  --border-primary: #e6dfd8; /* warm hairline (never cold gray) */
-  --border-secondary: #efece3;
-  --border-focus: #cc785c;
+  --border-primary: #dce5e8;
+  --border-secondary: #edf2f4;
+  --border-focus: #3b82f6;
 
-  --accent: #cc785c; /* signature coral */
-  --accent-light: #d68b72;
-  --accent-bg: #f7ede5; /* coral tint for badges / focus rings */
-  --action-soft: #f0ede4;
-  --action-soft-hover: #e6e1d4;
+  --accent: #2563eb;
+  --accent-light: #60a5fa;
+  --accent-bg: #e8f0ff;
+  --action-soft: #eef5f7;
+  --action-soft-hover: #ddebef;
   --action-run: #5db872; /* run = success green */
   --action-run-hover: #4aa35f;
   --action-run-bg: #e8f3ea;
   --text-on-run: #ffffff;
 
-  --settings-dialog-bg: #f5f3ed;
-  --settings-sidebar-bg: #efede4;
-  --settings-content-bg: #f8f6f0;
-  --settings-panel-bg: #faf9f5;
-  --settings-active-bg: #e6dfd8;
-  --settings-accent: #a9583e; /* settings keeps a muted coral accent */
-  --settings-accent-bg: #f0e4da;
+  --settings-dialog-bg: #f7fafb;
+  --settings-sidebar-bg: #e9f3f5;
+  --settings-content-bg: #fbfcfd;
+  --settings-panel-bg: #ffffff;
+  --settings-active-bg: #dfecef;
+  --settings-accent: #2563eb;
+  --settings-accent-bg: #e8f0ff;
   --settings-text-on-accent: #ffffff;
 
   /* Shadows — Vercel-style "shadow as border": whisper-light, layered.
    * Card elevation comes from the surface-color ladder + hairline, not drop shadows. */
-  --shadow-sm: 0 1px 2px rgba(38, 37, 30, 0.04);
-  --shadow-md: 0 1px 2px rgba(38, 37, 30, 0.04), 0 0 0 1px rgba(38, 37, 30, 0.06);
-  --shadow-lg: 0 4px 12px rgba(38, 37, 30, 0.06), 0 0 0 1px rgba(38, 37, 30, 0.06);
-  --shadow-xl: 0 12px 32px rgba(38, 37, 30, 0.08), 0 0 0 1px rgba(38, 37, 30, 0.06);
+  --shadow-sm: 0 1px 2px rgba(15, 23, 42, 0.05);
+  --shadow-md: 0 1px 2px rgba(15, 23, 42, 0.06), 0 0 0 1px rgba(15, 23, 42, 0.05);
+  --shadow-lg: 0 8px 24px rgba(15, 23, 42, 0.08), 0 0 0 1px rgba(15, 23, 42, 0.06);
+  --shadow-xl: 0 18px 48px rgba(15, 23, 42, 0.12), 0 0 0 1px rgba(15, 23, 42, 0.06);
   --shadow-glow: 0 0 0 3px var(--accent-bg);
 
   /* Semantic colors — real chroma, not grays */
@@ -100,14 +99,14 @@
   --color-info: #5db8a6;
   --color-info-bg: #e3f2ef;
   --color-info-text: #2d6b62;
-  --color-purple: #8b5cf6; /* thinking segments now show real violet */
+  --color-purple: #8b5cf6;
   --color-purple-bg: #ede7fd;
   --color-code-text: #e2e8f0;
 }
 
 /* ============================================================================
  * DARK THEME — cool precision instrument (Linear / Raycast lineage)
- * Near-black canvas, blue-tinted neutrals, coral accent kept for brand parity.
+ * Near-black canvas, blue-tinted neutrals, blue accent kept for brand parity.
  * Elevation via surface ladder + 0.5–1px hairlines, not drop shadows.
  * ========================================================================== */
 .dark {
@@ -116,7 +115,7 @@
   --bg-chat: #08090a; /* Void — main canvas (darkest) */
   --bg-hover: #1a1c1f;
   --bg-input: #141517;
-  --bg-user-msg: #cc785c; /* coral stays — brand consistency */
+  --bg-user-msg: #3b82f6;
   --bg-assistant-msg: transparent;
   --bg-code: #07080a;
   --bg-code-header: #111315;
@@ -134,15 +133,15 @@
   --text-on-soft-action: #f3f4f6;
   --text-user-msg: #ffffff;
   --text-assistant-msg: #f3f4f6;
-  --text-link: #d68b72; /* coral-tinted link */
+  --text-link: #93c5fd;
 
   --border-primary: #23252a; /* hairline */
   --border-secondary: #1a1c1f;
-  --border-focus: #cc785c;
+  --border-focus: #60a5fa;
 
-  --accent: #cc785c; /* coral — same as light, brand parity */
-  --accent-light: #d68b72;
-  --accent-bg: #3a2418; /* deep coral tint on dark */
+  --accent: #60a5fa;
+  --accent-light: #93c5fd;
+  --accent-bg: #10243f;
   --action-soft: #1a1c1f;
   --action-soft-hover: #23252a;
   --action-run: #5db872;
@@ -155,8 +154,8 @@
   --settings-content-bg: #111315;
   --settings-panel-bg: #141517;
   --settings-active-bg: #23252a;
-  --settings-accent: #d68b72;
-  --settings-accent-bg: #3a2418;
+  --settings-accent: #60a5fa;
+  --settings-accent-bg: #10243f;
   --settings-text-on-accent: #08090a;
 
   /* Shadows — near-zero (Linear philosophy: borders carry elevation, not shadows) */
@@ -195,9 +194,7 @@ body {
   color: var(--text-primary);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  /* Tighten tracking at body sizes (Inter shines with slight negative ls).
-   * ss03 = single-story g (Linear/Raycast signature). */
-  letter-spacing: -0.011em;
+  letter-spacing: 0;
   font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11', 'ss03', 'zero';
 }
 
@@ -446,19 +443,19 @@ body {
 .md-content h1 {
   font-size: 1.5em;
   font-weight: 600; /* no 700 — weight discipline (Linear/Vercel) */
-  letter-spacing: -0.022em;
+  letter-spacing: 0;
   margin: 0.6em 0 0.3em;
 }
 .md-content h2 {
   font-size: 1.3em;
   font-weight: 600;
-  letter-spacing: -0.016em;
+  letter-spacing: 0;
   margin: 0.5em 0 0.25em;
 }
 .md-content h3 {
   font-size: 1.1em;
   font-weight: 600;
-  letter-spacing: -0.011em;
+  letter-spacing: 0;
   margin: 0.4em 0 0.2em;
 }
 .md-content p {

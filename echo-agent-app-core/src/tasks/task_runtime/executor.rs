@@ -1066,6 +1066,7 @@ async fn execute_task(
     };
 
     let worker_trace_id = task_id.clone();
+    let contract = subagent_runtime_contract(&primary_agent, &task.agent_role, &task.kind).await;
     tracing::info!(
         run_id = %run_id,
         task_id = %task_id,
@@ -1087,20 +1088,12 @@ async fn execute_task(
     ) {
         tracing::warn!(task_id = %task_id, error = %e, "failed to mark task running");
     }
-    emit_exec(
+    emit_task_started(
         trace_sink.as_ref(),
-        ExecEvent::for_task(
-            run_id.clone(),
-            worker_trace_id.clone(),
-            "started",
-            serde_json::json!({
-                "kind": task.kind.as_str(),
-                "agent_role": &task.agent_role,
-            }),
-        )
-        .with_agent(task.agent_role.clone())
-        .with_title(task.title.clone())
-        .with_task(task.description.clone()),
+        &run_id,
+        &worker_trace_id,
+        &task,
+        &contract,
     );
 
     // Acquire concurrency permits with cancel awareness:
@@ -1292,6 +1285,7 @@ async fn execute_task(
     // dependencies, so the worker gets compact upstream context instead of
     // (or in addition to) re-reading everything from scratch (plan §1039).
     let dep_summaries = collect_dependency_summaries(&store, &run_id, &task);
+    let parent_goal = store.get_run(&run_id).ok().flatten().map(|run| run.goal);
 
     // Stable workspace context for the worker — prepended to the task prompt
     // so workers know where to operate without needing CWD in their system prompt.
@@ -1303,7 +1297,12 @@ async fn execute_task(
             String::new()
         }
     };
-    let prompt = build_task_prompt(&task, &dep_summaries, delegation_policy);
+    let prompt = build_task_prompt(
+        &task,
+        &dep_summaries,
+        delegation_policy,
+        parent_goal.as_deref(),
+    );
     let prompt = format!("{ws_prefix}{prompt}");
 
     // Dispatch the task. Three paths, by kind:
@@ -1351,7 +1350,7 @@ async fn execute_task(
             prompt_chars = prompt.chars().count(),
             "task_runtime: delegating read-only task to subagent"
         );
-        match run_readonly_worker(
+        let dispatch_result = run_readonly_worker(
             &primary_agent,
             &run_id,
             &execution_id,
@@ -1362,8 +1361,8 @@ async fn execute_task(
             delegation_policy,
             trace_sink.clone(),
         )
-        .await
-        {
+        .await;
+        match dispatch_result {
             Ok(sub_result) => {
                 tracing::info!(
                     run_id = %run_id,
@@ -1396,7 +1395,7 @@ async fn execute_task(
             prompt_chars = prompt.chars().count(),
             "task_runtime: delegating writer task to subagent"
         );
-        match run_writer_worker(
+        let dispatch_result = run_writer_worker(
             &primary_agent,
             store.clone(),
             &run_id,
@@ -1407,8 +1406,8 @@ async fn execute_task(
             delegation_policy,
             trace_sink.clone(),
         )
-        .await
-        {
+        .await;
+        match dispatch_result {
             Ok(sub_result) => {
                 tracing::info!(
                     run_id = %run_id,
@@ -1432,6 +1431,14 @@ async fn execute_task(
                     error = %e,
                     "writer subagent dispatch failed; falling back to in-place main-agent execution"
                 );
+                emit_task_isolation_observed(
+                    trace_sink.as_ref(),
+                    &run_id,
+                    &worker_trace_id,
+                    &task,
+                    &contract,
+                    "primary-fallback",
+                );
                 (
                     run_main_agent_task(
                         &primary_agent,
@@ -1448,6 +1455,14 @@ async fn execute_task(
             }
         }
     } else {
+        emit_task_isolation_observed(
+            trace_sink.as_ref(),
+            &run_id,
+            &worker_trace_id,
+            &task,
+            &contract,
+            "primary",
+        );
         (
             run_main_agent_task(
                 &primary_agent,
@@ -1501,6 +1516,7 @@ async fn execute_task(
     match result {
         Ok(text) => {
             let suggested_tasks = extract_suggested_tasks_from_worker_output(&text);
+            let evidence_files = extract_evidence_paths_from_worker_output(&text);
             // The worker's full output is stored in TaskExecutionSummary.completed_work
             // (read by build_run_summaries → main agent's plan_execute ToolResult) and
             // returned as the task summary (used by the review gate for write tasks and
@@ -1520,7 +1536,7 @@ async fn execute_task(
                 task_id: task_id.clone(),
                 worker_agent: task.agent_role.clone(),
                 completed_work: vec![text.trim().to_string()],
-                files_read: vec![],
+                files_read: evidence_files,
                 files_changed: if is_write { task.files.clone() } else { vec![] },
                 decisions: vec![],
                 failures: vec![],
@@ -1572,6 +1588,7 @@ async fn execute_task(
 }
 
 const MAX_SUGGESTED_TASKS_PER_WORKER: usize = 5;
+const MAX_EVIDENCE_PATHS_PER_WORKER: usize = 24;
 
 #[derive(Debug, serde::Deserialize)]
 struct SuggestedTaskEnvelope {
@@ -1611,6 +1628,208 @@ fn extract_suggested_tasks_from_worker_output(text: &str) -> Vec<SuggestedTask> 
         }
     }
     out
+}
+
+fn extract_evidence_paths_from_worker_output(text: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+
+    for raw in text.split(|ch: char| ch.is_whitespace() || matches!(ch, '，' | '、' | '；')) {
+        if out.len() >= MAX_EVIDENCE_PATHS_PER_WORKER {
+            break;
+        }
+        if let Some((_, destination_with_suffix)) = raw.split_once("](") {
+            let destination_with_closing =
+                destination_with_suffix.trim_end_matches([',', ';', '.', '。', '，', '；']);
+            if let Some(destination) = destination_with_closing.strip_suffix(')') {
+                push_evidence_path(destination, true, &mut seen, &mut out);
+            }
+            continue;
+        }
+        push_evidence_path(raw, false, &mut seen, &mut out);
+    }
+    out
+}
+
+fn push_evidence_path(
+    token: &str,
+    explicit_markdown_destination: bool,
+    seen: &mut HashSet<String>,
+    out: &mut Vec<String>,
+) {
+    if let Some(path) = normalize_evidence_path_token(token, explicit_markdown_destination)
+        && seen.insert(path.clone())
+    {
+        out.push(path);
+    }
+}
+
+fn normalize_evidence_path_token(
+    token: &str,
+    explicit_markdown_destination: bool,
+) -> Option<String> {
+    let trimmed = token
+        .trim()
+        .trim_start_matches(['`', '\'', '"', '(', '[', '{', '<'])
+        .trim_end_matches(|ch: char| {
+            matches!(
+                ch,
+                '`' | '\'' | '"' | ')' | ']' | '}' | '>' | ',' | ';' | '.' | '。'
+            )
+        });
+    let lower = trimmed.to_ascii_lowercase();
+    if trimmed.is_empty()
+        || trimmed.contains('@')
+        || (looks_like_uri(&lower)
+            && !is_explicit_markdown_line_reference(trimmed, explicit_markdown_destination))
+    {
+        return None;
+    }
+
+    let path = if let Some((path, location)) = trimmed.rsplit_once(':') {
+        if is_line_or_range(location) {
+            path
+        } else {
+            trimmed
+        }
+    } else {
+        trimmed
+    };
+    let path = path.trim_end_matches([':', '.', '。']);
+    if path.is_empty()
+        || looks_like_semantic_version(path)
+        || looks_like_hostname(path)
+        || (!explicit_markdown_destination && !looks_like_path(path))
+    {
+        return None;
+    }
+    Some(path.chars().take(240).collect())
+}
+
+fn looks_like_semantic_version(token: &str) -> bool {
+    let candidate = token
+        .strip_prefix('v')
+        .or_else(|| token.strip_prefix('V'))
+        .unwrap_or(token);
+    let parts: Vec<&str> = candidate.split('.').collect();
+    parts.len() >= 2
+        && parts
+            .iter()
+            .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit()))
+}
+
+fn looks_like_uri(token: &str) -> bool {
+    let Some((scheme, remainder)) = token.split_once(':') else {
+        return false;
+    };
+    if scheme.chars().count() == 1
+        && scheme.chars().all(|ch| ch.is_ascii_alphabetic())
+        && (remainder.starts_with('/') || remainder.starts_with('\\'))
+    {
+        return false;
+    }
+    let mut chars = scheme.chars();
+    chars.next().is_some_and(|ch| ch.is_ascii_alphabetic())
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
+}
+
+fn is_explicit_markdown_line_reference(token: &str, explicit: bool) -> bool {
+    if !explicit {
+        return false;
+    }
+    let Some((path, location)) = token.rsplit_once(':') else {
+        return false;
+    };
+    !path.contains(':')
+        && is_line_or_range(location)
+        && (path == "README"
+            || path == "Makefile"
+            || path.starts_with('.')
+            || path.contains('/')
+            || path.contains('\\')
+            || path
+                .rsplit_once('.')
+                .is_some_and(|(_, extension)| is_credible_file_extension(extension)))
+}
+
+fn looks_like_hostname(token: &str) -> bool {
+    let normalized = token.trim_start_matches("//");
+    let authority = normalized.split(['/', '\\']).next().unwrap_or_default();
+    let Some((host, suffix)) = authority.rsplit_once('.') else {
+        return false;
+    };
+    if host.is_empty() || suffix.is_empty() {
+        return false;
+    }
+    let has_path = normalized.contains('/') || normalized.contains('\\');
+    has_path || !is_credible_file_extension(suffix)
+}
+
+fn is_credible_file_extension(extension: &str) -> bool {
+    matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "c" | "cc"
+            | "cpp"
+            | "css"
+            | "csv"
+            | "go"
+            | "h"
+            | "hpp"
+            | "html"
+            | "ini"
+            | "java"
+            | "js"
+            | "json"
+            | "jsx"
+            | "kt"
+            | "lock"
+            | "md"
+            | "mjs"
+            | "py"
+            | "rb"
+            | "rs"
+            | "sh"
+            | "sql"
+            | "toml"
+            | "ts"
+            | "tsx"
+            | "txt"
+            | "xml"
+            | "yaml"
+            | "yml"
+            | "zig"
+    )
+}
+
+fn is_line_or_range(location: &str) -> bool {
+    if location.is_empty() {
+        return false;
+    }
+    if let Some((start, end)) = location.split_once('-') {
+        return !start.is_empty()
+            && !end.is_empty()
+            && start.chars().all(|ch| ch.is_ascii_digit())
+            && end.chars().all(|ch| ch.is_ascii_digit());
+    }
+    location.chars().all(|ch| ch.is_ascii_digit())
+}
+
+fn looks_like_path(token: &str) -> bool {
+    let has_explicit_prefix = token.starts_with("./")
+        || token.starts_with("../")
+        || token.starts_with('/')
+        || token.starts_with("~/")
+        || token.starts_with(".\\")
+        || token.starts_with("..\\")
+        || token.starts_with('\\');
+    has_explicit_prefix || has_filename_extension(token)
+}
+
+fn has_filename_extension(token: &str) -> bool {
+    let filename = token.rsplit(['/', '\\']).next().unwrap_or_default();
+    filename
+        .rsplit_once('.')
+        .is_some_and(|(stem, extension)| !stem.is_empty() && !extension.is_empty())
 }
 
 fn suggested_task_json_candidates(text: &str) -> Vec<String> {
@@ -1889,6 +2108,123 @@ fn collect_dependency_summaries(
         .collect()
 }
 
+struct SubagentRuntimeContract {
+    prompt_source: String,
+    isolation_requested: String,
+    context_in: String,
+    returns: String,
+}
+
+fn runtime_contract_started_payload(contract: &SubagentRuntimeContract) -> serde_json::Value {
+    serde_json::json!({
+        "prompt_source": contract.prompt_source,
+        "isolation_requested": contract.isolation_requested,
+        "context_in": contract.context_in,
+        "returns": contract.returns,
+    })
+}
+
+fn runtime_isolation_observed_payload(
+    contract: &SubagentRuntimeContract,
+    isolation_observed: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "isolation_requested": contract.isolation_requested,
+        "isolation_observed": isolation_observed,
+    })
+}
+
+fn emit_task_started(
+    sink: Option<&ExecSink>,
+    run_id: &str,
+    worker_trace_id: &str,
+    task: &PlanTask,
+    contract: &SubagentRuntimeContract,
+) {
+    let mut payload = runtime_contract_started_payload(contract);
+    if let Some(payload) = payload.as_object_mut() {
+        payload.insert(
+            "kind".to_string(),
+            serde_json::Value::String(task.kind.as_str().to_string()),
+        );
+        payload.insert(
+            "agent_role".to_string(),
+            serde_json::Value::String(task.agent_role.clone()),
+        );
+    }
+    emit_exec(
+        sink,
+        ExecEvent::for_task(run_id, worker_trace_id, "started", payload)
+            .with_agent(task.agent_role.clone())
+            .with_title(task.title.clone())
+            .with_task(task.description.clone()),
+    );
+}
+
+fn emit_task_isolation_observed(
+    sink: Option<&ExecSink>,
+    run_id: &str,
+    worker_trace_id: &str,
+    task: &PlanTask,
+    contract: &SubagentRuntimeContract,
+    isolation_observed: &str,
+) {
+    emit_exec(
+        sink,
+        ExecEvent::for_task(
+            run_id,
+            worker_trace_id,
+            "isolation_observed",
+            runtime_isolation_observed_payload(contract, isolation_observed),
+        )
+        .with_agent(task.agent_role.clone())
+        .with_title(task.title.clone()),
+    );
+}
+
+async fn subagent_runtime_contract(
+    primary_agent: &crate::agent_handle::AgentHandle,
+    agent_role: &str,
+    kind: &PlanTaskKind,
+) -> SubagentRuntimeContract {
+    let registry = primary_agent
+        .read(|agent| agent.subagent_registry().clone())
+        .await;
+    let definitions = registry.list_available().await;
+    let definition = definitions.iter().find(|def| def.name == agent_role);
+
+    let prompt_source = definition
+        .and_then(|def| {
+            def.tags
+                .iter()
+                .find_map(|tag| tag.strip_prefix("prompt_source:").map(str::to_string))
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let isolation_requested = definition
+        .and_then(|def| {
+            def.tags
+                .iter()
+                .find_map(|tag| tag.strip_prefix("isolation:").map(str::to_string))
+        })
+        .unwrap_or_else(|| {
+            if matches!(kind, PlanTaskKind::Implementation | PlanTaskKind::Debugging) {
+                "worktree".to_string()
+            } else if kind.is_read_only() {
+                "context".to_string()
+            } else {
+                "primary".to_string()
+            }
+        });
+
+    SubagentRuntimeContract {
+        prompt_source,
+        isolation_requested,
+        context_in: "task_context + dependency summaries + workspace root".to_string(),
+        returns: "TaskExecutionSummary + execution://event trace".to_string(),
+    }
+}
+
 /// Build the prompt handed to a task's worker. Combines the task brief with
 /// its verification criteria, the Summary Chain from completed dependencies,
 /// and a read-only reminder for non-mutating kinds.
@@ -1896,6 +2232,7 @@ fn build_task_prompt(
     task: &PlanTask,
     dep_summaries: &[(String, String)],
     delegation_policy: echo_agent::tasks::NestedDelegationPolicy,
+    parent_goal: Option<&str>,
 ) -> String {
     let mut s = String::new();
     // [task_context] marker: all content below is dynamic per-task information.
@@ -1903,6 +2240,9 @@ fn build_task_prompt(
     // target files, verification steps, and dependency summaries go HERE
     // (in the user message), keeping the system prefix cache-stable.
     s.push_str("[task_context]\n");
+    if let Some(goal) = parent_goal.filter(|goal| !goal.trim().is_empty()) {
+        s.push_str(&format!("Parent goal: {goal}\n\n"));
+    }
     s.push_str(&format!("Task: {}\n\n{}\n\n", task.title, task.description));
     // Summary Chain: compact context from completed upstream tasks. Replaces
     // the raw upstream worker conversations (plan §1039-1062).
@@ -1958,7 +2298,15 @@ fn build_task_prompt(
          ```\n\
          Only suggest tasks that are genuinely needed and scoped enough to execute independently.\n",
     );
-    s.push_str("\nReturn a concise summary of what you did and found.");
+    s.push_str(
+        "\nReturn contract for the main agent:\n\
+         - Completed work: concise, evidence-backed findings or changes.\n\
+         - Evidence: include file paths with line numbers when applicable (path:line).\n\
+         - Decisions: list any concrete design/analysis decisions you made.\n\
+         - Failures/blockers: name failed commands, missing data, or uncertainty.\n\
+         - Verification: say exactly what you ran or why you could not run it.\n\
+         - Next implications: what the main agent should do with your result.\n",
+    );
     s
 }
 
@@ -2262,6 +2610,7 @@ async fn run_main_agent_task(
                                 "cached_prompt_tokens": cached_prompt_tokens,
                                 "cache_creation_prompt_tokens": cache_creation_prompt_tokens,
                                 "usage_reported": usage_reported,
+                                "usage_event_id": uuid::Uuid::new_v4().to_string(),
                             });
                             if let Err(error) = store.record_worker_llm_usage(
                                 &run_id,
@@ -2628,44 +2977,30 @@ pub async fn drive_unattended_run(
         cancel_for_scope.clone(),
         None, // trace_sink — no GUI event stream for unattended run
         async {
-            // Inject external context so worker-spawned tools can read
-            // run_id/cancel across spawn boundaries (same pattern as
-            // launch_unified_run in chat.rs).
-            use echo_core::tools::ExternalRunContext;
             let agent_inner = primary_agent.inner().clone();
             let agent = agent_inner.read().await;
-            agent.set_external_context(&ExternalRunContext {
-                run_id: run_id_for_scope.clone(),
-                execution_id: None,
-                message_id: None, // unattended/cron path has no chat message
-                cancel: Some(std::sync::Arc::new(cancel_for_scope.clone())),
-                trace_sink: None,
-                delegation_policy: None,
-            });
-
-            // D7 stage 2: bind the agent's working_dir to the worktree path
-            // so every shell/file/git tool runs inside the isolated checkout.
-            // Must happen before execute_stream_with_cancel (which triggers
-            // tool calls). set_working_dir is &self and uses internal mutex.
-            //
-            // Phase C (fixed): the cron caller now acquires a per-run POOL
-            // agent (build_fire_fn → pool.acquire(run-scoped key)), so this
-            // binding mutates the run's OWN agent — overlapping cron runs no
-            // longer clobber each other's working_dir (the latent bug that was
-            // previously masked only by the agent's execution_mutex). The
-            // AgentChat path (submit_run) likewise passes its own pool-acquired
-            // agent, so this is isolated in all live callers. The only residual
-            // shared-agent caller is the no-pool fallback (single-agent setups),
-            // where there is no overlap to worry about.
-            if let Some(ref wt_path) = wt_path_for_scope {
-                agent.set_working_dir(Some(wt_path.clone()));
-            }
+            let invocation = echo_core::agent::AgentInvocationContext {
+                runtime: Some(echo_core::tools::ExternalRunContext {
+                    run_id: run_id_for_scope.clone(),
+                    execution_id: None,
+                    message_id: None, // unattended/cron path has no chat message
+                    cancel: Some(std::sync::Arc::new(cancel_for_scope.clone())),
+                    trace_sink: None,
+                    delegation_policy: None,
+                }),
+                working_dir: wt_path_for_scope,
+                cancel: None,
+            };
 
             // Execute the prompt. The agent's ReAct loop will call
             // plan_create + plan_execute, which runs the plan through
             // execute_run with all safety gates (preflight, approval skip).
             match agent
-                .execute_stream_with_cancel(&prompt_owned, cancel_for_scope.clone())
+                .execute_stream_with_invocation_context(
+                    &prompt_owned,
+                    cancel_for_scope.clone(),
+                    invocation,
+                )
                 .await
             {
                 Ok(mut stream) => {
@@ -2980,6 +3315,247 @@ mod tests {
     }
 
     #[test]
+    fn evidence_path_extraction_keeps_file_refs_without_urls() -> Result<(), String> {
+        let text = "发现见 echo-agent/src/agent/react/mod.rs:2253，\
+            中文文件在 docs/设计/上下文.md:12；外部参考 https://example.com/a/b。";
+        let paths = extract_evidence_paths_from_worker_output(text);
+        if !paths.contains(&"echo-agent/src/agent/react/mod.rs".to_string()) {
+            return Err("expected Rust file path evidence".to_string());
+        }
+        if !paths.contains(&"docs/设计/上下文.md".to_string()) {
+            return Err("expected UTF-8 file path evidence".to_string());
+        }
+        if paths.iter().any(|path| path.starts_with("https://")) {
+            return Err("URL should not be treated as file evidence".to_string());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_path_extraction_supports_markdown_links_and_line_ranges() -> Result<(), String> {
+        let text = "See [runtime code](echo-agent-app-core/src/tasks/task_runtime/executor.rs:1629-1684) \
+            and [design](./docs/设计/上下文.md:10-18).";
+        let paths = extract_evidence_paths_from_worker_output(text);
+        for expected in [
+            "echo-agent-app-core/src/tasks/task_runtime/executor.rs",
+            "./docs/设计/上下文.md",
+        ] {
+            if !paths.iter().any(|path| path == expected) {
+                return Err(format!("missing Markdown evidence destination: {expected}"));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_path_extraction_rejects_urls_and_generic_slash_prose() -> Result<(), String> {
+        let text = "Use and/or when needed. Read [external](https://example.com/docs/file.rs:12) \
+            or visit http://example.test/a/b. This is prose/without/a/file.";
+        let paths = extract_evidence_paths_from_worker_output(text);
+        if !paths.is_empty() {
+            return Err(format!(
+                "URLs and generic slash prose must not become evidence: {paths:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_markdown_accepts_extensionless_dotfiles_and_parentheses() -> Result<(), String> {
+        let text = "Read [overview](README), [build](Makefile:12), \
+            [config](.github/workflows/ci.yml:8-14), [.env](.env), and \
+            [nested design](docs/context(lifecycle).md:20-24).";
+        let paths = extract_evidence_paths_from_worker_output(text);
+        for expected in [
+            "README",
+            "Makefile",
+            ".github/workflows/ci.yml",
+            ".env",
+            "docs/context(lifecycle).md",
+        ] {
+            if !paths.iter().any(|path| path == expected) {
+                return Err(format!("missing explicit Markdown evidence: {expected}"));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_bare_tokens_reject_non_file_lookalikes() -> Result<(), String> {
+        let text = "Contact dev@example.com or visit example.com docs.example.org and \
+            [host path](example.com/docs/file.rs). Versions 1.2.3 and v2.10.4 are not files; \
+            neither is choice/alternative.";
+        let paths = extract_evidence_paths_from_worker_output(text);
+        if !paths.is_empty() {
+            return Err(format!("non-file lookalikes must be rejected: {paths:?}"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_rejects_generic_uris_versions_and_uncommon_domains() -> Result<(), String> {
+        let text = "ftp://files.example.xyz/src/lib.rs ssh://host.internal/README.md \
+            custom://example.dev/Makefile versions 1.2 v1.2 10.20 and \
+            [domain path](docs.example.xyz/reference/file.rs).";
+        let paths = extract_evidence_paths_from_worker_output(text);
+        if !paths.is_empty() {
+            return Err(format!("URI/version/domain lookalikes leaked: {paths:?}"));
+        }
+
+        let credible =
+            extract_evidence_paths_from_worker_output("[source](src/lib.rs) [guide](README.md)");
+        if credible != ["src/lib.rs", "README.md"] {
+            return Err(format!(
+                "credible explicit file references were lost: {credible:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn evidence_rejects_rfc_scheme_prefixes_but_keeps_windows_drives() -> Result<(), String> {
+        let text = "urn:isbn:9780143127796 file:///tmp/report.rs mailto:dev@example.com \
+            ssh:host/path.rs custom:value/path.ts C:\\repo\\src\\main.rs:12 \
+            D:/workspace/README.md:4-8";
+        let paths = extract_evidence_paths_from_worker_output(text);
+        if paths
+            != [
+                "C:\\repo\\src\\main.rs".to_string(),
+                "D:/workspace/README.md".to_string(),
+            ]
+        {
+            return Err(format!("scheme/drive classification was wrong: {paths:?}"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_contract_distinguishes_requested_and_observed_isolation() -> Result<(), String> {
+        let contract = SubagentRuntimeContract {
+            prompt_source: "builtin:implementer".to_string(),
+            isolation_requested: "worktree".to_string(),
+            context_in: "task context".to_string(),
+            returns: "summary".to_string(),
+        };
+        let started = runtime_contract_started_payload(&contract);
+        if started.get("isolation").is_some() {
+            return Err(
+                "legacy isolation field must not claim configured isolation happened".into(),
+            );
+        }
+        if started
+            .get("isolation_requested")
+            .and_then(|value| value.as_str())
+            != Some("worktree")
+        {
+            return Err("started event must report requested worktree isolation".into());
+        }
+        if started.get("isolation_observed").is_some() {
+            return Err("started event must not invent observed isolation".into());
+        }
+
+        let fallback = runtime_isolation_observed_payload(&contract, "primary-fallback");
+        if fallback
+            .get("isolation_observed")
+            .and_then(|value| value.as_str())
+            != Some("primary-fallback")
+        {
+            return Err("writer fallback must report primary-fallback observation".into());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn writer_runtime_contract_requests_worktree_without_claiming_fallback()
+    -> Result<(), String> {
+        let agent = echo_agent::agent::ReactAgentBuilder::new()
+            .model("test-model")
+            .system_prompt("test")
+            .build()
+            .map_err(|error| error.to_string())?;
+        let handle = crate::agent_handle::AgentHandle::new(agent);
+
+        let contract =
+            subagent_runtime_contract(&handle, "missing-writer", &PlanTaskKind::Implementation)
+                .await;
+        if contract.isolation_requested != "worktree" {
+            return Err(format!(
+                "writer must request worktree isolation, got {}",
+                contract.isolation_requested
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn primary_isolation_event_reaches_sink_before_terminal() -> Result<(), String> {
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::<ExecEvent>::new()));
+        let sink_recorded = Arc::clone(&recorded);
+        let sink: ExecSink = Arc::new(move |event| {
+            sink_recorded
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push(event);
+        });
+        let task = PlanTask {
+            id: "task-1".to_string(),
+            title: "Inspect runtime".to_string(),
+            description: "Inspect context lifecycle".to_string(),
+            kind: PlanTaskKind::Investigation,
+            agent_role: "explorer".to_string(),
+            ..PlanTask::default()
+        };
+        let contract = SubagentRuntimeContract {
+            prompt_source: "builtin:explorer".to_string(),
+            isolation_requested: "primary".to_string(),
+            context_in: "task context".to_string(),
+            returns: "summary".to_string(),
+        };
+
+        emit_task_started(Some(&sink), "run-1", "task-1", &task, &contract);
+        emit_task_isolation_observed(Some(&sink), "run-1", "task-1", &task, &contract, "primary");
+        emit_exec(
+            Some(&sink),
+            ExecEvent::for_task(
+                "run-1",
+                "task-1",
+                "completed",
+                serde_json::json!({"output": "done"}),
+            ),
+        );
+
+        let events = recorded.lock().unwrap_or_else(|error| error.into_inner());
+        let event_names: Vec<&str> = events.iter().map(|event| event.event.as_str()).collect();
+        if event_names != ["started", "isolation_observed", "completed"] {
+            return Err(format!("unexpected event ordering: {event_names:?}"));
+        }
+        let started = events
+            .first()
+            .ok_or_else(|| "missing started event".to_string())?;
+        let observed = events
+            .get(1)
+            .ok_or_else(|| "missing isolation observation".to_string())?;
+        if started.payload.get("isolation").is_some() || observed.payload.get("isolation").is_some()
+        {
+            return Err("backend must not emit the legacy isolation field".to_string());
+        }
+        if started
+            .payload
+            .get("isolation_requested")
+            .and_then(|value| value.as_str())
+            != Some("primary")
+            || observed
+                .payload
+                .get("isolation_observed")
+                .and_then(|value| value.as_str())
+                != Some("primary")
+        {
+            return Err("requested/observed isolation fields were not delivered".to_string());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn preflight_disabled_rejects_write_kinds() {
         // B1: stage-1 regression — under Disabled, write kinds are rejected.
         let task = preflight_task("t1", PlanTaskKind::Implementation, &[], &[]);
@@ -3268,11 +3844,14 @@ Read the runtime path and found one missing branch.
             &task,
             &[],
             echo_agent::tasks::NestedDelegationPolicy::default(),
+            Some("Fix the GUI context runtime"),
         );
+        assert!(p.contains("Parent goal: Fix the GUI context runtime"));
         assert!(p.contains("READ-ONLY"));
         assert!(p.contains("chat.rs"));
         assert!(p.contains("report root cause"));
         assert!(p.contains("Do not delegate this task to other agents"));
+        assert!(p.contains("Return contract for the main agent"));
     }
 
     #[test]
@@ -3288,6 +3867,7 @@ Read the runtime path and found one missing branch.
             &task,
             &[],
             echo_agent::tasks::NestedDelegationPolicy::default(),
+            None,
         );
         assert!(!p.contains("READ-ONLY"));
         assert!(p.contains("scoped change"));
@@ -3310,6 +3890,7 @@ Read the runtime path and found one missing branch.
                 delegate_depth: 0,
                 max_delegate_depth: 2,
             },
+            None,
         );
         assert!(p.contains("may use agent_tool"));
         assert!(p.contains("within this PlanTask only"));

@@ -60,7 +60,7 @@ export function ToolCallCard({
           <div>
             <div className="mb-1 flex items-center justify-between">
               <span
-                className={`font-medium uppercase tracking-wider text-[var(--text-tertiary)] ${compact ? 'text-[9px]' : 'text-[11px]'}`}
+                className={`font-medium uppercase text-[var(--text-tertiary)] ${compact ? 'text-[9px]' : 'text-[11px]'}`}
               >
                 参数
               </span>
@@ -80,7 +80,7 @@ export function ToolCallCard({
           <div>
             <div className="mb-1 flex items-center justify-between">
               <span
-                className={`font-medium uppercase tracking-wider text-[var(--text-tertiary)] ${compact ? 'text-[9px]' : 'text-[11px]'}`}
+                className={`font-medium uppercase text-[var(--text-tertiary)] ${compact ? 'text-[9px]' : 'text-[11px]'}`}
               >
                 结果
               </span>

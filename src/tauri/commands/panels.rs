@@ -7,6 +7,7 @@
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
 use echo_agent_app_core::state::{AuditDecision, PermissionBehavior, PermissionRuleConfig};
+use echo_agent_app_core::tasks::task_runtime::compact_context::RUNTIME_RECOVERY_MARKER;
 use serde::Serialize;
 use serde_json::json;
 use std::path::{Path, PathBuf};
@@ -1018,7 +1019,14 @@ pub async fn compress_context(
 pub async fn get_compression_stats(
     state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
-    let (message_count, current_tokens, token_limit, compression_ratio) = state
+    let (
+        message_count,
+        current_tokens,
+        token_limit,
+        compression_ratio,
+        protected_message_count,
+        runtime_recovery_active,
+    ) = state
         .app_state
         .connection
         .agent
@@ -1032,6 +1040,8 @@ pub async fn get_compression_stats(
                     ctx.token_estimate(),
                     token_limit,
                     ratio,
+                    ctx.protected_message_count(),
+                    ctx.has_projection(RUNTIME_RECOVERY_MARKER),
                 )
             })
         })
@@ -1043,6 +1053,8 @@ pub async fn get_compression_stats(
         "current_tokens": current_tokens,
         "token_limit": token_limit,
         "compression_ratio": compression_ratio,
+        "protected_message_count": protected_message_count,
+        "runtime_recovery_active": runtime_recovery_active,
         "needs_compression": needs_compression,
     }))
 }

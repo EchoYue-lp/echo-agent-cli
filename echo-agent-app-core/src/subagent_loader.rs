@@ -109,6 +109,9 @@ pub struct WorkerDefinition {
     pub name: String,
     pub description: String,
     pub system_prompt: String,
+    /// Where the subagent prompt came from. Stable diagnostic value:
+    /// `builtin:<name>`, `user:<path>`, or `project:<path>`.
+    pub source: String,
     pub readonly: bool,
     /// Sprint 8: whether Fork dispatch should isolate this subagent in a git
     /// worktree. Mapped from frontmatter `worktree: true`. Only meaningful for
@@ -163,13 +166,13 @@ pub fn discover_subagents(
     // 2. User scope (~/.echo-agent/subagents/).
     if let Some(home) = user_home {
         let user_dir = home.join(".echo-agent").join("subagents");
-        merge_scope(&mut by_name, &user_dir);
+        merge_scope(&mut by_name, "user", &user_dir);
     }
 
     // 3. Project scope (<root>/.eko/subagents/) — highest priority, last.
     if let Some(root) = project_root {
         let project_dir = root.join(".eko").join("subagents");
-        merge_scope(&mut by_name, &project_dir);
+        merge_scope(&mut by_name, "project", &project_dir);
     }
 
     // Preserve builtin order for stable registration, then append any
@@ -197,7 +200,11 @@ pub fn discover_subagents(
 /// **overwriting** any same-named entry. Higher-priority scopes are merged
 /// later (builtins first → user → project), so the last write wins, giving
 /// project > user > builtin precedence.
-fn merge_scope(by_name: &mut std::collections::HashMap<String, WorkerDefinition>, dir: &Path) {
+fn merge_scope(
+    by_name: &mut std::collections::HashMap<String, WorkerDefinition>,
+    scope: &str,
+    dir: &Path,
+) {
     if !dir.is_dir() {
         return;
     }
@@ -205,7 +212,8 @@ fn merge_scope(by_name: &mut std::collections::HashMap<String, WorkerDefinition>
     scan_directory(dir, 0, &mut found);
     for (path, content) in found {
         match parse_worker_md(&content, None) {
-            Ok(def) => {
+            Ok(mut def) => {
+                def.source = format!("{scope}:{}", path.display());
                 by_name.insert(def.name.clone(), def);
             }
             Err(e) => {
@@ -351,6 +359,9 @@ pub fn parse_worker_md(
     };
 
     Ok(WorkerDefinition {
+        source: fallback_name
+            .map(|name| format!("builtin:{name}"))
+            .unwrap_or_else(|| "file:<unknown>".to_string()),
         name,
         description: fm.description,
         system_prompt,

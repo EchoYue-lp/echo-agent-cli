@@ -55,8 +55,7 @@ function reconstructSteps(events: ExecutionEvent[]): {
   for (const e of events) {
     if (e.event === 'thinking_delta') {
       if (e.content) currentThinking.push(e.content);
-    } else if (e.event === 'usage') {
-      // thinking_ended maps to `usage`; flush the accumulated thinking.
+    } else if (e.event === 'thinking_ended') {
       flushThinking();
     } else if (e.event === 'tool_started') {
       flushThinking();
@@ -120,9 +119,9 @@ export const SubagentStreamBlock = memo(function SubagentStreamBlock({
     );
 
   return (
-    <div className="my-0.5 rounded-md px-2 py-1 hover:bg-[var(--bg-hover)] transition-colors">
+    <div className="my-0.5 border-l border-[var(--border-primary)] pl-3">
       {/* Header (always visible): title + status + progress summary */}
-      <div className="flex w-full items-center gap-1.5 text-[11px]">
+      <div className="flex w-full items-center gap-1.5 text-[12px]">
         <button
           type="button"
           onClick={() => setExpanded((e) => !e)}
@@ -134,7 +133,7 @@ export const SubagentStreamBlock = memo(function SubagentStreamBlock({
         <button
           type="button"
           onClick={() => selectSubagent(run.subagentRunId)}
-          className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
+          className="flex min-w-0 flex-1 items-center gap-1.5 rounded-md px-1 py-0.5 text-left transition-colors hover:bg-[var(--bg-hover)]"
         >
           {statusIcon}
           <span className="truncate font-medium text-[var(--text-primary)]">
@@ -148,7 +147,7 @@ export const SubagentStreamBlock = memo(function SubagentStreamBlock({
       </div>
 
       {expanded && (
-        <div className="mt-1.5 space-y-1.5 pl-1">
+        <div className="mt-1.5 space-y-1.5 pl-4">
           {/* Prompt */}
           {run.task && (
             <div>

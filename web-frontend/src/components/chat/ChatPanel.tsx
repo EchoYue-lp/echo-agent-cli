@@ -103,13 +103,17 @@ export function ChatPanel() {
   };
 
   return (
-    <div className="flex h-full flex-col min-h-0" role="main" aria-label="聊天面板">
-      <div className="flex h-12 shrink-0 items-center justify-between border-b border-[var(--border-primary)] bg-[var(--bg-primary)] px-12">
+    <div
+      className="flex h-full min-h-0 flex-col bg-[var(--bg-chat)]"
+      role="main"
+      aria-label="聊天面板"
+    >
+      <div className="flex h-11 shrink-0 items-center justify-between border-b border-[var(--border-secondary)] bg-[var(--bg-chat)]/95 px-12 backdrop-blur">
         <div className="min-w-0">
-          <div className="truncate text-sm font-semibold text-[var(--text-primary)]">
+          <div className="truncate text-[13px] font-medium text-[var(--text-primary)]">
             {currentWorkspace?.name || 'EKO'}
           </div>
-          <div className="truncate text-[11px] text-[var(--text-tertiary)]">
+          <div className="truncate text-[10px] text-[var(--text-tertiary)]">
             {currentWorkspace?.root || '选择或创建一个任务开始工作'}
           </div>
         </div>
@@ -129,7 +133,7 @@ export function ChatPanel() {
       ) : (
         <div
           ref={scrollRef}
-          className="flex-1 overflow-y-auto min-h-0"
+          className="min-h-0 flex-1 overflow-y-auto"
           onScroll={handleScroll}
           role="log"
           aria-live="polite"
@@ -138,8 +142,8 @@ export function ChatPanel() {
           {messages.length === 0 ? (
             <WelcomeScreen onSuggestionClick={handleSuggestionClick} />
           ) : (
-            <div className="mx-auto w-full max-w-[768px] px-5 sm:px-8">
-              <div className="space-y-1 pb-4 pt-4">
+            <div className="mx-auto w-full max-w-[980px] px-4 sm:px-6 lg:px-8">
+              <div className="space-y-1 pb-6 pt-5">
                 {messages.map((msg, idx) => {
                   const prevMsg = idx > 0 ? messages[idx - 1] : null;
                   const showSeparator =
@@ -274,9 +278,9 @@ export function ChatPanel() {
         </div>
       )}
 
-      <div>
+      <div className="shrink-0 bg-[linear-gradient(to_top,var(--bg-chat)_72%,transparent)]">
         {approvalRequest && (
-          <div className="mx-auto w-full max-w-[768px] px-5 pb-2 sm:px-8">
+          <div className="mx-auto w-full max-w-[980px] px-4 pb-2 sm:px-6 lg:px-8">
             <ApprovalCard
               request={approvalRequest}
               onApprove={() => sendApproval(approvalRequest.requestId, true)}

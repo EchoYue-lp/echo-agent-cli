@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "dev:tauri": "vite --mode tauri",
+    "test": "vitest run",
     "build": "tsc -b && vite build",
     "build:tauri": "tsc -b && vite build --mode tauri",
     "preview": "vite preview"
@@ -35,6 +36,7 @@
     "prettier": "^3.8.3",
     "tailwindcss": "^4.1.7",
     "typescript": "~5.8.3",
-    "vite": "^6.3.5"
+    "vite": "^6.3.5",
+    "vitest": "^4.1.10"
   }
 }

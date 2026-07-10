@@ -44,10 +44,9 @@ export function computeSubagentProgress(run: SubagentRunState): SubagentProgress
   const events = run.events;
   const toolCount = events.filter((e) => e.event === 'tool_started').length;
   const readCount = countReadTools(events);
-  // `usage` events correspond to thinking_ended (one round of thinking per
-  // model call). thinking_ended itself also maps to `usage`, so this counts
-  // completed thinking rounds.
-  const thinkingRounds = events.filter((e) => e.event === 'usage').length;
+  // A thinking_ended event closes one model reasoning round. Canonical usage
+  // is accounted separately and must not inflate progress.
+  const thinkingRounds = events.filter((e) => e.event === 'thinking_ended').length;
   return {
     status: run.status,
     toolCount,

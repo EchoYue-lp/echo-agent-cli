@@ -279,7 +279,7 @@ export function SettingsDialog() {
         {/* Left sidebar — settings nav */}
         <div className="flex w-[220px] shrink-0 flex-col border-r border-[var(--border-primary)] bg-[var(--settings-sidebar-bg)]">
           <div className="flex items-center justify-between border-b border-[var(--border-secondary)] px-5 py-4">
-            <h2 className="text-sm font-semibold tracking-tight text-[var(--text-primary)]">
+            <h2 className="text-sm font-semibold text-[var(--text-primary)]">
               设置
             </h2>
             <button
@@ -322,7 +322,7 @@ export function SettingsDialog() {
                   className="flex w-full items-center gap-2 px-2.5 pb-2 text-left"
                 >
                   <group.icon size={12} className="text-[var(--text-tertiary)]" />
-                  <span className="flex-1 text-[11px] font-semibold uppercase tracking-widest text-[var(--text-tertiary)]">
+                  <span className="flex-1 text-[11px] font-semibold uppercase text-[var(--text-tertiary)]">
                     {group.label}
                   </span>
                   {group.tier === 'advanced' &&

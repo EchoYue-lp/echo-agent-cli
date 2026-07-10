@@ -90,11 +90,11 @@ export function WelcomeScreen({
   return (
     <div className="flex h-full flex-col items-center justify-center px-4">
       <div className="mb-10 flex flex-col items-center">
-        <div className="animate-slide-up mb-5 flex h-12 w-12 items-center justify-center rounded-xl border border-[var(--border-primary)] bg-[var(--bg-primary)] text-[var(--accent)] shadow-[var(--shadow-sm)]">
-          <Sparkles size={22} />
+        <div className="animate-slide-up mb-5 flex h-10 w-10 items-center justify-center text-[var(--text-tertiary)]">
+          <Sparkles size={20} />
         </div>
         <h1
-          className="animate-slide-up text-xl font-semibold tracking-tight text-[var(--text-primary)]"
+          className="animate-slide-up text-xl font-semibold text-[var(--text-primary)]"
           style={{ animationDelay: '0.05s' }}
         >
           今天有什么可以帮你的？
@@ -109,21 +109,22 @@ export function WelcomeScreen({
 
       {/* Continue last session */}
       {!checking && latestSession && (
-        <div className="animate-slide-up mb-6 w-full max-w-2xl" style={{ animationDelay: '0.12s' }}>
+        <div
+          className="animate-slide-up mb-6 w-full max-w-[960px]"
+          style={{ animationDelay: '0.12s' }}
+        >
           <button
             onClick={handleResume}
             disabled={resumeLoading}
-            className="group flex w-full items-center gap-4 rounded-xl border border-[var(--border-primary)] bg-[var(--bg-primary)] p-4 text-left transition-all duration-200 hover:-translate-y-0.5 hover:shadow-[var(--shadow-lg)] disabled:opacity-60 disabled:cursor-not-allowed"
-            style={{ borderColor: 'var(--accent)' }}
+            className="group flex w-full items-center gap-4 rounded-lg border border-[var(--border-primary)] bg-transparent p-4 text-left transition-colors duration-200 hover:bg-[var(--bg-hover)] disabled:cursor-not-allowed disabled:opacity-60"
+            style={{ borderColor: 'var(--border-primary)' }}
             onMouseEnter={(e) => {
               if (!resumeLoading) {
                 e.currentTarget.style.borderColor = 'var(--accent)';
-                e.currentTarget.style.boxShadow =
-                  '0 8px 28px -4px color-mix(in srgb, var(--accent) 35%, transparent)';
               }
             }}
             onMouseLeave={(e) => {
-              e.currentTarget.style.boxShadow = '';
+              e.currentTarget.style.borderColor = 'var(--border-primary)';
             }}
           >
             <div
@@ -159,7 +160,7 @@ export function WelcomeScreen({
         </div>
       )}
 
-      <div className="grid w-full max-w-2xl grid-cols-1 gap-3 sm:grid-cols-2">
+      <div className="grid w-full max-w-[960px] grid-cols-1 gap-3 sm:grid-cols-2">
         {suggestions.map((s, i) => (
           <button
             key={i}

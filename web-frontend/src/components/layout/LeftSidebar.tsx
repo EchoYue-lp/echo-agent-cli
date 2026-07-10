@@ -160,19 +160,17 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
   const hasMoreConvs = current && !showAllConvs && conversations.length > MAX_RECENT_CONVERSATIONS;
 
   return (
-    <div className="flex h-full flex-col bg-[var(--bg-sidebar)]">
+    <div className="flex h-full flex-col bg-[var(--bg-sidebar)] text-[var(--text-secondary)]">
       {/* Brand Header */}
-      <div className="flex items-center justify-between px-3 py-3">
+      <div className="flex items-center justify-between px-2.5 py-2.5">
         <div className="flex items-center gap-2">
           <BrandIcon size="md" />
-          <span className="text-sm font-semibold tracking-tight text-[var(--text-primary)]">
-            EKO
-          </span>
+          <span className="text-sm font-semibold text-[var(--text-primary)]">EKO</span>
           {current && (
             <div className="flex items-center gap-1">
               <button
                 onClick={() => onNewTask()}
-                className="flex max-w-[118px] items-center gap-1 rounded-md bg-[var(--bg-hover)] px-1.5 py-0.5 text-[11px] font-medium text-[var(--text-secondary)] transition-colors hover:text-[var(--text-primary)]"
+                className="flex max-w-[104px] items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] font-medium text-[var(--text-secondary)] transition-colors hover:bg-[var(--bg-sidebar-hover)] hover:text-[var(--text-primary)]"
                 title={`当前: ${current.name}\n${current.root}`}
               >
                 <FolderOpen size={11} />
@@ -190,7 +188,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
         </div>
         <button
           onClick={toggleTheme}
-          className="rounded-lg p-1.5 text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-sidebar-hover)] hover:text-[var(--text-primary)]"
+          className="rounded-md p-1.5 text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-sidebar-hover)] hover:text-[var(--text-primary)]"
           title={theme === 'dark' ? '浅色模式' : '深色模式'}
         >
           {theme === 'dark' ? <Sun size={14} /> : <Moon size={14} />}
@@ -198,17 +196,17 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
       </div>
 
       {/* New Task + Search */}
-      <div className="space-y-2 px-3 pb-3">
+      <div className="space-y-2 px-2.5 pb-3">
         <button
           onClick={() => onNewTask()}
-          className="flex w-full items-center gap-2 rounded-lg bg-[var(--action-soft)] px-3 py-2 text-sm font-medium text-[var(--text-on-soft-action)] transition-colors hover:bg-[var(--action-soft-hover)]"
+          className="flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-[13px] font-medium text-[var(--text-primary)] transition-colors hover:bg-[var(--bg-sidebar-hover)]"
         >
           <Plus size={15} />
           新建任务
         </button>
 
         {workspaces.length > 0 && (
-          <div className="flex items-center gap-2 rounded-lg bg-[var(--bg-hover)] px-3 py-1.5 transition-colors focus-within:ring-1 focus-within:ring-[var(--border-focus)]">
+          <div className="flex items-center gap-2 rounded-md bg-[var(--bg-sidebar-hover)]/70 px-2.5 py-1.5 transition-colors focus-within:bg-[var(--bg-primary)] focus-within:ring-1 focus-within:ring-[var(--border-focus)]">
             <Search size={13} className="shrink-0 text-[var(--text-tertiary)]" />
             <input
               ref={searchInputRef}
@@ -235,7 +233,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
       {/* Search Results — conversation content matches */}
       {isSearchingContent && (
         <div className="border-b border-[var(--border-primary)] px-2 pb-2">
-          <div className="px-1 py-1 text-[10px] font-semibold uppercase tracking-wider text-[var(--text-tertiary)]">
+          <div className="px-1 py-1 text-[10px] font-semibold uppercase text-[var(--text-tertiary)]">
             搜索结果 ({searchResults.length})
           </div>
           {isSearching && (
@@ -273,7 +271,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
       )}
 
       {/* Task (Workspace) List — expandable with conversations */}
-      <div className="flex-1 overflow-y-auto px-2 pb-2">
+      <div className="flex-1 overflow-y-auto px-1.5 pb-2">
         {filtered.length === 0 && !searchQuery && (
           <div className="px-3 py-8 text-center">
             <FolderOpen size={24} className="mx-auto mb-2 text-[var(--text-tertiary)]" />
@@ -297,15 +295,15 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
             <div key={ws.id} className="mb-0.5">
               {/* Workspace row */}
               <div
-                className={`group relative cursor-pointer rounded-lg transition-all
+                className={`group relative cursor-pointer rounded-md transition-all
                   ${
                     isActive
-                      ? 'bg-[var(--bg-sidebar-active)]'
+                      ? 'bg-[var(--bg-sidebar-active)] shadow-[inset_3px_0_0_var(--accent)]'
                       : 'hover:bg-[var(--bg-sidebar-hover)]'
                   }`}
                 onClick={() => handleSwitch(ws)}
               >
-                <div className="flex items-center gap-2 px-2 py-2.5">
+                <div className="flex items-center gap-2 px-2.5 py-2">
                   {/* Expand arrow */}
                   {isActive ? (
                     isExpanded ? (
@@ -318,19 +316,13 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
                   )}
 
                   <div className="min-w-0 flex-1">
-                    <div
-                      className={`truncate text-[13px] ${isActive ? 'font-medium' : ''} text-[var(--text-primary)]`}
-                    >
+                    <div className={`truncate text-[13px] ${isActive ? 'font-medium' : ''}`}>
                       {ws.name}
                     </div>
                     <div className="truncate text-[11px] text-[var(--text-tertiary)]">
                       {ws.root}
                     </div>
                   </div>
-
-                  {isActive && (
-                    <div className="h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--accent)]" />
-                  )}
 
                   <div className="flex shrink-0 items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
                     <button
@@ -360,7 +352,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
 
               {/* Expanded conversations */}
               {isExpanded && (
-                <div className="ml-7 border-l border-[var(--border-primary)] pl-2 pb-1">
+                <div className="ml-7 border-l border-[var(--border-primary)] pb-1 pl-2">
                   {isConvLoading && visibleConvs.length === 0 && (
                     <div className="flex items-center gap-2 py-2 px-1">
                       <Loader2 size={12} className="animate-spin text-[var(--text-tertiary)]" />
@@ -380,7 +372,7 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
                       className={`cursor-pointer rounded-md px-2 py-1.5 text-[12px] transition-colors
                         ${
                           activeConvId === conv.id
-                            ? 'bg-[var(--bg-sidebar-active)] text-[var(--text-primary)] font-medium'
+                            ? 'bg-[var(--bg-sidebar-active)] font-medium text-[var(--text-primary)]'
                             : 'text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'
                         }`}
                       onClick={(e) => {
@@ -425,14 +417,14 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
       <div className="border-t border-[var(--border-primary)] px-2 py-2">
         <button
           onClick={toggleTerminal}
-          className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-xs font-medium text-[var(--text-secondary)] transition-all hover:bg-[var(--bg-sidebar-hover)] hover:text-[var(--text-primary)]"
+          className="flex w-full items-center gap-2.5 rounded-md px-3 py-2 text-xs font-medium text-[var(--text-secondary)] transition-all hover:bg-[var(--bg-sidebar-hover)] hover:text-[var(--text-primary)]"
         >
           <Terminal size={14} />
           终端
         </button>
         <button
           onClick={openSettings}
-          className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-xs font-medium text-[var(--text-secondary)] transition-all hover:bg-[var(--bg-sidebar-hover)] hover:text-[var(--text-primary)]"
+          className="flex w-full items-center gap-2.5 rounded-md px-3 py-2 text-xs font-medium text-[var(--text-secondary)] transition-all hover:bg-[var(--bg-sidebar-hover)] hover:text-[var(--text-primary)]"
         >
           <Settings size={14} />
           设置

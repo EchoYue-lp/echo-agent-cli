@@ -20,6 +20,7 @@ import {
   progressSummary,
   statusLabel,
 } from '../../utils/subagentProgress';
+import { isCanonicalUsageEvent } from '../compress/subagentUsage';
 
 interface SubagentDetailViewProps {
   run: SubagentRunState;
@@ -52,9 +53,12 @@ function reconstructSteps(events: ExecutionEvent[]): SubagentStep[] {
       continue;
     }
 
-    if (event.event === 'usage') {
-      // thinking_ended maps to `usage`; flush accumulated thinking and emit a
-      // usage step (carries token / cache diagnostics on the top level).
+    if (event.event === 'thinking_ended') {
+      flushThinking();
+      continue;
+    }
+
+    if (isCanonicalUsageEvent(event)) {
       flushThinking();
       steps.push({ type: 'usage', event });
       continue;
@@ -116,15 +120,21 @@ function formatTime(epochMs: number): string {
 }
 
 function usageLine(event: ExecutionEvent): string {
-  const prompt = Number(event.prompt_tokens ?? 0);
-  const completion = Number(event.completion_tokens ?? 0);
-  const cached = Number(event.cached_prompt_tokens ?? 0);
-  if (!prompt && !completion && !cached) return 'usage metadata';
-  return `input ${prompt.toLocaleString()} / output ${completion.toLocaleString()} / cached ${cached.toLocaleString()}`;
+  const parts: string[] = [];
+  if (typeof event.prompt_tokens === 'number') {
+    parts.push(`input ${event.prompt_tokens.toLocaleString()}`);
+  }
+  if (typeof event.completion_tokens === 'number') {
+    parts.push(`output ${event.completion_tokens.toLocaleString()}`);
+  }
+  if (typeof event.cached_prompt_tokens === 'number') {
+    parts.push(`cached ${event.cached_prompt_tokens.toLocaleString()}`);
+  }
+  return parts.length > 0 ? parts.join(' / ') : 'usage metadata';
 }
 
 export function SubagentDetailView({ run, allRuns, onBack }: SubagentDetailViewProps) {
-  const [activeTab, setActiveTab] = useState<'process' | 'prompt' | 'result'>('process');
+  const [activeTab, setActiveTab] = useState<'process' | 'task' | 'result'>('process');
   const selectSubagent = useSubagentDetailStore((state) => state.selectSubagent);
   const progress = useMemo(() => computeSubagentProgress(run), [run.events, run.status]);
   const steps = useMemo(() => reconstructSteps(run.events), [run.events]);
@@ -172,13 +182,13 @@ export function SubagentDetailView({ run, allRuns, onBack }: SubagentDetailViewP
         <div className="mt-4 flex gap-1 border-b border-[var(--border-primary)]">
           {[
             ['process', '执行过程', TerminalSquare],
-            ['prompt', '提示词', ClipboardList],
+            ['task', '任务输入', ClipboardList],
             ['result', '结果', Gauge],
           ].map(([id, label, Icon]) => (
             <button
               key={id as string}
               type="button"
-              onClick={() => setActiveTab(id as 'process' | 'prompt' | 'result')}
+              onClick={() => setActiveTab(id as 'process' | 'task' | 'result')}
               className="flex items-center gap-1.5 border-b-2 px-3 py-2 text-xs font-medium transition-colors"
               style={{
                 borderColor: activeTab === id ? 'var(--accent)' : 'transparent',
@@ -193,13 +203,23 @@ export function SubagentDetailView({ run, allRuns, onBack }: SubagentDetailViewP
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4 sm:px-8">
-        {activeTab === 'prompt' && (
+        {activeTab === 'task' && (
           <div className="mx-auto max-w-[880px]">
-            <SectionTitle title="提示词" subtitle="这个 subagent 收到的任务输入" />
+            <SectionTitle title="任务输入" subtitle="[task_context] 动态输入" />
+            <div className="mb-3 flex flex-wrap gap-2 text-[10px]">
+              <ContextChip label="prompt" value={run.promptSource ?? 'unknown'} />
+              <ContextChip
+                label="isolation requested"
+                value={run.isolationRequested ?? 'unknown'}
+              />
+              <ContextChip label="isolation observed" value={run.isolationObserved ?? 'unknown'} />
+              <ContextChip label="context" value={run.contextIn ?? 'unknown'} />
+              <ContextChip label="return" value={run.returns ?? 'unknown'} />
+            </div>
             {run.task ? (
               <MarkdownContent content={run.task} className="text-sm" />
             ) : (
-              <EmptyState text="这个 subagent 暂时没有记录提示词。" />
+              <EmptyState text="这个 subagent 暂时没有记录任务输入。" />
             )}
           </div>
         )}
@@ -302,6 +322,22 @@ function SectionTitle({ title, subtitle }: { title: string; subtitle: string }) 
       <h3 className="text-sm font-semibold text-[var(--text-primary)]">{title}</h3>
       <p className="mt-0.5 text-xs text-[var(--text-tertiary)]">{subtitle}</p>
     </div>
+  );
+}
+
+function ContextChip({ label, value }: { label: string; value: string }) {
+  return (
+    <span
+      className="inline-flex max-w-full items-center gap-1 rounded-md border px-2 py-1"
+      style={{
+        borderColor: 'var(--border-primary)',
+        background: 'var(--bg-secondary)',
+        color: 'var(--text-tertiary)',
+      }}
+    >
+      <span className="font-mono uppercase">{label}</span>
+      <span className="truncate text-[var(--text-secondary)]">{value}</span>
+    </span>
   );
 }
 

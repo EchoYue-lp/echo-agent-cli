@@ -18,13 +18,15 @@
  */
 
 import { create } from 'zustand';
+import { isCanonicalUsageEvent } from '../components/compress/subagentUsage';
 
 /** Event variants carried on execution://event with kind="subagent". */
 export type SubagentRunEventKind =
   | 'started'
   | 'thinking_started'
   | 'thinking_delta'
-  | 'usage' // corresponds to thinking_ended (carries token counts)
+  | 'thinking_ended'
+  | 'usage' // canonical DispatchLlmUsage event with provider/cache metadata
   | 'token_delta'
   | 'tool_started'
   | 'tool_completed'
@@ -57,6 +59,11 @@ export interface ExecutionEvent {
   iteration_count?: number;
   output?: string;
   error?: string;
+  prompt_source?: string;
+  isolation_requested?: string;
+  isolation_observed?: string;
+  context_in?: string;
+  returns?: string;
   // LLM cache diagnostics (present on `usage` events, emitted per model call)
   message_id?: string;
   model?: string;
@@ -64,6 +71,7 @@ export interface ExecutionEvent {
   cached_prompt_tokens?: number;
   cache_creation_prompt_tokens?: number;
   usage_reported?: boolean;
+  usage_event_id?: string;
   [key: string]: unknown;
 }
 
@@ -89,6 +97,11 @@ export interface SubagentRunState {
   iterationCount?: number;
   output?: string;
   error?: string;
+  promptSource?: string;
+  isolationRequested?: string;
+  isolationObserved?: string;
+  contextIn?: string;
+  returns?: string;
   /** Message id that triggered the run (chat message_key); pins this run to a
    * chat message block. Absent for non-chat paths (cron). */
   messageId?: string;
@@ -158,7 +171,9 @@ export const useSubagentRunStore = create<SubagentRunStore>((set) => ({
           : [...run.events, ev];
       // Accumulate LLM usage events separately (uncapped, but bounded by the
       // number of model calls — typically small) for cache-diagnostics panels.
-      const usageEvents = ev.event === 'usage' ? [...(run.usageEvents ?? []), ev] : run.usageEvents;
+      const usageEvents = isCanonicalUsageEvent(ev)
+        ? [...(run.usageEvents ?? []), ev]
+        : run.usageEvents;
       const next: SubagentRunState = {
         ...run,
         // Preserve any field present on the event (overwrites prev).
@@ -173,6 +188,11 @@ export const useSubagentRunStore = create<SubagentRunStore>((set) => ({
         iterationCount: ev.iteration_count ?? run.iterationCount,
         output: ev.output ?? run.output,
         error: ev.error ?? run.error,
+        promptSource: ev.prompt_source ?? run.promptSource,
+        isolationRequested: ev.isolation_requested ?? run.isolationRequested,
+        isolationObserved: ev.isolation_observed ?? run.isolationObserved,
+        contextIn: ev.context_in ?? run.contextIn,
+        returns: ev.returns ?? run.returns,
         messageId: ev.message_id ?? run.messageId,
         usageEvents,
         events,

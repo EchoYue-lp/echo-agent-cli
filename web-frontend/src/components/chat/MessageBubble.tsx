@@ -133,10 +133,10 @@ export const MessageBubble = memo(function MessageBubble({
   let thinkingIndex = 0;
 
   return (
-    <div className={`flex gap-3 py-3.5`}>
+    <div className="flex gap-3 py-3.5">
       {/* Avatar — assistant only; user messages are full-width rows (no bubble) */}
       {!isUser && (
-        <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg border border-[var(--border-primary)] bg-[var(--bg-secondary)] text-xs font-semibold text-[var(--text-secondary)]">
+        <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-xs font-semibold text-[var(--text-tertiary)]">
           <Bot size={14} />
         </div>
       )}
@@ -190,9 +190,7 @@ export const MessageBubble = memo(function MessageBubble({
           </div>
         )}
 
-        {/* User message text — full-width row with a coral left rail (no bubble).
-         * Distinguishes user from assistant by background tint + accent border,
-         * the way Claude / ChatGPT / Cursor do (bubbles signal "messenger"). */}
+        {/* User prompt reads as a lightweight prompt row, not a content card. */}
         {isUser && message.content && (
           <div className="group/msg relative w-full">
             {!editing && (
@@ -240,7 +238,7 @@ export const MessageBubble = memo(function MessageBubble({
                 </div>
               </div>
             ) : (
-              <div className="rounded-lg border-l-[3px] border-l-[var(--accent)] bg-[var(--accent-bg)] px-4 py-2.5 text-sm leading-relaxed text-[var(--text-primary)]">
+              <div className="rounded-xl border border-[var(--border-primary)] bg-[var(--bg-primary)] px-4 py-3 text-sm leading-relaxed text-[var(--text-primary)]">
                 <div className="whitespace-pre-wrap break-words">{message.content}</div>
               </div>
             )}

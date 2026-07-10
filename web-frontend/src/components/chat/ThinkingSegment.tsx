@@ -27,12 +27,10 @@ export const ThinkingSegment = memo(function ThinkingSegment({
   const label = total > 1 ? `思考 ${index}/${total}` : '思考';
 
   return (
-    <div
-      className="my-1 rounded-md border-l-2 border-[var(--color-purple)] bg-[var(--bg-primary)] px-3 py-1.5"
-    >
+    <div className="my-1 border-l border-[var(--border-primary)] pl-3">
       <button
         onClick={() => setExpanded((e) => !e)}
-        className="flex w-full items-center gap-1.5 text-left"
+        className="flex w-full items-center gap-1.5 py-0.5 text-left"
       >
         {expanded ? (
           <ChevronDown size={11} className="text-[var(--text-tertiary)]" />
@@ -41,12 +39,16 @@ export const ThinkingSegment = memo(function ThinkingSegment({
         )}
         <Brain
           size={11}
-          className={isStreaming ? 'text-[var(--color-purple)] animate-pulse' : 'text-[var(--color-purple)]'}
+          className={
+            isStreaming
+              ? 'animate-pulse text-[var(--text-tertiary)]'
+              : 'text-[var(--text-tertiary)]'
+          }
         />
-        <span className="text-[10px] font-medium text-[var(--color-purple)]">{label}</span>
+        <span className="text-[12px] text-[var(--text-tertiary)]">{label}</span>
       </button>
       {expanded && (
-        <div className="mt-1.5 leading-relaxed text-[var(--text-secondary)]">
+        <div className="mt-1 leading-relaxed text-[var(--text-secondary)]">
           <MarkdownContent content={content} className="text-sm" />
         </div>
       )}

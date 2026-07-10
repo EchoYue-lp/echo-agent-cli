@@ -17,6 +17,18 @@ use state::TauriState;
 use std::sync::Arc;
 use tauri::Emitter;
 
+fn subagent_usage_event_name(
+    event: &echo_agent::agent::subagent::SubagentEvent,
+) -> Option<&'static str> {
+    use echo_agent::agent::subagent::SubagentEvent;
+
+    match event {
+        SubagentEvent::DispatchThinkingEnded { .. } => Some("thinking_ended"),
+        SubagentEvent::DispatchLlmUsage { .. } => Some("usage"),
+        _ => None,
+    }
+}
+
 /// Task event payload emitted to the frontend via `app.emit("task://event", ...)`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -385,10 +397,13 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                             Box::pin(async move { a.subagent_registry().event_bus().subscribe() })
                         })
                         .await;
+                    let mut usage_sequence_by_execution =
+                        std::collections::HashMap::<String, u64>::new();
                     loop {
                         match rx.recv().await {
                             Ok(event) => {
                                 use echo_agent::agent::subagent::SubagentEvent;
+                                let usage_event_type = subagent_usage_event_name(event.as_ref());
                                 let (event_type, execution_id, run_id, agent_name, extra) =
                                     match event.as_ref() {
                                         SubagentEvent::DispatchStarted {
@@ -409,6 +424,22 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                                 "mode": format!("{:?}", mode),
                                                 "task": task.clone(),
                                                 "message_id": message_id.clone(),
+                                            }),
+                                        ),
+                                        SubagentEvent::DispatchIsolationObserved {
+                                            parent,
+                                            agent,
+                                            isolation,
+                                            execution_id,
+                                            run_id,
+                                        } => (
+                                            "isolation_observed",
+                                            execution_id.clone(),
+                                            run_id.clone(),
+                                            agent.clone(),
+                                            serde_json::json!({
+                                                "parent": parent.clone(),
+                                                "isolation_observed": isolation.as_str(),
                                             }),
                                         ),
                                         SubagentEvent::DispatchCompleted {
@@ -497,7 +528,7 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                             execution_id,
                                             run_id,
                                         } => (
-                                            "usage",
+                                            usage_event_type.unwrap_or("thinking_ended"),
                                             execution_id.clone(),
                                             run_id.clone(),
                                             agent.clone(),
@@ -573,23 +604,39 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
                                             usage_reported,
                                             execution_id,
                                             run_id,
-                                        } => (
-                                            "usage",
-                                            execution_id.clone(),
-                                            run_id.clone(),
-                                            agent.clone(),
-                                            serde_json::json!({
-                                                "parent": parent.clone(),
-                                                "model": model.clone(),
-                                                "prompt_tokens": prompt_tokens,
-                                                "completion_tokens": completion_tokens,
-                                                "total_tokens": total_tokens,
-                                                "cached_prompt_tokens": cached_prompt_tokens,
-                                                "cache_creation_prompt_tokens":
-                                                    cache_creation_prompt_tokens,
-                                                "usage_reported": usage_reported,
-                                            }),
-                                        ),
+                                        } => {
+                                            let usage_key = execution_id.clone().unwrap_or_else(|| {
+                                                format!(
+                                                    "{}:{}",
+                                                    run_id.as_deref().unwrap_or("unknown-run"),
+                                                    agent
+                                                )
+                                            });
+                                            let sequence = usage_sequence_by_execution
+                                                .entry(usage_key.clone())
+                                                .or_insert(0);
+                                            *sequence = sequence.saturating_add(1);
+                                            let usage_event_id =
+                                                format!("{usage_key}:usage:{sequence}");
+                                            (
+                                                usage_event_type.unwrap_or("usage"),
+                                                execution_id.clone(),
+                                                run_id.clone(),
+                                                agent.clone(),
+                                                serde_json::json!({
+                                                    "parent": parent.clone(),
+                                                    "model": model.clone(),
+                                                    "prompt_tokens": prompt_tokens,
+                                                    "completion_tokens": completion_tokens,
+                                                    "total_tokens": total_tokens,
+                                                    "cached_prompt_tokens": cached_prompt_tokens,
+                                                    "cache_creation_prompt_tokens":
+                                                        cache_creation_prompt_tokens,
+                                                    "usage_reported": usage_reported,
+                                                    "usage_event_id": usage_event_id,
+                                                }),
+                                            )
+                                        }
                                         // Registered/Unregistered/Team* are not
                                         // execution-flow events; skip them.
                                         _ => continue,
@@ -668,4 +715,38 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
 
             Ok(())
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::subagent_usage_event_name;
+    use echo_agent::agent::subagent::SubagentEvent;
+
+    #[test]
+    fn thinking_ended_and_llm_usage_have_distinct_execution_event_names() {
+        let thinking = SubagentEvent::DispatchThinkingEnded {
+            parent: "main".to_string(),
+            agent: "worker".to_string(),
+            prompt_tokens: 10,
+            completion_tokens: 2,
+            execution_id: Some("task:1".to_string()),
+            run_id: Some("run".to_string()),
+        };
+        let usage = SubagentEvent::DispatchLlmUsage {
+            parent: "main".to_string(),
+            agent: "worker".to_string(),
+            model: "test".to_string(),
+            prompt_tokens: 10,
+            completion_tokens: 2,
+            total_tokens: 12,
+            cached_prompt_tokens: 0,
+            cache_creation_prompt_tokens: 0,
+            usage_reported: true,
+            execution_id: Some("task:1".to_string()),
+            run_id: Some("run".to_string()),
+        };
+
+        assert_eq!(subagent_usage_event_name(&thinking), Some("thinking_ended"));
+        assert_eq!(subagent_usage_event_name(&usage), Some("usage"));
+    }
 }

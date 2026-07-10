@@ -394,6 +394,11 @@ pub async fn create_agent(
         tracing::error!("Failed to build agent: {e}");
         format!("Failed to initialize agent: {e}. Please check your configuration and try again.")
     })?;
+    agent.set_pre_model_context_projector(Some(std::sync::Arc::new(
+        crate::tasks::task_runtime::compact_context::TaskRuntimeContextProjector::new(
+            crate::tasks::task_runtime::compact_context::task_runtime_projection_registry(),
+        ),
+    )));
     let cache_user_id = load_or_create_cache_user_id();
     agent.config_mut().set_cache_user_id(&cache_user_id);
 
@@ -548,11 +553,22 @@ async fn register_default_subagents(
         };
         match build_result {
             Ok(worker) => {
+                crate::tasks::task_runtime::compact_context::install_task_context_protection(
+                    &worker,
+                )
+                .await;
                 let worker_handle = crate::agent_handle::AgentHandle::new(worker);
 
                 let mut builder = SubagentBuilder::new(&worker_def.name)
                     .description(&worker_def.description)
                     .fork_mode();
+                if let Some(path) = worker_def
+                    .source
+                    .strip_prefix("project:")
+                    .or_else(|| worker_def.source.strip_prefix("user:"))
+                {
+                    builder = builder.custom(path);
+                }
                 if worker_def.can_delegate {
                     builder = builder.can_delegate();
                 }
@@ -577,6 +593,19 @@ async fn register_default_subagents(
                 if let Some(spec) = worker_def.team.clone() {
                     builder = builder.team(spec);
                 }
+                builder = builder.tag(format!("prompt_source:{}", worker_def.source));
+                builder = builder.tag(if worker_def.readonly {
+                    "capability:readonly"
+                } else {
+                    "capability:writer"
+                });
+                builder = builder.tag(if worker_def.isolate_worktree {
+                    "isolation:worktree"
+                } else if worker_def.isolate_workspace {
+                    "isolation:workspace"
+                } else {
+                    "isolation:context"
+                });
                 for tag in &worker_def.tags {
                     builder = builder.tag(tag);
                 }
@@ -1241,8 +1270,10 @@ pub fn init_logging(level: &str) {
 /// tracing-subscriber 默认用 UTC（RFC3339 带 `Z` 后缀）。本格式器改用
 /// `chrono::Local` 输出机器当前时区时间（如 `2026-07-09T09:50:48.876+08:00`），
 /// 便于本地排查问题。chrono::Local 读取系统时区（`TZ` 环境变量或系统配置）。
+#[cfg(not(feature = "telemetry"))]
 struct LocalTimer;
 
+#[cfg(not(feature = "telemetry"))]
 impl tracing_subscriber::fmt::time::FormatTime for LocalTimer {
     fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
         // RFC3339 + 本地时区偏移，保留毫秒精度（与默认 SystemTime 精度一致）。
@@ -1347,7 +1378,7 @@ pub fn init_logging_with_target(level: &str, target: LogTarget) {
     });
 }
 
-#[cfg_attr(feature = "telemetry", allow(dead_code))]
+#[cfg(not(feature = "telemetry"))]
 fn tui_log_path() -> std::path::PathBuf {
     if let Ok(cwd) = std::env::current_dir() {
         let mut current = cwd.as_path();
@@ -1383,6 +1414,7 @@ fn tui_log_path() -> std::path::PathBuf {
 /// output is also persisted to disk (the stderr stream itself is lost once the
 /// terminal that launched the app is closed). Append mode keeps history across
 /// restarts; rotate/truncate manually if it grows too large.
+#[cfg(not(feature = "telemetry"))]
 fn app_log_file() -> Option<std::fs::File> {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     let dir = std::path::PathBuf::from(home)

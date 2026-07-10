@@ -1,7 +1,7 @@
 //! TaskRuntime panels.
 //!
 //! Renders the structured state of a complex-task run from the canonical
-//! SQLite store (via taskRuntimeStore), NOT from regex-scanned chat messages.
+//! file-backed TaskRuntime store (via taskRuntimeStore), NOT from regex-scanned chat messages.
 //! Shows: run header, plan + approval actions (when AwaitingPlanApproval),
 //! todo list with live status, and artifacts.
 //!
@@ -33,6 +33,7 @@ import {
   type SubagentRunState,
 } from '../../stores/subagentRunStore';
 import type { TodoStatus } from '../../generated';
+import { isCanonicalUsageEvent } from '../compress/subagentUsage';
 
 const STATUS_LABEL: Record<string, string> = {
   pending: '待处理',
@@ -120,7 +121,14 @@ interface CacheDiagnostic {
 // top level — no more payload digging, and no thinking_end fallback needed
 // (LlmUsage covers every model call).
 function cacheUsageFromEvents(events: ExecutionEvent[]): CacheUsageSummary {
-  const usageEvents = events.filter((e) => e.event === 'usage');
+  const seenEventIds = new Set<string>();
+  const usageEvents = events.filter((event) => {
+    if (!isCanonicalUsageEvent(event)) return false;
+    if (!event.usage_event_id) return true;
+    if (seenEventIds.has(event.usage_event_id)) return false;
+    seenEventIds.add(event.usage_event_id);
+    return true;
+  });
   const models = uniqueValues(usageEvents.map((e) => e.model));
   return usageEvents.reduce<CacheUsageSummary>(
     (summary, event) => {
@@ -153,7 +161,7 @@ function cacheUsageFromEvents(events: ExecutionEvent[]): CacheUsageSummary {
 }
 
 export function cacheUsageForRuns(runs: SubagentRunState[]): CacheUsageSummary {
-  return cacheUsageFromEvents(runs.flatMap((run) => run.events));
+  return cacheUsageFromEvents(runs.flatMap((run) => run.usageEvents ?? []));
 }
 
 function cacheReadRate(summary: CacheUsageSummary): number | null {

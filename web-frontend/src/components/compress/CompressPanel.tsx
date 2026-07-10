@@ -1,14 +1,41 @@
-import { useEffect, useState } from 'react';
-import { Minimize2, BarChart3, Zap } from 'lucide-react';
+import { useEffect, useState, type ReactNode } from 'react';
+import { Minimize2, BarChart3, Zap, Brain, ShieldCheck, Workflow } from 'lucide-react';
 import { compressApi } from '../../api/endpoints';
 import type { CompressionStats, CompressResponse } from '../../types/api';
-import { useChatStore } from '../../stores/chatStore';
+import { cacheHitRate, useChatStore } from '../../stores/chatStore';
+import { useConversationStore } from '../../stores/conversationStore';
+import { useSubagentRunStore } from '../../stores/subagentRunStore';
+import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
+import { summarizeSubagentUsage } from './subagentUsage';
+
+function formatTokens(n: number): string {
+  if (n < 1000) return String(n);
+  const formatted = (n / 1000).toFixed(n < 10_000 ? 1 : 0);
+  return formatted.endsWith('.0') ? `${Math.round(n / 1000)}k` : `${formatted}k`;
+}
+
+function formatPct(pct: number): string {
+  if (pct > 0 && pct < 1) return '<1%';
+  if (pct < 10) return `${Math.round(pct * 10) / 10}%`;
+  return `${Math.round(pct)}%`;
+}
+
+function usageTone(pct: number): string {
+  if (pct >= 90) return 'var(--color-error)';
+  if (pct >= 70) return 'var(--color-warning)';
+  return 'var(--accent)';
+}
 
 export function CompressPanel() {
   const [stats, setStats] = useState<CompressionStats | null>(null);
   const [lastCompress, setLastCompress] = useState<CompressResponse | null>(null);
   const [compressing, setCompressing] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
+  const contextWindow = useChatStore((s) => s.contextWindow);
+  const usageAccumulator = useChatStore((s) => s.usageAccumulator);
+  const subagentRuns = useSubagentRunStore((s) => s.runs);
+  const activeConversationId = useConversationStore((s) => s.activeId);
+  const runtimeConversationId = useTaskRuntimeStore((s) => s.activeRun?.conversation_id ?? null);
 
   const loadStats = async () => {
     try {
@@ -50,6 +77,15 @@ export function CompressPanel() {
 
   const usagePct =
     stats && stats.token_limit > 0 ? (stats.current_tokens / stats.token_limit) * 100 : 0;
+  const mainPct =
+    stats && contextWindow && stats.token_limit > 0
+      ? (contextWindow.inputTokens / stats.token_limit) * 100
+      : null;
+  const subagentUsage = summarizeSubagentUsage(
+    Object.values(subagentRuns),
+    activeConversationId ?? runtimeConversationId
+  );
+  const cacheRate = cacheHitRate(usageAccumulator);
 
   return (
     <div className="p-3 space-y-3">
@@ -67,51 +103,82 @@ export function CompressPanel() {
         <div className="rounded-lg border p-3" style={{ borderColor: 'var(--border-primary)' }}>
           <div className="flex items-center gap-2 mb-2">
             <BarChart3 size={14} style={{ color: 'var(--accent)' }} />
-            <span className="text-xs font-medium" style={{ color: 'var(--text-primary)' }}>
-              当前上下文
-            </span>
-          </div>
-          <div className="space-y-1.5 text-xs" style={{ color: 'var(--text-secondary)' }}>
-            <div className="flex justify-between">
-              <span>消息数</span>
-              <span style={{ color: 'var(--text-primary)' }}>{stats.message_count}</span>
+            <div className="flex min-w-0 flex-1 items-center justify-between gap-2">
+              <span className="text-xs font-medium" style={{ color: 'var(--text-primary)' }}>
+                上下文运行态
+              </span>
+              <span className="text-[10px]" style={{ color: 'var(--text-tertiary)' }}>
+                main / worker
+              </span>
             </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-2">
+            <MetricTile
+              icon={<Brain size={13} />}
+              label="主 agent 输入"
+              value={
+                contextWindow
+                  ? `${formatTokens(contextWindow.inputTokens)} / ${formatTokens(stats.token_limit)}`
+                  : '等待 usage'
+              }
+              sub={
+                mainPct != null
+                  ? `${formatPct(mainPct)} · ${contextWindow?.usageReported ? 'provider' : '估算'}`
+                  : '最近一次 LLM 输入'
+              }
+              accent={mainPct != null ? usageTone(mainPct) : 'var(--text-tertiary)'}
+            />
+            <MetricTile
+              icon={<Minimize2 size={13} />}
+              label="压缩候选"
+              value={`${formatTokens(stats.current_tokens)} / ${formatTokens(stats.token_limit)}`}
+              sub={`${stats.message_count} 条 · ${formatPct(usagePct)}`}
+              accent={usageTone(usagePct)}
+            />
+            <MetricTile
+              icon={<ShieldCheck size={13} />}
+              label="恢复胶囊"
+              value={stats.runtime_recovery_active ? '已继承' : '未激活'}
+              sub={`${stats.protected_message_count ?? 0} 条 protected`}
+              accent={
+                stats.runtime_recovery_active ? 'var(--color-success)' : 'var(--text-tertiary)'
+              }
+            />
+            <MetricTile
+              icon={<Workflow size={13} />}
+              label="Subagent trace"
+              value={`${subagentUsage.running}/${subagentUsage.total}`}
+              sub={`输入 ${formatTokens(subagentUsage.input)} · 输出 ${formatTokens(subagentUsage.output)}`}
+              accent={subagentUsage.running > 0 ? 'var(--color-info)' : 'var(--text-tertiary)'}
+            />
+          </div>
+
+          <div className="mt-3 space-y-1.5 text-xs" style={{ color: 'var(--text-secondary)' }}>
             <div className="flex justify-between">
-              <span>令牌数</span>
+              <span>缓存命中率</span>
               <span style={{ color: 'var(--text-primary)' }}>
-                {stats.current_tokens} / {stats.token_limit}
+                {cacheRate == null ? '--' : `${(cacheRate * 100).toFixed(1)}%`}
               </span>
             </div>
             <div className="mt-2">
               <div className="flex justify-between mb-1">
-                <span>使用率</span>
-                <span
-                  style={{
-                    color:
-                      usagePct > 80
-                        ? 'var(--color-error)'
-                        : usagePct > 50
-                          ? 'var(--color-warning)'
-                          : 'var(--color-success)',
-                  }}
-                >
-                  {usagePct.toFixed(1)}%
-                </span>
+                <span>压缩候选使用率</span>
+                <span style={{ color: usageTone(usagePct) }}>{formatPct(usagePct)}</span>
               </div>
               <div
-                className="h-2 rounded-full overflow-hidden"
-                style={{ background: 'var(--bg-hover)' }}
+                className="h-2.5 rounded-full overflow-hidden border"
+                style={{
+                  background: 'var(--bg-hover)',
+                  borderColor: 'var(--border-primary)',
+                }}
               >
                 <div
                   className="h-full rounded-full transition-all duration-500"
                   style={{
                     width: `${Math.min(usagePct, 100)}%`,
-                    background:
-                      usagePct > 80
-                        ? 'var(--color-error)'
-                        : usagePct > 50
-                          ? 'var(--color-warning)'
-                          : 'var(--color-success)',
+                    background: usageTone(usagePct),
+                    boxShadow: `0 0 10px ${usageTone(usagePct)}`,
                   }}
                 />
               </div>
@@ -193,6 +260,41 @@ export function CompressPanel() {
           发送消息以查看上下文统计
         </div>
       )}
+    </div>
+  );
+}
+
+function MetricTile({
+  icon,
+  label,
+  value,
+  sub,
+  accent,
+}: {
+  icon: ReactNode;
+  label: string;
+  value: string;
+  sub: string;
+  accent: string;
+}) {
+  return (
+    <div
+      className="min-w-0 rounded-md border p-2"
+      style={{
+        borderColor: `color-mix(in srgb, ${accent} 30%, var(--border-primary))`,
+        background: `color-mix(in srgb, ${accent} 8%, var(--bg-secondary))`,
+      }}
+    >
+      <div className="mb-1 flex items-center gap-1.5 text-[10px]" style={{ color: accent }}>
+        {icon}
+        <span className="truncate font-medium">{label}</span>
+      </div>
+      <div className="truncate text-[12px] font-semibold" style={{ color: 'var(--text-primary)' }}>
+        {value}
+      </div>
+      <div className="mt-0.5 truncate text-[10px]" style={{ color: 'var(--text-tertiary)' }}>
+        {sub}
+      </div>
     </div>
   );
 }

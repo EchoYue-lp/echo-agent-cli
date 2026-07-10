@@ -302,6 +302,8 @@ export interface CompressionStats {
   token_limit: number;
   message_count: number;
   compression_ratio: number;
+  protected_message_count?: number;
+  runtime_recovery_active?: boolean;
   needs_compression: boolean;
 }
 

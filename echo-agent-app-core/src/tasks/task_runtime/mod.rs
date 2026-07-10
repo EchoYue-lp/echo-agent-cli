@@ -36,6 +36,7 @@
 //! The framework already re-exports a `TaskEvent` from `echo_agent::tasks`.
 //! To avoid shadowing, this module's event type is named `RuntimeTaskEvent`
 //! and its event-kind enum is `RuntimeEventKind`.
+pub mod compact_context;
 pub mod event_rebuild;
 pub mod execute_plan_tool;
 pub mod executor;

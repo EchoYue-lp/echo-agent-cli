@@ -12,14 +12,14 @@
 //! echo-agent-cli --model claude-sonnet-4-6
 //! ```
 
-#[cfg(feature = "tui")]
+#[cfg(any(feature = "tui", all(feature = "channels", not(feature = "gui"))))]
 use echo_agent_cli::cli;
-#[cfg(feature = "tui")]
+#[cfg(any(feature = "tui", all(feature = "channels", not(feature = "gui"))))]
 use echo_agent_cli::config;
-#[cfg(feature = "tui")]
+#[cfg(any(feature = "tui", all(feature = "channels", not(feature = "gui"))))]
 use echo_agent_cli::infra;
 
-#[cfg(feature = "tui")]
+#[cfg(any(feature = "tui", all(feature = "channels", not(feature = "gui"))))]
 use clap::Parser;
 
 // ── 主入口 ─────────────────────────────────────────────────────
@@ -27,18 +27,17 @@ use clap::Parser;
 /// Build a `TaskRuntimeStore` for headless (non-GUI) entry points (TUI / channels).
 ///
 /// Opens the on-disk store (recovering any incomplete runs), falling back to an
-/// in-memory store if the db is unavailable. Returned as `Option<Arc<...>>`
+/// in-memory store if the file-backed store is unavailable. Returned as `Option<Arc<...>>`
 /// because `drive_chat` takes `Option<&TaskRuntimeStore>` (normal-only callers
 /// pass `None`). Headless modes support complex tasks (TUI/GUI parity,
 /// AGENTS.md), so they always provide a store.
-#[cfg(any(feature = "tui", feature = "channels"))]
-#[cfg_attr(test, allow(dead_code))]
+#[cfg(any(feature = "tui", all(feature = "channels", not(feature = "gui"))))]
 fn build_task_runtime_store_for_headless()
 -> Option<std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>> {
     let store = match echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore::new() {
         Ok(store) => store,
         Err(e) => {
-            tracing::warn!("Failed to open task_runtime.db: {e}; in-memory fallback");
+            tracing::warn!("Failed to open TaskRuntime store: {e}; in-memory fallback");
             match echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore::new_in_memory() {
                 Ok(store) => store,
                 Err(memory_error) => {
@@ -73,13 +72,18 @@ async fn main() -> anyhow::Result<()> {
         run_tui_or_cli_entry().await
     }
 
-    #[cfg(all(not(feature = "tui"), not(feature = "gui")))]
+    #[cfg(all(feature = "channels", not(feature = "gui"), not(feature = "tui")))]
     {
-        compile_error!("Either the tui or gui feature must be enabled");
+        run_tui_or_cli_entry().await
+    }
+
+    #[cfg(all(not(feature = "tui"), not(feature = "gui"), not(feature = "channels")))]
+    {
+        compile_error!("One of the tui, gui, or channels features must be enabled");
     }
 }
 
-#[cfg(feature = "tui")]
+#[cfg(any(feature = "tui", all(feature = "channels", not(feature = "gui"))))]
 async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
     // 解析命令行参数
     let args = cli::Args::parse();
@@ -270,11 +274,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                         .await;
                 }
                 let date: String = session.updated_at.chars().take(19).collect();
-                let short_id = if session.id.len() >= 8 {
-                    &session.id[..8]
-                } else {
-                    &session.id
-                };
+                let short_id: String = session.id.chars().take(8).collect();
                 println!(
                     "\u{2713} Resuming session {} from {}, {} messages",
                     short_id, date, msg_count

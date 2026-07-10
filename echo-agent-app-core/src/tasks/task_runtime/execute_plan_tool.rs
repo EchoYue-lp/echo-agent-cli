@@ -561,8 +561,9 @@ impl Tool for ExecutePlanTool {
                     summary_chars = summaries.chars().count(),
                     "plan_execute: run already completed after waiting for lock"
                 );
-                return Ok(ToolResult::success(format!(
-                    "计划执行完成。各 subagent 的产出如下,请基于这些内容撰写最终答案:\n\n{summaries}"
+                return Ok(ToolResult::success(plan_execute_outcome_text(
+                    &RunOutcome::Completed,
+                    &summaries,
                 )));
             }
 
@@ -606,13 +607,17 @@ impl Tool for ExecutePlanTool {
                         summary_chars = summaries.chars().count(),
                         "plan_execute: completed"
                     );
-                    Ok(ToolResult::success(format!(
-                        "计划执行完成。各 subagent 的产出如下,请基于这些内容撰写最终答案:\n\n{summaries}"
+                    Ok(ToolResult::success(plan_execute_outcome_text(
+                        &RunOutcome::Completed,
+                        &summaries,
                     )))
                 }
                 Ok(RunOutcome::Cancelled) => {
                     tracing::info!(run_id = %run_id, "plan_execute: cancelled");
-                    Ok(ToolResult::success("计划执行被取消。"))
+                    Ok(ToolResult::success(plan_execute_outcome_text(
+                        &RunOutcome::Cancelled,
+                        "",
+                    )))
                 }
                 Ok(RunOutcome::Failed {
                     failed_task_id,
@@ -624,8 +629,12 @@ impl Tool for ExecutePlanTool {
                         error = %error,
                         "plan_execute: failed"
                     );
-                    Ok(ToolResult::success(format!(
-                        "计划执行失败 (任务 {failed_task_id}): {error}。可调整计划后重试。"
+                    Ok(ToolResult::success(plan_execute_outcome_text(
+                        &RunOutcome::Failed {
+                            failed_task_id,
+                            error,
+                        },
+                        "",
                     )))
                 }
                 Ok(RunOutcome::Paused {
@@ -638,8 +647,12 @@ impl Tool for ExecutePlanTool {
                         error = %error,
                         "plan_execute: paused"
                     );
-                    Ok(ToolResult::success(format!(
-                        "计划因任务 {failed_task_id} 失败而暂停: {error}。"
+                    Ok(ToolResult::success(plan_execute_outcome_text(
+                        &RunOutcome::Paused {
+                            failed_task_id,
+                            error,
+                        },
+                        "",
                     )))
                 }
                 Err(e) => {
@@ -662,6 +675,23 @@ impl Tool for ExecutePlanTool {
         Box::pin(async move {
             super::task_tools::scoped_with_ctx_run_id(ctx, || self.execute(params)).await
         })
+    }
+}
+
+fn plan_execute_outcome_text(outcome: &RunOutcome, summaries: &str) -> String {
+    match outcome {
+        RunOutcome::Completed => format!(
+            "计划执行完成。各 subagent 的产出如下,请基于这些内容撰写最终答案:\n\n{summaries}"
+        ),
+        RunOutcome::Cancelled => "计划执行被取消。".to_string(),
+        RunOutcome::Failed {
+            failed_task_id,
+            error,
+        } => format!("计划执行失败 (任务 {failed_task_id}): {error}。可调整计划后重试。"),
+        RunOutcome::Paused {
+            failed_task_id,
+            error,
+        } => format!("计划因任务 {failed_task_id} 失败而暂停: {error}。"),
     }
 }
 
@@ -997,6 +1027,33 @@ mod tests {
         assert!(text.contains("核心运行时"));
         assert!(text.contains("梳理 runtime"));
         assert!(text.contains("runtime.rs"));
+        Ok(())
+    }
+
+    #[test]
+    fn every_plan_execute_outcome_omits_runtime_recovery_marker() -> std::result::Result<(), String>
+    {
+        let outcomes = [
+            RunOutcome::Completed,
+            RunOutcome::Cancelled,
+            RunOutcome::Failed {
+                failed_task_id: "failed-task".to_string(),
+                error: "failed".to_string(),
+            },
+            RunOutcome::Paused {
+                failed_task_id: "paused-task".to_string(),
+                error: "paused".to_string(),
+            },
+        ];
+
+        for outcome in &outcomes {
+            let text = plan_execute_outcome_text(outcome, "worker summary");
+            if text.contains(super::super::compact_context::RUNTIME_RECOVERY_MARKER) {
+                return Err(format!(
+                    "plan_execute outcome must be ordinary status text: {outcome:?}"
+                ));
+            }
+        }
         Ok(())
     }
 
