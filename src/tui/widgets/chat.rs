@@ -1,7 +1,9 @@
 //! Chat area widget — modern message display with adaptive theme.
 
 use crate::tui::markdown::render_markdown;
-use crate::tui::{MessageRole, Theme, ToolExecutionStatus, TuiApp, tool_command, tool_output_tail};
+use crate::tui::{
+    MessageRole, Theme, ToolExecutionStatus, TuiApp, tool_command, tool_detail, tool_output_tail,
+};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -258,11 +260,20 @@ pub fn build_chat_lines(
             } else {
                 metadata
             };
+            let detail = tool_detail(tool);
             lines.push(Line::from(vec![
                 Span::styled(format!(" {symbol} "), Style::default().fg(color)),
                 Span::styled(
                     tool_command(&tool.name, &tool.args),
                     Style::default().fg(t.text).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    if detail.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · {detail}")
+                    },
+                    Style::default().fg(t.subtext),
                 ),
                 Span::styled(format!(" · {timing}"), Style::default().fg(t.subtext)),
             ]));

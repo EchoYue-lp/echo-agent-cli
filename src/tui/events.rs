@@ -316,12 +316,83 @@ fn append_bounded(target: &mut String, chunk: &str, max_chars: usize) {
 #[cfg(test)]
 mod tool_execution_tests {
     use super::append_bounded;
+    use crate::tui::{
+        ToolExecutionMessage, ToolExecutionStatus, tool_command, tool_detail, tool_output_tail,
+    };
+    use std::collections::HashMap;
+    use std::time::Instant;
 
     #[test]
     fn bounded_tool_output_keeps_unicode_tail() {
         let mut output = "开始🙂".to_string();
         append_bounded(&mut output, "结束世界", 5);
         assert_eq!(output, "🙂结束世界");
+    }
+
+    fn execution(name: &str, args: &str, status: ToolExecutionStatus) -> ToolExecutionMessage {
+        ToolExecutionMessage {
+            call_id: "call-1".to_string(),
+            name: name.to_string(),
+            args: args.to_string(),
+            status,
+            stdout: "result line".to_string(),
+            stderr: String::new(),
+            progress: None,
+            started_at: Instant::now(),
+            finished_at: None,
+            metadata: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn file_tools_render_compact_titles() {
+        assert_eq!(
+            tool_command(
+                "read_file",
+                r#"{"path":"src/main.rs","offset":10,"limit":20}"#
+            ),
+            "src/main.rs"
+        );
+        assert_eq!(
+            tool_command("edit_file", r#"{"path":"src/lib.rs"}"#),
+            "Edit src/lib.rs"
+        );
+    }
+
+    #[test]
+    fn read_detail_uses_requested_line_range() {
+        let tool = execution(
+            "read_file",
+            r#"{"path":"src/main.rs","offset":10,"limit":20}"#,
+            ToolExecutionStatus::Succeeded,
+        );
+        assert_eq!(tool_detail(&tool), "lines 10-29");
+        assert!(tool_output_tail(&tool, 6).is_empty());
+    }
+
+    #[test]
+    fn failed_read_keeps_error_tail() {
+        let mut tool = execution(
+            "read_file",
+            r#"{"path":"missing.rs"}"#,
+            ToolExecutionStatus::Failed,
+        );
+        tool.stderr = "file not found".to_string();
+        assert_eq!(
+            tool_output_tail(&tool, 6),
+            vec!["file not found".to_string()]
+        );
+    }
+
+    #[test]
+    fn search_detail_includes_scope_and_result_count() {
+        let mut tool = execution(
+            "grep",
+            r#"{"pattern":"ToolResult","path":"src"}"#,
+            ToolExecutionStatus::Succeeded,
+        );
+        tool.stdout = "src/lib.rs:10:ToolResult\n\n12 matches found".to_string();
+        assert_eq!(tool_detail(&tool), "in src · 12 matches");
     }
 }
 

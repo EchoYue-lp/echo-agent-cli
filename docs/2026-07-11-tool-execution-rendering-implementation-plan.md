@@ -2,7 +2,7 @@
 
 日期: 2026-07-11
 
-状态: shell 垂直切片已完成并合并;通用 renderer 扩展待后续阶段
+状态: shell 垂直切片与 M5 第一批 read/edit/search renderer 已完成;browser/MCP/subagent renderer 待后续阶段
 
 ## 0. 实施结果 (2026-07-11)
 
@@ -20,6 +20,14 @@
 - Phase 10 的 read/search/browser/MCP/subagent 专属 renderer registry。
 - 超长完整日志独立 artifact 落盘。
 - 将 execution order/batch 内部引用进一步归一成纯 call_id 索引;当前结构已按 call_id 更新且行为正确,后续可在不改变事件合同的前提下瘦身。
+
+M5 第一批完成 (2026-07-11):
+
+- GUI 新增纯函数 renderer registry,覆盖 `read_file`、`edit_file/write_file/create_file`、`grep/glob/code_search/search_text`,未知工具回退 Generic。
+- read 展示路径与行范围;write/edit/create 展示动作、路径、dry-run/行数/size 变化;search 展示查询、范围、过滤条件和可解析的命中数。
+- 上述工具成功态默认压缩为单行,失败态仍显示错误 tail,展开后保留完整输出与 diff。
+- TUI 使用同一字段语义生成紧凑标题与 detail,成功态不刷大段结果,失败态保留 tail;文件写工具原有完整 diff 视图不变。
+- Browser、MCP、subagent 未注册到该 registry,继续使用既有专属事件/面板或 Generic fallback,避免重复卡片。
 
 验证结果:
 
@@ -494,16 +502,16 @@ interface ToolExecutionView {
 
 建议顺序:
 
-1. `read_file`:路径、行范围、读取行数。
-2. `edit_file/write_file/create_file`:路径、增删行、diff。
-3. `search/code_search`:查询词、命中数、文件数。
+1. ✅ `read_file`:路径、行范围、读取行数。
+2. ✅ `edit_file/write_file/create_file`:路径、变更规模、diff。
+3. ✅ `grep/glob/code_search/search_text`:查询词、范围、过滤条件、命中摘要。
 4. browser/web:域名、页面标题、动作摘要。
 5. MCP:server/tool 名、结果类型。
 6. subagent/task:复用现有 execution panel,不重复造卡片。
 
-- [ ] 每类 renderer 只解析已知字段,解析失败回退 Generic。
-- [ ] 文件写工具完成后优先显示 diff/统计,不展示整份 JSON args。
-- [ ] 读/搜索工具成功态默认单行,避免占据聊天主视觉。
+- [x] 每类 renderer 只解析已知字段,解析失败回退 Generic。
+- [x] 文件写工具完成后优先显示 diff/统计,不展示整份 JSON args。
+- [x] 读/搜索工具成功态默认单行,避免占据聊天主视觉。
 - [ ] browser screenshot/chart/image 等富媒体继续走已有专属组件。
 
 ## 8. 输出、背压与内存策略

@@ -5,30 +5,28 @@ import {
   ChevronRight,
   CircleStop,
   Copy,
+  FileSearch,
+  FileText,
   LoaderCircle,
+  Pencil,
   Terminal,
   Wrench,
   X,
 } from 'lucide-react';
 import type { ToolExecution } from '../../types/api';
+import { describeToolExecution } from './tools/toolRenderers';
 
 interface InlineToolCallProps {
   toolCall: ToolExecution;
   index: number;
 }
 
-function commandFor(tool: ToolExecution): string {
-  if (tool.name === 'shell' && tool.args && typeof tool.args === 'object') {
-    const command = (tool.args as Record<string, unknown>).command;
-    if (typeof command === 'string') return command;
-  }
-  const args = tool.args == null ? '' : JSON.stringify(tool.args);
-  return args ? `${tool.name} ${args}` : tool.name;
-}
-
 function tail(text: string, count = 6): string {
   const lines = text.split('\n');
-  return lines.slice(Math.max(0, lines.length - count)).join('\n').trimEnd();
+  return lines
+    .slice(Math.max(0, lines.length - count))
+    .join('\n')
+    .trimEnd();
 }
 
 export const InlineToolCall = memo(function InlineToolCall({
@@ -45,7 +43,7 @@ export const InlineToolCall = memo(function InlineToolCall({
     return () => window.clearInterval(timer);
   }, [toolCall.status]);
 
-  const command = useMemo(() => commandFor(toolCall), [toolCall]);
+  const descriptor = useMemo(() => describeToolExecution(toolCall), [toolCall]);
   const elapsed = Math.max(0, (toolCall.finishedAt ?? now) - toolCall.startedAt) / 1000;
   const durationMs = Number(toolCall.metadata?.duration_ms);
   const duration = Number.isFinite(durationMs) ? durationMs / 1000 : elapsed;
@@ -57,6 +55,8 @@ export const InlineToolCall = memo(function InlineToolCall({
       ? toolCall.stderr || toolCall.result || toolCall.stdout
       : toolCall.stdout || toolCall.log || toolCall.stderr || toolCall.progress?.message || ''
   );
+  const collapsedPreview =
+    descriptor.collapseSuccessfulOutput && toolCall.status === 'succeeded' ? '' : preview;
   const fullOutput = [
     toolCall.stdout && `stdout\n${toolCall.stdout}`,
     toolCall.stderr && `stderr\n${toolCall.stderr}`,
@@ -80,6 +80,18 @@ export const InlineToolCall = memo(function InlineToolCall({
   ) : (
     <CircleStop size={12} className="text-[var(--text-tertiary)]" />
   );
+  const toolIcon =
+    descriptor.kind === 'shell' ? (
+      <Terminal size={12} className="mt-0.5 shrink-0 text-[var(--text-tertiary)]" />
+    ) : descriptor.kind === 'read' ? (
+      <FileText size={12} className="mt-0.5 shrink-0 text-[var(--text-tertiary)]" />
+    ) : descriptor.kind === 'write' ? (
+      <Pencil size={12} className="mt-0.5 shrink-0 text-[var(--text-tertiary)]" />
+    ) : descriptor.kind === 'search' ? (
+      <FileSearch size={12} className="mt-0.5 shrink-0 text-[var(--text-tertiary)]" />
+    ) : (
+      <Wrench size={12} className="mt-0.5 shrink-0 text-[var(--text-tertiary)]" />
+    );
 
   return (
     <div className="my-1 min-w-0 pl-2 font-mono text-[11px]">
@@ -93,36 +105,35 @@ export const InlineToolCall = memo(function InlineToolCall({
           {expanded ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
         </button>
         <span className="mt-0.5 shrink-0">{statusIcon}</span>
-        {toolCall.name === 'shell' ? (
-          <Terminal size={12} className="mt-0.5 shrink-0 text-[var(--text-tertiary)]" />
-        ) : (
-          <Wrench size={12} className="mt-0.5 shrink-0 text-[var(--text-tertiary)]" />
-        )}
+        {toolIcon}
         <button
           type="button"
           onClick={() => setExpanded((value) => !value)}
           className="min-w-0 flex-1 break-words text-left leading-5 text-[var(--text-primary)]"
         >
-          {command}
+          <span>{descriptor.title}</span>
+          {descriptor.detail && (
+            <span className="ml-1.5 text-[var(--text-tertiary)]">{descriptor.detail}</span>
+          )}
         </button>
         <span className="shrink-0 pt-0.5 tabular-nums text-[var(--text-tertiary)]">
           {duration.toFixed(1)}s{exitCode == null ? '' : ` · exit ${exitCode}`}
         </span>
         <button
           type="button"
-          onClick={() => copyText(command, 'command')}
+          onClick={() => copyText(descriptor.title, 'command')}
           className="mt-0.5 shrink-0 text-[var(--text-tertiary)] hover:text-[var(--text-primary)]"
-          title="复制命令"
+          title={descriptor.kind === 'shell' ? '复制命令' : '复制摘要'}
         >
           {copied === 'command' ? <Check size={11} /> : <Copy size={11} />}
         </button>
       </div>
 
-      {!expanded && preview && (
+      {!expanded && collapsedPreview && (
         <pre
           className={`ml-[46px] max-h-[7.5rem] overflow-hidden whitespace-pre-wrap break-words text-[10px] leading-[1.25rem] ${failed ? 'text-[var(--color-error)]' : 'text-[var(--text-tertiary)]'}`}
         >
-          {preview}
+          {collapsedPreview}
         </pre>
       )}
 

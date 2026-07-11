@@ -376,16 +376,121 @@ pub enum MessageRole {
 }
 
 pub(crate) fn tool_command(name: &str, args: &str) -> String {
-    if name == "shell"
-        && let Ok(value) = serde_json::from_str::<serde_json::Value>(args)
-        && let Some(command) = value.get("command").and_then(serde_json::Value::as_str)
-    {
-        return command.to_string();
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(args) else {
+        return format!("{name} {args}");
+    };
+    let text = |keys: &[&str]| {
+        keys.iter()
+            .find_map(|key| value.get(*key).and_then(serde_json::Value::as_str))
+    };
+    match name {
+        "shell" => text(&["command"]).unwrap_or("shell").to_string(),
+        "read_file" => text(&["path", "file_path"]).unwrap_or("file").to_string(),
+        "edit_file" => format!("Edit {}", text(&["path", "file_path"]).unwrap_or("file")),
+        "write_file" => format!("Write {}", text(&["path", "file_path"]).unwrap_or("file")),
+        "create_file" => format!("Create {}", text(&["path", "file_path"]).unwrap_or("file")),
+        "grep" | "code_search" | "search_text" => format!(
+            "Search \"{}\"",
+            text(&["query", "pattern", "symbol"]).unwrap_or("query")
+        ),
+        "glob" => format!("Find \"{}\"", text(&["pattern"]).unwrap_or("pattern")),
+        _ => format!("{name} {args}"),
     }
-    format!("{name} {args}")
+}
+
+pub(crate) fn tool_detail(tool: &ToolExecutionMessage) -> String {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&tool.args) else {
+        return String::new();
+    };
+    match tool.name.as_str() {
+        "read_file" => {
+            let offset = value
+                .get("offset")
+                .or_else(|| value.get("start_line"))
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(1);
+            let limit = value
+                .get("limit")
+                .or_else(|| value.get("line_count"))
+                .and_then(serde_json::Value::as_i64);
+            match limit {
+                Some(limit) if limit >= 0 => {
+                    let end = offset
+                        .saturating_add(limit as u64)
+                        .saturating_sub(1)
+                        .max(offset);
+                    format!("lines {offset}-{end}")
+                }
+                Some(_) => format!("preview from line {offset}"),
+                None => format!("from line {offset}"),
+            }
+        }
+        "grep" | "glob" | "code_search" | "search_text" => {
+            let scope = value
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .filter(|path| *path != ".")
+                .map(|path| format!("in {path}"));
+            let count = tool_result_count(&tool.stdout);
+            [scope, count]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" · ")
+        }
+        "edit_file" | "write_file" | "create_file" => {
+            if value.get("dry_run").and_then(serde_json::Value::as_bool) == Some(true) {
+                "dry run".to_string()
+            } else {
+                String::new()
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+fn tool_result_count(output: &str) -> Option<String> {
+    output.lines().rev().find_map(|line| {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        words.iter().enumerate().find_map(|(index, word)| {
+            let label = word.trim_matches(|character: char| !character.is_alphabetic());
+            if !matches!(
+                label.to_ascii_lowercase().as_str(),
+                "matches" | "results" | "files"
+            ) {
+                return None;
+            }
+            words
+                .get(index.saturating_sub(1))
+                .and_then(|value| {
+                    value
+                        .trim_matches(|character: char| !character.is_numeric())
+                        .parse::<u64>()
+                        .ok()
+                })
+                .map(|count| format!("{count} {label}"))
+        })
+    })
+}
+
+pub(crate) fn tool_shows_success_tail(tool: &ToolExecutionMessage) -> bool {
+    !matches!(
+        tool.name.as_str(),
+        "read_file"
+            | "edit_file"
+            | "write_file"
+            | "create_file"
+            | "grep"
+            | "glob"
+            | "code_search"
+            | "search_text"
+    )
 }
 
 pub(crate) fn tool_output_tail(tool: &ToolExecutionMessage, max_lines: usize) -> Vec<String> {
+    if tool.status == ToolExecutionStatus::Succeeded && !tool_shows_success_tail(tool) {
+        return Vec::new();
+    }
     let source = if tool.status == ToolExecutionStatus::Failed && !tool.stderr.is_empty() {
         &tool.stderr
     } else if !tool.stdout.is_empty() {
@@ -1165,10 +1270,13 @@ impl TuiApp {
                 } else {
                     metadata
                 };
-                let header = format!(
-                    " {symbol} {} · {timing}",
-                    tool_command(&tool.name, &tool.args)
-                );
+                let title = tool_command(&tool.name, &tool.args);
+                let detail = tool_detail(tool);
+                let header = if detail.is_empty() {
+                    format!(" {symbol} {title} · {timing}")
+                } else {
+                    format!(" {symbol} {title} · {detail} · {timing}")
+                };
                 for wrapped in textwrap::wrap(&header, wrap_opts) {
                     out.push(WrappedLine {
                         text: wrapped.into_owned(),
