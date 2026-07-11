@@ -1,5 +1,4 @@
-import type { ToolCallInfo } from '../generated';
-import type { ChatMessage } from '../types/api';
+import type { ChatMessage, ToolExecution } from '../types/api';
 
 export type ChangeStatus = 'modified' | 'added' | 'deleted';
 
@@ -36,7 +35,7 @@ function str(args: unknown, key: string): string {
  * NOTE: This list intentionally covers the common file-modifying tools. It does
  * not cover shell commands (sed, git apply, etc.) or arbitrary MCP tools —
  * those require backend-side git status / file watcher integration. */
-const FILE_TOOL_EXTRACTORS: Record<string, (tc: ToolCallInfo) => PathStatus[]> = {
+const FILE_TOOL_EXTRACTORS: Record<string, (tc: ToolExecution) => PathStatus[]> = {
   create_file: (tc) => [{ path: str(tc.args, 'path'), status: 'added', writeArgs: tc.args }],
   write_file: (tc) => [{ path: str(tc.args, 'path'), status: 'modified', writeArgs: tc.args }],
   edit_file: (tc) => [{ path: str(tc.args, 'path'), status: 'modified', writeArgs: tc.args }],

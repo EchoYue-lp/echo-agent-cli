@@ -2,7 +2,8 @@
 
 use super::{
     ChatMessage, MessageRole, QueuedTurn, SubagentRuntimeView, TaskProgressEntry,
-    TaskRuntimeTaskView, TaskRuntimeView, TaskStripStatus, TuiApp,
+    TaskRuntimeTaskView, TaskRuntimeView, TaskStripStatus, ToolExecutionMessage,
+    ToolExecutionStatus, TuiApp,
 };
 use crate::agent_handle::AgentHandle;
 use crate::tui::clipboard;
@@ -234,15 +235,40 @@ enum AgentEvent {
         completion_tokens: usize,
     },
     /// A tool batch is starting (tools between start and end are concurrent).
-    ToolBatchStart { tool_count: usize },
+    ToolBatchStart {
+        tool_count: usize,
+    },
     /// A tool batch has ended.
     ToolBatchEnd,
     /// The final complete answer from the agent.
     FinalAnswer(String),
+    Cancelled,
     /// A tool is about to be called.
-    ToolCall { name: String, args: String },
+    ToolCall {
+        call_id: String,
+        name: String,
+        args: String,
+    },
+    ToolProgress {
+        call_id: String,
+        message: String,
+    },
+    ToolOutput {
+        call_id: String,
+        channel: ToolOutputChannel,
+        chunk: String,
+    },
+    ToolComplete {
+        call_id: String,
+        success: bool,
+        metadata: std::collections::HashMap<String, String>,
+    },
     /// A tool execution completed.
-    ToolResult { name: String, output: String },
+    ToolResult {
+        call_id: String,
+        output: String,
+        success: bool,
+    },
     /// An error occurred.
     Error(String),
     /// Context was auto-compressed to fit within token limits.
@@ -261,6 +287,42 @@ enum AgentEvent {
         /// false = provider 未报 usage，勿更新 snapshot / accumulator。
         usage_reported: bool,
     },
+}
+
+#[derive(Clone, Copy)]
+enum ToolOutputChannel {
+    Stdout,
+    Stderr,
+    Log,
+}
+
+fn find_tool_mut<'a>(app: &'a mut TuiApp, call_id: &str) -> Option<&'a mut ToolExecutionMessage> {
+    app.messages
+        .iter_mut()
+        .find_map(|message| match &mut message.role {
+            MessageRole::ToolExecution(tool) if tool.call_id == call_id => Some(tool.as_mut()),
+            _ => None,
+        })
+}
+
+fn append_bounded(target: &mut String, chunk: &str, max_chars: usize) {
+    target.push_str(chunk);
+    let count = target.chars().count();
+    if count > max_chars {
+        *target = target.chars().skip(count - max_chars).collect();
+    }
+}
+
+#[cfg(test)]
+mod tool_execution_tests {
+    use super::append_bounded;
+
+    #[test]
+    fn bounded_tool_output_keeps_unicode_tail() {
+        let mut output = "开始🙂".to_string();
+        append_bounded(&mut output, "结束世界", 5);
+        assert_eq!(output, "🙂结束世界");
+    }
 }
 
 /// Run the main event loop.
@@ -312,6 +374,9 @@ pub async fn run_event_loop(
         // Flush buffered streaming tokens (throttled to ~2 updates/sec).
         app.flush_pending_stream();
 
+        if app.has_running_tools() {
+            app.invalidate_messages_cache();
+        }
         // Rebuild chat line cache if stale (avoids expensive markdown re-render).
         app.prepare_chat_cache();
 
@@ -377,46 +442,134 @@ pub async fn run_event_loop(
                     app.finalize_stream();
                     dispatch_next_queued(app, &agent, agent_tx.clone()).await;
                 }
-                AgentEvent::ToolCall { name, args } => {
-                    let display = if args.chars().count() > 2000 {
-                        let truncated: String = args.chars().take(2000).collect();
-                        format!("{} ({}...)", name, truncated)
-                    } else {
-                        format!("{} ({})", name, args)
-                    };
-                    app.messages.push(ChatMessage {
-                        role: MessageRole::System,
-                        content: format!("🔧 调用工具: {}", display),
-                    });
+                AgentEvent::Cancelled => {
+                    let now = Instant::now();
+                    for message in &mut app.messages {
+                        if let MessageRole::ToolExecution(tool) = &mut message.role
+                            && tool.status == ToolExecutionStatus::Running
+                        {
+                            tool.status = ToolExecutionStatus::Cancelled;
+                            tool.finished_at = Some(now);
+                        }
+                    }
+                    app.invalidate_messages_cache();
+                    app.is_processing = false;
+                    app.active_cancel = None;
+                    app.status_msg = "Cancelled".to_string();
                 }
-                AgentEvent::ToolResult { name, output } => {
-                    // File-editing tools get a dedicated diff display
-                    if matches!(name.as_str(), "edit_file" | "create_file" | "write_file") {
+                AgentEvent::ToolCall {
+                    call_id,
+                    name,
+                    args,
+                } => {
+                    app.messages.push(ChatMessage {
+                        role: MessageRole::ToolExecution(Box::new(ToolExecutionMessage {
+                            call_id,
+                            name,
+                            args,
+                            status: ToolExecutionStatus::Running,
+                            stdout: String::new(),
+                            stderr: String::new(),
+                            progress: None,
+                            started_at: Instant::now(),
+                            finished_at: None,
+                            metadata: std::collections::HashMap::new(),
+                        })),
+                        content: String::new(),
+                    });
+                    app.rebuild_message_groups();
+                }
+                AgentEvent::ToolProgress { call_id, message } => {
+                    if let Some(tool) = find_tool_mut(app, &call_id) {
+                        tool.progress = Some(message);
+                    }
+                    app.invalidate_messages_cache();
+                }
+                AgentEvent::ToolOutput {
+                    call_id,
+                    channel,
+                    chunk,
+                } => {
+                    if let Some(tool) = find_tool_mut(app, &call_id) {
+                        let target = match channel {
+                            ToolOutputChannel::Stdout | ToolOutputChannel::Log => &mut tool.stdout,
+                            ToolOutputChannel::Stderr => &mut tool.stderr,
+                        };
+                        append_bounded(target, &chunk, 131_072);
+                    }
+                    app.invalidate_messages_cache();
+                }
+                AgentEvent::ToolComplete {
+                    call_id,
+                    success,
+                    metadata,
+                } => {
+                    if let Some(tool) = find_tool_mut(app, &call_id) {
+                        tool.status = if success {
+                            ToolExecutionStatus::Succeeded
+                        } else {
+                            ToolExecutionStatus::Failed
+                        };
+                        tool.finished_at = Some(Instant::now());
+                        tool.metadata = metadata;
+                    }
+                    app.invalidate_messages_cache();
+                }
+                AgentEvent::ToolResult {
+                    call_id,
+                    output,
+                    success,
+                } => {
+                    let mut diff_tool_name = None;
+                    if let Some(tool) = find_tool_mut(app, &call_id) {
+                        tool.status = if success {
+                            ToolExecutionStatus::Succeeded
+                        } else {
+                            ToolExecutionStatus::Failed
+                        };
+                        tool.finished_at = Some(Instant::now());
+                        if matches!(
+                            tool.name.as_str(),
+                            "edit_file" | "create_file" | "write_file"
+                        ) {
+                            diff_tool_name = Some(tool.name.clone());
+                        }
+                        if success && tool.stdout.is_empty() {
+                            tool.stdout = output.clone();
+                        } else if !success && tool.stderr.is_empty() {
+                            tool.stderr = output.clone();
+                        }
+                    }
+                    if let Some(tool_name) = diff_tool_name {
                         app.messages.push(ChatMessage {
-                            role: MessageRole::ToolResult {
-                                tool_name: name.clone(),
-                            },
+                            role: MessageRole::ToolResult { tool_name },
                             content: output,
                         });
-                    } else {
-                        let display = if output.chars().count() > 100 {
-                            let truncated: String = output.chars().take(100).collect();
-                            format!("{} → {}...", name, truncated)
-                        } else {
-                            format!("{} → {}", name, output)
-                        };
-                        app.messages.push(ChatMessage {
-                            role: MessageRole::System,
-                            content: format!("✓ {}", display),
-                        });
+                        app.rebuild_message_groups();
                     }
-                    app.rebuild_message_groups();
+                    app.invalidate_messages_cache();
                 }
                 AgentEvent::Error(e) => {
                     let was_cancelled = app
                         .active_cancel
                         .as_ref()
                         .is_some_and(echo_agent::agent::CancellationToken::is_cancelled);
+                    for message in &mut app.messages {
+                        if let MessageRole::ToolExecution(tool) = &mut message.role
+                            && tool.status == ToolExecutionStatus::Running
+                        {
+                            tool.status = if was_cancelled {
+                                ToolExecutionStatus::Cancelled
+                            } else {
+                                ToolExecutionStatus::Failed
+                            };
+                            if !was_cancelled && tool.stderr.is_empty() {
+                                tool.stderr = e.clone();
+                            }
+                            tool.finished_at = Some(Instant::now());
+                        }
+                    }
+                    app.invalidate_messages_cache();
                     app.messages.push(ChatMessage {
                         role: MessageRole::System,
                         content: if was_cancelled {
@@ -1506,12 +1659,60 @@ impl echo_agent_app_core::chat_driver::ChatSink for TuiChatSink {
             }
             echo_agent::agent::AgentEvent::ToolBatchEnd => AgentEvent::ToolBatchEnd,
             echo_agent::agent::AgentEvent::FinalAnswer(answer) => AgentEvent::FinalAnswer(answer),
-            echo_agent::agent::AgentEvent::ToolCall { name, args } => AgentEvent::ToolCall {
+            echo_agent::agent::AgentEvent::Cancelled => AgentEvent::Cancelled,
+            echo_agent::agent::AgentEvent::ToolCall {
+                call_id,
+                name,
+                args,
+            } => AgentEvent::ToolCall {
+                call_id,
                 name,
                 args: args.to_string(),
             },
-            echo_agent::agent::AgentEvent::ToolResult { name, output } => {
-                AgentEvent::ToolResult { name, output }
+            echo_agent::agent::AgentEvent::ToolStream {
+                call_id,
+                event:
+                    echo_agent::tools::ToolStreamEvent::Progress {
+                        message,
+                        percent: _,
+                    },
+                ..
+            } => AgentEvent::ToolProgress { call_id, message },
+            echo_agent::agent::AgentEvent::ToolStream {
+                call_id,
+                event: echo_agent::tools::ToolStreamEvent::Output { channel, chunk },
+                ..
+            } => AgentEvent::ToolOutput {
+                call_id,
+                channel: match channel {
+                    echo_agent::tools::ToolOutputChannel::Stdout => ToolOutputChannel::Stdout,
+                    echo_agent::tools::ToolOutputChannel::Stderr => ToolOutputChannel::Stderr,
+                    echo_agent::tools::ToolOutputChannel::Log => ToolOutputChannel::Log,
+                },
+                chunk,
+            },
+            echo_agent::agent::AgentEvent::ToolStream {
+                call_id,
+                event: echo_agent::tools::ToolStreamEvent::Complete(result),
+                ..
+            } => AgentEvent::ToolComplete {
+                call_id,
+                success: result.success,
+                metadata: result.metadata,
+            },
+            echo_agent::agent::AgentEvent::ToolResult {
+                call_id, output, ..
+            } => AgentEvent::ToolResult {
+                call_id,
+                output,
+                success: true,
+            },
+            echo_agent::agent::AgentEvent::ToolError { call_id, error, .. } => {
+                AgentEvent::ToolResult {
+                    call_id,
+                    output: error,
+                    success: false,
+                }
             }
             echo_agent::agent::AgentEvent::ContextCompressed {
                 before_count,

@@ -208,7 +208,19 @@ export const SubagentStreamBlock = memo(function SubagentStreamBlock({
                   return (
                     <InlineToolCall
                       key={i}
-                      toolCall={{ name, args, result: resultStr, success }}
+                      toolCall={{
+                        id: String(step.toolStart?.call_id ?? `subagent-tool-${i}`),
+                        name,
+                        args,
+                        result: resultStr,
+                        success,
+                        status: success ? 'succeeded' : 'failed',
+                        stdout: success ? resultStr : '',
+                        stderr: success ? '' : resultStr,
+                        log: '',
+                        startedAt: Number(step.toolStart?.timestamp ?? Date.now()),
+                        finishedAt: Number(step.toolResult?.timestamp ?? Date.now()),
+                      }}
                       index={i}
                     />
                   );

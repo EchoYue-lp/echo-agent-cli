@@ -9,6 +9,7 @@ use chrono::Utc;
 use echo_agent::agent::CancellationToken;
 use echo_agent::human_loop::{HumanLoopProvider, HumanLoopRequest, HumanLoopResponse};
 use echo_agent::prelude::AgentEvent;
+use echo_agent::tools::{ToolOutputChannel, ToolStreamEvent};
 use echo_agent_app_core::chat_driver::ChatSink;
 use echo_agent_app_core::observability::{TraceEvent, TraceKind};
 use echo_agent_app_core::tasks::task_runtime::executor::ExecEvent;
@@ -61,11 +62,32 @@ pub enum ChatEvent {
     },
     #[serde(rename = "tool_start")]
     ToolStart {
+        call_id: String,
         name: String,
         args: serde_json::Value,
     },
+    #[serde(rename = "tool_progress")]
+    ToolProgress {
+        call_id: String,
+        message: String,
+        percent: Option<u8>,
+    },
+    #[serde(rename = "tool_output")]
+    ToolOutput {
+        call_id: String,
+        channel: String,
+        chunk: String,
+    },
+    #[serde(rename = "tool_complete")]
+    ToolComplete {
+        call_id: String,
+        success: bool,
+        metadata: std::collections::HashMap<String, String>,
+        truncated: bool,
+    },
     #[serde(rename = "tool_result")]
     ToolResult {
+        call_id: String,
         name: String,
         result: String,
         success: bool,
@@ -1213,7 +1235,11 @@ fn agent_event_to_chat_event(
             before_tokens: *before_tokens,
             after_tokens: *after_tokens,
         }),
-        AgentEvent::ToolCall { name, args } => {
+        AgentEvent::ToolCall {
+            call_id,
+            name,
+            args,
+        } => {
             let _ = emit_chat_event(
                 app,
                 &ChatEvent::RunStatus {
@@ -1223,16 +1249,60 @@ fn agent_event_to_chat_event(
                 conversation_id,
             );
             Some(ChatEvent::ToolStart {
+                call_id: call_id.clone(),
                 name: name.clone(),
                 args: args.clone(),
             })
         }
-        AgentEvent::ToolResult { name, output } => Some(ChatEvent::ToolResult {
+        AgentEvent::ToolStream {
+            call_id,
+            event: ToolStreamEvent::Progress { message, percent },
+            ..
+        } => Some(ChatEvent::ToolProgress {
+            call_id: call_id.clone(),
+            message: message.clone(),
+            percent: *percent,
+        }),
+        AgentEvent::ToolStream {
+            call_id,
+            event: ToolStreamEvent::Output { channel, chunk },
+            ..
+        } => Some(ChatEvent::ToolOutput {
+            call_id: call_id.clone(),
+            channel: match channel {
+                ToolOutputChannel::Stdout => "stdout",
+                ToolOutputChannel::Stderr => "stderr",
+                ToolOutputChannel::Log => "log",
+            }
+            .to_string(),
+            chunk: chunk.clone(),
+        }),
+        AgentEvent::ToolStream {
+            call_id,
+            event: ToolStreamEvent::Complete(result),
+            ..
+        } => Some(ChatEvent::ToolComplete {
+            call_id: call_id.clone(),
+            success: result.success,
+            metadata: result.metadata.clone(),
+            truncated: result.truncated,
+        }),
+        AgentEvent::ToolResult {
+            call_id,
+            name,
+            output,
+        } => Some(ChatEvent::ToolResult {
+            call_id: call_id.clone(),
             name: name.clone(),
             result: output.clone(),
             success: true,
         }),
-        AgentEvent::ToolError { name, error } => Some(ChatEvent::ToolResult {
+        AgentEvent::ToolError {
+            call_id,
+            name,
+            error,
+        } => Some(ChatEvent::ToolResult {
+            call_id: call_id.clone(),
             name: name.clone(),
             result: error.clone(),
             success: false,

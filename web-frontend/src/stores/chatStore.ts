@@ -2,7 +2,7 @@ import { create } from 'zustand';
 import type {
   ChatMessage,
   ApprovalRequest,
-  ToolCallInfo,
+  ToolExecution,
   ExecutionRound,
   ChatRunStatus,
 } from '../types/api';
@@ -11,7 +11,15 @@ import { useConversationStore } from './conversationStore';
 /** In-progress round being built during streaming */
 interface CurrentRound {
   thinking?: { content: string };
-  tools: { name: string; args: unknown; result?: string; success?: boolean }[];
+  tools: ToolExecution[];
+}
+
+const TOOL_OUTPUT_LIMIT = 131_072;
+
+function appendBounded(current: string, chunk: string): { value: string; truncated: boolean } {
+  const next = current + chunk;
+  if (next.length <= TOOL_OUTPUT_LIMIT) return { value: next, truncated: false };
+  return { value: next.slice(next.length - TOOL_OUTPUT_LIMIT), truncated: true };
 }
 
 /** 当前上下文窗口占用快照（对齐 Claude Code statusline 语义）。 */
@@ -55,7 +63,6 @@ interface ChatState {
     context?: unknown;
     phase?: string;
   } | null;
-  pendingToolCalls: { name: string; args: unknown }[];
   /** True when viewing a loaded historical conversation (agent has no context) */
   isHistoryView: boolean;
   /** Current round being built during streaming */
@@ -75,8 +82,16 @@ interface ChatState {
   appendToken: (id: string, token: string) => void;
   appendThinking: (id: string, token: string) => void;
   startThinkingSegment: (id: string) => void;
-  setToolCall: (name: string, args: unknown) => void;
-  completeToolCall: (name: string, result: string, success: boolean) => void;
+  setToolCall: (callId: string, name: string, args: unknown) => void;
+  updateToolProgress: (callId: string, message: string, percent?: number) => void;
+  appendToolOutput: (callId: string, channel: 'stdout' | 'stderr' | 'log', chunk: string) => void;
+  completeToolStream: (
+    callId: string,
+    success: boolean,
+    metadata: Record<string, string>,
+    truncated: boolean
+  ) => void;
+  completeToolCall: (callId: string, result: string, success: boolean) => void;
   startToolBatch: (toolCount: number) => void;
   endToolBatch: () => void;
   finalizeAssistantMessage: (id: string, content: string) => void;
@@ -87,6 +102,7 @@ interface ChatState {
   setThinking: (v: boolean) => void;
   setRunStatus: (status: ChatRunStatus) => void;
   markCancelled: () => void;
+  markRunningToolsFailed: (message: string) => void;
   setApprovalRequest: (r: ApprovalRequest | null) => void;
   setInputRequest: (r: { requestId: string; prompt?: string } | null) => void;
   setSelectionRequest: (r: ChatState['selectionRequest']) => void;
@@ -147,7 +163,6 @@ export const useChatStore = create<ChatState>((set, get) => ({
   approvalRequest: null,
   inputRequest: null,
   selectionRequest: null,
-  pendingToolCalls: [],
   isHistoryView: false,
   currentRound: null,
   contextWindow: null,
@@ -286,53 +301,118 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   setThinking: (v) => set({ isThinking: v, runStatus: v ? 'thinking' : get().runStatus }),
 
-  setToolCall: (name, args) => {
+  setToolCall: (callId, name, args) => {
     set((s) => {
-      const pendingToolCalls = [...s.pendingToolCalls, { name, args }];
+      const tool: ToolExecution = {
+        id: callId,
+        name,
+        args,
+        result: '',
+        success: false,
+        status: 'running',
+        stdout: '',
+        stderr: '',
+        log: '',
+        startedAt: Date.now(),
+      };
       // Record execution step NOW (at tool_start), not at tool_result time.
       // This ensures correct chronological interleaving with thinking segments.
       const messages = s.messages.map((m) => {
         if (!m.isStreaming) return m;
-        // Index = completed tool calls + currently pending (before this one)
-        const toolIndex = (m.toolCalls || []).length + s.pendingToolCalls.length;
+        const toolCalls = [...(m.toolCalls || []), tool];
+        const toolIndex = toolCalls.length - 1;
         const executionSteps = [
           ...(m.executionSteps || []),
           { type: 'tool' as const, index: toolIndex },
         ];
-        return { ...m, executionSteps };
+        return { ...m, toolCalls, executionSteps };
       });
       // Also add tool to current round for round-based rendering
       const currentRound = s.currentRound
-        ? { ...s.currentRound, tools: [...s.currentRound.tools, { name, args }] }
-        : { tools: [{ name, args }] };
-      return { pendingToolCalls, messages, currentRound, runStatus: 'using_tool' };
+        ? { ...s.currentRound, tools: [...s.currentRound.tools, tool] }
+        : { tools: [tool] };
+      return { messages, currentRound, runStatus: 'using_tool' };
     });
   },
 
-  completeToolCall: (name, result, success) => {
-    const { pendingToolCalls } = get();
-    // 按顺序匹配：取第一个 pending tool call（FIFO）
-    const idx = pendingToolCalls.findIndex((tc) => tc.name === name);
-    if (idx === -1) return;
-    const matched = pendingToolCalls[idx];
-    const tc: ToolCallInfo = { name, args: matched.args, result, success };
+  updateToolProgress: (callId, message, percent) => {
     set((s) => {
-      // Update tool result in current round if exists
+      const update = (tool: ToolExecution) =>
+        tool.id === callId ? { ...tool, progress: { message, percent } } : tool;
+      return {
+        messages: s.messages.map((m) =>
+          m.isStreaming ? { ...m, toolCalls: (m.toolCalls || []).map(update) } : m
+        ),
+        currentRound: s.currentRound
+          ? { ...s.currentRound, tools: s.currentRound.tools.map(update) }
+          : null,
+      };
+    });
+  },
+
+  appendToolOutput: (callId, channel, chunk) => {
+    set((s) => {
+      const update = (tool: ToolExecution): ToolExecution => {
+        if (tool.id !== callId) return tool;
+        const appended = appendBounded(tool[channel], chunk);
+        return { ...tool, [channel]: appended.value, truncated: tool.truncated || appended.truncated };
+      };
+      return {
+        messages: s.messages.map((m) =>
+          m.isStreaming ? { ...m, toolCalls: (m.toolCalls || []).map(update) } : m
+        ),
+        currentRound: s.currentRound
+          ? { ...s.currentRound, tools: s.currentRound.tools.map(update) }
+          : null,
+      };
+    });
+  },
+
+  completeToolStream: (callId, success, metadata, truncated) => {
+    set((s) => {
+      const update = (tool: ToolExecution): ToolExecution =>
+        tool.id === callId
+          ? {
+              ...tool,
+              success,
+              status: success ? 'succeeded' : 'failed',
+              metadata,
+              truncated: tool.truncated || truncated,
+              finishedAt: Date.now(),
+            }
+          : tool;
+      return {
+        messages: s.messages.map((m) =>
+          m.isStreaming ? { ...m, toolCalls: (m.toolCalls || []).map(update) } : m
+        ),
+        currentRound: s.currentRound
+          ? { ...s.currentRound, tools: s.currentRound.tools.map(update) }
+          : null,
+      };
+    });
+  },
+
+  completeToolCall: (callId, result, success) => {
+    set((s) => {
+      const update = (tool: ToolExecution): ToolExecution => {
+        if (tool.id !== callId) return tool;
+        return {
+          ...tool,
+          result,
+          success,
+          status: success ? 'succeeded' : 'failed',
+          finishedAt: Date.now(),
+          stdout: success && !tool.stdout ? result : tool.stdout,
+          stderr: !success && !tool.stderr ? result : tool.stderr,
+        };
+      };
       const currentRound = s.currentRound
-        ? {
-            ...s.currentRound,
-            tools: s.currentRound.tools.map((t) =>
-              t.name === name && t.result === undefined ? { ...t, result, success } : t
-            ),
-          }
+        ? { ...s.currentRound, tools: s.currentRound.tools.map(update) }
         : null;
       return {
-        pendingToolCalls: s.pendingToolCalls.filter((_, i) => i !== idx),
         messages: s.messages.map((m) => {
           if (!m.isStreaming) return m;
-          const toolCalls = [...(m.toolCalls || []), tc];
-          // executionStep already recorded at setToolCall (tool_start) time — don't add again
-          return { ...m, toolCalls };
+          return { ...m, toolCalls: (m.toolCalls || []).map(update) };
         }),
         currentRound,
       };
@@ -365,10 +445,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const round: ExecutionRound = {
       thinking: currentRound.thinking,
       tools: currentRound.tools.map((t) => ({
-        name: t.name,
-        args: t.args,
-        result: t.result || '',
-        success: t.success ?? true,
+        ...t,
       })),
     };
     set((s) => ({
@@ -432,12 +509,41 @@ export const useChatStore = create<ChatState>((set, get) => ({
       isCancelled: true,
       isThinking: false,
       runStatus: 'cancelled',
-      pendingToolCalls: [],
       messages: s.messages.map((m) =>
-        m.isStreaming ? { ...m, isStreaming: false, content: m.content || '' } : m
+        m.isStreaming
+          ? {
+              ...m,
+              isStreaming: false,
+              content: m.content || '',
+              toolCalls: (m.toolCalls || []).map((tool) =>
+                tool.status === 'running'
+                  ? { ...tool, status: 'cancelled' as const, finishedAt: Date.now() }
+                  : tool
+              ),
+            }
+          : m
       ),
     }));
     scheduleAutoSave();
+  },
+
+  markRunningToolsFailed: (message) => {
+    set((s) => ({
+      messages: s.messages.map((m) => ({
+        ...m,
+        toolCalls: (m.toolCalls || []).map((tool) =>
+          tool.status === 'running'
+            ? {
+                ...tool,
+                status: 'failed' as const,
+                success: false,
+                stderr: tool.stderr || message,
+                finishedAt: Date.now(),
+              }
+            : tool
+        ),
+      })),
+    }));
   },
 
   setApprovalRequest: (r) =>
@@ -465,7 +571,6 @@ export const useChatStore = create<ChatState>((set, get) => ({
       approvalRequest: null,
       inputRequest: null,
       selectionRequest: null,
-      pendingToolCalls: [],
       currentRound: null,
       contextWindow: null,
       usageAccumulator: { totalInput: 0, totalCached: 0 },

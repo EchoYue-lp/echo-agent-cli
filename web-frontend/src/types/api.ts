@@ -8,7 +8,6 @@
 // Re-export generated types that were previously duplicated here (6-10).
 // Consumers importing from `types/api` still work; new code should import
 // from `generated/` directly.
-import type { ToolCallInfo } from '../generated';
 export type {
   ChatRequest,
   ChatResponse,
@@ -47,6 +46,25 @@ export type ChatRunStatus =
   | 'failed'
   | 'cancelled';
 
+export type ToolExecutionStatus = 'running' | 'succeeded' | 'failed' | 'cancelled';
+
+export interface ToolExecution {
+  id: string;
+  name: string;
+  args: unknown;
+  result: string;
+  success: boolean;
+  status: ToolExecutionStatus;
+  stdout: string;
+  stderr: string;
+  log: string;
+  progress?: { message: string; percent?: number };
+  startedAt: number;
+  finishedAt?: number;
+  truncated?: boolean;
+  metadata?: Record<string, string>;
+}
+
 /**
  * ChatEvent — 后端推给前端的聊天事件 (P2-5 discriminated union)。
  *
@@ -78,8 +96,17 @@ export type ChatEvent = {
       before_tokens: number;
       after_tokens: number;
     }
-  | { type: 'tool_start'; name: string; args: unknown }
-  | { type: 'tool_result'; name: string; result: string; success: boolean }
+  | { type: 'tool_start'; call_id: string; name: string; args: unknown }
+  | { type: 'tool_progress'; call_id: string; message: string; percent?: number | null }
+  | { type: 'tool_output'; call_id: string; channel: 'stdout' | 'stderr' | 'log'; chunk: string }
+  | {
+      type: 'tool_complete';
+      call_id: string;
+      success: boolean;
+      metadata: Record<string, string>;
+      truncated: boolean;
+    }
+  | { type: 'tool_result'; call_id: string; name: string; result: string; success: boolean }
   | { type: 'chart'; spec: unknown }
   | { type: 'final_answer'; data: string }
   | { type: 'cancelled' }
@@ -241,7 +268,7 @@ export interface ExecutionRound {
   /** Thinking that precedes this round's tools */
   thinking?: { content: string };
   /** Tools executed in this round (parallel if >1) */
-  tools: ToolCallInfo[];
+  tools: ToolExecution[];
 }
 
 // Chat store types
@@ -252,7 +279,7 @@ export interface ChatMessage {
   thinkingContent?: string; // deprecated, kept for history display
   thinkingSegments?: { content: string }[];
   attachments?: { name: string; mime_type: string; url: string; size: number }[];
-  toolCalls?: ToolCallInfo[];
+  toolCalls?: ToolExecution[];
   chartSpecs?: unknown[];
   isStreaming?: boolean;
   timestamp: number;
@@ -351,7 +378,7 @@ export interface SavedMessage {
   execution_steps?: { type: string; index: number }[];
   execution_rounds?: {
     thinking?: { content: string };
-    tools: { name: string; args: unknown; result: string; success: boolean }[];
+    tools: ToolExecution[];
   }[];
   tool_result?: string | null;
   /** User-uploaded attachments (images/documents) as data URLs, so the

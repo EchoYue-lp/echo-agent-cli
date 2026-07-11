@@ -78,11 +78,13 @@ pub async fn save_conversation(
             // attachments and historically held thinking segments).
             let has_thinking = m.thinking_segments.is_some();
             let has_steps = m.execution_steps.is_some();
+            let has_rounds = m.execution_rounds.is_some();
             let has_attachments = m.attachments.as_ref().is_some_and(|a| !a.is_empty());
-            let attachments_json = if has_thinking || has_steps || has_attachments {
+            let attachments_json = if has_thinking || has_steps || has_rounds || has_attachments {
                 let payload = AttachmentsPayload {
                     thinking_segments: m.thinking_segments.unwrap_or_default(),
                     execution_steps: m.execution_steps.unwrap_or_default(),
+                    execution_rounds: m.execution_rounds,
                     attachments: m.attachments.unwrap_or_default(),
                 };
                 serde_json::to_string(&payload).ok()
@@ -143,7 +145,7 @@ pub async fn get_conversation(
         .map(|m| {
             // Parse attachments_json which may contain thinking_segments +
             // execution_steps + real attachments, or legacy plain array format.
-            let (thinking_segments, execution_steps, attachments) = m
+            let (thinking_segments, execution_steps, execution_rounds, attachments) = m
                 .attachments_json
                 .and_then(|s| AttachmentsPayload::parse(&s))
                 .map(|p| {
@@ -162,9 +164,9 @@ pub async fn get_conversation(
                     } else {
                         Some(p.attachments)
                     };
-                    (ts, es, att)
+                    (ts, es, p.execution_rounds, att)
                 })
-                .unwrap_or((None, None, None));
+                .unwrap_or((None, None, None, None));
 
             SavedMessage {
                 role: m.role,
@@ -175,6 +177,7 @@ pub async fn get_conversation(
                 thinking_segments,
                 tool_result: m.tool_result_json,
                 execution_steps,
+                execution_rounds,
                 attachments,
             }
         })
@@ -219,11 +222,14 @@ pub async fn update_conversation(
             .map(|m| {
                 let has_thinking = m.thinking_segments.is_some();
                 let has_steps = m.execution_steps.is_some();
+                let has_rounds = m.execution_rounds.is_some();
                 let has_attachments = m.attachments.as_ref().is_some_and(|a| !a.is_empty());
-                let attachments_json = if has_thinking || has_steps || has_attachments {
+                let attachments_json = if has_thinking || has_steps || has_rounds || has_attachments
+                {
                     let payload = AttachmentsPayload {
                         thinking_segments: m.thinking_segments.unwrap_or_default(),
                         execution_steps: m.execution_steps.unwrap_or_default(),
+                        execution_rounds: m.execution_rounds,
                         attachments: m.attachments.unwrap_or_default(),
                     };
                     serde_json::to_string(&payload).ok()

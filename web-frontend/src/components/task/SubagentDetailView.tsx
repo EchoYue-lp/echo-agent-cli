@@ -283,7 +283,19 @@ export function SubagentDetailView({ run, allRuns, onBack }: SubagentDetailViewP
                   return (
                     <InlineToolCall
                       key={index}
-                      toolCall={{ name, args, result: resultText, success }}
+                      toolCall={{
+                        id: String(step.toolStart?.call_id ?? `subagent-tool-${index}`),
+                        name,
+                        args,
+                        result: resultText,
+                        success,
+                        status: success ? 'succeeded' : 'failed',
+                        stdout: success ? resultText : '',
+                        stderr: success ? '' : resultText,
+                        log: '',
+                        startedAt: Number(step.toolStart?.timestamp ?? Date.now()),
+                        finishedAt: Number(step.toolResult?.timestamp ?? Date.now()),
+                      }}
                       index={index}
                     />
                   );

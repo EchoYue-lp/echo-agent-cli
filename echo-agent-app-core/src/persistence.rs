@@ -46,6 +46,10 @@ pub struct SavedMessage {
     /// for correct chronological interleaving when loading from history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_steps: Option<Vec<SavedExecutionStep>>,
+    /// Final UI projection for thinking/tool rounds. Incremental chunks are
+    /// folded into bounded terminal state before this value is persisted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_rounds: Option<serde_json::Value>,
     /// User-uploaded attachments (images/documents) attached to this message.
     /// Stored as a data URL so the message renders identically on reload.
     /// None or empty for non-multimodal messages.
@@ -82,6 +86,8 @@ pub struct AttachmentsPayload {
     pub thinking_segments: Vec<String>,
     #[serde(default)]
     pub execution_steps: Vec<SavedExecutionStep>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_rounds: Option<serde_json::Value>,
     /// Real user-uploaded attachments (images/documents). Despite the column
     /// name `attachments_json` historically holding thinking segments, this key
     /// holds the actual attachment data URL so messages render on reload.
@@ -101,6 +107,7 @@ impl AttachmentsPayload {
             return Some(Self {
                 thinking_segments: segments,
                 execution_steps: Vec::new(),
+                execution_rounds: None,
                 attachments: Vec::new(),
             });
         }
@@ -341,6 +348,7 @@ impl Persistence {
             }),
             thinking_segments: None,
             execution_steps: None,
+            execution_rounds: None,
             tool_result: None,
             attachments: None,
         }
@@ -369,6 +377,7 @@ mod tests {
             tool_calls: None,
             thinking_segments: None,
             execution_steps: None,
+            execution_rounds: None,
             tool_result: None,
             attachments: None,
         };
@@ -395,5 +404,41 @@ mod tests {
         let mut list = [a, b];
         list.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
         assert_eq!(list[0].name, "b");
+    }
+
+    #[test]
+    fn attachments_payload_round_trips_tool_execution_projection() {
+        let rounds = serde_json::json!([{
+            "tools": [{
+                "id": "call-1",
+                "name": "shell",
+                "status": "succeeded",
+                "stdout": "done",
+                "stderr": "",
+                "metadata": {"exit_code": "0", "duration_ms": "1250"}
+            }]
+        }]);
+        let payload = AttachmentsPayload {
+            thinking_segments: Vec::new(),
+            execution_steps: Vec::new(),
+            execution_rounds: Some(rounds.clone()),
+            attachments: Vec::new(),
+        };
+        let encoded = serde_json::to_string(&payload).unwrap_or_default();
+        let decoded = AttachmentsPayload::parse(&encoded);
+
+        assert_eq!(
+            decoded.and_then(|value| value.execution_rounds),
+            Some(rounds)
+        );
+    }
+
+    #[test]
+    fn attachments_payload_accepts_legacy_thinking_array() {
+        let decoded = AttachmentsPayload::parse(r#"["分析","完成"]"#);
+        assert_eq!(
+            decoded.map(|value| value.thinking_segments),
+            Some(vec!["分析".to_string(), "完成".to_string()])
+        );
     }
 }

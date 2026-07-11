@@ -1,122 +1,149 @@
-import { useState, memo } from 'react';
-import { ChevronDown, ChevronRight, Wrench, Copy, Check } from 'lucide-react';
-
-// We use a lightweight inline type to avoid importing generated types that may not have the exact shape.
-interface ToolCallInfo {
-  name: string;
-  args?: unknown;
-  result?: string;
-  success?: boolean;
-}
+import { memo, useEffect, useMemo, useState } from 'react';
+import {
+  Check,
+  ChevronDown,
+  ChevronRight,
+  CircleStop,
+  Copy,
+  LoaderCircle,
+  Terminal,
+  Wrench,
+  X,
+} from 'lucide-react';
+import type { ToolExecution } from '../../types/api';
 
 interface InlineToolCallProps {
-  toolCall: ToolCallInfo;
-  /** 1-based index among tool calls in this round */
+  toolCall: ToolExecution;
   index: number;
 }
 
-/**
- * One tool call rendered as a lightweight inline collapsible row in the
- * one-stream layout: a one-line event that can expand for args/result.
- */
+function commandFor(tool: ToolExecution): string {
+  if (tool.name === 'shell' && tool.args && typeof tool.args === 'object') {
+    const command = (tool.args as Record<string, unknown>).command;
+    if (typeof command === 'string') return command;
+  }
+  const args = tool.args == null ? '' : JSON.stringify(tool.args);
+  return args ? `${tool.name} ${args}` : tool.name;
+}
+
+function tail(text: string, count = 6): string {
+  const lines = text.split('\n');
+  return lines.slice(Math.max(0, lines.length - count)).join('\n').trimEnd();
+}
+
 export const InlineToolCall = memo(function InlineToolCall({
   toolCall,
   index: _index,
 }: InlineToolCallProps) {
   const [expanded, setExpanded] = useState(false);
   const [copied, setCopied] = useState<string | null>(null);
+  const [now, setNow] = useState(Date.now());
 
-  const statusColor = toolCall.success !== false ? 'var(--color-success)' : 'var(--color-error)';
-  const statusLabel = toolCall.success !== false ? '✓' : '✗';
+  useEffect(() => {
+    if (toolCall.status !== 'running') return;
+    const timer = window.setInterval(() => setNow(Date.now()), 250);
+    return () => window.clearInterval(timer);
+  }, [toolCall.status]);
 
-  // One-line arg preview: first string-ish value, truncated.
-  const argPreview = (() => {
-    const args = toolCall.args;
-    if (args == null) return '';
-    if (typeof args === 'string') return args;
-    if (typeof args === 'object') {
-      const entries = Object.entries(args as Record<string, unknown>);
-      if (entries.length === 0) return '';
-      const [k, v] = entries[0];
-      const vStr = typeof v === 'string' ? v : JSON.stringify(v);
-      return `${k}: ${vStr}`;
-    }
-    return String(args);
-  })();
-  const argPreviewTruncated = argPreview.length > 60 ? argPreview.slice(0, 60) + '…' : argPreview;
+  const command = useMemo(() => commandFor(toolCall), [toolCall]);
+  const elapsed = Math.max(0, (toolCall.finishedAt ?? now) - toolCall.startedAt) / 1000;
+  const durationMs = Number(toolCall.metadata?.duration_ms);
+  const duration = Number.isFinite(durationMs) ? durationMs / 1000 : elapsed;
+  const exitCode = toolCall.metadata?.exit_code;
+  const failed = toolCall.status === 'failed';
+  const running = toolCall.status === 'running';
+  const preview = tail(
+    failed
+      ? toolCall.stderr || toolCall.result || toolCall.stdout
+      : toolCall.stdout || toolCall.log || toolCall.stderr || toolCall.progress?.message || ''
+  );
+  const fullOutput = [
+    toolCall.stdout && `stdout\n${toolCall.stdout}`,
+    toolCall.stderr && `stderr\n${toolCall.stderr}`,
+    toolCall.log && `log\n${toolCall.log}`,
+  ]
+    .filter(Boolean)
+    .join('\n\n');
 
-  const copyText = (text: string, label: string) => {
-    navigator.clipboard.writeText(text);
+  const copyText = async (text: string, label: string) => {
+    await navigator.clipboard.writeText(text);
     setCopied(label);
-    setTimeout(() => setCopied(null), 2000);
+    window.setTimeout(() => setCopied(null), 1500);
   };
 
+  const statusIcon = running ? (
+    <LoaderCircle size={12} className="animate-spin text-[var(--accent)]" />
+  ) : toolCall.status === 'succeeded' ? (
+    <Check size={12} className="text-[var(--color-success)]" />
+  ) : failed ? (
+    <X size={12} className="text-[var(--color-error)]" />
+  ) : (
+    <CircleStop size={12} className="text-[var(--text-tertiary)]" />
+  );
+
   return (
-    <div className="my-0.5 pl-3">
-      <button
-        onClick={() => setExpanded((e) => !e)}
-        className="flex w-full items-center gap-1.5 py-0.5 text-left text-[11px]"
-      >
-        {expanded ? (
-          <ChevronDown size={10} className="shrink-0 text-[var(--text-tertiary)]" />
+    <div className="my-1 min-w-0 pl-2 font-mono text-[11px]">
+      <div className="flex min-h-6 min-w-0 items-start gap-1.5 py-0.5">
+        <button
+          type="button"
+          onClick={() => setExpanded((value) => !value)}
+          className="mt-0.5 shrink-0 text-[var(--text-tertiary)]"
+          title={expanded ? '折叠工具输出' : '展开工具输出'}
+        >
+          {expanded ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+        </button>
+        <span className="mt-0.5 shrink-0">{statusIcon}</span>
+        {toolCall.name === 'shell' ? (
+          <Terminal size={12} className="mt-0.5 shrink-0 text-[var(--text-tertiary)]" />
         ) : (
-          <ChevronRight size={10} className="shrink-0 text-[var(--text-tertiary)]" />
+          <Wrench size={12} className="mt-0.5 shrink-0 text-[var(--text-tertiary)]" />
         )}
-        <Wrench size={10} className="shrink-0" style={{ color: statusColor }} />
-        <span className="font-medium text-[var(--text-primary)]">{toolCall.name}</span>
-        {argPreviewTruncated && (
-          <span className="truncate text-[var(--text-tertiary)]">{argPreviewTruncated}</span>
-        )}
-        <span className="ml-auto shrink-0" style={{ color: statusColor }}>
-          {statusLabel}
+        <button
+          type="button"
+          onClick={() => setExpanded((value) => !value)}
+          className="min-w-0 flex-1 break-words text-left leading-5 text-[var(--text-primary)]"
+        >
+          {command}
+        </button>
+        <span className="shrink-0 pt-0.5 tabular-nums text-[var(--text-tertiary)]">
+          {duration.toFixed(1)}s{exitCode == null ? '' : ` · exit ${exitCode}`}
         </span>
-      </button>
+        <button
+          type="button"
+          onClick={() => copyText(command, 'command')}
+          className="mt-0.5 shrink-0 text-[var(--text-tertiary)] hover:text-[var(--text-primary)]"
+          title="复制命令"
+        >
+          {copied === 'command' ? <Check size={11} /> : <Copy size={11} />}
+        </button>
+      </div>
+
+      {!expanded && preview && (
+        <pre
+          className={`ml-[46px] max-h-[7.5rem] overflow-hidden whitespace-pre-wrap break-words text-[10px] leading-[1.25rem] ${failed ? 'text-[var(--color-error)]' : 'text-[var(--text-tertiary)]'}`}
+        >
+          {preview}
+        </pre>
+      )}
+
       {expanded && (
-        <div className="mt-1 space-y-2 pb-1">
-          <div>
-            <div className="mb-0.5 flex items-center justify-between">
-              <span className="text-[9px] font-medium uppercase text-[var(--text-tertiary)]">
-                参数
-              </span>
+        <div className="ml-[46px] mt-1 min-w-0 border-l border-[var(--border-primary)] pl-2">
+          <div className="mb-1 flex items-center justify-between text-[9px] uppercase text-[var(--text-tertiary)]">
+            <span>{toolCall.truncated ? '输出 · 已截断' : '输出'}</span>
+            {fullOutput && (
               <button
-                onClick={(e) => {
-                  e.stopPropagation();
-                  copyText(JSON.stringify(toolCall.args ?? {}, null, 2), 'args');
-                }}
-                className="flex items-center gap-0.5 text-[10px] text-[var(--text-tertiary)]"
+                type="button"
+                onClick={() => copyText(fullOutput, 'output')}
+                className="flex items-center gap-1 normal-case hover:text-[var(--text-primary)]"
               >
-                {copied === 'args' ? <Check size={9} /> : <Copy size={9} />}
-                {copied === 'args' ? '已复制' : '复制'}
+                {copied === 'output' ? <Check size={10} /> : <Copy size={10} />}
+                {copied === 'output' ? '已复制' : '复制'}
               </button>
-            </div>
-            <pre className="max-h-32 overflow-auto rounded-md bg-[var(--bg-code)] p-2 text-[10px] leading-relaxed text-[var(--color-code-text)]">
-              {JSON.stringify(toolCall.args ?? {}, null, 2)}
-            </pre>
+            )}
           </div>
-          {toolCall.result !== undefined && (
-            <div>
-              <div className="mb-0.5 flex items-center justify-between">
-                <span className="text-[9px] font-medium uppercase text-[var(--text-tertiary)]">
-                  结果
-                </span>
-                <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    copyText(toolCall.result ?? '', 'result');
-                  }}
-                  className="flex items-center gap-0.5 text-[10px] text-[var(--text-tertiary)]"
-                >
-                  {copied === 'result' ? <Check size={9} /> : <Copy size={9} />}
-                  {copied === 'result' ? '已复制' : '复制'}
-                </button>
-              </div>
-              <pre className="max-h-40 overflow-auto rounded-md bg-[var(--bg-code)] p-2 text-[10px] leading-relaxed text-[var(--color-code-text)]">
-                {(toolCall.result ?? '').length > 2000
-                  ? (toolCall.result ?? '').slice(0, 2000) + '\n...'
-                  : (toolCall.result ?? '')}
-              </pre>
-            </div>
-          )}
+          <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words bg-[var(--bg-code)] p-2 text-[10px] leading-relaxed text-[var(--color-code-text)]">
+            {fullOutput || toolCall.progress?.message || '暂无输出'}
+          </pre>
         </div>
       )}
     </div>

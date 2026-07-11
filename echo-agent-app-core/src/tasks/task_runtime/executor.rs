@@ -2670,7 +2670,11 @@ async fn run_main_agent_task(
                                 .with_title(title.clone()),
                             );
                         }
-                        AgentEvent::ToolCall { name, args } => {
+                        AgentEvent::ToolCall {
+                            call_id,
+                            name,
+                            args,
+                        } => {
                             emit_exec(
                                 trace_sink.as_ref(),
                                 ExecEvent::for_task(
@@ -2678,6 +2682,7 @@ async fn run_main_agent_task(
                                     task_id.clone(),
                                     "tool_started",
                                     serde_json::json!({
+                                        "call_id": call_id,
                                         "name": name,
                                         "args": args,
                                     }),
@@ -2687,6 +2692,7 @@ async fn run_main_agent_task(
                             );
                         }
                         AgentEvent::ToolResult {
+                            call_id,
                             name,
                             output: result,
                         } => {
@@ -2697,6 +2703,7 @@ async fn run_main_agent_task(
                                     task_id.clone(),
                                     "tool_completed",
                                     serde_json::json!({
+                                        "call_id": call_id,
                                         "name": name,
                                         "result": result,
                                         "success": true,
@@ -2706,7 +2713,11 @@ async fn run_main_agent_task(
                                 .with_title(title.clone()),
                             );
                         }
-                        AgentEvent::ToolError { name, error } => {
+                        AgentEvent::ToolError {
+                            call_id,
+                            name,
+                            error,
+                        } => {
                             emit_exec(
                                 trace_sink.as_ref(),
                                 ExecEvent::for_task(
@@ -2714,10 +2725,61 @@ async fn run_main_agent_task(
                                     task_id.clone(),
                                     "tool_completed",
                                     serde_json::json!({
+                                        "call_id": call_id,
                                         "name": name,
                                         "result": error,
                                         "success": false,
                                     }),
+                                )
+                                .with_agent(agent_role.clone())
+                                .with_title(title.clone()),
+                            );
+                        }
+                        AgentEvent::ToolStream {
+                            call_id,
+                            name,
+                            event,
+                        } => {
+                            let (event_type, payload) = match event {
+                                echo_agent::tools::ToolStreamEvent::Progress {
+                                    message,
+                                    percent,
+                                } => ("tool_output", serde_json::json!({
+                                    "call_id": call_id,
+                                    "name": name,
+                                    "message": message,
+                                    "percent": percent,
+                                })),
+                                echo_agent::tools::ToolStreamEvent::Output { channel, chunk } => {
+                                    ("tool_output", serde_json::json!({
+                                        "call_id": call_id,
+                                        "name": name,
+                                        "channel": match channel {
+                                            echo_agent::tools::ToolOutputChannel::Stdout => "stdout",
+                                            echo_agent::tools::ToolOutputChannel::Stderr => "stderr",
+                                            echo_agent::tools::ToolOutputChannel::Log => "log",
+                                        },
+                                        "chunk": chunk,
+                                    }))
+                                }
+                                echo_agent::tools::ToolStreamEvent::Complete(result) => (
+                                    "tool_completed",
+                                    serde_json::json!({
+                                        "call_id": call_id,
+                                        "name": name,
+                                        "success": result.success,
+                                        "metadata": result.metadata,
+                                        "truncated": result.truncated,
+                                    }),
+                                ),
+                            };
+                            emit_exec(
+                                trace_sink.as_ref(),
+                                ExecEvent::for_task(
+                                    run_id.clone(),
+                                    task_id.clone(),
+                                    event_type,
+                                    payload,
                                 )
                                 .with_agent(agent_role.clone())
                                 .with_title(title.clone()),

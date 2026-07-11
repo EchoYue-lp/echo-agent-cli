@@ -1,6 +1,5 @@
 import { useState, memo } from 'react';
-import type { ChatMessage, ExecutionRound } from '../../types/api';
-import type { ToolCallInfo } from '../../generated';
+import type { ChatMessage, ExecutionRound, ToolExecution } from '../../types/api';
 import { Bot, Copy, Check, RefreshCw, Pencil, X, ArrowUp, File, Download } from 'lucide-react';
 import MarkdownContent from '../common/MarkdownContent';
 import { ThinkingSegment } from './ThinkingSegment';
@@ -50,7 +49,7 @@ function isImageFile(mime: string): boolean {
 interface FlatStep {
   type: 'thinking' | 'tool';
   thinkingContent?: string;
-  toolCall?: ToolCallInfo;
+  toolCall?: ToolExecution;
   toolIndex: number;
 }
 
@@ -58,7 +57,7 @@ function flattenSteps(message: ChatMessage): { steps: FlatStep[]; thinkingTotal:
   const steps: FlatStep[] = [];
   let thinkingTotal = 0;
 
-  if (message.executionRounds && message.executionRounds.length > 0) {
+  if (!message.isStreaming && message.executionRounds && message.executionRounds.length > 0) {
     message.executionRounds.forEach((round: ExecutionRound) => {
       if (round.thinking && round.thinking.content.trim()) {
         steps.push({ type: 'thinking', thinkingContent: round.thinking.content, toolIndex: 0 });

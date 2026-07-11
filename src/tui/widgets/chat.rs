@@ -1,7 +1,7 @@
 //! Chat area widget — modern message display with adaptive theme.
 
 use crate::tui::markdown::render_markdown;
-use crate::tui::{MessageRole, Theme, TuiApp};
+use crate::tui::{MessageRole, Theme, ToolExecutionStatus, TuiApp, tool_command, tool_output_tail};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -237,6 +237,40 @@ pub fn build_chat_lines(
             let diff_lines = render_diff_content(content, t);
             for line in diff_lines {
                 lines.push(line);
+            }
+        }
+        MessageRole::ToolExecution(tool) => {
+            lines.push(Line::from(""));
+            let elapsed = tool
+                .finished_at
+                .unwrap_or_else(std::time::Instant::now)
+                .saturating_duration_since(tool.started_at)
+                .as_secs_f32();
+            let (symbol, color) = match tool.status {
+                ToolExecutionStatus::Running => ("●", t.yellow),
+                ToolExecutionStatus::Succeeded => ("✓", t.green),
+                ToolExecutionStatus::Failed => ("✗", t.red),
+                ToolExecutionStatus::Cancelled => ("■", t.subtext),
+            };
+            let metadata = crate::tui::tool_metadata_label(tool);
+            let timing = if metadata.is_empty() {
+                format!("{elapsed:.1}s")
+            } else {
+                metadata
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {symbol} "), Style::default().fg(color)),
+                Span::styled(
+                    tool_command(&tool.name, &tool.args),
+                    Style::default().fg(t.text).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!(" · {timing}"), Style::default().fg(t.subtext)),
+            ]));
+            for output in tool_output_tail(tool, 6) {
+                lines.push(Line::from(vec![
+                    Span::styled("   ", Style::default()),
+                    Span::styled(output, Style::default().fg(t.subtext)),
+                ]));
             }
         }
     }

@@ -99,7 +99,7 @@ function chatMessagesToSaved(messages: ChatMessage[]) {
     execution_steps?: { type: string; index: number }[];
     execution_rounds?: {
       thinking?: { content: string };
-      tools: { name: string; args: unknown; result: string; success: boolean }[];
+      tools: NonNullable<ChatMessage['toolCalls']>;
     }[];
     tool_result?: string;
     attachments?: { name: string; mime_type: string; url: string; size: number }[];
@@ -130,10 +130,8 @@ function chatMessagesToSaved(messages: ChatMessage[]) {
       entry.execution_rounds = m.executionRounds.map((r) => ({
         thinking: r.thinking ? { content: r.thinking.content } : undefined,
         tools: r.tools.map((t) => ({
-          name: t.name,
-          args: t.args,
-          result: t.result,
-          success: t.success,
+          ...t,
+          status: t.status === 'running' ? ('cancelled' as const) : t.status,
         })),
       }));
     }
@@ -141,7 +139,7 @@ function chatMessagesToSaved(messages: ChatMessage[]) {
     // Save tool calls with stable IDs and results
     if (m.toolCalls && m.toolCalls.length > 0) {
       entry.tool_calls = m.toolCalls.map((tc, i) => ({
-        id: `tc-${m.id}-${i}`,
+        id: tc.id || `tc-${m.id}-${i}`,
         name: tc.name,
         arguments: typeof tc.args === 'string' ? tc.args : JSON.stringify(tc.args || {}),
       }));
@@ -292,10 +290,18 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
         // Typed via the SavedMessage shape instead of `any` (P1-40).
         if (m.execution_rounds && m.execution_rounds.length > 0) {
           type ExecutionRoundTool = {
+            id?: string;
             name: string;
             args: unknown;
             result: string;
             success: boolean;
+            status?: 'running' | 'succeeded' | 'failed' | 'cancelled';
+            stdout?: string;
+            stderr?: string;
+            log?: string;
+            startedAt?: number;
+            finishedAt?: number;
+            truncated?: boolean;
           };
           type ExecutionRound = {
             thinking?: { content: string };
@@ -304,11 +310,19 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
           base.executionRounds = (m.execution_rounds as ExecutionRound[]).map((r) => ({
             thinking: r.thinking ? { content: r.thinking.content } : undefined,
             tools: (r.tools || []).map(
-              (t): ExecutionRoundTool => ({
+              (t, index) => ({
+                id: t.id || `restored-${index}-${Date.now()}`,
                 name: t.name,
                 args: t.args || {},
                 result: t.result || '',
                 success: t.success ?? true,
+                status: t.status === 'running' ? 'cancelled' : t.status || 'succeeded',
+                stdout: t.stdout || (t.success === false ? '' : t.result || ''),
+                stderr: t.stderr || (t.success === false ? t.result || '' : ''),
+                log: t.log || '',
+                startedAt: t.startedAt || Date.now(),
+                finishedAt: t.finishedAt || Date.now(),
+                truncated: t.truncated,
               })
             ),
           }));
@@ -317,6 +331,7 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
         // Restore tool calls on assistant messages
         if (m.role === 'assistant' && m.tool_calls && m.tool_calls.length > 0) {
           base.toolCalls = m.tool_calls.map((tc) => ({
+            id: tc.id,
             name: tc.name,
             args: (() => {
               try {
@@ -327,6 +342,12 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
             })(),
             result: '',
             success: true,
+            status: 'succeeded',
+            stdout: '',
+            stderr: '',
+            log: '',
+            startedAt: Date.now(),
+            finishedAt: Date.now(),
           }));
         }
 
@@ -345,10 +366,17 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
           base.content = m.tool_result || m.content || '';
           base.toolCalls = [
             {
+              id: `restored-tool-${Date.now()}`,
               name: 'tool',
               args: {},
               result: m.tool_result || m.content || '',
               success: true,
+              status: 'succeeded',
+              stdout: m.tool_result || m.content || '',
+              stderr: '',
+              log: '',
+              startedAt: Date.now(),
+              finishedAt: Date.now(),
             },
           ];
         }

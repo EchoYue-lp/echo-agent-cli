@@ -585,7 +585,7 @@ async fn chat_with_agent(agent: &AgentHandle, message: &str, output: &OutputRend
                                 );
                                 first_chunk = true;
                             }
-                            AgentEvent::ToolCall { name, args } => {
+                            AgentEvent::ToolCall { name, args, .. } => {
                                 clear_spinner!();
                                 tool_call_count += 1;
                                 TOTAL_TOOL_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -613,6 +613,7 @@ async fn chat_with_agent(agent: &AgentHandle, message: &str, output: &OutputRend
                             AgentEvent::ToolResult {
                                 name,
                                 output: tool_output,
+                                ..
                             } => {
                                 // Auto-track file changes for coding loop
                                 if matches!(
@@ -630,7 +631,7 @@ async fn chat_with_agent(agent: &AgentHandle, message: &str, output: &OutputRend
                                 output.print_tool_result(&name, &tool_output, true);
                                 first_chunk = true;
                             }
-                            AgentEvent::ToolError { name, error } => {
+                            AgentEvent::ToolError { name, error, .. } => {
                                 let err_text = format!("✗ {}: {}", name, error);
                                 let styled = nu_ansi_term::Color::Red.paint(&err_text);
                                 println!("  {}", styled);

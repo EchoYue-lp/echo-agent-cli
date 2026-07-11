@@ -341,6 +341,28 @@ pub struct ChatMessage {
     pub content: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolExecutionStatus {
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolExecutionMessage {
+    pub call_id: String,
+    pub name: String,
+    pub args: String,
+    pub status: ToolExecutionStatus,
+    pub stdout: String,
+    pub stderr: String,
+    pub progress: Option<String>,
+    pub started_at: Instant,
+    pub finished_at: Option<Instant>,
+    pub metadata: std::collections::HashMap<String, String>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum MessageRole {
     User,
@@ -350,6 +372,54 @@ pub enum MessageRole {
     ToolResult {
         tool_name: String,
     },
+    ToolExecution(Box<ToolExecutionMessage>),
+}
+
+pub(crate) fn tool_command(name: &str, args: &str) -> String {
+    if name == "shell"
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(args)
+        && let Some(command) = value.get("command").and_then(serde_json::Value::as_str)
+    {
+        return command.to_string();
+    }
+    format!("{name} {args}")
+}
+
+pub(crate) fn tool_output_tail(tool: &ToolExecutionMessage, max_lines: usize) -> Vec<String> {
+    let source = if tool.status == ToolExecutionStatus::Failed && !tool.stderr.is_empty() {
+        &tool.stderr
+    } else if !tool.stdout.is_empty() {
+        &tool.stdout
+    } else if !tool.stderr.is_empty() {
+        &tool.stderr
+    } else {
+        return tool.progress.clone().into_iter().collect();
+    };
+    let lines: Vec<&str> = source.lines().collect();
+    let start = lines.len().saturating_sub(max_lines);
+    lines
+        .get(start..)
+        .unwrap_or_default()
+        .iter()
+        .map(|line| (*line).to_string())
+        .collect()
+}
+
+pub(crate) fn tool_metadata_label(tool: &ToolExecutionMessage) -> String {
+    let duration = tool
+        .metadata
+        .get("duration_ms")
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|value| format!("{:.1}s", value as f64 / 1000.0));
+    let exit_code = tool
+        .metadata
+        .get("exit_code")
+        .map(|value| format!("exit {value}"));
+    [duration, exit_code]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 /// A group of related messages (thinking + tool calls + final answer).
@@ -512,7 +582,9 @@ impl TuiApp {
                     });
                     i += 1;
                 }
-                MessageRole::Assistant | MessageRole::ToolResult { .. } => {
+                MessageRole::Assistant
+                | MessageRole::ToolResult { .. }
+                | MessageRole::ToolExecution(_) => {
                     // Group consecutive Assistant and ToolResult messages
                     let start = i;
                     let mut thinking_count = 0;
@@ -535,6 +607,10 @@ impl TuiApp {
                                 i += 1;
                             }
                             MessageRole::ToolResult { .. } => {
+                                tool_call_count += 1;
+                                i += 1;
+                            }
+                            MessageRole::ToolExecution(_) => {
                                 tool_call_count += 1;
                                 i += 1;
                             }
@@ -721,6 +797,20 @@ impl TuiApp {
     /// Check whether the messages cache needs rebuilding.
     pub(crate) fn is_messages_cache_stale(&self) -> bool {
         self.messages.len() != self.chat_cache_msg_count
+    }
+
+    pub(crate) fn invalidate_messages_cache(&mut self) {
+        self.chat_cache_msg_count = usize::MAX;
+    }
+
+    pub(crate) fn has_running_tools(&self) -> bool {
+        self.messages.iter().any(|message| {
+            matches!(
+                &message.role,
+                MessageRole::ToolExecution(tool)
+                    if tool.status == ToolExecutionStatus::Running
+            )
+        })
     }
 
     /// Check whether the stream cache needs rebuilding.
@@ -1045,6 +1135,48 @@ impl TuiApp {
                 for raw_line in content.lines().skip(1) {
                     let clean = widgets::chat::strip_ansi(raw_line);
                     let prefixed = format!("  {clean}");
+                    for wrapped in textwrap::wrap(&prefixed, wrap_opts) {
+                        out.push(WrappedLine {
+                            text: wrapped.into_owned(),
+                            message_idx: msg_idx,
+                        });
+                    }
+                }
+            }
+            MessageRole::ToolExecution(tool) => {
+                let elapsed = tool
+                    .finished_at
+                    .unwrap_or_else(Instant::now)
+                    .saturating_duration_since(tool.started_at)
+                    .as_secs_f32();
+                let symbol = match tool.status {
+                    ToolExecutionStatus::Running => "●",
+                    ToolExecutionStatus::Succeeded => "✓",
+                    ToolExecutionStatus::Failed => "✗",
+                    ToolExecutionStatus::Cancelled => "■",
+                };
+                out.push(WrappedLine {
+                    text: String::new(),
+                    message_idx: msg_idx,
+                });
+                let metadata = tool_metadata_label(tool);
+                let timing = if metadata.is_empty() {
+                    format!("{elapsed:.1}s")
+                } else {
+                    metadata
+                };
+                let header = format!(
+                    " {symbol} {} · {timing}",
+                    tool_command(&tool.name, &tool.args)
+                );
+                for wrapped in textwrap::wrap(&header, wrap_opts) {
+                    out.push(WrappedLine {
+                        text: wrapped.into_owned(),
+                        message_idx: msg_idx,
+                    });
+                }
+                for raw_line in tool_output_tail(tool, 6) {
+                    let prefixed = format!("   {raw_line}");
                     for wrapped in textwrap::wrap(&prefixed, wrap_opts) {
                         out.push(WrappedLine {
                             text: wrapped.into_owned(),
