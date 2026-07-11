@@ -1,6 +1,9 @@
 use echo_agent::config::{AppConfig, ConfiguredModel};
 use echo_agent::llm::config::{all_provider_metadata, provider_base_url, provider_env_var_names};
+use echo_agent::llm::core::capabilities::infer_context_window;
 use serde::Serialize;
+
+const DEFAULT_CONTEXT_WINDOW: u32 = 396_000;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ProviderTemplate {
@@ -112,10 +115,18 @@ pub fn configured_model_views(config: &mut AppConfig) -> Vec<ConfiguredModelView
                 base_url: runtime.base_url,
                 temperature: model.temperature,
                 max_tokens: model.max_tokens,
-                context_window: model.context_window,
+                context_window: Some(effective_context_window(model)),
             }
         })
         .collect()
+}
+
+fn effective_context_window(model: &ConfiguredModel) -> u32 {
+    model
+        .context_window
+        .or_else(|| infer_context_window(&model.provider, &model.model))
+        .unwrap_or(DEFAULT_CONTEXT_WINDOW)
+        .clamp(1, 10_000_000)
 }
 
 pub fn upsert_configured_model(config: &mut AppConfig, mut model: ConfiguredModel) -> String {
@@ -317,4 +328,43 @@ fn display_name_from_model(model: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn configured_model(
+        provider: &str,
+        model: &str,
+        context_window: Option<u32>,
+    ) -> ConfiguredModel {
+        ConfiguredModel {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            context_window,
+            ..ConfiguredModel::default()
+        }
+    }
+
+    #[test]
+    fn effective_context_window_prefers_explicit_value() {
+        let model = configured_model("anthropic", "claude-4-sonnet", Some(353_000));
+        assert_eq!(effective_context_window(&model), 353_000);
+    }
+
+    #[test]
+    fn effective_context_window_infers_known_models() {
+        let openai = configured_model("openai", "gpt-5.6-sol", None);
+        let anthropic = configured_model("anthropic", "claude-sonnet-5", None);
+
+        assert_eq!(effective_context_window(&openai), 1_050_000);
+        assert_eq!(effective_context_window(&anthropic), 1_000_000);
+    }
+
+    #[test]
+    fn effective_context_window_uses_framework_default_for_unknown_models() {
+        let model = configured_model("custom", "local-model", None);
+        assert_eq!(effective_context_window(&model), DEFAULT_CONTEXT_WINDOW);
+    }
 }

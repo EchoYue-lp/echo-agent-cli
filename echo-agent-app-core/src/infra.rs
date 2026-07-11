@@ -16,8 +16,8 @@ use crate::model_config;
 use crate::project::prompt::PromptAssembler;
 use crate::tasks::task_runtime::TaskRouteKind;
 
-/// Default context window size in tokens (128K).
-const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
+/// Default context window size in tokens (396K).
+const DEFAULT_CONTEXT_WINDOW: usize = 396_000;
 
 /// Default max output tokens when not configured (sensible for 128K context models).
 const DEFAULT_MAX_TOKENS: u32 = 8192;
