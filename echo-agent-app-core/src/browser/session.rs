@@ -23,6 +23,14 @@ pub enum BrowserSessionStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserBackend {
+    #[default]
+    Managed,
+    Chrome,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BrowserTab {
     pub id: String,
@@ -37,6 +45,8 @@ pub struct BrowserSession {
     pub id: String,
     pub conversation_id: String,
     pub status: BrowserSessionStatus,
+    #[serde(default)]
+    pub backend: BrowserBackend,
     #[serde(default)]
     pub developer_mode: bool,
     pub tabs: Vec<BrowserTab>,
@@ -127,6 +137,7 @@ impl BrowserSessionManager {
                 }
             };
             session.status = BrowserSessionStatus::Closed;
+            session.backend = BrowserBackend::Managed;
             let next_tab_index = session
                 .tabs
                 .iter()
@@ -183,6 +194,7 @@ impl BrowserSessionManager {
                     id: session_id,
                     conversation_id: conversation_id.to_string(),
                     status: BrowserSessionStatus::Starting,
+                    backend: BrowserBackend::Managed,
                     developer_mode: false,
                     tabs: vec![main_tab.clone()],
                     created_at: now,
@@ -371,6 +383,28 @@ impl BrowserSessionManager {
         }
     }
 
+    pub async fn set_backend(&self, conversation_id: &str, backend: BrowserBackend) {
+        let session = if let Some(state) = self.sessions.write().await.get_mut(conversation_id) {
+            state.session.backend = backend;
+            state.session.updated_at = Utc::now();
+            Some(state.session.clone())
+        } else {
+            None
+        };
+        if let Some(session) = session {
+            self.persist(&session).await;
+        }
+    }
+
+    pub async fn backend(&self, conversation_id: &str) -> BrowserBackend {
+        self.sessions
+            .read()
+            .await
+            .get(conversation_id)
+            .map(|state| state.session.backend)
+            .unwrap_or_default()
+    }
+
     pub async fn developer_mode(&self, conversation_id: &str) -> bool {
         self.sessions
             .read()
@@ -500,6 +534,19 @@ mod tests {
 
         assert!(manager.developer_mode("conv-1").await);
         assert!(!manager.developer_mode("conv-2").await);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn backend_is_conversation_scoped() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let manager = BrowserSessionManager::new(temp.path().to_path_buf(), 32);
+        manager.lease_tab("conv-1", MAIN_TAB_OWNER, None).await;
+        manager.lease_tab("conv-2", MAIN_TAB_OWNER, None).await;
+        manager.set_backend("conv-1", BrowserBackend::Chrome).await;
+
+        assert_eq!(manager.backend("conv-1").await, BrowserBackend::Chrome);
+        assert_eq!(manager.backend("conv-2").await, BrowserBackend::Managed);
         Ok(())
     }
 

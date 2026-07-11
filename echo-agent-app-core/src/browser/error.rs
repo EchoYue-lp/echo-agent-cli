@@ -8,11 +8,11 @@ pub enum BrowserError {
     Prerequisite(String),
     #[error("browser runtime I/O failed: {0}")]
     Io(String),
-    #[error("Playwright MCP connection failed: {0}")]
+    #[error("browser connection failed: {0}")]
     Connection(String),
     #[error("browser operation cancelled")]
     Cancelled,
-    #[error("Playwright MCP tool '{tool}' failed: {message}")]
+    #[error("browser tool '{tool}' failed: {message}")]
     Tool { tool: String, message: String },
 }
 

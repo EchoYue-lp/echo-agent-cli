@@ -16,6 +16,9 @@ pub struct BrowserConfig {
     pub startup_timeout_secs: u64,
     pub allowed_domains: Vec<String>,
     pub blocked_domains: Vec<String>,
+    pub chrome_enabled: bool,
+    pub chrome_bridge_dir: PathBuf,
+    pub chrome_extension_id: Option<String>,
 }
 
 impl BrowserConfig {
@@ -29,6 +32,8 @@ impl BrowserConfig {
         config.package = env_non_empty("EKO_BROWSER_MCP_PACKAGE").unwrap_or(config.package);
         config.allowed_domains = env_list("EKO_BROWSER_ALLOWED_DOMAINS");
         config.blocked_domains = env_list("EKO_BROWSER_BLOCKED_DOMAINS");
+        config.chrome_enabled = env_bool("EKO_CHROME_ENABLED").unwrap_or(config.chrome_enabled);
+        config.chrome_extension_id = env_non_empty("EKO_CHROME_EXTENSION_ID");
         if let Some(path) = env_non_empty("EKO_BROWSER_PROFILE_DIR") {
             config.user_data_dir = PathBuf::from(path);
         }
@@ -37,6 +42,9 @@ impl BrowserConfig {
         }
         if let Some(path) = env_non_empty("EKO_BROWSER_SESSION_DIR") {
             config.session_dir = PathBuf::from(path);
+        }
+        if let Some(path) = env_non_empty("EKO_CHROME_BRIDGE_DIR") {
+            config.chrome_bridge_dir = PathBuf::from(path);
         }
         if let Some(timeout) = env_non_empty("EKO_BROWSER_STARTUP_TIMEOUT_SECS")
             .and_then(|value| value.parse::<u64>().ok())
@@ -107,6 +115,9 @@ impl Default for BrowserConfig {
             startup_timeout_secs: 60,
             allowed_domains: Vec::new(),
             blocked_domains: Vec::new(),
+            chrome_enabled: true,
+            chrome_bridge_dir: base_dir.join("chrome"),
+            chrome_extension_id: None,
         }
     }
 }

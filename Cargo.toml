@@ -47,6 +47,10 @@ name = "echo-agent-tauri"
 path = "src-tauri/src/main.rs"
 required-features = ["gui"]
 
+[[bin]]
+name = "eko-chrome-native-host"
+path = "src/bin/eko-chrome-native-host.rs"
+
 [dependencies]
 echo-agent-app-core = { path = "./echo-agent-app-core" }
 echo-agent = { version = "0.2.0", package = "echo_agent", path = "../echo-agent", features = ["mcp", "lsp", "human-loop", "subagent", "tasks", "eval", "improve"] }

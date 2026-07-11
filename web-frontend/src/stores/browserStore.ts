@@ -22,6 +22,7 @@ export interface BrowserSession {
   id: string;
   conversation_id: string;
   status: BrowserStatus;
+  backend?: 'managed' | 'chrome';
   developer_mode?: boolean;
   tabs: BrowserTab[];
 }
@@ -47,6 +48,7 @@ export type BrowserEvent =
       category: string;
       observation: { session_id: string; tab_id: string; summary: string; captured_at: string };
     }
+  | { type: 'backend_changed'; session_id: string; backend: 'managed' | 'chrome' }
   | {
       type: 'confirmation_requested';
       session_id: string;
@@ -72,6 +74,7 @@ interface BrowserViewState {
 interface BrowserStore {
   open: boolean;
   views: Record<string, BrowserViewState>;
+  chromeConnected: boolean;
   toggle: () => void;
   setOpen: (open: boolean) => void;
   ingest: (event: BrowserEvent) => void;
@@ -83,6 +86,8 @@ interface BrowserStore {
   selectTab: (conversationId: string, index: number) => Promise<void>;
   newTab: (conversationId: string) => Promise<void>;
   closeTab: (conversationId: string, index: number) => Promise<void>;
+  setBackend: (conversationId: string, backend: 'managed' | 'chrome') => Promise<void>;
+  refreshChromeStatus: () => Promise<void>;
 }
 
 function updateSession(
@@ -104,6 +109,7 @@ async function invokeBrowser(command: string, args?: Record<string, unknown>) {
 export const useBrowserStore = create<BrowserStore>((set) => ({
   open: false,
   views: {},
+  chromeConnected: false,
   toggle: () => set((state) => ({ open: !state.open })),
   setOpen: (open) => set({ open }),
   ingest: (event) =>
@@ -135,6 +141,13 @@ export const useBrowserStore = create<BrowserStore>((set) => ({
             ...view,
             session: { ...view.session, tabs: [...view.session.tabs, event.tab] },
             activeTabId: event.tab.id,
+          };
+        }
+        if (event.type === 'backend_changed') {
+          return {
+            ...view,
+            frame: null,
+            session: { ...view.session, backend: event.backend, status: 'ready' },
           };
         }
         if (event.type === 'navigation_started') {
@@ -244,4 +257,26 @@ export const useBrowserStore = create<BrowserStore>((set) => ({
     invokeBrowser('browser_tabs', { conversationId, action: 'new', url: 'about:blank' }),
   closeTab: (conversationId, index) =>
     invokeBrowser('browser_tabs', { conversationId, action: 'close', index }),
+  setBackend: async (conversationId, backend) => {
+    try {
+      await invokeBrowser('browser_set_backend', { conversationId, backend });
+    } catch (error) {
+      set((state) => ({
+        views: updateSession(
+          state.views,
+          state.views[conversationId]?.session.id ?? '',
+          (view) => ({ ...view, error: errorMessage(error) })
+        ),
+      }));
+    }
+  },
+  refreshChromeStatus: async () => {
+    if (!isTauri()) return;
+    try {
+      const status = await apiInvoke<{ connected: boolean }>('chrome_setup_status');
+      set({ chromeConnected: status.connected });
+    } catch {
+      set({ chromeConnected: false });
+    }
+  },
 }));

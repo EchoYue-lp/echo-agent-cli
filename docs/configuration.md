@@ -205,10 +205,21 @@ EKO_BROWSER_HEADLESS=false
 EKO_BROWSER_PROFILE_DIR=~/.echo-agent/browser/profiles/managed
 EKO_BROWSER_OUTPUT_DIR=~/.echo-agent/browser/output
 EKO_BROWSER_STARTUP_TIMEOUT_SECS=60
+EKO_CHROME_ENABLED=true
+# Optional: pin the desktop bridge to the unpacked/Web Store extension id.
+EKO_CHROME_EXTENSION_ID=abcdefghijklmnopabcdefghijklmnop
 ```
 
 保留手动 MCP 配置兼容路径。希望完全使用自定义 Playwright MCP 配置时，可设
 `EKO_BROWSER_ENABLED=false`，避免同时启动托管 sidecar。
+
+### Chrome 登录态模式
+
+需要现有 Chrome 登录态时，可加载仓库 `chrome-extension/` 下的 Manifest V3
+扩展，并通过桌面命令 `chrome_install_native_host` 注册 Native Messaging Host。
+扩展 popup 必须由用户授权当前站点和标签页；普通公开网页与 localhost 仍默认
+使用托管 Chromium。Chrome 模式不会读取 Cookie、密码、浏览历史或 Profile
+文件。可用 `EKO_CHROME_ENABLED=false` 单独关闭扩展 bridge，而不影响托管浏览器。
 
 ## 模型配置详解
 

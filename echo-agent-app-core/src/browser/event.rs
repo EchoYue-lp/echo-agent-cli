@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use super::session::{BrowserObservation, BrowserSession, BrowserTab};
+use super::session::{BrowserBackend, BrowserObservation, BrowserSession, BrowserTab};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BrowserFrame {
@@ -38,6 +38,10 @@ pub enum BrowserEvent {
     Diagnostic {
         category: String,
         observation: BrowserObservation,
+    },
+    BackendChanged {
+        session_id: String,
+        backend: BrowserBackend,
     },
     ConfirmationRequested {
         session_id: String,
@@ -90,6 +94,7 @@ impl BrowserEvent {
             Self::Snapshot { .. } => "browser_snapshot",
             Self::Screenshot { .. } => "browser_screenshot",
             Self::Diagnostic { .. } => "browser_diagnostic",
+            Self::BackendChanged { .. } => "browser_backend_changed",
             Self::ConfirmationRequested { .. } => "browser_confirmation_requested",
             Self::ConfirmationResolved { .. } => "browser_confirmation_resolved",
             Self::ActionStarted { .. } => "browser_action_started",

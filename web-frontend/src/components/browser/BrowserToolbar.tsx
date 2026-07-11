@@ -1,5 +1,14 @@
 import { useEffect, useState } from 'react';
-import { ArrowLeft, ArrowRight, RefreshCw, RotateCw, Square, X } from 'lucide-react';
+import {
+  AppWindow,
+  ArrowLeft,
+  ArrowRight,
+  Chrome,
+  RefreshCw,
+  RotateCw,
+  Square,
+  X,
+} from 'lucide-react';
 
 export function BrowserToolbar({
   url,
@@ -10,6 +19,9 @@ export function BrowserToolbar({
   onStop,
   onRefreshFrame,
   onClose,
+  backend,
+  chromeConnected,
+  onBackendChange,
 }: {
   url: string;
   busy: boolean;
@@ -19,6 +31,9 @@ export function BrowserToolbar({
   onStop: () => void;
   onRefreshFrame: () => void;
   onClose: () => void;
+  backend: 'managed' | 'chrome';
+  chromeConnected: boolean;
+  onBackendChange: (backend: 'managed' | 'chrome') => void;
 }) {
   const [value, setValue] = useState(url);
   useEffect(() => setValue(url), [url]);
@@ -59,6 +74,22 @@ export function BrowserToolbar({
       <button className={iconClass} onClick={onRefreshFrame} title="刷新画面">
         <RefreshCw size={13} />
       </button>
+      <div className="flex h-7 shrink-0 items-center rounded-md border border-[var(--border-primary)] p-0.5">
+        <button
+          className={`${iconClass} h-6 w-6 ${backend === 'managed' ? 'bg-[var(--bg-hover)] text-[var(--text-primary)]' : ''}`}
+          onClick={() => onBackendChange('managed')}
+          title="托管 Chromium"
+        >
+          <AppWindow size={12} />
+        </button>
+        <button
+          className={`${iconClass} h-6 w-6 ${backend === 'chrome' ? 'bg-[var(--bg-hover)] text-[var(--text-primary)]' : ''}`}
+          onClick={() => onBackendChange('chrome')}
+          title={chromeConnected ? '已连接 Chrome' : 'Chrome 扩展未连接'}
+        >
+          <Chrome size={12} />
+        </button>
+      </div>
       <button className={iconClass} onClick={onClose} title="关闭浏览器面板">
         <X size={14} />
       </button>

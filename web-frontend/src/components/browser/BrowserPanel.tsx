@@ -1,4 +1,5 @@
-import { Activity, Globe2, PanelRightOpen } from 'lucide-react';
+import { useEffect } from 'react';
+import { Activity, Chrome, Globe2, PanelRightOpen } from 'lucide-react';
 import { useBrowserEvents } from '../../hooks/useBrowserEvents';
 import { useConversationStore } from '../../stores/conversationStore';
 import { useBrowserStore } from '../../stores/browserStore';
@@ -15,6 +16,9 @@ export function BrowserPanel() {
     conversationId ? state.views[conversationId] : undefined
   );
   const store = useBrowserStore();
+  useEffect(() => {
+    void store.refreshChromeStatus();
+  }, [store.refreshChromeStatus]);
   const activeTab =
     view?.session.tabs.find((tab) => tab.id === view.activeTabId) ?? view?.session.tabs[0];
   const busy =
@@ -52,6 +56,11 @@ export function BrowserPanel() {
           onStop={() => void store.stop()}
           onRefreshFrame={() => call(store.refreshFrame)}
           onClose={() => store.setOpen(false)}
+          backend={view?.session.backend ?? 'managed'}
+          chromeConnected={store.chromeConnected}
+          onBackendChange={(backend) =>
+            conversationId && void store.setBackend(conversationId, backend)
+          }
         />
         <BrowserTabs
           tabs={view?.session.tabs ?? []}
@@ -71,6 +80,12 @@ export function BrowserPanel() {
               >
                 <Activity size={11} />
                 {view?.diagnostics.length}
+              </span>
+            )}
+            {view?.session.backend === 'chrome' && (
+              <span className="flex shrink-0 items-center gap-1" title="使用已授权 Chrome 标签页">
+                <Chrome size={11} />
+                Chrome
               </span>
             )}
             <span className="flex min-w-0 items-center gap-1">

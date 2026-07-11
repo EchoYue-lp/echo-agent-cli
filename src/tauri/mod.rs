@@ -112,6 +112,9 @@ pub fn build_tauri_app(
             commands::browser::browser_screenshot,
             commands::browser::browser_tabs,
             commands::browser::browser_stop,
+            commands::browser::browser_set_backend,
+            commands::browser::chrome_setup_status,
+            commands::browser::chrome_install_native_host,
             // Config
             commands::config::get_config,
             commands::config::update_config,

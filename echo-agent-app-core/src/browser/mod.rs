@@ -1,3 +1,4 @@
+pub mod chrome;
 pub mod config;
 pub mod error;
 pub mod event;
@@ -21,13 +22,14 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
+pub use chrome::{ChromeBridgeStatus, ChromeConnectionManager};
 pub use config::BrowserConfig;
 pub use error::{BrowserError, BrowserResult};
 pub use event::{BrowserEvent, BrowserFrame};
 pub use risk::BrowserActionRisk;
 pub use session::{
-    BrowserObservation, BrowserSession, BrowserSessionManager, BrowserSessionStatus, BrowserTab,
-    MAIN_TAB_OWNER,
+    BrowserBackend, BrowserObservation, BrowserSession, BrowserSessionManager,
+    BrowserSessionStatus, BrowserTab, MAIN_TAB_OWNER,
 };
 use sidecar::BrowserSidecar;
 
@@ -39,6 +41,7 @@ pub struct BrowserRuntime {
 struct BrowserRuntimeInner {
     config: BrowserConfig,
     sessions: BrowserSessionManager,
+    chrome: ChromeConnectionManager,
     client: RwLock<Option<Arc<McpClient>>>,
     connect_lock: Mutex<()>,
     locator_failures: Mutex<HashMap<String, u8>>,
@@ -51,10 +54,17 @@ impl BrowserRuntime {
     pub async fn start(config: BrowserConfig) -> Arc<Self> {
         let sessions = BrowserSessionManager::new(config.session_dir.clone(), 12_000);
         sessions.restore_metadata().await;
+        let chrome = ChromeConnectionManager::start(
+            config.chrome_enabled,
+            config.chrome_bridge_dir.clone(),
+            config.chrome_extension_id.clone(),
+        )
+        .await;
         let runtime = Arc::new(Self {
             inner: Arc::new(BrowserRuntimeInner {
                 config,
                 sessions,
+                chrome,
                 client: RwLock::new(None),
                 connect_lock: Mutex::new(()),
                 locator_failures: Mutex::new(HashMap::new()),
@@ -92,7 +102,7 @@ impl BrowserRuntime {
     }
 
     fn install_tools_for(&self, agent: &mut echo_agent::agent::ReactAgent, actor: BrowserActor) {
-        if self.inner.config.enabled {
+        if self.inner.config.enabled || self.inner.config.chrome_enabled {
             agent.add_tools(self.tools_for(actor));
         }
     }
@@ -164,6 +174,11 @@ impl BrowserRuntime {
     }
 
     pub async fn interrupt(&self) {
+        let _ = self
+            .inner
+            .chrome
+            .browser_action("*", "interrupt", json!({}))
+            .await;
         let client = self.inner.client.write().await.take();
         if let Some(client) = client {
             client.close().await;
@@ -173,11 +188,16 @@ impl BrowserRuntime {
     pub async fn shutdown(&self) {
         self.inner.shutdown.cancel();
         self.inner.sessions.close_all().await;
+        self.inner.chrome.shutdown().await;
         let client = self.inner.client.write().await.take();
         if let Some(client) = client {
             client.close().await;
             tracing::info!("managed Playwright MCP runtime stopped");
         }
+    }
+
+    pub async fn chrome_status(&self) -> ChromeBridgeStatus {
+        self.inner.chrome.status().await
     }
 
     async fn ensure_client(&self) -> BrowserResult<Arc<McpClient>> {
@@ -315,6 +335,65 @@ impl BrowserRuntime {
         let turn_id = context.turn_id.clone();
         let execution_id = context.execution_id.clone();
         let action_name = action.name().to_string();
+        if action == BrowserAction::Backend {
+            let backend = params
+                .get("backend")
+                .and_then(Value::as_str)
+                .ok_or_else(|| BrowserError::Tool {
+                    tool: action_name.clone(),
+                    message: "backend must be managed or chrome".to_string(),
+                })?;
+            self.inner.sessions.emit(BrowserEvent::ActionStarted {
+                session_id: lease.session_id.clone(),
+                tab_id: lease.tab_id.clone(),
+                action: action_name.clone(),
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                execution_id: execution_id.clone(),
+            });
+            let result = match backend {
+                "managed" => {
+                    if self.inner.sessions.backend(conversation_id).await == BrowserBackend::Chrome
+                    {
+                        let _ = self.inner.chrome.release_task(conversation_id).await;
+                    }
+                    self.inner
+                        .sessions
+                        .set_backend(conversation_id, BrowserBackend::Managed)
+                        .await;
+                    json!({ "backend": "managed" })
+                }
+                "chrome" => {
+                    let tab_id = params.get("tabId").and_then(Value::as_u64);
+                    let claimed = self.inner.chrome.claim_tab(conversation_id, tab_id).await?;
+                    self.inner
+                        .sessions
+                        .set_backend(conversation_id, BrowserBackend::Chrome)
+                        .await;
+                    claimed
+                }
+                _ => {
+                    return Err(BrowserError::Tool {
+                        tool: action_name,
+                        message: "backend must be managed or chrome".to_string(),
+                    });
+                }
+            };
+            let selected_backend = self.inner.sessions.backend(conversation_id).await;
+            self.inner.sessions.emit(BrowserEvent::BackendChanged {
+                session_id: lease.session_id.clone(),
+                backend: selected_backend,
+            });
+            self.inner.sessions.emit(BrowserEvent::ActionCompleted {
+                session_id: lease.session_id,
+                tab_id: lease.tab_id,
+                action: action_name,
+                run_id,
+                turn_id,
+                execution_id,
+            });
+            return Ok(ToolResult::success_json(result));
+        }
         let action_risk = BrowserActionRisk::classify(action, &params)?;
         if action_risk.requires_confirmation() {
             let confirmation_args = action_risk.confirmation_args(action, &params);
@@ -415,6 +494,20 @@ impl BrowserRuntime {
                 message: "enable browser_developer_mode for this conversation before tracing"
                     .to_string(),
             });
+        }
+        if self.inner.sessions.backend(conversation_id).await == BrowserBackend::Chrome {
+            return self
+                .execute_chrome_action(
+                    conversation_id,
+                    &lease,
+                    action,
+                    params,
+                    context,
+                    run_id,
+                    turn_id,
+                    execution_id,
+                )
+                .await;
         }
         let locator_failure_key = locator_failure_key(&lease, action, &params);
         if let Some(key) = locator_failure_key.as_ref()
@@ -629,7 +722,8 @@ impl BrowserRuntime {
                             });
                         }
                     }
-                    BrowserAction::Tabs | BrowserAction::DeveloperMode => {}
+                    BrowserAction::Backend | BrowserAction::Tabs | BrowserAction::DeveloperMode => {
+                    }
                 }
                 if tabs_command.as_deref() == Some("close") {
                     let index = requested_index.unwrap_or(lease.tab_index);
@@ -818,6 +912,224 @@ impl BrowserRuntime {
                 | HumanLoopResponse::ModifiedArgs { .. }
         ))
     }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_chrome_action(
+        &self,
+        conversation_id: &str,
+        lease: &session::BrowserLease,
+        action: BrowserAction,
+        params: ToolParameters,
+        context: &ToolContext,
+        run_id: Option<String>,
+        turn_id: Option<String>,
+        execution_id: Option<String>,
+    ) -> BrowserResult<ToolResult> {
+        let method = match action {
+            BrowserAction::Navigate => "navigate",
+            BrowserAction::Snapshot => "snapshot",
+            BrowserAction::Click => "click",
+            BrowserAction::Fill => "fill",
+            BrowserAction::Screenshot => "screenshot",
+            BrowserAction::Back => "back",
+            BrowserAction::Reload => "reload",
+            BrowserAction::Tabs => "tabs",
+            BrowserAction::Scroll => "scroll",
+            BrowserAction::DomInspect => "snapshot",
+            BrowserAction::ClickAt | BrowserAction::TypeAt => {
+                return Err(BrowserError::Tool {
+                    tool: action.name().to_string(),
+                    message: "coordinate control is available only in managed Chromium".to_string(),
+                });
+            }
+            BrowserAction::Console | BrowserAction::Network | BrowserAction::PerformanceTrace => {
+                return Err(BrowserError::Tool {
+                    tool: action.name().to_string(),
+                    message: "this diagnostic requires managed Chromium; Chrome CDP is not enabled"
+                        .to_string(),
+                });
+            }
+            BrowserAction::Backend | BrowserAction::DeveloperMode => {
+                return Err(BrowserError::Tool {
+                    tool: action.name().to_string(),
+                    message: "browser action was routed through an invalid backend path"
+                        .to_string(),
+                });
+            }
+        };
+        let mut arguments = serde_json::Map::from_iter(params);
+        for key in [
+            "effect",
+            "confirmationSummary",
+            "destination",
+            "dataCategories",
+            "element",
+        ] {
+            arguments.remove(key);
+        }
+        let action_name = action.name().to_string();
+        if action == BrowserAction::Navigate {
+            let url = arguments
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            self.inner.sessions.emit(BrowserEvent::NavigationStarted {
+                session_id: lease.session_id.clone(),
+                tab_id: lease.tab_id.clone(),
+                url,
+            });
+            self.inner
+                .sessions
+                .set_status(conversation_id, BrowserSessionStatus::Navigating)
+                .await;
+        } else {
+            self.inner
+                .sessions
+                .set_status(conversation_id, BrowserSessionStatus::Acting)
+                .await;
+        }
+        self.inner.sessions.emit(BrowserEvent::ActionStarted {
+            session_id: lease.session_id.clone(),
+            tab_id: lease.tab_id.clone(),
+            action: action_name.clone(),
+            run_id: run_id.clone(),
+            turn_id: turn_id.clone(),
+            execution_id: execution_id.clone(),
+        });
+
+        let request = self.inner.chrome.browser_action(
+            conversation_id,
+            method,
+            Value::Object(arguments.clone()),
+        );
+        let raw = if let Some(cancel) = context.cancel.as_deref() {
+            tokio::select! {
+                _ = cancel.cancelled() => Err(BrowserError::Cancelled),
+                result = request => result,
+            }
+        } else {
+            request.await
+        };
+        let raw = match raw {
+            Ok(raw) => raw,
+            Err(error) => {
+                self.inner
+                    .sessions
+                    .set_status(conversation_id, BrowserSessionStatus::Failed)
+                    .await;
+                self.inner.sessions.emit(BrowserEvent::ActionFailed {
+                    session_id: lease.session_id.clone(),
+                    tab_id: lease.tab_id.clone(),
+                    action: action_name,
+                    error: error.to_string(),
+                    run_id,
+                    turn_id,
+                    execution_id,
+                });
+                return Err(error);
+            }
+        };
+        self.inner
+            .sessions
+            .set_status(conversation_id, BrowserSessionStatus::Ready)
+            .await;
+        if let Some(url) = raw.get("url").and_then(Value::as_str) {
+            self.inner
+                .sessions
+                .update_url(conversation_id, &lease.tab_id, url)
+                .await;
+            if action == BrowserAction::Navigate {
+                self.inner.sessions.emit(BrowserEvent::NavigationCompleted {
+                    session_id: lease.session_id.clone(),
+                    tab_id: lease.tab_id.clone(),
+                    url: url.to_string(),
+                });
+            }
+        }
+
+        let mut result = chrome_tool_result(action, raw);
+        let observation = self
+            .inner
+            .sessions
+            .observation(lease, &action_name, &result);
+        match action {
+            BrowserAction::Snapshot | BrowserAction::DomInspect => self
+                .inner
+                .sessions
+                .emit(BrowserEvent::Snapshot { observation }),
+            BrowserAction::Screenshot => {
+                let frame = browser_frame(&result);
+                self.inner
+                    .sessions
+                    .emit(BrowserEvent::Screenshot { observation, frame });
+            }
+            BrowserAction::Navigate
+            | BrowserAction::Click
+            | BrowserAction::Fill
+            | BrowserAction::Scroll
+            | BrowserAction::Back
+            | BrowserAction::Reload => {
+                if let Ok(frame) = self
+                    .inner
+                    .chrome
+                    .browser_action(conversation_id, "screenshot", json!({}))
+                    .await
+                {
+                    let frame_result = chrome_tool_result(BrowserAction::Screenshot, frame);
+                    let frame_observation =
+                        self.inner
+                            .sessions
+                            .observation(lease, "browser_screenshot", &frame_result);
+                    self.inner.sessions.emit(BrowserEvent::Screenshot {
+                        observation: frame_observation,
+                        frame: browser_frame(&frame_result),
+                    });
+                }
+            }
+            _ => {}
+        }
+        self.inner.sessions.emit(BrowserEvent::ActionCompleted {
+            session_id: lease.session_id.clone(),
+            tab_id: lease.tab_id.clone(),
+            action: action_name,
+            run_id,
+            turn_id,
+            execution_id,
+        });
+        if action == BrowserAction::DomInspect {
+            result.kind = ToolResultKind::Text;
+        }
+        Ok(result)
+    }
+}
+
+fn chrome_tool_result(action: BrowserAction, value: Value) -> ToolResult {
+    if action == BrowserAction::Screenshot {
+        let data = value.get("data").and_then(Value::as_str);
+        let mime_type = value
+            .get("mimeType")
+            .and_then(Value::as_str)
+            .unwrap_or("image/png")
+            .to_string();
+        if let Some(data) = data
+            && let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data)
+        {
+            let mut result = ToolResult::success("Captured authorized Chrome tab screenshot.");
+            result.kind = ToolResultKind::Image {
+                mime_type: mime_type.clone(),
+            };
+            result.bytes = Some(bytes);
+            result.mime_type = Some(mime_type);
+            return result;
+        }
+    }
+    if let Some(text) = value.get("text").and_then(Value::as_str) {
+        let mut result = ToolResult::success(text.to_string());
+        result.data = Some(value);
+        return result;
+    }
+    ToolResult::success_json(value)
 }
 
 fn mcp_tool_result(tool: &str, result: McpToolCallResult) -> BrowserResult<McpToolCallResult> {
@@ -887,6 +1199,7 @@ fn redact_browser_diagnostics(output: &str) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BrowserAction {
+    Backend,
     Navigate,
     Snapshot,
     Click,
@@ -912,7 +1225,8 @@ enum BrowserActor {
 }
 
 impl BrowserAction {
-    const ALL: [Self; 16] = [
+    const ALL: [Self; 17] = [
+        Self::Backend,
         Self::Navigate,
         Self::Snapshot,
         Self::Click,
@@ -933,6 +1247,7 @@ impl BrowserAction {
 
     pub fn name(self) -> &'static str {
         match self {
+            Self::Backend => "browser_backend",
             Self::Navigate => "browser_navigate",
             Self::Snapshot => "browser_snapshot",
             Self::Click => "browser_click",
@@ -954,7 +1269,10 @@ impl BrowserAction {
 
     fn description(self) -> &'static str {
         match self {
-            Self::Navigate => "Navigate the managed browser to a URL.",
+            Self::Backend => {
+                "Select managed Chromium or an explicitly authorized Chrome tab for this conversation."
+            }
+            Self::Navigate => "Navigate the current browser backend to a URL.",
             Self::Snapshot => "Read a structured accessibility snapshot of the current page.",
             Self::Click => "Click an element identified by a Playwright snapshot target.",
             Self::Fill => "Fill or type text into an editable element.",
@@ -985,6 +1303,13 @@ impl BrowserAction {
 
     fn parameters(self) -> Value {
         match self {
+            Self::Backend => object_schema(
+                json!({
+                    "backend": { "type": "string", "enum": ["managed", "chrome"] },
+                    "tabId": { "type": "integer", "minimum": 0, "description": "Optional authorized Chrome tab id" }
+                }),
+                &["backend"],
+            ),
             Self::Navigate => object_schema(
                 json!({
                     "url": { "type": "string", "description": "URL to open" }
@@ -1120,6 +1445,7 @@ impl BrowserAction {
             arguments.remove(key);
         }
         match self {
+            Self::Backend => Ok(("browser_get_config", Value::Object(arguments))),
             Self::Navigate => Ok(("browser_navigate", Value::Object(arguments))),
             Self::Snapshot => Ok(("browser_snapshot", Value::Object(arguments))),
             Self::Click => Ok(("browser_click", Value::Object(arguments))),
@@ -1183,7 +1509,8 @@ impl BrowserAction {
 
     fn risk(self) -> ToolRiskLevel {
         match self {
-            Self::Snapshot
+            Self::Backend
+            | Self::Snapshot
             | Self::Screenshot
             | Self::Console
             | Self::Network
@@ -1378,6 +1705,7 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                "browser_backend",
                 "browser_navigate",
                 "browser_snapshot",
                 "browser_click",
