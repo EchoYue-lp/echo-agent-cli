@@ -2,6 +2,7 @@ pub mod agent_handle;
 pub mod agent_pool;
 pub mod attachments;
 pub mod auto_memory;
+pub mod browser;
 pub mod chat_driver;
 pub mod chat_resources;
 pub mod config;

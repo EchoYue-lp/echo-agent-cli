@@ -191,6 +191,25 @@ MCP 配置文件搜索路径（按优先级）：
 2. `./.echo-agent/mcp.json`
 3. `~/.echo-agent/mcp.json`
 
+### 托管浏览器
+
+EKO 默认在应用启动后后台预热 `@playwright/mcp@latest`，无需把 Playwright
+写入 `mcp.json`。需要 Node.js 18 或更高版本以及可用的 `npm`/`npx`。浏览器
+Profile 和输出默认位于 `~/.echo-agent/browser/`。
+
+可用环境变量：
+
+```bash
+EKO_BROWSER_ENABLED=true
+EKO_BROWSER_HEADLESS=false
+EKO_BROWSER_PROFILE_DIR=~/.echo-agent/browser/profiles/managed
+EKO_BROWSER_OUTPUT_DIR=~/.echo-agent/browser/output
+EKO_BROWSER_STARTUP_TIMEOUT_SECS=60
+```
+
+保留手动 MCP 配置兼容路径。希望完全使用自定义 Playwright MCP 配置时，可设
+`EKO_BROWSER_ENABLED=false`，避免同时启动托管 sidecar。
+
 ## 模型配置详解
 
 ### 支持的模型提供商

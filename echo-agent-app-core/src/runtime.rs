@@ -48,6 +48,8 @@ pub struct AgentRuntime {
     /// and garbage collection. Created in bootstrap when a `Store` is available.
     /// Used by `/memory-review` command and session-end review hooks.
     pub review_integration: Option<Arc<ReviewIntegration>>,
+    /// Application-owned Playwright MCP runtime shared by every agent surface.
+    pub browser_runtime: Arc<crate::browser::BrowserRuntime>,
 }
 
 impl AgentRuntime {
@@ -88,6 +90,15 @@ impl AgentRuntime {
         if params.conversation_id.is_none() {
             params.conversation_id = Some(infra::default_primary_conversation_id());
         }
+
+        let browser_runtime = match params.browser_runtime.clone() {
+            Some(runtime) => runtime,
+            None => {
+                crate::browser::BrowserRuntime::start(crate::browser::BrowserConfig::from_env())
+                    .await
+            }
+        };
+        params.browser_runtime = Some(browser_runtime.clone());
 
         // ── 0b. Unified memory — load instruction files (user.md / project.md /
         //       local.md) BEFORE building the agent so we can hand the assembled
@@ -359,6 +370,7 @@ impl AgentRuntime {
             subagent_hook_bridge: Some(subagent_hook_bridge),
             state_store,
             review_integration,
+            browser_runtime,
         })
     }
 

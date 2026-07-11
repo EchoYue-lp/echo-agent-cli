@@ -109,6 +109,10 @@ pub struct AgentCreateParams {
     /// task-management tools (plan_create/update/complete/skip/list) so the
     /// main agent can autonomously manage its plan during execution.
     pub task_runtime_store: Option<Arc<crate::tasks::task_runtime::TaskRuntimeStore>>,
+    /// Shared application-owned managed browser runtime. The same instance is
+    /// installed on the primary agent and all built-in subagents so one
+    /// Playwright MCP sidecar owns the managed browser profile.
+    pub browser_runtime: Option<Arc<crate::browser::BrowserRuntime>>,
     /// Route kind for plan_execute tool registration. When Some, the
     /// `plan_execute` tool is registered on the agent (never on subagents,
     /// per §10.2). The route determines whether ComplexRuntime approval
@@ -419,6 +423,10 @@ pub async fn create_agent(
     let cache_user_id = load_or_create_cache_user_id();
     agent.config_mut().set_cache_user_id(&cache_user_id);
 
+    if let Some(browser_runtime) = &params.browser_runtime {
+        browser_runtime.install_tools(&mut agent);
+    }
+
     // Inject LlmCritic for self-verification. The critic scores the agent's
     // final_answer; if below threshold (7.0), feedback is injected and the
     // agent retries (up to verifier_max_retries=2).
@@ -451,6 +459,7 @@ pub async fn create_agent(
         &cache_user_id,
         subagent_project_root.as_deref(),
         subagent_user_home.as_deref(),
+        params.browser_runtime.clone(),
     )
     .await;
 
@@ -531,6 +540,7 @@ async fn register_default_subagents(
     cache_user_id: &str,
     project_root: Option<&std::path::Path>,
     user_home: Option<&std::path::Path>,
+    browser_runtime: Option<Arc<crate::browser::BrowserRuntime>>,
 ) {
     let workers = crate::subagent_loader::discover_subagents(project_root, user_home);
     tracing::info!(
@@ -577,6 +587,7 @@ async fn register_default_subagents(
                 cache_user_id,
                 worker_def.can_delegate,
                 max_iterations,
+                browser_runtime.clone(),
             )
         } else {
             build_writer_worker_agent(
@@ -591,6 +602,7 @@ async fn register_default_subagents(
                 cache_user_id,
                 worker_def.can_delegate,
                 max_iterations,
+                browser_runtime.clone(),
             )
         };
         match build_result {
@@ -749,6 +761,7 @@ fn build_writer_worker_agent(
     cache_user_id: &str,
     can_delegate: bool,
     max_iterations: usize,
+    browser_runtime: Option<Arc<crate::browser::BrowserRuntime>>,
 ) -> std::result::Result<ReactAgent, echo_agent::error::ReactError> {
     // Mirror build_readonly_worker_agent, but OMIT `.readonly_tools()` → the
     // default `readonly_tools: false` triggers `register_all_tools`, giving the
@@ -794,6 +807,9 @@ fn build_writer_worker_agent(
     }
 
     let mut worker = builder.build()?;
+    if let Some(browser_runtime) = browser_runtime {
+        browser_runtime.install_tools(&mut worker);
+    }
     let has_client = worker.llm_client().is_some();
     tracing::info!(
         worker_name = name,
@@ -820,6 +836,7 @@ fn build_readonly_worker_agent(
     cache_user_id: &str,
     can_delegate: bool,
     max_iterations: usize,
+    browser_runtime: Option<Arc<crate::browser::BrowserRuntime>>,
 ) -> std::result::Result<ReactAgent, echo_agent::error::ReactError> {
     let mut builder = ReactAgentBuilder::new()
         .model(model)
@@ -859,6 +876,9 @@ fn build_readonly_worker_agent(
     }
 
     let mut worker = builder.build()?;
+    if let Some(browser_runtime) = browser_runtime {
+        browser_runtime.install_tools(&mut worker);
+    }
     let has_client = worker.llm_client().is_some();
     tracing::info!(
         worker_name = name,

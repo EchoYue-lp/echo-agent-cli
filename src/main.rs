@@ -150,6 +150,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
         memory_context_suffix: None,
         working_dir: None,
         task_runtime_store: None,
+        browser_runtime: None,
         route: None,
     };
     // ── Bootstrap Agent Runtime (shared TUI/GUI initialization) ──
@@ -331,6 +332,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             }
         }
 
+        runtime.browser_runtime.shutdown().await;
         drop(runtime);
         cancel_token.cancel();
 
@@ -383,6 +385,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             } else {
                 // 仅 channels 模式，等待 channels 或 Ctrl+C
                 channels_handle.await??;
+                runtime.browser_runtime.shutdown().await;
                 return Ok(());
             }
             // channels 会在后台运行，主模式退出后自动结束
@@ -411,6 +414,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
     }
 
     // Keep runtime alive until shutdown
+    runtime.browser_runtime.shutdown().await;
     drop(runtime);
     cancel_token.cancel();
 
@@ -459,6 +463,7 @@ mod tests {
             memory_context_suffix: None,
             working_dir: None,
             task_runtime_store: None,
+            browser_runtime: None,
             route: None,
         };
         let app_config = config::AppConfig::default();

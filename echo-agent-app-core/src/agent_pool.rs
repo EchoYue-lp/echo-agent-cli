@@ -108,6 +108,7 @@ pub struct SharedResources {
     /// management tools (plan_create/update/complete/skip/list) registered so
     /// the main agent can autonomously manage its plan during execution.
     pub task_runtime_store: Option<Arc<crate::tasks::task_runtime::TaskRuntimeStore>>,
+    pub browser_runtime: Option<Arc<crate::browser::BrowserRuntime>>,
 }
 
 impl SharedResources {
@@ -151,6 +152,7 @@ impl SharedResources {
                     // (AppState / pool init) injects it separately so pooled
                     // agents can register task-management tools.
                     task_runtime_store: None,
+                    browser_runtime: None,
                 }
             })
             .await
@@ -223,6 +225,8 @@ impl AgentPool {
             runtime.review_integration.clone(),
         )
         .await;
+        let mut shared = shared;
+        shared.browser_runtime = Some(runtime.browser_runtime.clone());
 
         // Extract skill descriptors from primary agent (avoids re-reading from disk)
         let skill_descriptors = runtime.agent_handle.read(|a| a.skill_descriptors()).await;
@@ -760,6 +764,7 @@ impl AgentPool {
             // route is intentionally None for pooled agents (workers never get
             // plan_execute per §10.2).
             task_runtime_store: self.shared.task_runtime_store.clone(),
+            browser_runtime: self.shared.browser_runtime.clone(),
             route: None,
         };
         let mut agent = infra::create_agent(&params, &app_config)

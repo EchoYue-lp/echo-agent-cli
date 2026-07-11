@@ -146,6 +146,7 @@ async fn run_desktop() -> anyhow::Result<()> {
         // (AppState creates it later). Tools are registered post-hoc via
         // `register_task_tools_on_agent` once AppState is built.
         task_runtime_store: None,
+        browser_runtime: None,
         route: None,
     };
 
@@ -248,6 +249,7 @@ async fn run_desktop() -> anyhow::Result<()> {
 
     // Tauri window closed → cancel background tasks
     cancel_token.cancel();
+    runtime.browser_runtime.shutdown().await;
 
     Ok(())
 }

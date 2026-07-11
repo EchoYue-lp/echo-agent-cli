@@ -97,6 +97,56 @@ The first managed tool set is navigation, snapshot, click, fill, screenshot,
 back, reload, and tab management. Tool injection must use the same construction
 path for main and subagents so interaction modes remain functionally equal.
 
+### Phase 1 implementation
+
+Phase 1 uses one application-owned `BrowserRuntime` and one Playwright MCP stdio
+client. The framework's public `McpClient` remains the protocol/process primitive;
+EKO owns prerequisite checks, managed paths, stable tool names, connection
+serialization, restart policy, and shutdown.
+
+- Startup checks Node.js 18+, npm, and npx, then creates
+  `~/.echo-agent/browser/profiles/managed` and
+  `~/.echo-agent/browser/output`.
+- Sidecar startup is prewarmed in the background so an unavailable npm registry
+  does not block chat startup. The first browser call waits for or creates the
+  same connection.
+- One client is shared by the primary agent, built-in subagents, and pooled
+  conversation/task agents. This avoids multiple Playwright processes trying to
+  lock the same profile.
+- A transport/tool failure invalidates the client, closes the failed sidecar,
+  serializes one restart, and retries the action once. Browser failure returns a
+  tool error and does not terminate the chat run.
+- TUI/CLI/channel and GUI shutdown paths explicitly close the managed sidecar.
+
+The stable Phase 1 EKO tool contract is:
+
+```text
+browser_navigate
+browser_snapshot
+browser_click
+browser_fill
+browser_screenshot
+browser_back
+browser_reload
+browser_tabs
+```
+
+Where Playwright MCP uses different names, the application adapter translates
+them (`browser_fill` to `browser_type`, `browser_screenshot` to
+`browser_take_screenshot`, and `browser_back` to `browser_navigate_back`).
+
+Environment overrides:
+
+| Variable | Purpose |
+| --- | --- |
+| `EKO_BROWSER_ENABLED` | Enable/disable the managed runtime; defaults to enabled. |
+| `EKO_BROWSER_HEADLESS` | Run Playwright headless; defaults to headed. |
+| `EKO_BROWSER_NODE` / `EKO_BROWSER_NPM` / `EKO_BROWSER_NPX` | Override prerequisite executable names. |
+| `EKO_BROWSER_MCP_PACKAGE` | Override `@playwright/mcp@latest`. |
+| `EKO_BROWSER_PROFILE_DIR` | Override the managed browser profile path. |
+| `EKO_BROWSER_OUTPUT_DIR` | Override browser output path. |
+| `EKO_BROWSER_STARTUP_TIMEOUT_SECS` | MCP handshake timeout; defaults to 60 seconds. |
+
 ## Session model
 
 - `conversation_id` owns one logical `BrowserSession`.
