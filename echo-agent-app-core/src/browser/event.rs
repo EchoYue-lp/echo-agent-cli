@@ -2,6 +2,12 @@ use serde::{Deserialize, Serialize};
 
 use super::session::{BrowserObservation, BrowserSession, BrowserTab};
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BrowserFrame {
+    pub data_url: String,
+    pub mime_type: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BrowserEvent {
@@ -27,6 +33,7 @@ pub enum BrowserEvent {
     },
     Screenshot {
         observation: BrowserObservation,
+        frame: Option<BrowserFrame>,
     },
     ActionStarted {
         session_id: String,

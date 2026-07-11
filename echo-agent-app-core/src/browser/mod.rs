@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 pub use config::BrowserConfig;
 pub use error::{BrowserError, BrowserResult};
-pub use event::BrowserEvent;
+pub use event::{BrowserEvent, BrowserFrame};
 pub use session::{
     BrowserObservation, BrowserSession, BrowserSessionManager, BrowserSessionStatus, BrowserTab,
     MAIN_TAB_OWNER,
@@ -109,6 +109,29 @@ impl BrowserRuntime {
 
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<BrowserEvent> {
         self.inner.sessions.subscribe()
+    }
+
+    pub async fn execute_main(
+        &self,
+        conversation_id: String,
+        action: BrowserAction,
+        params: ToolParameters,
+        cancel: Option<Arc<CancellationToken>>,
+    ) -> BrowserResult<ToolResult> {
+        let context = ToolContext {
+            conversation_id: Some(conversation_id),
+            cancel,
+            ..ToolContext::default()
+        };
+        self.call(action, params, &context, BrowserActor::Main)
+            .await
+    }
+
+    pub async fn interrupt(&self) {
+        let client = self.inner.client.write().await.take();
+        if let Some(client) = client {
+            client.close().await;
+        }
     }
 
     pub async fn shutdown(&self) {
@@ -318,11 +341,38 @@ impl BrowserRuntime {
                         .inner
                         .sessions
                         .emit(BrowserEvent::Snapshot { observation }),
-                    BrowserAction::Screenshot => self
-                        .inner
-                        .sessions
-                        .emit(BrowserEvent::Screenshot { observation }),
-                    _ => {}
+                    BrowserAction::Screenshot => {
+                        let frame = browser_frame(&result);
+                        self.inner
+                            .sessions
+                            .emit(BrowserEvent::Screenshot { observation, frame });
+                    }
+                    BrowserAction::Navigate
+                    | BrowserAction::Click
+                    | BrowserAction::Fill
+                    | BrowserAction::Back
+                    | BrowserAction::Reload => {
+                        if let Ok(raw_frame) = self
+                            .call_mcp(
+                                "browser_take_screenshot",
+                                json!({ "type": "png" }),
+                                context.cancel.as_deref(),
+                            )
+                            .await
+                        {
+                            let frame_result = tool_result(raw_frame);
+                            let frame_observation = self.inner.sessions.observation(
+                                &lease,
+                                "browser_screenshot",
+                                &frame_result,
+                            );
+                            self.inner.sessions.emit(BrowserEvent::Screenshot {
+                                observation: frame_observation,
+                                frame: browser_frame(&frame_result),
+                            });
+                        }
+                    }
+                    BrowserAction::Tabs => {}
                 }
                 if tabs_command.as_deref() == Some("close") {
                     let index = requested_index.unwrap_or(lease.tab_index);
@@ -441,7 +491,7 @@ impl BrowserAction {
         Self::Tabs,
     ];
 
-    fn name(self) -> &'static str {
+    pub fn name(self) -> &'static str {
         match self {
             Self::Navigate => "browser_navigate",
             Self::Snapshot => "browser_snapshot",
@@ -661,6 +711,25 @@ fn tool_result(result: McpToolCallResult) -> ToolResult {
     tool_result
 }
 
+fn browser_frame(result: &ToolResult) -> Option<BrowserFrame> {
+    let bytes = result.bytes.as_ref()?;
+    if bytes.len() > 8 * 1024 * 1024 {
+        tracing::warn!(
+            bytes = bytes.len(),
+            "browser screenshot omitted from GUI event"
+        );
+        return None;
+    }
+    let mime_type = result.mime_type.as_deref().unwrap_or("image/png");
+    Some(BrowserFrame {
+        data_url: format!(
+            "data:{mime_type};base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        ),
+        mime_type: mime_type.to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -723,6 +792,18 @@ mod tests {
             ToolResultKind::Image {
                 mime_type: "image/png".to_string()
             }
+        );
+    }
+
+    #[test]
+    fn screenshot_frame_is_serializable_for_tauri_events() {
+        let mut result = ToolResult::success("captured");
+        result.bytes = Some(vec![1_u8, 2, 3]);
+        result.mime_type = Some("image/png".to_string());
+        let frame = browser_frame(&result);
+        assert_eq!(
+            frame.as_ref().map(|value| value.data_url.as_str()),
+            Some("data:image/png;base64,AQID")
         );
     }
 

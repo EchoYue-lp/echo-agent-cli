@@ -6,6 +6,7 @@
 //! - Convert errors to `IpcError`
 //! - Return DTOs
 
+pub mod browser;
 pub mod chat;
 pub mod config;
 pub mod conversations;

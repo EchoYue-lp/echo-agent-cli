@@ -205,6 +205,31 @@ The panel contains browser-native controls, tabs, URL/status state, the latest
 frame, active-target highlighting, and loading/error/disconnected/confirmation
 states. It is an unframed workspace region, not a card nested in another card.
 
+### Phase 3 implementation
+
+`BrowserRuntime` remains the single authority for browser actions. Tauri holds
+the application-owned runtime, exposes thin GUI commands for navigation, back,
+reload, stop, screenshot refresh, and tab operations, and forwards the existing
+`BrowserEvent` stream over `browser://event`. GUI commands call the same runtime
+path as agent tools and therefore reuse conversation-scoped sessions and the
+main-tab lease instead of creating a second browser controller.
+
+Screenshot events include an optional bounded `data:` frame. Successful
+navigation, click, fill, back, and reload actions capture a best-effort frame
+before emitting completion; an explicit screenshot also emits its image. Raw
+frames larger than 8 MiB are omitted from the event rather than growing IPC and
+frontend memory without limit. Screenshots remain ephemeral and are not written
+to conversation/session metadata.
+
+The frontend `browserStore` keys views by stable `conversation_id` and merges
+session/tab/navigation/action/screenshot events by `session_id`. Per-turn
+`run_id` changes therefore do not reset the browser workspace. The desktop
+panel uses a constrained 360-680 px right split; below the desktop breakpoint it
+becomes a 92vw overlay with a backdrop. The existing task rail remains a sibling
+workspace surface. The first release is screenshot-driven, not a video stream,
+and deliberately disables forward navigation until the managed runtime exposes
+that action.
+
 ## DOM and visual control
 
 Action resolution follows this order:

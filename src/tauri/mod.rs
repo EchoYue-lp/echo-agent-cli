@@ -11,7 +11,7 @@ pub mod path_validator;
 pub mod state;
 pub mod terminal;
 
-use echo_agent_app_core::AppState;
+use echo_agent_app_core::{AppState, browser::BrowserRuntime};
 use serde::Serialize;
 use state::TauriState;
 use std::sync::Arc;
@@ -59,24 +59,44 @@ pub enum TaskEventPayload {
     Failed { task_id: String, error: String },
 }
 
-pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
+pub fn build_tauri_app(
+    app_state: Arc<AppState>,
+    browser_runtime: Arc<BrowserRuntime>,
+) -> tauri::Builder<tauri::Wry> {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
-        .manage(TauriState::new(app_state))
+        .manage(TauriState::new(app_state, browser_runtime))
         .setup(|app| {
+            use tauri::{Emitter, Manager};
+
             // Auto-open DevTools in debug builds so `cargo tauri dev` users can
             // inspect the WebView console immediately (Cmd+Option+I to toggle).
             #[cfg(debug_assertions)]
             {
-                use tauri::Manager;
                 if let Some(window) = app.get_webview_window("main") {
                     window.open_devtools();
                 }
             }
+
+            let app_handle = app.handle().clone();
+            let mut browser_events = app.state::<TauriState>().browser_runtime.subscribe();
+            tokio::spawn(async move {
+                loop {
+                    match browser_events.recv().await {
+                        Ok(event) => {
+                            let _ = app_handle.emit("browser://event", event);
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                            tracing::warn!(count, "browser event receiver lagged");
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -86,6 +106,12 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
             ipc::native_notify,
             ipc::get_system_info,
             ipc::native_open_path,
+            commands::browser::browser_navigate,
+            commands::browser::browser_back,
+            commands::browser::browser_reload,
+            commands::browser::browser_screenshot,
+            commands::browser::browser_tabs,
+            commands::browser::browser_stop,
             // Config
             commands::config::get_config,
             commands::config::update_config,

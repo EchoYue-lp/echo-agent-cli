@@ -2,6 +2,7 @@ import { useCallback, useState, useMemo, useEffect } from 'react';
 import { AppLayout } from './components/layout/AppLayout';
 import { LeftSidebar } from './components/layout/LeftSidebar';
 import { RightRail } from './components/layout/RightRail';
+import { BrowserPanel } from './components/browser/BrowserPanel';
 import { ChatPanel } from './components/chat/ChatPanel';
 import { SettingsDialog } from './components/layout/SettingsDialog';
 import { InterruptPromptDialog } from './components/task/TaskRuntimePanel';
@@ -169,7 +170,12 @@ function App() {
         <AppLayout
           left={<LeftSidebar onNewTask={handleNewTask} />}
           center={<ChatPanel />}
-          right={<RightRail />}
+          right={
+            <>
+              <BrowserPanel />
+              <RightRail />
+            </>
+          }
         />
         <SettingsDialog />
         <NewTaskDialog isOpen={newTaskOpen} onClose={() => setNewTaskOpen(false)} />

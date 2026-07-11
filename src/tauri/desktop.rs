@@ -243,7 +243,7 @@ async fn run_desktop() -> anyhow::Result<()> {
     }
 
     // ── Launch Tauri window ──
-    crate::tauri::build_tauri_app(state.clone())
+    crate::tauri::build_tauri_app(state.clone(), runtime.browser_runtime.clone())
         .run(tauri::generate_context!())
         .expect("error while running Tauri application");
 
