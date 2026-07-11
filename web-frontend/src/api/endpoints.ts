@@ -188,14 +188,18 @@ export const skillsApi = {
       : post<LoadSkillsResponse>(`/skills/${name}/enable`, {}),
   disable: (name: string) =>
     isTauri()
-      ? apiInvoke<{ success: boolean; requires_restart?: boolean; message?: string; skills?: SkillInfo[] }>(
-          'disable_skill',
-          { name }
-        )
-      : post<{ success: boolean; requires_restart?: boolean; message?: string; skills?: SkillInfo[] }>(
-          `/skills/${name}/disable`,
-          {}
-        ),
+      ? apiInvoke<{
+          success: boolean;
+          requires_restart?: boolean;
+          message?: string;
+          skills?: SkillInfo[];
+        }>('disable_skill', { name })
+      : post<{
+          success: boolean;
+          requires_restart?: boolean;
+          message?: string;
+          skills?: SkillInfo[];
+        }>(`/skills/${name}/disable`, {}),
   upload: (rootDir: string, files: { path: string; content: string }[]) =>
     isTauri()
       ? Promise.reject(new Error('Tauri 模式请使用“浏览”选择本地技能目录加载'))
@@ -575,8 +579,6 @@ export const taskRuntimeApi = {
       ? apiInvoke<TaskRun>('create_task_run', { req })
       : post<TaskRun>('/task_runtime/runs', req),
 
-
-
   // ── Execution ────────────────────────────────────────────────────────
   executeRun: (runId: string) =>
     isTauri()
@@ -742,7 +744,9 @@ export const traceEventsApi = {
   getCacheDiagnostics: (sessionId?: string) =>
     isTauri()
       ? apiInvoke<CacheDiagnosticsData>('get_cache_diagnostics', { sessionId: sessionId ?? null })
-      : get<CacheDiagnosticsData>(`/trace-events/diagnostics${sessionId ? `?session_id=${sessionId}` : ''}`),
+      : get<CacheDiagnosticsData>(
+          `/trace-events/diagnostics${sessionId ? `?session_id=${sessionId}` : ''}`
+        ),
 };
 
 // ── Files API ───────────────────────────────────────────────────────
@@ -1137,20 +1141,16 @@ export const providerApi = {
           levels: string[];
           model: string;
           provider: string;
-        }>(`/models/thinking-support?provider=${encodeURIComponent(req.provider)}&model=${encodeURIComponent(req.model)}`),
+        }>(
+          `/models/thinking-support?provider=${encodeURIComponent(req.provider)}&model=${encodeURIComponent(req.model)}`
+        ),
   /** Dynamically set the active agent's thinking-depth at runtime. Decoupled
    *  from model config — the user toggles it from the chat input toolbar.
    *  Models that don't support thinking silently ignore it. */
   setThinking: (spec: string) =>
     isTauri()
-      ? apiInvoke<{ success: boolean; spec: string; applied: boolean }>(
-          'set_thinking',
-          { spec },
-        )
-      : post<{ success: boolean; spec: string; applied: boolean }>(
-          '/models/thinking',
-          { spec },
-        ),
+      ? apiInvoke<{ success: boolean; spec: string; applied: boolean }>('set_thinking', { spec })
+      : post<{ success: boolean; spec: string; applied: boolean }>('/models/thinking', { spec }),
 };
 
 // ── Plugin API ──────────────────────────────────────────────────────────

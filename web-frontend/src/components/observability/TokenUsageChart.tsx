@@ -45,7 +45,15 @@ export function TokenUsageChart({ events }: TokenUsageChartProps) {
     const cacheWrite = calls.reduce((sum, c) => sum + c.cacheWrite, 0);
     const missingUsage = calls.filter((c) => !c.usageReported).length;
     const cacheReadRate = input > 0 ? cached / input : 0;
-    return { input, output, cached, cacheWrite, missingUsage, cacheReadRate, total: input + output };
+    return {
+      input,
+      output,
+      cached,
+      cacheWrite,
+      missingUsage,
+      cacheReadRate,
+      total: input + output,
+    };
   }, [calls]);
 
   const maxTotal = useMemo(() => Math.max(1, ...calls.map((c) => c.total)), [calls]);

@@ -53,8 +53,7 @@ async function loadConversationRunGroup(conversationId: string, focusedRun: Task
   const groupRuns = allRuns
     .filter(
       (run) =>
-        run.conversation_id === conversationId &&
-        run.root_message_id === focusedRun.root_message_id
+        run.conversation_id === conversationId && run.root_message_id === focusedRun.root_message_id
     )
     .sort((a, b) => runTime(a.created_at) - runTime(b.created_at));
   const runs = groupRuns.length ? groupRuns : [focusedRun];

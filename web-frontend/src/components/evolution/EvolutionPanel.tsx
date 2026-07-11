@@ -247,7 +247,11 @@ export function EvolutionPanel() {
           <>
             {/* 总记忆数 + 技能健康概览 */}
             <div className="grid grid-cols-3 gap-2 mb-3">
-              <StatCard label="总记忆" value={dashboard.total_memories} icon={<Database size={10} />} />
+              <StatCard
+                label="总记忆"
+                value={dashboard.total_memories}
+                icon={<Database size={10} />}
+              />
               <StatCard
                 label="健康技能"
                 value={dashboard.skill_health.healthy_skills}
@@ -314,10 +318,7 @@ export function EvolutionPanel() {
 
             {/* 最近变更活动 */}
             {dashboard.recent_activities.length > 0 && (
-              <div
-                className="rounded-lg border"
-                style={{ borderColor: 'var(--border-primary)' }}
-              >
+              <div className="rounded-lg border" style={{ borderColor: 'var(--border-primary)' }}>
                 <div
                   className="border-b px-3 py-2"
                   style={{ borderColor: 'var(--border-primary)' }}
@@ -519,8 +520,8 @@ export function EvolutionPanel() {
         </div>
 
         <p className="text-xs mb-3" style={{ color: 'var(--text-secondary)' }}>
-          系统从重复工作流/调试经验中检测出可复用模式。生成草稿 → 审阅 → 激活后,
-          技能进入正式 skills 目录,下次加载时自动生效。
+          系统从重复工作流/调试经验中检测出可复用模式。生成草稿 → 审阅 → 激活后, 技能进入正式 skills
+          目录,下次加载时自动生效。
         </p>
 
         {skillCandidates.length > 0 ? (
@@ -533,19 +534,28 @@ export function EvolutionPanel() {
               >
                 <div className="flex items-center justify-between mb-1.5">
                   <div className="flex items-center gap-2 min-w-0">
-                    <span className="text-xs font-medium truncate" style={{ color: 'var(--text-primary)' }}>
+                    <span
+                      className="text-xs font-medium truncate"
+                      style={{ color: 'var(--text-primary)' }}
+                    >
                       {c.name}
                     </span>
                     {c.activated && (
                       <span
                         className="flex items-center gap-0.5 rounded-md px-1 py-0.5 text-[9px] shrink-0"
-                        style={{ background: 'var(--color-success-bg, rgba(34,197,94,0.1))', color: 'var(--color-success)' }}
+                        style={{
+                          background: 'var(--color-success-bg, rgba(34,197,94,0.1))',
+                          color: 'var(--color-success)',
+                        }}
                       >
                         <CheckCircle size={8} /> 已激活
                       </span>
                     )}
                   </div>
-                  <div className="flex items-center gap-2 shrink-0 text-[10px]" style={{ color: 'var(--text-tertiary)' }}>
+                  <div
+                    className="flex items-center gap-2 shrink-0 text-[10px]"
+                    style={{ color: 'var(--text-tertiary)' }}
+                  >
                     <span title="观测样本数">{c.sample_count} 次</span>
                     <span
                       className="rounded-md px-1 py-0.5"
@@ -566,8 +576,10 @@ export function EvolutionPanel() {
                       disabled={actingOnSkill !== null}
                       className="flex items-center gap-1 rounded-md px-2 py-1 text-[10px] font-medium transition-colors"
                       style={{
-                        background: actingOnSkill === c.name ? 'var(--border-primary)' : 'var(--bg-hover)',
-                        color: actingOnSkill === c.name ? 'var(--text-tertiary)' : 'var(--text-primary)',
+                        background:
+                          actingOnSkill === c.name ? 'var(--border-primary)' : 'var(--bg-hover)',
+                        color:
+                          actingOnSkill === c.name ? 'var(--text-tertiary)' : 'var(--text-primary)',
                       }}
                     >
                       {actingOnSkill === c.name ? (
@@ -584,8 +596,10 @@ export function EvolutionPanel() {
                       disabled={actingOnSkill !== null}
                       className="flex items-center gap-1 rounded-md px-2 py-1 text-[10px] font-medium transition-colors"
                       style={{
-                        background: actingOnSkill === c.name ? 'var(--border-primary)' : 'var(--action-run)',
-                        color: actingOnSkill === c.name ? 'var(--text-tertiary)' : 'var(--text-on-run)',
+                        background:
+                          actingOnSkill === c.name ? 'var(--border-primary)' : 'var(--action-run)',
+                        color:
+                          actingOnSkill === c.name ? 'var(--text-tertiary)' : 'var(--text-on-run)',
                       }}
                     >
                       {actingOnSkill === c.name ? (

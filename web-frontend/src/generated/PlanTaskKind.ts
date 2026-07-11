@@ -5,4 +5,12 @@
  * to decide parallelism and locking: read-only kinds parallelize freely,
  * mutating kinds serialize behind file/workspace locks.
  */
-export type PlanTaskKind = "read_only_review" | "investigation" | "test_plan" | "implementation" | "debugging" | "review" | "summary" | "verification";
+export type PlanTaskKind =
+  | 'read_only_review'
+  | 'investigation'
+  | 'test_plan'
+  | 'implementation'
+  | 'debugging'
+  | 'review'
+  | 'summary'
+  | 'verification';

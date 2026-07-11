@@ -19,7 +19,10 @@ interface InlineToolCallProps {
  * One tool call rendered as a lightweight inline collapsible row in the
  * one-stream layout: a one-line event that can expand for args/result.
  */
-export const InlineToolCall = memo(function InlineToolCall({ toolCall, index: _index }: InlineToolCallProps) {
+export const InlineToolCall = memo(function InlineToolCall({
+  toolCall,
+  index: _index,
+}: InlineToolCallProps) {
   const [expanded, setExpanded] = useState(false);
   const [copied, setCopied] = useState<string | null>(null);
 
@@ -40,8 +43,7 @@ export const InlineToolCall = memo(function InlineToolCall({ toolCall, index: _i
     }
     return String(args);
   })();
-  const argPreviewTruncated =
-    argPreview.length > 60 ? argPreview.slice(0, 60) + '…' : argPreview;
+  const argPreviewTruncated = argPreview.length > 60 ? argPreview.slice(0, 60) + '…' : argPreview;
 
   const copyText = (text: string, label: string) => {
     navigator.clipboard.writeText(text);

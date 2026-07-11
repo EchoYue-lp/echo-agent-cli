@@ -47,7 +47,10 @@ export function PlanEditor({ initialTasks, onSave, onClose }: PlanEditorProps) {
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={onClose}>
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
+      onClick={onClose}
+    >
       <div
         className="w-[720px] max-h-[80vh] rounded-lg flex flex-col"
         style={{ background: 'var(--bg-primary)', border: '1px solid var(--border-primary)' }}
@@ -63,19 +66,29 @@ export function PlanEditor({ initialTasks, onSave, onClose }: PlanEditorProps) {
           <div className="flex gap-2 items-center">
             <button
               className="text-xs"
-              style={{ color: mode === 'form' ? 'var(--text-primary)' : 'var(--text-tertiary)', fontWeight: mode === 'form' ? 600 : 400 }}
+              style={{
+                color: mode === 'form' ? 'var(--text-primary)' : 'var(--text-tertiary)',
+                fontWeight: mode === 'form' ? 600 : 400,
+              }}
               onClick={() => setMode('form')}
             >
               表单
             </button>
             <button
               className="text-xs"
-              style={{ color: mode === 'json' ? 'var(--text-primary)' : 'var(--text-tertiary)', fontWeight: mode === 'json' ? 600 : 400 }}
+              style={{
+                color: mode === 'json' ? 'var(--text-primary)' : 'var(--text-tertiary)',
+                fontWeight: mode === 'json' ? 600 : 400,
+              }}
               onClick={() => setMode('json')}
             >
               JSON
             </button>
-            <button onClick={onClose} className="text-xs ml-2" style={{ color: 'var(--text-tertiary)' }}>
+            <button
+              onClick={onClose}
+              className="text-xs ml-2"
+              style={{ color: 'var(--text-tertiary)' }}
+            >
               ✕
             </button>
           </div>
@@ -122,11 +135,19 @@ export function PlanEditor({ initialTasks, onSave, onClose }: PlanEditorProps) {
               <button
                 onClick={applyJson}
                 className="text-xs px-2 py-1 rounded-md"
-                style={{ background: 'var(--bg-hover)', color: 'var(--text-secondary)', border: '1px solid var(--border-secondary)' }}
+                style={{
+                  background: 'var(--bg-hover)',
+                  color: 'var(--text-secondary)',
+                  border: '1px solid var(--border-secondary)',
+                }}
               >
                 应用 JSON
               </button>
-              {error && <div className="text-xs" style={{ color: 'var(--color-error)' }}>{error}</div>}
+              {error && (
+                <div className="text-xs" style={{ color: 'var(--color-error)' }}>
+                  {error}
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -137,7 +158,11 @@ export function PlanEditor({ initialTasks, onSave, onClose }: PlanEditorProps) {
           <button
             onClick={onClose}
             className="px-3 py-1 text-xs rounded-md"
-            style={{ background: 'var(--bg-hover)', color: 'var(--text-secondary)', border: '1px solid var(--border-secondary)' }}
+            style={{
+              background: 'var(--bg-hover)',
+              color: 'var(--text-secondary)',
+              border: '1px solid var(--border-secondary)',
+            }}
           >
             取消
           </button>

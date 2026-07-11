@@ -48,12 +48,13 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     try {
       if (import.meta.env.DEV) console.debug('[workspaceStore] switchTo:', id);
       const res = await workspaceApi.switch(id);
-      if (import.meta.env.DEV) console.debug(
-        '[workspaceStore] switch API returned:',
-        res.workspace?.name,
-        'debug_conv_count:',
-        (res as any).debug_conversation_count
-      );
+      if (import.meta.env.DEV)
+        console.debug(
+          '[workspaceStore] switch API returned:',
+          res.workspace?.name,
+          'debug_conv_count:',
+          (res as any).debug_conversation_count
+        );
       set({ current: res.workspace });
 
       // Clear current chat
@@ -72,10 +73,11 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       const { useConversationStore } = await import('./conversationStore');
       useConversationStore.setState({ activeId: null });
       await useConversationStore.getState().init();
-      if (import.meta.env.DEV) console.debug(
-        '[workspaceStore] conversations loaded:',
-        useConversationStore.getState().conversations.length
-      );
+      if (import.meta.env.DEV)
+        console.debug(
+          '[workspaceStore] conversations loaded:',
+          useConversationStore.getState().conversations.length
+        );
     } catch (e) {
       console.error('[workspaceStore] Failed to switch workspace:', e);
       throw e;

@@ -35,9 +35,7 @@ export function LoginForm() {
           >
             <Sparkles size={28} color="white" />
           </div>
-          <h1 className="text-xl font-semibold tracking-tight text-[var(--text-primary)]">
-            EKO
-          </h1>
+          <h1 className="text-xl font-semibold tracking-tight text-[var(--text-primary)]">EKO</h1>
           <p className="mt-1 text-sm text-[var(--text-secondary)]">登录以继续使用</p>
         </div>
 
@@ -105,7 +103,6 @@ export function LoginForm() {
               '登录'
             )}
           </button>
-
         </form>
 
         <div className="mt-6 rounded-lg border border-[var(--border-primary)] bg-[var(--bg-hover)] p-3">

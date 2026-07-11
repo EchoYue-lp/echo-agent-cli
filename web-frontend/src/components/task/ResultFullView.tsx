@@ -7,7 +7,10 @@ interface ResultFullViewProps {
 
 export function ResultFullView({ content, onClose }: ResultFullViewProps) {
   return (
-    <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center" onClick={onClose}>
+    <div
+      className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center"
+      onClick={onClose}
+    >
       <div
         className="w-[900px] max-w-[95vw] h-[85vh] rounded-lg flex flex-col"
         style={{ background: 'var(--bg-primary)', border: '1px solid var(--border-primary)' }}

@@ -203,8 +203,7 @@ export const useSubagentRunStore = create<SubagentRunStore>((set) => ({
         contextIn: ev.context_in ?? run.contextIn,
         returns: ev.returns ?? run.returns,
         messageId: ev.message_id ?? run.messageId,
-        background:
-          typeof ev.background === 'boolean' ? ev.background : run.background,
+        background: typeof ev.background === 'boolean' ? ev.background : run.background,
         summary: typeof ev.summary === 'string' ? ev.summary : run.summary,
         usageEvents,
         events,

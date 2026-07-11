@@ -46,11 +46,7 @@ export function ToolsPanel() {
           style={{ background: 'var(--color-error-bg)', color: 'var(--color-error)' }}
         >
           工具列表加载失败：{loadError}
-          <button
-            onClick={load}
-            className="ml-2 underline"
-            style={{ color: 'var(--color-error)' }}
-          >
+          <button onClick={load} className="ml-2 underline" style={{ color: 'var(--color-error)' }}>
             重试
           </button>
         </div>

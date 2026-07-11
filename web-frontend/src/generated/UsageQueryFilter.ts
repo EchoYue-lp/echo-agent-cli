@@ -3,4 +3,15 @@
 /**
  * Query filter for listing usage records.
  */
-export type UsageQueryFilter = { session_id: string | null, run_id: string | null, worker_id: string | null, model: string | null, provider: string | null, route_kind: string | null, created_after: string | null, created_before: string | null, limit: number | null, offset: number | null, };
+export type UsageQueryFilter = {
+  session_id: string | null;
+  run_id: string | null;
+  worker_id: string | null;
+  model: string | null;
+  provider: string | null;
+  route_kind: string | null;
+  created_after: string | null;
+  created_before: string | null;
+  limit: number | null;
+  offset: number | null;
+};

@@ -43,9 +43,7 @@ export function FailureToast({ onDismiss }: FailureToastProps) {
     >
       <AlertCircle size={15} style={{ color: 'var(--color-error)' }} />
       <span className="flex-1 text-xs" style={{ color: 'var(--text-primary)' }}>
-        {runFailed
-          ? '任务执行失败'
-          : `有 ${count} 项执行失败`}
+        {runFailed ? '任务执行失败' : `有 ${count} 项执行失败`}
       </span>
       <button
         onClick={onDismiss}

@@ -40,7 +40,7 @@ function CodeBlock({ className, children }: { className?: string; children?: Rea
         setCopied(true);
         setTimeout(() => setCopied(false), 1200);
       },
-      () => {},
+      () => {}
     );
   };
 
@@ -67,11 +67,7 @@ function InlineCode({ children }: { children?: React.ReactNode }) {
   return <code className="md-inline-code">{children}</code>;
 }
 
-const MarkdownContent = memo(function MarkdownContent({
-  content,
-  className,
-  maxHeight,
-}: Props) {
+const MarkdownContent = memo(function MarkdownContent({ content, className, maxHeight }: Props) {
   const wrapperStyle: CSSProperties = {};
   if (maxHeight) {
     wrapperStyle.maxHeight = maxHeight;

@@ -12,4 +12,9 @@
  *
  * `General` is always first-class because many tasks declare no domain.
  */
-export type DomainProfile = "general" | "ai_coding" | "data_analysis" | "academic_research" | "medical_research";
+export type DomainProfile =
+  | 'general'
+  | 'ai_coding'
+  | 'data_analysis'
+  | 'academic_research'
+  | 'medical_research';

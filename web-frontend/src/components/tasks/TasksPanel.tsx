@@ -5,15 +5,7 @@ import {
   type BackgroundTask,
   type SubmitTaskRequest,
 } from '../../api/endpoints';
-import {
-  Play,
-  XCircle,
-  RefreshCw,
-  Plus,
-  ChevronDown,
-  ChevronUp,
-  HandMetal,
-} from 'lucide-react';
+import { Play, XCircle, RefreshCw, Plus, ChevronDown, ChevronUp, HandMetal } from 'lucide-react';
 
 const STATUS_COLORS: Record<string, string> = {
   pending: 'var(--color-warning)',
@@ -80,7 +72,9 @@ export function TasksPanel() {
         try {
           const plan = await taskRuntimeApi.getPlan(task.id);
           if (plan && plan.tasks.length > 0) {
-            const done = plan.tasks.filter((t: { status: string }) => t.status === 'completed').length;
+            const done = plan.tasks.filter(
+              (t: { status: string }) => t.status === 'completed'
+            ).length;
             const pct = Math.round((done / plan.tasks.length) * 100);
             setProgressMap((prev) => ({
               ...prev,

@@ -3,4 +3,10 @@
 /**
  * Per-model breakdown in a run usage summary.
  */
-export type ModelUsageSummary = { model: string, llm_calls: bigint, input_tokens: bigint, output_tokens: bigint, cached_input_tokens: bigint, };
+export type ModelUsageSummary = {
+  model: string;
+  llm_calls: bigint;
+  input_tokens: bigint;
+  output_tokens: bigint;
+  cached_input_tokens: bigint;
+};

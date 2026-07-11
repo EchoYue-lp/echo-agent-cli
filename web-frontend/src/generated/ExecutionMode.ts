@@ -3,4 +3,4 @@
 /**
  * How the user wants a plan to execute after approval.
  */
-export type ExecutionMode = "sequential" | "parallel" | "plan_only";
+export type ExecutionMode = 'sequential' | 'parallel' | 'plan_only';

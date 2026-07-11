@@ -3,4 +3,4 @@
 /**
  * Grouping dimension for aggregation queries.
  */
-export type UsageGroupBy = "Model" | "Provider" | "RouteKind" | "Session" | "Worker" | "TimeWindow";
+export type UsageGroupBy = 'Model' | 'Provider' | 'RouteKind' | 'Session' | 'Worker' | 'TimeWindow';

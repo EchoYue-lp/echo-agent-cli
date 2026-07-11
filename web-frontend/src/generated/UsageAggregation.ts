@@ -3,4 +3,16 @@
 /**
  * Aggregated usage values for one group.
  */
-export type UsageAggregation = { group_key: string | null, group_value: string | null, window_start: string | null, window_end: string | null, llm_calls: bigint, input_tokens: bigint, output_tokens: bigint, cached_input_tokens: bigint, cache_creation_input_tokens: bigint, cache_read_rate: number, calls_missing_usage: bigint, };
+export type UsageAggregation = {
+  group_key: string | null;
+  group_value: string | null;
+  window_start: string | null;
+  window_end: string | null;
+  llm_calls: bigint;
+  input_tokens: bigint;
+  output_tokens: bigint;
+  cached_input_tokens: bigint;
+  cache_creation_input_tokens: bigint;
+  cache_read_rate: number;
+  calls_missing_usage: bigint;
+};

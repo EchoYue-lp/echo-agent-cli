@@ -36,10 +36,7 @@ function str(args: unknown, key: string): string {
  * NOTE: This list intentionally covers the common file-modifying tools. It does
  * not cover shell commands (sed, git apply, etc.) or arbitrary MCP tools —
  * those require backend-side git status / file watcher integration. */
-const FILE_TOOL_EXTRACTORS: Record<
-  string,
-  (tc: ToolCallInfo) => PathStatus[]
-> = {
+const FILE_TOOL_EXTRACTORS: Record<string, (tc: ToolCallInfo) => PathStatus[]> = {
   create_file: (tc) => [{ path: str(tc.args, 'path'), status: 'added', writeArgs: tc.args }],
   write_file: (tc) => [{ path: str(tc.args, 'path'), status: 'modified', writeArgs: tc.args }],
   edit_file: (tc) => [{ path: str(tc.args, 'path'), status: 'modified', writeArgs: tc.args }],
@@ -52,13 +49,18 @@ const FILE_TOOL_EXTRACTORS: Record<
   ],
   apply_patch: (tc) => [{ path: str(tc.args, 'path'), status: 'modified', writeArgs: tc.args }],
   multi_edit: (tc) => {
-    const edits = tc.args && typeof tc.args === 'object' && 'edits' in (tc.args as Record<string, unknown>)
-      ? (tc.args as Record<string, unknown>).edits
-      : null;
+    const edits =
+      tc.args && typeof tc.args === 'object' && 'edits' in (tc.args as Record<string, unknown>)
+        ? (tc.args as Record<string, unknown>).edits
+        : null;
     if (!Array.isArray(edits)) return [];
     return edits
       .filter((e): e is Record<string, unknown> => e && typeof e === 'object')
-      .map((e) => ({ path: str(e as unknown, 'path'), status: 'modified' as const, writeArgs: tc.args }));
+      .map((e) => ({
+        path: str(e as unknown, 'path'),
+        status: 'modified' as const,
+        writeArgs: tc.args,
+      }));
   },
 };
 
@@ -112,7 +114,5 @@ export function deriveChangedFiles(messages: ChatMessage[]): ChangedFile[] {
     }
   }
 
-  return Array.from(byPath.values()).sort(
-    (a, b) => b.lastTouchedAt - a.lastTouchedAt
-  );
+  return Array.from(byPath.values()).sort((a, b) => b.lastTouchedAt - a.lastTouchedAt);
 }

@@ -51,8 +51,14 @@ export function UsageTrendsPanel() {
       // Compute per-run summaries
       const items: RunSummary[] = [];
       for (const [runId, recs] of byRun) {
-        let totalIn = 0, totalOut = 0, totalCached = 0, totalCacheWrite = 0;
-        const modelMap = new Map<string, { calls: number; inp: number; out: number; cached: number }>();
+        let totalIn = 0,
+          totalOut = 0,
+          totalCached = 0,
+          totalCacheWrite = 0;
+        const modelMap = new Map<
+          string,
+          { calls: number; inp: number; out: number; cached: number }
+        >();
         for (const r of recs) {
           const inp = (r.input_tokens as number) || 0;
           const out = (r.output_tokens as number) || 0;
@@ -126,17 +132,36 @@ export function UsageTrendsPanel() {
       </div>
 
       {error && (
-        <div className="mb-3 rounded-md px-3 py-2 text-xs" style={{ background: 'var(--bg-hover)', color: 'var(--color-error)' }}>
+        <div
+          className="mb-3 rounded-md px-3 py-2 text-xs"
+          style={{ background: 'var(--bg-hover)', color: 'var(--color-error)' }}
+        >
           {error}
         </div>
       )}
 
       {/* Aggregate gauges */}
       <div className="grid grid-cols-4 gap-2 mb-4">
-        <Metric label="Total LLM calls" value={totalCalls.toLocaleString()} icon={<Cpu size={14} />} />
-        <Metric label="Total input" value={totalInput.toLocaleString()} icon={<Activity size={14} />} />
-        <Metric label="Overall cache read" value={formatRate(totalInput > 0 ? totalCached / totalInput : 0)} icon={<TrendingUp size={14} />} />
-        <Metric label="Runs" value={summaries.length.toLocaleString()} icon={<Server size={14} />} />
+        <Metric
+          label="Total LLM calls"
+          value={totalCalls.toLocaleString()}
+          icon={<Cpu size={14} />}
+        />
+        <Metric
+          label="Total input"
+          value={totalInput.toLocaleString()}
+          icon={<Activity size={14} />}
+        />
+        <Metric
+          label="Overall cache read"
+          value={formatRate(totalInput > 0 ? totalCached / totalInput : 0)}
+          icon={<TrendingUp size={14} />}
+        />
+        <Metric
+          label="Runs"
+          value={summaries.length.toLocaleString()}
+          icon={<Server size={14} />}
+        />
       </div>
 
       {/* Per-run breakdown */}
@@ -146,9 +171,16 @@ export function UsageTrendsPanel() {
         </div>
         <div className="space-y-2">
           {summaries.map((s, i) => (
-            <div key={i} className="rounded-lg border p-3" style={{ borderColor: 'var(--border-secondary)', background: 'var(--bg-secondary)' }}>
+            <div
+              key={i}
+              className="rounded-lg border p-3"
+              style={{ borderColor: 'var(--border-secondary)', background: 'var(--bg-secondary)' }}
+            >
               <div className="flex items-center justify-between mb-2">
-                <span className="text-xs font-mono font-medium" style={{ color: 'var(--text-primary)' }}>
+                <span
+                  className="text-xs font-mono font-medium"
+                  style={{ color: 'var(--text-primary)' }}
+                >
                   {s.run_id ? s.run_id.slice(0, 16) + '...' : '(no run)'}
                 </span>
                 <span className="text-[11px]" style={{ color: 'var(--text-tertiary)' }}>
@@ -157,19 +189,32 @@ export function UsageTrendsPanel() {
               </div>
               <div className="grid grid-cols-3 gap-2 text-[11px]">
                 <div style={{ color: 'var(--text-tertiary)' }}>
-                  Input: <span style={{ color: 'var(--text-primary)' }}>{s.total_input_tokens.toLocaleString()}</span>
+                  Input:{' '}
+                  <span style={{ color: 'var(--text-primary)' }}>
+                    {s.total_input_tokens.toLocaleString()}
+                  </span>
                 </div>
                 <div style={{ color: 'var(--text-tertiary)' }}>
-                  Output: <span style={{ color: 'var(--text-primary)' }}>{s.total_output_tokens.toLocaleString()}</span>
+                  Output:{' '}
+                  <span style={{ color: 'var(--text-primary)' }}>
+                    {s.total_output_tokens.toLocaleString()}
+                  </span>
                 </div>
                 <div style={{ color: 'var(--text-tertiary)' }}>
-                  Cached: <span style={{ color: 'var(--text-primary)' }}>{s.total_cached_input_tokens.toLocaleString()}</span>
+                  Cached:{' '}
+                  <span style={{ color: 'var(--text-primary)' }}>
+                    {s.total_cached_input_tokens.toLocaleString()}
+                  </span>
                 </div>
               </div>
               {s.model_breakdown.length > 1 && (
                 <div className="mt-2 flex flex-wrap gap-1">
                   {s.model_breakdown.map((m, j) => (
-                    <span key={j} className="rounded-md px-1.5 py-0.5 text-[10px] font-mono" style={{ background: 'var(--bg-hover)', color: 'var(--text-secondary)' }}>
+                    <span
+                      key={j}
+                      className="rounded-md px-1.5 py-0.5 text-[10px] font-mono"
+                      style={{ background: 'var(--bg-hover)', color: 'var(--text-secondary)' }}
+                    >
                       {m.model}: {m.llm_calls} calls
                     </span>
                   ))}
@@ -178,7 +223,10 @@ export function UsageTrendsPanel() {
             </div>
           ))}
           {summaries.length === 0 && !loading && (
-            <div className="rounded-md p-6 text-center text-xs" style={{ color: 'var(--text-tertiary)', background: 'var(--bg-secondary)' }}>
+            <div
+              className="rounded-md p-6 text-center text-xs"
+              style={{ color: 'var(--text-tertiary)', background: 'var(--bg-secondary)' }}
+            >
               暂无 usage 数据。发送消息或执行 TaskRuntime 后会在这里显示。
             </div>
           )}
@@ -191,10 +239,16 @@ export function UsageTrendsPanel() {
 function Metric({ label, value, icon }: { label: string; value: string; icon: React.ReactNode }) {
   return (
     <div className="rounded-lg p-3" style={{ background: 'var(--bg-secondary)' }}>
-      <div className="mb-1 flex items-center gap-1.5 text-[10px]" style={{ color: 'var(--text-tertiary)' }}>
+      <div
+        className="mb-1 flex items-center gap-1.5 text-[10px]"
+        style={{ color: 'var(--text-tertiary)' }}
+      >
         {icon} {label}
       </div>
-      <div className="truncate font-mono text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>
+      <div
+        className="truncate font-mono text-sm font-semibold"
+        style={{ color: 'var(--text-primary)' }}
+      >
         {value}
       </div>
     </div>

@@ -90,26 +90,48 @@ export function CacheDiagnosticsPanel() {
             className="rounded-lg border p-4"
             style={{ borderColor: 'var(--border-secondary)', background: 'var(--bg-secondary)' }}
           >
-            <div className="flex items-center gap-2 text-xs font-semibold mb-2" style={{ color: 'var(--text-primary)' }}>
+            <div
+              className="flex items-center gap-2 text-xs font-semibold mb-2"
+              style={{ color: 'var(--text-primary)' }}
+            >
               <TrendingUp size={14} /> 当前缓存命中率
             </div>
             <div className="flex items-end gap-2">
-              <span className="text-2xl font-bold font-mono" style={{ color: data.overall_read_rate > 0.3 ? 'var(--color-success)' : 'var(--color-error)' }}>
+              <span
+                className="text-2xl font-bold font-mono"
+                style={{
+                  color:
+                    data.overall_read_rate > 0.3 ? 'var(--color-success)' : 'var(--color-error)',
+                }}
+              >
                 {formatRate(data.overall_read_rate)}
               </span>
               <span className="text-xs" style={{ color: 'var(--text-tertiary)' }}>
-                {data.total_cached_input_tokens.toLocaleString()} / {data.total_input_tokens.toLocaleString()} tokens
+                {data.total_cached_input_tokens.toLocaleString()} /{' '}
+                {data.total_input_tokens.toLocaleString()} tokens
               </span>
             </div>
             <div className="mt-3 grid grid-cols-3 gap-2 text-[11px]">
               <div style={{ color: 'var(--text-tertiary)' }}>
-                LLM calls: <span style={{ color: 'var(--text-primary)' }}>{data.total_llm_calls}</span>
+                LLM calls:{' '}
+                <span style={{ color: 'var(--text-primary)' }}>{data.total_llm_calls}</span>
               </div>
               <div style={{ color: 'var(--text-tertiary)' }}>
-                Missing usage: <span style={{ color: data.calls_missing_usage > 0 ? 'var(--color-error)' : 'var(--text-primary)' }}>{data.calls_missing_usage}</span>
+                Missing usage:{' '}
+                <span
+                  style={{
+                    color:
+                      data.calls_missing_usage > 0 ? 'var(--color-error)' : 'var(--text-primary)',
+                  }}
+                >
+                  {data.calls_missing_usage}
+                </span>
               </div>
               <div style={{ color: 'var(--text-tertiary)' }}>
-                Cache write: <span style={{ color: 'var(--text-primary)' }}>{data.total_cache_creation_input_tokens.toLocaleString()}</span>
+                Cache write:{' '}
+                <span style={{ color: 'var(--text-primary)' }}>
+                  {data.total_cache_creation_input_tokens.toLocaleString()}
+                </span>
               </div>
             </div>
           </div>
@@ -125,15 +147,24 @@ export function CacheDiagnosticsPanel() {
                   <div
                     key={i}
                     className="rounded-lg border p-3"
-                    style={{ borderColor: 'var(--border-secondary)', background: severityBg(issue.severity) }}
+                    style={{
+                      borderColor: 'var(--border-secondary)',
+                      background: severityBg(issue.severity),
+                    }}
                   >
                     <div className="flex items-start gap-2">
                       {severityIcon(issue.severity)}
                       <div className="min-w-0">
-                        <div className="text-xs font-medium" style={{ color: 'var(--text-primary)' }}>
+                        <div
+                          className="text-xs font-medium"
+                          style={{ color: 'var(--text-primary)' }}
+                        >
                           {issue.kind.replace(/_/g, ' ')}
                         </div>
-                        <div className="mt-1 text-xs leading-relaxed" style={{ color: 'var(--text-secondary)' }}>
+                        <div
+                          className="mt-1 text-xs leading-relaxed"
+                          style={{ color: 'var(--text-secondary)' }}
+                        >
                           {issue.message}
                         </div>
                         <div className="mt-1 text-[11px]" style={{ color: 'var(--text-tertiary)' }}>
@@ -150,7 +181,10 @@ export function CacheDiagnosticsPanel() {
           {/* Suggested Fixes */}
           {data.suggested_fixes.length > 0 && (
             <section>
-              <div className="mb-2 flex items-center gap-2 text-xs font-semibold" style={{ color: 'var(--text-primary)' }}>
+              <div
+                className="mb-2 flex items-center gap-2 text-xs font-semibold"
+                style={{ color: 'var(--text-primary)' }}
+              >
                 <CheckCircle size={14} /> 修复建议
               </div>
               <div className="space-y-1.5">
@@ -173,16 +207,49 @@ export function CacheDiagnosticsPanel() {
               <div className="mb-2 text-xs font-semibold" style={{ color: 'var(--text-primary)' }}>
                 最近 {data.recent_calls.length} 次 LLM 调用对比
               </div>
-              <div className="overflow-auto rounded-lg border" style={{ borderColor: 'var(--border-primary)' }}>
+              <div
+                className="overflow-auto rounded-lg border"
+                style={{ borderColor: 'var(--border-primary)' }}
+              >
                 <table className="w-full text-[11px]">
                   <thead>
                     <tr style={{ background: 'var(--bg-hover)' }}>
-                      <th className="px-2 py-1.5 text-left" style={{ color: 'var(--text-tertiary)' }}>Model</th>
-                      <th className="px-2 py-1.5 text-right" style={{ color: 'var(--text-tertiary)' }}>Input</th>
-                      <th className="px-2 py-1.5 text-right" style={{ color: 'var(--text-tertiary)' }}>Cached</th>
-                      <th className="px-2 py-1.5 text-left" style={{ color: 'var(--text-tertiary)' }}>System Hash</th>
-                      <th className="px-2 py-1.5 text-left" style={{ color: 'var(--text-tertiary)' }}>Tools Hash</th>
-                      <th className="px-2 py-1.5 text-left" style={{ color: 'var(--text-tertiary)' }}>CWD Hash</th>
+                      <th
+                        className="px-2 py-1.5 text-left"
+                        style={{ color: 'var(--text-tertiary)' }}
+                      >
+                        Model
+                      </th>
+                      <th
+                        className="px-2 py-1.5 text-right"
+                        style={{ color: 'var(--text-tertiary)' }}
+                      >
+                        Input
+                      </th>
+                      <th
+                        className="px-2 py-1.5 text-right"
+                        style={{ color: 'var(--text-tertiary)' }}
+                      >
+                        Cached
+                      </th>
+                      <th
+                        className="px-2 py-1.5 text-left"
+                        style={{ color: 'var(--text-tertiary)' }}
+                      >
+                        System Hash
+                      </th>
+                      <th
+                        className="px-2 py-1.5 text-left"
+                        style={{ color: 'var(--text-tertiary)' }}
+                      >
+                        Tools Hash
+                      </th>
+                      <th
+                        className="px-2 py-1.5 text-left"
+                        style={{ color: 'var(--text-tertiary)' }}
+                      >
+                        CWD Hash
+                      </th>
                     </tr>
                   </thead>
                   <tbody>
@@ -192,16 +259,43 @@ export function CacheDiagnosticsPanel() {
                         className="border-t"
                         style={{ borderColor: 'var(--border-secondary)' }}
                       >
-                        <td className="px-2 py-1.5 font-mono" style={{ color: 'var(--text-primary)' }}>{call.model}</td>
-                        <td className="px-2 py-1.5 text-right font-mono" style={{ color: 'var(--text-secondary)' }}>{call.input_tokens.toLocaleString()}</td>
-                        <td className="px-2 py-1.5 text-right font-mono" style={{ color: 'var(--text-secondary)' }}>{call.cached_input_tokens.toLocaleString()}</td>
-                        <td className="px-2 py-1.5 font-mono" style={{ color: 'var(--text-tertiary)' }} title={call.system_prompt_hash ?? undefined}>
+                        <td
+                          className="px-2 py-1.5 font-mono"
+                          style={{ color: 'var(--text-primary)' }}
+                        >
+                          {call.model}
+                        </td>
+                        <td
+                          className="px-2 py-1.5 text-right font-mono"
+                          style={{ color: 'var(--text-secondary)' }}
+                        >
+                          {call.input_tokens.toLocaleString()}
+                        </td>
+                        <td
+                          className="px-2 py-1.5 text-right font-mono"
+                          style={{ color: 'var(--text-secondary)' }}
+                        >
+                          {call.cached_input_tokens.toLocaleString()}
+                        </td>
+                        <td
+                          className="px-2 py-1.5 font-mono"
+                          style={{ color: 'var(--text-tertiary)' }}
+                          title={call.system_prompt_hash ?? undefined}
+                        >
                           {hashPreview(call.system_prompt_hash)}
                         </td>
-                        <td className="px-2 py-1.5 font-mono" style={{ color: 'var(--text-tertiary)' }} title={call.tools_schema_hash ?? undefined}>
+                        <td
+                          className="px-2 py-1.5 font-mono"
+                          style={{ color: 'var(--text-tertiary)' }}
+                          title={call.tools_schema_hash ?? undefined}
+                        >
                           {hashPreview(call.tools_schema_hash)}
                         </td>
-                        <td className="px-2 py-1.5 font-mono" style={{ color: 'var(--text-tertiary)' }} title={call.cwd_hash ?? undefined}>
+                        <td
+                          className="px-2 py-1.5 font-mono"
+                          style={{ color: 'var(--text-tertiary)' }}
+                          title={call.cwd_hash ?? undefined}
+                        >
                           {hashPreview(call.cwd_hash)}
                         </td>
                       </tr>
@@ -213,7 +307,10 @@ export function CacheDiagnosticsPanel() {
           )}
 
           {!data && !loading && (
-            <div className="rounded-md p-6 text-center text-xs" style={{ color: 'var(--text-tertiary)', background: 'var(--bg-secondary)' }}>
+            <div
+              className="rounded-md p-6 text-center text-xs"
+              style={{ color: 'var(--text-tertiary)', background: 'var(--bg-secondary)' }}
+            >
               暂无缓存诊断数据。发送消息后再查看。
             </div>
           )}

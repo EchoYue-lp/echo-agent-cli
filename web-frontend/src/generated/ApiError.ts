@@ -3,24 +3,25 @@
 /**
  * 统一的 API 错误响应结构
  */
-export type ApiError = { 
-/**
- * 错误码，如 "VALIDATION_ERROR", "NOT_FOUND", "INTERNAL_ERROR"
- */
-code: string, 
-/**
- * 人类可读的错误消息
- */
-message: string, 
-/**
- * HTTP 状态码
- */
-status: number, 
-/**
- * 可选的调试信息
- */
-details: string | null, 
-/**
- * 请求追踪 ID
- */
-request_id: string | null, };
+export type ApiError = {
+  /**
+   * 错误码，如 "VALIDATION_ERROR", "NOT_FOUND", "INTERNAL_ERROR"
+   */
+  code: string;
+  /**
+   * 人类可读的错误消息
+   */
+  message: string;
+  /**
+   * HTTP 状态码
+   */
+  status: number;
+  /**
+   * 可选的调试信息
+   */
+  details: string | null;
+  /**
+   * 请求追踪 ID
+   */
+  request_id: string | null;
+};

@@ -4,4 +4,4 @@
  * Manual override of how a user message should be handled.
  * `Auto` defers to the router; the other two force a path.
  */
-export type InteractionMode = "chat" | "task" | "auto";
+export type InteractionMode = 'chat' | 'task' | 'auto';

@@ -5,4 +5,16 @@
  * workers consume this instead of the full raw conversation — see the
  * "Summary Chain" section of the plan.
  */
-export type TaskExecutionSummary = { run_id: string, task_id: string, worker_agent: string, completed_work: Array<string>, files_read: Array<string>, files_changed: Array<string>, decisions: Array<string>, failures: Array<string>, verification: Array<string>, next_implications: Array<string>, created_at: string, };
+export type TaskExecutionSummary = {
+  run_id: string;
+  task_id: string;
+  worker_agent: string;
+  completed_work: Array<string>;
+  files_read: Array<string>;
+  files_changed: Array<string>;
+  decisions: Array<string>;
+  failures: Array<string>;
+  verification: Array<string>;
+  next_implications: Array<string>;
+  created_at: string;
+};

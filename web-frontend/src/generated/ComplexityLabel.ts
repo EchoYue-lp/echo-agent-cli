@@ -3,4 +3,4 @@
 /**
  * serde-friendly label (Complexity is unit-like and not serialized directly).
  */
-export type ComplexityLabel = "simple" | "complex";
+export type ComplexityLabel = 'simple' | 'complex';

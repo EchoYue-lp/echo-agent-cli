@@ -2,12 +2,29 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { skillsApi } from '../../api/endpoints';
 import type { SkillInfo } from '../../types/api';
 import { CATEGORY_LABELS } from '../../types/api';
-import { BookOpen, ChevronDown, ChevronRight, FolderOpen, Loader2, Power, Search, Star, AlertTriangle } from 'lucide-react';
+import {
+  BookOpen,
+  ChevronDown,
+  ChevronRight,
+  FolderOpen,
+  Loader2,
+  Power,
+  Search,
+  Star,
+  AlertTriangle,
+} from 'lucide-react';
 import { useToastStore } from '../../stores/toastStore';
 import { fileSystem, isTauri } from '../../lib/tauri-bridge';
 
 /** Category sort order for consistent display. */
-const CATEGORY_ORDER = ['methodology', 'development', 'document', 'design', 'research', 'automation'];
+const CATEGORY_ORDER = [
+  'methodology',
+  'development',
+  'document',
+  'design',
+  'research',
+  'automation',
+];
 
 export function SkillsPanel() {
   const [skills, setSkills] = useState<SkillInfo[]>([]);
@@ -58,7 +75,8 @@ export function SkillsPanel() {
   const toggleCategory = (cat: string) => {
     setCollapsedCategories((prev) => {
       const next = new Set(prev);
-      if (next.has(cat)) next.delete(cat); else next.add(cat);
+      if (next.has(cat)) next.delete(cat);
+      else next.add(cat);
       return next;
     });
   };
@@ -277,87 +295,96 @@ export function SkillsPanel() {
                 {enabledCount}/{catSkills.length}
               </span>
             </button>
-            {!collapsed && catSkills.map((sk) => (
-              <div
-                key={sk.name}
-                className="ml-2 mt-1 rounded-lg border px-3 py-2"
-                style={{ borderColor: s.border, background: s.bg }}
-              >
-                <div className="flex items-start gap-2">
-                  {sk.is_baseline ? (
-                    <Star size={12} className="mt-0.5 shrink-0" style={{ color: '#eab308' }} />
-                  ) : (
-                    <BookOpen size={12} className="mt-0.5 shrink-0" style={{ color: s.accent }} />
-                  )}
-                  <div className="min-w-0 flex-1">
-                    <div className="flex min-w-0 items-center gap-1.5">
-                      <span className="truncate text-xs font-medium" style={{ color: s.text }}>
-                        {sk.name}
-                      </span>
-                      {sk.is_baseline && (
-                        <span
-                          className="shrink-0 rounded-md px-1 py-0.5 text-[8px] font-medium"
-                          style={{ background: '#eab30820', color: '#eab308' }}
-                        >
-                          baseline
-                        </span>
-                      )}
-                      {sk.missing_dependencies && sk.missing_dependencies.length > 0 && (
-                        <span title={sk.missing_dependencies.join(', ')}>
-                          <AlertTriangle size={10} className="shrink-0" style={{ color: '#f59e0b' }} />
-                        </span>
-                      )}
-                      <span
-                        className="shrink-0 rounded-md px-1.5 py-0.5 text-[9px]"
-                        style={{
-                          background: sk.loaded ? 'var(--accent-muted)' : 'var(--bg-hover)',
-                          color: sk.loaded ? s.accent : s.textTer,
-                        }}
-                      >
-                        {sk.loaded ? '已接入' : '可用'}
-                      </span>
-                    </div>
-                    <p className="mt-1 text-xs" style={{ color: s.textSec }}>
-                      {sk.description || '无描述'}
-                    </p>
-                    {(sk.upstream_version || sk.source) && (
-                      <div className="mt-0.5 flex gap-2 text-[9px]" style={{ color: s.textTer }}>
-                        {sk.source && <span>{sk.source}</span>}
-                        {sk.upstream_version && <span>· v{sk.upstream_version}</span>}
-                      </div>
+            {!collapsed &&
+              catSkills.map((sk) => (
+                <div
+                  key={sk.name}
+                  className="ml-2 mt-1 rounded-lg border px-3 py-2"
+                  style={{ borderColor: s.border, background: s.bg }}
+                >
+                  <div className="flex items-start gap-2">
+                    {sk.is_baseline ? (
+                      <Star size={12} className="mt-0.5 shrink-0" style={{ color: '#eab308' }} />
+                    ) : (
+                      <BookOpen size={12} className="mt-0.5 shrink-0" style={{ color: s.accent }} />
                     )}
+                    <div className="min-w-0 flex-1">
+                      <div className="flex min-w-0 items-center gap-1.5">
+                        <span className="truncate text-xs font-medium" style={{ color: s.text }}>
+                          {sk.name}
+                        </span>
+                        {sk.is_baseline && (
+                          <span
+                            className="shrink-0 rounded-md px-1 py-0.5 text-[8px] font-medium"
+                            style={{ background: '#eab30820', color: '#eab308' }}
+                          >
+                            baseline
+                          </span>
+                        )}
+                        {sk.missing_dependencies && sk.missing_dependencies.length > 0 && (
+                          <span title={sk.missing_dependencies.join(', ')}>
+                            <AlertTriangle
+                              size={10}
+                              className="shrink-0"
+                              style={{ color: '#f59e0b' }}
+                            />
+                          </span>
+                        )}
+                        <span
+                          className="shrink-0 rounded-md px-1.5 py-0.5 text-[9px]"
+                          style={{
+                            background: sk.loaded ? 'var(--accent-muted)' : 'var(--bg-hover)',
+                            color: sk.loaded ? s.accent : s.textTer,
+                          }}
+                        >
+                          {sk.loaded ? '已接入' : '可用'}
+                        </span>
+                      </div>
+                      <p className="mt-1 text-xs" style={{ color: s.textSec }}>
+                        {sk.description || '无描述'}
+                      </p>
+                      {(sk.upstream_version || sk.source) && (
+                        <div className="mt-0.5 flex gap-2 text-[9px]" style={{ color: s.textTer }}>
+                          {sk.source && <span>{sk.source}</span>}
+                          {sk.upstream_version && <span>· v{sk.upstream_version}</span>}
+                        </div>
+                      )}
+                    </div>
+                    <button
+                      onClick={() => (sk.loaded ? disableSkill(sk.name) : enableSkill(sk.name))}
+                      disabled={Boolean(busySkill)}
+                      className="flex shrink-0 items-center gap-1 rounded-md border px-2 py-1 text-[10px] transition-opacity disabled:opacity-50"
+                      style={{ borderColor: s.border, color: s.text }}
+                      title={sk.loaded ? '禁用技能' : '启用技能'}
+                    >
+                      {busySkill === sk.name ? (
+                        <Loader2 size={11} className="animate-spin" />
+                      ) : (
+                        <Power size={11} />
+                      )}
+                      {sk.loaded ? '禁用' : '启用'}
+                    </button>
                   </div>
-                  <button
-                    onClick={() => (sk.loaded ? disableSkill(sk.name) : enableSkill(sk.name))}
-                    disabled={Boolean(busySkill)}
-                    className="flex shrink-0 items-center gap-1 rounded-md border px-2 py-1 text-[10px] transition-opacity disabled:opacity-50"
-                    style={{ borderColor: s.border, color: s.text }}
-                    title={sk.loaded ? '禁用技能' : '启用技能'}
-                  >
-                    {busySkill === sk.name ? <Loader2 size={11} className="animate-spin" /> : <Power size={11} />}
-                    {sk.loaded ? '禁用' : '启用'}
-                  </button>
+                  {sk.tags && sk.tags.length > 0 && (
+                    <div className="mt-1.5 flex flex-wrap gap-1">
+                      {sk.tags.map((tag) => (
+                        <span
+                          key={tag}
+                          className="rounded-md px-1.5 py-0.5 text-[9px]"
+                          style={{ background: 'var(--bg-hover)', color: s.textTer }}
+                        >
+                          {tag}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  {sk.file && (
+                    <p className="mt-1 text-[10px]" style={{ color: s.textTer }}>
+                      {sk.file}
+                    </p>
+                  )}
                 </div>
-                {sk.tags && sk.tags.length > 0 && (
-                  <div className="mt-1.5 flex flex-wrap gap-1">
-                    {sk.tags.map((tag) => (
-                      <span
-                        key={tag}
-                        className="rounded-md px-1.5 py-0.5 text-[9px]"
-                        style={{ background: 'var(--bg-hover)', color: s.textTer }}
-                      >
-                        {tag}
-                      </span>
-                    ))}
-                  </div>
-                )}
-                {sk.file && (
-                  <p className="mt-1 text-[10px]" style={{ color: s.textTer }}>
-                    {sk.file}
-                  </p>
-                )}
-              </div>
-            ))}
+              ))}
           </div>
         );
       })}

@@ -18,4 +18,4 @@
  * 删去了 Planning/AwaitingPlanApproval/Ready/WaitingApproval/WaitingInput/Suspended/Cancelling
  * —— 这些"plan 是否被批准"的语义改由编排层(L1) + Paused 承载,不进 run 状态机。
  */
-export type TaskRunStatus = "pending" | "running" | "paused" | "cancelled" | "failed" | "completed";
+export type TaskRunStatus = 'pending' | 'running' | 'paused' | 'cancelled' | 'failed' | 'completed';

@@ -1,5 +1,14 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
-import { Activity, AlertTriangle, Cpu, Gauge, RefreshCw, Server, Stethoscope, TrendingUp } from 'lucide-react';
+import {
+  Activity,
+  AlertTriangle,
+  Cpu,
+  Gauge,
+  RefreshCw,
+  Server,
+  Stethoscope,
+  TrendingUp,
+} from 'lucide-react';
 import { traceEventsApi, type TraceEvent, type TraceSummary } from '../../api/endpoints';
 import { TraceTimeline } from './TraceTimeline';
 import { TokenUsageChart } from './TokenUsageChart';
@@ -86,10 +95,14 @@ function diagnosticMessages(total: UsageAggregate, models: ModelAggregate[]): st
     messages.push(`时间窗口内出现 ${models.length} 个模型；不同模型通常不会共享 prompt cache。`);
   }
   if (rate != null && rate < 0.2 && total.input >= 1000) {
-    messages.push('cache read rate 偏低。优先检查 system prefix、tools 定义、cwd/记忆/hook 注入和 subagent prompt 是否稳定。');
+    messages.push(
+      'cache read rate 偏低。优先检查 system prefix、tools 定义、cwd/记忆/hook 注入和 subagent prompt 是否稳定。'
+    );
   }
   if (total.cacheWrite > total.cached && total.cacheWrite > 0) {
-    messages.push('cache write 高于 cache read，说明更多是在创建缓存；重复同类任务后 read 仍不上升才需要继续排查前缀稳定性。');
+    messages.push(
+      'cache write 高于 cache read，说明更多是在创建缓存；重复同类任务后 read 仍不上升才需要继续排查前缀稳定性。'
+    );
   }
   if (messages.length === 0) {
     messages.push('当前缓存数据没有明显异常。继续观察相同模型、相同提示词下的 read rate 趋势。');
@@ -143,13 +156,19 @@ export function ObservabilityPanel() {
       sessions
         .map((session) => ({
           ...session,
-          events: cutoff == null ? session.events : session.events.filter((event) => eventTimeMs(event) >= cutoff),
+          events:
+            cutoff == null
+              ? session.events
+              : session.events.filter((event) => eventTimeMs(event) >= cutoff),
         }))
         .filter((session) => session.events.length > 0),
     [sessions, cutoff]
   );
 
-  const allEvents = useMemo(() => filteredSessions.flatMap((session) => session.events), [filteredSessions]);
+  const allEvents = useMemo(
+    () => filteredSessions.flatMap((session) => session.events),
+    [filteredSessions]
+  );
   const totalUsage = useMemo(() => {
     const usage = emptyUsage();
     allEvents.forEach((event) => addUsage(usage, event));
@@ -169,7 +188,9 @@ export function ObservabilityPanel() {
   }, [allEvents]);
 
   const selectedSession =
-    filteredSessions.find((session) => session.sessionId === selectedSessionId) ?? filteredSessions[0] ?? null;
+    filteredSessions.find((session) => session.sessionId === selectedSessionId) ??
+    filteredSessions[0] ??
+    null;
   const diagnostics = diagnosticMessages(totalUsage, modelUsage);
 
   return (
@@ -200,7 +221,8 @@ export function ObservabilityPanel() {
           style={{
             background: activeTab === 'overview' ? 'var(--bg-secondary)' : 'transparent',
             color: activeTab === 'overview' ? 'var(--text-primary)' : 'var(--text-tertiary)',
-            borderBottom: activeTab === 'overview' ? `2px solid var(--accent)` : '2px solid transparent',
+            borderBottom:
+              activeTab === 'overview' ? `2px solid var(--accent)` : '2px solid transparent',
           }}
         >
           <Activity size={13} className="inline mr-1" /> 运行概览
@@ -211,7 +233,8 @@ export function ObservabilityPanel() {
           style={{
             background: activeTab === 'diagnostics' ? 'var(--bg-secondary)' : 'transparent',
             color: activeTab === 'diagnostics' ? 'var(--text-primary)' : 'var(--text-tertiary)',
-            borderBottom: activeTab === 'diagnostics' ? `2px solid var(--accent)` : '2px solid transparent',
+            borderBottom:
+              activeTab === 'diagnostics' ? `2px solid var(--accent)` : '2px solid transparent',
           }}
         >
           <Stethoscope size={13} className="inline mr-1" /> 缓存诊断
@@ -222,7 +245,8 @@ export function ObservabilityPanel() {
           style={{
             background: activeTab === 'trends' ? 'var(--bg-secondary)' : 'transparent',
             color: activeTab === 'trends' ? 'var(--text-primary)' : 'var(--text-tertiary)',
-            borderBottom: activeTab === 'trends' ? `2px solid var(--accent)` : '2px solid transparent',
+            borderBottom:
+              activeTab === 'trends' ? `2px solid var(--accent)` : '2px solid transparent',
           }}
         >
           <TrendingUp size={13} className="inline mr-1" /> Usage 趋势
@@ -235,108 +259,156 @@ export function ObservabilityPanel() {
         <UsageTrendsPanel />
       ) : (
         <>
-      <div className="mb-4 flex flex-wrap gap-1">
-        {WINDOWS.map((window) => (
-          <button
-            key={window.id}
-            onClick={() => setWindowId(window.id)}
-            className="rounded-md px-2 py-1 text-xs"
-            style={{
-              background: windowId === window.id ? 'var(--accent)' : 'var(--bg-hover)',
-              color: windowId === window.id ? 'var(--text-on-accent)' : 'var(--text-secondary)',
-            }}
-          >
-            {window.label}
-          </button>
-        ))}
-      </div>
-
-      {error && (
-        <div className="mb-3 rounded-md px-3 py-2 text-xs" style={{ background: 'var(--bg-hover)', color: 'var(--color-error)' }}>
-          {error}
-        </div>
-      )}
-
-      <div className="grid grid-cols-4 gap-2">
-        <Metric label="LLM calls" value={totalUsage.calls.toLocaleString()} icon={<Cpu size={14} />} />
-        <Metric label="Input tokens" value={totalUsage.input.toLocaleString()} icon={<Activity size={14} />} />
-        <Metric label="Cache read" value={formatRate(readRate(totalUsage))} icon={<Gauge size={14} />} />
-        <Metric label="Missing usage" value={totalUsage.missingUsage.toLocaleString()} icon={<AlertTriangle size={14} />} />
-      </div>
-
-      <div className="mt-4 grid min-h-0 flex-1 grid-cols-[minmax(220px,280px)_1fr] gap-4">
-        <section className="min-h-0 overflow-auto">
-          <PanelTitle icon={<Server size={13} />} title="会话" />
-          <div className="space-y-1.5">
-            {filteredSessions.map((session) => {
-              const usage = emptyUsage();
-              session.events.forEach((event) => addUsage(usage, event));
-              return (
-                <button
-                  key={session.sessionId}
-                  onClick={() => setSelectedSessionId(session.sessionId)}
-                  className="w-full rounded-md px-2 py-2 text-left"
-                  style={{
-                    background: selectedSession?.sessionId === session.sessionId ? 'var(--bg-hover)' : 'var(--bg-secondary)',
-                    color: 'var(--text-secondary)',
-                  }}
-                >
-                  <div className="truncate text-xs font-medium" style={{ color: 'var(--text-primary)' }}>
-                    {session.sessionId}
-                  </div>
-                  <div className="mt-1 text-[10px]" style={{ color: 'var(--text-tertiary)' }}>
-                    {usage.calls} calls · {formatRate(readRate(usage))} cache read
-                  </div>
-                </button>
-              );
-            })}
-            {filteredSessions.length === 0 && (
-              <div className="rounded-md p-3 text-center text-xs" style={{ color: 'var(--text-tertiary)', background: 'var(--bg-secondary)' }}>
-                当前窗口暂无 trace 数据
-              </div>
-            )}
-          </div>
-        </section>
-
-        <section className="min-h-0 overflow-auto">
-          <PanelTitle icon={<Gauge size={13} />} title="诊断建议" />
-          <div className="mb-4 space-y-1.5">
-            {diagnostics.map((message) => (
-              <div key={message} className="rounded-md px-3 py-2 text-xs" style={{ background: 'var(--bg-secondary)', color: 'var(--text-secondary)' }}>
-                {message}
-              </div>
+          <div className="mb-4 flex flex-wrap gap-1">
+            {WINDOWS.map((window) => (
+              <button
+                key={window.id}
+                onClick={() => setWindowId(window.id)}
+                className="rounded-md px-2 py-1 text-xs"
+                style={{
+                  background: windowId === window.id ? 'var(--accent)' : 'var(--bg-hover)',
+                  color: windowId === window.id ? 'var(--text-on-accent)' : 'var(--text-secondary)',
+                }}
+              >
+                {window.label}
+              </button>
             ))}
           </div>
 
-          <PanelTitle icon={<Cpu size={13} />} title="模型对比" />
-          <div className="mb-4 overflow-hidden rounded-lg border" style={{ borderColor: 'var(--border-primary)' }}>
-            {modelUsage.map((model) => (
-              <div key={model.model} className="grid grid-cols-[1fr_80px_80px_80px] gap-2 border-b px-3 py-2 text-xs last:border-b-0" style={{ borderColor: 'var(--border-primary)' }}>
-                <span className="truncate font-mono" style={{ color: 'var(--text-primary)' }}>{model.model}</span>
-                <span style={{ color: 'var(--text-secondary)' }}>{model.calls} calls</span>
-                <span style={{ color: 'var(--text-secondary)' }}>{formatRate(readRate(model))}</span>
-                <span style={{ color: 'var(--text-tertiary)' }}>{model.missingUsage} missing</span>
-              </div>
-            ))}
-            {modelUsage.length === 0 && (
-              <div className="px-3 py-4 text-center text-xs" style={{ color: 'var(--text-tertiary)' }}>
-                暂无模型 usage
-              </div>
-            )}
-          </div>
-
-          {selectedSession && (
-            <>
-              <PanelTitle icon={<Activity size={13} />} title="选中会话 usage" />
-              <div className="mb-4">
-                <TokenUsageChart events={selectedSession.events} />
-              </div>
-              <PanelTitle icon={<Activity size={13} />} title="事件时间线" />
-              <TraceTimeline events={selectedSession.events} />
-            </>
+          {error && (
+            <div
+              className="mb-3 rounded-md px-3 py-2 text-xs"
+              style={{ background: 'var(--bg-hover)', color: 'var(--color-error)' }}
+            >
+              {error}
+            </div>
           )}
-        </section>
-      </div>
+
+          <div className="grid grid-cols-4 gap-2">
+            <Metric
+              label="LLM calls"
+              value={totalUsage.calls.toLocaleString()}
+              icon={<Cpu size={14} />}
+            />
+            <Metric
+              label="Input tokens"
+              value={totalUsage.input.toLocaleString()}
+              icon={<Activity size={14} />}
+            />
+            <Metric
+              label="Cache read"
+              value={formatRate(readRate(totalUsage))}
+              icon={<Gauge size={14} />}
+            />
+            <Metric
+              label="Missing usage"
+              value={totalUsage.missingUsage.toLocaleString()}
+              icon={<AlertTriangle size={14} />}
+            />
+          </div>
+
+          <div className="mt-4 grid min-h-0 flex-1 grid-cols-[minmax(220px,280px)_1fr] gap-4">
+            <section className="min-h-0 overflow-auto">
+              <PanelTitle icon={<Server size={13} />} title="会话" />
+              <div className="space-y-1.5">
+                {filteredSessions.map((session) => {
+                  const usage = emptyUsage();
+                  session.events.forEach((event) => addUsage(usage, event));
+                  return (
+                    <button
+                      key={session.sessionId}
+                      onClick={() => setSelectedSessionId(session.sessionId)}
+                      className="w-full rounded-md px-2 py-2 text-left"
+                      style={{
+                        background:
+                          selectedSession?.sessionId === session.sessionId
+                            ? 'var(--bg-hover)'
+                            : 'var(--bg-secondary)',
+                        color: 'var(--text-secondary)',
+                      }}
+                    >
+                      <div
+                        className="truncate text-xs font-medium"
+                        style={{ color: 'var(--text-primary)' }}
+                      >
+                        {session.sessionId}
+                      </div>
+                      <div className="mt-1 text-[10px]" style={{ color: 'var(--text-tertiary)' }}>
+                        {usage.calls} calls · {formatRate(readRate(usage))} cache read
+                      </div>
+                    </button>
+                  );
+                })}
+                {filteredSessions.length === 0 && (
+                  <div
+                    className="rounded-md p-3 text-center text-xs"
+                    style={{ color: 'var(--text-tertiary)', background: 'var(--bg-secondary)' }}
+                  >
+                    当前窗口暂无 trace 数据
+                  </div>
+                )}
+              </div>
+            </section>
+
+            <section className="min-h-0 overflow-auto">
+              <PanelTitle icon={<Gauge size={13} />} title="诊断建议" />
+              <div className="mb-4 space-y-1.5">
+                {diagnostics.map((message) => (
+                  <div
+                    key={message}
+                    className="rounded-md px-3 py-2 text-xs"
+                    style={{ background: 'var(--bg-secondary)', color: 'var(--text-secondary)' }}
+                  >
+                    {message}
+                  </div>
+                ))}
+              </div>
+
+              <PanelTitle icon={<Cpu size={13} />} title="模型对比" />
+              <div
+                className="mb-4 overflow-hidden rounded-lg border"
+                style={{ borderColor: 'var(--border-primary)' }}
+              >
+                {modelUsage.map((model) => (
+                  <div
+                    key={model.model}
+                    className="grid grid-cols-[1fr_80px_80px_80px] gap-2 border-b px-3 py-2 text-xs last:border-b-0"
+                    style={{ borderColor: 'var(--border-primary)' }}
+                  >
+                    <span className="truncate font-mono" style={{ color: 'var(--text-primary)' }}>
+                      {model.model}
+                    </span>
+                    <span style={{ color: 'var(--text-secondary)' }}>{model.calls} calls</span>
+                    <span style={{ color: 'var(--text-secondary)' }}>
+                      {formatRate(readRate(model))}
+                    </span>
+                    <span style={{ color: 'var(--text-tertiary)' }}>
+                      {model.missingUsage} missing
+                    </span>
+                  </div>
+                ))}
+                {modelUsage.length === 0 && (
+                  <div
+                    className="px-3 py-4 text-center text-xs"
+                    style={{ color: 'var(--text-tertiary)' }}
+                  >
+                    暂无模型 usage
+                  </div>
+                )}
+              </div>
+
+              {selectedSession && (
+                <>
+                  <PanelTitle icon={<Activity size={13} />} title="选中会话 usage" />
+                  <div className="mb-4">
+                    <TokenUsageChart events={selectedSession.events} />
+                  </div>
+                  <PanelTitle icon={<Activity size={13} />} title="事件时间线" />
+                  <TraceTimeline events={selectedSession.events} />
+                </>
+              )}
+            </section>
+          </div>
         </>
       )}
     </div>
@@ -346,11 +418,17 @@ export function ObservabilityPanel() {
 function Metric({ label, value, icon }: { label: string; value: string; icon: ReactNode }) {
   return (
     <div className="rounded-lg p-3" style={{ background: 'var(--bg-secondary)' }}>
-      <div className="mb-1 flex items-center gap-1.5 text-[10px]" style={{ color: 'var(--text-tertiary)' }}>
+      <div
+        className="mb-1 flex items-center gap-1.5 text-[10px]"
+        style={{ color: 'var(--text-tertiary)' }}
+      >
         {icon}
         {label}
       </div>
-      <div className="truncate font-mono text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>
+      <div
+        className="truncate font-mono text-sm font-semibold"
+        style={{ color: 'var(--text-primary)' }}
+      >
         {value}
       </div>
     </div>
@@ -359,7 +437,10 @@ function Metric({ label, value, icon }: { label: string; value: string; icon: Re
 
 function PanelTitle({ icon, title }: { icon: ReactNode; title: string }) {
   return (
-    <div className="mb-2 flex items-center gap-1.5 text-xs font-medium" style={{ color: 'var(--text-primary)' }}>
+    <div
+      className="mb-2 flex items-center gap-1.5 text-xs font-medium"
+      style={{ color: 'var(--text-primary)' }}
+    >
       {icon}
       {title}
     </div>
