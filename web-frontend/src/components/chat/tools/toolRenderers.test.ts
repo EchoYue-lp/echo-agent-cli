@@ -50,4 +50,38 @@ describe('tool renderer registry', () => {
       detail: '{"value":1}',
     });
   });
+
+  it('summarizes browser actions by domain and target', () => {
+    expect(
+      describeToolExecution(
+        tool('browser_click', { url: 'https://docs.rs/echo-agent', target: 'Search' })
+      )
+    ).toMatchObject({
+      kind: 'browser',
+      title: 'Click',
+      detail: 'https://docs.rs/echo-agent · Search',
+    });
+  });
+
+  it('summarizes MCP identity and structured result type', () => {
+    expect(describeToolExecution(tool('mcp__github__list_issues', {}, '[{"id":1}]'))).toMatchObject(
+      {
+        kind: 'mcp',
+        title: 'github · list_issues',
+        detail: 'JSON array',
+      }
+    );
+  });
+
+  it('summarizes subagent dispatch without duplicating its execution panel', () => {
+    expect(
+      describeToolExecution(
+        tool('agent_tool', { agent_name: 'reviewer', task: 'Review the browser renderer' })
+      )
+    ).toMatchObject({
+      kind: 'task',
+      title: 'Subagent reviewer',
+      detail: 'Review the browser renderer',
+    });
+  });
 });

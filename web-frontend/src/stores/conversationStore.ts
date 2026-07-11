@@ -309,22 +309,20 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
           };
           base.executionRounds = (m.execution_rounds as ExecutionRound[]).map((r) => ({
             thinking: r.thinking ? { content: r.thinking.content } : undefined,
-            tools: (r.tools || []).map(
-              (t, index) => ({
-                id: t.id || `restored-${index}-${Date.now()}`,
-                name: t.name,
-                args: t.args || {},
-                result: t.result || '',
-                success: t.success ?? true,
-                status: t.status === 'running' ? 'cancelled' : t.status || 'succeeded',
-                stdout: t.stdout || (t.success === false ? '' : t.result || ''),
-                stderr: t.stderr || (t.success === false ? t.result || '' : ''),
-                log: t.log || '',
-                startedAt: t.startedAt || Date.now(),
-                finishedAt: t.finishedAt || Date.now(),
-                truncated: t.truncated,
-              })
-            ),
+            tools: (r.tools || []).map((t, index) => ({
+              id: t.id || `restored-${index}-${Date.now()}`,
+              name: t.name,
+              args: t.args || {},
+              result: t.result || '',
+              success: t.success ?? true,
+              status: t.status === 'running' ? 'cancelled' : t.status || 'succeeded',
+              stdout: t.stdout || (t.success === false ? '' : t.result || ''),
+              stderr: t.stderr || (t.success === false ? t.result || '' : ''),
+              log: t.log || '',
+              startedAt: t.startedAt || Date.now(),
+              finishedAt: t.finishedAt || Date.now(),
+              truncated: t.truncated,
+            })),
           }));
         }
 

@@ -394,6 +394,34 @@ pub(crate) fn tool_command(name: &str, args: &str) -> String {
             text(&["query", "pattern", "symbol"]).unwrap_or("query")
         ),
         "glob" => format!("Find \"{}\"", text(&["pattern"]).unwrap_or("pattern")),
+        name if name.starts_with("browser_") => {
+            let action = name.trim_start_matches("browser_").replace('_', " ");
+            if name == "browser_navigate" {
+                format!("Open {}", text(&["url"]).unwrap_or("page"))
+            } else {
+                format!(
+                    "{}{}",
+                    action.chars().next().unwrap_or_default().to_uppercase(),
+                    action.chars().skip(1).collect::<String>()
+                )
+            }
+        }
+        "agent_tool" => format!("Subagent {}", text(&["agent_name"]).unwrap_or("dispatch")),
+        "create_complex_task" => "Start task run".to_string(),
+        "plan_execute" => value
+            .get("task")
+            .and_then(|task| task.get("agent_role"))
+            .and_then(serde_json::Value::as_str)
+            .map(|role| format!("Execute with {role}"))
+            .unwrap_or_else(|| "Execute plan".to_string()),
+        name if name.starts_with("mcp__") => {
+            let mut parts = name.splitn(3, "__");
+            let _prefix = parts.next();
+            match (parts.next(), parts.next()) {
+                (Some(server), Some(tool)) => format!("{server} · {tool}"),
+                _ => name.to_string(),
+            }
+        }
         _ => format!("{name} {args}"),
     }
 }
@@ -445,6 +473,38 @@ pub(crate) fn tool_detail(tool: &ToolExecutionMessage) -> String {
                 String::new()
             }
         }
+        name if name.starts_with("browser_") => [
+            value
+                .get("url")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            value
+                .get("target")
+                .or_else(|| value.get("element"))
+                .or_else(|| value.get("selector"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · "),
+        "agent_tool" => value
+            .get("task")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        "create_complex_task" => value
+            .get("user_goal")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        "plan_execute" => value
+            .get("task")
+            .and_then(|task| task.get("description"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
         _ => String::new(),
     }
 }
@@ -484,6 +544,26 @@ pub(crate) fn tool_shows_success_tail(tool: &ToolExecutionMessage) -> bool {
             | "glob"
             | "code_search"
             | "search_text"
+            | "agent_tool"
+            | "plan_execute"
+            | "create_complex_task"
+            | "browser_backend"
+            | "browser_navigate"
+            | "browser_snapshot"
+            | "browser_click"
+            | "browser_fill"
+            | "browser_screenshot"
+            | "browser_back"
+            | "browser_reload"
+            | "browser_tabs"
+            | "browser_click_at"
+            | "browser_type_at"
+            | "browser_scroll"
+            | "browser_console"
+            | "browser_network"
+            | "browser_dom_inspect"
+            | "browser_performance_trace"
+            | "browser_developer_mode"
     )
 }
 

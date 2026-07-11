@@ -2,7 +2,7 @@
 
 日期: 2026-07-11
 
-状态: shell 垂直切片与 M5 第一批 read/edit/search renderer 已完成;browser/MCP/subagent renderer 待后续阶段
+状态: shell 垂直切片与 M5 read/edit/search/browser/MCP/subagent renderer 已完成
 
 ## 0. 实施结果 (2026-07-11)
 
@@ -28,6 +28,12 @@ M5 第一批完成 (2026-07-11):
 - 上述工具成功态默认压缩为单行,失败态仍显示错误 tail,展开后保留完整输出与 diff。
 - TUI 使用同一字段语义生成紧凑标题与 detail,成功态不刷大段结果,失败态保留 tail;文件写工具原有完整 diff 视图不变。
 - Browser、MCP、subagent 未注册到该 registry,继续使用既有专属事件/面板或 Generic fallback,避免重复卡片。
+
+M5 第二批完成 (2026-07-11):
+
+- GUI/TUI 新增 browser 紧凑摘要:动作、URL/域名与 target；成功态折叠文本输出,截图与实时页面继续由既有 Browser Panel/BrowserEvent 承载。
+- MCP renderer 只在事件提供显式 `mcp__server__tool` identity、`mcp_server` metadata 或 server 参数时启用,显示 server/tool 与 text/JSON result type；缺少来源时不猜 server,继续 Generic fallback。
+- `agent_tool`、`plan_execute`、`create_complex_task` 显示 subagent/plan/run 摘要并折叠成功输出；完整生命周期继续复用既有 execution panel/SubagentStreamBlock,不重复造卡片。
 
 验证结果:
 
@@ -505,14 +511,14 @@ interface ToolExecutionView {
 1. ✅ `read_file`:路径、行范围、读取行数。
 2. ✅ `edit_file/write_file/create_file`:路径、变更规模、diff。
 3. ✅ `grep/glob/code_search/search_text`:查询词、范围、过滤条件、命中摘要。
-4. browser/web:域名、页面标题、动作摘要。
-5. MCP:server/tool 名、结果类型。
-6. subagent/task:复用现有 execution panel,不重复造卡片。
+4. ✅ browser/web:域名、页面标题、动作摘要。
+5. ✅ MCP:server/tool 名、结果类型。
+6. ✅ subagent/task:复用现有 execution panel,不重复造卡片。
 
 - [x] 每类 renderer 只解析已知字段,解析失败回退 Generic。
 - [x] 文件写工具完成后优先显示 diff/统计,不展示整份 JSON args。
 - [x] 读/搜索工具成功态默认单行,避免占据聊天主视觉。
-- [ ] browser screenshot/chart/image 等富媒体继续走已有专属组件。
+- [x] browser screenshot/chart/image 等富媒体继续走已有专属组件。
 
 ## 8. 输出、背压与内存策略
 

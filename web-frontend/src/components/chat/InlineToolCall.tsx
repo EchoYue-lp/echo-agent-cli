@@ -7,9 +7,12 @@ import {
   Copy,
   FileSearch,
   FileText,
+  Globe,
   LoaderCircle,
   Pencil,
+  Plug,
   Terminal,
+  Workflow,
   Wrench,
   X,
 } from 'lucide-react';
@@ -89,6 +92,12 @@ export const InlineToolCall = memo(function InlineToolCall({
       <Pencil size={12} className="mt-0.5 shrink-0 text-[var(--text-tertiary)]" />
     ) : descriptor.kind === 'search' ? (
       <FileSearch size={12} className="mt-0.5 shrink-0 text-[var(--text-tertiary)]" />
+    ) : descriptor.kind === 'browser' ? (
+      <Globe size={12} className="mt-0.5 shrink-0 text-[var(--text-tertiary)]" />
+    ) : descriptor.kind === 'mcp' ? (
+      <Plug size={12} className="mt-0.5 shrink-0 text-[var(--text-tertiary)]" />
+    ) : descriptor.kind === 'task' ? (
+      <Workflow size={12} className="mt-0.5 shrink-0 text-[var(--text-tertiary)]" />
     ) : (
       <Wrench size={12} className="mt-0.5 shrink-0 text-[var(--text-tertiary)]" />
     );

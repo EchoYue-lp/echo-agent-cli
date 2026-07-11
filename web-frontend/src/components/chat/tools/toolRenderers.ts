@@ -1,6 +1,14 @@
 import type { ToolExecution } from '../../../types/api';
 
-export type ToolRendererKind = 'shell' | 'read' | 'write' | 'search' | 'generic';
+export type ToolRendererKind =
+  | 'shell'
+  | 'read'
+  | 'write'
+  | 'search'
+  | 'browser'
+  | 'mcp'
+  | 'task'
+  | 'generic';
 
 export interface ToolRenderDescriptor {
   kind: ToolRendererKind;
@@ -32,6 +40,97 @@ function numberArg(args: Record<string, unknown>, ...keys: string[]): number | u
 function resultCount(result: string): string | undefined {
   const match = result.match(/(?:showing\s+\d+\s+of\s+)?(\d+)\s+(?:matches|results|files?)\b/i);
   return match?.[1] ? `${match[1]} matches` : undefined;
+}
+
+function browserDomain(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  try {
+    return new URL(value).hostname || value;
+  } catch {
+    return value;
+  }
+}
+
+function describeBrowser(tool: ToolExecution): ToolRenderDescriptor {
+  const args = argsRecord(tool);
+  const url = textArg(args, 'url');
+  const domain = browserDomain(url);
+  const target = textArg(args, 'target', 'element', 'selector', 'ref');
+  const action = tool.name.replace(/^browser_/, '').replaceAll('_', ' ');
+  const title =
+    tool.name === 'browser_navigate'
+      ? `Open ${domain || 'page'}`
+      : tool.name === 'browser_snapshot'
+        ? `Inspect ${domain || 'page'}`
+        : `${action.charAt(0).toUpperCase()}${action.slice(1)}`;
+  const detail = [url && domain !== url ? url : undefined, target].filter(Boolean).join(' · ');
+  return {
+    kind: 'browser',
+    title,
+    detail: detail || undefined,
+    collapseSuccessfulOutput: true,
+  };
+}
+
+function mcpIdentity(tool: ToolExecution): { server?: string; name: string } | undefined {
+  const args = argsRecord(tool);
+  const server = tool.metadata?.mcp_server || textArg(args, 'server', 'server_name');
+  const namespaced = tool.name.match(/^mcp__(.+?)__(.+)$/);
+  if (namespaced?.[1] && namespaced[2]) return { server: namespaced[1], name: namespaced[2] };
+  if (!server) return undefined;
+  return { server, name: tool.name };
+}
+
+function mcpResultType(tool: ToolExecution): string {
+  const explicit = tool.metadata?.result_type;
+  if (explicit) return explicit;
+  const result = tool.result.trim();
+  if (!result) return 'empty result';
+  try {
+    const value: unknown = JSON.parse(result);
+    return Array.isArray(value) ? 'JSON array' : 'JSON object';
+  } catch {
+    return 'text result';
+  }
+}
+
+function describeMcp(
+  tool: ToolExecution,
+  identity: { server?: string; name: string }
+): ToolRenderDescriptor {
+  return {
+    kind: 'mcp',
+    title: identity.server ? `${identity.server} · ${identity.name}` : identity.name,
+    detail: tool.status === 'running' ? undefined : mcpResultType(tool),
+    collapseSuccessfulOutput: true,
+  };
+}
+
+function describeTask(tool: ToolExecution): ToolRenderDescriptor {
+  const args = argsRecord(tool);
+  const inlineTask =
+    args.task && typeof args.task === 'object' ? (args.task as Record<string, unknown>) : undefined;
+  const role = textArg(args, 'agent_name') || (inlineTask && textArg(inlineTask, 'agent_role'));
+  const task =
+    textArg(args, 'user_goal') ||
+    (typeof args.task === 'string' ? args.task : undefined) ||
+    (inlineTask && textArg(inlineTask, 'description'));
+  const title =
+    tool.name === 'agent_tool'
+      ? `Subagent ${role || 'dispatch'}`
+      : tool.name === 'create_complex_task'
+        ? 'Start task run'
+        : tool.name === 'plan_execute'
+          ? role
+            ? `Execute with ${role}`
+            : 'Execute plan'
+          : tool.name.replaceAll('_', ' ');
+  return {
+    kind: 'task',
+    title,
+    detail: task || undefined,
+    collapseSuccessfulOutput: true,
+  };
 }
 
 function describeRead(tool: ToolExecution): ToolRenderDescriptor {
@@ -97,6 +196,11 @@ export function describeToolExecution(tool: ToolExecution): ToolRenderDescriptor
   if (['edit_file', 'write_file', 'create_file'].includes(tool.name)) return describeWrite(tool);
   if (['grep', 'glob', 'code_search', 'search_text'].includes(tool.name))
     return describeSearch(tool);
+  if (tool.name.startsWith('browser_')) return describeBrowser(tool);
+  if (['agent_tool', 'plan_execute', 'create_complex_task'].includes(tool.name))
+    return describeTask(tool);
+  const mcp = mcpIdentity(tool);
+  if (mcp) return describeMcp(tool, mcp);
 
   const args = tool.args == null ? '' : JSON.stringify(tool.args);
   return {

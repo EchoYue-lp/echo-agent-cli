@@ -19,7 +19,9 @@ describe('chat tool execution projection', () => {
     store.appendToolOutput('call-a', 'stderr', 'warning');
     store.completeToolCall('call-a', 'failed', false);
 
-    const tools = useChatStore.getState().messages.find((message) => message.isStreaming)?.toolCalls;
+    const tools = useChatStore
+      .getState()
+      .messages.find((message) => message.isStreaming)?.toolCalls;
     expect(tools).toHaveLength(2);
     expect(tools?.find((tool) => tool.id === 'call-a')).toMatchObject({
       status: 'failed',
@@ -49,12 +51,7 @@ describe('chat tool execution projection', () => {
     const store = useChatStore.getState();
     store.startAssistantMessage('assistant-metadata');
     store.setToolCall('call-meta', 'shell', { command: 'exit 7' });
-    store.completeToolStream(
-      'call-meta',
-      false,
-      { exit_code: '7', duration_ms: '1250' },
-      true
-    );
+    store.completeToolStream('call-meta', false, { exit_code: '7', duration_ms: '1250' }, true);
 
     const tool = useChatStore.getState().messages[0]?.toolCalls?.[0];
     expect(tool).toMatchObject({

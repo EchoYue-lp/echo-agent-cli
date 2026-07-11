@@ -394,6 +394,39 @@ mod tool_execution_tests {
         tool.stdout = "src/lib.rs:10:ToolResult\n\n12 matches found".to_string();
         assert_eq!(tool_detail(&tool), "in src · 12 matches");
     }
+
+    #[test]
+    fn browser_and_subagent_tools_render_compact_titles() {
+        assert_eq!(
+            tool_command(
+                "browser_navigate",
+                r#"{"url":"https://docs.rs/echo-agent"}"#
+            ),
+            "Open https://docs.rs/echo-agent"
+        );
+        assert_eq!(
+            tool_command(
+                "agent_tool",
+                r#"{"agent_name":"reviewer","task":"Review renderer"}"#
+            ),
+            "Subagent reviewer"
+        );
+    }
+
+    #[test]
+    fn task_tool_detail_reuses_existing_execution_panel_summary() {
+        let tool = execution(
+            "plan_execute",
+            r#"{"task":{"agent_role":"explorer","description":"Inspect browser events"}}"#,
+            ToolExecutionStatus::Succeeded,
+        );
+        assert_eq!(
+            tool_command(&tool.name, &tool.args),
+            "Execute with explorer"
+        );
+        assert_eq!(tool_detail(&tool), "Inspect browser events");
+        assert!(tool_output_tail(&tool, 6).is_empty());
+    }
 }
 
 /// Run the main event loop.

@@ -355,7 +355,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const update = (tool: ToolExecution): ToolExecution => {
         if (tool.id !== callId) return tool;
         const appended = appendBounded(tool[channel], chunk);
-        return { ...tool, [channel]: appended.value, truncated: tool.truncated || appended.truncated };
+        return {
+          ...tool,
+          [channel]: appended.value,
+          truncated: tool.truncated || appended.truncated,
+        };
       };
       return {
         messages: s.messages.map((m) =>
