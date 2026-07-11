@@ -54,23 +54,24 @@ pub trait ChatSink: Send + Sync + 'static {
 ///
 /// Wraps `message` (plus optional `multimodal`) into one `Message`, streams the
 /// agent's reply through `sink`, and returns. No route pre-judgment; the
-/// per-turn TaskRuntime run is only the shared context anchor for task tools
-/// and forked subagents. The agent still decides whether a complex run is
+/// turn id is only the shared context anchor for task tools and forked
+/// subagents. A TaskRuntime run is created lazily only when the agent actually
+/// creates or executes a plan. The agent still decides whether a complex run is
 /// warranted by calling `plan_create`, `plan_execute`, or
 /// `create_complex_task`.
 ///
-/// ## run_id scoping (防"真空区"死结)
+/// ## turn/run identity
 ///
-/// 普通 chat 轮次也包一层 `with_run_context`,用 `res.root_message_id` 作
-/// run_id。这样主 agent 在 ReAct 循环里调
+/// 普通 chat 轮次使用 `res.root_message_id` 作 turn_id。task tools 若被调用，
+/// 会从该 turn_id 派生独立的 `taskrun:<turn_id>`，并按需创建正式 TaskRun。这样
+/// 主 agent 在 ReAct 循环里调
 /// `plan_create` / `plan_execute` / `create_complex_task` 等依赖
 /// `require_run_id()` 的工具时,能从 task_local 读到 run_id,不再被
 /// `"no active run — run_id not set in context"` 提前拒绝(对齐 Claude Code
 /// 的无门槛只读 dispatch)。
 ///
-/// 该 run_id 同时写入 TaskRuntimeStore 和 Agent ExternalRunContext,作为
-/// 本轮 task/subagent trace 的统一锚点。`create_complex_task` 仍会 new 一个
-/// Uuid 作背景 run id,不与这个前台 chat run 冲突。
+/// turn_id 进入 Agent ExternalRunContext；普通聊天不写 TaskRuntimeStore。
+/// `create_complex_task` 和 inline/formal plan 各自拥有真正的 run_id。
 pub async fn drive_chat(
     agent: &AgentHandle,
     message: &str,
@@ -81,65 +82,26 @@ pub async fn drive_chat(
     // plan_execute / create_complex_task) can read it via require_run_id().
     // Use root_message_id (unique per turn, set by all 3 callers); fall back to
     // a fresh uuid if a caller forgot to set it (defensive, never panics).
-    let run_id = if res.root_message_id.trim().is_empty() {
-        tracing::warn!("drive_chat: root_message_id empty — using fallback uuid as run_id");
+    let turn_id = if res.root_message_id.trim().is_empty() {
+        tracing::warn!("drive_chat: root_message_id empty — using fallback uuid as turn_id");
         uuid::Uuid::new_v4().to_string()
     } else {
         res.root_message_id.clone()
     };
 
-    // Ensure the TaskRuntimeStore has a run record for this turn's run_id.
-    // drive_chat scopes run_id=root_message_id into task_local so task_* tools
-    // can read it, but without a create_run the store has no record → every
-    // plan_create write becomes an orphan (no RunCreated event ancestor) and
-    // rebuild_plan_from_events discards them → task_list returns empty.
-    // Idempotent: skips if the run already exists (create_complex_task / a
-    // resumed turn may have created it).
-    if let Some(store) = res.store.as_ref() {
-        let conv = res
-            .conv_id
-            .clone()
-            .unwrap_or_else(|| format!("message:{run_id}"));
-        match store.create_run(
-            &run_id,
-            "default",
-            &conv,
-            &run_id,
-            crate::tasks::task_runtime::types::DomainProfile::General,
-            message,
-            "chat_turn",
-            crate::tasks::task_runtime::types::AttendedMode::Attended,
-        ) {
-            Ok(run) => {
-                if run.status == crate::tasks::task_runtime::types::TaskRunStatus::Pending {
-                    let _ = store.transition_run(
-                        &run_id,
-                        crate::tasks::task_runtime::types::TaskRunStatus::Running,
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    run_id = %run_id,
-                    "drive_chat: ad-hoc create_run failed (task tools may not persist)"
-                );
-            }
-        }
-    }
-
     let cancel = res.cancel.clone();
     let trace_sink = res.sink.worker_trace_sink();
-    let run_id_for_inner = run_id.clone();
+    let formal_run_id = crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(&turn_id);
+    let turn_id_for_inner = turn_id.clone();
     let _projection_registration = res.store.as_ref().map(|store| {
         crate::tasks::task_runtime::compact_context::task_runtime_projection_registry()
-            .register(run_id.clone(), std::sync::Arc::clone(store))
+            .register(formal_run_id.clone(), std::sync::Arc::clone(store))
     });
     crate::tasks::task_runtime::task_tools::with_run_context(
-        run_id,
+        formal_run_id,
         cancel,
         trace_sink,
-        drive_chat_inner(agent, message, multimodal, res, run_id_for_inner),
+        drive_chat_inner(agent, message, multimodal, res, turn_id_for_inner),
     )
     .await
 }
@@ -150,7 +112,7 @@ async fn drive_chat_inner(
     message: &str,
     multimodal: Option<&Message>,
     res: std::sync::Arc<crate::chat_resources::ChatResources>,
-    run_id: String,
+    turn_id: String,
 ) -> Result<(), String> {
     let msg: Message = match multimodal {
         Some(m) => m.clone(),
@@ -173,6 +135,7 @@ async fn drive_chat_inner(
     // resources scope, so we can apply Chat-mode tool hiding after acquiring
     // the agent read guard.
     let interaction_mode = res.interaction_mode;
+    let conversation_id = res.conv_id.clone();
     // Scope the chat resources into a task_local so tools the agent calls
     // mid-ReAct (create_complex_task / check_run_status / cancel_run, Phase B3)
     // can reach pool/store/sink via `current_chat_resources()`.
@@ -215,11 +178,11 @@ async fn drive_chat_inner(
         // running inside the framework's spawned tool executor.
         let invocation = echo_core::agent::AgentInvocationContext {
             runtime: Some(echo_core::tools::ExternalRunContext {
-                run_id: run_id.clone(),
+                conversation_id,
+                run_id: None,
+                turn_id: Some(turn_id.clone()),
                 execution_id: None,
-                // Chat path: run_id == root_message_id (set in drive_chat), so the
-                // subagent stream can be pinned to this turn's message block.
-                message_id: Some(run_id),
+                message_id: Some(turn_id),
                 cancel: Some(std::sync::Arc::new(cancel.clone())),
                 trace_sink: sink.trace_sink(),
                 delegation_policy: None,
@@ -360,7 +323,7 @@ mod tests {
         );
         let res = Arc::new(crate::chat_resources::ChatResources {
             pool: None,
-            store: Some(store),
+            store: Some(Arc::clone(&store)),
             sink,
             conv_id: None,
             root_message_id: "m1".to_string(),
@@ -379,6 +342,13 @@ mod tests {
             "drive_chat should stream FinalAnswer to sink; events recorded: {}",
             chat_sink.event_count()
         );
+        assert!(
+            store
+                .get_run(&crate::tasks::task_runtime::task_tools::formal_run_id_for_turn("m1"))
+                .expect("read task run")
+                .is_none(),
+            "ordinary chat must not create a TaskRun"
+        );
     }
 
     #[tokio::test]
@@ -392,7 +362,8 @@ mod tests {
         use echo_agent::agent::CancellationToken;
         use std::sync::Arc;
 
-        let run_id = "projection-spawn-boundary";
+        let turn_id = "projection-spawn-boundary";
+        let run_id = crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(turn_id);
         let mock = Arc::new(
             echo_agent::testing::MockLlmClient::new()
                 .with_model_name("t")
@@ -413,10 +384,10 @@ mod tests {
         );
         store
             .create_run(
-                run_id,
+                &run_id,
                 "default",
                 "c1",
-                run_id,
+                turn_id,
                 DomainProfile::General,
                 "boundary goal",
                 "complex_runtime",
@@ -426,7 +397,7 @@ mod tests {
         store
             .attach_plan(&TaskPlan {
                 plan_id: "boundary-plan".to_string(),
-                run_id: run_id.to_string(),
+                run_id: run_id.clone(),
                 domain_profile: DomainProfile::General,
                 goal: "boundary goal".to_string(),
                 assumptions: Vec::new(),
@@ -448,7 +419,7 @@ mod tests {
             store: Some(Arc::clone(&store)),
             sink,
             conv_id: Some("c1".to_string()),
-            root_message_id: run_id.to_string(),
+            root_message_id: turn_id.to_string(),
             attachments: Vec::new(),
             cancel: CancellationToken::new(),
             mode_hint: None,
@@ -473,7 +444,7 @@ mod tests {
         {
             return Err("runtime projection did not cross snapshot/spawn boundary".to_string());
         }
-        if task_runtime_projection_registry().contains(run_id) {
+        if task_runtime_projection_registry().contains(&run_id) {
             return Err("drive_chat did not unregister projection on exit".to_string());
         }
         Ok(())

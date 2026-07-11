@@ -224,8 +224,8 @@ impl Tool for ExecutePlanTool {
     fn execute<'a>(&'a self, params: ToolParameters) -> BoxFuture<'a, error::Result<ToolResult>> {
         Box::pin(async move {
             // ── 从 task_local 读取 run_id (§10.1) ──
-            // drive_chat 已为普通 chat 轮次 scope 了 run_id (用 root_message_id),
-            // 故这里总能拿到值。
+            // drive_chat 为普通 chat turn scope 了独立 formal run id
+            // (`taskrun:<turn_id>`)，故这里总能拿到值；TaskRun 仍按需创建。
             //
             // P1.0: `mut` — inline 分支会重新赋值为独立的 inline_<uuid> run_id,
             // 让后续 route_str/lock/execute_run/build_run_summaries 全部用 inline
@@ -235,7 +235,9 @@ impl Tool for ExecutePlanTool {
                 Ok(id) => id,
                 Err(e) => return Ok(e),
             };
-            let root_message_id = run_id.clone();
+            let root_message_id = crate::chat_resources::current_chat_resources()
+                .map(|resources| resources.root_message_id.clone())
+                .unwrap_or_else(|| run_id.clone());
             tracing::info!(
                 run_id = %run_id,
                 has_inline_task = params.contains_key("task"),
@@ -250,8 +252,7 @@ impl Tool for ExecutePlanTool {
             // ── inline task 路径 (吸收原 delegate_readonly 语义) ──
             // 当 LLM 传入 task 对象时,组装单任务 plan 直接走 execute_run,
             // 继承全部可见性 (started/completed/usage) + 调度 + 统计。
-            // 普通 chat 轮次的 run_id (root_message_id) 没在 store 建过 run,
-            // 故需先建 ad-hoc run (create_run + transition Running)。
+            // 普通 chat turn 不预建 TaskRun；inline 路径会创建自己的独立 run。
             if params.contains_key("task") {
                 if crate::chat_resources::current_chat_resources()
                     .is_some_and(|res| res.interaction_mode == super::types::InteractionMode::Task)

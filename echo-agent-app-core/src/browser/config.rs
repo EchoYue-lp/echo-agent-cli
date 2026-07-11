@@ -11,6 +11,7 @@ pub struct BrowserConfig {
     pub package: String,
     pub user_data_dir: PathBuf,
     pub output_dir: PathBuf,
+    pub session_dir: PathBuf,
     pub headless: bool,
     pub startup_timeout_secs: u64,
 }
@@ -29,6 +30,9 @@ impl BrowserConfig {
         }
         if let Some(path) = env_non_empty("EKO_BROWSER_OUTPUT_DIR") {
             config.output_dir = PathBuf::from(path);
+        }
+        if let Some(path) = env_non_empty("EKO_BROWSER_SESSION_DIR") {
+            config.session_dir = PathBuf::from(path);
         }
         if let Some(timeout) = env_non_empty("EKO_BROWSER_STARTUP_TIMEOUT_SECS")
             .and_then(|value| value.parse::<u64>().ok())
@@ -67,6 +71,7 @@ impl Default for BrowserConfig {
             package: DEFAULT_PACKAGE.to_string(),
             user_data_dir: base_dir.join("profiles").join("managed"),
             output_dir: base_dir.join("output"),
+            session_dir: base_dir.join("sessions"),
             headless: false,
             startup_timeout_secs: 60,
         }

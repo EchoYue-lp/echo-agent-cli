@@ -808,7 +808,7 @@ fn build_writer_worker_agent(
 
     let mut worker = builder.build()?;
     if let Some(browser_runtime) = browser_runtime {
-        browser_runtime.install_tools(&mut worker);
+        browser_runtime.install_worker_tools(&mut worker);
     }
     let has_client = worker.llm_client().is_some();
     tracing::info!(
@@ -877,7 +877,7 @@ fn build_readonly_worker_agent(
 
     let mut worker = builder.build()?;
     if let Some(browser_runtime) = browser_runtime {
-        browser_runtime.install_tools(&mut worker);
+        browser_runtime.install_worker_tools(&mut worker);
     }
     let has_client = worker.llm_client().is_some();
     tracing::info!(

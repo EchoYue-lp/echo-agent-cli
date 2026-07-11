@@ -1,5 +1,7 @@
 pub mod config;
 pub mod error;
+pub mod event;
+pub mod session;
 pub mod sidecar;
 
 use std::sync::Arc;
@@ -8,7 +10,7 @@ use std::time::Duration;
 use base64::Engine;
 use echo_agent::mcp::{McpClient, McpContent, McpToolCallResult};
 use echo_agent::prelude::{Tool, ToolParameters, ToolResult, ToolRiskLevel};
-use echo_core::tools::ToolResultKind;
+use echo_core::tools::{ToolContext, ToolResultKind};
 use futures::future::BoxFuture;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock};
@@ -16,6 +18,11 @@ use tokio_util::sync::CancellationToken;
 
 pub use config::BrowserConfig;
 pub use error::{BrowserError, BrowserResult};
+pub use event::BrowserEvent;
+pub use session::{
+    BrowserObservation, BrowserSession, BrowserSessionManager, BrowserSessionStatus, BrowserTab,
+    MAIN_TAB_OWNER,
+};
 use sidecar::BrowserSidecar;
 
 #[derive(Clone)]
@@ -25,6 +32,7 @@ pub struct BrowserRuntime {
 
 struct BrowserRuntimeInner {
     config: BrowserConfig,
+    sessions: BrowserSessionManager,
     client: RwLock<Option<Arc<McpClient>>>,
     connect_lock: Mutex<()>,
     shutdown: CancellationToken,
@@ -32,9 +40,12 @@ struct BrowserRuntimeInner {
 
 impl BrowserRuntime {
     pub async fn start(config: BrowserConfig) -> Arc<Self> {
+        let sessions = BrowserSessionManager::new(config.session_dir.clone(), 12_000);
+        sessions.restore_metadata().await;
         let runtime = Arc::new(Self {
             inner: Arc::new(BrowserRuntimeInner {
                 config,
+                sessions,
                 client: RwLock::new(None),
                 connect_lock: Mutex::new(()),
                 shutdown: CancellationToken::new(),
@@ -61,12 +72,24 @@ impl BrowserRuntime {
     }
 
     pub fn install_tools(&self, agent: &mut echo_agent::agent::ReactAgent) {
+        self.install_tools_for(agent, BrowserActor::Main);
+    }
+
+    pub fn install_worker_tools(&self, agent: &mut echo_agent::agent::ReactAgent) {
+        self.install_tools_for(agent, BrowserActor::Worker);
+    }
+
+    fn install_tools_for(&self, agent: &mut echo_agent::agent::ReactAgent, actor: BrowserActor) {
         if self.inner.config.enabled {
-            agent.add_tools(self.tools());
+            agent.add_tools(self.tools_for(actor));
         }
     }
 
     pub fn tools(&self) -> Vec<Box<dyn Tool>> {
+        self.tools_for(BrowserActor::Main)
+    }
+
+    fn tools_for(&self, actor: BrowserActor) -> Vec<Box<dyn Tool>> {
         BrowserAction::ALL
             .iter()
             .copied()
@@ -74,13 +97,23 @@ impl BrowserRuntime {
                 Box::new(ManagedBrowserTool {
                     runtime: self.clone(),
                     action,
+                    actor,
                 }) as Box<dyn Tool>
             })
             .collect()
     }
 
+    pub fn session_manager(&self) -> BrowserSessionManager {
+        self.inner.sessions.clone()
+    }
+
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<BrowserEvent> {
+        self.inner.sessions.subscribe()
+    }
+
     pub async fn shutdown(&self) {
         self.inner.shutdown.cancel();
+        self.inner.sessions.close_all().await;
         let client = self.inner.client.write().await.take();
         if let Some(client) = client {
             client.close().await;
@@ -139,11 +172,213 @@ impl BrowserRuntime {
         &self,
         action: BrowserAction,
         params: ToolParameters,
+        context: &ToolContext,
+        actor: BrowserActor,
     ) -> BrowserResult<ToolResult> {
+        let conversation_id = context
+            .conversation_id
+            .as_deref()
+            .unwrap_or("browser-default");
+        let owner_id = match actor {
+            BrowserActor::Main => MAIN_TAB_OWNER.to_string(),
+            BrowserActor::Worker => context
+                .execution_id
+                .clone()
+                .or_else(|| context.run_id.clone())
+                .or_else(|| context.turn_id.clone())
+                .unwrap_or_else(|| format!("worker-{}", uuid::Uuid::new_v4())),
+        };
+        let tabs_command = if action == BrowserAction::Tabs {
+            params
+                .get("action")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        } else {
+            None
+        };
+        let requested_index = params
+            .get("index")
+            .and_then(Value::as_u64)
+            .and_then(|index| usize::try_from(index).ok());
+        let lease = match tabs_command.as_deref() {
+            Some("new") => self
+                .inner
+                .sessions
+                .open_tab(conversation_id, &owner_id, context.run_id.as_deref())
+                .await
+                .ok_or_else(|| {
+                    BrowserError::Connection("failed to allocate managed browser tab".to_string())
+                })?,
+            Some("select") => {
+                let index = requested_index.ok_or_else(|| BrowserError::Tool {
+                    tool: action.name().to_string(),
+                    message: "select requires a valid non-negative tab index".to_string(),
+                })?;
+                self.inner
+                    .sessions
+                    .select_tab(conversation_id, &owner_id, index)
+                    .await
+                    .ok_or_else(|| BrowserError::Tool {
+                        tool: action.name().to_string(),
+                        message: format!("managed tab index {index} does not exist"),
+                    })?
+            }
+            _ => {
+                self.inner
+                    .sessions
+                    .lease_tab(conversation_id, &owner_id, context.run_id.as_deref())
+                    .await
+            }
+        };
+        let _operation = self.inner.sessions.lock_operation().await;
+        if tabs_command.as_deref() == Some("new") || tabs_command.as_deref() == Some("select") {
+            // The explicit browser_tabs call below performs the matching MCP operation.
+        } else if lease.opened {
+            self.call_mcp(
+                "browser_tabs",
+                json!({ "action": "new", "url": "about:blank" }),
+                context.cancel.as_deref(),
+            )
+            .await?;
+        } else {
+            self.call_mcp(
+                "browser_tabs",
+                json!({ "action": "select", "index": lease.tab_index }),
+                context.cancel.as_deref(),
+            )
+            .await?;
+        }
+
         let (tool, arguments) = action.translate(params)?;
+        let run_id = context.run_id.clone();
+        let turn_id = context.turn_id.clone();
+        let execution_id = context.execution_id.clone();
+        let action_name = action.name().to_string();
+        if action == BrowserAction::Navigate {
+            let url = arguments
+                .get("url")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            self.inner.sessions.emit(BrowserEvent::NavigationStarted {
+                session_id: lease.session_id.clone(),
+                tab_id: lease.tab_id.clone(),
+                url,
+            });
+            self.inner
+                .sessions
+                .set_status(conversation_id, BrowserSessionStatus::Navigating)
+                .await;
+        } else {
+            self.inner
+                .sessions
+                .set_status(conversation_id, BrowserSessionStatus::Acting)
+                .await;
+        }
+        self.inner.sessions.emit(BrowserEvent::ActionStarted {
+            session_id: lease.session_id.clone(),
+            tab_id: lease.tab_id.clone(),
+            action: action_name.clone(),
+            run_id: run_id.clone(),
+            turn_id: turn_id.clone(),
+            execution_id: execution_id.clone(),
+        });
+
+        match self
+            .call_mcp(tool, arguments.clone(), context.cancel.as_deref())
+            .await
+        {
+            Ok(raw_result) => {
+                let result = tool_result(raw_result);
+                self.inner
+                    .sessions
+                    .set_status(conversation_id, BrowserSessionStatus::Ready)
+                    .await;
+                if action == BrowserAction::Navigate {
+                    let url = arguments
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    self.inner
+                        .sessions
+                        .update_url(conversation_id, &lease.tab_id, url)
+                        .await;
+                    self.inner.sessions.emit(BrowserEvent::NavigationCompleted {
+                        session_id: lease.session_id.clone(),
+                        tab_id: lease.tab_id.clone(),
+                        url: url.to_string(),
+                    });
+                }
+                let observation = self
+                    .inner
+                    .sessions
+                    .observation(&lease, &action_name, &result);
+                match action {
+                    BrowserAction::Snapshot => self
+                        .inner
+                        .sessions
+                        .emit(BrowserEvent::Snapshot { observation }),
+                    BrowserAction::Screenshot => self
+                        .inner
+                        .sessions
+                        .emit(BrowserEvent::Screenshot { observation }),
+                    _ => {}
+                }
+                if tabs_command.as_deref() == Some("close") {
+                    let index = requested_index.unwrap_or(lease.tab_index);
+                    self.inner.sessions.close_tab(conversation_id, index).await;
+                }
+                self.inner.sessions.emit(BrowserEvent::ActionCompleted {
+                    session_id: lease.session_id,
+                    tab_id: lease.tab_id,
+                    action: action_name,
+                    run_id,
+                    turn_id,
+                    execution_id,
+                });
+                Ok(result)
+            }
+            Err(error) => {
+                self.inner
+                    .sessions
+                    .set_status(conversation_id, BrowserSessionStatus::Failed)
+                    .await;
+                self.inner.sessions.emit(BrowserEvent::ActionFailed {
+                    session_id: lease.session_id,
+                    tab_id: lease.tab_id,
+                    action: action_name,
+                    run_id,
+                    turn_id,
+                    execution_id,
+                    error: error.to_string(),
+                });
+                Err(error)
+            }
+        }
+    }
+
+    async fn call_mcp(
+        &self,
+        tool: &'static str,
+        arguments: Value,
+        cancel: Option<&CancellationToken>,
+    ) -> BrowserResult<McpToolCallResult> {
         let first = self.ensure_client().await?;
-        match first.call_tool(tool, arguments.clone()).await {
-            Ok(result) => Ok(tool_result(result)),
+        let first_call = first.call_tool(tool, arguments.clone());
+        let first_result = if let Some(cancel) = cancel {
+            tokio::select! {
+                result = first_call => result,
+                _ = cancel.cancelled() => {
+                    self.invalidate_client(&first).await;
+                    first.close().await;
+                    return Err(BrowserError::Cancelled);
+                }
+            }
+        } else {
+            first_call.await
+        };
+        match first_result {
+            Ok(result) => Ok(result),
             Err(first_error) => {
                 tracing::warn!(
                     tool,
@@ -153,21 +388,31 @@ impl BrowserRuntime {
                 self.invalidate_client(&first).await;
                 first.close().await;
                 let restarted = self.ensure_client().await?;
-                restarted
-                    .call_tool(tool, arguments)
-                    .await
-                    .map(tool_result)
-                    .map_err(|error| BrowserError::Tool {
-                        tool: tool.to_string(),
-                        message: error.to_string(),
-                    })
+                let retry = restarted.call_tool(tool, arguments);
+                let result = if let Some(cancel) = cancel {
+                    tokio::select! {
+                        result = retry => result,
+                        _ = cancel.cancelled() => {
+                            self.invalidate_client(&restarted).await;
+                            restarted.close().await;
+                            return Err(BrowserError::Cancelled);
+                        }
+                    }
+                } else {
+                    retry.await
+                };
+                result.map_err(|error| BrowserError::Tool {
+                    tool: tool.to_string(),
+                    message: error.to_string(),
+                })
             }
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BrowserAction {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserAction {
     Navigate,
     Snapshot,
     Click,
@@ -176,6 +421,12 @@ enum BrowserAction {
     Back,
     Reload,
     Tabs,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserActor {
+    Main,
+    Worker,
 }
 
 impl BrowserAction {
@@ -304,6 +555,7 @@ impl BrowserAction {
 struct ManagedBrowserTool {
     runtime: BrowserRuntime,
     action: BrowserAction,
+    actor: BrowserActor,
 }
 
 impl Tool for ManagedBrowserTool {
@@ -328,7 +580,28 @@ impl Tool for ManagedBrowserTool {
         parameters: ToolParameters,
     ) -> BoxFuture<'a, echo_agent::error::Result<ToolResult>> {
         Box::pin(async move {
-            match self.runtime.call(self.action, parameters).await {
+            match self
+                .runtime
+                .call(self.action, parameters, &ToolContext::default(), self.actor)
+                .await
+            {
+                Ok(result) => Ok(result),
+                Err(error) => Ok(ToolResult::error(error.to_string())),
+            }
+        })
+    }
+
+    fn execute_with_context<'a>(
+        &'a self,
+        parameters: ToolParameters,
+        context: &'a ToolContext,
+    ) -> BoxFuture<'a, echo_agent::error::Result<ToolResult>> {
+        Box::pin(async move {
+            match self
+                .runtime
+                .call(self.action, parameters, context, self.actor)
+                .await
+            {
                 Ok(result) => Ok(result),
                 Err(error) => Ok(ToolResult::error(error.to_string())),
             }

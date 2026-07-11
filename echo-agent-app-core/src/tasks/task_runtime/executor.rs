@@ -2361,7 +2361,9 @@ async fn run_readonly_worker(
             let core_trace_sink = worker_trace_sink_to_core(trace_sink);
             Box::pin(async move {
                 let runtime_context = Some(echo_core::tools::ExternalRunContext {
-                    run_id: run_id.clone(),
+                    conversation_id: None,
+                    run_id: Some(run_id.clone()),
+                    turn_id: message_id.clone(),
                     execution_id: Some(execution_id),
                     message_id,
                     cancel: Some(Arc::new(cancel.clone())),
@@ -2439,7 +2441,8 @@ async fn run_writer_worker(
     // (parity with run_main_agent_task, executor.rs:1373-1380).
     let run_record = store.get_run(run_id).ok().flatten();
     let root_message_id = run_record.as_ref().map(|r| r.root_message_id.clone());
-    let run_message: Option<echo_core::llm::types::Message> = run_record.and_then(|r| {
+    let conversation_id = run_record.as_ref().map(|r| r.conversation_id.clone());
+    let run_message: Option<echo_core::llm::types::Message> = run_record.as_ref().and_then(|r| {
         if r.attachments.is_empty() {
             None
         } else {
@@ -2457,7 +2460,9 @@ async fn run_writer_worker(
             let core_trace_sink = worker_trace_sink_to_core(trace_sink);
             Box::pin(async move {
                 let runtime_context = Some(echo_core::tools::ExternalRunContext {
-                    run_id: run_id.clone(),
+                    conversation_id: conversation_id.clone(),
+                    run_id: Some(run_id.clone()),
+                    turn_id: root_message_id.clone(),
                     execution_id: Some(execution_id),
                     message_id: root_message_id,
                     cancel: Some(Arc::new(cancel.clone())),
@@ -2898,6 +2903,11 @@ pub async fn drive_unattended_run(
     repo_root: Option<std::path::PathBuf>,
 ) -> Result<String, ExecError> {
     let child_cancel = parent_cancel.child_token();
+    let conversation_id_for_scope = store
+        .get_run(run_id)
+        .ok()
+        .flatten()
+        .map(|run| run.conversation_id);
 
     // D7 stage 2: attempt to provision an isolated git worktree for write
     // operations. Lazy: only when mode is Worktree AND a repo_root is given
@@ -3007,7 +3017,9 @@ pub async fn drive_unattended_run(
             let agent = agent_inner.read().await;
             let invocation = echo_core::agent::AgentInvocationContext {
                 runtime: Some(echo_core::tools::ExternalRunContext {
-                    run_id: run_id_for_scope.clone(),
+                    conversation_id: conversation_id_for_scope.clone(),
+                    run_id: Some(run_id_for_scope.clone()),
+                    turn_id: None,
                     execution_id: None,
                     message_id: None, // unattended/cron path has no chat message
                     cancel: Some(std::sync::Arc::new(cancel_for_scope.clone())),

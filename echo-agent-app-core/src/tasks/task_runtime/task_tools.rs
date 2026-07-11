@@ -151,6 +151,10 @@ pub(crate) fn require_run_id() -> std::result::Result<String, ToolResult> {
     current_run_id().ok_or_else(|| ToolResult::error("no active run — run_id not set in context"))
 }
 
+pub(crate) fn formal_run_id_for_turn(turn_id: &str) -> String {
+    format!("taskrun:{turn_id}")
+}
+
 /// 从 ToolContext 优先读 run_id(跨 spawn 安全),回退 task_local(主 agent scope)。
 ///
 /// 这是根治 task_local 跨 tokio::spawn 断裂的关键:subagent 在框架层 dispatch_fork
@@ -163,6 +167,7 @@ pub(crate) fn run_id_from_ctx_or_local(
 ) -> std::result::Result<String, ToolResult> {
     ctx.run_id
         .clone()
+        .or_else(|| ctx.turn_id.as_deref().map(formal_run_id_for_turn))
         .or_else(current_run_id)
         .ok_or_else(|| ToolResult::error("no active run — run_id not in ToolContext or task_local"))
 }
@@ -186,7 +191,11 @@ where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = R>,
 {
-    match &ctx.run_id {
+    let scoped_run_id = ctx
+        .run_id
+        .clone()
+        .or_else(|| ctx.turn_id.as_deref().map(formal_run_id_for_turn));
+    match scoped_run_id {
         Some(rid) => {
             let cancel = ctx
                 .cancel
@@ -204,7 +213,7 @@ where
             CURRENT_CANCEL
                 .scope(
                     cancel,
-                    CURRENT_RUN_ID.scope(rid.clone(), CURRENT_TRACE_SINK.scope(trace_sink, f())),
+                    CURRENT_RUN_ID.scope(rid, CURRENT_TRACE_SINK.scope(trace_sink, f())),
                 )
                 .await
         }

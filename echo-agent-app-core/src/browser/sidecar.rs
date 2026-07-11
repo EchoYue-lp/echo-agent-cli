@@ -28,6 +28,9 @@ impl BrowserSidecar {
         tokio::fs::create_dir_all(&config.output_dir)
             .await
             .map_err(|error| BrowserError::Io(error.to_string()))?;
+        tokio::fs::create_dir_all(&config.session_dir)
+            .await
+            .map_err(|error| BrowserError::Io(error.to_string()))?;
         Ok(())
     }
 

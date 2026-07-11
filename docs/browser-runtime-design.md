@@ -26,6 +26,10 @@ The implementation proceeds in independently committable stages:
 - [Playwright MCP](https://github.com/microsoft/playwright-mcp) provides the
   initial browser execution engine so EKO does not duplicate semantic locators,
   navigation waits, tab handling, or page lifecycle behavior.
+- [Claude Code hooks](https://docs.anthropic.com/en/docs/claude-code/hooks)
+  distinguish a stable `session_id`, per-prompt `prompt_id`, subagent
+  `agent_id`, and tool `tool_use_id`. Codex's JSON event/runtime model likewise
+  separates a persistent thread, each turn, and items inside the turn.
 
 The shared pattern is to keep browser execution outside the agent loop, expose
 structured browser actions and observations as tools/events, and treat an
@@ -145,19 +149,46 @@ Environment overrides:
 | `EKO_BROWSER_MCP_PACKAGE` | Override `@playwright/mcp@latest`. |
 | `EKO_BROWSER_PROFILE_DIR` | Override the managed browser profile path. |
 | `EKO_BROWSER_OUTPUT_DIR` | Override browser output path. |
+| `EKO_BROWSER_SESSION_DIR` | Override lightweight browser session metadata path. |
 | `EKO_BROWSER_STARTUP_TIMEOUT_SECS` | MCP handshake timeout; defaults to 60 seconds. |
 
 ## Session model
 
+- Identity is layered rather than collapsed: `conversation_id` is stable across
+  turns, `turn_id` identifies one user prompt, `run_id` exists only for an
+  actual formal/background/inline task run, and `execution_id` identifies a
+  concrete worker execution. An ordinary chat turn does not create a
+  `TaskRuntimeStore` run record.
 - `conversation_id` owns one logical `BrowserSession`.
-- A main run or subagent execution may lease a tab without changing another
-  execution's current tab.
-- Writes to one tab are serialized; independent tabs may operate concurrently.
+- The main agent always leases the conversation's main tab across turns. A
+  worker leases a separate tab keyed by `execution_id`, falling back to the
+  formal run or turn id only for legacy callers.
+- Playwright MCP's stdio connection exposes one selected tab for the whole
+  browser context. EKO therefore holds a context-level atomic operation lock
+  around select-tab plus action. This safely prevents a worker from redirecting
+  the main agent's action, but does not claim true same-context tab concurrency.
+  Per-tab concurrent writes require a future driver with independent page
+  handles/contexts (the DOM/CDP phase), not additional mutex bookkeeping.
 - Run cancellation cancels in-flight browser waits and actions.
 - Observations are bounded structured fragments. Complete DOM or accessibility
   trees are not appended to model context.
 - Persisted metadata may describe prior URLs and tabs, but a restored
   conversation never claims that an old browser process is still alive.
+
+### Phase 2 implementation
+
+`BrowserSessionManager` owns in-memory sessions, tab leases, a bounded broadcast
+event stream, and JSON metadata under `~/.echo-agent/browser/sessions`. Metadata
+contains only session/tab identity, URL/title, status, and timestamps. It does
+not contain DOM snapshots, screenshots, cookies, authorization headers, or form
+values. Restored records are always marked `closed`; the next browser use starts
+a fresh live session id.
+
+Managed browser tools consume framework `ToolContext` through
+`execute_with_context`. The generic context now carries optional `run_id` plus
+`conversation_id`, `turn_id`, and `execution_id` across spawned subagents. This
+is a generic invocation identity correction in `echo-agent`; browser ownership,
+leases, persistence, and events remain entirely in `echo-agent-cli`.
 
 The runtime emits session, tab, navigation, snapshot, screenshot, action, and
 close events. Backend events are authoritative for URL, tab, status, and frame

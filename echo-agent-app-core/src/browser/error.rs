@@ -10,6 +10,8 @@ pub enum BrowserError {
     Io(String),
     #[error("Playwright MCP connection failed: {0}")]
     Connection(String),
+    #[error("browser operation cancelled")]
+    Cancelled,
     #[error("Playwright MCP tool '{tool}' failed: {message}")]
     Tool { tool: String, message: String },
 }

@@ -136,7 +136,11 @@ impl PreModelContextProjector for TaskRuntimeContextProjector {
         context: &'a ProjectionContext,
     ) -> BoxFuture<'a, AgentResult<Vec<ContextProjection>>> {
         Box::pin(async move {
-            let run_id = context.run_id.as_deref();
+            let derived_run_id = context
+                .turn_id
+                .as_deref()
+                .map(super::task_tools::formal_run_id_for_turn);
+            let run_id = context.run_id.as_deref().or(derived_run_id.as_deref());
             let store = run_id.and_then(|run_id| self.registry.store(run_id));
             Ok(vec![ContextProjection {
                 marker: RUNTIME_RECOVERY_MARKER.to_string(),
@@ -522,6 +526,7 @@ mod tests {
             session_id: None,
             conversation_id: Some("c1".to_string()),
             run_id: run_id.map(str::to_string),
+            turn_id: None,
         }
     }
 
