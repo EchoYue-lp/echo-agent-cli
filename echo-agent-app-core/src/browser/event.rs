@@ -35,6 +35,10 @@ pub enum BrowserEvent {
         observation: BrowserObservation,
         frame: Option<BrowserFrame>,
     },
+    Diagnostic {
+        category: String,
+        observation: BrowserObservation,
+    },
     ActionStarted {
         session_id: String,
         tab_id: String,
@@ -74,6 +78,7 @@ impl BrowserEvent {
             Self::NavigationCompleted { .. } => "browser_navigation_completed",
             Self::Snapshot { .. } => "browser_snapshot",
             Self::Screenshot { .. } => "browser_screenshot",
+            Self::Diagnostic { .. } => "browser_diagnostic",
             Self::ActionStarted { .. } => "browser_action_started",
             Self::ActionCompleted { .. } => "browser_action_completed",
             Self::ActionFailed { .. } => "browser_action_failed",

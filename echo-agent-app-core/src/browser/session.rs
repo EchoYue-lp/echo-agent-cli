@@ -36,6 +36,8 @@ pub struct BrowserSession {
     pub id: String,
     pub conversation_id: String,
     pub status: BrowserSessionStatus,
+    #[serde(default)]
+    pub developer_mode: bool,
     pub tabs: Vec<BrowserTab>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -180,6 +182,7 @@ impl BrowserSessionManager {
                     id: session_id,
                     conversation_id: conversation_id.to_string(),
                     status: BrowserSessionStatus::Starting,
+                    developer_mode: false,
                     tabs: vec![main_tab.clone()],
                     created_at: now,
                     updated_at: now,
@@ -354,6 +357,27 @@ impl BrowserSessionManager {
         }
     }
 
+    pub async fn set_developer_mode(&self, conversation_id: &str, enabled: bool) {
+        let session = if let Some(state) = self.sessions.write().await.get_mut(conversation_id) {
+            state.session.developer_mode = enabled;
+            state.session.updated_at = Utc::now();
+            Some(state.session.clone())
+        } else {
+            None
+        };
+        if let Some(session) = session {
+            self.persist(&session).await;
+        }
+    }
+
+    pub async fn developer_mode(&self, conversation_id: &str) -> bool {
+        self.sessions
+            .read()
+            .await
+            .get(conversation_id)
+            .is_some_and(|state| state.session.developer_mode)
+    }
+
     pub async fn update_url(&self, conversation_id: &str, tab_id: &str, url: &str) {
         let session = if let Some(state) = self.sessions.write().await.get_mut(conversation_id) {
             if let Some(tab) = state.session.tabs.iter_mut().find(|tab| tab.id == tab_id) {
@@ -463,6 +487,19 @@ mod tests {
         assert!(worker.opened);
         assert!(!worker_again.opened);
         Ok::<(), String>(())
+    }
+
+    #[tokio::test]
+    async fn developer_mode_is_scoped_to_conversation() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let manager = BrowserSessionManager::new(temp.path().to_path_buf(), 32);
+        manager.lease_tab("conv-1", MAIN_TAB_OWNER, None).await;
+        manager.lease_tab("conv-2", MAIN_TAB_OWNER, None).await;
+        manager.set_developer_mode("conv-1", true).await;
+
+        assert!(manager.developer_mode("conv-1").await);
+        assert!(!manager.developer_mode("conv-2").await);
+        Ok(())
     }
 
     #[test]

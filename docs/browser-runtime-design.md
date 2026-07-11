@@ -245,6 +245,56 @@ bounded and then falls back or returns a structured error. Console, network,
 DOM inspection, and performance traces are diagnostic observations, not
 unbounded context dumps.
 
+### Phase 4 implementation
+
+The implementation follows the actual `@playwright/mcp` capability contract
+(reviewed against the official package README, locally resolved as 0.0.78):
+core automation supplies accessibility snapshots, targeted `browser_find`,
+console messages, and network request lists; the opt-in `vision` capability
+supplies coordinate mouse input; the opt-in `devtools` capability supplies
+element highlights and Playwright traces. EKO enables `vision,devtools` on the
+managed sidecar but continues to expose its own stable application-level tool
+names.
+
+The Phase 4 tools are:
+
+```text
+browser_click_at
+browser_type_at
+browser_scroll
+browser_console
+browser_network
+browser_dom_inspect
+browser_performance_trace
+browser_developer_mode
+```
+
+Semantic `browser_click`/`browser_fill` remain the default. Their target is the
+snapshot ref or unique stable selector accepted by Playwright MCP. A target is
+keyed by session, tab, action, and locator; after two failures the same locator
+is rejected with guidance to inspect a fresh bounded DOM fragment or use the
+coordinate fallback. Application-level MCP errors (`is_error`) now enter the
+failure path instead of being emitted as successful actions.
+
+Coordinate typing focuses the requested point and emits UTF-8-safe key presses,
+bounded to 500 characters. Coordinate click, type, and scroll all trigger the
+same post-action screenshot verification used by semantic actions. Semantic
+click/fill briefly use the DevTools highlight overlay so the GUI screenshot
+shows the active target, then remove it.
+
+`browser_dom_inspect` uses `browser_find` for text/regex snippets or a bounded
+target/depth/box snapshot. Console and network results use the existing 12K
+observation limit. Network diagnostics intentionally expose request lists only,
+not full request headers or bodies. Console/network text is filtered for common
+authorization, cookie, token, and password markers, and structured payloads are
+dropped before the result reaches the model or GUI.
+
+Developer Mode is a lightweight per-conversation flag stored with browser
+session metadata. It gates `browser_performance_trace`; it is not folded into
+ordinary browser actions or global agent permission mode. Trace start/stop uses
+Playwright MCP's supported DevTools tools rather than introducing an EKO CDP
+protocol or framework-layer browser state.
+
 ## Confirmation and trust model
 
 EKO is a local personal assistant. Ordinary browsing is not gated by agent

@@ -49,6 +49,8 @@ impl BrowserConfig {
             self.package.clone(),
             "--user-data-dir".to_string(),
             self.user_data_dir.to_string_lossy().into_owned(),
+            "--caps".to_string(),
+            "vision,devtools".to_string(),
         ];
         if self.headless {
             args.push("--headless".to_string());
@@ -114,6 +116,8 @@ mod tests {
                 "@playwright/mcp@test",
                 "--user-data-dir",
                 "/tmp/eko-browser-profile",
+                "--caps",
+                "vision,devtools",
                 "--headless",
             ]
         );

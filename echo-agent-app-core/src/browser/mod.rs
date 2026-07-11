@@ -4,6 +4,7 @@ pub mod event;
 pub mod session;
 pub mod sidecar;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,6 +36,7 @@ struct BrowserRuntimeInner {
     sessions: BrowserSessionManager,
     client: RwLock<Option<Arc<McpClient>>>,
     connect_lock: Mutex<()>,
+    locator_failures: Mutex<HashMap<String, u8>>,
     shutdown: CancellationToken,
 }
 
@@ -48,6 +50,7 @@ impl BrowserRuntime {
                 sessions,
                 client: RwLock::new(None),
                 connect_lock: Mutex::new(()),
+                locator_failures: Mutex::new(HashMap::new()),
                 shutdown: CancellationToken::new(),
             }),
         });
@@ -253,6 +256,71 @@ impl BrowserRuntime {
                     .await
             }
         };
+        let run_id = context.run_id.clone();
+        let turn_id = context.turn_id.clone();
+        let execution_id = context.execution_id.clone();
+        let action_name = action.name().to_string();
+        if action == BrowserAction::DeveloperMode {
+            let enabled = params
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| BrowserError::Tool {
+                    tool: action_name.clone(),
+                    message: "enabled must be a boolean".to_string(),
+                })?;
+            self.inner.sessions.emit(BrowserEvent::ActionStarted {
+                session_id: lease.session_id.clone(),
+                tab_id: lease.tab_id.clone(),
+                action: action_name.clone(),
+                run_id: run_id.clone(),
+                turn_id: turn_id.clone(),
+                execution_id: execution_id.clone(),
+            });
+            self.inner
+                .sessions
+                .set_developer_mode(conversation_id, enabled)
+                .await;
+            self.inner.sessions.emit(BrowserEvent::ActionCompleted {
+                session_id: lease.session_id,
+                tab_id: lease.tab_id,
+                action: action_name,
+                run_id,
+                turn_id,
+                execution_id,
+            });
+            return Ok(ToolResult::success(if enabled {
+                "Browser Developer Mode enabled for this conversation."
+            } else {
+                "Browser Developer Mode disabled for this conversation."
+            }));
+        }
+        if action == BrowserAction::PerformanceTrace
+            && !self.inner.sessions.developer_mode(conversation_id).await
+        {
+            return Err(BrowserError::Tool {
+                tool: action_name,
+                message: "enable browser_developer_mode for this conversation before tracing"
+                    .to_string(),
+            });
+        }
+        let locator_failure_key = locator_failure_key(&lease, action, &params);
+        if let Some(key) = locator_failure_key.as_ref()
+            && self
+                .inner
+                .locator_failures
+                .lock()
+                .await
+                .get(key)
+                .copied()
+                .unwrap_or(0)
+                >= 2
+        {
+            return Err(BrowserError::Tool {
+                tool: action_name,
+                message: "the same locator failed twice; inspect a fresh DOM fragment or use coordinate control"
+                    .to_string(),
+            });
+        }
         let _operation = self.inner.sessions.lock_operation().await;
         if tabs_command.as_deref() == Some("new") || tabs_command.as_deref() == Some("select") {
             // The explicit browser_tabs call below performs the matching MCP operation.
@@ -272,11 +340,28 @@ impl BrowserRuntime {
             .await?;
         }
 
-        let (tool, arguments) = action.translate(params)?;
-        let run_id = context.run_id.clone();
-        let turn_id = context.turn_id.clone();
-        let execution_id = context.execution_id.clone();
-        let action_name = action.name().to_string();
+        let type_at_text = if action == BrowserAction::TypeAt {
+            Some(
+                params
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| BrowserError::Tool {
+                        tool: action_name.clone(),
+                        message: "text must be a string".to_string(),
+                    })?
+                    .chars()
+                    .take(500)
+                    .collect::<String>(),
+            )
+        } else {
+            None
+        };
+        let (tool, mut arguments) = action.translate(params)?;
+        if action == BrowserAction::TypeAt
+            && let Value::Object(values) = &mut arguments
+        {
+            values.remove("text");
+        }
         if action == BrowserAction::Navigate {
             let url = arguments
                 .get("url")
@@ -307,12 +392,48 @@ impl BrowserRuntime {
             execution_id: execution_id.clone(),
         });
 
-        match self
-            .call_mcp(tool, arguments.clone(), context.cancel.as_deref())
-            .await
-        {
+        let highlight_arguments = if matches!(action, BrowserAction::Click | BrowserAction::Fill) {
+            arguments
+                .get("target")
+                .and_then(Value::as_str)
+                .map(|target| {
+                    json!({
+                        "target": target,
+                        "element": arguments.get("element").and_then(Value::as_str),
+                        "style": "outline: 2px solid #2563eb; outline-offset: 2px"
+                    })
+                })
+        } else {
+            None
+        };
+        if let Some(highlight) = highlight_arguments.as_ref() {
+            let _ = self
+                .call_mcp(
+                    "browser_highlight",
+                    highlight.clone(),
+                    context.cancel.as_deref(),
+                )
+                .await;
+        }
+
+        let raw_call = if let Some(text) = type_at_text {
+            self.type_at(arguments.clone(), &text, context.cancel.as_deref())
+                .await
+        } else {
+            self.call_mcp(tool, arguments.clone(), context.cancel.as_deref())
+                .await
+        };
+        match raw_call {
             Ok(raw_result) => {
-                let result = tool_result(raw_result);
+                if let Some(key) = locator_failure_key.as_ref() {
+                    self.inner.locator_failures.lock().await.remove(key);
+                }
+                let mut result = tool_result(raw_result);
+                if matches!(action, BrowserAction::Console | BrowserAction::Network) {
+                    result.output = redact_browser_diagnostics(&result.output);
+                    result.data = None;
+                    result.kind = ToolResultKind::Text;
+                }
                 self.inner
                     .sessions
                     .set_status(conversation_id, BrowserSessionStatus::Ready)
@@ -341,6 +462,26 @@ impl BrowserRuntime {
                         .inner
                         .sessions
                         .emit(BrowserEvent::Snapshot { observation }),
+                    BrowserAction::DomInspect => {
+                        self.inner.sessions.emit(BrowserEvent::Diagnostic {
+                            category: "dom".to_string(),
+                            observation,
+                        })
+                    }
+                    BrowserAction::Console => self.inner.sessions.emit(BrowserEvent::Diagnostic {
+                        category: "console".to_string(),
+                        observation,
+                    }),
+                    BrowserAction::Network => self.inner.sessions.emit(BrowserEvent::Diagnostic {
+                        category: "network".to_string(),
+                        observation,
+                    }),
+                    BrowserAction::PerformanceTrace => {
+                        self.inner.sessions.emit(BrowserEvent::Diagnostic {
+                            category: "performance".to_string(),
+                            observation,
+                        })
+                    }
                     BrowserAction::Screenshot => {
                         let frame = browser_frame(&result);
                         self.inner
@@ -350,6 +491,9 @@ impl BrowserRuntime {
                     BrowserAction::Navigate
                     | BrowserAction::Click
                     | BrowserAction::Fill
+                    | BrowserAction::ClickAt
+                    | BrowserAction::TypeAt
+                    | BrowserAction::Scroll
                     | BrowserAction::Back
                     | BrowserAction::Reload => {
                         if let Ok(raw_frame) = self
@@ -372,11 +516,20 @@ impl BrowserRuntime {
                             });
                         }
                     }
-                    BrowserAction::Tabs => {}
+                    BrowserAction::Tabs | BrowserAction::DeveloperMode => {}
                 }
                 if tabs_command.as_deref() == Some("close") {
                     let index = requested_index.unwrap_or(lease.tab_index);
                     self.inner.sessions.close_tab(conversation_id, index).await;
+                }
+                if let Some(highlight) = highlight_arguments {
+                    let _ = self
+                        .call_mcp(
+                            "browser_hide_highlight",
+                            hide_highlight_arguments(highlight),
+                            context.cancel.as_deref(),
+                        )
+                        .await;
                 }
                 self.inner.sessions.emit(BrowserEvent::ActionCompleted {
                     session_id: lease.session_id,
@@ -389,6 +542,20 @@ impl BrowserRuntime {
                 Ok(result)
             }
             Err(error) => {
+                if let Some(highlight) = highlight_arguments {
+                    let _ = self
+                        .call_mcp(
+                            "browser_hide_highlight",
+                            hide_highlight_arguments(highlight),
+                            context.cancel.as_deref(),
+                        )
+                        .await;
+                }
+                if let Some(key) = locator_failure_key {
+                    let mut failures = self.inner.locator_failures.lock().await;
+                    let count = failures.entry(key).or_insert(0);
+                    *count = count.saturating_add(1);
+                }
                 self.inner
                     .sessions
                     .set_status(conversation_id, BrowserSessionStatus::Failed)
@@ -428,7 +595,7 @@ impl BrowserRuntime {
             first_call.await
         };
         match first_result {
-            Ok(result) => Ok(result),
+            Ok(result) => mcp_tool_result(tool, result),
             Err(first_error) => {
                 tracing::warn!(
                     tool,
@@ -451,13 +618,108 @@ impl BrowserRuntime {
                 } else {
                     retry.await
                 };
-                result.map_err(|error| BrowserError::Tool {
+                let result = result.map_err(|error| BrowserError::Tool {
                     tool: tool.to_string(),
                     message: error.to_string(),
-                })
+                })?;
+                mcp_tool_result(tool, result)
             }
         }
     }
+
+    async fn type_at(
+        &self,
+        click_arguments: Value,
+        text: &str,
+        cancel: Option<&CancellationToken>,
+    ) -> BrowserResult<McpToolCallResult> {
+        self.call_mcp("browser_mouse_click_xy", click_arguments, cancel)
+            .await?;
+        for character in text.chars() {
+            let key = match character {
+                '\n' => "Enter".to_string(),
+                '\t' => "Tab".to_string(),
+                value => value.to_string(),
+            };
+            self.call_mcp("browser_press_key", json!({ "key": key }), cancel)
+                .await?;
+        }
+        Ok(McpToolCallResult {
+            content: vec![McpContent::Text {
+                text: format!(
+                    "Typed {} characters at the requested coordinates.",
+                    text.chars().count()
+                ),
+            }],
+            is_error: false,
+            structured_content: None,
+            extra: serde_json::Map::new(),
+        })
+    }
+}
+
+fn mcp_tool_result(tool: &str, result: McpToolCallResult) -> BrowserResult<McpToolCallResult> {
+    if result.is_error {
+        return Err(BrowserError::Tool {
+            tool: tool.to_string(),
+            message: McpClient::content_to_text(&result.content),
+        });
+    }
+    Ok(result)
+}
+
+fn locator_failure_key(
+    lease: &session::BrowserLease,
+    action: BrowserAction,
+    params: &ToolParameters,
+) -> Option<String> {
+    if !matches!(action, BrowserAction::Click | BrowserAction::Fill) {
+        return None;
+    }
+    let target = params.get("target")?.as_str()?;
+    Some(format!(
+        "{}:{}:{}:{}",
+        lease.session_id,
+        lease.tab_id,
+        action.name(),
+        target
+    ))
+}
+
+fn hide_highlight_arguments(mut arguments: Value) -> Value {
+    if let Value::Object(values) = &mut arguments {
+        values.remove("style");
+    }
+    arguments
+}
+
+fn redact_browser_diagnostics(output: &str) -> String {
+    output
+        .lines()
+        .map(|line| {
+            let lower = line.to_ascii_lowercase();
+            if [
+                "authorization",
+                "proxy-authorization",
+                "cookie:",
+                "set-cookie",
+                "api_key",
+                "api-key",
+                "access_token",
+                "refresh_token",
+                "password",
+                "passwd",
+            ]
+            .iter()
+            .any(|marker| lower.contains(marker))
+            {
+                "[REDACTED sensitive browser diagnostic]".to_string()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -471,6 +733,14 @@ pub enum BrowserAction {
     Back,
     Reload,
     Tabs,
+    ClickAt,
+    TypeAt,
+    Scroll,
+    Console,
+    Network,
+    DomInspect,
+    PerformanceTrace,
+    DeveloperMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -480,7 +750,7 @@ enum BrowserActor {
 }
 
 impl BrowserAction {
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 16] = [
         Self::Navigate,
         Self::Snapshot,
         Self::Click,
@@ -489,6 +759,14 @@ impl BrowserAction {
         Self::Back,
         Self::Reload,
         Self::Tabs,
+        Self::ClickAt,
+        Self::TypeAt,
+        Self::Scroll,
+        Self::Console,
+        Self::Network,
+        Self::DomInspect,
+        Self::PerformanceTrace,
+        Self::DeveloperMode,
     ];
 
     pub fn name(self) -> &'static str {
@@ -501,6 +779,14 @@ impl BrowserAction {
             Self::Back => "browser_back",
             Self::Reload => "browser_reload",
             Self::Tabs => "browser_tabs",
+            Self::ClickAt => "browser_click_at",
+            Self::TypeAt => "browser_type_at",
+            Self::Scroll => "browser_scroll",
+            Self::Console => "browser_console",
+            Self::Network => "browser_network",
+            Self::DomInspect => "browser_dom_inspect",
+            Self::PerformanceTrace => "browser_performance_trace",
+            Self::DeveloperMode => "browser_developer_mode",
         }
     }
 
@@ -514,6 +800,24 @@ impl BrowserAction {
             Self::Back => "Navigate the current tab back one history entry.",
             Self::Reload => "Reload the current page.",
             Self::Tabs => "List, create, close, or select managed browser tabs.",
+            Self::ClickAt => {
+                "Click viewport coordinates when semantic DOM targeting is unavailable."
+            }
+            Self::TypeAt => {
+                "Focus viewport coordinates and type text when semantic DOM targeting is unavailable."
+            }
+            Self::Scroll => "Scroll the current viewport by pixel deltas.",
+            Self::Console => "Read bounded browser console diagnostics.",
+            Self::Network => "Read bounded browser network request diagnostics.",
+            Self::DomInspect => {
+                "Inspect a bounded DOM/accessibility fragment near a target or matching text."
+            }
+            Self::PerformanceTrace => {
+                "Start or stop a Playwright performance trace in Developer Mode."
+            }
+            Self::DeveloperMode => {
+                "Enable or disable session-scoped browser developer diagnostics."
+            }
         }
     }
 
@@ -569,6 +873,61 @@ impl BrowserAction {
                 }),
                 &["action"],
             ),
+            Self::ClickAt => object_schema(
+                json!({
+                    "x": { "type": "number", "minimum": 0 },
+                    "y": { "type": "number", "minimum": 0 },
+                    "button": { "type": "string", "enum": ["left", "right", "middle"] },
+                    "clickCount": { "type": "integer", "minimum": 1, "maximum": 3 }
+                }),
+                &["x", "y"],
+            ),
+            Self::TypeAt => object_schema(
+                json!({
+                    "x": { "type": "number", "minimum": 0 },
+                    "y": { "type": "number", "minimum": 0 },
+                    "text": { "type": "string", "maxLength": 500 }
+                }),
+                &["x", "y", "text"],
+            ),
+            Self::Scroll => object_schema(
+                json!({
+                    "deltaX": { "type": "number" },
+                    "deltaY": { "type": "number" }
+                }),
+                &["deltaY"],
+            ),
+            Self::Console => object_schema(
+                json!({
+                    "level": { "type": "string", "enum": ["error", "warning", "info", "debug"] },
+                    "all": { "type": "boolean" }
+                }),
+                &[],
+            ),
+            Self::Network => object_schema(
+                json!({
+                    "includeStatic": { "type": "boolean" },
+                    "filter": { "type": "string" }
+                }),
+                &[],
+            ),
+            Self::DomInspect => object_schema(
+                json!({
+                    "target": { "type": "string" },
+                    "text": { "type": "string" },
+                    "regex": { "type": "string" },
+                    "depth": { "type": "integer", "minimum": 1, "maximum": 12 },
+                    "boxes": { "type": "boolean" }
+                }),
+                &[],
+            ),
+            Self::PerformanceTrace => object_schema(
+                json!({ "action": { "type": "string", "enum": ["start", "stop"] } }),
+                &["action"],
+            ),
+            Self::DeveloperMode => {
+                object_schema(json!({ "enabled": { "type": "boolean" } }), &["enabled"])
+            }
         }
     }
 
@@ -591,12 +950,59 @@ impl BrowserAction {
                 json!({ "function": "() => window.location.reload()" }),
             )),
             Self::Tabs => Ok(("browser_tabs", Value::Object(arguments))),
+            Self::ClickAt => Ok(("browser_mouse_click_xy", Value::Object(arguments))),
+            Self::TypeAt => Ok(("browser_mouse_click_xy", Value::Object(arguments))),
+            Self::Scroll => {
+                arguments
+                    .entry("deltaX".to_string())
+                    .or_insert_with(|| Value::Number(0.into()));
+                Ok(("browser_mouse_wheel", Value::Object(arguments)))
+            }
+            Self::Console => {
+                arguments
+                    .entry("level".to_string())
+                    .or_insert_with(|| Value::String("warning".to_string()));
+                Ok(("browser_console_messages", Value::Object(arguments)))
+            }
+            Self::Network => {
+                if let Some(value) = arguments.remove("includeStatic") {
+                    arguments.insert("static".to_string(), value);
+                }
+                Ok(("browser_network_requests", Value::Object(arguments)))
+            }
+            Self::DomInspect => {
+                if arguments.contains_key("text") || arguments.contains_key("regex") {
+                    arguments.remove("target");
+                    arguments.remove("depth");
+                    arguments.remove("boxes");
+                    Ok(("browser_find", Value::Object(arguments)))
+                } else {
+                    Ok(("browser_snapshot", Value::Object(arguments)))
+                }
+            }
+            Self::PerformanceTrace => {
+                let command = arguments
+                    .get("action")
+                    .and_then(Value::as_str)
+                    .unwrap_or("start");
+                if command == "stop" {
+                    Ok(("browser_stop_tracing", json!({})))
+                } else {
+                    Ok(("browser_start_tracing", json!({})))
+                }
+            }
+            Self::DeveloperMode => Ok(("browser_get_config", json!({}))),
         }
     }
 
     fn risk(self) -> ToolRiskLevel {
         match self {
-            Self::Snapshot | Self::Screenshot => ToolRiskLevel::ReadOnly,
+            Self::Snapshot
+            | Self::Screenshot
+            | Self::Console
+            | Self::Network
+            | Self::DomInspect
+            | Self::PerformanceTrace => ToolRiskLevel::ReadOnly,
             _ => ToolRiskLevel::Standard,
         }
     }
@@ -752,6 +1158,14 @@ mod tests {
                 "browser_back",
                 "browser_reload",
                 "browser_tabs",
+                "browser_click_at",
+                "browser_type_at",
+                "browser_scroll",
+                "browser_console",
+                "browser_network",
+                "browser_dom_inspect",
+                "browser_performance_trace",
+                "browser_developer_mode",
             ]
         );
     }
@@ -767,9 +1181,90 @@ mod tests {
         let (back, _) = BrowserAction::Back
             .translate(ToolParameters::new())
             .unwrap_or(("", Value::Null));
+        let (click_at, _) = BrowserAction::ClickAt
+            .translate(ToolParameters::new())
+            .unwrap_or(("", Value::Null));
+        let (console, _) = BrowserAction::Console
+            .translate(ToolParameters::new())
+            .unwrap_or(("", Value::Null));
         assert_eq!(fill, "browser_type");
         assert_eq!(screenshot, "browser_take_screenshot");
         assert_eq!(back, "browser_navigate_back");
+        assert_eq!(click_at, "browser_mouse_click_xy");
+        assert_eq!(console, "browser_console_messages");
+    }
+
+    #[test]
+    fn dom_and_network_diagnostics_choose_bounded_tools() {
+        let (find, find_args) = BrowserAction::DomInspect
+            .translate(ToolParameters::from([(
+                "text".to_string(),
+                Value::String("checkout".to_string()),
+            )]))
+            .unwrap_or(("", Value::Null));
+        let (requests, request_args) = BrowserAction::Network
+            .translate(ToolParameters::from([(
+                "includeStatic".to_string(),
+                Value::Bool(false),
+            )]))
+            .unwrap_or(("", Value::Null));
+
+        assert_eq!(find, "browser_find");
+        assert_eq!(
+            find_args.get("text").and_then(Value::as_str),
+            Some("checkout")
+        );
+        assert_eq!(requests, "browser_network_requests");
+        assert_eq!(
+            request_args.get("static").and_then(Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn mcp_application_errors_are_not_reported_as_success() {
+        let result = mcp_tool_result(
+            "browser_click",
+            McpToolCallResult {
+                content: vec![McpContent::Text {
+                    text: "locator not found".to_string(),
+                }],
+                is_error: true,
+                structured_content: None,
+                extra: serde_json::Map::new(),
+            },
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn browser_diagnostics_redact_sensitive_lines() {
+        let output = "GET /api 500\nAuthorization: Bearer secret\nCookie: sid=secret\nplain error";
+        let redacted = redact_browser_diagnostics(output);
+        assert!(redacted.contains("GET /api 500"));
+        assert!(redacted.contains("plain error"));
+        assert!(!redacted.contains("Bearer secret"));
+        assert!(!redacted.contains("sid=secret"));
+    }
+
+    #[test]
+    fn locator_failure_key_is_scoped_to_tab_action_and_target() {
+        let lease = session::BrowserLease {
+            session_id: "session".to_string(),
+            tab_id: "tab".to_string(),
+            tab_index: 0,
+            opened: false,
+        };
+        let params = ToolParameters::from([(
+            "target".to_string(),
+            Value::String("button-submit".to_string()),
+        )]);
+
+        assert_eq!(
+            locator_failure_key(&lease, BrowserAction::Click, &params).as_deref(),
+            Some("session:tab:browser_click:button-submit")
+        );
+        assert!(locator_failure_key(&lease, BrowserAction::ClickAt, &params).is_none());
     }
 
     #[test]

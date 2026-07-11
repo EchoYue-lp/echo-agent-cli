@@ -1,4 +1,4 @@
-import { Globe2, PanelRightOpen } from 'lucide-react';
+import { Activity, Globe2, PanelRightOpen } from 'lucide-react';
 import { useBrowserEvents } from '../../hooks/useBrowserEvents';
 import { useConversationStore } from '../../stores/conversationStore';
 import { useBrowserStore } from '../../stores/browserStore';
@@ -63,9 +63,20 @@ export function BrowserPanel() {
         <BrowserViewport frame={view?.frame} busy={Boolean(busy)} />
         <footer className="flex h-7 shrink-0 items-center justify-between gap-3 border-t border-[var(--border-primary)] px-2.5">
           <BrowserStatus status={view?.session.status} error={view?.error} />
-          <div className="flex min-w-0 items-center gap-1 text-[10px] text-[var(--text-tertiary)]">
-            <Globe2 size={11} />
-            <span className="truncate">{activeTab?.url ?? 'about:blank'}</span>
+          <div className="flex min-w-0 items-center gap-2 text-[10px] text-[var(--text-tertiary)]">
+            {Boolean(view?.diagnostics.length) && (
+              <span
+                className="flex shrink-0 items-center gap-1"
+                title={`诊断记录 ${view?.diagnostics.length ?? 0}`}
+              >
+                <Activity size={11} />
+                {view?.diagnostics.length}
+              </span>
+            )}
+            <span className="flex min-w-0 items-center gap-1">
+              <Globe2 size={11} />
+              <span className="truncate">{activeTab?.url ?? 'about:blank'}</span>
+            </span>
           </div>
         </footer>
       </aside>

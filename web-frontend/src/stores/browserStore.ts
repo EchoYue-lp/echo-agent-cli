@@ -15,6 +15,7 @@ export interface BrowserSession {
   id: string;
   conversation_id: string;
   status: BrowserStatus;
+  developer_mode?: boolean;
   tabs: BrowserTab[];
 }
 
@@ -34,6 +35,11 @@ export type BrowserEvent =
       observation: { session_id: string; tab_id: string; captured_at: string };
       frame?: BrowserFrame | null;
     }
+  | {
+      type: 'diagnostic';
+      category: string;
+      observation: { session_id: string; tab_id: string; summary: string; captured_at: string };
+    }
   | { type: 'action_started'; session_id: string; tab_id: string; action: string }
   | { type: 'action_completed'; session_id: string; tab_id: string; action: string }
   | { type: 'action_failed'; session_id: string; tab_id: string; action: string; error: string }
@@ -45,6 +51,7 @@ interface BrowserViewState {
   frame: string | null;
   frameCapturedAt: string | null;
   error: string | null;
+  diagnostics: Array<{ category: string; summary: string; capturedAt: string }>;
 }
 
 interface BrowserStore {
@@ -98,12 +105,13 @@ export const useBrowserStore = create<BrowserStore>((set) => ({
               frame: null,
               frameCapturedAt: null,
               error: null,
+              diagnostics: [],
             },
           },
         };
       }
       const sessionId =
-        event.type === 'snapshot' || event.type === 'screenshot'
+        event.type === 'snapshot' || event.type === 'screenshot' || event.type === 'diagnostic'
           ? event.observation.session_id
           : event.session_id;
       const views = updateSession(state.views, sessionId, (view) => {
@@ -159,6 +167,19 @@ export const useBrowserStore = create<BrowserStore>((set) => ({
             activeTabId: event.observation.tab_id,
             frame: event.frame.data_url,
             frameCapturedAt: event.observation.captured_at,
+          };
+        }
+        if (event.type === 'diagnostic') {
+          return {
+            ...view,
+            diagnostics: [
+              ...view.diagnostics.slice(-19),
+              {
+                category: event.category,
+                summary: event.observation.summary,
+                capturedAt: event.observation.captured_at,
+              },
+            ],
           };
         }
         if (event.type === 'session_closed') {
