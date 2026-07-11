@@ -155,6 +155,9 @@ impl AgentRuntime {
             tracing::info!("HITL dispatcher + PermissionService wired to agent");
             dispatcher
         };
+        browser_runtime
+            .set_default_approval_provider(hitl_dispatcher.clone())
+            .await;
 
         // ── 5. Built-in skills ──
         {

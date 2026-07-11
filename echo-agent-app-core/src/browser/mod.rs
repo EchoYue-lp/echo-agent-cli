@@ -1,6 +1,7 @@
 pub mod config;
 pub mod error;
 pub mod event;
+pub mod risk;
 pub mod session;
 pub mod sidecar;
 
@@ -9,6 +10,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine;
+use echo_agent::human_loop::{
+    HumanLoopKind, HumanLoopProvider, HumanLoopRequest, HumanLoopResponse,
+};
 use echo_agent::mcp::{McpClient, McpContent, McpToolCallResult};
 use echo_agent::prelude::{Tool, ToolParameters, ToolResult, ToolRiskLevel};
 use echo_core::tools::{ToolContext, ToolResultKind};
@@ -20,6 +24,7 @@ use tokio_util::sync::CancellationToken;
 pub use config::BrowserConfig;
 pub use error::{BrowserError, BrowserResult};
 pub use event::{BrowserEvent, BrowserFrame};
+pub use risk::BrowserActionRisk;
 pub use session::{
     BrowserObservation, BrowserSession, BrowserSessionManager, BrowserSessionStatus, BrowserTab,
     MAIN_TAB_OWNER,
@@ -37,6 +42,8 @@ struct BrowserRuntimeInner {
     client: RwLock<Option<Arc<McpClient>>>,
     connect_lock: Mutex<()>,
     locator_failures: Mutex<HashMap<String, u8>>,
+    default_approval_provider: RwLock<Option<Arc<dyn HumanLoopProvider>>>,
+    conversation_approval_providers: RwLock<HashMap<String, Arc<dyn HumanLoopProvider>>>,
     shutdown: CancellationToken,
 }
 
@@ -51,6 +58,8 @@ impl BrowserRuntime {
                 client: RwLock::new(None),
                 connect_lock: Mutex::new(()),
                 locator_failures: Mutex::new(HashMap::new()),
+                default_approval_provider: RwLock::new(None),
+                conversation_approval_providers: RwLock::new(HashMap::new()),
                 shutdown: CancellationToken::new(),
             }),
         });
@@ -112,6 +121,30 @@ impl BrowserRuntime {
 
     pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<BrowserEvent> {
         self.inner.sessions.subscribe()
+    }
+
+    pub async fn set_default_approval_provider(&self, provider: Arc<dyn HumanLoopProvider>) {
+        *self.inner.default_approval_provider.write().await = Some(provider);
+    }
+
+    pub async fn set_conversation_approval_provider(
+        &self,
+        conversation_id: String,
+        provider: Arc<dyn HumanLoopProvider>,
+    ) {
+        self.inner
+            .conversation_approval_providers
+            .write()
+            .await
+            .insert(conversation_id, provider);
+    }
+
+    pub async fn remove_conversation_approval_provider(&self, conversation_id: &str) {
+        self.inner
+            .conversation_approval_providers
+            .write()
+            .await
+            .remove(conversation_id);
     }
 
     pub async fn execute_main(
@@ -205,6 +238,28 @@ impl BrowserRuntime {
             .conversation_id
             .as_deref()
             .unwrap_or("browser-default");
+        let navigation_url = match action {
+            BrowserAction::Navigate => {
+                Some(params.get("url").and_then(Value::as_str).ok_or_else(|| {
+                    BrowserError::Tool {
+                        tool: action.name().to_string(),
+                        message: "url must be a string".to_string(),
+                    }
+                })?)
+            }
+            BrowserAction::Tabs if params.get("action").and_then(Value::as_str) == Some("new") => {
+                params.get("url").and_then(Value::as_str)
+            }
+            _ => None,
+        };
+        if let Some(url) = navigation_url
+            && !self.inner.config.allows_url(url)
+        {
+            return Err(BrowserError::Tool {
+                tool: action.name().to_string(),
+                message: "navigation blocked by browser domain configuration".to_string(),
+            });
+        }
         let owner_id = match actor {
             BrowserActor::Main => MAIN_TAB_OWNER.to_string(),
             BrowserActor::Worker => context
@@ -260,6 +315,64 @@ impl BrowserRuntime {
         let turn_id = context.turn_id.clone();
         let execution_id = context.execution_id.clone();
         let action_name = action.name().to_string();
+        let action_risk = BrowserActionRisk::classify(action, &params)?;
+        if action_risk.requires_confirmation() {
+            let confirmation_args = action_risk.confirmation_args(action, &params);
+            let summary = confirmation_args
+                .get("summary")
+                .and_then(Value::as_str)
+                .unwrap_or(action_risk.label())
+                .to_string();
+            self.inner
+                .sessions
+                .set_status(conversation_id, BrowserSessionStatus::WaitingConfirmation)
+                .await;
+            self.inner
+                .sessions
+                .emit(BrowserEvent::ConfirmationRequested {
+                    session_id: lease.session_id.clone(),
+                    tab_id: lease.tab_id.clone(),
+                    risk: action_risk.label().to_string(),
+                    summary,
+                });
+            let approved = match self
+                .confirm_action(conversation_id, action, action_risk, &params)
+                .await
+            {
+                Ok(approved) => approved,
+                Err(error) => {
+                    self.inner
+                        .sessions
+                        .emit(BrowserEvent::ConfirmationResolved {
+                            session_id: lease.session_id.clone(),
+                            tab_id: lease.tab_id.clone(),
+                            approved: false,
+                        });
+                    self.inner
+                        .sessions
+                        .set_status(conversation_id, BrowserSessionStatus::Ready)
+                        .await;
+                    return Err(error);
+                }
+            };
+            self.inner
+                .sessions
+                .emit(BrowserEvent::ConfirmationResolved {
+                    session_id: lease.session_id.clone(),
+                    tab_id: lease.tab_id.clone(),
+                    approved,
+                });
+            if !approved {
+                self.inner
+                    .sessions
+                    .set_status(conversation_id, BrowserSessionStatus::Ready)
+                    .await;
+                return Err(BrowserError::Tool {
+                    tool: action_name,
+                    message: "browser action was not approved".to_string(),
+                });
+            }
+        }
         if action == BrowserAction::DeveloperMode {
             let enabled = params
                 .get("enabled")
@@ -656,6 +769,55 @@ impl BrowserRuntime {
             extra: serde_json::Map::new(),
         })
     }
+
+    async fn confirm_action(
+        &self,
+        conversation_id: &str,
+        action: BrowserAction,
+        risk: BrowserActionRisk,
+        params: &ToolParameters,
+    ) -> BrowserResult<bool> {
+        let conversation_provider = self
+            .inner
+            .conversation_approval_providers
+            .read()
+            .await
+            .get(conversation_id)
+            .cloned();
+        let provider = match conversation_provider {
+            Some(provider) => Some(provider),
+            None => self.inner.default_approval_provider.read().await.clone(),
+        }
+        .ok_or_else(|| BrowserError::Tool {
+            tool: action.name().to_string(),
+            message: "no HITL provider is available for consequential browser action".to_string(),
+        })?;
+        let request = HumanLoopRequest {
+            kind: HumanLoopKind::Approval,
+            prompt: risk.prompt(params),
+            tool_name: Some(action.name().to_string()),
+            args: Some(risk.confirmation_args(action, params)),
+            risk_level: Some(risk.risk_level()),
+            timeout: Some(Duration::from_secs(5 * 60)),
+            task_id: None,
+            options: None,
+            context: None,
+            phase: None,
+        };
+        let response = provider
+            .request(request)
+            .await
+            .map_err(|error| BrowserError::Tool {
+                tool: action.name().to_string(),
+                message: error.to_string(),
+            })?;
+        Ok(matches!(
+            response,
+            HumanLoopResponse::Approved
+                | HumanLoopResponse::ApprovedWithScope { .. }
+                | HumanLoopResponse::ModifiedArgs { .. }
+        ))
+    }
 }
 
 fn mcp_tool_result(tool: &str, result: McpToolCallResult) -> BrowserResult<McpToolCallResult> {
@@ -840,9 +1002,13 @@ impl BrowserAction {
                     "target": { "type": "string", "description": "Exact target reference from browser_snapshot" },
                     "element": { "type": "string", "description": "Human-readable element description" },
                     "button": { "type": "string", "enum": ["left", "right", "middle"] },
-                    "doubleClick": { "type": "boolean" }
+                    "doubleClick": { "type": "boolean" },
+                    "effect": browser_effect_schema(),
+                    "confirmationSummary": confirmation_summary_schema(),
+                    "destination": confirmation_destination_schema(),
+                    "dataCategories": data_categories_schema()
                 }),
-                &["target"],
+                &["target", "effect"],
             ),
             Self::Fill => object_schema(
                 json!({
@@ -850,9 +1016,13 @@ impl BrowserAction {
                     "text": { "type": "string", "description": "Text to enter" },
                     "element": { "type": "string", "description": "Human-readable field description" },
                     "submit": { "type": "boolean" },
-                    "slowly": { "type": "boolean" }
+                    "slowly": { "type": "boolean" },
+                    "effect": browser_effect_schema(),
+                    "confirmationSummary": confirmation_summary_schema(),
+                    "destination": confirmation_destination_schema(),
+                    "dataCategories": data_categories_schema()
                 }),
-                &["target", "text"],
+                &["target", "text", "effect"],
             ),
             Self::Screenshot => object_schema(
                 json!({
@@ -878,17 +1048,25 @@ impl BrowserAction {
                     "x": { "type": "number", "minimum": 0 },
                     "y": { "type": "number", "minimum": 0 },
                     "button": { "type": "string", "enum": ["left", "right", "middle"] },
-                    "clickCount": { "type": "integer", "minimum": 1, "maximum": 3 }
+                    "clickCount": { "type": "integer", "minimum": 1, "maximum": 3 },
+                    "effect": browser_effect_schema(),
+                    "confirmationSummary": confirmation_summary_schema(),
+                    "destination": confirmation_destination_schema(),
+                    "dataCategories": data_categories_schema()
                 }),
-                &["x", "y"],
+                &["x", "y", "effect"],
             ),
             Self::TypeAt => object_schema(
                 json!({
                     "x": { "type": "number", "minimum": 0 },
                     "y": { "type": "number", "minimum": 0 },
-                    "text": { "type": "string", "maxLength": 500 }
+                    "text": { "type": "string", "maxLength": 500 },
+                    "effect": browser_effect_schema(),
+                    "confirmationSummary": confirmation_summary_schema(),
+                    "destination": confirmation_destination_schema(),
+                    "dataCategories": data_categories_schema()
                 }),
-                &["x", "y", "text"],
+                &["x", "y", "text", "effect"],
             ),
             Self::Scroll => object_schema(
                 json!({
@@ -933,6 +1111,14 @@ impl BrowserAction {
 
     fn translate(self, params: ToolParameters) -> BrowserResult<(&'static str, Value)> {
         let mut arguments = serde_json::Map::from_iter(params);
+        for key in [
+            "effect",
+            "confirmationSummary",
+            "destination",
+            "dataCategories",
+        ] {
+            arguments.remove(key);
+        }
         match self {
             Self::Navigate => Ok(("browser_navigate", Value::Object(arguments))),
             Self::Snapshot => Ok(("browser_snapshot", Value::Object(arguments))),
@@ -1074,6 +1260,48 @@ fn object_schema(properties: Value, required: &[&str]) -> Value {
     })
 }
 
+fn browser_effect_schema() -> Value {
+    json!({
+        "type": "string",
+        "description": "Declare the real external effect. Use none for navigation or unsubmitted input.",
+        "enum": [
+            "none",
+            "sensitive_submit",
+            "purchase",
+            "publish",
+            "send_message",
+            "account_change",
+            "permission_change",
+            "cloud_delete"
+        ]
+    })
+}
+
+fn confirmation_summary_schema() -> Value {
+    json!({
+        "type": "string",
+        "maxLength": 300,
+        "description": "Short user-facing description of the consequence. Never include passwords, tokens, cookies, payment numbers, or entered field values."
+    })
+}
+
+fn confirmation_destination_schema() -> Value {
+    json!({
+        "type": "string",
+        "maxLength": 300,
+        "description": "Human-readable destination such as the site, recipient, account, or resource. Never include secret values."
+    })
+}
+
+fn data_categories_schema() -> Value {
+    json!({
+        "type": "array",
+        "description": "Names of data categories being submitted, without their values.",
+        "items": { "type": "string", "maxLength": 100 },
+        "maxItems": 12
+    })
+}
+
 fn tool_result(result: McpToolCallResult) -> ToolResult {
     let text = McpClient::content_to_text(&result.content);
     if result.is_error {
@@ -1192,6 +1420,74 @@ mod tests {
         assert_eq!(back, "browser_navigate_back");
         assert_eq!(click_at, "browser_mouse_click_xy");
         assert_eq!(console, "browser_console_messages");
+    }
+
+    #[test]
+    fn application_confirmation_metadata_is_not_sent_to_playwright() {
+        let translated = BrowserAction::Click.translate(ToolParameters::from([
+            ("target".to_string(), Value::String("submit".to_string())),
+            ("effect".to_string(), Value::String("purchase".to_string())),
+            (
+                "confirmationSummary".to_string(),
+                Value::String("Place order".to_string()),
+            ),
+            (
+                "destination".to_string(),
+                Value::String("example.com".to_string()),
+            ),
+            ("dataCategories".to_string(), json!(["shipping address"])),
+        ]));
+
+        assert!(translated.is_ok());
+        let (_, arguments) = translated.unwrap_or(("", Value::Null));
+        assert_eq!(
+            arguments.get("target").and_then(Value::as_str),
+            Some("submit")
+        );
+        assert!(arguments.get("effect").is_none());
+        assert!(arguments.get("confirmationSummary").is_none());
+        assert!(arguments.get("destination").is_none());
+        assert!(arguments.get("dataCategories").is_none());
+    }
+
+    #[tokio::test]
+    async fn domain_policy_covers_navigation_and_new_tabs() -> Result<(), String> {
+        let runtime = BrowserRuntime::start(BrowserConfig {
+            enabled: false,
+            blocked_domains: vec!["blocked.example".to_string()],
+            ..BrowserConfig::default()
+        })
+        .await;
+        let context = ToolContext::default();
+        let navigate = runtime
+            .call(
+                BrowserAction::Navigate,
+                ToolParameters::from([(
+                    "url".to_string(),
+                    Value::String("https://blocked.example/page".to_string()),
+                )]),
+                &context,
+                BrowserActor::Main,
+            )
+            .await;
+        let new_tab = runtime
+            .call(
+                BrowserAction::Tabs,
+                ToolParameters::from([
+                    ("action".to_string(), Value::String("new".to_string())),
+                    (
+                        "url".to_string(),
+                        Value::String("https://blocked.example/page".to_string()),
+                    ),
+                ]),
+                &context,
+                BrowserActor::Main,
+            )
+            .await;
+
+        assert!(navigate.is_err());
+        assert!(new_tab.is_err());
+        Ok(())
     }
 
     #[test]

@@ -311,6 +311,43 @@ replacement for agent permission mode. Page content is untrusted input. Logs
 must redact cookies, authorization headers, form secrets, and equivalent
 credentials.
 
+### Phase 5 implementation
+
+The implementation follows Codex Browser's action-time confirmation pattern:
+reading and ordinary interaction stay available, while a concrete operation
+that sends data or changes external state presents the destination and data
+categories immediately before execution. EKO uses the same separation because
+static tool-level permissions cannot distinguish a harmless link click from a
+purchase button. Browser risk therefore remains application-owned and does not
+change `echo-agent` permission semantics.
+
+`BrowserActionRisk` classifies effect-capable click/fill/coordinate actions as
+`none`, sensitive submission, purchase/payment, publish, send message, account
+change, permission change, or cloud deletion. The effect is an explicit tool
+argument rather than an inference from untrusted page text. A consequential
+effect is valid only on a committing click, submitted fill, or coordinate type
+that presses Enter. Ordinary actions use `effect: none` and never enter HITL,
+including under the default permission mode.
+
+Consequential actions use the existing `HumanLoopProvider`. The shared runtime
+dispatcher covers TUI/CLI/channel operation, while GUI turns install their
+conversation-scoped Tauri provider so concurrent conversations do not race.
+Confirmation events project `waiting_confirmation` into the Browser Panel.
+Rejection restores the session to `Ready`; it rejects only the proposed action
+and does not falsely mark the browser process as failed.
+
+The confirmation payload contains only risk, action name, a bounded summary,
+destination, and names of data categories. Form text and locator arguments are
+never forwarded to HITL or Playwright as confirmation metadata. Summaries are
+UTF-8 safely limited to 300 characters and common authorization/cookie/token
+markers are redacted. Schema descriptions explicitly prohibit secret values.
+
+`EKO_BROWSER_ALLOWED_DOMAINS` and `EKO_BROWSER_BLOCKED_DOMAINS` provide optional
+comma-separated browser navigation policy. Block rules win over allow rules,
+exact hosts and subdomains match, and an empty allow list preserves the local
+assistant default of unrestricted browsing. This policy is independent of
+agent `permission_mode`.
+
 ## Chrome extension mode
 
 The Chrome extension is additive and does not replace managed Chromium. Public

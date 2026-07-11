@@ -550,6 +550,13 @@ pub async fn send_chat_message(
             })
         })
         .await;
+    let browser_approval_key = conversation_id
+        .clone()
+        .unwrap_or_else(|| "browser-default".to_string());
+    state
+        .browser_runtime
+        .set_conversation_approval_provider(browser_approval_key.clone(), hitl_handler.clone())
+        .await;
 
     // Capture cache-diagnostic fingerprints BEFORE streaming (same as the
     // pre-B4 inline normal path): they ride along in the sink so the unified

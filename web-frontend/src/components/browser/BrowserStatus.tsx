@@ -18,6 +18,14 @@ export function BrowserStatus({ status, error }: { status?: Status; error?: stri
       </div>
     );
   }
+  if (status === 'waiting_confirmation') {
+    return (
+      <div className="flex items-center gap-1.5 text-[11px] text-[var(--color-warning)]">
+        <AlertCircle size={12} />
+        <span>等待确认</span>
+      </div>
+    );
+  }
   if (!status || status === 'closed') {
     return (
       <div className="flex items-center gap-1.5 text-[11px] text-[var(--text-tertiary)]">

@@ -1,7 +1,14 @@
 import { create } from 'zustand';
 import { apiInvoke, errorMessage, isTauri } from '../lib/tauri-bridge';
 
-export type BrowserStatus = 'starting' | 'ready' | 'navigating' | 'acting' | 'closed' | 'failed';
+export type BrowserStatus =
+  | 'starting'
+  | 'ready'
+  | 'navigating'
+  | 'acting'
+  | 'waiting_confirmation'
+  | 'closed'
+  | 'failed';
 
 export interface BrowserTab {
   id: string;
@@ -40,6 +47,14 @@ export type BrowserEvent =
       category: string;
       observation: { session_id: string; tab_id: string; summary: string; captured_at: string };
     }
+  | {
+      type: 'confirmation_requested';
+      session_id: string;
+      tab_id: string;
+      risk: string;
+      summary: string;
+    }
+  | { type: 'confirmation_resolved'; session_id: string; tab_id: string; approved: boolean }
   | { type: 'action_started'; session_id: string; tab_id: string; action: string }
   | { type: 'action_completed'; session_id: string; tab_id: string; action: string }
   | { type: 'action_failed'; session_id: string; tab_id: string; action: string; error: string }
@@ -149,6 +164,20 @@ export const useBrowserStore = create<BrowserStore>((set) => ({
             activeTabId: event.tab_id,
             error: null,
             session: { ...view.session, status: 'acting' },
+          };
+        }
+        if (event.type === 'confirmation_requested') {
+          return {
+            ...view,
+            activeTabId: event.tab_id,
+            error: null,
+            session: { ...view.session, status: 'waiting_confirmation' },
+          };
+        }
+        if (event.type === 'confirmation_resolved') {
+          return {
+            ...view,
+            session: { ...view.session, status: event.approved ? 'acting' : 'ready' },
           };
         }
         if (event.type === 'action_completed') {

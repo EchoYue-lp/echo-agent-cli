@@ -14,6 +14,8 @@ pub struct BrowserConfig {
     pub session_dir: PathBuf,
     pub headless: bool,
     pub startup_timeout_secs: u64,
+    pub allowed_domains: Vec<String>,
+    pub blocked_domains: Vec<String>,
 }
 
 impl BrowserConfig {
@@ -25,6 +27,8 @@ impl BrowserConfig {
         config.npm_command = env_non_empty("EKO_BROWSER_NPM").unwrap_or(config.npm_command);
         config.npx_command = env_non_empty("EKO_BROWSER_NPX").unwrap_or(config.npx_command);
         config.package = env_non_empty("EKO_BROWSER_MCP_PACKAGE").unwrap_or(config.package);
+        config.allowed_domains = env_list("EKO_BROWSER_ALLOWED_DOMAINS");
+        config.blocked_domains = env_list("EKO_BROWSER_BLOCKED_DOMAINS");
         if let Some(path) = env_non_empty("EKO_BROWSER_PROFILE_DIR") {
             config.user_data_dir = PathBuf::from(path);
         }
@@ -57,6 +61,31 @@ impl BrowserConfig {
         }
         args
     }
+
+    pub fn allows_url(&self, value: &str) -> bool {
+        if value == "about:blank" {
+            return true;
+        }
+        let Ok(url) = reqwest::Url::parse(value) else {
+            return false;
+        };
+        let Some(host) = url.host_str() else {
+            return false;
+        };
+        let host = host.to_ascii_lowercase();
+        if self
+            .blocked_domains
+            .iter()
+            .any(|domain| domain_matches(&host, domain))
+        {
+            return false;
+        }
+        self.allowed_domains.is_empty()
+            || self
+                .allowed_domains
+                .iter()
+                .any(|domain| domain_matches(&host, domain))
+    }
 }
 
 impl Default for BrowserConfig {
@@ -76,6 +105,8 @@ impl Default for BrowserConfig {
             session_dir: base_dir.join("sessions"),
             headless: false,
             startup_timeout_secs: 60,
+            allowed_domains: Vec::new(),
+            blocked_domains: Vec::new(),
         }
     }
 }
@@ -93,6 +124,31 @@ fn env_bool(name: &str) -> Option<bool> {
         "0" | "false" | "no" | "off" => Some(false),
         _ => None,
     }
+}
+
+fn env_list(name: &str) -> Vec<String> {
+    env_non_empty(name)
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(|item| item.to_ascii_lowercase())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn domain_matches(host: &str, configured: &str) -> bool {
+    let domain = configured
+        .trim()
+        .trim_start_matches('.')
+        .to_ascii_lowercase();
+    !domain.is_empty()
+        && (host == domain
+            || host
+                .strip_suffix(&domain)
+                .is_some_and(|prefix| prefix.ends_with('.')))
 }
 
 #[cfg(test)]
@@ -121,5 +177,19 @@ mod tests {
                 "--headless",
             ]
         );
+    }
+
+    #[test]
+    fn domain_policy_blocks_before_allowing_subdomains() {
+        let config = BrowserConfig {
+            allowed_domains: vec!["example.com".to_string(), "localhost".to_string()],
+            blocked_domains: vec!["private.example.com".to_string()],
+            ..BrowserConfig::default()
+        };
+        assert!(config.allows_url("https://docs.example.com/page"));
+        assert!(config.allows_url("http://localhost:1420"));
+        assert!(!config.allows_url("https://private.example.com"));
+        assert!(!config.allows_url("https://example.org"));
+        assert!(!config.allows_url("not a url"));
     }
 }

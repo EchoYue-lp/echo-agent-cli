@@ -18,6 +18,7 @@ pub enum BrowserSessionStatus {
     Ready,
     Navigating,
     Acting,
+    WaitingConfirmation,
     Closed,
     Failed,
 }

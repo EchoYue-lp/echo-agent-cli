@@ -39,6 +39,17 @@ pub enum BrowserEvent {
         category: String,
         observation: BrowserObservation,
     },
+    ConfirmationRequested {
+        session_id: String,
+        tab_id: String,
+        risk: String,
+        summary: String,
+    },
+    ConfirmationResolved {
+        session_id: String,
+        tab_id: String,
+        approved: bool,
+    },
     ActionStarted {
         session_id: String,
         tab_id: String,
@@ -79,6 +90,8 @@ impl BrowserEvent {
             Self::Snapshot { .. } => "browser_snapshot",
             Self::Screenshot { .. } => "browser_screenshot",
             Self::Diagnostic { .. } => "browser_diagnostic",
+            Self::ConfirmationRequested { .. } => "browser_confirmation_requested",
+            Self::ConfirmationResolved { .. } => "browser_confirmation_resolved",
             Self::ActionStarted { .. } => "browser_action_started",
             Self::ActionCompleted { .. } => "browser_action_completed",
             Self::ActionFailed { .. } => "browser_action_failed",
