@@ -51,13 +51,19 @@ impl Widget for Sidebar {
             .style(Style::default().fg(t.overlay0))
             .highlight_style(Style::default().fg(t.cyan).add_modifier(Modifier::BOLD))
             .divider(Span::styled(" \u{2502} ", Style::default().fg(t.surface0)));
-        f.render_widget(tabs, sidebar_chunks[0]);
+        let Some(tab_area) = sidebar_chunks.first().copied() else {
+            return;
+        };
+        let Some(content_area) = sidebar_chunks.get(1).copied() else {
+            return;
+        };
+        f.render_widget(tabs, tab_area);
 
         // Tab content
         match app.sidebar_tab {
-            0 => render_file_tree(f, sidebar_chunks[1], t),
-            1 => render_tools_list(f, app, sidebar_chunks[1], t),
-            2 => render_tasks_list(f, app, sidebar_chunks[1], t),
+            0 => render_file_tree(f, content_area, t),
+            1 => render_tools_list(f, app, content_area, t),
+            2 => render_tasks_list(f, app, content_area, t),
             _ => {}
         }
     }
@@ -115,25 +121,106 @@ fn render_tools_list(f: &mut Frame, app: &TuiApp, area: Rect, t: &Theme) {
 }
 
 fn render_tasks_list(_f: &mut Frame, app: &TuiApp, area: Rect, t: &Theme) {
-    let header = ListItem::new(Line::from(vec![Span::styled(
-        format!("  {} Active Tasks", "\u{1f4cb}"),
+    let mut items = vec![ListItem::new(Line::from(vec![Span::styled(
+        format!("  {} TaskRuntime", "\u{1f4cb}"),
         Style::default().fg(t.cyan).add_modifier(Modifier::BOLD),
-    )]));
-
-    let task_item = if let Some(ref task) = app.active_task {
-        ListItem::new(Line::from(vec![
+    )]))];
+    if let Some(view) = &app.task_runtime_view {
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled("  Run ", Style::default().fg(t.overlay0)),
+            Span::styled(
+                super::task_strip::truncate_str(&view.run_id, 14),
+                Style::default().fg(t.text),
+            ),
+        ])));
+        items.push(ListItem::new(Line::from(Span::styled(
+            format!("  [{}]", view.status),
+            Style::default().fg(status_color(&view.status, t)),
+        ))));
+        items.push(ListItem::new(Line::from(Span::styled(
+            format!("  {}", super::task_strip::truncate_str(&view.goal, 20)),
+            Style::default().fg(t.subtext),
+        ))));
+        items.push(ListItem::new(Line::from("")));
+        for task in view
+            .tasks
+            .iter()
+            .take(area.height.saturating_sub(6).saturating_div(2) as usize)
+        {
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("  {} ", task_icon(&task.status)),
+                    Style::default().fg(status_color(&task.status, t)),
+                ),
+                Span::styled(
+                    super::task_strip::truncate_str(&task.title, 17),
+                    Style::default().fg(t.text),
+                ),
+            ])));
+            items.push(ListItem::new(Line::from(Span::styled(
+                format!("      {}", task.agent_role),
+                Style::default().fg(t.overlay0),
+            ))));
+        }
+    } else if let Some(ref task) = app.active_task {
+        items.push(ListItem::new(Line::from(vec![
             Span::styled(format!("    {} ", "\u{25b6}"), Style::default().fg(t.green)),
             Span::styled(task.as_str(), Style::default().fg(t.text)),
-        ]))
+        ])));
     } else {
-        ListItem::new(Line::from(vec![Span::styled(
-            format!("    {} No active background tasks", "\u{25cb}"),
+        items.push(ListItem::new(Line::from(vec![Span::styled(
+            "    No task run for this conversation",
             Style::default()
                 .fg(t.overlay0)
                 .add_modifier(Modifier::ITALIC),
-        )]))
-    };
+        )])));
+    }
 
-    let list = List::new(vec![header, task_item]);
+    if !app.subagent_runs.is_empty() {
+        items.push(ListItem::new(Line::from("")));
+        items.push(ListItem::new(Line::from(Span::styled(
+            "  Subagents",
+            Style::default().fg(t.cyan).add_modifier(Modifier::BOLD),
+        ))));
+        for run in app.subagent_runs.iter().rev().take(4).rev() {
+            let background = if run.background { " bg" } else { "" };
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("  {} ", task_icon(&run.status)),
+                    Style::default().fg(status_color(&run.status, t)),
+                ),
+                Span::styled(
+                    super::task_strip::truncate_str(&run.agent, 12),
+                    Style::default().fg(t.text),
+                ),
+                Span::styled(
+                    format!(" {}t{}", run.tool_calls, background),
+                    Style::default().fg(t.overlay0),
+                ),
+            ])));
+        }
+    }
+
+    let list = List::new(items);
     _f.render_widget(list, area);
+}
+
+fn task_icon(status: &str) -> &'static str {
+    match status {
+        "running" => "▶",
+        "completed" => "✓",
+        "failed" => "×",
+        "blocked" => "!",
+        "skipped" => "-",
+        _ => "○",
+    }
+}
+
+fn status_color(status: &str, t: &Theme) -> ratatui::style::Color {
+    match status {
+        "running" => t.yellow,
+        "completed" => t.green,
+        "failed" | "blocked" | "cancelled" => t.red,
+        _ => t.overlay0,
+    }
 }

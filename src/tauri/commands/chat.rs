@@ -503,6 +503,26 @@ pub async fn send_chat_message(
         }));
     }
 
+    let active_turn_key = conversation_id
+        .clone()
+        .unwrap_or_else(|| format!("message:{message_key}"));
+    match state
+        .app_state
+        .session
+        .active_chat_turns
+        .entry(active_turn_key.clone())
+    {
+        dashmap::mapref::entry::Entry::Occupied(entry) => {
+            return Err(IpcError::Validation(format!(
+                "chat_turn_busy:{}",
+                entry.get()
+            )));
+        }
+        dashmap::mapref::entry::Entry::Vacant(entry) => {
+            entry.insert(message_key.clone());
+        }
+    }
+
     let cancel_token = CancellationToken::new();
 
     // Register cancel token so `cancel_chat(message_key)` (the GUI "stop"
@@ -633,6 +653,11 @@ pub async fn send_chat_message(
     let agent_handle_clone = agent_handle.clone();
     let cleanup_tokens = state.app_state.session.cancel_token.clone();
     let cleanup_key = message_key.clone();
+    let active_chat_turns = state.app_state.session.active_chat_turns.clone();
+    let active_turn_key_for_cleanup = active_turn_key.clone();
+    let runtime_store = state.app_state.tasks.runtime.clone();
+    let run_id_for_cleanup = message_key.clone();
+    let cancel_for_status = cancel_token.clone();
     tokio::spawn(async move {
         let start = std::time::Instant::now();
         // Multimodal: drive_chat takes Option<&Message>; pass the pre-built one
@@ -647,7 +672,9 @@ pub async fn send_chat_message(
             res,
         )
         .await;
-        let terminal_status = if outcome.is_ok() {
+        let terminal_status = if cancel_for_status.is_cancelled() {
+            "cancelled"
+        } else if outcome.is_ok() {
             "completed"
         } else {
             "failed"
@@ -655,11 +682,34 @@ pub async fn send_chat_message(
         if let Err(e) = &outcome {
             tracing::warn!(error = %e, "drive_chat chat turn errored");
         }
-        // Signal terminal status for the inline chat run, then clean up the
-        // turn-scoped cancel token + restore an empty HITL dispatcher so the
-        // agent doesn't fall back to terminal-blocking approval between turns.
-        sink.on_run_status(terminal_status);
         cleanup_tokens.remove(&cleanup_key);
+        if active_chat_turns
+            .get(&active_turn_key_for_cleanup)
+            .is_some_and(|entry| entry.value() == &cleanup_key)
+        {
+            active_chat_turns.remove(&active_turn_key_for_cleanup);
+        }
+        if let Some(store) = runtime_store {
+            let status = match terminal_status {
+                "completed" => {
+                    echo_agent_app_core::tasks::task_runtime::types::TaskRunStatus::Completed
+                }
+                "cancelled" => {
+                    echo_agent_app_core::tasks::task_runtime::types::TaskRunStatus::Cancelled
+                }
+                _ => echo_agent_app_core::tasks::task_runtime::types::TaskRunStatus::Failed,
+            };
+            if let Err(error) = store.transition_run(&run_id_for_cleanup, status) {
+                tracing::warn!(
+                    error = %error,
+                    run_id = %run_id_for_cleanup,
+                    "failed to persist foreground chat terminal status"
+                );
+            }
+        }
+        // Release all execution ownership before emitting Done. The frontend
+        // may immediately dispatch the next queued turn when it receives it.
+        sink.on_run_status(terminal_status);
         agent_handle_clone
             .write_async(|agent| {
                 Box::pin(async move {
@@ -679,6 +729,66 @@ pub async fn send_chat_message(
         "success": true,
         "message_key": message_key,
     }))
+}
+
+/// Inject additional user input into the active foreground turn.
+#[tauri::command]
+pub async fn steer_chat_message(
+    state: tauri::State<'_, TauriState>,
+    message: String,
+    conversation_id: String,
+    attachments: Option<Vec<echo_agent_app_core::types::AttachmentData>>,
+) -> Result<serde_json::Value, IpcError> {
+    if message.trim().is_empty() && attachments.as_ref().is_none_or(Vec::is_empty) {
+        return Err(IpcError::Validation("steer input is empty".to_string()));
+    }
+    let expected_turn_id = state
+        .app_state
+        .session
+        .active_chat_turns
+        .get(&conversation_id)
+        .map(|entry| entry.value().clone())
+        .ok_or_else(|| IpcError::Validation("no active chat turn".to_string()))?;
+    let saved_attachments = attachments.unwrap_or_default();
+    let steer_message = if saved_attachments.is_empty() {
+        echo_core::llm::types::Message::user(message)
+    } else {
+        let ws_root = state.app_state.current_workspace().await.map(|ws| ws.root);
+        let uploads_dir = echo_agent_app_core::attachments::resolve_uploads_dir(ws_root.as_deref());
+        let saved =
+            echo_agent_app_core::attachments::save_attachments(&saved_attachments, &uploads_dir);
+        if saved.is_empty() {
+            echo_core::llm::types::Message::user(message)
+        } else {
+            echo_agent_app_core::attachments::build_message(&message, &saved)
+                .map_err(|error| IpcError::Validation(error.to_string()))?
+        }
+    };
+    let agent = state.app_state.connection.agent_for(&conversation_id).await;
+    match agent
+        .steer_input(Some(&expected_turn_id), steer_message)
+        .await
+    {
+        Ok(turn_id) => Ok(serde_json::json!({
+            "kind": "accepted",
+            "turn_id": turn_id,
+        })),
+        Err(echo_agent::agent::TurnSteerError::NotSteerable { turn_id }) => Ok(serde_json::json!({
+            "kind": "not_steerable",
+            "turn_id": turn_id,
+        })),
+        Err(echo_agent::agent::TurnSteerError::NoActiveTurn) => {
+            Ok(serde_json::json!({"kind": "no_active_turn"}))
+        }
+        Err(echo_agent::agent::TurnSteerError::TurnMismatch { expected, actual }) => {
+            Ok(serde_json::json!({
+                "kind": "turn_mismatch",
+                "expected": expected,
+                "actual": actual,
+            }))
+        }
+        Err(error) => Err(IpcError::Validation(error.to_string())),
+    }
 }
 
 /// Cancel an active chat stream.

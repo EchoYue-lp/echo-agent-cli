@@ -203,6 +203,7 @@ pub fn build_tauri_app(app_state: Arc<AppState>) -> tauri::Builder<tauri::Wry> {
             commands::conversations::search_conversations,
             // Chat streaming
             commands::chat::send_chat_message,
+            commands::chat::steer_chat_message,
             commands::chat::cancel_chat,
             commands::chat::send_approval_response,
             commands::chat::send_input_response,

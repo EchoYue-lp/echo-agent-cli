@@ -419,6 +419,19 @@ impl AgentPool {
                         if let Some(cw) = runtime.context_window {
                             agent.set_token_limit(cw as usize);
                         }
+                        match runtime.thinking.as_deref() {
+                            Some(spec) if !spec.trim().is_empty() => {
+                                match echo_agent::llm::ThinkingConfig::parse_spec(spec) {
+                                    Ok(config) => agent.set_thinking(config),
+                                    Err(error) => tracing::warn!(
+                                        thinking_spec = spec,
+                                        error = %error,
+                                        "AgentPool: ignoring invalid thinking configuration"
+                                    ),
+                                }
+                            }
+                            _ => agent.set_thinking(None),
+                        }
                     })
                 })
                 .await;

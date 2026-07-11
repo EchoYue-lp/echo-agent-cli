@@ -28,7 +28,12 @@ fn theme_set() -> &'static ThemeSet {
 
 fn syntect_theme() -> &'static syntect::highlighting::Theme {
     // "base16-ocean.dark" is a good dark theme.
-    &theme_set().themes["base16-ocean.dark"]
+    static FALLBACK: OnceLock<syntect::highlighting::Theme> = OnceLock::new();
+    theme_set()
+        .themes
+        .get("base16-ocean.dark")
+        .or_else(|| theme_set().themes.values().next())
+        .unwrap_or_else(|| FALLBACK.get_or_init(Default::default))
 }
 
 // ── Color helpers ───────────────────────────────────────────────────────────
@@ -373,7 +378,9 @@ impl MarkdownRenderer {
         let mut col_widths = vec![0usize; num_cols];
         for row in &self.table_rows {
             for (i, cell) in row.iter().enumerate().take(num_cols) {
-                col_widths[i] = col_widths[i].max(cell.len().min(40));
+                if let Some(width) = col_widths.get_mut(i) {
+                    *width = (*width).max(cell.len().min(40));
+                }
             }
         }
 

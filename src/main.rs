@@ -112,13 +112,39 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
         infra::init_logging(&app_config.logging.level);
     }
 
+    // TUI/CLI and GUI share the same file-backed conversation projection.
+    let conversation_store = echo_agent_app_core::infra::create_conversation_store();
+    let requested_conversation_id = if let Some(id) = args.resume.as_ref() {
+        Some(id.clone())
+    } else if args.r#continue {
+        match conversation_store.as_ref() {
+            Some(store) => store
+                .list_conversations(echo_agent::memory::ConversationFilter {
+                    limit: Some(1),
+                    ..Default::default()
+                })
+                .await?
+                .first()
+                .map(|conversation| conversation.conversation_id.clone()),
+            None => None,
+        }
+    } else {
+        None
+    };
+    if (args.r#continue || args.resume.is_some()) && requested_conversation_id.is_none() {
+        anyhow::bail!("No persisted conversation is available to resume");
+    }
+    let conversation_id = requested_conversation_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
     // 创建 Agent + 加载 MCP 配置（统一路径，消除重复）
     let params = echo_agent_cli::infra::AgentCreateParams {
         model: args.model.clone(),
         system_prompt: None,
         project: args.project.clone(),
         session_id: None,
-        conversation_id: None,
+        conversation_id: Some(conversation_id.clone()),
         react_checkpoint_interval: None,
         state_store: None,
         memory_context_suffix: None,
@@ -130,6 +156,33 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
     let runtime =
         echo_agent_app_core::runtime::AgentRuntime::bootstrap(&app_config, params).await?;
     let agent_handle = runtime.agent_handle.clone();
+    echo_agent_app_core::infra::inject_conversation_store(&agent_handle, &conversation_store);
+
+    if requested_conversation_id.is_some() {
+        let store = conversation_store
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Conversation store is unavailable"))?;
+        let conversation = store
+            .get_conversation(&conversation_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Conversation '{conversation_id}' was not found"))?;
+        let stored = store.get_messages(&conversation_id).await?;
+        let messages = echo_agent_app_core::conversation_restore::restore_messages(&stored);
+        let message_count = messages.len();
+        agent_handle
+            .read_async(|agent| Box::pin(async move { agent.load_messages(messages).await }))
+            .await;
+        let short_id: String = conversation_id.chars().take(8).collect();
+        let date: String = conversation.updated_at.chars().take(19).collect();
+        tracing::info!(
+            conversation_id = %conversation_id,
+            message_count,
+            "Conversation resumed from file store"
+        );
+        if !is_tui_entry {
+            println!("Resuming conversation {short_id} from {date}, {message_count} messages");
+        }
+    }
 
     // Spawn config file watcher (fires ConfigChange hooks + reloads hooks on change)
     let cancel_token = tokio_util::sync::CancellationToken::new();
@@ -158,147 +211,6 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             }
         }
     };
-
-    // ── G3: Session resume (--continue / --resume) ──────────────────
-    if args.r#continue || args.resume.is_some() {
-        use echo_agent::llm::types::{FunctionCall, Message, MessageContent, ToolCall};
-        use echo_agent_cli::sessions::{Session, SessionManager};
-
-        /// Convert persisted session messages back into agent `Message` values,
-        /// re-linking tool-result messages to their parent assistant tool-call IDs.
-        fn restore_messages(session: &Session) -> Vec<Message> {
-            let mut out: Vec<Message> = Vec::new();
-            let mut pending_tc_ids: Vec<String> = Vec::new();
-            // Map tool_call_id → tool name from the preceding assistant message
-            let mut tc_name_map: std::collections::HashMap<String, String> =
-                std::collections::HashMap::new();
-            let mut tc_idx: usize = 0;
-
-            for sm in &session.messages {
-                let text = sm.content.clone().unwrap_or_default();
-                match sm.role.as_str() {
-                    "system" => {
-                        out.push(Message::system(text));
-                        pending_tc_ids.clear();
-                        tc_name_map.clear();
-                        tc_idx = 0;
-                    }
-                    "user" => {
-                        out.push(Message::user(text));
-                        pending_tc_ids.clear();
-                        tc_name_map.clear();
-                        tc_idx = 0;
-                    }
-                    "assistant" => {
-                        if let Some(ref tcs) = sm.tool_calls {
-                            let calls: Vec<ToolCall> = tcs
-                                .iter()
-                                .map(|tc| ToolCall {
-                                    id: tc.id.clone(),
-                                    call_type: "function".to_string(),
-                                    function: FunctionCall {
-                                        name: tc.name.clone(),
-                                        arguments: tc.arguments.clone(),
-                                    },
-                                })
-                                .collect();
-                            pending_tc_ids = calls.iter().map(|c| c.id.clone()).collect();
-                            tc_name_map.clear();
-                            for tc in tcs {
-                                tc_name_map.insert(tc.id.clone(), tc.name.clone());
-                            }
-                            tc_idx = 0;
-                            let mut msg = Message::assistant_with_tools(calls);
-                            if !text.is_empty() {
-                                msg.content = MessageContent::Text(text);
-                            }
-                            out.push(msg);
-                        } else {
-                            out.push(Message::assistant(text));
-                            pending_tc_ids.clear();
-                            tc_name_map.clear();
-                            tc_idx = 0;
-                        }
-                    }
-                    "tool" => {
-                        let id = pending_tc_ids.get(tc_idx).cloned().unwrap_or_else(|| {
-                            tracing::warn!(
-                                "restore_messages: tool result at index {tc_idx} has no matching tool call ID, using placeholder"
-                            );
-                            format!("unknown_{tc_idx}")
-                        });
-                        // Restore tool name from the assistant's tool_calls
-                        let name = tc_name_map.get(&id).cloned().unwrap_or_default();
-                        tc_idx += 1;
-                        out.push(Message::tool_result(id, name, text));
-                    }
-                    _ => {
-                        out.push(Message::user(text));
-                    }
-                }
-            }
-            out
-        }
-
-        let manager = SessionManager::new();
-        let resume_result: anyhow::Result<Option<echo_agent_cli::sessions::Session>> = if let Some(
-            ref session_id,
-        ) =
-            args.resume
-        {
-            match manager.load(session_id) {
-                Ok(s) => Ok(Some(s)),
-                Err(_) => {
-                    eprintln!(
-                        "\u{2717} Session '{}' not found. Use `echo-agent-cli sessions list` to see available sessions.",
-                        session_id
-                    );
-                    std::process::exit(1);
-                }
-            }
-        } else {
-            manager.get_latest()
-        };
-
-        match resume_result {
-            Ok(Some(session)) => {
-                let messages = restore_messages(&session);
-                let msg_count = messages.len();
-                if !messages.is_empty() {
-                    agent_handle
-                        .read_async(|a| {
-                            Box::pin(async move {
-                                a.load_messages(messages).await;
-                            })
-                        })
-                        .await;
-                }
-                let date: String = session.updated_at.chars().take(19).collect();
-                let short_id: String = session.id.chars().take(8).collect();
-                println!(
-                    "\u{2713} Resuming session {} from {}, {} messages",
-                    short_id, date, msg_count
-                );
-                tracing::info!(
-                    session_id = %session.id,
-                    messages = msg_count,
-                    "Session resumed"
-                );
-            }
-            Ok(None) => {
-                eprintln!(
-                    "\u{2717} No previous sessions found. Start a new session normally, then use --continue to resume it later."
-                );
-                std::process::exit(1);
-            }
-            Err(e) => {
-                eprintln!(
-                    "\u{26a0} Failed to load session data: {e}. Starting a fresh session instead."
-                );
-                tracing::warn!("Session resume failed, falling back to new session: {e}");
-            }
-        }
-    }
 
     // ── User-facing TUI mode (default) ─────────────────────────────────
     #[cfg(feature = "tui")]
@@ -379,6 +291,20 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             pool,
             task_runtime_store,
             runtime.review_integration.clone(),
+            conversation_store.clone(),
+            conversation_id.clone(),
+            app_config
+                .configured_models
+                .iter()
+                .filter(|model| model.enabled)
+                .map(|model| {
+                    echo_agent_app_core::model_config::resolve_runtime_model(
+                        &app_config,
+                        Some(&model.id),
+                    )
+                })
+                .collect(),
+            args.no_alt_screen,
         )
         .await?;
 
@@ -509,6 +435,7 @@ mod tests {
             web: false,
             cli: false,
             tui: false,
+            no_alt_screen: false,
             port: 3000,
             host: "127.0.0.1".to_string(),
             model: Some("test-model".to_string()),
@@ -535,10 +462,14 @@ mod tests {
             route: None,
         };
         let app_config = config::AppConfig::default();
-        let agent = match tokio::runtime::Runtime::new()
-            .expect("runtime")
-            .block_on(infra::create_agent(&params, &app_config))
-        {
+        let runtime = match tokio::runtime::Runtime::new() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                eprintln!("test setup failed: runtime: {error}");
+                return;
+            }
+        };
+        let agent = match runtime.block_on(infra::create_agent(&params, &app_config)) {
             Ok(a) => a,
             Err(e) => {
                 eprintln!("test setup failed: create_agent: {e}");

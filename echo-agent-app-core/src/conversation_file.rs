@@ -487,35 +487,35 @@ impl SessionSearchEngine {
         results
     }
 
-    /// Re-index all sessions from the file system (v2 sessions only — v1 is
-    /// legacy). Scans `~/.echo-agent/sessions_v2/*.json`.
+    /// Re-index all conversations from the canonical file-backed store.
     pub fn reindex_all(&self) -> std::io::Result<usize> {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        let dir = PathBuf::from(home).join(".echo-agent").join("sessions_v2");
+        let dir = PathBuf::from(home)
+            .join(".echo-agent")
+            .join("conversations");
         if !dir.exists() {
             return Ok(0);
         }
-        let mut count = 0;
+        let mut count: usize = 0;
         for entry in std::fs::read_dir(&dir)?.flatten() {
             let path = entry.path();
             if path.extension().is_some_and(|e| e == "json")
                 && let Ok(data) = std::fs::read_to_string(&path)
-                && let Ok(session) = serde_json::from_str::<serde_json::Value>(&data)
+                && let Ok(record) = serde_json::from_str::<ConversationRecord>(&data)
             {
-                let id = session["id"].as_str().unwrap_or("").to_string();
-                let name = session["name"].as_str().unwrap_or("").to_string();
-                let model = session["model"].as_str().unwrap_or("").to_string();
-                let messages: Vec<String> = session["messages"]
-                    .as_array()
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|m| m["content"].as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let id = record.conversation.conversation_id;
+                let name = record
+                    .conversation
+                    .title
+                    .unwrap_or_else(|| "Untitled".to_string());
+                let messages = record
+                    .messages
+                    .into_iter()
+                    .filter_map(|message| message.content)
+                    .collect::<Vec<_>>();
                 if !id.is_empty() {
-                    self.index_session(&id, &name, &model, &messages);
-                    count += 1;
+                    self.index_session(&id, &name, "", &messages);
+                    count = count.saturating_add(1);
                 }
             }
         }

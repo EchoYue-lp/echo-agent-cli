@@ -36,20 +36,21 @@ pub fn draw(f: &mut Frame, app: &TuiApp) {
     // Conditionally show task strip below input when there are active parallel tasks.
     let task_strip_rows = app.parallel_tasks.len().min(5) as u16;
     let has_tasks = !app.parallel_tasks.is_empty();
+    let input_rows = app.input_height(size.width);
 
     // Main layout: status bar + body (sidebar+chat) + input + [task strip].
     let constraints = if has_tasks {
         vec![
             Constraint::Length(1),               // StatusBar
             Constraint::Min(8),                  // Chat (+ sidebar)
-            Constraint::Length(3),               // Input
+            Constraint::Length(input_rows),      // Input
             Constraint::Length(task_strip_rows), // TaskStrip (dynamic, bottom)
         ]
     } else {
         vec![
-            Constraint::Length(1), // StatusBar
-            Constraint::Min(8),    // Chat (+ sidebar)
-            Constraint::Length(3), // Input
+            Constraint::Length(1),          // StatusBar
+            Constraint::Min(8),             // Chat (+ sidebar)
+            Constraint::Length(input_rows), // Input
         ]
     };
 
@@ -57,9 +58,18 @@ pub fn draw(f: &mut Frame, app: &TuiApp) {
         .direction(Direction::Vertical)
         .constraints(constraints)
         .split(size);
+    let Some(status_area) = main_chunks.first().copied() else {
+        return;
+    };
+    let Some(body_area) = main_chunks.get(1).copied() else {
+        return;
+    };
+    let Some(input_area) = main_chunks.get(2).copied() else {
+        return;
+    };
 
     // ── Status bar ─────────────────────────────────────────────────────
-    StatusBar.render(f, main_chunks[0], app);
+    StatusBar.render(f, status_area, app);
 
     // ── Body (sidebar + chat) ──────────────────────────────────────────
     if app.sidebar_visible {
@@ -69,24 +79,28 @@ pub fn draw(f: &mut Frame, app: &TuiApp) {
                 Constraint::Length(24), // Sidebar
                 Constraint::Min(40),    // Chat area
             ])
-            .split(main_chunks[1]);
+            .split(body_area);
 
-        Sidebar.render(f, body_chunks[0], app);
-        Chat.render(f, body_chunks[1], app);
+        if let Some(sidebar_area) = body_chunks.first().copied() {
+            Sidebar.render(f, sidebar_area, app);
+        }
+        if let Some(chat_area) = body_chunks.get(1).copied() {
+            Chat.render(f, chat_area, app);
+        }
     } else {
-        Chat.render(f, main_chunks[1], app);
+        Chat.render(f, body_area, app);
     }
 
     // ── Input box ──────────────────────────────────────────────────────
-    Input.render(f, main_chunks[2], app);
+    Input.render(f, input_area, app);
 
     // ── Task strip (conditional, below input) ──────────────────────────
-    if has_tasks {
-        TaskStrip.render(f, main_chunks[3], app);
+    if has_tasks && let Some(task_area) = main_chunks.get(3).copied() {
+        TaskStrip.render(f, task_area, app);
     }
 
     // ── Approval card (inline overlay, bottom of chat area) ────────────
-    render_approval_card(f, app, main_chunks[1]);
+    render_approval_card(f, app, body_area);
 }
 
 /// Render the approval request card as an inline overlay at the bottom of the chat area.
@@ -154,7 +168,7 @@ fn render_approval_card(f: &mut Frame, app: &TuiApp, chat_area: Rect) {
     if !approval.args_display.is_empty() {
         let arg_lines: Vec<&str> = approval.args_display.lines().collect();
         let show_lines = arg_lines.len().min(args_max_lines);
-        for line in &arg_lines[..show_lines] {
+        for line in arg_lines.iter().take(show_lines) {
             lines.push(Line::from(Span::styled(
                 format!("  {}", line),
                 Style::default().fg(theme.subtext),

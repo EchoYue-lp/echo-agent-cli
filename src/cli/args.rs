@@ -14,6 +14,10 @@ pub struct Args {
     #[arg(long, short = 't', default_value_t = false)]
     pub tui: bool,
 
+    /// Render without the alternate screen so terminal scrollback is preserved.
+    #[arg(long, default_value_t = false)]
+    pub no_alt_screen: bool,
+
     /// 内部 Web 服务入口（仅供 GUI/调试使用；默认隐藏）
     #[arg(long, default_value_t = false, hide = true)]
     pub web: bool,

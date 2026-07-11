@@ -12,7 +12,9 @@ import { useSubagentDetailStore } from '../../stores/subagentDetailStore';
 import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
 import { SubagentDetailView } from '../task/SubagentDetailView';
 import { FailureToast } from './FailureToast';
+import { CornerUpLeft, GripVertical, X } from 'lucide-react';
 import type { Attachment } from '../../types/api';
+import type { QueuedChatInput } from '../../hooks/useTauriChat';
 
 // Tauri IPC is the only live transport. The WebSocket transport
 // (hooks/useWebSocket.ts) was removed after the chat path migrated to Tauri
@@ -50,19 +52,32 @@ export function ChatPanel() {
   const scrollRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
   const isNearBottomRef = useRef(true);
-  const { sendMessage, sendApproval, sendInput, sendSelection, cancel } = useChatTransport();
+  const {
+    sendMessage,
+    sendApproval,
+    sendInput,
+    sendSelection,
+    cancel,
+    queuedInputs,
+    clearQueuedMessages,
+    removeQueuedMessage,
+    reorderQueuedMessage,
+    steerQueuedMessage,
+  } = useChatTransport();
 
   const clearCurrentChat = useCallback(async () => {
+    clearQueuedMessages();
     cancel();
     await useConversationStore.getState().clearCurrent();
     useTaskRuntimeStore.getState().reset();
     useSubagentRunStore.getState().clear();
     closeSubagentDetail();
-  }, [cancel, closeSubagentDetail]);
+  }, [cancel, clearQueuedMessages, closeSubagentDetail]);
 
   const handleRegenerate = () => {
     // Cancel any in-flight run before regenerating — otherwise late-arriving
     // token events from the old run land on a deleted message (orphan).
+    clearQueuedMessages();
     cancel();
     const store = useChatStore.getState();
     const content = store.prepareRegenerate();
@@ -70,6 +85,7 @@ export function ChatPanel() {
   };
 
   const handleEditAndResend = (messageId: string, newContent: string) => {
+    clearQueuedMessages();
     cancel();
     const store = useChatStore.getState();
     const content = store.prepareEditAndResend(messageId, newContent);
@@ -309,9 +325,93 @@ export function ChatPanel() {
             </button>
           </div>
         )}
-        <ChatInput onSend={handleSend} isStreaming={isStreaming} onCancel={cancel} />
+        {queuedInputs.length > 0 && (
+          <QueuedInputList
+            items={queuedInputs}
+            onRemove={removeQueuedMessage}
+            onReorder={reorderQueuedMessage}
+            onSteer={steerQueuedMessage}
+          />
+        )}
+        <ChatInput
+          onSend={handleSend}
+          isStreaming={isStreaming}
+          onCancel={cancel}
+          queuedCount={queuedInputs.length}
+        />
       </div>
     </div>
+  );
+}
+
+function QueuedInputList({
+  items,
+  onRemove,
+  onReorder,
+  onSteer,
+}: {
+  items: QueuedChatInput[];
+  onRemove: (id: string) => void;
+  onReorder: (sourceId: string, targetId: string) => void;
+  onSteer: (id: string) => Promise<boolean>;
+}) {
+  const [draggedId, setDraggedId] = useState<string | null>(null);
+
+  return (
+    <section className="mx-auto mb-2 w-full max-w-[980px] px-4 sm:px-6 lg:px-8">
+      <div className="mb-1 flex items-center justify-between px-1 text-[11px] text-[var(--text-tertiary)]">
+        <span>排队任务 {items.length}</span>
+        <span>拖动调整执行顺序</span>
+      </div>
+      <div className="max-h-40 space-y-1 overflow-y-auto">
+        {items.map((item, index) => (
+          <div
+            key={item.id}
+            draggable
+            onDragStart={() => setDraggedId(item.id)}
+            onDragEnd={() => setDraggedId(null)}
+            onDragOver={(event) => event.preventDefault()}
+            onDrop={(event) => {
+              event.preventDefault();
+              if (draggedId) onReorder(draggedId, item.id);
+              setDraggedId(null);
+            }}
+            className="flex min-h-9 items-center gap-2 border-l-2 border-[var(--border-primary)] bg-[var(--bg-secondary)] px-2 py-1.5 text-xs transition-colors hover:bg-[var(--bg-hover)]"
+            style={{ opacity: draggedId === item.id ? 0.55 : 1 }}
+          >
+            <GripVertical
+              size={14}
+              className="shrink-0 cursor-grab text-[var(--text-tertiary)] active:cursor-grabbing"
+              aria-hidden="true"
+            />
+            <span className="w-5 shrink-0 text-center tabular-nums text-[var(--text-tertiary)]">
+              {index + 1}
+            </span>
+            <span className="min-w-0 flex-1 truncate text-[var(--text-secondary)]">
+              {item.text || item.attachments?.map((file) => file.name).join(', ') || '附件'}
+            </span>
+            <button
+              type="button"
+              onClick={() => void onSteer(item.id)}
+              className="flex h-7 w-7 shrink-0 items-center justify-center text-[var(--text-tertiary)] hover:text-[var(--accent)]"
+              title="补充到当前任务"
+              aria-label="补充到当前任务"
+            >
+              <CornerUpLeft size={14} />
+            </button>
+            <button
+              type="button"
+              onClick={() => onRemove(item.id)}
+              className="flex h-7 w-7 shrink-0 items-center justify-center text-[var(--text-tertiary)] hover:text-[var(--color-error)]"
+              title="移出队列"
+              aria-label="移出队列"
+            >
+              <X size={14} />
+            </button>
+          </div>
+        ))}
+      </div>
+    </section>
   );
 }
 

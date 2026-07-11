@@ -346,7 +346,10 @@ pub struct ConfigState {
 /// 会话状态：工具状态 + 取消令牌
 pub struct SessionState {
     pub tool_states: RwLock<HashMap<String, ToolState>>,
-    pub cancel_token: DashMap<String, CancellationToken>,
+    pub cancel_token: Arc<DashMap<String, CancellationToken>>,
+    /// One foreground chat turn per conversation. UI surfaces may queue
+    /// follow-up input, but must never start two turns against the same agent.
+    pub active_chat_turns: Arc<DashMap<String, String>>,
 }
 
 /// 插件状态：MCP 服务管理
@@ -494,7 +497,8 @@ impl AppState {
             },
             session: SessionState {
                 tool_states: RwLock::new(HashMap::new()),
-                cancel_token: DashMap::new(),
+                cancel_token: Arc::new(DashMap::new()),
+                active_chat_turns: Arc::new(DashMap::new()),
             },
             plugins: PluginState {
                 mcp_config: RwLock::new(McpConfigFile::default()),

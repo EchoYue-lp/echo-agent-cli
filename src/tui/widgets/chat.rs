@@ -60,8 +60,8 @@ impl Widget for Chat {
                     usize::MAX
                 };
                 let line_idx = vis_idx - vis_start;
-                if line_idx < lines.len() {
-                    apply_highlight(&mut lines[line_idx], start_col, end_col);
+                if let Some(line) = lines.get_mut(line_idx) {
+                    apply_highlight(line, start_col, end_col);
                 }
             }
         }
@@ -152,7 +152,7 @@ fn apply_highlight(line: &mut Line<'static>, start_col: usize, end_col: usize) {
                 new_spans.push(Span::styled(text.to_string(), style));
             } else {
                 for (bs, be, highlighted) in &parts {
-                    let part_text = &text[*bs..*be];
+                    let part_text = text.get(*bs..*be).unwrap_or_default();
                     if !part_text.is_empty() {
                         let part_style = if *highlighted { hl_style } else { style };
                         new_spans.push(Span::styled(part_text.to_string(), part_style));

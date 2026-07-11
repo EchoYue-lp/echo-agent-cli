@@ -24,6 +24,7 @@ tui = [
     "dep:ratatui", "dep:crossterm", "dep:arboard",
     "dep:unicode-width", "dep:textwrap", "dep:strum",
     "dep:strum_macros", "dep:pulldown-cmark", "dep:syntect",
+    "dep:image",
 ]
 gui = [
     "dep:tauri", "dep:tauri-plugin-shell", "dep:tauri-plugin-dialog",
@@ -99,6 +100,7 @@ portable-pty = { version = "0.8", optional = true }
 dashmap = { version = "6", optional = true }
 base64 = "0.22"
 arboard = { version = "3", optional = true }
+image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

@@ -67,6 +67,11 @@ interface ChatState {
 
   addUserMessage: (content: string, attachments?: ChatMessage['attachments']) => void;
   startAssistantMessage: (idOverride?: string) => string;
+  continueAfterSteer: (
+    assistantId: string | null,
+    content: string,
+    attachments?: ChatMessage['attachments']
+  ) => string;
   appendToken: (id: string, token: string) => void;
   appendThinking: (id: string, token: string) => void;
   startThinkingSegment: (id: string) => void;
@@ -185,6 +190,53 @@ export const useChatStore = create<ChatState>((set, get) => ({
       runStatus: 'running',
     }));
     return id;
+  },
+
+  continueAfterSteer: (assistantId, content, attachments) => {
+    const nextAssistantId = nextId();
+    set((s) => {
+      const finalized = s.messages
+        .map((message) =>
+          message.id === assistantId ? { ...message, isStreaming: false } : message
+        )
+        .filter((message) => {
+          if (message.id !== assistantId || message.role !== 'assistant') return true;
+          return Boolean(
+            message.content ||
+            message.thinkingSegments?.length ||
+            message.toolCalls?.length ||
+            message.executionSteps?.length
+          );
+        });
+      return {
+        messages: trimToMax([
+          ...finalized,
+          {
+            id: nextId(),
+            role: 'user' as const,
+            content,
+            attachments,
+            timestamp: Date.now(),
+          },
+          {
+            id: nextAssistantId,
+            role: 'assistant' as const,
+            content: '',
+            thinkingSegments: [],
+            toolCalls: [],
+            executionSteps: [],
+            executionRounds: [],
+            isStreaming: true,
+            timestamp: Date.now(),
+          },
+        ]),
+        isStreaming: true,
+        isCancelled: false,
+        runStatus: 'running' as const,
+      };
+    });
+    scheduleAutoSave();
+    return nextAssistantId;
   },
 
   appendToken: (id, token) => {

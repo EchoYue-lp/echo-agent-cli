@@ -1753,6 +1753,7 @@ dependencies = [
  "echo_core",
  "futures",
  "hex",
+ "image",
  "indicatif",
  "notify",
  "nu-ansi-term",

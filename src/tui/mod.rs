@@ -22,7 +22,7 @@ pub mod widgets;
 use crate::agent_handle::AgentHandle;
 use crossterm::{
     cursor::Show,
-    event::{DisableMouseCapture, EnableMouseCapture},
+    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -32,6 +32,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::{Terminal, backend::CrosstermBackend};
+use std::collections::VecDeque;
 use std::io;
 use std::time::Instant;
 use textwrap::WordSplitter;
@@ -151,6 +152,43 @@ pub struct TaskProgressEntry {
     pub elapsed_label: String,
 }
 
+/// A user turn submitted while the foreground agent is still busy.
+#[derive(Clone, Debug)]
+pub struct QueuedTurn {
+    pub text: String,
+    pub attachments: Vec<echo_agent_app_core::attachments::AttachmentRef>,
+    pub interaction_mode: InteractionMode,
+}
+
+/// Read-only TUI projection of the authoritative TaskRuntime state.
+#[derive(Clone, Debug, Default)]
+pub struct TaskRuntimeView {
+    pub run_id: String,
+    pub goal: String,
+    pub status: String,
+    pub tasks: Vec<TaskRuntimeTaskView>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TaskRuntimeTaskView {
+    pub title: String,
+    pub status: String,
+    pub agent_role: String,
+}
+
+/// Live, in-memory projection of one framework subagent dispatch.
+#[derive(Clone, Debug, Default)]
+pub struct SubagentRuntimeView {
+    pub execution_id: String,
+    pub agent: String,
+    pub task: String,
+    pub status: String,
+    pub tool_calls: usize,
+    pub tokens_used: Option<u64>,
+    pub duration_ms: Option<u64>,
+    pub background: bool,
+}
+
 /// TUI application state.
 pub struct TuiApp {
     /// Current input text.
@@ -163,6 +201,12 @@ pub struct TuiApp {
     pub message_groups: Vec<MessageGroup>,
     /// Whether the agent is currently processing.
     pub is_processing: bool,
+    /// Cancellation authority for the current foreground turn.
+    pub active_cancel: Option<echo_agent::agent::CancellationToken>,
+    /// Framework turn id used by `/steer` while the turn is active.
+    pub active_turn_id: Option<String>,
+    /// FIFO turns submitted while the foreground agent is busy.
+    pub queued_turns: VecDeque<QueuedTurn>,
     /// Current streaming text being received.
     pub streaming_text: String,
     /// Slash command suggestions (shown as completion popup).
@@ -253,6 +297,10 @@ pub struct TuiApp {
     /// TaskRuntimeStore for create_run / cancel_run (Phase B3). Set by `run_tui`.
     pub task_runtime_store:
         Option<std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
+    /// Latest TaskRuntime projection for the current conversation.
+    pub task_runtime_view: Option<TaskRuntimeView>,
+    /// Live subagent dispatches observed from the framework event bus.
+    pub subagent_runs: Vec<SubagentRuntimeView>,
     /// Staged attachments from `/attach <path>` (B5.3). The next Enter sends
     /// them alongside the typed text as a multimodal message via
     /// `drive_chat(multimodal=Some)`, then drains the buffer. Empty = plain
@@ -267,6 +315,24 @@ pub struct TuiApp {
     /// and TaskRuntime runs to one conversation; enables transcript projection.
     /// Generated once per session in `run_tui`.
     pub conversation_id: Option<String>,
+    /// File-backed conversation projection shared with GUI and headless entry.
+    pub conversation_store: Option<std::sync::Arc<dyn echo_agent::memory::ConversationStore>>,
+    /// Runtime-ready configured models exposed by the product configuration.
+    pub configured_models: Vec<echo_agent_app_core::model_config::ModelRuntimeConfig>,
+    /// Preserve native terminal scrollback instead of entering the alternate screen.
+    pub inline_mode: bool,
+    /// Event-loop request to temporarily suspend the TUI and open `$VISUAL`/`$EDITOR`.
+    pub external_editor_requested: bool,
+    /// Project-relative paths used by `@` completion.
+    pub project_files: Vec<String>,
+    /// Current offset for repeated Ctrl+R reverse-history search.
+    pub reverse_search_idx: Option<usize>,
+    /// Stable query retained while repeated Ctrl+R walks older matches.
+    pub reverse_search_query: Option<String>,
+    /// Last idle Esc press, used for the double-Esc rewind gesture.
+    pub last_escape_at: Option<Instant>,
+    /// Event-loop request to rewind the most recent persisted turn.
+    pub rewind_requested: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -341,6 +407,9 @@ impl TuiApp {
             }],
             message_groups: vec![],
             is_processing: false,
+            active_cancel: None,
+            active_turn_id: None,
+            queued_turns: VecDeque::new(),
             streaming_text: String::new(),
             suggestions: vec![],
             selected_suggestion: 0,
@@ -382,9 +451,20 @@ impl TuiApp {
             pending_approval: None,
             pool: None,
             task_runtime_store: None,
+            task_runtime_view: None,
+            subagent_runs: Vec::new(),
             pending_attachments: Vec::new(),
             review_integration: None,
             conversation_id: None,
+            conversation_store: None,
+            configured_models: Vec::new(),
+            inline_mode: false,
+            external_editor_requested: false,
+            project_files: Vec::new(),
+            reverse_search_idx: None,
+            reverse_search_query: None,
+            last_escape_at: None,
+            rewind_requested: false,
         }
     }
 
@@ -407,7 +487,9 @@ impl TuiApp {
 
         let mut i = 0;
         while i < self.messages.len() {
-            let msg = &self.messages[i];
+            let Some(msg) = self.messages.get(i) else {
+                break;
+            };
 
             match msg.role {
                 MessageRole::User => {
@@ -438,10 +520,13 @@ impl TuiApp {
                     let mut has_final_answer = false;
 
                     while i < self.messages.len() {
-                        match &self.messages[i].role {
+                        let Some(current) = self.messages.get(i) else {
+                            break;
+                        };
+                        match &current.role {
                             MessageRole::Assistant => {
                                 // Check if this is a thinking message or final answer
-                                let content = &self.messages[i].content;
+                                let content = &current.content;
                                 if content.contains("🤔") || content.contains("Thinking:") {
                                     thinking_count += 1;
                                 } else if !content.is_empty() {
@@ -548,8 +633,8 @@ impl TuiApp {
         }
     }
 
-    /// Submit the current input. Returns the text if non-empty.
-    pub fn submit_input(&mut self) -> Option<String> {
+    /// Take the current input into history without starting an agent turn.
+    pub fn take_input(&mut self) -> Option<String> {
         let text = self.input.trim().to_string();
         if text.is_empty() {
             return None;
@@ -558,23 +643,33 @@ impl TuiApp {
         self.history.push(text.clone());
         self.history_idx = None;
 
-        self.messages.push(ChatMessage {
-            role: MessageRole::User,
-            content: text.clone(),
-        });
-        self.trim_old_messages();
-        self.rebuild_message_groups();
-
         self.input.clear();
         self.cursor = 0;
         self.suggestions.clear();
         self.chat_scroll = 0;
 
+        Some(text)
+    }
+
+    /// Mark a submitted turn as the active foreground turn.
+    pub fn start_turn(&mut self, text: &str) {
+        self.messages.push(ChatMessage {
+            role: MessageRole::User,
+            content: text.to_string(),
+        });
+        self.trim_old_messages();
+        self.rebuild_message_groups();
         self.is_processing = true;
         self.streaming_text.clear();
+        self.pending_stream.clear();
         self.status_msg = "Thinking...".to_string();
         self.clear_selection();
+    }
 
+    /// Submit and immediately start the current input.
+    pub fn submit_input(&mut self) -> Option<String> {
+        let text = self.take_input()?;
+        self.start_turn(&text);
         Some(text)
     }
 
@@ -616,6 +711,8 @@ impl TuiApp {
             self.streaming_text.clear();
         }
         self.is_processing = false;
+        self.active_cancel = None;
+        self.active_turn_id = None;
         self.status_msg = "Ready".to_string();
         self.trim_old_messages();
         self.rebuild_message_groups();
@@ -727,7 +824,12 @@ impl TuiApp {
         let mut running_total = total;
         while running_total > self.max_display_chars && 1 + removed < self.messages.len() {
             let idx = 1 + removed; // skip welcome message at index 0
-            running_total -= self.messages[idx].content.len();
+            let removed_chars = self
+                .messages
+                .get(idx)
+                .map(|message| message.content.len())
+                .unwrap_or(0);
+            running_total = running_total.saturating_sub(removed_chars);
             removed += 1;
         }
         if removed > 0 {
@@ -755,7 +857,9 @@ impl TuiApp {
             _ => self.history.len() - 1,
         };
         self.history_idx = Some(idx);
-        self.input = self.history[idx].clone();
+        if let Some(entry) = self.history.get(idx) {
+            self.input = entry.clone();
+        }
         self.cursor = self.input.len();
     }
 
@@ -764,7 +868,9 @@ impl TuiApp {
         match self.history_idx {
             Some(i) if i < self.history.len() - 1 => {
                 self.history_idx = Some(i + 1);
-                self.input = self.history[i + 1].clone();
+                if let Some(entry) = self.history.get(i.saturating_add(1)) {
+                    self.input = entry.clone();
+                }
                 self.cursor = self.input.len();
             }
             Some(_) => {
@@ -785,24 +891,39 @@ impl TuiApp {
     }
 
     /// Compute the chat area rect accounting for sidebar visibility.
-    pub fn compute_chat_rect(size: Rect, sidebar_visible: bool) -> Rect {
+    pub fn input_height(&self, width: u16) -> u16 {
+        let content_width = width.saturating_sub(2).max(1) as usize;
+        let visual_rows = self.input.split('\n').fold(0usize, |rows, line| {
+            let width = visual_width(line);
+            rows.saturating_add(width.max(1).div_ceil(content_width))
+        });
+        visual_rows.clamp(1, 8) as u16 + 2
+    }
+
+    pub fn compute_chat_rect(
+        size: Rect,
+        sidebar_visible: bool,
+        input_height: u16,
+        task_strip_rows: u16,
+    ) -> Rect {
         let constraints = vec![
             Constraint::Length(1), // StatusBar
             Constraint::Min(8),    // Body
-            Constraint::Length(2), // Input
+            Constraint::Length(input_height),
+            Constraint::Length(task_strip_rows),
         ];
         let main_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints(constraints)
             .split(size);
 
-        let body = main_chunks[1];
+        let body = main_chunks.get(1).copied().unwrap_or(size);
         if sidebar_visible {
             let body_chunks = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Length(24), Constraint::Min(40)])
                 .split(body);
-            body_chunks[1] // chat area (right of sidebar)
+            body_chunks.get(1).copied().unwrap_or(body)
         } else {
             body // full width
         }
@@ -1024,8 +1145,10 @@ impl TuiApp {
             let char_start = visual_col_to_char_idx(text, start_col);
             let char_end = visual_col_to_char_idx(text, end_col).min(text.len());
 
-            if char_start <= char_end {
-                result.push_str(&text[char_start..char_end]);
+            if char_start <= char_end
+                && let Some(selected) = text.get(char_start..char_end)
+            {
+                result.push_str(selected);
             }
             if line_idx < end.0 {
                 result.push('\n');
@@ -1083,6 +1206,102 @@ fn visual_col_to_char_idx(text: &str, visual_col: usize) -> usize {
     text.len()
 }
 
+fn collect_project_files(root: &std::path::Path, limit: usize) -> Vec<String> {
+    fn visit(root: &std::path::Path, dir: &std::path::Path, limit: usize, out: &mut Vec<String>) {
+        if out.len() >= limit {
+            return;
+        }
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            if out.len() >= limit {
+                return;
+            }
+            let path = entry.path();
+            let name = entry.file_name();
+            let hidden_or_build = name.to_str().is_some_and(|value| {
+                matches!(value, ".git" | ".worktrees" | "target" | "node_modules")
+            });
+            if hidden_or_build {
+                continue;
+            }
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(_) => continue,
+            };
+            if file_type.is_dir() {
+                visit(root, &path, limit, out);
+            } else if file_type.is_file()
+                && let Ok(relative) = path.strip_prefix(root)
+            {
+                out.push(relative.to_string_lossy().to_string());
+            }
+        }
+    }
+
+    let mut files = Vec::new();
+    visit(root, root, limit, &mut files);
+    files.sort();
+    files
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod state_tests {
+    use super::{Theme, TuiApp};
+
+    fn app() -> TuiApp {
+        let theme =
+            Theme::from_color_theme(&echo_agent_app_core::output::theme::ColorTheme::dark());
+        TuiApp::new("test-model".to_string(), "test".to_string(), theme)
+    }
+
+    #[test]
+    fn taking_input_does_not_start_turn_until_dispatched() {
+        let mut app = app();
+        app.input = "queued request".to_string();
+        app.cursor = app.input.len();
+
+        let text = app.take_input();
+
+        assert_eq!(text.as_deref(), Some("queued request"));
+        assert!(!app.is_processing);
+        assert!(!app.messages.iter().any(|m| m.content == "queued request"));
+
+        app.start_turn("queued request");
+        assert!(app.is_processing);
+        assert!(app.messages.iter().any(|m| m.content == "queued request"));
+    }
+
+    #[test]
+    fn input_height_grows_for_multiline_and_caps_at_eight_rows() {
+        let mut app = app();
+        assert_eq!(app.input_height(80), 3);
+
+        app.input = "一\n二\n三".to_string();
+        assert_eq!(app.input_height(80), 5);
+
+        app.input = (0..20).map(|_| "line").collect::<Vec<_>>().join("\n");
+        assert_eq!(app.input_height(80), 10);
+    }
+
+    #[test]
+    fn finalize_stream_releases_cancellation_authority() {
+        let mut app = app();
+        app.is_processing = true;
+        app.active_cancel = Some(echo_agent::agent::CancellationToken::new());
+        app.streaming_text = "done".to_string();
+
+        app.finalize_stream();
+
+        assert!(!app.is_processing);
+        assert!(app.active_cancel.is_none());
+        assert_eq!(app.last_assistant_response(), Some("done"));
+    }
+}
+
 // ── RAII Terminal Guard ─────────────────────────────────────────────────────
 
 /// RAII guard that sets up the terminal on creation and restores it on drop.
@@ -1090,16 +1309,27 @@ fn visual_col_to_char_idx(text: &str, visual_col: usize) -> usize {
 /// Redirects stderr to a log file at the OS file-descriptor level, so the
 /// existing tracing subscriber (set up in `main()`) writes to the file
 /// instead of corrupting the TUI screen.
-struct TerminalGuard;
+struct TerminalGuard {
+    inline_mode: bool,
+}
 
 impl TerminalGuard {
-    fn new() -> Self {
+    fn new(inline_mode: bool) -> Self {
         // Note: stderr redirect is handled earlier in main.rs by StderrRedirectGuard,
         // so this guard only manages raw mode, alternate screen, and panic hook.
 
         // 1. Enter raw mode + alternate screen.
         let _ = enable_raw_mode();
-        let _ = execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture);
+        if inline_mode {
+            let _ = execute!(io::stdout(), EnableMouseCapture, EnableBracketedPaste);
+        } else {
+            let _ = execute!(
+                io::stdout(),
+                EnterAlternateScreen,
+                EnableMouseCapture,
+                EnableBracketedPaste
+            );
+        }
 
         // 2. Install panic hook that restores terminal.
         let default_hook = std::panic::take_hook();
@@ -1107,14 +1337,17 @@ impl TerminalGuard {
             let _ = disable_raw_mode();
             let _ = execute!(
                 io::stdout(),
-                LeaveAlternateScreen,
+                DisableBracketedPaste,
                 DisableMouseCapture,
                 Show
             );
+            if !inline_mode {
+                let _ = execute!(io::stdout(), LeaveAlternateScreen);
+            }
             default_hook(info);
         }));
 
-        TerminalGuard
+        TerminalGuard { inline_mode }
     }
 }
 
@@ -1123,10 +1356,13 @@ impl Drop for TerminalGuard {
         let _ = disable_raw_mode();
         let _ = execute!(
             io::stdout(),
-            LeaveAlternateScreen,
+            DisableBracketedPaste,
             DisableMouseCapture,
             Show
         );
+        if !self.inline_mode {
+            let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        }
         use std::io::Write;
         let _ = io::stdout().flush();
     }
@@ -1152,13 +1388,17 @@ pub async fn run_tui(
         std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
     >,
     review_integration: Option<std::sync::Arc<ReviewIntegration>>,
+    conversation_store: Option<std::sync::Arc<dyn echo_agent::memory::ConversationStore>>,
+    conversation_id: String,
+    configured_models: Vec<echo_agent_app_core::model_config::ModelRuntimeConfig>,
+    inline_mode: bool,
 ) -> anyhow::Result<()> {
     // Use ColorTheme to generate Theme, unifying both theme systems.
     let color_theme = echo_agent_app_core::output::theme::ColorTheme::dark();
     let theme = Theme::from_color_theme(&color_theme);
 
     // Create the RAII guard — redirects stderr + sets up terminal.
-    let _guard = TerminalGuard::new();
+    let _guard = TerminalGuard::new(inline_mode);
 
     // Build the terminal.
     let backend = CrosstermBackend::new(io::stdout());
@@ -1178,7 +1418,10 @@ pub async fn run_tui(
     // 读取当前模型的上下文窗口上限（与 GUI panels.rs 同样走 agent.config().get_token_limit()）。
     app.context_window_size = agent.read(|a| a.config().get_token_limit() as u32).await;
     app.context_snapshot.context_window_size = app.context_window_size;
-    app.tool_count = 24; // Default estimate, updated dynamically.
+    app.tool_count = agent.read(|value| value.tool_names().len()).await;
+    app.permission_mode = agent
+        .read(|value| value.get_permission_mode().to_string())
+        .await;
     app.max_display_chars = tui_config.max_display_chars;
     app.pending_approval = Some(tui_pending);
     app.pool = Some(pool);
@@ -1186,7 +1429,39 @@ pub async fn run_tui(
     app.review_integration = review_integration;
     // One conversation id per TUI session (parity with GUI's per-conversation id):
     // binds this session's chat turns + TaskRuntime runs + transcript projection.
-    app.conversation_id = Some(uuid::Uuid::new_v4().to_string());
+    app.conversation_id = Some(conversation_id.clone());
+    app.conversation_store = conversation_store;
+    app.configured_models = configured_models;
+    app.inline_mode = inline_mode;
+    app.project_files = collect_project_files(std::path::Path::new("."), 10_000);
+    if let Some(store) = app.conversation_store.as_ref()
+        && let Ok(stored) = store.get_messages(&conversation_id).await
+        && !stored.is_empty()
+    {
+        app.messages = stored
+            .into_iter()
+            .filter_map(|message| {
+                let content = message.content?;
+                let role = match message.role.as_str() {
+                    "user" => MessageRole::User,
+                    "assistant" => MessageRole::Assistant,
+                    "tool" => MessageRole::ToolResult {
+                        tool_name: "tool".to_string(),
+                    },
+                    _ => MessageRole::System,
+                };
+                Some(ChatMessage { role, content })
+            })
+            .collect();
+        app.messages.push(ChatMessage {
+            role: MessageRole::System,
+            content: format!("Resumed conversation {conversation_id}"),
+        });
+        app.rebuild_message_groups();
+    }
+    agent
+        .write(|value| value.set_conversation_id(conversation_id))
+        .await;
 
     // ── Dreaming: daily self-evolution pass (mode parity with GUI) ────
     let dreaming_cancel = app.review_integration.as_ref().map(|ri| {

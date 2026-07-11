@@ -82,6 +82,7 @@ interface ChatInputProps {
   onSend: (text: string, attachments?: Attachment[]) => void;
   isStreaming?: boolean;
   onCancel?: () => void;
+  queuedCount?: number;
 }
 
 const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
@@ -344,7 +345,7 @@ function ContextRingIndicator({
   );
 }
 
-export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
+export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: ChatInputProps) {
   const [text, setText] = useState('');
   const [pendingFiles, setPendingFiles] = useState<PendingFile[]>([]);
   const [paletteSelectedIndex, setPaletteSelectedIndex] = useState(0);
@@ -369,8 +370,8 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
   // 上下文窗口占用（来自 llm_usage 事件 → chatStore）。
   const contextWindow = useChatStore((s) => s.contextWindow);
   const usageAccumulator = useChatStore((s) => s.usageAccumulator);
-  // 当前默认模型的 context_window 上限（ConfiguredModel 已有该字段）。
-  const contextWindowSize = activeModel?.context_window ?? null;
+  // 后端返回显式配置或模型推断后的有效窗口；无默认标记时与展示模型保持一致。
+  const contextWindowSize = displayModel?.context_window ?? null;
   const activePermissionMode =
     PERMISSION_MODES.find((mode) => mode.id === permissionMode) ?? PERMISSION_MODES[0];
   const activeInteractionMode =
@@ -624,17 +625,6 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
   // ── Send ──
 
   const handleSend = async () => {
-    // P1-5: streaming 期间拒绝再次发送。业界(ChatGPT/Claude.ai)统一不允许多条
-    // 消息并发 streaming — 本地 agent 后端本就串行生成, 前端并发只会让第二条
-    // 覆盖第一条的 streaming 状态 ref (assistantIdRef/currentMessageKeyRef/thinkingIdRef),
-    // 导致第一条的 token 错误路由到第二条。UI 上发送按钮在 streaming 时已变 Stop,
-    // 这里挡住 Enter 键 / 程序化调用等旁路。
-    //
-    // 例外：/clear|/cls 是会话控制，不是并发消息。clearCurrentChat 会先 cancel
-    // 再清会话；若这里直接 return，执行中按 Enter 发 /clear 会「没反应」。
-    const trimmedEarly = text.trim().toLowerCase();
-    const isSessionClear = trimmedEarly === '/clear' || trimmedEarly === '/cls';
-    if (isStreaming && !isSessionClear) return;
     const trimmed = text.trim();
     if (!trimmed && pendingFiles.length === 0) return;
 
@@ -908,6 +898,7 @@ export function ChatInput({ onSend, isStreaming, onCancel }: ChatInputProps) {
           </div>
           <div className="flex flex-wrap items-center justify-between gap-2 px-2 text-[11px] text-[var(--text-tertiary)]">
             <div className="flex min-w-0 flex-wrap items-center gap-1.5 sm:gap-2">
+              {queuedCount > 0 && <span>已排队 {queuedCount} 条</span>}
               <div className="relative">
                 <button
                   type="button"

@@ -62,6 +62,11 @@ pub enum SlashCommand {
     Stats,
     Status,
     New,
+    Sessions,
+    Resume,
+    Fork,
+    Rename,
+    DeleteSession,
     Compact,
     Copy,
 
@@ -74,11 +79,18 @@ pub enum SlashCommand {
     Forget,
     /// Attach a file (image/document) to the next message (B5.3 multimodal).
     Attach,
+    Skills,
+    Mcp,
+    Hooks,
 
     // -- Coding --
     Plan,
     Mode,
     Tasks,
+    Steer,
+    TaskCancel,
+    TaskPause,
+    TaskResume,
     Test,
     CodeReview,
     Diff,
@@ -117,6 +129,11 @@ impl SlashCommand {
             Self::Stats => "Show session statistics",
             Self::Status => "Show agent status",
             Self::New => "Start a new session",
+            Self::Sessions => "List or search persisted conversations",
+            Self::Resume => "Resume a persisted conversation",
+            Self::Fork => "Fork the current conversation",
+            Self::Rename => "Rename the current conversation",
+            Self::DeleteSession => "Delete a persisted conversation",
             Self::Compact => "Compress context window",
             Self::Copy => "Copy the last response to clipboard (or Ctrl+Y)",
 
@@ -127,10 +144,17 @@ impl SlashCommand {
             Self::Remember => "Save a fact to memory",
             Self::Forget => "Remove a fact from memory",
             Self::Attach => "Attach a file to the next message (/attach <path>)",
+            Self::Skills => "List and manage skills",
+            Self::Mcp => "List, load, or disconnect MCP servers",
+            Self::Hooks => "List, reload, or test hooks",
 
             Self::Plan => "Enter plan mode (read-only)",
             Self::Mode => "Switch interaction mode (auto/chat/task)",
             Self::Tasks => "Show active tasks",
+            Self::Steer => "Inject guidance into the active turn or queue it",
+            Self::TaskCancel => "Cancel the current or specified task run",
+            Self::TaskPause => "Pause the current or specified task run",
+            Self::TaskResume => "Resume the current or specified task run",
             Self::Test => "Run tests",
             Self::CodeReview => "Request a code review",
             Self::Diff => "Show git or file diff",
@@ -163,6 +187,11 @@ impl SlashCommand {
             | Self::Stats
             | Self::Status
             | Self::New
+            | Self::Sessions
+            | Self::Resume
+            | Self::Fork
+            | Self::Rename
+            | Self::DeleteSession
             | Self::Compact
             | Self::Copy => Category::Session,
             Self::Model
@@ -171,10 +200,20 @@ impl SlashCommand {
             | Self::Memory
             | Self::Remember
             | Self::Forget
-            | Self::Attach => Category::Context,
-            Self::Plan | Self::Mode | Self::Tasks | Self::Test | Self::CodeReview | Self::Diff => {
-                Category::Coding
-            }
+            | Self::Attach
+            | Self::Skills
+            | Self::Mcp
+            | Self::Hooks => Category::Context,
+            Self::Plan
+            | Self::Mode
+            | Self::Tasks
+            | Self::Steer
+            | Self::TaskCancel
+            | Self::TaskPause
+            | Self::TaskResume
+            | Self::Test
+            | Self::CodeReview
+            | Self::Diff => Category::Coding,
             Self::Git => Category::Git,
             Self::Pipeline => Category::Pipeline,
             Self::Permission => Category::Security,
@@ -201,8 +240,18 @@ impl SlashCommand {
             Self::Test => "[test-name]",
             Self::Plan => "",
             Self::Mode => "[auto|chat|task]",
+            Self::TaskCancel | Self::TaskPause | Self::TaskResume => "[run-id]",
+            Self::Steer => "<instruction>",
+            Self::Sessions => "[query]",
+            Self::Resume => "<conversation-id>",
+            Self::Fork => "[title]",
+            Self::Rename => "<title>",
+            Self::DeleteSession => "<conversation-id>",
             Self::CodeReview => "[file-or-dir]",
             Self::Attach => "<file-path>",
+            Self::Skills => "[list|search|install|uninstall|info|refresh] [args]",
+            Self::Mcp => "[list|load <config>|disconnect <name>]",
+            Self::Hooks => "[list|reload|test <event>]",
             _ => "",
         }
     }

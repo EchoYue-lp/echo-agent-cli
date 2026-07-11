@@ -1,11 +1,21 @@
 //! TUI event loop — handles keyboard input, terminal resize, and agent streaming.
 
-use super::{ChatMessage, MessageRole, TaskProgressEntry, TaskStripStatus, TuiApp};
+use super::{
+    ChatMessage, MessageRole, QueuedTurn, SubagentRuntimeView, TaskProgressEntry,
+    TaskRuntimeTaskView, TaskRuntimeView, TaskStripStatus, TuiApp,
+};
 use crate::agent_handle::AgentHandle;
 use crate::tui::clipboard;
 use crate::tui::commands::SlashCommand;
 use crate::tui::ui;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
+use crossterm::event::{
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind,
+};
+use crossterm::execute;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use ratatui::layout::Rect;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::io;
@@ -13,6 +23,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, mpsc};
 
+use echo_agent::agent::subagent::SubagentEvent;
 use echo_agent::tasks::TaskEvent;
 use echo_agent_app_core::context_window::ContextWindowSnapshot;
 use echo_agent_app_core::tasks::BackgroundTaskService;
@@ -72,7 +83,9 @@ async fn handle_approval_key(
                     let s = &mut approval.feedback_input;
                     let byte_idx = approval.feedback_cursor;
                     // Find the start of the previous character
-                    let prev = s[..byte_idx]
+                    let prev = s
+                        .get(..byte_idx)
+                        .unwrap_or_default()
                         .char_indices()
                         .next_back()
                         .map(|(i, _)| i)
@@ -93,7 +106,9 @@ async fn handle_approval_key(
             KeyCode::Left => {
                 if approval.feedback_cursor > 0 {
                     let s = &approval.feedback_input;
-                    approval.feedback_cursor = s[..approval.feedback_cursor]
+                    approval.feedback_cursor = s
+                        .get(..approval.feedback_cursor)
+                        .unwrap_or_default()
                         .char_indices()
                         .next_back()
                         .map(|(i, _)| i)
@@ -104,7 +119,9 @@ async fn handle_approval_key(
             KeyCode::Right => {
                 let s = &approval.feedback_input;
                 if approval.feedback_cursor < s.len() {
-                    approval.feedback_cursor += s[approval.feedback_cursor..]
+                    approval.feedback_cursor += s
+                        .get(approval.feedback_cursor..)
+                        .unwrap_or_default()
                         .chars()
                         .next()
                         .map(|c| c.len_utf8())
@@ -258,6 +275,12 @@ pub async fn run_event_loop(
     // Subscribe to task events for the parallel task progress strip.
     let mut task_event_rx: Option<broadcast::Receiver<Arc<TaskEvent>>> =
         task_service.as_ref().map(|svc| svc.subscribe_events());
+    let mut subagent_event_rx = agent
+        .read(|a| a.subagent_registry().event_bus().subscribe())
+        .await;
+    let mut last_runtime_refresh = Instant::now()
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or_else(Instant::now);
 
     loop {
         // ── Drain task events into parallel_tasks ──────────────────────
@@ -266,11 +289,24 @@ pub async fn run_event_loop(
                 update_parallel_tasks(app, &event);
             }
         }
+        while let Ok(event) = subagent_event_rx.try_recv() {
+            update_subagent_runs(app, &event);
+        }
+
+        if last_runtime_refresh.elapsed() >= Duration::from_millis(250) {
+            refresh_task_runtime_view(app);
+            last_runtime_refresh = Instant::now();
+        }
 
         // Pre-compute chat area and wrapped lines for mouse selection.
         let size = terminal.size()?;
         let screen = Rect::new(0, 0, size.width, size.height);
-        app.chat_area = TuiApp::compute_chat_rect(screen, app.sidebar_visible);
+        app.chat_area = TuiApp::compute_chat_rect(
+            screen,
+            app.sidebar_visible,
+            app.input_height(screen.width),
+            app.parallel_tasks.len().min(5) as u16,
+        );
         app.update_wrapped_lines(app.chat_area.width);
 
         // Flush buffered streaming tokens (throttled to ~2 updates/sec).
@@ -339,6 +375,7 @@ pub async fn run_event_loop(
                 }
                 AgentEvent::FinalAnswer(_answer) => {
                     app.finalize_stream();
+                    dispatch_next_queued(app, &agent, agent_tx.clone()).await;
                 }
                 AgentEvent::ToolCall { name, args } => {
                     let display = if args.chars().count() > 2000 {
@@ -376,12 +413,27 @@ pub async fn run_event_loop(
                     app.rebuild_message_groups();
                 }
                 AgentEvent::Error(e) => {
+                    let was_cancelled = app
+                        .active_cancel
+                        .as_ref()
+                        .is_some_and(echo_agent::agent::CancellationToken::is_cancelled);
                     app.messages.push(ChatMessage {
                         role: MessageRole::System,
-                        content: format!("Error: {e}"),
+                        content: if was_cancelled {
+                            "Cancelled by user.".to_string()
+                        } else {
+                            format!("Error: {e}")
+                        },
                     });
                     app.is_processing = false;
-                    app.status_msg = "Error".to_string();
+                    app.active_cancel = None;
+                    app.active_turn_id = None;
+                    app.status_msg = if was_cancelled {
+                        "Cancelled".to_string()
+                    } else {
+                        "Error".to_string()
+                    };
+                    dispatch_next_queued(app, &agent, agent_tx.clone()).await;
                 }
                 AgentEvent::ContextCompressed {
                     before_count,
@@ -412,6 +464,7 @@ pub async fn run_event_loop(
         match event::poll(POLL_INTERVAL) {
             Ok(true) => match event::read() {
                 Ok(Event::Key(key)) => handle_key(app, key, &agent, agent_tx.clone()).await,
+                Ok(Event::Paste(text)) => insert_text(app, &text),
                 Ok(Event::Mouse(mouse)) => handle_mouse(app, &mouse),
                 Ok(Event::Resize(_, _)) => {} // ratatui handles resize automatically
                 Ok(_) => {}
@@ -432,6 +485,19 @@ pub async fn run_event_loop(
                 if e.kind() != io::ErrorKind::WouldBlock {
                     return Err(e.into());
                 }
+            }
+        }
+
+        if app.external_editor_requested {
+            app.external_editor_requested = false;
+            if let Err(error) = open_external_editor(terminal, app) {
+                app.status_msg = format!("External editor failed: {error}");
+            }
+        }
+        if app.rewind_requested {
+            app.rewind_requested = false;
+            if let Err(error) = rewind_last_turn(app, &agent).await {
+                app.status_msg = format!("Rewind failed: {error}");
             }
         }
 
@@ -600,7 +666,22 @@ fn handle_global_shortcuts(app: &mut TuiApp, key: &KeyEvent) -> Option<bool> {
     }
 
     match key.code {
-        KeyCode::Char('c') | KeyCode::Char('q') => {
+        KeyCode::Char('c') => {
+            if app.is_processing {
+                handle_esc(app);
+            } else if !app.input.is_empty() {
+                app.input.clear();
+                app.cursor = 0;
+                app.update_suggestions();
+            } else {
+                app.should_quit = true;
+            }
+            Some(true)
+        }
+        KeyCode::Char('q') => {
+            if let Some(cancel) = &app.active_cancel {
+                cancel.cancel();
+            }
             app.should_quit = true;
             Some(true)
         }
@@ -636,6 +717,35 @@ fn handle_global_shortcuts(app: &mut TuiApp, key: &KeyEvent) -> Option<bool> {
             }
             Some(true)
         }
+        KeyCode::Char('g') => {
+            app.external_editor_requested = true;
+            Some(true)
+        }
+        KeyCode::Char('r') => {
+            reverse_history_search(app);
+            Some(true)
+        }
+        KeyCode::Char('o') => {
+            let collapse = app.message_groups.iter().any(|group| group.collapsed);
+            for group in &mut app.message_groups {
+                if matches!(
+                    group.group_type,
+                    super::MessageGroupType::AssistantTurn { .. }
+                ) {
+                    group.collapsed = !collapse;
+                }
+            }
+            app.status_msg = if collapse {
+                "Expanded transcript details".to_string()
+            } else {
+                "Collapsed transcript details".to_string()
+            };
+            Some(true)
+        }
+        KeyCode::Char('v') => {
+            paste_clipboard(app);
+            Some(true)
+        }
         _ => None,
     }
 }
@@ -648,10 +758,50 @@ async fn handle_normal_key(
     agent: &AgentHandle,
     agent_tx: mpsc::UnboundedSender<AgentEvent>,
 ) {
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::Char('a') => {
+                app.cursor = current_line_start(&app.input, app.cursor);
+                return;
+            }
+            KeyCode::Char('e') => {
+                app.cursor = current_line_end(&app.input, app.cursor);
+                return;
+            }
+            KeyCode::Char('j') => {
+                insert_newline(app);
+                return;
+            }
+            KeyCode::Char('u') => {
+                let start = current_line_start(&app.input, app.cursor);
+                app.input.drain(start..app.cursor);
+                app.cursor = start;
+                app.update_suggestions();
+                return;
+            }
+            KeyCode::Char('w') => {
+                delete_previous_word(app);
+                return;
+            }
+            _ => {}
+        }
+    }
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        match key.code {
+            KeyCode::Char('b') => {
+                app.cursor = previous_word_boundary(&app.input, app.cursor);
+                return;
+            }
+            KeyCode::Char('f') => {
+                app.cursor = next_word_boundary(&app.input, app.cursor);
+                return;
+            }
+            _ => {}
+        }
+    }
     // Shift+Enter: newline
     if key.modifiers.contains(KeyModifiers::SHIFT) && key.code == KeyCode::Enter {
-        app.input.insert(app.cursor, '\n');
-        app.cursor += 1;
+        insert_newline(app);
         return;
     }
 
@@ -662,12 +812,13 @@ async fn handle_normal_key(
         KeyCode::Delete => handle_delete(app),
         KeyCode::Left => handle_cursor_left(app),
         KeyCode::Right => handle_cursor_right(app),
-        KeyCode::Home => app.cursor = 0,
-        KeyCode::End => app.cursor = app.input.len(),
+        KeyCode::Home => app.cursor = current_line_start(&app.input, app.cursor),
+        KeyCode::End => app.cursor = current_line_end(&app.input, app.cursor),
         KeyCode::Up => handle_up(app, key),
         KeyCode::Down => handle_down(app, key),
         KeyCode::PageUp => app.chat_scroll = app.chat_scroll.saturating_add(30),
         KeyCode::PageDown => app.chat_scroll = app.chat_scroll.saturating_sub(30),
+        KeyCode::Tab if complete_file_reference(app) => {}
         KeyCode::Tab => app.sidebar_tab = (app.sidebar_tab + 1) % 3,
         KeyCode::Esc => handle_esc(app),
         _ => {}
@@ -679,36 +830,91 @@ async fn handle_enter(
     agent: &AgentHandle,
     agent_tx: mpsc::UnboundedSender<AgentEvent>,
 ) {
+    let Some(text) = app.take_input() else {
+        return;
+    };
+    if let Some(steer_text) = text.strip_prefix("/steer ") {
+        steer_active_turn(app, agent, steer_text.trim()).await;
+        return;
+    }
+    if text.starts_with('/') {
+        if app.is_processing && !slash_command_allowed_while_busy(&text) {
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content: "Agent 正在运行。请先按 Esc 中断，或等待当前轮结束后再执行该命令。"
+                    .to_string(),
+            });
+            app.rebuild_message_groups();
+            return;
+        }
+        handle_slash_command(app, agent, agent_tx, &text).await;
+        return;
+    }
+    if let Some(command) = text.strip_prefix('!') {
+        run_local_shell(app, command.trim()).await;
+        return;
+    }
+
+    let turn = QueuedTurn {
+        text,
+        attachments: std::mem::take(&mut app.pending_attachments),
+        interaction_mode: app.interaction_mode,
+    };
     if app.is_processing {
-        // Can't send while processing; insert newline instead.
-        app.input.insert(app.cursor, '\n');
-        app.cursor += 1;
-    } else if let Some(text) = app.submit_input() {
-        if text.starts_with('/') {
-            handle_slash_command(app, agent, &text).await;
-        } else {
-            // B5.3: drain staged attachments (/attach). If any, build a
-            // multimodal Message and pass it to drive_chat; also bind them on
-            // ChatResources so any autonomous run the agent spins up sees them.
-            let staged = std::mem::take(&mut app.pending_attachments);
-            let multimodal = if staged.is_empty() {
+        let preview: String = turn.text.chars().take(60).collect();
+        app.queued_turns.push_back(turn);
+        app.status_msg = format!("运行中 · 已排队 {} 条", app.queued_turns.len());
+        tracing::info!(queued = app.queued_turns.len(), preview, "TUI turn queued");
+        return;
+    }
+    dispatch_turn(app, agent, agent_tx, turn).await;
+}
+
+async fn dispatch_turn(
+    app: &mut TuiApp,
+    agent: &AgentHandle,
+    agent_tx: mpsc::UnboundedSender<AgentEvent>,
+    turn: QueuedTurn,
+) {
+    if let (Some(store), Some(conversation_id)) = (
+        app.conversation_store.as_ref(),
+        app.conversation_id.as_deref(),
+    ) {
+        let title: String = turn.text.chars().take(80).collect();
+        if let Err(error) = store
+            .ensure_conversation(echo_agent::memory::NewConversation {
+                conversation_id: conversation_id.to_string(),
+                user_id: "default".to_string(),
+                agent_type: None,
+                title: Some(title),
+            })
+            .await
+        {
+            tracing::warn!(error = %error, conversation_id, "failed to ensure TUI conversation metadata");
+        }
+    }
+    app.start_turn(&turn.text);
+    let multimodal = if turn.attachments.is_empty() {
+        None
+    } else {
+        match echo_agent_app_core::attachments::build_message_from_refs(
+            &turn.text,
+            &turn.attachments,
+        ) {
+            Ok(msg) => Some(msg),
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to build multimodal message; sending text only");
                 None
-            } else {
-                match echo_agent_app_core::attachments::build_message_from_refs(&text, &staged) {
-                    Ok(msg) => Some(msg),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "failed to build multimodal message; sending text only");
-                        None
-                    }
-                }
-            };
-            let cancel = echo_agent::agent::CancellationToken::new();
-            let sink: std::sync::Arc<dyn echo_agent_app_core::chat_driver::ChatSink> =
-                std::sync::Arc::new(TuiChatSink::new(agent_tx.clone()));
-            // B4.3 / P1.2: per-turn mode hint, mirroring GUI's chat.rs.
-            // Tool availability is enforced separately; this prompt gives the
-            // model the matching behavior contract without a runtime state machine.
-            let mode_hint = match app.interaction_mode {
+            }
+        }
+    };
+    let cancel = echo_agent::agent::CancellationToken::new();
+    app.active_cancel = Some(cancel.clone());
+    let turn_id = uuid::Uuid::new_v4().to_string();
+    app.active_turn_id = Some(turn_id.clone());
+    let sink: std::sync::Arc<dyn echo_agent_app_core::chat_driver::ChatSink> =
+        std::sync::Arc::new(TuiChatSink::new(agent_tx));
+    let mode_hint = match turn.interaction_mode {
                 InteractionMode::Chat => Some(
                     "Chat mode — task runtime tools are unavailable in this turn. \
                      Reply directly with ordinary chat/tool usage; do not create or execute a task plan."
@@ -727,43 +933,311 @@ async fn handle_enter(
                      create a formal plan with plan_create and then plan_execute()."
                         .to_string(),
                 ),
-            };
-            let res = std::sync::Arc::new(echo_agent_app_core::chat_resources::ChatResources {
-                pool: app.pool.clone(),
-                store: app.task_runtime_store.clone(),
-                sink,
-                // TUI/GUI parity (AGENTS.md): bind this turn to the session's
-                // conversation id so TaskRuntime runs + transcript projection work.
-                conv_id: app.conversation_id.clone(),
-                root_message_id: uuid::Uuid::new_v4().to_string(),
-                // Bind staged refs so subagents in an autonomous run see them too.
-                attachments: staged,
-                cancel,
-                mode_hint,
-                interaction_mode: app.interaction_mode,
-                // B5.1 (TUI/GUI parity): build a layer_manager per turn from
-                // review_integration so autonomous runs block-write their
-                // completion memory (`taskrun:completed`). None = no review/memory
-                // subsystem (writes become no-ops).
-                layer_manager: app
-                    .review_integration
-                    .as_ref()
-                    .map(|ri| std::sync::Arc::new(ri.create_layer_manager())),
+    };
+    let res = std::sync::Arc::new(echo_agent_app_core::chat_resources::ChatResources {
+        pool: app.pool.clone(),
+        store: app.task_runtime_store.clone(),
+        sink,
+        // TUI/GUI parity (AGENTS.md): bind this turn to the session's
+        // conversation id so TaskRuntime runs + transcript projection work.
+        conv_id: app.conversation_id.clone(),
+        root_message_id: turn_id,
+        // Bind staged refs so subagents in an autonomous run see them too.
+        attachments: turn.attachments,
+        cancel,
+        mode_hint,
+        interaction_mode: turn.interaction_mode,
+        // B5.1 (TUI/GUI parity): build a layer_manager per turn from
+        // review_integration so autonomous runs block-write their
+        // completion memory (`taskrun:completed`). None = no review/memory
+        // subsystem (writes become no-ops).
+        layer_manager: app
+            .review_integration
+            .as_ref()
+            .map(|ri| std::sync::Arc::new(ri.create_layer_manager())),
+    });
+    send_to_agent(agent, turn.text, multimodal, res).await;
+}
+
+async fn steer_active_turn(app: &mut TuiApp, agent: &AgentHandle, text: &str) {
+    if text.is_empty() {
+        app.status_msg = "Usage: /steer <补充指令>".to_string();
+        return;
+    }
+    let Some(turn_id) = app.active_turn_id.clone() else {
+        app.status_msg = "当前没有可补充的运行任务".to_string();
+        return;
+    };
+    match agent
+        .steer_input(
+            Some(&turn_id),
+            echo_agent::prelude::Message::user(text.to_string()),
+        )
+        .await
+    {
+        Ok(_) => {
+            app.messages.push(ChatMessage {
+                role: MessageRole::User,
+                content: text.to_string(),
             });
-            send_to_agent(agent, text, multimodal, res).await;
+            app.rebuild_message_groups();
+            app.status_msg = "已补充到当前任务".to_string();
+        }
+        Err(echo_agent::agent::TurnSteerError::NotSteerable { .. }) => {
+            app.queued_turns.push_back(QueuedTurn {
+                text: text.to_string(),
+                attachments: Vec::new(),
+                interaction_mode: app.interaction_mode,
+            });
+            app.status_msg = format!("当前阶段不可插入 · 已排队 {} 条", app.queued_turns.len());
+        }
+        Err(error) => {
+            app.status_msg = format!("补充失败: {error}");
         }
     }
+}
+
+async fn dispatch_next_queued(
+    app: &mut TuiApp,
+    agent: &AgentHandle,
+    agent_tx: mpsc::UnboundedSender<AgentEvent>,
+) {
+    if let Some(turn) = app.queued_turns.pop_front() {
+        dispatch_turn(app, agent, agent_tx, turn).await;
+    }
+}
+
+fn slash_command_allowed_while_busy(text: &str) -> bool {
+    let command = text.split_whitespace().next().unwrap_or("");
+    matches!(
+        command,
+        "/help" | "/status" | "/stats" | "/cost" | "/copy" | "/tasks" | "/steer"
+    )
 }
 
 fn handle_char_input(app: &mut TuiApp, c: char) {
     app.input.insert(app.cursor, c);
     app.cursor += c.len_utf8();
+    app.reverse_search_idx = None;
+    app.reverse_search_query = None;
     app.update_suggestions();
+}
+
+fn insert_text(app: &mut TuiApp, text: &str) {
+    app.input.insert_str(app.cursor, text);
+    app.cursor = app.cursor.saturating_add(text.len());
+    app.reverse_search_idx = None;
+    app.reverse_search_query = None;
+    app.update_suggestions();
+}
+
+fn paste_clipboard(app: &mut TuiApp) {
+    let mut clipboard = match arboard::Clipboard::new() {
+        Ok(clipboard) => clipboard,
+        Err(error) => {
+            app.status_msg = format!("Clipboard unavailable: {error}");
+            return;
+        }
+    };
+    if let Ok(image) = clipboard.get_image() {
+        let width = match u32::try_from(image.width) {
+            Ok(value) => value,
+            Err(_) => {
+                app.status_msg = "Clipboard image width is unsupported".to_string();
+                return;
+            }
+        };
+        let height = match u32::try_from(image.height) {
+            Ok(value) => value,
+            Err(_) => {
+                app.status_msg = "Clipboard image height is unsupported".to_string();
+                return;
+            }
+        };
+        let path = std::env::temp_dir().join(format!("eko-clipboard-{}.png", uuid::Uuid::new_v4()));
+        let saved = image::save_buffer_with_format(
+            &path,
+            image.bytes.as_ref(),
+            width,
+            height,
+            image::ColorType::Rgba8,
+            image::ImageFormat::Png,
+        );
+        match saved.and_then(|()| {
+            stage_attachment(&mut app.pending_attachments, &path)
+                .map(|_| ())
+                .map_err(image::ImageError::IoError)
+        }) {
+            Ok(()) => {
+                app.status_msg = format!(
+                    "Clipboard image attached · {} file(s) staged",
+                    app.pending_attachments.len()
+                );
+            }
+            Err(error) => app.status_msg = format!("Clipboard image attach failed: {error}"),
+        }
+        let _ = std::fs::remove_file(path);
+        return;
+    }
+    match clipboard.get_text() {
+        Ok(text) => insert_text(app, &text),
+        Err(error) => app.status_msg = format!("Clipboard has no supported content: {error}"),
+    }
+}
+
+fn reverse_history_search(app: &mut TuiApp) {
+    if app.history.is_empty() {
+        app.status_msg = "No input history".to_string();
+        return;
+    }
+    let query = app
+        .reverse_search_query
+        .clone()
+        .unwrap_or_else(|| app.input.clone());
+    app.reverse_search_query = Some(query.clone());
+    let start = app.reverse_search_idx.unwrap_or(app.history.len());
+    let found = app
+        .history
+        .get(..start)
+        .and_then(|items| {
+            items
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, item)| query.is_empty() || item.contains(&query))
+        })
+        .map(|(index, item)| (index, item.clone()));
+    match found {
+        Some((index, item)) => {
+            app.input = item;
+            app.cursor = app.input.len();
+            app.reverse_search_idx = Some(index);
+            app.status_msg = format!("reverse-i-search: {}", app.input);
+            app.update_suggestions();
+        }
+        None => app.status_msg = format!("No earlier history match for: {query}"),
+    }
+}
+
+fn complete_file_reference(app: &mut TuiApp) -> bool {
+    let Some(prefix) = app.input.get(..app.cursor) else {
+        return false;
+    };
+    let token_start = prefix
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| ch.is_whitespace())
+        .map(|(index, ch)| index.saturating_add(ch.len_utf8()))
+        .unwrap_or(0);
+    let Some(token) = prefix.get(token_start..) else {
+        return false;
+    };
+    let Some(query) = token.strip_prefix('@') else {
+        return false;
+    };
+    let query_lower = query.to_ascii_lowercase();
+    let Some(path) = app
+        .project_files
+        .iter()
+        .find(|path| path.to_ascii_lowercase().contains(&query_lower) && path.as_str() != query)
+    else {
+        app.status_msg = format!("No file match for @{query}");
+        return true;
+    };
+    app.input
+        .replace_range(token_start..app.cursor, &format!("@{path}"));
+    app.cursor = token_start.saturating_add(1).saturating_add(path.len());
+    app.status_msg = format!("Referenced file: {path}");
+    true
+}
+
+async fn run_local_shell(app: &mut TuiApp, command: &str) {
+    if command.is_empty() {
+        app.messages.push(ChatMessage {
+            role: MessageRole::System,
+            content: "Usage: !<shell command>".to_string(),
+        });
+        return;
+    }
+    app.status_msg = format!("Running shell: {command}");
+    let result = tokio::process::Command::new("sh")
+        .arg("-lc")
+        .arg(command)
+        .output()
+        .await;
+    let content = match result {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let status = output.status.code().map_or_else(
+                || "terminated by signal".to_string(),
+                |code| format!("exit {code}"),
+            );
+            format!("$ {command}\n[{status}]\n{stdout}{stderr}")
+        }
+        Err(error) => format!("$ {command}\nFailed to execute: {error}"),
+    };
+    app.messages.push(ChatMessage {
+        role: MessageRole::System,
+        content,
+    });
+    app.status_msg = "Ready".to_string();
+    app.rebuild_message_groups();
+}
+
+fn open_external_editor(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut TuiApp,
+) -> anyhow::Result<()> {
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".to_string());
+    let path = std::env::temp_dir().join(format!("eko-prompt-{}.md", uuid::Uuid::new_v4()));
+    std::fs::write(&path, &app.input)?;
+
+    disable_raw_mode()?;
+    execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture)?;
+    if !app.inline_mode {
+        execute!(io::stdout(), LeaveAlternateScreen)?;
+    }
+    let status = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("${VISUAL:-${EDITOR:-vi}} \"$1\"")
+        .arg("eko-editor")
+        .arg(&path)
+        .status();
+    let edited = std::fs::read_to_string(&path);
+    let _ = std::fs::remove_file(&path);
+    enable_raw_mode()?;
+    if app.inline_mode {
+        execute!(io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
+    } else {
+        execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            EnableBracketedPaste
+        )?;
+    }
+    terminal.clear()?;
+
+    status?
+        .success()
+        .then_some(())
+        .ok_or_else(|| anyhow::anyhow!("editor '{editor}' exited unsuccessfully"))?;
+    app.input = edited?;
+    app.cursor = app.input.len();
+    app.update_suggestions();
+    app.status_msg = "Prompt updated from external editor".to_string();
+    Ok(())
 }
 
 fn handle_backspace(app: &mut TuiApp) {
     if app.cursor > 0 {
-        let prev = app.input[..app.cursor]
+        let prev = app
+            .input
+            .get(..app.cursor)
+            .unwrap_or_default()
             .char_indices()
             .next_back()
             .map(|(i, _)| i)
@@ -777,7 +1251,10 @@ fn handle_backspace(app: &mut TuiApp) {
 fn handle_delete(app: &mut TuiApp) {
     if app.cursor < app.input.len() {
         let cur = app.cursor;
-        let next = app.input[cur..]
+        let next = app
+            .input
+            .get(cur..)
+            .unwrap_or_default()
             .char_indices()
             .nth(1)
             .map(|(i, _)| cur + i)
@@ -788,7 +1265,10 @@ fn handle_delete(app: &mut TuiApp) {
 
 fn handle_cursor_left(app: &mut TuiApp) {
     if app.cursor > 0 {
-        let prev = app.input[..app.cursor]
+        let prev = app
+            .input
+            .get(..app.cursor)
+            .unwrap_or_default()
             .char_indices()
             .next_back()
             .map(|(i, _)| i)
@@ -800,7 +1280,10 @@ fn handle_cursor_left(app: &mut TuiApp) {
 fn handle_cursor_right(app: &mut TuiApp) {
     if app.cursor < app.input.len() {
         let cur = app.cursor;
-        let ch_len = app.input[cur..]
+        let ch_len = app
+            .input
+            .get(cur..)
+            .unwrap_or_default()
             .chars()
             .next()
             .map(|c| c.len_utf8())
@@ -812,7 +1295,7 @@ fn handle_cursor_right(app: &mut TuiApp) {
 fn handle_up(app: &mut TuiApp, key: &KeyEvent) {
     if key.modifiers.contains(KeyModifiers::SHIFT) {
         app.chat_scroll = app.chat_scroll.saturating_add(10);
-    } else {
+    } else if !move_cursor_vertical(app, -1) {
         app.history_up();
     }
 }
@@ -820,18 +1303,172 @@ fn handle_up(app: &mut TuiApp, key: &KeyEvent) {
 fn handle_down(app: &mut TuiApp, key: &KeyEvent) {
     if key.modifiers.contains(KeyModifiers::SHIFT) {
         app.chat_scroll = app.chat_scroll.saturating_sub(10);
-    } else {
+    } else if !move_cursor_vertical(app, 1) {
         app.history_down();
     }
 }
 
+fn insert_newline(app: &mut TuiApp) {
+    app.input.insert(app.cursor, '\n');
+    app.cursor = app.cursor.saturating_add(1);
+    app.update_suggestions();
+}
+
+fn current_line_start(text: &str, cursor: usize) -> usize {
+    text.get(..cursor)
+        .and_then(|prefix| prefix.rfind('\n').map(|idx| idx.saturating_add(1)))
+        .unwrap_or(0)
+}
+
+fn current_line_end(text: &str, cursor: usize) -> usize {
+    text.get(cursor..)
+        .and_then(|suffix| suffix.find('\n').map(|idx| cursor.saturating_add(idx)))
+        .unwrap_or(text.len())
+}
+
+fn move_cursor_vertical(app: &mut TuiApp, direction: i8) -> bool {
+    let line_start = current_line_start(&app.input, app.cursor);
+    let column = app
+        .input
+        .get(line_start..app.cursor)
+        .map(|s| s.chars().count())
+        .unwrap_or(0);
+    let target = if direction < 0 {
+        if line_start == 0 {
+            return false;
+        }
+        let previous_end = line_start.saturating_sub(1);
+        let previous_start = current_line_start(&app.input, previous_end);
+        (previous_start, previous_end)
+    } else {
+        let line_end = current_line_end(&app.input, app.cursor);
+        if line_end >= app.input.len() {
+            return false;
+        }
+        let next_start = line_end.saturating_add(1);
+        (next_start, current_line_end(&app.input, next_start))
+    };
+    app.cursor = app
+        .input
+        .get(target.0..target.1)
+        .and_then(|line| {
+            line.char_indices()
+                .nth(column)
+                .map(|(idx, _)| target.0 + idx)
+        })
+        .unwrap_or(target.1);
+    true
+}
+
+fn previous_word_boundary(text: &str, cursor: usize) -> usize {
+    let Some(prefix) = text.get(..cursor) else {
+        return cursor;
+    };
+    let mut seen_word = false;
+    for (idx, ch) in prefix.char_indices().rev() {
+        if ch.is_whitespace() {
+            if seen_word {
+                return idx.saturating_add(ch.len_utf8());
+            }
+        } else {
+            seen_word = true;
+        }
+    }
+    0
+}
+
+fn next_word_boundary(text: &str, cursor: usize) -> usize {
+    let Some(suffix) = text.get(cursor..) else {
+        return cursor;
+    };
+    let mut seen_word = false;
+    for (idx, ch) in suffix.char_indices() {
+        if ch.is_whitespace() {
+            if seen_word {
+                return cursor.saturating_add(idx);
+            }
+        } else {
+            seen_word = true;
+        }
+    }
+    text.len()
+}
+
+fn delete_previous_word(app: &mut TuiApp) {
+    let start = previous_word_boundary(&app.input, app.cursor);
+    app.input.drain(start..app.cursor);
+    app.cursor = start;
+    app.update_suggestions();
+}
+
 fn handle_esc(app: &mut TuiApp) {
     if app.is_processing {
-        app.is_processing = false;
-        app.streaming_text.clear();
-        app.pending_stream.clear();
-        app.status_msg = "Cancelled".to_string();
+        if let Some(cancel) = &app.active_cancel {
+            cancel.cancel();
+            app.status_msg = "Cancelling...".to_string();
+        } else {
+            app.status_msg = "Waiting for current turn to settle...".to_string();
+        }
+    } else {
+        let now = Instant::now();
+        let double_press = app
+            .last_escape_at
+            .is_some_and(|previous| now.duration_since(previous) <= Duration::from_millis(800));
+        if double_press {
+            app.rewind_requested = true;
+            app.last_escape_at = None;
+        } else {
+            app.last_escape_at = Some(now);
+            app.status_msg = "Press Esc again to rewind the last turn".to_string();
+        }
     }
+}
+
+async fn rewind_last_turn(app: &mut TuiApp, agent: &AgentHandle) -> anyhow::Result<()> {
+    let store = app
+        .conversation_store
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("conversation persistence is unavailable"))?;
+    let conversation_id = app
+        .conversation_id
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("no active conversation"))?;
+    let mut stored = store.get_messages(conversation_id).await?;
+    let user_index = stored
+        .iter()
+        .rposition(|message| message.role == "user")
+        .ok_or_else(|| anyhow::anyhow!("no user turn to rewind"))?;
+    let prompt = stored
+        .get(user_index)
+        .and_then(|message| message.content.clone())
+        .unwrap_or_default();
+    stored.truncate(user_index);
+    store.save_messages(conversation_id, &stored).await?;
+    let runtime_messages = echo_agent_app_core::conversation_restore::restore_messages(&stored);
+    agent
+        .read_async(|value| Box::pin(async move { value.load_messages(runtime_messages).await }))
+        .await;
+    app.input = prompt;
+    app.cursor = app.input.len();
+    app.messages = stored
+        .into_iter()
+        .filter_map(|message| {
+            let content = message.content?;
+            let role = match message.role.as_str() {
+                "user" => MessageRole::User,
+                "assistant" => MessageRole::Assistant,
+                "tool" => MessageRole::ToolResult {
+                    tool_name: "tool".to_string(),
+                },
+                _ => MessageRole::System,
+            };
+            Some(ChatMessage { role, content })
+        })
+        .collect();
+    app.status_msg = "Last turn rewound into the editor".to_string();
+    app.rebuild_message_groups();
+    app.update_suggestions();
+    Ok(())
 }
 
 // ── Agent communication ─────────────────────────────────────────────────
@@ -1004,9 +1641,14 @@ fn infer_mime(name: &str) -> String {
 }
 
 /// Handle slash commands locally in the TUI.
-async fn handle_slash_command(app: &mut TuiApp, agent: &AgentHandle, cmd: &str) {
+async fn handle_slash_command(
+    app: &mut TuiApp,
+    agent: &AgentHandle,
+    agent_tx: mpsc::UnboundedSender<AgentEvent>,
+    cmd: &str,
+) {
     let parts: Vec<&str> = cmd.trim().splitn(2, ' ').collect();
-    let command = parts[0].to_lowercase();
+    let command = parts.first().copied().unwrap_or_default().to_lowercase();
     let args = parts.get(1).unwrap_or(&"");
 
     let slash_cmd = command
@@ -1034,16 +1676,26 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &AgentHandle, cmd: &str) 
                 help.push('\n');
             }
             help.push_str("  Keybindings:\n");
-            help.push_str("    Ctrl+C / Ctrl+Q    Quit\n");
+            help.push_str("    Ctrl+C             Interrupt / clear draft / quit when empty\n");
+            help.push_str("    Ctrl+Q             Quit\n");
             help.push_str("    Ctrl+B             Toggle sidebar\n");
             help.push_str("    Ctrl+L             Clear chat\n");
-            help.push_str("    Shift+Enter        Newline in input\n");
+            help.push_str("    Ctrl+G             Edit prompt in $VISUAL/$EDITOR\n");
+            help.push_str("    Ctrl+R             Reverse-search input history\n");
+            help.push_str("    Ctrl+O             Toggle transcript details\n");
+            help.push_str("    Ctrl+V             Paste text or attach clipboard image\n");
+            help.push_str("    Shift+Enter/Ctrl+J Newline in input\n");
+            help.push_str("    Ctrl+A / Ctrl+E    Start/end of current line\n");
+            help.push_str("    Ctrl+U / Ctrl+W    Delete to line start / previous word\n");
+            help.push_str("    Alt+B / Alt+F      Move by word\n");
             help.push_str("    Esc                Cancel generation\n");
             help.push_str("    Tab                Cycle sidebar tabs\n");
             help.push_str("    Up/Down            Navigate input history\n");
             help.push_str("    Shift+Up/Down      Scroll chat\n");
             help.push_str("    PageUp/PageDown    Scroll chat faster\n");
             help.push_str("    Mouse wheel        Scroll chat\n");
+            help.push_str("    !command           Run a local shell command\n");
+            help.push_str("    @path + Tab        Complete a project file reference\n");
 
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
@@ -1052,42 +1704,358 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &AgentHandle, cmd: &str) 
         }
         Some(SlashCommand::Model) => {
             if args.is_empty() {
+                let configured = app
+                    .configured_models
+                    .iter()
+                    .map(|model| {
+                        format!("  {}  {} ({})", model.id, model.display_name, model.model)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 app.messages.push(ChatMessage {
                     role: MessageRole::System,
-                    content: format!("Current model: {}", app.model),
+                    content: if configured.is_empty() {
+                        format!(
+                            "Current model: {}\nNo configured model alternatives.",
+                            app.model
+                        )
+                    } else {
+                        format!(
+                            "Current model: {}\nConfigured models:\n{}",
+                            app.model, configured
+                        )
+                    },
                 });
             } else {
-                app.model = args.to_string();
+                let requested = args.trim().to_string();
+                let runtime = app
+                    .configured_models
+                    .iter()
+                    .find(|model| model.id == requested || model.model == requested)
+                    .cloned();
+                let active_model = match runtime {
+                    Some(runtime) => {
+                        agent
+                            .write(|value| {
+                                if let Some(token) = runtime.auth_token.as_deref() {
+                                    value.set_llm_config(
+                                        echo_agent_app_core::infra::build_llm_config(
+                                            &runtime.provider,
+                                            token,
+                                            &runtime.model,
+                                            runtime.base_url.as_deref(),
+                                        ),
+                                    );
+                                } else {
+                                    value.set_model(&runtime.model);
+                                }
+                                value.set_temperature(runtime.temperature);
+                                value.set_max_tokens(runtime.max_tokens);
+                                if let Some(limit) = runtime.context_window {
+                                    value.set_token_limit(limit as usize);
+                                }
+                            })
+                            .await;
+                        if let Some(pool) = &app.pool {
+                            pool.apply_runtime_model(runtime.clone()).await;
+                        }
+                        runtime.model
+                    }
+                    None => {
+                        agent.write(|value| value.set_model(&requested)).await;
+                        requested
+                    }
+                };
+                app.model = active_model;
                 app.messages.push(ChatMessage {
                     role: MessageRole::System,
-                    content: format!("Model switched to: {}", app.model),
+                    content: format!("Active model switched to: {}", app.model),
                 });
             }
         }
-        Some(SlashCommand::Clear) => {
-            app.messages.clear();
-            app.tokens = (0, 0, 0);
-            app.streaming_text.clear();
-            app.pending_stream.clear();
-            app.pending_attachments.clear();
-            app.is_processing = false;
-            app.chat_scroll = 0;
-            app.conversation_id = Some(uuid::Uuid::new_v4().to_string());
-            app.clear_selection();
-            // conversation 边界：Snapshot + Accumulator 双清（与 Web clearMessages 对等）。
-            app.context_snapshot.clear_usage();
-            app.usage_accumulator.reset();
-            agent
-                .read_async(|a| {
-                    Box::pin(async move {
-                        use echo_agent::agent::Agent;
-                        a.reset().await;
+        Some(SlashCommand::Think) => {
+            if args.trim().is_empty() {
+                let current = agent
+                    .read(|value| {
+                        value
+                            .thinking()
+                            .map(|config| format!("{config:?}"))
+                            .unwrap_or_else(|| "model default".to_string())
                     })
-                })
-                .await;
+                    .await;
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: format!("Thinking configuration: {current}"),
+                });
+            } else {
+                match echo_agent::llm::ThinkingConfig::parse_spec(args.trim()) {
+                    Ok(config) => {
+                        agent.write(|value| value.set_thinking(config)).await;
+                        app.messages.push(ChatMessage {
+                            role: MessageRole::System,
+                            content: format!("Thinking configuration set to: {}", args.trim()),
+                        });
+                    }
+                    Err(error) => app.messages.push(ChatMessage {
+                        role: MessageRole::System,
+                        content: format!("Invalid thinking configuration: {error}"),
+                    }),
+                }
+            }
+        }
+        Some(SlashCommand::System) => {
+            use echo_agent::agent::Agent;
+            if args.trim().is_empty() {
+                let prompt = agent.read(|value| value.current_system_prompt()).await;
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: prompt,
+                });
+            } else {
+                agent
+                    .read(|value| value.set_system_prompt(args.trim()))
+                    .await;
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: "System prompt updated for this runtime.".to_string(),
+                });
+            }
+        }
+        Some(SlashCommand::Memory) => {
+            let store = agent.read(|value| value.store().cloned()).await;
+            let content = match store {
+                Some(store) => match store.list(&["default", "memories"]).await {
+                    Ok(items) if items.is_empty() => "No long-term memories.".to_string(),
+                    Ok(items) => items
+                        .into_iter()
+                        .map(|item| format!("{}: {}", item.key, item.value))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                    Err(error) => format!("Failed to list memories: {error}"),
+                },
+                None => "No long-term memory store is configured.".to_string(),
+            };
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
-                content: "Conversation cleared.".to_string(),
+                content,
+            });
+        }
+        Some(SlashCommand::Remember) => {
+            let store = agent.read(|value| value.store().cloned()).await;
+            let content = match store {
+                _ if args.trim().is_empty() => "Usage: /remember <fact>".to_string(),
+                Some(store) => {
+                    let key = uuid::Uuid::new_v4().to_string();
+                    match store
+                        .put(
+                            &["default", "memories"],
+                            &key,
+                            serde_json::Value::String(args.trim().to_string()),
+                        )
+                        .await
+                    {
+                        Ok(()) => format!("Memory saved with key: {key}"),
+                        Err(error) => format!("Failed to save memory: {error}"),
+                    }
+                }
+                None => "No long-term memory store is configured.".to_string(),
+            };
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content,
+            });
+        }
+        Some(SlashCommand::Forget) => {
+            let store = agent.read(|value| value.store().cloned()).await;
+            let content = match store {
+                _ if args.trim().is_empty() => "Usage: /forget <key-or-query>".to_string(),
+                Some(store) => {
+                    let query = args.trim();
+                    let mut keys = match store.search(&["default", "memories"], query, 20).await {
+                        Ok(items) => items.into_iter().map(|item| item.key).collect::<Vec<_>>(),
+                        Err(_) => Vec::new(),
+                    };
+                    if keys.is_empty() {
+                        keys.push(query.to_string());
+                    }
+                    let mut removed = 0usize;
+                    for key in keys {
+                        if store
+                            .delete(&["default", "memories"], &key)
+                            .await
+                            .unwrap_or(false)
+                        {
+                            removed = removed.saturating_add(1);
+                        }
+                    }
+                    format!("Removed {removed} matching memory item(s).")
+                }
+                None => "No long-term memory store is configured.".to_string(),
+            };
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content,
+            });
+        }
+        Some(SlashCommand::Clear) => {
+            reset_conversation_state(app, agent, false).await;
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content: "Conversation context cleared.".to_string(),
+            });
+        }
+        Some(SlashCommand::New) => {
+            reset_conversation_state(app, agent, true).await;
+            if !args.trim().is_empty()
+                && let (Some(store), Some(id)) = (
+                    app.conversation_store.as_ref(),
+                    app.conversation_id.as_deref(),
+                )
+            {
+                let _ = store
+                    .ensure_conversation(echo_agent::memory::NewConversation {
+                        conversation_id: id.to_string(),
+                        user_id: "default".to_string(),
+                        agent_type: None,
+                        title: Some(args.trim().to_string()),
+                    })
+                    .await;
+            }
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content: "New conversation started.".to_string(),
+            });
+        }
+        Some(SlashCommand::Sessions) => {
+            let Some(store) = app.conversation_store.as_ref() else {
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: "Conversation persistence is unavailable.".to_string(),
+                });
+                return;
+            };
+            let result = if args.trim().is_empty() {
+                store
+                    .list_conversations(echo_agent::memory::ConversationFilter {
+                        limit: Some(30),
+                        ..Default::default()
+                    })
+                    .await
+            } else {
+                store.search_conversations(args.trim(), 30).await
+            };
+            let content = match result {
+                Ok(items) if items.is_empty() => "No persisted conversations.".to_string(),
+                Ok(items) => items
+                    .into_iter()
+                    .map(|item| {
+                        let marker = if app.conversation_id.as_deref()
+                            == Some(item.conversation_id.as_str())
+                        {
+                            "*"
+                        } else {
+                            " "
+                        };
+                        format!(
+                            "{} {}  {:>4} messages  {}",
+                            marker,
+                            item.conversation_id,
+                            item.message_count,
+                            item.title.unwrap_or_else(|| "Untitled".to_string())
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                Err(error) => format!("Failed to list conversations: {error}"),
+            };
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content,
+            });
+        }
+        Some(SlashCommand::Resume) => {
+            if app.is_processing {
+                app.status_msg =
+                    "Cancel the active turn before switching conversations".to_string();
+            } else if args.trim().is_empty() {
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: "Usage: /resume <conversation-id>".to_string(),
+                });
+            } else if let Err(error) = resume_conversation(app, agent, args.trim()).await {
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: format!("Failed to resume conversation: {error}"),
+                });
+            }
+        }
+        Some(SlashCommand::Fork) => {
+            if app.is_processing {
+                app.status_msg = "Cancel the active turn before forking".to_string();
+            } else if let Err(error) = fork_conversation(app, agent, args.trim()).await {
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: format!("Failed to fork conversation: {error}"),
+                });
+            }
+        }
+        Some(SlashCommand::Rename) => {
+            let result = match (
+                app.conversation_store.as_ref(),
+                app.conversation_id.as_deref(),
+            ) {
+                (_, _) if args.trim().is_empty() => Err("Usage: /rename <title>".to_string()),
+                (Some(store), Some(id)) => store
+                    .update_conversation(id, Some(args.trim()), None, None)
+                    .await
+                    .map_err(|error| error.to_string()),
+                _ => Err("Conversation persistence is unavailable".to_string()),
+            };
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content: match result {
+                    Ok(()) => format!("Conversation renamed to: {}", args.trim()),
+                    Err(error) => error,
+                },
+            });
+        }
+        Some(SlashCommand::DeleteSession) => {
+            let id = args.trim();
+            let result = match app.conversation_store.as_ref() {
+                _ if id.is_empty() => Err("Usage: /delete-session <conversation-id>".to_string()),
+                Some(store) => store
+                    .delete_conversation(id)
+                    .await
+                    .map_err(|error| error.to_string()),
+                None => Err("Conversation persistence is unavailable".to_string()),
+            };
+            if result.is_ok() && app.conversation_id.as_deref() == Some(id) {
+                reset_conversation_state(app, agent, true).await;
+            }
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content: match result {
+                    Ok(()) => format!("Deleted conversation: {id}"),
+                    Err(error) => error,
+                },
+            });
+        }
+        Some(SlashCommand::History) => {
+            let content = if app.history.is_empty() {
+                "No input history in this session.".to_string()
+            } else {
+                app.history
+                    .iter()
+                    .rev()
+                    .take(20)
+                    .enumerate()
+                    .map(|(idx, entry)| format!("{}. {}", idx + 1, entry))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content,
             });
         }
         Some(SlashCommand::Stats) => {
@@ -1151,10 +2119,26 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &AgentHandle, cmd: &str) 
             }
         },
         Some(SlashCommand::Plan) => {
-            app.mode = "plan".to_string();
+            let enabled = match args.trim() {
+                "off" => false,
+                "" | "on" => true,
+                _ => {
+                    app.messages.push(ChatMessage {
+                        role: MessageRole::System,
+                        content: "Usage: /plan [on|off]".to_string(),
+                    });
+                    return;
+                }
+            };
+            agent.write(|value| value.set_plan_mode(enabled)).await;
+            app.mode = if enabled { "plan" } else { "chat" }.to_string();
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
-                content: "Entered plan mode. Write operations are disabled.".to_string(),
+                content: if enabled {
+                    "Entered plan mode. Write operations are disabled.".to_string()
+                } else {
+                    "Exited plan mode.".to_string()
+                },
             });
         }
         Some(SlashCommand::Mode) => {
@@ -1228,6 +2212,230 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &AgentHandle, cmd: &str) 
                 }
             }
         }
+        Some(SlashCommand::Skills) => {
+            let mut parts = args.split_whitespace();
+            let sub = parts.next().unwrap_or("list");
+            let rest = parts.collect::<Vec<_>>().join(" ");
+            let mut hub = crate::skills_hub::SkillsHub::new();
+            let loaded = agent.read(|value| value.skill_names()).await;
+            hub.set_loaded_skills(loaded);
+            let content = match sub {
+                "list" | "ls" => hub
+                    .list()
+                    .into_iter()
+                    .map(|entry| {
+                        format!(
+                            "[{}] {} - {}",
+                            if entry.loaded { "loaded" } else { "available" },
+                            entry.name,
+                            entry.description
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                "search" | "find" if !rest.is_empty() => hub
+                    .search(&rest)
+                    .into_iter()
+                    .map(|entry| format!("{} - {}", entry.name, entry.description))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                "info" if !rest.is_empty() => hub.get(&rest).map_or_else(
+                    || format!("Skill '{rest}' was not found."),
+                    |entry| {
+                        format!(
+                            "{}\n{}\nPath: {}\nVersion: {}\nAuthor: {}",
+                            entry.name,
+                            entry.description,
+                            entry.path.display(),
+                            entry
+                                .version
+                                .clone()
+                                .unwrap_or_else(|| "unknown".to_string()),
+                            entry
+                                .author
+                                .clone()
+                                .unwrap_or_else(|| "unknown".to_string())
+                        )
+                    },
+                ),
+                "refresh" => {
+                    hub.refresh();
+                    let root = hub.root().to_path_buf();
+                    match agent
+                        .write_async(|value| {
+                            Box::pin(async move { value.load_skills_from_dir(root).await })
+                        })
+                        .await
+                    {
+                        Ok(names) => format!("Skills refreshed; {} loaded.", names.len()),
+                        Err(error) => format!("Skill refresh failed: {error}"),
+                    }
+                }
+                "install" if !rest.is_empty() => {
+                    let result = if rest.starts_with("https://") || rest.ends_with(".git") {
+                        crate::skills_hub::install::install_from_git(&rest, None, &mut hub).await
+                    } else {
+                        crate::skills_hub::install::install_from_local(
+                            std::path::Path::new(&rest),
+                            &mut hub,
+                        )
+                    };
+                    match result {
+                        Ok(installed) => {
+                            let root = hub.root().to_path_buf();
+                            let load_result = agent
+                                .write_async(|value| {
+                                    Box::pin(async move { value.load_skills_from_dir(root).await })
+                                })
+                                .await;
+                            match load_result {
+                                Ok(_) => format!(
+                                    "Installed and loaded skill: {} ({})",
+                                    installed.name,
+                                    installed.path.display()
+                                ),
+                                Err(error) => format!(
+                                    "Installed {}, but runtime reload failed: {error}",
+                                    installed.name
+                                ),
+                            }
+                        }
+                        Err(error) => format!("Skill install failed: {error}"),
+                    }
+                }
+                "uninstall" | "remove" | "rm" if !rest.is_empty() => {
+                    match crate::skills_hub::install::uninstall(&rest, &mut hub) {
+                        Ok(()) => {
+                            format!("Uninstalled skill: {rest}. Restart to unload active content.")
+                        }
+                        Err(error) => format!("Skill uninstall failed: {error}"),
+                    }
+                }
+                _ => {
+                    "Usage: /skills [list|search|install|uninstall|info|refresh] [args]".to_string()
+                }
+            };
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content: if content.is_empty() {
+                    "No matching skills.".to_string()
+                } else {
+                    content
+                },
+            });
+        }
+        Some(SlashCommand::Mcp) => {
+            let mut parts = args.split_whitespace();
+            let sub = parts.next().unwrap_or("list");
+            let target = parts.collect::<Vec<_>>().join(" ");
+            let content = match sub {
+                "list" | "ls" => {
+                    let servers = agent
+                        .read(|value| {
+                            value
+                                .list_mcp_servers()
+                                .into_iter()
+                                .map(ToString::to_string)
+                                .collect::<Vec<_>>()
+                        })
+                        .await;
+                    if servers.is_empty() {
+                        "No MCP servers connected.".to_string()
+                    } else {
+                        format!("Connected MCP servers:\n{}", servers.join("\n"))
+                    }
+                }
+                "load" if !target.is_empty() => {
+                    let path = std::path::PathBuf::from(&target);
+                    match agent
+                        .write_async(|value| {
+                            Box::pin(async move { value.load_mcp_from_file(path).await })
+                        })
+                        .await
+                    {
+                        Ok(clients) => format!("Loaded {} MCP server(s).", clients.len()),
+                        Err(error) => format!("MCP load failed: {error}"),
+                    }
+                }
+                "disconnect" if !target.is_empty() => {
+                    if agent
+                        .write_async(|value| {
+                            let target = target.clone();
+                            Box::pin(async move { value.disconnect_mcp(&target).await })
+                        })
+                        .await
+                    {
+                        format!("Disconnected MCP server: {target}")
+                    } else {
+                        format!("MCP server '{target}' is not connected.")
+                    }
+                }
+                _ => "Usage: /mcp [list|load <config-file>|disconnect <name>]".to_string(),
+            };
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content,
+            });
+        }
+        Some(SlashCommand::Hooks) => {
+            let mut parts = args.split_whitespace();
+            let sub = parts.next().unwrap_or("list");
+            let target = parts.next().unwrap_or("");
+            let content = match sub {
+                "list" | "ls" => {
+                    agent
+                        .read_async(|value| {
+                            Box::pin(async move {
+                                let registry = value.hook_registry().read().await;
+                                let sources = registry.list_sources();
+                                if sources.is_empty() {
+                                    "No hooks registered.".to_string()
+                                } else {
+                                    sources
+                                        .into_iter()
+                                        .map(|(name, count)| format!("{name}: {count} rule(s)"))
+                                        .collect::<Vec<_>>()
+                                        .join("\n")
+                                }
+                            })
+                        })
+                        .await
+                }
+                "reload" => {
+                    let loaded = echo_agent_app_core::hooks_config::load_hooks_files();
+                    let count: usize = loaded.definition.rules.values().map(Vec::len).sum();
+                    let definition = loaded.definition;
+                    agent
+                        .write_async(|value| {
+                            Box::pin(async move {
+                                let mut registry = value.hook_registry().write().await;
+                                registry.clear_user_hooks();
+                                registry.register_user_hooks(definition);
+                            })
+                        })
+                        .await;
+                    format!("Hooks reloaded: {count} rule(s).")
+                }
+                "test" if !target.is_empty() => match parse_hook_event(target) {
+                    Some(event) => {
+                        let has = agent
+                            .read_async(|value| {
+                                Box::pin(async move {
+                                    value.hook_registry().read().await.has_hooks_for(event)
+                                })
+                            })
+                            .await;
+                        format!("Hooks for {target}: {}", if has { "yes" } else { "no" })
+                    }
+                    None => format!("Unknown hook event: {target}"),
+                },
+                _ => "Usage: /hooks [list|reload|test <event>]".to_string(),
+            };
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content,
+            });
+        }
         Some(SlashCommand::Permission) => {
             if args.is_empty() {
                 app.messages.push(ChatMessage {
@@ -1235,7 +2443,26 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &AgentHandle, cmd: &str) 
                     content: format!("Permission mode: {}", app.permission_mode),
                 });
             } else {
-                app.permission_mode = args.to_string();
+                let normalized = match args.trim().to_ascii_lowercase().as_str() {
+                    "ask" | "default" => "default",
+                    "auto" | "auto-edit" => "auto-edit",
+                    "full-auto" => "full-auto",
+                    "deny" | "strict" => "strict",
+                    _ => {
+                        app.messages.push(ChatMessage {
+                            role: MessageRole::System,
+                            content: "Unknown permission mode; use default, auto-edit, full-auto, or strict".to_string(),
+                        });
+                        return;
+                    }
+                };
+                agent
+                    .write(|value| value.set_permission_mode(normalized))
+                    .await;
+                if let Some(pool) = &app.pool {
+                    pool.apply_permission_mode(normalized.to_string()).await;
+                }
+                app.permission_mode = normalized.to_string();
                 app.messages.push(ChatMessage {
                     role: MessageRole::System,
                     content: format!("Permission mode set to: {}", app.permission_mode),
@@ -1321,7 +2548,7 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &AgentHandle, cmd: &str) 
                     };
                     content.push_str(&format!("  {} {} [{:?}]\n", icon, name, meta.lifecycle));
                 }
-                content.push_str("\nUse /skill-create <name> to generate a draft, /skill-promote <name> to activate.");
+                content.push_str("\nUse /skills to inspect, install, refresh, or remove skills.");
                 app.messages.push(ChatMessage {
                     role: MessageRole::System,
                     content,
@@ -1345,27 +2572,549 @@ async fn handle_slash_command(app: &mut TuiApp, agent: &AgentHandle, cmd: &str) 
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
                 content: format!(
-                    "Token usage: prompt={}, completion={}, total={}",
+                    "Token usage: prompt={}, completion={}, requests={}",
                     app.tokens.0, app.tokens.1, app.tokens.2
                 ),
             });
         }
         Some(SlashCommand::Tools) => {
+            let tools = agent.read(|value| value.tool_names()).await;
+            app.tool_count = tools.len();
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
-                content: format!("Available tools: {} (see sidebar for list)", app.tool_count),
+                content: if tools.is_empty() {
+                    "No tools registered.".to_string()
+                } else {
+                    format!("Available tools ({}):\n{}", tools.len(), tools.join("\n"))
+                },
             });
         }
-        _ => {
+        Some(SlashCommand::Tasks) => {
+            app.sidebar_visible = true;
+            app.sidebar_tab = 2;
+            refresh_task_runtime_view(app);
+            let mut content = app
+                .task_runtime_view
+                .as_ref()
+                .map(format_task_runtime_view)
+                .unwrap_or_else(|| "No TaskRuntime run for this conversation.".to_string());
+            append_subagent_summary(&mut content, &app.subagent_runs);
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
-                content: format!("Command '{}' sent to agent for processing.", command),
+                content,
+            });
+        }
+        Some(SlashCommand::Steer) => {
+            let instruction = args.trim();
+            if instruction.is_empty() {
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: "Usage: /steer <instruction>".to_string(),
+                });
+                return;
+            }
+            let attachments = std::mem::take(&mut app.pending_attachments);
+            let message = if attachments.is_empty() {
+                echo_agent::llm::types::Message::user(instruction.to_string())
+            } else {
+                match echo_agent_app_core::attachments::build_message_from_refs(
+                    instruction,
+                    &attachments,
+                ) {
+                    Ok(message) => message,
+                    Err(error) => {
+                        app.messages.push(ChatMessage {
+                            role: MessageRole::System,
+                            content: format!("Failed to build steer attachment: {error}"),
+                        });
+                        app.pending_attachments = attachments;
+                        return;
+                    }
+                }
+            };
+            match agent.steer_input(None, message).await {
+                Ok(turn_id) => {
+                    app.messages.push(ChatMessage {
+                        role: MessageRole::User,
+                        content: instruction.to_string(),
+                    });
+                    app.status_msg = format!("Guidance injected into turn {turn_id}");
+                }
+                Err(
+                    echo_agent::agent::TurnSteerError::NoActiveTurn
+                    | echo_agent::agent::TurnSteerError::NotSteerable { .. }
+                    | echo_agent::agent::TurnSteerError::TurnMismatch { .. },
+                ) => {
+                    app.queued_turns.push_back(QueuedTurn {
+                        text: instruction.to_string(),
+                        attachments,
+                        interaction_mode: app.interaction_mode,
+                    });
+                    app.status_msg = format!(
+                        "Current stage is not steerable; queued {} follow-up(s)",
+                        app.queued_turns.len()
+                    );
+                }
+                Err(error) => {
+                    app.pending_attachments = attachments;
+                    app.messages.push(ChatMessage {
+                        role: MessageRole::System,
+                        content: format!("Steer failed: {error}"),
+                    });
+                }
+            }
+        }
+        Some(SlashCommand::TaskCancel)
+        | Some(SlashCommand::TaskPause)
+        | Some(SlashCommand::TaskResume) => {
+            let action = slash_cmd.unwrap_or(SlashCommand::Tasks);
+            let Some(store) = app.task_runtime_store.as_ref() else {
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: "Task runtime is unavailable.".to_string(),
+                });
+                return;
+            };
+            let run_id = if args.trim().is_empty() {
+                app.task_runtime_view
+                    .as_ref()
+                    .map(|view| view.run_id.clone())
+            } else {
+                Some(args.trim().to_string())
+            };
+            let Some(run_id) = run_id else {
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: "No active task run. Supply a run id explicitly.".to_string(),
+                });
+                return;
+            };
+            let result = match action {
+                SlashCommand::TaskCancel => {
+                    if store.cancel_run(&run_id) {
+                        Ok("cancelled")
+                    } else {
+                        Err("run is not active or has no cancellation handle".to_string())
+                    }
+                }
+                SlashCommand::TaskPause => store
+                    .transition_run(
+                        &run_id,
+                        echo_agent_app_core::tasks::task_runtime::TaskRunStatus::Paused,
+                    )
+                    .map(|_| "paused")
+                    .map_err(|error| error.to_string()),
+                SlashCommand::TaskResume => store
+                    .resume_task_run(&run_id)
+                    .map(|_| "resumed")
+                    .map_err(|error| error.to_string()),
+                _ => Err("unsupported task action".to_string()),
+            };
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content: match result {
+                    Ok(label) => format!("Task run {run_id} {label}."),
+                    Err(error) => format!("Task run action failed: {error}"),
+                },
+            });
+            refresh_task_runtime_view(app);
+        }
+        Some(SlashCommand::Test)
+        | Some(SlashCommand::CodeReview)
+        | Some(SlashCommand::Diff)
+        | Some(SlashCommand::Git)
+        | Some(SlashCommand::Pipeline)
+        | Some(SlashCommand::Cron)
+        | Some(SlashCommand::AutoMemory) => {
+            let prompt = match slash_cmd.unwrap_or(SlashCommand::Status) {
+                SlashCommand::Test => format!(
+                    "Run the relevant project tests{} and report failures with actionable fixes.",
+                    if args.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!(" matching '{}'", args.trim())
+                    }
+                ),
+                SlashCommand::CodeReview => format!(
+                    "Review {}. Prioritize bugs, regressions, security issues, and missing tests; provide file and line references.",
+                    if args.trim().is_empty() {
+                        "the current changes"
+                    } else {
+                        args.trim()
+                    }
+                ),
+                SlashCommand::Diff => format!(
+                    "Inspect and explain the current diff{}.",
+                    if args.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!(" for {}", args.trim())
+                    }
+                ),
+                SlashCommand::Git => format!(
+                    "Perform this git operation and report the result: {}",
+                    args.trim()
+                ),
+                SlashCommand::Pipeline => {
+                    format!("Manage the requested pipeline operation: {}", args.trim())
+                }
+                SlashCommand::Cron => format!(
+                    "Manage the requested scheduled task operation: {}",
+                    args.trim()
+                ),
+                SlashCommand::AutoMemory => format!(
+                    "Configure automatic memory behavior as requested: {}",
+                    args.trim()
+                ),
+                _ => String::new(),
+            };
+            dispatch_turn(
+                app,
+                agent,
+                agent_tx,
+                QueuedTurn {
+                    text: prompt,
+                    attachments: Vec::new(),
+                    interaction_mode: app.interaction_mode,
+                },
+            )
+            .await;
+        }
+        None => {
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content: format!("Unknown command: {command}"),
             });
         }
     }
 
+    if !app.is_processing {
+        app.status_msg = "Ready".to_string();
+    }
+}
+
+async fn reset_conversation_state(app: &mut TuiApp, agent: &AgentHandle, new_id: bool) {
+    if !new_id
+        && let (Some(store), Some(id)) = (
+            app.conversation_store.as_ref(),
+            app.conversation_id.as_deref(),
+        )
+        && let Err(error) = store.save_messages(id, &[]).await
+    {
+        tracing::warn!(error = %error, conversation_id = id, "failed to clear persisted conversation");
+    }
+    if new_id {
+        let id = uuid::Uuid::new_v4().to_string();
+        app.conversation_id = Some(id.clone());
+        agent.write(|value| value.set_conversation_id(id)).await;
+    }
+    app.messages.clear();
+    app.tokens = (0, 0, 0);
+    app.streaming_text.clear();
+    app.pending_stream.clear();
+    app.pending_attachments.clear();
+    app.queued_turns.clear();
+    app.active_cancel = None;
+    app.active_turn_id = None;
+    app.task_runtime_view = None;
+    app.subagent_runs.clear();
     app.is_processing = false;
-    app.status_msg = "Ready".to_string();
+    app.chat_scroll = 0;
+    app.clear_selection();
+    app.context_snapshot.clear_usage();
+    app.usage_accumulator.reset();
+    agent
+        .read_async(|value| {
+            Box::pin(async move {
+                use echo_agent::agent::Agent;
+                value.reset().await;
+            })
+        })
+        .await;
+}
+
+async fn resume_conversation(
+    app: &mut TuiApp,
+    agent: &AgentHandle,
+    conversation_id: &str,
+) -> anyhow::Result<()> {
+    let store = app
+        .conversation_store
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("conversation persistence is unavailable"))?;
+    let conversation = store
+        .get_conversation(conversation_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("conversation '{conversation_id}' was not found"))?;
+    let stored = store.get_messages(conversation_id).await?;
+    let runtime_messages = echo_agent_app_core::conversation_restore::restore_messages(&stored);
+    agent
+        .write(|value| value.set_conversation_id(conversation_id.to_string()))
+        .await;
+    agent
+        .read_async(|value| Box::pin(async move { value.load_messages(runtime_messages).await }))
+        .await;
+
+    app.conversation_id = Some(conversation_id.to_string());
+    app.messages = stored
+        .into_iter()
+        .filter_map(|message| {
+            let content = message.content?;
+            let role = match message.role.as_str() {
+                "user" => MessageRole::User,
+                "assistant" => MessageRole::Assistant,
+                "tool" => MessageRole::ToolResult {
+                    tool_name: "tool".to_string(),
+                },
+                _ => MessageRole::System,
+            };
+            Some(ChatMessage { role, content })
+        })
+        .collect();
+    app.messages.push(ChatMessage {
+        role: MessageRole::System,
+        content: format!(
+            "Resumed conversation: {} ({})",
+            conversation.title.unwrap_or_else(|| "Untitled".to_string()),
+            conversation_id
+        ),
+    });
+    app.task_runtime_view = None;
+    app.subagent_runs.clear();
+    app.chat_scroll = 0;
+    app.rebuild_message_groups();
+    Ok(())
+}
+
+async fn fork_conversation(
+    app: &mut TuiApp,
+    agent: &AgentHandle,
+    title: &str,
+) -> anyhow::Result<()> {
+    let store = app
+        .conversation_store
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("conversation persistence is unavailable"))?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let runtime_messages = agent
+        .read_async(|value| Box::pin(async move { value.get_messages().await }))
+        .await;
+    let projected = echo_agent::memory::project_messages(&id, &runtime_messages)?;
+    let default_title = app
+        .conversation_id
+        .as_deref()
+        .map(|source| format!("Fork of {}", source.chars().take(8).collect::<String>()))
+        .unwrap_or_else(|| "Forked conversation".to_string());
+    store
+        .create_conversation(echo_agent::memory::NewConversation {
+            conversation_id: id.clone(),
+            user_id: "default".to_string(),
+            agent_type: None,
+            title: Some(if title.is_empty() {
+                default_title
+            } else {
+                title.to_string()
+            }),
+        })
+        .await?;
+    store.save_messages(&id, &projected).await?;
+    agent
+        .write(|value| value.set_conversation_id(id.clone()))
+        .await;
+    app.conversation_id = Some(id.clone());
+    app.messages.push(ChatMessage {
+        role: MessageRole::System,
+        content: format!("Forked into conversation: {id}"),
+    });
+    Ok(())
+}
+
+fn refresh_task_runtime_view(app: &mut TuiApp) {
+    let Some(store) = &app.task_runtime_store else {
+        app.task_runtime_view = None;
+        return;
+    };
+    let Some(conversation_id) = app.conversation_id.as_deref() else {
+        app.task_runtime_view = None;
+        return;
+    };
+    let run = match store.latest_run_for_conversation(conversation_id) {
+        Ok(run) => run,
+        Err(e) => {
+            tracing::warn!(error = %e, "TUI failed to refresh TaskRuntime run");
+            return;
+        }
+    };
+    let Some(run) = run else {
+        app.task_runtime_view = None;
+        return;
+    };
+    let tasks = match store.get_plan(&run.run_id) {
+        Ok(Some(plan)) => plan
+            .tasks
+            .into_iter()
+            .map(|task| TaskRuntimeTaskView {
+                title: task.title,
+                status: task.status.as_str().to_string(),
+                agent_role: task.agent_role,
+            })
+            .collect(),
+        Ok(None) => Vec::new(),
+        Err(e) => {
+            tracing::warn!(error = %e, run_id = %run.run_id, "TUI failed to refresh TaskRuntime plan");
+            Vec::new()
+        }
+    };
+    app.task_runtime_view = Some(TaskRuntimeView {
+        run_id: run.run_id,
+        goal: run.goal,
+        status: run.status.as_str().to_string(),
+        tasks,
+    });
+}
+
+fn format_task_runtime_view(view: &TaskRuntimeView) -> String {
+    let mut content = format!("Run {} [{}]\nGoal: {}", view.run_id, view.status, view.goal);
+    if view.tasks.is_empty() {
+        content.push_str("\nPlan: not created yet");
+        return content;
+    }
+    content.push_str("\nPlan:");
+    for task in &view.tasks {
+        content.push_str(&format!(
+            "\n  [{}] {} ({})",
+            task.status, task.title, task.agent_role
+        ));
+    }
+    content
+}
+
+fn append_subagent_summary(content: &mut String, runs: &[SubagentRuntimeView]) {
+    if runs.is_empty() {
+        return;
+    }
+    content.push_str("\nSubagents:");
+    for run in runs.iter().rev().take(10).rev() {
+        let usage = run
+            .tokens_used
+            .map(|tokens| format!(", {tokens} tokens"))
+            .unwrap_or_default();
+        content.push_str(&format!(
+            "\n  [{}] {} · {} tools{}",
+            run.status, run.agent, run.tool_calls, usage
+        ));
+    }
+}
+
+fn parse_hook_event(name: &str) -> Option<echo_agent::skills::hooks::HookEvent> {
+    use echo_agent::skills::hooks::HookEvent;
+    match name {
+        "PreToolUse" => Some(HookEvent::PreToolUse),
+        "PostToolUse" => Some(HookEvent::PostToolUse),
+        "PostToolUseFailure" => Some(HookEvent::PostToolUseFailure),
+        "SessionStart" => Some(HookEvent::SessionStart),
+        "SessionEnd" => Some(HookEvent::SessionEnd),
+        "Stop" => Some(HookEvent::Stop),
+        "UserPromptSubmit" => Some(HookEvent::UserPromptSubmit),
+        "ConfigChange" => Some(HookEvent::ConfigChange),
+        _ => None,
+    }
+}
+
+fn update_subagent_runs(app: &mut TuiApp, event: &SubagentEvent) {
+    match event {
+        SubagentEvent::DispatchStarted {
+            agent,
+            task,
+            execution_id,
+            background,
+            ..
+        } => {
+            let id = subagent_event_id(execution_id.as_deref(), agent);
+            if let Some(run) = app
+                .subagent_runs
+                .iter_mut()
+                .find(|run| run.execution_id == id)
+            {
+                run.agent = agent.clone();
+                run.task = task.clone();
+                run.status = "running".to_string();
+                run.background = *background;
+            } else {
+                app.subagent_runs.push(SubagentRuntimeView {
+                    execution_id: id,
+                    agent: agent.clone(),
+                    task: task.clone(),
+                    status: "running".to_string(),
+                    tool_calls: 0,
+                    tokens_used: None,
+                    duration_ms: None,
+                    background: *background,
+                });
+            }
+        }
+        SubagentEvent::DispatchToolStarted {
+            agent,
+            execution_id,
+            ..
+        } => {
+            if let Some(run) = find_subagent_run_mut(app, execution_id.as_deref(), agent) {
+                run.tool_calls = run.tool_calls.saturating_add(1);
+            }
+        }
+        SubagentEvent::DispatchCompleted {
+            agent,
+            execution_id,
+            duration_ms,
+            tokens_used,
+            ..
+        } => {
+            if let Some(run) = find_subagent_run_mut(app, execution_id.as_deref(), agent) {
+                run.status = "completed".to_string();
+                run.duration_ms = Some(*duration_ms);
+                run.tokens_used = *tokens_used;
+            }
+        }
+        SubagentEvent::DispatchFailed {
+            agent,
+            execution_id,
+            ..
+        } => {
+            if let Some(run) = find_subagent_run_mut(app, execution_id.as_deref(), agent) {
+                run.status = "failed".to_string();
+            }
+        }
+        SubagentEvent::DispatchCancelled {
+            agent,
+            execution_id,
+            ..
+        } => {
+            if let Some(run) = find_subagent_run_mut(app, execution_id.as_deref(), agent) {
+                run.status = "cancelled".to_string();
+            }
+        }
+        _ => {}
+    }
+    if app.subagent_runs.len() > 50 {
+        let remove = app.subagent_runs.len().saturating_sub(50);
+        app.subagent_runs.drain(..remove);
+    }
+}
+
+fn subagent_event_id(execution_id: Option<&str>, agent: &str) -> String {
+    execution_id.unwrap_or(agent).to_string()
+}
+
+fn find_subagent_run_mut<'a>(
+    app: &'a mut TuiApp,
+    execution_id: Option<&str>,
+    agent: &str,
+) -> Option<&'a mut SubagentRuntimeView> {
+    let id = subagent_event_id(execution_id, agent);
+    app.subagent_runs
+        .iter_mut()
+        .rev()
+        .find(|run| run.execution_id == id)
 }
 
 // ── Parallel task progress strip ────────────────────────────────────────
@@ -1507,8 +3256,19 @@ fn parse_interaction_mode(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_interaction_mode;
+    use super::{
+        complete_file_reference, delete_previous_word, format_task_runtime_view, handle_esc,
+        move_cursor_vertical, parse_interaction_mode, reverse_history_search,
+        slash_command_allowed_while_busy, update_subagent_runs,
+    };
+    use crate::tui::{TaskRuntimeTaskView, TaskRuntimeView, Theme, TuiApp};
     use echo_agent_app_core::tasks::task_runtime::types::InteractionMode;
+
+    fn app() -> TuiApp {
+        let theme =
+            Theme::from_color_theme(&echo_agent_app_core::output::theme::ColorTheme::dark());
+        TuiApp::new("test-model".to_string(), "test".to_string(), theme)
+    }
 
     #[test]
     fn parses_auto_chat_task_case_insensitively() {
@@ -1530,5 +3290,163 @@ mod tests {
         assert_eq!(parse_interaction_mode("plan"), None);
         assert_eq!(parse_interaction_mode("xyz"), None);
         assert_eq!(parse_interaction_mode(""), None);
+    }
+
+    #[test]
+    fn interrupt_cancels_backend_but_keeps_turn_busy_until_settle() {
+        let mut app = app();
+        let cancel = echo_agent::agent::CancellationToken::new();
+        app.is_processing = true;
+        app.active_cancel = Some(cancel.clone());
+
+        handle_esc(&mut app);
+
+        assert!(cancel.is_cancelled());
+        assert!(app.is_processing);
+        assert_eq!(app.status_msg, "Cancelling...");
+    }
+
+    #[test]
+    fn multiline_cursor_moves_without_breaking_utf8() {
+        let mut app = app();
+        app.input = "中文abc\n第二行".to_string();
+        app.cursor = app.input.len();
+
+        assert!(move_cursor_vertical(&mut app, -1));
+        assert!(app.input.is_char_boundary(app.cursor));
+        assert!(app.cursor < app.input.len());
+
+        assert!(move_cursor_vertical(&mut app, 1));
+        assert_eq!(app.cursor, app.input.len());
+    }
+
+    #[test]
+    fn delete_previous_word_is_utf8_safe() {
+        let mut app = app();
+        app.input = "保留 删除我".to_string();
+        app.cursor = app.input.len();
+
+        delete_previous_word(&mut app);
+
+        assert_eq!(app.input, "保留 ");
+        assert_eq!(app.cursor, app.input.len());
+    }
+
+    #[test]
+    fn busy_command_allowlist_is_explicit() {
+        assert!(slash_command_allowed_while_busy("/status"));
+        assert!(slash_command_allowed_while_busy("/tasks"));
+        assert!(slash_command_allowed_while_busy("/steer focus on tests"));
+        assert!(!slash_command_allowed_while_busy("/clear"));
+        assert!(!slash_command_allowed_while_busy("/model other"));
+    }
+
+    #[test]
+    fn repeated_idle_escape_requests_rewind() {
+        let mut app = app();
+
+        handle_esc(&mut app);
+        assert!(!app.rewind_requested);
+        handle_esc(&mut app);
+
+        assert!(app.rewind_requested);
+        assert!(app.last_escape_at.is_none());
+    }
+
+    #[test]
+    fn reverse_search_walks_earlier_matches() {
+        let mut app = app();
+        app.history = vec![
+            "first build".to_string(),
+            "run tests".to_string(),
+            "second build".to_string(),
+        ];
+        app.input = "build".to_string();
+        app.cursor = app.input.len();
+
+        reverse_history_search(&mut app);
+        assert_eq!(app.input, "second build");
+        reverse_history_search(&mut app);
+        assert_eq!(app.input, "first build");
+    }
+
+    #[test]
+    fn file_reference_completion_keeps_utf8_boundary() {
+        let mut app = app();
+        app.project_files = vec!["src/中文.rs".to_string()];
+        app.input = "检查 @中文".to_string();
+        app.cursor = app.input.len();
+
+        assert!(complete_file_reference(&mut app));
+        assert_eq!(app.input, "检查 @src/中文.rs");
+        assert!(app.input.is_char_boundary(app.cursor));
+    }
+
+    #[test]
+    fn task_runtime_projection_formats_plan_state() {
+        let view = TaskRuntimeView {
+            run_id: "run-1".to_string(),
+            goal: "补齐 TUI".to_string(),
+            status: "running".to_string(),
+            tasks: vec![TaskRuntimeTaskView {
+                title: "实现队列".to_string(),
+                status: "completed".to_string(),
+                agent_role: "implementer".to_string(),
+            }],
+        };
+
+        let text = format_task_runtime_view(&view);
+        assert!(text.contains("run-1 [running]"));
+        assert!(text.contains("[completed] 实现队列 (implementer)"));
+    }
+
+    #[test]
+    fn subagent_events_update_live_projection() {
+        use echo_agent::agent::subagent::{ExecutionMode, SubagentEvent};
+
+        let mut app = app();
+        update_subagent_runs(
+            &mut app,
+            &SubagentEvent::DispatchStarted {
+                parent: "main".to_string(),
+                agent: "explorer".to_string(),
+                mode: ExecutionMode::Fork,
+                task: "inspect TUI".to_string(),
+                execution_id: Some("task-1:1".to_string()),
+                run_id: Some("run-1".to_string()),
+                message_id: None,
+                background: false,
+            },
+        );
+        update_subagent_runs(
+            &mut app,
+            &SubagentEvent::DispatchToolStarted {
+                parent: "main".to_string(),
+                agent: "explorer".to_string(),
+                name: "read_file".to_string(),
+                args: serde_json::json!({}),
+                execution_id: Some("task-1:1".to_string()),
+                run_id: Some("run-1".to_string()),
+            },
+        );
+        update_subagent_runs(
+            &mut app,
+            &SubagentEvent::DispatchCompleted {
+                parent: "main".to_string(),
+                agent: "explorer".to_string(),
+                duration_ms: 120,
+                tokens_used: Some(42),
+                iterations: Some(1),
+                output: "done".to_string(),
+                execution_id: Some("task-1:1".to_string()),
+                run_id: Some("run-1".to_string()),
+            },
+        );
+
+        let run = app.subagent_runs.first().cloned().unwrap_or_default();
+        assert_eq!(run.status, "completed");
+        assert_eq!(run.tool_calls, 1);
+        assert_eq!(run.tokens_used, Some(42));
+        assert_eq!(run.duration_ms, Some(120));
     }
 }

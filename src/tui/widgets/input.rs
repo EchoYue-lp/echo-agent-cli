@@ -6,7 +6,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use unicode_width::UnicodeWidthStr;
 
 use super::Widget;
@@ -37,22 +37,22 @@ impl Widget for Input {
         };
         f.render_widget(separator, sep_area);
 
-        let inner = Rect {
+        let body = Rect {
             x: area.x,
             y: area.y + 1,
             width: area.width,
-            height: 1,
+            height: area.height.saturating_sub(2),
         };
         let footer = Rect {
             x: area.x,
-            y: area.y + 2,
+            y: area.y + area.height.saturating_sub(1),
             width: area.width,
-            height: area.height.saturating_sub(2).min(1),
+            height: 1,
         };
 
         // Draw suggestions popup above the input if any.
         if !app.suggestions.is_empty() {
-            render_suggestions(f, app, inner);
+            render_suggestions(f, app, body);
         }
 
         // Prompt indicator
@@ -83,25 +83,68 @@ impl Widget for Input {
             (Span::raw(app.input.clone()), Style::default())
         };
 
-        let input = Paragraph::new(Line::from(vec![prompt_icon, text_span])).style(style);
-        f.render_widget(input, inner);
+        let prompt_area = Rect {
+            x: body.x,
+            y: body.y,
+            width: body.width.min(2),
+            height: body.height,
+        };
+        let text_area = Rect {
+            x: body.x.saturating_add(2),
+            y: body.y,
+            width: body.width.saturating_sub(2),
+            height: body.height,
+        };
+        f.render_widget(Paragraph::new(Line::from(prompt_icon)), prompt_area);
+        let before_cursor = app.input.get(..app.cursor).unwrap_or("");
+        let content_width = text_area.width.max(1) as usize;
+        let mut cursor_row = 0usize;
+        let mut cursor_col = 0usize;
+        for (idx, line) in before_cursor.split('\n').enumerate() {
+            let line_width = UnicodeWidthStr::width(line);
+            if idx > 0 {
+                cursor_row = cursor_row.saturating_add(1);
+            }
+            cursor_row = cursor_row.saturating_add(line_width / content_width);
+            cursor_col = line_width % content_width;
+        }
+        let scroll_y = cursor_row.saturating_sub(text_area.height.saturating_sub(1) as usize);
+        let input = Paragraph::new(Line::from(text_span))
+            .style(style)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll_y as u16, 0));
+        f.render_widget(input, text_area);
 
         if footer.height > 0 {
+            let queued = app.queued_turns.front().map_or_else(
+                || "队列 0".to_string(),
+                |turn| {
+                    let preview: String = turn.text.chars().take(24).collect();
+                    format!("队列 {} · next: {}", app.queued_turns.len(), preview)
+                },
+            );
             let footer_line = Line::from(vec![
                 Span::styled("  Enter 发送", Style::default().fg(t.overlay0)),
                 Span::styled("  Shift+Enter 换行", Style::default().fg(t.overlay0)),
-                Span::styled("  / 命令", Style::default().fg(t.overlay0)),
+                Span::styled(
+                    format!("  {queued}"),
+                    if app.queued_turns.is_empty() {
+                        Style::default().fg(t.overlay0)
+                    } else {
+                        Style::default().fg(t.yellow).add_modifier(Modifier::BOLD)
+                    },
+                ),
             ]);
             f.render_widget(Paragraph::new(footer_line), footer);
         }
 
         // Show cursor (offset by prompt display width).
         if !app.is_processing {
-            let before_cursor = app.input.get(..app.cursor).unwrap_or("");
-            let display_width = UnicodeWidthStr::width(before_cursor) as u16;
-            let max_x = inner.width.saturating_sub(1);
-            let cursor_x = inner.x + 2 + display_width.min(max_x.saturating_sub(2));
-            f.set_cursor_position((cursor_x, inner.y));
+            let visible_row = cursor_row.saturating_sub(scroll_y);
+            f.set_cursor_position((
+                text_area.x.saturating_add(cursor_col as u16),
+                text_area.y.saturating_add(visible_row as u16),
+            ));
         }
     }
 }

@@ -28,9 +28,7 @@ impl Widget for TaskStrip {
 
         // Show at most `area.height` tasks (typically 3–5 rows).
         let max_rows = area.height as usize;
-        let visible_tasks = &app.parallel_tasks[..app.parallel_tasks.len().min(max_rows)];
-
-        for (i, entry) in visible_tasks.iter().enumerate() {
+        for (i, entry) in app.parallel_tasks.iter().take(max_rows).enumerate() {
             let row_y = area.y + i as u16;
             let row_area = Rect::new(area.x, row_y, area.width, 1);
 
