@@ -128,7 +128,7 @@ export function McpManagerPanel({
             <div className="md:col-span-2">
               <label className="block text-xs text-[var(--text-tertiary)] mb-1">Command</label>
               <input
-                placeholder="e.g., npx -y @anthropic-ai/mcp-server-playwright"
+                placeholder="e.g., npx -y @playwright/mcp@latest"
                 value={newServer.command || ''}
                 onChange={(e) => setNewServer({ ...newServer, command: e.target.value })}
                 className="w-full px-3 py-2 rounded-lg bg-[var(--bg-primary)] border border-[var(--border-primary)] text-sm text-[var(--text-primary)] font-mono focus:outline-none focus:border-[var(--border-focus)] focus:ring-2 focus:ring-[var(--accent-bg)]"

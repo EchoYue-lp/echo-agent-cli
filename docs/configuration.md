@@ -154,7 +154,7 @@ tui:
   "mcpServers": {
     "playwright": {
       "command": "npx",
-      "args": ["-y", "@anthropic-ai/mcp-server-playwright"],
+      "args": ["-y", "@playwright/mcp@latest"],
       "disabled": false,
       "description": "Playwright MCP Server - 浏览器自动化"
     },
