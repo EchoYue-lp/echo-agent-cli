@@ -262,6 +262,7 @@ enum AgentEvent {
         call_id: String,
         success: bool,
         metadata: std::collections::HashMap<String, String>,
+        truncated: bool,
     },
     /// A tool execution completed.
     ToolResult {
@@ -305,12 +306,34 @@ fn find_tool_mut<'a>(app: &'a mut TuiApp, call_id: &str) -> Option<&'a mut ToolE
         })
 }
 
-fn append_bounded(target: &mut String, chunk: &str, max_chars: usize) {
+fn append_bounded(
+    target: &mut String,
+    chunk: &str,
+    max_chars: usize,
+    max_bytes: usize,
+    max_lines: usize,
+) -> bool {
     target.push_str(chunk);
-    let count = target.chars().count();
-    if count > max_chars {
-        *target = target.chars().skip(count - max_chars).collect();
+    let mut kept = Vec::new();
+    let mut bytes = 0usize;
+    let mut lines = 1usize;
+    for character in target.chars().rev() {
+        let next_lines = lines.saturating_add(usize::from(character == '\n'));
+        if kept.len().saturating_add(1) > max_chars
+            || bytes.saturating_add(character.len_utf8()) > max_bytes
+            || next_lines > max_lines
+        {
+            break;
+        }
+        bytes = bytes.saturating_add(character.len_utf8());
+        lines = next_lines;
+        kept.push(character);
     }
+    let truncated = kept.len() < target.chars().count();
+    if truncated {
+        *target = kept.into_iter().rev().collect();
+    }
+    truncated
 }
 
 #[cfg(test)]
@@ -325,8 +348,19 @@ mod tool_execution_tests {
     #[test]
     fn bounded_tool_output_keeps_unicode_tail() {
         let mut output = "开始🙂".to_string();
-        append_bounded(&mut output, "结束世界", 5);
+        append_bounded(&mut output, "结束世界", 5, usize::MAX, usize::MAX);
         assert_eq!(output, "🙂结束世界");
+    }
+
+    #[test]
+    fn bounded_tool_output_respects_utf8_bytes_and_lines() {
+        let mut output = "🙂🙂🙂".to_string();
+        assert!(append_bounded(&mut output, "", usize::MAX, 8, usize::MAX));
+        assert_eq!(output, "🙂🙂");
+
+        let mut lines = "1\n2\n3\n4".to_string();
+        assert!(append_bounded(&mut lines, "", usize::MAX, usize::MAX, 3));
+        assert_eq!(lines, "2\n3\n4");
     }
 
     fn execution(name: &str, args: &str, status: ToolExecutionStatus) -> ToolExecutionMessage {
@@ -337,7 +371,9 @@ mod tool_execution_tests {
             status,
             stdout: "result line".to_string(),
             stderr: String::new(),
+            log: String::new(),
             progress: None,
+            truncated: false,
             started_at: Instant::now(),
             finished_at: None,
             metadata: HashMap::new(),
@@ -426,6 +462,29 @@ mod tool_execution_tests {
         );
         assert_eq!(tool_detail(&tool), "Inspect browser events");
         assert!(tool_output_tail(&tool, 6).is_empty());
+    }
+
+    #[test]
+    fn mcp_detail_uses_framework_result_metadata() {
+        let mut tool = execution("list_issues", "{}", ToolExecutionStatus::Succeeded);
+        tool.metadata
+            .insert("tool_source".to_string(), "mcp".to_string());
+        tool.metadata
+            .insert("mcp_server".to_string(), "github".to_string());
+        tool.metadata
+            .insert("mcp_tool".to_string(), "list_issues".to_string());
+        tool.metadata
+            .insert("result_type".to_string(), "json".to_string());
+        assert_eq!(tool_detail(&tool), "github · list_issues · json result");
+    }
+
+    #[test]
+    fn log_channel_remains_distinct_and_visible() {
+        let mut tool = execution("custom", "{}", ToolExecutionStatus::Running);
+        tool.stdout.clear();
+        tool.log = "phase one".to_string();
+        assert_eq!(tool_output_tail(&tool, 6), vec!["phase one".to_string()]);
+        assert!(tool.stderr.is_empty());
     }
 }
 
@@ -574,7 +633,9 @@ pub async fn run_event_loop(
                             status: ToolExecutionStatus::Running,
                             stdout: String::new(),
                             stderr: String::new(),
+                            log: String::new(),
                             progress: None,
+                            truncated: false,
                             started_at: Instant::now(),
                             finished_at: None,
                             metadata: std::collections::HashMap::new(),
@@ -596,10 +657,11 @@ pub async fn run_event_loop(
                 } => {
                     if let Some(tool) = find_tool_mut(app, &call_id) {
                         let target = match channel {
-                            ToolOutputChannel::Stdout | ToolOutputChannel::Log => &mut tool.stdout,
+                            ToolOutputChannel::Stdout => &mut tool.stdout,
                             ToolOutputChannel::Stderr => &mut tool.stderr,
+                            ToolOutputChannel::Log => &mut tool.log,
                         };
-                        append_bounded(target, &chunk, 131_072);
+                        tool.truncated |= append_bounded(target, &chunk, 131_072, 131_072, 1_000);
                     }
                     app.invalidate_messages_cache();
                 }
@@ -607,6 +669,7 @@ pub async fn run_event_loop(
                     call_id,
                     success,
                     metadata,
+                    truncated,
                 } => {
                     if let Some(tool) = find_tool_mut(app, &call_id) {
                         tool.status = if success {
@@ -615,6 +678,10 @@ pub async fn run_event_loop(
                             ToolExecutionStatus::Failed
                         };
                         tool.finished_at = Some(Instant::now());
+                        tool.truncated |= truncated
+                            || metadata
+                                .get("output_truncated")
+                                .is_some_and(|value| value == "true");
                         tool.metadata = metadata;
                     }
                     app.invalidate_messages_cache();
@@ -1803,6 +1870,7 @@ impl echo_agent_app_core::chat_driver::ChatSink for TuiChatSink {
                 call_id,
                 success: result.success,
                 metadata: result.metadata,
+                truncated: result.truncated,
             },
             echo_agent::agent::AgentEvent::ToolResult {
                 call_id, output, ..

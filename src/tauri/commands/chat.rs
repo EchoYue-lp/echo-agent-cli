@@ -1422,3 +1422,33 @@ pub async fn get_cache_diagnostics(
         "recent_calls": recent_calls,
     }))
 }
+
+#[cfg(test)]
+mod tool_transport_tests {
+    use super::ChatEvent;
+
+    #[test]
+    fn tool_output_transport_preserves_call_id_and_channel() -> Result<(), String> {
+        for channel in ["stdout", "stderr", "log"] {
+            let value = serde_json::to_value(ChatEvent::ToolOutput {
+                call_id: "call-42".to_string(),
+                channel: channel.to_string(),
+                chunk: "你好🙂".to_string(),
+            })
+            .map_err(|error| error.to_string())?;
+            assert_eq!(
+                value.get("type").and_then(serde_json::Value::as_str),
+                Some("tool_output")
+            );
+            assert_eq!(
+                value.get("call_id").and_then(serde_json::Value::as_str),
+                Some("call-42")
+            );
+            assert_eq!(
+                value.get("channel").and_then(serde_json::Value::as_str),
+                Some(channel)
+            );
+        }
+        Ok(())
+    }
+}

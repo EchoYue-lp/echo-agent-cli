@@ -31,7 +31,7 @@ use echo_agent_app_core::evolution::ReviewIntegration;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::{Terminal, TerminalOptions, Viewport, backend::CrosstermBackend};
 use std::collections::VecDeque;
 use std::io;
 use std::time::Instant;
@@ -357,7 +357,9 @@ pub struct ToolExecutionMessage {
     pub status: ToolExecutionStatus,
     pub stdout: String,
     pub stderr: String,
+    pub log: String,
     pub progress: Option<String>,
+    pub truncated: bool,
     pub started_at: Instant,
     pub finished_at: Option<Instant>,
     pub metadata: std::collections::HashMap<String, String>,
@@ -427,6 +429,25 @@ pub(crate) fn tool_command(name: &str, args: &str) -> String {
 }
 
 pub(crate) fn tool_detail(tool: &ToolExecutionMessage) -> String {
+    if tool.metadata.get("tool_source").map(String::as_str) == Some("mcp") {
+        let identity = [
+            tool.metadata.get("mcp_server").cloned(),
+            tool.metadata.get("mcp_tool").cloned(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ");
+        let result_type = tool
+            .metadata
+            .get("result_type")
+            .map(|value| format!("{value} result"));
+        return [(!identity.is_empty()).then_some(identity), result_type]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" · ");
+    }
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&tool.args) else {
         return String::new();
     };
@@ -474,10 +495,13 @@ pub(crate) fn tool_detail(tool: &ToolExecutionMessage) -> String {
             }
         }
         name if name.starts_with("browser_") => [
-            value
-                .get("url")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string),
+            tool.metadata.get("browser_title").cloned(),
+            tool.metadata.get("browser_url").cloned().or_else(|| {
+                value
+                    .get("url")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            }),
             value
                 .get("target")
                 .or_else(|| value.get("element"))
@@ -577,6 +601,8 @@ pub(crate) fn tool_output_tail(tool: &ToolExecutionMessage, max_lines: usize) ->
         &tool.stdout
     } else if !tool.stderr.is_empty() {
         &tool.stderr
+    } else if !tool.log.is_empty() {
+        &tool.log
     } else {
         return tool.progress.clone().into_iter().collect();
     };
@@ -600,7 +626,8 @@ pub(crate) fn tool_metadata_label(tool: &ToolExecutionMessage) -> String {
         .metadata
         .get("exit_code")
         .map(|value| format!("exit {value}"));
-    [duration, exit_code]
+    let truncated = tool.truncated.then(|| "truncated".to_string());
+    [duration, exit_code, truncated]
         .into_iter()
         .flatten()
         .collect::<Vec<_>>()
@@ -1570,7 +1597,7 @@ fn collect_project_files(root: &std::path::Path, limit: usize) -> Vec<String> {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod state_tests {
-    use super::{Theme, TuiApp};
+    use super::{Theme, TuiApp, Viewport, tui_viewport};
 
     fn app() -> TuiApp {
         let theme =
@@ -1608,6 +1635,13 @@ mod state_tests {
     }
 
     #[test]
+    fn inline_mode_uses_scrollback_preserving_viewport() {
+        assert_eq!(tui_viewport(true, 40), Viewport::Inline(39));
+        assert_eq!(tui_viewport(true, 5), Viewport::Inline(10));
+        assert_eq!(tui_viewport(false, 40), Viewport::Fullscreen);
+    }
+
+    #[test]
     fn finalize_stream_releases_cancellation_authority() {
         let mut app = app();
         app.is_processing = true;
@@ -1631,6 +1665,14 @@ mod state_tests {
 /// instead of corrupting the TUI screen.
 struct TerminalGuard {
     inline_mode: bool,
+}
+
+fn tui_viewport(inline_mode: bool, terminal_height: u16) -> Viewport {
+    if inline_mode {
+        Viewport::Inline(terminal_height.saturating_sub(1).max(10))
+    } else {
+        Viewport::Fullscreen
+    }
 }
 
 impl TerminalGuard {
@@ -1722,7 +1764,15 @@ pub async fn run_tui(
 
     // Build the terminal.
     let backend = CrosstermBackend::new(io::stdout());
-    let mut terminal = Terminal::new(backend)?;
+    let terminal_height = crossterm::terminal::size()
+        .map(|(_, height)| height)
+        .unwrap_or(24);
+    let mut terminal = Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: tui_viewport(inline_mode, terminal_height),
+        },
+    )?;
     terminal.clear()?;
 
     // Get agent model name via read lock.

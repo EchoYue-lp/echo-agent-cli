@@ -54,7 +54,9 @@ function browserDomain(value: string | undefined): string | undefined {
 function describeBrowser(tool: ToolExecution): ToolRenderDescriptor {
   const args = argsRecord(tool);
   const url = textArg(args, 'url');
-  const domain = browserDomain(url);
+  const observedUrl = tool.metadata?.browser_url || url;
+  const domain = browserDomain(observedUrl);
+  const pageTitle = tool.metadata?.browser_title;
   const target = textArg(args, 'target', 'element', 'selector', 'ref');
   const action = tool.name.replace(/^browser_/, '').replaceAll('_', ' ');
   const title =
@@ -63,7 +65,13 @@ function describeBrowser(tool: ToolExecution): ToolRenderDescriptor {
       : tool.name === 'browser_snapshot'
         ? `Inspect ${domain || 'page'}`
         : `${action.charAt(0).toUpperCase()}${action.slice(1)}`;
-  const detail = [url && domain !== url ? url : undefined, target].filter(Boolean).join(' · ');
+  const detail = [
+    pageTitle,
+    observedUrl && domain !== observedUrl ? observedUrl : undefined,
+    target,
+  ]
+    .filter(Boolean)
+    .join(' · ');
   return {
     kind: 'browser',
     title,
@@ -75,15 +83,18 @@ function describeBrowser(tool: ToolExecution): ToolRenderDescriptor {
 function mcpIdentity(tool: ToolExecution): { server?: string; name: string } | undefined {
   const args = argsRecord(tool);
   const server = tool.metadata?.mcp_server || textArg(args, 'server', 'server_name');
+  const metadataTool = tool.metadata?.mcp_tool;
   const namespaced = tool.name.match(/^mcp__(.+?)__(.+)$/);
   if (namespaced?.[1] && namespaced[2]) return { server: namespaced[1], name: namespaced[2] };
-  if (!server) return undefined;
-  return { server, name: tool.name };
+  if (tool.metadata?.tool_source === 'mcp' || server || metadataTool) {
+    return { server, name: metadataTool || tool.name };
+  }
+  return undefined;
 }
 
 function mcpResultType(tool: ToolExecution): string {
   const explicit = tool.metadata?.result_type;
-  if (explicit) return explicit;
+  if (explicit) return explicit === 'json' ? 'JSON result' : `${explicit} result`;
   const result = tool.result.trim();
   if (!result) return 'empty result';
   try {

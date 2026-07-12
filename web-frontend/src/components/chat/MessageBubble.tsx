@@ -63,8 +63,9 @@ function flattenSteps(message: ChatMessage): { steps: FlatStep[]; thinkingTotal:
         steps.push({ type: 'thinking', thinkingContent: round.thinking.content, toolIndex: 0 });
         thinkingTotal++;
       }
-      round.tools.forEach((tc) => {
-        steps.push({ type: 'tool', toolCall: tc, toolIndex: steps.length });
+      round.toolCallIds.forEach((callId) => {
+        const tc = message.toolCalls?.find((tool) => tool.id === callId);
+        if (tc) steps.push({ type: 'tool', toolCall: tc, toolIndex: steps.length });
       });
     });
   } else if (message.executionSteps && message.executionSteps.length > 0) {
@@ -76,8 +77,8 @@ function flattenSteps(message: ChatMessage): { steps: FlatStep[]; thinkingTotal:
           thinkingTotal++;
         }
       } else if (step.type === 'tool') {
-        const tc = message.toolCalls?.[step.index];
-        if (tc) steps.push({ type: 'tool', toolCall: tc, toolIndex: step.index });
+        const tc = message.toolCalls?.find((tool) => tool.id === step.callId);
+        if (tc) steps.push({ type: 'tool', toolCall: tc, toolIndex: steps.length });
       }
     });
   } else {

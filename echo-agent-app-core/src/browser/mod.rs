@@ -640,6 +640,16 @@ impl BrowserRuntime {
                     result.data = None;
                     result.kind = ToolResultKind::Text;
                 }
+                let (page_url, page_title) = attach_browser_page_metadata(&mut result);
+                self.inner
+                    .sessions
+                    .update_page_metadata(
+                        conversation_id,
+                        &lease.tab_id,
+                        page_url.as_deref(),
+                        page_title.as_deref(),
+                    )
+                    .await;
                 self.inner
                     .sessions
                     .set_status(conversation_id, BrowserSessionStatus::Ready)
@@ -649,10 +659,12 @@ impl BrowserRuntime {
                         .get("url")
                         .and_then(Value::as_str)
                         .unwrap_or_default();
-                    self.inner
-                        .sessions
-                        .update_url(conversation_id, &lease.tab_id, url)
-                        .await;
+                    if page_url.is_none() {
+                        self.inner
+                            .sessions
+                            .update_url(conversation_id, &lease.tab_id, url)
+                            .await;
+                    }
                     self.inner.sessions.emit(BrowserEvent::NavigationCompleted {
                         session_id: lease.session_id.clone(),
                         tab_id: lease.tab_id.clone(),
@@ -1034,7 +1046,9 @@ impl BrowserRuntime {
             .sessions
             .set_status(conversation_id, BrowserSessionStatus::Ready)
             .await;
-        if let Some(url) = raw.get("url").and_then(Value::as_str) {
+        let chrome_page_url = raw.get("url").and_then(Value::as_str).map(str::to_string);
+        let chrome_page_title = raw.get("title").and_then(Value::as_str).map(str::to_string);
+        if let Some(url) = chrome_page_url.as_deref() {
             self.inner
                 .sessions
                 .update_url(conversation_id, &lease.tab_id, url)
@@ -1049,6 +1063,28 @@ impl BrowserRuntime {
         }
 
         let mut result = chrome_tool_result(action, raw);
+        let (parsed_url, parsed_title) = attach_browser_page_metadata(&mut result);
+        let page_url = parsed_url.or(chrome_page_url);
+        let page_title = parsed_title.or(chrome_page_title);
+        if let Some(url) = &page_url {
+            result
+                .metadata
+                .insert("browser_url".to_string(), url.clone());
+        }
+        if let Some(title) = &page_title {
+            result
+                .metadata
+                .insert("browser_title".to_string(), title.clone());
+        }
+        self.inner
+            .sessions
+            .update_page_metadata(
+                conversation_id,
+                &lease.tab_id,
+                page_url.as_deref(),
+                page_title.as_deref(),
+            )
+            .await;
         let observation = self
             .inner
             .sessions
@@ -1691,6 +1727,41 @@ fn browser_frame(result: &ToolResult) -> Option<BrowserFrame> {
     })
 }
 
+fn attach_browser_page_metadata(result: &mut ToolResult) -> (Option<String>, Option<String>) {
+    let mut url = None;
+    let mut title = None;
+    for line in result.output.lines() {
+        let line = line.trim();
+        if url.is_none() {
+            url = line
+                .strip_prefix("- Page URL:")
+                .or_else(|| line.strip_prefix("Page URL:"))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+        }
+        if title.is_none() {
+            title = line
+                .strip_prefix("- Page Title:")
+                .or_else(|| line.strip_prefix("Page Title:"))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string);
+        }
+    }
+    if let Some(url) = &url {
+        result
+            .metadata
+            .insert("browser_url".to_string(), url.clone());
+    }
+    if let Some(title) = &title {
+        result
+            .metadata
+            .insert("browser_title".to_string(), title.clone());
+    }
+    (url, title)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1869,6 +1940,20 @@ mod tests {
         assert!(redacted.contains("plain error"));
         assert!(!redacted.contains("Bearer secret"));
         assert!(!redacted.contains("sid=secret"));
+    }
+
+    #[test]
+    fn playwright_page_state_becomes_renderer_metadata() {
+        let mut result = ToolResult::success(
+            "### Page state\n- Page URL: https://example.com/docs\n- Page Title: Example Docs",
+        );
+        let (url, title) = attach_browser_page_metadata(&mut result);
+        assert_eq!(url.as_deref(), Some("https://example.com/docs"));
+        assert_eq!(title.as_deref(), Some("Example Docs"));
+        assert_eq!(
+            result.metadata.get("browser_title").map(String::as_str),
+            Some("Example Docs")
+        );
     }
 
     #[test]

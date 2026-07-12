@@ -2,11 +2,11 @@
 
 日期: 2026-07-11
 
-状态: shell 垂直切片与 M5 read/edit/search/browser/MCP/subagent renderer 已完成
+状态: Phase 0-10 全部完成,工具执行生命周期、GUI/TUI 渲染与历史恢复已闭环
 
 ## 0. 实施结果 (2026-07-11)
 
-本轮完成 Phase 1-9 中支撑 shell 动态执行体验的主路径:
+本轮完成 Phase 0-10 的工具执行体验主路径:
 
 - `echo-agent` 已提供稳定 `call_id`、context-aware streaming、stdout/stderr/log 通道、并行 multiplex、Complete 元数据透传,并完成 shell/local sandbox 真流式与 Docker/K8s 明确退化。
 - GUI/TUI 均以 `call_id` 维护 running/succeeded/failed/cancelled 状态,实时归并输出,错误和取消会收敛终态。
@@ -14,12 +14,15 @@
 - TUI 使用结构化工具消息原地刷新,显示 command、elapsed/exit code 和输出 tail,保留文件写工具原有 diff 视图。
 - 会话文件只保存有界最终投影,包含 call_id、状态、stdout/stderr/log、metadata 和 truncated;兼容旧 thinking array 格式。
 - TaskRuntime trace 同步接收 tool output/complete 事件,GUI/TUI/任务运行时共享相同生命周期语义。
+- MCP 工具暴露稳定的 `mcp__server__tool` identity,执行结果携带 server/tool/result type 元数据,不同 server 的同名工具不再冲突。
+- Browser 执行结果携带实际页面 URL/title,GUI/TUI renderer 使用观测到的页面信息而不是只展示请求参数。
+- GUI execution order 与 round 只引用 call_id,历史恢复在边界处兼容旧 index 结构,运行中记录恢复为 cancelled 终态。
+- GUI/TUI 分离 stdout/stderr/log 通道并实施字符、UTF-8 字节、行数三重上限；TUI inline viewport 保留 `--no-alt-screen` scrollback。
 
-本轮明确延后:
+项目演进后的明确取舍:
 
-- Phase 10 的 read/search/browser/MCP/subagent 专属 renderer registry。
-- 超长完整日志独立 artifact 落盘。
-- 将 execution order/batch 内部引用进一步归一成纯 call_id 索引;当前结构已按 call_id 更新且行为正确,后续可在不改变事件合同的前提下瘦身。
+- WebSocket transport 已从 GUI 主路径移除,Tauri 是唯一实时 GUI transport；因此不保留两套 transport 的字段对齐成本,GUI/TUI 共享同一应用层事件语义与 reducer 合同。
+- 超长完整日志 artifact 仍是按需能力,本地会话默认只保存有界最终投影；当前产品没有必须永久保存完整日志的需求,不额外落盘。
 
 M5 第一批完成 (2026-07-11):
 
@@ -38,8 +41,8 @@ M5 第二批完成 (2026-07-11):
 验证结果:
 
 - `echo-agent`: `verify-all-crates.sh` 全绿,8 crate 共 1469 项测试、clippy 零警告、独立 feature 矩阵通过。
-- `echo-agent-cli`: workspace 520 项测试通过,GUI feature 40 项测试通过,默认与 GUI clippy 零警告,channels 与 tui+telemetry+eval+improve 组合通过。
-- `web-frontend`: 14 项 Vitest、TypeScript build、Vite production build 通过。
+- `echo-agent-cli`: workspace 533 项测试通过,GUI feature 41 项测试通过,all-features 与 GUI/CLI feature 组合编译通过,clippy 零警告。
+- `web-frontend`: 28 项 Vitest、TypeScript build、Prettier check、Vite production build 通过。
 
 ## 1. 目标
 
@@ -237,14 +240,14 @@ pub enum ToolStreamEvent {
 - `echo-agent-cli/web-frontend/src/stores/chatStore.ts`
 - `echo-agent-cli/src/tui/events.rs`
 
-- [ ] 为两个同名并行工具编写失败测试,证明当前按 name 无法稳定关联。
-- [ ] 为 `ToolStreamEvent` 编写 serde round-trip 测试。
-- [ ] 为 AgentEvent call identity 编写编译期/行为测试。
-- [ ] 为 GUI reducer 写 running/succeeded/failed 状态测试。
-- [ ] 为 TUI reducer 写 ToolStream 当前被丢弃的回归测试。
-- [ ] 记录 shell 现有静态 GUI/TUI 基线截图,用于最终对比,不作为代码依赖。
+- [x] 为两个同名并行工具编写失败测试,证明当前按 name 无法稳定关联。
+- [x] 为 `ToolStreamEvent` 编写 serde round-trip 测试。
+- [x] 为 AgentEvent call identity 编写编译期/行为测试。
+- [x] 为 GUI reducer 写 running/succeeded/failed 状态测试。
+- [x] 为 TUI reducer 写 ToolStream 当前被丢弃的回归测试。
+- [x] 记录 shell 现有静态 GUI/TUI 基线截图,用于最终对比,不作为代码依赖。
 
-**退出条件:** 所有新增测试因目标接口或目标行为尚不存在而失败,失败原因明确。
+**完成说明:** 实施阶段使用失败测试锁定缺口,最终保留为 identity、stream、reducer 与 viewport 行为回归测试；桌面和移动端基线已完成实机浏览器复核。
 
 ### Phase 1: 框架稳定 identity
 
@@ -259,13 +262,13 @@ pub enum ToolStreamEvent {
 - `echo-agent/src/a2a/server.rs`
 - 所有 `AgentEvent::{ToolCall,ToolResult,ToolError,ToolStream}` 消费点和测试
 
-- [ ] 给四类 AgentEvent 增加 `call_id`。
-- [ ] `run_tools()` 发 ToolCall 时使用 `steps` 中已有 ID。
-- [ ] 执行结果与错误沿用同一个 ID,禁止按 zip 外的名称回查。
-- [ ] pipeline 缺失 ID 时安全生成 UUID,不使用空字符串作为执行键。
-- [ ] 更新 subagent、A2A、trace、webhook、eval 等消费者。
-- [ ] 删除应用层按 name FIFO 关联的假设和注释。
-- [ ] 增加同名并行工具乱序完成测试。
+- [x] 给四类 AgentEvent 增加 `call_id`。
+- [x] `run_tools()` 发 ToolCall 时使用 `steps` 中已有 ID。
+- [x] 执行结果与错误沿用同一个 ID,禁止按 zip 外的名称回查。
+- [x] pipeline 缺失 ID 时安全生成 UUID,不使用空字符串作为执行键。
+- [x] 更新 subagent、A2A、trace、webhook、eval 等消费者。
+- [x] 删除应用层按 name FIFO 关联的假设和注释。
+- [x] 增加同名并行工具乱序完成测试。
 
 **退出条件:** 同一 batch 内两个 `shell` 可乱序结束,事件仍归入各自 call。
 
@@ -280,16 +283,16 @@ pub enum ToolStreamEvent {
 - `echo-agent/src/agent/react/run/pipeline.rs`
 - `echo-agent/src/agent/react/run/phases/tools.rs`
 
-- [ ] 新增 `Tool::execute_stream_with_context(params, ctx)`。
-- [ ] 默认实现调用 `execute_with_context()` 并产生单个 `Complete`。
-- [ ] `execute_stream()` 作为空 context 兼容入口,内部委托新方法。
-- [ ] ToolManager 新增返回实时 stream 的 context-aware API。
-- [ ] 删除或改写 `execute_tool_stream_collect()`,生产路径禁止先 collect 再返回。
-- [ ] 将 ToolManager 的 semaphore permit 生命周期绑定到 stream 完成或 drop。
-- [ ] 超时覆盖整个流消费周期,而不只是 stream 创建 future。
-- [ ] 取消时 drop stream 并释放 permit；工具负责 kill-on-drop 子进程。
-- [ ] 重试只允许发生在尚未向外发出可见 Output 前；已发 chunk 后失败不得从头重放造成重复日志。
-- [ ] 非 streaming 工具继续只产生最终 Complete,无调用方特判。
+- [x] 新增 `Tool::execute_stream_with_context(params, ctx)`。
+- [x] 默认实现调用 `execute_with_context()` 并产生单个 `Complete`。
+- [x] `execute_stream()` 作为空 context 兼容入口,内部委托新方法。
+- [x] ToolManager 新增返回实时 stream 的 context-aware API。
+- [x] 删除或改写 `execute_tool_stream_collect()`,生产路径禁止先 collect 再返回。
+- [x] 将 ToolManager 的 semaphore permit 生命周期绑定到 stream 完成或 drop。
+- [x] 超时覆盖整个流消费周期,而不只是 stream 创建 future。
+- [x] 取消时 drop stream 并释放 permit；工具负责 kill-on-drop 子进程。
+- [x] 重试只允许发生在尚未向外发出可见 Output 前；已发 chunk 后失败不得从头重放造成重复日志。
+- [x] 非 streaming 工具继续只产生最终 Complete,无调用方特判。
 
 **退出条件:** mock streaming tool 的第一个 chunk 能在工具完成前抵达 ReAct 消费者。
 
@@ -303,14 +306,14 @@ pub enum ToolStreamEvent {
 - `echo-agent/src/agent/react/run/execution.rs`
 - `echo-agent/src/agent/react/run/stream_macros.rs`
 
-- [ ] 每个并发工具 future 把 `(call_id, name, ToolStreamEvent)` 发送到内部 bounded mpsc。
-- [ ] 主循环同时消费增量事件、工具完成、取消和 batch timeout。
-- [ ] `Progress/Output` 立即映射为 `AgentEvent::ToolStream`。
-- [ ] `Complete(success)` 只产生一个最终 `ToolResult`。
-- [ ] `Complete(failure)` 或基础设施错误产生 `ToolError`。
-- [ ] 最终 Message::tool_result 仍使用原始 tool call ID,供下一轮模型上下文关联。
-- [ ] `ToolBatchEnd` 只在所有工具终态收敛后发出。
-- [ ] channel 满时采用有界背压,不静默丢弃 stderr；取消仍优先响应。
+- [x] 每个并发工具 future 把 `(call_id, name, ToolStreamEvent)` 发送到内部 bounded mpsc。
+- [x] 主循环同时消费增量事件、工具完成、取消和 batch timeout。
+- [x] `Progress/Output` 立即映射为 `AgentEvent::ToolStream`。
+- [x] `Complete(success)` 只产生一个最终 `ToolResult`。
+- [x] `Complete(failure)` 或基础设施错误产生 `ToolError`。
+- [x] 最终 Message::tool_result 仍使用原始 tool call ID,供下一轮模型上下文关联。
+- [x] `ToolBatchEnd` 只在所有工具终态收敛后发出。
+- [x] channel 满时采用有界背压,不静默丢弃 stderr；取消仍优先响应。
 
 **退出条件:** 两个 mock 工具的 chunk 可交错出现,各自只有一个终态事件,batch 正确闭合。
 
@@ -326,23 +329,23 @@ pub enum ToolStreamEvent {
 - `echo-agent/echo-execution/src/sandbox/docker.rs`
 - `echo-agent/echo-execution/src/sandbox/k8s.rs`
 
-- [ ] `ShellTool::supports_streaming()` 返回 true。
-- [ ] 实现 `execute_stream_with_context()`。
-- [ ] 非沙箱路径使用 `spawn()` + piped stdout/stderr,禁止 `Command::output()`。
-- [ ] 两条 pipe 并行读取,按实际到达顺序产生 Output。
-- [ ] UTF-8 解码使用增量/有损安全路径,不得按任意字节位置切 Rust `str`。
-- [ ] 记录 start time、cwd、exit code 与字节计数。
-- [ ] timeout/cancel/drop 后终止并回收子进程,避免 orphan。
-- [ ] 设定单工具内存输出上限与 UI stream 上限；最终 ToolResult 标记 truncated。
-- [ ] sandbox trait 增加通用流式执行入口,默认可退化为单次 Complete。
-- [ ] Local sandbox 优先实现真流式；Docker/K8s 若暂不能流式,必须明确退化并有测试,不能虚报实时。
-- [ ] stdout 为空但 stderr 有内容的失败命令仍保留 stderr。
+- [x] `ShellTool::supports_streaming()` 返回 true。
+- [x] 实现 `execute_stream_with_context()`。
+- [x] 非沙箱路径使用 `spawn()` + piped stdout/stderr,禁止 `Command::output()`。
+- [x] 两条 pipe 并行读取,按实际到达顺序产生 Output。
+- [x] UTF-8 解码使用增量/有损安全路径,不得按任意字节位置切 Rust `str`。
+- [x] 记录 start time、cwd、exit code 与字节计数。
+- [x] timeout/cancel/drop 后终止并回收子进程,避免 orphan。
+- [x] 设定单工具内存输出上限与 UI stream 上限；最终 ToolResult 标记 truncated。
+- [x] sandbox trait 增加通用流式执行入口,默认可退化为单次 Complete。
+- [x] Local sandbox 优先实现真流式；Docker/K8s 若暂不能流式,必须明确退化并有测试,不能虚报实时。
+- [x] stdout 为空但 stderr 有内容的失败命令仍保留 stderr。
 
 **退出条件:** `printf + sleep + printf` 的首段在进程结束前可见；非零退出、超时、取消均正确收敛。
 
 ### Phase 5: 应用层统一 transport contract
 
-**目标:** Tauri、WebSocket、TUI 消费同一执行事件含义。
+**目标:** GUI transport 与 TUI 消费同一执行事件含义。
 
 **文件:**
 
@@ -362,11 +365,11 @@ tool_output   { call_id, channel, chunk }
 tool_finished { call_id, name, success, result, metadata, finished_at }
 ```
 
-- [ ] Tauri 与 WebSocket 字段、命名和终态语义一致。
-- [ ] 不再把 `tool_result success` 当完整生命周期。
-- [ ] TUI sink 透传 ToolStream,不得进入 unrendered 分支。
-- [ ] 所有 transport 序列化测试覆盖 call_id 与 Output channel。
-- [ ] 错误和取消必须产生终态,避免 GUI/TUI 永久 running。
+- [x] Tauri 与 TUI 的字段、命名和终态语义一致；WebSocket 已从当前 GUI 架构移除,不保留无运行入口的双 transport。
+- [x] 不再把 `tool_result success` 当完整生命周期。
+- [x] TUI sink 透传 ToolStream,不得进入 unrendered 分支。
+- [x] 所有 transport 序列化测试覆盖 call_id 与 Output channel。
+- [x] 错误和取消必须产生终态,避免 GUI/TUI 永久 running。
 
 **退出条件:** 同一录制事件序列可分别驱动 GUI 与 TUI reducer 得到等价状态。
 
@@ -407,13 +410,13 @@ interface ToolExecutionView {
 }
 ```
 
-- [ ] reducer 只按 call_id 更新。
-- [ ] running 与 success 是互斥状态。
-- [ ] chunk append 使用有界 buffer,保留 tail 并记录 truncated。
-- [ ] 消息中的 execution order 记录 call_id,不复制整份对象。
-- [ ] batch/round 只保存 call_id 列表。
-- [ ] 恢复历史时直接构造终态 ToolExecutionView。
-- [ ] 删除 `pendingToolCalls.findIndex(tc.name === name)`。
+- [x] reducer 只按 call_id 更新。
+- [x] running 与 success 是互斥状态。
+- [x] chunk append 使用有界 buffer,保留 tail 并记录 truncated。
+- [x] 消息中的 execution order 记录 call_id,不复制整份对象。
+- [x] batch/round 只保存 call_id 列表。
+- [x] 恢复历史时直接构造终态 ToolExecutionView。
+- [x] 删除 `pendingToolCalls.findIndex(tc.name === name)`。
 
 **退出条件:** GUI store 单测覆盖开始、交错 chunk、乱序完成、失败、取消、重复终态和未知 call_id。
 
@@ -443,17 +446,17 @@ interface ToolExecutionView {
         error[E0308]: mismatched types
 ```
 
-- [ ] 工具 renderer registry 按 kind 分派,未知工具走 Generic fallback。
-- [ ] shell 标题直接展示 command,不显示 `shell {"command":...}`。
-- [ ] spinner、elapsed time 在 running 时更新。
-- [ ] 默认显示最近 3-6 行输出,成功且无重要输出时可完全折叠。
-- [ ] 失败默认展示 stderr/错误 tail,但不强制展开全部日志。
-- [ ] stdout/stderr 使用不同但克制的文本颜色。
-- [ ] 支持复制 command、stdout、stderr 和全部日志。
-- [ ] 自动滚动仅在用户位于底部时继续；用户向上滚动后不抢焦点。
-- [ ] 不嵌套卡片,不使用大面积边框和状态 badge。
-- [ ] 小屏宽度下 command 可换行或截断,状态/耗时不得覆盖正文。
-- [ ] 复用现有字体/主题变量,不引入一套孤立配色。
+- [x] 工具 renderer registry 按 kind 分派,未知工具走 Generic fallback。
+- [x] shell 标题直接展示 command,不显示 `shell {"command":...}`。
+- [x] spinner、elapsed time 在 running 时更新。
+- [x] 默认显示最近 3-6 行输出,成功且无重要输出时可完全折叠。
+- [x] 失败默认展示 stderr/错误 tail,但不强制展开全部日志。
+- [x] stdout/stderr 使用不同但克制的文本颜色。
+- [x] 支持复制 command、stdout、stderr 和全部日志。
+- [x] 自动滚动仅在用户位于底部时继续；用户向上滚动后不抢焦点。
+- [x] 不嵌套卡片,不使用大面积边框和状态 badge。
+- [x] 小屏宽度下 command 可换行或截断,状态/耗时不得覆盖正文。
+- [x] 复用现有字体/主题变量,不引入一套孤立配色。
 
 **退出条件:** 运行 10 秒命令时 GUI 持续变化；1440x900 与 390x844 无重叠、横向溢出。
 
@@ -469,16 +472,16 @@ interface ToolExecutionView {
 - `echo-agent-cli/src/tui/ui.rs`
 - TUI reducer/widget tests
 
-- [ ] 新增结构化 `ToolExecutionMessage`,禁止再把工具开始/结果写成 `MessageRole::System` 字符串。
-- [ ] message/group 以 call_id 引用工具执行状态。
-- [ ] running spinner 随既有 render tick 更新,不创建额外无界 timer task。
-- [ ] 实时显示 output tail 与 elapsed time。
-- [ ] 完成态压缩成一行,失败态附加关键 stderr。
-- [ ] Ctrl+O 沿用 transcript 展开/折叠；必要时补 Enter 针对当前执行项展开。
-- [ ] 并行工具各占一行并独立刷新。
-- [ ] 终端宽度不足时 UTF-8 安全裁剪,不得字节切片。
-- [ ] 去掉“所有 shell 都是 irreversible DANGER”的渲染；只有真实审批/风险事件显示风险提示。
-- [ ] `--no-alt-screen` 下完成态仍保留可读 scrollback,运行中临时帧不得刷屏。
+- [x] 新增结构化 `ToolExecutionMessage`,禁止再把工具开始/结果写成 `MessageRole::System` 字符串。
+- [x] message/group 以 call_id 引用工具执行状态。
+- [x] running spinner 随既有 render tick 更新,不创建额外无界 timer task。
+- [x] 实时显示 output tail 与 elapsed time。
+- [x] 完成态压缩成一行,失败态附加关键 stderr。
+- [x] Ctrl+O 沿用 transcript 展开/折叠；必要时补 Enter 针对当前执行项展开。
+- [x] 并行工具各占一行并独立刷新。
+- [x] 终端宽度不足时 UTF-8 安全裁剪,不得字节切片。
+- [x] 去掉“所有 shell 都是 irreversible DANGER”的渲染；只有真实审批/风险事件显示风险提示。
+- [x] `--no-alt-screen` 下完成态仍保留可读 scrollback,运行中临时帧不得刷屏。
 
 **退出条件:** TUI 中长命令可实时更新且完成后收敛成紧凑记录；同名并行 shell 不覆盖。
 
@@ -493,12 +496,12 @@ interface ToolExecutionView {
 - `echo-agent-cli/echo-agent-app-core/src/conversation_restore.rs`
 - `echo-agent-cli/web-frontend/src/stores/conversationStore.ts`
 
-- [ ] SavedToolCall 增加稳定 call_id、status、metadata 与 capped stdout/stderr。
-- [ ] 只保存最终投影,不保存每个 ToolStream chunk。
-- [ ] 输出按字符/字节双上限安全截断并记录 truncated。
-- [ ] 超长完整日志若需要保留,写独立 file artifact 并保存路径；默认不强制落盘。
-- [ ] 恢复后工具为终态,不得重新出现 spinner。
-- [ ] 删除过时的 name-only 恢复逻辑。
+- [x] SavedToolCall 增加稳定 call_id、status、metadata 与 capped stdout/stderr。
+- [x] 只保存最终投影,不保存每个 ToolStream chunk。
+- [x] 输出按字符/字节双上限安全截断并记录 truncated。
+- [x] 超长完整日志 artifact 保持按需设计；当前默认不落盘,会话仅保存有界最终投影。
+- [x] 恢复后工具为终态,不得重新出现 spinner。
+- [x] 删除过时的 name-only 恢复逻辑。
 
 **退出条件:** 重启后 shell command、成功/失败、exit code、duration 和有限输出可恢复。
 
@@ -666,17 +669,8 @@ bounded channel 提供背压,但 UI 渲染需要节流。GUI/TUI 可每 50-100ms
 
 `echo-agent-cli` 当前存在 Browser Runtime Phase 5 用户改动。实施时必须在独立 worktree/分支进行,不得覆盖或混入现有工作区改动；合并前先 merge main 并按 AGENTS.md 检查 Cargo 相对路径。
 
-## 14. 首个执行窗口建议
+## 14. 完成状态
 
-首个实现窗口只做 M1:
+M1-M5 已全部交付。框架层负责通用 identity、stream、cancel、timeout 与 MCP server-qualified identity；EKO 应用层负责 transport 投影、GUI/TUI 状态、渲染和文件会话恢复。没有引入 SQLite、额外权限门控或框架层 UI 产品概念。
 
-1. 重读本计划与 MASTER-PLAN。
-2. 新建 `echo-agent` feature worktree。
-3. 完成 Phase 0 identity/stream contract 红测。
-4. 完成 Phase 1 call_id 全链路迁移。
-5. 完成 Phase 2 context-aware streaming API。
-6. 完成 Phase 3 mock 并行流 multiplex。
-7. 跑 `verify-all-crates.sh`、cargo clean、提交框架。
-8. 更新 MASTER-PLAN,再决定同窗口继续 ShellTool 还是换新窗口。
-
-不要在首个提交同时改 GUI/TUI。先让框架事件合同稳定,避免两端围绕临时协议重复返工。
+后续若产品明确要求永久保留超长完整日志,再在应用层增加 file artifact；该能力不影响本计划当前验收结论。

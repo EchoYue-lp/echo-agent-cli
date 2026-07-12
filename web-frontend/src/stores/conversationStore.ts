@@ -2,7 +2,8 @@ import { create } from 'zustand';
 import { useChatStore } from './chatStore';
 import { sessionApi, conversationApi } from '../api/endpoints';
 import { useToastStore } from './toastStore';
-import type { ChatMessage } from '../types/api';
+import type { ChatMessage, ExecutionStep, ToolExecution } from '../types/api';
+import { appendBoundedToolOutput } from '../lib/toolOutput';
 
 // ── Types ──
 
@@ -96,7 +97,7 @@ function chatMessagesToSaved(messages: ChatMessage[]) {
     content: string;
     tool_calls?: { id: string; name: string; arguments: string }[];
     thinking_segments?: string[];
-    execution_steps?: { type: string; index: number }[];
+    execution_steps?: { type: string; index?: number; call_id?: string }[];
     execution_rounds?: {
       thinking?: { content: string };
       tools: NonNullable<ChatMessage['toolCalls']>;
@@ -119,20 +120,22 @@ function chatMessagesToSaved(messages: ChatMessage[]) {
 
     // Save execution steps (chronological order of thinking/tool interleaving)
     if (m.executionSteps && m.executionSteps.length > 0) {
-      entry.execution_steps = m.executionSteps.map((s) => ({
-        type: s.type,
-        index: s.index,
-      }));
+      entry.execution_steps = m.executionSteps.map((s) =>
+        s.type === 'thinking'
+          ? { type: s.type, index: s.index }
+          : { type: s.type, call_id: s.callId }
+      );
     }
 
     // Save execution rounds (round-based model with thinking + parallel tools)
     if (m.executionRounds && m.executionRounds.length > 0) {
+      const toolsById = new Map((m.toolCalls || []).map((tool) => [tool.id, tool]));
       entry.execution_rounds = m.executionRounds.map((r) => ({
         thinking: r.thinking ? { content: r.thinking.content } : undefined,
-        tools: r.tools.map((t) => ({
-          ...t,
-          status: t.status === 'running' ? ('cancelled' as const) : t.status,
-        })),
+        tools: r.toolCallIds
+          .map((callId) => toolsById.get(callId))
+          .filter((tool): tool is ToolExecution => tool != null)
+          .map(finalToolProjection),
       }));
     }
 
@@ -159,6 +162,23 @@ function chatMessagesToSaved(messages: ChatMessage[]) {
   }
 
   return saved;
+}
+
+function finalToolProjection(tool: ToolExecution): ToolExecution {
+  const stdout = appendBoundedToolOutput('', tool.stdout);
+  const stderr = appendBoundedToolOutput('', tool.stderr);
+  const log = appendBoundedToolOutput('', tool.log);
+  const running = tool.status === 'running';
+  return {
+    ...tool,
+    status: running ? 'cancelled' : tool.status,
+    success: running ? false : tool.success,
+    stdout: stdout.value,
+    stderr: stderr.value,
+    log: log.value,
+    truncated: tool.truncated || stdout.truncated || stderr.truncated || log.truncated,
+    finishedAt: tool.finishedAt || Date.now(),
+  };
 }
 
 // ── Store ──
@@ -278,14 +298,6 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
           base.thinkingSegments = m.thinking_segments.map((s) => ({ content: s }));
         }
 
-        // Restore execution steps (chronological order of thinking/tool interleaving)
-        if (m.execution_steps && m.execution_steps.length > 0) {
-          base.executionSteps = m.execution_steps.map((s) => ({
-            type: s.type as 'thinking' | 'tool',
-            index: s.index,
-          }));
-        }
-
         // Restore execution rounds (round-based model).
         // Typed via the SavedMessage shape instead of `any` (P1-40).
         if (m.execution_rounds && m.execution_rounds.length > 0) {
@@ -302,32 +314,48 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
             startedAt?: number;
             finishedAt?: number;
             truncated?: boolean;
+            metadata?: Record<string, string>;
           };
           type ExecutionRound = {
             thinking?: { content: string };
             tools: ExecutionRoundTool[];
           };
-          base.executionRounds = (m.execution_rounds as ExecutionRound[]).map((r) => ({
-            thinking: r.thinking ? { content: r.thinking.content } : undefined,
-            tools: (r.tools || []).map((t, index) => ({
-              id: t.id || `restored-${index}-${Date.now()}`,
-              name: t.name,
-              args: t.args || {},
-              result: t.result || '',
-              success: t.success ?? true,
-              status: t.status === 'running' ? 'cancelled' : t.status || 'succeeded',
-              stdout: t.stdout || (t.success === false ? '' : t.result || ''),
-              stderr: t.stderr || (t.success === false ? t.result || '' : ''),
-              log: t.log || '',
-              startedAt: t.startedAt || Date.now(),
-              finishedAt: t.finishedAt || Date.now(),
-              truncated: t.truncated,
-            })),
-          }));
+          const restoredTools = new Map<string, ToolExecution>();
+          base.executionRounds = (m.execution_rounds as ExecutionRound[]).map((r, roundIndex) => {
+            const toolCallIds = (r.tools || []).map((t, toolIndex) => {
+              const id = t.id || `restored-${roundIndex}-${toolIndex}`;
+              restoredTools.set(id, {
+                id,
+                name: t.name,
+                args: t.args || {},
+                result: t.result || '',
+                success: t.success ?? true,
+                status: t.status === 'running' ? 'cancelled' : t.status || 'succeeded',
+                stdout: t.stdout || (t.success === false ? '' : t.result || ''),
+                stderr: t.stderr || (t.success === false ? t.result || '' : ''),
+                log: t.log || '',
+                startedAt: t.startedAt || Date.now(),
+                finishedAt: t.finishedAt || Date.now(),
+                truncated: t.truncated,
+                metadata: t.metadata,
+              });
+              return id;
+            });
+            return {
+              thinking: r.thinking ? { content: r.thinking.content } : undefined,
+              toolCallIds,
+            };
+          });
+          base.toolCalls = [...restoredTools.values()];
         }
 
         // Restore tool calls on assistant messages
-        if (m.role === 'assistant' && m.tool_calls && m.tool_calls.length > 0) {
+        if (
+          !base.toolCalls?.length &&
+          m.role === 'assistant' &&
+          m.tool_calls &&
+          m.tool_calls.length > 0
+        ) {
           base.toolCalls = m.tool_calls.map((tc) => ({
             id: tc.id,
             name: tc.name,
@@ -347,6 +375,21 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
             startedAt: Date.now(),
             finishedAt: Date.now(),
           }));
+        }
+
+        // Restore chronological order. New records reference stable call IDs;
+        // old records with tool indexes are converted at the boundary.
+        if (m.execution_steps && m.execution_steps.length > 0) {
+          base.executionSteps = m.execution_steps.reduce<ExecutionStep[]>((steps, step) => {
+            if (step.type === 'thinking' && step.index != null) {
+              steps.push({ type: 'thinking', index: step.index });
+            }
+            if (step.type === 'tool') {
+              const callId = step.call_id || base.toolCalls?.[step.index ?? -1]?.id;
+              if (callId) steps.push({ type: 'tool', callId });
+            }
+            return steps;
+          }, []);
         }
 
         // Restore attachments (data URLs) so images/files render on reload.

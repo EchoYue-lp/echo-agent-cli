@@ -67,6 +67,19 @@ export const InlineToolCall = memo(function InlineToolCall({
   ]
     .filter(Boolean)
     .join('\n\n');
+  const outputSections = [
+    toolCall.stdout && {
+      label: 'stdout',
+      text: toolCall.stdout,
+      tone: 'text-[var(--color-code-text)]',
+    },
+    toolCall.stderr && {
+      label: 'stderr',
+      text: toolCall.stderr,
+      tone: 'text-[var(--color-error)]',
+    },
+    toolCall.log && { label: 'log', text: toolCall.log, tone: 'text-[var(--text-secondary)]' },
+  ].filter((section): section is { label: string; text: string; tone: string } => Boolean(section));
 
   const copyText = async (text: string, label: string) => {
     await navigator.clipboard.writeText(text);
@@ -157,13 +170,38 @@ export const InlineToolCall = memo(function InlineToolCall({
                 className="flex items-center gap-1 normal-case hover:text-[var(--text-primary)]"
               >
                 {copied === 'output' ? <Check size={10} /> : <Copy size={10} />}
-                {copied === 'output' ? '已复制' : '复制'}
+                {copied === 'output' ? '已复制' : '复制全部'}
               </button>
             )}
           </div>
-          <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words bg-[var(--bg-code)] p-2 text-[10px] leading-relaxed text-[var(--color-code-text)]">
-            {fullOutput || toolCall.progress?.message || '暂无输出'}
-          </pre>
+          {outputSections.length > 0 ? (
+            <div className="max-h-64 space-y-2 overflow-auto bg-[var(--bg-code)] p-2">
+              {outputSections.map((section) => (
+                <section key={section.label}>
+                  <div className="mb-0.5 flex items-center justify-between text-[9px] text-[var(--text-tertiary)]">
+                    <span>{section.label}</span>
+                    <button
+                      type="button"
+                      onClick={() => copyText(section.text, section.label)}
+                      className="flex items-center gap-1 hover:text-[var(--text-primary)]"
+                    >
+                      {copied === section.label ? <Check size={9} /> : <Copy size={9} />}
+                      {copied === section.label ? '已复制' : '复制'}
+                    </button>
+                  </div>
+                  <pre
+                    className={`whitespace-pre-wrap break-words text-[10px] leading-relaxed ${section.tone}`}
+                  >
+                    {section.text}
+                  </pre>
+                </section>
+              ))}
+            </div>
+          ) : (
+            <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words bg-[var(--bg-code)] p-2 text-[10px] leading-relaxed text-[var(--color-code-text)]">
+              {toolCall.progress?.message || '暂无输出'}
+            </pre>
+          )}
         </div>
       )}
     </div>

@@ -74,7 +74,10 @@ pub struct SavedAttachment {
 pub struct SavedExecutionStep {
     #[serde(rename = "type")]
     pub step_type: String, // "thinking" or "tool"
-    pub index: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_id: Option<String>,
 }
 
 /// Combined payload stored in attachments_json (backward compatible).
@@ -431,6 +434,22 @@ mod tests {
             decoded.and_then(|value| value.execution_rounds),
             Some(rounds)
         );
+    }
+
+    #[test]
+    fn execution_steps_store_tool_call_identity() -> Result<(), String> {
+        let step = SavedExecutionStep {
+            step_type: "tool".to_string(),
+            index: None,
+            call_id: Some("call-42".to_string()),
+        };
+        let value = serde_json::to_value(step).map_err(|error| error.to_string())?;
+        assert_eq!(
+            value.get("call_id").and_then(serde_json::Value::as_str),
+            Some("call-42")
+        );
+        assert!(value.get("index").is_none());
+        Ok(())
     }
 
     #[test]

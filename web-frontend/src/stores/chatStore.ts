@@ -7,19 +7,12 @@ import type {
   ChatRunStatus,
 } from '../types/api';
 import { useConversationStore } from './conversationStore';
+import { appendBoundedToolOutput } from '../lib/toolOutput';
 
 /** In-progress round being built during streaming */
 interface CurrentRound {
   thinking?: { content: string };
-  tools: ToolExecution[];
-}
-
-const TOOL_OUTPUT_LIMIT = 131_072;
-
-function appendBounded(current: string, chunk: string): { value: string; truncated: boolean } {
-  const next = current + chunk;
-  if (next.length <= TOOL_OUTPUT_LIMIT) return { value: next, truncated: false };
-  return { value: next.slice(next.length - TOOL_OUTPUT_LIMIT), truncated: true };
+  toolCallIds: string[];
 }
 
 /** 当前上下文窗口占用快照（对齐 Claude Code statusline 语义）。 */
@@ -320,17 +313,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const messages = s.messages.map((m) => {
         if (!m.isStreaming) return m;
         const toolCalls = [...(m.toolCalls || []), tool];
-        const toolIndex = toolCalls.length - 1;
-        const executionSteps = [
-          ...(m.executionSteps || []),
-          { type: 'tool' as const, index: toolIndex },
-        ];
+        const executionSteps = [...(m.executionSteps || []), { type: 'tool' as const, callId }];
         return { ...m, toolCalls, executionSteps };
       });
       // Also add tool to current round for round-based rendering
       const currentRound = s.currentRound
-        ? { ...s.currentRound, tools: [...s.currentRound.tools, tool] }
-        : { tools: [tool] };
+        ? { ...s.currentRound, toolCallIds: [...s.currentRound.toolCallIds, callId] }
+        : { toolCallIds: [callId] };
       return { messages, currentRound, runStatus: 'using_tool' };
     });
   },
@@ -343,9 +332,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         messages: s.messages.map((m) =>
           m.isStreaming ? { ...m, toolCalls: (m.toolCalls || []).map(update) } : m
         ),
-        currentRound: s.currentRound
-          ? { ...s.currentRound, tools: s.currentRound.tools.map(update) }
-          : null,
+        currentRound: s.currentRound,
       };
     });
   },
@@ -354,7 +341,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     set((s) => {
       const update = (tool: ToolExecution): ToolExecution => {
         if (tool.id !== callId) return tool;
-        const appended = appendBounded(tool[channel], chunk);
+        const appended = appendBoundedToolOutput(tool[channel], chunk);
         return {
           ...tool,
           [channel]: appended.value,
@@ -365,9 +352,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         messages: s.messages.map((m) =>
           m.isStreaming ? { ...m, toolCalls: (m.toolCalls || []).map(update) } : m
         ),
-        currentRound: s.currentRound
-          ? { ...s.currentRound, tools: s.currentRound.tools.map(update) }
-          : null,
+        currentRound: s.currentRound,
       };
     });
   },
@@ -376,22 +361,22 @@ export const useChatStore = create<ChatState>((set, get) => ({
     set((s) => {
       const update = (tool: ToolExecution): ToolExecution =>
         tool.id === callId
-          ? {
-              ...tool,
-              success,
-              status: success ? 'succeeded' : 'failed',
-              metadata,
-              truncated: tool.truncated || truncated,
-              finishedAt: Date.now(),
-            }
+          ? tool.status === 'running'
+            ? {
+                ...tool,
+                success,
+                status: success ? 'succeeded' : 'failed',
+                metadata,
+                truncated: tool.truncated || truncated,
+                finishedAt: Date.now(),
+              }
+            : tool
           : tool;
       return {
         messages: s.messages.map((m) =>
           m.isStreaming ? { ...m, toolCalls: (m.toolCalls || []).map(update) } : m
         ),
-        currentRound: s.currentRound
-          ? { ...s.currentRound, tools: s.currentRound.tools.map(update) }
-          : null,
+        currentRound: s.currentRound,
       };
     });
   },
@@ -403,22 +388,19 @@ export const useChatStore = create<ChatState>((set, get) => ({
         return {
           ...tool,
           result,
-          success,
-          status: success ? 'succeeded' : 'failed',
-          finishedAt: Date.now(),
+          success: tool.status === 'running' ? success : tool.success,
+          status: tool.status === 'running' ? (success ? 'succeeded' : 'failed') : tool.status,
+          finishedAt: tool.finishedAt ?? Date.now(),
           stdout: success && !tool.stdout ? result : tool.stdout,
           stderr: !success && !tool.stderr ? result : tool.stderr,
         };
       };
-      const currentRound = s.currentRound
-        ? { ...s.currentRound, tools: s.currentRound.tools.map(update) }
-        : null;
       return {
         messages: s.messages.map((m) => {
           if (!m.isStreaming) return m;
           return { ...m, toolCalls: (m.toolCalls || []).map(update) };
         }),
-        currentRound,
+        currentRound: s.currentRound,
       };
     });
   },
@@ -436,7 +418,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     set({
       currentRound: {
         thinking: lastSegment?.content ? { content: lastSegment.content } : undefined,
-        tools: [],
+        toolCallIds: [],
       },
     });
   },
@@ -448,9 +430,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     if (!currentRound) return;
     const round: ExecutionRound = {
       thinking: currentRound.thinking,
-      tools: currentRound.tools.map((t) => ({
-        ...t,
-      })),
+      toolCallIds: [...currentRound.toolCallIds],
     };
     set((s) => ({
       currentRound: null,

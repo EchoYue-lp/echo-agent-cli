@@ -52,14 +52,15 @@ describe('tool renderer registry', () => {
   });
 
   it('summarizes browser actions by domain and target', () => {
-    expect(
-      describeToolExecution(
-        tool('browser_click', { url: 'https://docs.rs/echo-agent', target: 'Search' })
-      )
-    ).toMatchObject({
+    const execution = tool('browser_click', { target: 'Search' });
+    execution.metadata = {
+      browser_url: 'https://docs.rs/echo-agent',
+      browser_title: 'echo-agent docs',
+    };
+    expect(describeToolExecution(execution)).toMatchObject({
       kind: 'browser',
       title: 'Click',
-      detail: 'https://docs.rs/echo-agent · Search',
+      detail: 'echo-agent docs · https://docs.rs/echo-agent · Search',
     });
   });
 
@@ -71,6 +72,21 @@ describe('tool renderer registry', () => {
         detail: 'JSON array',
       }
     );
+  });
+
+  it('uses MCP result metadata from the framework adapter', () => {
+    const execution = tool('list_issues', {}, '{"items":[]}');
+    execution.metadata = {
+      tool_source: 'mcp',
+      mcp_server: 'github',
+      mcp_tool: 'list_issues',
+      result_type: 'json',
+    };
+    expect(describeToolExecution(execution)).toMatchObject({
+      kind: 'mcp',
+      title: 'github · list_issues',
+      detail: 'JSON result',
+    });
   });
 
   it('summarizes subagent dispatch without duplicating its execution panel', () => {

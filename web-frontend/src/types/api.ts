@@ -267,9 +267,11 @@ export interface Attachment {
 export interface ExecutionRound {
   /** Thinking that precedes this round's tools */
   thinking?: { content: string };
-  /** Tools executed in this round (parallel if >1) */
-  tools: ToolExecution[];
+  /** Stable call IDs executed in this round (parallel if >1). */
+  toolCallIds: string[];
 }
+
+export type ExecutionStep = { type: 'thinking'; index: number } | { type: 'tool'; callId: string };
 
 // Chat store types
 export interface ChatMessage {
@@ -284,7 +286,7 @@ export interface ChatMessage {
   isStreaming?: boolean;
   timestamp: number;
   /** @deprecated Use executionRounds instead. Flat execution order tracking for backward compat. */
-  executionSteps?: { type: 'thinking' | 'tool'; index: number }[];
+  executionSteps?: ExecutionStep[];
   /** Execution rounds: each round = one ReAct iteration (thinking + tool batch) */
   executionRounds?: ExecutionRound[];
 }
@@ -375,7 +377,7 @@ export interface SavedMessage {
   content: string | null;
   tool_calls?: { id: string; name: string; arguments: string }[];
   thinking_segments?: string[];
-  execution_steps?: { type: string; index: number }[];
+  execution_steps?: { type: string; index?: number; call_id?: string }[];
   execution_rounds?: {
     thinking?: { content: string };
     tools: ToolExecution[];

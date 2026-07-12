@@ -414,9 +414,25 @@ impl BrowserSessionManager {
     }
 
     pub async fn update_url(&self, conversation_id: &str, tab_id: &str, url: &str) {
+        self.update_page_metadata(conversation_id, tab_id, Some(url), None)
+            .await;
+    }
+
+    pub async fn update_page_metadata(
+        &self,
+        conversation_id: &str,
+        tab_id: &str,
+        url: Option<&str>,
+        title: Option<&str>,
+    ) {
         let session = if let Some(state) = self.sessions.write().await.get_mut(conversation_id) {
             if let Some(tab) = state.session.tabs.iter_mut().find(|tab| tab.id == tab_id) {
-                tab.url = Some(url.to_string());
+                if let Some(url) = url {
+                    tab.url = Some(url.to_string());
+                }
+                if let Some(title) = title {
+                    tab.title = Some(title.to_string());
+                }
             }
             state.session.updated_at = Utc::now();
             Some(state.session.clone())
@@ -564,6 +580,37 @@ mod tests {
 
         assert_eq!(observation.summary, "你好世");
         assert!(observation.truncated);
+    }
+
+    #[tokio::test]
+    async fn page_metadata_updates_the_leased_tab() -> Result<(), String> {
+        let dir = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let manager = BrowserSessionManager::new(dir.path().to_path_buf(), 100);
+        let lease = manager
+            .lease_tab("conversation", MAIN_TAB_OWNER, None)
+            .await;
+        manager
+            .update_page_metadata(
+                "conversation",
+                &lease.tab_id,
+                Some("https://example.com"),
+                Some("Example"),
+            )
+            .await;
+        let session = manager
+            .sessions()
+            .await
+            .into_iter()
+            .next()
+            .ok_or_else(|| "session missing".to_string())?;
+        let tab = session
+            .tabs
+            .iter()
+            .find(|tab| tab.id == lease.tab_id)
+            .ok_or_else(|| "tab missing".to_string())?;
+        assert_eq!(tab.url.as_deref(), Some("https://example.com"));
+        assert_eq!(tab.title.as_deref(), Some("Example"));
+        Ok(())
     }
 
     #[tokio::test]
