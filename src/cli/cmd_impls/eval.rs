@@ -20,6 +20,24 @@ async fn cmd_trace(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
                     for event in &run.events {
                         use echo_agent::trace::RunEvent;
                         match event {
+                            RunEvent::BudgetDecision {
+                                decision,
+                                reason,
+                                iteration,
+                                reported_model_tokens,
+                                usage_complete,
+                            } => println!(
+                                "  Budget: {} ({}, iteration {}, {} reported tokens, usage {})",
+                                decision,
+                                reason,
+                                iteration,
+                                reported_model_tokens,
+                                if *usage_complete {
+                                    "complete"
+                                } else {
+                                    "partial"
+                                }
+                            ),
                             RunEvent::LlmCall {
                                 prompt_tokens,
                                 completion_tokens,

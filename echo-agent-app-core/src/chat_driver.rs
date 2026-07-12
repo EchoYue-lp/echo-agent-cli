@@ -188,6 +188,7 @@ async fn drive_chat_inner(
             working_dir: None,
             cancel: None,
             disabled_tools,
+            run_budget: None,
         };
         let stream_result = guard
             .execute_stream_message_with_invocation_context(msg, cancel, invocation)
