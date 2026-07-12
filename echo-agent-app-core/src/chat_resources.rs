@@ -39,9 +39,9 @@ pub struct ChatResources {
     /// None (Auto) adds nothing. Pure prompt — NO code route branch.
     pub mode_hint: Option<String>,
     /// The interaction mode for this turn (Chat/Task/Auto). P1.1: when this is
-    /// `Chat`, `drive_chat` hides task-management tools from the LLM (via
-    /// `set_disabled_tools`) so the model physically cannot call them — not
-    /// just a prompt hint. Default `Auto` for callers that don't set it.
+    /// `Chat`, `drive_chat` hides task-management tools through the invocation
+    /// context so the model physically cannot call them — not just a prompt
+    /// hint. Default `Auto` for callers that don't set it.
     pub interaction_mode: crate::tasks::task_runtime::InteractionMode,
     /// Memory layer manager for durable write-back of completed runs
     /// (B5.1): `create_complex_task` forwards this into the background Run's

@@ -3090,6 +3090,7 @@ pub async fn drive_unattended_run(
                 }),
                 working_dir: wt_path_for_scope,
                 cancel: None,
+                disabled_tools: None,
             };
 
             // Execute the prompt. The agent's ReAct loop will call

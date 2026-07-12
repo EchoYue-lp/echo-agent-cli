@@ -144,31 +144,29 @@ async fn drive_chat_inner(
         // stream borrows the agent (same pattern as the GUI's normal chat path).
         let inner = agent.inner().clone();
         let guard = inner.read().await;
-        // P1.1: Chat 模式下,物理隐藏任务管理工具(不只是 prompt hint)。对标
-        // Claude Code plan mode = 工具子集 + 权限,非运行时状态机。
-        // set_disabled_tools 接收 &self(改的是 Arc<RwLock> 内部),所以 read guard
-        // 足够。Task/Auto 清除可能残留的 disabled 集(同一 pooled agent 上一轮
-        // Chat 设过)。
+        // Chat 模式下物理隐藏任务管理工具(不只是 prompt hint)。工具排除属于
+        // invocation 值,不会修改 pooled agent 的共享状态。
         use crate::tasks::task_runtime::InteractionMode;
-        if interaction_mode == InteractionMode::Chat {
-            let hidden: std::collections::HashSet<String> = [
-                "plan_create",
-                "task_update",
-                "task_complete",
-                "task_skip",
-                "task_list",
-                "plan_execute",
-                "create_complex_task",
-                "check_run_status",
-                "cancel_run",
-            ]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-            guard.set_disabled_tools(Some(hidden));
+        let disabled_tools = if interaction_mode == InteractionMode::Chat {
+            Some(
+                [
+                    "plan_create",
+                    "task_update",
+                    "task_complete",
+                    "task_skip",
+                    "task_list",
+                    "plan_execute",
+                    "create_complex_task",
+                    "check_run_status",
+                    "cancel_run",
+                ]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            )
         } else {
-            guard.set_disabled_tools(None);
-        }
+            None
+        };
 
         // `with_run_context` is task-local and does not cross the framework's
         // forked subagent `tokio::spawn`; ExternalRunContext is the value-carried
@@ -189,6 +187,7 @@ async fn drive_chat_inner(
             }),
             working_dir: None,
             cancel: None,
+            disabled_tools,
         };
         let stream_result = guard
             .execute_stream_message_with_invocation_context(msg, cancel, invocation)
@@ -261,6 +260,35 @@ impl ChatSink for ChannelChatSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct CountingTool {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl echo_core::tools::Tool for CountingTool {
+        fn name(&self) -> &str {
+            "create_complex_task"
+        }
+
+        fn description(&self) -> &str {
+            "test invocation-scoped tool visibility"
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _parameters: echo_core::tools::ToolParameters,
+        ) -> futures::future::BoxFuture<'a, echo_core::error::Result<echo_core::tools::ToolResult>>
+        {
+            Box::pin(async move {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(echo_core::tools::ToolResult::success("created"))
+            })
+        }
+    }
 
     /// Test-only sink that records received events for assertions.
     struct MockChatSink {
@@ -514,6 +542,63 @@ mod tests {
             user_text.contains("hi there"),
             "original user text should follow the hint; got: {user_text}"
         );
+    }
+
+    #[tokio::test]
+    async fn chat_tool_exclusions_are_invocation_scoped_on_pooled_agent() -> Result<(), String> {
+        use echo_agent::agent::CancellationToken;
+        use std::sync::Arc;
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mock = Arc::new(
+            echo_agent::testing::MockLlmClient::new()
+                .with_model_name("t")
+                .then_tool_call("chat-call", "create_complex_task", "{}")
+                .with_response("chat done")
+                .then_tool_call("auto-call", "create_complex_task", "{}")
+                .with_response("auto done"),
+        );
+        let agent = AgentHandle::new(
+            echo_agent::agent::ReactAgentBuilder::new()
+                .model("t")
+                .llm_client(mock)
+                .tool(Box::new(CountingTool {
+                    calls: Arc::clone(&calls),
+                }))
+                .build()
+                .map_err(|error| error.to_string())?,
+        );
+
+        for (root_message_id, interaction_mode) in [
+            (
+                "chat-hidden",
+                crate::tasks::task_runtime::InteractionMode::Chat,
+            ),
+            (
+                "auto-visible",
+                crate::tasks::task_runtime::InteractionMode::Auto,
+            ),
+        ] {
+            let sink: Arc<dyn ChatSink> = Arc::new(MockChatSink::default());
+            let resources = Arc::new(crate::chat_resources::ChatResources {
+                pool: None,
+                store: None,
+                sink,
+                conv_id: None,
+                root_message_id: root_message_id.to_string(),
+                attachments: Vec::new(),
+                cancel: CancellationToken::new(),
+                mode_hint: None,
+                interaction_mode,
+                layer_manager: None,
+            });
+            drive_chat(&agent, "run", None, resources).await?;
+        }
+
+        if calls.load(std::sync::atomic::Ordering::SeqCst) != 1 {
+            return Err("Chat exclusion leaked or Auto tool execution was blocked".to_string());
+        }
+        Ok(())
     }
 
     #[tokio::test]
