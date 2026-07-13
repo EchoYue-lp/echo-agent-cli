@@ -962,10 +962,10 @@ struct TauriChatSink {
 }
 
 impl echo_agent_app_core::chat_driver::ChatSink for TauriChatSink {
-    fn on_agent_event(&self, event: AgentEvent) -> bool {
+    fn on_agent_event(&self, event: echo_agent::agent::EventEnvelope) -> bool {
         let chat_event = agent_event_to_chat_event(
             &self.app,
-            &event,
+            &event.payload,
             &self.message_key,
             &self.conversation_id,
             &self.trace_session_id,

@@ -1814,8 +1814,8 @@ impl TuiChatSink {
 }
 
 impl echo_agent_app_core::chat_driver::ChatSink for TuiChatSink {
-    fn on_agent_event(&self, event: echo_agent::agent::AgentEvent) -> bool {
-        let mapped = match event {
+    fn on_agent_event(&self, event: echo_agent::agent::EventEnvelope) -> bool {
+        let mapped = match event.payload {
             echo_agent::agent::AgentEvent::Token(t) => AgentEvent::Token(t),
             echo_agent::agent::AgentEvent::ThinkStart => AgentEvent::ThinkStart,
             echo_agent::agent::AgentEvent::ThinkEnd {

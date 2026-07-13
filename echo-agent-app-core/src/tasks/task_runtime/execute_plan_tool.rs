@@ -866,7 +866,7 @@ mod tests {
     struct NoopChatSink;
 
     impl ChatSink for NoopChatSink {
-        fn on_agent_event(&self, _event: AgentEvent) -> bool {
+        fn on_agent_event(&self, _event: echo_agent::agent::EventEnvelope) -> bool {
             true
         }
     }

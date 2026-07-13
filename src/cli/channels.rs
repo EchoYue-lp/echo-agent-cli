@@ -116,10 +116,10 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
 
         // 3. Drive through the shared `drive_chat` entry (TUI/GUI parity,
         //    AGENTS.md): route the message (normal vs complex) and stream
-        //    AgentEvents to a channel sink; per-sender isolation means no
+        //    versioned agent events to a channel sink; per-sender isolation means no
         //    concurrency, so the read guard is held for the stream lifetime
         //    inside `drive_chat` (same as TUI send_to_agent).
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<echo_agent::agent::AgentEvent>();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<echo_agent::agent::EventEnvelope>();
         let text = msg.text.clone();
         // B5.4: convert IM-channel attachments (QQ/飞书 images/files) into a
         // multimodal Message so the agent sees them — same path the GUI and
@@ -165,12 +165,11 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                 tracing::warn!(error = %e, conv = %conv_owned, "channel drive_chat failed");
             }
         });
-        // Wrap each AgentEvent as Ok(...) — drive_chat already handled stream
-        // errors internally (terminal status), so the aggregate stage sees only
-        // successful events. (Matches the old chat_stream contract where the
-        // final stream was Result<Item>.)
+        // Project each shared envelope payload into the existing sentence
+        // aggregator. Identity and ordering were already validated by drive_chat,
+        // which also normalized stream errors into terminal payloads.
         let event_stream = futures::stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|item| (Ok(item), rx))
+            rx.recv().await.map(|item| (Ok(item.payload), rx))
         })
         .boxed();
 

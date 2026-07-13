@@ -11,7 +11,9 @@
 //! Multimodal is passed through (`Option<&Message>`) so TUI / channel can
 //! attach images/files the same way GUI already does.
 
-use echo_agent::agent::{Agent, AgentEvent, AgentHandle};
+use echo_agent::agent::{
+    Agent, AgentEvent, AgentHandle, EventEnvelope, EventIdentity, envelope_event_stream,
+};
 use echo_agent::prelude::Message;
 use echo_core::tools::TraceSinkFn;
 use futures::StreamExt;
@@ -26,7 +28,7 @@ use futures::StreamExt;
 /// `on_agent_event` is the only required method — it consumes one event from
 /// the chat/run stream and returns `false` to stop early (e.g. on cancel).
 pub trait ChatSink: Send + Sync + 'static {
-    fn on_agent_event(&self, event: AgentEvent) -> bool;
+    fn on_agent_event(&self, event: EventEnvelope) -> bool;
     fn on_run_status(&self, _status: &str) {}
     fn on_interrupt(&self, _run_id: &str, _goal: &str, _new_message: &str) {}
     /// Trace sink forwarded into the framework's external run context
@@ -174,6 +176,13 @@ async fn drive_chat_inner(
         // `trace_sink` here is the framework-Value form; `scoped_with_ctx_run_id`
         // re-scopes it into `CURRENT_TRACE_SINK` for tools (e.g. plan_execute)
         // running inside the framework's spawned tool executor.
+        let event_identity = EventIdentity {
+            conversation_id: conversation_id.clone(),
+            run_id: None,
+            turn_id: turn_id.clone(),
+            execution_id: None,
+            parent_event_id: None,
+        };
         let invocation = echo_core::agent::AgentInvocationContext {
             runtime: Some(echo_core::tools::ExternalRunContext {
                 conversation_id,
@@ -193,19 +202,25 @@ async fn drive_chat_inner(
         let stream_result = guard
             .execute_stream_message_with_invocation_context(msg, cancel, invocation)
             .await;
-        let mut stream = match stream_result {
+        let raw_stream = match stream_result {
             Ok(stream) => stream,
             Err(e) => {
                 // F1-5: 此前只 return Err 字符串, 不经 sink 发 Error 事件 →
                 // 前端 assistant 消息卡在 streaming。发 Error 让前端终止流式状态。
                 tracing::warn!(error = %e, "agent stream setup failed during chat");
-                let _ = sink.on_agent_event(AgentEvent::Error {
-                    source: "chat_driver".into(),
-                    message: e.to_string(),
-                });
+                let _ = sink.on_agent_event(EventEnvelope::new(
+                    &event_identity,
+                    1,
+                    None,
+                    AgentEvent::Error {
+                        source: "chat_driver".into(),
+                        message: e.to_string(),
+                    },
+                ));
                 return Err(e.to_string());
             }
         };
+        let mut stream = envelope_event_stream(raw_stream, event_identity);
         async {
             while let Some(event_result) = stream.next().await {
                 match event_result {
@@ -215,13 +230,10 @@ async fn drive_chat_inner(
                         }
                     }
                     Err(e) => {
-                        // F1-4: 此前只 tracing::warn + break, 不发 Error 事件 →
-                        // 前端不知道流已异常终止, 消息卡 streaming。发 Error 兜底。
+                        // The envelope adapter normalizes raw stream errors into
+                        // terminal payloads. This branch remains for future
+                        // transport adapters that can fail independently.
                         tracing::warn!(error = %e, "agent stream error during chat");
-                        let _ = sink.on_agent_event(AgentEvent::Error {
-                            source: "chat_driver".into(),
-                            message: e.to_string(),
-                        });
                         break;
                     }
                 }
@@ -233,25 +245,25 @@ async fn drive_chat_inner(
     .await
 }
 
-/// A `ChatSink` that forwards every `AgentEvent` to an mpsc channel.
+/// A `ChatSink` that forwards every `EventEnvelope` to an mpsc channel.
 ///
-/// Used by modes whose renderer consumes a stream of `AgentEvent`s over a
+/// Used by modes whose renderer consumes a stream of event envelopes over a
 /// channel — TUI (forwards to the UI render loop) and IM channels (aggregate
 /// by sentence). Other event kinds (run status / worker trace / interrupt)
 /// are no-op for these modes: they render the stream directly and don't need
 /// GUI-style side-event emission.
 pub struct ChannelChatSink {
-    tx: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
+    tx: tokio::sync::mpsc::UnboundedSender<EventEnvelope>,
 }
 
 impl ChannelChatSink {
-    pub fn new(tx: tokio::sync::mpsc::UnboundedSender<AgentEvent>) -> Self {
+    pub fn new(tx: tokio::sync::mpsc::UnboundedSender<EventEnvelope>) -> Self {
         Self { tx }
     }
 }
 
 impl ChatSink for ChannelChatSink {
-    fn on_agent_event(&self, event: AgentEvent) -> bool {
+    fn on_agent_event(&self, event: EventEnvelope) -> bool {
         // Forward to the channel; if the receiver was dropped (UI quit /
         // channel closed), return false so the driver stops streaming.
         self.tx.send(event).is_ok()
@@ -293,7 +305,7 @@ mod tests {
 
     /// Test-only sink that records received events for assertions.
     struct MockChatSink {
-        events: std::sync::Mutex<Vec<AgentEvent>>,
+        events: std::sync::Mutex<Vec<EventEnvelope>>,
     }
 
     impl Default for MockChatSink {
@@ -305,7 +317,7 @@ mod tests {
     }
 
     impl ChatSink for MockChatSink {
-        fn on_agent_event(&self, event: AgentEvent) -> bool {
+        fn on_agent_event(&self, event: EventEnvelope) -> bool {
             self.events
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -320,10 +332,25 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .iter()
-                .any(|e| matches!(e, AgentEvent::FinalAnswer(_)))
+                .any(|e| matches!(e.payload, AgentEvent::FinalAnswer(_)))
         }
         fn event_count(&self) -> usize {
             self.events.lock().unwrap_or_else(|e| e.into_inner()).len()
+        }
+        fn has_valid_contract(&self, conversation_id: &str, turn_id: &str) -> bool {
+            let events = self.events.lock().unwrap_or_else(|e| e.into_inner());
+            let terminal_count = events
+                .iter()
+                .filter(|event| event.payload.is_terminal())
+                .count();
+            events.iter().enumerate().all(|(index, event)| {
+                event.schema_version == echo_agent::agent::AGENT_EVENT_SCHEMA_VERSION
+                    && event.sequence == (index as u64).saturating_add(1)
+                    && event.conversation_id.as_deref() == Some(conversation_id)
+                    && event.turn_id == turn_id
+                    && event.run_id.is_none()
+                    && !event.event_id.is_empty()
+            }) && terminal_count == 1
         }
     }
 
@@ -354,7 +381,7 @@ mod tests {
             pool: None,
             store: Some(Arc::clone(&store)),
             sink,
-            conv_id: None,
+            conv_id: Some("c1".to_string()),
             root_message_id: "m1".to_string(),
             attachments: vec![],
             cancel,
@@ -370,6 +397,10 @@ mod tests {
             chat_sink.has_final_answer(),
             "drive_chat should stream FinalAnswer to sink; events recorded: {}",
             chat_sink.event_count()
+        );
+        assert!(
+            chat_sink.has_valid_contract("c1", "m1"),
+            "drive_chat should preserve version, identity, sequence, and exactly one terminal"
         );
         assert!(
             store
@@ -606,26 +637,40 @@ mod tests {
     async fn channel_chat_sink_forwards_events() {
         use tokio::sync::mpsc;
 
-        let (tx, mut rx) = mpsc::unbounded_channel::<AgentEvent>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<EventEnvelope>();
         let sink = ChannelChatSink::new(tx);
+        let identity = EventIdentity {
+            turn_id: "turn-1".to_string(),
+            ..EventIdentity::default()
+        };
 
         // on_agent_event forwards each event to the channel and keeps going.
         assert!(
-            sink.on_agent_event(AgentEvent::Token("hel".to_string())),
+            sink.on_agent_event(EventEnvelope::new(
+                &identity,
+                1,
+                None,
+                AgentEvent::Token("hel".to_string()),
+            )),
             "on_agent_event should return true to continue"
         );
         assert!(
-            sink.on_agent_event(AgentEvent::Token("lo".to_string())),
+            sink.on_agent_event(EventEnvelope::new(
+                &identity,
+                2,
+                None,
+                AgentEvent::Token("lo".to_string()),
+            )),
             "second event should also be accepted"
         );
 
         let first = rx.recv().await.expect("first event should be forwarded");
         let second = rx.recv().await.expect("second event should be forwarded");
-        match first {
+        match first.payload {
             AgentEvent::Token(t) => assert_eq!(t, "hel"),
             other => panic!("first should be Token(\"hel\"); got {other:?}"),
         }
-        match second {
+        match second.payload {
             AgentEvent::Token(t) => assert_eq!(t, "lo"),
             other => panic!("second should be Token(\"lo\"); got {other:?}"),
         }

@@ -450,7 +450,12 @@ async fn chat_with_agent(agent: &AgentHandle, message: &str, output: &OutputRend
     // ReactAgent serializes execution internally via execution_mutex
     let agent_guard = agent.inner().read().await;
     match agent_guard.chat_stream(message).await {
-        Ok(mut stream) => {
+        Ok(raw_stream) => {
+            let identity = echo_agent::agent::EventIdentity {
+                turn_id: uuid::Uuid::new_v4().to_string(),
+                ..echo_agent::agent::EventIdentity::default()
+            };
+            let mut stream = echo_agent::agent::envelope_event_stream(raw_stream, identity);
             spinner.set_message("Waiting for response...");
             let mut spinner_cleared = false;
             let mut first_chunk = true;
@@ -470,7 +475,8 @@ async fn chat_with_agent(agent: &AgentHandle, message: &str, output: &OutputRend
 
             while let Some(result) = stream.next().await {
                 match result {
-                    Ok(event) => {
+                    Ok(envelope) => {
+                        let event = envelope.payload;
                         // Record trace entry for significant events
                         {
                             let (_etype, _detail) = match &event {

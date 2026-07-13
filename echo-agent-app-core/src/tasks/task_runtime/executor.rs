@@ -2504,8 +2504,8 @@ async fn run_writer_worker(
     // emitted by the framework's executor event bus, not this caller.
 }
 
-/// Run a MUTATING task (verification) directly on the PRIMARY agent via
-/// `Agent::execute`. These tasks are never delegated to a read-only subagent
+/// Run a MUTATING task (verification) directly on the PRIMARY agent via its
+/// versioned streaming contract. These tasks are never delegated to a read-only subagent
 /// (workers can't write). The write_sem acquired by the caller serializes them,
 /// and the primary agent's execution_mutex serializes them further — correct,
 /// because mutating work must not race.
@@ -2529,38 +2529,66 @@ async fn run_main_agent_task(
 
     // Rebuild a multimodal Message when the run carries user attachments, so
     // write-task workers see the same images/files as the main agent (#1b).
-    let run_message: Option<echo_core::llm::types::Message> =
-        store.get_run(&run_id).ok().flatten().and_then(|r| {
-            if r.attachments.is_empty() {
-                None
-            } else {
-                crate::attachments::build_message_from_refs(prompt, &r.attachments).ok()
-            }
-        });
+    let run_record = store.get_run(&run_id).ok().flatten();
+    let conversation_id = run_record.as_ref().map(|run| run.conversation_id.clone());
+    let root_message_id = run_record.as_ref().map(|run| run.root_message_id.clone());
+    let run_message: Option<echo_core::llm::types::Message> = run_record.as_ref().and_then(|r| {
+        if r.attachments.is_empty() {
+            None
+        } else {
+            crate::attachments::build_message_from_refs(prompt, &r.attachments).ok()
+        }
+    });
 
     primary_agent
         .read_async(|agent| {
             let prompt = prompt.to_string();
             let run_message = run_message.clone();
             Box::pin(async move {
+                let invocation = echo_core::agent::AgentInvocationContext {
+                    runtime: Some(echo_core::tools::ExternalRunContext {
+                        conversation_id,
+                        run_id: Some(run_id.clone()),
+                        turn_id: root_message_id.clone(),
+                        execution_id: Some(task_id.clone()),
+                        message_id: root_message_id,
+                        cancel: Some(Arc::new(cancel.clone())),
+                        trace_sink: worker_trace_sink_to_core(trace_sink.clone()),
+                        delegation_policy: None,
+                    }),
+                    working_dir: None,
+                    cancel: None,
+                    disabled_tools: None,
+                    run_budget: None,
+                };
+                let event_identity = echo_core::agent::EventIdentity::from_invocation(&invocation);
                 // Multimodal path when the run has attachments; plain text otherwise.
-                let mut stream = if let Some(msg) = run_message {
+                let raw_stream = if let Some(msg) = run_message {
                     agent
-                        .execute_stream_message_with_cancel(msg, cancel)
+                        .execute_stream_message_with_invocation_context(
+                            msg,
+                            cancel,
+                            invocation,
+                        )
                         .await
                         .map_err(|e| format!("main agent stream failed: {e}"))?
                 } else {
                     agent
-                        .execute_stream_with_cancel(&prompt, cancel)
+                        .execute_stream_with_invocation_context(&prompt, cancel, invocation)
                         .await
                         .map_err(|e| format!("main agent stream failed: {e}"))?
                 };
+                let mut stream = echo_core::agent::envelope_event_stream(
+                    raw_stream,
+                    event_identity,
+                );
                 let mut output = String::new();
                 let mut in_thinking = false;
 
                 while let Some(event_result) = stream.next().await {
-                    let event =
-                        event_result.map_err(|e| format!("main agent stream failed: {e}"))?;
+                    let event = event_result
+                        .map_err(|e| format!("main agent stream failed: {e}"))?
+                        .payload;
                     match event {
                         AgentEvent::Token(content) => {
                             if in_thinking {
@@ -3093,6 +3121,7 @@ pub async fn drive_unattended_run(
                 disabled_tools: None,
                 run_budget: None,
             };
+            let event_identity = echo_core::agent::EventIdentity::from_invocation(&invocation);
 
             // Execute the prompt. The agent's ReAct loop will call
             // plan_create + plan_execute, which runs the plan through
@@ -3105,7 +3134,9 @@ pub async fn drive_unattended_run(
                 )
                 .await
             {
-                Ok(mut stream) => {
+                Ok(raw_stream) => {
+                    let mut stream =
+                        echo_core::agent::envelope_event_stream(raw_stream, event_identity);
                     // Drain the stream to completion. We don't forward events
                     // to a GUI (unattended run has no UI), but we must consume
                     // the stream so the agent finishes its work.
