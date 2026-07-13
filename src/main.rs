@@ -305,6 +305,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                     )
                 })
                 .collect(),
+            runtime.browser_runtime.clone(),
             args.no_alt_screen,
         )
         .await?;

@@ -117,6 +117,8 @@ pub fn build_tauri_app(
             commands::browser::browser_set_backend,
             commands::browser::chrome_setup_status,
             commands::browser::chrome_install_native_host,
+            commands::browser::chrome_open_extensions_page,
+            commands::browser::chrome_open_extension_dir,
             // Config
             commands::config::get_config,
             commands::config::update_config,
@@ -144,8 +146,10 @@ pub fn build_tauri_app(
             // Files
             commands::files::list_files,
             commands::files::read_file,
+            commands::files::write_file,
             commands::files::diff_file,
             commands::files::file_tree,
+            commands::files::workspace_changes,
             commands::files::browse_directories,
             // Tasks
             commands::tasks::list_tasks,

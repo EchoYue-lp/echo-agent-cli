@@ -226,12 +226,11 @@ to conversation/session metadata.
 
 The frontend `browserStore` keys views by stable `conversation_id` and merges
 session/tab/navigation/action/screenshot events by `session_id`. Per-turn
-`run_id` changes therefore do not reset the browser workspace. The desktop
-panel uses a constrained 360-680 px right split; below the desktop breakpoint it
-becomes a 92vw overlay with a backdrop. The existing task rail remains a sibling
-workspace surface. The first release is screenshot-driven, not a video stream,
-and deliberately disables forward navigation until the managed runtime exposes
-that action.
+`run_id` changes therefore do not reset the browser workspace. The original
+Phase 3 desktop panel used a constrained 360-680 px split and kept the task rail
+as a sibling surface. The later unified workspace section replaces that layout
+while retaining the screenshot-driven runtime and deliberately disabled forward
+navigation until the managed runtime exposes that action.
 
 ## DOM and visual control
 
@@ -414,6 +413,44 @@ does not request cookies, history, bookmarks, passwords, or profile access.
 Chrome's `debugger` permission is optional and requires a separate popup action;
 the CDP bridge accepts only a small read-oriented command allowlist. It is not
 part of normal page control or the default install permission prompt.
+
+## Unified preview workspace and controlled editing
+
+The GUI now presents tasks and previews in one right-side workspace instead of
+three competing drawers. The top-level tabs are `Tasks` and `Preview`; Preview
+contains `Web` and `Files`. Chat-header buttons open the intended destination
+directly, and the collapse button is labelled independently from browser
+actions. On narrow screens the workspace becomes a full-width overlay above the
+left navigation, so browser and file controls remain operable.
+
+The web preview works without an active conversation by using a workspace-level
+UI scope. URL submission, reload, screenshot refresh, backend changes, and tab
+actions surface command errors instead of failing silently. Managed sessions
+refresh their screenshot at a bounded 1.5-second interval only while the panel
+is mounted and ready. Chrome remains an explicit user or agent choice; EKO never
+switches from managed browsing based on the URL or login-page detection.
+
+Selecting `Connect Chrome...` opens a setup flow that reports the desktop
+bridge and native-host states, opens `chrome://extensions` and the bundled
+extension directory, validates and registers the extension id, polls for the
+extension connection, and claims the authorized tab before closing. Switching
+back to managed mode releases the EKO Chrome lease but does not close a
+user-owned tab.
+
+The file preview uses workspace-relative Tauri commands for the tree, Git
+changes, file content, and diffs. Text, images, PDFs, unsupported binaries, and
+deleted/untracked Git states have explicit render paths. Text files can enter an
+optional CodeMirror edit mode; preview remains the default. Saving sends the
+SHA-256 revision that was read, writes through a unique temporary file and
+rename, and rejects stale saves if an agent or external editor changed the file.
+Dirty drafts are preserved and shown as conflicts rather than overwritten.
+
+This is intentionally a controlled cowork editor, not a second full IDE:
+project inspection and review remain lightweight, while small corrections can
+be made without leaving EKO. Larger refactors still belong to agent tools or an
+external editor. TUI exposes the same product capabilities through
+`/preview`, `/edit`, and `/browser [status|managed|chrome]`; rendering differs,
+but browser/backend selection and file access are not GUI-only product logic.
 
 ## Verification gates
 

@@ -2,7 +2,12 @@
 
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
+use base64::Engine;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
+
+const MAX_TEXT_BYTES: u64 = 2 * 1024 * 1024;
+const MAX_PREVIEW_BYTES: u64 = 10 * 1024 * 1024;
 
 #[derive(Debug, Serialize)]
 pub struct FileEntry {
@@ -20,6 +25,16 @@ pub struct FileContent {
     pub content: String,
     pub size: u64,
     pub language: Option<String>,
+    pub kind: String,
+    pub mime_type: Option<String>,
+    pub data_url: Option<String>,
+    pub revision: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkspaceChange {
+    pub path: String,
+    pub status: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -132,33 +147,120 @@ pub async fn read_file(
     path: String,
 ) -> Result<FileContent, IpcError> {
     let base = get_workspace_root(&state).await;
+    read_workspace_file(&base, path)
+}
+
+#[tauri::command]
+pub async fn write_file(
+    state: tauri::State<'_, TauriState>,
+    path: String,
+    content: String,
+    expected_revision: String,
+) -> Result<FileContent, IpcError> {
+    let base = get_workspace_root(&state).await;
+    write_workspace_file(&base, path, content, expected_revision)
+}
+
+fn write_workspace_file(
+    base: &std::path::Path,
+    path: String,
+    content: String,
+    expected_revision: String,
+) -> Result<FileContent, IpcError> {
     let target = base.join(&path);
-
-    crate::tauri::path_validator::validate_within_base(&target, &base)
+    crate::tauri::path_validator::validate_within_base(&target, base)
         .map_err(IpcError::Validation)?;
-
-    if !target.exists() {
+    if !target.is_file() {
         return Err(IpcError::NotFound("File not found".to_string()));
     }
-    if target.is_dir() {
-        return Err(IpcError::Validation("Path is a directory".to_string()));
+    if content.len() as u64 > MAX_TEXT_BYTES {
+        return Err(IpcError::Validation(
+            "File too large to edit (>2MB)".to_string(),
+        ));
     }
 
-    let metadata = std::fs::metadata(&target).map_err(|e| IpcError::Internal(e.to_string()))?;
-    if metadata.len() > 1024 * 1024 {
-        return Err(IpcError::Validation("File too large (>1MB)".to_string()));
+    let current = std::fs::read(&target).map_err(|error| IpcError::Internal(error.to_string()))?;
+    if file_revision(&current) != expected_revision {
+        return Err(IpcError::Validation(
+            "File changed on disk; reload it before saving".to_string(),
+        ));
     }
 
-    let content =
-        std::fs::read_to_string(&target).map_err(|e| IpcError::Internal(e.to_string()))?;
-    let language = detect_language(&path);
+    let parent = target
+        .parent()
+        .ok_or_else(|| IpcError::Validation("File has no parent directory".to_string()))?;
+    let file_name = target
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| IpcError::Validation("File name is not valid UTF-8".to_string()))?;
+    let temporary = parent.join(format!(".{file_name}.eko-{}.tmp", uuid::Uuid::new_v4()));
+    std::fs::write(&temporary, content.as_bytes())
+        .map_err(|error| IpcError::Internal(error.to_string()))?;
+    if let Ok(metadata) = std::fs::metadata(&target) {
+        let _ = std::fs::set_permissions(&temporary, metadata.permissions());
+    }
+    if let Err(error) = std::fs::rename(&temporary, &target) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(IpcError::Internal(error.to_string()));
+    }
 
-    Ok(FileContent {
-        path,
-        content,
-        size: metadata.len(),
-        language,
+    read_workspace_file(base, path)
+}
+
+#[tauri::command]
+pub async fn workspace_changes(
+    state: tauri::State<'_, TauriState>,
+) -> Result<Vec<WorkspaceChange>, IpcError> {
+    let base = get_workspace_root(&state).await;
+    let output = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("git")
+            .args(["status", "--porcelain=v1", "--untracked-files=all"])
+            .current_dir(base)
+            .output()
     })
+    .await
+    .map_err(|error| IpcError::Internal(format!("git status task failed: {error}")))?
+    .map_err(|error| IpcError::Internal(error.to_string()))?;
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+
+    Ok(parse_workspace_changes(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+fn parse_workspace_changes(text: &str) -> Vec<WorkspaceChange> {
+    let mut changes = Vec::new();
+    for line in text.lines() {
+        let Some(status_code) = line.get(..2) else {
+            continue;
+        };
+        let Some(raw_path) = line.get(3..) else {
+            continue;
+        };
+        let path = raw_path
+            .rsplit_once(" -> ")
+            .map(|(_, current)| current)
+            .unwrap_or(raw_path)
+            .trim_matches('"')
+            .to_string();
+        if path.is_empty() {
+            continue;
+        }
+        let status = if status_code.contains('D') {
+            "deleted"
+        } else if status_code.contains('?') || status_code.contains('A') {
+            "added"
+        } else {
+            "modified"
+        };
+        changes.push(WorkspaceChange {
+            path,
+            status: status.to_string(),
+        });
+    }
+    changes
 }
 
 #[tauri::command]
@@ -379,6 +481,91 @@ fn detect_language(path: &str) -> Option<String> {
     Some(lang.to_string())
 }
 
+fn read_workspace_file(base: &std::path::Path, path: String) -> Result<FileContent, IpcError> {
+    let target = base.join(&path);
+    crate::tauri::path_validator::validate_within_base(&target, base)
+        .map_err(IpcError::Validation)?;
+    if !target.exists() {
+        return Err(IpcError::NotFound("File not found".to_string()));
+    }
+    if target.is_dir() {
+        return Err(IpcError::Validation("Path is a directory".to_string()));
+    }
+
+    let metadata =
+        std::fs::metadata(&target).map_err(|error| IpcError::Internal(error.to_string()))?;
+    if metadata.len() > MAX_PREVIEW_BYTES {
+        return Err(IpcError::Validation(
+            "File too large to preview (>10MB)".to_string(),
+        ));
+    }
+    let bytes = std::fs::read(&target).map_err(|error| IpcError::Internal(error.to_string()))?;
+    let revision = file_revision(&bytes);
+    let preview_type = preview_type(&path);
+
+    match preview_type {
+        Some((kind, mime_type)) => Ok(FileContent {
+            path,
+            content: String::new(),
+            size: metadata.len(),
+            language: None,
+            kind: kind.to_string(),
+            mime_type: Some(mime_type.to_string()),
+            data_url: Some(format!(
+                "data:{mime_type};base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            )),
+            revision,
+        }),
+        None if metadata.len() <= MAX_TEXT_BYTES => match String::from_utf8(bytes) {
+            Ok(content) => Ok(FileContent {
+                language: detect_language(&path),
+                path,
+                content,
+                size: metadata.len(),
+                kind: "text".to_string(),
+                mime_type: Some("text/plain".to_string()),
+                data_url: None,
+                revision,
+            }),
+            Err(_) => Ok(binary_file_content(path, metadata.len(), revision)),
+        },
+        None => Ok(binary_file_content(path, metadata.len(), revision)),
+    }
+}
+
+fn binary_file_content(path: String, size: u64, revision: String) -> FileContent {
+    FileContent {
+        path,
+        content: String::new(),
+        size,
+        language: None,
+        kind: "binary".to_string(),
+        mime_type: None,
+        data_url: None,
+        revision,
+    }
+}
+
+fn preview_type(path: &str) -> Option<(&'static str, &'static str)> {
+    let extension = std::path::Path::new(path)
+        .extension()
+        .and_then(|value| value.to_str())?
+        .to_ascii_lowercase();
+    match extension.as_str() {
+        "png" => Some(("image", "image/png")),
+        "jpg" | "jpeg" => Some(("image", "image/jpeg")),
+        "gif" => Some(("image", "image/gif")),
+        "webp" => Some(("image", "image/webp")),
+        "pdf" => Some(("pdf", "application/pdf")),
+        _ => None,
+    }
+}
+
+fn file_revision(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
 fn is_safe_git_ref(git_ref: &str) -> bool {
     if git_ref.is_empty() {
         return false;
@@ -457,4 +644,79 @@ fn build_tree(
         }
     }
     nodes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_preview_types_and_text_languages() {
+        assert_eq!(
+            preview_type("assets/photo.PNG"),
+            Some(("image", "image/png"))
+        );
+        assert_eq!(
+            preview_type("docs/report.pdf"),
+            Some(("pdf", "application/pdf"))
+        );
+        assert_eq!(preview_type("src/main.rs"), None);
+        assert_eq!(detect_language("src/main.rs").as_deref(), Some("rust"));
+    }
+
+    #[test]
+    fn revisions_change_with_unicode_content() {
+        let first = file_revision("你好".as_bytes());
+        let second = file_revision("你好!".as_bytes());
+        assert_eq!(first.chars().count(), 64);
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn parses_git_status_with_unicode_and_renames() {
+        let changes = parse_workspace_changes(
+            " M src/main.rs\n?? 文档/说明.md\nR  old-name.txt -> new-name.txt\n D removed.txt\n",
+        );
+        assert_eq!(changes.len(), 4);
+        assert_eq!(
+            changes.first().map(|item| item.status.as_str()),
+            Some("modified")
+        );
+        assert_eq!(
+            changes.get(1).map(|item| item.path.as_str()),
+            Some("文档/说明.md")
+        );
+        assert_eq!(
+            changes.get(2).map(|item| item.path.as_str()),
+            Some("new-name.txt")
+        );
+        assert_eq!(
+            changes.get(3).map(|item| item.status.as_str()),
+            Some("deleted")
+        );
+    }
+
+    #[test]
+    fn refuses_to_overwrite_an_external_file_change() -> Result<(), Box<dyn std::error::Error>> {
+        let base = std::env::temp_dir().join(format!("eko-file-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&base)?;
+        let path = "notes.txt".to_string();
+        let target = base.join(&path);
+        std::fs::write(&target, "first")?;
+
+        let initial = read_workspace_file(&base, path.clone())
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let saved =
+            write_workspace_file(&base, path.clone(), "second".to_string(), initial.revision)
+                .map_err(|error| std::io::Error::other(error.to_string()))?;
+        assert_eq!(saved.content, "second");
+
+        std::fs::write(&target, "external")?;
+        let stale_save = write_workspace_file(&base, path, "third".to_string(), saved.revision);
+        assert!(matches!(stale_save, Err(IpcError::Validation(_))));
+        assert_eq!(std::fs::read_to_string(&target)?, "external");
+
+        std::fs::remove_dir_all(base)?;
+        Ok(())
+    }
 }

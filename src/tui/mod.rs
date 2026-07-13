@@ -323,6 +323,10 @@ pub struct TuiApp {
     pub inline_mode: bool,
     /// Event-loop request to temporarily suspend the TUI and open `$VISUAL`/`$EDITOR`.
     pub external_editor_requested: bool,
+    /// Project file requested by `/edit`, opened after the current input event settles.
+    pub external_file_editor_requested: Option<std::path::PathBuf>,
+    /// Shared browser runtime used by direct TUI browser commands.
+    pub browser_runtime: Option<std::sync::Arc<echo_agent_app_core::browser::BrowserRuntime>>,
     /// Project-relative paths used by `@` completion.
     pub project_files: Vec<String>,
     /// Current offset for repeated Ctrl+R reverse-history search.
@@ -742,6 +746,8 @@ impl TuiApp {
             configured_models: Vec::new(),
             inline_mode: false,
             external_editor_requested: false,
+            external_file_editor_requested: None,
+            browser_runtime: None,
             project_files: Vec::new(),
             reverse_search_idx: None,
             reverse_search_query: None,
@@ -1753,6 +1759,7 @@ pub async fn run_tui(
     conversation_store: Option<std::sync::Arc<dyn echo_agent::memory::ConversationStore>>,
     conversation_id: String,
     configured_models: Vec<echo_agent_app_core::model_config::ModelRuntimeConfig>,
+    browser_runtime: std::sync::Arc<echo_agent_app_core::browser::BrowserRuntime>,
     inline_mode: bool,
 ) -> anyhow::Result<()> {
     // Use ColorTheme to generate Theme, unifying both theme systems.
@@ -1802,6 +1809,7 @@ pub async fn run_tui(
     app.conversation_id = Some(conversation_id.clone());
     app.conversation_store = conversation_store;
     app.configured_models = configured_models;
+    app.browser_runtime = Some(browser_runtime);
     app.inline_mode = inline_mode;
     app.project_files = collect_project_files(std::path::Path::new("."), 10_000);
     if let Some(store) = app.conversation_store.as_ref()

@@ -1,24 +1,36 @@
-import { useEffect } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { Activity, Chrome, Globe2 } from 'lucide-react';
 import { useBrowserEvents } from '../../hooks/useBrowserEvents';
 import { useConversationStore } from '../../stores/conversationStore';
+import { useWorkspaceStore } from '../../stores/workspaceStore';
 import { useBrowserStore } from '../../stores/browserStore';
+import { useRightWorkspaceStore } from '../../stores/rightWorkspaceStore';
 import { BrowserStatus } from './BrowserStatus';
 import { BrowserTabs } from './BrowserTabs';
 import { BrowserToolbar } from './BrowserToolbar';
 import { BrowserViewport } from './BrowserViewport';
+import { ChromeSetupDialog } from './ChromeSetupDialog';
 
 export function BrowserPanel() {
   useBrowserEvents();
+  const [chromeSetupOpen, setChromeSetupOpen] = useState(false);
   const conversationId = useConversationStore((state) => state.activeId);
-  const open = useBrowserStore((state) => state.open);
-  const view = useBrowserStore((state) =>
-    conversationId ? state.views[conversationId] : undefined
-  );
+  const workspaceId = useWorkspaceStore((state) => state.current?.id);
+  const browserScopeId = conversationId ?? `ui-preview:${workspaceId ?? 'global'}`;
+  const view = useBrowserStore((state) => state.views[browserScopeId]);
   const store = useBrowserStore();
+  const closeWorkspace = useRightWorkspaceStore((state) => state.close);
+  const handleChromeConnectionChange = useCallback((connected: boolean) => {
+    useBrowserStore.setState({ chromeConnected: connected });
+  }, []);
   useEffect(() => {
     void store.refreshChromeStatus();
   }, [store.refreshChromeStatus]);
+  useEffect(() => {
+    if (!view || view.session.status !== 'ready') return;
+    const timer = window.setInterval(() => void store.refreshFrame(browserScopeId), 1500);
+    return () => window.clearInterval(timer);
+  }, [browserScopeId, store.refreshFrame, view?.session.status]);
   const activeTab =
     view?.session.tabs.find((tab) => tab.id === view.activeTabId) ?? view?.session.tabs[0];
   const busy =
@@ -26,51 +38,50 @@ export function BrowserPanel() {
     view?.session.status === 'acting' ||
     view?.session.status === 'starting';
 
-  if (!open) return null;
-
   const call = (fn: (id: string) => Promise<void>) => {
-    if (conversationId) void fn(conversationId);
+    void fn(browserScopeId);
   };
   return (
     <>
-      <div
-        className="fixed inset-0 z-30 bg-black/25 lg:hidden"
-        onClick={() => store.setOpen(false)}
-      />
-      <aside className="fixed inset-y-0 right-0 z-40 flex w-[min(92vw,680px)] min-w-0 flex-col border-l border-[var(--border-primary)] bg-[var(--bg-primary)] shadow-xl lg:relative lg:z-20 lg:w-[clamp(360px,42vw,680px)] lg:shadow-none">
+      <div className="flex h-full min-h-0 flex-col">
         <BrowserToolbar
           url={activeTab?.url ?? ''}
           busy={Boolean(busy)}
-          onNavigate={(url) => conversationId && void store.navigate(conversationId, url)}
+          onNavigate={(url) => void store.navigate(browserScopeId, url)}
           onBack={() => call(store.back)}
           onReload={() => call(store.reload)}
           onStop={() => void store.stop()}
           onRefreshFrame={() => call(store.refreshFrame)}
-          onClose={() => store.setOpen(false)}
+          onClose={closeWorkspace}
           backend={view?.session.backend ?? 'managed'}
           chromeConnected={store.chromeConnected}
-          onBackendChange={(backend) =>
-            conversationId && void store.setBackend(conversationId, backend)
-          }
+          onBackendChange={(backend) => {
+            void store.setBackend(browserScopeId, backend).then((error) => {
+              if (error && backend === 'chrome') setChromeSetupOpen(true);
+            });
+          }}
+          onChromeSetup={() => setChromeSetupOpen(true)}
         />
         <BrowserTabs
           tabs={view?.session.tabs ?? []}
           activeTabId={view?.activeTabId ?? null}
-          onSelect={(index) => conversationId && void store.selectTab(conversationId, index)}
+          onSelect={(index) => void store.selectTab(browserScopeId, index)}
           onNew={() => call(store.newTab)}
-          onClose={(index) => conversationId && void store.closeTab(conversationId, index)}
+          onClose={(index) => void store.closeTab(browserScopeId, index)}
         />
         <BrowserViewport
           frame={view?.frame}
           busy={Boolean(busy)}
-          interactive={Boolean(conversationId && view)}
-          onClickAt={(x, y) => conversationId && void store.clickAt(conversationId, x, y)}
-          onScroll={(deltaX, deltaY) =>
-            conversationId && void store.scroll(conversationId, deltaX, deltaY)
-          }
+          clickable={Boolean(view && view.session.backend !== 'chrome')}
+          scrollable={Boolean(view)}
+          onClickAt={(x, y) => void store.clickAt(browserScopeId, x, y)}
+          onScroll={(deltaX, deltaY) => void store.scroll(browserScopeId, deltaX, deltaY)}
         />
         <footer className="flex h-7 shrink-0 items-center justify-between gap-3 border-t border-[var(--border-primary)] px-2.5">
-          <BrowserStatus status={view?.session.status} error={view?.error} />
+          <BrowserStatus
+            status={view?.session.status}
+            error={view?.error ?? store.commandErrors[browserScopeId]}
+          />
           <div className="flex min-w-0 items-center gap-2 text-[10px] text-[var(--text-tertiary)]">
             {Boolean(view?.diagnostics.length) && (
               <span
@@ -93,7 +104,18 @@ export function BrowserPanel() {
             </span>
           </div>
         </footer>
-      </aside>
+      </div>
+      {chromeSetupOpen && (
+        <ChromeSetupDialog
+          onClose={() => setChromeSetupOpen(false)}
+          onConnectionChange={handleChromeConnectionChange}
+          onUseChrome={async () => {
+            const error = await store.setBackend(browserScopeId, 'chrome');
+            if (!error) setChromeSetupOpen(false);
+            return error;
+          }}
+        />
+      )}
     </>
   );
 }

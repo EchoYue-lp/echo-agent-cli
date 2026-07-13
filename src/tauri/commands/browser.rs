@@ -6,7 +6,9 @@ use serde::Serialize;
 use serde_json::Value;
 use serde_json::json;
 use std::collections::HashMap;
-use tauri::State;
+use std::path::PathBuf;
+use std::process::Command;
+use tauri::{AppHandle, Manager, State};
 
 async fn execute(
     state: &TauriState,
@@ -144,20 +146,40 @@ pub struct ChromeSetupStatus {
     pub extension_origin: Option<String>,
     pub endpoint_file: String,
     pub startup_error: Option<String>,
+    pub native_host_installed: bool,
+    pub extension_path: Option<String>,
 }
 
 #[tauri::command]
 pub async fn chrome_setup_status(
+    app: AppHandle,
     state: State<'_, TauriState>,
 ) -> Result<ChromeSetupStatus, String> {
     let status = state.browser_runtime.chrome_status().await;
+    let native_host_installed = chrome_native_host_manifest_path()
+        .map(|path| path.is_file())
+        .unwrap_or(false);
     Ok(ChromeSetupStatus {
         enabled: status.enabled,
         connected: status.connected,
         extension_origin: status.extension_origin,
         endpoint_file: status.endpoint_file.to_string_lossy().into_owned(),
         startup_error: status.startup_error,
+        native_host_installed,
+        extension_path: chrome_extension_dir(&app).map(|path| path.to_string_lossy().into_owned()),
     })
+}
+
+#[tauri::command]
+pub fn chrome_open_extensions_page() -> Result<(), String> {
+    open_chrome_extensions_page()
+}
+
+#[tauri::command]
+pub fn chrome_open_extension_dir(app: AppHandle) -> Result<(), String> {
+    let extension_dir = chrome_extension_dir(&app)
+        .ok_or_else(|| "bundled Chrome extension directory is unavailable".to_string())?;
+    open_path(&extension_dir)
 }
 
 #[tauri::command]
@@ -219,6 +241,52 @@ fn validate_extension_id(value: &str) -> Result<(), String> {
 
 fn chrome_native_host_binary() -> Result<std::path::PathBuf, String> {
     std::env::current_exe().map_err(|error| error.to_string())
+}
+
+fn chrome_extension_dir(app: &AppHandle) -> Option<PathBuf> {
+    let bundled = app
+        .path()
+        .resource_dir()
+        .ok()
+        .map(|directory| directory.join("chrome-extension"));
+    if bundled.as_ref().is_some_and(|directory| directory.is_dir()) {
+        return bundled;
+    }
+
+    let development = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("chrome-extension");
+    development.is_dir().then_some(development)
+}
+
+fn open_path(path: &std::path::Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let child = Command::new("open").arg(path).spawn();
+    #[cfg(target_os = "linux")]
+    let child = Command::new("xdg-open").arg(path).spawn();
+    #[cfg(target_os = "windows")]
+    let child = Command::new("explorer").arg(path).spawn();
+
+    child
+        .map(|_| ())
+        .map_err(|error| format!("failed to open {}: {error}", path.display()))
+}
+
+fn open_chrome_extensions_page() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let child = Command::new("open")
+        .args(["-a", "Google Chrome", "chrome://extensions"])
+        .spawn();
+    #[cfg(target_os = "linux")]
+    let child = Command::new("google-chrome")
+        .arg("chrome://extensions")
+        .spawn();
+    #[cfg(target_os = "windows")]
+    let child = Command::new("cmd")
+        .args(["/C", "start", "", "chrome://extensions"])
+        .spawn();
+
+    child
+        .map(|_| ())
+        .map_err(|error| format!("failed to open Chrome extensions: {error}"))
 }
 
 fn chrome_native_host_manifest_path() -> Result<std::path::PathBuf, String> {

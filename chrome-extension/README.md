@@ -3,13 +3,13 @@
 This Manifest V3 extension connects explicitly authorized Chrome tabs to the
 local EKO desktop app through Chrome Native Messaging.
 
-Development setup:
+Desktop setup:
 
-1. Load this directory as an unpacked extension from `chrome://extensions`.
-2. Copy the generated extension id and call the desktop
-   `chrome_install_native_host` command (or use the future setup UI).
-3. Restart the extension and confirm its popup shows `Connected`.
-4. Open the popup on a website and authorize that site and tab.
+1. Choose `Connect Chrome...` in the EKO browser backend selector.
+2. Open Chrome extensions and load the directory shown by EKO as an unpacked extension.
+3. Copy the generated extension id into EKO and register the native host.
+4. Restart the extension and confirm its popup shows `Connected`.
+5. Open the popup on a website and authorize that site and tab.
 
 The installed native-host manifest points at the EKO desktop executable itself.
 When Chrome launches that executable with a `chrome-extension://` origin, EKO

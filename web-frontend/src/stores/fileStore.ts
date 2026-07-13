@@ -1,101 +1,302 @@
 import { create } from 'zustand';
-import { get } from '../api/client';
+import {
+  filesApi,
+  type DiffHunk,
+  type FileContent,
+  type FileEntry,
+  type FileTreeNode,
+  type WorkspaceChange,
+} from '../api/endpoints';
+import { errorMessage } from '../lib/tauri-bridge';
 
-interface FileEntry {
-  name: string;
-  path: string;
-  is_dir: boolean;
-  size: number;
-  modified?: string;
-  extension?: string;
-}
-
-interface TreeNode {
-  name: string;
-  path: string;
-  is_dir: boolean;
-  children?: TreeNode[];
-}
-
-interface FileContent {
-  path: string;
-  content: string;
-  size: number;
-  language?: string;
-}
-
-interface DiffHunk {
-  old_start: number;
-  old_count: number;
-  new_start: number;
-  new_count: number;
-  lines: { tag: string; old_line?: number; new_line?: number; content: string }[];
+export interface FileDocument {
+  file: FileContent;
+  draft: string;
+  dirty: boolean;
+  editing: boolean;
+  conflict: boolean;
 }
 
 interface FileStore {
-  tree: TreeNode[];
+  tree: FileTreeNode[];
+  openFiles: string[];
   selectedFile: string | null;
-  fileContent: FileContent | null;
+  documents: Record<string, FileDocument>;
   diffHunks: DiffHunk[];
+  changes: WorkspaceChange[];
   loading: boolean;
+  saving: boolean;
   error: string | null;
-  viewMode: 'content' | 'diff';
-
+  viewMode: 'content' | 'edit' | 'diff';
   loadTree: (depth?: number) => Promise<void>;
-  selectFile: (path: string) => Promise<void>;
+  loadChanges: () => Promise<void>;
+  selectFile: (path: string, forceReload?: boolean) => Promise<void>;
   loadDiff: (path: string, gitRef?: string) => Promise<void>;
-  clearSelection: () => void;
-  setViewMode: (mode: 'content' | 'diff') => void;
+  setViewMode: (mode: 'content' | 'edit' | 'diff') => void;
+  updateDraft: (content: string) => void;
+  saveSelected: () => Promise<boolean>;
+  discardSelected: () => Promise<void>;
+  refreshSelectedFromDisk: () => Promise<void>;
+  closeFile: (path: string, force?: boolean) => boolean;
+  clearError: () => void;
 }
 
-export type { FileEntry, TreeNode, FileContent, DiffHunk };
+export type { FileEntry, FileContent, FileTreeNode, DiffHunk, WorkspaceChange };
 
-export const useFileStore = create<FileStore>((set) => ({
+export const useFileStore = create<FileStore>((set, get) => ({
   tree: [],
+  openFiles: [],
   selectedFile: null,
-  fileContent: null,
+  documents: {},
   diffHunks: [],
+  changes: [],
   loading: false,
+  saving: false,
   error: null,
   viewMode: 'content',
 
-  loadTree: async (depth = 3) => {
+  loadTree: async (depth = 4) => {
     set({ loading: true, error: null });
     try {
-      const data = await get<TreeNode[]>(`/files/tree?depth=${depth}`);
-      set({ tree: data, loading: false });
-    } catch (e: unknown) {
-      set({ error: e instanceof Error ? e.message : String(e), loading: false });
+      const tree = await filesApi.tree(depth);
+      set({ tree, loading: false });
+    } catch (error) {
+      set({ error: errorMessage(error), loading: false });
     }
   },
 
-  selectFile: async (path: string) => {
+  loadChanges: async () => {
+    try {
+      set({ changes: await filesApi.changes() });
+    } catch (error) {
+      set({ error: errorMessage(error) });
+    }
+  },
+
+  selectFile: async (path, forceReload = false) => {
+    const existing = get().documents[path];
+    if (existing && !forceReload) {
+      set({ selectedFile: path, viewMode: existing.editing ? 'edit' : 'content', error: null });
+      return;
+    }
+    if (existing?.dirty && forceReload) {
+      set((state) => ({
+        selectedFile: path,
+        documents: {
+          ...state.documents,
+          [path]: { ...existing, conflict: true },
+        },
+        error: '文件已在磁盘变化，当前草稿尚未保存',
+      }));
+      return;
+    }
+
     set({ selectedFile: path, loading: true, error: null, diffHunks: [], viewMode: 'content' });
     try {
-      const data = await get<FileContent>(`/files/read?path=${encodeURIComponent(path)}`);
-      set({ fileContent: data, loading: false });
-    } catch (e: unknown) {
-      set({ error: e instanceof Error ? e.message : String(e), loading: false });
+      const file = await filesApi.read(path);
+      set((state) => ({
+        openFiles: state.openFiles.includes(path) ? state.openFiles : [...state.openFiles, path],
+        documents: {
+          ...state.documents,
+          [path]: {
+            file,
+            draft: file.content,
+            dirty: false,
+            editing: false,
+            conflict: false,
+          },
+        },
+        loading: false,
+      }));
+    } catch (error) {
+      set({ error: errorMessage(error), loading: false });
     }
   },
 
-  loadDiff: async (path: string, gitRef = 'HEAD') => {
+  loadDiff: async (path, gitRef = 'HEAD') => {
     set({ selectedFile: path, loading: true, error: null, viewMode: 'diff' });
     try {
-      const data = await get<{
-        path: string;
-        old_content: string;
-        new_content: string;
-        hunks: DiffHunk[];
-      }>(`/files/diff?path=${encodeURIComponent(path)}&git_ref=${gitRef}`);
-      set({ diffHunks: data.hunks, fileContent: null, loading: false });
-    } catch (e: unknown) {
-      set({ error: e instanceof Error ? e.message : String(e), loading: false });
+      const [data, file] = await Promise.all([
+        filesApi.diff(path, gitRef),
+        get().documents[path] ? Promise.resolve(null) : filesApi.read(path).catch(() => null),
+      ]);
+      set((state) => ({
+        openFiles: state.openFiles.includes(path) ? state.openFiles : [...state.openFiles, path],
+        documents: file
+          ? {
+              ...state.documents,
+              [path]: {
+                file,
+                draft: file.content,
+                dirty: false,
+                editing: false,
+                conflict: false,
+              },
+            }
+          : state.documents,
+        diffHunks: data.hunks,
+        loading: false,
+      }));
+    } catch (error) {
+      set({ error: errorMessage(error), loading: false });
     }
   },
 
-  clearSelection: () =>
-    set({ selectedFile: null, fileContent: null, diffHunks: [], viewMode: 'content' }),
+  setViewMode: (viewMode) => {
+    const selectedFile = get().selectedFile;
+    if (selectedFile && viewMode === 'edit') {
+      const document = get().documents[selectedFile];
+      if (!document || document.file.kind !== 'text') return;
+      set((state) => ({
+        viewMode,
+        documents: {
+          ...state.documents,
+          [selectedFile]: { ...document, editing: true },
+        },
+      }));
+      return;
+    }
+    set({ viewMode });
+  },
 
-  setViewMode: (mode) => set({ viewMode: mode }),
+  updateDraft: (content) => {
+    const selectedFile = get().selectedFile;
+    if (!selectedFile) return;
+    const document = get().documents[selectedFile];
+    if (!document) return;
+    set((state) => ({
+      documents: {
+        ...state.documents,
+        [selectedFile]: {
+          ...document,
+          draft: content,
+          dirty: content !== document.file.content,
+        },
+      },
+    }));
+  },
+
+  saveSelected: async () => {
+    const selectedFile = get().selectedFile;
+    if (!selectedFile) return false;
+    const document = get().documents[selectedFile];
+    if (!document || !document.dirty || document.file.kind !== 'text') return true;
+    set({ saving: true, error: null });
+    try {
+      const file = await filesApi.write(selectedFile, document.draft, document.file.revision);
+      set((state) => {
+        const current = state.documents[selectedFile];
+        if (!current) return { saving: false };
+        const editedDuringSave = current.draft !== document.draft;
+        return {
+          saving: false,
+          documents: {
+            ...state.documents,
+            [selectedFile]: {
+              file,
+              draft: editedDuringSave ? current.draft : file.content,
+              dirty: editedDuringSave,
+              editing: true,
+              conflict: false,
+            },
+          },
+        };
+      });
+      void get().loadChanges();
+      return true;
+    } catch (error) {
+      const message = errorMessage(error);
+      set((state) => ({
+        saving: false,
+        error: message,
+        documents: {
+          ...state.documents,
+          [selectedFile]: {
+            ...(state.documents[selectedFile] ?? document),
+            conflict: message.includes('changed on disk'),
+          },
+        },
+      }));
+      return false;
+    }
+  },
+
+  discardSelected: async () => {
+    const selectedFile = get().selectedFile;
+    if (!selectedFile) return;
+    set((state) => {
+      const documents = { ...state.documents };
+      delete documents[selectedFile];
+      return { documents };
+    });
+    await get().selectFile(selectedFile, true);
+  },
+
+  refreshSelectedFromDisk: async () => {
+    const selectedFile = get().selectedFile;
+    if (!selectedFile) return;
+    const document = get().documents[selectedFile];
+    if (!document) return;
+    try {
+      const file = await filesApi.read(selectedFile);
+      const latest = get().documents[selectedFile];
+      if (!latest || latest.file.revision !== document.file.revision) return;
+      if (file.revision === latest.file.revision) return;
+      if (latest.dirty) {
+        set((state) => {
+          const current = state.documents[selectedFile];
+          if (!current || current.file.revision !== document.file.revision) return state;
+          return {
+            documents: {
+              ...state.documents,
+              [selectedFile]: { ...current, conflict: true },
+            },
+            error: '文件已被 Agent 或外部程序修改，当前草稿未覆盖磁盘内容',
+          };
+        });
+        return;
+      }
+      set((state) => {
+        const current = state.documents[selectedFile];
+        if (!current || current.file.revision !== document.file.revision) return state;
+        if (current.dirty) {
+          return {
+            documents: {
+              ...state.documents,
+              [selectedFile]: { ...current, conflict: true },
+            },
+            error: '文件已被 Agent 或外部程序修改，当前草稿未覆盖磁盘内容',
+          };
+        }
+        return {
+          documents: {
+            ...state.documents,
+            [selectedFile]: {
+              file,
+              draft: file.content,
+              dirty: false,
+              editing: current.editing,
+              conflict: false,
+            },
+          },
+        };
+      });
+    } catch (error) {
+      set({ error: errorMessage(error) });
+    }
+  },
+
+  closeFile: (path, force = false) => {
+    const state = get();
+    if (state.documents[path]?.dirty && !force) return false;
+    const openFiles = state.openFiles.filter((item) => item !== path);
+    const documents = { ...state.documents };
+    delete documents[path];
+    const selectedFile =
+      state.selectedFile === path ? (openFiles.at(-1) ?? null) : state.selectedFile;
+    set({ openFiles, documents, selectedFile, diffHunks: [], viewMode: 'content' });
+    return true;
+  },
+
+  clearError: () => set({ error: null }),
 }));

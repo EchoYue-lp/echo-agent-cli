@@ -30,13 +30,15 @@ export function imagePoint(
 export function BrowserViewport({
   frame,
   busy,
-  interactive,
+  clickable,
+  scrollable,
   onClickAt,
   onScroll,
 }: {
   frame?: string | null;
   busy: boolean;
-  interactive: boolean;
+  clickable: boolean;
+  scrollable: boolean;
   onClickAt: (x: number, y: number) => void;
   onScroll: (deltaX: number, deltaY: number) => void;
 }) {
@@ -52,7 +54,7 @@ export function BrowserViewport({
     <div
       className="relative min-h-0 flex-1 overflow-hidden bg-white"
       onWheel={(event) => {
-        if (!interactive || busy || !frame) return;
+        if (!scrollable || busy || !frame) return;
         event.preventDefault();
         if (scrollTimer.current !== null) window.clearTimeout(scrollTimer.current);
         pendingScroll.current.x += event.deltaX;
@@ -71,7 +73,7 @@ export function BrowserViewport({
           alt="浏览器页面截图"
           draggable={false}
           onClick={(event) => {
-            if (!interactive || busy) return;
+            if (!clickable || busy) return;
             const image = event.currentTarget;
             const point = imagePoint(
               event.clientX,
@@ -82,7 +84,7 @@ export function BrowserViewport({
             );
             if (point) onClickAt(point.x, point.y);
           }}
-          className={`block h-full w-full select-none object-contain object-top ${interactive && !busy ? 'cursor-pointer' : 'cursor-default'}`}
+          className={`block h-full w-full select-none object-contain object-top ${clickable && !busy ? 'cursor-pointer' : 'cursor-default'}`}
         />
       ) : (
         <div className="flex h-full min-h-[240px] flex-col items-center justify-center gap-2 bg-[var(--bg-chat)] text-[var(--text-tertiary)]">

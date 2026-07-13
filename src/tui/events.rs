@@ -818,6 +818,21 @@ pub async fn run_event_loop(
                 app.status_msg = format!("External editor failed: {error}");
             }
         }
+        if let Some(path) = app.external_file_editor_requested.take() {
+            match open_external_file_editor(terminal, app.inline_mode, &path) {
+                Ok(()) => {
+                    app.status_msg = format!("Saved {}", path.display());
+                    app.messages.push(ChatMessage {
+                        role: MessageRole::System,
+                        content: format!("Edited {} in external editor.", path.display()),
+                    });
+                    app.rebuild_message_groups();
+                }
+                Err(error) => {
+                    app.status_msg = format!("File editor failed: {error}");
+                }
+            }
+        }
         if app.rewind_requested {
             app.rewind_requested = false;
             if let Err(error) = rewind_last_turn(app, &agent).await {
@@ -1519,21 +1534,53 @@ fn open_external_editor(
     let path = std::env::temp_dir().join(format!("eko-prompt-{}.md", uuid::Uuid::new_v4()));
     std::fs::write(&path, &app.input)?;
 
+    let status = run_external_editor(terminal, app.inline_mode, &path);
+    let edited = std::fs::read_to_string(&path);
+    let _ = std::fs::remove_file(&path);
+    status?
+        .success()
+        .then_some(())
+        .ok_or_else(|| anyhow::anyhow!("editor '{editor}' exited unsuccessfully"))?;
+    app.input = edited?;
+    app.cursor = app.input.len();
+    app.update_suggestions();
+    app.status_msg = "Prompt updated from external editor".to_string();
+    Ok(())
+}
+
+fn open_external_file_editor(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    inline_mode: bool,
+    path: &std::path::Path,
+) -> anyhow::Result<()> {
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "vi".to_string());
+    let status = run_external_editor(terminal, inline_mode, path)?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| anyhow::anyhow!("editor '{editor}' exited unsuccessfully"))
+}
+
+fn run_external_editor(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    inline_mode: bool,
+    path: &std::path::Path,
+) -> anyhow::Result<std::process::ExitStatus> {
     disable_raw_mode()?;
     execute!(io::stdout(), DisableBracketedPaste, DisableMouseCapture)?;
-    if !app.inline_mode {
+    if !inline_mode {
         execute!(io::stdout(), LeaveAlternateScreen)?;
     }
     let status = std::process::Command::new("sh")
         .arg("-c")
         .arg("${VISUAL:-${EDITOR:-vi}} \"$1\"")
         .arg("eko-editor")
-        .arg(&path)
+        .arg(path)
         .status();
-    let edited = std::fs::read_to_string(&path);
-    let _ = std::fs::remove_file(&path);
     enable_raw_mode()?;
-    if app.inline_mode {
+    if inline_mode {
         execute!(io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
     } else {
         execute!(
@@ -1544,16 +1591,7 @@ fn open_external_editor(
         )?;
     }
     terminal.clear()?;
-
-    status?
-        .success()
-        .then_some(())
-        .ok_or_else(|| anyhow::anyhow!("editor '{editor}' exited unsuccessfully"))?;
-    app.input = edited?;
-    app.cursor = app.input.len();
-    app.update_suggestions();
-    app.status_msg = "Prompt updated from external editor".to_string();
-    Ok(())
+    status.map_err(Into::into)
 }
 
 fn handle_backspace(app: &mut TuiApp) {
@@ -3092,6 +3130,108 @@ async fn handle_slash_command(
             });
             refresh_task_runtime_view(app);
         }
+        Some(SlashCommand::Preview) => {
+            match resolve_tui_workspace_file(args) {
+                Ok(path) => match std::fs::read_to_string(&path) {
+                    Ok(content) => {
+                        let limit = 40_000;
+                        let truncated = content.chars().count() > limit;
+                        let preview = content.chars().take(limit).collect::<String>();
+                        app.messages.push(ChatMessage {
+                            role: MessageRole::System,
+                            content: format!(
+                                "--- {}{} ---\n{}",
+                                path.display(),
+                                if truncated { " (truncated)" } else { "" },
+                                preview
+                            ),
+                        });
+                    }
+                    Err(error) => app.messages.push(ChatMessage {
+                        role: MessageRole::System,
+                        content: format!("Preview failed: {error}"),
+                    }),
+                },
+                Err(error) => app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: format!("Preview failed: {error}"),
+                }),
+            }
+            app.rebuild_message_groups();
+        }
+        Some(SlashCommand::Edit) => match resolve_tui_workspace_file(args) {
+            Ok(path) => {
+                app.external_file_editor_requested = Some(path);
+                app.status_msg = "Opening file editor...".to_string();
+            }
+            Err(error) => {
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: format!("Edit failed: {error}"),
+                });
+                app.rebuild_message_groups();
+            }
+        },
+        Some(SlashCommand::Browser) => {
+            let Some(runtime) = app.browser_runtime.clone() else {
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: "Browser runtime is unavailable.".to_string(),
+                });
+                app.rebuild_message_groups();
+                return;
+            };
+            let requested = args.trim().to_ascii_lowercase();
+            if requested.is_empty() || requested == "status" {
+                let status = runtime.chrome_status().await;
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: format!(
+                        "Chrome bridge: {}\nEndpoint: {}{}",
+                        if status.connected {
+                            "connected"
+                        } else {
+                            "disconnected"
+                        },
+                        status.endpoint_file.display(),
+                        status
+                            .startup_error
+                            .map(|error| format!("\nError: {error}"))
+                            .unwrap_or_default()
+                    ),
+                });
+            } else if requested == "managed" || requested == "chrome" {
+                let conversation_id = app
+                    .conversation_id
+                    .clone()
+                    .unwrap_or_else(|| "tui-preview".to_string());
+                let params = std::collections::HashMap::from([(
+                    "backend".to_string(),
+                    serde_json::Value::String(requested.clone()),
+                )]);
+                let result = runtime
+                    .execute_main(
+                        conversation_id,
+                        echo_agent_app_core::browser::BrowserAction::Backend,
+                        params,
+                        None,
+                    )
+                    .await;
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: match result {
+                        Ok(_) => format!("Browser backend switched to {requested}."),
+                        Err(error) => format!("Browser backend switch failed: {error}"),
+                    },
+                });
+            } else {
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: "Usage: /browser [status|managed|chrome]".to_string(),
+                });
+            }
+            app.rebuild_message_groups();
+        }
         Some(SlashCommand::Test)
         | Some(SlashCommand::CodeReview)
         | Some(SlashCommand::Diff)
@@ -3164,6 +3304,28 @@ async fn handle_slash_command(
     if !app.is_processing {
         app.status_msg = "Ready".to_string();
     }
+}
+
+fn resolve_tui_workspace_file(value: &str) -> anyhow::Result<std::path::PathBuf> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow::anyhow!("a file path is required"));
+    }
+    let root = std::env::current_dir()?.canonicalize()?;
+    let requested = std::path::PathBuf::from(trimmed);
+    let target = if requested.is_absolute() {
+        requested
+    } else {
+        root.join(requested)
+    }
+    .canonicalize()?;
+    if !target.starts_with(&root) {
+        return Err(anyhow::anyhow!("file is outside the current workspace"));
+    }
+    if !target.is_file() {
+        return Err(anyhow::anyhow!("path is not a file"));
+    }
+    Ok(target)
 }
 
 async fn reset_conversation_state(app: &mut TuiApp, agent: &AgentHandle, new_id: bool) {
@@ -3631,8 +3793,8 @@ fn parse_interaction_mode(
 mod tests {
     use super::{
         complete_file_reference, delete_previous_word, format_task_runtime_view, handle_esc,
-        move_cursor_vertical, parse_interaction_mode, reverse_history_search,
-        slash_command_allowed_while_busy, update_subagent_runs,
+        move_cursor_vertical, parse_interaction_mode, resolve_tui_workspace_file,
+        reverse_history_search, slash_command_allowed_while_busy, update_subagent_runs,
     };
     use crate::tui::{TaskRuntimeTaskView, TaskRuntimeView, Theme, TuiApp};
     use echo_agent_app_core::tasks::task_runtime::types::InteractionMode;
@@ -3753,6 +3915,12 @@ mod tests {
         assert!(complete_file_reference(&mut app));
         assert_eq!(app.input, "检查 @src/中文.rs");
         assert!(app.input.is_char_boundary(app.cursor));
+    }
+
+    #[test]
+    fn tui_workspace_file_resolution_accepts_repo_files_and_rejects_empty_input() {
+        assert!(resolve_tui_workspace_file("Cargo.toml").is_ok());
+        assert!(resolve_tui_workspace_file("").is_err());
     }
 
     #[test]

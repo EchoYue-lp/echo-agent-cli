@@ -772,6 +772,15 @@ export interface FileContent {
   content: string;
   size: number;
   language?: string;
+  kind: 'text' | 'image' | 'pdf' | 'binary';
+  mime_type?: string | null;
+  data_url?: string | null;
+  revision: string;
+}
+
+export interface WorkspaceChange {
+  path: string;
+  status: 'modified' | 'added' | 'deleted';
 }
 
 export interface DiffLine {
@@ -805,6 +814,13 @@ export const filesApi = {
     isTauri()
       ? apiInvoke<FileContent>('read_file', { path })
       : get<FileContent>(`/files/read?path=${encodeURIComponent(path)}`),
+  write: (path: string, content: string, expectedRevision: string) =>
+    isTauri()
+      ? apiInvoke<FileContent>('write_file', { path, content, expectedRevision })
+      : put<FileContent>(`/files/write?path=${encodeURIComponent(path)}`, {
+          content,
+          expected_revision: expectedRevision,
+        }),
   diff: (path: string, gitRef = 'HEAD') =>
     isTauri()
       ? apiInvoke<DiffResult>('diff_file', { path, git_ref: gitRef })
@@ -813,6 +829,10 @@ export const filesApi = {
     isTauri()
       ? apiInvoke<FileTreeNode[]>('file_tree', { depth })
       : get<FileTreeNode[]>(`/files/tree?depth=${depth}`),
+  changes: () =>
+    isTauri()
+      ? apiInvoke<WorkspaceChange[]>('workspace_changes')
+      : get<WorkspaceChange[]>('/files/changes'),
 };
 
 // ── Terminal API ────────────────────────────────────────────────────

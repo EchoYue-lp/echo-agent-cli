@@ -1,6 +1,6 @@
 # GUI Status
 
-Last reviewed: 2026-06-16
+Last reviewed: 2026-07-13
 
 This document records the real GUI/Tauri state so review work does not mistake hidden or stubbed panels for completed features.
 
@@ -53,6 +53,11 @@ These GUI surfaces are visible and backed by real Tauri IPC or runtime state:
 | Scratchpad | Connected to `.eko/scratchpad.md` |
 | Decisions | Connected to `.eko/decisions.jsonl` |
 | Worktree | Connected to `git worktree` |
+| Unified right workspace | Connected: tasks plus web/file preview, resizable desktop and full-width mobile overlay |
+| Managed browser preview | Connected: URL navigation, tabs, screenshots, bounded live refresh, visible command errors |
+| Chrome browser backend | Connected through setup/status UI, native-host registration, extension authorization, and explicit backend selection |
+| Project file preview | Connected: tree, Git changes, text/image/PDF/binary states, and diff |
+| Controlled file editing | Connected: CodeMirror text editing, dirty tabs, save shortcut, atomic write, and revision conflict protection |
 
 ## Hidden Or Partial GUI Features
 
@@ -71,3 +76,5 @@ These surfaces must not be presented as finished GUI features:
 - GUI feature completeness should be reviewed by visible surface plus backend behavior, not by the existence of frontend components.
 - Hidden frontend components are allowed while backend work is pending, but README/review docs must list them as hidden or incomplete.
 - `cargo gui-dev` is the preferred daily GUI command. `cargo tauri dev` is compatibility convenience.
+- Browser backend switching is explicit. EKO does not infer Chrome from a URL or login page.
+- File editing is optional and text-only; preview remains the default workspace behavior.

@@ -1,19 +1,8 @@
-import { useEffect, useMemo, useState } from 'react';
-import {
-  CheckCircle2,
-  Circle,
-  Loader2,
-  AlertCircle,
-  ListTodo,
-  ChevronLeft,
-  PanelRightClose,
-} from 'lucide-react';
-import { useConversationStore } from '../../stores/conversationStore';
-import { useChangesStore } from '../../stores/changesStore';
+import { useEffect } from 'react';
+import { AlertCircle, CheckCircle2, Circle, FileDiff, ListTodo, Loader2 } from 'lucide-react';
 import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
-import { deriveChangedFiles } from '../../utils/deriveChangedFiles';
-import { useChatStore } from '../../stores/chatStore';
-import { ChangesDrawer } from '../changes/ChangesDrawer';
+import { useFileStore } from '../../stores/fileStore';
+import { useRightWorkspaceStore } from '../../stores/rightWorkspaceStore';
 
 const TODO_LABEL: Record<string, string> = {
   pending: '待处理',
@@ -24,102 +13,55 @@ const TODO_LABEL: Record<string, string> = {
   skipped: '已跳过',
 };
 
-/** Status icon for a todo, driven by the store's raw status (no subagent derivation). */
 function TodoIcon({ status }: { status: string }) {
   switch (status) {
     case 'completed':
-      return <CheckCircle2 size={13} style={{ color: 'var(--color-success)' }} />;
+      return <CheckCircle2 size={13} className="text-[var(--color-success)]" />;
     case 'running':
-      return <Loader2 size={13} className="animate-spin" style={{ color: 'var(--color-info)' }} />;
+      return <Loader2 size={13} className="animate-spin text-[var(--color-info)]" />;
     case 'failed':
-      return <AlertCircle size={13} style={{ color: 'var(--color-error)' }} />;
+      return <AlertCircle size={13} className="text-[var(--color-error)]" />;
     default:
-      return <Circle size={13} style={{ color: 'var(--text-tertiary)' }} />;
+      return <Circle size={13} className="text-[var(--text-tertiary)]" />;
   }
 }
 
-/**
- * RightRail — a compact task-todo capsule.
- *
- * Collapsed (default): a small floating pill in the top-right corner showing
- * the live todo progress (e.g. "2/5"). Expanded: a narrow panel with just the
- * todo list. Everything else the old "工作台" showed (run header, cache usage,
- * subagents, changed-files output) was removed — those are available elsewhere
- * (main timeline / changes drawer) and made the rail a heavy 316px card.
- */
 export function RightRail() {
-  const [expanded, setExpanded] = useState(false);
-  const activeId = useConversationStore((s) => s.activeId);
-  const messages = useChatStore((s) => s.messages);
-  const { todos } = useTaskRuntimeStore();
+  const todos = useTaskRuntimeStore((state) => state.todos);
+  const changes = useFileStore((state) => state.changes);
+  const loadChanges = useFileStore((state) => state.loadChanges);
+  const loadDiff = useFileStore((state) => state.loadDiff);
+  const openFiles = useRightWorkspaceStore((state) => state.openFiles);
+  const completed = todos.filter((todo) => todo.status === 'completed').length;
 
-  // Changed-files derivation feeds the ChangesDrawer (opened from the main
-  // panel); the rail itself no longer lists them.
   useEffect(() => {
-    useChangesStore.getState().checkSessionChange(activeId);
-  }, [activeId]);
-  const toolCallCount = useMemo(() => {
-    let n = 0;
-    for (const m of messages) n += (m.toolCalls ?? []).length;
-    return n;
-  }, [messages]);
-  useEffect(() => {
-    useChangesStore.getState().setFiles(deriveChangedFiles(messages));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [toolCallCount]);
-
-  const completedCount = todos.filter((t) => t.status === 'completed').length;
-  const hasTodos = todos.length > 0;
-
-  // No todos and nothing to track → don't render the rail at all.
-  if (!hasTodos) {
-    return <ChangesDrawer />;
-  }
+    void loadChanges();
+    const timer = window.setInterval(() => void loadChanges(), 2500);
+    return () => window.clearInterval(timer);
+  }, [loadChanges]);
 
   return (
-    <aside className="relative hidden h-full shrink-0 overflow-visible lg:block">
-      {/* Collapsed: small floating capsule */}
-      {!expanded && (
-        <button
-          onClick={() => setExpanded(true)}
-          className="absolute right-3 top-14 z-30 flex items-center gap-1.5 rounded-full border border-[var(--border-primary)] bg-[var(--bg-primary)]/95 px-2.5 py-1.5 text-xs font-medium tabular-nums text-[var(--text-secondary)] shadow-[var(--shadow-sm)] backdrop-blur transition-colors hover:border-[var(--accent)] hover:text-[var(--text-primary)]"
-          title="展开任务列表"
-          aria-label="展开任务列表"
-        >
-          <ListTodo size={13} />
-          <span>
-            {completedCount}/{todos.length}
+    <div className="flex h-full min-h-0 flex-col overflow-y-auto">
+      <section className="border-b border-[var(--border-primary)]">
+        <div className="flex h-9 items-center justify-between px-3">
+          <div className="flex items-center gap-1.5 text-xs font-medium text-[var(--text-primary)]">
+            <ListTodo size={13} className="text-[var(--accent)]" />
+            任务
+          </div>
+          <span className="text-[10px] tabular-nums text-[var(--text-tertiary)]">
+            {completed}/{todos.length}
           </span>
-          <ChevronLeft size={12} className="text-[var(--text-tertiary)]" />
-        </button>
-      )}
-
-      {/* Expanded: narrow todo-only panel */}
-      {expanded && (
-        <div className="flex h-full w-[240px] flex-col border-l border-[var(--border-primary)] bg-[var(--bg-rail)]">
-          <header className="flex shrink-0 items-center justify-between gap-2 px-3 py-2.5">
-            <div className="flex min-w-0 items-center gap-1.5">
-              <ListTodo size={13} style={{ color: 'var(--accent)' }} />
-              <span className="text-xs font-medium text-[var(--text-primary)]">任务</span>
-              <span className="text-[10px] tabular-nums text-[var(--text-tertiary)]">
-                {completedCount}/{todos.length}
-              </span>
+        </div>
+        <div className="space-y-0.5 px-2 pb-3">
+          {todos.length === 0 ? (
+            <div className="px-2 py-5 text-center text-xs text-[var(--text-tertiary)]">
+              当前没有执行中的任务
             </div>
-            <button
-              onClick={() => setExpanded(false)}
-              className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
-              title="收起"
-              aria-label="收起"
-            >
-              <PanelRightClose size={14} />
-            </button>
-          </header>
-
-          <div className="min-h-0 flex-1 space-y-0.5 overflow-y-auto px-2 pb-3">
-            {todos.map((todo) => (
+          ) : (
+            todos.map((todo) => (
               <div
                 key={todo.id}
-                className="flex items-start gap-1.5 rounded-md px-1.5 py-1 hover:bg-[var(--bg-hover)]"
+                className="flex items-start gap-2 rounded-md px-2 py-1.5 hover:bg-[var(--bg-hover)]"
               >
                 <div className="mt-0.5 shrink-0">
                   <TodoIcon status={todo.status} />
@@ -136,12 +78,52 @@ export function RightRail() {
                   </div>
                 </div>
               </div>
-            ))}
-          </div>
+            ))
+          )}
         </div>
-      )}
+      </section>
 
-      <ChangesDrawer />
-    </aside>
+      <section className="min-h-0 flex-1">
+        <div className="flex h-9 items-center justify-between px-3">
+          <div className="flex items-center gap-1.5 text-xs font-medium text-[var(--text-primary)]">
+            <FileDiff size={13} className="text-[var(--accent)]" />
+            工作区变更
+          </div>
+          <span className="text-[10px] text-[var(--text-tertiary)]">{changes.length}</span>
+        </div>
+        <div className="space-y-0.5 px-2 pb-3">
+          {changes.length === 0 ? (
+            <div className="px-2 py-5 text-center text-xs text-[var(--text-tertiary)]">
+              工作区没有未提交变更
+            </div>
+          ) : (
+            changes.map((change) => (
+              <button
+                key={`${change.status}:${change.path}`}
+                type="button"
+                onClick={() => {
+                  openFiles();
+                  void loadDiff(change.path);
+                }}
+                className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left hover:bg-[var(--bg-hover)]"
+              >
+                <span
+                  className={`h-1.5 w-1.5 shrink-0 rounded-full ${
+                    change.status === 'added'
+                      ? 'bg-[var(--color-success)]'
+                      : change.status === 'deleted'
+                        ? 'bg-[var(--color-error)]'
+                        : 'bg-[var(--color-warning)]'
+                  }`}
+                />
+                <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-[var(--text-secondary)]">
+                  {change.path}
+                </span>
+              </button>
+            ))
+          )}
+        </div>
+      </section>
+    </div>
   );
 }

@@ -31,7 +31,7 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' ws://127.0.0.1:* ws://localhost:* wss://127.0.0.1:* wss://localhost:*; img-src 'self' data: blob:; font-src 'self' data:"
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' ws://127.0.0.1:* ws://localhost:* wss://127.0.0.1:* wss://localhost:*; img-src 'self' data: blob:; frame-src 'self' data: blob:; font-src 'self' data:"
     }
   },
   "bundle": {
@@ -43,6 +43,9 @@
       "src-tauri/icons/128x128@2x.png",
       "src-tauri/icons/icon.icns",
       "src-tauri/icons/icon.ico"
-    ]
+    ],
+    "resources": {
+      "chrome-extension/": "chrome-extension/"
+    }
   }
 }

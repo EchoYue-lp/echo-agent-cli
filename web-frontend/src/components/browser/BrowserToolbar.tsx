@@ -13,6 +13,7 @@ export function BrowserToolbar({
   backend,
   chromeConnected,
   onBackendChange,
+  onChromeSetup,
 }: {
   url: string;
   busy: boolean;
@@ -25,6 +26,7 @@ export function BrowserToolbar({
   backend: 'managed' | 'chrome';
   chromeConnected: boolean;
   onBackendChange: (backend: 'managed' | 'chrome') => void;
+  onChromeSetup: () => void;
 }) {
   const [value, setValue] = useState(url);
   useEffect(() => setValue(url), [url]);
@@ -76,15 +78,20 @@ export function BrowserToolbar({
       <select
         id="browser-backend"
         value={backend}
-        onChange={(event) => onBackendChange(event.target.value as 'managed' | 'chrome')}
-        className="h-7 w-[68px] shrink-0 rounded-md border border-[var(--border-primary)] bg-[var(--bg-chat)] px-1.5 text-[11px] text-[var(--text-secondary)] outline-none focus:border-[var(--accent)]"
-        title={chromeConnected ? '选择浏览器模式' : 'Chrome 扩展未连接'}
+        onChange={(event) => {
+          const next = event.target.value as 'managed' | 'chrome';
+          if (next === 'chrome' && !chromeConnected) {
+            onChromeSetup();
+            return;
+          }
+          onBackendChange(next);
+        }}
+        className="h-7 w-[96px] shrink-0 rounded-md border border-[var(--border-primary)] bg-[var(--bg-chat)] px-1.5 text-[11px] text-[var(--text-secondary)] outline-none focus:border-[var(--accent)]"
+        title={chromeConnected ? '选择浏览器模式' : '连接 Chrome'}
         aria-label="浏览器模式"
       >
         <option value="managed">内置</option>
-        <option value="chrome" disabled={!chromeConnected}>
-          Chrome
-        </option>
+        <option value="chrome">{chromeConnected ? 'Chrome' : '连接 Chrome…'}</option>
       </select>
       <button type="button" className={iconClass} onClick={onClose} title="关闭浏览器面板">
         <X size={14} />
