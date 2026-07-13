@@ -74,6 +74,45 @@ pub async fn browser_screenshot(
 }
 
 #[tauri::command]
+pub async fn browser_click_at(
+    state: State<'_, TauriState>,
+    conversation_id: String,
+    x: f64,
+    y: f64,
+) -> Result<(), String> {
+    execute(
+        &state,
+        conversation_id,
+        BrowserAction::ClickAt,
+        HashMap::from([
+            ("x".to_string(), json!(x)),
+            ("y".to_string(), json!(y)),
+            ("effect".to_string(), Value::String("none".to_string())),
+        ]),
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn browser_scroll(
+    state: State<'_, TauriState>,
+    conversation_id: String,
+    delta_x: f64,
+    delta_y: f64,
+) -> Result<(), String> {
+    execute(
+        &state,
+        conversation_id,
+        BrowserAction::Scroll,
+        HashMap::from([
+            ("deltaX".to_string(), json!(delta_x)),
+            ("deltaY".to_string(), json!(delta_y)),
+        ]),
+    )
+    .await
+}
+
+#[tauri::command]
 pub async fn browser_tabs(
     state: State<'_, TauriState>,
     conversation_id: String,

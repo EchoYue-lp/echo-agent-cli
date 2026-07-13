@@ -75,13 +75,14 @@ interface BrowserStore {
   open: boolean;
   views: Record<string, BrowserViewState>;
   chromeConnected: boolean;
-  toggle: () => void;
   setOpen: (open: boolean) => void;
   ingest: (event: BrowserEvent) => void;
   navigate: (conversationId: string, url: string) => Promise<void>;
   back: (conversationId: string) => Promise<void>;
   reload: (conversationId: string) => Promise<void>;
   refreshFrame: (conversationId: string) => Promise<void>;
+  clickAt: (conversationId: string, x: number, y: number) => Promise<void>;
+  scroll: (conversationId: string, deltaX: number, deltaY: number) => Promise<void>;
   stop: () => Promise<void>;
   selectTab: (conversationId: string, index: number) => Promise<void>;
   newTab: (conversationId: string) => Promise<void>;
@@ -110,7 +111,6 @@ export const useBrowserStore = create<BrowserStore>((set) => ({
   open: false,
   views: {},
   chromeConnected: false,
-  toggle: () => set((state) => ({ open: !state.open })),
   setOpen: (open) => set({ open }),
   ingest: (event) =>
     set((state) => {
@@ -250,6 +250,32 @@ export const useBrowserStore = create<BrowserStore>((set) => ({
   back: (conversationId) => invokeBrowser('browser_back', { conversationId }),
   reload: (conversationId) => invokeBrowser('browser_reload', { conversationId }),
   refreshFrame: (conversationId) => invokeBrowser('browser_screenshot', { conversationId }),
+  clickAt: async (conversationId, x, y) => {
+    try {
+      await invokeBrowser('browser_click_at', { conversationId, x, y });
+    } catch (error) {
+      set((state) => ({
+        views: updateSession(
+          state.views,
+          state.views[conversationId]?.session.id ?? '',
+          (view) => ({ ...view, error: errorMessage(error) })
+        ),
+      }));
+    }
+  },
+  scroll: async (conversationId, deltaX, deltaY) => {
+    try {
+      await invokeBrowser('browser_scroll', { conversationId, deltaX, deltaY });
+    } catch (error) {
+      set((state) => ({
+        views: updateSession(
+          state.views,
+          state.views[conversationId]?.session.id ?? '',
+          (view) => ({ ...view, error: errorMessage(error) })
+        ),
+      }));
+    }
+  },
   stop: () => invokeBrowser('browser_stop'),
   selectTab: (conversationId, index) =>
     invokeBrowser('browser_tabs', { conversationId, action: 'select', index }),

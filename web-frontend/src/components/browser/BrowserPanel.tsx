@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { Activity, Chrome, Globe2, PanelRightOpen } from 'lucide-react';
+import { Activity, Chrome, Globe2 } from 'lucide-react';
 import { useBrowserEvents } from '../../hooks/useBrowserEvents';
 import { useConversationStore } from '../../stores/conversationStore';
 import { useBrowserStore } from '../../stores/browserStore';
@@ -26,16 +26,7 @@ export function BrowserPanel() {
     view?.session.status === 'acting' ||
     view?.session.status === 'starting';
 
-  if (!open)
-    return (
-      <button
-        onClick={store.toggle}
-        className="absolute right-3 top-3 z-30 flex h-8 w-8 items-center justify-center rounded-md border border-[var(--border-primary)] bg-[var(--bg-primary)] text-[var(--text-tertiary)] shadow-[var(--shadow-sm)] hover:text-[var(--text-primary)]"
-        title="打开浏览器面板"
-      >
-        <PanelRightOpen size={15} />
-      </button>
-    );
+  if (!open) return null;
 
   const call = (fn: (id: string) => Promise<void>) => {
     if (conversationId) void fn(conversationId);
@@ -69,7 +60,15 @@ export function BrowserPanel() {
           onNew={() => call(store.newTab)}
           onClose={(index) => conversationId && void store.closeTab(conversationId, index)}
         />
-        <BrowserViewport frame={view?.frame} busy={Boolean(busy)} />
+        <BrowserViewport
+          frame={view?.frame}
+          busy={Boolean(busy)}
+          interactive={Boolean(conversationId && view)}
+          onClickAt={(x, y) => conversationId && void store.clickAt(conversationId, x, y)}
+          onScroll={(deltaX, deltaY) =>
+            conversationId && void store.scroll(conversationId, deltaX, deltaY)
+          }
+        />
         <footer className="flex h-7 shrink-0 items-center justify-between gap-3 border-t border-[var(--border-primary)] px-2.5">
           <BrowserStatus status={view?.session.status} error={view?.error} />
           <div className="flex min-w-0 items-center gap-2 text-[10px] text-[var(--text-tertiary)]">

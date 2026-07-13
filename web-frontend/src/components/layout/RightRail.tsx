@@ -1,5 +1,13 @@
 import { useEffect, useMemo, useState } from 'react';
-import { CheckCircle2, Circle, Loader2, AlertCircle, ListTodo, ChevronLeft } from 'lucide-react';
+import {
+  CheckCircle2,
+  Circle,
+  Loader2,
+  AlertCircle,
+  ListTodo,
+  ChevronLeft,
+  PanelRightClose,
+} from 'lucide-react';
 import { useConversationStore } from '../../stores/conversationStore';
 import { useChangesStore } from '../../stores/changesStore';
 import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
@@ -103,7 +111,7 @@ export function RightRail() {
               title="收起"
               aria-label="收起"
             >
-              <ChevronLeft size={14} className="rotate-180" />
+              <PanelRightClose size={14} />
             </button>
           </header>
 

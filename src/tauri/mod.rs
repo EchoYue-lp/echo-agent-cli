@@ -110,6 +110,8 @@ pub fn build_tauri_app(
             commands::browser::browser_back,
             commands::browser::browser_reload,
             commands::browser::browser_screenshot,
+            commands::browser::browser_click_at,
+            commands::browser::browser_scroll,
             commands::browser::browser_tabs,
             commands::browser::browser_stop,
             commands::browser::browser_set_backend,

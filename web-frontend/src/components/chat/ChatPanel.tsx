@@ -12,9 +12,10 @@ import { useSubagentDetailStore } from '../../stores/subagentDetailStore';
 import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
 import { SubagentDetailView } from '../task/SubagentDetailView';
 import { FailureToast } from './FailureToast';
-import { CornerUpLeft, GripVertical, X } from 'lucide-react';
+import { CornerUpLeft, Globe2, GripVertical, X } from 'lucide-react';
 import type { Attachment } from '../../types/api';
 import type { QueuedChatInput } from '../../hooks/useTauriChat';
+import { useBrowserStore } from '../../stores/browserStore';
 
 // Tauri IPC is the only live transport. The WebSocket transport
 // (hooks/useWebSocket.ts) was removed after the chat path migrated to Tauri
@@ -32,6 +33,8 @@ export function ChatPanel() {
   const isCancelled = useChatStore((s) => s.isCancelled);
   const runStatus = useChatStore((s) => s.runStatus);
   const currentWorkspace = useWorkspaceStore((s) => s.current);
+  const browserOpen = useBrowserStore((s) => s.open);
+  const setBrowserOpen = useBrowserStore((s) => s.setOpen);
   const subagentRuns = useSubagentRunStore((s) => s.runs);
   const selectedSubagentRef = useSubagentDetailStore((s) => s.selected);
   const closeSubagentDetail = useSubagentDetailStore((s) => s.close);
@@ -133,9 +136,22 @@ export function ChatPanel() {
             {currentWorkspace?.root || '选择或创建一个任务开始工作'}
           </div>
         </div>
-        <div className="hidden items-center gap-2 text-xs text-[var(--text-tertiary)] sm:flex">
-          <span className="h-2 w-2 rounded-full bg-[var(--accent)]" />
-          <span>{runStatusLabel(runStatus, isStreaming)}</span>
+        <div className="flex items-center gap-2 text-xs text-[var(--text-tertiary)]">
+          <div className="hidden items-center gap-2 sm:flex">
+            <span className="h-2 w-2 rounded-full bg-[var(--accent)]" />
+            <span>{runStatusLabel(runStatus, isStreaming)}</span>
+          </div>
+          {!browserOpen && (
+            <button
+              type="button"
+              onClick={() => setBrowserOpen(true)}
+              className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+              title="打开浏览器"
+              aria-label="打开浏览器"
+            >
+              <Globe2 size={15} />
+            </button>
+          )}
         </div>
       </div>
       {selectedSubagent ? (

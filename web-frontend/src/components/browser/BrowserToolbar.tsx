@@ -1,14 +1,5 @@
 import { useEffect, useState } from 'react';
-import {
-  AppWindow,
-  ArrowLeft,
-  ArrowRight,
-  Chrome,
-  RefreshCw,
-  RotateCw,
-  Square,
-  X,
-} from 'lucide-react';
+import { ArrowLeft, Camera, CornerDownLeft, RotateCw, Square, X } from 'lucide-react';
 
 export function BrowserToolbar({
   url,
@@ -47,14 +38,18 @@ export function BrowserToolbar({
   const iconClass =
     'flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] disabled:opacity-35';
   return (
-    <div className="flex h-10 shrink-0 items-center gap-1 border-b border-[var(--border-primary)] bg-[var(--bg-primary)] px-2">
-      <button className={iconClass} onClick={onBack} title="后退">
+    <form
+      className="flex h-10 shrink-0 items-center gap-1 border-b border-[var(--border-primary)] bg-[var(--bg-primary)] px-2"
+      onSubmit={(event) => {
+        event.preventDefault();
+        submit();
+      }}
+    >
+      <button type="button" className={iconClass} onClick={onBack} title="后退">
         <ArrowLeft size={14} />
       </button>
-      <button className={iconClass} disabled title="前进暂不可用">
-        <ArrowRight size={14} />
-      </button>
       <button
+        type="button"
         className={iconClass}
         onClick={busy ? onStop : onReload}
         title={busy ? '停止' : '刷新'}
@@ -64,35 +59,36 @@ export function BrowserToolbar({
       <input
         value={value}
         onChange={(event) => setValue(event.target.value)}
-        onKeyDown={(event) => {
-          if (event.key === 'Enter') submit();
-        }}
         className="h-7 min-w-0 flex-1 rounded-md border border-[var(--border-primary)] bg-[var(--bg-chat)] px-2.5 text-xs text-[var(--text-primary)] outline-none focus:border-[var(--accent)]"
         aria-label="地址"
+        placeholder="输入网址"
         spellCheck={false}
       />
-      <button className={iconClass} onClick={onRefreshFrame} title="刷新画面">
-        <RefreshCw size={13} />
+      <button type="submit" className={iconClass} disabled={busy || !value.trim()} title="前往">
+        <CornerDownLeft size={13} />
       </button>
-      <div className="flex h-7 shrink-0 items-center rounded-md border border-[var(--border-primary)] p-0.5">
-        <button
-          className={`${iconClass} h-6 w-6 ${backend === 'managed' ? 'bg-[var(--bg-hover)] text-[var(--text-primary)]' : ''}`}
-          onClick={() => onBackendChange('managed')}
-          title="托管 Chromium"
-        >
-          <AppWindow size={12} />
-        </button>
-        <button
-          className={`${iconClass} h-6 w-6 ${backend === 'chrome' ? 'bg-[var(--bg-hover)] text-[var(--text-primary)]' : ''}`}
-          onClick={() => onBackendChange('chrome')}
-          title={chromeConnected ? '已连接 Chrome' : 'Chrome 扩展未连接'}
-        >
-          <Chrome size={12} />
-        </button>
-      </div>
-      <button className={iconClass} onClick={onClose} title="关闭浏览器面板">
+      <button type="button" className={iconClass} onClick={onRefreshFrame} title="更新页面截图">
+        <Camera size={13} />
+      </button>
+      <label className="sr-only" htmlFor="browser-backend">
+        浏览器模式
+      </label>
+      <select
+        id="browser-backend"
+        value={backend}
+        onChange={(event) => onBackendChange(event.target.value as 'managed' | 'chrome')}
+        className="h-7 w-[68px] shrink-0 rounded-md border border-[var(--border-primary)] bg-[var(--bg-chat)] px-1.5 text-[11px] text-[var(--text-secondary)] outline-none focus:border-[var(--accent)]"
+        title={chromeConnected ? '选择浏览器模式' : 'Chrome 扩展未连接'}
+        aria-label="浏览器模式"
+      >
+        <option value="managed">内置</option>
+        <option value="chrome" disabled={!chromeConnected}>
+          Chrome
+        </option>
+      </select>
+      <button type="button" className={iconClass} onClick={onClose} title="关闭浏览器面板">
         <X size={14} />
       </button>
-    </div>
+    </form>
   );
 }
