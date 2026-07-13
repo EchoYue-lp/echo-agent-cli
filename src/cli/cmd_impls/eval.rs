@@ -65,6 +65,17 @@ async fn cmd_trace(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
                             }
                             RunEvent::Error { message } => println!("  Error: {}", message),
                             RunEvent::Checkpoint { id } => println!("  Checkpoint: {}", id),
+                            RunEvent::CheckpointResumed {
+                                conversation_id,
+                                completed_tool_call_ids,
+                                checkpoint_timestamp,
+                            } => println!(
+                                "  Resumed: {} at {} ({} completed tools: {})",
+                                conversation_id,
+                                checkpoint_timestamp,
+                                completed_tool_call_ids.len(),
+                                completed_tool_call_ids.join(", ")
+                            ),
                             RunEvent::PhaseTransition { phase, iteration } => {
                                 println!("  Phase: {} (iteration {})", phase, iteration)
                             }
