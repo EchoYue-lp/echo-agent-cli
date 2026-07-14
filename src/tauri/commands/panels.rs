@@ -1025,6 +1025,7 @@ pub async fn get_compression_stats(
         token_limit,
         compression_ratio,
         protected_message_count,
+        protected_tokens,
         runtime_recovery_active,
     ) = state
         .app_state
@@ -1041,6 +1042,7 @@ pub async fn get_compression_stats(
                     token_limit,
                     ratio,
                     ctx.protected_message_count(),
+                    ctx.protected_token_estimate(),
                     ctx.has_projection(RUNTIME_RECOVERY_MARKER),
                 )
             })
@@ -1054,6 +1056,7 @@ pub async fn get_compression_stats(
         "token_limit": token_limit,
         "compression_ratio": compression_ratio,
         "protected_message_count": protected_message_count,
+        "protected_tokens": protected_tokens,
         "runtime_recovery_active": runtime_recovery_active,
         "needs_compression": needs_compression,
     }))

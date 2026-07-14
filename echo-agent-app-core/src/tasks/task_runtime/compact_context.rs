@@ -156,7 +156,7 @@ impl PreModelContextProjector for TaskRuntimeContextProjector {
 /// Protect the dynamic task brief for the current worker invocation.
 pub async fn install_task_context_protection(agent: &ReactAgent) {
     let mut ctx = agent.context().lock().await;
-    ctx.add_protected_marker(TASK_CONTEXT_MARKER.to_string());
+    ctx.add_replaceable_protected_marker(TASK_CONTEXT_MARKER.to_string());
 }
 
 /// Derive a compact, compression-safe view of the active runtime state.
@@ -399,6 +399,49 @@ mod tests {
     use chrono::Utc;
     use echo_agent::compression::{ContextManager, PreModelContextProjector, ProjectionContext};
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn worker_task_context_protection_replaces_previous_brief() -> Result<(), String> {
+        let agent = ReactAgent::new(echo_agent::agent::AgentConfig::minimal(
+            "test-model",
+            "worker",
+        ));
+        install_task_context_protection(&agent).await;
+        let context_handle = agent.context();
+        let mut context = context_handle.lock().await;
+        context.push(Message::user(format!(
+            "{TASK_CONTEXT_MARKER} previous assignment"
+        )));
+        context.push(Message::user(format!(
+            "{TASK_CONTEXT_MARKER} current assignment"
+        )));
+
+        let briefs: Vec<_> = context
+            .messages()
+            .iter()
+            .filter(|message| {
+                message
+                    .content
+                    .as_text_ref()
+                    .is_some_and(|text| text.contains(TASK_CONTEXT_MARKER))
+            })
+            .collect();
+        if briefs.len() != 1 {
+            return Err(format!(
+                "expected one current task brief, got {}",
+                briefs.len()
+            ));
+        }
+        if !briefs.first().is_some_and(|message| {
+            message
+                .content
+                .as_text_ref()
+                .is_some_and(|text| text.ends_with("current assignment"))
+        }) {
+            return Err("latest task brief was not retained".to_string());
+        }
+        Ok(())
+    }
 
     fn seed_store() -> Result<TaskRuntimeStore, String> {
         let store =
