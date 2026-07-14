@@ -21,29 +21,20 @@ allowed-tools: []
 
 Help turn ideas into fully formed designs and specs through natural collaborative dialogue.
 
-Start by understanding the current project context, then ask questions one at a time to refine the idea. Once you understand what you're building, present the design and get user approval.
-
-<HARD-GATE>
-Do NOT invoke any implementation skill, write any code, scaffold any project, or take any implementation action until you have presented a design and the user has approved it. This applies to EVERY project regardless of perceived simplicity.
-</HARD-GATE>
-
-## Anti-Pattern: "This Is Too Simple To Need A Design"
-
-Every project goes through this process. A todo list, a single-function utility, a config change — all of them. "Simple" projects are where unexamined assumptions cause the most wasted work. The design can be short (a few sentences for truly simple projects), but you MUST present it and get approval.
+Use this skill when the user is exploring an idea, requests a design/spec, or when a high-impact implementation choice is genuinely unresolved. Do not turn a clear bug fix, small config change, or already-approved design into a mandatory approval ceremony.
 
 ## Checklist
 
 1. **Explore project context** — check files, docs, recent commits
-2. **Ask clarifying questions** — one at a time, understand purpose/constraints/success criteria
-3. **Propose 2-3 approaches** — with trade-offs and your recommendation
-4. **Present design** — get user approval
-5. **Write design doc** — save and commit
-6. **Transition to implementation** — invoke writing-plans skill
+2. **Define outcome and constraints** — ask only questions whose answers materially change the design
+3. **Investigate precedent** — for architecture, state, API, or orchestration decisions, research mature implementations and existing repository mechanisms
+4. **Compare viable approaches** — include alternatives only when they are meaningfully different
+5. **Present a recommendation** — explain trade-offs, ownership boundary, failure behavior, and validation
+6. **Get approval when needed** — required for requested design-only work or a choice that changes scope; otherwise proceed within the user's implementation authorization
 
 ## Key Principles
 
-- **One question at a time** - Don't overwhelm with multiple questions
-- **Multiple choice preferred** - Easier to answer than open-ended when possible
+- **Narrow questions** - Ask only what cannot be discovered and would materially affect the result
 - **YAGNI ruthlessly** - Remove unnecessary features from all designs
 - **Explore alternatives** - Always propose 2-3 approaches before settling
 - **Incremental validation** - Present design, get approval before moving on

@@ -17,17 +17,20 @@ allowed-tools: [bash, git]
 
 # Using Git Worktrees
 
-When starting feature work that needs isolation from the current workspace, use git worktrees to create an isolated workspace.
+Use git worktrees when isolated writes materially protect the current workspace or enable safe parallel development. Follow repository-specific worktree rules and paths.
 
 ## When to Use
 
-- Before executing implementation plans
-- When working on features that need isolation
-- Before making changes that could affect the main workspace
+- Parallel writer tasks with disjoint ownership
+- Risky or long-lived feature work that should not mix with current uncommitted changes
+- Cross-repository work where each repository needs a dedicated branch/worktree
 
 ## Process
 
-1. Create a worktree: `git worktree add -b feature/name ../path feature-name`
-2. Work in the isolated directory
-3. When done, remove: `git worktree remove ../path`
-4. Clean up branch if not merged
+1. Inspect status, branches, existing worktrees, ignore rules, and the repository's required worktree location.
+2. Create a clearly named branch/worktree without overwriting an existing path. Record any temporary dependency-path changes.
+3. Work and verify inside the worktree. Do not modify the main checkout or another worker's worktree.
+4. Before integration, merge/reconcile the current main branch as required and restore portable relative dependency paths.
+5. Verify the integrated result, then remove/prune the worktree and delete the branch only after confirming no unique work remains.
+
+Do not assume the example command or directory layout fits every repository. Never delete a worktree or branch merely because it is not currently checked out.

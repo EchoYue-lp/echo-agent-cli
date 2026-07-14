@@ -2291,16 +2291,20 @@ fn build_task_prompt(
     }
     if task.kind.is_read_only() {
         s.push_str(
-            "You are a READ-ONLY subagent. Do NOT modify files or run mutating shell commands. \
-             Report findings concretely with file paths.\n",
+            "Execution boundary: READ-ONLY. You may inspect files, metadata, logs, and other \
+             available evidence, including non-mutating commands. Do not edit files, install \
+             dependencies, change repository state, or run commands with side effects.\n",
         );
     } else {
         s.push_str(
-            "You may make the scoped change described above. Keep edits minimal and on-scope. \
-             Run the listed verification when done.\n",
+            "Execution boundary: SCOPED WRITE. Change only the targets required for this task, \
+             preserve unrelated user work, and run every listed verification that is available.\n",
         );
     }
-    s.push_str("\nYou may plan your own steps internally, but do not modify the global plan. ");
+    s.push_str(
+        "\nWork to the stated outcome and success evidence. Inspect before concluding, keep fact and \
+         inference distinct, and do not modify the global plan. ",
+    );
     if delegation_policy.can_delegate() {
         s.push_str(
             "This role may use agent_tool for tightly scoped child subagent help within this \
@@ -2311,25 +2315,26 @@ fn build_task_prompt(
         s.push_str("Do not delegate this task to other agents. ");
     }
     s.push_str(
-        "If this task reveals follow-up work that should be scheduled by the main TaskRuntime, \
+        "If the evidence reveals genuinely required follow-up work that is outside this task, \
          include an optional fenced JSON block exactly like:\n\
          ```json\n\
          {\"suggested_tasks\":[{\"title\":\"short title\",\"description\":\"specific follow-up\",\
          \"kind\":\"investigation\",\"agent_role\":\"explorer\",\"dependencies\":[],\
          \"why_needed\":\"why this is needed\",\"risk\":\"low|medium|high\"}]}\n\
          ```\n\
-         Only suggest tasks that are genuinely needed and scoped enough to execute independently.\n",
+         Suggest only independently executable work necessary for the parent goal; do not use \
+         suggestions as a substitute for completing the assigned task.\n",
     );
     s.push_str(
-        "\nReturn format for the main agent:\n\
-         1) Write a short SUMMARY (≤ 1200 chars) under heading `## Summary`\n\
-         2) Optionally `## Artifacts` as bullet file paths\n\
-         3) Optionally the suggested_tasks JSON block above\n\
-         Everything else may be detailed notes; the parent only receives Summary \
-         (+ suggested_tasks / artifacts).\n\
-         Also cover when relevant:\n\
-         - Evidence: file paths with line numbers (path:line)\n\
-         - Decisions / failures / verification / next implications\n",
+        "\nReturn contract:\n\
+         1) `## Summary` — at most 1200 characters; answer the assigned question or state the \
+         completed change, with the strongest evidence and any material limitation.\n\
+         2) `## Evidence` — concise bullets with path:line, source identifiers, calculations, or \
+         verification results when relevant.\n\
+         3) Optional `## Artifacts` — bullet paths to files actually produced.\n\
+         4) Optional suggested_tasks JSON block above.\n\
+         Detailed notes may follow, but the parent primarily consumes Summary, Evidence, \
+         Artifacts, and suggested tasks. Never claim an artifact or check that does not exist.\n",
     );
     s
 }
@@ -3984,8 +3989,9 @@ Read the runtime path and found one missing branch.
         assert!(p.contains("chat.rs"));
         assert!(p.contains("report root cause"));
         assert!(p.contains("Do not delegate this task to other agents"));
-        assert!(p.contains("Return format for the main agent"));
+        assert!(p.contains("Return contract"));
         assert!(p.contains("## Summary"));
+        assert!(p.contains("## Evidence"));
     }
 
     #[test]
@@ -4004,7 +4010,7 @@ Read the runtime path and found one missing branch.
             None,
         );
         assert!(!p.contains("READ-ONLY"));
-        assert!(p.contains("scoped change"));
+        assert!(p.contains("SCOPED WRITE"));
     }
 
     #[test]

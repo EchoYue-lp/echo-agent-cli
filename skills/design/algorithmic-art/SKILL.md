@@ -17,11 +17,10 @@ allowed-tools: [bash, read, write]
 ---
 # Algorithmic Art
 
-Create generative art using p5.js. Produce algorithmic visual compositions with particles, flow fields, and mathematical patterns.
+Create an original generative artwork whose visual concept is expressed through an intentional system, not a random collection of particles.
 
-## Features
+Define the concept, composition, palette, motion behavior, interaction, and output dimensions before implementation. Choose an algorithm that supports the concept: flow fields, agents, recursion, noise, tiling, cellular systems, or geometry. Expose a small set of meaningful parameters and use a seed when reproducibility matters.
 
-- Particle systems and flow fields
-- Geometric patterns
-- Color theory and palettes
-- Interactive and animated outputs
+Implement with p5.js or the project's existing canvas stack. Keep animation stable across common frame rates and pixel densities. Provide pause/reset/export controls when useful. Avoid copying a living artist's signature style; translate requested influences into general visual properties.
+
+Run the piece, inspect actual frames at target sizes, and revise empty areas, clipping, contrast, performance, and repetitive artifacts. Deliver runnable source plus a representative exported image or animation and the seed/parameters used.

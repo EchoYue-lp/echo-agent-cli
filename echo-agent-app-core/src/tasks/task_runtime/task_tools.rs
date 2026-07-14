@@ -656,7 +656,7 @@ impl Tool for CreateComplexTaskTool {
     }
 
     fn description(&self) -> &str {
-        r#"Create a background orchestrated Run for a complex multi-step task. ONLY use when one of these holds: (1) multi-step & time-consuming (>3 steps, each costly in tokens/time); (2) complex code generation (multi-file / architectural); (3) needs long-lived state (cross-turn / persisted); (4) multi-source research synthesis. For simple Q&A, single-file tweaks, or one-shot queries, DO NOT call this — reply directly. You MUST give a `reason` justifying the complexity. Default `priority`=background (non-blocking); use foreground only for tasks <1min where you need the result in this same reply."#
+        r#"Create an independent orchestrated Run for work that should outlive the current chat turn or needs substantial multi-step coordination. Use it only when a material complexity signal applies: expensive dependent steps, multi-file/architectural implementation, long-lived state, or multi-source synthesis. Use direct work or a single subagent for narrower requests. `reason` must name the signals and why ordinary in-turn execution is insufficient. Prefer background so the user can continue; choose foreground only when the current reply depends on a prompt result."#
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -665,9 +665,9 @@ impl Tool for CreateComplexTaskTool {
             "required": ["user_goal", "reason", "domain_profile", "plan_mode"],
             "properties": {
                 "user_goal": { "type": "string", "description": "The user's full goal (verbatim or distilled), as the Run's goal." },
-                "reason": { "type": "string", "description": "Why this is complex. List the complexity signals hit: multi_step / needs_research / needs_code_gen / long_running / multi_file. Anti-abuse audit." },
-                "domain_profile": { "type": "string", "enum": ["general","ai_coding","data_analysis","academic_research","medical_research"], "description": "Domain. Determines subagent roles / review checklist." },
-                "plan_mode": { "type": "string", "enum": ["plan_then_execute","direct_execute"], "description": "plan_then_execute = plan_create a plan first (reviewable) then plan_execute; direct_execute = agent ReActs autonomously in the Run." },
+                "reason": { "type": "string", "description": "Why an independent Run is warranted. Name the material signals: dependent multi_step work, multi_file/architectural change, long_running/cross_turn state, or multi_source synthesis." },
+                "domain_profile": { "type": "string", "enum": ["general","ai_coding","data_analysis","academic_research","medical_research"], "description": "Best-fit evidence and review profile. Cross-domain tasks should choose the profile that governs the final claim or artifact." },
+                "plan_mode": { "type": "string", "enum": ["plan_then_execute","direct_execute"], "description": "Use plan_then_execute when the work benefits from an explicit reviewable DAG; use direct_execute only when autonomous ReAct is sufficient and a formal plan adds no value." },
                 "initial_plan": { "type": "array", "items": { "type": "object", "properties": { "step_name": {"type":"string"}, "expected_outcome": {"type":"string"} }, "required": ["step_name"] }, "description": "Optional coarse decomposition (>=2 steps) as a brief. Not the PlanTask DAG — the Run's agent refines via plan_create." },
                 "priority": { "type": "string", "enum": ["foreground","background"], "default": "background", "description": "Default background (returns run_id immediately, non-blocking). foreground only for <1min tasks where you need the result in this turn (blocks the UI until done)." }
             }

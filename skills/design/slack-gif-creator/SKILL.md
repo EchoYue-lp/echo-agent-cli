@@ -18,15 +18,10 @@ allowed-tools: [bash]
 ---
 # Slack GIF Creator
 
-Create animated GIFs optimized for Slack sharing.
+Create a short, readable looping GIF optimized for the user's actual Slack use case.
 
-## Features
+Confirm whether the output is a message GIF, reaction, or custom emoji; establish dimensions, duration, loop behavior, background transparency, text, and target file-size limit. Design for small display: one focal action, high contrast, few frames, and no fine detail or rapid flashing.
 
-- Text animations and effects
-- Image sequence to GIF conversion
-- Size optimization for Slack limits
-- Custom emoji creation
+Use Pillow/imageio or existing project tooling. Preserve transparency where needed, choose a stable frame duration, optimize palette and changed regions, and avoid unnecessary resolution. For text, verify legibility at Slack display size and use fonts available in the workspace.
 
-## Requirements
-
-- Python: `Pillow`, `imageio` (auto via `uv run`)
+Render and inspect the loop, first/last-frame transition, transparency, dimensions, frame rate, and final byte size. Deliver the GIF plus source frames/script and report the verified dimensions, duration, and size.

@@ -18,18 +18,21 @@ allowed-tools: [bash, git]
 
 # Finishing a Development Branch
 
-When implementation is complete, all tests pass, and you need to decide how to integrate the work.
+Use only when implementation and required verification are complete and the user has asked to integrate, publish, or clean up the branch.
 
 ## Options
 
 1. **Merge directly** — for small, well-tested changes on personal branches
 2. **Create a PR** — for shared branches or changes needing review
-3. **Clean up** — discard the branch if the work is no longer needed
+3. **Clean up** — remove worktree/branch only after confirming the work is integrated or explicitly unwanted
 
 ## Process
 
 1. Verify all tests pass
 2. Run linting and formatting
 3. Check git status — no unexpected changes
-4. Choose integration method
-5. Execute and verify
+4. Check repository-specific merge, signing, worktree, and push rules
+5. Choose the authorized integration method; ask before publishing or discarding work when authorization is not explicit
+6. Execute and verify the resulting branch/PR/remote state
+
+Never use destructive reset/checkout or force-push as cleanup shortcuts. Preserve unrelated changes and report any verification that could not be completed.

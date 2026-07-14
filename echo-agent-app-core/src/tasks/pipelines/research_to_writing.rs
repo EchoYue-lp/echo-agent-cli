@@ -192,8 +192,8 @@ pub fn build_research_to_writing_graph(agent: SharedAgent) -> anyhow::Result<Gra
                          and note that full text was not accessible.\n\
                          5. Prioritize depth over breadth: it is better to thoroughly analyze \
                          {top_n} papers than superficially skim {max_papers}.\n\n\
-                         IMPORTANT: You MUST use pdf_fetch to download papers. Do NOT just \
-                         summarize the abstracts — read the actual papers.",
+                         Use pdf_fetch when it is available and a full-text URL can be verified. Never describe an \
+                         abstract-only source as a full-text reading; record the access level for each source.",
                         top_n = (max_papers / 2).clamp(3, 10),
                     ),
                 )?;
@@ -201,26 +201,25 @@ pub fn build_research_to_writing_graph(agent: SharedAgent) -> anyhow::Result<Gra
                 state.set(
                     "tpl_synthesize",
                     format!(
-                        "You are writing a comprehensive literature review on: {topic}\n\n\
-                         IMPORTANT: The following paper analyses are based on FULL TEXT readings, not just abstracts. \
-                         Use the detailed findings, methodology descriptions, and specific evidence extracted from the papers.\n\n\
-                         Based on the following analyzed papers, write a structured literature review \
+                        "Synthesize the analyzed sources into a literature review on: {topic}\n\n\
+                         Respect the access level and limitations recorded for each source. Use only verifiable \
+                         bibliographic details and evidence in the inputs. Write a structured review \
                          that includes:\n\
                          1. Introduction and background\n\
                          2. Key themes and approaches in the field\n\
                          3. Comparison of methodologies (use specific details from the full texts)\n\
                          4. Major findings and contributions (cite specific results and metrics)\n\
                          5. Identified gaps and future directions\n\n\
-                         Use proper academic citations [1], [2], etc.\n\
-                         Reference specific experiments, datasets, or results mentioned in the full texts."
+                         Use consistent numbered citations [1], [2], etc. Tie central claims to specific studies, \
+                         preserve conflicting findings, and state scope and search limitations."
                     ),
                 )?;
 
                 state.set(
                     "tpl_write",
                     format!(
-                        "You are writing an academic paper on: {topic}\n\n\
-                         Using the literature review below, write a complete paper draft with:\n\
+                        "Draft an academic paper on {topic} using the supplied review as the evidence base. Do not \
+                         invent methods, experiments, results, or citations. Include:\n\
                          1. Title\n\
                          2. Abstract (150-250 words)\n\
                          3. Introduction\n\
@@ -229,32 +228,28 @@ pub fn build_research_to_writing_graph(agent: SharedAgent) -> anyhow::Result<Gra
                          6. Analysis / Discussion\n\
                          7. Conclusion and Future Work\n\
                          8. References\n\n\
-                         Maintain academic tone, proper citations, and logical flow."
+                         Maintain academic tone, citation traceability, and logical flow. Label proposed work as \
+                         proposed and keep claims within the supplied evidence."
                     ),
                 )?;
 
                 state.set(
                     "tpl_review",
                     format!(
-                        "You are a peer reviewer evaluating an academic paper on: {topic}\n\n\
-                         Review the following paper draft and provide:\n\
-                         1. Overall quality score (0-100) -- at the very beginning of your response, \
-                         output exactly: QUALITY_SCORE: <number>\n\
-                         2. Strengths (what works well)\n\
-                         3. Weaknesses (what needs improvement)\n\
-                         4. Specific suggestions for each section\n\n\
-                         Be thorough and constructive."
+                        "Peer-review the supplied draft on {topic} for contribution, citation support, methodology, \
+                         internal consistency, limitations, and claim strength. Begin exactly with \
+                         QUALITY_SCORE: <0-100>, then provide:\n\
+                         - strengths worth preserving\n\
+                         - concrete defects ordered by impact\n\
+                         - section-specific revisions and citations requiring verification."
                     ),
                 )?;
 
                 state.set(
                     "tpl_revise",
-                    "You are a revision specialist.\n\n\
-                     Revise the following paper draft based on the reviewer feedback.\n\
-                     Address every point raised by the reviewer.\n\n\
-                     Original Draft:\n\n\n\
-                     Reviewer Feedback:\n\n\n\
-                     Provide the complete revised paper with improvements.",
+                    "Revise the complete paper using the supplied review as evidence to assess. Correct valid issues, \
+                     preserve supported content, remove or qualify unsupported claims, and never invent sources or \
+                     results. Return the full revised paper.",
                 )?;
 
                 Ok(())
@@ -475,53 +470,41 @@ pub fn build_research_to_writing_graph(agent: SharedAgent) -> anyhow::Result<Gra
                 state.set(
                     "tpl_outline",
                     format!(
-                        "You are an expert content planner. Based on the research context provided, \
-                         create a detailed outline for a {format} on the topic '{topic}' \
-                         targeted at {audience}. \
-                         The outline should refine and restructure the research findings into a \
-                         compelling narrative structure. \
-                         Include: title, sections with key points, and logical flow. \
-                         Output the outline as structured text."
+                        "Using the supplied research context, create an evidence-aware outline for a {format} on \
+                         '{topic}' for {audience}. Define the reader outcome, proposed title, section purpose, central \
+                         claim, supporting sources/evidence, limitations, and transitions. Do not add claims absent \
+                         from the research context."
                     ),
                 )?;
                 state.set(
                     "tpl_draft",
                     format!(
-                        "You are a skilled writer. Based on the outline and research context provided, \
-                         write a complete {format} on '{topic}' for {audience}. \
-                         Incorporate the research findings, literature review insights, and \
-                         maintain academic rigor while ensuring accessibility for the target audience. \
-                         Follow the outline structure closely. Write in a clear, engaging style. \
-                         Output the full draft."
+                        "Write a complete {format} on '{topic}' for {audience} from the supplied outline and research \
+                         context. Preserve citation traceability and uncertainty, keep claims within the evidence, and \
+                         use accessible language without weakening technical meaning. Return the full draft."
                     ),
                 )?;
                 state.set(
                     "tpl_review",
-                    "You are a critical reviewer. Review the draft provided and evaluate it on: \
-                         clarity, coherence, accuracy, audience fit, academic rigor, and overall quality. \
-                         Score the draft from 0 to 100. \
-                         At the very beginning of your response, output exactly: \
-                         QUALITY_SCORE: <number> \
-                         Then provide specific, actionable feedback for improvement. \
-                         Output the review with quality score.".to_string(),
+                    "Review the draft for purpose, clarity, coherence, factual and citation support, audience fit, \
+                         academic rigor, limitations, and claim strength. Begin exactly with QUALITY_SCORE: <0-100>. \
+                         Then give strengths worth preserving and prioritized, section-specific corrections. Treat the \
+                         research context as the evidence boundary.".to_string(),
                 )?;
                 state.set(
                     "tpl_revise",
                     format!(
-                        "You are a revision specialist. Based on the draft and review feedback \
-                         provided, revise the {format} on '{topic}' to address all the reviewer's concerns. \
-                         Improve clarity, coherence, accuracy, audience fit, and academic rigor. \
-                         Output the revised version of the full content."
+                        "Revise the complete {format} on '{topic}' using the review feedback as claims to evaluate. \
+                         Fix valid issues, preserve supported material, maintain audience fit, and do not invent facts \
+                         or citations. Return the full revised content."
                     ),
                 )?;
                 state.set(
                     "tpl_finalize",
                     format!(
-                        "You are a final editor. Polish the content provided into a final, \
-                         publication-ready {format} on '{topic}' for {audience}. \
-                         Fix any remaining grammar, style, or formatting issues. \
-                         Ensure citations are properly formatted. \
-                         Output the final polished version."
+                        "Final-edit the supplied {format} on '{topic}' for {audience}. Preserve meaning, evidence \
+                         boundaries, citations, structure, and requested length while correcting grammar, consistency, \
+                         formatting, and readability. Do not add new substantive claims. Return only the final content."
                     ),
                 )?;
 

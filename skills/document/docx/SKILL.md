@@ -28,17 +28,14 @@ hooks:
 ---
 # DOCX Skill
 
-Create, edit, and analyze Word documents (.docx) with support for tracked changes, comments, formatting, and text extraction.
+Create or edit a Word document while preserving its structure, styles, revision semantics, and intended print layout.
 
-## Features
+## Contract
 
-- Create new Word documents from Markdown or plain text
-- Edit existing documents: add/remove text, apply formatting
-- Add comments and tracked changes (revision marks)
-- Extract text and structure from documents
-- Convert between formats
+- Inspect the existing document, template, styles, sections, headers/footers, tables, fields, comments, and tracked changes before editing. Preserve unrelated formatting and metadata.
+- Use structured DOCX APIs/XML rather than treating the file as plain text. For redlines, represent additions/deletions and comments as real Word revisions when requested.
+- Reuse paragraph/table styles and theme fonts. Avoid manual formatting that creates visually similar but structurally inconsistent content.
+- Preserve links, numbering, cross-references, page breaks, and accessibility information where possible. Do not silently accept/reject existing revisions.
+- After every material edit, render the DOCX with LibreOffice and inspect page images for overflow, broken tables, orphan headings, missing fonts, and header/footer changes.
 
-## Requirements
-
-- LibreOffice (`soffice`) for document rendering
-- Python packages: `defusedxml`, `lxml` (auto-installed via `uv run --script`)
+Deliver the final `.docx` and report any unsupported feature, font substitution, unresolved revision, or layout risk. A file that opens is not sufficient verification; the rendered pages must be checked.

@@ -18,17 +18,20 @@ allowed-tools: [bash]
 
 # Dispatching Parallel Agents
 
-When facing 2+ independent tasks that can be worked on without shared state or sequential dependencies, dispatch parallel subagents.
+Use parallel subagents when two or more bounded tasks are genuinely independent and isolated context will reduce noise or latency. Parallelism is a tool, not a default response to task size.
 
 ## When to Use
 
-- Multiple independent tasks in a plan
-- Tasks that don't share state
-- Fan-out operations (search multiple things, check multiple files)
+- Read-only investigations over separate modules, sources, datasets, or hypotheses
+- Independent artifact generation with disjoint output ownership
+- Reviews that benefit from different evidence lenses
 
 ## Process
 
-1. Identify independent tasks — no shared state, no sequential dependency
-2. Dispatch each as a separate subagent
-3. Wait for all to complete
-4. Synthesize results
+1. Define one outcome, evidence requirement, boundary, and return format per subagent.
+2. Confirm no data dependency, overlapping write target, shared mutable state, or approval sequence.
+3. Choose the most specific roles and dispatch only the useful fan-out; keep dependent work local or sequential.
+4. Inspect results for failures, duplication, and conflicts. Re-run only the missing line of evidence.
+5. Synthesize against the parent goal; do not paste worker summaries as the final answer.
+
+Avoid parallel dispatch for tiny tasks, tightly coupled debugging, overlapping file edits, or work whose outputs cannot be reconciled reliably.

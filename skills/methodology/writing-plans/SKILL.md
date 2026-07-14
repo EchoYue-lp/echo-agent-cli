@@ -19,7 +19,7 @@ allowed-tools: []
 
 # Writing Plans
 
-Write comprehensive implementation plans assuming the engineer has zero context for our codebase and questionable taste. Document everything they need to know: which files to touch, code, testing, docs. Give them the whole plan as bite-sized tasks.
+Write an implementation plan that another capable engineer or agent can execute without reconstructing hidden assumptions. Ground it in the current repository and name the evidence behind important decisions.
 
 ## When to Use
 
@@ -31,14 +31,15 @@ Write comprehensive implementation plans assuming the engineer has zero context 
 ## Plan Structure
 
 1. **Goal** — one sentence describing what this builds
-2. **Architecture** — 2-3 sentences about approach
-3. **Tech Stack** — key technologies
-4. **File Structure** — which files are created/modified and why
-5. **Tasks** — each task is independently testable, has exact file paths, complete code, test commands
+2. **Current evidence** — existing mechanisms, constraints, and runtime path
+3. **Ownership** — framework vs application boundary and data/state owners
+4. **Approach** — API/data flow/state transitions and failure behavior where relevant
+5. **Files and tasks** — concrete targets, dependencies, outcome, and verification for each step
+6. **Risks/open questions** — only those that materially affect execution
 
 ## Key Principles
 
-- **TDD**: every task starts with a failing test
-- **No placeholders**: no TODOs, no "implement later"
-- **Bite-sized**: each step is one action (2-5 minutes)
+- **Evidence first**: confirm the capability does not already exist and reference relevant code
+- **Testable**: each task has a completion signal; use test-first when it adds regression value
+- **Executable**: avoid vague verbs, invented APIs, and unnecessary code dumps
 - **DRY + YAGNI**: don't over-engineer

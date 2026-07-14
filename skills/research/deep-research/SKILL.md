@@ -17,20 +17,15 @@ allowed-tools: [bash, web_search, web_fetch]
 ---
 # Deep Research
 
-Deep research harness — fan-out web searches, fetch sources, adversarially verify claims, synthesize a cited report.
+Use for questions whose answer depends on multiple sources, conflicting evidence, or a reproducible search trail. Do not invoke it for a fact that one authoritative source can answer.
 
-## When to Use
+## Contract
 
-- Complex research questions needing multiple sources
-- Fact-checking and verification tasks
-- Literature surveys
-- Competitive analysis
+- Define the question, audience, decision, date sensitivity, jurisdiction/domain, and what would count as sufficient evidence.
+- Decompose by claim or uncertainty, then search independent lines in parallel. Prefer primary and authoritative sources; use secondary sources to discover context or disagreement.
+- Read the underlying source before citing it. Record publication/update date, scope, methodology, conflicts, and whether it directly supports the claim.
+- Cross-check central claims, numbers, dates, and quotations. Treat absence of evidence, search-result snippets, and repeated syndication as weak evidence.
+- Use a retrieval budget: stop when the core request is supported and remaining searches would only add repetition. Expand only for a missing material fact or an explicitly exhaustive request.
+- Synthesize by claim, not by source. Separate consensus, disagreement, inference, and unknowns; include limitations and counterevidence.
 
-## Process
-
-1. Break down the question into sub-queries
-2. Search multiple sources in parallel
-3. Fetch and read relevant sources
-4. Cross-verify claims across sources
-5. Synthesize findings into a structured report
-6. Cite all sources
+Deliver the supported conclusion first, followed by decisive evidence and source links/citations in the active tool's format. State search scope and unresolved gaps.

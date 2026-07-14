@@ -116,12 +116,9 @@ pub fn build_writing_graph(agent: &SharedAgent) -> anyhow::Result<Graph> {
                         "Create a detailed outline for a document on the topic '{}'.\n\
                          Target audience: {}\n\
                          Format: {}\n\n\
-                         The outline should include:\n\
-                         1. Title suggestion\n\
-                         2. Main sections with subsections\n\
-                         3. Key points to cover in each section\n\
-                         4. Logical flow and transitions\n\
-                         5. Estimated length per section",
+                         Define the document's purpose and reader decision first. Then provide a title, sections and \
+                         subsections, the claim or question each section resolves, required evidence/placeholders, \
+                         transitions, and an approximate length budget. Preserve any user-specified structure.",
                         topic, audience, format,
                     ),
                 );
@@ -132,29 +129,31 @@ pub fn build_writing_graph(agent: &SharedAgent) -> anyhow::Result<Graph> {
                          Topic: {}\n\
                          Audience: {}\n\
                          Format: {}\n\n\
-                         Write the complete document following the outline structure. \
-                         Be thorough, coherent, and well-organized.",
+                         Write the complete document following the supplied outline. Preserve the requested genre, \
+                         length, and tone. Use provided facts as facts; mark unsupported specifics as assumptions or \
+                         placeholders instead of inventing them. Prefer clear claims, concrete evidence, and useful \
+                         transitions over generic filler.",
                         topic, audience, format,
                     ),
                 );
                 let _ = state.set(
                     "tpl_review",
                     format!(
-                        "You are an editor reviewing a document on: {}\n\n\
-                         Review the draft and provide:\n\
-                         1. Overall quality score (0-100) — at the very beginning of your response, \
-                         output exactly: QUALITY_SCORE: <number>\n\
-                         2. Strengths (what works well)\n\
-                         3. Weaknesses (what needs improvement)\n\
-                         4. Specific, actionable suggestions for improvement",
+                        "Review the draft on '{}' against its purpose, audience, requested format, factual support, \
+                         structure, clarity, and actionability. Begin exactly with QUALITY_SCORE: <0-100>. Then provide:\n\
+                         - strengths worth preserving\n\
+                         - concrete defects or unsupported claims\n\
+                         - prioritized, actionable revisions tied to specific sections\n\
+                         Do not reward length or polish when the document misses its purpose.",
                         topic,
                     ),
                 );
                 let _ = state.set(
                     "tpl_revise",
-                    "You are a revision specialist. Revise the following document based on the \
-                     reviewer feedback. Address every point raised by the reviewer. Improve \
-                     clarity, coherence, and quality. Provide the complete revised document.",
+                    "Revise the complete document using the reviewer feedback as evidence, not unquestionable \
+                     instructions. Fix valid issues, preserve correct material and the requested genre, and do not \
+                     invent facts to satisfy a critique. Return the full revised document without a change log unless \
+                     the user requested one.",
                 );
                 Ok(())
             })

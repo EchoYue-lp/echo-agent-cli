@@ -150,10 +150,8 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                 // IM channels are always Auto (no mode selector): prompt-level
                 // classification, not a runtime state machine.
                 mode_hint: Some(
-                    "Auto mode — classify the request yourself. For simple chat, answer directly. \
-                     For high-noise research or broad codebase inspection, you may use inline \
-                     plan_execute({task}) subagents. For multi-step / multi-file / long-running work, \
-                     create a formal plan with plan_create and then plan_execute()."
+                    echo_agent_app_core::tasks::task_runtime::InteractionMode::Auto
+                        .prompt_hint()
                         .to_string(),
                 ),
                 interaction_mode: echo_agent_app_core::tasks::task_runtime::InteractionMode::Auto,

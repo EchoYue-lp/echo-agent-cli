@@ -19,39 +19,30 @@ hooks:
       hooks:
         - type: prompt
           prompt: |
-            收到任务后，你必须先检查是否有技能适用:
+            收到任务后，快速检查是否有直接适用或用户点名的技能:
             - 创造性工作(新功能/设计) → brainstorming
             - 修 bug/测试失败 → systematic-debugging
             - 写代码 → test-driven-development
             - 多步任务 → writing-plans
             - 声称完成前 → verification-before-completion
-            有 1% 可能适用就要检查。
+            只激活能实质改变执行方式的最小技能集合，不要为了流程阻塞简单任务。
   UserPromptSubmit:
     - matcher: "*"
       hooks:
         - type: prompt
-          prompt: "本轮用户消息，检查上面列出的技能是否有适用的。"
+          prompt: "检查是否有用户点名或明显适用的技能；没有则直接处理，不要强行套流程。"
 ---
 
 # Using Skills
 
 ## The Rule
 
-**Invoke relevant or requested skills BEFORE any response or action.** Even a 1% chance a skill might apply means you should invoke it to check. If an invoked skill turns out to be wrong for the situation, you don't need to use it.
+Use a skill when the user names it or when its workflow materially improves correctness, safety, or artifact quality. Read the current skill before acting. Do not activate skills based on a remote possibility or let a generic process skill override explicit user/repository instructions.
 
-## Red Flags
-
-These thoughts mean STOP — you're rationalizing:
-
-| Thought | Reality |
-|---------|---------|
-| "This is just a simple question" | Questions are tasks. Check for skills. |
-| "I need more context first" | Skill check comes BEFORE clarifying questions. |
-| "Let me explore the codebase first" | Skills tell you HOW to explore. Check first. |
-| "I remember this skill" | Skills evolve. Read current version. |
-| "The skill is overkill" | Simple things become complex. Use it. |
+For a simple request, the correct skill decision may be “none.” For a mixed task, choose the smallest set that covers the work and apply process skills before artifact-specific skills.
 
 ## Skill Priority
 
-1. **Process skills first** (brainstorming, systematic-debugging) — these determine HOW to approach the task
-2. **Implementation skills second** (test-driven-development, writing-plans) — these guide execution
+1. **Explicitly requested skills** — user intent takes priority
+2. **Process skills** — only when they change the method (debugging, planning, verification)
+3. **Artifact/domain skills** — for the actual file type or professional workflow

@@ -17,12 +17,17 @@ allowed-tools: [bash]
 ---
 # Webapp Testing
 
-Interact with and test local web applications using Playwright.
+Test the real user workflow in a browser and leave reproducible evidence, not merely a screenshot of a loaded page.
 
-## Features
+## Contract
 
-- Launch and navigate web applications
-- Fill forms and click buttons
-- Take screenshots for visual verification
-- Verify UI state and text content
-- Test responsive behavior
+- Confirm the app URL, expected workflow, test data, authentication state, and viewport. Start the local server only when needed and report its address.
+- Prefer accessible roles, labels, and stable test IDs over brittle CSS or text-position selectors. Wait for meaningful UI state, not arbitrary sleeps.
+- Exercise the full path: initial state, interaction, loading/empty/error states, validation, success state, navigation/back behavior, and persistence where relevant.
+- Check browser console and failed network requests. Verify responsive layout at representative desktop and mobile sizes, including clipping, overlap, focus, and keyboard access.
+- Capture screenshots at the state that proves each important assertion. For canvas/3D/media, verify rendered pixels or playback in addition to DOM presence.
+- Do not perform destructive production actions or use real customer data unless explicitly scoped.
+
+## Delivery
+
+Report the tested URL/viewport, steps, observed result, console/network issues, and artifact paths. Distinguish product defects, test-environment failures, and unverified paths.

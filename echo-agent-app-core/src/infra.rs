@@ -28,52 +28,26 @@ const DEFAULT_MAX_TOKENS: u32 = 8192;
 /// (对齐 Claude Code 的 subagent:轻量派发是工具,正式并行是 runtime).
 const TASK_MANAGEMENT_GUIDE: &str = r#"
 
-## Task Management
-When task-management tools are available in the current turn, use them to manage a formal task plan:
-plan_create, task_update, task_complete, task_skip, task_list.
-- When task-management tools are hidden/unavailable (for example Chat mode), answer directly and do not claim you can create or execute a task plan.
-- When you discover additional work is needed, use plan_create to add it.
-- When a task is no longer relevant (e.g., you found it's unnecessary), use task_skip.
-- When you complete a task, use task_complete to mark it done.
-- Use task_list to review current plan state.
-Update your plan frequently as your understanding deepens when a formal plan is active.
+## Task And Delegation Tools
 
-## 即时委派（agent_tool）
-对高噪声、边界清晰的副作用任务，直接用 agent_tool(agent_name, task) 派到独立上下文。
-默认 fresh 上下文（不继承本会话历史）；需要共享对话背景时再设 mode=fork。
-角色列表见下方 Available subagents。
-**对高噪声任务要主动用**:大范围代码库检索、多文件架构梳理、冗长日志分析、多源调研综合。
-- 适合:架构分析、bug 排查的代码侧调研、文档/配置检索、审查验证。
-- 不适合:单文件小改、简单问答、一次性查询(直接做即可)。
+Choose the lightest mechanism that still gives the user a reliable result:
+- Direct work: simple questions, narrow edits, and short tool sequences.
+- `agent_tool`: one bounded, high-noise subtask that benefits from an isolated context. Use a role whose description matches the work. Fresh context is the default; fork only when the child genuinely needs the conversation history.
+- `plan_create` + `plan_execute()`: a reviewable multi-step DAG with dependencies, parallel work, writer tasks, or explicit verification. In Task mode, this is the required execution path.
+- `create_complex_task`: a long-lived foreground/background Run for work that should survive the current chat turn or requires substantial multi-step orchestration.
 
-## 多步编排（plan_create + plan_execute）
-plan_execute 是统一的 DAG 派发入口。它的可用参数由当前模式决定:
+### Formal Plan Contract
+- Create tasks with a concrete outcome, kind, role, targets, dependencies, and verification. Avoid vague tasks such as "continue improving".
+- Independent read-only tasks may run in parallel. Writer tasks must declare their intended files or artifacts so the runtime can isolate and schedule them safely.
+- Keep the plan truthful as evidence changes: use `task_update`, `task_complete`, `task_skip`, and `task_list`. Do not mark work complete before its verification is addressed.
+- `plan_execute({task})` is only for inline single-subagent dispatch when that field exists in the active tool schema. Never use it as a substitute for the formal DAG in Task mode.
+- After execution, synthesize the worker evidence, resolve conflicts, and answer the user's original goal. Do not merely repeat worker summaries.
 
-### 1. 单步派发(传 task 参数)——仅当当前 schema 暴露 task 字段时使用
-直接派一个只读 subagent 在独立上下文跑 ReAct,只回传结论摘要给你。
-
-### 2. 多 subagent 编排(不传 task,先用 plan_create 拆 plan)——Task 模式和正式多步任务使用
-1. **拆分计划**:plan_create 拆成可独立执行的子任务(每个有清晰 title/description/kind),depends_on 表达依赖(并行无依赖,串行 A depends_on B)。title 不能为空。
-2. **统一执行**:拆完调 plan_execute,引擎(run_dag)按依赖自动并行调度多个 subagent,收集产出摘要。
-3. **收口**:plan_execute 返回结果后,基于结果写最终答案。
-4. **写任务**:需改文件的子任务用对应 kind(implementation/debugging/verification),plan_execute 安排对应 writer 角色。
-
-正式多 subagent 编排必须用 plan_create + plan_execute()。不要在 Task 模式里调用 plan_execute({task})。
-
-你是长生命周期的主 agent:跨多个对话 turn 保持上下文。用户可能中途插话改计划——用 task_update/task_complete/task_skip 调整。
-
-## 自主创建复杂任务(create_complex_task)
-create_complex_task 让你为复杂任务创建后台 Run(独立 agent + plan/subagent 编排,与当前对话解耦)。**仅在任务满足以下任一时使用**:
-1. 多步耗时(>3 步且单步耗 token/时间);
-2. 复杂代码生成(多文件/架构级);
-3. 需长期保持的状态(跨多轮/持久化);
-4. 多源调研综合。
-
-简单问答/单文件小改/一次性查询——**直接回复,禁止调用 create_complex_task**。
-调用时必须给出 reason 论证复杂度(列出命中信号:multi_step/needs_research/needs_code_gen/long_running/multi_file);列不出有效信号就不要调用。
-默认 priority=background(不阻塞用户界面);仅当任务预估 <1 分钟且你需在本轮回复中直接用结果时才用 foreground。
-后台 Run 完成后结果写入记忆库——用户下次提问时你经记忆召回即可复述,无需在创建时阻塞等待。
-可用 check_run_status 查询后台 Run 状态,cancel_run 取消不再需要的 Run。
+### Complex Run Contract
+Use `create_complex_task` only when at least one material complexity signal applies: expensive multi-step work, multi-file or architectural implementation, long-lived/cross-turn state, or multi-source synthesis. Put the signals and why they matter in `reason`.
+- Prefer `priority=background` when the user can continue without the result. Use foreground only when the result is needed in the current reply and the run is expected to finish promptly.
+- Do not create a complex Run for ordinary Q&A, a narrow edit, or a one-shot lookup.
+- Use `check_run_status` for a requested status check and `cancel_run` when the Run is no longer wanted. Do not busy-poll.
 "#;
 
 /// Agent creation parameters (extracted from CLI args or config).
@@ -210,8 +184,12 @@ pub async fn create_agent(
     } else {
         DEFAULT_CONTEXT_WINDOW
     };
-    let mut assembler =
-        PromptAssembler::default(base_system_prompt, project_ctx.as_ref(), model_window);
+    let mut assembler = PromptAssembler::default(
+        base_system_prompt,
+        Some(TASK_MANAGEMENT_GUIDE),
+        project_ctx.as_ref(),
+        model_window,
+    );
     // Inject the unified instruction/profile context so the agent's system prompt
     // reflects EKO user/project/local instruction files. Dynamic long-term
     // memories stay query-dependent and are recalled per turn through the Store.
@@ -219,9 +197,6 @@ pub async fn create_agent(
         assembler.add_memory_context(memory_suffix);
     }
     let mut system_prompt = assembler.assemble();
-
-    // Inject task management guide when the agent has task tools available.
-    system_prompt.push_str(TASK_MANAGEMENT_GUIDE);
 
     // Resolve subagent .md scopes early so the role catalog can be injected
     // into the system prompt before build (same defs used by register_default_subagents).
@@ -1831,7 +1806,12 @@ pub fn build_llm_config(
 
 #[cfg(test)]
 mod resolve_worker_model_tests {
-    use super::resolve_worker_model;
+    use super::{TASK_MANAGEMENT_GUIDE, resolve_worker_model};
+
+    #[test]
+    fn stable_task_guide_stays_within_cache_budget() {
+        assert!(TASK_MANAGEMENT_GUIDE.chars().count() <= 2_400);
+    }
 
     #[test]
     fn none_inherits_parent() {

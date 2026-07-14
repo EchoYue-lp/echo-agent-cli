@@ -17,20 +17,16 @@ allowed-tools: []
 ---
 # Internal Communications
 
-Help write various types of internal communications.
+Produce communication that helps a specific internal audience understand status, make a decision, or take action.
 
-## Document Types
+## Contract
 
-- Status reports and project updates
-- Leadership updates and newsletters
-- FAQs and announcements
-- Incident reports and post-mortems
-- Meeting notes and summaries
+- Establish audience, purpose, decision/action, reporting period, owner, and sensitivity. Reuse the organization's template and terminology when available.
+- Treat supplied notes, metrics, dates, owners, and status as evidence. Do not invent progress, commitments, root causes, or executive quotes.
+- Lead with the outcome: current state, what changed, impact, decision needed, and next owner/date. Separate facts, risks, decisions, and proposals.
+- For incidents and postmortems, use a blameless timeline, customer/system impact, contributing conditions, detection/response gaps, and owned corrective actions. Distinguish confirmed cause from hypothesis.
+- For meeting notes, record decisions and action items with owners and dates; omit conversational transcript unless requested.
 
-## Process
+## Quality Check
 
-1. Understand the audience and context
-2. Gather relevant information and data
-3. Structure the communication appropriately
-4. Write clearly and concisely
-5. Review for tone and accuracy
+Verify names, numbers, dates, links, confidentiality, and action ownership. Remove filler, vague status words, and unsupported optimism. Return the finished communication, plus a short list of unresolved placeholders only when required inputs are missing.

@@ -26,17 +26,14 @@ hooks:
 ---
 # PPTX Skill
 
-Create and edit PowerPoint presentations (.pptx). Support for slide layouts, text formatting, images, charts, and speaker notes.
+Create or edit a presentation that works as a live visual narrative, not a document pasted onto slides.
 
-## Features
+## Contract
 
-- Create presentations from outlines or Markdown
-- Apply themes and slide layouts
-- Add text, images, charts, and tables to slides
-- Edit existing presentations
-- Extract content from slides
+- Establish audience, setting, duration, decision/outcome, aspect ratio, brand/template, and required source material.
+- Build a narrative arc and give each slide one job. Use concise titles that state the takeaway, then support it with evidence, diagrams, charts, or imagery.
+- Reuse slide masters/layouts and theme tokens. Keep type sizes readable, charts honest, tables sparse, and speaker notes separate from on-slide copy.
+- When editing, preserve unrelated animations, notes, links, masters, and object alignment. Do not invent metrics, customer claims, or citations to strengthen a story.
+- Render the deck with LibreOffice and inspect every slide for clipping, font substitution, overlap, weak contrast, off-canvas objects, and inconsistent margins.
 
-## Requirements
-
-- LibreOffice (`soffice`) for rendering
-- Python: `python-pptx` (auto via `uv run`)
+Deliver the final `.pptx`, rendered preview/PDF when useful, and disclose missing assets, font substitutions, or unsupported animation behavior.

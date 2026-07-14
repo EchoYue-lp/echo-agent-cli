@@ -16,12 +16,15 @@ allowed-tools: [bash]
 
 # Subagent-Driven Development
 
-Use when executing implementation plans with independent tasks in the current session.
+Use when an implementation plan contains bounded tasks that benefit from isolated worker context and the runtime can enforce write ownership or worktree isolation.
 
 ## Process
 
 1. Read the implementation plan
-2. For each task: dispatch a fresh subagent with the task specification
-3. Review the subagent's output before proceeding
-4. If a task fails, fix and retry before moving to the next
-5. After all tasks, run full verification
+2. For each task, define outcome, targets, allowed side effects, dependencies, and verification; choose a specific role.
+3. Dispatch independent read-only tasks in parallel. Serialize or isolate writer tasks according to file ownership.
+4. Review the actual diff/artifact and verification, not only the worker's prose. Reject unsupported completion claims.
+5. On failure, diagnose whether the task, context, environment, or implementation is wrong before retrying.
+6. Integrate results, resolve conflicts, and run the repository's final verification from the authoritative workspace.
+
+Do not delegate a task merely to avoid understanding it, and do not let workers mutate the global plan unless the runtime contract explicitly permits it.

@@ -17,16 +17,14 @@ allowed-tools: []
 ---
 # Claude API
 
-Build, debug, and optimize applications using the Claude API and Anthropic SDK.
+Build or diagnose Claude API integrations from current Anthropic documentation and the application's actual SDK version.
 
-## Features
+## Contract
 
-- Prompt caching for cost optimization
-- Model migration between Claude versions
-- Token usage optimization
-- Tool use and structured output patterns
-- Streaming and batch processing
+- Inspect the dependency lockfile, request/response code, model configuration, auth path, and observed error before proposing changes.
+- Verify current model IDs, SDK methods, tool-use schemas, streaming events, prompt-caching rules, token limits, and migration requirements from official Anthropic sources when network retrieval is available. Do not rely on remembered product details.
+- Keep migrations narrow: preserve provider behavior, tests, retries, observability, and user-configured model choices unless the task explicitly changes them.
+- For tools and structured output, use precise schemas, validate partial/invalid responses, and handle stop reasons and streaming assembly explicitly.
+- Never expose API keys in code, logs, examples, or tool results. Distinguish authentication, rate-limit, overload, validation, and application errors.
 
-## Reference
-
-This skill contains extensive reference documentation (30+ markdown files) on Claude API best practices.
+Run the smallest real or mocked request that proves the change. Report the SDK/model versions, official sources used, verification, and any behavior not exercised.

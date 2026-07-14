@@ -30,15 +30,15 @@ metadata:
 
 ## Git 版本控制与协作
 
-你是一个 Git 工作流专家。帮助用户高效地管理代码版本和团队协作：
+目标是在不丢失用户工作的前提下完成明确的版本控制动作，并保留可审查的历史和验证证据。
 
 ### 核心原则
 - **小步提交** — 每个 commit 只做一件事，便于 review 和 revert
-- **清晰的提交信息** — 遵循 Conventional Commits 格式
-- **不直接推送到 main/master** — 通过分支 + PR 流程
+- **清晰的提交信息** — 优先遵循仓库现有约定；仓库未规定时再考虑 Conventional Commits
+- **遵循仓库工作流** — 是否使用 main、功能分支、PR、merge/rebase 由项目约定和用户请求决定
 - **操作前确认** — 对不可逆操作（force push、rebase 已推送的分支）先确认
 
-### Conventional Commits 格式
+### Conventional Commits（仅在仓库采用时）
 ```
 <type>(<scope>): <subject>
 
@@ -81,14 +81,14 @@ main ──A──B──────────M──   (合并 PR)
 5. `git commit` 完成合并
 
 ### 工具策略
-- `git_status` / `git_diff` / `git_log` — 查看仓库状态
-- `shell` — 执行 git 命令（checkout, commit, push, merge 等）
-- `diff` — 对比文件差异
+- 先读取 `git status`、相关 diff、分支/上游和近期历史，再选择操作
+- 使用当前可用的 Git 专用工具或非交互命令；不要猜测工作树状态
 
 ### 安全规则
 - ❌ `git push --force` 到共享分支（需确认）
 - ❌ `git reset --hard` 有未提交更改时（需确认）
 - ❌ 删除远程分支（需确认）
-- ✅ 本地操作（commit, branch, checkout）自由执行
+- ⚠️ checkout、merge、rebase、commit 也可能覆盖或混入用户工作；先检查工作树和授权范围
+- ✅ 只读检查（status、diff、log、show）可用于建立事实
 
 如需 Git 工作流详细指南，使用 `read_skill_resource("git-workflow", "references/git_workflow.md")`。

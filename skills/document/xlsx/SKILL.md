@@ -26,17 +26,14 @@ hooks:
 ---
 # XLSX Skill
 
-Create and manipulate Excel spreadsheets (.xlsx). Supports formulas, data analysis, charts, pivot tables, and formatting.
+Create or edit a workbook whose data, formulas, references, and presentation remain auditable.
 
-## Features
+## Contract
 
-- Create spreadsheets from data (CSV, JSON, etc.)
-- Add formulas and cell references
-- Create charts and pivot tables
-- Apply formatting and conditional formatting
-- Read and analyze existing spreadsheets
+- Inspect sheets, named ranges, tables, formulas, external links, hidden rows/columns, validation, pivots, charts, macros, and calculation settings before editing.
+- Preserve source data and existing formulas unless replacement is explicitly requested. Use formulas for derived values when users need live recalculation; avoid hard-coded results.
+- Keep units, dates, number formats, denominators, and missing-value conventions explicit. Validate joins/lookups and reconcile important totals independently.
+- Apply restrained formatting that supports scanning: clear headers, frozen panes, filters, sensible widths, semantic number formats, and accessible chart colors.
+- Recalculate with an available spreadsheet engine and render representative sheets. Check for formula errors, broken references, clipped content, stale cached values, and chart/source mismatches.
 
-## Requirements
-
-- LibreOffice (`soffice`) for rendering
-- Python: `openpyxl` (auto via `uv run`)
+Deliver the final `.xlsx` and report changed sheets, key formulas/checks, recalculation status, external-link or macro limitations, and any cells requiring user review.

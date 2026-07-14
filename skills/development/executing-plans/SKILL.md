@@ -16,12 +16,12 @@ allowed-tools: []
 
 # Executing Plans
 
-When you have a written implementation plan to execute in a separate session with review checkpoints.
+Use when an approved or already-authoritative plan must be executed. The plan guides work but does not override current repository evidence or user instructions.
 
 ## Process
 
-1. Load the plan document
-2. Execute tasks one by one in order
-3. At each checkpoint, review progress against the plan
-4. Report completion of each task
-5. Flag any deviations from the plan
+1. Load the plan and the current repository/task state; identify stale assumptions before editing.
+2. Execute tasks according to real dependencies. Parallelize only independent work and preserve task/file ownership.
+3. After each task, run its completion check and update status truthfully.
+4. If evidence invalidates the plan, stop that branch, explain the deviation, and revise the plan rather than forcing the old design.
+5. Run final cross-task verification and synthesize the user-facing outcome, residual risks, and unverified paths.

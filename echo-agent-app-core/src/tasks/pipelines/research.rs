@@ -146,8 +146,9 @@ pub fn build_research_graph(agent: SharedAgent) -> anyhow::Result<Graph> {
                          and note that full text was not accessible.\n\
                          5. Prioritize depth over breadth: it is better to thoroughly analyze \
                          {top_n} papers than superficially skim {max_papers}.\n\n\
-                         IMPORTANT: You MUST use pdf_fetch to download papers. Do NOT just \
-                         summarize the abstracts — read the actual papers.",
+                         Use pdf_fetch when it is available and a full-text URL can be verified. Do not claim a \
+                         full-text reading when only an abstract or snippet was accessible; label the evidence level \
+                         for each paper.",
                         top_n = (max_papers / 2).clamp(3, 10),
                     ),
                 )?;
@@ -155,27 +156,24 @@ pub fn build_research_graph(agent: SharedAgent) -> anyhow::Result<Graph> {
                 state.set(
                     "tpl_synthesize",
                     format!(
-                        "You are writing a comprehensive literature review on: {topic}\n\n\
-                         IMPORTANT: The following paper analyses are based on FULL TEXT readings, not just abstracts. \
-                         Use the detailed findings, methodology descriptions, and specific evidence extracted from the papers.\n\n\
-                         Based on the following analyzed papers, write a structured literature review \
-                         that includes:\n\
+                        "Synthesize the analyzed sources into a literature review on: {topic}\n\n\
+                         Treat each upstream analysis according to its stated access level; do not assume full text. \
+                         Use only verifiable bibliographic details and evidence present in the inputs. Include:\n\
                          1. Introduction and background context\n\
                          2. Key themes and approaches in the field\n\
                          3. Comparison of methodologies across papers (use specific details from the full texts)\n\
                          4. Major findings and contributions (cite specific results and metrics)\n\
                          5. Identified gaps, contradictions, and future directions\n\n\
-                         Use proper academic citations [1], [2], etc.\n\
-                         Ensure each claim is grounded in evidence from the papers analyzed.\n\
-                         Reference specific experiments, datasets, or results mentioned in the full texts."
+                         Use consistent numbered citations [1], [2], etc. Tie material claims to specific studies, \
+                         distinguish source findings from synthesis, preserve disagreement, and state search/scope limitations."
                     ),
                 )?;
 
                 state.set(
                     "tpl_write",
                     format!(
-                        "You are writing an academic paper on: {topic}\n\n\
-                         Using the literature review below, write a complete paper draft with:\n\
+                        "Draft an academic paper on {topic} using the supplied literature review as the evidence base. \
+                         Do not invent a novel method, experiment, result, or citation when none is supplied. Include:\n\
                          1. Title\n\
                          2. Abstract (150-250 words)\n\
                          3. Introduction\n\
@@ -184,32 +182,28 @@ pub fn build_research_graph(agent: SharedAgent) -> anyhow::Result<Graph> {
                          6. Analysis / Discussion\n\
                          7. Conclusion and Future Work\n\
                          8. References\n\n\
-                         Maintain academic tone, proper citations, and logical flow.\n\
-                         Ensure every citation references an actual paper from the review."
+                         Maintain an academic tone and logical argument. Every citation must map to an actual source in \
+                         the review; label proposed methodology or future work as proposed rather than completed."
                     ),
                 )?;
 
                 state.set(
                     "tpl_review",
                     format!(
-                        "You are a peer reviewer evaluating an academic paper on: {topic}\n\n\
-                         Review the following paper draft and provide:\n\
-                         1. Overall quality score (0-100) -- at the very beginning of your response, \
-                         output exactly: QUALITY_SCORE: <number>\n\
-                         2. Strengths (what works well)\n\
-                         3. Weaknesses (what needs improvement)\n\
-                         4. Specific, actionable suggestions for each section\n\n\
-                         Be thorough and constructive."
+                        "Peer-review the supplied draft on {topic}. Check contribution, factual/citation support, \
+                         methodology, internal consistency, evidence strength, limitations, and whether claims exceed \
+                         results. Begin exactly with QUALITY_SCORE: <0-100>, then provide:\n\
+                         - strengths worth preserving\n\
+                         - concrete defects ordered by impact\n\
+                         - section-specific revisions and any citation requiring verification."
                     ),
                 )?;
 
                 state.set(
                     "tpl_revise",
-                    "You are a revision specialist.\n\n\
-                     Revise the following paper draft based on the reviewer feedback.\n\
-                     Address every point raised by the reviewer. Improve clarity, rigor, \
-                     citation accuracy, and overall quality.\n\n\
-                     Provide the complete revised paper with improvements.",
+                    "Revise the complete paper using the review as a set of claims to evaluate. Correct valid issues, \
+                     preserve supported material, remove or qualify unsupported claims, and never invent evidence or \
+                     citations to satisfy feedback. Return the full revised paper.",
                 )?;
 
                 Ok(())

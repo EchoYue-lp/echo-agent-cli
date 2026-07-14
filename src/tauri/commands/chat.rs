@@ -638,26 +638,7 @@ pub async fn send_chat_message(
         .interaction_mode
         .load(std::sync::atomic::Ordering::Relaxed);
     let interaction_mode = InteractionMode::from_u8(raw);
-    let mode_hint = match interaction_mode {
-        InteractionMode::Chat => Some(
-            "Chat mode — task runtime tools are unavailable in this turn. \
-             Reply directly with ordinary chat/tool usage; do not create or execute a task plan."
-                .to_string(),
-        ),
-        InteractionMode::Task => Some(
-            "Task mode — use formal plan execution. First create explicit PlanTask items with \
-             plan_create, then call plan_execute() with no task argument to run the DAG. \
-             Do not use plan_execute({task}) inline single-subagent dispatch in Task mode."
-                .to_string(),
-        ),
-        InteractionMode::Auto => Some(
-            "Auto mode — classify the request yourself. For simple chat, answer directly. \
-             For high-noise research or broad codebase inspection, you may use inline \
-             plan_execute({task}) subagents. For multi-step / multi-file / long-running work, \
-             create a formal plan with plan_create and then plan_execute()."
-                .to_string(),
-        ),
-    };
+    let mode_hint = Some(interaction_mode.prompt_hint().to_string());
 
     let res = std::sync::Arc::new(echo_agent_app_core::chat_resources::ChatResources {
         pool: state.app_state.connection.pool.clone(),

@@ -110,11 +110,12 @@ pub static GENERAL: ProfileTemplate = ProfileTemplate {
     label: "General",
     default_worker_roles: GENERAL_WORKER_ROLES,
     prompt_suffix: "\
-Use the universal task methodology: clarify the goal, split work into small \
-verifiable tasks, mark read-only investigation tasks as parallelizable, and \
-keep mutating/serial work separate. State assumptions and risks explicitly. \
-Prefer concrete file paths, data sources, or discovery targets over vague \
-phrasing like 'continue improving' or 'handle edge cases'.",
+Build the smallest plan that fully satisfies the user's outcome. Each task must \
+produce a decision, evidence set, change, artifact, or verification result. Use \
+dependencies only for real information or mutation ordering; independent work \
+should be parallelizable. Assign a role by capability, name concrete targets, \
+and state what evidence will prove the task complete. Keep assumptions, external \
+side effects, and unresolved risks explicit.",
     workflows: UNIVERSAL_WORKFLOWS,
     review_checklist: &[
         "Is the goal understood and restated?",
@@ -131,16 +132,14 @@ pub static AI_CODING: ProfileTemplate = ProfileTemplate {
     label: "AI Coding",
     default_worker_roles: AI_CODING_WORKER_ROLES,
     prompt_suffix: "\
-This is a software-engineering workspace. Split work into read-only review / \
-investigation tasks (parallelizable) and implementation tasks (serialized). \
-Every implementation task must list concrete file paths and a verification \
-step (cargo check / npm build / relevant tests). Read-only work is delegated \
-to registered capability subagents; implementation/debugging tasks are NOT \
-delegated to a subagent — the main agent performs writes directly, serially and \
-approval-gated. So only assign read-only kinds (read_only_review, \
-investigation, test_plan, review, summary) a subagent role from the registered \
-set. Coding tasks can still use data, research, or medical subagents when the \
-actual goal crosses those boundaries.",
+This is a software-engineering workspace. Plan from repository evidence, not \
+from an imagined greenfield design. Separate discovery, implementation, and \
+verification outcomes. Read-only work can run in parallel; writer tasks should \
+declare owned files and use a writer-capable role so the runtime can isolate \
+their changes. Every behavior-changing task needs a concrete verification path \
+(targeted tests plus the repository-required build/type/format checks). Include \
+dirty-worktree preservation, state ownership, failure handling, and rollback \
+considerations when relevant. Cross-domain tasks may use data or research roles.",
     workflows: CODING_WORKFLOWS,
     review_checklist: &[
         "Architecture fit with existing code?",
@@ -158,13 +157,13 @@ pub static DATA_ANALYSIS: ProfileTemplate = ProfileTemplate {
     label: "Data Analysis",
     default_worker_roles: DATA_ANALYSIS_WORKER_ROLES,
     prompt_suffix: "\
-This is a data-analysis task. Make data provenance explicit. Split work into \
-profiling, cleaning, analysis, and reproducibility checks. Every \
-transformation must be reproducible from a script or notebook artifact. \
-Flag missing values, outliers, and metric-definition inconsistencies. Avoid \
-conclusions overfit to a convenient subset of the data. Use coding subagents \
-when the analysis depends on scripts/notebooks/packages, and research or \
-medical subagents when the data question depends on external evidence.",
+This is a data-analysis task. Make the analytical question and decision metric \
+explicit. Plan provenance/schema profiling before transformations, and plan \
+transformations before inference. Preserve raw inputs; require reproducible \
+artifacts, row-count/quality checks, assumption tests, uncertainty, and at least \
+one sensitivity or reconciliation check for material conclusions. Separate \
+descriptive, predictive, and causal claims. Add research or coding tasks when \
+external evidence, scripts, notebooks, or packages are necessary.",
     workflows: UNIVERSAL_WORKFLOWS,
     review_checklist: &[
         "Data source and provenance are clear?",
@@ -182,13 +181,13 @@ pub static ACADEMIC_RESEARCH: ProfileTemplate = ProfileTemplate {
     label: "Academic Research",
     default_worker_roles: ACADEMIC_RESEARCH_WORKER_ROLES,
     prompt_suffix: "\
-This is an academic-research task. Make the search strategy explicit. Every \
-claim must cite a real, verifiable source. Distinguish study types and state \
-evidence level where possible. Include disagreements and limitations. Do not \
-let claims exceed the strength of the underlying evidence. Output an evidence \
-table and a bibliography artifact. Use data-analysis subagents when papers, \
-datasets, statistics, or plots need scrutiny; use coding subagents when the \
-research includes reproducible code, tools, notebooks, or implementation.",
+This is an academic-research task. Plan the question, source strategy, screening \
+criteria, extraction fields, critical appraisal, synthesis, and citation audit. \
+Central claims need directly supporting, verifiable sources. Distinguish study \
+type, peer-review status, methods, population/data, effect or result, and \
+limitations. Preserve disagreement and null results. Require a search trail and \
+evidence table when the scope is a review; add data or coding tasks for \
+statistical, dataset, notebook, or reproducibility work.",
     workflows: UNIVERSAL_WORKFLOWS,
     review_checklist: &[
         "Search strategy explicit and reproducible?",
@@ -206,14 +205,13 @@ pub static MEDICAL_RESEARCH: ProfileTemplate = ProfileTemplate {
     label: "Medical Research",
     default_worker_roles: MEDICAL_RESEARCH_WORKER_ROLES,
     prompt_suffix: "\
-This is a medical-research task with strict safety and evidence boundaries. \
-Prioritize authoritative sources (guidelines, systematic reviews). \
-Distinguish guideline / systematic-review / trial types and state evidence \
-level. Make uncertainty explicit. NEVER present a diagnosis or treatment as \
-medical advice — include a non-diagnostic disclaimer where appropriate. \
-Every clinical statement must be directly supported by a reliable citation. \
-Use data-analysis subagents for cohorts, datasets, statistics, or biomedical \
-tables, and coding subagents for notebooks, scripts, pipelines, or tool review.",
+This is a medical-research task. Frame the question with PICO/PECO or an \
+equivalent structure and prioritize current guidelines, systematic reviews, and \
+pivotal studies. Plan direct citation support for material clinical claims, \
+evidence-quality and applicability assessment, harms/contraindications, \
+conflicting guidance, and uncertainty. Do not convert population evidence into \
+individual diagnosis or treatment. Add data-analysis or coding tasks for \
+cohorts, statistics, tables, notebooks, pipelines, or reproducibility work.",
     workflows: UNIVERSAL_WORKFLOWS,
     review_checklist: &[
         "Authoritative sources prioritized?",

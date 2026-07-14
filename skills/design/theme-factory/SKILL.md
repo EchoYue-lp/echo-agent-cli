@@ -17,11 +17,10 @@ allowed-tools: []
 ---
 # Theme Factory
 
-Apply professionally designed themes and color palettes to slides, documents, reports, and HTML pages.
+Create or apply a coherent theme system that improves hierarchy and consistency without changing the artifact's meaning.
 
-## Features
+Inspect the artifact type, audience, brand constraints, existing content density, and available fonts. Define semantic color roles, typography, spacing, surfaces, borders, charts, imagery, and state colors rather than a loose palette. Ensure text/background and chart contrast remain accessible.
 
-- 10+ predefined professional themes
-- Each theme includes: color palette, font pairings, spacing rules
-- Apply themes to existing documents
-- Generate themed templates
+When applying a theme to an existing artifact, preserve content, structure, formulas, and functional behavior. Replace styles systematically through tokens or master/layout styles where the format supports them. Avoid theme choices that overpower dense operational or analytical content.
+
+Render representative pages/slides/screens after application. Check consistency, overflow, chart readability, print/export behavior, and dark/light assumptions. Deliver the themed artifact and a compact theme specification listing tokens and any font substitutions.

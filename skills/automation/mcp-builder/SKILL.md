@@ -16,11 +16,16 @@ allowed-tools: [bash, read, write]
 ---
 # MCP Builder
 
-Create high-quality MCP (Model Context Protocol) servers that enable LLMs to interact with external services through well-designed tools.
+Build an MCP server whose tools are predictable, inspectable, and easy for an agent to call correctly.
 
-## Features
+## Contract
 
-- Build MCP servers in Python (FastMCP) or Node/TypeScript
-- Design clean tool interfaces with proper validation
-- Handle authentication and rate limiting
-- Test and debug MCP servers
+- Inspect the target API, repository conventions, existing MCP configuration, and SDK version before choosing Python or TypeScript. Reuse the project's stack when possible.
+- Design tools around user outcomes, not raw endpoint mirrors. Use specific names, concise descriptions, minimal required parameters, enums for closed sets, and structured results with stable error shapes.
+- Keep authentication and secrets outside prompts, logs, fixtures, and returned tool content. Validate obvious malformed input, but do not add product-level permission gates that make a trusted local extension unusable.
+- Define timeout, retry, pagination, rate-limit, cancellation, and partial-failure behavior. Avoid hidden writes; tool descriptions must disclose material side effects.
+- Add tests for schema validation, happy path, upstream errors, empty results, and representative agent calls. Run an MCP inspector or client smoke test when available.
+
+## Delivery
+
+Provide the working server, configuration example without secrets, tool catalog, verification evidence, and any upstream assumptions. Do not claim compatibility with a client or API version that was not tested.

@@ -148,6 +148,22 @@ impl InteractionMode {
             InteractionMode::Auto => "Auto",
         }
     }
+
+    /// Per-turn behavior contract injected into the user message. Keeping this
+    /// here ensures GUI, TUI, and channel entry points stay behaviorally equal.
+    pub fn prompt_hint(&self) -> &'static str {
+        match self {
+            InteractionMode::Chat => {
+                "Chat mode. TaskRuntime tools are unavailable for this turn. Resolve the request directly with ordinary conversation and available non-task tools. Do not claim to create, execute, or update a formal plan."
+            }
+            InteractionMode::Task => {
+                "Task mode. Use a formal, reviewable DAG: create concrete PlanTask items with plan_create, then call plan_execute() without a task argument. Keep task status and verification current. Do not use inline plan_execute({task}) dispatch in this mode."
+            }
+            InteractionMode::Auto => {
+                "Auto mode. Choose the lightest reliable path: answer or act directly for simple work; use one isolated subagent for a bounded high-noise investigation; use plan_create plus plan_execute() for multi-step, multi-file, dependent, or long-running work."
+            }
+        }
+    }
 }
 
 // ── Attended mode ───────────────────────────────────────────────────────
@@ -1248,6 +1264,20 @@ pub struct RunUsageSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn interaction_mode_prompt_contracts_are_distinct_and_actionable() {
+        let chat = InteractionMode::Chat.prompt_hint();
+        let task = InteractionMode::Task.prompt_hint();
+        let auto = InteractionMode::Auto.prompt_hint();
+
+        assert!(chat.contains("TaskRuntime tools are unavailable"));
+        assert!(task.contains("plan_create"));
+        assert!(task.contains("plan_execute()"));
+        assert!(auto.contains("lightest reliable path"));
+        assert_ne!(chat, task);
+        assert_ne!(task, auto);
+    }
 
     #[test]
     fn status_machine_allows_documented_transitions() {

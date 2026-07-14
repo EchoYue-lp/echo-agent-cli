@@ -18,15 +18,10 @@ allowed-tools: [bash, read, write]
 ---
 # Canvas Design
 
-Create beautiful visual art in .png and .pdf documents. Design posters, logos, infographics, and other visual content.
+Create a finished static visual whose hierarchy, typography, composition, and export quality match its real use.
 
-## Features
+Establish audience, message, dimensions, viewing distance, required copy, brand assets, and output format. Build one strong visual concept with a clear focal point and reading order. Use a deliberate grid, restrained type system, accessible contrast, and imagery that carries information rather than decoration.
 
-- Create visual designs from text descriptions
-- Output formats: PNG, PDF
-- Support for typography, colors, layouts
-- Iterative design refinement
+For posters and infographics, prioritize scan order and factual integrity. For logos, produce original geometry, test small-size legibility, and avoid confusing similarity to existing marks. Preserve supplied text exactly unless editing is requested.
 
-## Requirements
-
-- Font files in resources/ directory (loaded on demand)
+Render before delivery. Inspect at 100% and target display size for clipping, awkward line breaks, alignment, margins, raster quality, and PDF font/image embedding. Revise until clean. Deliver source plus requested PNG/PDF exports and note any substituted fonts or missing assets.

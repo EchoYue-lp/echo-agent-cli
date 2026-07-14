@@ -116,9 +116,11 @@ pub fn build_data_graph(shared: SharedAgent, max_charts: usize) -> anyhow::Resul
                 };
 
                 let prompt = format!(
-                    "You are a data analyst. Describe the dataset at '{dataset_path}'.\n\
+                    "Inspect the dataset at '{dataset_path}' and establish a trustworthy analysis baseline.\n\
                      {tool_guidance}\n\
-                     Report: columns, data types, shape, and any obvious issues.\n\
+                     Report provenance if known, sheets/tables, row and column counts, field names, inferred types, \
+                     units/time grain, candidate keys, missingness, duplicates, parsing problems, and obvious range issues. \
+                     Do not silently clean or reinterpret values in this stage.\n\
                      {objective_section}",
                     objective_section = if objective.is_empty() { String::new() } else {
                         format!("Focus especially on aspects relevant to: {}", objective)
@@ -144,13 +146,16 @@ pub fn build_data_graph(shared: SharedAgent, max_charts: usize) -> anyhow::Resul
                     ""
                 };
                 let prompt = format!(
-                    "Given this data description:\n{description}\n{prev_warning}\n\
-                     Compute a statistical profile using these tools:\n\
+                    "Validate and extend the dataset profile below. Treat the previous description as a hypothesis, \
+                     not authoritative evidence.\n\n{description}\n{prev_warning}\n\
+                     Use the available tools as appropriate:\n\
                      - data_stats for per-column statistics (mean, median, std dev, percentiles)\n\
                      - profile_data for dimension/metric classification and missing rates\n\
                      - missing_value_analysis for detailed missing value patterns\n\
                      - correlate_data for correlations between numeric columns\n\
-                     Present the profile in a structured format."
+                     Report sample sizes and denominators, missing/duplicate patterns, suspicious values, distribution \
+                     shape, and correlations with warnings about non-numeric encodings or insufficient observations. \
+                     Do not infer causality."
                 );
                 state.set("profile_prompt", prompt)?;
                 Ok(())
@@ -167,12 +172,14 @@ pub fn build_data_graph(shared: SharedAgent, max_charts: usize) -> anyhow::Resul
                     tracing::warn!(pipeline = "data_analysis", stage = "analyze", "Profile stage produced empty output");
                 }
                 let prompt = format!(
-                    "Analyze this data and identify patterns, outliers, and insights:\n\n\
+                    "Answer the analytical objective using the minimum method sufficient for a defensible result.\n\n\
                      Data Description:\n{description}\n\n\
                      Statistical Profile:\n{profile}\n\
                      {objective_section}\n\
                      Use tools like filter_data, aggregate_data, topn_data, contribution_data, \
-                     outlier_detection, and pivot_data as appropriate.",
+                     outlier_detection, and pivot_data as appropriate. Define each metric and denominator, verify \
+                     important calculations, distinguish description/association/prediction/causation, and report \
+                     uncertainty and data limitations alongside findings.",
                     objective_section = if objective.is_empty() { String::new() } else {
                         format!("\nFocus the analysis on: {}", objective)
                     }
@@ -192,13 +199,15 @@ pub fn build_data_graph(shared: SharedAgent, max_charts: usize) -> anyhow::Resul
                 }
                 let prompt = format!(
                     "Given this analysis:\n{analysis}\n\n\
-                     Suggest {max_charts} visualizations that best illustrate these findings.\n\
-                     Use generate_chart tool to create actual charts.\n\
+                     Create up to {max_charts} visualizations only where a chart materially improves understanding.\n\
+                     Use generate_chart to create actual charts and verify that the encoded fields match the claim.\n\
                      For each visualization, specify:\n\
                      - Chart type (bar, line, scatter, heatmap, boxplot, pie, area)\n\
                      - Which columns to use (x_field, y_field, color_field)\n\
                      - What insight it reveals\n\
-                     - Suggested title and axis labels"
+                     - Suggested title and axis labels\n\
+                     Avoid truncated axes, inappropriate aggregation, misleading dual scales, unreadable categories, \
+                     and chart types that obscure magnitude. State when the available data cannot support a useful chart."
                 );
                 state.set("visualize_prompt", prompt)?;
                 Ok(())
@@ -214,14 +223,12 @@ pub fn build_data_graph(shared: SharedAgent, max_charts: usize) -> anyhow::Resul
                     tracing::warn!(pipeline = "data_analysis", stage = "summarize", "Both analysis and visualization stages produced empty output");
                 }
                 let prompt = format!(
-                    "Create a concise executive summary of these data findings:\n\n\
+                    "Create a concise evidence-grounded summary of these data findings:\n\n\
                      Analysis:\n{analysis}\n\n\
                      Recommended Visualizations:\n{viz}\n\n\
-                     The summary should include:\n\
-                     1. Key findings (top 3-5 insights)\n\
-                     2. Data quality assessment\n\
-                     3. Recommendations for further investigation\n\
-                     4. Suggested next steps"
+                     Include the decision-relevant findings, metric definitions and denominators, uncertainty, data \
+                     quality limitations, and the smallest justified next actions. Do not introduce claims or numbers \
+                     absent from the analysis. Separate observed results from interpretation."
                 );
                 state.set("summarize_prompt", prompt)?;
                 Ok(())

@@ -28,7 +28,7 @@ hooks:
 
 # Test-Driven Development
 
-When implementing any feature or bugfix, follow the Red-Green-Refactor cycle BEFORE writing implementation code.
+Use Red-Green-Refactor when behavior can be expressed in an automated test and the test provides useful regression protection. Scale the method to risk and repository conventions.
 
 ## Process
 
@@ -39,7 +39,7 @@ When implementing any feature or bugfix, follow the Red-Green-Refactor cycle BEF
 
 ## Key Principles
 
-- Never write implementation code without a failing test first
-- The test IS the specification
+- Prefer a failing regression test first for bugs and contract changes; when infrastructure or exploratory work makes that impractical, identify the validation before editing and add coverage as soon as the behavior is stable
+- Tests are executable evidence, not the whole specification; also respect user requirements, interfaces, and repository rules
 - Minimal implementation — only what's needed to pass
-- Refactor fearlessly — tests have your back
+- Refactor only within scope and keep the full relevant suite green

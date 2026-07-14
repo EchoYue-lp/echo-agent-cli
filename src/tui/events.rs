@@ -28,7 +28,6 @@ use echo_agent::agent::subagent::SubagentEvent;
 use echo_agent::tasks::TaskEvent;
 use echo_agent_app_core::context_window::ContextWindowSnapshot;
 use echo_agent_app_core::tasks::BackgroundTaskService;
-use echo_agent_app_core::tasks::task_runtime::InteractionMode;
 
 /// Poll interval for non-blocking event check.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -1253,26 +1252,7 @@ async fn dispatch_turn(
     app.active_turn_id = Some(turn_id.clone());
     let sink: std::sync::Arc<dyn echo_agent_app_core::chat_driver::ChatSink> =
         std::sync::Arc::new(TuiChatSink::new(agent_tx));
-    let mode_hint = match turn.interaction_mode {
-                InteractionMode::Chat => Some(
-                    "Chat mode — task runtime tools are unavailable in this turn. \
-                     Reply directly with ordinary chat/tool usage; do not create or execute a task plan."
-                        .to_string(),
-                ),
-                InteractionMode::Task => Some(
-                    "Task mode — use formal plan execution. First create explicit PlanTask items with \
-                     plan_create, then call plan_execute() with no task argument to run the DAG. \
-                     Do not use plan_execute({task}) inline single-subagent dispatch in Task mode."
-                        .to_string(),
-                ),
-                InteractionMode::Auto => Some(
-                    "Auto mode — classify the request yourself. For simple chat, answer directly. \
-                     For high-noise research or broad codebase inspection, you may use inline \
-                     plan_execute({task}) subagents. For multi-step / multi-file / long-running work, \
-                     create a formal plan with plan_create and then plan_execute()."
-                        .to_string(),
-                ),
-    };
+    let mode_hint = Some(turn.interaction_mode.prompt_hint().to_string());
     let res = std::sync::Arc::new(echo_agent_app_core::chat_resources::ChatResources {
         pool: app.pool.clone(),
         store: app.task_runtime_store.clone(),
