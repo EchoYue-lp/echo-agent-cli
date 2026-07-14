@@ -43,9 +43,6 @@
       "src-tauri/icons/128x128@2x.png",
       "src-tauri/icons/icon.icns",
       "src-tauri/icons/icon.ico"
-    ],
-    "resources": {
-      "chrome-extension/": "chrome-extension/"
-    }
+    ]
   }
 }

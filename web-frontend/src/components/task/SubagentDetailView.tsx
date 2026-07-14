@@ -15,6 +15,7 @@ import { useSubagentDetailStore } from '../../stores/subagentDetailStore';
 import { CacheUsageCard, cacheUsageForRuns } from './TaskRuntimePanel';
 import MarkdownContent from '../common/MarkdownContent';
 import { InlineToolCall } from '../chat/InlineToolCall';
+import { isSubagentDispatchTool } from '../chat/tools/toolRenderers';
 import {
   computeSubagentProgress,
   progressSummary,
@@ -134,7 +135,7 @@ function usageLine(event: ExecutionEvent): string {
 }
 
 export function SubagentDetailView({ run, allRuns, onBack }: SubagentDetailViewProps) {
-  const [activeTab, setActiveTab] = useState<'process' | 'task' | 'result'>('process');
+  const [activeTab, setActiveTab] = useState<'task' | 'process' | 'result'>('process');
   const selectSubagent = useSubagentDetailStore((state) => state.selectSubagent);
   const progress = useMemo(() => computeSubagentProgress(run), [run.events, run.status]);
   const steps = useMemo(() => reconstructSteps(run.events), [run.events]);
@@ -181,8 +182,8 @@ export function SubagentDetailView({ run, allRuns, onBack }: SubagentDetailViewP
 
         <div className="mt-4 flex gap-1 border-b border-[var(--border-primary)]">
           {[
-            ['process', '执行过程', TerminalSquare],
-            ['task', '任务输入', ClipboardList],
+            ['task', '提示词 / 任务', ClipboardList],
+            ['process', '执行细节', TerminalSquare],
             ['result', '结果', Gauge],
           ].map(([id, label, Icon]) => (
             <button
@@ -205,7 +206,7 @@ export function SubagentDetailView({ run, allRuns, onBack }: SubagentDetailViewP
       <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4 sm:px-8">
         {activeTab === 'task' && (
           <div className="mx-auto max-w-[880px]">
-            <SectionTitle title="任务输入" subtitle="[task_context] 动态输入" />
+            <SectionTitle title="提示词 / 任务" subtitle="分派给 subagent 的任务与上下文" />
             <div className="mb-3 flex flex-wrap gap-2 text-[10px]">
               <ContextChip label="prompt" value={run.promptSource ?? 'unknown'} />
               <ContextChip
@@ -237,7 +238,7 @@ export function SubagentDetailView({ run, allRuns, onBack }: SubagentDetailViewP
 
         {activeTab === 'process' && (
           <div className="mx-auto max-w-[880px] space-y-4">
-            <SectionTitle title="执行过程" subtitle="思考、工具调用、token/cache 事件" />
+            <SectionTitle title="执行细节" subtitle="思考、工具调用、token/cache 事件" />
             <div className="md:hidden">
               <CacheUsageCard summary={cacheSummary} compact />
             </div>
@@ -277,6 +278,7 @@ export function SubagentDetailView({ run, allRuns, onBack }: SubagentDetailViewP
                   }
 
                   const name = String(step.toolStart?.name ?? step.toolResult?.name ?? 'tool');
+                  if (isSubagentDispatchTool(name)) return null;
                   const args = step.toolStart?.args ?? {};
                   const resultText = String(step.toolResult?.result ?? '');
                   const success = step.toolResult?.success !== false;
@@ -289,12 +291,14 @@ export function SubagentDetailView({ run, allRuns, onBack }: SubagentDetailViewP
                         args,
                         result: resultText,
                         success,
-                        status: success ? 'succeeded' : 'failed',
+                        status: step.toolResult ? (success ? 'succeeded' : 'failed') : 'running',
                         stdout: success ? resultText : '',
                         stderr: success ? '' : resultText,
                         log: '',
                         startedAt: Number(step.toolStart?.timestamp ?? Date.now()),
-                        finishedAt: Number(step.toolResult?.timestamp ?? Date.now()),
+                        finishedAt: step.toolResult
+                          ? Number(step.toolResult.timestamp ?? Date.now())
+                          : undefined,
                       }}
                       index={index}
                     />

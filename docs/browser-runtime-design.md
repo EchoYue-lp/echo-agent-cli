@@ -151,9 +151,8 @@ Environment overrides:
 | `EKO_BROWSER_OUTPUT_DIR` | Override browser output path. |
 | `EKO_BROWSER_SESSION_DIR` | Override lightweight browser session metadata path. |
 | `EKO_BROWSER_STARTUP_TIMEOUT_SECS` | MCP handshake timeout; defaults to 60 seconds. |
-| `EKO_CHROME_ENABLED` | Enable the local Chrome extension bridge; defaults to enabled. |
-| `EKO_CHROME_BRIDGE_DIR` | Override the private endpoint-file directory. |
-| `EKO_CHROME_EXTENSION_ID` | Optionally pin the desktop handshake to one extension id. |
+| `EKO_BROWSER_EXTENSION_ENABLED` | Enable the official Playwright Extension backend; defaults to enabled. |
+| `EKO_BROWSER_EXTENSION_TOKEN` | Optional token configured in the Playwright Extension to bypass repeated connection approval. |
 
 ## Session model
 
@@ -352,76 +351,59 @@ agent `permission_mode`.
 
 ## Chrome extension mode
 
-The Chrome extension is additive and does not replace managed Chromium. Public
+The Chrome backend is additive and does not replace managed Chromium. Public
 pages and localhost use the managed browser by default; existing Chrome is
-selected only when a task needs the user's current authenticated state.
-
-The extension uses Manifest V3, a native messaging host, and an EKO connection
-manager. It operates only on explicitly authorized tabs/tab groups through
-Chrome APIs and a bounded message protocol. EKO does not read cookie databases,
-password stores, or Chrome profile files. Releasing a task stops EKO control
-without closing pages that the user already owned.
+selected only when a task needs the user's current authenticated state. EKO
+does not read cookie databases, password stores, or Chrome profile files.
 
 ### Phase 6 implementation
 
-The design follows two official implementation constraints. Codex Chrome uses
-the signed-in browser only when a task needs existing account state, keeps each
-task in a Chrome tab group, and retains the built-in browser for localhost and
-public pages. Chrome Native Messaging launches a host over stdin/stdout with
-32-bit native-endian length-prefixed UTF-8 JSON, limits host-to-extension
-messages to 1 MiB, and restricts host access through exact `allowed_origins`.
-Chrome scripting additionally requires `scripting` plus `activeTab` or a host
-permission. EKO adopts those boundaries rather than treating Chrome as another
-Playwright profile.
+The implementation follows the official
+[Playwright MCP extension mode](https://github.com/microsoft/playwright-mcp#extension-mode).
+`@playwright/mcp@latest --extension` connects to the user's existing Chrome or
+Edge session through the official
+[Playwright Extension](https://github.com/microsoft/playwright/tree/main/packages/extension#readme).
+This preserves logged-in state while retaining the same MCP accessibility
+snapshot and action protocol used by managed Chromium. Codex's browser model
+provides the product-level precedent: use an existing signed-in browser only
+when authenticated state is needed, while keeping an isolated browser as the
+default for public pages and localhost.
 
 `browser_backend` explicitly selects `managed` or `chrome` for one
 conversation. The selection is stored in lightweight `BrowserSession` metadata
 but restored sessions always return to managed mode because a historical file
-cannot prove that a Chrome extension, tab, or permission remains live. Existing
-navigation, snapshot, click, fill, screenshot, back, reload, scroll, and tab
-tools route through the selected backend. Coordinate input and Playwright-only
-diagnostics remain managed-browser capabilities instead of pretending Chrome
-implements them.
+cannot prove that the extension connection or selected tab remains live.
+Switching backends resets EKO's synthetic tab-index mapping so stale indices
+cannot target a different browser. Navigation, snapshots, semantic and
+coordinate input, screenshots, diagnostics, tracing, and tab operations all go
+through the same adapter and MCP tool names on both backends.
 
-The desktop `ChromeConnectionManager` listens only on a random `127.0.0.1`
-port. Each app launch generates a new token and writes protocol, port, token,
-and optional pinned extension id to a `0600` endpoint file. The native host
-validates that file, sends Chrome's caller origin in its handshake, and bridges
-bounded JSON messages. The desktop validates protocol, token, exact optional
-extension id, request ids, 30-second timeouts, and a 1 MiB message ceiling.
-Startup failures remain visible in `chrome_setup_status` instead of silently
-appearing connected.
+The application owns two independent sidecars: managed mode supplies a private
+profile and output directory; Chrome mode supplies `--extension` and no profile
+path. The optional `EKO_BROWSER_EXTENSION_TOKEN` is forwarded only as
+`PLAYWRIGHT_MCP_EXTENSION_TOKEN`. Without it, Playwright presents its own tab
+selection and approval flow. Startup and connection failures remain visible in
+`chrome_setup_status` instead of silently appearing connected.
 
-The packaged EKO executable is also the native host entry point. Chrome starts
-it with a `chrome-extension://` origin, which enters bridge mode before Tauri
-or logging initialization, so installation never depends on a side binary that
-may be missing from the app bundle. A standalone `eko-chrome-native-host` bin
-remains for development and framing tests. `chrome_install_native_host` writes
-the per-user Chrome manifest with an exact extension origin on macOS/Linux;
-Windows is intentionally reported as requiring installer registry integration.
+EKO intentionally does not maintain a parallel Chrome control protocol. The
+former custom Manifest V3 extension, Native Messaging host, endpoint file, DOM
+injection selectors, and CDP allowlist were removed. Delegating those details
+to the official implementation reduces duplicate browser semantics and keeps
+managed and signed-in browsing behavior aligned as Playwright evolves.
 
-The extension lives in `chrome-extension/`. Its popup is the authorization
-surface: the user grants an optional host permission and authorizes the active
-tab. The service worker rejects unlisted tabs and unapproved destinations,
-groups claimed tabs under `EKO · <conversation>`, and tracks which tabs EKO
-created. Releasing a task ungroups all task tabs; closing is permitted only for
-tabs created by EKO, never for user-owned pre-existing tabs.
-
-The bridge supplies bounded DOM snapshots with stable selectors, semantic
-click/fill, navigation, screenshots, scrolling, and task-tab operations. It
-does not request cookies, history, bookmarks, passwords, or profile access.
-Chrome's `debugger` permission is optional and requires a separate popup action;
-the CDP bridge accepts only a small read-oriented command allowlist. It is not
-part of normal page control or the default install permission prompt.
+The initially selected Chrome tab is treated as user-owned by EKO's session
+projection and cannot be closed through `browser_tabs`. Tabs created after the
+connection may be closed normally. Closing or changing the originally selected
+tab remains an explicit user action in Chrome.
 
 ## Unified preview workspace and controlled editing
 
-The GUI now presents tasks and previews in one right-side workspace instead of
-three competing drawers. The top-level tabs are `Tasks` and `Preview`; Preview
-contains `Web` and `Files`. Chat-header buttons open the intended destination
-directly, and the collapse button is labelled independently from browser
-actions. On narrow screens the workspace becomes a full-width overlay above the
-left navigation, so browser and file controls remain operable.
+The GUI now presents tasks, browser, and files in one right-side workspace
+instead of competing drawers and nested preview tabs. Chat-header buttons open
+the intended destination directly, and the collapse button is labelled
+independently from browser actions. On narrow screens the workspace becomes a
+full-width overlay above the left navigation, so browser and file controls
+remain operable.
 
 The web preview works without an active conversation by using a workspace-level
 UI scope. URL submission, reload, screenshot refresh, backend changes, and tab
@@ -430,12 +412,10 @@ refresh their screenshot at a bounded 1.5-second interval only while the panel
 is mounted and ready. Chrome remains an explicit user or agent choice; EKO never
 switches from managed browsing based on the URL or login-page detection.
 
-Selecting `Connect Chrome...` opens a setup flow that reports the desktop
-bridge and native-host states, opens `chrome://extensions` and the bundled
-extension directory, validates and registers the extension id, polls for the
-extension connection, and claims the authorized tab before closing. Switching
-back to managed mode releases the EKO Chrome lease but does not close a
-user-owned tab.
+Selecting `Connect Chrome...` opens a setup flow that reports the extension MCP
+state, links to the official Chrome Web Store listing, and starts Playwright's
+tab selection/approval flow. Switching back to managed mode drops the extension
+sidecar's active EKO session mapping but does not close a user-owned tab.
 
 The file preview uses workspace-relative Tauri commands for the tree, Git
 changes, file content, and diffs. Text, images, PDFs, unsupported binaries, and

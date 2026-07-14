@@ -5,6 +5,7 @@ import MarkdownContent from '../common/MarkdownContent';
 import { ThinkingSegment } from './ThinkingSegment';
 import { InlineToolCall } from './InlineToolCall';
 import { ParallelExecutionBlock } from './ParallelExecutionBlock';
+import { isSubagentDispatchTool } from './tools/toolRenderers';
 
 interface MessageBubbleProps {
   message: ChatMessage;
@@ -65,7 +66,9 @@ function flattenSteps(message: ChatMessage): { steps: FlatStep[]; thinkingTotal:
       }
       round.toolCallIds.forEach((callId) => {
         const tc = message.toolCalls?.find((tool) => tool.id === callId);
-        if (tc) steps.push({ type: 'tool', toolCall: tc, toolIndex: steps.length });
+        if (tc && !isSubagentDispatchTool(tc.name)) {
+          steps.push({ type: 'tool', toolCall: tc, toolIndex: steps.length });
+        }
       });
     });
   } else if (message.executionSteps && message.executionSteps.length > 0) {
@@ -78,7 +81,9 @@ function flattenSteps(message: ChatMessage): { steps: FlatStep[]; thinkingTotal:
         }
       } else if (step.type === 'tool') {
         const tc = message.toolCalls?.find((tool) => tool.id === step.callId);
-        if (tc) steps.push({ type: 'tool', toolCall: tc, toolIndex: steps.length });
+        if (tc && !isSubagentDispatchTool(tc.name)) {
+          steps.push({ type: 'tool', toolCall: tc, toolIndex: steps.length });
+        }
       }
     });
   } else {
@@ -93,7 +98,9 @@ function flattenSteps(message: ChatMessage): { steps: FlatStep[]; thinkingTotal:
       thinkingTotal++;
     }
     (message.toolCalls || []).forEach((tc, i) => {
-      steps.push({ type: 'tool', toolCall: tc, toolIndex: i });
+      if (!isSubagentDispatchTool(tc.name)) {
+        steps.push({ type: 'tool', toolCall: tc, toolIndex: i });
+      }
     });
   }
   return { steps, thinkingTotal };

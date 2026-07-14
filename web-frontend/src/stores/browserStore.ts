@@ -34,6 +34,7 @@ interface BrowserFrame {
 
 export type BrowserEvent =
   | { type: 'session_started'; session: BrowserSession }
+  | { type: 'session_updated'; session: BrowserSession }
   | { type: 'tab_opened'; session_id: string; tab: BrowserTab }
   | { type: 'navigation_started'; session_id: string; tab_id: string; url: string }
   | { type: 'navigation_completed'; session_id: string; tab_id: string; url: string }
@@ -112,7 +113,7 @@ export const useBrowserStore = create<BrowserStore>((set) => ({
   chromeConnected: false,
   ingest: (event) =>
     set((state) => {
-      if (event.type === 'session_started') {
+      if (event.type === 'session_started' || event.type === 'session_updated') {
         const firstTab = event.session.tabs[0];
         return {
           views: {
@@ -313,6 +314,7 @@ export const useBrowserStore = create<BrowserStore>((set) => ({
       await invokeBrowser('browser_set_backend', { conversationId, backend });
       set((state) => ({
         commandErrors: { ...state.commandErrors, [conversationId]: '' },
+        chromeConnected: backend === 'chrome' ? true : state.chromeConnected,
       }));
       return null;
     } catch (error) {

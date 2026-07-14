@@ -14,6 +14,9 @@ pub enum BrowserEvent {
     SessionStarted {
         session: BrowserSession,
     },
+    SessionUpdated {
+        session: BrowserSession,
+    },
     TabOpened {
         session_id: String,
         tab: BrowserTab,
@@ -88,6 +91,7 @@ impl BrowserEvent {
     pub fn name(&self) -> &'static str {
         match self {
             Self::SessionStarted { .. } => "browser_session_started",
+            Self::SessionUpdated { .. } => "browser_session_updated",
             Self::TabOpened { .. } => "browser_tab_opened",
             Self::NavigationStarted { .. } => "browser_navigation_started",
             Self::NavigationCompleted { .. } => "browser_navigation_completed",

@@ -1,4 +1,3 @@
-pub mod chrome_native_host;
 pub mod cli;
 pub mod logging;
 

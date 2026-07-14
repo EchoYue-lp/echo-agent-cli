@@ -2,7 +2,7 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum BrowserError {
-    #[error("managed browser is disabled")]
+    #[error("browser backend is disabled")]
     Disabled,
     #[error("browser prerequisite check failed: {0}")]
     Prerequisite(String),

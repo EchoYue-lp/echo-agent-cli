@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { ToolExecution } from '../../../types/api';
-import { describeToolExecution } from './toolRenderers';
+import { describeToolExecution, isSubagentDispatchTool } from './toolRenderers';
 
 function tool(name: string, args: unknown, result = ''): ToolExecution {
   return {
@@ -99,5 +99,12 @@ describe('tool renderer registry', () => {
       title: 'Subagent reviewer',
       detail: 'Review the browser renderer',
     });
+  });
+
+  it('identifies dispatch tools that are represented by subagent panels', () => {
+    expect(isSubagentDispatchTool('agent_tool')).toBe(true);
+    expect(isSubagentDispatchTool('plan_execute')).toBe(true);
+    expect(isSubagentDispatchTool('create_complex_task')).toBe(false);
+    expect(isSubagentDispatchTool('read_file')).toBe(false);
   });
 });

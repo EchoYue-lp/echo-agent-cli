@@ -6,17 +6,15 @@ use tokio::process::Command;
 
 use super::config::BrowserConfig;
 use super::error::{BrowserError, BrowserResult};
+use super::session::BrowserBackend;
 
 pub const BROWSER_MCP_SERVER_NAME: &str = "eko-playwright";
+pub const BROWSER_MCP_EXTENSION_SERVER_NAME: &str = "eko-playwright-extension";
 
 pub struct BrowserSidecar;
 
 impl BrowserSidecar {
     pub async fn prepare(config: &BrowserConfig) -> BrowserResult<()> {
-        if !config.enabled {
-            return Err(BrowserError::Disabled);
-        }
-
         let node = command_version(&config.node_command).await?;
         require_node_18(&node)?;
         command_version(&config.npm_command).await?;
@@ -34,19 +32,32 @@ impl BrowserSidecar {
         Ok(())
     }
 
-    pub fn server_config(config: &BrowserConfig) -> McpServerConfig {
-        McpServerConfig::stdio_with_env(
-            BROWSER_MCP_SERVER_NAME,
-            config.npx_command.clone(),
-            config.sidecar_args(),
-            vec![
-                ("NO_COLOR".to_string(), "1".to_string()),
-                (
-                    "PLAYWRIGHT_MCP_OUTPUT_DIR".to_string(),
-                    config.output_dir.to_string_lossy().into_owned(),
-                ),
-            ],
-        )
+    pub fn server_config(config: &BrowserConfig, backend: BrowserBackend) -> McpServerConfig {
+        let (name, args, output_dir) = match backend {
+            BrowserBackend::Managed => (
+                BROWSER_MCP_SERVER_NAME,
+                config.managed_sidecar_args(),
+                config.output_dir.clone(),
+            ),
+            BrowserBackend::Chrome => (
+                BROWSER_MCP_EXTENSION_SERVER_NAME,
+                config.extension_sidecar_args(),
+                config.output_dir.join("extension"),
+            ),
+        };
+        let mut env = vec![
+            ("NO_COLOR".to_string(), "1".to_string()),
+            (
+                "PLAYWRIGHT_MCP_OUTPUT_DIR".to_string(),
+                output_dir.to_string_lossy().into_owned(),
+            ),
+        ];
+        if backend == BrowserBackend::Chrome
+            && let Some(token) = config.extension_token.as_ref()
+        {
+            env.push(("PLAYWRIGHT_MCP_EXTENSION_TOKEN".to_string(), token.clone()));
+        }
+        McpServerConfig::stdio_with_env(name, config.npx_command.clone(), args, env)
     }
 }
 
@@ -118,7 +129,7 @@ mod tests {
             output_dir: PathBuf::from("/tmp/eko-browser-output"),
             ..BrowserConfig::default()
         };
-        let server = BrowserSidecar::server_config(&config);
+        let server = BrowserSidecar::server_config(&config, BrowserBackend::Managed);
         let TransportConfig::Stdio { args, env, .. } = server.transport else {
             return Err("managed Playwright MCP must use stdio transport");
         };
@@ -126,6 +137,30 @@ mod tests {
         assert!(!args.iter().any(|arg| arg.starts_with("-o")));
         assert!(env.iter().any(|(name, value)| {
             name == "PLAYWRIGHT_MCP_OUTPUT_DIR" && value == "/tmp/eko-browser-output"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn extension_server_uses_official_extension_and_optional_token() -> Result<(), &'static str> {
+        let config = BrowserConfig {
+            package: "@playwright/mcp@test".to_string(),
+            output_dir: PathBuf::from("/tmp/eko-browser-output"),
+            extension_token: Some("secret-token".to_string()),
+            ..BrowserConfig::default()
+        };
+        let server = BrowserSidecar::server_config(&config, BrowserBackend::Chrome);
+        assert_eq!(server.name, BROWSER_MCP_EXTENSION_SERVER_NAME);
+        let TransportConfig::Stdio { args, env, .. } = server.transport else {
+            return Err("extension Playwright MCP must use stdio transport");
+        };
+
+        assert!(args.iter().any(|arg| arg == "--extension"));
+        assert!(env.iter().any(|(key, value)| {
+            key == "PLAYWRIGHT_MCP_EXTENSION_TOKEN" && value == "secret-token"
+        }));
+        assert!(env.iter().any(|(key, value)| {
+            key == "PLAYWRIGHT_MCP_OUTPUT_DIR" && value == "/tmp/eko-browser-output/extension"
         }));
         Ok(())
     }

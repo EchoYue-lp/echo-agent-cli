@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { ArrowLeft, Camera, CornerDownLeft, RotateCw, Square, X } from 'lucide-react';
+import { ArrowLeft, Camera, CornerDownLeft, Plus, RotateCw, Square } from 'lucide-react';
 
 export function BrowserToolbar({
   url,
@@ -9,7 +9,7 @@ export function BrowserToolbar({
   onReload,
   onStop,
   onRefreshFrame,
-  onClose,
+  onNewTab,
   backend,
   chromeConnected,
   onBackendChange,
@@ -22,7 +22,7 @@ export function BrowserToolbar({
   onReload: () => void;
   onStop: () => void;
   onRefreshFrame: () => void;
-  onClose: () => void;
+  onNewTab: () => void;
   backend: 'managed' | 'chrome';
   chromeConnected: boolean;
   onBackendChange: (backend: 'managed' | 'chrome') => void;
@@ -72,6 +72,9 @@ export function BrowserToolbar({
       <button type="button" className={iconClass} onClick={onRefreshFrame} title="更新页面截图">
         <Camera size={13} />
       </button>
+      <button type="button" className={iconClass} onClick={onNewTab} title="新建标签页">
+        <Plus size={13} />
+      </button>
       <label className="sr-only" htmlFor="browser-backend">
         浏览器模式
       </label>
@@ -86,16 +89,13 @@ export function BrowserToolbar({
           }
           onBackendChange(next);
         }}
-        className="h-7 w-[96px] shrink-0 rounded-md border border-[var(--border-primary)] bg-[var(--bg-chat)] px-1.5 text-[11px] text-[var(--text-secondary)] outline-none focus:border-[var(--accent)]"
+        className="h-7 w-[88px] shrink-0 rounded-md border border-[var(--border-primary)] bg-[var(--bg-chat)] px-1.5 text-[11px] text-[var(--text-secondary)] outline-none focus:border-[var(--accent)]"
         title={chromeConnected ? '选择浏览器模式' : '连接 Chrome'}
         aria-label="浏览器模式"
       >
         <option value="managed">内置</option>
         <option value="chrome">{chromeConnected ? 'Chrome' : '连接 Chrome…'}</option>
       </select>
-      <button type="button" className={iconClass} onClick={onClose} title="关闭浏览器面板">
-        <X size={14} />
-      </button>
     </form>
   );
 }

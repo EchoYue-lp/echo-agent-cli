@@ -4,7 +4,6 @@ import { useBrowserEvents } from '../../hooks/useBrowserEvents';
 import { useConversationStore } from '../../stores/conversationStore';
 import { useWorkspaceStore } from '../../stores/workspaceStore';
 import { useBrowserStore } from '../../stores/browserStore';
-import { useRightWorkspaceStore } from '../../stores/rightWorkspaceStore';
 import { BrowserStatus } from './BrowserStatus';
 import { BrowserTabs } from './BrowserTabs';
 import { BrowserToolbar } from './BrowserToolbar';
@@ -19,7 +18,6 @@ export function BrowserPanel() {
   const browserScopeId = conversationId ?? `ui-preview:${workspaceId ?? 'global'}`;
   const view = useBrowserStore((state) => state.views[browserScopeId]);
   const store = useBrowserStore();
-  const closeWorkspace = useRightWorkspaceStore((state) => state.close);
   const handleChromeConnectionChange = useCallback((connected: boolean) => {
     useBrowserStore.setState({ chromeConnected: connected });
   }, []);
@@ -52,7 +50,7 @@ export function BrowserPanel() {
           onReload={() => call(store.reload)}
           onStop={() => void store.stop()}
           onRefreshFrame={() => call(store.refreshFrame)}
-          onClose={closeWorkspace}
+          onNewTab={() => call(store.newTab)}
           backend={view?.session.backend ?? 'managed'}
           chromeConnected={store.chromeConnected}
           onBackendChange={(backend) => {
@@ -66,7 +64,6 @@ export function BrowserPanel() {
           tabs={view?.session.tabs ?? []}
           activeTabId={view?.activeTabId ?? null}
           onSelect={(index) => void store.selectTab(browserScopeId, index)}
-          onNew={() => call(store.newTab)}
           onClose={(index) => void store.closeTab(browserScopeId, index)}
         />
         <BrowserViewport
@@ -77,33 +74,40 @@ export function BrowserPanel() {
           onClickAt={(x, y) => void store.clickAt(browserScopeId, x, y)}
           onScroll={(deltaX, deltaY) => void store.scroll(browserScopeId, deltaX, deltaY)}
         />
-        <footer className="flex h-7 shrink-0 items-center justify-between gap-3 border-t border-[var(--border-primary)] px-2.5">
-          <BrowserStatus
-            status={view?.session.status}
-            error={view?.error ?? store.commandErrors[browserScopeId]}
-          />
-          <div className="flex min-w-0 items-center gap-2 text-[10px] text-[var(--text-tertiary)]">
-            {Boolean(view?.diagnostics.length) && (
-              <span
-                className="flex shrink-0 items-center gap-1"
-                title={`诊断记录 ${view?.diagnostics.length ?? 0}`}
-              >
-                <Activity size={11} />
-                {view?.diagnostics.length}
+        {(busy ||
+          view?.session.status === 'waiting_confirmation' ||
+          view?.error ||
+          store.commandErrors[browserScopeId] ||
+          Boolean(view?.diagnostics.length) ||
+          view?.session.backend === 'chrome') && (
+          <footer className="flex h-7 shrink-0 items-center justify-between gap-3 border-t border-[var(--border-primary)] px-2.5">
+            <BrowserStatus
+              status={view?.session.status}
+              error={view?.error ?? store.commandErrors[browserScopeId]}
+            />
+            <div className="flex min-w-0 items-center gap-2 text-[10px] text-[var(--text-tertiary)]">
+              {Boolean(view?.diagnostics.length) && (
+                <span
+                  className="flex shrink-0 items-center gap-1"
+                  title={`诊断记录 ${view?.diagnostics.length ?? 0}`}
+                >
+                  <Activity size={11} />
+                  {view?.diagnostics.length}
+                </span>
+              )}
+              {view?.session.backend === 'chrome' && (
+                <span className="flex shrink-0 items-center gap-1" title="使用已授权 Chrome 标签页">
+                  <Chrome size={11} />
+                  Chrome
+                </span>
+              )}
+              <span className="flex min-w-0 items-center gap-1">
+                <Globe2 size={11} />
+                <span className="truncate">{activeTab?.url ?? 'about:blank'}</span>
               </span>
-            )}
-            {view?.session.backend === 'chrome' && (
-              <span className="flex shrink-0 items-center gap-1" title="使用已授权 Chrome 标签页">
-                <Chrome size={11} />
-                Chrome
-              </span>
-            )}
-            <span className="flex min-w-0 items-center gap-1">
-              <Globe2 size={11} />
-              <span className="truncate">{activeTab?.url ?? 'about:blank'}</span>
-            </span>
-          </div>
-        </footer>
+            </div>
+          </footer>
+        )}
       </div>
       {chromeSetupOpen && (
         <ChromeSetupDialog

@@ -383,9 +383,29 @@ impl BrowserSessionManager {
         }
     }
 
-    pub async fn set_backend(&self, conversation_id: &str, backend: BrowserBackend) {
+    pub async fn switch_backend(
+        &self,
+        conversation_id: &str,
+        backend: BrowserBackend,
+    ) -> Option<BrowserSession> {
         let session = if let Some(state) = self.sessions.write().await.get_mut(conversation_id) {
+            if state.session.backend == backend {
+                return Some(state.session.clone());
+            }
             state.session.backend = backend;
+            let main_tab = BrowserTab {
+                id: format!("tab-{}", uuid::Uuid::new_v4()),
+                index: 0,
+                owner_run_id: None,
+                url: None,
+                title: None,
+            };
+            state.session.tabs = vec![main_tab.clone()];
+            state.owner_tabs.clear();
+            state
+                .owner_tabs
+                .insert(MAIN_TAB_OWNER.to_string(), main_tab.id);
+            state.next_tab_index = 1;
             state.session.updated_at = Utc::now();
             Some(state.session.clone())
         } else {
@@ -393,7 +413,9 @@ impl BrowserSessionManager {
         };
         if let Some(session) = session {
             self.persist(&session).await;
+            return Some(session);
         }
+        None
     }
 
     pub async fn backend(&self, conversation_id: &str) -> BrowserBackend {
@@ -559,10 +581,47 @@ mod tests {
         let manager = BrowserSessionManager::new(temp.path().to_path_buf(), 32);
         manager.lease_tab("conv-1", MAIN_TAB_OWNER, None).await;
         manager.lease_tab("conv-2", MAIN_TAB_OWNER, None).await;
-        manager.set_backend("conv-1", BrowserBackend::Chrome).await;
+        manager
+            .switch_backend("conv-1", BrowserBackend::Chrome)
+            .await;
 
         assert_eq!(manager.backend("conv-1").await, BrowserBackend::Chrome);
         assert_eq!(manager.backend("conv-2").await, BrowserBackend::Managed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn switching_backend_resets_tab_indices() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let manager = BrowserSessionManager::new(temp.path().to_path_buf(), 32);
+        manager.lease_tab("conv-1", MAIN_TAB_OWNER, None).await;
+        manager.open_tab("conv-1", "worker", Some("run-1")).await;
+
+        let session = manager
+            .switch_backend("conv-1", BrowserBackend::Chrome)
+            .await
+            .ok_or_else(|| "session missing".to_string())?;
+
+        assert_eq!(session.backend, BrowserBackend::Chrome);
+        assert_eq!(session.tabs.len(), 1);
+        assert_eq!(session.tabs.first().map(|tab| tab.index), Some(0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn selecting_current_backend_preserves_tabs() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let manager = BrowserSessionManager::new(temp.path().to_path_buf(), 32);
+        let main = manager.lease_tab("conv-1", MAIN_TAB_OWNER, None).await;
+        manager.open_tab("conv-1", "worker", Some("run-1")).await;
+
+        let session = manager
+            .switch_backend("conv-1", BrowserBackend::Managed)
+            .await
+            .ok_or_else(|| "session missing".to_string())?;
+
+        assert_eq!(session.tabs.len(), 2);
+        assert!(session.tabs.iter().any(|tab| tab.id == main.tab_id));
         Ok(())
     }
 

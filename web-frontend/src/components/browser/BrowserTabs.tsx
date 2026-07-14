@@ -1,19 +1,19 @@
-import { Plus, X } from 'lucide-react';
+import { X } from 'lucide-react';
 import type { BrowserTab } from '../../stores/browserStore';
 
 export function BrowserTabs({
   tabs,
   activeTabId,
   onSelect,
-  onNew,
   onClose,
 }: {
   tabs: BrowserTab[];
   activeTabId: string | null;
   onSelect: (index: number) => void;
-  onNew: () => void;
   onClose: (index: number) => void;
 }) {
+  if (tabs.length <= 1) return null;
+
   return (
     <div className="flex h-8 shrink-0 items-end border-b border-[var(--border-primary)] bg-[var(--bg-sidebar)] px-1">
       <div className="flex min-w-0 flex-1 overflow-x-auto">
@@ -55,13 +55,6 @@ export function BrowserTabs({
           </div>
         ))}
       </div>
-      <button
-        onClick={onNew}
-        className="mb-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-[var(--text-tertiary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
-        title="新建标签页"
-      >
-        <Plus size={13} />
-      </button>
     </div>
   );
 }

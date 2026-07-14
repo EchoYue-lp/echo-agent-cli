@@ -1,13 +1,19 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { FileCode, Globe2, GripVertical, ListTodo, PanelRightClose } from 'lucide-react';
-import { useRightWorkspaceStore } from '../../stores/rightWorkspaceStore';
+import {
+  rightWorkspaceWidthForViewport,
+  useRightWorkspaceStore,
+} from '../../stores/rightWorkspaceStore';
+import { useUiStore } from '../../stores/uiStore';
 import { BrowserPanel } from '../browser/BrowserPanel';
 import { FileBrowser } from '../file-browser/FileBrowser';
 import { RightRail } from './RightRail';
 
 export function RightWorkspace() {
   const store = useRightWorkspaceStore();
+  const leftSidebarOpen = useUiStore((state) => state.leftSidebarOpen);
   const resizing = useRef(false);
+  const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
 
   useEffect(() => {
     const move = (event: PointerEvent) => {
@@ -16,26 +22,31 @@ export function RightWorkspace() {
     const stop = () => {
       resizing.current = false;
     };
+    const resize = () => setViewportWidth(window.innerWidth);
     window.addEventListener('pointermove', move);
     window.addEventListener('pointerup', stop);
+    window.addEventListener('resize', resize);
     return () => {
       window.removeEventListener('pointermove', move);
       window.removeEventListener('pointerup', stop);
+      window.removeEventListener('resize', resize);
     };
   }, [store.setWidth]);
 
   if (!store.open) return null;
 
+  const width = rightWorkspaceWidthForViewport(store.width, viewportWidth, leftSidebarOpen);
+
   return (
     <>
-      <div className="fixed inset-0 z-[55] bg-black/25 lg:hidden" onClick={store.close} />
+      <div className="fixed inset-0 z-[55] bg-black/25 xl:hidden" onClick={store.close} />
       <aside
-        className="fixed inset-y-0 right-0 z-[60] flex w-[min(94vw,760px)] min-w-0 flex-col border-l border-[var(--border-primary)] bg-[var(--bg-primary)] shadow-xl max-md:!w-full max-md:border-l-0 lg:relative lg:z-20 lg:shadow-none"
-        style={{ width: `min(94vw, ${store.width}px)` }}
+        className="fixed inset-y-0 right-0 z-[60] flex min-w-0 flex-col border-l border-[var(--border-primary)] bg-[var(--bg-primary)] shadow-xl max-md:!w-full max-md:border-l-0 xl:relative xl:z-20 xl:shadow-none"
+        style={{ width }}
       >
         <button
           type="button"
-          className="absolute inset-y-0 -left-1 z-10 hidden w-2 cursor-col-resize items-center justify-center text-transparent hover:text-[var(--text-tertiary)] lg:flex"
+          className="absolute inset-y-0 -left-1 z-10 hidden w-2 cursor-col-resize items-center justify-center text-transparent hover:text-[var(--text-tertiary)] xl:flex"
           onPointerDown={() => {
             resizing.current = true;
           }}
@@ -52,10 +63,16 @@ export function RightWorkspace() {
             onClick={() => store.setActiveTab('tasks')}
           />
           <WorkspaceTab
-            active={store.activeTab === 'preview'}
+            active={store.activeTab === 'browser'}
             icon={<Globe2 size={13} />}
-            label="预览"
-            onClick={() => store.setActiveTab('preview')}
+            label="浏览器"
+            onClick={() => store.setActiveTab('browser')}
+          />
+          <WorkspaceTab
+            active={store.activeTab === 'files'}
+            icon={<FileCode size={13} />}
+            label="文件"
+            onClick={() => store.setActiveTab('files')}
           />
           <div className="flex-1" />
           <button
@@ -68,27 +85,10 @@ export function RightWorkspace() {
           </button>
         </header>
 
-        {store.activeTab === 'preview' && (
-          <div className="flex h-8 shrink-0 items-center gap-1 border-b border-[var(--border-primary)] px-2">
-            <PreviewTabButton
-              active={store.previewTab === 'browser'}
-              icon={<Globe2 size={12} />}
-              label="网页"
-              onClick={() => store.setPreviewTab('browser')}
-            />
-            <PreviewTabButton
-              active={store.previewTab === 'files'}
-              icon={<FileCode size={12} />}
-              label="文件"
-              onClick={() => store.setPreviewTab('files')}
-            />
-          </div>
-        )}
-
         <div className="min-h-0 flex-1">
           {store.activeTab === 'tasks' ? (
             <RightRail />
-          ) : store.previewTab === 'browser' ? (
+          ) : store.activeTab === 'browser' ? (
             <BrowserPanel />
           ) : (
             <FileBrowser />
@@ -104,16 +104,13 @@ function WorkspaceTab({ active, icon, label, onClick }: TabButtonProps) {
     <button
       type="button"
       onClick={onClick}
-      className={`flex h-7 items-center gap-1.5 rounded-md px-2.5 text-xs ${active ? 'bg-[var(--bg-hover)] text-[var(--text-primary)]' : 'text-[var(--text-tertiary)] hover:text-[var(--text-primary)]'}`}
+      aria-pressed={active}
+      className={`relative flex h-10 items-center gap-1.5 px-2.5 text-xs transition-colors ${active ? 'text-[var(--text-primary)] after:absolute after:inset-x-2 after:bottom-0 after:h-0.5 after:bg-[var(--accent)]' : 'text-[var(--text-tertiary)] hover:text-[var(--text-primary)]'}`}
     >
       {icon}
       {label}
     </button>
   );
-}
-
-function PreviewTabButton(props: TabButtonProps) {
-  return <WorkspaceTab {...props} />;
 }
 
 interface TabButtonProps {

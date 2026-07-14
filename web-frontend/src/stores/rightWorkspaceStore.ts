@@ -1,43 +1,53 @@
 import { create } from 'zustand';
 
-export type RightWorkspaceTab = 'tasks' | 'preview';
-export type PreviewTab = 'browser' | 'files';
+export type RightWorkspaceTab = 'tasks' | 'browser' | 'files';
 
 interface RightWorkspaceState {
   open: boolean;
   activeTab: RightWorkspaceTab;
-  previewTab: PreviewTab;
   width: number;
+  openWorkspace: () => void;
   openTasks: () => void;
   openBrowser: () => void;
   openFiles: () => void;
   close: () => void;
   setActiveTab: (tab: RightWorkspaceTab) => void;
-  setPreviewTab: (tab: PreviewTab) => void;
   setWidth: (width: number) => void;
 }
 
 function initialWidth(): number {
-  if (typeof window === 'undefined') return 560;
+  if (typeof window === 'undefined') return 520;
   const stored = Number.parseInt(localStorage.getItem('eko-right-workspace-width') ?? '', 10);
-  return Number.isFinite(stored) ? boundRightWorkspaceWidth(stored) : 560;
+  return Number.isFinite(stored) ? boundRightWorkspaceWidth(stored) : 520;
 }
 
 export function boundRightWorkspaceWidth(width: number): number {
   return Math.min(760, Math.max(380, width));
 }
 
+export function rightWorkspaceWidthForViewport(
+  preferredWidth: number,
+  viewportWidth: number,
+  leftSidebarOpen: boolean
+): number {
+  const bounded = boundRightWorkspaceWidth(preferredWidth);
+  if (viewportWidth < 1280) return Math.min(bounded, Math.floor(viewportWidth * 0.94));
+
+  const leftSidebarWidth = leftSidebarOpen ? 272 : 0;
+  const available = viewportWidth - leftSidebarWidth - 520;
+  return Math.max(380, Math.min(bounded, available));
+}
+
 export const useRightWorkspaceStore = create<RightWorkspaceState>((set) => ({
   open: false,
   activeTab: 'tasks',
-  previewTab: 'browser',
   width: initialWidth(),
+  openWorkspace: () => set({ open: true }),
   openTasks: () => set({ open: true, activeTab: 'tasks' }),
-  openBrowser: () => set({ open: true, activeTab: 'preview', previewTab: 'browser' }),
-  openFiles: () => set({ open: true, activeTab: 'preview', previewTab: 'files' }),
+  openBrowser: () => set({ open: true, activeTab: 'browser' }),
+  openFiles: () => set({ open: true, activeTab: 'files' }),
   close: () => set({ open: false }),
   setActiveTab: (activeTab) => set({ activeTab }),
-  setPreviewTab: (previewTab) => set({ activeTab: 'preview', previewTab }),
   setWidth: (width) => {
     const bounded = boundRightWorkspaceWidth(width);
     localStorage.setItem('eko-right-workspace-width', String(bounded));

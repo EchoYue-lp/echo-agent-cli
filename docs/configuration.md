@@ -205,9 +205,9 @@ EKO_BROWSER_HEADLESS=false
 EKO_BROWSER_PROFILE_DIR=~/.echo-agent/browser/profiles/managed
 EKO_BROWSER_OUTPUT_DIR=~/.echo-agent/browser/output
 EKO_BROWSER_STARTUP_TIMEOUT_SECS=60
-EKO_CHROME_ENABLED=true
-# Optional: pin the desktop bridge to the unpacked/Web Store extension id.
-EKO_CHROME_EXTENSION_ID=abcdefghijklmnopabcdefghijklmnop
+EKO_BROWSER_EXTENSION_ENABLED=true
+# Optional: reuse the token configured in the official Playwright Extension.
+EKO_BROWSER_EXTENSION_TOKEN=replace-with-extension-token
 ```
 
 保留手动 MCP 配置兼容路径。希望完全使用自定义 Playwright MCP 配置时，可设
@@ -215,11 +215,16 @@ EKO_CHROME_EXTENSION_ID=abcdefghijklmnopabcdefghijklmnop
 
 ### Chrome 登录态模式
 
-需要现有 Chrome 登录态时，可加载仓库 `chrome-extension/` 下的 Manifest V3
-扩展，并通过桌面命令 `chrome_install_native_host` 注册 Native Messaging Host。
-扩展 popup 必须由用户授权当前站点和标签页；普通公开网页与 localhost 仍默认
-使用托管 Chromium。Chrome 模式不会读取 Cookie、密码、浏览历史或 Profile
-文件。可用 `EKO_CHROME_ENABLED=false` 单独关闭扩展 bridge，而不影响托管浏览器。
+需要现有 Chrome 登录态时，安装官方
+[Playwright Extension](https://chromewebstore.google.com/detail/playwright-extension/mmlmfjhmonkocbjadbfplnigmagldckm)。
+EKO 会启动第二个 `@playwright/mcp@latest --extension` sidecar；首次切换到 Chrome
+时，由 Playwright 的标签页选择界面决定本次连接控制哪个页面。普通公开网页与
+localhost 仍默认使用托管 Chromium。
+
+扩展设置页可生成连接 token。将同一值写入
+`EKO_BROWSER_EXTENSION_TOKEN` 后，sidecar 通过
+`PLAYWRIGHT_MCP_EXTENSION_TOKEN` 连接，可省去重复批准。可用
+`EKO_BROWSER_EXTENSION_ENABLED=false` 单独关闭 Chrome 后端，不影响托管浏览器。
 
 ## 模型配置详解
 

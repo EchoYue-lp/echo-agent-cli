@@ -12,7 +12,7 @@ import { useSubagentDetailStore } from '../../stores/subagentDetailStore';
 import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
 import { SubagentDetailView } from '../task/SubagentDetailView';
 import { FailureToast } from './FailureToast';
-import { CornerUpLeft, FileCode, Globe2, GripVertical, ListTodo, X } from 'lucide-react';
+import { CornerUpLeft, GripVertical, PanelRightOpen, X } from 'lucide-react';
 import type { Attachment } from '../../types/api';
 import type { QueuedChatInput } from '../../hooks/useTauriChat';
 import { useRightWorkspaceStore } from '../../stores/rightWorkspaceStore';
@@ -143,35 +143,17 @@ export function ChatPanel() {
           </div>
           <button
             type="button"
-            onClick={rightWorkspace.openTasks}
-            className="relative flex h-7 w-7 items-center justify-center rounded-md text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
-            title="任务"
-            aria-label="打开任务面板"
+            onClick={rightWorkspace.openWorkspace}
+            className={`relative flex h-7 w-7 items-center justify-center rounded-md transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)] ${rightWorkspace.open ? 'bg-[var(--bg-hover)] text-[var(--text-primary)]' : 'text-[var(--text-tertiary)]'}`}
+            title="右侧工作区"
+            aria-label="打开右侧工作区"
           >
-            <ListTodo size={15} />
+            <PanelRightOpen size={15} />
             {todoCount > 0 && (
               <span className="absolute -right-0.5 -top-0.5 min-w-3 rounded-full bg-[var(--accent)] px-0.5 text-center text-[8px] leading-3 text-white">
                 {todoCount > 9 ? '9+' : todoCount}
               </span>
             )}
-          </button>
-          <button
-            type="button"
-            onClick={rightWorkspace.openBrowser}
-            className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
-            title="网页预览"
-            aria-label="打开网页预览"
-          >
-            <Globe2 size={15} />
-          </button>
-          <button
-            type="button"
-            onClick={rightWorkspace.openFiles}
-            className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--text-tertiary)] transition-colors hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
-            title="项目文件"
-            aria-label="打开项目文件"
-          >
-            <FileCode size={15} />
           </button>
         </div>
       </div>

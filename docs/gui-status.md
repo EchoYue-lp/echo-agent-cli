@@ -55,7 +55,7 @@ These GUI surfaces are visible and backed by real Tauri IPC or runtime state:
 | Worktree | Connected to `git worktree` |
 | Unified right workspace | Connected: tasks plus web/file preview, resizable desktop and full-width mobile overlay |
 | Managed browser preview | Connected: URL navigation, tabs, screenshots, bounded live refresh, visible command errors |
-| Chrome browser backend | Connected through setup/status UI, native-host registration, extension authorization, and explicit backend selection |
+| Chrome browser backend | Connected through the official Playwright Extension, setup/status UI, and explicit backend selection |
 | Project file preview | Connected: tree, Git changes, text/image/PDF/binary states, and diff |
 | Controlled file editing | Connected: CodeMirror text editing, dirty tabs, save shortcut, atomic write, and revision conflict protection |
 

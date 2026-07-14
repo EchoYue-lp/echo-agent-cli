@@ -3163,17 +3163,22 @@ async fn handle_slash_command(
             };
             let requested = args.trim().to_ascii_lowercase();
             if requested.is_empty() || requested == "status" {
-                let status = runtime.chrome_status().await;
+                let status = runtime.extension_status().await;
                 app.messages.push(ChatMessage {
                     role: MessageRole::System,
                     content: format!(
-                        "Chrome bridge: {}\nEndpoint: {}{}",
+                        "Playwright Extension: {}\nPackage: {}\nConnection token: {}{}",
                         if status.connected {
                             "connected"
                         } else {
                             "disconnected"
                         },
-                        status.endpoint_file.display(),
+                        status.package,
+                        if status.token_configured {
+                            "configured"
+                        } else {
+                            "not configured"
+                        },
                         status
                             .startup_error
                             .map(|error| format!("\nError: {error}"))

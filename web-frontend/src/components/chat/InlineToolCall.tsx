@@ -24,14 +24,6 @@ interface InlineToolCallProps {
   index: number;
 }
 
-function tail(text: string, count = 6): string {
-  const lines = text.split('\n');
-  return lines
-    .slice(Math.max(0, lines.length - count))
-    .join('\n')
-    .trimEnd();
-}
-
 export const InlineToolCall = memo(function InlineToolCall({
   toolCall,
   index: _index,
@@ -53,13 +45,6 @@ export const InlineToolCall = memo(function InlineToolCall({
   const exitCode = toolCall.metadata?.exit_code;
   const failed = toolCall.status === 'failed';
   const running = toolCall.status === 'running';
-  const preview = tail(
-    failed
-      ? toolCall.stderr || toolCall.result || toolCall.stdout
-      : toolCall.stdout || toolCall.log || toolCall.stderr || toolCall.progress?.message || ''
-  );
-  const collapsedPreview =
-    descriptor.collapseSuccessfulOutput && toolCall.status === 'succeeded' ? '' : preview;
   const fullOutput = [
     toolCall.stdout && `stdout\n${toolCall.stdout}`,
     toolCall.stderr && `stderr\n${toolCall.stderr}`,
@@ -150,14 +135,6 @@ export const InlineToolCall = memo(function InlineToolCall({
           {copied === 'command' ? <Check size={11} /> : <Copy size={11} />}
         </button>
       </div>
-
-      {!expanded && collapsedPreview && (
-        <pre
-          className={`ml-[46px] max-h-[7.5rem] overflow-hidden whitespace-pre-wrap break-words text-[10px] leading-[1.25rem] ${failed ? 'text-[var(--color-error)]' : 'text-[var(--text-tertiary)]'}`}
-        >
-          {collapsedPreview}
-        </pre>
-      )}
 
       {expanded && (
         <div className="ml-[46px] mt-1 min-w-0 border-l border-[var(--border-primary)] pl-2">

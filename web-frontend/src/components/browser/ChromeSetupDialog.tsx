@@ -1,27 +1,13 @@
 import { useCallback, useEffect, useState } from 'react';
-import {
-  CheckCircle2,
-  Chrome,
-  ExternalLink,
-  FolderOpen,
-  LoaderCircle,
-  RefreshCw,
-  X,
-} from 'lucide-react';
+import { Chrome, ExternalLink, RefreshCw, X } from 'lucide-react';
 import { apiInvoke, errorMessage, isTauri } from '../../lib/tauri-bridge';
 
 export interface ChromeSetupStatus {
   enabled: boolean;
   connected: boolean;
-  extensionOrigin?: string | null;
-  endpointFile: string;
+  tokenConfigured: boolean;
+  package: string;
   startupError?: string | null;
-  nativeHostInstalled: boolean;
-  extensionPath?: string | null;
-}
-
-export function isChromeExtensionId(value: string): boolean {
-  return /^[a-p]{32}$/.test(value);
 }
 
 export function ChromeSetupDialog({
@@ -34,7 +20,6 @@ export function ChromeSetupDialog({
   onUseChrome: () => Promise<string | null>;
 }) {
   const [status, setStatus] = useState<ChromeSetupStatus | null>(null);
-  const [extensionId, setExtensionId] = useState('');
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -60,31 +45,13 @@ export function ChromeSetupDialog({
     return () => window.clearInterval(timer);
   }, [refresh]);
 
-  const invoke = async (command: string) => {
-    setBusy(command);
+  const openExtensionPage = async () => {
+    setBusy('chrome_open_extensions_page');
     setError(null);
     try {
-      await apiInvoke(command);
+      await apiInvoke('chrome_open_extensions_page');
     } catch (invokeError) {
       setError(errorMessage(invokeError));
-    } finally {
-      setBusy(null);
-    }
-  };
-
-  const installHost = async () => {
-    const normalizedId = extensionId.trim().toLowerCase();
-    if (!isChromeExtensionId(normalizedId)) {
-      setError('扩展 ID 应为 32 位 a-p 小写字母');
-      return;
-    }
-    setBusy('chrome_install_native_host');
-    setError(null);
-    try {
-      await apiInvoke('chrome_install_native_host', { extensionId: normalizedId });
-      await refresh();
-    } catch (installError) {
-      setError(errorMessage(installError));
     } finally {
       setBusy(null);
     }
@@ -94,7 +61,11 @@ export function ChromeSetupDialog({
     setBusy('browser_set_backend');
     setError(null);
     const backendError = await onUseChrome();
-    if (backendError) setError(backendError);
+    if (backendError) {
+      setError(backendError);
+    } else {
+      onConnectionChange(true);
+    }
     setBusy(null);
   };
 
@@ -129,74 +100,45 @@ export function ChromeSetupDialog({
 
         <div className="space-y-4 p-4">
           <div className="grid grid-cols-2 gap-px overflow-hidden rounded-md border border-[var(--border-primary)] bg-[var(--border-primary)]">
-            <StatusCell label="桌面桥接" ready={Boolean(status?.connected)} />
-            <StatusCell
-              label="Native Host"
-              ready={Boolean(status?.nativeHostInstalled)}
-              readyLabel="已注册"
-            />
+            <StatusCell label="扩展后端" ready={Boolean(status?.enabled)} readyLabel="已启用" />
+            <StatusCell label="MCP 连接" ready={Boolean(status?.connected)} />
           </div>
 
           <section className="space-y-2">
-            <div className="text-xs font-medium text-[var(--text-primary)]">1. 加载 EKO 扩展</div>
-            <div className="flex flex-wrap gap-2">
-              <button
-                type="button"
-                className={buttonClass}
-                disabled={busy !== null}
-                onClick={() => void invoke('chrome_open_extensions_page')}
-              >
-                <ExternalLink size={13} />
-                打开 Chrome 扩展页
-              </button>
-              <button
-                type="button"
-                className={buttonClass}
-                disabled={busy !== null || !status?.extensionPath}
-                onClick={() => void invoke('chrome_open_extension_dir')}
-              >
-                <FolderOpen size={13} />
-                打开扩展目录
-              </button>
+            <div className="text-xs font-medium text-[var(--text-primary)]">
+              1. 安装 Playwright Extension
             </div>
+            <p className="text-xs leading-relaxed text-[var(--text-tertiary)]">
+              官方扩展允许 EKO 连接现有 Chrome 标签页，并复用当前登录状态。
+            </p>
+            <button
+              type="button"
+              className={buttonClass}
+              disabled={busy !== null}
+              onClick={() => void openExtensionPage()}
+            >
+              <ExternalLink size={13} />从 Chrome Web Store 安装
+            </button>
           </section>
 
           <section className="space-y-2">
-            <label
-              htmlFor="chrome-extension-id"
-              className="block text-xs font-medium text-[var(--text-primary)]"
-            >
-              2. 注册扩展 ID
-            </label>
-            <div className="flex gap-2">
-              <input
-                id="chrome-extension-id"
-                value={extensionId}
-                onChange={(event) => setExtensionId(event.target.value)}
-                maxLength={32}
-                spellCheck={false}
-                placeholder="Chrome 扩展 ID"
-                className="h-8 min-w-0 flex-1 rounded-md border border-[var(--border-primary)] bg-[var(--bg-chat)] px-2.5 font-mono text-xs text-[var(--text-primary)] outline-none focus:border-[var(--accent)]"
-              />
-              <button
-                type="button"
-                className={buttonClass}
-                disabled={busy !== null || !isChromeExtensionId(extensionId.trim().toLowerCase())}
-                onClick={() => void installHost()}
-              >
-                {busy === 'chrome_install_native_host' ? (
-                  <LoaderCircle size={13} className="animate-spin" />
-                ) : (
-                  <CheckCircle2 size={13} />
-                )}
-                注册
-              </button>
+            <div className="text-xs font-medium text-[var(--text-primary)]">
+              2. 连接并选择标签页
+            </div>
+            <p className="text-xs leading-relaxed text-[var(--text-tertiary)]">
+              点击“使用 Chrome”后，Playwright
+              会打开标签页选择页面。选择本次任务可以控制的标签页并批准连接。
+            </p>
+            <div className="rounded-md bg-[var(--bg-secondary)] px-3 py-2 text-[11px] leading-relaxed text-[var(--text-tertiary)]">
+              {status?.tokenConfigured
+                ? '已配置免确认连接令牌。'
+                : '可选：设置 EKO_BROWSER_EXTENSION_TOKEN，避免每次连接都手动批准。'}
             </div>
           </section>
 
           <section className="flex items-center justify-between gap-3 border-t border-[var(--border-primary)] pt-4">
             <div className="min-w-0 text-xs text-[var(--text-tertiary)]">
-              {status?.connected ? '3. 在扩展中授权当前标签页' : '等待 Chrome 扩展连接'}
+              {status?.connected ? 'Playwright Extension 已连接' : status?.package}
             </div>
             <div className="flex shrink-0 gap-2">
               <button
@@ -211,7 +153,7 @@ export function ChromeSetupDialog({
               <button
                 type="button"
                 className="h-8 rounded-md bg-[var(--accent)] px-3 text-xs font-medium text-white disabled:cursor-not-allowed disabled:opacity-40"
-                disabled={!status?.connected || busy !== null}
+                disabled={!status?.enabled || busy !== null}
                 onClick={() => void useChrome()}
               >
                 {busy === 'browser_set_backend' ? '正在连接…' : '使用 Chrome'}

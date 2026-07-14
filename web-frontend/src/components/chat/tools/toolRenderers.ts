@@ -14,7 +14,10 @@ export interface ToolRenderDescriptor {
   kind: ToolRendererKind;
   title: string;
   detail?: string;
-  collapseSuccessfulOutput: boolean;
+}
+
+export function isSubagentDispatchTool(name: string): boolean {
+  return name === 'agent_tool' || name === 'plan_execute';
 }
 
 function argsRecord(tool: ToolExecution): Record<string, unknown> {
@@ -76,7 +79,6 @@ function describeBrowser(tool: ToolExecution): ToolRenderDescriptor {
     kind: 'browser',
     title,
     detail: detail || undefined,
-    collapseSuccessfulOutput: true,
   };
 }
 
@@ -113,7 +115,6 @@ function describeMcp(
     kind: 'mcp',
     title: identity.server ? `${identity.server} · ${identity.name}` : identity.name,
     detail: tool.status === 'running' ? undefined : mcpResultType(tool),
-    collapseSuccessfulOutput: true,
   };
 }
 
@@ -140,7 +141,6 @@ function describeTask(tool: ToolExecution): ToolRenderDescriptor {
     kind: 'task',
     title,
     detail: task || undefined,
-    collapseSuccessfulOutput: true,
   };
 }
 
@@ -155,7 +155,7 @@ function describeRead(tool: ToolExecution): ToolRenderDescriptor {
       : limit < 0
         ? `preview from line ${offset}`
         : `lines ${offset}-${Math.max(offset, offset + limit - 1)}`;
-  return { kind: 'read', title: path, detail: range, collapseSuccessfulOutput: true };
+  return { kind: 'read', title: path, detail: range };
 }
 
 function describeWrite(tool: ToolExecution): ToolRenderDescriptor {
@@ -178,7 +178,6 @@ function describeWrite(tool: ToolExecution): ToolRenderDescriptor {
     kind: 'write',
     title: `${action} ${path}`,
     detail: details.join(' · ') || undefined,
-    collapseSuccessfulOutput: true,
   };
 }
 
@@ -194,14 +193,13 @@ function describeSearch(tool: ToolExecution): ToolRenderDescriptor {
     detail:
       [path !== '.' ? `in ${path}` : undefined, filter, count].filter(Boolean).join(' · ') ||
       undefined,
-    collapseSuccessfulOutput: true,
   };
 }
 
 export function describeToolExecution(tool: ToolExecution): ToolRenderDescriptor {
   if (tool.name === 'shell') {
     const command = textArg(argsRecord(tool), 'command') || 'shell';
-    return { kind: 'shell', title: command, collapseSuccessfulOutput: false };
+    return { kind: 'shell', title: command };
   }
   if (tool.name === 'read_file') return describeRead(tool);
   if (['edit_file', 'write_file', 'create_file'].includes(tool.name)) return describeWrite(tool);
@@ -218,6 +216,5 @@ export function describeToolExecution(tool: ToolExecution): ToolRenderDescriptor
     kind: 'generic',
     title: tool.name,
     detail: args || undefined,
-    collapseSuccessfulOutput: false,
   };
 }

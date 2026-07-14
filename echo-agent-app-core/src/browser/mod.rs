@@ -1,4 +1,3 @@
-pub mod chrome;
 pub mod config;
 pub mod error;
 pub mod event;
@@ -22,7 +21,6 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
-pub use chrome::{ChromeBridgeStatus, ChromeConnectionManager};
 pub use config::BrowserConfig;
 pub use error::{BrowserError, BrowserResult};
 pub use event::{BrowserEvent, BrowserFrame};
@@ -41,32 +39,40 @@ pub struct BrowserRuntime {
 struct BrowserRuntimeInner {
     config: BrowserConfig,
     sessions: BrowserSessionManager,
-    chrome: ChromeConnectionManager,
-    client: RwLock<Option<Arc<McpClient>>>,
-    connect_lock: Mutex<()>,
+    managed_client: RwLock<Option<Arc<McpClient>>>,
+    extension_client: RwLock<Option<Arc<McpClient>>>,
+    managed_connect_lock: Mutex<()>,
+    extension_connect_lock: Mutex<()>,
+    extension_startup_error: RwLock<Option<String>>,
     locator_failures: Mutex<HashMap<String, u8>>,
     default_approval_provider: RwLock<Option<Arc<dyn HumanLoopProvider>>>,
     conversation_approval_providers: RwLock<HashMap<String, Arc<dyn HumanLoopProvider>>>,
     shutdown: CancellationToken,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BrowserExtensionStatus {
+    pub enabled: bool,
+    pub connected: bool,
+    pub token_configured: bool,
+    pub package: String,
+    pub startup_error: Option<String>,
+}
+
 impl BrowserRuntime {
     pub async fn start(config: BrowserConfig) -> Arc<Self> {
         let sessions = BrowserSessionManager::new(config.session_dir.clone(), 12_000);
         sessions.restore_metadata().await;
-        let chrome = ChromeConnectionManager::start(
-            config.chrome_enabled,
-            config.chrome_bridge_dir.clone(),
-            config.chrome_extension_id.clone(),
-        )
-        .await;
         let runtime = Arc::new(Self {
             inner: Arc::new(BrowserRuntimeInner {
                 config,
                 sessions,
-                chrome,
-                client: RwLock::new(None),
-                connect_lock: Mutex::new(()),
+                managed_client: RwLock::new(None),
+                extension_client: RwLock::new(None),
+                managed_connect_lock: Mutex::new(()),
+                extension_connect_lock: Mutex::new(()),
+                extension_startup_error: RwLock::new(None),
                 locator_failures: Mutex::new(HashMap::new()),
                 default_approval_provider: RwLock::new(None),
                 conversation_approval_providers: RwLock::new(HashMap::new()),
@@ -79,7 +85,7 @@ impl BrowserRuntime {
         }
         let prewarm = runtime.clone();
         tokio::spawn(async move {
-            match prewarm.ensure_client().await {
+            match prewarm.ensure_client(BrowserBackend::Managed).await {
                 Ok(client) => tracing::info!(
                     tools = client.tools().len(),
                     "managed Playwright MCP runtime ready"
@@ -102,7 +108,7 @@ impl BrowserRuntime {
     }
 
     fn install_tools_for(&self, agent: &mut echo_agent::agent::ReactAgent, actor: BrowserActor) {
-        if self.inner.config.enabled || self.inner.config.chrome_enabled {
+        if self.inner.config.enabled || self.inner.config.extension_enabled {
             agent.add_tools(self.tools_for(actor));
         }
     }
@@ -174,47 +180,71 @@ impl BrowserRuntime {
     }
 
     pub async fn interrupt(&self) {
-        let _ = self
-            .inner
-            .chrome
-            .browser_action("*", "interrupt", json!({}))
-            .await;
-        let client = self.inner.client.write().await.take();
-        if let Some(client) = client {
-            client.close().await;
+        for backend in [BrowserBackend::Managed, BrowserBackend::Chrome] {
+            let client = self.client_slot(backend).write().await.take();
+            if let Some(client) = client {
+                client.close().await;
+            }
         }
     }
 
     pub async fn shutdown(&self) {
         self.inner.shutdown.cancel();
         self.inner.sessions.close_all().await;
-        self.inner.chrome.shutdown().await;
-        let client = self.inner.client.write().await.take();
-        if let Some(client) = client {
-            client.close().await;
-            tracing::info!("managed Playwright MCP runtime stopped");
+        for backend in [BrowserBackend::Managed, BrowserBackend::Chrome] {
+            let client = self.client_slot(backend).write().await.take();
+            if let Some(client) = client {
+                client.close().await;
+            }
+        }
+        tracing::info!("Playwright MCP browser runtimes stopped");
+    }
+
+    pub async fn extension_status(&self) -> BrowserExtensionStatus {
+        let startup_error = self.inner.extension_startup_error.read().await.clone();
+        BrowserExtensionStatus {
+            enabled: self.inner.config.extension_enabled,
+            connected: self.inner.extension_client.read().await.is_some()
+                && startup_error.is_none(),
+            token_configured: self.inner.config.extension_token.is_some(),
+            package: self.inner.config.package.clone(),
+            startup_error,
         }
     }
 
-    pub async fn chrome_status(&self) -> ChromeBridgeStatus {
-        self.inner.chrome.status().await
+    fn client_slot(&self, backend: BrowserBackend) -> &RwLock<Option<Arc<McpClient>>> {
+        match backend {
+            BrowserBackend::Managed => &self.inner.managed_client,
+            BrowserBackend::Chrome => &self.inner.extension_client,
+        }
     }
 
-    async fn ensure_client(&self) -> BrowserResult<Arc<McpClient>> {
+    fn connect_lock(&self, backend: BrowserBackend) -> &Mutex<()> {
+        match backend {
+            BrowserBackend::Managed => &self.inner.managed_connect_lock,
+            BrowserBackend::Chrome => &self.inner.extension_connect_lock,
+        }
+    }
+
+    async fn ensure_client(&self, backend: BrowserBackend) -> BrowserResult<Arc<McpClient>> {
         if self.inner.shutdown.is_cancelled() {
             return Err(BrowserError::Connection(
                 "browser runtime is shutting down".to_string(),
             ));
         }
-        if !self.inner.config.enabled {
+        let enabled = match backend {
+            BrowserBackend::Managed => self.inner.config.enabled,
+            BrowserBackend::Chrome => self.inner.config.extension_enabled,
+        };
+        if !enabled {
             return Err(BrowserError::Disabled);
         }
-        if let Some(client) = self.inner.client.read().await.clone() {
+        if let Some(client) = self.client_slot(backend).read().await.clone() {
             return Ok(client);
         }
 
-        let _guard = self.inner.connect_lock.lock().await;
-        if let Some(client) = self.inner.client.read().await.clone() {
+        let _guard = self.connect_lock(backend).lock().await;
+        if let Some(client) = self.client_slot(backend).read().await.clone() {
             return Ok(client);
         }
 
@@ -222,7 +252,7 @@ impl BrowserRuntime {
         let timeout = Duration::from_secs(self.inner.config.startup_timeout_secs);
         let client = tokio::time::timeout(
             timeout,
-            McpClient::new(BrowserSidecar::server_config(&self.inner.config)),
+            McpClient::new(BrowserSidecar::server_config(&self.inner.config, backend)),
         )
         .await
         .map_err(|_| BrowserError::Connection(format!("startup timed out after {timeout:?}")))?
@@ -233,12 +263,12 @@ impl BrowserRuntime {
                 "browser runtime shut down during startup".to_string(),
             ));
         }
-        *self.inner.client.write().await = Some(client.clone());
+        *self.client_slot(backend).write().await = Some(client.clone());
         Ok(client)
     }
 
-    async fn invalidate_client(&self, failed: &Arc<McpClient>) {
-        let mut current = self.inner.client.write().await;
+    async fn invalidate_client(&self, backend: BrowserBackend, failed: &Arc<McpClient>) {
+        let mut current = self.client_slot(backend).write().await;
         if current
             .as_ref()
             .is_some_and(|client| Arc::ptr_eq(client, failed))
@@ -308,7 +338,7 @@ impl BrowserRuntime {
                 .open_tab(conversation_id, &owner_id, context.run_id.as_deref())
                 .await
                 .ok_or_else(|| {
-                    BrowserError::Connection("failed to allocate managed browser tab".to_string())
+                    BrowserError::Connection("failed to allocate browser tab".to_string())
                 })?,
             Some("select") => {
                 let index = requested_index.ok_or_else(|| BrowserError::Tool {
@@ -321,7 +351,7 @@ impl BrowserRuntime {
                     .await
                     .ok_or_else(|| BrowserError::Tool {
                         tool: action.name().to_string(),
-                        message: format!("managed tab index {index} does not exist"),
+                        message: format!("browser tab index {index} does not exist"),
                     })?
             }
             _ => {
@@ -353,24 +383,54 @@ impl BrowserRuntime {
             });
             let result = match backend {
                 "managed" => {
-                    if self.inner.sessions.backend(conversation_id).await == BrowserBackend::Chrome
-                    {
-                        let _ = self.inner.chrome.release_task(conversation_id).await;
-                    }
+                    let session = self
+                        .inner
+                        .sessions
+                        .switch_backend(conversation_id, BrowserBackend::Managed)
+                        .await
+                        .ok_or_else(|| {
+                            BrowserError::Connection("browser session missing".to_string())
+                        })?;
                     self.inner
                         .sessions
-                        .set_backend(conversation_id, BrowserBackend::Managed)
-                        .await;
+                        .emit(BrowserEvent::SessionUpdated { session });
                     json!({ "backend": "managed" })
                 }
                 "chrome" => {
-                    let tab_id = params.get("tabId").and_then(Value::as_u64);
-                    let claimed = self.inner.chrome.claim_tab(conversation_id, tab_id).await?;
+                    let connection = self
+                        .call_mcp(
+                            BrowserBackend::Chrome,
+                            "browser_tabs",
+                            json!({ "action": "list" }),
+                            context.cancel.as_deref(),
+                        )
+                        .await;
+                    if let Err(error) = connection {
+                        *self.inner.extension_startup_error.write().await = Some(error.to_string());
+                        self.inner.sessions.emit(BrowserEvent::ActionFailed {
+                            session_id: lease.session_id,
+                            tab_id: lease.tab_id,
+                            action: action_name,
+                            run_id,
+                            turn_id,
+                            execution_id,
+                            error: error.to_string(),
+                        });
+                        return Err(error);
+                    }
+                    *self.inner.extension_startup_error.write().await = None;
+                    let session = self
+                        .inner
+                        .sessions
+                        .switch_backend(conversation_id, BrowserBackend::Chrome)
+                        .await
+                        .ok_or_else(|| {
+                            BrowserError::Connection("browser session missing".to_string())
+                        })?;
                     self.inner
                         .sessions
-                        .set_backend(conversation_id, BrowserBackend::Chrome)
-                        .await;
-                    claimed
+                        .emit(BrowserEvent::SessionUpdated { session });
+                    json!({ "backend": "chrome", "driver": "playwright_extension" })
                 }
                 _ => {
                     return Err(BrowserError::Tool {
@@ -379,14 +439,19 @@ impl BrowserRuntime {
                     });
                 }
             };
+            let completion_lease = self
+                .inner
+                .sessions
+                .lease_tab(conversation_id, &owner_id, context.run_id.as_deref())
+                .await;
             let selected_backend = self.inner.sessions.backend(conversation_id).await;
             self.inner.sessions.emit(BrowserEvent::BackendChanged {
-                session_id: lease.session_id.clone(),
+                session_id: completion_lease.session_id.clone(),
                 backend: selected_backend,
             });
             self.inner.sessions.emit(BrowserEvent::ActionCompleted {
-                session_id: lease.session_id,
-                tab_id: lease.tab_id,
+                session_id: completion_lease.session_id,
+                tab_id: completion_lease.tab_id,
                 action: action_name,
                 run_id,
                 turn_id,
@@ -495,19 +560,16 @@ impl BrowserRuntime {
                     .to_string(),
             });
         }
-        if self.inner.sessions.backend(conversation_id).await == BrowserBackend::Chrome {
-            return self
-                .execute_chrome_action(
-                    conversation_id,
-                    &lease,
-                    action,
-                    params,
-                    context,
-                    run_id,
-                    turn_id,
-                    execution_id,
-                )
-                .await;
+        let backend = self.inner.sessions.backend(conversation_id).await;
+        if backend == BrowserBackend::Chrome
+            && tabs_command.as_deref() == Some("close")
+            && requested_index.unwrap_or(lease.tab_index) == 0
+        {
+            return Err(BrowserError::Tool {
+                tool: action_name,
+                message: "the Chrome tab selected through the Playwright extension remains user-owned; close it in Chrome"
+                    .to_string(),
+            });
         }
         let locator_failure_key = locator_failure_key(&lease, action, &params);
         if let Some(key) = locator_failure_key.as_ref()
@@ -532,6 +594,7 @@ impl BrowserRuntime {
             // The explicit browser_tabs call below performs the matching MCP operation.
         } else if lease.opened {
             self.call_mcp(
+                backend,
                 "browser_tabs",
                 json!({ "action": "new", "url": "about:blank" }),
                 context.cancel.as_deref(),
@@ -539,6 +602,7 @@ impl BrowserRuntime {
             .await?;
         } else {
             self.call_mcp(
+                backend,
                 "browser_tabs",
                 json!({ "action": "select", "index": lease.tab_index }),
                 context.cancel.as_deref(),
@@ -615,6 +679,7 @@ impl BrowserRuntime {
         if let Some(highlight) = highlight_arguments.as_ref() {
             let _ = self
                 .call_mcp(
+                    backend,
                     "browser_highlight",
                     highlight.clone(),
                     context.cancel.as_deref(),
@@ -623,10 +688,10 @@ impl BrowserRuntime {
         }
 
         let raw_call = if let Some(text) = type_at_text {
-            self.type_at(arguments.clone(), &text, context.cancel.as_deref())
+            self.type_at(backend, arguments.clone(), &text, context.cancel.as_deref())
                 .await
         } else {
-            self.call_mcp(tool, arguments.clone(), context.cancel.as_deref())
+            self.call_mcp(backend, tool, arguments.clone(), context.cancel.as_deref())
                 .await
         };
         match raw_call {
@@ -716,6 +781,7 @@ impl BrowserRuntime {
                     | BrowserAction::Reload => {
                         if let Ok(raw_frame) = self
                             .call_mcp(
+                                backend,
                                 "browser_take_screenshot",
                                 json!({ "type": "png" }),
                                 context.cancel.as_deref(),
@@ -744,6 +810,7 @@ impl BrowserRuntime {
                 if let Some(highlight) = highlight_arguments {
                     let _ = self
                         .call_mcp(
+                            backend,
                             "browser_hide_highlight",
                             hide_highlight_arguments(highlight),
                             context.cancel.as_deref(),
@@ -764,6 +831,7 @@ impl BrowserRuntime {
                 if let Some(highlight) = highlight_arguments {
                     let _ = self
                         .call_mcp(
+                            backend,
                             "browser_hide_highlight",
                             hide_highlight_arguments(highlight),
                             context.cancel.as_deref(),
@@ -795,17 +863,18 @@ impl BrowserRuntime {
 
     async fn call_mcp(
         &self,
+        backend: BrowserBackend,
         tool: &'static str,
         arguments: Value,
         cancel: Option<&CancellationToken>,
     ) -> BrowserResult<McpToolCallResult> {
-        let first = self.ensure_client().await?;
+        let first = self.ensure_client(backend).await?;
         let first_call = first.call_tool(tool, arguments.clone());
         let first_result = if let Some(cancel) = cancel {
             tokio::select! {
                 result = first_call => result,
                 _ = cancel.cancelled() => {
-                    self.invalidate_client(&first).await;
+                    self.invalidate_client(backend, &first).await;
                     first.close().await;
                     return Err(BrowserError::Cancelled);
                 }
@@ -818,18 +887,19 @@ impl BrowserRuntime {
             Err(first_error) => {
                 tracing::warn!(
                     tool,
+                    ?backend,
                     error = %first_error,
-                    "Playwright MCP call failed; restarting managed sidecar"
+                    "Playwright MCP call failed; restarting browser sidecar"
                 );
-                self.invalidate_client(&first).await;
+                self.invalidate_client(backend, &first).await;
                 first.close().await;
-                let restarted = self.ensure_client().await?;
+                let restarted = self.ensure_client(backend).await?;
                 let retry = restarted.call_tool(tool, arguments);
                 let result = if let Some(cancel) = cancel {
                     tokio::select! {
                         result = retry => result,
                         _ = cancel.cancelled() => {
-                            self.invalidate_client(&restarted).await;
+                            self.invalidate_client(backend, &restarted).await;
                             restarted.close().await;
                             return Err(BrowserError::Cancelled);
                         }
@@ -837,10 +907,17 @@ impl BrowserRuntime {
                 } else {
                     retry.await
                 };
-                let result = result.map_err(|error| BrowserError::Tool {
-                    tool: tool.to_string(),
-                    message: error.to_string(),
-                })?;
+                let result = match result {
+                    Ok(result) => result,
+                    Err(error) => {
+                        self.invalidate_client(backend, &restarted).await;
+                        restarted.close().await;
+                        return Err(BrowserError::Tool {
+                            tool: tool.to_string(),
+                            message: error.to_string(),
+                        });
+                    }
+                };
                 mcp_tool_result(tool, result)
             }
         }
@@ -848,11 +925,12 @@ impl BrowserRuntime {
 
     async fn type_at(
         &self,
+        backend: BrowserBackend,
         click_arguments: Value,
         text: &str,
         cancel: Option<&CancellationToken>,
     ) -> BrowserResult<McpToolCallResult> {
-        self.call_mcp("browser_mouse_click_xy", click_arguments, cancel)
+        self.call_mcp(backend, "browser_mouse_click_xy", click_arguments, cancel)
             .await?;
         for character in text.chars() {
             let key = match character {
@@ -860,7 +938,7 @@ impl BrowserRuntime {
                 '\t' => "Tab".to_string(),
                 value => value.to_string(),
             };
-            self.call_mcp("browser_press_key", json!({ "key": key }), cancel)
+            self.call_mcp(backend, "browser_press_key", json!({ "key": key }), cancel)
                 .await?;
         }
         Ok(McpToolCallResult {
@@ -924,248 +1002,6 @@ impl BrowserRuntime {
                 | HumanLoopResponse::ModifiedArgs { .. }
         ))
     }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn execute_chrome_action(
-        &self,
-        conversation_id: &str,
-        lease: &session::BrowserLease,
-        action: BrowserAction,
-        params: ToolParameters,
-        context: &ToolContext,
-        run_id: Option<String>,
-        turn_id: Option<String>,
-        execution_id: Option<String>,
-    ) -> BrowserResult<ToolResult> {
-        let method = match action {
-            BrowserAction::Navigate => "navigate",
-            BrowserAction::Snapshot => "snapshot",
-            BrowserAction::Click => "click",
-            BrowserAction::Fill => "fill",
-            BrowserAction::Screenshot => "screenshot",
-            BrowserAction::Back => "back",
-            BrowserAction::Reload => "reload",
-            BrowserAction::Tabs => "tabs",
-            BrowserAction::Scroll => "scroll",
-            BrowserAction::DomInspect => "snapshot",
-            BrowserAction::ClickAt | BrowserAction::TypeAt => {
-                return Err(BrowserError::Tool {
-                    tool: action.name().to_string(),
-                    message: "coordinate control is available only in managed Chromium".to_string(),
-                });
-            }
-            BrowserAction::Console | BrowserAction::Network | BrowserAction::PerformanceTrace => {
-                return Err(BrowserError::Tool {
-                    tool: action.name().to_string(),
-                    message: "this diagnostic requires managed Chromium; Chrome CDP is not enabled"
-                        .to_string(),
-                });
-            }
-            BrowserAction::Backend | BrowserAction::DeveloperMode => {
-                return Err(BrowserError::Tool {
-                    tool: action.name().to_string(),
-                    message: "browser action was routed through an invalid backend path"
-                        .to_string(),
-                });
-            }
-        };
-        let mut arguments = serde_json::Map::from_iter(params);
-        for key in [
-            "effect",
-            "confirmationSummary",
-            "destination",
-            "dataCategories",
-            "element",
-        ] {
-            arguments.remove(key);
-        }
-        let action_name = action.name().to_string();
-        if action == BrowserAction::Navigate {
-            let url = arguments
-                .get("url")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            self.inner.sessions.emit(BrowserEvent::NavigationStarted {
-                session_id: lease.session_id.clone(),
-                tab_id: lease.tab_id.clone(),
-                url,
-            });
-            self.inner
-                .sessions
-                .set_status(conversation_id, BrowserSessionStatus::Navigating)
-                .await;
-        } else {
-            self.inner
-                .sessions
-                .set_status(conversation_id, BrowserSessionStatus::Acting)
-                .await;
-        }
-        self.inner.sessions.emit(BrowserEvent::ActionStarted {
-            session_id: lease.session_id.clone(),
-            tab_id: lease.tab_id.clone(),
-            action: action_name.clone(),
-            run_id: run_id.clone(),
-            turn_id: turn_id.clone(),
-            execution_id: execution_id.clone(),
-        });
-
-        let request = self.inner.chrome.browser_action(
-            conversation_id,
-            method,
-            Value::Object(arguments.clone()),
-        );
-        let raw = if let Some(cancel) = context.cancel.as_deref() {
-            tokio::select! {
-                _ = cancel.cancelled() => Err(BrowserError::Cancelled),
-                result = request => result,
-            }
-        } else {
-            request.await
-        };
-        let raw = match raw {
-            Ok(raw) => raw,
-            Err(error) => {
-                self.inner
-                    .sessions
-                    .set_status(conversation_id, BrowserSessionStatus::Failed)
-                    .await;
-                self.inner.sessions.emit(BrowserEvent::ActionFailed {
-                    session_id: lease.session_id.clone(),
-                    tab_id: lease.tab_id.clone(),
-                    action: action_name,
-                    error: error.to_string(),
-                    run_id,
-                    turn_id,
-                    execution_id,
-                });
-                return Err(error);
-            }
-        };
-        self.inner
-            .sessions
-            .set_status(conversation_id, BrowserSessionStatus::Ready)
-            .await;
-        let chrome_page_url = raw.get("url").and_then(Value::as_str).map(str::to_string);
-        let chrome_page_title = raw.get("title").and_then(Value::as_str).map(str::to_string);
-        if let Some(url) = chrome_page_url.as_deref() {
-            self.inner
-                .sessions
-                .update_url(conversation_id, &lease.tab_id, url)
-                .await;
-            if action == BrowserAction::Navigate {
-                self.inner.sessions.emit(BrowserEvent::NavigationCompleted {
-                    session_id: lease.session_id.clone(),
-                    tab_id: lease.tab_id.clone(),
-                    url: url.to_string(),
-                });
-            }
-        }
-
-        let mut result = chrome_tool_result(action, raw);
-        let (parsed_url, parsed_title) = attach_browser_page_metadata(&mut result);
-        let page_url = parsed_url.or(chrome_page_url);
-        let page_title = parsed_title.or(chrome_page_title);
-        if let Some(url) = &page_url {
-            result
-                .metadata
-                .insert("browser_url".to_string(), url.clone());
-        }
-        if let Some(title) = &page_title {
-            result
-                .metadata
-                .insert("browser_title".to_string(), title.clone());
-        }
-        self.inner
-            .sessions
-            .update_page_metadata(
-                conversation_id,
-                &lease.tab_id,
-                page_url.as_deref(),
-                page_title.as_deref(),
-            )
-            .await;
-        let observation = self
-            .inner
-            .sessions
-            .observation(lease, &action_name, &result);
-        match action {
-            BrowserAction::Snapshot | BrowserAction::DomInspect => self
-                .inner
-                .sessions
-                .emit(BrowserEvent::Snapshot { observation }),
-            BrowserAction::Screenshot => {
-                let frame = browser_frame(&result);
-                self.inner
-                    .sessions
-                    .emit(BrowserEvent::Screenshot { observation, frame });
-            }
-            BrowserAction::Navigate
-            | BrowserAction::Click
-            | BrowserAction::Fill
-            | BrowserAction::Scroll
-            | BrowserAction::Back
-            | BrowserAction::Reload => {
-                if let Ok(frame) = self
-                    .inner
-                    .chrome
-                    .browser_action(conversation_id, "screenshot", json!({}))
-                    .await
-                {
-                    let frame_result = chrome_tool_result(BrowserAction::Screenshot, frame);
-                    let frame_observation =
-                        self.inner
-                            .sessions
-                            .observation(lease, "browser_screenshot", &frame_result);
-                    self.inner.sessions.emit(BrowserEvent::Screenshot {
-                        observation: frame_observation,
-                        frame: browser_frame(&frame_result),
-                    });
-                }
-            }
-            _ => {}
-        }
-        self.inner.sessions.emit(BrowserEvent::ActionCompleted {
-            session_id: lease.session_id.clone(),
-            tab_id: lease.tab_id.clone(),
-            action: action_name,
-            run_id,
-            turn_id,
-            execution_id,
-        });
-        if action == BrowserAction::DomInspect {
-            result.kind = ToolResultKind::Text;
-        }
-        Ok(result)
-    }
-}
-
-fn chrome_tool_result(action: BrowserAction, value: Value) -> ToolResult {
-    if action == BrowserAction::Screenshot {
-        let data = value.get("data").and_then(Value::as_str);
-        let mime_type = value
-            .get("mimeType")
-            .and_then(Value::as_str)
-            .unwrap_or("image/png")
-            .to_string();
-        if let Some(data) = data
-            && let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data)
-        {
-            let mut result = ToolResult::success("Captured authorized Chrome tab screenshot.");
-            result.kind = ToolResultKind::Image {
-                mime_type: mime_type.clone(),
-            };
-            result.bytes = Some(bytes);
-            result.mime_type = Some(mime_type);
-            return result;
-        }
-    }
-    if let Some(text) = value.get("text").and_then(Value::as_str) {
-        let mut result = ToolResult::success(text.to_string());
-        result.data = Some(value);
-        return result;
-    }
-    ToolResult::success_json(value)
 }
 
 fn mcp_tool_result(tool: &str, result: McpToolCallResult) -> BrowserResult<McpToolCallResult> {
@@ -1306,7 +1142,7 @@ impl BrowserAction {
     fn description(self) -> &'static str {
         match self {
             Self::Backend => {
-                "Select managed Chromium or an explicitly authorized Chrome tab for this conversation."
+                "Select managed Chromium or Chrome through the official Playwright Extension for this conversation."
             }
             Self::Navigate => "Navigate the current browser backend to a URL.",
             Self::Snapshot => "Read a structured accessibility snapshot of the current page.",
@@ -1315,7 +1151,7 @@ impl BrowserAction {
             Self::Screenshot => "Capture the current page or a selected element.",
             Self::Back => "Navigate the current tab back one history entry.",
             Self::Reload => "Reload the current page.",
-            Self::Tabs => "List, create, close, or select managed browser tabs.",
+            Self::Tabs => "List, create, close, or select browser tabs.",
             Self::ClickAt => {
                 "Click viewport coordinates when semantic DOM targeting is unavailable."
             }
@@ -1341,8 +1177,7 @@ impl BrowserAction {
         match self {
             Self::Backend => object_schema(
                 json!({
-                    "backend": { "type": "string", "enum": ["managed", "chrome"] },
-                    "tabId": { "type": "integer", "minimum": 0, "description": "Optional authorized Chrome tab id" }
+                    "backend": { "type": "string", "enum": ["managed", "chrome"] }
                 }),
                 &["backend"],
             ),

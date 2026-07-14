@@ -9,9 +9,9 @@ import {
   Brain,
 } from 'lucide-react';
 import type { SubagentRunState, ExecutionEvent } from '../../stores/subagentRunStore';
-import { useSubagentDetailStore } from '../../stores/subagentDetailStore';
 import MarkdownContent from '../common/MarkdownContent';
 import { InlineToolCall } from './InlineToolCall';
+import { isSubagentDispatchTool } from './tools/toolRenderers';
 import {
   computeSubagentProgress,
   progressSummary,
@@ -23,6 +23,8 @@ interface SubagentStreamBlockProps {
   /** All execution traces in this run (for recursive child lookup). */
   allRuns: SubagentRunState[];
 }
+
+type SubagentTab = 'task' | 'process' | 'result';
 
 /** Reconstruct a subagent's thinking+tool loop from raw events. */
 interface SubagentStep {
@@ -90,16 +92,20 @@ export const SubagentStreamBlock = memo(function SubagentStreamBlock({
   allRuns,
 }: SubagentStreamBlockProps) {
   const [expanded, setExpanded] = useState(run.status === 'running');
-  const selectSubagent = useSubagentDetailStore((state) => state.selectSubagent);
-  const [sectionExpanded, setSectionExpanded] = useState({
-    prompt: false,
-    process: true,
-    result: true,
-  });
+  const [activeTab, setActiveTab] = useState<SubagentTab>('process');
 
   const progress = useMemo(() => computeSubagentProgress(run), [run.events, run.status]);
   const summary = progressSummary(progress);
   const { steps } = useMemo(() => reconstructSteps(run.events), [run.events]);
+  const visibleSteps = useMemo(
+    () =>
+      steps.filter(
+        (step) =>
+          step.type === 'thinking' ||
+          !isSubagentDispatchTool(String(step.toolStart?.name ?? step.toolResult?.name ?? 'tool'))
+      ),
+    [steps]
+  );
   const result = useMemo(() => subagentResult(run), [run.events, run.output]);
 
   const children = useMemo(
@@ -132,7 +138,7 @@ export const SubagentStreamBlock = memo(function SubagentStreamBlock({
         </button>
         <button
           type="button"
-          onClick={() => selectSubagent(run.subagentRunId)}
+          onClick={() => setExpanded((value) => !value)}
           className="flex min-w-0 flex-1 items-center gap-1.5 rounded-md px-1 py-0.5 text-left transition-colors hover:bg-[var(--bg-hover)]"
         >
           {statusIcon}
@@ -155,40 +161,51 @@ export const SubagentStreamBlock = memo(function SubagentStreamBlock({
       </div>
 
       {expanded && (
-        <div className="mt-1.5 space-y-1.5 pl-4">
-          {/* Prompt */}
-          {run.task && (
-            <div>
+        <div className="ml-4 mt-1.5 min-w-0">
+          <div
+            className="flex h-8 items-end gap-1 border-b border-[var(--border-primary)]"
+            role="tablist"
+            aria-label={`${run.agent || 'subagent'} 执行信息`}
+          >
+            {(
+              [
+                ['task', '提示词 / 任务'],
+                ['process', '执行细节'],
+                ['result', '结果'],
+              ] as const
+            ).map(([id, label]) => (
               <button
-                onClick={() => setSectionExpanded((s) => ({ ...s, prompt: !s.prompt }))}
-                className="flex items-center gap-1 text-[10px] font-medium text-[var(--text-tertiary)]"
+                key={id}
+                type="button"
+                role="tab"
+                aria-selected={activeTab === id}
+                onClick={() => setActiveTab(id)}
+                className="h-8 border-b-2 px-2 text-[10px] font-medium transition-colors"
+                style={{
+                  borderColor: activeTab === id ? 'var(--accent)' : 'transparent',
+                  color: activeTab === id ? 'var(--text-primary)' : 'var(--text-tertiary)',
+                }}
               >
-                {sectionExpanded.prompt ? <ChevronDown size={9} /> : <ChevronRight size={9} />}
-                提示词
+                {label}
               </button>
-              {sectionExpanded.prompt && <MarkdownContent content={run.task} className="text-sm" />}
-            </div>
-          )}
+            ))}
+          </div>
 
-          {/* Execution process: flat thinking + tool loop (NO nested left-border blocks) */}
-          <div>
-            <button
-              onClick={() => setSectionExpanded((s) => ({ ...s, process: !s.process }))}
-              className="flex items-center gap-1 text-[10px] font-medium text-[var(--text-tertiary)]"
-            >
-              {sectionExpanded.process ? <ChevronDown size={9} /> : <ChevronRight size={9} />}
-              执行过程
-            </button>
-            {sectionExpanded.process && (
-              <div className="mt-1 space-y-1">
-                {steps.length === 0 && (
-                  <div className="text-[11px] text-[var(--text-tertiary)]">暂无事件</div>
+          <div className="min-w-0 py-2" role="tabpanel">
+            {activeTab === 'task' &&
+              (run.task ? (
+                <MarkdownContent content={run.task} className="text-sm" maxHeight={320} />
+              ) : (
+                <div className="text-[11px] text-[var(--text-tertiary)]">暂无任务输入</div>
+              ))}
+
+            {activeTab === 'process' && (
+              <div className="space-y-1.5">
+                {visibleSteps.length === 0 && children.length === 0 && (
+                  <div className="text-[11px] text-[var(--text-tertiary)]">暂无执行事件</div>
                 )}
-                {steps.map((step, i) => {
+                {visibleSteps.map((step, i) => {
                   if (step.type === 'thinking') {
-                    // Flat thinking: small label + markdown inline, no nested
-                    // bordered box. Matches the one-stream layout where every
-                    // item (thinking/tool/subagent) is a peer in the flow.
                     return (
                       <div key={i}>
                         <div className="mb-0.5 flex items-center gap-1">
@@ -201,7 +218,7 @@ export const SubagentStreamBlock = memo(function SubagentStreamBlock({
                       </div>
                     );
                   }
-                  const name = String(step.toolStart?.name ?? 'tool');
+                  const name = String(step.toolStart?.name ?? step.toolResult?.name ?? 'tool');
                   const args = step.toolStart?.args ?? {};
                   const resultStr = String(step.toolResult?.result ?? '');
                   const success = step.toolResult?.success !== false;
@@ -214,18 +231,19 @@ export const SubagentStreamBlock = memo(function SubagentStreamBlock({
                         args,
                         result: resultStr,
                         success,
-                        status: success ? 'succeeded' : 'failed',
+                        status: step.toolResult ? (success ? 'succeeded' : 'failed') : 'running',
                         stdout: success ? resultStr : '',
                         stderr: success ? '' : resultStr,
                         log: '',
                         startedAt: Number(step.toolStart?.timestamp ?? Date.now()),
-                        finishedAt: Number(step.toolResult?.timestamp ?? Date.now()),
+                        finishedAt: step.toolResult
+                          ? Number(step.toolResult.timestamp ?? Date.now())
+                          : undefined,
                       }}
                       index={i}
                     />
                   );
                 })}
-                {/* Recursive children (nested sub-agents) */}
                 {children.length > 0 && (
                   <div className="ml-2 border-l border-[var(--border-primary)] pl-2">
                     {children.map((child) => (
@@ -239,23 +257,16 @@ export const SubagentStreamBlock = memo(function SubagentStreamBlock({
                 )}
               </div>
             )}
-          </div>
 
-          {/* Result */}
-          {result && (
-            <div>
-              <button
-                onClick={() => setSectionExpanded((s) => ({ ...s, result: !s.result }))}
-                className="flex items-center gap-1 text-[10px] font-medium text-[var(--text-tertiary)]"
-              >
-                {sectionExpanded.result ? <ChevronDown size={9} /> : <ChevronRight size={9} />}
-                结果
-              </button>
-              {sectionExpanded.result && (
+            {activeTab === 'result' &&
+              (result ? (
                 <MarkdownContent content={result} className="text-sm" maxHeight={400} />
-              )}
-            </div>
-          )}
+              ) : (
+                <div className="text-[11px] text-[var(--text-tertiary)]">
+                  {run.status === 'running' ? '正在等待执行结果' : '暂无结果'}
+                </div>
+              ))}
+          </div>
         </div>
       )}
     </div>

@@ -9,6 +9,7 @@ import {
   ChevronLeft,
   File as FileIcon,
   FileCode,
+  FileDiff,
   FolderTree,
   GitCompare,
   Image as ImageIcon,
@@ -68,17 +69,22 @@ export function FileBrowser() {
     }
   };
 
+  const openChange = (path: string) => {
+    void store.loadDiff(path);
+    if (window.innerWidth < 768) setMobileShowTree(false);
+  };
+
   return (
-    <div className="flex h-full min-h-0 w-full">
+    <div className="relative flex h-full min-h-0 w-full">
       <div
-        className={`w-[220px] shrink-0 overflow-hidden border-r border-[var(--border-primary)] bg-[var(--bg-sidebar)] max-md:absolute max-md:inset-y-0 max-md:left-0 max-md:z-20 max-md:w-[min(78vw,280px)] ${mobileShowTree ? '' : 'max-md:hidden'}`}
+        className={`w-[min(38%,220px)] min-w-[150px] shrink-0 overflow-hidden border-r border-[var(--border-primary)] bg-[var(--bg-sidebar)] max-md:absolute max-md:inset-y-0 max-md:left-0 max-md:z-20 max-md:w-[min(78vw,280px)] ${mobileShowTree ? '' : 'max-md:hidden'}`}
       >
         <div className="flex h-full flex-col">
           <div className="flex h-9 items-center justify-between border-b border-[var(--border-primary)] px-2.5">
             <div className="flex min-w-0 items-center gap-1.5">
               <FolderTree size={13} className="text-[var(--accent)]" />
               <span className="truncate text-xs font-medium text-[var(--text-secondary)]">
-                文件
+                项目文件
               </span>
             </div>
             <button
@@ -90,6 +96,40 @@ export function FileBrowser() {
               <RefreshCw size={12} className={store.loading ? 'animate-spin' : ''} />
             </button>
           </div>
+          {store.changes.length > 0 && (
+            <div className="shrink-0 border-b border-[var(--border-primary)] px-1.5 py-1.5">
+              <div className="flex h-7 items-center justify-between px-1.5 text-[10px] font-medium text-[var(--text-tertiary)]">
+                <span className="flex items-center gap-1.5">
+                  <FileDiff size={11} />
+                  工作区变更
+                </span>
+                <span className="tabular-nums">{store.changes.length}</span>
+              </div>
+              <div className="max-h-40 space-y-0.5 overflow-y-auto">
+                {store.changes.map((change) => (
+                  <button
+                    key={`${change.status}:${change.path}`}
+                    type="button"
+                    onClick={() => openChange(change.path)}
+                    className="flex w-full items-center gap-2 rounded-md px-1.5 py-1 text-left hover:bg-[var(--bg-hover)]"
+                  >
+                    <span
+                      className={`h-1.5 w-1.5 shrink-0 rounded-full ${
+                        change.status === 'added'
+                          ? 'bg-[var(--color-success)]'
+                          : change.status === 'deleted'
+                            ? 'bg-[var(--color-error)]'
+                            : 'bg-[var(--color-warning)]'
+                      }`}
+                    />
+                    <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-[var(--text-secondary)]">
+                      {change.path}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
           <div className="min-h-0 flex-1 overflow-y-auto">
             {store.loading && store.tree.length === 0 ? (
               <div className="flex justify-center py-8">
