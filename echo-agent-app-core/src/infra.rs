@@ -22,6 +22,18 @@ const DEFAULT_CONTEXT_WINDOW: usize = 396_000;
 /// Default max output tokens when not configured (sensible for 128K context models).
 const DEFAULT_MAX_TOKENS: u32 = 8192;
 
+/// EKO product default for one tool result returned to the model. The generic
+/// framework keeps 0 as opt-out so other consumers choose their own budget.
+const DEFAULT_MAX_TOOL_OUTPUT_TOKENS: usize = 8_000;
+
+fn resolved_max_tool_output_tokens(configured: usize) -> usize {
+    if configured > 0 {
+        configured
+    } else {
+        DEFAULT_MAX_TOOL_OUTPUT_TOKENS
+    }
+}
+
 /// Guide appended to the system prompt when task management tools are
 /// available. Instructs the agent to actively manage its task plan and
 /// proactively dispatch readonly subagents for investigation-heavy work
@@ -221,6 +233,8 @@ pub async fn create_agent(
     } else {
         DEFAULT_CONTEXT_WINDOW
     };
+    let max_tool_output_tokens =
+        resolved_max_tool_output_tokens(app_config.agent.max_tool_output_tokens);
 
     // Use ReactAgentBuilder — mode is resolved at the CLI layer,
     // framework only receives model + system_prompt + tools.
@@ -236,6 +250,7 @@ pub async fn create_agent(
         .enable_human_in_loop()
         .max_iterations(app_config.agent.max_iterations)
         .token_limit(token_limit)
+        .max_tool_output_tokens(max_tool_output_tokens)
         .max_tokens(Some(max_tokens.unwrap_or(DEFAULT_MAX_TOKENS)))
         .temperature(temperature)
         .tool_execution(echo_agent::tools::ToolExecutionConfig {
@@ -431,6 +446,7 @@ pub async fn create_agent(
         max_tokens,
         token_limit,
         app_config.agent.tool_timeout_ms,
+        max_tool_output_tokens,
         &cache_user_id,
         subagent_project_root.as_deref(),
         subagent_user_home.as_deref(),
@@ -512,6 +528,7 @@ async fn register_default_subagents(
     max_tokens: Option<u32>,
     token_limit: usize,
     tool_timeout_ms: u64,
+    max_tool_output_tokens: usize,
     cache_user_id: &str,
     project_root: Option<&std::path::Path>,
     user_home: Option<&std::path::Path>,
@@ -559,6 +576,7 @@ async fn register_default_subagents(
                 max_tokens,
                 token_limit,
                 tool_timeout_ms,
+                max_tool_output_tokens,
                 cache_user_id,
                 worker_def.can_delegate,
                 max_iterations,
@@ -574,6 +592,7 @@ async fn register_default_subagents(
                 max_tokens,
                 token_limit,
                 tool_timeout_ms,
+                max_tool_output_tokens,
                 cache_user_id,
                 worker_def.can_delegate,
                 max_iterations,
@@ -733,6 +752,7 @@ fn build_writer_worker_agent(
     max_tokens: Option<u32>,
     token_limit: usize,
     tool_timeout_ms: u64,
+    max_tool_output_tokens: usize,
     cache_user_id: &str,
     can_delegate: bool,
     max_iterations: usize,
@@ -755,6 +775,7 @@ fn build_writer_worker_agent(
         .enable_subagent()
         .max_iterations(max_iterations)
         .token_limit(token_limit)
+        .max_tool_output_tokens(max_tool_output_tokens)
         .max_tokens(max_tokens.or(Some(DEFAULT_MAX_TOKENS)))
         .temperature(temperature)
         .tool_execution(echo_agent::tools::ToolExecutionConfig {
@@ -808,6 +829,7 @@ fn build_readonly_worker_agent(
     max_tokens: Option<u32>,
     token_limit: usize,
     tool_timeout_ms: u64,
+    max_tool_output_tokens: usize,
     cache_user_id: &str,
     can_delegate: bool,
     max_iterations: usize,
@@ -824,6 +846,7 @@ fn build_readonly_worker_agent(
         .enable_subagent()
         .max_iterations(max_iterations)
         .token_limit(token_limit)
+        .max_tool_output_tokens(max_tool_output_tokens)
         .max_tokens(max_tokens.or(Some(DEFAULT_MAX_TOKENS)))
         .temperature(temperature)
         .tool_execution(echo_agent::tools::ToolExecutionConfig {
@@ -1806,11 +1829,23 @@ pub fn build_llm_config(
 
 #[cfg(test)]
 mod resolve_worker_model_tests {
-    use super::{TASK_MANAGEMENT_GUIDE, resolve_worker_model};
+    use super::{
+        DEFAULT_MAX_TOOL_OUTPUT_TOKENS, TASK_MANAGEMENT_GUIDE, resolve_worker_model,
+        resolved_max_tool_output_tokens,
+    };
 
     #[test]
     fn stable_task_guide_stays_within_cache_budget() {
         assert!(TASK_MANAGEMENT_GUIDE.chars().count() <= 2_400);
+    }
+
+    #[test]
+    fn tool_output_budget_uses_eko_default_when_unset() {
+        assert_eq!(
+            resolved_max_tool_output_tokens(0),
+            DEFAULT_MAX_TOOL_OUTPUT_TOKENS
+        );
+        assert_eq!(resolved_max_tool_output_tokens(4_000), 4_000);
     }
 
     #[test]

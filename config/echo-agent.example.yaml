@@ -34,6 +34,11 @@ agent:
   enable_memory: true         # 启用记忆
   enable_human_in_loop: true  # 启用人工介入
   memory_path: "~/.echo-agent/memory"  # 记忆存储路径
+  tool_timeout_ms: 120000     # 单次工具调用超时（毫秒）
+  max_tool_output_tokens: 8000 # 单个工具结果进入模型上下文的 Token 上限
+  token_limit: 0              # 0 = 使用模型上下文窗口或应用默认值
+  compress_strategy: "sliding"
+  compress_window: 20
 
 # ── MCP 配置 ─────────────────────────────────────────────────────
 mcp:

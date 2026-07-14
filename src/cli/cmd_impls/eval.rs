@@ -52,12 +52,20 @@ async fn cmd_trace(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
                             RunEvent::ToolResult {
                                 name,
                                 output_truncated,
+                                original_bytes,
+                                returned_bytes,
+                                estimated_tokens,
+                                output_handling,
                                 ..
                             } => {
                                 println!(
-                                    "  Tool Result: {} {}",
+                                    "  Tool Result: {} {} [{}; {} -> {} bytes; ~{} tokens]",
                                     name,
-                                    if *output_truncated { "(truncated)" } else { "" }
+                                    if *output_truncated { "(truncated)" } else { "" },
+                                    output_handling.as_deref().unwrap_or("unknown"),
+                                    original_bytes,
+                                    returned_bytes,
+                                    estimated_tokens,
                                 );
                             }
                             RunEvent::ToolError { name, message, .. } => {
