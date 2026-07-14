@@ -7,18 +7,19 @@
 //! ## Prefix Caching Optimization
 //!
 //! Module priority ordering is designed to maximize LLM provider-side prefix caching:
-//! - **P0 (base)**, **P1 (core)**, and **P2 (runtime guide)** are stable across requests,
-//!   forming a cacheable prefix that rarely changes.
-//! - **P3-P6** (project rules, structure, git, task state) are variable and placed
-//!   after the stable prefix, so cache invalidation only affects the tail.
+//! - **P0-P4** (base, core, runtime guide, durable instructions, subagent catalog)
+//!   form the stable session prefix.
+//! - **P5-P7** (project rules, structure, git) follow that prefix and carry
+//!   explicit token caps.
 //!
 //! This means consecutive requests within the same mode share a long common prefix
 //! that OpenAI, DeepSeek, and Anthropic can cache automatically.
 
 use super::context::ProjectContext;
+use echo_core::tokenizer::{HeuristicTokenizer, Tokenizer};
 
 /// Stable product-level operating contract. Dynamic project, memory, mode, and
-/// task context is appended after this cache-friendly prefix.
+/// task context follows this cache-friendly prefix.
 pub const CORE_ASSISTANT_PROMPT: &str = r#"# EKO Operating Contract
 
 You are EKO, a local personal AI workbench running on the user's machine. You help with real software projects, research, data analysis, documents, and long-running work. Your job is to move the user's goal to a trustworthy result, not merely produce plausible text.
@@ -82,6 +83,23 @@ pub struct PromptModule {
     pub required: bool,
 }
 
+/// Token and inclusion result for one assembled prompt module.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptModuleUsage {
+    pub name: String,
+    pub estimated_tokens: usize,
+    pub included: bool,
+    pub truncated: bool,
+}
+
+/// Prompt text plus budget diagnostics used by tests and observability.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptAssembly {
+    pub prompt: String,
+    pub estimated_tokens: usize,
+    pub modules: Vec<PromptModuleUsage>,
+}
+
 /// Assembles the system prompt from priority-ordered modules with budget awareness.
 pub struct PromptAssembler {
     modules: Vec<PromptModule>,
@@ -108,37 +126,80 @@ impl PromptAssembler {
     /// Required modules are always included. Non-required modules are truncated
     /// to their token budget when the total exceeds `total_budget`.
     pub fn assemble(&self) -> String {
+        self.assemble_with_report().prompt
+    }
+
+    /// Build the prompt and return per-module budget diagnostics.
+    pub fn assemble_with_report(&self) -> PromptAssembly {
+        let tokenizer = HeuristicTokenizer;
         let mut parts = Vec::new();
         let mut used_tokens = 0usize;
+        let mut usages = Vec::new();
 
         for module in &self.modules {
-            let rendered_content = module.content.clone();
-
-            let est_tokens = rendered_content.len() / 4; // rough token estimate
-            if module.required || used_tokens + est_tokens <= self.total_budget {
-                let content = if !module.required
-                    && module.token_budget > 0
-                    && est_tokens > module.token_budget
-                {
-                    // Truncate to budget
-                    let max_chars = module.token_budget * 4;
-                    let truncated: String = rendered_content.chars().take(max_chars).collect();
-                    format!("{truncated}\n[Module truncated to {max_chars} chars]")
-                } else {
-                    rendered_content
-                };
-                used_tokens += content.len() / 4;
-                parts.push(content);
-            } else {
-                // Skip non-required module that would exceed budget
-                parts.push(format!(
-                    "[Module '{}' skipped: budget exceeded (used {} tokens of {})]",
-                    module.name, used_tokens, self.total_budget
-                ));
+            let estimated = tokenizer.count_tokens(&module.content);
+            if module.required {
+                used_tokens = used_tokens.saturating_add(estimated);
+                parts.push(module.content.clone());
+                usages.push(PromptModuleUsage {
+                    name: module.name.clone(),
+                    estimated_tokens: estimated,
+                    included: true,
+                    truncated: false,
+                });
+                continue;
             }
+
+            let remaining = self.total_budget.saturating_sub(used_tokens);
+            let module_limit = if module.token_budget == 0 {
+                remaining
+            } else {
+                remaining.min(module.token_budget)
+            };
+            if module_limit == 0 {
+                usages.push(PromptModuleUsage {
+                    name: module.name.clone(),
+                    estimated_tokens: 0,
+                    included: false,
+                    truncated: false,
+                });
+                continue;
+            }
+
+            let (content, truncated) = if estimated > module_limit {
+                (
+                    truncate_to_estimated_tokens(&module.content, module_limit),
+                    true,
+                )
+            } else {
+                (module.content.clone(), false)
+            };
+            let included_tokens = tokenizer.count_tokens(&content);
+            if content.is_empty() {
+                usages.push(PromptModuleUsage {
+                    name: module.name.clone(),
+                    estimated_tokens: 0,
+                    included: false,
+                    truncated,
+                });
+                continue;
+            }
+            used_tokens = used_tokens.saturating_add(included_tokens);
+            parts.push(content);
+            usages.push(PromptModuleUsage {
+                name: module.name.clone(),
+                estimated_tokens: included_tokens,
+                included: true,
+                truncated,
+            });
         }
 
-        parts.join("\n\n")
+        let prompt = parts.join("\n\n");
+        PromptAssembly {
+            estimated_tokens: tokenizer.count_tokens(&prompt),
+            prompt,
+            modules: usages,
+        }
     }
 
     /// Build default modules for a session.
@@ -180,7 +241,7 @@ impl PromptAssembler {
             });
         }
 
-        // P3: Project rules (high priority but can be truncated)
+        // P5: Project rules (high priority but can be truncated)
         if let Some(ctx) = project_ctx {
             if !ctx.instructions.is_empty() {
                 let rules: String = ctx
@@ -191,13 +252,13 @@ impl PromptAssembler {
                 assembler.add_module(PromptModule {
                     name: "project_rules".into(),
                     content: format!("## Project Instructions\n\n{rules}"),
-                    priority: 3,
-                    token_budget: model_window / 10, // 10% for rules
+                    priority: 5,
+                    token_budget: (model_window / 10).min(6_000),
                     required: false,
                 });
             }
 
-            // P4: Project structure
+            // P6: Project structure
             if !ctx.file_tree_summary.is_empty() {
                 assembler.add_module(PromptModule {
                     name: "project_structure".into(),
@@ -205,52 +266,72 @@ impl PromptAssembler {
                         "## Project Structure ({})\n\n```\n{}\n```",
                         ctx.name, ctx.file_tree_summary
                     ),
-                    priority: 4,
-                    token_budget: model_window / 8, // 12.5% for structure
+                    priority: 6,
+                    token_budget: (model_window / 8).min(4_000),
                     required: false,
                 });
             }
 
-            // P5: Git context (low priority)
+            // P7: Git context (low priority)
             if let Some(git_ctx) = super::context::load_git_context(&ctx.root) {
                 assembler.add_module(PromptModule {
                     name: "git_context".into(),
                     content: format!("## Git Status\n\n{git_ctx}"),
-                    priority: 5,
-                    token_budget: model_window / 12, // ~8% for git
+                    priority: 7,
+                    token_budget: (model_window / 12).min(1_500),
                     required: false,
                 });
             }
         }
 
-        // P6: Task state placeholder (lowest priority)
-        assembler.add_module(PromptModule {
-            name: "task_state".into(),
-            content: "[Task state: no active tasks]".into(),
-            priority: 6,
-            token_budget: model_window / 20, // 5% for task state
-            required: false,
-        });
-
         assembler
     }
 
-    /// Add memory + profile context as P7 module.
-    ///
-    /// Call this after `default_for_mode` with the pre-assembled memory context
-    /// string (from `UnifiedMemory::system_prompt_context()` and profiles).
-    pub fn add_memory_context(&mut self, context: &str) {
+    /// Add stable user/project/local instruction context as P3.
+    pub fn add_instruction_context(&mut self, context: &str) {
         if context.is_empty() {
             return;
         }
         self.add_module(PromptModule {
-            name: "memory_context".into(),
+            name: "instruction_context".into(),
             content: context.to_string(),
-            priority: 7,
-            token_budget: self.total_budget / 20, // 5% budget
+            priority: 3,
+            token_budget: (self.total_budget / 10).min(4_000),
             required: false,
         });
     }
+
+    /// Add the stable subagent catalog as P4.
+    pub fn add_subagent_catalog(&mut self, catalog: &str) {
+        if catalog.is_empty() {
+            return;
+        }
+        self.add_module(PromptModule {
+            name: "subagent_catalog".into(),
+            content: catalog.to_string(),
+            priority: 4,
+            token_budget: (self.total_budget / 20).min(2_000),
+            required: false,
+        });
+    }
+}
+
+fn truncate_to_estimated_tokens(text: &str, max_tokens: usize) -> String {
+    if max_tokens == 0 {
+        return String::new();
+    }
+    let max_weight = max_tokens.saturating_mul(4).saturating_add(3);
+    let mut weight = 0usize;
+    text.chars()
+        .take_while(|character| {
+            let next = weight.saturating_add(if character.is_ascii() { 1 } else { 2 });
+            if next > max_weight {
+                return false;
+            }
+            weight = next;
+            true
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -284,10 +365,38 @@ mod tests {
             .find("# EKO Operating Contract")
             .unwrap_or(usize::MAX);
         let runtime_index = prompt.find("stable runtime guide").unwrap_or(usize::MAX);
-        let task_state_index = prompt.find("[Task state:").unwrap_or(usize::MAX);
 
         assert!(base_index < contract_index);
         assert!(contract_index < runtime_index);
-        assert!(runtime_index < task_state_index);
+        assert!(!prompt.contains("[Task state:"));
+    }
+
+    #[test]
+    fn optional_modules_use_mixed_language_token_budgets_without_prompt_noise() {
+        let mut assembler = PromptAssembler::new(80);
+        assembler.add_module(PromptModule {
+            name: "base".into(),
+            content: "stable".into(),
+            priority: 0,
+            token_budget: 0,
+            required: true,
+        });
+        assembler.add_module(PromptModule {
+            name: "dynamic".into(),
+            content: "中文动态上下文".repeat(100),
+            priority: 1,
+            token_budget: 20,
+            required: false,
+        });
+
+        let assembly = assembler.assemble_with_report();
+        let dynamic = assembly
+            .modules
+            .iter()
+            .find(|module| module.name == "dynamic");
+        assert!(dynamic.is_some_and(|module| module.included && module.truncated));
+        assert!(dynamic.is_some_and(|module| module.estimated_tokens <= 20));
+        assert!(!assembly.prompt.contains("Module truncated"));
+        assert!(!assembly.prompt.contains("budget exceeded"));
     }
 }

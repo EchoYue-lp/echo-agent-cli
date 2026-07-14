@@ -42,6 +42,7 @@ use tokio::sync::RwLock;
 use crate::config::AppConfig;
 use crate::infra;
 use crate::model_config::ModelRuntimeConfig;
+use crate::workspace::WorkspaceKind;
 
 /// Configuration for the agent pool.
 #[derive(Debug, Clone)]
@@ -201,6 +202,8 @@ pub struct AgentPool {
     /// current workspace's memory store (not the stale shared.store captured
     /// at bootstrap). `None` means "use shared.store" (pre-switch behavior).
     memory_store_override: RwLock<Option<Arc<dyn echo_agent::memory::Store>>>,
+    /// Active workspace profile applied to existing and future pooled agents.
+    workspace_kind: RwLock<WorkspaceKind>,
 }
 
 impl AgentPool {
@@ -241,6 +244,7 @@ impl AgentPool {
             skill_descriptors: RwLock::new(skill_descriptors),
             cleanup_cancel: CancellationToken::new(),
             memory_store_override: RwLock::new(None),
+            workspace_kind: RwLock::new(WorkspaceKind::General),
         };
 
         // Pre-create background agent if enabled
@@ -540,6 +544,30 @@ impl AgentPool {
         }
         let pooled_agents = self.agents.read().await.len();
         tracing::info!(?path, pooled_agents, "AgentPool: working_dir applied");
+    }
+
+    /// Apply one workspace prompt/skill profile to existing and future agents.
+    pub async fn apply_workspace_routing(&self, kind: WorkspaceKind) {
+        *self.workspace_kind.write().await = kind.clone();
+        let agents: Vec<AgentHandle> = self
+            .agents
+            .read()
+            .await
+            .values()
+            .map(|pooled| pooled.handle.clone())
+            .collect();
+        for handle in agents {
+            let kind = kind.clone();
+            handle
+                .write_async(|agent| {
+                    Box::pin(async move {
+                        crate::workspace_routing::configure_agent_for_workspace(agent, &kind).await;
+                    })
+                })
+                .await;
+        }
+        let pooled_agents = self.agents.read().await.len();
+        tracing::info!(?kind, pooled_agents, "AgentPool: workspace routing applied");
     }
 
     /// Rebind all pooled agents to a workspace-scoped memory store.
@@ -852,6 +880,9 @@ impl AgentPool {
             agent.skill_registry_mut().register_descriptor(desc.clone());
         }
 
+        let workspace_kind = self.workspace_kind.read().await.clone();
+        crate::workspace_routing::configure_agent_for_workspace(&mut agent, &workspace_kind).await;
+
         // 3b. Auto-compression — pooled agents must not rely solely on the
         // 200-msg hard cap. Mirror the primary agent wiring (runtime.rs) so
         // long GUI multi-session runs are protected by the configured strategy.
@@ -1141,6 +1172,7 @@ mod tests {
             skill_descriptors: RwLock::new(vec![]),
             cleanup_cancel: CancellationToken::new(),
             memory_store_override: RwLock::new(None),
+            workspace_kind: RwLock::new(WorkspaceKind::General),
         }
     }
 
@@ -1174,7 +1206,40 @@ mod tests {
             skill_descriptors: RwLock::new(vec![]),
             cleanup_cancel: CancellationToken::new(),
             memory_store_override: RwLock::new(None),
+            workspace_kind: RwLock::new(WorkspaceKind::General),
         }
+    }
+
+    #[tokio::test]
+    async fn workspace_routing_applies_to_existing_and_future_pool_agents() -> Result<(), String> {
+        let pool = create_test_pool(4, false).await;
+        let existing = pool
+            .acquire("existing")
+            .await
+            .map_err(|error| error.to_string())?;
+
+        pool.apply_workspace_routing(WorkspaceKind::DataAnalysis { datasets: vec![] })
+            .await;
+        let existing_context = existing.read(|agent| agent.context().clone()).await;
+        assert!(
+            existing_context
+                .lock()
+                .await
+                .has_projection("eko:workspace-profile")
+        );
+
+        let future = pool
+            .acquire("future")
+            .await
+            .map_err(|error| error.to_string())?;
+        let future_context = future.read(|agent| agent.context().clone()).await;
+        assert!(
+            future_context
+                .lock()
+                .await
+                .has_projection("eko:workspace-profile")
+        );
+        Ok(())
     }
 
     #[tokio::test]

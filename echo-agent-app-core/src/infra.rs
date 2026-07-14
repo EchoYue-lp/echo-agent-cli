@@ -38,7 +38,7 @@ fn resolved_max_tool_output_tokens(configured: usize) -> usize {
 /// available. Instructs the agent to actively manage its task plan and
 /// proactively dispatch readonly subagents for investigation-heavy work
 /// (对齐 Claude Code 的 subagent:轻量派发是工具,正式并行是 runtime).
-const TASK_MANAGEMENT_GUIDE: &str = r#"
+pub(crate) const TASK_MANAGEMENT_GUIDE: &str = r#"
 
 ## Task And Delegation Tools
 
@@ -206,9 +206,8 @@ pub async fn create_agent(
     // reflects EKO user/project/local instruction files. Dynamic long-term
     // memories stay query-dependent and are recalled per turn through the Store.
     if let Some(ref memory_suffix) = params.memory_context_suffix {
-        assembler.add_memory_context(memory_suffix);
+        assembler.add_instruction_context(memory_suffix);
     }
-    let mut system_prompt = assembler.assemble();
 
     // Resolve subagent .md scopes early so the role catalog can be injected
     // into the system prompt before build (same defs used by register_default_subagents).
@@ -223,9 +222,9 @@ pub async fn create_agent(
         subagent_project_root.as_deref(),
         subagent_user_home.as_deref(),
     );
-    system_prompt.push_str(&crate::subagent_loader::format_subagent_catalog(
-        &discovered_subagents,
-    ));
+    let subagent_catalog = crate::subagent_loader::format_subagent_catalog(&discovered_subagents);
+    assembler.add_subagent_catalog(&subagent_catalog);
+    let system_prompt = assembler.assemble();
 
     // Determine config values from AppConfig
     let token_limit = if app_config.agent.token_limit > 0 {

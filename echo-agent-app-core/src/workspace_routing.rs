@@ -4,6 +4,17 @@
 
 use crate::workspace::WorkspaceKind;
 use echo_agent::agent::ReactAgent;
+use echo_agent::llm::types::Message;
+
+const WORKSPACE_PROFILE_PROJECTION: &str = "eko:workspace-profile";
+const MEDICAL_SKILLS: &[&str] = &["evidence-medicine", "paper-search", "paper-reader"];
+const RESEARCH_SKILLS: &[&str] = &["paper-search", "paper-reader", "doc-writing"];
+const DATA_SKILLS: &[&str] = &[
+    "data-wrangling",
+    "statistical-analysis",
+    "data-visualization",
+];
+const CODE_SKILLS: &[&str] = &["coding", "git-workflow"];
 
 /// 医学研究系统提示词增强
 const MEDICAL_RESEARCH_PROMPT: &str = r#"
@@ -57,64 +68,36 @@ Outcome: deliver a repository-native change that solves the requested behavior a
 ///
 /// 自动激活相关 Skills 并注入专业系统提示词。
 pub async fn configure_agent_for_workspace(agent: &mut ReactAgent, kind: &WorkspaceKind) {
-    match kind {
-        WorkspaceKind::Medical { .. } => {
-            // 激活医学研究相关 Skills
-            activate_skill_safe(agent, "evidence-medicine").await;
-            activate_skill_safe(agent, "paper-search").await;
-            activate_skill_safe(agent, "paper-reader").await;
-
-            // 注入医学研究系统提示词
-            append_system_prompt(agent, MEDICAL_RESEARCH_PROMPT).await;
-
-            tracing::info!("Workspace routing: Medical research mode configured");
-        }
-
+    let (skills, profile, label): (&[&str], Option<&str>, &str) = match kind {
+        WorkspaceKind::Medical { .. } => (
+            MEDICAL_SKILLS,
+            Some(MEDICAL_RESEARCH_PROMPT),
+            "medical_research",
+        ),
         WorkspaceKind::Research { .. } => {
-            // 激活学术研究相关 Skills
-            activate_skill_safe(agent, "paper-search").await;
-            activate_skill_safe(agent, "paper-reader").await;
-            activate_skill_safe(agent, "doc-writing").await;
-
-            // 注入学术研究系统提示词
-            append_system_prompt(agent, RESEARCH_PROMPT).await;
-
-            tracing::info!("Workspace routing: Research mode configured");
+            (RESEARCH_SKILLS, Some(RESEARCH_PROMPT), "academic_research")
         }
-
         WorkspaceKind::DataAnalysis { .. } => {
-            // 激活数据分析相关 Skills
-            activate_skill_safe(agent, "data-wrangling").await;
-            activate_skill_safe(agent, "statistical-analysis").await;
-            activate_skill_safe(agent, "data-visualization").await;
-
-            // 注入数据分析系统提示词
-            append_system_prompt(agent, DATA_ANALYSIS_PROMPT).await;
-
-            tracing::info!("Workspace routing: Data analysis mode configured");
+            (DATA_SKILLS, Some(DATA_ANALYSIS_PROMPT), "data_analysis")
         }
+        WorkspaceKind::Code { .. } => (CODE_SKILLS, Some(CODE_PROMPT), "ai_coding"),
+        WorkspaceKind::General => (&[], None, "general"),
+    };
 
-        WorkspaceKind::Code { .. } => {
-            // 激活代码项目相关 Skills
-            activate_skill_safe(agent, "coding").await;
-            activate_skill_safe(agent, "git-workflow").await;
-
-            // 注入代码项目系统提示词
-            append_system_prompt(agent, CODE_PROMPT).await;
-
-            tracing::info!("Workspace routing: Code project mode configured");
-        }
-
-        WorkspaceKind::General => {
-            // 通用模式不自动激活特定 Skills
-            tracing::info!("Workspace routing: General mode (no specific skills activated)");
-        }
+    for skill in skills {
+        activate_skill_safe(agent, skill).await;
     }
+
+    agent.context().lock().await.replace_projection(
+        WORKSPACE_PROFILE_PROJECTION,
+        profile.map(|prompt| Message::system(prompt.trim().to_string())),
+    );
+    tracing::info!(profile = label, "Workspace routing configured");
 }
 
 /// 安全地激活 Skill（忽略错误）
-async fn activate_skill_safe(agent: &mut ReactAgent, skill_name: &str) {
-    match agent.skill_registry_mut().activate(skill_name).await {
+async fn activate_skill_safe(agent: &ReactAgent, skill_name: &str) {
+    match agent.activate_skill(skill_name).await {
         Ok(_) => {
             tracing::debug!("Skill '{}' activated successfully", skill_name);
         }
@@ -128,9 +111,76 @@ async fn activate_skill_safe(agent: &mut ReactAgent, skill_name: &str) {
     }
 }
 
-/// 追加系统提示词
-async fn append_system_prompt(agent: &mut ReactAgent, additional_prompt: &str) {
-    let current_prompt = agent.config().get_system_prompt().to_string();
-    let new_prompt = format!("{}{}", current_prompt, additional_prompt);
-    agent.set_system_prompt(new_prompt).await;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use echo_agent::agent::AgentConfig;
+
+    #[test]
+    fn workspace_profiles_are_bounded_behavior_contracts() -> Result<(), String> {
+        for (name, prompt) in [
+            ("medical", MEDICAL_RESEARCH_PROMPT),
+            ("research", RESEARCH_PROMPT),
+            ("data", DATA_ANALYSIS_PROMPT),
+            ("coding", CODE_PROMPT),
+        ] {
+            let report = crate::prompt_contract::audit_prompt(
+                &crate::prompt_contract::PromptContractSpec {
+                    name,
+                    max_tokens: 360,
+                    required_phrases: &["Outcome:", "Completion requires", "evidence"],
+                    forbidden_phrases: crate::prompt_contract::DEMO_PHRASES,
+                },
+                prompt,
+            );
+            if !report.is_compliant() {
+                return Err(report.summary());
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn workspace_profile_replaces_without_mutating_root_prompt() {
+        let mut agent = ReactAgent::new(AgentConfig::minimal("model", "agent"));
+        let root_prompt = agent.config().get_system_prompt().to_string();
+
+        configure_agent_for_workspace(&mut agent, &WorkspaceKind::Code { repo_url: None }).await;
+        configure_agent_for_workspace(
+            &mut agent,
+            &WorkspaceKind::DataAnalysis { datasets: vec![] },
+        )
+        .await;
+
+        assert_eq!(agent.config().get_system_prompt(), root_prompt);
+        let context = agent.context().lock().await;
+        assert!(context.has_projection(WORKSPACE_PROFILE_PROJECTION));
+        let profiles: Vec<_> = context
+            .messages()
+            .iter()
+            .filter(|message| {
+                message
+                    .content
+                    .as_text_ref()
+                    .is_some_and(|text| text.contains("## Workspace Profile:"))
+            })
+            .collect();
+        assert_eq!(profiles.len(), 1);
+        assert!(profiles.first().is_some_and(|message| {
+            message
+                .content
+                .as_text_ref()
+                .is_some_and(|text| text.contains("Data Analysis"))
+        }));
+        drop(context);
+
+        configure_agent_for_workspace(&mut agent, &WorkspaceKind::General).await;
+        assert!(
+            !agent
+                .context()
+                .lock()
+                .await
+                .has_projection(WORKSPACE_PROFILE_PROJECTION)
+        );
+    }
 }

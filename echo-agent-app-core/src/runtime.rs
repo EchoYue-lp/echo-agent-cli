@@ -102,7 +102,7 @@ impl AgentRuntime {
 
         // ── 0b. Unified memory — load instruction files (user.md / project.md /
         //       local.md) BEFORE building the agent so we can hand the assembled
-        //       instruction suffix to `PromptAssembler::add_memory_context`.
+        //       instruction suffix to `PromptAssembler::add_instruction_context`.
         //       Dynamic long-term memories remain query-dependent and are recalled
         //       during each turn through the agent memory store. ──
         let unified_memory = crate::unified_memory::UnifiedMemory::load();

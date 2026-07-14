@@ -958,14 +958,19 @@ impl AppState {
     /// 应用工作区路由配置（根据 WorkspaceKind 激活 Skills 和注入系统提示词）
     async fn apply_workspace_routing(&self, workspace: &Workspace) {
         let kind = workspace.kind.clone();
+        let primary_kind = kind.clone();
         self.connection
             .agent
             .write_async(|agent| {
                 Box::pin(async move {
-                    crate::workspace_routing::configure_agent_for_workspace(agent, &kind).await;
+                    crate::workspace_routing::configure_agent_for_workspace(agent, &primary_kind)
+                        .await;
                 })
             })
             .await;
+        if let Some(ref pool) = self.connection.pool {
+            pool.apply_workspace_routing(kind).await;
+        }
     }
 
     /// 退出工作区（回到全局默认路径）。
@@ -1037,6 +1042,20 @@ impl AppState {
         // running in the exited workspace (P1 — exit_workspace pool reset).
         if let Some(ref pool) = self.connection.pool {
             pool.apply_working_dir(None).await;
+        }
+
+        let general = crate::workspace::WorkspaceKind::General;
+        self.connection
+            .agent
+            .write_async(|agent| {
+                Box::pin(async move {
+                    crate::workspace_routing::configure_agent_for_workspace(agent, &general).await;
+                })
+            })
+            .await;
+        if let Some(ref pool) = self.connection.pool {
+            pool.apply_workspace_routing(crate::workspace::WorkspaceKind::General)
+                .await;
         }
 
         tracing::info!("Exited workspace, using global default paths");
