@@ -106,7 +106,7 @@ GUI/TUI/CLI 共用候选列表、接受、编辑、拒绝、撤销操作。用�
 
 验收：三端能力对等；接受/拒绝可审计；没有隐藏的 LLM 后台写入。
 
-实现：CLI/TUI 均提供 `/evidence-inbox`，GUI EvolutionPanel 提供 pending/applied/rejected/all 视图与 edit/accept/reject/undo。三端优先复用 runtime 已绑定、可随 workspace 切换重绑的 `ReviewIntegration`，不再各自按进程 cwd 推导 inbox。accept 才通过共享 `MemoryLayerManager` 写 typed memory，undo 删除对应 memory 并恢复 pending；规则晋升和 skill draft/activation 继续走各自已有的显式 review gate。
+实现：CLI/TUI 均提供 `/evidence-inbox`，GUI EvolutionPanel 只提供 pending/expired/undoable 三种工作视图与 edit/accept/reject/undo；拒绝历史保留在 append-only JSONL 中但不进入 Inbox。三端优先复用 runtime 已绑定、可随 workspace 切换重绑的 `ReviewIntegration`，不再各自按进程 cwd 推导 inbox。accept 才通过共享 `MemoryLayerManager` 写 typed memory，undo 删除对应 memory 并恢复 pending；规则晋升和 skill draft/activation 继续走各自已有的显式 review gate。
 
 ### Phase D：Curator workspace scope + loader authority（已完成）
 
@@ -122,14 +122,14 @@ Dreaming 是唯一的确定性记忆维护执行器：只根据 recall/inactivit
 
 验收：无人确认时不会自动改写已有事实或技能；自动任务幂等、低 token、可关闭。
 
-### Phase F：基于真实使用反馈改善能力（已完成）
+### Phase F：按需诊断（已完成并收缩）
 
-不做本地 benchmark loop。使用真实运行信号：用户纠正、撤销、候选接受率、skill 成功/失败、重复工具失败、人工重试。先改善 skill/rule/memory，再考虑是否存在足够证据修改基础 prompt；基础 prompt 修改必须是版本化 artifact，不能在线自改。
+不做本地 benchmark loop、后台扫描或主动改善建议。Evidence JSONL 只保留候选快照与 accept/reject/undo/stale 交互事件，用于 Review Inbox 的待确认、过期和可撤销状态。Dashboard 只在用户打开面板或执行 `/evolution-dashboard` 时扫描最近最多 200 个 run；仅当同类工具错误至少出现 3 次且跨越至少 2 个 run 时，显示最多 3 条简短提醒。
 
-验收：每项改善都有真实来源和前后指标；不引入 EvalRunner、SQLite 或自动 prompt rewrite。
+验收：无后台任务、无主动通知、无接受率/拒绝率/撤销率、无低样本 skill 排名；不引入 EvalRunner、SQLite、后台 LLM reviewer 或自动 prompt rewrite；任何指标都不能自动修改 prompt、skill、rule 或 memory。
 
-实现：Evidence JSONL schema v3 在保持旧 candidate snapshot 可读的前提下，追加 accept/reject/undo 的 attempt/success/failure interaction；过期 merge proposal 使用框架 typed error 识别，不再依赖错误字符串。Dashboard 复用 Evidence、memory audit、run trace、skill telemetry，提供 7/30 天与全量窗口：候选首决策接受/拒绝率、撤销率、过期 proposal、reviewed/automatic mutation、工具成功失败、跨 run 重复失败与无效重试。TraceAnalyzer 对生产环境同时写入的 `ToolResult(false)`/`ToolError` 去重，并只暴露参数结构、不暴露参数值；skill 指标明确为“skill 激活期间的工具可靠性”，不冒充任务级成功率。GUI/TUI/CLI 共用同一聚合器和 workspace-bound 数据源。全部统计为本地确定性扫描，不调用 LLM、不注入 Agent 上下文，因此不增加常规请求 token 或破坏 KV cache。
+实现：Evidence JSONL schema v3 保持旧 candidate snapshot 可读，stale interaction 派生 transient `expired` 状态，刷新后的 proposal 会清除旧过期标记。Dashboard 已删除 Evidence/audit/skill KPI、时间窗口和比率计算，只复用 trace 的跨 run 失败去重结果。TraceAnalyzer 继续对生产环境同时写入的 `ToolResult(false)`/`ToolError` 去重，并只暴露参数结构、不暴露参数值。GUI/TUI/CLI 共用同一 Review Inbox filter 与按需 Dashboard；诊断不调用 LLM、不注入 Agent 上下文，因此不增加常规请求 token 或破坏 KV cache。
 
 ## 6. 下一阶段优先级
 
-Phase F 指标底座已完成。下一阶段只做基于累积真实数据的确定性 Review Inbox 建议：优先暴露高撤销 memory/rule、低可靠 skill、跨 run 重复失败模式，并继续要求用户显式确认后才修改 artifact。当前数据不足时只展示指标，不生成建议；仍不建设 EvalRunner、后台 LLM reviewer 或在线 prompt rewrite。
+不继续建设自动改善建议系统。自进化子系统停在“候选需确认 + 过期可见 + 可撤销 + 重复工具错误按需提醒”的轻量边界。后续精力优先投入 Agent 主流程、工具可靠性、任务完成率、上下文效率，以及 TUI/GUI/CLI 功能对等。

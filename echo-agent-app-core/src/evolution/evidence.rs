@@ -1,6 +1,6 @@
 //! Workspace-scoped evidence candidates backed by an append-only JSONL log.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -119,7 +119,7 @@ pub enum EvidenceInteractionAction {
     UndoFailed(EvidenceInteractionFailureKind),
 }
 
-/// Stable failure classes used by product metrics.
+/// Stable failure classes used by Review Inbox diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceInteractionFailureKind {
@@ -139,34 +139,6 @@ pub struct EvidenceInteractionEvent {
     pub candidate_id: String,
     pub action: EvidenceInteractionAction,
     pub timestamp: DateTime<Utc>,
-}
-
-/// Evidence decision metrics for one time window.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct EvidenceFeedbackMetrics {
-    pub candidates_created: usize,
-    pub current_pending: usize,
-    pub current_applied: usize,
-    pub current_rejected: usize,
-    pub accept_attempts: usize,
-    pub accepted_candidates: usize,
-    pub rejected_candidates: usize,
-    pub undone_candidates: usize,
-    pub stale_proposal_failures: usize,
-    pub decision_sample_size: usize,
-    pub acceptance_rate: Option<f32>,
-    pub rejection_rate: Option<f32>,
-    pub undo_rate: Option<f32>,
-    pub by_source: HashMap<EvidenceSource, EvidenceSourceMetrics>,
-}
-
-/// Candidate outcomes attributed to each evidence producer.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct EvidenceSourceMetrics {
-    pub candidates: usize,
-    pub accepted: usize,
-    pub rejected: usize,
-    pub undone: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,6 +172,35 @@ pub struct EvidenceCandidate {
     pub revision: u64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// Candidate plus transient Review Inbox state derived from interaction events.
+#[derive(Debug, Clone, Serialize)]
+pub struct EvidenceReviewItem {
+    #[serde(flatten)]
+    pub candidate: EvidenceCandidate,
+    pub expired: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvidenceReviewFilter {
+    Pending,
+    Expired,
+    Undoable,
+}
+
+impl EvidenceReviewFilter {
+    pub fn matches(self, item: &EvidenceReviewItem) -> bool {
+        match self {
+            Self::Pending => {
+                item.candidate.status == EvidenceCandidateStatus::Pending && !item.expired
+            }
+            Self::Expired => {
+                item.candidate.status == EvidenceCandidateStatus::Pending && item.expired
+            }
+            Self::Undoable => item.candidate.status == EvidenceCandidateStatus::Applied,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -406,141 +407,27 @@ impl EvidenceStore {
         Ok(candidates)
     }
 
-    /// Aggregate real Review Inbox decisions for a time window.
-    pub fn feedback_metrics(
-        &self,
-        after: Option<DateTime<Utc>>,
-    ) -> Result<EvidenceFeedbackMetrics, String> {
-        let candidates = self.read_latest()?;
-        let interactions = self.read_interactions()?;
-        let mut metrics = EvidenceFeedbackMetrics::default();
-        let mut accepted = HashSet::new();
-        let mut rejected = HashSet::new();
-        let mut undone = HashSet::new();
-        let mut first_decisions = HashMap::new();
+    /// Build the small, on-demand Review Inbox projection.
+    pub fn review_items(&self) -> Result<Vec<EvidenceReviewItem>, String> {
+        let stale_failures = self.latest_stale_failures()?;
+        Ok(self
+            .list()?
+            .into_iter()
+            .map(|candidate| {
+                let expired = candidate.status == EvidenceCandidateStatus::Pending
+                    && stale_failures
+                        .get(&candidate.candidate_id)
+                        .is_some_and(|timestamp| *timestamp >= candidate.updated_at);
+                EvidenceReviewItem { candidate, expired }
+            })
+            .collect())
+    }
 
-        for event in interactions
-            .iter()
-            .filter(|event| after.is_none_or(|after| event.timestamp >= after))
-        {
-            match event.action {
-                EvidenceInteractionAction::AcceptAttempt => {
-                    metrics.accept_attempts = metrics.accept_attempts.saturating_add(1);
-                }
-                EvidenceInteractionAction::AcceptSucceeded => {
-                    accepted.insert(event.candidate_id.clone());
-                    first_decisions
-                        .entry(event.candidate_id.clone())
-                        .or_insert(true);
-                }
-                EvidenceInteractionAction::AcceptFailed(
-                    EvidenceInteractionFailureKind::StaleProposal,
-                ) => {
-                    metrics.stale_proposal_failures =
-                        metrics.stale_proposal_failures.saturating_add(1);
-                }
-                EvidenceInteractionAction::Rejected => {
-                    rejected.insert(event.candidate_id.clone());
-                    first_decisions
-                        .entry(event.candidate_id.clone())
-                        .or_insert(false);
-                }
-                EvidenceInteractionAction::UndoSucceeded => {
-                    undone.insert(event.candidate_id.clone());
-                }
-                EvidenceInteractionAction::AcceptFailed(_)
-                | EvidenceInteractionAction::UndoAttempt
-                | EvidenceInteractionAction::UndoFailed(_) => {}
-            }
-        }
-
-        for candidate in candidates.values() {
-            if after.is_none_or(|after| candidate.created_at >= after) {
-                metrics.candidates_created = metrics.candidates_created.saturating_add(1);
-                match candidate.status {
-                    EvidenceCandidateStatus::Pending => {
-                        metrics.current_pending = metrics.current_pending.saturating_add(1);
-                    }
-                    EvidenceCandidateStatus::Applied => {
-                        metrics.current_applied = metrics.current_applied.saturating_add(1);
-                    }
-                    EvidenceCandidateStatus::Rejected => {
-                        metrics.current_rejected = metrics.current_rejected.saturating_add(1);
-                    }
-                }
-            }
-
-            // Candidate snapshots created before interaction events existed still
-            // contribute their current disposition to all-time metrics.
-            if after.is_none() {
-                match candidate.status {
-                    EvidenceCandidateStatus::Applied => {
-                        accepted.insert(candidate.candidate_id.clone());
-                        first_decisions
-                            .entry(candidate.candidate_id.clone())
-                            .or_insert(true);
-                    }
-                    EvidenceCandidateStatus::Rejected => {
-                        rejected.insert(candidate.candidate_id.clone());
-                        first_decisions
-                            .entry(candidate.candidate_id.clone())
-                            .or_insert(false);
-                    }
-                    EvidenceCandidateStatus::Pending => {}
-                }
-            }
-        }
-
-        metrics.accepted_candidates = accepted.len();
-        metrics.rejected_candidates = rejected.len();
-        metrics.undone_candidates = undone.len();
-        metrics.decision_sample_size = first_decisions.len();
-        if metrics.decision_sample_size >= 10 {
-            let first_accepts = first_decisions
-                .values()
-                .filter(|accepted| **accepted)
-                .count();
-            metrics.acceptance_rate =
-                Some(first_accepts as f32 / metrics.decision_sample_size as f32);
-            metrics.rejection_rate = Some(
-                metrics.decision_sample_size.saturating_sub(first_accepts) as f32
-                    / metrics.decision_sample_size as f32,
-            );
-        }
-        if metrics.accepted_candidates >= 10 {
-            metrics.undo_rate =
-                Some(metrics.undone_candidates as f32 / metrics.accepted_candidates as f32);
-        }
-
-        for candidate in candidates.values() {
-            let candidate_in_window = after.is_none_or(|after| candidate.created_at >= after)
-                || accepted.contains(&candidate.candidate_id)
-                || rejected.contains(&candidate.candidate_id)
-                || undone.contains(&candidate.candidate_id);
-            if !candidate_in_window {
-                continue;
-            }
-            let sources = candidate
-                .evidence
-                .iter()
-                .map(|evidence| evidence.source)
-                .collect::<HashSet<_>>();
-            for source in sources {
-                let source_metrics = metrics.by_source.entry(source).or_default();
-                source_metrics.candidates = source_metrics.candidates.saturating_add(1);
-                if accepted.contains(&candidate.candidate_id) {
-                    source_metrics.accepted = source_metrics.accepted.saturating_add(1);
-                }
-                if rejected.contains(&candidate.candidate_id) {
-                    source_metrics.rejected = source_metrics.rejected.saturating_add(1);
-                }
-                if undone.contains(&candidate.candidate_id) {
-                    source_metrics.undone = source_metrics.undone.saturating_add(1);
-                }
-            }
-        }
-
-        Ok(metrics)
+    pub fn review_item(&self, candidate_id: &str) -> Result<Option<EvidenceReviewItem>, String> {
+        Ok(self
+            .review_items()?
+            .into_iter()
+            .find(|item| item.candidate.candidate_id == candidate_id))
     }
 
     pub fn get(&self, candidate_id: &str) -> Result<Option<EvidenceCandidate>, String> {
@@ -952,6 +839,24 @@ impl EvidenceStore {
         result
     }
 
+    fn latest_stale_failures(&self) -> Result<HashMap<String, DateTime<Utc>>, String> {
+        let mut latest: HashMap<String, DateTime<Utc>> = HashMap::new();
+        for event in self.read_interactions()? {
+            if matches!(
+                event.action,
+                EvidenceInteractionAction::AcceptFailed(
+                    EvidenceInteractionFailureKind::StaleProposal
+                )
+            ) {
+                latest
+                    .entry(event.candidate_id)
+                    .and_modify(|timestamp| *timestamp = (*timestamp).max(event.timestamp))
+                    .or_insert(event.timestamp);
+            }
+        }
+        Ok(latest)
+    }
+
     fn record_interaction(
         &self,
         candidate_id: &str,
@@ -984,7 +889,7 @@ impl EvidenceStore {
             tracing::warn!(
                 candidate_id,
                 error = %error,
-                "failed to append Evidence interaction metric"
+                "failed to append Evidence interaction event"
             );
         }
     }
@@ -1234,6 +1139,12 @@ mod tests {
 
         assert_eq!(duplicate.status, EvidenceCandidateStatus::Rejected);
         assert_eq!(duplicate.evidence.len(), 2);
+        let rejected_item = store
+            .review_item(&candidate.candidate_id)?
+            .ok_or_else(|| "rejected candidate missing from audit log".to_string())?;
+        assert!(!EvidenceReviewFilter::Pending.matches(&rejected_item));
+        assert!(!EvidenceReviewFilter::Expired.matches(&rejected_item));
+        assert!(!EvidenceReviewFilter::Undoable.matches(&rejected_item));
         Ok(())
     }
 
@@ -1299,14 +1210,19 @@ mod tests {
             .await?;
         assert_eq!(accepted.status, EvidenceCandidateStatus::Applied);
         assert!(accepted.target.is_some());
+        let accepted_item = store
+            .review_item(&candidate.candidate_id)?
+            .ok_or_else(|| "accepted candidate missing from Review Inbox".to_string())?;
+        assert!(EvidenceReviewFilter::Undoable.matches(&accepted_item));
 
         let undone = store.undo(&candidate.candidate_id, &layer_manager).await?;
         assert_eq!(undone.status, EvidenceCandidateStatus::Pending);
         assert!(undone.target.is_none());
-        let metrics = store.feedback_metrics(None)?;
-        assert_eq!(metrics.accept_attempts, 1);
-        assert_eq!(metrics.accepted_candidates, 1);
-        assert_eq!(metrics.undone_candidates, 1);
+        let review_item = store
+            .review_item(&candidate.candidate_id)?
+            .ok_or_else(|| "undone candidate missing from Review Inbox".to_string())?;
+        assert!(!review_item.expired);
+        assert!(EvidenceReviewFilter::Pending.matches(&review_item));
         Ok(())
     }
 
@@ -1398,29 +1314,43 @@ mod tests {
             current.1.meta.status,
             echo_agent::memory::MemoryStatus::Active
         );
-        let metrics = store.feedback_metrics(None)?;
-        assert_eq!(metrics.accept_attempts, 1);
-        assert_eq!(metrics.accepted_candidates, 0);
-        assert_eq!(metrics.stale_proposal_failures, 1);
+        let review_item = store
+            .review_item(&candidate.candidate_id)?
+            .ok_or_else(|| "stale candidate missing from Review Inbox".to_string())?;
+        assert!(review_item.expired);
+        assert!(EvidenceReviewFilter::Expired.matches(&review_item));
+        assert!(!EvidenceReviewFilter::Pending.matches(&review_item));
         Ok(())
     }
 
     #[test]
-    fn rejected_candidates_are_counted_from_interaction_events() -> Result<(), String> {
+    fn refreshed_candidate_clears_older_stale_marker() -> Result<(), String> {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let store = EvidenceStore::new(temp.path().join(".eko"));
-        let candidate = store.upsert(draft("Keep metrics local", "user decision"))?;
-        store.reject(&candidate.candidate_id)?;
+        let proposal = conflict_proposal();
+        let candidate = capture_memory_conflict(&store, &proposal)?;
+        store.record_interaction(
+            &candidate.candidate_id,
+            EvidenceInteractionAction::AcceptFailed(EvidenceInteractionFailureKind::StaleProposal),
+        )?;
+        let expired = store
+            .review_item(&candidate.candidate_id)?
+            .ok_or_else(|| "candidate missing after stale interaction".to_string())?;
+        assert!(expired.expired);
 
-        let metrics = store.feedback_metrics(None)?;
-        assert_eq!(metrics.rejected_candidates, 1);
-        assert_eq!(metrics.decision_sample_size, 1);
-        assert_eq!(metrics.acceptance_rate, None);
-        let source_metrics = metrics
-            .by_source
-            .get(&EvidenceSource::AutoMemory)
-            .ok_or_else(|| "missing AutoMemory source metrics".to_string())?;
-        assert_eq!(source_metrics.rejected, 1);
+        let mut refreshed = proposal;
+        if let Some(member) = refreshed
+            .members
+            .iter_mut()
+            .find(|member| member.key == "make")
+        {
+            member.updated_at = member.updated_at.saturating_add(1);
+        }
+        capture_memory_conflict(&store, &refreshed)?;
+        let current = store
+            .review_item(&candidate.candidate_id)?
+            .ok_or_else(|| "refreshed candidate missing".to_string())?;
+        assert!(!current.expired);
         Ok(())
     }
 }

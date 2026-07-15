@@ -1369,25 +1369,24 @@ pub async fn list_evidence_candidates(
     state: tauri::State<'_, TauriState>,
     status: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    use echo_agent_app_core::evolution::EvidenceCandidateStatus;
+    use echo_agent_app_core::evolution::EvidenceReviewFilter;
 
     let filter = match status.as_deref() {
-        None | Some("all") => None,
-        Some("pending") => Some(EvidenceCandidateStatus::Pending),
-        Some("applied") => Some(EvidenceCandidateStatus::Applied),
-        Some("rejected") => Some(EvidenceCandidateStatus::Rejected),
+        None | Some("pending") => EvidenceReviewFilter::Pending,
+        Some("expired") => EvidenceReviewFilter::Expired,
+        Some("applied") | Some("undoable") => EvidenceReviewFilter::Undoable,
         Some(other) => {
             return Err(IpcError::Validation(format!(
-                "Unknown evidence status filter: {other}"
+                "Unknown Review Inbox filter: {other}"
             )));
         }
     };
     let store = evidence_store_for_state(&state).await?;
     let candidates: Vec<_> = store
-        .list()
+        .review_items()
         .map_err(IpcError::Internal)?
         .into_iter()
-        .filter(|candidate| filter.is_none_or(|value| candidate.status == value))
+        .filter(|candidate| filter.matches(candidate))
         .collect();
     Ok(json!({
         "candidates": candidates,
@@ -1523,9 +1522,8 @@ pub async fn curator_action(
 // Evolution Dashboard
 // ════════════════════════════════════════════════════════════════════════════
 
-/// 返回自进化系统的概览指标:分层记忆统计(按 type/status)、技能健康度、
-/// 最近变更活动。复用 app-core 的 `Dashboard`(扫 WARM_NAMESPACE,与写入/召回
-/// 同源),让用户第一次能"看见"系统学到了什么。
+/// 返回自进化系统的按需概览:分层记忆统计、最近变更活动,以及跨 run
+/// 重复工具错误。只在用户打开面板时扫描,不启动后台诊断任务。
 ///
 /// 这是阶段 1(Dashboard 接线)的后端入口;前端 `EvolutionPanel` 据此渲染
 /// "进化概览"段。构造 pattern 复刻自 `cmd_evolution_dashboard`
@@ -1545,14 +1543,12 @@ pub async fn get_evolution_dashboard(
         .as_ref()
         .map(|integration| integration.echo_agent_dir())
         .unwrap_or_else(echo_agent_app_core::evolution::discover_echo_agent_dir);
-    let evidence_store = echo_agent_app_core::evolution::EvidenceStore::new(&echo_agent_dir);
-
     let change_log = echo_agent::evolution::JsonlChangeLog::new(
         echo_agent_dir.join("evolution").join("changelog.jsonl"),
     );
 
-    let dashboard = echo_agent_app_core::evolution::Dashboard::new(store, change_log)
-        .with_feedback_sources(evidence_store, run_store);
+    let dashboard =
+        echo_agent_app_core::evolution::Dashboard::new(store, change_log).with_run_store(run_store);
     let metrics = dashboard.generate_metrics().await;
 
     Ok(json!({ "metrics": metrics }))

@@ -3084,7 +3084,7 @@ async fn handle_slash_command(
             }
         }
         Some(SlashCommand::EvidenceInbox) => {
-            use echo_agent_app_core::evolution::EvidenceCandidateStatus;
+            use echo_agent_app_core::evolution::EvidenceReviewFilter;
 
             let store = app
                 .review_integration
@@ -3103,25 +3103,34 @@ async fn handle_slash_command(
             let candidate_id = parts.next();
             let content = parts.next();
             let result = match sub {
-                "list" | "ls" | "pending" | "all" | "applied" | "rejected" => {
+                "list" | "ls" | "pending" | "expired" | "stale" | "applied"
+                | "undoable" => {
                     let filter = match sub {
-                        "list" | "ls" | "pending" => Some(EvidenceCandidateStatus::Pending),
-                        "applied" => Some(EvidenceCandidateStatus::Applied),
-                        "rejected" => Some(EvidenceCandidateStatus::Rejected),
-                        _ => None,
+                        "expired" | "stale" => EvidenceReviewFilter::Expired,
+                        "applied" | "undoable" => EvidenceReviewFilter::Undoable,
+                        _ => EvidenceReviewFilter::Pending,
                     };
-                    match store.list() {
+                    match store.review_items() {
                         Ok(candidates) => {
                             let lines: Vec<_> = candidates
                                 .into_iter()
-                                .filter(|candidate| {
-                                    filter.is_none_or(|status| candidate.status == status)
-                                })
-                                .map(|candidate| {
-                                    format!(
-                                        "{} [{:?}/{:?}] {:.2} {}",
-                                        candidate.candidate_id,
+                                .filter(|candidate| filter.matches(candidate))
+                                .map(|item| {
+                                    let candidate = item.candidate;
+                                    let state = if item.expired {
+                                        "Expired"
+                                    } else if matches!(
                                         candidate.status,
+                                        echo_agent_app_core::evolution::EvidenceCandidateStatus::Applied
+                                    ) {
+                                        "Undoable"
+                                    } else {
+                                        "Ready"
+                                    };
+                                    format!(
+                                        "{} [{} / {:?}] {:.2} {}",
+                                        candidate.candidate_id,
+                                        state,
                                         candidate.kind,
                                         candidate.confidence,
                                         candidate.content
@@ -3138,8 +3147,9 @@ async fn handle_slash_command(
                     }
                 }
                 "show" => match candidate_id {
-                    Some(id) => match store.get(id) {
-                        Ok(Some(candidate)) => {
+                    Some(id) => match store.review_item(id) {
+                        Ok(Some(item)) => {
+                            let candidate = item.candidate;
                             let evidence = candidate
                                 .evidence
                                 .iter()
@@ -3154,10 +3164,11 @@ async fn handle_slash_command(
                                 .collect::<Vec<_>>()
                                 .join("\n");
                             format!(
-                                "{}\nKind: {:?}  Status: {:?}  Confidence: {:.2}\n{}",
+                                "{}\nKind: {:?}  Status: {:?}{}  Confidence: {:.2}\n{}",
                                 candidate.content,
                                 candidate.kind,
                                 candidate.status,
+                                if item.expired { " (expired)" } else { "" },
                                 candidate.confidence,
                                 evidence
                             )
@@ -3205,7 +3216,7 @@ async fn handle_slash_command(
                     },
                     None => format!("Usage: /evidence-inbox {sub} <candidate-id>"),
                 },
-                _ => "Usage: /evidence-inbox <list|all|show|edit|accept|reject|undo> [candidate-id] [content]".to_string(),
+                _ => "Usage: /evidence-inbox <pending|expired|undoable|show|edit|accept|reject|undo> [candidate-id] [content]".to_string(),
             };
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
@@ -3223,15 +3234,6 @@ async fn handle_slash_command(
                 });
                 return;
             };
-            let evidence_store = app
-                .review_integration
-                .as_ref()
-                .map(|integration| integration.evidence_store())
-                .unwrap_or_else(|| {
-                    echo_agent_app_core::evolution::EvidenceStore::new(
-                        echo_agent_app_core::evolution::discover_echo_agent_dir(),
-                    )
-                });
             let echo_agent_dir = app
                 .review_integration
                 .as_ref()
@@ -3241,7 +3243,7 @@ async fn handle_slash_command(
                 echo_agent_dir.join("evolution").join("changelog.jsonl"),
             );
             let dashboard = echo_agent_app_core::evolution::Dashboard::new(store, change_log)
-                .with_feedback_sources(evidence_store, run_store);
+                .with_run_store(run_store);
             let metrics = dashboard.generate_metrics().await;
             app.messages.push(ChatMessage {
                 role: MessageRole::System,

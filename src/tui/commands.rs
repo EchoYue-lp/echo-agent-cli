@@ -185,7 +185,7 @@ impl SlashCommand {
             Self::Tools => "List available tools",
             Self::Cost => "Show token cost summary",
             Self::PromptDiagnostics => "Show prompt and protected-context diagnostics",
-            Self::EvolutionDashboard => "Show real evolution usage and reliability metrics",
+            Self::EvolutionDashboard => "Show on-demand evolution diagnostics",
             Self::Help => "Show help",
 
             Self::Quit => "Quit the TUI",
@@ -279,7 +279,7 @@ impl SlashCommand {
             Self::Mcp => "[list|load <config>|disconnect <name>]",
             Self::Hooks => "[list|reload|test <event>]",
             Self::EvidenceInbox => {
-                "[list|all|show|edit|accept|reject|undo] [candidate-id] [content]"
+                "[pending|expired|undoable|show|edit|accept|reject|undo] [candidate-id] [content]"
             }
             _ => "",
         }

@@ -572,46 +572,6 @@ export interface MemoryStats {
   archived_count: number;
 }
 
-export interface SkillHealthOverview {
-  total_skills: number;
-  reliable_skills: number;
-  unreliable_skills: number;
-  needs_attention: number;
-  observed_tool_calls: number;
-  successful_tool_calls: number;
-  failed_tool_calls: number;
-  avg_tool_success_rate: number;
-}
-
-export interface EvidenceFeedbackMetrics {
-  candidates_created: number;
-  current_pending: number;
-  current_applied: number;
-  current_rejected: number;
-  accept_attempts: number;
-  accepted_candidates: number;
-  rejected_candidates: number;
-  undone_candidates: number;
-  stale_proposal_failures: number;
-  decision_sample_size: number;
-  acceptance_rate: number | null;
-  rejection_rate: number | null;
-  undo_rate: number | null;
-  by_source: Record<
-    string,
-    { candidates: number; accepted: number; rejected: number; undone: number }
-  >;
-}
-
-export interface AuditFeedbackMetrics {
-  total_mutations: number;
-  by_entity: Record<string, number>;
-  by_change: Record<string, number>;
-  by_trigger: Record<string, number>;
-  reviewed_mutations: number;
-  automatic_maintenance_mutations: number;
-}
-
 export interface ToolFailurePattern {
   tool_name: string;
   error_class: string;
@@ -625,28 +585,9 @@ export interface ToolFailurePattern {
   last_seen: string | null;
 }
 
-export interface ToolFeedbackMetrics {
-  run_count: number;
-  total_calls: number;
-  success_count: number;
-  failure_count: number;
-  failure_rate: number | null;
-  repeated_failure_patterns: number;
-  ineffective_retry_count: number;
-  top_repeated_failures: ToolFailurePattern[];
-}
-
-export interface FeedbackWindowMetrics {
-  evidence: EvidenceFeedbackMetrics;
-  audit: AuditFeedbackMetrics;
-  tools: ToolFeedbackMetrics;
-  data_errors: string[];
-}
-
-export interface RealUsageMetrics {
-  last_7_days: FeedbackWindowMetrics;
-  last_30_days: FeedbackWindowMetrics;
-  all_time: FeedbackWindowMetrics;
+export interface ToolDiagnostics {
+  repeated_failures: ToolFailurePattern[];
+  scan_error: string | null;
 }
 
 export interface ActivityEntry {
@@ -661,8 +602,7 @@ export interface DashboardMetrics {
   /** key = MemoryStatus 字符串(Active/Archived/...) */
   memory_by_status: Record<string, number>;
   total_memories: number;
-  skill_health: SkillHealthOverview;
-  real_usage: RealUsageMetrics;
+  tool_diagnostics: ToolDiagnostics;
   recent_activities: ActivityEntry[];
   generated_at: string;
 }
@@ -690,6 +630,7 @@ export interface SkillCandidateInfo {
 }
 
 export type EvidenceCandidateStatus = 'pending' | 'applied' | 'rejected';
+export type EvidenceInboxFilter = 'pending' | 'expired' | 'applied';
 export type EvidenceKind =
   | 'user_preference'
   | 'project_fact'
@@ -752,6 +693,7 @@ export interface EvidenceCandidate {
   revision: number;
   created_at: string;
   updated_at: string;
+  expired?: boolean;
 }
 
 // ── Provider types ──────────────────────────────────────────────────────────

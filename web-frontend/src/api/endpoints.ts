@@ -36,7 +36,7 @@ import type {
   RuleProposal,
   SkillCandidateInfo,
   EvidenceCandidate,
-  EvidenceCandidateStatus,
+  EvidenceInboxFilter,
   ConfiguredModelListResponse,
   ProviderTemplate,
   TestConnectionResponse,
@@ -1037,7 +1037,7 @@ export const evolutionApi = {
           evidence_candidate?: EvidenceCandidate | null;
           error?: string | null;
         }>('/evolution/review', { run_id: runId }),
-  listEvidence: (status: EvidenceCandidateStatus | 'all' = 'pending') =>
+  listEvidence: (status: EvidenceInboxFilter = 'pending') =>
     isTauri()
       ? apiInvoke<{ candidates: EvidenceCandidate[]; count: number; path: string }>(
           'list_evidence_candidates',

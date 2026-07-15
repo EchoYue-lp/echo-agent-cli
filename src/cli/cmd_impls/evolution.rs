@@ -1532,8 +1532,8 @@ async fn cmd_evolution_dashboard(ctx: &CommandContext, _args: &[&str]) -> Comman
             .join("changelog.jsonl"),
     );
 
-    let dashboard = echo_agent_app_core::evolution::Dashboard::new(store, change_log)
-        .with_feedback_sources(current_evidence_store(ctx), run_store);
+    let dashboard =
+        echo_agent_app_core::evolution::Dashboard::new(store, change_log).with_run_store(run_store);
 
     println!("Generating evolution dashboard...\n");
 
@@ -1548,7 +1548,7 @@ cmd!(
     EvolutionDashboardCommand,
     "evolution-dashboard",
     CommandCategory::Advanced,
-    "Display evolution system metrics and status overview",
+    "Display on-demand evolution diagnostics",
     cmd_evolution_dashboard
 );
 
@@ -1665,33 +1665,43 @@ cmd!(
 // ── EvidenceInboxCommand ────────────────────────────────────────────
 
 async fn cmd_evidence_inbox(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
-    use echo_agent_app_core::evolution::EvidenceCandidateStatus;
+    use echo_agent_app_core::evolution::EvidenceReviewFilter;
 
     let store = current_evidence_store(ctx);
     let sub = args.first().copied().unwrap_or("list");
     match sub {
-        "list" | "ls" | "pending" | "all" | "applied" | "rejected" => {
+        "list" | "ls" | "pending" | "expired" | "stale" | "applied" | "undoable" => {
             let filter = match sub {
-                "list" | "ls" | "pending" => Some(EvidenceCandidateStatus::Pending),
-                "applied" => Some(EvidenceCandidateStatus::Applied),
-                "rejected" => Some(EvidenceCandidateStatus::Rejected),
-                _ => None,
+                "expired" | "stale" => EvidenceReviewFilter::Expired,
+                "applied" | "undoable" => EvidenceReviewFilter::Undoable,
+                _ => EvidenceReviewFilter::Pending,
             };
-            match store.list() {
+            match store.review_items() {
                 Ok(candidates) => {
                     let visible: Vec<_> = candidates
                         .into_iter()
-                        .filter(|candidate| filter.is_none_or(|status| candidate.status == status))
+                        .filter(|candidate| filter.matches(candidate))
                         .collect();
                     if visible.is_empty() {
                         println!("Review Inbox is empty for this filter.");
                     } else {
                         println!("\n--- Review Inbox ({}) ---", visible.len());
-                        for candidate in visible {
-                            println!(
-                                "{} [{:?}/{:?}] {:.2} {}",
-                                candidate.candidate_id,
+                        for item in visible {
+                            let candidate = item.candidate;
+                            let state = if item.expired {
+                                "Expired"
+                            } else if matches!(
                                 candidate.status,
+                                echo_agent_app_core::evolution::EvidenceCandidateStatus::Applied
+                            ) {
+                                "Undoable"
+                            } else {
+                                "Ready"
+                            };
+                            println!(
+                                "{} [{} / {:?}] {:.2} {}",
+                                candidate.candidate_id,
+                                state,
                                 candidate.kind,
                                 candidate.confidence,
                                 candidate.content
@@ -1707,12 +1717,16 @@ async fn cmd_evidence_inbox(ctx: &CommandContext, args: &[&str]) -> CommandOutco
                 println!("Usage: /evidence-inbox show <candidate-id>");
                 return CommandOutcome::Continue;
             };
-            match store.get(candidate_id) {
-                Ok(Some(candidate)) => {
+            match store.review_item(candidate_id) {
+                Ok(Some(item)) => {
+                    let candidate = item.candidate;
                     println!("{}", candidate.content);
                     println!(
-                        "Kind: {:?}  Status: {:?}  Confidence: {:.2}",
-                        candidate.kind, candidate.status, candidate.confidence
+                        "Kind: {:?}  Status: {:?}{}  Confidence: {:.2}",
+                        candidate.kind,
+                        candidate.status,
+                        if item.expired { " (expired)" } else { "" },
+                        candidate.confidence
                     );
                     println!("Scope: {:?}", candidate.scope);
                     for evidence in candidate.evidence {
@@ -1787,7 +1801,7 @@ async fn cmd_evidence_inbox(ctx: &CommandContext, args: &[&str]) -> CommandOutco
         }
         _ => {
             println!(
-                "Usage: /evidence-inbox <list|all|show|edit|accept|reject|undo> [candidate-id] [content]"
+                "Usage: /evidence-inbox <pending|expired|undoable|show|edit|accept|reject|undo> [candidate-id] [content]"
             );
         }
     }

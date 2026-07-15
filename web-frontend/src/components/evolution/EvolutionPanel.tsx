@@ -9,7 +9,6 @@ import {
   Archive,
   Clock,
   Database,
-  Heart,
   Gift,
   Wand2,
   Zap,
@@ -19,7 +18,6 @@ import {
   Undo2,
   Pencil,
   Save,
-  Activity,
   AlertTriangle,
 } from 'lucide-react';
 import { evolutionApi } from '../../api/endpoints';
@@ -31,7 +29,7 @@ import type {
   RuleProposal,
   SkillCandidateInfo,
   EvidenceCandidate,
-  EvidenceCandidateStatus,
+  EvidenceInboxFilter,
 } from '../../types/api';
 
 export function EvolutionPanel() {
@@ -40,7 +38,6 @@ export function EvolutionPanel() {
   // ── Dashboard state(进化概览:分层记忆统计 + 技能健康 + 变更活动)
   const [dashboard, setDashboard] = useState<DashboardMetrics | null>(null);
   const [loadingDashboard, setLoadingDashboard] = useState(false);
-  const [usageWindow, setUsageWindow] = useState<'7d' | '30d' | 'all'>('30d');
 
   // ── Rule proposals state(规则候选:用户审阅 → 采纳才写 AGENTS.md)
   const [proposals, setProposals] = useState<RuleProposal[]>([]);
@@ -53,7 +50,7 @@ export function EvolutionPanel() {
   const [actingOnSkill, setActingOnSkill] = useState<string | null>(null);
 
   const [evidenceCandidates, setEvidenceCandidates] = useState<EvidenceCandidate[]>([]);
-  const [evidenceFilter, setEvidenceFilter] = useState<EvidenceCandidateStatus | 'all'>('pending');
+  const [evidenceFilter, setEvidenceFilter] = useState<EvidenceInboxFilter>('pending');
   const [loadingEvidence, setLoadingEvidence] = useState(false);
   const [actingOnEvidence, setActingOnEvidence] = useState<string | null>(null);
   const [editingEvidence, setEditingEvidence] = useState<string | null>(null);
@@ -168,7 +165,7 @@ export function EvolutionPanel() {
     }
   };
 
-  const loadEvidence = async (filter: EvidenceCandidateStatus | 'all' = evidenceFilter) => {
+  const loadEvidence = async (filter: EvidenceInboxFilter = evidenceFilter) => {
     setLoadingEvidence(true);
     try {
       const data = await evolutionApi.listEvidence(filter);
@@ -179,7 +176,7 @@ export function EvolutionPanel() {
     setLoadingEvidence(false);
   };
 
-  const selectEvidenceFilter = (filter: EvidenceCandidateStatus | 'all') => {
+  const selectEvidenceFilter = (filter: EvidenceInboxFilter) => {
     setEvidenceFilter(filter);
     void loadEvidence(filter);
   };
@@ -200,6 +197,7 @@ export function EvolutionPanel() {
       await Promise.all([loadEvidence(), loadDashboard()]);
     } catch (e) {
       addToast('error', `操作失败: ${e instanceof Error ? e.message : '未知错误'}`);
+      await loadEvidence();
     }
     setActingOnEvidence(null);
   };
@@ -250,14 +248,6 @@ export function EvolutionPanel() {
     setCuratorLoading(false);
   };
 
-  const activeUsage = dashboard
-    ? usageWindow === '7d'
-      ? dashboard.real_usage.last_7_days
-      : usageWindow === '30d'
-        ? dashboard.real_usage.last_30_days
-        : dashboard.real_usage.all_time
-    : null;
-
   return (
     <div className="space-y-6">
       {/* ── Section 0: Evolution Overview (Dashboard) ── */}
@@ -282,107 +272,37 @@ export function EvolutionPanel() {
 
         {dashboard ? (
           <>
-            {/* 总记忆数 + 技能健康概览 */}
-            <div className="mb-3 grid grid-cols-1 gap-2 sm:grid-cols-3">
+            <div className="mb-3 max-w-36">
               <StatCard
                 label="总记忆"
                 value={dashboard.total_memories}
                 icon={<Database size={10} />}
               />
-              <StatCard
-                label="工具可靠技能"
-                value={dashboard.skill_health.reliable_skills}
-                color="var(--color-success)"
-                icon={<Heart size={10} />}
-              />
-              <StatCard
-                label="需关注"
-                value={dashboard.skill_health.needs_attention}
-                color="var(--color-warning, orange)"
-              />
             </div>
 
-            {activeUsage && (
-              <div className="mb-3 border-y py-3" style={{ borderColor: 'var(--border-primary)' }}>
-                <div className="mb-2 flex flex-col items-start justify-between gap-2 sm:flex-row sm:items-center">
-                  <div className="flex items-center gap-1.5">
-                    <Activity size={12} style={{ color: 'var(--accent)' }} />
-                    <span
-                      className="text-[11px] font-medium"
-                      style={{ color: 'var(--text-secondary)' }}
-                    >
-                      真实使用反馈
+            {dashboard.tool_diagnostics.repeated_failures.length > 0 && (
+              <div
+                className="mb-3 space-y-1 rounded-md border px-2.5 py-2"
+                style={{
+                  borderColor: 'var(--color-warning, orange)',
+                  color: 'var(--text-secondary)',
+                }}
+              >
+                {dashboard.tool_diagnostics.repeated_failures.map((failure) => (
+                  <div
+                    key={`${failure.tool_name}-${failure.error_class}-${failure.pattern}`}
+                    className="flex items-start gap-1.5 text-[10px]"
+                  >
+                    <AlertTriangle
+                      size={10}
+                      className="mt-0.5 shrink-0"
+                      style={{ color: 'var(--color-warning, orange)' }}
+                    />
+                    <span className="min-w-0 truncate">
+                      {failure.tool_name} 在 {failure.distinct_run_count} 个任务中重复失败
                     </span>
                   </div>
-                  <div
-                    className="grid w-full grid-cols-3 gap-0.5 rounded-md p-0.5 sm:w-auto"
-                    style={{ background: 'var(--bg-hover)' }}
-                  >
-                    {(['7d', '30d', 'all'] as const).map((window) => (
-                      <button
-                        key={window}
-                        onClick={() => setUsageWindow(window)}
-                        className="rounded px-2 py-0.5 text-[9px] font-medium"
-                        style={{
-                          background: usageWindow === window ? 'var(--bg-primary)' : 'transparent',
-                          color:
-                            usageWindow === window ? 'var(--text-primary)' : 'var(--text-tertiary)',
-                        }}
-                      >
-                        {window === 'all' ? '全部' : window}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                <div className="grid grid-cols-1 gap-x-4 gap-y-1 text-[10px] sm:grid-cols-2">
-                  <MetricLine
-                    label="候选决策"
-                    value={`${activeUsage.evidence.accepted_candidates} 接受 / ${activeUsage.evidence.rejected_candidates} 拒绝`}
-                  />
-                  <MetricLine
-                    label="撤销 / 过期"
-                    value={`${activeUsage.evidence.undone_candidates} / ${activeUsage.evidence.stale_proposal_failures}`}
-                  />
-                  <MetricLine
-                    label="工具失败"
-                    value={`${activeUsage.tools.failure_count} / ${activeUsage.tools.total_calls} (${formatMetricRate(activeUsage.tools.failure_rate)})`}
-                  />
-                  <MetricLine
-                    label="重复 / 无效重试"
-                    value={`${activeUsage.tools.repeated_failure_patterns} / ${activeUsage.tools.ineffective_retry_count}`}
-                  />
-                  <MetricLine label="审计变更" value={activeUsage.audit.total_mutations} />
-                  <MetricLine
-                    label="接受 / 拒绝 / 撤销率"
-                    value={`${formatMetricRate(activeUsage.evidence.acceptance_rate)} / ${formatMetricRate(activeUsage.evidence.rejection_rate)} / ${formatMetricRate(activeUsage.evidence.undo_rate)}`}
-                    wide
-                  />
-                </div>
-
-                {activeUsage.tools.top_repeated_failures.length > 0 && (
-                  <div className="mt-2 space-y-1">
-                    {activeUsage.tools.top_repeated_failures.slice(0, 3).map((failure) => (
-                      <div
-                        key={`${failure.tool_name}-${failure.error_class}-${failure.pattern}`}
-                        className="flex items-start gap-1.5 text-[10px]"
-                        style={{ color: 'var(--text-tertiary)' }}
-                      >
-                        <AlertTriangle size={10} className="mt-0.5 shrink-0" />
-                        <span className="min-w-0 truncate">
-                          {failure.tool_name}: {failure.error_class} ({failure.occurrence_count} 次
-                          / {failure.distinct_run_count} runs)
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                )}
-
-                {activeUsage.data_errors.length > 0 && (
-                  <div className="mt-2 text-[10px]" style={{ color: 'var(--color-error)' }}>
-                    {activeUsage.data_errors.join('; ')}
-                  </div>
-                )}
+                ))}
               </div>
             )}
 
@@ -527,10 +447,10 @@ export function EvolutionPanel() {
         </div>
 
         <div
-          className="grid grid-cols-4 gap-0.5 rounded-md p-0.5 mb-3"
+          className="grid grid-cols-3 gap-0.5 rounded-md p-0.5 mb-3"
           style={{ background: 'var(--bg-hover)' }}
         >
-          {(['pending', 'applied', 'rejected', 'all'] as const).map((filter) => (
+          {(['pending', 'expired', 'applied'] as const).map((filter) => (
             <button
               key={filter}
               onClick={() => selectEvidenceFilter(filter)}
@@ -540,13 +460,7 @@ export function EvolutionPanel() {
                 color: evidenceFilter === filter ? 'var(--text-primary)' : 'var(--text-tertiary)',
               }}
             >
-              {filter === 'pending'
-                ? '待审'
-                : filter === 'applied'
-                  ? '已采纳'
-                  : filter === 'rejected'
-                    ? '已拒绝'
-                    : '全部'}
+              {filter === 'pending' ? '待确认' : filter === 'expired' ? '已过期' : '可撤销'}
             </button>
           ))}
         </div>
@@ -571,6 +485,17 @@ export function EvolutionPanel() {
                       >
                         {candidate.kind}
                       </span>
+                      {candidate.expired && (
+                        <span
+                          className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[9px] shrink-0"
+                          style={{
+                            background: 'var(--bg-hover)',
+                            color: 'var(--color-warning, orange)',
+                          }}
+                        >
+                          <AlertTriangle size={9} /> 已过期
+                        </span>
+                      )}
                       <span
                         className="font-mono text-[9px] truncate"
                         style={{ color: 'var(--text-tertiary)' }}
@@ -618,6 +543,7 @@ export function EvolutionPanel() {
 
                   <div className="flex items-center justify-end gap-1.5 mt-3">
                     {candidate.status !== 'applied' &&
+                      !candidate.expired &&
                       !isMemoryMerge &&
                       (isEditing ? (
                         <>
@@ -665,7 +591,7 @@ export function EvolutionPanel() {
                         <X size={13} />
                       </button>
                     )}
-                    {candidate.status !== 'applied' ? (
+                    {candidate.status !== 'applied' && !candidate.expired ? (
                       <button
                         onClick={() => runEvidenceAction('accept', candidate.candidate_id)}
                         disabled={isActing}
@@ -679,7 +605,7 @@ export function EvolutionPanel() {
                           <Check size={13} />
                         )}
                       </button>
-                    ) : (
+                    ) : candidate.status === 'applied' ? (
                       <button
                         onClick={() => runEvidenceAction('undo', candidate.candidate_id)}
                         disabled={isActing}
@@ -693,7 +619,7 @@ export function EvolutionPanel() {
                           <Undo2 size={13} />
                         )}
                       </button>
-                    )}
+                    ) : null}
                   </div>
                 </div>
               );
@@ -1204,31 +1130,4 @@ function StatCard({
       </div>
     </div>
   );
-}
-
-function MetricLine({
-  label,
-  value,
-  wide = false,
-}: {
-  label: string;
-  value: number | string;
-  wide?: boolean;
-}) {
-  return (
-    <div
-      className={`flex min-w-0 items-center justify-between gap-2 ${wide ? 'sm:col-span-2' : ''}`}
-    >
-      <span className="truncate" style={{ color: 'var(--text-tertiary)' }}>
-        {label}
-      </span>
-      <span className="shrink-0 font-mono" style={{ color: 'var(--text-secondary)' }}>
-        {value}
-      </span>
-    </div>
-  );
-}
-
-function formatMetricRate(rate: number | null) {
-  return rate === null ? '样本不足' : `${(rate * 100).toFixed(1)}%`;
 }
