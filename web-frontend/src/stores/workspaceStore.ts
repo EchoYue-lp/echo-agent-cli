@@ -1,5 +1,7 @@
 import { create } from 'zustand';
-import { workspaceApi, type Workspace } from '../api/endpoints';
+import { sessionApi, workspaceApi, type Workspace } from '../api/endpoints';
+import { useChatStore } from './chatStore';
+import { useConversationStore } from './conversationStore';
 
 interface WorkspaceState {
   /** All workspaces */
@@ -58,19 +60,16 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       set({ current: res.workspace });
 
       // Clear current chat
-      const { useChatStore } = await import('./chatStore');
       useChatStore.getState().clearMessages();
 
       // Reset agent session (best-effort, must not block)
       try {
-        const { sessionApi } = await import('../api/endpoints');
         await sessionApi.reset();
       } catch (e) {
         console.warn('[workspaceStore] session reset failed (non-fatal):', e);
       }
 
       // Reload conversations from the new workspace's store
-      const { useConversationStore } = await import('./conversationStore');
       useConversationStore.setState({ activeId: null });
       await useConversationStore.getState().init();
       if (import.meta.env.DEV)

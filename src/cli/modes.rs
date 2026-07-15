@@ -18,6 +18,7 @@ fn repl_config_for(args: &Args) -> crate::cli::ReplConfig {
         task_service: None,
         scheduler_runner: None,
         review_integration: None,
+        prompt_assembly: None,
     }
 }
 
@@ -29,6 +30,7 @@ pub async fn run_cli_mode(
     app_config: &AppConfig,
     task_store: std::sync::Arc<dyn echo_agent::memory::Store>,
     review_integration: Option<std::sync::Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
+    prompt_assembly: echo_agent_app_core::project::prompt::PromptAssembly,
 ) -> Result<()> {
     // Start BackgroundTaskService for CLI mode
     let (task_service, scheduler_runner) = {
@@ -48,6 +50,7 @@ pub async fn run_cli_mode(
     repl_config.task_service = task_service;
     repl_config.scheduler_runner = scheduler_runner;
     repl_config.review_integration = review_integration;
+    repl_config.prompt_assembly = Some(prompt_assembly);
 
     crate::cli::run_repl(agent, repl_config).await
 }

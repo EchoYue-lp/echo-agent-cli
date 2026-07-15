@@ -1112,7 +1112,7 @@ fn agent_event_to_chat_event(
     // same events onto `execution://event` (kind="subagent", id="main") caused
     // duplicate rendering in SubagentStreamBlock AND a stale "running" card
     // (main run had no `started`/`completed` lifecycle pairing). Main-agent
-    // cache diagnostics go through `trace_collector` + SQLite via
+    // cache diagnostics go through `trace_collector` + the file-backed runtime store via
     // `get_cache_diagnostics`, not through the execution://event store.
     match event {
         AgentEvent::Token(data) => Some(ChatEvent::Token { data: data.clone() }),
@@ -1172,7 +1172,7 @@ fn agent_event_to_chat_event(
                     ]),
                 },
             );
-            // Persist usage to SQLite for trend analysis
+            // Persist usage to the local file-backed runtime store for trend analysis.
             if let Some(store) = usage_store {
                 let record = echo_agent_app_core::tasks::task_runtime::UsageRecord {
                     id: uuid::Uuid::new_v4().to_string(),
@@ -1356,6 +1356,27 @@ pub async fn get_cache_diagnostics(
     }
 
     let diagnostics = compute_cache_diagnostics(&events);
+    let prompt_assembly = state.app_state.trace.prompt_assembly.read().await.clone();
+    let context_handle = state
+        .app_state
+        .connection
+        .primary_agent()
+        .read(|agent| agent.context().clone())
+        .await;
+    let context_snapshot = {
+        let context = context_handle.lock().await;
+        serde_json::json!({
+            "message_count": context.messages().len(),
+            "estimated_tokens": context.token_estimate(),
+            "protected_message_count": context.protected_message_count(),
+            "protected_tokens": context.protected_token_estimate(),
+        })
+    };
+    let behavior_fixtures = echo_agent_app_core::prompt_eval::prompt_behavior_case_summaries()
+        .unwrap_or_else(|error| {
+            tracing::warn!(%error, "Failed to load prompt behavior fixtures");
+            Vec::new()
+        });
     let recent_calls: Vec<serde_json::Value> = events
         .iter()
         .rev()
@@ -1401,6 +1422,10 @@ pub async fn get_cache_diagnostics(
         })).collect::<Vec<_>>(),
         "suggested_fixes": diagnostics.suggested_fixes,
         "recent_calls": recent_calls,
+        "fingerprint_changes": diagnostics.fingerprint_changes,
+        "prompt_assembly": prompt_assembly,
+        "context_snapshot": context_snapshot,
+        "behavior_fixtures": behavior_fixtures,
     }))
 }
 

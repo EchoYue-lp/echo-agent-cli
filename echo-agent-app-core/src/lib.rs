@@ -27,6 +27,7 @@ pub mod persistence;
 pub mod profiles;
 pub mod project;
 pub mod prompt_contract;
+pub mod prompt_eval;
 pub mod run_driver;
 pub mod runtime_state_file;
 pub mod scheduler;

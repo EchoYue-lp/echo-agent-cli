@@ -116,6 +116,7 @@ pub enum SlashCommand {
     // -- Info --
     Tools,
     Cost,
+    PromptDiagnostics,
     Help,
 
     // -- Exit --
@@ -178,6 +179,7 @@ impl SlashCommand {
 
             Self::Tools => "List available tools",
             Self::Cost => "Show token cost summary",
+            Self::PromptDiagnostics => "Show prompt and protected-context diagnostics",
             Self::Help => "Show help",
 
             Self::Quit => "Quit the TUI",
@@ -229,7 +231,7 @@ impl SlashCommand {
             Self::Cron | Self::AutoMemory | Self::MemoryReview | Self::SkillCandidates => {
                 Category::Scheduling
             }
-            Self::Tools | Self::Cost | Self::Help => Category::Info,
+            Self::Tools | Self::Cost | Self::PromptDiagnostics | Self::Help => Category::Info,
             Self::Quit | Self::Exit => Category::Exit,
         }
     }

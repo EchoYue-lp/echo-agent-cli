@@ -41,11 +41,28 @@ async fn cmd_trace(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
                             RunEvent::LlmCall {
                                 prompt_tokens,
                                 completion_tokens,
+                                cached_prompt_tokens,
+                                cache_creation_prompt_tokens,
+                                usage_reported,
+                                estimated_context_tokens,
+                                protected_context_tokens,
+                                protected_message_count,
                                 ..
                             } => {
                                 println!(
-                                    "  LLM Call: {}->{} tokens",
-                                    prompt_tokens, completion_tokens
+                                    "  LLM Call: {}->{} tokens, cached {}, cache write {}, context ~{}, protected ~{} ({} messages), usage {}",
+                                    prompt_tokens,
+                                    completion_tokens,
+                                    cached_prompt_tokens,
+                                    cache_creation_prompt_tokens,
+                                    estimated_context_tokens,
+                                    protected_context_tokens,
+                                    protected_message_count,
+                                    if *usage_reported {
+                                        "reported"
+                                    } else {
+                                        "missing"
+                                    },
                                 );
                             }
                             RunEvent::ToolCall { name, .. } => println!("  Tool Call: {}", name),
@@ -177,6 +194,78 @@ cmd!(
     cmd_improve
 );
 
+async fn cmd_prompt_eval(_ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
+    match echo_agent_app_core::prompt_eval::prompt_behavior_case_summaries() {
+        Ok(cases) => {
+            println!("\nPrompt behavior fixtures: {}", cases.len());
+            for case in cases {
+                println!(
+                    "  [{}] {} — {} ({})",
+                    case.domain, case.id, case.name, case.criterion
+                );
+            }
+        }
+        Err(error) => println!("Prompt behavior fixtures unavailable: {error}"),
+    }
+    CommandOutcome::Continue
+}
+cmd!(
+    PromptEvalCommand,
+    "prompt-eval",
+    CommandCategory::Debug,
+    "List cross-domain prompt behavior fixtures",
+    cmd_prompt_eval
+);
+
+async fn cmd_prompt_diagnostics(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
+    let context = ctx.agent.read(|agent| agent.context().clone()).await;
+    let (message_count, estimated_tokens, protected_message_count, protected_tokens) = {
+        let context = context.lock().await;
+        (
+            context.messages().len(),
+            context.token_estimate(),
+            context.protected_message_count(),
+            context.protected_token_estimate(),
+        )
+    };
+
+    println!("\nPrompt diagnostics (local estimates):");
+    if let Some(assembly) = ctx.prompt_assembly.as_ref() {
+        println!("  Static prompt: ~{} tokens", assembly.estimated_tokens);
+        for module in &assembly.modules {
+            let status = if !module.included {
+                "omitted"
+            } else if module.truncated {
+                "truncated"
+            } else {
+                "full"
+            };
+            println!(
+                "    {:<24} ~{:>6} tokens  {}",
+                module.name, module.estimated_tokens, status
+            );
+        }
+    } else {
+        println!("  Static prompt report: unavailable");
+    }
+    println!(
+        "  Current context: ~{} tokens across {} messages",
+        estimated_tokens, message_count
+    );
+    println!(
+        "  Protected context: ~{} tokens across {} messages",
+        protected_tokens, protected_message_count
+    );
+    CommandOutcome::Continue
+}
+cmd!(
+    PromptDiagnosticsCommand,
+    "prompt-diagnostics",
+    CommandCategory::Debug,
+    "Show prompt modules and current protected-context estimates",
+    cmd_prompt_diagnostics
+);
+
 // ── RunsCommand ───────────────────────────────────────────────────────
 
 async fn cmd_runs(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
@@ -254,6 +343,8 @@ pub fn register_all(registry: &mut crate::cli::command::CommandRegistry) {
     registry.register(Arc::new(TraceCommand));
     registry.register(Arc::new(SelfReviewCommand));
     registry.register(Arc::new(ImproveCommand));
+    registry.register(Arc::new(PromptEvalCommand));
+    registry.register(Arc::new(PromptDiagnosticsCommand));
     registry.register(Arc::new(RunsCommand));
     registry.register(Arc::new(RunCommand));
 }

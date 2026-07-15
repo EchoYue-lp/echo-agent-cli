@@ -198,7 +198,8 @@ async fn run_desktop() -> anyhow::Result<()> {
         conversation_store,
         app_config.clone(),
     )
-    .with_review_integration(runtime.review_integration.clone());
+    .with_review_integration(runtime.review_integration.clone())
+    .with_prompt_assembly(runtime.prompt_assembly.clone());
 
     // Inject the TaskRuntimeStore into the pool so pooled agents get the
     // task-management tools, and register those tools on the primary agent

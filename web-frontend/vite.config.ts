@@ -10,6 +10,21 @@ export default defineConfig(({ mode }) => {
     build: {
       // Tauri v2 frontend plugins must be bundled by Vite — they are NOT
       // available as global scripts in the webview. Do NOT externalize them.
+      // The application entry is kept below 600 kB minified (about 150 kB gzip)
+      // after large editor, terminal, markdown, and icon dependencies are split.
+      chunkSizeWarningLimit: 600,
+      rollupOptions: {
+        output: {
+          manualChunks: {
+            react: ['react', 'react-dom'],
+            editor: ['@uiw/react-codemirror', '@codemirror/language-data'],
+            markdown: ['react-markdown', 'remark-gfm'],
+            terminal: ['@xterm/xterm', '@xterm/addon-fit'],
+            icons: ['lucide-react'],
+            state: ['zustand'],
+          },
+        },
+      },
     },
     server: {
       port: 1420,

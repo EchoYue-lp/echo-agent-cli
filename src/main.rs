@@ -306,6 +306,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                 })
                 .collect(),
             runtime.browser_runtime.clone(),
+            runtime.prompt_assembly.clone(),
             args.no_alt_screen,
         )
         .await?;
@@ -381,6 +382,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                     &app_config,
                     task_store.clone(),
                     runtime.review_integration.clone(),
+                    runtime.prompt_assembly.clone(),
                 )
                 .await?;
             } else {
@@ -406,6 +408,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             &app_config,
             task_store.clone(),
             runtime.review_integration.clone(),
+            runtime.prompt_assembly.clone(),
         )
         .await?;
     } else {

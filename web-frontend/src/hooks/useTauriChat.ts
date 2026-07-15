@@ -2,6 +2,7 @@ import { useRef, useCallback, useEffect, useState } from 'react';
 import { useChatStore } from '../stores/chatStore';
 import { useConversationStore } from '../stores/conversationStore';
 import { useSubagentRunStore, type ExecutionEvent } from '../stores/subagentRunStore';
+import { useTaskRuntimeStore } from '../stores/taskRuntimeStore';
 import { useToastStore } from '../stores/toastStore';
 import { isTauri, apiInvoke, errorMessage } from '../lib/tauri-bridge';
 import { handleChatEvent } from './chatEventHandler';
@@ -125,10 +126,9 @@ export function useTauriChat() {
             (payload.conversation_id as string | undefined) ??
             useConversationStore.getState().activeId;
           if (convId) {
-            import('../stores/taskRuntimeStore')
-              .then(({ useTaskRuntimeStore }) => {
-                useTaskRuntimeStore.getState().loadByConversation(convId);
-              })
+            useTaskRuntimeStore
+              .getState()
+              .loadByConversation(convId)
               .catch((e) => console.warn('[TauriChat] Failed to load task run on run_started:', e));
           }
         }
@@ -208,24 +208,20 @@ export function useTauriChat() {
       // event handler deleted in the 13→6 state machine migration).
       const createdRunId = chatResult?.run_id ?? chatResult?.runId;
       if (createdRunId && conversation_id) {
-        import('../stores/taskRuntimeStore')
-          .then(({ useTaskRuntimeStore }) => {
-            useTaskRuntimeStore
-              .getState()
-              .loadByConversation(conversation_id!)
-              .then(() => {
-                const store = useTaskRuntimeStore.getState();
-                const run = store.activeRun;
-                if (
-                  run &&
-                  (run.status === 'pending' || run.status === 'running' || run.status === 'paused')
-                ) {
-                  store.startPolling(run.run_id);
-                }
-              })
-              .catch((e) => console.warn('[TauriChat] Failed to load task runtime:', e));
+        useTaskRuntimeStore
+          .getState()
+          .loadByConversation(conversation_id)
+          .then(() => {
+            const store = useTaskRuntimeStore.getState();
+            const run = store.activeRun;
+            if (
+              run &&
+              (run.status === 'pending' || run.status === 'running' || run.status === 'paused')
+            ) {
+              store.startPolling(run.run_id);
+            }
           })
-          .catch((e) => console.warn('[TauriChat] Failed to import taskRuntimeStore:', e));
+          .catch((e) => console.warn('[TauriChat] Failed to load task runtime:', e));
       }
     } catch (e) {
       console.error('[TauriChat] Failed to send message:', e);

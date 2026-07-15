@@ -381,7 +381,7 @@ pub struct SchedulerState {
 pub struct TaskState {
     pub service: Option<Arc<crate::tasks::BackgroundTaskService>>,
     pub cancel_token: CancellationToken,
-    /// TaskRuntime canonical SQLite store for complex-task runs, plans,
+    /// TaskRuntime canonical file-backed store for complex-task runs, plans,
     /// todos, events, artifacts, reviews, and execution summaries.
     /// Backs the `task://event` query commands. `None` only if both the
     /// on-disk open and the in-memory fallback failed (extreme OOM).
@@ -411,6 +411,8 @@ pub struct TraceState {
     pub analyzer: RwLock<Option<echo_agent::trace::TraceAnalyzer>>,
     /// 实时追踪事件收集器。
     pub collector: std::sync::Arc<crate::observability::TraceCollector>,
+    /// Static prompt-module report for the primary EKO agent.
+    pub prompt_assembly: RwLock<Option<crate::project::prompt::PromptAssembly>>,
 }
 
 /// 工作区状态
@@ -560,6 +562,7 @@ impl AppState {
             trace: TraceState {
                 analyzer: RwLock::new(None),
                 collector: std::sync::Arc::new(crate::observability::TraceCollector::new()),
+                prompt_assembly: RwLock::new(None),
             },
             workspace: WorkspaceState {
                 current: RwLock::new(None),
@@ -581,6 +584,15 @@ impl AppState {
         review_integration: Option<Arc<crate::evolution::ReviewIntegration>>,
     ) -> Self {
         self.review_integration = review_integration;
+        self
+    }
+
+    /// Attach the prompt-module report captured during runtime bootstrap.
+    pub fn with_prompt_assembly(
+        mut self,
+        prompt_assembly: crate::project::prompt::PromptAssembly,
+    ) -> Self {
+        *self.trace.prompt_assembly.get_mut() = Some(prompt_assembly);
         self
     }
 

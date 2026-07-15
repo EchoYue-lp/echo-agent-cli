@@ -136,6 +136,168 @@ export function CacheDiagnosticsPanel() {
             </div>
           </div>
 
+          {data.prompt_assembly && (
+            <section>
+              <div className="mb-2 text-xs font-semibold" style={{ color: 'var(--text-primary)' }}>
+                Prompt 组成
+              </div>
+              <div
+                className="mb-2 grid grid-cols-2 gap-x-4 gap-y-1 border-y py-2 text-[11px] sm:grid-cols-4"
+                style={{ borderColor: 'var(--border-secondary)' }}
+              >
+                <div style={{ color: 'var(--text-tertiary)' }}>
+                  静态 Prompt 估算{' '}
+                  <span className="font-mono" style={{ color: 'var(--text-primary)' }}>
+                    {data.prompt_assembly.estimated_tokens.toLocaleString()}
+                  </span>
+                </div>
+                <div style={{ color: 'var(--text-tertiary)' }}>
+                  当前上下文估算{' '}
+                  <span className="font-mono" style={{ color: 'var(--text-primary)' }}>
+                    {data.context_snapshot.estimated_tokens.toLocaleString()}
+                  </span>
+                </div>
+                <div style={{ color: 'var(--text-tertiary)' }}>
+                  Protected 估算{' '}
+                  <span className="font-mono" style={{ color: 'var(--text-primary)' }}>
+                    {data.context_snapshot.protected_tokens.toLocaleString()}
+                  </span>
+                </div>
+                <div style={{ color: 'var(--text-tertiary)' }}>
+                  消息{' '}
+                  <span className="font-mono" style={{ color: 'var(--text-primary)' }}>
+                    {data.context_snapshot.message_count}
+                  </span>
+                </div>
+              </div>
+              <div
+                className="overflow-auto rounded-lg border"
+                style={{ borderColor: 'var(--border-primary)' }}
+              >
+                <table className="w-full text-[11px]">
+                  <thead>
+                    <tr style={{ background: 'var(--bg-hover)' }}>
+                      <th
+                        className="px-2 py-1.5 text-left"
+                        style={{ color: 'var(--text-tertiary)' }}
+                      >
+                        模块
+                      </th>
+                      <th
+                        className="px-2 py-1.5 text-right"
+                        style={{ color: 'var(--text-tertiary)' }}
+                      >
+                        Tokens
+                      </th>
+                      <th
+                        className="px-2 py-1.5 text-right"
+                        style={{ color: 'var(--text-tertiary)' }}
+                      >
+                        状态
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {data.prompt_assembly.modules.map((module) => (
+                      <tr
+                        key={module.name}
+                        className="border-t"
+                        style={{ borderColor: 'var(--border-secondary)' }}
+                      >
+                        <td
+                          className="px-2 py-1.5 font-mono"
+                          style={{ color: 'var(--text-primary)' }}
+                        >
+                          {module.name}
+                        </td>
+                        <td
+                          className="px-2 py-1.5 text-right font-mono"
+                          style={{ color: 'var(--text-secondary)' }}
+                        >
+                          {module.estimated_tokens.toLocaleString()}
+                        </td>
+                        <td
+                          className="px-2 py-1.5 text-right"
+                          style={{
+                            color: module.included
+                              ? module.truncated
+                                ? 'var(--color-warning)'
+                                : 'var(--color-success)'
+                              : 'var(--text-tertiary)',
+                          }}
+                        >
+                          {module.included ? (module.truncated ? '截断' : '完整') : '省略'}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </section>
+          )}
+
+          {data.behavior_fixtures.length > 0 && (
+            <section>
+              <div className="mb-2 text-xs font-semibold" style={{ color: 'var(--text-primary)' }}>
+                行为评测基线
+              </div>
+              <div
+                className="overflow-auto rounded-lg border"
+                style={{ borderColor: 'var(--border-primary)' }}
+              >
+                <table className="w-full text-[11px]">
+                  <thead>
+                    <tr style={{ background: 'var(--bg-hover)' }}>
+                      <th
+                        className="px-2 py-1.5 text-left"
+                        style={{ color: 'var(--text-tertiary)' }}
+                      >
+                        领域
+                      </th>
+                      <th
+                        className="px-2 py-1.5 text-left"
+                        style={{ color: 'var(--text-tertiary)' }}
+                      >
+                        Case
+                      </th>
+                      <th
+                        className="px-2 py-1.5 text-left"
+                        style={{ color: 'var(--text-tertiary)' }}
+                      >
+                        判定
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {data.behavior_fixtures.map((fixture) => (
+                      <tr
+                        key={fixture.id}
+                        className="border-t"
+                        style={{ borderColor: 'var(--border-secondary)' }}
+                      >
+                        <td
+                          className="px-2 py-1.5 font-mono"
+                          style={{ color: 'var(--text-secondary)' }}
+                        >
+                          {fixture.domain}
+                        </td>
+                        <td className="px-2 py-1.5" style={{ color: 'var(--text-primary)' }}>
+                          {fixture.name}
+                        </td>
+                        <td
+                          className="px-2 py-1.5 font-mono"
+                          style={{ color: 'var(--text-tertiary)' }}
+                        >
+                          {fixture.criterion}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </section>
+          )}
+
           {/* Issues */}
           {data.issues.length > 0 && (
             <section>

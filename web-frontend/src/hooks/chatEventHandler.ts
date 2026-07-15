@@ -207,14 +207,10 @@ export function handleChatEvent(event: ChatEvent, ctx: EventContext): void {
         // status. Without 'completed'/'failed'/'cancelled' in the allowlist,
         // updateRunStatus would never see a terminal state and polling
         // would never stop.
-        import('../stores/taskRuntimeStore')
-          .then(({ useTaskRuntimeStore }) => {
-            const taskStore = useTaskRuntimeStore.getState();
-            if (taskStore.activeRun) {
-              taskStore.updateRunStatus(validated);
-            }
-          })
-          .catch(() => {});
+        const taskStore = useTaskRuntimeStore.getState();
+        if (taskStore.activeRun) {
+          taskStore.updateRunStatus(validated);
+        }
       }
       break;
     }

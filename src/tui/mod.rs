@@ -319,6 +319,8 @@ pub struct TuiApp {
     pub conversation_store: Option<std::sync::Arc<dyn echo_agent::memory::ConversationStore>>,
     /// Runtime-ready configured models exposed by the product configuration.
     pub configured_models: Vec<echo_agent_app_core::model_config::ModelRuntimeConfig>,
+    /// Static prompt-module report captured during runtime bootstrap.
+    pub prompt_assembly: Option<echo_agent_app_core::project::prompt::PromptAssembly>,
     /// Preserve native terminal scrollback instead of entering the alternate screen.
     pub inline_mode: bool,
     /// Event-loop request to temporarily suspend the TUI and open `$VISUAL`/`$EDITOR`.
@@ -744,6 +746,7 @@ impl TuiApp {
             conversation_id: None,
             conversation_store: None,
             configured_models: Vec::new(),
+            prompt_assembly: None,
             inline_mode: false,
             external_editor_requested: false,
             external_file_editor_requested: None,
@@ -1760,6 +1763,7 @@ pub async fn run_tui(
     conversation_id: String,
     configured_models: Vec<echo_agent_app_core::model_config::ModelRuntimeConfig>,
     browser_runtime: std::sync::Arc<echo_agent_app_core::browser::BrowserRuntime>,
+    prompt_assembly: echo_agent_app_core::project::prompt::PromptAssembly,
     inline_mode: bool,
 ) -> anyhow::Result<()> {
     // Use ColorTheme to generate Theme, unifying both theme systems.
@@ -1809,6 +1813,7 @@ pub async fn run_tui(
     app.conversation_id = Some(conversation_id.clone());
     app.conversation_store = conversation_store;
     app.configured_models = configured_models;
+    app.prompt_assembly = Some(prompt_assembly);
     app.browser_runtime = Some(browser_runtime);
     app.inline_mode = inline_mode;
     app.project_files = collect_project_files(std::path::Path::new("."), 10_000);

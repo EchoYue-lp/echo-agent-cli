@@ -2968,6 +2968,52 @@ async fn handle_slash_command(
                 ),
             });
         }
+        Some(SlashCommand::PromptDiagnostics) => {
+            let context = agent.read(|value| value.context().clone()).await;
+            let (message_count, estimated_tokens, protected_message_count, protected_tokens) = {
+                let context = context.lock().await;
+                (
+                    context.messages().len(),
+                    context.token_estimate(),
+                    context.protected_message_count(),
+                    context.protected_token_estimate(),
+                )
+            };
+            let mut content = String::from("Prompt diagnostics (local estimates):\n");
+            if let Some(assembly) = app.prompt_assembly.as_ref() {
+                content.push_str(&format!(
+                    "  Static prompt: ~{} tokens\n",
+                    assembly.estimated_tokens
+                ));
+                for module in &assembly.modules {
+                    let status = if !module.included {
+                        "omitted"
+                    } else if module.truncated {
+                        "truncated"
+                    } else {
+                        "full"
+                    };
+                    content.push_str(&format!(
+                        "    {:<24} ~{:>6} tokens  {}\n",
+                        module.name, module.estimated_tokens, status
+                    ));
+                }
+            } else {
+                content.push_str("  Static prompt report: unavailable\n");
+            }
+            content.push_str(&format!(
+                "  Current context: ~{} tokens across {} messages\n",
+                estimated_tokens, message_count
+            ));
+            content.push_str(&format!(
+                "  Protected context: ~{} tokens across {} messages",
+                protected_tokens, protected_message_count
+            ));
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content,
+            });
+        }
         Some(SlashCommand::Tools) => {
             let tools = agent.read(|value| value.tool_names()).await;
             app.tool_count = tools.len();

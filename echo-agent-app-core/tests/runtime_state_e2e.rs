@@ -151,3 +151,47 @@ async fn memory_context_suffix_lands_in_system_prompt() {
          prompt was: {prompt}"
     );
 }
+
+#[tokio::test]
+async fn create_agent_exposes_prompt_assembly_diagnostics() -> Result<(), String> {
+    let params = AgentCreateParams {
+        model: Some("test-model".to_string()),
+        system_prompt: Some("base prompt".to_string()),
+        project: None,
+        session_id: None,
+        conversation_id: None,
+        react_checkpoint_interval: None,
+        state_store: None,
+        memory_context_suffix: Some("## Durable instructions\nKeep evidence.".to_string()),
+        working_dir: None,
+        task_runtime_store: None,
+        browser_runtime: None,
+        route: None,
+    };
+    let created = infra::create_agent_with_diagnostics(&params, &make_app_config()).await?;
+
+    if created.prompt_assembly.estimated_tokens == 0 {
+        return Err("prompt assembly reported zero tokens".into());
+    }
+    for required in ["base", "assistant", "runtime", "instruction_context"] {
+        if !created
+            .prompt_assembly
+            .modules
+            .iter()
+            .any(|module| module.name == required && module.included)
+        {
+            return Err(format!(
+                "prompt assembly missing included module: {required}"
+            ));
+        }
+    }
+    if created.agent.system_prompt() != created.prompt_assembly.prompt {
+        return Err("agent prompt diverged from prompt assembly report".into());
+    }
+    let serialized = serde_json::to_value(&created.prompt_assembly)
+        .map_err(|error| format!("serialize prompt assembly: {error}"))?;
+    if serialized.get("prompt").is_some() {
+        return Err("prompt assembly diagnostics exposed the full prompt".into());
+    }
+    Ok(())
+}

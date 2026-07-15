@@ -715,6 +715,27 @@ export interface CacheDiagnosticsData {
   issues: CacheIssueData[];
   suggested_fixes: string[];
   recent_calls: RecentCallFingerprint[];
+  prompt_assembly?: {
+    estimated_tokens: number;
+    modules: Array<{
+      name: string;
+      estimated_tokens: number;
+      included: boolean;
+      truncated: boolean;
+    }>;
+  } | null;
+  context_snapshot: {
+    message_count: number;
+    estimated_tokens: number;
+    protected_message_count: number;
+    protected_tokens: number;
+  };
+  behavior_fixtures: Array<{
+    id: string;
+    name: string;
+    domain: string;
+    criterion: string;
+  }>;
   fingerprint_changes: {
     system_prompt_hash_changes: number;
     tools_schema_hash_changes: number;

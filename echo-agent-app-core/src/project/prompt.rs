@@ -17,6 +17,7 @@
 
 use super::context::ProjectContext;
 use echo_core::tokenizer::{HeuristicTokenizer, Tokenizer};
+use serde::Serialize;
 
 /// Stable product-level operating contract. Dynamic project, memory, mode, and
 /// task context follows this cache-friendly prefix.
@@ -84,7 +85,7 @@ pub struct PromptModule {
 }
 
 /// Token and inclusion result for one assembled prompt module.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PromptModuleUsage {
     pub name: String,
     pub estimated_tokens: usize,
@@ -93,8 +94,9 @@ pub struct PromptModuleUsage {
 }
 
 /// Prompt text plus budget diagnostics used by tests and observability.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PromptAssembly {
+    #[serde(skip_serializing)]
     pub prompt: String,
     pub estimated_tokens: usize,
     pub modules: Vec<PromptModuleUsage>,

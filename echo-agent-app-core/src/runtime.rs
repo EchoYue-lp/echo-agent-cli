@@ -50,6 +50,8 @@ pub struct AgentRuntime {
     pub review_integration: Option<Arc<ReviewIntegration>>,
     /// Application-owned Playwright MCP runtime shared by every agent surface.
     pub browser_runtime: Arc<crate::browser::BrowserRuntime>,
+    /// Static EKO prompt-module budget report captured at agent build time.
+    pub prompt_assembly: crate::project::prompt::PromptAssembly,
 }
 
 impl AgentRuntime {
@@ -116,9 +118,11 @@ impl AgentRuntime {
         );
 
         // ── 1. Create Agent ──
-        let mut agent = infra::create_agent(&params, app_config)
+        let created = infra::create_agent_with_diagnostics(&params, app_config)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut agent = created.agent;
+        let prompt_assembly = created.prompt_assembly;
 
         // ── 2. Load MCP ──
         infra::load_mcp_config(&mut agent, None, app_config).await;
@@ -374,6 +378,7 @@ impl AgentRuntime {
             state_store,
             review_integration,
             browser_runtime,
+            prompt_assembly,
         })
     }
 
@@ -390,7 +395,8 @@ impl AgentRuntime {
             conversation_store,
             self.app_config.clone(),
         )
-        .with_review_integration(self.review_integration.clone());
+        .with_review_integration(self.review_integration.clone())
+        .with_prompt_assembly(self.prompt_assembly.clone());
         // Note: task_service and scheduler are started separately by the caller
         // because they need a Store which may be created differently per entry.
         state

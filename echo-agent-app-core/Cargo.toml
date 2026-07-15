@@ -14,7 +14,7 @@ echo-agent = { version = "0.2", package = "echo_agent", path = "../../echo-agent
     "mcp", "lsp", "human-loop", "subagent", "git", "tasks",
     "shell", "files", "web",
     "data", "statistics", "chart", "research", "media",
-    "database", "rag",
+    "database", "rag", "eval",
 ] }
 echo-core = { version = "0.2", package = "echo_core", path = "../../echo-agent/echo-core" }
 tokio = { version = "1", features = ["full"] }

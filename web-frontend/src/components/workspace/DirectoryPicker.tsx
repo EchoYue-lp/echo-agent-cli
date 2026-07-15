@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { FolderOpen, ArrowUp, ChevronRight, X } from 'lucide-react';
+import { get } from '../../api/client';
 
 interface BrowseEntry {
   name: string;
@@ -35,7 +36,6 @@ export default function DirectoryPicker({
   const browse = useCallback(async (path?: string) => {
     setLoading(true);
     try {
-      const { get } = await import('../../api/client');
       const params = path ? `?path=${encodeURIComponent(path)}` : '';
       const data = await get<BrowseResult>(`/files/browse${params}`);
       setCurrentPath(data.current);

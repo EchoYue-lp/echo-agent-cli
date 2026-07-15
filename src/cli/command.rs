@@ -93,6 +93,8 @@ pub struct CommandContext {
     pub task_service: Option<Arc<echo_agent_app_core::tasks::BackgroundTaskService>>,
     /// Scheduler runner for managing cron tasks.
     pub scheduler: Option<Arc<echo_agent_app_core::scheduler::SchedulerRunner>>,
+    /// Static prompt-module report captured during runtime bootstrap.
+    pub prompt_assembly: Option<echo_agent_app_core::project::prompt::PromptAssembly>,
 }
 
 impl CommandContext {
@@ -104,6 +106,7 @@ impl CommandContext {
             registry: None,
             task_service: None,
             scheduler: None,
+            prompt_assembly: None,
         }
     }
 
@@ -138,6 +141,14 @@ impl CommandContext {
         runner: Arc<echo_agent_app_core::scheduler::SchedulerRunner>,
     ) -> Self {
         self.scheduler = Some(runner);
+        self
+    }
+
+    pub fn with_prompt_assembly(
+        mut self,
+        prompt_assembly: echo_agent_app_core::project::prompt::PromptAssembly,
+    ) -> Self {
+        self.prompt_assembly = Some(prompt_assembly);
         self
     }
 

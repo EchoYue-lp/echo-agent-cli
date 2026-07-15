@@ -55,6 +55,8 @@ pub struct ReplConfig {
     /// in session-end memory review. When `None`, review functions fall back
     /// to building a temporary instance (legacy behavior).
     pub review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
+    /// Static prompt-module report captured during runtime bootstrap.
+    pub prompt_assembly: Option<echo_agent_app_core::project::prompt::PromptAssembly>,
 }
 
 impl Default for ReplConfig {
@@ -67,6 +69,7 @@ impl Default for ReplConfig {
             task_service: None,
             scheduler_runner: None,
             review_integration: None,
+            prompt_assembly: None,
         }
     }
 }
@@ -151,7 +154,8 @@ pub async fn run_repl(agent: AgentHandle, config: ReplConfig) -> anyhow::Result<
         .with_registry(Arc::new(registry))
         .with_coding_loop(coding_loop)
         .with_task_service_opt(config.task_service)
-        .with_scheduler_opt(config.scheduler_runner);
+        .with_scheduler_opt(config.scheduler_runner)
+        .with_prompt_assembly(config.prompt_assembly);
 
     let editor_config = EditorConfig {
         prompt: config.prompt.clone(),

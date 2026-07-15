@@ -22,6 +22,7 @@ import { conversationApi } from '../../api/endpoints';
 import type { Workspace } from '../../api/endpoints';
 import type { ConversationListItem } from '../../types/api';
 import { getWorkspaceKind } from '../../lib/workspaceKinds';
+import { fileSystem } from '../../lib/tauri-bridge';
 
 const MAX_RECENT_CONVERSATIONS = 5;
 
@@ -119,7 +120,6 @@ export function LeftSidebar({ onNewTask }: { onNewTask: () => void }) {
   const handleOpenFolder = async (e: React.MouseEvent, ws: Workspace) => {
     e.stopPropagation();
     try {
-      const { fileSystem } = await import('../../lib/tauri-bridge');
       await fileSystem.openPath(ws.root);
     } catch (err) {
       console.error('Open folder failed:', err);

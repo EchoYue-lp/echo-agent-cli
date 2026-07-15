@@ -141,20 +141,27 @@ pub fn load_or_create_cache_user_id() -> String {
     tracing::info!(%id, "created new cache_user_id");
     id
 }
-/// 创建 Agent 实例
-///
-/// Uses `ReactAgentBuilder` to construct the agent. The framework is mode-agnostic;
-/// domain specialization is handled by the Skill system (SKILL.md files).
-///
-/// # Errors
-///
-/// Returns `Err` if the agent builder fails (e.g. missing required config like
-/// an API key or an invalid model name). Callers should surface this to the user
-/// rather than crashing.
+/// Agent plus EKO-owned prompt assembly diagnostics.
+pub struct CreatedAgent {
+    pub agent: ReactAgent,
+    pub prompt_assembly: crate::project::prompt::PromptAssembly,
+}
+
+/// Create an Agent instance without retaining build diagnostics.
 pub async fn create_agent(
     params: &AgentCreateParams,
     app_config: &AppConfig,
 ) -> std::result::Result<ReactAgent, String> {
+    create_agent_with_diagnostics(params, app_config)
+        .await
+        .map(|created| created.agent)
+}
+
+/// Create an agent and retain the application-owned prompt assembly report.
+pub async fn create_agent_with_diagnostics(
+    params: &AgentCreateParams,
+    app_config: &AppConfig,
+) -> std::result::Result<CreatedAgent, String> {
     // Resolve the product-level configured model first. The legacy `model`
     // section is only a persisted mirror/fallback; GUI/CLI/TUI should all
     // converge on configured_models for actual runtime wiring.
@@ -224,7 +231,8 @@ pub async fn create_agent(
     );
     let subagent_catalog = crate::subagent_loader::format_subagent_catalog(&discovered_subagents);
     assembler.add_subagent_catalog(&subagent_catalog);
-    let system_prompt = assembler.assemble();
+    let prompt_assembly = assembler.assemble_with_report();
+    let system_prompt = prompt_assembly.prompt.clone();
 
     // Determine config values from AppConfig
     let token_limit = if app_config.agent.token_limit > 0 {
@@ -485,7 +493,10 @@ pub async fn create_agent(
         );
     }
 
-    Ok(agent)
+    Ok(CreatedAgent {
+        agent,
+        prompt_assembly,
+    })
 }
 
 /// Resolve a worker model frontmatter value to a concrete model id.
