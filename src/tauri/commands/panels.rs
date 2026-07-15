@@ -242,64 +242,9 @@ async fn auto_memory_config_status(
     let messages = current_agent_messages(state).await;
     let observations = echo_agent_app_core::auto_memory::extract_observations(&messages, &config);
     let root = workspace_project_root(state).await?;
-    let memory_path = root.join(".eko").join("project.md");
-    Ok((config, observations.len(), memory_path))
-}
-
-fn persist_auto_memory_observations(
-    memory_path: &Path,
-    observations: &[echo_agent_app_core::auto_memory::Observation],
-) -> Result<(), IpcError> {
-    if observations.is_empty() {
-        return Ok(());
-    }
-
-    let formatted = echo_agent_app_core::auto_memory::format_observations_for_memory(observations);
-    if let Some(parent) = memory_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| IpcError::Internal(format!("Failed to create memory directory: {e}")))?;
-    }
-
-    let existing = std::fs::read_to_string(memory_path).unwrap_or_default();
-    let new_content = if let Some(marker_pos) = existing.find("## Auto-extracted observations") {
-        let before = existing.get(..marker_pos).unwrap_or_default();
-        format!("{}{}", before.trim_end(), formatted)
-    } else if existing.is_empty() {
-        formatted
-    } else {
-        format!("{}\n{}", existing.trim_end(), formatted)
-    };
-
-    std::fs::write(memory_path, new_content)
-        .map_err(|e| IpcError::Internal(format!("Failed to write project memory: {e}")))?;
-    Ok(())
-}
-
-async fn write_auto_memory_observations(
-    state: &TauriState,
-    observations: &[echo_agent_app_core::auto_memory::Observation],
-) -> Result<usize, IpcError> {
-    if observations.is_empty() {
-        return Ok(0);
-    }
-
-    let Some(layer_manager) = state
-        .app_state
-        .connection
-        .primary_agent()
-        .read(|agent| agent.memory_layer_manager().cloned())
-        .await
-    else {
-        tracing::debug!("auto-memory: primary agent has no shared layer manager");
-        return Ok(0);
-    };
-
-    echo_agent_app_core::auto_memory::write_observations_to_memory_layer(
-        observations,
-        &layer_manager,
-    )
-    .await
-    .map_err(IpcError::Internal)
+    let inbox_path =
+        echo_agent_app_core::workspace::layout::WorkspaceLayout::evidence_candidates(&root);
+    Ok((config, observations.len(), inbox_path))
 }
 
 #[tauri::command]
@@ -347,19 +292,21 @@ pub async fn extract_auto_memory(
     let messages = current_agent_messages(&state).await;
     let observations = echo_agent_app_core::auto_memory::extract_observations(&messages, &config);
     let root = workspace_project_root(&state).await?;
-    let memory_path = root.join(".eko").join("project.md");
-    persist_auto_memory_observations(&memory_path, &observations)?;
-    let typed_written = write_auto_memory_observations(&state, &observations).await?;
+    let store = echo_agent_app_core::evolution::EvidenceStore::new(root.join(".eko"));
+    let candidates =
+        echo_agent_app_core::auto_memory::queue_observations(&store, &observations, &messages)
+            .map_err(IpcError::Internal)?;
     let count = observations.len();
     let formatted = echo_agent_app_core::auto_memory::format_observations_for_memory(&observations);
 
     Ok(json!({
         "success": true,
         "count": count,
-        "typed_written": typed_written,
+        "queued": candidates.len(),
+        "candidates": candidates,
         "observations": observations,
         "formatted": formatted,
-        "memory_path": memory_path.display().to_string(),
+        "memory_path": store.path().display().to_string(),
     }))
 }
 
@@ -1382,25 +1329,131 @@ pub async fn review_run(
     let outcome = handle
         .await
         .map_err(|e| IpcError::Internal(format!("Background review task failed to join: {e}")))?;
+    let evidence_candidate = match state.app_state.review_integration.as_ref() {
+        Some(integration) => integration
+            .capture_review_outcome(&outcome)
+            .map_err(IpcError::Internal)?,
+        None => echo_agent_app_core::evolution::capture_review_outcome(
+            &echo_agent_app_core::evolution::EvidenceStore::new(
+                echo_agent_app_core::evolution::discover_echo_agent_dir(),
+            ),
+            &outcome,
+        )
+        .map_err(IpcError::Internal)?,
+    };
     Ok(json!({
         "success": outcome.error.is_none(),
         "run_id": outcome.run_id,
         "actions": outcome.actions,
         "nothing_to_save": outcome.nothing_to_save,
         "candidate": outcome.candidate,
+        "evidence_candidate": evidence_candidate,
         "error": outcome.error,
     }))
 }
 
+async fn evidence_store_for_state(
+    state: &TauriState,
+) -> Result<echo_agent_app_core::evolution::EvidenceStore, IpcError> {
+    if let Some(integration) = state.app_state.review_integration.as_ref() {
+        return Ok(integration.evidence_store());
+    }
+    let root = workspace_project_root(state).await?;
+    Ok(echo_agent_app_core::evolution::EvidenceStore::new(
+        root.join(".eko"),
+    ))
+}
+
+#[tauri::command]
+pub async fn list_evidence_candidates(
+    state: tauri::State<'_, TauriState>,
+    status: Option<String>,
+) -> Result<serde_json::Value, IpcError> {
+    use echo_agent_app_core::evolution::EvidenceCandidateStatus;
+
+    let filter = match status.as_deref() {
+        None | Some("all") => None,
+        Some("pending") => Some(EvidenceCandidateStatus::Pending),
+        Some("applied") => Some(EvidenceCandidateStatus::Applied),
+        Some("rejected") => Some(EvidenceCandidateStatus::Rejected),
+        Some(other) => {
+            return Err(IpcError::Validation(format!(
+                "Unknown evidence status filter: {other}"
+            )));
+        }
+    };
+    let store = evidence_store_for_state(&state).await?;
+    let candidates: Vec<_> = store
+        .list()
+        .map_err(IpcError::Internal)?
+        .into_iter()
+        .filter(|candidate| filter.is_none_or(|value| candidate.status == value))
+        .collect();
+    Ok(json!({
+        "candidates": candidates,
+        "count": candidates.len(),
+        "path": store.path().display().to_string(),
+    }))
+}
+
+#[tauri::command]
+pub async fn evidence_candidate_action(
+    state: tauri::State<'_, TauriState>,
+    action: String,
+    candidate_id: String,
+    content: Option<String>,
+) -> Result<serde_json::Value, IpcError> {
+    let store = evidence_store_for_state(&state).await?;
+    let candidate = match action.as_str() {
+        "edit" => store
+            .edit(&candidate_id, content.as_deref().unwrap_or_default())
+            .map_err(IpcError::Internal)?,
+        "reject" => store.reject(&candidate_id).map_err(IpcError::Internal)?,
+        "accept" | "undo" => {
+            let layer_manager = state
+                .app_state
+                .connection
+                .primary_agent()
+                .read(|agent| agent.memory_layer_manager().cloned())
+                .await
+                .ok_or_else(|| IpcError::Internal("No layered memory manager available".into()))?;
+            if action == "accept" {
+                store
+                    .accept(&candidate_id, content.as_deref(), &layer_manager)
+                    .await
+                    .map_err(IpcError::Internal)?
+            } else {
+                store
+                    .undo(&candidate_id, &layer_manager)
+                    .await
+                    .map_err(IpcError::Internal)?
+            }
+        }
+        other => {
+            return Err(IpcError::Validation(format!(
+                "Unknown evidence action: {other}"
+            )));
+        }
+    };
+    Ok(json!({ "success": true, "candidate": candidate }))
+}
+
 #[tauri::command]
 pub async fn curator_action(
-    _state: tauri::State<'_, TauriState>,
+    state: tauri::State<'_, TauriState>,
     action: String,
     skill_name: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    let curator = echo_agent::evolution::Curator::default_path(
-        echo_agent::evolution::CuratorConfig::default(),
-    );
+    let curator = state
+        .app_state
+        .review_integration
+        .as_ref()
+        .map(|integration| integration.curator())
+        .unwrap_or_else(|| {
+            echo_agent_app_core::evolution::workspace_curator(
+                &echo_agent_app_core::evolution::discover_echo_agent_dir(),
+            )
+        });
 
     match action.as_str() {
         "status" => Ok(json!({
@@ -1411,6 +1464,16 @@ pub async fn curator_action(
             let transitions = curator
                 .apply_transitions()
                 .map_err(|e| IpcError::Internal(e.to_string()))?;
+            state
+                .app_state
+                .connection
+                .primary_agent()
+                .write_async(|agent| {
+                    Box::pin(async move {
+                        agent.reconcile_skill_load_policy().await;
+                    })
+                })
+                .await;
             let transition_values: Vec<serde_json::Value> = transitions
                 .iter()
                 .map(|(skill, from, to)| {
@@ -1667,7 +1730,14 @@ pub async fn generate_skill_draft(
     );
     let typed = echo_agent::memory::TypedMemoryStore::new(store);
 
-    let generator = echo_agent::evolution::SkillDraftGenerator::new(echo_agent_dir, &change_log);
+    let curator = state
+        .app_state
+        .review_integration
+        .as_ref()
+        .map(|integration| integration.curator())
+        .unwrap_or_else(|| echo_agent_app_core::evolution::workspace_curator(&echo_agent_dir));
+    let generator = echo_agent::evolution::SkillDraftGenerator::new(echo_agent_dir, &change_log)
+        .with_curator(curator);
     let result = generator
         .generate(&name, &typed)
         .await
@@ -1715,12 +1785,39 @@ pub async fn activate_skill_draft(
         .map_err(|e| IpcError::Internal(format!("Failed to copy draft SKILL.md: {e}")))?;
 
     // curator 状态 Draft→Active。
-    let curator = echo_agent::evolution::Curator::default_path(
-        echo_agent::evolution::CuratorConfig::default(),
-    );
-    if let Err(e) = curator.promote_to_active(&name) {
-        tracing::warn!(name = %name, error = %e, "Failed to promote '{}' to active", name);
+    let curator = state
+        .app_state
+        .review_integration
+        .as_ref()
+        .map(|integration| integration.curator())
+        .unwrap_or_else(|| echo_agent_app_core::evolution::workspace_curator(&echo_agent_dir));
+    let active_skill_path = target_dir.join("SKILL.md");
+    match curator.promote_to_active_at(&name, Some(&active_skill_path)) {
+        Ok(true) => {}
+        Ok(false) => {
+            let _ = std::fs::remove_file(&active_skill_path);
+            return Err(IpcError::Validation(format!(
+                "Skill '{name}' is not in Draft lifecycle state"
+            )));
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&active_skill_path);
+            return Err(IpcError::Internal(format!(
+                "Failed to promote '{name}' to active: {error}"
+            )));
+        }
     }
+
+    let load_root = target_dir
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| target_dir.clone());
+    agent
+        .write_async(|runtime| {
+            Box::pin(async move { runtime.load_skills_from_dir(load_root).await })
+        })
+        .await
+        .map_err(|error| IpcError::Internal(format!("Failed to load activated skill: {error}")))?;
 
     echo_agent_app_core::evolution::fire_evolution_hook(
         &agent,

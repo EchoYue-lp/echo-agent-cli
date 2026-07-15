@@ -619,6 +619,39 @@ export interface SkillCandidateInfo {
   confidence: number;
 }
 
+export type EvidenceCandidateStatus = 'pending' | 'applied' | 'rejected';
+export type EvidenceKind =
+  | 'user_preference'
+  | 'project_fact'
+  | 'debugging_lesson'
+  | 'error_resolution'
+  | 'workflow_pattern'
+  | 'skill';
+
+export interface EvidenceRef {
+  source: 'background_reviewer' | 'trigger_detector' | 'auto_memory';
+  source_run_id?: string;
+  source_role?: string;
+  source_turn?: number;
+  quote: string;
+}
+
+export interface EvidenceCandidate {
+  schema_version: number;
+  candidate_id: string;
+  fingerprint: string;
+  kind: EvidenceKind;
+  scope: { kind: 'user' | 'workspace' | 'session'; id: string };
+  content: string;
+  evidence: EvidenceRef[];
+  confidence: number;
+  status: EvidenceCandidateStatus;
+  target?: { kind: 'memory'; key: string };
+  revision: number;
+  created_at: string;
+  updated_at: string;
+}
+
 // ── Provider types ──────────────────────────────────────────────────────────
 
 export interface ProviderTemplate {

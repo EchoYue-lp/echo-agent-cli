@@ -404,12 +404,12 @@ pub enum ObservationCategory {
 
 `deduplicate_observations` (`mod.rs:262-282`) 按 category + 文本长度倒序排，丢弃"短的（≤20 字符）是别人前缀"的项。
 
-`append_to_project_memory(observations)` (`mod.rs:326-364`)：写到 `<project_root>/.eko/project.md`。如果文件已含 `## Auto-extracted observations`，从该 marker 开始截断后追加新版（语义是**替换**该段而非累加）。
+EKO 不再把启发式观察直接写入 `.eko/project.md` 或 typed memory。`queue_observations` 将每条观察转换为带 source role/turn/exact quote 的 `EvidenceCandidate`，写入 `.eko/evolution/evidence-candidates.jsonl`；用户在 Review Inbox 采纳后才通过共享 `MemoryLayerManager` 写长期记忆。
 
 #### 触发点
 
 - REPL 退出 hook：`echo-agent-cli/src/cli/repl.rs:189-258` 的 `run_auto_memory_on_exit(agent)`；受 `AUTO_MEMORY_ENABLED` atomic flag 控制（`L201`）。
-- 显式 slash command：`echo-agent-cli/src/cli/cmd_impls/all.rs:306-342` 调用 `run_auto_memory_extraction()`（便捷封装）。
+- 显式 slash command：CLI/TUI `/auto-memory extract` 和 GUI Memory Panel「送审」均写 Review Inbox。
 
 ### §9.2 `BackgroundReviewer`（框架、LLM）
 
@@ -435,7 +435,7 @@ pub struct BackgroundReviewer {
 | 用户显式发"帮我从这次对话里学一些经验" | `BackgroundReviewer`（LLM 生成带证据候选，默认不写记忆） |
 | 大批量历史对话的回顾分析 | `BackgroundReviewer` |
 
-二者的职责不同：`auto_memory` 仍会写 `.md`/typed memory；`BackgroundReviewer` 默认只返回候选，只有框架复用方显式开启 `auto_persist_user_preferences` 才可能把高置信用户偏好写成 Draft memory。
+二者的检测方式不同，但 EKO 的持久化出口相同：`auto_memory` 提供零 LLM 的启发式候选，`BackgroundReviewer` 提供带精确证据的 LLM 候选；两者都进入统一 Review Inbox，不直接改长期记忆。
 
 ---
 

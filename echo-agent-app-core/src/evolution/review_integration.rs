@@ -14,8 +14,8 @@
 //! framework internals.
 
 use echo_agent::evolution::{
-    MemoryLayerManager, MemoryReviewer, MemoryRuntimeIntegrationBuilder, ReviewChange,
-    ReviewConfig, ReviewReport, SkillCandidateDetector, SkillDraftGenerator,
+    Curator, CuratorConfig, MemoryLayerManager, MemoryReviewer, MemoryRuntimeIntegrationBuilder,
+    ReviewChange, ReviewConfig, ReviewReport, SkillCandidateDetector, SkillDraftGenerator,
 };
 use echo_agent::memory::Store;
 use echo_agent::memory::TypedMemoryStore;
@@ -23,6 +23,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use super::evidence::{
+    EvidenceCandidate, EvidenceCandidateDraft, EvidenceKind, EvidenceRef, EvidenceSource,
+    EvidenceStore, capture_review_outcome,
+};
 
 /// Bridges the framework's review system into the product lifecycle.
 ///
@@ -71,6 +76,29 @@ impl ReviewIntegration {
     /// Get the current review config.
     pub fn config(&self) -> &ReviewConfig {
         &self.config
+    }
+
+    /// Workspace-scoped evidence store bound to the current memory root.
+    pub fn evidence_store(&self) -> EvidenceStore {
+        EvidenceStore::new(self.current_echo_agent_dir())
+    }
+
+    /// Current workspace-local `.eko` root used by evolution artifacts.
+    pub fn echo_agent_dir(&self) -> PathBuf {
+        self.current_echo_agent_dir()
+    }
+
+    /// Workspace-scoped curator bound to the current memory root.
+    pub fn curator(&self) -> Curator {
+        workspace_curator(&self.current_echo_agent_dir())
+    }
+
+    /// Persist a structured background-review proposal in the unified inbox.
+    pub fn capture_review_outcome(
+        &self,
+        outcome: &echo_agent::evolution::ReviewOutcome,
+    ) -> Result<Option<EvidenceCandidate>, String> {
+        capture_review_outcome(&self.evidence_store(), outcome)
     }
 
     /// Get the write counter (for diagnostics / testing).
@@ -135,7 +163,7 @@ impl ReviewIntegration {
 
         // ── Skill candidate detection ──────────────────────────────
         if self.config.detect_skill_candidates {
-            let detector = SkillCandidateDetector::new();
+            let detector = SkillCandidateDetector::new().with_curator(self.curator());
             match detector.detect(&typed_store, change_log.as_ref()).await {
                 Ok(candidate_report) => {
                     for candidate in &candidate_report.new_candidates {
@@ -151,7 +179,8 @@ impl ReviewIntegration {
                         && !candidate_report.new_candidates.is_empty()
                     {
                         let generator =
-                            SkillDraftGenerator::new(echo_agent_dir.clone(), change_log.as_ref());
+                            SkillDraftGenerator::new(echo_agent_dir.clone(), change_log.as_ref())
+                                .with_curator(self.curator());
                         for candidate in &candidate_report.new_candidates {
                             match generator.generate_from_candidate(candidate).await {
                                 Ok(draft_result) => {
@@ -213,6 +242,108 @@ impl ReviewIntegration {
             .write_counter(self.write_counter.clone())
             .review_every_n_writes(self.config.review_every_n_writes)
     }
+
+    fn current_echo_agent_dir(&self) -> PathBuf {
+        self.echo_agent_dir
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_else(|error| error.into_inner().clone())
+    }
+}
+
+impl echo_agent::evolution::MemoryTriggerSink for ReviewIntegration {
+    fn on_trigger<'a>(
+        &'a self,
+        trigger: &'a echo_agent::evolution::TriggerMatch,
+    ) -> futures::future::BoxFuture<
+        'a,
+        std::result::Result<echo_agent::evolution::MemoryTriggerDisposition, String>,
+    > {
+        Box::pin(async move {
+            let kind = match trigger.memory_type {
+                echo_agent::memory::MemoryType::UserPreference => EvidenceKind::UserPreference,
+                echo_agent::memory::MemoryType::DebuggingLesson => EvidenceKind::DebuggingLesson,
+                echo_agent::memory::MemoryType::ErrorResolution => EvidenceKind::ErrorResolution,
+                echo_agent::memory::MemoryType::WorkflowPattern => EvidenceKind::WorkflowPattern,
+                _ => EvidenceKind::ProjectFact,
+            };
+            let evidence = trigger
+                .evidence
+                .iter()
+                .map(|item| EvidenceRef {
+                    source: EvidenceSource::TriggerDetector,
+                    source_run_id: None,
+                    source_role: Some(item.source_role.clone()),
+                    source_turn: None,
+                    quote: item.quote.clone(),
+                })
+                .collect();
+            if let Err(error) = self.evidence_store().upsert(EvidenceCandidateDraft {
+                kind,
+                scope: matches!(kind, EvidenceKind::UserPreference)
+                    .then(|| super::evidence::EvidenceScope::User("local-user".to_string())),
+                content: trigger.content.clone(),
+                evidence,
+                confidence: trigger.confidence,
+            }) {
+                // EKO treats inferred memory as review-only. Do not let an inbox
+                // storage failure fall through to the framework's direct durable
+                // write path and silently bypass that review gate.
+                tracing::warn!(%error, "failed to queue trigger evidence; candidate dropped");
+            }
+            Ok(echo_agent::evolution::MemoryTriggerDisposition::Captured)
+        })
+    }
+}
+
+impl echo_agent::skills::external::SkillLoadPolicy for ReviewIntegration {
+    fn allows(&self, descriptor: &echo_agent::skills::external::SkillDescriptor) -> bool {
+        if descriptor
+            .location
+            .ancestors()
+            .any(|ancestor| ancestor.file_name().and_then(|name| name.to_str()) == Some("_drafts"))
+        {
+            return false;
+        }
+        let current_root = self.current_echo_agent_dir().join("skills");
+        if let Some(skill_root) = workspace_skill_root(&descriptor.location)
+            && normalize_path(&skill_root) != normalize_path(&current_root)
+        {
+            return false;
+        }
+        let Some(meta) = self.curator().skill_for_path(&descriptor.location) else {
+            return true;
+        };
+        matches!(
+            meta.lifecycle,
+            echo_agent::evolution::SkillLifecycle::Active
+                | echo_agent::evolution::SkillLifecycle::Stale
+        )
+    }
+}
+
+fn workspace_skill_root(path: &std::path::Path) -> Option<PathBuf> {
+    path.ancestors().find_map(|ancestor| {
+        let is_skills = ancestor.file_name().and_then(|name| name.to_str()) == Some("skills");
+        let parent_is_eko = ancestor
+            .parent()
+            .and_then(|parent| parent.file_name())
+            .and_then(|name| name.to_str())
+            == Some(".eko");
+        (is_skills && parent_is_eko).then(|| ancestor.to_path_buf())
+    })
+}
+
+fn normalize_path(path: &std::path::Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Construct the authoritative curator for one `.eko`/framework state directory.
+pub fn workspace_curator(echo_agent_dir: &std::path::Path) -> Curator {
+    Curator::new(
+        CuratorConfig::default(),
+        echo_agent_dir.join("evolution").join("curator-state.json"),
+    )
 }
 
 /// Discover the `.eko/` directory for the current project.
@@ -366,6 +497,39 @@ mod tests {
         assert!(text.contains("10 entries scanned"));
         assert!(text.contains("Stale entries (flagged): 3"));
         assert!(text.contains("Archived 'old_fact'"));
+    }
+
+    #[test]
+    fn skill_policy_blocks_drafts_and_foreign_workspaces() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let echo_dir = temp.path().join("workspace-a/.eko");
+        let store = Arc::new(echo_agent::memory::InMemoryStore::new()) as Arc<dyn Store>;
+        let integration = ReviewIntegration::new(ReviewConfig::default(), echo_dir.clone(), store);
+        let mut descriptor = echo_agent::skills::external::parse_skill_md(
+            "---\nname: test-skill\ndescription: test skill\n---\nbody",
+        )
+        .map_err(|error| error.to_string())?;
+
+        descriptor.location = echo_dir.join("skills/_drafts/test-skill/SKILL.md");
+        assert!(!echo_agent::skills::external::SkillLoadPolicy::allows(
+            &integration,
+            &descriptor,
+        ));
+
+        descriptor.location = echo_dir.join("skills/test-skill/SKILL.md");
+        assert!(echo_agent::skills::external::SkillLoadPolicy::allows(
+            &integration,
+            &descriptor,
+        ));
+
+        descriptor.location = temp
+            .path()
+            .join("workspace-b/.eko/skills/test-skill/SKILL.md");
+        assert!(!echo_agent::skills::external::SkillLoadPolicy::allows(
+            &integration,
+            &descriptor,
+        ));
+        Ok(())
     }
 
     #[tokio::test]

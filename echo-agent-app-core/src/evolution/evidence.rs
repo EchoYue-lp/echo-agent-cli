@@ -1,0 +1,602 @@
+//! Workspace-scoped evidence candidates backed by an append-only JSONL log.
+
+use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use chrono::{DateTime, Utc};
+use fs2::FileExt;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+const SCHEMA_VERSION: u32 = 1;
+const MAX_EVIDENCE_ITEMS: usize = 16;
+const MAX_EVIDENCE_CHARS: usize = 1_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceSource {
+    BackgroundReviewer,
+    TriggerDetector,
+    AutoMemory,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceKind {
+    UserPreference,
+    ProjectFact,
+    DebuggingLesson,
+    ErrorResolution,
+    WorkflowPattern,
+    Skill,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
+pub enum EvidenceScope {
+    User(String),
+    Workspace(String),
+    Session(String),
+}
+
+impl EvidenceScope {
+    fn fingerprint_key(&self) -> String {
+        match self {
+            Self::User(id) => format!("user:{id}"),
+            Self::Workspace(id) => format!("workspace:{id}"),
+            Self::Session(id) => format!("session:{id}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceRef {
+    pub source: EvidenceSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_turn: Option<usize>,
+    pub quote: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceCandidateStatus {
+    Pending,
+    Applied,
+    Rejected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EvidenceTarget {
+    Memory { key: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvidenceCandidate {
+    pub schema_version: u32,
+    pub candidate_id: String,
+    pub fingerprint: String,
+    pub kind: EvidenceKind,
+    pub scope: EvidenceScope,
+    pub content: String,
+    pub evidence: Vec<EvidenceRef>,
+    pub confidence: f32,
+    pub status: EvidenceCandidateStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<EvidenceTarget>,
+    pub revision: u64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EvidenceCandidateDraft {
+    pub kind: EvidenceKind,
+    pub scope: Option<EvidenceScope>,
+    pub content: String,
+    pub evidence: Vec<EvidenceRef>,
+    pub confidence: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct EvidenceStore {
+    path: PathBuf,
+    scope: EvidenceScope,
+}
+
+/// Convert and persist a framework background-review proposal.
+pub fn capture_review_outcome(
+    store: &EvidenceStore,
+    outcome: &echo_agent::evolution::ReviewOutcome,
+) -> Result<Option<EvidenceCandidate>, String> {
+    let Some(candidate) = &outcome.candidate else {
+        return Ok(None);
+    };
+    let kind = match candidate.kind {
+        echo_agent::evolution::ReviewCandidateKind::UserPreference => EvidenceKind::UserPreference,
+        echo_agent::evolution::ReviewCandidateKind::ProjectFact => EvidenceKind::ProjectFact,
+        echo_agent::evolution::ReviewCandidateKind::DebuggingLesson => {
+            EvidenceKind::DebuggingLesson
+        }
+        echo_agent::evolution::ReviewCandidateKind::Skill => EvidenceKind::Skill,
+    };
+    store
+        .upsert(EvidenceCandidateDraft {
+            kind,
+            scope: matches!(kind, EvidenceKind::UserPreference)
+                .then(|| EvidenceScope::User("local-user".to_string())),
+            content: candidate.content.clone(),
+            evidence: vec![EvidenceRef {
+                source: EvidenceSource::BackgroundReviewer,
+                source_run_id: Some(outcome.run_id.clone()),
+                source_role: None,
+                source_turn: None,
+                quote: candidate.evidence.clone(),
+            }],
+            confidence: candidate.confidence,
+        })
+        .map(Some)
+}
+
+impl EvidenceStore {
+    pub fn new(echo_agent_dir: impl Into<PathBuf>) -> Self {
+        let echo_agent_dir = echo_agent_dir.into();
+        let scope_root = echo_agent_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| echo_agent_dir.clone());
+        let normalized_root = scope_root
+            .canonicalize()
+            .unwrap_or_else(|_| scope_root.clone());
+        Self {
+            path: echo_agent_dir
+                .join("evolution")
+                .join("evidence-candidates.jsonl"),
+            scope: EvidenceScope::Workspace(normalized_root.display().to_string()),
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn scope(&self) -> &EvidenceScope {
+        &self.scope
+    }
+
+    pub fn upsert(&self, mut draft: EvidenceCandidateDraft) -> Result<EvidenceCandidate, String> {
+        draft.content = normalize_content(&draft.content);
+        if draft.content.is_empty() {
+            return Err("evidence candidate content cannot be empty".to_string());
+        }
+        draft.confidence = draft.confidence.clamp(0.0, 1.0);
+        draft.evidence = sanitize_evidence(draft.evidence);
+        if draft.evidence.is_empty() {
+            return Err("evidence candidate requires at least one source excerpt".to_string());
+        }
+
+        self.with_locked_log(|latest, file| {
+            let scope = draft.scope.clone().unwrap_or_else(|| self.scope.clone());
+            let fingerprint = candidate_fingerprint(draft.kind, &scope, &draft.content);
+            if let Some(existing) = latest
+                .values()
+                .find(|candidate| candidate.fingerprint == fingerprint)
+            {
+                let mut updated = existing.clone();
+                let mut changed = false;
+                for evidence in &draft.evidence {
+                    if updated.evidence.len() >= MAX_EVIDENCE_ITEMS {
+                        break;
+                    }
+                    if !updated.evidence.contains(evidence) {
+                        updated.evidence.push(evidence.clone());
+                        changed = true;
+                    }
+                }
+                let confidence = updated.confidence.max(draft.confidence);
+                if (confidence - updated.confidence).abs() > f32::EPSILON {
+                    updated.confidence = confidence;
+                    changed = true;
+                }
+                if changed {
+                    updated.revision = updated.revision.saturating_add(1);
+                    updated.updated_at = Utc::now();
+                    append_snapshot(file, &updated)?;
+                }
+                return Ok(updated);
+            }
+
+            let now = Utc::now();
+            let candidate = EvidenceCandidate {
+                schema_version: SCHEMA_VERSION,
+                candidate_id: format!("ec_{}", uuid::Uuid::new_v4().simple()),
+                fingerprint,
+                kind: draft.kind,
+                scope,
+                content: draft.content,
+                evidence: draft.evidence,
+                confidence: draft.confidence,
+                status: EvidenceCandidateStatus::Pending,
+                target: None,
+                revision: 1,
+                created_at: now,
+                updated_at: now,
+            };
+            append_snapshot(file, &candidate)?;
+            Ok(candidate)
+        })
+    }
+
+    pub fn list(&self) -> Result<Vec<EvidenceCandidate>, String> {
+        let mut candidates: Vec<_> = self.read_latest()?.into_values().collect();
+        candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.updated_at));
+        Ok(candidates)
+    }
+
+    pub fn get(&self, candidate_id: &str) -> Result<Option<EvidenceCandidate>, String> {
+        Ok(self.read_latest()?.remove(candidate_id))
+    }
+
+    pub fn edit(&self, candidate_id: &str, content: &str) -> Result<EvidenceCandidate, String> {
+        let normalized = normalize_content(content);
+        if normalized.is_empty() {
+            return Err("edited candidate content cannot be empty".to_string());
+        }
+        self.update(candidate_id, |candidate, latest| {
+            if candidate.status == EvidenceCandidateStatus::Applied {
+                return Err("undo an applied candidate before editing it".to_string());
+            }
+            let fingerprint = candidate_fingerprint(candidate.kind, &candidate.scope, &normalized);
+            if latest.values().any(|other| {
+                other.candidate_id != candidate.candidate_id && other.fingerprint == fingerprint
+            }) {
+                return Err("edited content duplicates another candidate".to_string());
+            }
+            candidate.content = normalized;
+            candidate.fingerprint = fingerprint;
+            Ok(())
+        })
+    }
+
+    pub fn reject(&self, candidate_id: &str) -> Result<EvidenceCandidate, String> {
+        self.update(candidate_id, |candidate, _| {
+            if candidate.status == EvidenceCandidateStatus::Applied {
+                return Err("undo an applied candidate before rejecting it".to_string());
+            }
+            candidate.status = EvidenceCandidateStatus::Rejected;
+            Ok(())
+        })
+    }
+
+    pub async fn accept(
+        &self,
+        candidate_id: &str,
+        edited_content: Option<&str>,
+        layer_manager: &Arc<echo_agent::evolution::MemoryLayerManager>,
+    ) -> Result<EvidenceCandidate, String> {
+        let mut candidate = self
+            .get(candidate_id)?
+            .ok_or_else(|| format!("evidence candidate '{candidate_id}' not found"))?;
+        if let Some(content) = edited_content {
+            candidate = self.edit(candidate_id, content)?;
+        }
+        if candidate.status == EvidenceCandidateStatus::Applied {
+            return Ok(candidate);
+        }
+        let memory_type = memory_type_for_kind(candidate.kind)?;
+        let key = format!("evidence_{}", candidate.candidate_id);
+        let meta = echo_agent::memory::MemoryMeta::new(
+            memory_type,
+            echo_agent::memory::MemorySource::ExplicitSave,
+            "evidence_inbox",
+        )
+        .with_confidence(candidate.confidence);
+        layer_manager
+            .write_memory(&key, &candidate.content, meta)
+            .await
+            .map_err(|error| format!("failed to apply evidence candidate: {error}"))?;
+
+        let update_result = self.update(candidate_id, |candidate, _| {
+            candidate.status = EvidenceCandidateStatus::Applied;
+            candidate.target = Some(EvidenceTarget::Memory { key: key.clone() });
+            Ok(())
+        });
+        match update_result {
+            Ok(candidate) => Ok(candidate),
+            Err(update_error) => match layer_manager.delete_memory(&key).await {
+                Ok(_) => Err(format!(
+                    "failed to record applied evidence candidate; memory write was rolled back: {update_error}"
+                )),
+                Err(rollback_error) => Err(format!(
+                    "failed to record applied evidence candidate ({update_error}); failed to roll back memory write ({rollback_error})"
+                )),
+            },
+        }
+    }
+
+    pub async fn undo(
+        &self,
+        candidate_id: &str,
+        layer_manager: &Arc<echo_agent::evolution::MemoryLayerManager>,
+    ) -> Result<EvidenceCandidate, String> {
+        let candidate = self
+            .get(candidate_id)?
+            .ok_or_else(|| format!("evidence candidate '{candidate_id}' not found"))?;
+        let Some(EvidenceTarget::Memory { key }) = candidate.target.as_ref() else {
+            return Err("candidate has no applied memory to undo".to_string());
+        };
+        let memory_type = memory_type_for_kind(candidate.kind)?;
+        layer_manager
+            .delete_memory(key)
+            .await
+            .map_err(|error| format!("failed to remove applied memory: {error}"))?;
+        let update_result = self.update(candidate_id, |candidate, _| {
+            candidate.status = EvidenceCandidateStatus::Pending;
+            candidate.target = None;
+            Ok(())
+        });
+        match update_result {
+            Ok(candidate) => Ok(candidate),
+            Err(update_error) => {
+                let meta = echo_agent::memory::MemoryMeta::new(
+                    memory_type,
+                    echo_agent::memory::MemorySource::ExplicitSave,
+                    "evidence_inbox",
+                )
+                .with_confidence(candidate.confidence);
+                match layer_manager
+                    .write_memory(key, &candidate.content, meta)
+                    .await
+                {
+                    Ok(_) => Err(format!(
+                        "failed to record evidence undo; memory deletion was rolled back: {update_error}"
+                    )),
+                    Err(rollback_error) => Err(format!(
+                        "failed to record evidence undo ({update_error}); failed to restore memory ({rollback_error})"
+                    )),
+                }
+            }
+        }
+    }
+
+    fn update<F>(&self, candidate_id: &str, mutate: F) -> Result<EvidenceCandidate, String>
+    where
+        F: FnOnce(
+            &mut EvidenceCandidate,
+            &HashMap<String, EvidenceCandidate>,
+        ) -> Result<(), String>,
+    {
+        self.with_locked_log(|latest, file| {
+            let mut candidate = latest
+                .get(candidate_id)
+                .cloned()
+                .ok_or_else(|| format!("evidence candidate '{candidate_id}' not found"))?;
+            mutate(&mut candidate, latest)?;
+            candidate.revision = candidate.revision.saturating_add(1);
+            candidate.updated_at = Utc::now();
+            append_snapshot(file, &candidate)?;
+            Ok(candidate)
+        })
+    }
+
+    fn read_latest(&self) -> Result<HashMap<String, EvidenceCandidate>, String> {
+        if !self.path.exists() {
+            return Ok(HashMap::new());
+        }
+        let lock_path = self.path.with_extension("jsonl.lock");
+        let lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|error| format!("failed to open evidence lock: {error}"))?;
+        lock.lock_shared()
+            .map_err(|error| format!("failed to lock evidence log for reading: {error}"))?;
+        let result = File::open(&self.path)
+            .map_err(|error| format!("failed to open evidence log: {error}"))
+            .and_then(read_latest_from);
+        let _ = lock.unlock();
+        result
+    }
+
+    fn with_locked_log<T, F>(&self, operation: F) -> Result<T, String>
+    where
+        F: FnOnce(&HashMap<String, EvidenceCandidate>, &mut File) -> Result<T, String>,
+    {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("failed to create evidence directory: {error}"))?;
+        }
+        let lock_path = self.path.with_extension("jsonl.lock");
+        let lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|error| format!("failed to open evidence lock: {error}"))?;
+        lock.lock_exclusive()
+            .map_err(|error| format!("failed to lock evidence log: {error}"))?;
+
+        let latest = if self.path.exists() {
+            let read_file = File::open(&self.path)
+                .map_err(|error| format!("failed to open evidence log: {error}"))?;
+            read_latest_from(read_file)?
+        } else {
+            HashMap::new()
+        };
+        let mut append_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(|error| format!("failed to append evidence log: {error}"))?;
+        let result = operation(&latest, &mut append_file);
+        let _ = lock.unlock();
+        result
+    }
+}
+
+fn read_latest_from(file: File) -> Result<HashMap<String, EvidenceCandidate>, String> {
+    let mut latest = HashMap::new();
+    for (index, line) in BufReader::new(file).lines().enumerate() {
+        let line = line.map_err(|error| format!("failed to read evidence line: {error}"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let candidate: EvidenceCandidate = serde_json::from_str(&line).map_err(|error| {
+            format!(
+                "invalid evidence JSONL record at line {}: {error}",
+                index.saturating_add(1)
+            )
+        })?;
+        latest.insert(candidate.candidate_id.clone(), candidate);
+    }
+    Ok(latest)
+}
+
+fn append_snapshot(file: &mut File, candidate: &EvidenceCandidate) -> Result<(), String> {
+    let mut line = serde_json::to_vec(candidate)
+        .map_err(|error| format!("failed to serialize evidence candidate: {error}"))?;
+    line.push(b'\n');
+    file.write_all(&line)
+        .map_err(|error| format!("failed to write evidence candidate: {error}"))?;
+    file.sync_data()
+        .map_err(|error| format!("failed to sync evidence candidate: {error}"))
+}
+
+fn normalize_content(content: &str) -> String {
+    content.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn sanitize_evidence(evidence: Vec<EvidenceRef>) -> Vec<EvidenceRef> {
+    let mut result = Vec::new();
+    for mut item in evidence {
+        item.quote = item.quote.trim().chars().take(MAX_EVIDENCE_CHARS).collect();
+        if !item.quote.is_empty() && !result.contains(&item) {
+            result.push(item);
+        }
+        if result.len() >= MAX_EVIDENCE_ITEMS {
+            break;
+        }
+    }
+    result
+}
+
+fn candidate_fingerprint(kind: EvidenceKind, scope: &EvidenceScope, content: &str) -> String {
+    let normalized = normalize_content(content).to_lowercase();
+    let mut hasher = Sha256::new();
+    hasher.update(format!(
+        "{kind:?}\n{}\n{normalized}",
+        scope.fingerprint_key()
+    ));
+    hex::encode(hasher.finalize())
+}
+
+fn memory_type_for_kind(kind: EvidenceKind) -> Result<echo_agent::memory::MemoryType, String> {
+    match kind {
+        EvidenceKind::UserPreference => Ok(echo_agent::memory::MemoryType::UserPreference),
+        EvidenceKind::ProjectFact => Ok(echo_agent::memory::MemoryType::ProjectFact),
+        EvidenceKind::DebuggingLesson => Ok(echo_agent::memory::MemoryType::DebuggingLesson),
+        EvidenceKind::ErrorResolution => Ok(echo_agent::memory::MemoryType::ErrorResolution),
+        EvidenceKind::WorkflowPattern => Ok(echo_agent::memory::MemoryType::WorkflowPattern),
+        EvidenceKind::Skill => {
+            Err("skill evidence must use the dedicated skill candidate review flow".to_string())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn draft(content: &str, quote: &str) -> EvidenceCandidateDraft {
+        EvidenceCandidateDraft {
+            kind: EvidenceKind::ProjectFact,
+            scope: None,
+            content: content.to_string(),
+            evidence: vec![EvidenceRef {
+                source: EvidenceSource::AutoMemory,
+                source_run_id: None,
+                source_role: Some("assistant".to_string()),
+                source_turn: Some(1),
+                quote: quote.to_string(),
+            }],
+            confidence: 0.8,
+        }
+    }
+
+    #[test]
+    fn deduplicates_by_scope_kind_and_normalized_content() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let store = EvidenceStore::new(temp.path().join(".eko"));
+        let first = store.upsert(draft("Project uses Rust", "first"))?;
+        let second = store.upsert(draft("  project   uses RUST ", "second"))?;
+
+        assert_eq!(first.candidate_id, second.candidate_id);
+        assert_eq!(second.evidence.len(), 2);
+        assert_eq!(store.list()?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn rejected_candidate_is_not_resurrected_by_duplicate_evidence() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let store = EvidenceStore::new(temp.path().join(".eko"));
+        let candidate = store.upsert(draft("Keep JSONL", "first"))?;
+        store.reject(&candidate.candidate_id)?;
+        let duplicate = store.upsert(draft("keep jsonl", "second"))?;
+
+        assert_eq!(duplicate.status, EvidenceCandidateStatus::Rejected);
+        assert_eq!(duplicate.evidence.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn editing_does_not_reuse_fingerprint_derived_candidate_ids() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let store = EvidenceStore::new(temp.path().join(".eko"));
+        let original = store.upsert(draft("Original project fact", "first"))?;
+        let edited = store.edit(&original.candidate_id, "Edited project fact")?;
+        let repeated_original = store.upsert(draft("Original project fact", "second"))?;
+
+        assert_eq!(edited.candidate_id, original.candidate_id);
+        assert_ne!(repeated_original.candidate_id, original.candidate_id);
+        assert_eq!(store.list()?.len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn accept_and_undo_are_backed_by_layered_memory() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let store = EvidenceStore::new(temp.path().join(".eko"));
+        let candidate = store.upsert(draft("Use append-only JSONL", "decision evidence"))?;
+        let memory_store = Arc::new(echo_agent::memory::InMemoryStore::new());
+        let change_log = echo_agent::evolution::JsonlChangeLog::new(
+            temp.path().join(".eko/evolution/change-log.jsonl"),
+        );
+        let layer_manager = Arc::new(echo_agent::evolution::MemoryLayerManager::new(
+            temp.path().join(".eko"),
+            memory_store,
+            Box::new(change_log),
+        ));
+
+        let accepted = store
+            .accept(&candidate.candidate_id, None, &layer_manager)
+            .await?;
+        assert_eq!(accepted.status, EvidenceCandidateStatus::Applied);
+        assert!(accepted.target.is_some());
+
+        let undone = store.undo(&candidate.candidate_id, &layer_manager).await?;
+        assert_eq!(undone.status, EvidenceCandidateStatus::Pending);
+        assert!(undone.target.is_none());
+        Ok(())
+    }
+}

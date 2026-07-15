@@ -55,12 +55,27 @@ impl WorkspaceLayout {
     /// 动态记忆 store 文件：`{root}/.eko/memory/store.json`
     ///
     /// Warm-layer KV store for agent-learned dynamic memories (remember /
-    /// AutoMemory / L3 promotion / TaskRuntime memory_bridge writes).
+    /// accepted evidence / L3 promotion / TaskRuntime memory_bridge writes).
     /// Physically isolated per workspace/project so memories don't leak
     /// across projects (mirrors how hot-layer `MEMORY.md` already follows
     /// the project root).
     pub fn memory_store(root: &Path) -> PathBuf {
         Self::memory(root).join("store.json")
+    }
+
+    /// 自进化状态目录：`{root}/.eko/evolution/`
+    pub fn evolution(root: &Path) -> PathBuf {
+        Self::state_dir(root).join("evolution")
+    }
+
+    /// 统一证据候选日志：`{root}/.eko/evolution/evidence-candidates.jsonl`
+    pub fn evidence_candidates(root: &Path) -> PathBuf {
+        Self::evolution(root).join("evidence-candidates.jsonl")
+    }
+
+    /// 工作区 Curator 状态：`{root}/.eko/evolution/curator-state.json`
+    pub fn curator_state(root: &Path) -> PathBuf {
+        Self::evolution(root).join("curator-state.json")
     }
 
     /// 数据集目录（数据分析工作区）：`{root}/.eko/data/`
@@ -128,6 +143,7 @@ impl WorkspaceLayout {
             Self::sessions(root),
             Self::conversations(root),
             Self::memory(root),
+            Self::evolution(root),
             Self::data(root),
             Self::papers(root),
             Self::artifacts(root),

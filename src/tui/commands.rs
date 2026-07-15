@@ -111,6 +111,7 @@ pub enum SlashCommand {
     Cron,
     AutoMemory,
     RunReview,
+    EvidenceInbox,
     MemoryReview,
     SkillCandidates,
 
@@ -176,6 +177,7 @@ impl SlashCommand {
             Self::Cron => "Manage scheduled tasks",
             Self::AutoMemory => "Toggle auto-memory",
             Self::RunReview => "Propose evidence-linked memory candidates from the last run",
+            Self::EvidenceInbox => "Review evidence-backed memory candidates",
             Self::MemoryReview => "Review and clean up accumulated memories",
             Self::SkillCandidates => "List skill candidates and drafts",
 
@@ -233,6 +235,7 @@ impl SlashCommand {
             Self::Cron
             | Self::AutoMemory
             | Self::RunReview
+            | Self::EvidenceInbox
             | Self::MemoryReview
             | Self::SkillCandidates => Category::Scheduling,
             Self::Tools | Self::Cost | Self::PromptDiagnostics | Self::Help => Category::Info,
@@ -269,6 +272,9 @@ impl SlashCommand {
             Self::Skills => "[list|search|install|uninstall|info|refresh] [args]",
             Self::Mcp => "[list|load <config>|disconnect <name>]",
             Self::Hooks => "[list|reload|test <event>]",
+            Self::EvidenceInbox => {
+                "[list|all|show|edit|accept|reject|undo] [candidate-id] [content]"
+            }
             _ => "",
         }
     }

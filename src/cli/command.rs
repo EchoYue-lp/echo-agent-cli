@@ -95,6 +95,8 @@ pub struct CommandContext {
     pub scheduler: Option<Arc<echo_agent_app_core::scheduler::SchedulerRunner>>,
     /// Static prompt-module report captured during runtime bootstrap.
     pub prompt_assembly: Option<echo_agent_app_core::project::prompt::PromptAssembly>,
+    /// Workspace-bound review/evolution integration shared with the runtime.
+    pub review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
 }
 
 impl CommandContext {
@@ -107,6 +109,7 @@ impl CommandContext {
             task_service: None,
             scheduler: None,
             prompt_assembly: None,
+            review_integration: None,
         }
     }
 
@@ -149,6 +152,14 @@ impl CommandContext {
         prompt_assembly: echo_agent_app_core::project::prompt::PromptAssembly,
     ) -> Self {
         self.prompt_assembly = Some(prompt_assembly);
+        self
+    }
+
+    pub fn with_review_integration(
+        mut self,
+        review_integration: Arc<echo_agent_app_core::evolution::ReviewIntegration>,
+    ) -> Self {
+        self.review_integration = Some(review_integration);
         self
     }
 

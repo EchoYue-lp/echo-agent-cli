@@ -6,6 +6,31 @@ use std::sync::Arc;
 use echo_agent::workspace::state::profiles::{AgentProfile, ProfileStore, UserProfile};
 use echo_agent::workspace::state::skill_telemetry::SkillTelemetryStore;
 
+fn current_echo_agent_dir(ctx: &CommandContext) -> std::path::PathBuf {
+    ctx.review_integration
+        .as_ref()
+        .map(|integration| integration.echo_agent_dir())
+        .unwrap_or_else(echo_agent_app_core::evolution::discover_echo_agent_dir)
+}
+
+fn current_curator(ctx: &CommandContext) -> echo_agent::evolution::Curator {
+    ctx.review_integration
+        .as_ref()
+        .map(|integration| integration.curator())
+        .unwrap_or_else(|| {
+            echo_agent_app_core::evolution::workspace_curator(&current_echo_agent_dir(ctx))
+        })
+}
+
+fn current_evidence_store(ctx: &CommandContext) -> echo_agent_app_core::evolution::EvidenceStore {
+    ctx.review_integration
+        .as_ref()
+        .map(|integration| integration.evidence_store())
+        .unwrap_or_else(|| {
+            echo_agent_app_core::evolution::EvidenceStore::new(current_echo_agent_dir(ctx))
+        })
+}
+
 // ── ReviewCommand ───────────────────────────────────────────────────
 
 async fn cmd_review(ctx: &CommandContext, _args: &[&str]) -> CommandOutcome {
@@ -77,17 +102,20 @@ async fn cmd_review(ctx: &CommandContext, _args: &[&str]) -> CommandOutcome {
         memory_store.clone(),
         Some(run_store),
     );
-    let reviewer = if let Some(store) = memory_store {
-        let review_integration = Arc::new(echo_agent_app_core::evolution::ReviewIntegration::new(
+    let reviewer = if let Some(review_integration) = ctx.review_integration.as_ref() {
+        reviewer.with_layer_manager(Arc::new(review_integration.create_layer_manager()))
+    } else if let Some(store) = memory_store {
+        let review_integration = echo_agent_app_core::evolution::ReviewIntegration::new(
             echo_agent::evolution::ReviewConfig::default(),
-            echo_agent_app_core::evolution::discover_echo_agent_dir(),
+            current_echo_agent_dir(ctx),
             store,
-        ));
+        );
         reviewer.with_layer_manager(Arc::new(review_integration.create_layer_manager()))
     } else {
         reviewer
     };
 
+    let evidence_store = current_evidence_store(ctx);
     match reviewer.review(&run) {
         Ok(handle) => match handle.await {
             Ok(outcome) => {
@@ -102,6 +130,19 @@ async fn cmd_review(ctx: &CommandContext, _args: &[&str]) -> CommandOutcome {
                         println!("  Evidence: {}", candidate.evidence);
                         println!("  Confidence: {:.2}", candidate.confidence);
                     }
+                }
+                match echo_agent_app_core::evolution::capture_review_outcome(
+                    &evidence_store,
+                    &outcome,
+                ) {
+                    Ok(Some(candidate)) => {
+                        println!(
+                            "  Inbox: {} ({:?})",
+                            candidate.candidate_id, candidate.status
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(error) => println!("Warning: failed to queue review candidate: {error}"),
                 }
                 if let Some(ref err) = outcome.error {
                     println!("Warning: {err}");
@@ -126,9 +167,7 @@ cmd!(
 
 async fn cmd_curator(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     let sub = args.first().copied().unwrap_or("status");
-    let curator = echo_agent::evolution::Curator::default_path(
-        echo_agent::evolution::CuratorConfig::default(),
-    );
+    let curator = current_curator(ctx);
 
     match sub {
         "status" => {
@@ -145,6 +184,13 @@ async fn cmd_curator(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         }
         "run" => match curator.apply_transitions() {
             Ok(transitions) if !transitions.is_empty() => {
+                ctx.agent
+                    .write_async(|agent| {
+                        Box::pin(async move {
+                            agent.reconcile_skill_load_policy().await;
+                        })
+                    })
+                    .await;
                 println!("Applied {} transition(s):", transitions.len());
                 for (name, from, to) in &transitions {
                     println!("  {name}: {from:?} → {to:?}");
@@ -550,7 +596,7 @@ async fn cmd_memory_review(ctx: &CommandContext, _args: &[&str]) -> CommandOutco
         }
     };
 
-    let echo_agent_dir = echo_agent_app_core::evolution::discover_echo_agent_dir();
+    let echo_agent_dir = current_echo_agent_dir(ctx);
     let review_integration = echo_agent_app_core::evolution::ReviewIntegration::new(
         echo_agent::evolution::ReviewConfig::default(),
         echo_agent_dir,
@@ -582,13 +628,11 @@ cmd!(
 
 // ── SkillCandidatesCommand ──────────────────────────────────────────
 
-async fn cmd_skill_candidates(_ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
+async fn cmd_skill_candidates(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     let sub = args.first().copied().unwrap_or("list");
 
     // Load curator state to find candidates and drafts.
-    let curator = echo_agent::evolution::Curator::default_path(
-        echo_agent::evolution::CuratorConfig::default(),
-    );
+    let curator = current_curator(ctx);
     let state = curator.load_state();
 
     let candidates_and_drafts: Vec<_> = state
@@ -677,7 +721,7 @@ cmd!(
 
 // ── SkillPromoteCommand ────────────────────────────────────────────
 
-async fn cmd_skill_promote(_ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
+async fn cmd_skill_promote(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     let name = match args.first() {
         Some(n) => *n,
         None => {
@@ -687,19 +731,61 @@ async fn cmd_skill_promote(_ctx: &CommandContext, args: &[&str]) -> CommandOutco
         }
     };
 
-    let curator = echo_agent::evolution::Curator::default_path(
-        echo_agent::evolution::CuratorConfig::default(),
-    );
+    let curator = current_curator(ctx);
 
     // Check current lifecycle state.
     let state = curator.load_state();
     match state.skills.get(name) {
         Some(meta) => match meta.lifecycle {
-            echo_agent::evolution::SkillLifecycle::Draft => match curator.promote_to_active(name) {
-                Ok(true) => println!("✓ Skill '{}' promoted from Draft to Active.", name),
-                Ok(false) => println!("Skill '{}' was not in Draft state.", name),
-                Err(e) => println!("Error promoting skill: {e}"),
-            },
+            echo_agent::evolution::SkillLifecycle::Draft => {
+                let echo_agent_dir = current_echo_agent_dir(ctx);
+                let draft_path = echo_agent_dir
+                    .join("skills")
+                    .join("_drafts")
+                    .join(name)
+                    .join("SKILL.md");
+                let active_dir = echo_agent_dir.join("skills").join(name);
+                let active_path = active_dir.join("SKILL.md");
+                let copy_result = std::fs::create_dir_all(&active_dir)
+                    .and_then(|_| std::fs::copy(&draft_path, &active_path));
+                match copy_result {
+                    Ok(_) => match curator.promote_to_active_at(name, Some(&active_path)) {
+                        Ok(true) => {
+                            let load_root = active_dir
+                                .parent()
+                                .map(std::path::Path::to_path_buf)
+                                .unwrap_or(active_dir.clone());
+                            match ctx
+                                .agent
+                                .write_async(|agent| {
+                                    Box::pin(
+                                        async move { agent.load_skills_from_dir(load_root).await },
+                                    )
+                                })
+                                .await
+                            {
+                                Ok(_) => println!(
+                                    "✓ Skill '{}' promoted from Draft to Active and loaded.",
+                                    name
+                                ),
+                                Err(error) => println!(
+                                    "Skill '{}' is active, but runtime load failed: {error}",
+                                    name
+                                ),
+                            }
+                        }
+                        Ok(false) => {
+                            let _ = std::fs::remove_file(&active_path);
+                            println!("Skill '{}' was not in Draft state.", name);
+                        }
+                        Err(e) => {
+                            let _ = std::fs::remove_file(&active_path);
+                            println!("Error promoting skill: {e}");
+                        }
+                    },
+                    Err(error) => println!("Failed to activate draft skill: {error}"),
+                }
+            }
             echo_agent::evolution::SkillLifecycle::Candidate => {
                 println!("Skill '{}' is a Candidate, not a Draft.", name);
                 println!(
@@ -745,16 +831,14 @@ async fn cmd_skill_create(ctx: &CommandContext, args: &[&str]) -> CommandOutcome
         }
     };
 
-    let echo_agent_dir = echo_agent_app_core::evolution::discover_echo_agent_dir();
+    let echo_agent_dir = current_echo_agent_dir(ctx);
 
     // If no name given, list candidates.
     let name = match name {
         Some(n) => n.to_string(),
         None => {
             // List available candidates.
-            let curator = echo_agent::evolution::Curator::default_path(
-                echo_agent::evolution::CuratorConfig::default(),
-            );
+            let curator = current_curator(ctx);
             let state = curator.load_state();
             let candidates: Vec<_> = state
                 .skills
@@ -789,7 +873,8 @@ async fn cmd_skill_create(ctx: &CommandContext, args: &[&str]) -> CommandOutcome
     let generator = echo_agent::evolution::SkillDraftGenerator::new(
         echo_agent_dir,
         &change_log as &dyn echo_agent::evolution::ChangeLog,
-    );
+    )
+    .with_curator(current_curator(ctx));
 
     match generator.generate(&name, &typed_store).await {
         Ok(result) => {
@@ -852,7 +937,7 @@ async fn cmd_skill_merge(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
             })
             .await;
 
-        let echo_agent_dir = echo_agent_app_core::evolution::discover_echo_agent_dir();
+        let echo_agent_dir = current_echo_agent_dir(ctx);
         let log_path = echo_agent_dir.join("evolution").join("change-log.jsonl");
         if let Some(parent) = log_path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -952,15 +1037,14 @@ async fn cmd_skill_merge(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
                     })
                     .await;
 
-                let echo_agent_dir = echo_agent_app_core::evolution::discover_echo_agent_dir();
+                let echo_agent_dir = current_echo_agent_dir(ctx);
                 let log_path = echo_agent_dir.join("evolution").join("change-log.jsonl");
                 if let Some(parent) = log_path.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
                 let change_log = echo_agent::evolution::JsonlChangeLog::new(log_path);
 
-                let curator_config = echo_agent::evolution::CuratorConfig::default();
-                let curator = echo_agent::evolution::Curator::default_path(curator_config);
+                let curator = current_curator(ctx);
                 let merger = echo_agent::evolution::SkillMerger::new(store.clone(), curator);
 
                 let mut primary_desc_mut = primary_desc;
@@ -1265,7 +1349,7 @@ async fn cmd_skill_patch(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
         };
 
         // Create change log.
-        let echo_agent_dir = echo_agent_app_core::evolution::discover_echo_agent_dir();
+        let echo_agent_dir = current_echo_agent_dir(ctx);
         let log_path = echo_agent_dir.join("evolution").join("change-log.jsonl");
         if let Some(parent) = log_path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -1381,7 +1465,7 @@ async fn cmd_rule_promote(ctx: &CommandContext, args: &[&str]) -> CommandOutcome
             match proposal {
                 Some(prop) => {
                     let change_log = echo_agent::evolution::JsonlChangeLog::new(
-                        echo_agent_app_core::evolution::discover_echo_agent_dir()
+                        current_echo_agent_dir(ctx)
                             .join("evolution")
                             .join("changelog.jsonl"),
                     );
@@ -1440,7 +1524,7 @@ async fn cmd_evolution_dashboard(ctx: &CommandContext, _args: &[&str]) -> Comman
     };
 
     let change_log = echo_agent::evolution::JsonlChangeLog::new(
-        echo_agent_app_core::evolution::discover_echo_agent_dir()
+        current_echo_agent_dir(ctx)
             .join("evolution")
             .join("changelog.jsonl"),
     );
@@ -1471,7 +1555,7 @@ cmd!(
 /// Register a manually-created SKILL.md as a user-owned skill.
 /// The curator will never auto-transition (archive/deprecate) it because
 /// `agent_created` is set to `false` (curator.rs:467 skips non-agent skills).
-async fn cmd_skill_register(_ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
+async fn cmd_skill_register(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     let name = match args.first() {
         Some(n) => *n,
         None => {
@@ -1482,11 +1566,12 @@ async fn cmd_skill_register(_ctx: &CommandContext, args: &[&str]) -> CommandOutc
         }
     };
 
-    let curator = echo_agent::evolution::Curator::default_path(
-        echo_agent::evolution::CuratorConfig::default(),
-    );
+    let curator = current_curator(ctx);
 
-    match curator.touch_skill(name, false) {
+    let echo_agent_dir = current_echo_agent_dir(ctx);
+    let skill_path = echo_agent_dir.join("skills").join(name).join("SKILL.md");
+    let path = skill_path.exists().then_some(skill_path.as_path());
+    match curator.touch_skill_at(name, path, false) {
         Ok(()) => {
             println!(
                 "✓ Skill '{}' registered as user-created (agent_created=false).",
@@ -1513,7 +1598,7 @@ cmd!(
 // ── SkillPinCommand ───────────────────────────────────────────────
 
 /// Pin a skill so it is exempt from all curator auto-transitions.
-async fn cmd_skill_pin(_ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
+async fn cmd_skill_pin(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     let name = match args.first() {
         Some(n) => *n,
         None => {
@@ -1523,9 +1608,7 @@ async fn cmd_skill_pin(_ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         }
     };
 
-    let curator = echo_agent::evolution::Curator::default_path(
-        echo_agent::evolution::CuratorConfig::default(),
-    );
+    let curator = current_curator(ctx);
 
     match curator.pin_skill(name) {
         Ok(()) => println!("✓ Skill '{}' pinned — exempt from auto-transitions.", name),
@@ -1545,7 +1628,7 @@ cmd!(
 // ── SkillUnpinCommand ─────────────────────────────────────────────
 
 /// Unpin a skill, restoring curator auto-transition eligibility.
-async fn cmd_skill_unpin(_ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
+async fn cmd_skill_unpin(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     let name = match args.first() {
         Some(n) => *n,
         None => {
@@ -1555,9 +1638,7 @@ async fn cmd_skill_unpin(_ctx: &CommandContext, args: &[&str]) -> CommandOutcome
         }
     };
 
-    let curator = echo_agent::evolution::Curator::default_path(
-        echo_agent::evolution::CuratorConfig::default(),
-    );
+    let curator = current_curator(ctx);
 
     match curator.unpin_skill(name) {
         Ok(()) => println!(
@@ -1575,6 +1656,146 @@ cmd!(
     CommandCategory::Advanced,
     "Unpin a skill — restore curator auto-transition eligibility",
     cmd_skill_unpin
+);
+
+// ── EvidenceInboxCommand ────────────────────────────────────────────
+
+async fn cmd_evidence_inbox(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
+    use echo_agent_app_core::evolution::EvidenceCandidateStatus;
+
+    let store = current_evidence_store(ctx);
+    let sub = args.first().copied().unwrap_or("list");
+    match sub {
+        "list" | "ls" | "pending" | "all" | "applied" | "rejected" => {
+            let filter = match sub {
+                "list" | "ls" | "pending" => Some(EvidenceCandidateStatus::Pending),
+                "applied" => Some(EvidenceCandidateStatus::Applied),
+                "rejected" => Some(EvidenceCandidateStatus::Rejected),
+                _ => None,
+            };
+            match store.list() {
+                Ok(candidates) => {
+                    let visible: Vec<_> = candidates
+                        .into_iter()
+                        .filter(|candidate| filter.is_none_or(|status| candidate.status == status))
+                        .collect();
+                    if visible.is_empty() {
+                        println!("Review Inbox is empty for this filter.");
+                    } else {
+                        println!("\n--- Review Inbox ({}) ---", visible.len());
+                        for candidate in visible {
+                            println!(
+                                "{} [{:?}/{:?}] {:.2} {}",
+                                candidate.candidate_id,
+                                candidate.status,
+                                candidate.kind,
+                                candidate.confidence,
+                                candidate.content
+                            );
+                        }
+                    }
+                }
+                Err(error) => println!("Failed to read Review Inbox: {error}"),
+            }
+        }
+        "show" => {
+            let Some(candidate_id) = args.get(1) else {
+                println!("Usage: /evidence-inbox show <candidate-id>");
+                return CommandOutcome::Continue;
+            };
+            match store.get(candidate_id) {
+                Ok(Some(candidate)) => {
+                    println!("{}", candidate.content);
+                    println!(
+                        "Kind: {:?}  Status: {:?}  Confidence: {:.2}",
+                        candidate.kind, candidate.status, candidate.confidence
+                    );
+                    println!("Scope: {:?}", candidate.scope);
+                    for evidence in candidate.evidence {
+                        println!(
+                            "Evidence [{:?}/{}]: {}",
+                            evidence.source,
+                            evidence.source_role.as_deref().unwrap_or("unknown"),
+                            evidence.quote
+                        );
+                    }
+                }
+                Ok(None) => println!("Candidate '{candidate_id}' not found."),
+                Err(error) => println!("Failed to read candidate: {error}"),
+            }
+        }
+        "edit" => {
+            let Some(candidate_id) = args.get(1) else {
+                println!("Usage: /evidence-inbox edit <candidate-id> <new-content>");
+                return CommandOutcome::Continue;
+            };
+            let content = args
+                .get(2..)
+                .map(|parts| parts.join(" "))
+                .unwrap_or_default();
+            match store.edit(candidate_id, &content) {
+                Ok(candidate) => {
+                    println!("Updated {}: {}", candidate.candidate_id, candidate.content)
+                }
+                Err(error) => println!("Failed to edit candidate: {error}"),
+            }
+        }
+        "reject" => {
+            let Some(candidate_id) = args.get(1) else {
+                println!("Usage: /evidence-inbox reject <candidate-id>");
+                return CommandOutcome::Continue;
+            };
+            match store.reject(candidate_id) {
+                Ok(candidate) => println!("Rejected {}.", candidate.candidate_id),
+                Err(error) => println!("Failed to reject candidate: {error}"),
+            }
+        }
+        "accept" | "undo" => {
+            let Some(candidate_id) = args.get(1) else {
+                println!("Usage: /evidence-inbox {sub} <candidate-id>");
+                return CommandOutcome::Continue;
+            };
+            let Some(layer_manager) = ctx
+                .agent
+                .read(|agent| agent.memory_layer_manager().cloned())
+                .await
+            else {
+                println!("No layered memory manager is available.");
+                return CommandOutcome::Continue;
+            };
+            let result = if sub == "accept" {
+                let edited = args
+                    .get(2..)
+                    .map(|parts| parts.join(" "))
+                    .filter(|content| !content.trim().is_empty());
+                store
+                    .accept(candidate_id, edited.as_deref(), &layer_manager)
+                    .await
+            } else {
+                store.undo(candidate_id, &layer_manager).await
+            };
+            match result {
+                Ok(candidate) => {
+                    println!("{} is now {:?}.", candidate.candidate_id, candidate.status)
+                }
+                Err(error) => println!("Review Inbox action failed: {error}"),
+            }
+        }
+        _ => {
+            println!(
+                "Usage: /evidence-inbox <list|all|show|edit|accept|reject|undo> [candidate-id] [content]"
+            );
+        }
+    }
+    CommandOutcome::Continue
+}
+cmd!(
+    EvidenceInboxCommand,
+    "evidence-inbox",
+    ["inbox"],
+    CommandCategory::Advanced,
+    "Review evidence-backed memory candidates",
+    cmd_evidence_inbox
 );
 
 // ── Register ────────────────────────────────────────────────────────
@@ -1597,4 +1818,5 @@ pub fn register_all(registry: &mut crate::cli::command::CommandRegistry) {
     registry.register(Arc::new(SkillRegisterCommand));
     registry.register(Arc::new(SkillPinCommand));
     registry.register(Arc::new(SkillUnpinCommand));
+    registry.register(Arc::new(EvidenceInboxCommand));
 }

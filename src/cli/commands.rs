@@ -28,6 +28,7 @@ pub struct CommandHandler {
     task_service: Option<Arc<echo_agent_app_core::tasks::BackgroundTaskService>>,
     scheduler: Option<Arc<echo_agent_app_core::scheduler::SchedulerRunner>>,
     prompt_assembly: Option<echo_agent_app_core::project::prompt::PromptAssembly>,
+    review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
 }
 
 impl CommandHandler {
@@ -40,6 +41,7 @@ impl CommandHandler {
             task_service: None,
             scheduler: None,
             prompt_assembly: None,
+            review_integration: None,
         }
     }
 
@@ -98,6 +100,14 @@ impl CommandHandler {
         self
     }
 
+    pub fn with_review_integration(
+        mut self,
+        review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
+    ) -> Self {
+        self.review_integration = review_integration;
+        self
+    }
+
     /// Process user input.
     pub async fn handle(&self, input: &str) -> CommandResult {
         let input = input.trim();
@@ -136,6 +146,7 @@ impl CommandHandler {
                 task_service: self.task_service.clone(),
                 scheduler: self.scheduler.clone(),
                 prompt_assembly: self.prompt_assembly.clone(),
+                review_integration: self.review_integration.clone(),
             };
 
             if let Some(outcome) = registry.dispatch(cmd_name, &ctx, args).await {

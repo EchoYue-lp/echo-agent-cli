@@ -938,6 +938,32 @@ impl AppState {
             //     dreaming、session-end 都用新 workspace 的记忆）。
             if let Some(ref ri) = self.review_integration {
                 ri.rebind(echo_agent_dir.clone(), store.clone());
+                self.connection
+                    .agent
+                    .write_async(|agent| {
+                        Box::pin(async move {
+                            agent.reconcile_skill_load_policy().await;
+                        })
+                    })
+                    .await;
+                let workspace_skills = echo_agent_dir.join("skills");
+                if workspace_skills.is_dir() {
+                    self.connection
+                        .agent
+                        .write_async(|agent| {
+                            Box::pin(async move {
+                                if let Err(error) =
+                                    agent.load_skills_from_dir(workspace_skills).await
+                                {
+                                    tracing::warn!(
+                                        %error,
+                                        "Failed to reload workspace-curated skills"
+                                    );
+                                }
+                            })
+                        })
+                        .await;
+                }
             }
             tracing::info!(
                 workspace = %workspace.id,
@@ -1040,6 +1066,31 @@ impl AppState {
                 .await;
             if let Some(ref ri) = self.review_integration {
                 ri.rebind(global_echo_dir.clone(), store.clone());
+                self.connection
+                    .agent
+                    .write_async(|agent| {
+                        Box::pin(async move {
+                            agent.reconcile_skill_load_policy().await;
+                        })
+                    })
+                    .await;
+                let global_skills = global_echo_dir.join("skills");
+                if global_skills.is_dir() {
+                    self.connection
+                        .agent
+                        .write_async(|agent| {
+                            Box::pin(async move {
+                                if let Err(error) = agent.load_skills_from_dir(global_skills).await
+                                {
+                                    tracing::warn!(
+                                        %error,
+                                        "Failed to reload global curated skills"
+                                    );
+                                }
+                            })
+                        })
+                        .await;
+                }
             }
             tracing::info!(
                 path = %global_store_path.display(),

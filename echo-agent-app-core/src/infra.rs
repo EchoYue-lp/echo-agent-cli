@@ -309,7 +309,7 @@ pub async fn create_agent_with_diagnostics(
 
     // Inject a workspace/project-scoped memory Store (FileStore). This OVERRIDES
     // the framework's default global `~/.echo-agent/store.json` — dynamic
-    // memories (remember / AutoMemory / L3 promotion / TaskRuntime bridge) are
+    // memories (remember / accepted evidence / L3 promotion / TaskRuntime bridge) are
     // physically isolated per project so they don't leak across projects,
     // mirroring how hot-layer `MEMORY.md` already follows the project root.
     // `params.working_dir` (workspace root) takes priority; otherwise we walk

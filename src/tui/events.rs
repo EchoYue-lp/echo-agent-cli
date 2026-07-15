@@ -2863,6 +2863,91 @@ async fn handle_slash_command(
         Some(SlashCommand::Quit) | Some(SlashCommand::Exit) => {
             app.should_quit = true;
         }
+        Some(SlashCommand::AutoMemory) => {
+            use echo_agent_app_core::auto_memory::{
+                AutoMemoryConfig, extract_observations, format_observations_for_memory,
+                queue_observations,
+            };
+
+            let sub = args.split_whitespace().next().unwrap_or("status");
+            let content = match sub {
+                "on" => {
+                    crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    "Auto-memory enabled.".to_string()
+                }
+                "off" => {
+                    crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    "Auto-memory disabled.".to_string()
+                }
+                "extract" | "show" => {
+                    let messages: Vec<(String, String)> = agent
+                        .read_async(|value| {
+                            Box::pin(async move {
+                                let context = value.context().lock().await;
+                                context
+                                    .messages()
+                                    .iter()
+                                    .map(|message| {
+                                        (
+                                            message.role.as_str().to_string(),
+                                            message
+                                                .content
+                                                .as_text()
+                                                .unwrap_or_default()
+                                                .to_string(),
+                                        )
+                                    })
+                                    .collect()
+                            })
+                        })
+                        .await;
+                    let observations =
+                        extract_observations(&messages, &AutoMemoryConfig::default());
+                    if sub == "show" {
+                        if observations.is_empty() {
+                            "No observations would be extracted.".to_string()
+                        } else {
+                            format_observations_for_memory(&observations)
+                        }
+                    } else {
+                        let store = app
+                            .review_integration
+                            .as_ref()
+                            .map(|integration| integration.evidence_store())
+                            .unwrap_or_else(|| {
+                                echo_agent_app_core::evolution::EvidenceStore::new(
+                                    echo_agent_app_core::evolution::discover_echo_agent_dir(),
+                                )
+                            });
+                        match queue_observations(&store, &observations, &messages) {
+                            Ok(candidates) => format!(
+                                "Queued {} auto-memory candidate(s) in Review Inbox.",
+                                candidates.len()
+                            ),
+                            Err(error) => format!("Auto-memory extraction failed: {error}"),
+                        }
+                    }
+                }
+                "config" | "status" => {
+                    let enabled = crate::cli::cmd_impls::all::AUTO_MEMORY_ENABLED
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let config = AutoMemoryConfig::default();
+                    format!(
+                        "Auto-memory: {}\nMinimum confidence: {:.0}%\nMaximum per session: {}",
+                        if enabled { "ON" } else { "OFF" },
+                        config.min_confidence * 100.0,
+                        config.max_per_session
+                    )
+                }
+                _ => "Usage: /auto-memory <on|off|extract|show|config>".to_string(),
+            };
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content,
+            });
+        }
         Some(SlashCommand::RunReview) => {
             let (run_store, llm_client, memory_store) = agent
                 .read(|value| {
@@ -2913,7 +2998,9 @@ async fn handle_slash_command(
                 memory_store.clone(),
                 Some(run_store),
             );
-            let reviewer = if let Some(store) = memory_store {
+            let reviewer = if let Some(review_integration) = app.review_integration.as_ref() {
+                reviewer.with_layer_manager(Arc::new(review_integration.create_layer_manager()))
+            } else if let Some(store) = memory_store {
                 let review_integration = echo_agent_app_core::evolution::ReviewIntegration::new(
                     echo_agent::evolution::ReviewConfig::default(),
                     echo_agent_app_core::evolution::discover_echo_agent_dir(),
@@ -2953,13 +3040,33 @@ async fn handle_slash_command(
                     });
                 }
                 Ok(outcome) => {
+                    let evidence_store = app
+                        .review_integration
+                        .as_ref()
+                        .map(|integration| integration.evidence_store())
+                        .unwrap_or_else(|| {
+                            echo_agent_app_core::evolution::EvidenceStore::new(
+                                echo_agent_app_core::evolution::discover_echo_agent_dir(),
+                            )
+                        });
+                    let queued = echo_agent_app_core::evolution::capture_review_outcome(
+                        &evidence_store,
+                        &outcome,
+                    );
                     let content = match outcome.candidate {
                         Some(candidate) => format!(
-                            "Candidate ({:?}, confidence {:.2}, not saved): {}\nEvidence: {}",
+                            "Candidate ({:?}, confidence {:.2}): {}\nEvidence: {}\n{}",
                             candidate.kind,
                             candidate.confidence,
                             candidate.content,
-                            candidate.evidence
+                            candidate.evidence,
+                            match queued {
+                                Ok(Some(stored)) => {
+                                    format!("Queued in Review Inbox as {}.", stored.candidate_id)
+                                }
+                                Ok(None) => "No inbox candidate was produced.".to_string(),
+                                Err(error) => format!("Failed to queue candidate: {error}"),
+                            }
                         ),
                         None => outcome.actions.join("\n"),
                     };
@@ -2976,17 +3083,147 @@ async fn handle_slash_command(
                 }
             }
         }
+        Some(SlashCommand::EvidenceInbox) => {
+            use echo_agent_app_core::evolution::EvidenceCandidateStatus;
+
+            let store = app
+                .review_integration
+                .as_ref()
+                .map(|integration| integration.evidence_store())
+                .unwrap_or_else(|| {
+                    echo_agent_app_core::evolution::EvidenceStore::new(
+                        echo_agent_app_core::evolution::discover_echo_agent_dir(),
+                    )
+                });
+            let mut parts = args.trim().splitn(3, ' ');
+            let sub = parts
+                .next()
+                .filter(|value| !value.is_empty())
+                .unwrap_or("list");
+            let candidate_id = parts.next();
+            let content = parts.next();
+            let result = match sub {
+                "list" | "ls" | "pending" | "all" | "applied" | "rejected" => {
+                    let filter = match sub {
+                        "list" | "ls" | "pending" => Some(EvidenceCandidateStatus::Pending),
+                        "applied" => Some(EvidenceCandidateStatus::Applied),
+                        "rejected" => Some(EvidenceCandidateStatus::Rejected),
+                        _ => None,
+                    };
+                    match store.list() {
+                        Ok(candidates) => {
+                            let lines: Vec<_> = candidates
+                                .into_iter()
+                                .filter(|candidate| {
+                                    filter.is_none_or(|status| candidate.status == status)
+                                })
+                                .map(|candidate| {
+                                    format!(
+                                        "{} [{:?}/{:?}] {:.2} {}",
+                                        candidate.candidate_id,
+                                        candidate.status,
+                                        candidate.kind,
+                                        candidate.confidence,
+                                        candidate.content
+                                    )
+                                })
+                                .collect();
+                            if lines.is_empty() {
+                                "Review Inbox is empty for this filter.".to_string()
+                            } else {
+                                lines.join("\n")
+                            }
+                        }
+                        Err(error) => format!("Failed to read Review Inbox: {error}"),
+                    }
+                }
+                "show" => match candidate_id {
+                    Some(id) => match store.get(id) {
+                        Ok(Some(candidate)) => {
+                            let evidence = candidate
+                                .evidence
+                                .iter()
+                                .map(|item| {
+                                    format!(
+                                        "[{:?}/{}] {}",
+                                        item.source,
+                                        item.source_role.as_deref().unwrap_or("unknown"),
+                                        item.quote
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
+                            format!(
+                                "{}\nKind: {:?}  Status: {:?}  Confidence: {:.2}\n{}",
+                                candidate.content,
+                                candidate.kind,
+                                candidate.status,
+                                candidate.confidence,
+                                evidence
+                            )
+                        }
+                        Ok(None) => format!("Candidate '{id}' not found."),
+                        Err(error) => format!("Failed to read candidate: {error}"),
+                    },
+                    None => "Usage: /evidence-inbox show <candidate-id>".to_string(),
+                },
+                "edit" => match (candidate_id, content) {
+                    (Some(id), Some(new_content)) => match store.edit(id, new_content) {
+                        Ok(candidate) => format!("Updated {}.", candidate.candidate_id),
+                        Err(error) => format!("Failed to edit candidate: {error}"),
+                    },
+                    _ => {
+                        "Usage: /evidence-inbox edit <candidate-id> <new-content>".to_string()
+                    }
+                },
+                "reject" => match candidate_id {
+                    Some(id) => match store.reject(id) {
+                        Ok(candidate) => format!("Rejected {}.", candidate.candidate_id),
+                        Err(error) => format!("Failed to reject candidate: {error}"),
+                    },
+                    None => "Usage: /evidence-inbox reject <candidate-id>".to_string(),
+                },
+                "accept" | "undo" => match candidate_id {
+                    Some(id) => match agent
+                        .read(|value| value.memory_layer_manager().cloned())
+                        .await
+                    {
+                        Some(layer_manager) => {
+                            let action = if sub == "accept" {
+                                store.accept(id, content, &layer_manager).await
+                            } else {
+                                store.undo(id, &layer_manager).await
+                            };
+                            match action {
+                                Ok(candidate) => {
+                                    format!("{} is now {:?}.", candidate.candidate_id, candidate.status)
+                                }
+                                Err(error) => format!("Review Inbox action failed: {error}"),
+                            }
+                        }
+                        None => "No layered memory manager is available.".to_string(),
+                    },
+                    None => format!("Usage: /evidence-inbox {sub} <candidate-id>"),
+                },
+                _ => "Usage: /evidence-inbox <list|all|show|edit|accept|reject|undo> [candidate-id] [content]".to_string(),
+            };
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content: result,
+            });
+        }
         Some(SlashCommand::MemoryReview) => {
             // Create ReviewIntegration on-the-fly from the agent's store
             let store = agent.read(|a| a.store().cloned()).await;
             match store {
                 Some(store) => {
-                    let echo_agent_dir = echo_agent_app_core::evolution::discover_echo_agent_dir();
-                    let review_integration = echo_agent_app_core::evolution::ReviewIntegration::new(
-                        echo_agent::evolution::ReviewConfig::default(),
-                        echo_agent_dir,
-                        store,
-                    );
+                    let review_integration = app.review_integration.clone().unwrap_or_else(|| {
+                        Arc::new(echo_agent_app_core::evolution::ReviewIntegration::new(
+                            echo_agent::evolution::ReviewConfig::default(),
+                            echo_agent_app_core::evolution::discover_echo_agent_dir(),
+                            store,
+                        ))
+                    });
 
                     app.messages.push(ChatMessage {
                         role: MessageRole::System,
@@ -3021,9 +3258,15 @@ async fn handle_slash_command(
         }
         Some(SlashCommand::SkillCandidates) => {
             // List candidates and drafts from Curator state
-            let curator = echo_agent::evolution::Curator::default_path(
-                echo_agent::evolution::CuratorConfig::default(),
-            );
+            let curator = app
+                .review_integration
+                .as_ref()
+                .map(|integration| integration.curator())
+                .unwrap_or_else(|| {
+                    echo_agent_app_core::evolution::workspace_curator(
+                        &echo_agent_app_core::evolution::discover_echo_agent_dir(),
+                    )
+                });
             let state = curator.load_state();
             let items: Vec<_> = state
                 .skills
@@ -3381,8 +3624,7 @@ async fn handle_slash_command(
         | Some(SlashCommand::Diff)
         | Some(SlashCommand::Git)
         | Some(SlashCommand::Pipeline)
-        | Some(SlashCommand::Cron)
-        | Some(SlashCommand::AutoMemory) => {
+        | Some(SlashCommand::Cron) => {
             let prompt = match slash_cmd.unwrap_or(SlashCommand::Status) {
                 SlashCommand::Test => format!(
                     "Run the relevant project tests{} and report failures with actionable fixes.",
@@ -3417,10 +3659,6 @@ async fn handle_slash_command(
                 }
                 SlashCommand::Cron => format!(
                     "Manage the requested scheduled task operation: {}",
-                    args.trim()
-                ),
-                SlashCommand::AutoMemory => format!(
-                    "Configure automatic memory behavior as requested: {}",
                     args.trim()
                 ),
                 _ => String::new(),

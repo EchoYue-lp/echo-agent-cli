@@ -13,6 +13,12 @@ import {
   Gift,
   Wand2,
   Zap,
+  Inbox,
+  Check,
+  X,
+  Undo2,
+  Pencil,
+  Save,
 } from 'lucide-react';
 import { evolutionApi } from '../../api/endpoints';
 import { useToastStore } from '../../stores/toastStore';
@@ -22,6 +28,8 @@ import type {
   DashboardMetrics,
   RuleProposal,
   SkillCandidateInfo,
+  EvidenceCandidate,
+  EvidenceCandidateStatus,
 } from '../../types/api';
 
 export function EvolutionPanel() {
@@ -41,6 +49,13 @@ export function EvolutionPanel() {
   const [loadingCandidates, setLoadingCandidates] = useState(false);
   const [actingOnSkill, setActingOnSkill] = useState<string | null>(null);
 
+  const [evidenceCandidates, setEvidenceCandidates] = useState<EvidenceCandidate[]>([]);
+  const [evidenceFilter, setEvidenceFilter] = useState<EvidenceCandidateStatus | 'all'>('pending');
+  const [loadingEvidence, setLoadingEvidence] = useState(false);
+  const [actingOnEvidence, setActingOnEvidence] = useState<string | null>(null);
+  const [editingEvidence, setEditingEvidence] = useState<string | null>(null);
+  const [evidenceEditText, setEvidenceEditText] = useState('');
+
   // ── Review state
   const [reviewing, setReviewing] = useState(false);
   const [reviewResult, setReviewResult] = useState<{
@@ -56,6 +71,7 @@ export function EvolutionPanel() {
       persisted: boolean;
     } | null;
     error?: string | null;
+    evidence_candidate?: EvidenceCandidate | null;
   } | null>(null);
   const [reviewError, setReviewError] = useState<string | null>(null);
 
@@ -149,11 +165,48 @@ export function EvolutionPanel() {
     }
   };
 
+  const loadEvidence = async (filter: EvidenceCandidateStatus | 'all' = evidenceFilter) => {
+    setLoadingEvidence(true);
+    try {
+      const data = await evolutionApi.listEvidence(filter);
+      setEvidenceCandidates(data.candidates);
+    } catch (e) {
+      console.error('Failed to load evidence candidates:', e);
+    }
+    setLoadingEvidence(false);
+  };
+
+  const selectEvidenceFilter = (filter: EvidenceCandidateStatus | 'all') => {
+    setEvidenceFilter(filter);
+    void loadEvidence(filter);
+  };
+
+  const runEvidenceAction = async (
+    action: 'edit' | 'accept' | 'reject' | 'undo',
+    candidateId: string,
+    content?: string
+  ) => {
+    setActingOnEvidence(candidateId);
+    try {
+      await evolutionApi.evidenceAction(action, candidateId, content);
+      setEditingEvidence(null);
+      addToast(
+        'success',
+        `候选已${action === 'accept' ? '采纳' : action === 'reject' ? '拒绝' : action === 'undo' ? '撤销' : '更新'}`
+      );
+      await Promise.all([loadEvidence(), loadDashboard()]);
+    } catch (e) {
+      addToast('error', `操作失败: ${e instanceof Error ? e.message : '未知错误'}`);
+    }
+    setActingOnEvidence(null);
+  };
+
   useEffect(() => {
     loadDashboard();
     loadProposals();
     loadSkillCandidates();
     loadCuratorStatus();
+    loadEvidence('pending');
   }, []);
 
   // ── Actions
@@ -167,6 +220,7 @@ export function EvolutionPanel() {
         setReviewError(res.error);
       } else {
         setReviewResult(res);
+        await loadEvidence();
       }
     } catch (e: unknown) {
       setReviewError(e instanceof Error ? e.message : 'Unknown error');
@@ -346,6 +400,215 @@ export function EvolutionPanel() {
               <Database size={20} className="mx-auto mb-1" />
             )}
             {loadingDashboard ? '加载中...' : '尚无进化数据。运行对话后将自动积累。'}
+          </div>
+        )}
+      </section>
+
+      <section>
+        <div className="flex items-center justify-between mb-3">
+          <div className="flex items-center gap-2">
+            <Inbox size={14} style={{ color: 'var(--accent)' }} />
+            <h3 className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>
+              Review Inbox
+            </h3>
+            {evidenceCandidates.length > 0 && (
+              <span
+                className="rounded-full px-1.5 py-0.5 text-[9px] font-medium"
+                style={{ background: 'var(--accent-bg)', color: 'var(--accent)' }}
+              >
+                {evidenceCandidates.length}
+              </span>
+            )}
+          </div>
+          <button
+            onClick={() => loadEvidence()}
+            disabled={loadingEvidence}
+            className="p-1 transition-colors"
+            style={{ color: 'var(--accent)' }}
+            title="刷新 Review Inbox"
+          >
+            <RefreshCw size={12} className={loadingEvidence ? 'animate-spin' : ''} />
+          </button>
+        </div>
+
+        <div
+          className="grid grid-cols-4 gap-0.5 rounded-md p-0.5 mb-3"
+          style={{ background: 'var(--bg-hover)' }}
+        >
+          {(['pending', 'applied', 'rejected', 'all'] as const).map((filter) => (
+            <button
+              key={filter}
+              onClick={() => selectEvidenceFilter(filter)}
+              className="rounded px-2 py-1 text-[10px] font-medium transition-colors"
+              style={{
+                background: evidenceFilter === filter ? 'var(--bg-primary)' : 'transparent',
+                color: evidenceFilter === filter ? 'var(--text-primary)' : 'var(--text-tertiary)',
+              }}
+            >
+              {filter === 'pending'
+                ? '待审'
+                : filter === 'applied'
+                  ? '已采纳'
+                  : filter === 'rejected'
+                    ? '已拒绝'
+                    : '全部'}
+            </button>
+          ))}
+        </div>
+
+        {evidenceCandidates.length > 0 ? (
+          <div className="space-y-2">
+            {evidenceCandidates.map((candidate) => {
+              const isEditing = editingEvidence === candidate.candidate_id;
+              const isActing = actingOnEvidence === candidate.candidate_id;
+              return (
+                <div
+                  key={candidate.candidate_id}
+                  className="rounded-lg border p-3"
+                  style={{ borderColor: 'var(--border-primary)' }}
+                >
+                  <div className="flex items-center justify-between gap-2 mb-2">
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      <span
+                        className="rounded px-1.5 py-0.5 text-[9px] shrink-0"
+                        style={{ background: 'var(--bg-hover)', color: 'var(--text-secondary)' }}
+                      >
+                        {candidate.kind}
+                      </span>
+                      <span
+                        className="font-mono text-[9px] truncate"
+                        style={{ color: 'var(--text-tertiary)' }}
+                      >
+                        {candidate.candidate_id}
+                      </span>
+                    </div>
+                    <span className="font-mono text-[10px]" style={{ color: 'var(--accent)' }}>
+                      {candidate.confidence.toFixed(2)}
+                    </span>
+                  </div>
+
+                  {isEditing ? (
+                    <textarea
+                      value={evidenceEditText}
+                      onChange={(event) => setEvidenceEditText(event.target.value)}
+                      rows={3}
+                      className="w-full resize-y rounded-md border px-2 py-1.5 text-xs outline-none"
+                      style={{
+                        borderColor: 'var(--border-primary)',
+                        background: 'var(--bg-primary)',
+                        color: 'var(--text-primary)',
+                      }}
+                    />
+                  ) : (
+                    <p className="text-xs" style={{ color: 'var(--text-primary)' }}>
+                      {candidate.content}
+                    </p>
+                  )}
+
+                  {candidate.evidence.slice(0, 2).map((item, index) => (
+                    <div
+                      key={`${candidate.candidate_id}-evidence-${index}`}
+                      className="mt-2 border-l-2 pl-2 text-[10px]"
+                      style={{
+                        borderColor: 'var(--border-primary)',
+                        color: 'var(--text-tertiary)',
+                      }}
+                    >
+                      <span className="font-medium">{item.source}</span>
+                      {item.source_role ? ` / ${item.source_role}` : ''}: {item.quote}
+                    </div>
+                  ))}
+
+                  <div className="flex items-center justify-end gap-1.5 mt-3">
+                    {candidate.status !== 'applied' &&
+                      (isEditing ? (
+                        <>
+                          <button
+                            onClick={() => setEditingEvidence(null)}
+                            className="p-1.5"
+                            title="取消编辑"
+                            style={{ color: 'var(--text-tertiary)' }}
+                          >
+                            <X size={12} />
+                          </button>
+                          <button
+                            onClick={() =>
+                              runEvidenceAction('edit', candidate.candidate_id, evidenceEditText)
+                            }
+                            disabled={isActing}
+                            className="p-1.5"
+                            title="保存编辑"
+                            style={{ color: 'var(--accent)' }}
+                          >
+                            <Save size={12} />
+                          </button>
+                        </>
+                      ) : (
+                        <button
+                          onClick={() => {
+                            setEditingEvidence(candidate.candidate_id);
+                            setEvidenceEditText(candidate.content);
+                          }}
+                          className="p-1.5"
+                          title="编辑候选"
+                          style={{ color: 'var(--text-tertiary)' }}
+                        >
+                          <Pencil size={12} />
+                        </button>
+                      ))}
+                    {candidate.status !== 'applied' && (
+                      <button
+                        onClick={() => runEvidenceAction('reject', candidate.candidate_id)}
+                        disabled={isActing}
+                        className="p-1.5"
+                        title="拒绝候选"
+                        style={{ color: 'var(--color-error)' }}
+                      >
+                        <X size={13} />
+                      </button>
+                    )}
+                    {candidate.status !== 'applied' ? (
+                      <button
+                        onClick={() => runEvidenceAction('accept', candidate.candidate_id)}
+                        disabled={isActing}
+                        className="p-1.5"
+                        title="采纳候选"
+                        style={{ color: 'var(--color-success)' }}
+                      >
+                        {isActing ? (
+                          <RefreshCw size={13} className="animate-spin" />
+                        ) : (
+                          <Check size={13} />
+                        )}
+                      </button>
+                    ) : (
+                      <button
+                        onClick={() => runEvidenceAction('undo', candidate.candidate_id)}
+                        disabled={isActing}
+                        className="p-1.5"
+                        title="撤销采纳"
+                        style={{ color: 'var(--text-secondary)' }}
+                      >
+                        {isActing ? (
+                          <RefreshCw size={13} className="animate-spin" />
+                        ) : (
+                          <Undo2 size={13} />
+                        )}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        ) : (
+          <div className="py-4 text-center text-xs" style={{ color: 'var(--text-tertiary)' }}>
+            {loadingEvidence ? (
+              <RefreshCw size={16} className="mx-auto mb-1 animate-spin" />
+            ) : (
+              <Inbox size={20} className="mx-auto mb-1" />
+            )}
+            {loadingEvidence ? '加载中...' : '当前筛选下没有候选。'}
           </div>
         )}
       </section>

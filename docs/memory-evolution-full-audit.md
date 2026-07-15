@@ -744,14 +744,14 @@ write_memory() → EvolutionSecurityGuard → audit log → warm store →
   ├─ [每轮 ReAct]
   │   ├─ record_trigger_data() → 记录工具成功/失败
   │   ├─ record_skill_telemetry() → 遥测写入 + curator touch_skill [框架自动]
-  │   ├─ detect_and_write_memory_triggers() → 触发器检测 + 自动持久化
+  │   ├─ detect_and_write_memory_triggers() → 触发器检测 → EvidenceCandidate sink
   │   ├─ ContextManager::prepare() → 压缩判断 + MemoryPromoter
   │   ├─ auto_snapshot() → SnapshotManager::capture()
   │   ├─ tool_error_feedback → 工具失败反馈给 LLM 自修正
   │   └─ verify_answer → LlmCritic 自检 (score≥7.0 通过, 最多重试2次, fail-open)
   │
   └─ [会话结束]
-      ├─ run_auto_memory_on_exit() → 关键词提取 → typed memory + project.md
+      ├─ run_auto_memory_on_exit() → 关键词提取 → Review Inbox JSONL
       ├─ run_reflection_on_exit() → LLM 轻量反思 → memory 文件
       ├─ MemoryReview 默认不在退出时自动运行（用户显式触发）
       ├─ cancel dreaming_task → 停止后台自进化

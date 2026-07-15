@@ -1706,6 +1706,7 @@ dependencies = [
  "dirs",
  "echo_agent",
  "echo_core",
+ "fs2",
  "futures",
  "hex",
  "hmac",

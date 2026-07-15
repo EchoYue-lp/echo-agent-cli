@@ -290,6 +290,8 @@ pub fn build_tauri_app(
             commands::panels::update_paper_notes,
             commands::panels::add_paper_tags,
             commands::panels::review_run,
+            commands::panels::list_evidence_candidates,
+            commands::panels::evidence_candidate_action,
             commands::panels::curator_action,
             commands::panels::get_evolution_dashboard,
             commands::panels::scan_rule_proposals,

@@ -304,8 +304,7 @@ pub static AUTO_MEMORY_ENABLED: std::sync::atomic::AtomicBool =
 
 async fn cmd_auto_memory(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     use echo_agent_app_core::auto_memory::{
-        AutoMemoryConfig, append_to_project_memory, extract_observations,
-        format_observations_for_memory, write_observations_to_memory_layer,
+        AutoMemoryConfig, extract_observations, format_observations_for_memory, queue_observations,
     };
 
     let sub = args.first().copied().unwrap_or("");
@@ -346,30 +345,22 @@ async fn cmd_auto_memory(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
                 return CommandOutcome::Continue;
             }
 
-            let typed_written = match handle.read(|a| a.memory_layer_manager().cloned()).await {
-                Some(lm) => match write_observations_to_memory_layer(&observations, &lm).await {
-                    Ok(count) => count,
-                    Err(e) => {
-                        println!("Typed auto-memory write failed: {e}");
-                        0
-                    }
-                },
-                None => {
-                    tracing::debug!(
-                        "auto-memory: agent has no shared layer manager, skipping typed write"
-                    );
-                    0
-                }
-            };
-
-            match append_to_project_memory(&observations) {
-                Ok(()) => {
-                    println!(
-                        "Extracted {} observation(s), saved {} to typed memory and project memory.",
-                        count, typed_written
-                    );
-                }
-                Err(e) => println!("Auto-memory extraction failed: {e}"),
+            let store = ctx
+                .review_integration
+                .as_ref()
+                .map(|integration| integration.evidence_store())
+                .unwrap_or_else(|| {
+                    echo_agent_app_core::evolution::EvidenceStore::new(
+                        echo_agent_app_core::evolution::discover_echo_agent_dir(),
+                    )
+                });
+            match queue_observations(&store, &observations, &messages) {
+                Ok(candidates) => println!(
+                    "Extracted {} observation(s); {} candidate(s) are in Review Inbox.",
+                    count,
+                    candidates.len()
+                ),
+                Err(e) => println!("Auto-memory candidate creation failed: {e}"),
             }
         }
         "show" => {
@@ -431,7 +422,7 @@ async fn cmd_auto_memory(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
             println!("Usage: /auto-memory <on|off|extract|show|config>");
             println!("  on      — enable auto-memory (default)");
             println!("  off     — disable auto-memory");
-            println!("  extract — manually extract and save observations now");
+            println!("  extract — extract observations into Review Inbox");
             println!("  show    — preview what would be extracted");
             println!("  config  — show current configuration");
         }
@@ -443,7 +434,7 @@ cmd!(
     "auto-memory",
     ["am"],
     CommandCategory::Context,
-    "Auto-extract and persist observations from sessions",
+    "Extract observations into the Review Inbox",
     cmd_auto_memory
 );
 

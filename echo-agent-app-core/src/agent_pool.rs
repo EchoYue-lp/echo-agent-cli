@@ -862,6 +862,8 @@ impl AgentPool {
         if let Some(ref review_integration) = self.shared.review_integration {
             let layer_manager = Arc::new(review_integration.create_layer_manager());
             agent.install_memory_layer_manager(layer_manager);
+            agent.set_memory_trigger_sink(Some(review_integration.clone()));
+            agent.set_skill_load_policy(Some(review_integration.clone()));
         }
         if let Some(ref ps) = self.shared.permission_service {
             agent.set_permission_service(ps.clone());

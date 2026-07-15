@@ -27,7 +27,7 @@
 
 由此采用的 EKO 取舍：run review 只生成证据候选；单次 run 不自动生成 skill；语义合并和规则/技能激活由用户确认；确定性的排序、衰减和状态维护可以自动执行。
 
-本轮尝试访问 Claude Code/Codex 官方在线文档，但当前环境的官方文档请求返回 403/网络传输失败。因此没有把无法核验的在线细节当作设计依据；后续网络恢复后应补一次官方文档复核。
+本轮通过 OpenAI 官方 Codex 文档接口核验到三点：`skills/list` 以 `cwd` 为 scope，支持强制刷新/额外 roots；技能启停配置以具体 `path + enabled` 为权威；`review/start` 是独立显式操作，而不是隐藏在普通运行中的自动语义写入。Claude Code 官方检索仍因环境解码失败未取得，因此没有补写无法核验的 Claude 细节。EKO 据此采用 workspace scope、path identity、显式 Review Inbox，并保留本地文件作为单一事实源。
 
 ## 3. 主要问题
 
@@ -92,23 +92,29 @@ run / explicit user correction / repeated telemetry
 
 删除 EKO eval/trajectory/improve 产品路径；BackgroundReviewer proposal-only；MemoryReview 默认保守；三端 run review 对等；修正 feature ownership 与文档。
 
-### Phase B：统一 EvidenceCandidate
+### Phase B：统一 EvidenceCandidate（已完成）
 
 在应用层定义统一候选文件协议（JSONL，不用 SQLite）：`candidate_id`、`kind`、`scope`、`source_run_id`、`source_role`、`evidence_quote`、`content`、`confidence`、`status`、`created_at`。把 BackgroundReviewer、TriggerDetector、AutoMemory 的语义输出汇入候选层，先去重再决定写 memory。
 
 验收：同一事实不会因多入口重复写入；任何记忆都能追到证据；无证据候选不能进入长期记忆。
 
-### Phase C：Review Inbox 与三端确认
+实现：`echo-agent-app-core/src/evolution/evidence.rs` 使用 append-only JSONL snapshot，候选 ID 使用独立 UUID，按 `scope + kind + normalized content` 生成 SHA-256 fingerprint；重复来源合并 evidence，Rejected 不会被后续重复检测复活，候选编辑也不会造成 fingerprint-derived ID 冲突。读写使用共享/独占文件锁，accept/undo 在状态日志失败时执行 memory 补偿回滚。BackgroundReviewer、TriggerDetector、AutoMemory 已统一进入此协议；Trigger inbox 失败时 fail-closed，不会绕过 review gate 直接写长期记忆；显式 `/remember` 仍直接保存。
+
+### Phase C：Review Inbox 与三端确认（已完成）
 
 GUI/TUI/CLI 共用候选列表、接受、编辑、拒绝、撤销操作。用户接受后才生成 ProjectFact/RuleProposal/SkillDraft；显式 `/remember` 继续允许直接保存。
 
 验收：三端能力对等；接受/拒绝可审计；没有隐藏的 LLM 后台写入。
 
-### Phase D：Curator workspace scope + loader authority
+实现：CLI/TUI 均提供 `/evidence-inbox`，GUI EvolutionPanel 提供 pending/applied/rejected/all 视图与 edit/accept/reject/undo。三端优先复用 runtime 已绑定、可随 workspace 切换重绑的 `ReviewIntegration`，不再各自按进程 cwd 推导 inbox。accept 才通过共享 `MemoryLayerManager` 写 typed memory，undo 删除对应 memory 并恢复 pending；规则晋升和 skill draft/activation 继续走各自已有的显式 review gate。
+
+### Phase D：Curator workspace scope + loader authority（已完成）
 
 把 Curator state 放入 workspace 的 `.eko/`，identity 使用稳定 skill descriptor/path，而不是全局 name。SkillLoader 在 catalog/discovery 阶段读取 lifecycle：Draft 不进 catalog，Deprecated/Archived 不加载，Pinned/用户技能不自动降级。
 
 验收：两个 workspace 同名 skill 不冲突；状态变化能真实改变加载行为；GUI/TUI/CLI 显示同一权威状态。
+
+实现：EKO Curator state 迁至 `{workspace}/.eko/evolution/curator-state.json`，`SkillMeta` 记录具体 `SKILL.md` path；框架新增通用 `SkillLoadPolicy` 与 reconcile API，EKO policy 阻止 Draft/Deprecated/Archived 及其它 workspace 的 `.eko/skills` 进入 catalog。workspace/curator 状态切换会立即 reconcile，skill 激活会绑定正式路径并即时加载。
 
 ### Phase E：拆分 maintenance 与 semantic mutation
 
@@ -124,4 +130,4 @@ Dreaming 只做可解释的 rank/decay/status 建议；MemoryReviewer 不直接�
 
 ## 6. 下一阶段优先级
 
-下一阶段应先做 Phase B，而不是继续扩充 Curator UI 或增加新的 LLM reviewer。统一候选协议是后续去重、确认、审计、Curator 权威化的共同地基，且属于 EKO 产品逻辑，应放在 `echo-agent-cli/echo-agent-app-core`；框架仅保留通用 review/evolution 原语。
+下一阶段进入 Phase E：拆分 deterministic maintenance 与 semantic mutation。优先审计 Dreaming/MemoryReviewer 的自动 merge、status/rank/decay 边界，把语义改写继续收口到 proposal；不新增 LLM reviewer、不引入 SQLite、不做本地 EvalRunner。

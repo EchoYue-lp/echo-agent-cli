@@ -1,80 +1,69 @@
 //! Auto-memory product integration.
 //!
-//! Generic observation extraction and typed-memory writes live in
-//! `echo_agent::evolution::auto_memory`. This module keeps only the app-side
-//! project memory file integration used by CLI/TUI/GUI.
+//! Generic observation extraction lives in `echo_agent::evolution::auto_memory`.
+//! EKO routes extracted observations into the workspace evidence inbox instead
+//! of writing inferred content directly into durable memory.
 
+use crate::evolution::{
+    EvidenceCandidate, EvidenceCandidateDraft, EvidenceKind, EvidenceRef, EvidenceSource,
+    EvidenceStore,
+};
 pub use echo_agent::evolution::auto_memory::{
     AutoMemoryConfig, Observation, ObservationCategory, extract_observations,
     format_observations_for_memory,
 };
-use std::sync::Arc;
 
-/// Append auto-extracted observations to the project memory file.
-///
-/// An application concern: the framework writes durable typed memory,
-/// while the product also maintains `.eko/project.md` as prompt context.
-pub fn append_to_project_memory(observations: &[Observation]) -> Result<(), String> {
-    if observations.is_empty() {
-        return Ok(());
-    }
-
-    let formatted = format_observations_for_memory(observations);
-    let cwd = std::env::current_dir().map_err(|e| format!("Failed to get cwd: {e}"))?;
-    let root = crate::utils::find_project_root(&cwd).unwrap_or(cwd);
-    let memory_path = root.join(".eko").join("project.md");
-
-    if let Some(parent) = memory_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create directory: {e}"))?;
-    }
-
-    let existing = std::fs::read_to_string(&memory_path).unwrap_or_default();
-    let new_content = if let Some(marker_pos) = existing.find("## Auto-extracted observations") {
-        let before = &existing[..marker_pos];
-        format!("{}{}", before.trim_end(), formatted)
-    } else if existing.is_empty() {
-        formatted
-    } else {
-        format!("{}\n{}", existing.trim_end(), formatted)
-    };
-
-    std::fs::write(&memory_path, new_content)
-        .map_err(|e| format!("Failed to write project memory: {e}"))?;
-    Ok(())
-}
-
-/// Run auto-memory extraction and persist only the app project-memory file.
-///
-/// Callers that also need runtime recall should additionally call
-/// `write_observations_to_memory_layer` with the runtime layer manager.
+/// Run auto-memory extraction and queue candidates for review.
 pub fn run_auto_memory_extraction(
     messages: &[(String, String)],
     config: &AutoMemoryConfig,
-) -> Result<usize, String> {
+) -> Result<Vec<EvidenceCandidate>, String> {
     let observations = extract_observations(messages, config);
-    let count = observations.len();
-    if count > 0 {
-        append_to_project_memory(&observations)?;
-    }
-    Ok(count)
+    let store = EvidenceStore::new(crate::evolution::discover_echo_agent_dir());
+    queue_observations(&store, &observations, messages)
 }
 
-/// App-side bridge: write observations through the agent's **shared** layer
-/// manager (stage4 F1, 割裂点 6).
-///
-/// Previously this built a fresh per-call `MemoryLayerManager` (via
-/// `ReviewIntegration::create_layer_manager`) that bypassed the agent's shared
-/// security guard, audit log, and write counter/observer. Callers now pass the
-/// agent's shared `MemoryLayerManager` (obtained via
-/// `ReactAgent::memory_layer_manager()`), so session-end auto-memory writes
-/// land on the same chokepoint as explicit `write_memory` calls.
-pub async fn write_observations_to_memory_layer(
+/// Queue inferred observations in the unified workspace inbox.
+pub fn queue_observations(
+    store: &EvidenceStore,
     observations: &[Observation],
-    layer_manager: &Arc<echo_agent::evolution::MemoryLayerManager>,
-) -> Result<usize, String> {
-    echo_agent::evolution::auto_memory::write_observations_to_memory_layer(
-        observations,
-        layer_manager,
-    )
-    .await
+    messages: &[(String, String)],
+) -> Result<Vec<EvidenceCandidate>, String> {
+    let mut candidates = Vec::new();
+    for observation in observations {
+        let source = observation.source_turn.and_then(|turn| {
+            messages
+                .get(turn)
+                .map(|(role, content)| (turn, role, content))
+        });
+        let (source_turn, source_role, quote) = match source {
+            Some((turn, role, content)) => (Some(turn), Some(role.clone()), content.clone()),
+            None => (observation.source_turn, None, observation.text.clone()),
+        };
+        let kind = match observation.category {
+            ObservationCategory::User => EvidenceKind::UserPreference,
+            ObservationCategory::Bug => EvidenceKind::DebuggingLesson,
+            ObservationCategory::Decision | ObservationCategory::Project => {
+                EvidenceKind::ProjectFact
+            }
+            ObservationCategory::FilePath => EvidenceKind::ProjectFact,
+        };
+        candidates.push(
+            store.upsert(EvidenceCandidateDraft {
+                kind,
+                scope: matches!(kind, EvidenceKind::UserPreference)
+                    .then(|| crate::evolution::EvidenceScope::User("local-user".to_string())),
+                content: observation.text.clone(),
+                evidence: vec![EvidenceRef {
+                    source: EvidenceSource::AutoMemory,
+                    source_run_id: None,
+                    source_role,
+                    source_turn,
+                    quote,
+                }],
+                confidence: observation.confidence as f32,
+            })?,
+        );
+    }
+    Ok(candidates)
 }

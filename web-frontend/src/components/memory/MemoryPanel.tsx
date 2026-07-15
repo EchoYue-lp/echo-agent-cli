@@ -75,10 +75,11 @@ export function MemoryPanel() {
       const result = await autoMemoryApi.extract();
       setAutoPreview(result.observations);
       setAutoMessage(
-        result.success ? `已保存 ${result.count} 条观察` : result.message || 'Auto Memory 未保存'
+        result.success
+          ? `已将 ${result.queued ?? result.count} 条候选送入 Review Inbox`
+          : result.message || 'Auto Memory 未生成候选'
       );
       await loadAutoMemoryStatus();
-      await loadEntries(selectedNs || undefined);
     } catch (e) {
       setAutoMessage(e instanceof Error ? e.message : 'Auto Memory 提取失败');
     } finally {
@@ -213,7 +214,7 @@ export function MemoryPanel() {
             style={{ background: s.accent }}
           >
             {autoBusy ? <Loader2 size={12} className="animate-spin" /> : <Sparkles size={12} />}
-            提取
+            送审
           </button>
         </div>
 

@@ -35,6 +35,8 @@ import type {
   DashboardMetrics,
   RuleProposal,
   SkillCandidateInfo,
+  EvidenceCandidate,
+  EvidenceCandidateStatus,
   ConfiguredModelListResponse,
   ProviderTemplate,
   TestConnectionResponse,
@@ -87,6 +89,8 @@ export interface AutoMemoryExtractResult extends AutoMemoryPreview {
   success: boolean;
   memory_path?: string;
   message?: string;
+  queued?: number;
+  candidates?: EvidenceCandidate[];
 }
 
 export interface ExecutionPolicySnapshot {
@@ -1015,6 +1019,7 @@ export const evolutionApi = {
             confidence: number;
             persisted: boolean;
           } | null;
+          evidence_candidate?: EvidenceCandidate | null;
           error?: string | null;
         }>('review_run', { run_id: runId })
       : post<{
@@ -1029,8 +1034,34 @@ export const evolutionApi = {
             confidence: number;
             persisted: boolean;
           } | null;
+          evidence_candidate?: EvidenceCandidate | null;
           error?: string | null;
         }>('/evolution/review', { run_id: runId }),
+  listEvidence: (status: EvidenceCandidateStatus | 'all' = 'pending') =>
+    isTauri()
+      ? apiInvoke<{ candidates: EvidenceCandidate[]; count: number; path: string }>(
+          'list_evidence_candidates',
+          { status }
+        )
+      : get<{ candidates: EvidenceCandidate[]; count: number; path: string }>(
+          `/evolution/evidence?status=${encodeURIComponent(status)}`
+        ),
+  evidenceAction: (
+    action: 'edit' | 'accept' | 'reject' | 'undo',
+    candidateId: string,
+    content?: string
+  ) =>
+    isTauri()
+      ? apiInvoke<{ success: boolean; candidate: EvidenceCandidate }>('evidence_candidate_action', {
+          action,
+          candidate_id: candidateId,
+          content,
+        })
+      : post<{ success: boolean; candidate: EvidenceCandidate }>('/evolution/evidence/action', {
+          action,
+          candidate_id: candidateId,
+          content,
+        }),
   curator: (action: string, skillName?: string) =>
     isTauri()
       ? apiInvoke<{

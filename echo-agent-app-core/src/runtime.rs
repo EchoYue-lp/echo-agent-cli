@@ -280,14 +280,24 @@ impl AgentRuntime {
         }
         if let Some(review_integration) = &review_integration {
             let layer_manager = Arc::new(review_integration.create_layer_manager());
+            let trigger_sink = review_integration.clone();
+            let skill_policy = review_integration.clone();
+            let workspace_skills = review_echo_agent_dir.join("skills");
             agent_handle
                 .write_async(|a| {
                     Box::pin(async move {
                         a.install_memory_layer_manager(layer_manager);
+                        a.set_memory_trigger_sink(Some(trigger_sink));
+                        a.set_skill_load_policy(Some(skill_policy));
+                        if workspace_skills.is_dir()
+                            && let Err(error) = a.load_skills_from_dir(workspace_skills).await
+                        {
+                            tracing::warn!(%error, "Failed to load workspace-curated skills");
+                        }
                     })
                 })
                 .await;
-            tracing::info!("Layered memory tools installed on primary agent");
+            tracing::info!("Layered memory, evidence sink, and skill policy installed");
         }
 
         // ── 9. Plugins ──

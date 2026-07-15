@@ -155,7 +155,8 @@ pub async fn run_repl(agent: AgentHandle, config: ReplConfig) -> anyhow::Result<
         .with_coding_loop(coding_loop)
         .with_task_service_opt(config.task_service)
         .with_scheduler_opt(config.scheduler_runner)
-        .with_prompt_assembly(config.prompt_assembly);
+        .with_prompt_assembly(config.prompt_assembly)
+        .with_review_integration(config.review_integration.clone());
 
     let editor_config = EditorConfig {
         prompt: config.prompt.clone(),
@@ -198,7 +199,7 @@ pub async fn run_repl(agent: AgentHandle, config: ReplConfig) -> anyhow::Result<
     }
 
     // ── Auto-memory: extract observations on session end ────────────
-    run_auto_memory_on_exit(&agent).await;
+    run_auto_memory_on_exit(&agent, &config.review_integration).await;
 
     // ── Reflection: summarize session learnings ─────────────────────
     run_reflection_on_exit(&agent).await;
@@ -217,10 +218,12 @@ pub async fn run_repl(agent: AgentHandle, config: ReplConfig) -> anyhow::Result<
 /// Run auto-memory extraction when the session ends.
 ///
 /// Non-blocking: errors are silently ignored to avoid disrupting exit flow.
-async fn run_auto_memory_on_exit(agent: &AgentHandle) {
+async fn run_auto_memory_on_exit(
+    agent: &AgentHandle,
+    review_integration: &Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
+) {
     use echo_agent_app_core::auto_memory::{
-        AutoMemoryConfig, append_to_project_memory, extract_observations,
-        format_observations_for_memory, write_observations_to_memory_layer,
+        AutoMemoryConfig, extract_observations, queue_observations,
     };
 
     // Check if auto-memory is enabled (shared with /auto-memory command)
@@ -261,41 +264,20 @@ async fn run_auto_memory_on_exit(agent: &AgentHandle) {
         return;
     }
 
-    let count = observations.len();
-    let formatted = format_observations_for_memory(&observations);
-
-    let typed_written = match agent.read(|a| a.memory_layer_manager().cloned()).await {
-        Some(lm) => match write_observations_to_memory_layer(&observations, &lm).await {
-            Ok(count) => count,
-            Err(e) => {
-                println!("  Auto-memory: failed to save typed memory ({})", e);
-                0
-            }
-        },
-        None => {
-            tracing::debug!("auto_memory: agent has no shared layer manager, skipping typed write");
-            0
-        }
-    };
-
-    match append_to_project_memory(&observations) {
-        Ok(()) => {
-            println!(
-                "  💾 Auto-memory: saved {} observation(s) to project memory, {} to typed memory.",
-                count, typed_written
-            );
-            // Print a brief summary of what was saved
-            for line in formatted.lines().take(8) {
-                println!("     {}", line);
-            }
-            if formatted.lines().count() > 8 {
-                println!("     ...");
-            }
-        }
-        Err(e) => {
-            // Silently report but don't block exit
-            println!("  Auto-memory: failed to save ({})", e);
-        }
+    let store = review_integration
+        .as_ref()
+        .map(|integration| integration.evidence_store())
+        .unwrap_or_else(|| {
+            echo_agent_app_core::evolution::EvidenceStore::new(
+                echo_agent_app_core::evolution::discover_echo_agent_dir(),
+            )
+        });
+    match queue_observations(&store, &observations, &messages) {
+        Ok(candidates) => println!(
+            "  Auto-memory: queued {} observation candidate(s) for review.",
+            candidates.len()
+        ),
+        Err(error) => println!("  Auto-memory: failed to queue candidates ({error})"),
     }
 }
 
