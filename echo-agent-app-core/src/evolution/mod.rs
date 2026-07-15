@@ -10,11 +10,16 @@ pub mod hook_fire;
 pub mod review_integration;
 pub mod rule_promoter;
 
-pub use dashboard::{ActivityEntry, Dashboard, DashboardMetrics, MemoryStats, SkillHealthOverview};
+pub use dashboard::{
+    ActivityEntry, AuditFeedbackMetrics, Dashboard, DashboardMetrics, FeedbackWindowMetrics,
+    MemoryStats, RealUsageMetrics, SkillHealthOverview, ToolFeedbackMetrics,
+};
 pub use evidence::{
     EvidenceAction, EvidenceCandidate, EvidenceCandidateDraft, EvidenceCandidateStatus,
-    EvidenceKind, EvidenceRef, EvidenceScope, EvidenceSource, EvidenceStore, EvidenceTarget,
-    capture_memory_conflict, capture_review_outcome,
+    EvidenceFeedbackMetrics, EvidenceInteractionAction, EvidenceInteractionEvent,
+    EvidenceInteractionFailureKind, EvidenceKind, EvidenceRef, EvidenceScope, EvidenceSource,
+    EvidenceSourceMetrics, EvidenceStore, EvidenceTarget, capture_memory_conflict,
+    capture_review_outcome,
 };
 pub use hook_fire::fire_evolution_hook;
 pub use review_integration::{

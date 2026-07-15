@@ -122,12 +122,14 @@ Dreaming 是唯一的确定性记忆维护执行器：只根据 recall/inactivit
 
 验收：无人确认时不会自动改写已有事实或技能；自动任务幂等、低 token、可关闭。
 
-### Phase F：基于真实使用反馈改善能力
+### Phase F：基于真实使用反馈改善能力（已完成）
 
 不做本地 benchmark loop。使用真实运行信号：用户纠正、撤销、候选接受率、skill 成功/失败、重复工具失败、人工重试。先改善 skill/rule/memory，再考虑是否存在足够证据修改基础 prompt；基础 prompt 修改必须是版本化 artifact，不能在线自改。
 
 验收：每项改善都有真实来源和前后指标；不引入 EvalRunner、SQLite 或自动 prompt rewrite。
 
+实现：Evidence JSONL schema v3 在保持旧 candidate snapshot 可读的前提下，追加 accept/reject/undo 的 attempt/success/failure interaction；过期 merge proposal 使用框架 typed error 识别，不再依赖错误字符串。Dashboard 复用 Evidence、memory audit、run trace、skill telemetry，提供 7/30 天与全量窗口：候选首决策接受/拒绝率、撤销率、过期 proposal、reviewed/automatic mutation、工具成功失败、跨 run 重复失败与无效重试。TraceAnalyzer 对生产环境同时写入的 `ToolResult(false)`/`ToolError` 去重，并只暴露参数结构、不暴露参数值；skill 指标明确为“skill 激活期间的工具可靠性”，不冒充任务级成功率。GUI/TUI/CLI 共用同一聚合器和 workspace-bound 数据源。全部统计为本地确定性扫描，不调用 LLM、不注入 Agent 上下文，因此不增加常规请求 token 或破坏 KV cache。
+
 ## 6. 下一阶段优先级
 
-下一阶段进入 Phase F，但仍不建设本地 benchmark/EvalRunner。优先把真实使用反馈做成低成本产品指标：候选接受/拒绝/撤销率、过期 proposal 数、skill 成功/失败和重复工具失败。指标先服务于 memory/rule/skill 改善；基础 prompt 只有在真实证据充分时才以版本化 artifact 修改，不允许在线自改。
+Phase F 指标底座已完成。下一阶段只做基于累积真实数据的确定性 Review Inbox 建议：优先暴露高撤销 memory/rule、低可靠 skill、跨 run 重复失败模式，并继续要求用户显式确认后才修改 artifact。当前数据不足时只展示指标，不生成建议；仍不建设 EvalRunner、后台 LLM reviewer 或在线 prompt rewrite。

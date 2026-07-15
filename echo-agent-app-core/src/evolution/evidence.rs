@@ -1,6 +1,6 @@
 //! Workspace-scoped evidence candidates backed by an append-only JSONL log.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -11,7 +11,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 const MAX_EVIDENCE_ITEMS: usize = 16;
 const MAX_EVIDENCE_CHARS: usize = 1_000;
 
@@ -106,6 +106,69 @@ pub enum EvidenceCandidateStatus {
     Rejected,
 }
 
+/// User interaction recorded alongside candidate snapshots in the Evidence JSONL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "failure_kind", rename_all = "snake_case")]
+pub enum EvidenceInteractionAction {
+    AcceptAttempt,
+    AcceptSucceeded,
+    AcceptFailed(EvidenceInteractionFailureKind),
+    Rejected,
+    UndoAttempt,
+    UndoSucceeded,
+    UndoFailed(EvidenceInteractionFailureKind),
+}
+
+/// Stable failure classes used by product metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceInteractionFailureKind {
+    StaleProposal,
+    Validation,
+    Mutation,
+    Persistence,
+    Rollback,
+}
+
+/// Append-only interaction event. Candidate snapshots remain backward compatible.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvidenceInteractionEvent {
+    pub schema_version: u32,
+    pub record_type: String,
+    pub event_id: String,
+    pub candidate_id: String,
+    pub action: EvidenceInteractionAction,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// Evidence decision metrics for one time window.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EvidenceFeedbackMetrics {
+    pub candidates_created: usize,
+    pub current_pending: usize,
+    pub current_applied: usize,
+    pub current_rejected: usize,
+    pub accept_attempts: usize,
+    pub accepted_candidates: usize,
+    pub rejected_candidates: usize,
+    pub undone_candidates: usize,
+    pub stale_proposal_failures: usize,
+    pub decision_sample_size: usize,
+    pub acceptance_rate: Option<f32>,
+    pub rejection_rate: Option<f32>,
+    pub undo_rate: Option<f32>,
+    pub by_source: HashMap<EvidenceSource, EvidenceSourceMetrics>,
+}
+
+/// Candidate outcomes attributed to each evidence producer.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EvidenceSourceMetrics {
+    pub candidates: usize,
+    pub accepted: usize,
+    pub rejected: usize,
+    pub undone: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EvidenceTarget {
@@ -147,6 +210,13 @@ pub struct EvidenceCandidateDraft {
     pub evidence: Vec<EvidenceRef>,
     pub action: Option<EvidenceAction>,
     pub confidence: f32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum EvidenceLogRecord {
+    Candidate(Box<EvidenceCandidate>),
+    Interaction(EvidenceInteractionEvent),
 }
 
 #[derive(Debug, Clone)]
@@ -336,6 +406,143 @@ impl EvidenceStore {
         Ok(candidates)
     }
 
+    /// Aggregate real Review Inbox decisions for a time window.
+    pub fn feedback_metrics(
+        &self,
+        after: Option<DateTime<Utc>>,
+    ) -> Result<EvidenceFeedbackMetrics, String> {
+        let candidates = self.read_latest()?;
+        let interactions = self.read_interactions()?;
+        let mut metrics = EvidenceFeedbackMetrics::default();
+        let mut accepted = HashSet::new();
+        let mut rejected = HashSet::new();
+        let mut undone = HashSet::new();
+        let mut first_decisions = HashMap::new();
+
+        for event in interactions
+            .iter()
+            .filter(|event| after.is_none_or(|after| event.timestamp >= after))
+        {
+            match event.action {
+                EvidenceInteractionAction::AcceptAttempt => {
+                    metrics.accept_attempts = metrics.accept_attempts.saturating_add(1);
+                }
+                EvidenceInteractionAction::AcceptSucceeded => {
+                    accepted.insert(event.candidate_id.clone());
+                    first_decisions
+                        .entry(event.candidate_id.clone())
+                        .or_insert(true);
+                }
+                EvidenceInteractionAction::AcceptFailed(
+                    EvidenceInteractionFailureKind::StaleProposal,
+                ) => {
+                    metrics.stale_proposal_failures =
+                        metrics.stale_proposal_failures.saturating_add(1);
+                }
+                EvidenceInteractionAction::Rejected => {
+                    rejected.insert(event.candidate_id.clone());
+                    first_decisions
+                        .entry(event.candidate_id.clone())
+                        .or_insert(false);
+                }
+                EvidenceInteractionAction::UndoSucceeded => {
+                    undone.insert(event.candidate_id.clone());
+                }
+                EvidenceInteractionAction::AcceptFailed(_)
+                | EvidenceInteractionAction::UndoAttempt
+                | EvidenceInteractionAction::UndoFailed(_) => {}
+            }
+        }
+
+        for candidate in candidates.values() {
+            if after.is_none_or(|after| candidate.created_at >= after) {
+                metrics.candidates_created = metrics.candidates_created.saturating_add(1);
+                match candidate.status {
+                    EvidenceCandidateStatus::Pending => {
+                        metrics.current_pending = metrics.current_pending.saturating_add(1);
+                    }
+                    EvidenceCandidateStatus::Applied => {
+                        metrics.current_applied = metrics.current_applied.saturating_add(1);
+                    }
+                    EvidenceCandidateStatus::Rejected => {
+                        metrics.current_rejected = metrics.current_rejected.saturating_add(1);
+                    }
+                }
+            }
+
+            // Candidate snapshots created before interaction events existed still
+            // contribute their current disposition to all-time metrics.
+            if after.is_none() {
+                match candidate.status {
+                    EvidenceCandidateStatus::Applied => {
+                        accepted.insert(candidate.candidate_id.clone());
+                        first_decisions
+                            .entry(candidate.candidate_id.clone())
+                            .or_insert(true);
+                    }
+                    EvidenceCandidateStatus::Rejected => {
+                        rejected.insert(candidate.candidate_id.clone());
+                        first_decisions
+                            .entry(candidate.candidate_id.clone())
+                            .or_insert(false);
+                    }
+                    EvidenceCandidateStatus::Pending => {}
+                }
+            }
+        }
+
+        metrics.accepted_candidates = accepted.len();
+        metrics.rejected_candidates = rejected.len();
+        metrics.undone_candidates = undone.len();
+        metrics.decision_sample_size = first_decisions.len();
+        if metrics.decision_sample_size >= 10 {
+            let first_accepts = first_decisions
+                .values()
+                .filter(|accepted| **accepted)
+                .count();
+            metrics.acceptance_rate =
+                Some(first_accepts as f32 / metrics.decision_sample_size as f32);
+            metrics.rejection_rate = Some(
+                metrics.decision_sample_size.saturating_sub(first_accepts) as f32
+                    / metrics.decision_sample_size as f32,
+            );
+        }
+        if metrics.accepted_candidates >= 10 {
+            metrics.undo_rate =
+                Some(metrics.undone_candidates as f32 / metrics.accepted_candidates as f32);
+        }
+
+        for candidate in candidates.values() {
+            let candidate_in_window = after.is_none_or(|after| candidate.created_at >= after)
+                || accepted.contains(&candidate.candidate_id)
+                || rejected.contains(&candidate.candidate_id)
+                || undone.contains(&candidate.candidate_id);
+            if !candidate_in_window {
+                continue;
+            }
+            let sources = candidate
+                .evidence
+                .iter()
+                .map(|evidence| evidence.source)
+                .collect::<HashSet<_>>();
+            for source in sources {
+                let source_metrics = metrics.by_source.entry(source).or_default();
+                source_metrics.candidates = source_metrics.candidates.saturating_add(1);
+                if accepted.contains(&candidate.candidate_id) {
+                    source_metrics.accepted = source_metrics.accepted.saturating_add(1);
+                }
+                if rejected.contains(&candidate.candidate_id) {
+                    source_metrics.rejected = source_metrics.rejected.saturating_add(1);
+                }
+                if undone.contains(&candidate.candidate_id) {
+                    source_metrics.undone = source_metrics.undone.saturating_add(1);
+                }
+            }
+        }
+
+        Ok(metrics)
+    }
+
     pub fn get(&self, candidate_id: &str) -> Result<Option<EvidenceCandidate>, String> {
         Ok(self.read_latest()?.remove(candidate_id))
     }
@@ -370,13 +577,15 @@ impl EvidenceStore {
     }
 
     pub fn reject(&self, candidate_id: &str) -> Result<EvidenceCandidate, String> {
-        self.update(candidate_id, |candidate, _| {
+        let candidate = self.update(candidate_id, |candidate, _| {
             if candidate.status == EvidenceCandidateStatus::Applied {
                 return Err("undo an applied candidate before rejecting it".to_string());
             }
             candidate.status = EvidenceCandidateStatus::Rejected;
             Ok(())
-        })
+        })?;
+        self.record_interaction_best_effort(candidate_id, EvidenceInteractionAction::Rejected);
+        Ok(candidate)
     }
 
     pub async fn accept(
@@ -388,11 +597,23 @@ impl EvidenceStore {
         let mut candidate = self
             .get(candidate_id)?
             .ok_or_else(|| format!("evidence candidate '{candidate_id}' not found"))?;
-        if let Some(content) = edited_content {
-            candidate = self.edit(candidate_id, content)?;
-        }
         if candidate.status == EvidenceCandidateStatus::Applied {
             return Ok(candidate);
+        }
+        self.record_interaction(candidate_id, EvidenceInteractionAction::AcceptAttempt)?;
+        if let Some(content) = edited_content {
+            candidate = match self.edit(candidate_id, content) {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    self.record_interaction_best_effort(
+                        candidate_id,
+                        EvidenceInteractionAction::AcceptFailed(
+                            EvidenceInteractionFailureKind::Validation,
+                        ),
+                    );
+                    return Err(error);
+                }
+            };
         }
         match candidate.action.clone() {
             EvidenceAction::SaveMemory => {
@@ -404,10 +625,18 @@ impl EvidenceStore {
                     "evidence_inbox",
                 )
                 .with_confidence(candidate.confidence);
-                layer_manager
+                if let Err(error) = layer_manager
                     .write_memory(&key, &candidate.content, meta)
                     .await
-                    .map_err(|error| format!("failed to apply evidence candidate: {error}"))?;
+                {
+                    self.record_interaction_best_effort(
+                        candidate_id,
+                        EvidenceInteractionAction::AcceptFailed(
+                            EvidenceInteractionFailureKind::Mutation,
+                        ),
+                    );
+                    return Err(format!("failed to apply evidence candidate: {error}"));
+                }
 
                 let update_result = self.update(candidate_id, |candidate, _| {
                     candidate.status = EvidenceCandidateStatus::Applied;
@@ -415,14 +644,36 @@ impl EvidenceStore {
                     Ok(())
                 });
                 match update_result {
-                    Ok(candidate) => Ok(candidate),
+                    Ok(candidate) => {
+                        self.record_interaction_best_effort(
+                            candidate_id,
+                            EvidenceInteractionAction::AcceptSucceeded,
+                        );
+                        Ok(candidate)
+                    }
                     Err(update_error) => match layer_manager.delete_memory(&key).await {
-                        Ok(_) => Err(format!(
-                            "failed to record applied evidence candidate; memory write was rolled back: {update_error}"
-                        )),
-                        Err(rollback_error) => Err(format!(
-                            "failed to record applied evidence candidate ({update_error}); failed to roll back memory write ({rollback_error})"
-                        )),
+                        Ok(_) => {
+                            self.record_interaction_best_effort(
+                                candidate_id,
+                                EvidenceInteractionAction::AcceptFailed(
+                                    EvidenceInteractionFailureKind::Persistence,
+                                ),
+                            );
+                            Err(format!(
+                                "failed to record applied evidence candidate; memory write was rolled back: {update_error}"
+                            ))
+                        }
+                        Err(rollback_error) => {
+                            self.record_interaction_best_effort(
+                                candidate_id,
+                                EvidenceInteractionAction::AcceptFailed(
+                                    EvidenceInteractionFailureKind::Rollback,
+                                ),
+                            );
+                            Err(format!(
+                                "failed to record applied evidence candidate ({update_error}); failed to roll back memory write ({rollback_error})"
+                            ))
+                        }
                     },
                 }
             }
@@ -430,10 +681,22 @@ impl EvidenceStore {
                 if edited_content.is_some() {
                     return Err("memory merge proposals cannot be edited during accept".to_string());
                 }
-                let applied = layer_manager
-                    .apply_merge_proposal(&proposal)
-                    .await
-                    .map_err(|error| format!("failed to apply memory merge proposal: {error}"))?;
+                let applied = match layer_manager.apply_merge_proposal(&proposal).await {
+                    Ok(applied) => applied,
+                    Err(error) => {
+                        let failure_kind =
+                            if echo_agent::evolution::is_stale_memory_proposal_error(&error) {
+                                EvidenceInteractionFailureKind::StaleProposal
+                            } else {
+                                EvidenceInteractionFailureKind::Mutation
+                            };
+                        self.record_interaction_best_effort(
+                            candidate_id,
+                            EvidenceInteractionAction::AcceptFailed(failure_kind),
+                        );
+                        return Err(format!("failed to apply memory merge proposal: {error}"));
+                    }
+                };
                 let before = applied.before.clone();
                 let primary_key = applied.primary_key.clone();
                 let superseded_keys = applied.superseded_keys.clone();
@@ -447,15 +710,37 @@ impl EvidenceStore {
                     Ok(())
                 });
                 match update_result {
-                    Ok(candidate) => Ok(candidate),
+                    Ok(candidate) => {
+                        self.record_interaction_best_effort(
+                            candidate_id,
+                            EvidenceInteractionAction::AcceptSucceeded,
+                        );
+                        Ok(candidate)
+                    }
                     Err(update_error) => {
                         match layer_manager.restore_merge_snapshots(&applied.before).await {
-                            Ok(()) => Err(format!(
-                                "failed to record applied memory merge; merge was rolled back: {update_error}"
-                            )),
-                            Err(rollback_error) => Err(format!(
-                                "failed to record applied memory merge ({update_error}); failed to roll back merge ({rollback_error})"
-                            )),
+                            Ok(()) => {
+                                self.record_interaction_best_effort(
+                                    candidate_id,
+                                    EvidenceInteractionAction::AcceptFailed(
+                                        EvidenceInteractionFailureKind::Persistence,
+                                    ),
+                                );
+                                Err(format!(
+                                    "failed to record applied memory merge; merge was rolled back: {update_error}"
+                                ))
+                            }
+                            Err(rollback_error) => {
+                                self.record_interaction_best_effort(
+                                    candidate_id,
+                                    EvidenceInteractionAction::AcceptFailed(
+                                        EvidenceInteractionFailureKind::Rollback,
+                                    ),
+                                );
+                                Err(format!(
+                                    "failed to record applied memory merge ({update_error}); failed to roll back merge ({rollback_error})"
+                                ))
+                            }
                         }
                     }
                 }
@@ -471,20 +756,40 @@ impl EvidenceStore {
         let candidate = self
             .get(candidate_id)?
             .ok_or_else(|| format!("evidence candidate '{candidate_id}' not found"))?;
-        let target = candidate
-            .target
-            .clone()
-            .ok_or_else(|| "candidate has no applied action to undo".to_string())?;
+        self.record_interaction(candidate_id, EvidenceInteractionAction::UndoAttempt)?;
+        let target = match candidate.target.clone() {
+            Some(target) => target,
+            None => {
+                self.record_interaction_best_effort(
+                    candidate_id,
+                    EvidenceInteractionAction::UndoFailed(
+                        EvidenceInteractionFailureKind::Validation,
+                    ),
+                );
+                return Err("candidate has no applied action to undo".to_string());
+            }
+        };
         match target {
             EvidenceTarget::Memory { key } => {
                 let memory_type = memory_type_for_kind(candidate.kind)?;
-                layer_manager
-                    .delete_memory(&key)
-                    .await
-                    .map_err(|error| format!("failed to remove applied memory: {error}"))?;
+                if let Err(error) = layer_manager.delete_memory(&key).await {
+                    self.record_interaction_best_effort(
+                        candidate_id,
+                        EvidenceInteractionAction::UndoFailed(
+                            EvidenceInteractionFailureKind::Mutation,
+                        ),
+                    );
+                    return Err(format!("failed to remove applied memory: {error}"));
+                }
                 let update_result = self.mark_pending(candidate_id);
                 match update_result {
-                    Ok(candidate) => Ok(candidate),
+                    Ok(candidate) => {
+                        self.record_interaction_best_effort(
+                            candidate_id,
+                            EvidenceInteractionAction::UndoSucceeded,
+                        );
+                        Ok(candidate)
+                    }
                     Err(update_error) => {
                         let meta = echo_agent::memory::MemoryMeta::new(
                             memory_type,
@@ -496,24 +801,51 @@ impl EvidenceStore {
                             .write_memory(&key, &candidate.content, meta)
                             .await
                         {
-                            Ok(_) => Err(format!(
-                                "failed to record evidence undo; memory deletion was rolled back: {update_error}"
-                            )),
-                            Err(rollback_error) => Err(format!(
-                                "failed to record evidence undo ({update_error}); failed to restore memory ({rollback_error})"
-                            )),
+                            Ok(_) => {
+                                self.record_interaction_best_effort(
+                                    candidate_id,
+                                    EvidenceInteractionAction::UndoFailed(
+                                        EvidenceInteractionFailureKind::Persistence,
+                                    ),
+                                );
+                                Err(format!(
+                                    "failed to record evidence undo; memory deletion was rolled back: {update_error}"
+                                ))
+                            }
+                            Err(rollback_error) => {
+                                self.record_interaction_best_effort(
+                                    candidate_id,
+                                    EvidenceInteractionAction::UndoFailed(
+                                        EvidenceInteractionFailureKind::Rollback,
+                                    ),
+                                );
+                                Err(format!(
+                                    "failed to record evidence undo ({update_error}); failed to restore memory ({rollback_error})"
+                                ))
+                            }
                         }
                     }
                 }
             }
             EvidenceTarget::MemoryMerge { before, .. } => {
-                layer_manager
-                    .restore_merge_snapshots(&before)
-                    .await
-                    .map_err(|error| format!("failed to undo memory merge: {error}"))?;
+                if let Err(error) = layer_manager.restore_merge_snapshots(&before).await {
+                    self.record_interaction_best_effort(
+                        candidate_id,
+                        EvidenceInteractionAction::UndoFailed(
+                            EvidenceInteractionFailureKind::Mutation,
+                        ),
+                    );
+                    return Err(format!("failed to undo memory merge: {error}"));
+                }
                 let update_result = self.mark_pending(candidate_id);
                 match update_result {
-                    Ok(candidate) => Ok(candidate),
+                    Ok(candidate) => {
+                        self.record_interaction_best_effort(
+                            candidate_id,
+                            EvidenceInteractionAction::UndoSucceeded,
+                        );
+                        Ok(candidate)
+                    }
                     Err(update_error) => {
                         let EvidenceAction::MergeMemories { proposal } = &candidate.action else {
                             return Err(format!(
@@ -521,12 +853,28 @@ impl EvidenceStore {
                             ));
                         };
                         match layer_manager.apply_merge_proposal(proposal).await {
-                            Ok(_) => Err(format!(
-                                "failed to record merge undo; merge was re-applied: {update_error}"
-                            )),
-                            Err(rollback_error) => Err(format!(
-                                "failed to record merge undo ({update_error}); failed to re-apply merge ({rollback_error})"
-                            )),
+                            Ok(_) => {
+                                self.record_interaction_best_effort(
+                                    candidate_id,
+                                    EvidenceInteractionAction::UndoFailed(
+                                        EvidenceInteractionFailureKind::Persistence,
+                                    ),
+                                );
+                                Err(format!(
+                                    "failed to record merge undo; merge was re-applied: {update_error}"
+                                ))
+                            }
+                            Err(rollback_error) => {
+                                self.record_interaction_best_effort(
+                                    candidate_id,
+                                    EvidenceInteractionAction::UndoFailed(
+                                        EvidenceInteractionFailureKind::Rollback,
+                                    ),
+                                );
+                                Err(format!(
+                                    "failed to record merge undo ({update_error}); failed to re-apply merge ({rollback_error})"
+                                ))
+                            }
                         }
                     }
                 }
@@ -583,6 +931,64 @@ impl EvidenceStore {
         result
     }
 
+    fn read_interactions(&self) -> Result<Vec<EvidenceInteractionEvent>, String> {
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let lock_path = self.path.with_extension("jsonl.lock");
+        let lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|error| format!("failed to open evidence lock: {error}"))?;
+        lock.lock_shared()
+            .map_err(|error| format!("failed to lock evidence log for reading: {error}"))?;
+        let result = File::open(&self.path)
+            .map_err(|error| format!("failed to open evidence log: {error}"))
+            .and_then(read_interactions_from);
+        let _ = lock.unlock();
+        result
+    }
+
+    fn record_interaction(
+        &self,
+        candidate_id: &str,
+        action: EvidenceInteractionAction,
+    ) -> Result<(), String> {
+        self.with_locked_log(|latest, file| {
+            if !latest.contains_key(candidate_id) {
+                return Err(format!("evidence candidate '{candidate_id}' not found"));
+            }
+            append_interaction(
+                file,
+                &EvidenceInteractionEvent {
+                    schema_version: SCHEMA_VERSION,
+                    record_type: "interaction".to_string(),
+                    event_id: format!("ei_{}", uuid::Uuid::new_v4().simple()),
+                    candidate_id: candidate_id.to_string(),
+                    action,
+                    timestamp: Utc::now(),
+                },
+            )
+        })
+    }
+
+    fn record_interaction_best_effort(
+        &self,
+        candidate_id: &str,
+        action: EvidenceInteractionAction,
+    ) {
+        if let Err(error) = self.record_interaction(candidate_id, action) {
+            tracing::warn!(
+                candidate_id,
+                error = %error,
+                "failed to append Evidence interaction metric"
+            );
+        }
+    }
+
     fn with_locked_log<T, F>(&self, operation: F) -> Result<T, String>
     where
         F: FnOnce(&HashMap<String, EvidenceCandidate>, &mut File) -> Result<T, String>,
@@ -627,15 +1033,38 @@ fn read_latest_from(file: File) -> Result<HashMap<String, EvidenceCandidate>, St
         if line.trim().is_empty() {
             continue;
         }
-        let candidate: EvidenceCandidate = serde_json::from_str(&line).map_err(|error| {
+        let record: EvidenceLogRecord = serde_json::from_str(&line).map_err(|error| {
             format!(
                 "invalid evidence JSONL record at line {}: {error}",
                 index.saturating_add(1)
             )
         })?;
-        latest.insert(candidate.candidate_id.clone(), candidate);
+        if let EvidenceLogRecord::Candidate(candidate) = record {
+            let candidate = *candidate;
+            latest.insert(candidate.candidate_id.clone(), candidate);
+        }
     }
     Ok(latest)
+}
+
+fn read_interactions_from(file: File) -> Result<Vec<EvidenceInteractionEvent>, String> {
+    let mut interactions = Vec::new();
+    for (index, line) in BufReader::new(file).lines().enumerate() {
+        let line = line.map_err(|error| format!("failed to read evidence line: {error}"))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record: EvidenceLogRecord = serde_json::from_str(&line).map_err(|error| {
+            format!(
+                "invalid evidence JSONL record at line {}: {error}",
+                index.saturating_add(1)
+            )
+        })?;
+        if let EvidenceLogRecord::Interaction(interaction) = record {
+            interactions.push(interaction);
+        }
+    }
+    Ok(interactions)
 }
 
 fn append_snapshot(file: &mut File, candidate: &EvidenceCandidate) -> Result<(), String> {
@@ -646,6 +1075,16 @@ fn append_snapshot(file: &mut File, candidate: &EvidenceCandidate) -> Result<(),
         .map_err(|error| format!("failed to write evidence candidate: {error}"))?;
     file.sync_data()
         .map_err(|error| format!("failed to sync evidence candidate: {error}"))
+}
+
+fn append_interaction(file: &mut File, event: &EvidenceInteractionEvent) -> Result<(), String> {
+    let mut line = serde_json::to_vec(event)
+        .map_err(|error| format!("failed to serialize evidence interaction: {error}"))?;
+    line.push(b'\n');
+    file.write_all(&line)
+        .map_err(|error| format!("failed to write evidence interaction: {error}"))?;
+    file.sync_data()
+        .map_err(|error| format!("failed to sync evidence interaction: {error}"))
 }
 
 fn normalize_content(content: &str) -> String {
@@ -864,6 +1303,10 @@ mod tests {
         let undone = store.undo(&candidate.candidate_id, &layer_manager).await?;
         assert_eq!(undone.status, EvidenceCandidateStatus::Pending);
         assert!(undone.target.is_none());
+        let metrics = store.feedback_metrics(None)?;
+        assert_eq!(metrics.accept_attempts, 1);
+        assert_eq!(metrics.accepted_candidates, 1);
+        assert_eq!(metrics.undone_candidates, 1);
         Ok(())
     }
 
@@ -955,6 +1398,29 @@ mod tests {
             current.1.meta.status,
             echo_agent::memory::MemoryStatus::Active
         );
+        let metrics = store.feedback_metrics(None)?;
+        assert_eq!(metrics.accept_attempts, 1);
+        assert_eq!(metrics.accepted_candidates, 0);
+        assert_eq!(metrics.stale_proposal_failures, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn rejected_candidates_are_counted_from_interaction_events() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let store = EvidenceStore::new(temp.path().join(".eko"));
+        let candidate = store.upsert(draft("Keep metrics local", "user decision"))?;
+        store.reject(&candidate.candidate_id)?;
+
+        let metrics = store.feedback_metrics(None)?;
+        assert_eq!(metrics.rejected_candidates, 1);
+        assert_eq!(metrics.decision_sample_size, 1);
+        assert_eq!(metrics.acceptance_rate, None);
+        let source_metrics = metrics
+            .by_source
+            .get(&EvidenceSource::AutoMemory)
+            .ok_or_else(|| "missing AutoMemory source metrics".to_string())?;
+        assert_eq!(source_metrics.rejected, 1);
         Ok(())
     }
 }

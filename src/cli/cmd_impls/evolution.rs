@@ -1514,7 +1514,10 @@ cmd!(
 // ── EvolutionDashboardCommand ─────────────────────────────────────
 
 async fn cmd_evolution_dashboard(ctx: &CommandContext, _args: &[&str]) -> CommandOutcome {
-    let store = ctx.agent.read(|a| a.store().cloned()).await;
+    let (store, run_store) = ctx
+        .agent
+        .read(|a| (a.store().cloned(), a.run_store.clone()))
+        .await;
     let store = match store {
         Some(s) => s,
         None => {
@@ -1529,7 +1532,8 @@ async fn cmd_evolution_dashboard(ctx: &CommandContext, _args: &[&str]) -> Comman
             .join("changelog.jsonl"),
     );
 
-    let dashboard = echo_agent_app_core::evolution::Dashboard::new(store, change_log);
+    let dashboard = echo_agent_app_core::evolution::Dashboard::new(store, change_log)
+        .with_feedback_sources(current_evidence_store(ctx), run_store);
 
     println!("Generating evolution dashboard...\n");
 

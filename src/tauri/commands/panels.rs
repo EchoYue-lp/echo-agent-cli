@@ -1535,18 +1535,24 @@ pub async fn get_evolution_dashboard(
     state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
     let agent = state.app_state.connection.primary_agent();
-    let store = agent
-        .read(|a| a.store().cloned())
-        .await
-        .ok_or_else(|| IpcError::Internal("No memory store configured".into()))?;
+    let (store, run_store) = agent
+        .read(|a| (a.store().cloned(), a.run_store().cloned()))
+        .await;
+    let store = store.ok_or_else(|| IpcError::Internal("No memory store configured".into()))?;
+    let echo_agent_dir = state
+        .app_state
+        .review_integration
+        .as_ref()
+        .map(|integration| integration.echo_agent_dir())
+        .unwrap_or_else(echo_agent_app_core::evolution::discover_echo_agent_dir);
+    let evidence_store = echo_agent_app_core::evolution::EvidenceStore::new(&echo_agent_dir);
 
     let change_log = echo_agent::evolution::JsonlChangeLog::new(
-        echo_agent_app_core::evolution::discover_echo_agent_dir()
-            .join("evolution")
-            .join("changelog.jsonl"),
+        echo_agent_dir.join("evolution").join("changelog.jsonl"),
     );
 
-    let dashboard = echo_agent_app_core::evolution::Dashboard::new(store, change_log);
+    let dashboard = echo_agent_app_core::evolution::Dashboard::new(store, change_log)
+        .with_feedback_sources(evidence_store, run_store);
     let metrics = dashboard.generate_metrics().await;
 
     Ok(json!({ "metrics": metrics }))

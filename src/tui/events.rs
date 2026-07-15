@@ -3212,6 +3212,42 @@ async fn handle_slash_command(
                 content: result,
             });
         }
+        Some(SlashCommand::EvolutionDashboard) => {
+            let (store, run_store) = agent
+                .read(|value| (value.store().cloned(), value.run_store.clone()))
+                .await;
+            let Some(store) = store else {
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: "No memory store configured.".to_string(),
+                });
+                return;
+            };
+            let evidence_store = app
+                .review_integration
+                .as_ref()
+                .map(|integration| integration.evidence_store())
+                .unwrap_or_else(|| {
+                    echo_agent_app_core::evolution::EvidenceStore::new(
+                        echo_agent_app_core::evolution::discover_echo_agent_dir(),
+                    )
+                });
+            let echo_agent_dir = app
+                .review_integration
+                .as_ref()
+                .map(|integration| integration.echo_agent_dir())
+                .unwrap_or_else(echo_agent_app_core::evolution::discover_echo_agent_dir);
+            let change_log = echo_agent::evolution::JsonlChangeLog::new(
+                echo_agent_dir.join("evolution").join("changelog.jsonl"),
+            );
+            let dashboard = echo_agent_app_core::evolution::Dashboard::new(store, change_log)
+                .with_feedback_sources(evidence_store, run_store);
+            let metrics = dashboard.generate_metrics().await;
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content: echo_agent_app_core::evolution::Dashboard::format_metrics(&metrics),
+            });
+        }
         Some(SlashCommand::MemoryReview) => {
             // Create ReviewIntegration on-the-fly from the agent's store
             let store = agent.read(|a| a.store().cloned()).await;

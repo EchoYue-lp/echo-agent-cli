@@ -19,6 +19,8 @@ import {
   Undo2,
   Pencil,
   Save,
+  Activity,
+  AlertTriangle,
 } from 'lucide-react';
 import { evolutionApi } from '../../api/endpoints';
 import { useToastStore } from '../../stores/toastStore';
@@ -38,6 +40,7 @@ export function EvolutionPanel() {
   // ── Dashboard state(进化概览:分层记忆统计 + 技能健康 + 变更活动)
   const [dashboard, setDashboard] = useState<DashboardMetrics | null>(null);
   const [loadingDashboard, setLoadingDashboard] = useState(false);
+  const [usageWindow, setUsageWindow] = useState<'7d' | '30d' | 'all'>('30d');
 
   // ── Rule proposals state(规则候选:用户审阅 → 采纳才写 AGENTS.md)
   const [proposals, setProposals] = useState<RuleProposal[]>([]);
@@ -247,6 +250,14 @@ export function EvolutionPanel() {
     setCuratorLoading(false);
   };
 
+  const activeUsage = dashboard
+    ? usageWindow === '7d'
+      ? dashboard.real_usage.last_7_days
+      : usageWindow === '30d'
+        ? dashboard.real_usage.last_30_days
+        : dashboard.real_usage.all_time
+    : null;
+
   return (
     <div className="space-y-6">
       {/* ── Section 0: Evolution Overview (Dashboard) ── */}
@@ -272,15 +283,15 @@ export function EvolutionPanel() {
         {dashboard ? (
           <>
             {/* 总记忆数 + 技能健康概览 */}
-            <div className="grid grid-cols-3 gap-2 mb-3">
+            <div className="mb-3 grid grid-cols-1 gap-2 sm:grid-cols-3">
               <StatCard
                 label="总记忆"
                 value={dashboard.total_memories}
                 icon={<Database size={10} />}
               />
               <StatCard
-                label="健康技能"
-                value={dashboard.skill_health.healthy_skills}
+                label="工具可靠技能"
+                value={dashboard.skill_health.reliable_skills}
                 color="var(--color-success)"
                 icon={<Heart size={10} />}
               />
@@ -290,6 +301,90 @@ export function EvolutionPanel() {
                 color="var(--color-warning, orange)"
               />
             </div>
+
+            {activeUsage && (
+              <div className="mb-3 border-y py-3" style={{ borderColor: 'var(--border-primary)' }}>
+                <div className="mb-2 flex flex-col items-start justify-between gap-2 sm:flex-row sm:items-center">
+                  <div className="flex items-center gap-1.5">
+                    <Activity size={12} style={{ color: 'var(--accent)' }} />
+                    <span
+                      className="text-[11px] font-medium"
+                      style={{ color: 'var(--text-secondary)' }}
+                    >
+                      真实使用反馈
+                    </span>
+                  </div>
+                  <div
+                    className="grid w-full grid-cols-3 gap-0.5 rounded-md p-0.5 sm:w-auto"
+                    style={{ background: 'var(--bg-hover)' }}
+                  >
+                    {(['7d', '30d', 'all'] as const).map((window) => (
+                      <button
+                        key={window}
+                        onClick={() => setUsageWindow(window)}
+                        className="rounded px-2 py-0.5 text-[9px] font-medium"
+                        style={{
+                          background: usageWindow === window ? 'var(--bg-primary)' : 'transparent',
+                          color:
+                            usageWindow === window ? 'var(--text-primary)' : 'var(--text-tertiary)',
+                        }}
+                      >
+                        {window === 'all' ? '全部' : window}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 gap-x-4 gap-y-1 text-[10px] sm:grid-cols-2">
+                  <MetricLine
+                    label="候选决策"
+                    value={`${activeUsage.evidence.accepted_candidates} 接受 / ${activeUsage.evidence.rejected_candidates} 拒绝`}
+                  />
+                  <MetricLine
+                    label="撤销 / 过期"
+                    value={`${activeUsage.evidence.undone_candidates} / ${activeUsage.evidence.stale_proposal_failures}`}
+                  />
+                  <MetricLine
+                    label="工具失败"
+                    value={`${activeUsage.tools.failure_count} / ${activeUsage.tools.total_calls} (${formatMetricRate(activeUsage.tools.failure_rate)})`}
+                  />
+                  <MetricLine
+                    label="重复 / 无效重试"
+                    value={`${activeUsage.tools.repeated_failure_patterns} / ${activeUsage.tools.ineffective_retry_count}`}
+                  />
+                  <MetricLine label="审计变更" value={activeUsage.audit.total_mutations} />
+                  <MetricLine
+                    label="接受 / 拒绝 / 撤销率"
+                    value={`${formatMetricRate(activeUsage.evidence.acceptance_rate)} / ${formatMetricRate(activeUsage.evidence.rejection_rate)} / ${formatMetricRate(activeUsage.evidence.undo_rate)}`}
+                    wide
+                  />
+                </div>
+
+                {activeUsage.tools.top_repeated_failures.length > 0 && (
+                  <div className="mt-2 space-y-1">
+                    {activeUsage.tools.top_repeated_failures.slice(0, 3).map((failure) => (
+                      <div
+                        key={`${failure.tool_name}-${failure.error_class}-${failure.pattern}`}
+                        className="flex items-start gap-1.5 text-[10px]"
+                        style={{ color: 'var(--text-tertiary)' }}
+                      >
+                        <AlertTriangle size={10} className="mt-0.5 shrink-0" />
+                        <span className="min-w-0 truncate">
+                          {failure.tool_name}: {failure.error_class} ({failure.occurrence_count} 次
+                          / {failure.distinct_run_count} runs)
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                {activeUsage.data_errors.length > 0 && (
+                  <div className="mt-2 text-[10px]" style={{ color: 'var(--color-error)' }}>
+                    {activeUsage.data_errors.join('; ')}
+                  </div>
+                )}
+              </div>
+            )}
 
             {/* 按记忆类型分布 */}
             {Object.keys(dashboard.memory_by_type).length > 0 && (
@@ -1109,4 +1204,31 @@ function StatCard({
       </div>
     </div>
   );
+}
+
+function MetricLine({
+  label,
+  value,
+  wide = false,
+}: {
+  label: string;
+  value: number | string;
+  wide?: boolean;
+}) {
+  return (
+    <div
+      className={`flex min-w-0 items-center justify-between gap-2 ${wide ? 'sm:col-span-2' : ''}`}
+    >
+      <span className="truncate" style={{ color: 'var(--text-tertiary)' }}>
+        {label}
+      </span>
+      <span className="shrink-0 font-mono" style={{ color: 'var(--text-secondary)' }}>
+        {value}
+      </span>
+    </div>
+  );
+}
+
+function formatMetricRate(rate: number | null) {
+  return rate === null ? '样本不足' : `${(rate * 100).toFixed(1)}%`;
 }
