@@ -461,6 +461,7 @@ export function EvolutionPanel() {
             {evidenceCandidates.map((candidate) => {
               const isEditing = editingEvidence === candidate.candidate_id;
               const isActing = actingOnEvidence === candidate.candidate_id;
+              const isMemoryMerge = candidate.action.kind === 'merge_memories';
               return (
                 <div
                   key={candidate.candidate_id}
@@ -515,12 +516,14 @@ export function EvolutionPanel() {
                       }}
                     >
                       <span className="font-medium">{item.source}</span>
+                      {item.source_memory_key ? ` / ${item.source_memory_key}` : ''}
                       {item.source_role ? ` / ${item.source_role}` : ''}: {item.quote}
                     </div>
                   ))}
 
                   <div className="flex items-center justify-end gap-1.5 mt-3">
                     {candidate.status !== 'applied' &&
+                      !isMemoryMerge &&
                       (isEditing ? (
                         <>
                           <button
@@ -572,7 +575,7 @@ export function EvolutionPanel() {
                         onClick={() => runEvidenceAction('accept', candidate.candidate_id)}
                         disabled={isActing}
                         className="p-1.5"
-                        title="采纳候选"
+                        title={isMemoryMerge ? '采纳并执行记忆合并' : '采纳候选'}
                         style={{ color: 'var(--color-success)' }}
                       >
                         {isActing ? (

@@ -626,15 +626,46 @@ export type EvidenceKind =
   | 'debugging_lesson'
   | 'error_resolution'
   | 'workflow_pattern'
-  | 'skill';
+  | 'skill'
+  | 'memory_conflict';
 
 export interface EvidenceRef {
-  source: 'background_reviewer' | 'trigger_detector' | 'auto_memory';
+  source: 'background_reviewer' | 'trigger_detector' | 'auto_memory' | 'memory_reviewer';
   source_run_id?: string;
   source_role?: string;
   source_turn?: number;
+  source_memory_key?: string;
   quote: string;
 }
+
+export interface MemoryConflictMember {
+  key: string;
+  content: string;
+  confidence: number;
+  status: 'draft' | 'active' | 'superseded' | 'archived';
+  recall_count: number;
+  updated_at: number;
+}
+
+export interface MemoryConflictProposal {
+  topic: string;
+  memory_type: string;
+  recommended_primary_key: string;
+  members: MemoryConflictMember[];
+}
+
+export type EvidenceAction =
+  | { kind: 'save_memory' }
+  | { kind: 'merge_memories'; proposal: MemoryConflictProposal };
+
+export type EvidenceTarget =
+  | { kind: 'memory'; key: string }
+  | {
+      kind: 'memory_merge';
+      primary_key: string;
+      superseded_keys: string[];
+      before: Array<{ key: string; content: string; meta: unknown }>;
+    };
 
 export interface EvidenceCandidate {
   schema_version: number;
@@ -644,9 +675,10 @@ export interface EvidenceCandidate {
   scope: { kind: 'user' | 'workspace' | 'session'; id: string };
   content: string;
   evidence: EvidenceRef[];
+  action: EvidenceAction;
   confidence: number;
   status: EvidenceCandidateStatus;
-  target?: { kind: 'memory'; key: string };
+  target?: EvidenceTarget;
   revision: number;
   created_at: string;
   updated_at: string;

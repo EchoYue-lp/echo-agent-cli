@@ -14,8 +14,8 @@
 - `BackgroundReviewer` 改为严格 JSON 候选，system 指令与不可信 transcript 分离，证据必须能在原 run 中精确核对。
 - Background review 默认 proposal-only；单次输出上限从 2048 降到 512 token，temperature 设为 0。
 - `/review`、TUI `/run-review`、GUI Evolution Panel 功能对等，明确显示证据、置信度和“未自动保存”。
-- `MemoryReviewer` 使用真实 `recall_count` 衡量使用度；默认关闭 session-end review，默认 `max_merges_per_review = 0`。
-- 删除每次 memory write 都触发但实际无操作的 observer。
+- `MemoryReviewer` 使用真实 `recall_count` 衡量使用度；默认关闭 session-end review，且已收口为 analysis-only。
+- 删除 every-N-writes 失效计数器；保留真正消费写入事件的通用 observer API。
 - Curator/candidate/draft/merge 统一归属 `evolution`，不再错误依赖 `improve`。
 
 ## 2. 参考实现与取舍
@@ -116,9 +116,9 @@ GUI/TUI/CLI 共用候选列表、接受、编辑、拒绝、撤销操作。用�
 
 实现：EKO Curator state 迁至 `{workspace}/.eko/evolution/curator-state.json`，`SkillMeta` 记录具体 `SKILL.md` path；框架新增通用 `SkillLoadPolicy` 与 reconcile API，EKO policy 阻止 Draft/Deprecated/Archived 及其它 workspace 的 `.eko/skills` 进入 catalog。workspace/curator 状态切换会立即 reconcile，skill 激活会绑定正式路径并即时加载。
 
-### Phase E：拆分 maintenance 与 semantic mutation
+### Phase E：拆分 maintenance 与 semantic mutation（已完成）
 
-Dreaming 只做可解释的 rank/decay/status 建议；MemoryReviewer 不直接合并文本；语义 merge、rule promotion、skill activation 全部进入 proposal。保留 recall telemetry，删除重复 cadence 和失效计数器。
+Dreaming 是唯一的确定性记忆维护执行器：只根据 recall/inactivity 做可解释的 promote/revive/archive，不改写语义内容，并返回逐项 decision report。MemoryReviewer 只做 staleness/conflict 分析；冲突转成带完整 proposal 的 `EvidenceCandidate(action=merge_memories)`，用户在三端 Review Inbox 采纳后才执行合并。合并执行前重新核对 topic/type/member/content/status/confidence/推荐 primary，过期建议 fail-before-mutation；accept 保存 before snapshot，undo 恢复内容和 typed metadata。单次最多 10 个冲突建议、每组最多 16 条，避免 JSONL 与上下文无界增长。every-N-writes cadence/counter 已删除，真实 recall telemetry 增加 `last_recalled_at`，hot/warm 往返不再丢 recall/revision 元数据。
 
 验收：无人确认时不会自动改写已有事实或技能；自动任务幂等、低 token、可关闭。
 
@@ -130,4 +130,4 @@ Dreaming 只做可解释的 rank/decay/status 建议；MemoryReviewer 不直接�
 
 ## 6. 下一阶段优先级
 
-下一阶段进入 Phase E：拆分 deterministic maintenance 与 semantic mutation。优先审计 Dreaming/MemoryReviewer 的自动 merge、status/rank/decay 边界，把语义改写继续收口到 proposal；不新增 LLM reviewer、不引入 SQLite、不做本地 EvalRunner。
+下一阶段进入 Phase F，但仍不建设本地 benchmark/EvalRunner。优先把真实使用反馈做成低成本产品指标：候选接受/拒绝/撤销率、过期 proposal 数、skill 成功/失败和重复工具失败。指标先服务于 memory/rule/skill 改善；基础 prompt 只有在真实证据充分时才以版本化 artifact 修改，不允许在线自改。

@@ -59,8 +59,10 @@ pub fn queue_observations(
                     source_run_id: None,
                     source_role,
                     source_turn,
+                    source_memory_key: None,
                     quote,
                 }],
+                action: None,
                 confidence: observation.confidence as f32,
             })?,
         );

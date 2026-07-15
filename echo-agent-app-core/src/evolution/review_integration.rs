@@ -9,9 +9,8 @@
 //!    write volume instead of recall value).
 //!
 //! The struct is self-contained: given a `Store`, an `echo_agent_dir`, and a
-//! [`ReviewConfig`], it creates its own [`MemoryLayerManager`] and
-//! [`ChangeLog`] on each review pass, so callers never need to wire up the
-//! framework internals.
+//! [`ReviewConfig`], it creates analysis and audit dependencies on demand and
+//! persists semantic proposals into the workspace Review Inbox.
 
 use echo_agent::evolution::{
     Curator, CuratorConfig, MemoryLayerManager, MemoryReviewer, MemoryRuntimeIntegrationBuilder,
@@ -22,11 +21,10 @@ use echo_agent::memory::TypedMemoryStore;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::RwLock;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::evidence::{
     EvidenceCandidate, EvidenceCandidateDraft, EvidenceKind, EvidenceRef, EvidenceSource,
-    EvidenceStore, capture_review_outcome,
+    EvidenceStore, capture_memory_conflict, capture_review_outcome,
 };
 
 /// Bridges the framework's review system into the product lifecycle.
@@ -37,7 +35,6 @@ use super::evidence::{
 /// internally on each review pass.
 pub struct ReviewIntegration {
     config: ReviewConfig,
-    write_counter: Arc<AtomicU64>,
     /// Path to the `.echo-agent/` (or `.eko/`) directory for the change log
     /// and MEMORY.md. Wrapped in `RwLock` so a workspace switch can rebind
     /// this and the `store` atomically without recreating the whole
@@ -52,7 +49,6 @@ impl ReviewIntegration {
     pub fn new(config: ReviewConfig, echo_agent_dir: PathBuf, store: Arc<dyn Store>) -> Self {
         Self {
             config,
-            write_counter: Arc::new(AtomicU64::new(0)),
             echo_agent_dir: RwLock::new(echo_agent_dir),
             store: RwLock::new(store),
         }
@@ -101,11 +97,6 @@ impl ReviewIntegration {
         capture_review_outcome(&self.evidence_store(), outcome)
     }
 
-    /// Get the write counter (for diagnostics / testing).
-    pub fn write_count(&self) -> u64 {
-        self.write_counter.load(Ordering::Relaxed)
-    }
-
     /// Called at session end. Runs a full review if configured.
     pub async fn on_session_end(&self) -> Option<Result<ReviewReport, String>> {
         if !self.config.review_on_session_end {
@@ -145,25 +136,23 @@ impl ReviewIntegration {
             (dir, st)
         };
         let typed_store = TypedMemoryStore::new(store.clone());
-        let runtime_builder = MemoryRuntimeIntegrationBuilder::new(echo_agent_dir.clone(), store)
-            .write_counter(self.write_counter.clone())
-            .review_every_n_writes(self.config.review_every_n_writes);
+        let runtime_builder = MemoryRuntimeIntegrationBuilder::new(echo_agent_dir.clone(), store);
         let change_log = runtime_builder.create_change_log();
-        let layer_manager = runtime_builder.build_layer_manager();
         let reviewer = MemoryReviewer::new();
         let mut report = reviewer
-            .review(
-                &typed_store,
-                &layer_manager,
-                change_log.as_ref(),
-                &self.config,
-            )
+            .review(&typed_store, &self.config)
             .await
             .map_err(|e| format!("Memory review failed: {e}"))?;
 
+        let evidence_store = EvidenceStore::new(echo_agent_dir.clone());
+        for proposal in &report.conflict_proposals {
+            capture_memory_conflict(&evidence_store, proposal)?;
+        }
+
         // ── Skill candidate detection ──────────────────────────────
         if self.config.detect_skill_candidates {
-            let detector = SkillCandidateDetector::new().with_curator(self.curator());
+            let detector =
+                SkillCandidateDetector::new().with_curator(workspace_curator(&echo_agent_dir));
             match detector.detect(&typed_store, change_log.as_ref()).await {
                 Ok(candidate_report) => {
                     for candidate in &candidate_report.new_candidates {
@@ -180,7 +169,7 @@ impl ReviewIntegration {
                     {
                         let generator =
                             SkillDraftGenerator::new(echo_agent_dir.clone(), change_log.as_ref())
-                                .with_curator(self.curator());
+                                .with_curator(workspace_curator(&echo_agent_dir));
                         for candidate in &candidate_report.new_candidates {
                             match generator.generate_from_candidate(candidate).await {
                                 Ok(draft_result) => {
@@ -215,10 +204,8 @@ impl ReviewIntegration {
 
     /// Create a `MemoryLayerManager` for the current workspace's memory store.
     ///
-    /// Wires the shared write counter so every memory write through this layer
-    /// manager is observable. Reads the current
-    /// `(echo_agent_dir, store)` from the inner locks — so after a workspace
-    /// `rebind`, this produces a manager bound to the new store/dir.
+    /// Reads the current `(echo_agent_dir, store)` from the inner locks, so
+    /// after a workspace `rebind` this manager uses the new workspace.
     pub fn create_layer_manager(&self) -> MemoryLayerManager {
         self.runtime_builder().build_layer_manager()
     }
@@ -239,8 +226,6 @@ impl ReviewIntegration {
             .map(|g| g.clone())
             .unwrap_or_else(|e| e.into_inner().clone());
         MemoryRuntimeIntegrationBuilder::new(echo_agent_dir, store)
-            .write_counter(self.write_counter.clone())
-            .review_every_n_writes(self.config.review_every_n_writes)
     }
 
     fn current_echo_agent_dir(&self) -> PathBuf {
@@ -275,6 +260,7 @@ impl echo_agent::evolution::MemoryTriggerSink for ReviewIntegration {
                     source_run_id: None,
                     source_role: Some(item.source_role.clone()),
                     source_turn: None,
+                    source_memory_key: None,
                     quote: item.quote.clone(),
                 })
                 .collect();
@@ -284,6 +270,7 @@ impl echo_agent::evolution::MemoryTriggerSink for ReviewIntegration {
                     .then(|| super::evidence::EvidenceScope::User("local-user".to_string())),
                 content: trigger.content.clone(),
                 evidence,
+                action: None,
                 confidence: trigger.confidence,
             }) {
                 // EKO treats inferred memory as review-only. Do not let an inbox
@@ -394,10 +381,9 @@ pub fn format_review_report(report: &ReviewReport) -> String {
         "  ⚠️  Conflict groups found: {}",
         report.conflict_groups
     ));
-    lines.push(format!("  🔀 Merges applied: {}", report.merges_applied));
     lines.push(format!(
-        "  📦 Entries archived: {}",
-        report.archives_applied
+        "  🔀 Conflict proposals queued: {}",
+        report.conflict_proposals.len()
     ));
     if report.candidates_proposed > 0 {
         lines.push(format!(
@@ -414,34 +400,29 @@ pub fn format_review_report(report: &ReviewReport) -> String {
 
     if !report.changes.is_empty() {
         lines.push(String::new());
-        lines.push("Changes:".to_string());
+        lines.push("Proposals:".to_string());
         for change in &report.changes {
             match change {
-                echo_agent::evolution::ReviewChange::Archive { key, staleness } => {
-                    lines.push(format!(
-                        "  📦 Archived '{}' (staleness: {:.2})",
-                        key, staleness
-                    ));
-                }
-                echo_agent::evolution::ReviewChange::Merge {
-                    primary_key,
-                    superseded_keys,
-                } => {
-                    lines.push(format!(
-                        "  🔀 Merged {} entries into '{}'",
-                        superseded_keys.len() + 1,
-                        primary_key
-                    ));
-                }
-                echo_agent::evolution::ReviewChange::StatusTransition {
+                echo_agent::evolution::ReviewChange::StalenessSuggested {
                     key,
-                    from,
-                    to,
+                    recommended_status,
                     staleness,
                 } => {
                     lines.push(format!(
-                        "  🔄 '{}' : {:?} → {:?} (staleness: {:.2})",
-                        key, from, to, staleness
+                        "  🕐 '{}' → suggested {:?} (staleness: {:.2})",
+                        key, recommended_status, staleness
+                    ));
+                }
+                echo_agent::evolution::ReviewChange::ConflictProposed {
+                    topic,
+                    recommended_primary_key,
+                    member_keys,
+                } => {
+                    lines.push(format!(
+                        "  🔀 Conflict '{}' among [{}]; recommended primary '{}'",
+                        topic,
+                        member_keys.join(", "),
+                        recommended_primary_key
                     ));
                 }
                 echo_agent::evolution::ReviewChange::CandidateProposed { name, sample_count } => {
@@ -484,19 +465,20 @@ mod tests {
             total_scanned: 10,
             stale_count: 3,
             conflict_groups: 2,
-            merges_applied: 1,
-            archives_applied: 1,
+            staleness_suggestions: Vec::new(),
+            conflict_proposals: Vec::new(),
             candidates_proposed: 0,
             drafts_generated: 0,
-            changes: vec![echo_agent::evolution::ReviewChange::Archive {
+            changes: vec![echo_agent::evolution::ReviewChange::StalenessSuggested {
                 key: "old_fact".to_string(),
+                recommended_status: echo_agent::memory::MemoryStatus::Archived,
                 staleness: 0.75,
             }],
         };
         let text = format_review_report(&report);
         assert!(text.contains("10 entries scanned"));
         assert!(text.contains("Stale entries (flagged): 3"));
-        assert!(text.contains("Archived 'old_fact'"));
+        assert!(text.contains("'old_fact' → suggested Archived"));
     }
 
     #[test]
@@ -533,42 +515,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_review_integration_write_counter() {
+    async fn memory_conflicts_are_queued_without_mutating_the_store() -> Result<(), String> {
         use echo_agent::evolution::ReviewConfig;
-        use echo_agent::memory::{InMemoryStore, MemoryMeta, MemorySource, MemoryType};
-
-        let store = Arc::new(InMemoryStore::new()) as Arc<dyn Store>;
-        let dir = tempfile::tempdir().expect("tempdir").keep();
-        let config = ReviewConfig {
-            review_every_n_writes: 3,
-            ..Default::default()
+        use echo_agent::memory::{
+            InMemoryStore, MemoryMeta, MemorySource, MemoryStatus, MemoryType,
         };
 
-        let ri = ReviewIntegration::new(config, dir, store);
+        let store = Arc::new(InMemoryStore::new()) as Arc<dyn Store>;
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let ri = ReviewIntegration::new(ReviewConfig::default(), temp.path().join(".eko"), store);
         let layer_manager = ri.create_layer_manager();
-        let meta = MemoryMeta::new(MemoryType::ProjectFact, MemorySource::AutoExtracted, "test");
+        let high = MemoryMeta::new(MemoryType::ProjectFact, MemorySource::ExplicitSave, "build")
+            .with_confidence(0.9);
+        let low = MemoryMeta::new(
+            MemoryType::ProjectFact,
+            MemorySource::AutoExtracted,
+            "build",
+        )
+        .with_confidence(0.5);
 
-        // Write-count-triggered review is removed; the shared counter remains
-        // available for diagnostics while Dreaming uses recall telemetry.
-        assert_eq!(ri.write_count(), 0);
+        layer_manager
+            .write_memory("cargo", "Build uses cargo", high)
+            .await
+            .map_err(|error| error.to_string())?;
+        layer_manager
+            .write_memory("make", "Build uses make", low)
+            .await
+            .map_err(|error| error.to_string())?;
 
-        layer_manager
-            .write_memory("one", "first project fact", meta.clone())
+        let report = ri.run_review().await?;
+        assert_eq!(report.conflict_proposals.len(), 1);
+        let queued = ri.evidence_store().list()?;
+        assert_eq!(queued.len(), 1);
+        let candidate = queued
+            .first()
+            .ok_or_else(|| "review did not queue a conflict candidate".to_string())?;
+        assert!(matches!(
+            candidate.action,
+            crate::evolution::EvidenceAction::MergeMemories { .. }
+        ));
+        let secondary = layer_manager
+            .locate("make")
             .await
-            .expect("write one");
-        layer_manager
-            .write_memory("two", "second project fact", meta.clone())
-            .await
-            .expect("write two");
-        layer_manager
-            .write_memory("three", "third project fact", meta)
-            .await
-            .expect("write three");
-        assert_eq!(
-            ri.write_count(),
-            3,
-            "counter still increments for diagnostics"
-        );
+            .ok_or_else(|| "secondary memory disappeared during review".to_string())?;
+        assert_eq!(secondary.1.meta.status, MemoryStatus::Active);
+        Ok(())
     }
 
     #[tokio::test]

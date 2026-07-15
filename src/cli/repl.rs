@@ -352,9 +352,9 @@ async fn run_reflection_on_exit(agent: &AgentHandle) {
 
 /// Run memory review when the session ends.
 ///
-/// Performs staleness scoring, conflict detection, merge, and archival
-/// on typed memories. Non-blocking: errors are silently ignored to avoid
-/// disrupting exit flow.
+/// Performs analysis-only staleness scoring and conflict detection on typed
+/// memories, then queues actionable proposals in the Review Inbox. Non-blocking:
+/// errors are reported without disrupting exit flow.
 ///
 /// When `shared_ri` is provided, reuses the bootstrap-time ReviewIntegration
 /// (same shared store + layer manager as Dreaming). Otherwise falls back to
@@ -371,12 +371,11 @@ async fn run_memory_review_on_exit(
                     let count = report.total_scanned;
                     if count > 0 {
                         println!(
-                            "  📋 Memory review: {} scanned, {} stale, {} conflicts, {} merged, {} archived",
+                            "  📋 Memory review: {} scanned, {} stale, {} conflicts, {} proposals queued",
                             count,
                             report.stale_count,
                             report.conflict_groups,
-                            report.merges_applied,
-                            report.archives_applied
+                            report.conflict_proposals.len()
                         );
                     }
                 }
@@ -407,12 +406,11 @@ async fn run_memory_review_on_exit(
                 let count = report.total_scanned;
                 if count > 0 {
                     println!(
-                        "  📋 Memory review: {} scanned, {} stale, {} conflicts, {} merged, {} archived",
+                        "  📋 Memory review: {} scanned, {} stale, {} conflicts, {} proposals queued",
                         count,
                         report.stale_count,
                         report.conflict_groups,
-                        report.merges_applied,
-                        report.archives_applied
+                        report.conflict_proposals.len()
                     );
                 }
             }

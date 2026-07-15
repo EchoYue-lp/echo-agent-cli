@@ -11,7 +11,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const MAX_EVIDENCE_ITEMS: usize = 16;
 const MAX_EVIDENCE_CHARS: usize = 1_000;
 
@@ -21,6 +21,7 @@ pub enum EvidenceSource {
     BackgroundReviewer,
     TriggerDetector,
     AutoMemory,
+    MemoryReviewer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -32,6 +33,7 @@ pub enum EvidenceKind {
     ErrorResolution,
     WorkflowPattern,
     Skill,
+    MemoryConflict,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -61,7 +63,39 @@ pub struct EvidenceRef {
     pub source_role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_turn: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_memory_key: Option<String>,
     pub quote: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EvidenceAction {
+    #[default]
+    SaveMemory,
+    MergeMemories {
+        proposal: echo_agent::evolution::MemoryConflictProposal,
+    },
+}
+
+impl EvidenceAction {
+    fn fingerprint_key(&self) -> String {
+        match self {
+            Self::SaveMemory => "save_memory".to_string(),
+            Self::MergeMemories { proposal } => {
+                let members = proposal
+                    .members
+                    .iter()
+                    .map(|member| format!("{}:{}", member.key, normalize_content(&member.content)))
+                    .collect::<Vec<_>>()
+                    .join("|");
+                format!(
+                    "merge:{:?}:{}:{}:{}",
+                    proposal.memory_type, proposal.topic, proposal.recommended_primary_key, members
+                )
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -72,10 +106,17 @@ pub enum EvidenceCandidateStatus {
     Rejected,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EvidenceTarget {
-    Memory { key: String },
+    Memory {
+        key: String,
+    },
+    MemoryMerge {
+        primary_key: String,
+        superseded_keys: Vec<String>,
+        before: Vec<echo_agent::evolution::MemoryMergeSnapshot>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +128,8 @@ pub struct EvidenceCandidate {
     pub scope: EvidenceScope,
     pub content: String,
     pub evidence: Vec<EvidenceRef>,
+    #[serde(default)]
+    pub action: EvidenceAction,
     pub confidence: f32,
     pub status: EvidenceCandidateStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -102,6 +145,7 @@ pub struct EvidenceCandidateDraft {
     pub scope: Option<EvidenceScope>,
     pub content: String,
     pub evidence: Vec<EvidenceRef>,
+    pub action: Option<EvidenceAction>,
     pub confidence: f32,
 }
 
@@ -138,11 +182,57 @@ pub fn capture_review_outcome(
                 source_run_id: Some(outcome.run_id.clone()),
                 source_role: None,
                 source_turn: None,
+                source_memory_key: None,
                 quote: candidate.evidence.clone(),
             }],
+            action: None,
             confidence: candidate.confidence,
         })
         .map(Some)
+}
+
+/// Persist an analysis-only memory conflict as an actionable inbox proposal.
+pub fn capture_memory_conflict(
+    store: &EvidenceStore,
+    proposal: &echo_agent::evolution::MemoryConflictProposal,
+) -> Result<EvidenceCandidate, String> {
+    let member_keys = proposal
+        .members
+        .iter()
+        .map(|member| member.key.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let confidence = proposal
+        .members
+        .iter()
+        .find(|member| member.key == proposal.recommended_primary_key)
+        .map(|member| member.confidence)
+        .unwrap_or(0.5);
+    let evidence = proposal
+        .members
+        .iter()
+        .map(|member| EvidenceRef {
+            source: EvidenceSource::MemoryReviewer,
+            source_run_id: None,
+            source_role: None,
+            source_turn: None,
+            source_memory_key: Some(member.key.clone()),
+            quote: member.content.clone(),
+        })
+        .collect();
+    store.upsert(EvidenceCandidateDraft {
+        kind: EvidenceKind::MemoryConflict,
+        scope: None,
+        content: format!(
+            "Resolve {:?} conflict for topic '{}'; recommended primary '{}' among [{}]",
+            proposal.memory_type, proposal.topic, proposal.recommended_primary_key, member_keys
+        ),
+        evidence,
+        action: Some(EvidenceAction::MergeMemories {
+            proposal: proposal.clone(),
+        }),
+        confidence,
+    })
 }
 
 impl EvidenceStore {
@@ -184,13 +274,18 @@ impl EvidenceStore {
 
         self.with_locked_log(|latest, file| {
             let scope = draft.scope.clone().unwrap_or_else(|| self.scope.clone());
-            let fingerprint = candidate_fingerprint(draft.kind, &scope, &draft.content);
+            let action = draft.action.clone().unwrap_or_default();
+            let fingerprint = candidate_fingerprint(draft.kind, &scope, &draft.content, &action);
             if let Some(existing) = latest
                 .values()
                 .find(|candidate| candidate.fingerprint == fingerprint)
             {
                 let mut updated = existing.clone();
                 let mut changed = false;
+                if updated.status == EvidenceCandidateStatus::Pending && updated.action != action {
+                    updated.action = action;
+                    changed = true;
+                }
                 for evidence in &draft.evidence {
                     if updated.evidence.len() >= MAX_EVIDENCE_ITEMS {
                         break;
@@ -222,6 +317,7 @@ impl EvidenceStore {
                 scope,
                 content: draft.content,
                 evidence: draft.evidence,
+                action,
                 confidence: draft.confidence,
                 status: EvidenceCandidateStatus::Pending,
                 target: None,
@@ -253,7 +349,15 @@ impl EvidenceStore {
             if candidate.status == EvidenceCandidateStatus::Applied {
                 return Err("undo an applied candidate before editing it".to_string());
             }
-            let fingerprint = candidate_fingerprint(candidate.kind, &candidate.scope, &normalized);
+            if !matches!(candidate.action, EvidenceAction::SaveMemory) {
+                return Err("semantic action proposals cannot edit their summary".to_string());
+            }
+            let fingerprint = candidate_fingerprint(
+                candidate.kind,
+                &candidate.scope,
+                &normalized,
+                &candidate.action,
+            );
             if latest.values().any(|other| {
                 other.candidate_id != candidate.candidate_id && other.fingerprint == fingerprint
             }) {
@@ -290,34 +394,72 @@ impl EvidenceStore {
         if candidate.status == EvidenceCandidateStatus::Applied {
             return Ok(candidate);
         }
-        let memory_type = memory_type_for_kind(candidate.kind)?;
-        let key = format!("evidence_{}", candidate.candidate_id);
-        let meta = echo_agent::memory::MemoryMeta::new(
-            memory_type,
-            echo_agent::memory::MemorySource::ExplicitSave,
-            "evidence_inbox",
-        )
-        .with_confidence(candidate.confidence);
-        layer_manager
-            .write_memory(&key, &candidate.content, meta)
-            .await
-            .map_err(|error| format!("failed to apply evidence candidate: {error}"))?;
+        match candidate.action.clone() {
+            EvidenceAction::SaveMemory => {
+                let memory_type = memory_type_for_kind(candidate.kind)?;
+                let key = format!("evidence_{}", candidate.candidate_id);
+                let meta = echo_agent::memory::MemoryMeta::new(
+                    memory_type,
+                    echo_agent::memory::MemorySource::ExplicitSave,
+                    "evidence_inbox",
+                )
+                .with_confidence(candidate.confidence);
+                layer_manager
+                    .write_memory(&key, &candidate.content, meta)
+                    .await
+                    .map_err(|error| format!("failed to apply evidence candidate: {error}"))?;
 
-        let update_result = self.update(candidate_id, |candidate, _| {
-            candidate.status = EvidenceCandidateStatus::Applied;
-            candidate.target = Some(EvidenceTarget::Memory { key: key.clone() });
-            Ok(())
-        });
-        match update_result {
-            Ok(candidate) => Ok(candidate),
-            Err(update_error) => match layer_manager.delete_memory(&key).await {
-                Ok(_) => Err(format!(
-                    "failed to record applied evidence candidate; memory write was rolled back: {update_error}"
-                )),
-                Err(rollback_error) => Err(format!(
-                    "failed to record applied evidence candidate ({update_error}); failed to roll back memory write ({rollback_error})"
-                )),
-            },
+                let update_result = self.update(candidate_id, |candidate, _| {
+                    candidate.status = EvidenceCandidateStatus::Applied;
+                    candidate.target = Some(EvidenceTarget::Memory { key: key.clone() });
+                    Ok(())
+                });
+                match update_result {
+                    Ok(candidate) => Ok(candidate),
+                    Err(update_error) => match layer_manager.delete_memory(&key).await {
+                        Ok(_) => Err(format!(
+                            "failed to record applied evidence candidate; memory write was rolled back: {update_error}"
+                        )),
+                        Err(rollback_error) => Err(format!(
+                            "failed to record applied evidence candidate ({update_error}); failed to roll back memory write ({rollback_error})"
+                        )),
+                    },
+                }
+            }
+            EvidenceAction::MergeMemories { proposal } => {
+                if edited_content.is_some() {
+                    return Err("memory merge proposals cannot be edited during accept".to_string());
+                }
+                let applied = layer_manager
+                    .apply_merge_proposal(&proposal)
+                    .await
+                    .map_err(|error| format!("failed to apply memory merge proposal: {error}"))?;
+                let before = applied.before.clone();
+                let primary_key = applied.primary_key.clone();
+                let superseded_keys = applied.superseded_keys.clone();
+                let update_result = self.update(candidate_id, |candidate, _| {
+                    candidate.status = EvidenceCandidateStatus::Applied;
+                    candidate.target = Some(EvidenceTarget::MemoryMerge {
+                        primary_key,
+                        superseded_keys,
+                        before: before.clone(),
+                    });
+                    Ok(())
+                });
+                match update_result {
+                    Ok(candidate) => Ok(candidate),
+                    Err(update_error) => {
+                        match layer_manager.restore_merge_snapshots(&applied.before).await {
+                            Ok(()) => Err(format!(
+                                "failed to record applied memory merge; merge was rolled back: {update_error}"
+                            )),
+                            Err(rollback_error) => Err(format!(
+                                "failed to record applied memory merge ({update_error}); failed to roll back merge ({rollback_error})"
+                            )),
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -329,41 +471,75 @@ impl EvidenceStore {
         let candidate = self
             .get(candidate_id)?
             .ok_or_else(|| format!("evidence candidate '{candidate_id}' not found"))?;
-        let Some(EvidenceTarget::Memory { key }) = candidate.target.as_ref() else {
-            return Err("candidate has no applied memory to undo".to_string());
-        };
-        let memory_type = memory_type_for_kind(candidate.kind)?;
-        layer_manager
-            .delete_memory(key)
-            .await
-            .map_err(|error| format!("failed to remove applied memory: {error}"))?;
-        let update_result = self.update(candidate_id, |candidate, _| {
-            candidate.status = EvidenceCandidateStatus::Pending;
-            candidate.target = None;
-            Ok(())
-        });
-        match update_result {
-            Ok(candidate) => Ok(candidate),
-            Err(update_error) => {
-                let meta = echo_agent::memory::MemoryMeta::new(
-                    memory_type,
-                    echo_agent::memory::MemorySource::ExplicitSave,
-                    "evidence_inbox",
-                )
-                .with_confidence(candidate.confidence);
-                match layer_manager
-                    .write_memory(key, &candidate.content, meta)
+        let target = candidate
+            .target
+            .clone()
+            .ok_or_else(|| "candidate has no applied action to undo".to_string())?;
+        match target {
+            EvidenceTarget::Memory { key } => {
+                let memory_type = memory_type_for_kind(candidate.kind)?;
+                layer_manager
+                    .delete_memory(&key)
                     .await
-                {
-                    Ok(_) => Err(format!(
-                        "failed to record evidence undo; memory deletion was rolled back: {update_error}"
-                    )),
-                    Err(rollback_error) => Err(format!(
-                        "failed to record evidence undo ({update_error}); failed to restore memory ({rollback_error})"
-                    )),
+                    .map_err(|error| format!("failed to remove applied memory: {error}"))?;
+                let update_result = self.mark_pending(candidate_id);
+                match update_result {
+                    Ok(candidate) => Ok(candidate),
+                    Err(update_error) => {
+                        let meta = echo_agent::memory::MemoryMeta::new(
+                            memory_type,
+                            echo_agent::memory::MemorySource::ExplicitSave,
+                            "evidence_inbox",
+                        )
+                        .with_confidence(candidate.confidence);
+                        match layer_manager
+                            .write_memory(&key, &candidate.content, meta)
+                            .await
+                        {
+                            Ok(_) => Err(format!(
+                                "failed to record evidence undo; memory deletion was rolled back: {update_error}"
+                            )),
+                            Err(rollback_error) => Err(format!(
+                                "failed to record evidence undo ({update_error}); failed to restore memory ({rollback_error})"
+                            )),
+                        }
+                    }
+                }
+            }
+            EvidenceTarget::MemoryMerge { before, .. } => {
+                layer_manager
+                    .restore_merge_snapshots(&before)
+                    .await
+                    .map_err(|error| format!("failed to undo memory merge: {error}"))?;
+                let update_result = self.mark_pending(candidate_id);
+                match update_result {
+                    Ok(candidate) => Ok(candidate),
+                    Err(update_error) => {
+                        let EvidenceAction::MergeMemories { proposal } = &candidate.action else {
+                            return Err(format!(
+                                "failed to record merge undo and candidate action is invalid: {update_error}"
+                            ));
+                        };
+                        match layer_manager.apply_merge_proposal(proposal).await {
+                            Ok(_) => Err(format!(
+                                "failed to record merge undo; merge was re-applied: {update_error}"
+                            )),
+                            Err(rollback_error) => Err(format!(
+                                "failed to record merge undo ({update_error}); failed to re-apply merge ({rollback_error})"
+                            )),
+                        }
+                    }
                 }
             }
         }
+    }
+
+    fn mark_pending(&self, candidate_id: &str) -> Result<EvidenceCandidate, String> {
+        self.update(candidate_id, |candidate, _| {
+            candidate.status = EvidenceCandidateStatus::Pending;
+            candidate.target = None;
+            Ok(())
+        })
     }
 
     fn update<F>(&self, candidate_id: &str, mutate: F) -> Result<EvidenceCandidate, String>
@@ -490,12 +666,18 @@ fn sanitize_evidence(evidence: Vec<EvidenceRef>) -> Vec<EvidenceRef> {
     result
 }
 
-fn candidate_fingerprint(kind: EvidenceKind, scope: &EvidenceScope, content: &str) -> String {
+fn candidate_fingerprint(
+    kind: EvidenceKind,
+    scope: &EvidenceScope,
+    content: &str,
+    action: &EvidenceAction,
+) -> String {
     let normalized = normalize_content(content).to_lowercase();
     let mut hasher = Sha256::new();
     hasher.update(format!(
-        "{kind:?}\n{}\n{normalized}",
-        scope.fingerprint_key()
+        "{kind:?}\n{}\n{normalized}\n{}",
+        scope.fingerprint_key(),
+        action.fingerprint_key()
     ));
     hex::encode(hasher.finalize())
 }
@@ -510,12 +692,67 @@ fn memory_type_for_kind(kind: EvidenceKind) -> Result<echo_agent::memory::Memory
         EvidenceKind::Skill => {
             Err("skill evidence must use the dedicated skill candidate review flow".to_string())
         }
+        EvidenceKind::MemoryConflict => {
+            Err("memory conflict evidence must use an explicit merge action".to_string())
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn conflict_proposal() -> echo_agent::evolution::MemoryConflictProposal {
+        echo_agent::evolution::MemoryConflictProposal {
+            topic: "build".to_string(),
+            memory_type: echo_agent::memory::MemoryType::ProjectFact,
+            recommended_primary_key: "cargo".to_string(),
+            members: vec![
+                echo_agent::evolution::MemoryConflictMember {
+                    key: "cargo".to_string(),
+                    content: "Build uses cargo".to_string(),
+                    confidence: 0.9,
+                    status: echo_agent::memory::MemoryStatus::Active,
+                    recall_count: 0,
+                    updated_at: 1,
+                },
+                echo_agent::evolution::MemoryConflictMember {
+                    key: "make".to_string(),
+                    content: "Build uses make".to_string(),
+                    confidence: 0.5,
+                    status: echo_agent::memory::MemoryStatus::Active,
+                    recall_count: 0,
+                    updated_at: 1,
+                },
+            ],
+        }
+    }
+
+    async fn seed_conflict(
+        layer_manager: &echo_agent::evolution::MemoryLayerManager,
+    ) -> Result<(), String> {
+        let high = echo_agent::memory::MemoryMeta::new(
+            echo_agent::memory::MemoryType::ProjectFact,
+            echo_agent::memory::MemorySource::ExplicitSave,
+            "build",
+        )
+        .with_confidence(0.9);
+        let low = echo_agent::memory::MemoryMeta::new(
+            echo_agent::memory::MemoryType::ProjectFact,
+            echo_agent::memory::MemorySource::AutoExtracted,
+            "build",
+        )
+        .with_confidence(0.5);
+        layer_manager
+            .write_memory("cargo", "Build uses cargo", high)
+            .await
+            .map_err(|error| error.to_string())?;
+        layer_manager
+            .write_memory("make", "Build uses make", low)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
 
     fn draft(content: &str, quote: &str) -> EvidenceCandidateDraft {
         EvidenceCandidateDraft {
@@ -527,8 +764,10 @@ mod tests {
                 source_run_id: None,
                 source_role: Some("assistant".to_string()),
                 source_turn: Some(1),
+                source_memory_key: None,
                 quote: quote.to_string(),
             }],
+            action: None,
             confidence: 0.8,
         }
     }
@@ -556,6 +795,34 @@ mod tests {
 
         assert_eq!(duplicate.status, EvidenceCandidateStatus::Rejected);
         assert_eq!(duplicate.evidence.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn pending_merge_candidate_refreshes_nonsemantic_proposal_metadata() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let store = EvidenceStore::new(temp.path().join(".eko"));
+        let proposal = conflict_proposal();
+        let first = capture_memory_conflict(&store, &proposal)?;
+        let mut refreshed = proposal;
+        if let Some(member) = refreshed
+            .members
+            .iter_mut()
+            .find(|member| member.key == "make")
+        {
+            member.confidence = 0.6;
+            member.updated_at = 2;
+        }
+        let second = capture_memory_conflict(&store, &refreshed)?;
+
+        assert_eq!(first.candidate_id, second.candidate_id);
+        assert!(second.revision > first.revision);
+        assert_eq!(
+            second.action,
+            EvidenceAction::MergeMemories {
+                proposal: refreshed
+            }
+        );
         Ok(())
     }
 
@@ -597,6 +864,97 @@ mod tests {
         let undone = store.undo(&candidate.candidate_id, &layer_manager).await?;
         assert_eq!(undone.status, EvidenceCandidateStatus::Pending);
         assert!(undone.target.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn memory_merge_candidate_accepts_and_restores_exact_metadata() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let store = EvidenceStore::new(temp.path().join(".eko"));
+        let memory_store = Arc::new(echo_agent::memory::InMemoryStore::new());
+        let change_log = echo_agent::evolution::JsonlChangeLog::new(
+            temp.path().join(".eko/evolution/change-log.jsonl"),
+        );
+        let layer_manager = Arc::new(echo_agent::evolution::MemoryLayerManager::new(
+            temp.path().join(".eko"),
+            memory_store,
+            Box::new(change_log),
+        ));
+        seed_conflict(&layer_manager).await?;
+        let proposal = conflict_proposal();
+        let candidate = capture_memory_conflict(&store, &proposal)?;
+
+        let accepted = store
+            .accept(&candidate.candidate_id, None, &layer_manager)
+            .await?;
+        assert_eq!(accepted.status, EvidenceCandidateStatus::Applied);
+        let secondary = layer_manager
+            .locate("make")
+            .await
+            .ok_or_else(|| "merged secondary memory disappeared".to_string())?;
+        assert_eq!(
+            secondary.1.meta.status,
+            echo_agent::memory::MemoryStatus::Superseded
+        );
+        assert_eq!(secondary.1.meta.superseded_by.as_deref(), Some("cargo"));
+
+        let undone = store.undo(&candidate.candidate_id, &layer_manager).await?;
+        assert_eq!(undone.status, EvidenceCandidateStatus::Pending);
+        let restored = layer_manager
+            .locate("make")
+            .await
+            .ok_or_else(|| "undone secondary memory disappeared".to_string())?;
+        assert_eq!(
+            restored.1.meta.status,
+            echo_agent::memory::MemoryStatus::Active
+        );
+        assert_eq!(restored.1.meta.superseded_by, None);
+        assert_eq!(restored.1.content, "Build uses make");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stale_memory_merge_candidate_fails_before_mutation() -> Result<(), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let store = EvidenceStore::new(temp.path().join(".eko"));
+        let memory_store = Arc::new(echo_agent::memory::InMemoryStore::new());
+        let change_log = echo_agent::evolution::JsonlChangeLog::new(
+            temp.path().join(".eko/evolution/change-log.jsonl"),
+        );
+        let layer_manager = Arc::new(echo_agent::evolution::MemoryLayerManager::new(
+            temp.path().join(".eko"),
+            memory_store,
+            Box::new(change_log),
+        ));
+        seed_conflict(&layer_manager).await?;
+        let proposal = conflict_proposal();
+        let candidate = capture_memory_conflict(&store, &proposal)?;
+        let changed_meta = echo_agent::memory::MemoryMeta::new(
+            echo_agent::memory::MemoryType::ProjectFact,
+            echo_agent::memory::MemorySource::ExplicitSave,
+            "build",
+        )
+        .with_confidence(0.5);
+        layer_manager
+            .write_memory("make", "Build uses ninja", changed_meta)
+            .await
+            .map_err(|error| error.to_string())?;
+
+        let error = store
+            .accept(&candidate.candidate_id, None, &layer_manager)
+            .await
+            .err()
+            .ok_or_else(|| "stale merge unexpectedly succeeded".to_string())?;
+        assert!(error.contains("refresh Review Inbox"));
+        let current = layer_manager
+            .locate("make")
+            .await
+            .ok_or_else(|| "stale secondary memory disappeared".to_string())?;
+        assert_eq!(current.1.content, "Build uses ninja");
+        assert_eq!(
+            current.1.meta.status,
+            echo_agent::memory::MemoryStatus::Active
+        );
         Ok(())
     }
 }

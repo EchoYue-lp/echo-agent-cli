@@ -308,7 +308,7 @@ write_memory() → EvolutionSecurityGuard → audit log → warm store →
 
 被以下组件使用：TriggerDetector、BackgroundReviewer、AutoMemory、remember 工具、Dreaming、MemoryReview。**应用层已深度接入**（agent_pool、task_runtime、auto_memory、review、repl 等全部路径）。
 
-### 3.6 MemoryReview — 过期/冲突/合并/归档
+### 3.6 MemoryReview — 过期/冲突分析与显式合并
 
 **文件**: `echo-agent/src/evolution/review.rs`（1000+行）
 
@@ -316,7 +316,7 @@ write_memory() → EvolutionSecurityGuard → audit log → warm store →
 |------|------|
 | `StalenessScorer` | `staleness = age×0.35 + low_usage×0.20 + instability×0.20 + contradiction×0.20 + source_weakness×0.05` |
 | `ConflictDetector` | 同 topic+type 但不同 content hash → 冲突组 |
-| `MemoryMerger` | 合并冲突组，supersede 冗余条目 |
+| `MemoryMerger` | 显式合并原语；只有用户采纳 proposal 后调用 |
 | `SkillCandidateDetector` | 扫描 WorkflowPattern/DebuggingLesson → 技能候选 |
 | `SkillDraftGenerator` | 候选 → SKILL.md 草稿 |
 
@@ -325,7 +325,7 @@ write_memory() → EvolutionSecurityGuard → audit log → warm store →
 2. ✅ **手动** — CLI/TUI/GUI 用户触发
 3. ❌ **Write-count-triggered** — 已删除无效的每次写入 observer
 
-默认 `max_merges_per_review = 0`，冲突只报告、不自动语义合并；低使用度改用真实 `recall_count`，不再误用 `revision_count`。
+`MemoryReviewer` 已是 analysis-only：输出 staleness suggestions 和有界 conflict proposals，不修改状态或内容。EKO 把 conflict proposal 写入 workspace JSONL Review Inbox，三端用户采纳后才执行；过期 proposal 在 mutation 前拒绝，undo 使用 before snapshot 恢复。Dreaming 独立承担基于 recall/inactivity 的确定性 promote/revive/archive。低使用度使用真实 `recall_count`，并记录 `last_recalled_at`；every-N-writes 失效计数器已删除。
 
 ### 3.7 Curator — 技能生命周期管理
 

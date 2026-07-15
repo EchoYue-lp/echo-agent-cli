@@ -319,12 +319,11 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                 Ok(report) => {
                     if report.total_scanned > 0 {
                         println!(
-                            "  📋 Memory review: {} scanned, {} stale, {} conflicts, {} merged, {} archived",
+                            "  📋 Memory review: {} scanned, {} stale, {} conflicts, {} proposals queued",
                             report.total_scanned,
                             report.stale_count,
                             report.conflict_groups,
-                            report.merges_applied,
-                            report.archives_applied
+                            report.conflict_proposals.len()
                         );
                     }
                 }
