@@ -860,11 +860,7 @@ impl AgentPool {
             agent.install_store(st.clone()).await;
         }
         if let Some(ref review_integration) = self.shared.review_integration {
-            let layer_manager = Arc::new(
-                review_integration
-                    .create_layer_manager()
-                    .with_write_observer(review_integration.clone()),
-            );
+            let layer_manager = Arc::new(review_integration.create_layer_manager());
             agent.install_memory_layer_manager(layer_manager);
         }
         if let Some(ref ps) = self.shared.permission_service {

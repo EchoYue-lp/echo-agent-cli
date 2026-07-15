@@ -4,13 +4,14 @@
 > **范围**: echo-agent (框架) + echo-agent-cli (EKO 应用) 的全部记忆/进化/改善代码
 > **对比参考**: Hermes Agent (Nous Research)
 > **修订记录**:
+> - 2026-07-15 v1.5: EKO 删除 EvalRunner、行为 fixture、`improve`/TrajectorySaver 产品链路；BackgroundReviewer 改为严格 JSON 候选且默认不保存；MemoryReview 默认关闭 session-end 与语义合并；Curator 归属 `evolution`。当前优化路线见 `docs/2026-07-15-self-evolution-review-and-roadmap.md`。
 > - 2026-07-01 v1.4: 阶段 5（Critic 默认策略）、SkillPatcher apply_patch 已实施完成。阶段 4（Embedding/RAG）已决策：暂不支持（对标 Claude Code/Codex/Cursor/OpenClaw 均无 RAG）。迭代计划阶段 1-6 全部完成。
 > - 2026-07-01 v1.3: 阶段 1（SkillTelemetry 写入端）、阶段 2（Dreaming 多模式对等）、阶段 3（Evolution hook fire 点）、阶段 6（技能来源 curator 边界）已实施完成
 > - 2026-07-01 v1.2: 修正 EmbeddingStore 状态表述（框架自动检测可能在 `OPENAI_API_KEY` 存在时激活）；补充 Hermes bundled + `prune_builtins` 细节；Critic 修复方向补充架构约束说明；陷阱 #3/#4 标记为已过时；Evolution hook fire 点描述精确化
 > - 2026-07-01 v1.1: 修正 SQLite/ConversationStore（EKO 使用 FileConversationStore 而非 SQLite，符合 AGENTS.md 硬约束）；RulePromoter namespace 死链已修；Dashboard 前端已接入；规则晋升已有 review gate；技能候选可视化已接入
 > - 2026-07-01 v1.0: 初始版本
 >
-> **重要阅读提示**: 本文严格区分「框架层有」和「应用层实际接入」。echo-agent 是通用框架，echo-agent-cli (EKO) 是产品。许多能力在框架中存在但在应用层未接入——这些在文中均标注为 ⚠️ 或 ❌。
+> **重要阅读提示**: 本文严格区分「框架层有」和「应用层实际接入」。echo-agent 是通用框架，echo-agent-cli (EKO) 是产品。2026-07-15 之前的行号和部分历史描述仅用于追溯；自进化当前决策以 `docs/2026-07-15-self-evolution-review-and-roadmap.md` 为准。
 
 ---
 
@@ -51,8 +52,8 @@
 │  │  background_review | candidate | draft | runtime_integration  │  │
 │  └──────────────────────────────────────────────────────────────┘  │
 │  ┌──────────────────────────────────────────────────────────────┐  │
-│  │          improve/ (8 文件, #[cfg(feature = "improve")])        │  │
-│  │  analyzer | trajectory | eval_improvement | loop | generator  │  │
+│  │          improve/ (框架可选, #[cfg(feature = "improve")])      │  │
+│  │  trajectory | analyzer/eval_improvement/loop/generator(+eval) │  │
 │  └──────────────────────────────────────────────────────────────┘  │
 │  ┌──────────────────────────────────────────────────────────────┐  │
 │  │  记忆基础设施: Store | ConversationStore | RuntimeStateStore  │  │
@@ -71,7 +72,7 @@
 |---------|---------|:---:|
 | (默认) | 全部 evolution/ 模块、ContextManager、SnapshotManager、全部记忆工具 | ✅ |
 | `sqlite` | SqliteStore、SqliteConversationStore、SqliteRuntimeStateStore | ❌ EKO 明确不使用 SQLite（AGENTS.md 硬约束，使用 `FileConversationStore`）。`sqlite` feature 仅供框架其他复用方 |
-| `improve` | Analyzer、ImprovementLoop、EvalDrivenImprovement、PromptGenerator、TrajectorySaver、Curator | ✅ TrajectorySaver + Curator |
+| `improve` | 框架通用 TrajectorySaver；与 `eval` 同开时增加 Analyzer、ImprovementLoop、EvalDrivenImprovement、PromptGenerator | ❌ EKO 不启用；Curator/BackgroundReviewer 属于默认 `evolution` |
 | `rag` | rag_index/search/chunk_document 工具 | ❌ 应用层未显式接入 |
 | `semantic-memory` | **空 feature**（定义但无代码关联） | N/A |
 
@@ -257,14 +258,16 @@ Tool 成功/失败记录在 `execution.rs:45-99` 的 `record_trigger_data` 中�
 
 **文件**: `echo-agent/src/evolution/background_review.rs`（580行）
 
-- 对话结束后，LLM 回放 transcript，识别值得持久化的记忆和技能更新
-- 使用 nonce 分隔符防 prompt injection
+- 用户显式触发后，LLM 回放 transcript，识别可能长期有价值的信息
+- system 指令与带 nonce 的不可信 transcript 分离；只接受严格 JSON 和精确证据引用
 - 三个审查 prompt：`MEMORY_REVIEW_PROMPT`、`SKILL_REVIEW_PROMPT`、`COMBINED_REVIEW_PROMPT`
-- 路由写入走 `MemoryLayerManager`（安全审计 + change log）
+- 默认 proposal-only，不写长期记忆；框架复用方可显式开启高置信用户偏好 Draft 写入
+- 单次最大输出 512 token，避免旧实现 2048 token 的浪费
 
 **调用点**（已接入）：
-- GUI 面板手动触发：`panels.rs:1477-1490`
-- CLI 命令：`/background-review` → `cmd_impls/evolution.rs:136`
+- GUI 面板手动触发：`review_run`
+- CLI 命令：`/review`
+- TUI 命令：`/run-review`
 
 ### 3.4 MemoryRecaller — 统一复合评分召回
 
@@ -318,9 +321,11 @@ write_memory() → EvolutionSecurityGuard → audit log → warm store →
 | `SkillDraftGenerator` | 候选 → SKILL.md 草稿 |
 
 **触发路径**：
-1. ✅ **Session-end** — `on_session_end()`（REPL 退出、TUI、Tauri 全端接入）
-2. ✅ **手动** — `/memory-review` CLI 命令
-3. ❌ **Write-count-triggered** — `on_memory_write()` 永远返回 `None`（被 Dreaming 替代，stage4 F1）
+1. ⚪ **Session-end** — 能力保留但默认关闭，避免和 Dreaming 重复维护
+2. ✅ **手动** — CLI/TUI/GUI 用户触发
+3. ❌ **Write-count-triggered** — 已删除无效的每次写入 observer
+
+默认 `max_merges_per_review = 0`，冲突只报告、不自动语义合并；低使用度改用真实 `recall_count`，不再误用 `revision_count`。
 
 ### 3.7 Curator — 技能生命周期管理
 
@@ -329,11 +334,11 @@ write_memory() → EvolutionSecurityGuard → audit log → warm store →
 **生命周期状态机**: `Candidate → Draft → Active → Stale → Deprecated → Archived`
 
 - 状态持久化到 `~/.echo-agent/curator_state.json`
-- Feature-gated: `#[cfg(feature = "improve")]`
+- 属于默认 `evolution`，不依赖 `improve`
 - CLI 命令群：`/skills`、`/skills promote`、`/skills list`
 - **三端全部接入**（CLI/TUI/GUI）
 
-> ⚠️ **关键缺陷**：Curator 的自动 transitions 依赖 `SkillTelemetry` 数据，但运行时无写入端（见 §8.1）。
+> ⚠️ **关键缺陷**：Curator 仍按全局文件和 skill name 建索引，可能跨 workspace 冲突；技能加载器也未把 Curator lifecycle 当作权威过滤条件。当前它是旁路元数据，不是完整生命周期控制面。
 
 ### 3.8 RulePromoter — 记忆→规则晋升
 
@@ -358,7 +363,7 @@ write_memory() → EvolutionSecurityGuard → audit log → warm store →
 
 ## 4. 自改善系统 (Self-Improvement)
 
-全部 feature-gated: `#[cfg(feature = "improve")]`，需要 `eval` feature。
+框架把演进核心与离线评测分开：BackgroundReviewer 与 Curator 位于默认 `evolution`；`TrajectorySaver` 是框架 `improve` 的可选离线导出；Analyzer / ImprovementLoop 还需同时启用 `eval`。EKO 不启用 `improve` 或 `eval`。
 
 ### 4.1 Analyzer — 静态 Run 分析
 
@@ -372,24 +377,22 @@ write_memory() → EvolutionSecurityGuard → audit log → warm store →
 - `MissingTool`：应该用但没用某个工具
 - `ExcessiveToolCalls`：简单任务过多工具调用
 
-生成 `ImprovementSuggestion`（PromptChange / PolicyChange / EvalGeneration）。
-CLI: `/self-review` → `cmd_impls/eval.rs:106`
+生成 `ImprovementSuggestion`（PromptChange / PolicyChange / EvalGeneration）。这是框架可选能力，EKO 无 CLI 入口。
 
 ### 4.2 ImprovementLoop — 迭代提示优化
 
 **文件**: `echo-agent/src/improve/loop.rs`（200行）
 
 - evaluate → detect failures → improve → re-evaluate 循环
-- CLI: `/improve`
+- 框架可选能力，EKO 无 CLI 入口
 
 ### 4.3 TrajectorySaver — 微调数据收集
 
 **文件**: `echo-agent/src/improve/trajectory.rs`（200行）
 
-- ShareGPT 格式 JSONL：`~/.echo-agent/trajectories/YYYY-MM-DD.jsonl`
-- CLI: `/trajectories` 命令（list/stats/export）
-- REPL 退出时自动保存
-- **已接入**
+- ShareGPT 格式 JSONL 导出，供确有微调数据需求的框架复用方显式调用
+- EKO 已删除 `/trajectories`、GUI stats、REPL 自动保存和 `improve` feature
+- 不把运行轨迹保存包装成“本地 agent 自改善闭环”
 
 ### 4.4 EvalDrivenImprovement / PromptGenerator
 
@@ -397,7 +400,7 @@ CLI: `/self-review` → `cmd_impls/eval.rs:106`
 
 - `EvalDrivenImprovement`：统一入口，包装 ImprovementLoop + HTML 报告
 - `PromptGenerator`：LLM 驱动提示优化
-- Feature-gated，编译通过但需要 eval 基础设施配套
+- 仅在框架同时启用 `improve` + `eval` 时编译；EKO 不启用
 
 ---
 
@@ -433,20 +436,20 @@ CLI: `/self-review` → `cmd_impls/eval.rs:106`
 | 1 | TriggerDetector | ✅ 框架自动 | 框架 react loop 自动触发，应用层通过安装 MemoryLayerManager 使其生效 |
 | 2 | Dreaming | ⚠️ 仅桌面端 | `tauri/desktop.rs:241` → `infra.rs:771`。CLI 和 TUI 未接入 |
 | 3 | MemoryRecaller | ✅ 框架自动 | 框架 react loop 自动触发（`context.rs:241/479/543`），每轮注入 context |
-| 4 | BackgroundReviewer | ✅ 已接入 | `panels.rs:1477`（GUI）、`evolution.rs:136`（CLI） |
-| 5 | MemoryReview/ReviewIntegration | ✅ 深度接入 | repl/main/desktop/TUI/Tauri 全部接入 |
+| 4 | BackgroundReviewer | ✅ 三端显式触发 | GUI、CLI `/review`、TUI `/run-review`；严格 JSON 候选，默认不保存 |
+| 5 | MemoryReview/ReviewIntegration | ✅ 手动接入 | 默认不在 session-end 自动运行，默认不做语义合并 |
 | 6 | AutoMemory | ✅ 已接入 | `repl.rs:181`、`/auto-memory` CLI 命令、Tauri panel 接口 |
 | 7 | Reflection | ✅ 已接入 | `repl.rs:184`、`/reflect` CLI 命令、`runtime.rs:401` |
 | 8 | MemoryLayerManager | ✅ 深度接入 | agent_pool、task_runtime、auto_memory、review、repl 等全部路径 |
 | 9 | TypedMemory/MemoryMeta/MemoryType | ✅ 已接入 | memory_bridge、rule_promoter、review_integration、dashboard、panels |
-| 10 | Curator | ✅ 已接入 | CLI/TUI/GUI 三端。⚠️ 自动 transitions 无遥测数据支撑 |
+| 10 | Curator | ⚠️ 已接入但非权威 | CLI/TUI/GUI 三端；全局 name key 且未控制 loader，需 workspace scope + loader 接线 |
 | 11 | SkillHealthMonitor/Patcher/Merger | ⚠️ CLI 命令存在但无数据 | 底层 SkillTelemetryStore 无运行时写入端 |
 | 12 | Critic/verify_answer | ❌ 未配置 | 框架有但应用层未配置。仅 `tool_error_feedback`（默认 true）自动生效 |
 | 13 | ConversationStore | ✅ 已接入 | `FileConversationStore`（`conversation_file.rs:1`: "EKO is local — no SQLite"）。三端注入，符合 AGENTS.md 硬约束 |
 | 14 | ContextManager/compress | ✅ 已接入 | CLI `/compress`/`/compact`、TUI、Tauri、自动压缩 |
 | 15 | EmbeddingStore/RAG | ⚠️ 框架自动检测 | 框架 `wrap_with_embedding_store_if_available()` 检测 `OPENAI_API_KEY` 等。EKO 无显式配置，但用户配了 OpenAI key 时会隐式激活。RAG 工具未注册 |
 | 16 | EvolutionSecurityGuard | ✅ 已接入 | `rule_promoter.rs` + MemoryLayerManager 内部 |
-| 17 | TrajectorySaver | ✅ 已接入 | CLI `/trajectories` 命令 + REPL 退出自动保存 |
+| 17 | TrajectorySaver | ❌ EKO 未接入 | 仅保留为 echo-agent 框架的可选显式导出 API |
 | 18 | RulePromoter | ✅ 已接入 | 应用层独有模块 |
 
 ---
@@ -750,11 +753,10 @@ CLI: `/self-review` → `cmd_impls/eval.rs:106`
   └─ [会话结束]
       ├─ run_auto_memory_on_exit() → 关键词提取 → typed memory + project.md
       ├─ run_reflection_on_exit() → LLM 轻量反思 → memory 文件
-      ├─ run_memory_review_on_exit() → MemoryReview (过期/冲突/合并/归档)
-      │   └─ 复用 bootstrap 的 ReviewIntegration (不再临时重建)
+      ├─ MemoryReview 默认不在退出时自动运行（用户显式触发）
       ├─ cancel dreaming_task → 停止后台自进化
       ├─ save_transcript_projection() → ConversationStore
-      └─ TrajectorySaver → JSONL (feature improve)
+      └─ 不自动保存微调 trajectory
 ```
 
 ---

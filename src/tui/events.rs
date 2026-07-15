@@ -2863,6 +2863,119 @@ async fn handle_slash_command(
         Some(SlashCommand::Quit) | Some(SlashCommand::Exit) => {
             app.should_quit = true;
         }
+        Some(SlashCommand::RunReview) => {
+            let (run_store, llm_client, memory_store) = agent
+                .read(|value| {
+                    (
+                        value.run_store.clone(),
+                        value.llm_client().cloned(),
+                        value.store().cloned(),
+                    )
+                })
+                .await;
+
+            let Some(run_store) = run_store else {
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: "No run store configured. Enable run tracing first.".to_string(),
+                });
+                return;
+            };
+            let Some(llm_client) = llm_client else {
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: "No LLM client available for run review.".to_string(),
+                });
+                return;
+            };
+
+            let runs = match run_store.list_all(1).await {
+                Ok(runs) => runs,
+                Err(error) => {
+                    app.messages.push(ChatMessage {
+                        role: MessageRole::System,
+                        content: format!("Failed to list runs: {error}"),
+                    });
+                    return;
+                }
+            };
+            let Some(run_summary) = runs.first() else {
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: "No runs to review.".to_string(),
+                });
+                return;
+            };
+
+            let reviewer = echo_agent::evolution::BackgroundReviewer::new(
+                echo_agent::evolution::BackgroundReviewConfig::default(),
+                llm_client,
+                memory_store.clone(),
+                Some(run_store),
+            );
+            let reviewer = if let Some(store) = memory_store {
+                let review_integration = echo_agent_app_core::evolution::ReviewIntegration::new(
+                    echo_agent::evolution::ReviewConfig::default(),
+                    echo_agent_app_core::evolution::discover_echo_agent_dir(),
+                    store,
+                );
+                reviewer.with_layer_manager(Arc::new(review_integration.create_layer_manager()))
+            } else {
+                reviewer
+            };
+
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content: format!(
+                    "Reviewing run {}...",
+                    run_summary.run_id.chars().take(12).collect::<String>()
+                ),
+            });
+            let handle = match reviewer.review_by_run_id(&run_summary.run_id) {
+                Ok(handle) => handle,
+                Err(error) => {
+                    app.messages.push(ChatMessage {
+                        role: MessageRole::System,
+                        content: format!("Run review failed: {error}"),
+                    });
+                    return;
+                }
+            };
+            match handle.await {
+                Ok(outcome) if outcome.nothing_to_save => {
+                    let content = outcome
+                        .error
+                        .map(|error| format!("Run review produced no candidate: {error}"))
+                        .unwrap_or_else(|| "Run review found no durable candidate.".to_string());
+                    app.messages.push(ChatMessage {
+                        role: MessageRole::System,
+                        content,
+                    });
+                }
+                Ok(outcome) => {
+                    let content = match outcome.candidate {
+                        Some(candidate) => format!(
+                            "Candidate ({:?}, confidence {:.2}, not saved): {}\nEvidence: {}",
+                            candidate.kind,
+                            candidate.confidence,
+                            candidate.content,
+                            candidate.evidence
+                        ),
+                        None => outcome.actions.join("\n"),
+                    };
+                    app.messages.push(ChatMessage {
+                        role: MessageRole::System,
+                        content,
+                    });
+                }
+                Err(error) => {
+                    app.messages.push(ChatMessage {
+                        role: MessageRole::System,
+                        content: format!("Run review task failed: {error}"),
+                    });
+                }
+            }
+        }
         Some(SlashCommand::MemoryReview) => {
             // Create ReviewIntegration on-the-fly from the agent's store
             let store = agent.read(|a| a.store().cloned()).await;
@@ -2908,8 +3021,8 @@ async fn handle_slash_command(
         }
         Some(SlashCommand::SkillCandidates) => {
             // List candidates and drafts from Curator state
-            let curator = echo_agent::improve::Curator::default_path(
-                echo_agent::improve::CuratorConfig::default(),
+            let curator = echo_agent::evolution::Curator::default_path(
+                echo_agent::evolution::CuratorConfig::default(),
             );
             let state = curator.load_state();
             let items: Vec<_> = state
@@ -2918,8 +3031,8 @@ async fn handle_slash_command(
                 .filter(|(_, m)| {
                     matches!(
                         m.lifecycle,
-                        echo_agent::improve::SkillLifecycle::Candidate
-                            | echo_agent::improve::SkillLifecycle::Draft
+                        echo_agent::evolution::SkillLifecycle::Candidate
+                            | echo_agent::evolution::SkillLifecycle::Draft
                     )
                 })
                 .collect();
@@ -2933,8 +3046,8 @@ async fn handle_slash_command(
                 let mut content = String::from("🎯 Skill Candidates & Drafts:\n");
                 for (name, meta) in &items {
                     let icon = match meta.lifecycle {
-                        echo_agent::improve::SkillLifecycle::Candidate => "🎯",
-                        echo_agent::improve::SkillLifecycle::Draft => "📝",
+                        echo_agent::evolution::SkillLifecycle::Candidate => "🎯",
+                        echo_agent::evolution::SkillLifecycle::Draft => "📝",
                         _ => "  ",
                     };
                     content.push_str(&format!("  {} {} [{:?}]\n", icon, name, meta.lifecycle));

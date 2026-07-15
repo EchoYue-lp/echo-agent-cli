@@ -1,8 +1,7 @@
 //! Review scheduling — wires [`MemoryReviewer`] into the product lifecycle.
 //!
 //! Trigger paths (stage4 F1):
-//! 1. **Automatic — session end**: After REPL/TUI exit, alongside existing
-//!    `run_auto_memory_on_exit()`.
+//! 1. **Optional — session end**: Disabled by default; callers may opt in.
 //! 2. **Manual — `/memory-review` command**: User-initiated full review.
 //! 3. **Scheduled — Dreaming**: A cron-driven `Dreaming::run` pass does
 //!    recall-frequency-driven promotion + staleness demote (replaces the old
@@ -15,8 +14,8 @@
 //! framework internals.
 
 use echo_agent::evolution::{
-    MemoryLayerManager, MemoryReviewer, MemoryRuntimeIntegrationBuilder, MemoryWriteObserver,
-    ReviewChange, ReviewConfig, ReviewReport, SkillCandidateDetector, SkillDraftGenerator,
+    MemoryLayerManager, MemoryReviewer, MemoryRuntimeIntegrationBuilder, ReviewChange,
+    ReviewConfig, ReviewReport, SkillCandidateDetector, SkillDraftGenerator,
 };
 use echo_agent::memory::Store;
 use echo_agent::memory::TypedMemoryStore;
@@ -79,27 +78,6 @@ impl ReviewIntegration {
         self.write_counter.load(Ordering::Relaxed)
     }
 
-    /// Called after each real memory write. The shared `write_counter` is
-    /// incremented by `MemoryLayerManager::write_memory`; this observer no
-    /// longer triggers a review on a write-count threshold.
-    ///
-    /// (stage4 F1) The old "every-N-writes triggers a full review" model
-    /// coupled review cadence to write volume rather than recall value, and
-    /// wrote through a per-pass layer manager that bypassed the agent's shared
-    /// instance. It is replaced by the scheduled **Dreaming** pass
-    /// (`Dreaming::run`), which promotes high-recall memories and batch-demotes
-    /// stale low-recall ones on a cron cadence. The `write_counter` is retained
-    /// for diagnostics only.
-    ///
-    /// Always returns `None` — reviews happen via `on_session_end`, the manual
-    /// `/memory-review` command, or the scheduled Dreaming pass.
-    pub async fn on_memory_write(&self) -> Option<Result<ReviewReport, String>> {
-        // Write-count-triggered review removed (stage4 F1); Dreaming took over.
-        // Counter still increments in `write_memory` for diagnostics.
-        let _ = self.write_counter.load(Ordering::Relaxed);
-        None
-    }
-
     /// Called at session end. Runs a full review if configured.
     pub async fn on_session_end(&self) -> Option<Result<ReviewReport, String>> {
         if !self.config.review_on_session_end {
@@ -119,8 +97,7 @@ impl ReviewIntegration {
     /// Internal: run the review and return the report.
     ///
     /// Creates framework plumbing through `MemoryRuntimeIntegrationBuilder` on
-    /// each call. Reviews are infrequent enough (session end, every 50 writes,
-    /// or manual) that this overhead is negligible.
+    /// each call. Reviews are manual by default, so this overhead is negligible.
     async fn run_review_inner(&self) -> Result<ReviewReport, String> {
         // Snapshot the current (echo_agent_dir, store) once per review pass.
         // `rebind` may fire between passes (workspace switch), but within a
@@ -209,9 +186,8 @@ impl ReviewIntegration {
 
     /// Create a `MemoryLayerManager` for the current workspace's memory store.
     ///
-    /// Wires the shared write counter so that every memory write through this
-    /// layer manager increments the counter, and `on_memory_write()` can trigger
-    /// periodic reviews without an explicit caller. Reads the current
+    /// Wires the shared write counter so every memory write through this layer
+    /// manager is observable. Reads the current
     /// `(echo_agent_dir, store)` from the inner locks — so after a workspace
     /// `rebind`, this produces a manager bound to the new store/dir.
     pub fn create_layer_manager(&self) -> MemoryLayerManager {
@@ -236,14 +212,6 @@ impl ReviewIntegration {
         MemoryRuntimeIntegrationBuilder::new(echo_agent_dir, store)
             .write_counter(self.write_counter.clone())
             .review_every_n_writes(self.config.review_every_n_writes)
-    }
-}
-
-impl MemoryWriteObserver for ReviewIntegration {
-    fn on_memory_write<'a>(&'a self) -> futures::future::BoxFuture<'a, ()> {
-        Box::pin(async move {
-            let _ = ReviewIntegration::on_memory_write(self).await;
-        })
     }
 }
 
@@ -416,28 +384,22 @@ mod tests {
         let layer_manager = ri.create_layer_manager();
         let meta = MemoryMeta::new(MemoryType::ProjectFact, MemorySource::AutoExtracted, "test");
 
-        // (stage4 F1) Write-count-triggered review is removed; the shared
-        // write_counter still increments (diagnostics) but on_memory_write never
-        // triggers a review (Dreaming took over recall-frequency-driven passes).
-        assert!(ri.on_memory_write().await.is_none());
+        // Write-count-triggered review is removed; the shared counter remains
+        // available for diagnostics while Dreaming uses recall telemetry.
         assert_eq!(ri.write_count(), 0);
 
         layer_manager
             .write_memory("one", "first project fact", meta.clone())
             .await
             .expect("write one");
-        assert!(ri.on_memory_write().await.is_none());
         layer_manager
             .write_memory("two", "second project fact", meta.clone())
             .await
             .expect("write two");
-        assert!(ri.on_memory_write().await.is_none());
         layer_manager
             .write_memory("three", "third project fact", meta)
             .await
             .expect("write three");
-        // Third write no longer triggers a review (Dreaming replaced it).
-        assert!(ri.on_memory_write().await.is_none());
         assert_eq!(
             ri.write_count(),
             3,

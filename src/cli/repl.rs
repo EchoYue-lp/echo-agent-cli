@@ -130,7 +130,7 @@ pub async fn run_repl(agent: AgentHandle, config: ReplConfig) -> anyhow::Result<
     crate::cli::cmd_impls::advanced::register_all(&mut registry);
     crate::cli::cmd_impls::skills::register_all(&mut registry);
     crate::cli::cmd_impls::hooks::register_all(&mut registry);
-    crate::cli::cmd_impls::eval::register_all(&mut registry);
+    crate::cli::cmd_impls::observability::register_all(&mut registry);
     crate::cli::cmd_impls::evolution::register_all(&mut registry);
     crate::cli::cmd_impls::tasks_ext::register_all(&mut registry);
     crate::cli::cmd_impls::research::register_all(&mut registry);
@@ -724,31 +724,11 @@ async fn chat_with_agent(agent: &AgentHandle, message: &str, output: &OutputRend
                 println!("{}", styled);
             }
 
-            // Auto-eval suggestion
+            // Post-run diagnostics suggestion
             if tool_call_count > 0 {
                 let hint = nu_ansi_term::Color::Fixed(8)
-                    .paint("  Tip: /self-review to analyze, /test to verify, /diff to review");
+                    .paint("  Tip: /trace to inspect, /test to verify, /diff to review");
                 println!("{}", hint);
-            }
-
-            // Auto-save trajectory (background, non-blocking)
-            {
-                let agent_clone = agent.clone();
-                tokio::spawn(async move {
-                    use echo_agent::agent::Agent;
-                    let result = agent_clone
-                        .read(|a| (a.run_store.clone(), a.model_name().to_string()))
-                        .await;
-                    let (store, model_name) = result;
-                    if let Some(ref store) = store
-                        && let Ok(runs) = store.list_all(1).await
-                        && let Some(summary) = runs.first()
-                        && let Ok(Some(run)) = store.load(&summary.run_id).await
-                        && let Ok(saver) = echo_agent::improve::TrajectorySaver::default_dir()
-                    {
-                        let _ = saver.save(&run, &model_name).await;
-                    }
-                });
             }
 
             // Interactive git change handling (replaces auto-commit)

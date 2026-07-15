@@ -1,72 +1,10 @@
-//! Evolution & trajectory slash commands — self-improvement and trajectory management.
+//! Memory, rule, and skill evolution slash commands.
 
 use crate::cli::command::{CommandCategory, CommandContext, CommandOutcome, cmd};
 use std::sync::Arc;
 
 use echo_agent::workspace::state::profiles::{AgentProfile, ProfileStore, UserProfile};
 use echo_agent::workspace::state::skill_telemetry::SkillTelemetryStore;
-
-// ── TrajectoriesCommand ─────────────────────────────────────────────
-
-async fn cmd_trajectories(_ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
-    let sub = args.first().copied().unwrap_or("list");
-
-    match sub {
-        "stats" => match echo_agent::improve::TrajectorySaver::default_dir() {
-            Ok(saver) => match saver.stats().await {
-                Ok(stats) => {
-                    println!("\n--- Trajectory Stats ---");
-                    println!("  Total:       {}", stats.total);
-                    println!("  Completed:   {}", stats.completed);
-                    println!("  Failed:      {}", stats.failed);
-                    println!("  Total tokens: {}", stats.total_tokens);
-                    println!("  Tool calls:  {}", stats.total_tool_calls);
-                    println!("  Avg duration: {}ms", stats.avg_duration_ms);
-                }
-                Err(e) => println!("Error reading stats: {e}"),
-            },
-            Err(e) => println!("Error initializing trajectory saver: {e}"),
-        },
-        _ => {
-            let date_filter = args.get(1).copied();
-            match echo_agent::improve::TrajectorySaver::default_dir() {
-                Ok(saver) => match saver.list(date_filter).await {
-                    Ok(entries) if !entries.is_empty() => {
-                        println!("\n--- Trajectories ---");
-                        for entry in entries.iter().take(20) {
-                            let status = if entry.completed { "✅" } else { "❌" };
-                            let id_short = &entry.id[..12.min(entry.id.len())];
-                            let preview: String = entry
-                                .conversations
-                                .first()
-                                .map(|m| m.value.chars().take(60).collect())
-                                .unwrap_or_default();
-                            println!(
-                                "  {status} {id_short}  [{}]  tokens={}  tools={}  {preview}",
-                                entry.model, entry.token_usage, entry.tool_call_count,
-                            );
-                        }
-                        if entries.len() > 20 {
-                            println!("  ... and {} more", entries.len() - 20);
-                        }
-                    }
-                    Ok(_) => println!("No trajectories saved yet. Run some conversations first."),
-                    Err(e) => println!("Error listing trajectories: {e}"),
-                },
-                Err(e) => println!("Error initializing trajectory saver: {e}"),
-            }
-        }
-    }
-    CommandOutcome::Continue
-}
-cmd!(
-    TrajectoriesCommand,
-    "trajectories",
-    ["traj"],
-    CommandCategory::Advanced,
-    "List or inspect saved trajectories",
-    cmd_trajectories
-);
 
 // ── ReviewCommand ───────────────────────────────────────────────────
 
@@ -130,7 +68,7 @@ async fn cmd_review(ctx: &CommandContext, _args: &[&str]) -> CommandOutcome {
 
     println!(
         "Reviewing run {}...",
-        &run.run_id[..12.min(run.run_id.len())]
+        run.run_id.chars().take(12).collect::<String>()
     );
 
     let reviewer = echo_agent::evolution::BackgroundReviewer::new(
@@ -145,11 +83,7 @@ async fn cmd_review(ctx: &CommandContext, _args: &[&str]) -> CommandOutcome {
             echo_agent_app_core::evolution::discover_echo_agent_dir(),
             store,
         ));
-        reviewer.with_layer_manager(Arc::new(
-            review_integration
-                .create_layer_manager()
-                .with_write_observer(review_integration),
-        ))
+        reviewer.with_layer_manager(Arc::new(review_integration.create_layer_manager()))
     } else {
         reviewer
     };
@@ -160,9 +94,13 @@ async fn cmd_review(ctx: &CommandContext, _args: &[&str]) -> CommandOutcome {
                 if outcome.nothing_to_save {
                     println!("Nothing to save.");
                 } else {
-                    println!("Review actions:");
+                    println!("Review candidates:");
                     for action in &outcome.actions {
                         println!("  - {action}");
+                    }
+                    if let Some(candidate) = &outcome.candidate {
+                        println!("  Evidence: {}", candidate.evidence);
+                        println!("  Confidence: {:.2}", candidate.confidence);
                     }
                 }
                 if let Some(ref err) = outcome.error {
@@ -180,7 +118,7 @@ cmd!(
     ReviewCommand,
     "review",
     CommandCategory::Advanced,
-    "Run background review on last run",
+    "Propose evidence-linked memory candidates from the last run",
     cmd_review
 );
 
@@ -188,8 +126,9 @@ cmd!(
 
 async fn cmd_curator(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     let sub = args.first().copied().unwrap_or("status");
-    let curator =
-        echo_agent::improve::Curator::default_path(echo_agent::improve::CuratorConfig::default());
+    let curator = echo_agent::evolution::Curator::default_path(
+        echo_agent::evolution::CuratorConfig::default(),
+    );
 
     match sub {
         "status" => {
@@ -273,7 +212,11 @@ async fn cmd_critiques(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                             } else {
                                 println!("  {} run(s) available for review.", runs.len());
                                 for run in runs.iter().take(10) {
-                                    println!("  • {} ({:?})", &run.run_id[..12.min(run.run_id.len())], run.status);
+                                    println!(
+                                        "  • {} ({:?})",
+                                        run.run_id.chars().take(12).collect::<String>(),
+                                        run.status
+                                    );
                                 }
                                 println!("\n  Run /review to generate critiques on the latest run.");
                             }
@@ -382,8 +325,11 @@ fn print_skill_review(t: &echo_agent::workspace::state::skill_telemetry::SkillTe
     if !t.common_failures.is_empty() {
         println!("\n❌ Common Failures:");
         for f in &t.common_failures {
-            let snippet = if f.error_snippet.len() > 80 {
-                format!("{}...", &f.error_snippet[..80])
+            let snippet = if f.error_snippet.chars().count() > 80 {
+                format!(
+                    "{}...",
+                    f.error_snippet.chars().take(80).collect::<String>()
+                )
             } else {
                 f.error_snippet.clone()
             };
@@ -545,12 +491,15 @@ async fn cmd_profile(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             }
         }
         "set" => {
-            if args.len() < 4 {
+            if args.len() < 3 {
                 println!("Usage: /profile set <key> <value>");
                 return CommandOutcome::Continue;
             }
-            let key = args[1];
-            let value = args[2..].join(" ");
+            let Some(key) = args.get(1).copied() else {
+                println!("Usage: /profile set <key> <value>");
+                return CommandOutcome::Continue;
+            };
+            let value = args.get(2..).unwrap_or_default().join(" ");
             let mut profile = profile_store
                 .load_user_profile()
                 .await
@@ -637,8 +586,9 @@ async fn cmd_skill_candidates(_ctx: &CommandContext, args: &[&str]) -> CommandOu
     let sub = args.first().copied().unwrap_or("list");
 
     // Load curator state to find candidates and drafts.
-    let curator =
-        echo_agent::improve::Curator::default_path(echo_agent::improve::CuratorConfig::default());
+    let curator = echo_agent::evolution::Curator::default_path(
+        echo_agent::evolution::CuratorConfig::default(),
+    );
     let state = curator.load_state();
 
     let candidates_and_drafts: Vec<_> = state
@@ -647,8 +597,8 @@ async fn cmd_skill_candidates(_ctx: &CommandContext, args: &[&str]) -> CommandOu
         .filter(|(_, meta)| {
             matches!(
                 meta.lifecycle,
-                echo_agent::improve::SkillLifecycle::Candidate
-                    | echo_agent::improve::SkillLifecycle::Draft
+                echo_agent::evolution::SkillLifecycle::Candidate
+                    | echo_agent::evolution::SkillLifecycle::Draft
             )
         })
         .collect();
@@ -686,20 +636,23 @@ async fn cmd_skill_candidates(_ctx: &CommandContext, args: &[&str]) -> CommandOu
                 let candidate_count = candidates_and_drafts
                     .iter()
                     .filter(|(_, m)| {
-                        matches!(m.lifecycle, echo_agent::improve::SkillLifecycle::Candidate)
+                        matches!(
+                            m.lifecycle,
+                            echo_agent::evolution::SkillLifecycle::Candidate
+                        )
                     })
                     .count();
                 let draft_count = candidates_and_drafts
                     .iter()
                     .filter(|(_, m)| {
-                        matches!(m.lifecycle, echo_agent::improve::SkillLifecycle::Draft)
+                        matches!(m.lifecycle, echo_agent::evolution::SkillLifecycle::Draft)
                     })
                     .count();
                 println!("  Candidates: {}  Drafts: {}", candidate_count, draft_count);
                 for (name, meta) in &candidates_and_drafts {
                     let icon = match meta.lifecycle {
-                        echo_agent::improve::SkillLifecycle::Candidate => "🎯",
-                        echo_agent::improve::SkillLifecycle::Draft => "📝",
+                        echo_agent::evolution::SkillLifecycle::Candidate => "🎯",
+                        echo_agent::evolution::SkillLifecycle::Draft => "📝",
                         _ => "  ",
                     };
                     println!("  {} {} [{:?}]", icon, name, meta.lifecycle);
@@ -734,26 +687,27 @@ async fn cmd_skill_promote(_ctx: &CommandContext, args: &[&str]) -> CommandOutco
         }
     };
 
-    let curator =
-        echo_agent::improve::Curator::default_path(echo_agent::improve::CuratorConfig::default());
+    let curator = echo_agent::evolution::Curator::default_path(
+        echo_agent::evolution::CuratorConfig::default(),
+    );
 
     // Check current lifecycle state.
     let state = curator.load_state();
     match state.skills.get(name) {
         Some(meta) => match meta.lifecycle {
-            echo_agent::improve::SkillLifecycle::Draft => match curator.promote_to_active(name) {
+            echo_agent::evolution::SkillLifecycle::Draft => match curator.promote_to_active(name) {
                 Ok(true) => println!("✓ Skill '{}' promoted from Draft to Active.", name),
                 Ok(false) => println!("Skill '{}' was not in Draft state.", name),
                 Err(e) => println!("Error promoting skill: {e}"),
             },
-            echo_agent::improve::SkillLifecycle::Candidate => {
+            echo_agent::evolution::SkillLifecycle::Candidate => {
                 println!("Skill '{}' is a Candidate, not a Draft.", name);
                 println!(
                     "Run /skill-create {} first to generate a draft SKILL.md.",
                     name
                 );
             }
-            echo_agent::improve::SkillLifecycle::Active => {
+            echo_agent::evolution::SkillLifecycle::Active => {
                 println!("Skill '{}' is already Active.", name);
             }
             other => println!(
@@ -798,15 +752,18 @@ async fn cmd_skill_create(ctx: &CommandContext, args: &[&str]) -> CommandOutcome
         Some(n) => n.to_string(),
         None => {
             // List available candidates.
-            let curator = echo_agent::improve::Curator::default_path(
-                echo_agent::improve::CuratorConfig::default(),
+            let curator = echo_agent::evolution::Curator::default_path(
+                echo_agent::evolution::CuratorConfig::default(),
             );
             let state = curator.load_state();
             let candidates: Vec<_> = state
                 .skills
                 .iter()
                 .filter(|(_, m)| {
-                    matches!(m.lifecycle, echo_agent::improve::SkillLifecycle::Candidate)
+                    matches!(
+                        m.lifecycle,
+                        echo_agent::evolution::SkillLifecycle::Candidate
+                    )
                 })
                 .collect();
             if candidates.is_empty() {
@@ -1002,8 +959,8 @@ async fn cmd_skill_merge(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
                 }
                 let change_log = echo_agent::evolution::JsonlChangeLog::new(log_path);
 
-                let curator_config = echo_agent::improve::CuratorConfig::default();
-                let curator = echo_agent::improve::Curator::default_path(curator_config);
+                let curator_config = echo_agent::evolution::CuratorConfig::default();
+                let curator = echo_agent::evolution::Curator::default_path(curator_config);
                 let merger = echo_agent::evolution::SkillMerger::new(store.clone(), curator);
 
                 let mut primary_desc_mut = primary_desc;
@@ -1251,14 +1208,20 @@ async fn cmd_skill_patch(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
         return CommandOutcome::Continue;
     }
 
-    let skill_name = args[0];
+    let Some(skill_name) = args.first().copied() else {
+        return CommandOutcome::Continue;
+    };
 
     // Sub-command: apply <index>
-    if args.len() >= 3 && args[1] == "apply" {
-        let idx: usize = match args[2].parse() {
+    if args.get(1).copied() == Some("apply") {
+        let Some(index_arg) = args.get(2).copied() else {
+            println!("Usage: /skill-patch <name> apply <index>");
+            return CommandOutcome::Continue;
+        };
+        let idx: usize = match index_arg.parse() {
             Ok(n) => n,
             Err(_) => {
-                println!("Invalid index '{}'. Must be a number.", args[2]);
+                println!("Invalid index '{index_arg}'. Must be a number.");
                 return CommandOutcome::Continue;
             }
         };
@@ -1519,8 +1482,9 @@ async fn cmd_skill_register(_ctx: &CommandContext, args: &[&str]) -> CommandOutc
         }
     };
 
-    let curator =
-        echo_agent::improve::Curator::default_path(echo_agent::improve::CuratorConfig::default());
+    let curator = echo_agent::evolution::Curator::default_path(
+        echo_agent::evolution::CuratorConfig::default(),
+    );
 
     match curator.touch_skill(name, false) {
         Ok(()) => {
@@ -1559,8 +1523,9 @@ async fn cmd_skill_pin(_ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         }
     };
 
-    let curator =
-        echo_agent::improve::Curator::default_path(echo_agent::improve::CuratorConfig::default());
+    let curator = echo_agent::evolution::Curator::default_path(
+        echo_agent::evolution::CuratorConfig::default(),
+    );
 
     match curator.pin_skill(name) {
         Ok(()) => println!("✓ Skill '{}' pinned — exempt from auto-transitions.", name),
@@ -1590,8 +1555,9 @@ async fn cmd_skill_unpin(_ctx: &CommandContext, args: &[&str]) -> CommandOutcome
         }
     };
 
-    let curator =
-        echo_agent::improve::Curator::default_path(echo_agent::improve::CuratorConfig::default());
+    let curator = echo_agent::evolution::Curator::default_path(
+        echo_agent::evolution::CuratorConfig::default(),
+    );
 
     match curator.unpin_skill(name) {
         Ok(()) => println!(
@@ -1614,7 +1580,6 @@ cmd!(
 // ── Register ────────────────────────────────────────────────────────
 
 pub fn register_all(registry: &mut crate::cli::command::CommandRegistry) {
-    registry.register(Arc::new(TrajectoriesCommand));
     registry.register(Arc::new(ReviewCommand));
     registry.register(Arc::new(CuratorCommand));
     registry.register(Arc::new(CritiquesCommand));

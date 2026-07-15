@@ -34,8 +34,6 @@ gui = [
 ]
 channels = ["echo-agent/channels"]
 telemetry = ["echo-agent/telemetry"]
-eval = ["echo-agent/eval"]
-improve = ["echo-agent/improve"]
 devtools = ["tauri?/devtools"]
 
 [[bin]]
@@ -49,7 +47,7 @@ required-features = ["gui"]
 
 [dependencies]
 echo-agent-app-core = { path = "./echo-agent-app-core" }
-echo-agent = { version = "0.2.0", package = "echo_agent", path = "../echo-agent", features = ["mcp", "lsp", "human-loop", "subagent", "tasks", "eval", "improve"] }
+echo-agent = { version = "0.2.0", package = "echo_agent", path = "../echo-agent", features = ["mcp", "lsp", "human-loop", "subagent", "tasks"] }
 echo-core = { version = "0.2", package = "echo_core", path = "../echo-agent/echo-core" }
 # async_trait: needed for `impl MessageHandler for AppChannelMessageHandler` (channels feature).
 async-trait = "0.1"

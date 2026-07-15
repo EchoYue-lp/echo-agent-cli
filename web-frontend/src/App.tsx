@@ -126,7 +126,7 @@ function App() {
       {
         id: 'settings-evolution',
         label: 'Settings: Self-Evolution',
-        description: 'Trajectory management, background review, and skill curation',
+        description: 'Memory review, rule proposals, and skill curation',
         action: () => {
           setActiveSettingsTab('evolution');
         },

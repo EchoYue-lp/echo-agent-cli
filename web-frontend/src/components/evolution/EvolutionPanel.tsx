@@ -1,16 +1,13 @@
 import { useEffect, useState } from 'react';
 import {
   Sparkles,
-  BarChart3,
   Search,
   RefreshCw,
   Pin,
   Play,
   CheckCircle,
-  XCircle,
   Archive,
   Clock,
-  Activity,
   Database,
   Heart,
   Gift,
@@ -20,8 +17,6 @@ import {
 import { evolutionApi } from '../../api/endpoints';
 import { useToastStore } from '../../stores/toastStore';
 import type {
-  TrajectoryEntry,
-  TrajectoryStats,
   CuratorStatus,
   CuratorTransition,
   DashboardMetrics,
@@ -46,12 +41,6 @@ export function EvolutionPanel() {
   const [loadingCandidates, setLoadingCandidates] = useState(false);
   const [actingOnSkill, setActingOnSkill] = useState<string | null>(null);
 
-  // ── Trajectory state
-  const [stats, setStats] = useState<TrajectoryStats | null>(null);
-  const [trajectories, setTrajectories] = useState<TrajectoryEntry[]>([]);
-  const [loadingStats, setLoadingStats] = useState(false);
-  const [loadingTraj, setLoadingTraj] = useState(false);
-
   // ── Review state
   const [reviewing, setReviewing] = useState(false);
   const [reviewResult, setReviewResult] = useState<{
@@ -59,6 +48,13 @@ export function EvolutionPanel() {
     run_id: string;
     actions: string[];
     nothing_to_save: boolean;
+    candidate?: {
+      kind: 'user_preference' | 'project_fact' | 'debugging_lesson' | 'skill';
+      content: string;
+      evidence: string;
+      confidence: number;
+      persisted: boolean;
+    } | null;
     error?: string | null;
   } | null>(null);
   const [reviewError, setReviewError] = useState<string | null>(null);
@@ -144,28 +140,6 @@ export function EvolutionPanel() {
     setActingOnSkill(null);
   };
 
-  const loadStats = async () => {
-    setLoadingStats(true);
-    try {
-      const data = await evolutionApi.trajectoryStats();
-      setStats(data.stats);
-    } catch (e) {
-      console.error('Failed to load trajectory stats:', e);
-    }
-    setLoadingStats(false);
-  };
-
-  const loadTrajectories = async () => {
-    setLoadingTraj(true);
-    try {
-      const data = await evolutionApi.trajectories();
-      setTrajectories(data.trajectories.slice(0, 20));
-    } catch (e) {
-      console.error('Failed to load trajectories:', e);
-    }
-    setLoadingTraj(false);
-  };
-
   const loadCuratorStatus = async () => {
     try {
       const res = await evolutionApi.curator('status');
@@ -179,8 +153,6 @@ export function EvolutionPanel() {
     loadDashboard();
     loadProposals();
     loadSkillCandidates();
-    loadStats();
-    loadTrajectories();
     loadCuratorStatus();
   }, []);
 
@@ -633,118 +605,17 @@ export function EvolutionPanel() {
         )}
       </section>
 
-      {/* ── Section 1: Trajectory Stats ── */}
-      <section>
-        <div className="flex items-center justify-between mb-3">
-          <div className="flex items-center gap-2">
-            <BarChart3 size={14} style={{ color: 'var(--accent)' }} />
-            <h3 className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>
-              轨迹统计
-            </h3>
-          </div>
-          <button
-            onClick={() => {
-              loadStats();
-              loadTrajectories();
-            }}
-            disabled={loadingStats}
-            className="flex items-center gap-1 text-[10px] font-medium transition-colors"
-            style={{ color: 'var(--accent)' }}
-          >
-            <RefreshCw size={10} className={loadingStats ? 'animate-spin' : ''} />
-            刷新
-          </button>
-        </div>
-
-        {stats && (
-          <div className="grid grid-cols-3 gap-2 mb-3">
-            <StatCard label="总运行数" value={stats.total} />
-            <StatCard label="已完成" value={stats.completed} color="var(--color-success)" />
-            <StatCard label="已失败" value={stats.failed} color="var(--color-error)" />
-            <StatCard label="总令牌" value={formatNumber(stats.total_tokens)} />
-            <StatCard label="工具调用" value={stats.total_tool_calls} />
-            <StatCard label="平均耗时" value={`${(stats.avg_duration_ms / 1000).toFixed(1)}s`} />
-          </div>
-        )}
-
-        {/* Recent trajectories */}
-        {trajectories.length > 0 && (
-          <div className="rounded-lg border" style={{ borderColor: 'var(--border-primary)' }}>
-            <div
-              className="flex items-center gap-2 border-b px-3 py-2"
-              style={{ borderColor: 'var(--border-primary)' }}
-            >
-              <Activity size={12} style={{ color: 'var(--text-tertiary)' }} />
-              <span className="text-[11px] font-medium" style={{ color: 'var(--text-secondary)' }}>
-                最近轨迹 ({trajectories.length})
-              </span>
-            </div>
-            <div
-              className="max-h-48 overflow-y-auto divide-y"
-              style={{ borderColor: 'var(--border-primary)' }}
-            >
-              {trajectories.map((t) => (
-                <div
-                  key={t.id}
-                  className="flex items-center justify-between px-3 py-2 text-xs"
-                  style={{ color: 'var(--text-secondary)' }}
-                >
-                  <div className="flex items-center gap-2 min-w-0">
-                    {t.completed ? (
-                      <CheckCircle size={11} style={{ color: 'var(--color-success)' }} />
-                    ) : (
-                      <XCircle size={11} style={{ color: 'var(--color-error)' }} />
-                    )}
-                    <span
-                      className="font-mono truncate"
-                      style={{ maxWidth: '80px', color: 'var(--text-tertiary)' }}
-                    >
-                      {t.id.slice(0, 8)}
-                    </span>
-                    <span
-                      className="rounded-md px-1.5 py-0.5 text-[10px]"
-                      style={{ background: 'var(--bg-hover)', color: 'var(--text-secondary)' }}
-                    >
-                      {t.model || 'unknown'}
-                    </span>
-                  </div>
-                  <div className="flex items-center gap-3 shrink-0">
-                    <span title="Tokens">{formatNumber(t.token_usage)} tok</span>
-                    <span title="Tool calls">{t.tool_call_count} tools</span>
-                    <span title="Duration">{(t.duration_ms / 1000).toFixed(1)}s</span>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-
-        {loadingTraj && trajectories.length === 0 && (
-          <div className="py-4 text-center text-xs" style={{ color: 'var(--text-tertiary)' }}>
-            <RefreshCw size={16} className="mx-auto mb-1 animate-spin" />
-            加载中...
-          </div>
-        )}
-
-        {!loadingTraj && trajectories.length === 0 && stats?.total === 0 && (
-          <div className="py-4 text-center text-xs" style={{ color: 'var(--text-tertiary)' }}>
-            <BarChart3 size={20} className="mx-auto mb-1" />
-            尚无轨迹数据。运行对话后将自动保存。
-          </div>
-        )}
-      </section>
-
-      {/* ── Section 2: Background Review ── */}
+      {/* ── Run Review ── */}
       <section>
         <div className="flex items-center gap-2 mb-3">
           <Search size={14} style={{ color: 'var(--accent)' }} />
           <h3 className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>
-            后台审查
+            运行回顾
           </h3>
         </div>
 
         <p className="text-xs mb-3" style={{ color: 'var(--text-secondary)' }}>
-          对最近的运行进行回顾审查，自动提取有价值的记忆和技能。
+          对最近一次运行生成带证据的长期记忆候选，默认不会自动写入记忆。
         </p>
 
         <button
@@ -811,6 +682,21 @@ export function EvolutionPanel() {
                   </li>
                 ))}
               </ul>
+            )}
+            {reviewResult.candidate && (
+              <div
+                className="mt-2 rounded-md px-2.5 py-2 text-[11px]"
+                style={{ background: 'var(--bg-hover)', color: 'var(--text-secondary)' }}
+              >
+                <div>
+                  类型: <span className="font-mono">{reviewResult.candidate.kind}</span>
+                </div>
+                <div className="mt-1">证据: {reviewResult.candidate.evidence}</div>
+                <div className="mt-1">
+                  置信度: {reviewResult.candidate.confidence.toFixed(2)} ·{' '}
+                  {reviewResult.candidate.persisted ? '已保存为草稿记忆' : '未自动保存'}
+                </div>
+              </div>
             )}
             {reviewResult.error && (
               <p className="mt-1 text-[10px]" style={{ color: 'var(--color-warning, orange)' }}>
@@ -957,10 +843,4 @@ function StatCard({
       </div>
     </div>
   );
-}
-
-function formatNumber(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
-  return String(n);
 }

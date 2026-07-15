@@ -279,11 +279,7 @@ impl AgentRuntime {
             tracing::info!("ReviewIntegration created for session");
         }
         if let Some(review_integration) = &review_integration {
-            let layer_manager = Arc::new(
-                review_integration
-                    .create_layer_manager()
-                    .with_write_observer(review_integration.clone()),
-            );
+            let layer_manager = Arc::new(review_integration.create_layer_manager());
             agent_handle
                 .write_async(|a| {
                     Box::pin(async move {

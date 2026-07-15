@@ -30,8 +30,6 @@ import type {
   SavedMessage,
   FullConfigResponse,
   FullConfigUpdateRequest,
-  TrajectoryEntry,
-  TrajectoryStats,
   CuratorStatus,
   CuratorTransition,
   DashboardMetrics,
@@ -730,12 +728,6 @@ export interface CacheDiagnosticsData {
     protected_message_count: number;
     protected_tokens: number;
   };
-  behavior_fixtures: Array<{
-    id: string;
-    name: string;
-    domain: string;
-    criterion: string;
-  }>;
   fingerprint_changes: {
     system_prompt_hash_changes: number;
     tools_schema_hash_changes: number;
@@ -1009,16 +1001,6 @@ export const workspaceApi = {
 // ── Evolution API (自进化) ─────────────────────────────────────────
 
 export const evolutionApi = {
-  trajectories: (date?: string) =>
-    isTauri()
-      ? apiInvoke<{ trajectories: TrajectoryEntry[]; count: number }>('get_trajectories', { date })
-      : get<{ trajectories: TrajectoryEntry[]; count: number }>(
-          `/evolution/trajectories${date ? `?date=${date}` : ''}`
-        ),
-  trajectoryStats: () =>
-    isTauri()
-      ? apiInvoke<{ stats: TrajectoryStats }>('get_trajectory_stats')
-      : get<{ stats: TrajectoryStats }>('/evolution/trajectories/stats'),
   review: (runId?: string) =>
     isTauri()
       ? apiInvoke<{
@@ -1026,13 +1008,27 @@ export const evolutionApi = {
           run_id: string;
           actions: string[];
           nothing_to_save: boolean;
+          candidate?: {
+            kind: 'user_preference' | 'project_fact' | 'debugging_lesson' | 'skill';
+            content: string;
+            evidence: string;
+            confidence: number;
+            persisted: boolean;
+          } | null;
           error?: string | null;
-        }>('review_trajectory', { trajectory_id: runId })
+        }>('review_run', { run_id: runId })
       : post<{
           success: boolean;
           run_id: string;
           actions: string[];
           nothing_to_save: boolean;
+          candidate?: {
+            kind: 'user_preference' | 'project_fact' | 'debugging_lesson' | 'skill';
+            content: string;
+            evidence: string;
+            confidence: number;
+            persisted: boolean;
+          } | null;
           error?: string | null;
         }>('/evolution/review', { run_id: runId }),
   curator: (action: string, skillName?: string) =>

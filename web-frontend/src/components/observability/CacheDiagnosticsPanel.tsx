@@ -236,68 +236,6 @@ export function CacheDiagnosticsPanel() {
             </section>
           )}
 
-          {data.behavior_fixtures.length > 0 && (
-            <section>
-              <div className="mb-2 text-xs font-semibold" style={{ color: 'var(--text-primary)' }}>
-                行为评测基线
-              </div>
-              <div
-                className="overflow-auto rounded-lg border"
-                style={{ borderColor: 'var(--border-primary)' }}
-              >
-                <table className="w-full text-[11px]">
-                  <thead>
-                    <tr style={{ background: 'var(--bg-hover)' }}>
-                      <th
-                        className="px-2 py-1.5 text-left"
-                        style={{ color: 'var(--text-tertiary)' }}
-                      >
-                        领域
-                      </th>
-                      <th
-                        className="px-2 py-1.5 text-left"
-                        style={{ color: 'var(--text-tertiary)' }}
-                      >
-                        Case
-                      </th>
-                      <th
-                        className="px-2 py-1.5 text-left"
-                        style={{ color: 'var(--text-tertiary)' }}
-                      >
-                        判定
-                      </th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {data.behavior_fixtures.map((fixture) => (
-                      <tr
-                        key={fixture.id}
-                        className="border-t"
-                        style={{ borderColor: 'var(--border-secondary)' }}
-                      >
-                        <td
-                          className="px-2 py-1.5 font-mono"
-                          style={{ color: 'var(--text-secondary)' }}
-                        >
-                          {fixture.domain}
-                        </td>
-                        <td className="px-2 py-1.5" style={{ color: 'var(--text-primary)' }}>
-                          {fixture.name}
-                        </td>
-                        <td
-                          className="px-2 py-1.5 font-mono"
-                          style={{ color: 'var(--text-tertiary)' }}
-                        >
-                          {fixture.criterion}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </section>
-          )}
-
           {/* Issues */}
           {data.issues.length > 0 && (
             <section>

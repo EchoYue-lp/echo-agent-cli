@@ -414,7 +414,7 @@ pub enum ObservationCategory {
 ### §9.2 `BackgroundReviewer`（框架、LLM）
 
 ```rust,ignore
-// echo-agent/src/improve/background_review.rs:111-116
+// echo-agent/src/evolution/background_review.rs
 pub struct BackgroundReviewer {
     config:        BackgroundReviewConfig,
     llm_client:    Arc<dyn LlmClient>,
@@ -423,19 +423,19 @@ pub struct BackgroundReviewer {
 }
 ```
 
-`review(&self, run: &Run) -> JoinHandle<ReviewOutcome>` (`L192-221`)：异步 spawn 一个 sub-agent，`build_transcript()` 拼装对话稿后挂 `MEMORY_REVIEW_PROMPT|SKILL_REVIEW_PROMPT|COMBINED_REVIEW_PROMPT`，构造受限工具集（仅记忆工具）的子 agent 来"审稿"。
+`review(&self, run: &Run) -> JoinHandle<ReviewOutcome>`：异步执行一次轻量 LLM 回顾。稳定 system prompt 与作为不可信证据的 transcript 分离，模型必须返回严格 JSON 候选，并提供可在原运行中核对的精确证据。默认只提出候选，不自动写记忆；输出上限为 512 token。
 
-调用点：仅 CLI `evolution` 命令（`echo-agent-cli/src/cli/cmd_impls/evolution.rs:136`），**没**有自动 post-run hook。也就是说：要触发 LLM 级别的对话审查，用户必须显式跑 `/review` 或 `POST /api/evolution/review`。
+调用点：CLI `/review`、TUI `/run-review`、GUI Evolution Panel。没有自动 post-run hook；用户必须显式触发。
 
 ### §9.3 选谁
 
 | 场景 | 用 |
 |------|---|
 | 每次对话结束默默把"用户偏好 / 项目模式"提取出来 | `auto_memory`（轻量、零 LLM 成本） |
-| 用户显式发"帮我从这次对话里学一些经验" | `BackgroundReviewer`（LLM 总结、写入记忆） |
+| 用户显式发"帮我从这次对话里学一些经验" | `BackgroundReviewer`（LLM 生成带证据候选，默认不写记忆） |
 | 大批量历史对话的回顾分析 | `BackgroundReviewer` |
 
-二者写的也不是同一个地方：`auto_memory` 写 `.md` 文件，`BackgroundReviewer` 写 `Store`。
+二者的职责不同：`auto_memory` 仍会写 `.md`/typed memory；`BackgroundReviewer` 默认只返回候选，只有框架复用方显式开启 `auto_persist_user_preferences` 才可能把高置信用户偏好写成 Draft memory。
 
 ---
 

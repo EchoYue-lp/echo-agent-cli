@@ -1372,11 +1372,6 @@ pub async fn get_cache_diagnostics(
             "protected_tokens": context.protected_token_estimate(),
         })
     };
-    let behavior_fixtures = echo_agent_app_core::prompt_eval::prompt_behavior_case_summaries()
-        .unwrap_or_else(|error| {
-            tracing::warn!(%error, "Failed to load prompt behavior fixtures");
-            Vec::new()
-        });
     let recent_calls: Vec<serde_json::Value> = events
         .iter()
         .rev()
@@ -1425,7 +1420,6 @@ pub async fn get_cache_diagnostics(
         "fingerprint_changes": diagnostics.fingerprint_changes,
         "prompt_assembly": prompt_assembly,
         "context_snapshot": context_snapshot,
-        "behavior_fixtures": behavior_fixtures,
     }))
 }
 

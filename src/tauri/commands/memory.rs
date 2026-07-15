@@ -2,8 +2,8 @@
 //!
 //! These commands are a legacy/admin surface for arbitrary Store namespaces.
 //! Runtime-recallable agent memories should be written through
-//! `MemoryLayerManager::write_memory` via AutoMemory, TriggerDetector,
-//! BackgroundReviewer, or the layered `remember` tool.
+//! `MemoryLayerManager::write_memory` via AutoMemory, TriggerDetector, an
+//! explicitly accepted review candidate, or the layered `remember` tool.
 
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;

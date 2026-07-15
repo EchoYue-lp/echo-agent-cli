@@ -262,7 +262,7 @@ fn persist_auto_memory_observations(
 
     let existing = std::fs::read_to_string(memory_path).unwrap_or_default();
     let new_content = if let Some(marker_pos) = existing.find("## Auto-extracted observations") {
-        let before = &existing[..marker_pos];
+        let before = existing.get(..marker_pos).unwrap_or_default();
         format!("{}{}", before.trim_end(), formatted)
     } else if existing.is_empty() {
         formatted
@@ -1304,7 +1304,7 @@ pub async fn add_paper_tags(
 // Evolution
 // ════════════════════════════════════════════════════════════════════════════
 
-fn curator_status_json(status: echo_agent::improve::CuratorStatus) -> serde_json::Value {
+fn curator_status_json(status: echo_agent::evolution::CuratorStatus) -> serde_json::Value {
     json!({
         "total": status.total,
         "candidate": status.candidate,
@@ -1319,39 +1319,9 @@ fn curator_status_json(status: echo_agent::improve::CuratorStatus) -> serde_json
 }
 
 #[tauri::command]
-pub async fn get_trajectories(
-    _state: tauri::State<'_, TauriState>,
-    date: Option<String>,
-) -> Result<serde_json::Value, IpcError> {
-    let saver = echo_agent::improve::TrajectorySaver::default_dir()
-        .map_err(|e| IpcError::Internal(e.to_string()))?;
-    let trajectories = saver
-        .list(date.as_deref())
-        .await
-        .map_err(|e| IpcError::Internal(e.to_string()))?;
-    Ok(json!({
-        "count": trajectories.len(),
-        "trajectories": trajectories,
-    }))
-}
-
-#[tauri::command]
-pub async fn get_trajectory_stats(
-    _state: tauri::State<'_, TauriState>,
-) -> Result<serde_json::Value, IpcError> {
-    let saver = echo_agent::improve::TrajectorySaver::default_dir()
-        .map_err(|e| IpcError::Internal(e.to_string()))?;
-    let stats = saver
-        .stats()
-        .await
-        .map_err(|e| IpcError::Internal(e.to_string()))?;
-    Ok(json!({ "stats": stats }))
-}
-
-#[tauri::command]
-pub async fn review_trajectory(
+pub async fn review_run(
     state: tauri::State<'_, TauriState>,
-    trajectory_id: Option<String>,
+    run_id: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
     let agent = state.app_state.connection.primary_agent();
     let (llm_client, memory_store, run_store) = agent
@@ -1369,7 +1339,7 @@ pub async fn review_trajectory(
     let run_store =
         run_store.ok_or_else(|| IpcError::Internal("No run store configured".into()))?;
 
-    let run_id = match trajectory_id {
+    let run_id = match run_id {
         Some(id) if !id.trim().is_empty() => id,
         _ => {
             let runs = run_store
@@ -1401,9 +1371,7 @@ pub async fn review_trajectory(
                 ))
             });
         reviewer.with_layer_manager(std::sync::Arc::new(
-            review_integration
-                .create_layer_manager()
-                .with_write_observer(review_integration.clone()),
+            review_integration.create_layer_manager(),
         ))
     } else {
         reviewer
@@ -1419,6 +1387,7 @@ pub async fn review_trajectory(
         "run_id": outcome.run_id,
         "actions": outcome.actions,
         "nothing_to_save": outcome.nothing_to_save,
+        "candidate": outcome.candidate,
         "error": outcome.error,
     }))
 }
@@ -1429,8 +1398,9 @@ pub async fn curator_action(
     action: String,
     skill_name: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    let curator =
-        echo_agent::improve::Curator::default_path(echo_agent::improve::CuratorConfig::default());
+    let curator = echo_agent::evolution::Curator::default_path(
+        echo_agent::evolution::CuratorConfig::default(),
+    );
 
     match action.as_str() {
         "status" => Ok(json!({
@@ -1744,15 +1714,12 @@ pub async fn activate_skill_draft(
     std::fs::copy(draft_dir.join("SKILL.md"), target_dir.join("SKILL.md"))
         .map_err(|e| IpcError::Internal(format!("Failed to copy draft SKILL.md: {e}")))?;
 
-    // curator 状态 Draft→Active(feature gate:improve)
-    #[cfg(feature = "improve")]
-    {
-        let curator = echo_agent::improve::Curator::default_path(
-            echo_agent::improve::CuratorConfig::default(),
-        );
-        if let Err(e) = curator.promote_to_active(&name) {
-            tracing::warn!(name = %name, error = %e, "Failed to promote '{}' to active", name);
-        }
+    // curator 状态 Draft→Active。
+    let curator = echo_agent::evolution::Curator::default_path(
+        echo_agent::evolution::CuratorConfig::default(),
+    );
+    if let Err(e) = curator.promote_to_active(&name) {
+        tracing::warn!(name = %name, error = %e, "Failed to promote '{}' to active", name);
     }
 
     echo_agent_app_core::evolution::fire_evolution_hook(

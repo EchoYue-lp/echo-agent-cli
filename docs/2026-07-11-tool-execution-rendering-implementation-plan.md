@@ -618,7 +618,7 @@ cd ..
 cargo clean
 ```
 
-另跑项目要求的 `channels`、`tui+telemetry`、`tui+eval`、`tui+improve`、`gui+devtools` 等关键组合。
+另跑项目要求的 `channels`、`tui+telemetry`、`gui+devtools` 等关键组合。
 
 ### 11.3 提交顺序
 

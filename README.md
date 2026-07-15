@@ -359,13 +359,13 @@ echo-agent-cli 启用以下 echo-agent 框架 features：
 
 | 命令 | 别名 | 描述 |
 |------|------|------|
-| `/trajectories` | `traj` | 查看执行轨迹 |
-| `/review` | | 自我审查 |
-| `/curator` | | 轨迹策展 |
+| `/review` | | 从最近运行生成带证据的记忆候选（默认不保存） |
+| `/curator` | | 管理技能生命周期 |
 | `/critiques` | `cq` | 查看评审意见 |
-| `/improve` | | 自我改进 |
-| `/runs` | | 列出评测运行 |
-| `/run` | | 查看评测运行详情 |
+| `/memory-review` | `mr` | 审查已积累记忆（默认不自动语义合并） |
+| `/skill-candidates` | `sc` | 查看技能候选与草稿 |
+| `/runs` | | 列出最近运行 |
+| `/run` | | 查看或导出运行详情 |
 
 #### Scheduling 定时调度
 

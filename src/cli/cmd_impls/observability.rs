@@ -1,8 +1,4 @@
-//! Evaluation & trace slash commands — trace, runs, self-review.
-//!
-//! (技能触发准确率评测 crate echo-agent-eval 已移除:其 case 仅覆盖老扁平技能、
-//! 门控阈值虚设、且只测 keyword 层,维护成本高于价值。日后如需触发评估,
-//! 可从 echo-agent 框架侧的 eval 模块重建。)
+//! Runtime observability slash commands for traces, prompt budgets, and runs.
 
 use crate::cli::command::{CommandCategory, CommandContext, CommandOutcome, cmd};
 use std::sync::Arc;
@@ -148,75 +144,6 @@ cmd!(
     cmd_trace
 );
 
-// ── SelfReviewCommand ──────────────────────────────────────────────────
-
-async fn cmd_self_review(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
-    let store = ctx.agent.read(|a| a.run_store.clone()).await;
-    if let Some(ref s) = store
-        && let Ok(runs) = s.list_all(1).await
-        && let Some(r) = runs.first()
-        && let Ok(Some(run)) = s.load(&r.run_id).await
-    {
-        let critique = echo_agent::improve::Analyzer::analyze(&run);
-        println!("\n{}", critique.format_report());
-        return CommandOutcome::Continue;
-    }
-    println!("No runs to review.");
-    CommandOutcome::Continue
-}
-cmd!(
-    SelfReviewCommand,
-    "self-review",
-    CommandCategory::Advanced,
-    "Analyze last run for improvements",
-    cmd_self_review
-);
-
-// ── ImproveCommand ────────────────────────────────────────────────────
-
-async fn cmd_improve(_ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
-    let sub = args.first().copied().unwrap_or("");
-    match sub {
-        "prompt" => {
-            println!("Analyzing failures for prompt improvements... Use /self-review first.")
-        }
-        "policy" => println!("Analyzing for policy suggestions... Use /self-review first."),
-        "eval" => println!("Generating eval cases from failures... Use /self-review first."),
-        _ => println!("Usage: /improve prompt|policy|eval"),
-    }
-    CommandOutcome::Continue
-}
-cmd!(
-    ImproveCommand,
-    "improve",
-    CommandCategory::Advanced,
-    "Improve prompt/policy/eval from runs",
-    cmd_improve
-);
-
-async fn cmd_prompt_eval(_ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
-    match echo_agent_app_core::prompt_eval::prompt_behavior_case_summaries() {
-        Ok(cases) => {
-            println!("\nPrompt behavior fixtures: {}", cases.len());
-            for case in cases {
-                println!(
-                    "  [{}] {} — {} ({})",
-                    case.domain, case.id, case.name, case.criterion
-                );
-            }
-        }
-        Err(error) => println!("Prompt behavior fixtures unavailable: {error}"),
-    }
-    CommandOutcome::Continue
-}
-cmd!(
-    PromptEvalCommand,
-    "prompt-eval",
-    CommandCategory::Debug,
-    "List cross-domain prompt behavior fixtures",
-    cmd_prompt_eval
-);
-
 async fn cmd_prompt_diagnostics(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
     let context = ctx.agent.read(|agent| agent.context().clone()).await;
     let (message_count, estimated_tokens, protected_message_count, protected_tokens) = {
@@ -275,12 +202,8 @@ async fn cmd_runs(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
             Ok(runs) => {
                 println!("\n--- Recent Runs ---");
                 for r in &runs {
-                    println!(
-                        "  {:?} {} — {}",
-                        r.status,
-                        &r.run_id[..12.min(r.run_id.len())],
-                        r.input_preview
-                    );
+                    let short_id: String = r.run_id.chars().take(12).collect();
+                    println!("  {:?} {} — {}", r.status, short_id, r.input_preview);
                 }
             }
             _ => println!("No runs recorded."),
@@ -301,28 +224,27 @@ cmd!(
 // ── RunCommand ────────────────────────────────────────────────────────
 
 async fn cmd_run_show(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
-    if args.is_empty() {
+    let Some(sub) = args.first().copied() else {
         println!("Usage: /run show <id> | /run export <id>");
-    } else {
-        let sub = args[0];
-        let id = args.get(1).copied().unwrap_or("");
-        let store = ctx.agent.read(|a| a.run_store.clone()).await;
-        if let Some(ref s) = store {
-            match sub {
-                "export" => {
-                    if let Ok(Some(run)) = s.load(id).await {
-                        println!("{}", serde_json::to_string_pretty(&run).unwrap_or_default());
-                    }
+        return CommandOutcome::Continue;
+    };
+    let id = args.get(1).copied().unwrap_or("");
+    let store = ctx.agent.read(|a| a.run_store.clone()).await;
+    if let Some(ref s) = store {
+        match sub {
+            "export" => {
+                if let Ok(Some(run)) = s.load(id).await {
+                    println!("{}", serde_json::to_string_pretty(&run).unwrap_or_default());
                 }
-                _ => {
-                    if let Ok(Some(run)) = s.load(id).await {
-                        println!(
-                            "\nRun: {}\nInput: {}\nEvents: {}",
-                            run.run_id,
-                            run.input,
-                            run.events.len()
-                        );
-                    }
+            }
+            _ => {
+                if let Ok(Some(run)) = s.load(id).await {
+                    println!(
+                        "\nRun: {}\nInput: {}\nEvents: {}",
+                        run.run_id,
+                        run.input,
+                        run.events.len()
+                    );
                 }
             }
         }
@@ -341,9 +263,6 @@ cmd!(
 
 pub fn register_all(registry: &mut crate::cli::command::CommandRegistry) {
     registry.register(Arc::new(TraceCommand));
-    registry.register(Arc::new(SelfReviewCommand));
-    registry.register(Arc::new(ImproveCommand));
-    registry.register(Arc::new(PromptEvalCommand));
     registry.register(Arc::new(PromptDiagnosticsCommand));
     registry.register(Arc::new(RunsCommand));
     registry.register(Arc::new(RunCommand));

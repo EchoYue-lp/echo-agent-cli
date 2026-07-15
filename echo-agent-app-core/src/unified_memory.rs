@@ -2,8 +2,9 @@
 //! and aggregates them for system-prompt injection.
 //!
 //! Dynamic agent-learned memories are managed by the layered
-//! `MemoryLayerManager` (written via AutoMemory / BackgroundReviewer / the
-//! layered `remember` tool), not by this type. The earlier product-level
+//! `MemoryLayerManager` (written via AutoMemory, TriggerDetector, or the layered
+//! `remember` tool), not by this type. BackgroundReviewer is proposal-only by
+//! default. The earlier product-level
 //! `remember` / `recall` helpers were半死 (never wired into the production
 //! read path) and have been removed.
 //!

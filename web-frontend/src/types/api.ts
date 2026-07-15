@@ -548,42 +548,6 @@ export interface HealthResponse {
 
 // ── Evolution / 自进化 types ──
 
-export interface ShareGPTMessage {
-  from: string;
-  value: string;
-}
-
-export interface TrajectoryEntry {
-  id: string;
-  session_id: string;
-  conversations: ShareGPTMessage[];
-  model: string;
-  completed: boolean;
-  timestamp: string;
-  token_usage: number;
-  tool_call_count: number;
-  duration_ms: number;
-}
-
-export interface TrajectoryStats {
-  total: number;
-  completed: number;
-  failed: number;
-  total_tokens: number;
-  total_tool_calls: number;
-  avg_duration_ms: number;
-}
-
-// Renamed from ReviewOutcome (6-10 C-tier): the generated `ReviewOutcome` is
-// the task-review enum ("pass"|"needs_fix"|"blocked"), which collided with
-// this evolution-specific struct. Disambiguated as TrajectoryReviewOutcome.
-export interface TrajectoryReviewOutcome {
-  run_id: string;
-  actions: string[];
-  nothing_to_save: boolean;
-  error?: string | null;
-}
-
 export interface CuratorStatus {
   total: number;
   active: number;
