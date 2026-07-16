@@ -69,6 +69,7 @@ pub enum SlashCommand {
     DeleteSession,
     Compact,
     Copy,
+    OpenArtifact,
 
     // -- Context --
     Model,
@@ -146,6 +147,7 @@ impl SlashCommand {
             Self::DeleteSession => "Delete a persisted conversation",
             Self::Compact => "Compress context window",
             Self::Copy => "Copy the last response to clipboard (or Ctrl+Y)",
+            Self::OpenArtifact => "Open the latest or specified tool-output artifact",
 
             Self::Model => "Switch or show current model",
             Self::Think => "Toggle reasoning/thinking display",
@@ -213,7 +215,8 @@ impl SlashCommand {
             | Self::Rename
             | Self::DeleteSession
             | Self::Compact
-            | Self::Copy => Category::Session,
+            | Self::Copy
+            | Self::OpenArtifact => Category::Session,
             Self::Model
             | Self::Think
             | Self::System
@@ -284,6 +287,7 @@ impl SlashCommand {
             Self::Fork => "[title]",
             Self::Rename => "<title>",
             Self::DeleteSession => "<conversation-id>",
+            Self::OpenArtifact => "[call-id|path]",
             Self::CodeReview => "[file-or-dir]",
             Self::Attach => "<file-path>",
             Self::Skills => "[list|search|install|uninstall|info|refresh] [args]",

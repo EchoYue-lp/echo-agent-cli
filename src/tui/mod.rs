@@ -598,28 +598,42 @@ pub(crate) fn tool_shows_success_tail(tool: &ToolExecutionMessage) -> bool {
 }
 
 pub(crate) fn tool_output_tail(tool: &ToolExecutionMessage, max_lines: usize) -> Vec<String> {
-    if tool.status == ToolExecutionStatus::Succeeded && !tool_shows_success_tail(tool) {
-        return Vec::new();
-    }
-    let source = if tool.status == ToolExecutionStatus::Failed && !tool.stderr.is_empty() {
-        &tool.stderr
+    let source = if tool.status == ToolExecutionStatus::Succeeded && !tool_shows_success_tail(tool)
+    {
+        None
+    } else if tool.status == ToolExecutionStatus::Failed && !tool.stderr.is_empty() {
+        Some(tool.stderr.as_str())
     } else if !tool.stdout.is_empty() {
-        &tool.stdout
+        Some(tool.stdout.as_str())
     } else if !tool.stderr.is_empty() {
-        &tool.stderr
+        Some(tool.stderr.as_str())
     } else if !tool.log.is_empty() {
-        &tool.log
+        Some(tool.log.as_str())
     } else {
-        return tool.progress.clone().into_iter().collect();
+        None
     };
-    let lines: Vec<&str> = source.lines().collect();
-    let start = lines.len().saturating_sub(max_lines);
-    lines
-        .get(start..)
-        .unwrap_or_default()
-        .iter()
-        .map(|line| (*line).to_string())
-        .collect()
+    let mut output: Vec<String> = match source {
+        Some(source) => {
+            let lines: Vec<&str> = source.lines().collect();
+            let start = lines.len().saturating_sub(max_lines);
+            lines
+                .get(start..)
+                .unwrap_or_default()
+                .iter()
+                .map(|line| (*line).to_string())
+                .collect()
+        }
+        None => tool.progress.clone().into_iter().collect(),
+    };
+    if let Some(path) = tool.metadata.get("artifact_path") {
+        let status = if std::path::Path::new(path).is_file() {
+            "full output"
+        } else {
+            "full output artifact missing"
+        };
+        output.push(format!("{status}: {path}"));
+    }
+    output
 }
 
 pub(crate) fn tool_metadata_label(tool: &ToolExecutionMessage) -> String {
@@ -634,7 +648,18 @@ pub(crate) fn tool_metadata_label(tool: &ToolExecutionMessage) -> String {
         .map(|value| format!("exit {value}"));
     let truncated = tool.truncated.then(|| "truncated".to_string());
     let failure = tool.metadata.get("failure_category").cloned();
-    [duration, exit_code, failure, truncated]
+    let artifact = tool.metadata.get("artifact_path").map(|path| {
+        if std::path::Path::new(path).is_file() {
+            tool.metadata
+                .get("artifact_bytes")
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(|bytes| format!("artifact {:.1} MiB", bytes as f64 / 1_048_576.0))
+                .unwrap_or_else(|| "artifact".to_string())
+        } else {
+            "artifact missing".to_string()
+        }
+    });
+    [duration, exit_code, failure, truncated, artifact]
         .into_iter()
         .flatten()
         .collect::<Vec<_>>()

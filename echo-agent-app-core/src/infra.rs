@@ -24,6 +24,7 @@ const DEFAULT_MAX_TOKENS: u32 = 8192;
 /// EKO product default for one tool result returned to the model. The generic
 /// framework keeps 0 as opt-out so other consumers choose their own budget.
 const DEFAULT_MAX_TOOL_OUTPUT_TOKENS: usize = 8_000;
+const TOOL_OUTPUT_ARTIFACT_MAX_AGE_SECS: u64 = 30 * 24 * 60 * 60;
 
 fn resolved_max_tool_output_tokens(configured: usize) -> usize {
     if configured > 0 {
@@ -31,6 +32,22 @@ fn resolved_max_tool_output_tokens(configured: usize) -> usize {
     } else {
         DEFAULT_MAX_TOOL_OUTPUT_TOKENS
     }
+}
+
+/// Product-owned storage policy for complete oversized tool output.
+///
+/// Artifacts use one stable global root so worktree/workspace removal cannot
+/// invalidate a running session's complete logs. Conversation deletion removes
+/// its scope immediately, while the 30-day max age prevents abandoned scopes
+/// from growing without bound.
+pub fn tool_output_artifact_config(
+    _working_dir: Option<&std::path::Path>,
+) -> echo_agent::tools::artifact::ToolOutputArtifactConfig {
+    let root_dir = crate::persistence::Persistence::base_dir()
+        .join("artifacts")
+        .join("tool-logs");
+    echo_agent::tools::artifact::ToolOutputArtifactConfig::new(root_dir, "conversation_or_30d")
+        .max_age_secs(Some(TOOL_OUTPUT_ARTIFACT_MAX_AGE_SECS))
 }
 
 /// Guide appended to the system prompt when task management tools are
@@ -257,6 +274,7 @@ pub async fn create_agent_with_diagnostics(
         .max_iterations(app_config.agent.max_iterations)
         .token_limit(token_limit)
         .max_tool_output_tokens(max_tool_output_tokens)
+        .tool_output_artifacts(tool_output_artifact_config(params.working_dir.as_deref()))
         .max_tokens(Some(max_tokens.unwrap_or(DEFAULT_MAX_TOKENS)))
         .temperature(temperature)
         .tool_execution(echo_agent::tools::ToolExecutionConfig {
@@ -559,6 +577,7 @@ async fn register_default_subagents(
     run_code_available: bool,
 ) {
     let workers = crate::subagent_loader::discover_subagents(project_root, user_home);
+    let tool_output_artifacts = agent.tool_output_artifacts();
     tracing::info!(
         count = workers.len(),
         names = ?workers.iter().map(|w| w.name.as_str()).collect::<Vec<_>>(),
@@ -627,6 +646,7 @@ async fn register_default_subagents(
         };
         match build_result {
             Ok(worker) => {
+                worker.set_tool_output_artifacts(tool_output_artifacts.clone());
                 crate::tasks::task_runtime::compact_context::install_task_context_protection(
                     &worker,
                 )

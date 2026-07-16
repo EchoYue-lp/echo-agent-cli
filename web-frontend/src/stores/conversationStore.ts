@@ -164,7 +164,7 @@ function chatMessagesToSaved(messages: ChatMessage[]) {
   return saved;
 }
 
-function finalToolProjection(tool: ToolExecution): ToolExecution {
+export function finalToolProjection(tool: ToolExecution): ToolExecution {
   const stdout = appendBoundedToolOutput('', tool.stdout);
   const stderr = appendBoundedToolOutput('', tool.stderr);
   const log = appendBoundedToolOutput('', tool.log);

@@ -911,6 +911,8 @@ impl TaskRuntimeStore {
                     "kind": a.kind.as_str(),
                     "title": a.title,
                     "task_id": a.task_id,
+                    "path": a.path,
+                    "metadata": a.metadata,
                 }),
             )?;
             self.shadow.rewrite_plan(&a.run_id)?;
@@ -1715,6 +1717,48 @@ mod tests {
         let evs = s.list_events("r1", 0).unwrap();
         assert_eq!(evs.len(), 1);
         assert_eq!(evs[0].event_type, RuntimeEventKind::RunCreated);
+    }
+
+    #[test]
+    fn artifact_round_trip_preserves_path_and_metadata() -> std::result::Result<(), String> {
+        let store = TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?;
+        store
+            .create_run(
+                "artifact-run",
+                "ws",
+                "conversation",
+                "message",
+                DomainProfile::General,
+                "artifact round trip",
+                "",
+                AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        let artifact = Artifact {
+            id: "artifact-1".to_string(),
+            run_id: "artifact-run".to_string(),
+            task_id: None,
+            kind: ArtifactKind::Trace,
+            title: "Complete tool output".to_string(),
+            path: Some("/tmp/tool-output.log".to_string()),
+            metadata: serde_json::json!({
+                "sha256": "abcdef",
+                "retention": "conversation_or_30d",
+            }),
+        };
+        store
+            .add_artifact(&artifact)
+            .map_err(|error| error.to_string())?;
+
+        let artifacts = store
+            .list_artifacts("artifact-run")
+            .map_err(|error| error.to_string())?;
+        let restored = artifacts
+            .first()
+            .ok_or_else(|| "artifact was not restored".to_string())?;
+        assert_eq!(restored.path, artifact.path);
+        assert_eq!(restored.metadata, artifact.metadata);
+        Ok(())
     }
 
     #[test]

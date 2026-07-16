@@ -1,10 +1,12 @@
 import { memo, useEffect, useMemo, useState } from 'react';
 import {
+  AlertTriangle,
   Check,
   ChevronDown,
   ChevronRight,
   CircleStop,
   Copy,
+  ExternalLink,
   FileSearch,
   FileText,
   Globe,
@@ -17,6 +19,7 @@ import {
   X,
 } from 'lucide-react';
 import type { ToolExecution } from '../../types/api';
+import { errorMessage, fileSystem } from '../../lib/tauri-bridge';
 import { describeToolExecution } from './tools/toolRenderers';
 
 interface InlineToolCallProps {
@@ -30,6 +33,7 @@ export const InlineToolCall = memo(function InlineToolCall({
 }: InlineToolCallProps) {
   const [expanded, setExpanded] = useState(false);
   const [copied, setCopied] = useState<string | null>(null);
+  const [artifactError, setArtifactError] = useState<string | null>(null);
   const [now, setNow] = useState(Date.now());
 
   useEffect(() => {
@@ -44,6 +48,14 @@ export const InlineToolCall = memo(function InlineToolCall({
   const duration = Number.isFinite(durationMs) ? durationMs / 1000 : elapsed;
   const exitCode = toolCall.metadata?.exit_code;
   const failure = toolCall.failure;
+  const artifactPath = toolCall.metadata?.artifact_path;
+  const artifactBytes = Number(toolCall.metadata?.artifact_bytes);
+  const artifactSize = Number.isFinite(artifactBytes)
+    ? artifactBytes >= 1024 * 1024
+      ? `${(artifactBytes / (1024 * 1024)).toFixed(1)} MiB`
+      : `${Math.max(0, Math.round(artifactBytes / 1024))} KiB`
+    : null;
+  const artifactHash = toolCall.metadata?.artifact_sha256?.slice(0, 12);
   const failed = toolCall.status === 'failed';
   const running = toolCall.status === 'running';
   const fullOutput = [
@@ -71,6 +83,17 @@ export const InlineToolCall = memo(function InlineToolCall({
     await navigator.clipboard.writeText(text);
     setCopied(label);
     window.setTimeout(() => setCopied(null), 1500);
+  };
+
+  const openArtifact = async () => {
+    if (!artifactPath) return;
+    setArtifactError(null);
+    try {
+      await fileSystem.openArtifact(artifactPath);
+    } catch (error) {
+      const message = errorMessage(error);
+      setArtifactError(message.includes('not found') ? '完整日志 artifact 已缺失' : message);
+    }
   };
 
   const statusIcon = running ? (
@@ -136,6 +159,16 @@ export const InlineToolCall = memo(function InlineToolCall({
         >
           {copied === 'command' ? <Check size={11} /> : <Copy size={11} />}
         </button>
+        {artifactPath && (
+          <button
+            type="button"
+            onClick={openArtifact}
+            className="mt-0.5 shrink-0 text-[var(--accent)] hover:text-[var(--text-primary)]"
+            title="打开完整日志 artifact"
+          >
+            <ExternalLink size={11} />
+          </button>
+        )}
       </div>
 
       {expanded && (
@@ -157,6 +190,28 @@ export const InlineToolCall = memo(function InlineToolCall({
             <div className="mb-2 border-l-2 border-[var(--color-error)] pl-2 text-[10px] leading-relaxed text-[var(--text-secondary)]">
               <div>{failure.recovery}</div>
               {failure.postcondition && <div>{failure.postcondition}</div>}
+            </div>
+          )}
+          {artifactPath && (
+            <div className="mb-2 flex min-w-0 items-center gap-2 border-l-2 border-[var(--accent)] pl-2 text-[10px] text-[var(--text-secondary)]">
+              {artifactError ? (
+                <AlertTriangle size={11} className="shrink-0 text-[var(--color-warning)]" />
+              ) : (
+                <FileText size={11} className="shrink-0 text-[var(--accent)]" />
+              )}
+              <span className="min-w-0 flex-1 truncate" title={artifactPath}>
+                {artifactError || `完整日志${artifactSize ? ` · ${artifactSize}` : ''}`}
+                {artifactHash ? ` · sha256 ${artifactHash}` : ''}
+              </span>
+              <button
+                type="button"
+                onClick={openArtifact}
+                className="flex shrink-0 items-center gap-1 text-[var(--accent)] hover:text-[var(--text-primary)]"
+                title="打开完整日志 artifact"
+              >
+                <ExternalLink size={10} />
+                打开
+              </button>
             </div>
           )}
           {outputSections.length > 0 ? (

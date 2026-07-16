@@ -275,6 +275,19 @@ pub async fn delete_conversation(
         .await
         .map_err(|e| IpcError::Internal(e.to_string()))?;
 
+    let artifact_config = state
+        .app_state
+        .connection
+        .agent
+        .read(|agent| agent.tool_output_artifacts())
+        .await;
+    if let Some(config) = artifact_config
+        && let Err(error) =
+            echo_agent::tools::artifact::cleanup_tool_output_scope(&config, &id, None)
+    {
+        tracing::warn!(conversation_id = %id, error = %error, "Failed to clean conversation tool artifacts");
+    }
+
     Ok(serde_json::json!({"success": true}))
 }
 

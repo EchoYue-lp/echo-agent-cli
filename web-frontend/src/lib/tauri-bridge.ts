@@ -122,6 +122,14 @@ export const fileSystem = {
     }
     // Web mode: not supported, silently ignore
   },
+
+  /** Open a persisted tool-output artifact without reading it into the WebView. */
+  async openArtifact(path: string): Promise<void> {
+    if (!isTauri()) {
+      throw new Error('当前 Web 模式不支持打开本地 artifact');
+    }
+    await invoke('native_open_path', { path });
+  },
 };
 
 // ── Notifications (IPC in Tauri, browser fallback in Web) ──

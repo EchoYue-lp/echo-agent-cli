@@ -202,6 +202,9 @@ pub struct AgentPool {
     /// current workspace's memory store (not the stale shared.store captured
     /// at bootstrap). `None` means "use shared.store" (pre-switch behavior).
     memory_store_override: RwLock<Option<Arc<dyn echo_agent::memory::Store>>>,
+    /// Product-owned complete tool-output artifact policy for existing and
+    /// future pooled agents. Updated together with workspace routing.
+    tool_output_artifacts: RwLock<echo_agent::tools::artifact::ToolOutputArtifactConfig>,
     /// Active workspace profile applied to existing and future pooled agents.
     workspace_kind: RwLock<WorkspaceKind>,
 }
@@ -233,6 +236,11 @@ impl AgentPool {
 
         // Extract skill descriptors from primary agent (avoids re-reading from disk)
         let skill_descriptors = runtime.agent_handle.read(|a| a.skill_descriptors()).await;
+        let tool_output_artifacts = runtime
+            .agent_handle
+            .read(|agent| agent.tool_output_artifacts())
+            .await
+            .unwrap_or_else(|| crate::infra::tool_output_artifact_config(None));
 
         let pool = Self {
             shared,
@@ -244,6 +252,7 @@ impl AgentPool {
             skill_descriptors: RwLock::new(skill_descriptors),
             cleanup_cancel: CancellationToken::new(),
             memory_store_override: RwLock::new(None),
+            tool_output_artifacts: RwLock::new(tool_output_artifacts),
             workspace_kind: RwLock::new(WorkspaceKind::General),
         };
 
@@ -525,6 +534,8 @@ impl AgentPool {
     /// Called after a workspace switch so that background tasks and
     /// multi-conversation agents operate in the new workspace root.
     pub async fn apply_working_dir(&self, path: Option<std::path::PathBuf>) {
+        let artifact_config = crate::infra::tool_output_artifact_config(path.as_deref());
+        *self.tool_output_artifacts.write().await = artifact_config.clone();
         let agents: Vec<AgentHandle> = self
             .agents
             .read()
@@ -534,10 +545,12 @@ impl AgentPool {
             .collect();
         for handle in agents {
             let path = path.clone();
+            let artifact_config = artifact_config.clone();
             handle
                 .write_async(|agent| {
                     Box::pin(async move {
                         agent.set_working_dir(path);
+                        agent.set_tool_output_artifacts(Some(artifact_config));
                     })
                 })
                 .await;
@@ -797,6 +810,7 @@ impl AgentPool {
         let mut agent = infra::create_agent(&params, &app_config)
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
+        agent.set_tool_output_artifacts(Some(self.tool_output_artifacts.read().await.clone()));
 
         // 2. Inject shared resources (replace independently-created ones)
         if let Some(ref llm) = self.shared.llm_client {
@@ -1169,6 +1183,7 @@ mod tests {
             skill_descriptors: RwLock::new(vec![]),
             cleanup_cancel: CancellationToken::new(),
             memory_store_override: RwLock::new(None),
+            tool_output_artifacts: RwLock::new(crate::infra::tool_output_artifact_config(None)),
             workspace_kind: RwLock::new(WorkspaceKind::General),
         }
     }
@@ -1203,6 +1218,7 @@ mod tests {
             skill_descriptors: RwLock::new(vec![]),
             cleanup_cancel: CancellationToken::new(),
             memory_store_override: RwLock::new(None),
+            tool_output_artifacts: RwLock::new(crate::infra::tool_output_artifact_config(None)),
             workspace_kind: RwLock::new(WorkspaceKind::General),
         }
     }

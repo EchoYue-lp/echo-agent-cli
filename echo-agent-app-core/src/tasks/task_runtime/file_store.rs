@@ -194,8 +194,14 @@ impl FileTaskStore {
                     )
                     .unwrap_or(super::types::ArtifactKind::File),
                     title: p.get("title")?.as_str()?.to_string(),
-                    path: None, // not carried on the event today
-                    metadata: serde_json::Value::Null,
+                    path: p
+                        .get("path")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string),
+                    metadata: p
+                        .get("metadata")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
                 })
             })
             .collect())

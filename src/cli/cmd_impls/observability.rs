@@ -69,6 +69,7 @@ async fn cmd_trace(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
                                 returned_bytes,
                                 estimated_tokens,
                                 output_handling,
+                                artifact,
                                 ..
                             } => {
                                 println!(
@@ -80,6 +81,15 @@ async fn cmd_trace(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
                                     returned_bytes,
                                     estimated_tokens,
                                 );
+                                if let Some(artifact) = artifact {
+                                    println!(
+                                        "    Artifact: {} ({} bytes, sha256 {}, retention {})",
+                                        artifact.path,
+                                        artifact.bytes,
+                                        artifact.sha256,
+                                        artifact.retention,
+                                    );
+                                }
                             }
                             RunEvent::ToolError { name, message, .. } => {
                                 println!("  Tool Error: {} - {}", name, message)

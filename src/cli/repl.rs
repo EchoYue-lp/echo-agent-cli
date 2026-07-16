@@ -621,6 +621,25 @@ async fn chat_with_agent(
                 output.print_tool_call(&name, &args);
                 first_chunk = true;
             }
+            AgentEvent::ToolStream {
+                event: echo_agent::tools::ToolStreamEvent::Complete(result),
+                ..
+            } => {
+                if let Some(path) = result.metadata.get("artifact_path") {
+                    let status = if std::path::Path::new(path).is_file() {
+                        "Full output artifact"
+                    } else {
+                        "Full output artifact missing"
+                    };
+                    let size = result
+                        .metadata
+                        .get("artifact_bytes")
+                        .and_then(|value| value.parse::<u64>().ok())
+                        .map(|bytes| format!(" ({:.1} MiB)", bytes as f64 / 1_048_576.0))
+                        .unwrap_or_default();
+                    println!("  {status}{size}: {path}");
+                }
+            }
             AgentEvent::ToolResult {
                 name,
                 output: tool_output,

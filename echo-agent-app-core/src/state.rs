@@ -831,6 +831,9 @@ impl AppState {
         let new_wd = Some(workspace.root.clone());
         self.connection.agent.try_write(|a| {
             a.set_working_dir(new_wd.clone());
+            a.set_tool_output_artifacts(Some(crate::infra::tool_output_artifact_config(
+                new_wd.as_deref(),
+            )));
         });
         // Propagate to all pooled agents so background tasks run in the new
         // workspace (P1-7).
@@ -999,6 +1002,10 @@ impl AppState {
             let mut persistence = self.storage.persistence.write().await;
             *persistence = global_persistence;
         }
+
+        self.connection.agent.try_write(|agent| {
+            agent.set_tool_output_artifacts(Some(crate::infra::tool_output_artifact_config(None)));
+        });
 
         // 重置 conversation_store 到全局默认路径（U1c：文件后端）
         let global_base = crate::persistence::Persistence::base_dir();

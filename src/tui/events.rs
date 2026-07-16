@@ -339,7 +339,8 @@ fn append_bounded(
 mod tool_execution_tests {
     use super::append_bounded;
     use crate::tui::{
-        ToolExecutionMessage, ToolExecutionStatus, tool_command, tool_detail, tool_output_tail,
+        ToolExecutionMessage, ToolExecutionStatus, tool_command, tool_detail, tool_metadata_label,
+        tool_output_tail,
     };
     use std::collections::HashMap;
     use std::time::Instant;
@@ -417,6 +418,28 @@ mod tool_execution_tests {
             tool_output_tail(&tool, 6),
             vec!["file not found".to_string()]
         );
+    }
+
+    #[test]
+    fn missing_artifact_is_visible_without_marking_tool_failed() {
+        let mut tool = execution(
+            "shell",
+            r#"{"command":"large-output"}"#,
+            ToolExecutionStatus::Succeeded,
+        );
+        tool.truncated = true;
+        tool.metadata.insert(
+            "artifact_path".to_string(),
+            "/path/that/does/not/exist/tool.log".to_string(),
+        );
+
+        assert!(tool_metadata_label(&tool).contains("artifact missing"));
+        assert!(
+            tool_output_tail(&tool, 6)
+                .iter()
+                .any(|line| line.contains("full output artifact missing"))
+        );
+        assert_eq!(tool.status, ToolExecutionStatus::Succeeded);
     }
 
     #[test]
@@ -2055,6 +2078,32 @@ fn infer_mime(name: &str) -> String {
     }
 }
 
+fn open_artifact_path(path: &std::path::Path) -> Result<(), String> {
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|error| format!("Tool-output artifact is missing: {error}"))?;
+
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("open").arg(&canonical).spawn();
+
+    #[cfg(target_os = "linux")]
+    let result = std::process::Command::new("xdg-open")
+        .arg(&canonical)
+        .spawn();
+
+    #[cfg(target_os = "windows")]
+    let result = std::process::Command::new("explorer")
+        .arg(&canonical)
+        .spawn();
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
+    return Err("Opening local artifacts is unsupported on this platform".to_string());
+
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    result
+        .map(|_| ())
+        .map_err(|error| format!("Failed to open tool-output artifact: {error}"))
+}
+
 /// Handle slash commands locally in the TUI.
 async fn handle_slash_command(
     app: &mut TuiApp,
@@ -2444,6 +2493,13 @@ async fn handle_slash_command(
                     .map_err(|error| error.to_string()),
                 None => Err("Conversation persistence is unavailable".to_string()),
             };
+            if result.is_ok()
+                && let Some(config) = agent.read(|a| a.tool_output_artifacts()).await
+                && let Err(error) =
+                    echo_agent::tools::artifact::cleanup_tool_output_scope(&config, id, None)
+            {
+                tracing::warn!(conversation_id = %id, error = %error, "Failed to clean conversation tool artifacts");
+            }
             if result.is_ok() && app.conversation_id.as_deref() == Some(id) {
                 reset_conversation_state(app, agent, true).await;
             }
@@ -2453,6 +2509,32 @@ async fn handle_slash_command(
                     Ok(()) => format!("Deleted conversation: {id}"),
                     Err(error) => error,
                 },
+            });
+        }
+        Some(SlashCommand::OpenArtifact) => {
+            let requested = args.trim();
+            let from_tool = app.messages.iter().rev().find_map(|message| {
+                let MessageRole::ToolExecution(tool) = &message.role else {
+                    return None;
+                };
+                if requested.is_empty() || tool.call_id == requested {
+                    tool.metadata.get("artifact_path").cloned()
+                } else {
+                    None
+                }
+            });
+            let path = from_tool.or_else(|| {
+                (!requested.is_empty())
+                    .then(|| std::path::PathBuf::from(requested).display().to_string())
+            });
+            let result = match path {
+                Some(path) => open_artifact_path(std::path::Path::new(&path))
+                    .map(|()| format!("Opened tool-output artifact: {path}")),
+                None => Err("No tool-output artifact is available".to_string()),
+            };
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content: result.unwrap_or_else(|error| error),
             });
         }
         Some(SlashCommand::History) => {
