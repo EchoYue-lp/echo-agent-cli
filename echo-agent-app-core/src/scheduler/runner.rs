@@ -1,9 +1,8 @@
 //! Cron scheduler adapter — wires the framework's `SchedulerRunner` to the
-//! CLI's `AgentHandle` and optional `BackgroundTaskService`.
+//! CLI's `AgentHandle` and TaskRuntime.
 //!
 //! The framework's runner is generic over a `FireFn` callback; this module
-//! provides [`build_fire_fn`] which constructs one that submits via
-//! `BackgroundTaskService` when available, falling back to direct agent chat.
+//! provides [`build_fire_fn`] which constructs one that launches TaskRuntime runs.
 //!
 //! Phase 3.1: ALL cron tasks route through the unified TaskRuntime executor
 //! (`launch_cron_run`). The legacy `[plan]` prefix is stripped for backward
@@ -13,7 +12,6 @@
 
 use crate::agent_handle::AgentHandle;
 use crate::agent_pool::AgentPool;
-use crate::tasks::service::BackgroundTaskService;
 use crate::tasks::task_runtime::{TaskRuntimeStore, launch_cron_run};
 use echo_agent::agent::CancellationToken;
 use echo_agent::scheduler::{
@@ -48,7 +46,6 @@ const PLAN_MARKER: &str = "[plan]";
 /// shared `agent` (the pre-C behavior, still correct for single-agent setups).
 pub fn build_fire_fn(
     agent: AgentHandle,
-    _task_service: Option<Arc<BackgroundTaskService>>,
     task_runtime_store: Option<Arc<TaskRuntimeStore>>,
     pool: Option<Arc<AgentPool>>,
 ) -> FireFn {
@@ -150,11 +147,10 @@ pub fn new_scheduler_runner(
     store: CronTaskStore,
     cancel: echo_agent::agent::CancellationToken,
     agent: AgentHandle,
-    task_service: Option<Arc<BackgroundTaskService>>,
     task_runtime_store: Option<Arc<TaskRuntimeStore>>,
     pool: Option<Arc<AgentPool>>,
 ) -> SchedulerRunner {
-    let fire_fn = build_fire_fn(agent, task_service, task_runtime_store, pool);
+    let fire_fn = build_fire_fn(agent, task_runtime_store, pool);
     SchedulerRunner::new(store, cancel, fire_fn)
 }
 
@@ -182,7 +178,7 @@ mod tests {
 
         // task_service=None:Phase 3.1 前会逼非-[plan] prompt 走 execute_direct;
         // 3.1 后 runtime_store(此处置 Some)接管所有 prompt → launch_cron_run。
-        let fire_fn = build_fire_fn(handle, None, Some(store.clone()), None);
+        let fire_fn = build_fire_fn(handle, Some(store.clone()), None);
 
         let task = CronTask::new("plain", "*/5 * * * *", "hello world");
         let result = fire_fn(task).await;
@@ -210,7 +206,7 @@ mod tests {
         let handle = AgentHandle::new(agent);
         let store =
             Arc::new(TaskRuntimeStore::new_in_memory().expect("in-memory store should init"));
-        let fire_fn = build_fire_fn(handle, None, Some(store.clone()), None);
+        let fire_fn = build_fire_fn(handle, Some(store.clone()), None);
 
         let task = CronTask::new("plan", "*/5 * * * *", "[plan] do the thing");
         let result = fire_fn(task).await;

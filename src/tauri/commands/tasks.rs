@@ -46,9 +46,7 @@ pub async fn list_tasks(state: tauri::State<'_, TauriState>) -> Result<Vec<TaskI
         .as_ref()
         .ok_or_else(|| IpcError::Internal("Task service not initialized".to_string()))?;
 
-    // Phase 3.4: unified list merges framework Tasks (pipeline) + Runs
-    // (AgentChat/Composite). Progress is None for run-sourced tasks (filled
-    // in by Task 5 via list_task_events).
+    // Background-task APIs are compatibility projections over TaskRun files.
     let tasks = service.list_unified(None);
     Ok(tasks
         .into_iter()
@@ -78,8 +76,7 @@ pub async fn submit_task(
     use echo_agent_app_core::tasks::BackgroundTaskKind;
     let params = params.unwrap_or_default();
 
-    // Phase 3.5: agent_chat is now submitted via submit_run (no framework Task).
-    // Pipeline kinds (research) still go through submit_with_options.
+    // Every accepted kind creates a TaskRun; the kind only changes the prompt.
     let (task_id, source) = match kind.as_str() {
         "agent_chat" | "chat" => {
             let prompt = params
@@ -121,7 +118,7 @@ pub async fn submit_task(
                 )
                 .await
                 .map_err(|e| IpcError::Internal(format!("Failed to submit task: {e}")))?;
-            (id, "framework")
+            (id, "run")
         }
         other => {
             return Err(IpcError::Validation(format!(
@@ -168,20 +165,7 @@ pub async fn cancel_task(
         .as_ref()
         .ok_or_else(|| IpcError::Internal("Task service not initialized".to_string()))?;
 
-    // Phase 3.4: try the run cancel token first (stronger — interrupts the
-    // driver), then fall back to service.cancel (framework + store transition).
-    let key = format!("__run__:{id}");
-    let cancelled_via_token = state
-        .app_state
-        .tasks
-        .run_cancel_tokens
-        .get(&key)
-        .map(|t| {
-            t.cancel();
-            true
-        })
-        .unwrap_or(false);
-    let cancelled = cancelled_via_token || service.cancel(&id).await;
+    let cancelled = service.cancel(&id).await;
     Ok(serde_json::json!({
         "success": cancelled,
         "task_id": id,
@@ -190,12 +174,9 @@ pub async fn cancel_task(
 
 fn task_to_info(
     task: echo_agent_app_core::tasks::UnifiedTaskInfo,
-    progress: Option<echo_agent_app_core::tasks::progress::TaskProgress>,
+    progress: Option<echo_agent::tasks::progress::TaskProgress>,
 ) -> TaskInfo {
-    // Phase 3.4: UnifiedTaskInfo pipes framework Tasks AND Runs through the
-    // same projection. Progress from ProgressBridge is only available for
-    // framework-sourced tasks; run-sourced tasks will get progress from
-    // TaskRuntimeStore events in Task 5.
+    // Progress is derived from the same TaskRuntime todo projection.
     let (progress_pct, progress_phase, progress_message, eta_secs) = match progress {
         Some(p) => (
             Some(p.percentage),
@@ -252,33 +233,28 @@ pub async fn get_task_dag(state: tauri::State<'_, TauriState>) -> Result<TaskDag
         .as_ref()
         .ok_or_else(|| IpcError::Internal("Task service not initialized".to_string()))?;
 
-    let manager = service.manager();
-    let tasks = manager.get_all_tasks();
-
-    let mermaid = manager.visualize_dependencies();
+    let tasks = service.list_unified(None);
+    let mut mermaid_lines = vec!["graph TD".to_string()];
+    for task in &tasks {
+        mermaid_lines.push(format!(
+            "    {}[\"{}\"]",
+            task.id,
+            task.description.replace('"', "'")
+        ));
+        for dependency in &task.dependencies {
+            mermaid_lines.push(format!("    {} --> {}", dependency, task.id));
+        }
+    }
+    let mermaid = mermaid_lines.join("\n");
 
     let task_nodes: Vec<TaskDagNode> = tasks
         .into_iter()
-        .map(|task| {
-            let status = match &task.status {
-                echo_agent_app_core::tasks::TaskStatus::Pending => "pending".to_string(),
-                echo_agent_app_core::tasks::TaskStatus::InProgress => "in_progress".to_string(),
-                echo_agent_app_core::tasks::TaskStatus::Completed => "completed".to_string(),
-                echo_agent_app_core::tasks::TaskStatus::Cancelled => "cancelled".to_string(),
-                echo_agent_app_core::tasks::TaskStatus::Failed(_) => "failed".to_string(),
-                echo_agent_app_core::tasks::TaskStatus::Blocked(_) => "blocked".to_string(),
-                echo_agent_app_core::tasks::TaskStatus::TimedOut { .. } => "timed_out".to_string(),
-                echo_agent_app_core::tasks::TaskStatus::Retrying { .. } => "retrying".to_string(),
-                echo_agent_app_core::tasks::TaskStatus::Skipped => "skipped".to_string(),
-                echo_agent_app_core::tasks::TaskStatus::Paused(_) => "paused".to_string(),
-            };
-            TaskDagNode {
-                id: task.id,
-                description: task.description,
-                status,
-                priority: task.priority,
-                dependencies: task.dependencies,
-            }
+        .map(|task| TaskDagNode {
+            id: task.id,
+            description: task.description,
+            status: task.status,
+            priority: task.priority,
+            dependencies: task.dependencies,
         })
         .collect();
 

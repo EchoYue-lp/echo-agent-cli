@@ -54,10 +54,8 @@ pub struct TaskRuntimeStore {
     /// status flipping to Skipped while execution continues).
     task_cancel_tokens:
         std::sync::Mutex<std::collections::HashMap<String, echo_agent::agent::CancellationToken>>,
-    /// Run-level cancel tokens (Phase B2). Background runs use an INDEPENDENT
-    /// token — never the chat turn's token (spec §5.5) — so the front-desk
-    /// "stop" doesn't kill a background run. `create_complex_task` registers
-    /// this; `cancel_run` triggers it; `drive_run_async` unregisters on terminal.
+    /// Active TaskRun driver tokens. Every entry point registers here so pause
+    /// and cancel target the real executor instead of a surface-local map.
     run_cancel_tokens:
         std::sync::Mutex<std::collections::HashMap<String, echo_agent::agent::CancellationToken>>,
     /// File shadow (U1c phase-0/0bc). The read/write authority for all task data.
@@ -73,6 +71,30 @@ pub struct TaskRuntimeStore {
     /// 可能并发覆写 plan.json。加 per-run Mutex 串行化同一 run 的所有 plan/run
     /// 变更 (对标调研结论: 进程内 Mutex 兜底, 同时防崩溃中态)。不同 run 互不影响。
     plan_locks: dashmap::DashMap<String, std::sync::Arc<std::sync::Mutex<()>>>,
+}
+
+/// RAII registration for one active TaskRun driver. Nested drivers for the
+/// same run restore the previous token when they finish (for example an
+/// unattended ReAct driver invoking `plan_execute`).
+pub struct RunCancellationRegistration {
+    store: std::sync::Arc<TaskRuntimeStore>,
+    run_id: String,
+    token: echo_agent::agent::CancellationToken,
+    previous: Option<echo_agent::agent::CancellationToken>,
+}
+
+impl Drop for RunCancellationRegistration {
+    fn drop(&mut self) {
+        if let Ok(mut map) = self.store.run_cancel_tokens.lock() {
+            if self.token.is_cancelled() {
+                map.remove(&self.run_id);
+            } else if let Some(previous) = self.previous.take() {
+                map.insert(self.run_id.clone(), previous);
+            } else {
+                map.remove(&self.run_id);
+            }
+        }
+    }
 }
 
 impl TaskRuntimeStore {
@@ -334,34 +356,27 @@ impl TaskRuntimeStore {
         }
     }
 
-    /// Register a run-level cancel token (Phase B2). Background runs MUST use an
-    /// independent token — never the chat turn's token (spec §5.5) — so the
-    /// front-desk "stop" does not kill a background run. `create_complex_task`
-    /// registers this; `cancel_run` triggers it.
-    pub fn register_run_cancel_token(
-        &self,
+    /// Register the active driver token and automatically restore/remove it
+    /// when the returned guard is dropped.
+    pub fn register_run_cancellation(
+        self: &std::sync::Arc<Self>,
         run_id: &str,
         token: echo_agent::agent::CancellationToken,
-    ) {
-        if let Ok(mut map) = self.run_cancel_tokens.lock() {
-            map.insert(run_id.to_string(), token);
-        }
+    ) -> Result<RunCancellationRegistration, StoreError> {
+        let previous = self
+            .run_cancel_tokens
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?
+            .insert(run_id.to_string(), token.clone());
+        Ok(RunCancellationRegistration {
+            store: self.clone(),
+            run_id: run_id.to_string(),
+            token,
+            previous,
+        })
     }
 
-    /// Remove a run's cancel token after the run reaches a terminal state
-    /// (Completed/Failed/Cancelled). Called by `drive_run_async` so the map
-    /// doesn't accumulate stale entries. No-op if already removed by `cancel_run`.
-    pub fn unregister_run_cancel_token(&self, run_id: &str) {
-        if let Ok(mut map) = self.run_cancel_tokens.lock() {
-            map.remove(run_id);
-        }
-    }
-
-    /// Cancel a run via its run-level token (Phase B2). Triggered by the
-    /// `cancel_run` tool or the GUI task panel's stop button. No-op (returns
-    /// `false`) if the run isn't currently active (no token registered, e.g.
-    /// already terminal). Removes the token so a second call is a no-op.
-    pub fn cancel_run(&self, run_id: &str) -> bool {
+    fn cancel_active_run(&self, run_id: &str) -> bool {
         if let Ok(mut map) = self.run_cancel_tokens.lock() {
             #[allow(clippy::collapsible_if)]
             // nested let-Ok/let-Some reads clearer than a let-chain
@@ -373,8 +388,59 @@ impl TaskRuntimeStore {
         false
     }
 
+    /// Request cancellation through the single TaskRuntime control path.
+    /// Active runs are stopped through their driver token so the executor owns
+    /// the terminal transition. Runs without a driver may only be cancelled
+    /// directly when they are not executing.
+    pub fn request_cancel(&self, run_id: &str) -> Result<bool, StoreError> {
+        if self.cancel_active_run(run_id) {
+            return Ok(true);
+        }
+        let Some(run) = self.get_run(run_id)? else {
+            return Ok(false);
+        };
+        match run.status {
+            TaskRunStatus::Pending | TaskRunStatus::Paused | TaskRunStatus::Failed => {
+                self.transition_run(run_id, TaskRunStatus::Cancelled)?;
+                Ok(true)
+            }
+            TaskRunStatus::Running | TaskRunStatus::Cancelled | TaskRunStatus::Completed => {
+                Ok(false)
+            }
+        }
+    }
+
+    /// Pause an actively driven run. The status changes first, then the same
+    /// run-scoped token used for cancellation stops in-flight workers. The
+    /// executor observes the durable Paused status and leaves the run resumable.
+    pub fn request_pause(&self, run_id: &str) -> Result<bool, StoreError> {
+        let Some(run) = self.get_run(run_id)? else {
+            return Ok(false);
+        };
+        if run.status != TaskRunStatus::Running {
+            return Ok(false);
+        }
+        let token = self
+            .run_cancel_tokens
+            .lock()
+            .map_err(|_| StoreError::LockPoisoned)?
+            .remove(run_id);
+        let Some(token) = token else {
+            return Ok(false);
+        };
+        if let Err(error) = self.transition_run(run_id, TaskRunStatus::Paused) {
+            self.run_cancel_tokens
+                .lock()
+                .map_err(|_| StoreError::LockPoisoned)?
+                .insert(run_id.to_string(), token);
+            return Err(error);
+        }
+        token.cancel();
+        Ok(true)
+    }
+
     /// Insert a new task into the plan, optionally after a given task id.
-    /// Works in any run state (not limited to `AwaitingPlanApproval`).
+    /// Works in any non-terminal run state.
     /// Validates dependency integrity and acyclicity. Emits `PlanEdited`.
     pub fn insert_task(
         &self,
@@ -642,9 +708,8 @@ impl TaskRuntimeStore {
         })
     }
 
-    /// Attach a generated plan to a run, replacing any prior plan, and
-    /// transition the run to `AwaitingPlanApproval` (from `Planning`).
-    /// All plan tasks and their todo rows are inserted in the same tx.
+    /// Attach a generated plan to a run, replacing any prior plan. Plan review
+    /// is an artifact/tool interaction and does not introduce run states.
     pub fn attach_plan(&self, plan: &TaskPlan) -> Result<(), StoreError> {
         // F2-1: 串行化 plan 变更。
         self.with_run_lock(&plan.run_id, || {
@@ -900,15 +965,10 @@ impl TaskRuntimeStore {
     ///
     /// Boot-time recovery of runs interrupted by a process restart.
     ///
-    /// A run left in `Running` when the process died has no driver to finish it
-    /// — it is a zombie that blocks the run list and can never complete. The
-    /// per-run lazy recovery in `run_dag` only fires when *that specific run*
-    /// is next executed, so a zombie that is never revisited stays forever.
-    ///
-    /// This scans all interrupted runs once at startup and transitions each to
-    /// `Failed` (with a note), matching the lazy-recovery outcome but applied
-    /// proactively. Pending / Paused are left untouched: they had not begun
-    /// executing, so they are not zombies and may be resumed by the caller.
+    /// A run left in `Running` when the process died has durable plan/task/tool
+    /// facts but no live driver. Move it to `Paused` so the normal resume path
+    /// can re-read the plan and skip completed work. Pending/Paused are left
+    /// untouched.
     /// Returns the number of runs recovered.
     ///
     /// Safe to call on an empty/fresh store (no-op).
@@ -934,12 +994,35 @@ impl TaskRuntimeStore {
                     "recover_incomplete: failed to note recovery"
                 );
             }
-            match self.transition_run(&run.run_id, TaskRunStatus::Failed) {
-                Ok(_) => tracing::info!(
-                    run_id = %run.run_id,
-                    from = %run.status.as_str(),
-                    "recovered interrupted run → Failed at boot"
-                ),
+            match self.transition_run(&run.run_id, TaskRunStatus::Paused) {
+                Ok(_) => {
+                    if let Ok(todos) = self.list_todos(&run.run_id) {
+                        for todo in todos
+                            .into_iter()
+                            .filter(|todo| todo.status == TodoStatus::Running)
+                        {
+                            if let Err(error) = self.set_task_status(
+                                &run.run_id,
+                                &todo.task_id,
+                                TodoStatus::Pending,
+                                None,
+                                Some("interrupted; pending resume"),
+                            ) {
+                                tracing::warn!(
+                                    run_id = %run.run_id,
+                                    task_id = %todo.task_id,
+                                    %error,
+                                    "recover_incomplete: failed to reset running task"
+                                );
+                            }
+                        }
+                    }
+                    tracing::info!(
+                        run_id = %run.run_id,
+                        from = %run.status.as_str(),
+                        "recovered interrupted run -> Paused at boot"
+                    );
+                }
                 Err(StoreError::IllegalTransition { from, .. }) => {
                     // State changed concurrently between list and transition —
                     // not an error, just skip this run.
@@ -952,7 +1035,7 @@ impl TaskRuntimeStore {
                 Err(e) => tracing::warn!(
                     run_id = %run.run_id,
                     error = %e,
-                    "recover_incomplete: failed to transition run to Failed"
+                    "recover_incomplete: failed to transition run to Paused"
                 ),
             }
         }
@@ -1027,6 +1110,54 @@ impl TaskRuntimeStore {
             None,
             RuntimeEventKind::Note,
             serde_json::json!({ "message": message }),
+        )?;
+        Ok(())
+    }
+
+    /// Persist trigger/scheduling metadata without expanding the TaskRun state
+    /// model. Consumers may rebuild this projection from the append-only event.
+    pub fn record_trigger_metadata(
+        &self,
+        run_id: &str,
+        source: &str,
+        kind: &str,
+        prompt: &str,
+        priority: u8,
+        dependencies: &[String],
+    ) -> Result<(), StoreError> {
+        self.shadow.append_event_line(
+            run_id,
+            None,
+            None,
+            RuntimeEventKind::Note,
+            serde_json::json!({
+                "kind": "trigger_metadata",
+                "source": source,
+                "task_kind": kind,
+                "prompt": prompt,
+                "priority": priority.min(10),
+                "dependencies": dependencies,
+            }),
+        )?;
+        Ok(())
+    }
+
+    pub fn record_execution_path(
+        &self,
+        run_id: &str,
+        requested_mode: &str,
+        observed_path: &str,
+    ) -> Result<(), StoreError> {
+        self.shadow.append_event_line(
+            run_id,
+            None,
+            None,
+            RuntimeEventKind::Note,
+            serde_json::json!({
+                "kind": "execution_path",
+                "requested_mode": requested_mode,
+                "observed_path": observed_path,
+            }),
         )?;
         Ok(())
     }
@@ -1361,6 +1492,67 @@ mod tests {
             .filter(|e| e.event_type == RuntimeEventKind::RunStatusChanged)
             .collect();
         assert!(status_changes.len() >= 2);
+    }
+
+    #[test]
+    fn boot_recovery_pauses_run_and_preserves_completed_tasks() -> Result<(), StoreError> {
+        let s = fresh();
+        seed_plan(&s);
+        s.set_task_status(
+            "r1",
+            "t1",
+            TodoStatus::Completed,
+            Some("explorer"),
+            Some("verified"),
+        )?;
+
+        assert_eq!(s.recover_incomplete(), 1);
+        let run = s
+            .get_run("r1")?
+            .ok_or_else(|| StoreError::RunNotFound("r1".to_string()))?;
+        assert_eq!(run.status, TaskRunStatus::Paused);
+        let todos = s.list_todos("r1")?;
+        let task = todos
+            .iter()
+            .find(|todo| todo.task_id == "t1")
+            .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
+        assert_eq!(task.status, TodoStatus::Completed);
+        assert_eq!(task.summary.as_deref(), Some("verified"));
+        Ok(())
+    }
+
+    #[test]
+    fn pause_request_stops_driver_and_keeps_run_resumable() -> Result<(), StoreError> {
+        let store = std::sync::Arc::new(fresh());
+        seed_plan(&store);
+        store.set_task_status("r1", "t1", TodoStatus::Running, Some("worker"), None)?;
+        let token = echo_agent::agent::CancellationToken::new();
+        let _registration = store.register_run_cancellation("r1", token.clone())?;
+
+        assert!(store.request_pause("r1")?);
+        assert!(token.is_cancelled());
+        let run = store
+            .get_run("r1")?
+            .ok_or_else(|| StoreError::RunNotFound("r1".to_string()))?;
+        assert_eq!(run.status, TaskRunStatus::Paused);
+        Ok(())
+    }
+
+    #[test]
+    fn boot_recovery_requeues_orphaned_running_task() -> Result<(), StoreError> {
+        let store = fresh();
+        seed_plan(&store);
+        store.set_task_status("r1", "t1", TodoStatus::Running, Some("worker"), None)?;
+
+        assert_eq!(store.recover_incomplete(), 1);
+        let todo = store
+            .list_todos("r1")?
+            .into_iter()
+            .find(|todo| todo.task_id == "t1")
+            .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
+        assert_eq!(todo.status, TodoStatus::Pending);
+        assert_eq!(todo.summary.as_deref(), Some("interrupted; pending resume"));
+        Ok(())
     }
 
     #[test]

@@ -29,9 +29,8 @@ use super::types::*;
 /// guarantee that matches its UX:
 /// - `None` — never write (cron / DAG / plan_execute tool: no recall closure
 ///   needed today; their results surface via other channels).
-/// - `FireAndForget` — write in a detached task, return immediately (the two
-///   GUI Tauri commands `resume_task_run` / `execute_task_run`: behavior
-///   unchanged from before B5.1).
+/// - `FireAndForget` — write in a detached task, return immediately (interactive
+///   `resume_task_run`).
 /// - `Blocking` — `await` the write before returning, so the caller knows the
 ///   memory is durable by the time it sees "completed" (`create_complex_task` /
 ///   `drive_run_async`: eliminates the recall race — a run that returns
@@ -80,18 +79,6 @@ pub enum MemoryEvent {
         task_title: String,
         issue_category: String,
         issue_message: String,
-    },
-    /// The user corrected or rejected an approval — record as a preference (plan §993).
-    UserCorrection {
-        run_id: String,
-        conversation_id: String,
-        correction: String,
-    },
-    /// An approval was rejected — record what was rejected (plan §994).
-    ApprovalRejected {
-        run_id: String,
-        tool_name: String,
-        reason: String,
     },
 }
 
@@ -292,41 +279,6 @@ async fn build_candidates(
                 memory_type: MemoryType::DebuggingLesson,
                 source: MemorySource::AutoExtracted,
                 category: format!("review_issue:{issue_category}"),
-                confidence: 0.7,
-            }]
-        }
-        MemoryEvent::UserCorrection {
-            run_id,
-            conversation_id,
-            correction,
-        } => {
-            vec![MemoryCandidate {
-                key: format!("taskrun:user_correction:{run_id}"),
-                content: format!(
-                    "User correction during task.\nRun: {run_id}\nConversation: {conversation_id}\n\
-                     Correction: {correction}\n\
-                     Treat as a preference signal for future similar work."
-                ),
-                memory_type: MemoryType::UserPreference,
-                source: MemorySource::UserCorrection,
-                category: "user_correction".to_string(),
-                confidence: 0.8,
-            }]
-        }
-        MemoryEvent::ApprovalRejected {
-            run_id,
-            tool_name,
-            reason,
-        } => {
-            vec![MemoryCandidate {
-                key: format!("taskrun:approval_rejected:{run_id}:{tool_name}"),
-                content: format!(
-                    "User rejected an approval.\nRun: {run_id}\nTool: {tool_name}\nReason: {reason}\n\
-                     The user chose not to allow this — respect in future requests."
-                ),
-                memory_type: MemoryType::UserPreference,
-                source: MemorySource::UserCorrection,
-                category: "approval_rejected".to_string(),
                 confidence: 0.7,
             }]
         }

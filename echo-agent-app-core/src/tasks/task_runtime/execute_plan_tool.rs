@@ -25,7 +25,6 @@ use futures::future::BoxFuture;
 use tokio::sync::Mutex as TokioMutex;
 
 use super::executor::{ExecEvent, RunOutcome, execute_run, preflight_unattended_plan};
-use super::router::TaskRouteKind;
 use super::store::TaskRuntimeStore;
 use super::types::{
     AttendedMode, DomainProfile, ExecutionMode, InteractionMode, PlanTask, PlanTaskKind,
@@ -85,48 +84,14 @@ async fn acquire_run_execution_lock(run_id: &str) -> RunExecutionGuard {
     }
 }
 
-/// ComplexRuntime plan-approval gate 的最长等待时间。
-///
-/// 设计依据(调研 Claude Code / Codex / Cursor / Devin, 2026-07-03):
-/// - Claude Code / Cursor: 交互式审批默认**无限等待** (fail-closed 挂起),
-///   靠权限模式前置消除"需要问"的场景, 不依赖定时器。
-/// - Codex: 人类审批无超时配置; 机器审批 (Guardian) 90s 硬超时 + fail-closed。
-/// - Devin: plan-gate 默认 30s 超时后 fail-open 继续 (异步协作产品)。
-///
-/// EKO 是本地、用户在场的同步工具 (对齐 Cursor / Claude Code 阵营),
-/// 故取 **fail-closed**: 超时后 run 留在 `Paused`, 不擅自执行写操作,
-/// 用户回来点 resume 即可继续 (是"暂停"而非"失败")。
-///
-/// 时长 5 分钟与 `hitl/dispatcher.rs` 的 per-provider 超时一致, 让两条
-/// 审批路径 (工具级 + run 级) 等待上限统一。本场景 (本地个人助理) 下仍
-/// 需要这一上限: 防止框架自身在"用户走开/切到别的窗口"时无限占用信号量
-/// 与 subagent slot, 符合 AGENTS.md "防止框架自身 bug/僵死造成破坏" 的加防护准则。
-const APPROVAL_GATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
-
-/// 在给定时限内等待 plan-approval 信号; 超时则 fail-closed 返回 `Err`。
-///
-/// 抽成独立函数便于单测超时/正常两条路径 —— 无需构造完整 Tool/run/plan 链路。
-/// (run 级审批门控此前为裸 `notified().await`, 无上限; 见 F3-1/F5-1。)
-async fn await_approval_with_timeout(
-    signal: &tokio::sync::Notify,
-    timeout: std::time::Duration,
-) -> Result<(), tokio::time::error::Elapsed> {
-    tokio::time::timeout(timeout, signal.notified()).await
-}
-
 /// L1→L2 桥接工具: 把 plan 提交给 run_dag 并行调度器。
 ///
 /// 字段说明:
 /// - `store`: TaskRuntimeStore (用来读/写 run 状态)
 /// - `primary_agent`: AgentHandle (传给 execute_run 做 subagent 调度)
-/// - `approval_signal`: ComplexRuntime 模式下等 resume_run 唤醒的 channel
 pub struct ExecutePlanTool {
     store: Arc<TaskRuntimeStore>,
     primary_agent: AgentHandle,
-    /// ComplexRuntime 审批唤醒通道 (spec §10.5)。
-    /// 首次调用时若 route == ComplexRuntime, 工具 transition `Paused`
-    /// 并等待此 signal; 外部调用 `notify_one()` 恢复。
-    approval_signal: Arc<tokio::sync::Notify>,
     /// D7 stage 2: unattended write mode for this tool's runs. Determines
     /// whether the CP A preflight loosens its write ban (Worktree/InPlace)
     /// or keeps stage-1 rejection (Disabled). Also scoped into a task-local
@@ -150,16 +115,8 @@ impl ExecutePlanTool {
         Self {
             store,
             primary_agent,
-            approval_signal: Arc::new(tokio::sync::Notify::new()),
             write_mode,
         }
-    }
-
-    /// Expose the approval signal so the frontend or an orchestration layer
-    /// can call `notify_one()` to resume a ComplexRuntime run after the user
-    /// has approved the plan.
-    pub fn approval_signal(&self) -> Arc<tokio::sync::Notify> {
-        self.approval_signal.clone()
     }
 }
 
@@ -432,7 +389,7 @@ impl Tool for ExecutePlanTool {
                 }
             }
 
-            // ── U1c phase-1: read attended_mode once for CP A + approval gate ──
+            // ── Read attended mode once for unattended preflight ──
             let attended_mode = self
                 .store
                 .get_run(&run_id)
@@ -463,63 +420,14 @@ impl Tool for ExecutePlanTool {
                 )));
             }
 
-            // ── §10.5: ComplexRuntime 审批闭环 ──
-            // Route is read from the persisted run record so the tool struct
-            // doesn't need it baked in at construction time.
+            // Route is diagnostic policy metadata. Plan review/approval is not
+            // a TaskRun state transition; risky tools remain governed by the
+            // shared permission/HITL contract during execution.
             let route_str = self
                 .store
                 .get_run_route(&run_id)
                 .unwrap_or_default()
                 .unwrap_or_default();
-            let route = TaskRouteKind::from_str(&route_str)
-                .unwrap_or(TaskRouteKind::ParallelReadonlyDelegation);
-            if route == TaskRouteKind::ComplexRuntime {
-                // U1c phase-1: Skip approval for unattended runs.
-                // Precise condition (spec §4.1 v2): Unattended + ReadOnlyPlanNoShell
-                // + preflight passed (CP A above already returned Ok). In stage 1,
-                // all unattended runs use ReadOnlyPlanNoShell, so the mode check
-                // is sufficient. Without this skip, the run would deadlock waiting
-                // for a human who isn't there.
-                if attended_mode != AttendedMode::Unattended {
-                    if let Err(e) = self.store.transition_run(&run_id, TaskRunStatus::Paused) {
-                        return Ok(ToolResult::error(format!("Failed to pause run: {e}")));
-                    }
-                    // Register the signal so resume_task_run can find it.
-                    super::task_tools::register_approval_signal(
-                        &run_id,
-                        self.approval_signal.clone(),
-                    );
-                    // 等待 resume_run 通过 approval_signal 唤醒, 带超时上限。
-                    // 超时 = fail-closed: run 保持 Paused (上面已 transition),
-                    // 不擅自执行写操作; 用户回来点 resume 即可重新进入审批流。
-                    let approval_result =
-                        await_approval_with_timeout(&self.approval_signal, APPROVAL_GATE_TIMEOUT)
-                            .await;
-                    // Remove the signal -- 无论超时还是唤醒都要清理, 避免泄漏
-                    // (G6/APPROVAL_NOTIFIES 未消费时泄漏, 见 code-review-2026-07-03 P1-3)。
-                    super::task_tools::remove_approval_signal(&run_id);
-                    if let Err(_elapsed) = approval_result {
-                        let _ = self.store.note(
-                            &run_id,
-                            None,
-                            &format!(
-                                "plan approval timed out after {}s; run left Paused, \
-                                 resume manually to retry",
-                                APPROVAL_GATE_TIMEOUT.as_secs()
-                            ),
-                        );
-                        return Ok(ToolResult::error(format!(
-                            "plan approval timed out after {}s. The run is paused — \
-                             call resume_run (or re-approve in the UI) to continue, \
-                             or cancel it to free the slot.",
-                            APPROVAL_GATE_TIMEOUT.as_secs()
-                        )));
-                    }
-                    if let Err(e) = self.store.transition_run(&run_id, TaskRunStatus::Running) {
-                        return Ok(ToolResult::error(format!("Failed to resume run: {e}")));
-                    }
-                }
-            }
 
             // ── Read trace_sink from task_local ──
             // (stage4 P4.1) cache_user_id read from single source inside
@@ -578,6 +486,17 @@ impl Tool for ExecutePlanTool {
             // preflight in `execute_task` (deep inside execute_run → run_dag)
             // can read it without threading the mode through every signature.
             let write_mode = self.write_mode;
+            let _cancel_registration = match self
+                .store
+                .register_run_cancellation(&run_id, cancel.clone())
+            {
+                Ok(registration) => registration,
+                Err(error) => {
+                    return Ok(ToolResult::error(format!(
+                        "Failed to register run cancellation: {error}"
+                    )));
+                }
+            };
             let outcome = super::task_tools::CURRENT_UNATTENDED_WRITE_MODE
                 .scope(write_mode, async {
                     execute_run(
@@ -1120,43 +1039,5 @@ mod tests {
         assert_eq!(tool.name(), "plan_execute");
         assert!(!tool.description().is_empty());
         assert!(tool.parameters().is_object());
-    }
-
-    /// F3-1/F5-1 回归: approval gate 超时后 fail-closed。
-    ///
-    /// `await_approval_with_timeout` 在无人 notify 时应在时限后返回 `Err`,
-    /// 主管线据此保持 run 在 Paused 并返回工具错误 (而非无限等待)。
-    /// 这里用极短超时避免单测拖慢 CI。
-    #[tokio::test]
-    async fn approval_gate_times_out_fail_closed() {
-        let signal = Arc::new(tokio::sync::Notify::new());
-        let started = tokio::time::Instant::now();
-        let result =
-            await_approval_with_timeout(&signal, std::time::Duration::from_millis(50)).await;
-        assert!(result.is_err(), "expected timeout, got {:?}", result);
-        // 至少等满了 50ms (容许调度抖动, 不卡上界)。
-        assert!(
-            started.elapsed() >= std::time::Duration::from_millis(45),
-            "elapsed {:?} < 45ms, timeout not honored",
-            started.elapsed()
-        );
-    }
-
-    /// F3-1 正路径: approval gate 在超时前被 resume_run 唤醒 → 返回 Ok。
-    ///
-    /// 验证 notify_one 能及时解除等待, 不影响正常审批流。
-    #[tokio::test]
-    async fn approval_gate_resumes_on_notify() {
-        let signal = Arc::new(tokio::sync::Notify::new());
-        let signal_clone = signal.clone();
-        // 立即 notify (模拟用户瞬间批准)。Notify 记录一个 permit,
-        // 后续 notified() 立即消费返回。
-        signal_clone.notify_one();
-        let result = await_approval_with_timeout(&signal, std::time::Duration::from_secs(5)).await;
-        assert!(
-            result.is_ok(),
-            "expected immediate resume, got {:?}",
-            result
-        );
     }
 }

@@ -604,6 +604,15 @@ pub async fn send_chat_message(
         })
         .await;
 
+    use echo_agent_app_core::tasks::task_runtime::InteractionMode;
+    let raw = state
+        .app_state
+        .tasks
+        .interaction_mode
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let interaction_mode = InteractionMode::from_u8(raw);
+    let mode_hint = Some(interaction_mode.prompt_hint().to_string());
+
     // Build the GUI sink + per-turn resources, then drive the whole turn
     // (normal reply AND any complex runs the agent autonomously spins up via
     // create_complex_task) through the single shared `drive_chat` entry. The
@@ -616,29 +625,15 @@ pub async fn send_chat_message(
         trace_collector: trace_collector.clone(),
         usage_store: usage_store.clone(),
         run_id: message_key.clone(),
-        route: "normal_chat".to_string(),
+        route: format!("requested:{}", interaction_mode.as_str()),
         sys_prompt_hash,
         tools_hash,
         cwd_hash,
         provider_name,
     });
-    // Signal the inline run lifecycle (running → terminal) so the GUI shows
-    // the spinner / terminal badge for the chat reply itself.
-    sink.on_run_status("running");
-
-    // B4.3 / P1.2: per-turn mode hint. Tool availability is still enforced by
-    // drive_chat / plan_execute; this prompt gives the model the matching
-    // behavior contract without introducing a runtime planning state machine.
-    // P1.1: also resolve the InteractionMode itself so ChatResources can carry
-    // it for the tool-hiding logic in drive_chat.
-    use echo_agent_app_core::tasks::task_runtime::InteractionMode;
-    let raw = state
-        .app_state
-        .tasks
-        .interaction_mode
-        .load(std::sync::atomic::Ordering::Relaxed);
-    let interaction_mode = InteractionMode::from_u8(raw);
-    let mode_hint = Some(interaction_mode.prompt_hint().to_string());
+    // Signal the chat-turn lifecycle so the GUI shows the spinner / terminal
+    // badge. Ordinary chat turns are not TaskRuntime runs.
+    sink.on_turn_status("running");
 
     let res = std::sync::Arc::new(echo_agent_app_core::chat_resources::ChatResources {
         pool: state.app_state.connection.pool.clone(),
@@ -665,8 +660,6 @@ pub async fn send_chat_message(
     let cleanup_key = message_key.clone();
     let active_chat_turns = state.app_state.session.active_chat_turns.clone();
     let active_turn_key_for_cleanup = active_turn_key.clone();
-    let runtime_store = state.app_state.tasks.runtime.clone();
-    let run_id_for_cleanup = message_key.clone();
     let cancel_for_status = cancel_token.clone();
     tokio::spawn(async move {
         let start = std::time::Instant::now();
@@ -699,27 +692,9 @@ pub async fn send_chat_message(
         {
             active_chat_turns.remove(&active_turn_key_for_cleanup);
         }
-        if let Some(store) = runtime_store {
-            let status = match terminal_status {
-                "completed" => {
-                    echo_agent_app_core::tasks::task_runtime::types::TaskRunStatus::Completed
-                }
-                "cancelled" => {
-                    echo_agent_app_core::tasks::task_runtime::types::TaskRunStatus::Cancelled
-                }
-                _ => echo_agent_app_core::tasks::task_runtime::types::TaskRunStatus::Failed,
-            };
-            if let Err(error) = store.transition_run(&run_id_for_cleanup, status) {
-                tracing::warn!(
-                    error = %error,
-                    run_id = %run_id_for_cleanup,
-                    "failed to persist foreground chat terminal status"
-                );
-            }
-        }
         // Release all execution ownership before emitting Done. The frontend
         // may immediately dispatch the next queued turn when it receives it.
-        sink.on_run_status(terminal_status);
+        sink.on_turn_status(terminal_status);
         agent_handle_clone
             .write_async(|agent| {
                 Box::pin(async move {
@@ -966,9 +941,9 @@ impl echo_agent_app_core::chat_driver::ChatSink for TauriChatSink {
         }
     }
 
-    fn on_run_status(&self, status: &str) {
-        // Running → emit RunStatus + RunStarted trace (with conv/mode/run/route),
-        // matching the pre-refactor GUI sequence.
+    fn on_turn_status(&self, status: &str) {
+        // A chat turn is not a TaskRuntime run. Only emit chat transport state;
+        // real run lifecycle events come from the TaskRuntime ExecSink.
         if status == "running" {
             emit_chat_event(
                 &self.app,
@@ -978,38 +953,8 @@ impl echo_agent_app_core::chat_driver::ChatSink for TauriChatSink {
                 &self.message_key,
                 &self.conversation_id,
             );
-            emit_execution_event(
-                &self.app,
-                &self.run_id,
-                "run",
-                "run_started",
-                "",
-                "",
-                serde_json::json!({
-                    "conversation_id": self.conversation_id,
-                    "mode": "unified_run",
-                    "run_id": self.run_id.clone(),
-                    "route": self.route.clone(),
-                }),
-            );
             return;
         }
-        // Terminal → run_completed/cancelled/failed + RunStatus + Done.
-        let event_name = match status {
-            "completed" => "run_completed",
-            "cancelled" => "run_cancelled",
-            "failed" => "run_failed",
-            _ => "run_status_changed",
-        };
-        emit_execution_event(
-            &self.app,
-            &self.run_id,
-            "run",
-            event_name,
-            "",
-            "",
-            serde_json::json!({ "status": status.to_string() }),
-        );
         let _ = emit_chat_event(
             &self.app,
             &ChatEvent::RunStatus {
@@ -1023,6 +968,30 @@ impl echo_agent_app_core::chat_driver::ChatSink for TauriChatSink {
             &ChatEvent::Done,
             &self.message_key,
             &self.conversation_id,
+        );
+    }
+
+    fn on_execution_path(&self, requested_mode: &str, observed_path: &str) {
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "requested_mode".to_string(),
+            serde_json::Value::String(requested_mode.to_string()),
+        );
+        metadata.insert(
+            "observed_path".to_string(),
+            serde_json::Value::String(observed_path.to_string()),
+        );
+        self.trace_collector.record_sync(
+            &self.trace_session_id,
+            TraceEvent {
+                timestamp: Utc::now(),
+                kind: TraceKind::PipelineStage {
+                    pipeline: "agent_route".to_string(),
+                    stage: observed_path.to_string(),
+                },
+                duration_ms: None,
+                metadata,
+            },
         );
     }
 

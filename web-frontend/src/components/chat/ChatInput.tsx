@@ -14,12 +14,7 @@ import {
   Check,
 } from 'lucide-react';
 import { Card } from '../common/Card';
-import {
-  permissionsApi,
-  providerApi,
-  taskRuntimeApi,
-  type ExecutionPolicySnapshot,
-} from '../../api/endpoints';
+import { permissionsApi, providerApi, taskRuntimeApi } from '../../api/endpoints';
 import { useUiStore } from '../../stores/uiStore';
 import { useToastStore } from '../../stores/toastStore';
 import { useChatStore, cacheHitRate } from '../../stores/chatStore';
@@ -55,9 +50,9 @@ const THINKING_LEVELS = [
 ] as const;
 const THINKING_STORAGE_KEY = 'echo_thinking_level';
 const INTERACTION_MODES = [
-  { id: 1, label: 'Chat', description: '简单对话，不进入 TaskRuntime' },
-  { id: 2, label: 'Task', description: '复杂任务，强制进入 TaskRuntime' },
-  { id: 0, label: 'Auto', description: '由运行时判断 Chat 或 Task' },
+  { id: 1, label: 'Chat', description: '直接对话' },
+  { id: 2, label: 'Task', description: '计划并执行复杂任务' },
+  { id: 0, label: 'Auto', description: '由 Agent 选择执行路径' },
 ] as const;
 function loadThinkingLevel(): string {
   try {
@@ -359,7 +354,6 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
   const [thinkingMenuOpen, setThinkingMenuOpen] = useState(false);
   const [switchingThinking, setSwitchingThinking] = useState(false);
   const [interactionMode, setInteractionMode] = useState<number>(0);
-  const [, setExecutionPolicy] = useState<ExecutionPolicySnapshot | null>(null);
   const [switchingInteractionMode, setSwitchingInteractionMode] = useState<number | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -412,25 +406,9 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
     }
   }, []);
 
-  const loadExecutionPolicy = useCallback(async () => {
-    try {
-      const policy = await taskRuntimeApi.getExecutionPolicy();
-      setExecutionPolicy(policy);
-      setInteractionMode(
-        INTERACTION_MODES.some((m) => m.id === policy.interaction_mode_id)
-          ? policy.interaction_mode_id
-          : 0
-      );
-      setPermissionMode(normalizePermissionMode(policy.permission_mode));
-    } catch (e) {
-      console.error('[ChatInput] Failed to load execution policy:', e);
-    }
-  }, []);
-
   useEffect(() => {
     loadInteractionMode();
-    loadExecutionPolicy();
-  }, [loadInteractionMode, loadExecutionPolicy]);
+  }, [loadInteractionMode]);
 
   useEffect(() => {
     const refreshPermissionMode = () => {
@@ -486,7 +464,6 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
       try {
         await permissionsApi.setMode(mode);
         setPermissionMode(mode);
-        await loadExecutionPolicy();
         notifyPermissionsChanged();
         setPermissionMenuOpen(false);
       } catch (e) {
@@ -495,7 +472,7 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
         setSwitchingPermissionMode(null);
       }
     },
-    [loadExecutionPolicy, permissionMode, switchingPermissionMode]
+    [permissionMode, switchingPermissionMode]
   );
 
   const switchInteractionMode = useCallback(
@@ -505,14 +482,13 @@ export function ChatInput({ onSend, isStreaming, onCancel, queuedCount = 0 }: Ch
       try {
         const next = await taskRuntimeApi.setInteractionMode(mode);
         setInteractionMode(INTERACTION_MODES.some((m) => m.id === next) ? next : mode);
-        await loadExecutionPolicy();
       } catch (e) {
         console.error('[ChatInput] Failed to switch interaction mode:', e);
       } finally {
         setSwitchingInteractionMode(null);
       }
     },
-    [interactionMode, loadExecutionPolicy, switchingInteractionMode]
+    [interactionMode, switchingInteractionMode]
   );
 
   // Switch the active agent's thinking-depth at runtime. Decoupled from model

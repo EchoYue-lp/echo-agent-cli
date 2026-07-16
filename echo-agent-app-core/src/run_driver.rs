@@ -62,6 +62,10 @@ pub struct RunPayload {
 /// `memory_bridge::write_memory_candidate` at terminal states. This function
 /// adds only the pool-isolation wiring on top.
 pub async fn drive_run_async(payload: RunPayload) -> Result<RunOutcome, String> {
+    let _cancel_registration = payload
+        .store
+        .register_run_cancellation(&payload.run_id, payload.cancel.clone())
+        .map_err(|error| format!("register run cancellation failed: {error}"))?;
     // acquire returns an OWNED AgentHandle (not a guard); the pool write-lock
     // is held only during create_agent and released here, so execute_run below
     // runs without holding any pool lock (spec §5.6, no deadlock).
@@ -87,10 +91,6 @@ pub async fn drive_run_async(payload: RunPayload) -> Result<RunOutcome, String> 
         crate::tasks::task_runtime::memory_bridge::MemoryPolicy::Blocking,
     )
     .await;
-    // Run is terminal (or failed to start) — drop its run-level cancel token so
-    // the map doesn't accumulate stale entries. No-op if `cancel_run` already
-    // removed it (spec §5.5 cleanup).
-    payload.store.unregister_run_cancel_token(&payload.run_id);
     // Phase C: release the per-run pool entry so it doesn't linger until the
     // 5-min idle evictor reaps it (a pre-existing minor leak this driver had
     // since B2). `acquire(run_id)` always creates a fresh entry (run_id is a
@@ -118,19 +118,51 @@ mod tests {
     /// the token → second cancel is a no-op (token removed). Mirrors the
     /// task-level `cancel_task` semantics.
     #[test]
-    fn run_cancel_token_roundtrip() {
+    fn run_cancel_token_roundtrip() -> Result<(), String> {
         use crate::tasks::task_runtime::store::TaskRuntimeStore;
-        let store = TaskRuntimeStore::new_in_memory().expect("in-memory store");
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
         let tok = CancellationToken::new();
-        store.register_run_cancel_token("r1", tok.clone());
+        let _registration = store
+            .register_run_cancellation("r1", tok.clone())
+            .map_err(|error| error.to_string())?;
         assert!(
-            store.cancel_run("r1"),
-            "first cancel_run should find and trigger the token"
+            store
+                .request_cancel("r1")
+                .map_err(|error| error.to_string())?,
+            "first request_cancel should find and trigger the token"
         );
         assert!(tok.is_cancelled(), "token should be cancelled");
         assert!(
-            !store.cancel_run("r1"),
-            "second cancel_run is a no-op — token already removed"
+            !store
+                .request_cancel("r1")
+                .map_err(|error| error.to_string())?,
+            "second request_cancel is a no-op — token already removed"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn nested_run_cancel_registration_restores_outer_driver() -> Result<(), String> {
+        use crate::tasks::task_runtime::store::TaskRuntimeStore;
+
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let outer = CancellationToken::new();
+        let inner = CancellationToken::new();
+        let _outer_registration = store
+            .register_run_cancellation("r1", outer.clone())
+            .map_err(|error| error.to_string())?;
+        {
+            let _inner_registration = store
+                .register_run_cancellation("r1", inner)
+                .map_err(|error| error.to_string())?;
+        }
+
+        assert!(
+            store
+                .request_cancel("r1")
+                .map_err(|error| error.to_string())?
+        );
+        assert!(outer.is_cancelled());
+        Ok(())
     }
 }

@@ -41,7 +41,7 @@ pub enum DomainProfile {
 }
 
 impl DomainProfile {
-    /// Stable lowercase identifier used as the SQLite discriminator column.
+    /// Stable lowercase identifier persisted in TaskRun files.
     pub fn as_str(&self) -> &'static str {
         match self {
             DomainProfile::General => "general",
@@ -67,7 +67,7 @@ impl DomainProfile {
 
 // ── Execution mode ──────────────────────────────────────────────────────
 
-/// How the user wants a plan to execute after approval.
+/// How a plan executes after it is created.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export, rename = "ExecutionMode")]
@@ -77,8 +77,6 @@ pub enum ExecutionMode {
     /// Execute parallel groups concurrently within the configured limits.
     #[default]
     Parallel,
-    /// Plan only — never execute until the user explicitly launches it.
-    PlanOnly,
 }
 
 impl ExecutionMode {
@@ -86,7 +84,6 @@ impl ExecutionMode {
         match self {
             ExecutionMode::Sequential => "sequential",
             ExecutionMode::Parallel => "parallel",
-            ExecutionMode::PlanOnly => "plan_only",
         }
     }
 
@@ -95,23 +92,23 @@ impl ExecutionMode {
         Some(match s {
             "sequential" => ExecutionMode::Sequential,
             "parallel" => ExecutionMode::Parallel,
-            "plan_only" => ExecutionMode::PlanOnly,
             _ => return None,
         })
     }
 }
 
 /// Manual override of how a user message should be handled.
-/// `Auto` defers to the router; the other two force a path.
+/// `Auto` lets the agent choose an execution path; the other two enforce the
+/// available tool surface and formal-run contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export, rename = "InteractionMode")]
 pub enum InteractionMode {
     /// Force normal chat — never enter TaskRuntime even for complex input.
     Chat,
-    /// Force TaskRuntime for the message instead of leaving it to Auto.
+    /// Create a formal TaskRuntime run and require a reviewable plan lifecycle.
     Task,
-    /// Auto-route: classifier decides (default).
+    /// Agent-selected direct/inline/formal execution (default).
     #[default]
     Auto,
 }
@@ -168,14 +165,14 @@ impl InteractionMode {
 
 // ── Attended mode ───────────────────────────────────────────────────────
 
-/// Whether a human is present during a run. Drives safety-gate behaviour:
-/// unattended runs skip the approval gate (when the plan passes preflight),
-/// reject writes at pre-scan, and never pause for human intervention.
+/// Whether a human is present during a run. Unattended runs apply the
+/// configured write preflight and fail task errors without waiting for input;
+/// both modes can still be explicitly paused through the shared control path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export, rename = "AttendedMode")]
 pub enum AttendedMode {
-    /// Chat-triggered run — a human is present and can approve / resume.
+    /// Chat-triggered run — a human is present and can answer tool HITL.
     #[default]
     Attended,
     /// Cron / IM triggered run — no human, must be self-contained.
@@ -441,9 +438,9 @@ impl TodoStatus {
 ///           Cancelled
 /// ```
 ///
-/// 极简 6 态(对齐 Claude Code/Codex:plan 审批不进状态机,用 Paused 表达)。
+/// 极简 6 态:plan 审批不进状态机;Paused 只表达用户中断、进程恢复或可恢复失败。
 /// 删去了 Planning/AwaitingPlanApproval/Ready/WaitingApproval/WaitingInput/Suspended/Cancelling
-/// —— 这些"plan 是否被批准"的语义改由编排层(L1) + Paused 承载,不进 run 状态机。
+/// —— 这些交互语义由工具/HITL 和事件流承载,不进入 run 状态机。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(export, rename = "TaskRunStatus")]
@@ -595,9 +592,6 @@ pub enum RuntimeEventKind {
     ReviewPassed,
     ReviewNeedsFix,
     ReviewBlocked,
-    ApprovalRequested,
-    ApprovalResolved,
-    ApprovalRejected,
     CircuitBreakerTripped,
     RunCancelled,
     Note,
@@ -625,9 +619,6 @@ impl RuntimeEventKind {
             ReviewPassed => "review_passed",
             ReviewNeedsFix => "review_needs_fix",
             ReviewBlocked => "review_blocked",
-            ApprovalRequested => "approval_requested",
-            ApprovalResolved => "approval_resolved",
-            ApprovalRejected => "approval_rejected",
             CircuitBreakerTripped => "circuit_breaker_tripped",
             RunCancelled => "run_cancelled",
             Note => "note",
@@ -655,9 +646,6 @@ impl RuntimeEventKind {
             "review_passed" => ReviewPassed,
             "review_needs_fix" => ReviewNeedsFix,
             "review_blocked" => ReviewBlocked,
-            "approval_requested" => ApprovalRequested,
-            "approval_resolved" => ApprovalResolved,
-            "approval_rejected" => ApprovalRejected,
             "circuit_breaker_tripped" => CircuitBreakerTripped,
             "run_cancelled" => RunCancelled,
             "note" => Note,
@@ -1143,7 +1131,7 @@ impl SuggestedTask {
 
 // ── Usage trend persistence ────────────────────────────────────────────
 
-/// A single LLM usage record persisted to SQLite for trend analysis.
+/// A single in-process LLM usage record for trend analysis.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, rename = "UsageRecord")]
 pub struct UsageRecord {

@@ -6,7 +6,7 @@
 //!
 //! This is deliberately separate from `chatStore` (which is a per-message
 //! streaming store) — a TaskRuntime run outlives any single chat turn and
-//! survives page refresh via the canonical SQLite store on the backend.
+//! survives page refresh via the canonical file-backed store on the backend.
 
 /// Maximum number of events retained in-memory. Events are not rendered
 /// (only plan/todos/artifacts are), so this cap prevents unbounded growth
@@ -18,14 +18,7 @@ let refreshInFlight = false;
 
 import { create } from 'zustand';
 import { taskRuntimeApi } from '../api/endpoints';
-import type {
-  TaskRun,
-  TaskPlan,
-  TodoItem,
-  RuntimeTaskEvent,
-  RuntimeArtifact,
-  TaskRunStatus,
-} from '../generated';
+import type { TaskRun, TaskPlan, TodoItem, RuntimeTaskEvent, RuntimeArtifact } from '../generated';
 
 type RunSnapshot = {
   run: TaskRun;
@@ -74,24 +67,6 @@ async function loadConversationRunGroup(conversationId: string, focusedRun: Task
   };
 }
 
-export interface RouteExplanation {
-  runId: string;
-  goal?: string;
-  domainProfile?: string;
-  route?: string;
-  interactionMode?: string;
-  permissionMode?: string;
-  approvalPolicy?: string;
-  routeReason?: string;
-  confidence?: number;
-  autoExecute?: boolean;
-  plannedWorkers: string[];
-  suggestedWorkers: string[];
-  activeSkills: string[];
-  routeSignals: string[];
-  classificationSignals: string[];
-}
-
 export interface TaskRuntimeState {
   /// The run the right rail is currently focused on (latest for the active
   /// conversation). Null when no complex task is in flight.
@@ -107,8 +82,6 @@ export interface TaskRuntimeState {
   error: string | null;
   /// Loading flag for plan generation (the LLM call can take a few seconds).
   generatingPlan: boolean;
-  /// Latest route/mode/approval explanation received from plan_ready.
-  routeExplanation: RouteExplanation | null;
   /// Interrupt prompt: set when a new message arrives while a run is
   /// in-progress. The GUI shows a dialog letting the user choose:
   /// resume / edit-and-resume / abandon.
@@ -122,11 +95,9 @@ export interface TaskRuntimeState {
   stopPolling: () => void;
   refresh: (runId: string) => Promise<void>;
   loadByConversation: (conversationId: string) => Promise<void>;
-  execute: (runId: string) => Promise<void>;
   cancel: (runId: string) => Promise<void>;
   openInterruptPrompt: (data: { runId: string; goal: string; newMessage: string }) => void;
   dismissInterruptPrompt: () => void;
-  updateRunStatus: (status: string) => void;
   // Dynamic task operations (Phase 2).
   insertTask: (afterTaskId: string | null, task: Record<string, unknown>) => Promise<void>;
   removeTask: (taskId: string) => Promise<void>;
@@ -145,7 +116,6 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
   lastSeq: '0',
   error: null,
   generatingPlan: false,
-  routeExplanation: null,
   interruptPrompt: null,
   pollingInterval: null,
 
@@ -226,7 +196,7 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
       const run = await taskRuntimeApi.latestRunForConversation(conversationId);
       if (run) {
         // Reset event cursor when switching runs so we don't cross streams.
-        set({ events: [], lastSeq: '0', routeExplanation: null });
+        set({ events: [], lastSeq: '0' });
         const { plan, todos, artifacts } = await loadConversationRunGroup(conversationId, run);
         set({
           activeRun: run,
@@ -245,18 +215,8 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
           events: [],
           artifacts: [],
           lastSeq: '0',
-          routeExplanation: null,
         });
       }
-    } catch (e) {
-      set({ error: e instanceof Error ? e.message : String(e) });
-    }
-  },
-
-  execute: async (runId: string) => {
-    try {
-      await taskRuntimeApi.executeRun(runId);
-      await get().refresh(runId);
     } catch (e) {
       set({ error: e instanceof Error ? e.message : String(e) });
     }
@@ -273,16 +233,6 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
 
   openInterruptPrompt: (data) => set({ interruptPrompt: data }),
   dismissInterruptPrompt: () => set({ interruptPrompt: null }),
-
-  updateRunStatus: (status: string) => {
-    const run = get().activeRun;
-    if (run) {
-      set({ activeRun: { ...run, status: status as TaskRunStatus } });
-      if (['completed', 'failed', 'cancelled'].includes(status)) {
-        get().stopPolling?.();
-      }
-    }
-  },
 
   insertTask: async (afterTaskId, task) => {
     const runId = get().activeRun?.run_id;
@@ -331,7 +281,6 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
       lastSeq: '0',
       error: null,
       generatingPlan: false,
-      routeExplanation: null,
       interruptPrompt: null,
     });
   },

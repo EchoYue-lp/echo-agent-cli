@@ -1,9 +1,4 @@
-//! Background task kind discriminator and metadata.
-//!
-//! The framework's `Task` type handles state machine, persistence, events,
-//! DAG scheduling, and retry. This module adds the "what to execute" dimension
-//! via `BackgroundTaskKind` — a tagged enum that maps to different execution
-//! strategies in `BackgroundTaskService`.
+//! Background trigger kinds converted into TaskRuntime prompts.
 //!
 //! **No default timeout**: tasks run until completion unless the caller
 //! explicitly sets one. Long-running research pipelines or multi-hour data
@@ -11,13 +6,12 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Tag prefix used to identify background task kinds on the framework's `Task.tags`.
+/// Tag prefix persisted in TaskRuntime trigger metadata.
 pub const BG_KIND_TAG_PREFIX: &str = "bg:kind:";
 
 /// Discriminator for what kind of work a background task performs.
 ///
-/// Stored as a tag on the framework's `Task` (e.g. `"bg:kind:agent_chat"`)
-/// and as the `kind` field in `BackgroundTaskMeta`.
+/// Persisted in the TaskRuntime run route and trigger event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "params")]
 pub enum BackgroundTaskKind {
@@ -76,30 +70,6 @@ pub enum BackgroundTaskKind {
     },
 }
 
-/// Workspace write policy for parallel background tasks.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkspaceWritePolicy {
-    /// Rely on existing tool permission, sandbox, and read-before-edit guards.
-    #[default]
-    Guarded,
-    /// Task should avoid writing workspace files.
-    ReadOnly,
-    /// Caller explicitly allows workspace writes.
-    AllowWrites,
-}
-
-/// Shell/sandbox execution policy for parallel background tasks.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SandboxExecutionPolicy {
-    /// Use existing shared sandbox/tool execution limits and permissions.
-    #[default]
-    SharedLimited,
-    /// Task should avoid shell/sandbox execution.
-    Disabled,
-}
-
 fn default_max_papers() -> usize {
     20
 }
@@ -149,42 +119,6 @@ pub enum ResearchOutputFormat {
     Latex,
 }
 
-/// Serializable metadata stored alongside the framework's `Task`.
-///
-/// Stored as JSON in a companion SQLite namespace keyed by task ID.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BackgroundTaskMeta {
-    /// What kind of work this task performs.
-    pub kind: BackgroundTaskKind,
-    /// Progress percentage (0-100), updated by the executor.
-    pub progress: u8,
-    /// Human-readable progress message.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub progress_message: Option<String>,
-    /// When this task was submitted (ISO 8601).
-    pub submitted_at: String,
-    /// Which interface submitted this (web, cli, tui, tauri).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub submitted_via: Option<String>,
-    /// Task priority (0-10, higher = more urgent). Default: 5.
-    #[serde(default = "default_priority")]
-    pub priority: u8,
-    /// List of task IDs this task depends on. Task will not start until
-    /// all dependencies reach `Completed` status.
-    #[serde(default)]
-    pub depends_on: Vec<String>,
-    /// Workspace write policy for parallel execution safety.
-    #[serde(default)]
-    pub workspace_write_policy: WorkspaceWritePolicy,
-    /// Shell/sandbox policy for parallel execution safety.
-    #[serde(default)]
-    pub sandbox_execution_policy: SandboxExecutionPolicy,
-}
-
-fn default_priority() -> u8 {
-    5
-}
-
 impl BackgroundTaskKind {
     /// Return the tag string for this kind (used in `Task.tags`).
     pub fn tag(&self) -> String {
@@ -197,11 +131,6 @@ impl BackgroundTaskKind {
         format!("{BG_KIND_TAG_PREFIX}{kind_name}")
     }
 
-    /// Parse a kind from a tag string.
-    pub fn from_tag(tag: &str) -> Option<&str> {
-        tag.strip_prefix(BG_KIND_TAG_PREFIX)
-    }
-
     /// Human-readable display name.
     pub fn display_name(&self) -> &'static str {
         match self {
@@ -209,18 +138,6 @@ impl BackgroundTaskKind {
             BackgroundTaskKind::ResearchToWriting { .. } => "Research to Writing",
             BackgroundTaskKind::DataPipeline { .. } => "Data Analysis",
             BackgroundTaskKind::WritingPipeline { .. } => "Writing",
-        }
-    }
-
-    /// Return the Agent mode name best suited for this task kind.
-    ///
-    /// Used by the unified dispatch to configure the task agent's system
-    /// prompt and available tools.
-    pub fn mode_name(&self) -> &str {
-        match self {
-            Self::Research { .. } | Self::ResearchToWriting { .. } => "research",
-            Self::DataPipeline { .. } => "data",
-            Self::WritingPipeline { .. } => "writing",
         }
     }
 
@@ -284,64 +201,5 @@ impl BackgroundTaskKind {
                  5. Finalize the document"
             ),
         }
-    }
-}
-
-impl BackgroundTaskMeta {
-    pub fn new(kind: BackgroundTaskKind, submitted_via: Option<String>) -> Self {
-        Self {
-            kind,
-            progress: 0,
-            progress_message: None,
-            submitted_at: echo_agent::utils::time::now_local().to_rfc3339(),
-            submitted_via,
-            priority: default_priority(),
-            depends_on: Vec::new(),
-            workspace_write_policy: WorkspaceWritePolicy::default(),
-            sandbox_execution_policy: SandboxExecutionPolicy::default(),
-        }
-    }
-
-    pub fn with_priority(mut self, priority: u8) -> Self {
-        self.priority = priority.min(10);
-        self
-    }
-
-    pub fn with_dependencies(mut self, depends_on: Vec<String>) -> Self {
-        self.depends_on = depends_on;
-        self
-    }
-
-    pub fn with_workspace_write_policy(mut self, policy: WorkspaceWritePolicy) -> Self {
-        self.workspace_write_policy = policy;
-        self
-    }
-
-    pub fn with_sandbox_execution_policy(mut self, policy: SandboxExecutionPolicy) -> Self {
-        self.sandbox_execution_policy = policy;
-        self
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn background_task_meta_defaults_to_guarded_parallel_resource_policies() {
-        let meta = BackgroundTaskMeta::new(
-            BackgroundTaskKind::Research {
-                topic: "hello".to_string(),
-                max_papers: 1,
-                output_format: ResearchOutputFormat::default(),
-            },
-            Some("test".to_string()),
-        );
-
-        assert_eq!(meta.workspace_write_policy, WorkspaceWritePolicy::Guarded);
-        assert_eq!(
-            meta.sandbox_execution_policy,
-            SandboxExecutionPolicy::SharedLimited
-        );
     }
 }

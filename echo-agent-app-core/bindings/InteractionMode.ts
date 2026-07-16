@@ -2,6 +2,7 @@
 
 /**
  * Manual override of how a user message should be handled.
- * `Auto` defers to the router; the other two force a path.
+ * `Auto` lets the agent choose an execution path; the other two enforce the
+ * available tool surface and formal-run contract.
  */
 export type InteractionMode = "chat" | "task" | "auto";

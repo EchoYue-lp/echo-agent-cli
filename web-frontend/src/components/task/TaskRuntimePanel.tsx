@@ -2,8 +2,7 @@
 //!
 //! Renders the structured state of a complex-task run from the canonical
 //! file-backed TaskRuntime store (via taskRuntimeStore), NOT from regex-scanned chat messages.
-//! Shows: run header, plan + approval actions (when AwaitingPlanApproval),
-//! todo list with live status, and artifacts.
+//! Shows the run header, plan, live todo status, recovery actions, and artifacts.
 //!
 //! The compact panel is mounted inside RightRail; the full detail panel is
 //! mounted in the main chat/work area.
@@ -409,8 +408,7 @@ function displayedTodoStatus(
 
 export function TaskRuntimePanel() {
   const traceRuns = useSubagentRunStore((s) => s.runs);
-  const { activeRun, plan, todos, routeExplanation, refresh, resumeTaskRun } =
-    useTaskRuntimeStore();
+  const { activeRun, plan, todos, refresh, resumeTaskRun } = useTaskRuntimeStore();
 
   const visibleTraceRuns = useMemo(
     () =>
@@ -430,11 +428,11 @@ export function TaskRuntimePanel() {
     [activeRun, traceRuns]
   );
 
-  if (!activeRun && !routeExplanation) return null;
+  if (!activeRun) return null;
 
   // Detailed execution timeline is now in ConversationTimeline (main panel).
   // This right-rail panel serves as a compact status summary only.
-  const runId = activeRun?.run_id ?? routeExplanation?.runId;
+  const runId = activeRun.run_id;
   const usageSummary = cacheUsageForRuns(visibleTraceRuns);
   const completedCount = todos.filter(
     (t) => displayedTodoStatus(t, visibleTraceRuns) === ('completed' as TodoStatus)
@@ -452,30 +450,30 @@ export function TaskRuntimePanel() {
         <span
           className="rounded-md px-1.5 py-0.5 text-[10px] font-medium"
           style={{
-            color: activeRun ? statusColor(activeRun.status) : 'var(--text-tertiary)',
+            color: statusColor(activeRun.status),
             background: 'var(--bg-hover)',
           }}
         >
-          {activeRun ? (STATUS_LABEL[activeRun.status] ?? activeRun.status) : '连接中'}
+          {STATUS_LABEL[activeRun.status] ?? activeRun.status}
         </span>
       </div>
 
       <div
         className="mb-2 truncate rounded-md px-2 py-1.5 text-[11px]"
         style={{ background: 'var(--bg-secondary)', color: 'var(--text-secondary)' }}
-        title={activeRun?.goal ?? routeExplanation?.goal}
+        title={activeRun.goal}
       >
-        {activeRun?.goal ?? routeExplanation?.goal ?? '正在读取任务'}
+        {activeRun.goal}
       </div>
 
-      {activeRun?.status === 'paused' && routeExplanation?.route === 'complex_runtime' && (
+      {activeRun.status === 'paused' && (
         <div className="mb-2">
           <button
             onClick={() => resumeTaskRun()}
             className="w-full rounded-md px-3 py-1.5 text-[11px] font-medium"
             style={{ background: 'var(--accent)', color: 'var(--text-on-accent)' }}
           >
-            开始执行
+            继续执行
           </button>
         </div>
       )}

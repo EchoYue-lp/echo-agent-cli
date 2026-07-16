@@ -4,11 +4,10 @@ import { TaskRuntimePanel } from '../task/TaskRuntimePanel';
 
 export function RightRail() {
   const activeRun = useTaskRuntimeStore((state) => state.activeRun);
-  const routeExplanation = useTaskRuntimeStore((state) => state.routeExplanation);
 
   return (
     <div className="h-full min-h-0 overflow-y-auto">
-      {activeRun || routeExplanation ? (
+      {activeRun ? (
         <TaskRuntimePanel />
       ) : (
         <div className="flex h-full flex-col items-center justify-center gap-2 px-8 text-center text-[var(--text-tertiary)]">

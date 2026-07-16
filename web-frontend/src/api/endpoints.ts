@@ -93,17 +93,6 @@ export interface AutoMemoryExtractResult extends AutoMemoryPreview {
   candidates?: EvidenceCandidate[];
 }
 
-export interface ExecutionPolicySnapshot {
-  interaction_mode: string;
-  interaction_mode_id: number;
-  interaction_mode_label: string;
-  permission_mode: string;
-  permission_mode_label: string;
-  router_behavior: string;
-  approval_behavior: string;
-  parallel_behavior: string;
-}
-
 export const sessionApi = {
   get: () => (isTauri() ? apiInvoke<SessionInfo>('get_session') : get<SessionInfo>('/session')),
   reset: () =>
@@ -519,8 +508,8 @@ export const tasksApi = {
 };
 
 // ── TaskRuntime API (complex-task runs, plans, todos, events, execution) ─
-// Read paths mirror tasksApi; mutations drive the plan-approval + execution
-// lifecycle. All Tauri args are snake_case.
+// Read paths mirror tasksApi; mutations drive the shared run lifecycle.
+// All Tauri args are snake_case.
 export const taskRuntimeApi = {
   // ── Reads ────────────────────────────────────────────────────────────
   getRun: (runId: string) =>
@@ -569,23 +558,6 @@ export const taskRuntimeApi = {
       ? apiInvoke<TaskExecutionSummary | null>('get_task_summary', { runId, taskId })
       : get<TaskExecutionSummary | null>(`/task_runtime/runs/${runId}/tasks/${taskId}/summary`),
 
-  // ── Mutations (plan lifecycle) ───────────────────────────────────────
-  createRun: (req: {
-    goal: string;
-    conversation_id: string;
-    workspace_id?: string;
-    root_message_id?: string;
-    domain_profile?: string;
-  }) =>
-    isTauri()
-      ? apiInvoke<TaskRun>('create_task_run', { req })
-      : post<TaskRun>('/task_runtime/runs', req),
-
-  // ── Execution ────────────────────────────────────────────────────────
-  executeRun: (runId: string) =>
-    isTauri()
-      ? apiInvoke<{ kind: string; run_id: string }>('execute_task_run', { runId })
-      : post<{ kind: string; run_id: string }>(`/task_runtime/runs/${runId}/execute`),
   cancelRun: (runId: string) =>
     isTauri()
       ? apiInvoke<{ success: boolean; run_id: string }>('cancel_task_run', {
@@ -615,7 +587,7 @@ export const taskRuntimeApi = {
       ? apiInvoke<void>('reorder_tasks', { runId, newOrder })
       : put(`/task_runtime/runs/${runId}/tasks/reorder`, { newOrder }),
 
-  // ── Execution policy ─────────────────────────────────────────────────
+  // ── Interaction mode ─────────────────────────────────────────────────
   setInteractionMode: (mode: number) =>
     isTauri()
       ? apiInvoke<number>('set_interaction_mode', { mode })
@@ -624,10 +596,6 @@ export const taskRuntimeApi = {
     isTauri()
       ? apiInvoke<number>('get_interaction_mode')
       : get<number>('/task_runtime/interaction_mode'),
-  getExecutionPolicy: () =>
-    isTauri()
-      ? apiInvoke<ExecutionPolicySnapshot>('get_execution_policy')
-      : get<ExecutionPolicySnapshot>('/task_runtime/execution_policy'),
   // Usage trends
   queryUsageRecords: (filter: Record<string, unknown>) =>
     isTauri()

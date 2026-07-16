@@ -1748,7 +1748,6 @@ impl Drop for TerminalGuard {
 #[allow(clippy::too_many_arguments)] // startup entry: agent + services + config + pool + store + review_integration all wired here
 pub async fn run_tui(
     agent: AgentHandle,
-    task_service: Option<std::sync::Arc<echo_agent_app_core::tasks::BackgroundTaskService>>,
     tui_config: &echo_agent_app_core::config::TuiConfig,
     mode_display: &str,
     tui_pending: std::sync::Arc<
@@ -1855,7 +1854,7 @@ pub async fn run_tui(
     });
 
     // Main event loop.
-    let result = events::run_event_loop(&mut terminal, &mut app, agent, task_service).await;
+    let result = events::run_event_loop(&mut terminal, &mut app, agent).await;
 
     // Stop Dreaming when the TUI session ends.
     if let Some(cancel) = dreaming_cancel {

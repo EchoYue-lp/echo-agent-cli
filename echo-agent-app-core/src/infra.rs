@@ -14,7 +14,6 @@ use crate::agent_handle::AgentHandle;
 use crate::config::AppConfig;
 use crate::model_config;
 use crate::project::prompt::PromptAssembler;
-use crate::tasks::task_runtime::TaskRouteKind;
 
 /// Default context window size in tokens (396K).
 const DEFAULT_CONTEXT_WINDOW: usize = 396_000;
@@ -99,11 +98,6 @@ pub struct AgentCreateParams {
     /// installed on the primary agent and all built-in subagents so one
     /// Playwright MCP sidecar owns the managed browser profile.
     pub browser_runtime: Option<Arc<crate::browser::BrowserRuntime>>,
-    /// Route kind for plan_execute tool registration. When Some, the
-    /// `plan_execute` tool is registered on the agent (never on subagents,
-    /// per §10.2). The route determines whether ComplexRuntime approval
-    /// gating is active (§10.5).
-    pub route: Option<TaskRouteKind>,
 }
 
 /// Generate a fresh conversation id for the primary (non-pooled) agent.

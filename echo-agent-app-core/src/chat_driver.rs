@@ -2,11 +2,10 @@
 //!
 //! `drive_chat` is the single, thin entry for a chat turn across TUI / CLI
 //! channel / GUI: it wraps the user input into one `Message`, streams the
-//! agent's ReAct reply through a per-mode `ChatSink`, and stops. It does NOT
-//! pre-judge normal vs complex. The per-turn TaskRuntime run is created only
-//! to give task tools and forked subagents one canonical run/trace context;
-//! the agent still decides whether to call `plan_create`, `plan_execute`, or
-//! `create_complex_task` (Phase B3+).
+//! agent's ReAct reply through a per-mode `ChatSink`, and stops. It does not
+//! classify Auto requests in advance. Task mode creates its required formal
+//! run before execution; Auto creates a run only when the agent invokes a
+//! formal plan or long-lived task tool; ordinary Chat/Auto turns create none.
 //!
 //! Multimodal is passed through (`Option<&Message>`) so TUI / channel can
 //! attach images/files the same way GUI already does.
@@ -17,6 +16,8 @@ use echo_agent::agent::{
 use echo_agent::prelude::Message;
 use echo_core::tools::TraceSinkFn;
 use futures::StreamExt;
+
+use crate::tasks::task_runtime::executor::ExecEvent;
 
 /// Per-mode event consumer for the shared chat driver.
 ///
@@ -29,7 +30,10 @@ use futures::StreamExt;
 /// the chat/run stream and returns `false` to stop early (e.g. on cancel).
 pub trait ChatSink: Send + Sync + 'static {
     fn on_agent_event(&self, event: EventEnvelope) -> bool;
-    fn on_run_status(&self, _status: &str) {}
+    /// Report the lifecycle of the interactive chat turn. This is deliberately
+    /// separate from TaskRuntime run events: an ordinary turn has no TaskRun.
+    fn on_turn_status(&self, _status: &str) {}
+    fn on_execution_path(&self, _requested_mode: &str, _observed_path: &str) {}
     fn on_interrupt(&self, _run_id: &str, _goal: &str, _new_message: &str) {}
     /// Trace sink forwarded into the framework's external run context
     /// (`ExternalRunContext.trace_sink`) so tools running inside a spawned
@@ -56,16 +60,14 @@ pub trait ChatSink: Send + Sync + 'static {
 ///
 /// Wraps `message` (plus optional `multimodal`) into one `Message`, streams the
 /// agent's reply through `sink`, and returns. No route pre-judgment; the
-/// turn id is only the shared context anchor for task tools and forked
-/// subagents. A TaskRuntime run is created lazily only when the agent actually
-/// creates or executes a plan. The agent still decides whether a complex run is
-/// warranted by calling `plan_create`, `plan_execute`, or
-/// `create_complex_task`.
+/// turn id is the shared context anchor for task tools and forked subagents.
+/// Task mode creates its formal TaskRun immediately; Auto creates one lazily
+/// only when the agent chooses a formal plan or long-lived run.
 ///
 /// ## turn/run identity
 ///
-/// 普通 chat 轮次使用 `res.root_message_id` 作 turn_id。task tools 若被调用，
-/// 会从该 turn_id 派生独立的 `taskrun:<turn_id>`，并按需创建正式 TaskRun。这样
+/// 普通 chat 轮次使用 `res.root_message_id` 作 turn_id。Task mode 和 task tools
+/// 从该 turn_id 派生独立的 `taskrun:<turn_id>`，并创建正式 TaskRun。这样
 /// 主 agent 在 ReAct 循环里调
 /// `plan_create` / `plan_execute` / `create_complex_task` 等依赖
 /// `require_run_id()` 的工具时,能从 task_local 读到 run_id,不再被
@@ -92,20 +94,204 @@ pub async fn drive_chat(
     };
 
     let cancel = res.cancel.clone();
-    let trace_sink = res.sink.worker_trace_sink();
+    let turn_cancel = cancel.clone();
+    let sink = res.sink.clone();
+    let trace_sink = sink.worker_trace_sink();
     let formal_run_id = crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(&turn_id);
+    let interaction_mode = res.interaction_mode;
+    let store = res.store.clone();
+    if interaction_mode == crate::tasks::task_runtime::InteractionMode::Task {
+        ensure_task_mode_run(
+            store.as_ref(),
+            &formal_run_id,
+            res.conv_id.as_deref(),
+            &turn_id,
+            message,
+            &res.attachments,
+            trace_sink.as_ref(),
+        )?;
+    }
+    let _cancel_registration =
+        if interaction_mode == crate::tasks::task_runtime::InteractionMode::Task {
+            match store.as_ref() {
+                Some(store) => Some(
+                    store
+                        .register_run_cancellation(&formal_run_id, cancel.clone())
+                        .map_err(|error| error.to_string())?,
+                ),
+                None => None,
+            }
+        } else {
+            None
+        };
     let turn_id_for_inner = turn_id.clone();
     let _projection_registration = res.store.as_ref().map(|store| {
         crate::tasks::task_runtime::compact_context::task_runtime_projection_registry()
             .register(formal_run_id.clone(), std::sync::Arc::clone(store))
     });
-    crate::tasks::task_runtime::task_tools::with_run_context(
-        formal_run_id,
+    let result = crate::tasks::task_runtime::task_tools::with_run_context(
+        formal_run_id.clone(),
         cancel,
-        trace_sink,
+        trace_sink.clone(),
         drive_chat_inner(agent, message, multimodal, res, turn_id_for_inner),
     )
-    .await
+    .await;
+    if interaction_mode == crate::tasks::task_runtime::InteractionMode::Task {
+        finalize_task_mode_run(
+            store.as_ref(),
+            &formal_run_id,
+            turn_cancel.is_cancelled(),
+            trace_sink.as_ref(),
+        );
+    }
+    let requested_mode = interaction_mode.as_str();
+    let observed_path =
+        observe_execution_path(store.as_ref(), &formal_run_id, &turn_id, requested_mode);
+    sink.on_execution_path(requested_mode, observed_path);
+    tracing::info!(
+        requested_mode,
+        observed_path,
+        turn_id,
+        "chat execution path observed"
+    );
+    result
+}
+
+fn ensure_task_mode_run(
+    store: Option<&std::sync::Arc<crate::tasks::task_runtime::TaskRuntimeStore>>,
+    run_id: &str,
+    conversation_id: Option<&str>,
+    turn_id: &str,
+    goal: &str,
+    attachments: &[crate::attachments::AttachmentRef],
+    trace_sink: Option<&crate::tasks::task_runtime::task_tools::TraceSink>,
+) -> Result<(), String> {
+    use crate::tasks::task_runtime::{AttendedMode, DomainProfile, TaskRunStatus};
+
+    let store = store.ok_or_else(|| "Task mode requires TaskRuntimeStore".to_string())?;
+    let run = store
+        .create_run(
+            run_id,
+            "default",
+            conversation_id.unwrap_or("message:task"),
+            turn_id,
+            DomainProfile::General,
+            goal,
+            "agent_task_plan",
+            AttendedMode::Attended,
+        )
+        .map_err(|error| error.to_string())?;
+    if !attachments.is_empty() {
+        store
+            .set_run_attachments(run_id, attachments)
+            .map_err(|error| error.to_string())?;
+    }
+    if run.status == TaskRunStatus::Pending {
+        store
+            .transition_run(run_id, TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+        if let Some(trace_sink) = trace_sink {
+            trace_sink(ExecEvent::run(
+                run_id.to_string(),
+                "run_started",
+                serde_json::json!({
+                    "conversation_id": conversation_id,
+                    "goal": goal,
+                    "mode": "task",
+                    "route": "agent_task_plan",
+                }),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn finalize_task_mode_run(
+    store: Option<&std::sync::Arc<crate::tasks::task_runtime::TaskRuntimeStore>>,
+    run_id: &str,
+    cancelled: bool,
+    trace_sink: Option<&crate::tasks::task_runtime::task_tools::TraceSink>,
+) {
+    use crate::tasks::task_runtime::TaskRunStatus;
+
+    let Some(store) = store else {
+        return;
+    };
+    let Ok(Some(run)) = store.get_run(run_id) else {
+        return;
+    };
+    if run.status != TaskRunStatus::Running {
+        return;
+    }
+    if cancelled {
+        if store
+            .transition_run(run_id, TaskRunStatus::Cancelled)
+            .is_ok()
+            && let Some(trace_sink) = trace_sink
+        {
+            trace_sink(ExecEvent::run(
+                run_id.to_string(),
+                "run_cancelled",
+                serde_json::json!({ "status": "cancelled", "mode": "task" }),
+            ));
+        }
+        return;
+    }
+    let reason = match store.get_plan(run_id) {
+        Ok(Some(_)) => "Task mode turn ended before plan_execute reached a terminal result",
+        _ => "Task mode turn ended without creating a formal plan",
+    };
+    let _ = store.note(run_id, None, reason);
+    if store.transition_run(run_id, TaskRunStatus::Failed).is_ok()
+        && let Some(trace_sink) = trace_sink
+    {
+        trace_sink(ExecEvent::run(
+            run_id.to_string(),
+            "run_failed",
+            serde_json::json!({ "error": reason, "mode": "task" }),
+        ));
+    }
+}
+
+fn observe_execution_path(
+    store: Option<&std::sync::Arc<crate::tasks::task_runtime::TaskRuntimeStore>>,
+    formal_run_id: &str,
+    turn_id: &str,
+    requested_mode: &str,
+) -> &'static str {
+    use crate::tasks::task_runtime::TaskRunStatus;
+
+    let Some(store) = store else {
+        return "direct";
+    };
+    let statuses = [
+        TaskRunStatus::Pending,
+        TaskRunStatus::Running,
+        TaskRunStatus::Paused,
+        TaskRunStatus::Cancelled,
+        TaskRunStatus::Failed,
+        TaskRunStatus::Completed,
+    ];
+    let Ok(runs) = store.list_runs_in(&statuses) else {
+        return "direct";
+    };
+    let matching: Vec<_> = runs
+        .into_iter()
+        .filter(|run| run.root_message_id == turn_id)
+        .collect();
+    let observed = if matching.iter().any(|run| run.run_id == formal_run_id) {
+        "formal_plan"
+    } else if matching.iter().any(|run| run.route == "agent_autonomous") {
+        "detached_background"
+    } else if matching.iter().any(|run| run.route == "agent_inline_task") {
+        "inline_subagent"
+    } else {
+        "direct"
+    };
+    for run in matching {
+        let _ = store.record_execution_path(&run.run_id, requested_mode, observed);
+    }
+    observed
 }
 
 /// Inner ReAct-streaming body of [`drive_chat`], run inside the run_id scope.
@@ -306,12 +492,14 @@ mod tests {
     /// Test-only sink that records received events for assertions.
     struct MockChatSink {
         events: std::sync::Mutex<Vec<EventEnvelope>>,
+        execution_paths: std::sync::Mutex<Vec<(String, String)>>,
     }
 
     impl Default for MockChatSink {
         fn default() -> Self {
             Self {
                 events: std::sync::Mutex::new(Vec::new()),
+                execution_paths: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
@@ -323,6 +511,13 @@ mod tests {
                 .unwrap_or_else(|e| e.into_inner())
                 .push(event);
             true
+        }
+
+        fn on_execution_path(&self, requested_mode: &str, observed_path: &str) {
+            self.execution_paths
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .push((requested_mode.to_string(), observed_path.to_string()));
         }
     }
 
@@ -352,6 +547,84 @@ mod tests {
                     && !event.event_id.is_empty()
             }) && terminal_count == 1
         }
+
+        fn execution_paths(&self) -> Vec<(String, String)> {
+            self.execution_paths
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn task_mode_creates_formal_run_and_rejects_direct_fallback() -> Result<(), String> {
+        use echo_agent::agent::CancellationToken;
+        use std::sync::Arc;
+
+        let llm = Arc::new(
+            echo_agent::testing::MockLlmClient::new()
+                .with_model_name("t")
+                .with_response("direct answer without plan"),
+        );
+        let agent = AgentHandle::new(
+            echo_agent::agent::ReactAgentBuilder::new()
+                .model("t")
+                .llm_client(llm)
+                .build()
+                .map_err(|error| error.to_string())?,
+        );
+        let store = Arc::new(
+            crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
+                .map_err(|error| error.to_string())?,
+        );
+        let chat_sink = Arc::new(MockChatSink::default());
+        let resources = Arc::new(crate::chat_resources::ChatResources {
+            pool: None,
+            store: Some(store.clone()),
+            sink: chat_sink.clone(),
+            conv_id: Some("task-conversation".to_string()),
+            root_message_id: "task-turn".to_string(),
+            attachments: Vec::new(),
+            cancel: CancellationToken::new(),
+            mode_hint: Some(
+                crate::tasks::task_runtime::InteractionMode::Task
+                    .prompt_hint()
+                    .to_string(),
+            ),
+            interaction_mode: crate::tasks::task_runtime::InteractionMode::Task,
+            layer_manager: None,
+        });
+
+        drive_chat(&agent, "build a formal plan", None, resources).await?;
+
+        let run_id = crate::tasks::task_runtime::task_tools::formal_run_id_for_turn("task-turn");
+        let run = store
+            .get_run(&run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "formal task run missing".to_string())?;
+        assert_eq!(
+            run.status,
+            crate::tasks::task_runtime::TaskRunStatus::Failed
+        );
+        assert_eq!(run.route, "agent_task_plan");
+        assert_eq!(
+            chat_sink.execution_paths(),
+            vec![("task".to_string(), "formal_plan".to_string())]
+        );
+        let has_path_event = store
+            .list_events(&run_id, 0)
+            .map_err(|error| error.to_string())?
+            .iter()
+            .any(|event| {
+                event.payload.get("kind").and_then(|value| value.as_str()) == Some("execution_path")
+                    && event
+                        .payload
+                        .get("requested_mode")
+                        .and_then(|value| value.as_str())
+                        == Some("task")
+            });
+        assert!(has_path_event);
+        Ok(())
     }
 
     #[tokio::test]

@@ -14,8 +14,8 @@
  *           Cancelled
  * ```
  *
- * 极简 6 态(对齐 Claude Code/Codex:plan 审批不进状态机,用 Paused 表达)。
+ * 极简 6 态:plan 审批不进状态机;Paused 只表达用户中断、进程恢复或可恢复失败。
  * 删去了 Planning/AwaitingPlanApproval/Ready/WaitingApproval/WaitingInput/Suspended/Cancelling
- * —— 这些"plan 是否被批准"的语义改由编排层(L1) + Paused 承载,不进 run 状态机。
+ * —— 这些交互语义由工具/HITL 和事件流承载,不进入 run 状态机。
  */
 export type TaskRunStatus = "pending" | "running" | "paused" | "cancelled" | "failed" | "completed";

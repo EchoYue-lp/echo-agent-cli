@@ -239,16 +239,19 @@ async fn pipeline_data(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
 
 async fn pipeline_list(ctx: &CommandContext, _args: &[&str]) -> CommandOutcome {
     if let Some(ref service) = ctx.task_service {
-        let tasks = service.list(None);
+        let tasks = service.list_unified(None);
         let pipeline_tasks: Vec<_> = tasks
             .iter()
             .filter(|t| {
-                t.tags.iter().any(|tag| {
-                    tag == "bg:kind:research"
-                        || tag == "bg:kind:research_to_writing"
-                        || tag == "bg:kind:data_pipeline"
-                        || tag == "bg:kind:writing_pipeline"
-                })
+                matches!(
+                    t.kind.as_deref(),
+                    Some(
+                        "bg:kind:research"
+                            | "bg:kind:research_to_writing"
+                            | "bg:kind:data_pipeline"
+                            | "bg:kind:writing_pipeline"
+                    )
+                )
             })
             .collect();
 
@@ -259,16 +262,16 @@ async fn pipeline_list(ctx: &CommandContext, _args: &[&str]) -> CommandOutcome {
         } else {
             println!("\n--- Pipelines ({}) ---", pipeline_tasks.len());
             for task in pipeline_tasks {
-                let status_icon = match &task.status {
-                    echo_agent_app_core::tasks::TaskStatus::Completed => "✓",
-                    echo_agent_app_core::tasks::TaskStatus::Failed(_) => "✗",
-                    echo_agent_app_core::tasks::TaskStatus::InProgress => "▶",
-                    echo_agent_app_core::tasks::TaskStatus::Pending => "○",
-                    echo_agent_app_core::tasks::TaskStatus::Cancelled => "⊘",
+                let status_icon = match task.status.as_str() {
+                    "completed" => "✓",
+                    "failed" => "✗",
+                    "in_progress" => "▶",
+                    "pending" => "○",
+                    "cancelled" => "⊘",
                     _ => "?",
                 };
                 println!(
-                    "  {} {} — {} ({:?})",
+                    "  {} {} — {} ({})",
                     status_icon, task.id, task.description, task.status
                 );
             }

@@ -12,7 +12,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use futures::StreamExt;
 use nu_ansi_term::Color;
 use reedline::{Prompt, PromptHistorySearchStatus, Signal};
 
@@ -57,6 +56,12 @@ pub struct ReplConfig {
     pub review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
     /// Static prompt-module report captured during runtime bootstrap.
     pub prompt_assembly: Option<echo_agent_app_core::project::prompt::PromptAssembly>,
+    /// Shared pool used by `create_complex_task` and background TaskRuntime runs.
+    pub pool: Option<Arc<echo_agent_app_core::agent_pool::AgentPool>>,
+    /// Canonical TaskRuntime store shared with TUI/channel/GUI entry points.
+    pub task_runtime_store: Option<Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
+    /// Persisted conversation identity for the shared chat driver.
+    pub conversation_id: String,
 }
 
 impl Default for ReplConfig {
@@ -70,6 +75,9 @@ impl Default for ReplConfig {
             scheduler_runner: None,
             review_integration: None,
             prompt_assembly: None,
+            pool: None,
+            task_runtime_store: None,
+            conversation_id: uuid::Uuid::new_v4().to_string(),
         }
     }
 }
@@ -153,9 +161,9 @@ pub async fn run_repl(agent: AgentHandle, config: ReplConfig) -> anyhow::Result<
     let cmd_handler = CommandHandler::new(agent.clone())
         .with_registry(Arc::new(registry))
         .with_coding_loop(coding_loop)
-        .with_task_service_opt(config.task_service)
-        .with_scheduler_opt(config.scheduler_runner)
-        .with_prompt_assembly(config.prompt_assembly)
+        .with_task_service_opt(config.task_service.clone())
+        .with_scheduler_opt(config.scheduler_runner.clone())
+        .with_prompt_assembly(config.prompt_assembly.clone())
         .with_review_integration(config.review_integration.clone());
 
     let editor_config = EditorConfig {
@@ -181,7 +189,7 @@ pub async fn run_repl(agent: AgentHandle, config: ReplConfig) -> anyhow::Result<
                     CommandResult::Continue => {}
                     CommandResult::Exit => break,
                     CommandResult::Chat(message) => {
-                        chat_with_agent(&agent, &message, &output).await;
+                        chat_with_agent(&agent, &message, &output, &config).await;
                     }
                 }
             }
@@ -423,326 +431,332 @@ async fn run_memory_review_on_exit(
 
 /// 与 Agent 对话
 #[allow(unused_assignments)]
-async fn chat_with_agent(agent: &AgentHandle, message: &str, output: &OutputRenderer) {
+async fn chat_with_agent(
+    agent: &AgentHandle,
+    message: &str,
+    output: &OutputRenderer,
+    config: &ReplConfig,
+) {
     output.print_user_message(message);
 
     // Show spinner during connection establishment and first-token wait.
-    // chat_stream() returns quickly (spawns internal task); the real wait
-    // is in stream.next().await for the first SSE chunk.
     let mut spinner = output.start_spinner("Connecting to model...");
 
-    // ReactAgent serializes execution internally via execution_mutex
-    let agent_guard = agent.inner().read().await;
-    match agent_guard.chat_stream(message).await {
-        Ok(raw_stream) => {
-            let identity = echo_agent::agent::EventIdentity {
-                turn_id: uuid::Uuid::new_v4().to_string(),
-                ..echo_agent::agent::EventIdentity::default()
-            };
-            let mut stream = echo_agent::agent::envelope_event_stream(raw_stream, identity);
-            spinner.set_message("Waiting for response...");
-            let mut spinner_cleared = false;
-            let mut first_chunk = true;
-            let mut iteration_count: u32 = 0;
-            let mut tool_call_count: u32 = 0;
-            let start_time = std::time::Instant::now();
+    // CLI consumes the same shared chat driver as GUI/TUI/channel. The channel
+    // sink preserves streaming while keeping terminal rendering in this REPL.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let sink: Arc<dyn echo_agent_app_core::chat_driver::ChatSink> =
+        Arc::new(echo_agent_app_core::chat_driver::ChannelChatSink::new(tx));
+    let turn_id = uuid::Uuid::new_v4().to_string();
+    let conversation_id = if config.conversation_id.trim().is_empty() {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        config.conversation_id.clone()
+    };
+    let interaction_mode = echo_agent_app_core::tasks::task_runtime::InteractionMode::Auto;
+    let resources = Arc::new(echo_agent_app_core::chat_resources::ChatResources {
+        pool: config.pool.clone(),
+        store: config.task_runtime_store.clone(),
+        sink,
+        conv_id: Some(conversation_id),
+        root_message_id: turn_id,
+        attachments: Vec::new(),
+        cancel: echo_agent::agent::CancellationToken::new(),
+        mode_hint: Some(interaction_mode.prompt_hint().to_string()),
+        interaction_mode,
+        layer_manager: config
+            .review_integration
+            .as_ref()
+            .map(|integration| Arc::new(integration.create_layer_manager())),
+    });
+    let agent_owned = agent.clone();
+    let message_owned = message.to_string();
+    let drive_task = tokio::spawn(async move {
+        echo_agent_app_core::chat_driver::drive_chat(&agent_owned, &message_owned, None, resources)
+            .await
+    });
 
-            // Helper: clear spinner on first meaningful event.
-            macro_rules! clear_spinner {
-                () => {
-                    if !spinner_cleared {
-                        spinner.finish_and_clear();
-                        spinner_cleared = true;
-                    }
-                };
+    spinner.set_message("Waiting for response...");
+    let mut spinner_cleared = false;
+    let mut first_chunk = true;
+    let mut iteration_count: u32 = 0;
+    let mut tool_call_count: u32 = 0;
+    let start_time = std::time::Instant::now();
+
+    // Helper: clear spinner on first meaningful event.
+    macro_rules! clear_spinner {
+        () => {
+            if !spinner_cleared {
+                spinner.finish_and_clear();
+                spinner_cleared = true;
             }
+        };
+    }
 
-            while let Some(result) = stream.next().await {
-                match result {
-                    Ok(envelope) => {
-                        let event = envelope.payload;
-                        // Record trace entry for significant events
-                        {
-                            let (_etype, _detail) = match &event {
-                                AgentEvent::ThinkStart => (
-                                    "think_start".into(),
-                                    format!("step {}", iteration_count + 1),
-                                ),
-                                AgentEvent::ThinkEnd {
-                                    prompt_tokens,
-                                    completion_tokens,
-                                } => (
-                                    "think_end".into(),
-                                    format!("in={prompt_tokens} out={completion_tokens}"),
-                                ),
-                                AgentEvent::LlmUsage {
-                                    cached_prompt_tokens,
-                                    cache_creation_prompt_tokens,
-                                    usage_reported,
-                                    ..
-                                } => (
-                                    "llm_usage".into(),
-                                    format!(
-                                        "cached={cached_prompt_tokens} cache_write={cache_creation_prompt_tokens} usage_reported={usage_reported}"
-                                    ),
-                                ),
-                                AgentEvent::ToolCall { name, .. } => {
-                                    ("tool_call".into(), name.clone())
-                                }
-                                AgentEvent::ToolResult { name, .. } => {
-                                    ("tool_result".into(), name.clone())
-                                }
-                                AgentEvent::ToolError { name, .. } => {
-                                    ("tool_error".into(), name.clone())
-                                }
-                                AgentEvent::FinalAnswer(_) => {
-                                    ("final_answer".into(), String::new())
-                                }
-                                AgentEvent::Cancelled => ("cancelled".into(), String::new()),
-                                AgentEvent::ContextCompressed {
-                                    before_tokens,
-                                    after_tokens,
-                                    ..
-                                } => (
-                                    "compressed".into(),
-                                    format!("{before_tokens}->{after_tokens}"),
-                                ),
-                                AgentEvent::SafetyNotice { action, risk, .. } => {
-                                    ("safety_notice".into(), format!("{action} — {risk}"))
-                                }
-                                _ => (String::new(), String::new()),
-                            };
-                        }
-                        match event {
-                            AgentEvent::ThinkStart => {
-                                clear_spinner!();
-                                if !first_chunk {
-                                    println!();
-                                }
-                                iteration_count += 1;
-                                let step_label =
-                                    format!("  ⏳ 思考中 (步骤 {})...", iteration_count);
-                                let styled = nu_ansi_term::Color::Fixed(8).paint(&step_label);
-                                println!("{}", styled);
-                                first_chunk = true;
-                            }
-                            AgentEvent::ThinkEnd {
-                                prompt_tokens,
-                                completion_tokens,
-                            } => {
-                                TOTAL_INPUT_TOKENS.fetch_add(prompt_tokens, Ordering::Relaxed);
-                                TOTAL_OUTPUT_TOKENS.fetch_add(completion_tokens, Ordering::Relaxed);
-                            }
-                            AgentEvent::LlmUsage { .. } => {}
-                            AgentEvent::Token(token) => {
-                                clear_spinner!();
-                                if first_chunk {
-                                    output.print_assistant_prefix();
-                                    first_chunk = false;
-                                }
-                                output.print_token(&token);
-                            }
-                            AgentEvent::SafetyNotice {
-                                action,
-                                reason,
-                                risk,
-                                permission,
-                            } => {
-                                clear_spinner!();
-                                if !first_chunk {
-                                    println!();
-                                }
-                                let icon = nu_ansi_term::Color::Yellow.paint("Safety");
-                                println!("  {}  {}", icon, action);
-                                println!("       Reason: {}", reason);
-                                println!("       Risk: {} | Permission: {}", risk, permission);
-                                first_chunk = true;
-                            }
-                            AgentEvent::ParameterError {
-                                tool,
-                                parameter,
-                                expected,
-                                got,
-                            } => {
-                                clear_spinner!();
-                                if !first_chunk {
-                                    println!();
-                                }
-                                let icon = nu_ansi_term::Color::Red.paint("ParamError");
-                                println!(
-                                    "  {}  {}: parameter '{}' expected {}, got {}",
-                                    icon, tool, parameter, expected, got
-                                );
-                                first_chunk = true;
-                            }
-                            AgentEvent::ToolCall { name, args, .. } => {
-                                clear_spinner!();
-                                tool_call_count += 1;
-                                TOTAL_TOOL_CALLS.fetch_add(1, Ordering::Relaxed);
-                                if !first_chunk {
-                                    println!();
-                                }
-                                // Danger warning for destructive operations
-                                if name == "shell" || name == "delete_file" || name == "git_commit"
-                                {
-                                    let danger = nu_ansi_term::Color::Red.paint(format!(
-                                        "DANGER: {} — irreversible operation",
-                                        name
-                                    ));
-                                    println!("  {}", danger);
-                                    if name == "shell"
-                                        && let Some(cmd) =
-                                            args.get("command").and_then(|v| v.as_str())
-                                    {
-                                        println!("     Command: {}", cmd);
-                                    }
-                                }
-                                output.print_tool_call(&name, &args);
-                                first_chunk = true;
-                            }
-                            AgentEvent::ToolResult {
-                                name,
-                                output: tool_output,
-                                ..
-                            } => {
-                                // Auto-track file changes for coding loop
-                                if matches!(
-                                    name.as_str(),
-                                    "write_file"
-                                        | "edit_file"
-                                        | "append_file"
-                                        | "create_file"
-                                        | "delete_file"
-                                        | "update_file"
-                                        | "move_file"
-                                ) {
-                                    FILE_CHANGE_COUNT.fetch_add(1, Ordering::Relaxed);
-                                }
-                                output.print_tool_result(&name, &tool_output, true);
-                                first_chunk = true;
-                            }
-                            AgentEvent::ToolError { name, error, .. } => {
-                                let err_text = format!("✗ {}: {}", name, error);
-                                let styled = nu_ansi_term::Color::Red.paint(&err_text);
-                                println!("  {}", styled);
-                                crate::webhook::emitter::emit_global(
-                                    crate::webhook::WebhookEvent::ToolFailed {
-                                        name: name.clone(),
-                                        error: error.clone(),
-                                    },
-                                );
-                                first_chunk = true;
-                            }
-                            AgentEvent::FinalAnswer(_answer) => {
-                                clear_spinner!();
-                                if !first_chunk {
-                                    println!();
-                                }
-                            }
-                            AgentEvent::Cancelled => {
-                                clear_spinner!();
-                                output.print_warning("执行已取消");
-                            }
-                            AgentEvent::MemoryRecalled { .. } => {}
-                            AgentEvent::Chart { .. } => {}
-                            AgentEvent::GuardTriggered { .. } => {}
-                            AgentEvent::Error { source, message } => {
-                                clear_spinner!();
-                                output.print_error(&format!("[{}] {}", source, message));
-                            }
-                            AgentEvent::ContextCompressed {
-                                before_count,
-                                after_count,
-                                before_tokens,
-                                after_tokens,
-                            } => {
-                                let saved = before_tokens.saturating_sub(after_tokens);
-                                let styled = nu_ansi_term::Color::Fixed(8).paint(format!(
-                                    "  📦 上下文自动压缩: {}→{} 条消息, {}→{} tokens (节省 {})",
-                                    before_count, after_count, before_tokens, after_tokens, saved
-                                ));
-                                println!("{}", styled);
-                            }
-                            _ => {}
-                        }
-                    }
-                    Err(e) => {
-                        clear_spinner!();
-                        output.print_error(&format!("错误: {}", e));
-                        break;
+    while let Some(envelope) = rx.recv().await {
+        let event = envelope.payload;
+        // Record trace entry for significant events
+        {
+            let (_etype, _detail) = match &event {
+                AgentEvent::ThinkStart => (
+                    "think_start".into(),
+                    format!("step {}", iteration_count + 1),
+                ),
+                AgentEvent::ThinkEnd {
+                    prompt_tokens,
+                    completion_tokens,
+                } => (
+                    "think_end".into(),
+                    format!("in={prompt_tokens} out={completion_tokens}"),
+                ),
+                AgentEvent::LlmUsage {
+                    cached_prompt_tokens,
+                    cache_creation_prompt_tokens,
+                    usage_reported,
+                    ..
+                } => (
+                    "llm_usage".into(),
+                    format!(
+                        "cached={cached_prompt_tokens} cache_write={cache_creation_prompt_tokens} usage_reported={usage_reported}"
+                    ),
+                ),
+                AgentEvent::ToolCall { name, .. } => ("tool_call".into(), name.clone()),
+                AgentEvent::ToolResult { name, .. } => ("tool_result".into(), name.clone()),
+                AgentEvent::ToolError { name, .. } => ("tool_error".into(), name.clone()),
+                AgentEvent::FinalAnswer(_) => ("final_answer".into(), String::new()),
+                AgentEvent::Cancelled => ("cancelled".into(), String::new()),
+                AgentEvent::ContextCompressed {
+                    before_tokens,
+                    after_tokens,
+                    ..
+                } => (
+                    "compressed".into(),
+                    format!("{before_tokens}->{after_tokens}"),
+                ),
+                AgentEvent::SafetyNotice { action, risk, .. } => {
+                    ("safety_notice".into(), format!("{action} — {risk}"))
+                }
+                _ => (String::new(), String::new()),
+            };
+        }
+        match event {
+            AgentEvent::ThinkStart => {
+                clear_spinner!();
+                if !first_chunk {
+                    println!();
+                }
+                iteration_count += 1;
+                let step_label = format!("  ⏳ 思考中 (步骤 {})...", iteration_count);
+                let styled = nu_ansi_term::Color::Fixed(8).paint(&step_label);
+                println!("{}", styled);
+                first_chunk = true;
+            }
+            AgentEvent::ThinkEnd {
+                prompt_tokens,
+                completion_tokens,
+            } => {
+                TOTAL_INPUT_TOKENS.fetch_add(prompt_tokens, Ordering::Relaxed);
+                TOTAL_OUTPUT_TOKENS.fetch_add(completion_tokens, Ordering::Relaxed);
+            }
+            AgentEvent::LlmUsage { .. } => {}
+            AgentEvent::Token(token) => {
+                clear_spinner!();
+                if first_chunk {
+                    output.print_assistant_prefix();
+                    first_chunk = false;
+                }
+                output.print_token(&token);
+            }
+            AgentEvent::SafetyNotice {
+                action,
+                reason,
+                risk,
+                permission,
+            } => {
+                clear_spinner!();
+                if !first_chunk {
+                    println!();
+                }
+                let icon = nu_ansi_term::Color::Yellow.paint("Safety");
+                println!("  {}  {}", icon, action);
+                println!("       Reason: {}", reason);
+                println!("       Risk: {} | Permission: {}", risk, permission);
+                first_chunk = true;
+            }
+            AgentEvent::ParameterError {
+                tool,
+                parameter,
+                expected,
+                got,
+            } => {
+                clear_spinner!();
+                if !first_chunk {
+                    println!();
+                }
+                let icon = nu_ansi_term::Color::Red.paint("ParamError");
+                println!(
+                    "  {}  {}: parameter '{}' expected {}, got {}",
+                    icon, tool, parameter, expected, got
+                );
+                first_chunk = true;
+            }
+            AgentEvent::ToolCall { name, args, .. } => {
+                clear_spinner!();
+                tool_call_count += 1;
+                TOTAL_TOOL_CALLS.fetch_add(1, Ordering::Relaxed);
+                if !first_chunk {
+                    println!();
+                }
+                // Danger warning for destructive operations
+                if name == "shell" || name == "delete_file" || name == "git_commit" {
+                    let danger = nu_ansi_term::Color::Red
+                        .paint(format!("DANGER: {} — irreversible operation", name));
+                    println!("  {}", danger);
+                    if name == "shell"
+                        && let Some(cmd) = args.get("command").and_then(|v| v.as_str())
+                    {
+                        println!("     Command: {}", cmd);
                     }
                 }
+                output.print_tool_call(&name, &args);
+                first_chunk = true;
             }
-
-            let elapsed = start_time.elapsed();
-
-            // Ensure spinner is cleared even if stream produced no meaningful events
-            clear_spinner!();
-
-            // Emit ChatCompleted webhook
-            {
-                let (input_tokens, output_tokens, _) = get_usage_stats();
-                crate::webhook::emitter::emit_global(crate::webhook::WebhookEvent::ChatCompleted {
-                    model: String::new(), // model not easily available here
-                    input_tokens,
-                    output_tokens,
-                    elapsed_ms: elapsed.as_millis() as u64,
+            AgentEvent::ToolResult {
+                name,
+                output: tool_output,
+                ..
+            } => {
+                // Auto-track file changes for coding loop
+                if matches!(
+                    name.as_str(),
+                    "write_file"
+                        | "edit_file"
+                        | "append_file"
+                        | "create_file"
+                        | "delete_file"
+                        | "update_file"
+                        | "move_file"
+                ) {
+                    FILE_CHANGE_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
+                output.print_tool_result(&name, &tool_output, true);
+                first_chunk = true;
+            }
+            AgentEvent::ToolError { name, error, .. } => {
+                let err_text = format!("✗ {}: {}", name, error);
+                let styled = nu_ansi_term::Color::Red.paint(&err_text);
+                println!("  {}", styled);
+                crate::webhook::emitter::emit_global(crate::webhook::WebhookEvent::ToolFailed {
+                    name: name.clone(),
+                    error: error.clone(),
                 });
+                first_chunk = true;
             }
-
-            let config = output.config();
-
-            if config.show_token_stats || config.show_tool_details {
-                println!();
-                let duration_str = if elapsed.as_secs() >= 60 {
-                    format!("{}m {}s", elapsed.as_secs() / 60, elapsed.as_secs() % 60)
-                } else {
-                    format!("{:.1}s", elapsed.as_secs_f64())
-                };
-                let stats = format!("  ⏱ {:.0}  🔧 {} 工具调用", duration_str, tool_call_count);
-                let styled = nu_ansi_term::Color::Fixed(8).paint(&stats);
+            AgentEvent::FinalAnswer(_answer) => {
+                clear_spinner!();
+                if !first_chunk {
+                    println!();
+                }
+            }
+            AgentEvent::Cancelled => {
+                clear_spinner!();
+                output.print_warning("执行已取消");
+            }
+            AgentEvent::MemoryRecalled { .. } => {}
+            AgentEvent::Chart { .. } => {}
+            AgentEvent::GuardTriggered { .. } => {}
+            AgentEvent::Error { source, message } => {
+                clear_spinner!();
+                output.print_error(&format!("[{}] {}", source, message));
+            }
+            AgentEvent::ContextCompressed {
+                before_count,
+                after_count,
+                before_tokens,
+                after_tokens,
+            } => {
+                let saved = before_tokens.saturating_sub(after_tokens);
+                let styled = nu_ansi_term::Color::Fixed(8).paint(format!(
+                    "  📦 上下文自动压缩: {}→{} 条消息, {}→{} tokens (节省 {})",
+                    before_count, after_count, before_tokens, after_tokens, saved
+                ));
                 println!("{}", styled);
             }
-
-            // Post-run diagnostics suggestion
-            if tool_call_count > 0 {
-                let hint = nu_ansi_term::Color::Fixed(8)
-                    .paint("  Tip: /trace to inspect, /test to verify, /diff to review");
-                println!("{}", hint);
-            }
-
-            // Interactive git change handling (replaces auto-commit)
-            let changes = FILE_CHANGE_COUNT.swap(0, Ordering::Relaxed);
-            if changes > 0 {
-                let cwd = std::env::current_dir().unwrap_or_default();
-                if cwd.join(".git").exists() {
-                    let choice = crate::cli::git_ops::prompt_for_git_action(changes);
-                    match choice {
-                        'c' => {
-                            if let Err(e) = crate::cli::git_ops::interactive_commit(&cwd, changes) {
-                                println!("  {} {}", nu_ansi_term::Color::Red.paint("✗"), e);
-                            }
-                        }
-                        's' => {
-                            if let Err(e) = crate::cli::git_ops::interactive_stage(&cwd) {
-                                println!("  {} {}", nu_ansi_term::Color::Red.paint("✗"), e);
-                            }
-                        }
-                        _ => {} // 'n' — do nothing
-                    }
-                }
-            }
-
-            println!();
-        }
-        Err(e) => {
-            spinner.finish_error(&format!("Connection failed: {}", e));
-            output.print_error(&format!("对话失败: {}", e));
-            crate::webhook::emitter::emit_global(crate::webhook::WebhookEvent::AgentError {
-                error: e.to_string(),
-            });
+            _ => {}
         }
     }
+
+    match drive_task.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "CLI shared chat driver returned an error");
+        }
+        Err(error) => {
+            clear_spinner!();
+            output.print_error(&format!("Chat driver task failed: {error}"));
+        }
+    }
+
+    let elapsed = start_time.elapsed();
+
+    // Ensure spinner is cleared even if stream produced no meaningful events
+    clear_spinner!();
+
+    // Emit ChatCompleted webhook
+    {
+        let (input_tokens, output_tokens, _) = get_usage_stats();
+        crate::webhook::emitter::emit_global(crate::webhook::WebhookEvent::ChatCompleted {
+            model: String::new(), // model not easily available here
+            input_tokens,
+            output_tokens,
+            elapsed_ms: elapsed.as_millis() as u64,
+        });
+    }
+
+    let config = output.config();
+
+    if config.show_token_stats || config.show_tool_details {
+        println!();
+        let duration_str = if elapsed.as_secs() >= 60 {
+            format!("{}m {}s", elapsed.as_secs() / 60, elapsed.as_secs() % 60)
+        } else {
+            format!("{:.1}s", elapsed.as_secs_f64())
+        };
+        let stats = format!("  ⏱ {:.0}  🔧 {} 工具调用", duration_str, tool_call_count);
+        let styled = nu_ansi_term::Color::Fixed(8).paint(&stats);
+        println!("{}", styled);
+    }
+
+    // Post-run diagnostics suggestion
+    if tool_call_count > 0 {
+        let hint = nu_ansi_term::Color::Fixed(8)
+            .paint("  Tip: /trace to inspect, /test to verify, /diff to review");
+        println!("{}", hint);
+    }
+
+    // Interactive git change handling (replaces auto-commit)
+    let changes = FILE_CHANGE_COUNT.swap(0, Ordering::Relaxed);
+    if changes > 0 {
+        let cwd = std::env::current_dir().unwrap_or_default();
+        if cwd.join(".git").exists() {
+            let choice = crate::cli::git_ops::prompt_for_git_action(changes);
+            match choice {
+                'c' => {
+                    if let Err(e) = crate::cli::git_ops::interactive_commit(&cwd, changes) {
+                        println!("  {} {}", nu_ansi_term::Color::Red.paint("✗"), e);
+                    }
+                }
+                's' => {
+                    if let Err(e) = crate::cli::git_ops::interactive_stage(&cwd) {
+                        println!("  {} {}", nu_ansi_term::Color::Red.paint("✗"), e);
+                    }
+                }
+                _ => {} // 'n' — do nothing
+            }
+        }
+    }
+
+    println!();
 }
 
 /// 自定义提示符

@@ -7,7 +7,6 @@ use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
 
 use echo_agent_app_core::tasks::task_runtime::types::*;
-use echo_agent_app_core::tasks::task_runtime::{ExecutionPolicy, ExecutionPolicySnapshot};
 use std::sync::Arc;
 use tauri::Emitter;
 
@@ -179,66 +178,6 @@ pub async fn get_interaction_mode(state: tauri::State<'_, TauriState>) -> Result
         .load(std::sync::atomic::Ordering::Relaxed))
 }
 
-/// Single GUI-facing snapshot of the execution policy. This intentionally
-/// keeps Chat/Task/Auto mode, approval mode, and read-only worker fanout in
-/// one place so the product can explain the runtime path before a message is
-/// sent.
-#[tauri::command]
-pub async fn get_execution_policy(
-    state: tauri::State<'_, TauriState>,
-) -> Result<ExecutionPolicySnapshot, IpcError> {
-    let interaction_mode = state
-        .app_state
-        .tasks
-        .interaction_mode
-        .load(std::sync::atomic::Ordering::Relaxed);
-    let permission_mode = state.app_state.config.permission_mode.read().await.clone();
-    Ok(ExecutionPolicy::from_raw(interaction_mode, permission_mode).snapshot())
-}
-
-/// Request body for [`create_task_run`].
-#[derive(Debug, serde::Deserialize)]
-pub struct CreateRunRequest {
-    pub goal: String,
-    pub conversation_id: String,
-    pub workspace_id: Option<String>,
-    pub root_message_id: Option<String>,
-    pub domain_profile: Option<String>,
-    pub route: Option<String>,
-}
-
-/// Create a new complex-task run in `Pending`. Returns the created run.
-#[tauri::command]
-pub async fn create_task_run(
-    state: tauri::State<'_, TauriState>,
-    req: CreateRunRequest,
-) -> Result<TaskRun, IpcError> {
-    let store = store(&state)?;
-    let profile = req
-        .domain_profile
-        .as_deref()
-        .and_then(DomainProfile::from_str)
-        .unwrap_or_default();
-    let run_id = uuid::Uuid::new_v4().to_string();
-    let workspace_id = req.workspace_id.unwrap_or_else(|| "default".to_string());
-    let root_message_id = req.root_message_id.unwrap_or_default();
-    let route = req.route.unwrap_or_default();
-    let run = store
-        .create_run(
-            &run_id,
-            &workspace_id,
-            &req.conversation_id,
-            &root_message_id,
-            profile,
-            &req.goal,
-            &route,
-            AttendedMode::Attended,
-        )
-        .map_err(internal)?;
-    tracing::info!(run_id = %run.run_id, profile = ?profile, "TaskRuntime run created");
-    Ok(run)
-}
-
 /// Resume a paused run. Transitions `Paused → Running` and re-launches the
 /// executor, which re-reads the plan from the store and skips already-completed
 /// tasks.
@@ -249,23 +188,11 @@ pub async fn resume_task_run(
     run_id: String,
 ) -> Result<serde_json::Value, IpcError> {
     let store = store(&state)?;
-
-    // spec §10.5: ComplexRuntime 审批闭环 — instead of directly transitioning to
-    // Running + spawning execute_run (which would cause TWO concurrent execute_run
-    // calls), we notify the approval_signal that the waiting plan_execute tool is
-    // listening on. The awakened plan_execute handles Paused→Running + execute_run.
-    if echo_agent_app_core::tasks::task_runtime::task_tools::notify_approval_signal(&run_id) {
-        tracing::info!(run_id = %run_id, "notified approval_signal -> plan_execute will resume");
-        return Ok(serde_json::json!({
-            "kind": "resumed",
-            "run_id": run_id,
-        }));
+    if store.get_plan(&run_id).map_err(internal)?.is_none() {
+        return Err(IpcError::Validation(format!(
+            "run {run_id} has no persisted plan to resume"
+        )));
     }
-
-    // Fallback: no plan_execute tool is waiting. Do the direct path:
-    // transition Paused -> Running + spawn executor.
-    store.resume_task_run(&run_id).map_err(internal)?;
-    tracing::info!(run_id = %run_id, "direct resume (no approval_signal) -> Running");
 
     let primary_agent = state.app_state.connection.primary_agent();
     let store_for_task = store.clone();
@@ -280,13 +207,11 @@ pub async fn resume_task_run(
         .as_ref()
         .map(|ri| std::sync::Arc::new(ri.create_layer_manager()));
     let cancel = echo_agent::agent::CancellationToken::new();
-    let run_key = format!("__run__:{run_id}");
-    state
-        .app_state
-        .tasks
-        .run_cancel_tokens
-        .insert(run_key.clone(), cancel.clone());
-    let run_cancel_tokens = state.app_state.tasks.run_cancel_tokens.clone();
+    let cancel_registration = store
+        .register_run_cancellation(&run_id, cancel.clone())
+        .map_err(internal)?;
+    store.resume_task_run(&run_id).map_err(internal)?;
+    tracing::info!(run_id = %run_id, "task run resumed -> Running");
     let trace_sink: echo_agent_app_core::tasks::task_runtime::ExecSink = Arc::new(move |ev| {
         // Forward run-level lifecycle events to the unified
         // `execution://event` channel (kind="run"). The frontend reads
@@ -305,6 +230,7 @@ pub async fn resume_task_run(
     let run_id_for_task = run_id.clone();
 
     tokio::spawn(async move {
+        let _cancel_registration = cancel_registration;
         let outcome = echo_agent_app_core::tasks::task_runtime::execute_run(
             store_for_task.clone(),
             Some(primary_agent_for_task),
@@ -314,13 +240,10 @@ pub async fn resume_task_run(
             Some(trace_sink),
             &run_id_for_task,
             cancel,
-            // B5.1: keep this GUI command's pre-B5.1 fire-and-forget memory write
-            // (resume_task_run / execute_task_run are the two callers that
-            // historically depended on execute_run's internal write).
+            // GUI resume keeps the interactive asynchronous memory projection.
             echo_agent_app_core::tasks::task_runtime::MemoryPolicy::FireAndForget,
         )
         .await;
-        run_cancel_tokens.remove(&format!("__run__:{run_id_for_task}"));
         match outcome {
             Ok(echo_agent_app_core::tasks::task_runtime::RunOutcome::Completed) => {
                 tracing::info!(run_id = %run_id_for_task, "resumed run completed");
@@ -398,118 +321,6 @@ pub async fn reorder_tasks(
     Ok(())
 }
 
-/// Launch execution of a run. The run must be in `Running`.
-/// Execution runs on a detached background task so the IPC returns
-/// immediately; progress is observable via `list_task_events` /
-/// `list_task_todos` polling or (PR 6) the GUI event feed. Returns immediately
-/// with the run's id so the caller can track it.
-#[tauri::command]
-pub async fn execute_task_run(
-    state: tauri::State<'_, TauriState>,
-    app: tauri::AppHandle,
-    run_id: String,
-) -> Result<serde_json::Value, IpcError> {
-    let store = store(&state)?;
-    // The primary agent is required: its subagent registry holds the worker
-    // roles (project_explorer, code_reviewer, etc.) that the executor
-    // dispatches to via delegate_to_agent_with_cancel. No pool is needed —
-    // fork-mode dispatch runs workers on isolated instances under the
-    // executor's own semaphore.
-    let primary_agent = state.app_state.connection.primary_agent();
-
-    // Snapshot the state for the validation error message.
-    let run = store
-        .get_run(&run_id)
-        .map_err(internal)?
-        .ok_or_else(|| IpcError::NotFound(format!("run {run_id} not found")))?;
-    if run.status != TaskRunStatus::Pending && run.status != TaskRunStatus::Running {
-        return Err(IpcError::Validation(format!(
-            "run {run_id} is {:?}; must be Pending or Running to execute",
-            run.status
-        )));
-    }
-
-    // Detached execution: the executor drives Running → terminal and
-    // writes every transition + TaskEvent to the store. The GUI observes via
-    // the read commands. A run-scoped CancellationToken is stored on the
-    // session map (same mechanism as chat cancel) so cancel_task_run can find it.
-    let store_for_task = store.clone();
-    let primary_agent_for_task = primary_agent.clone();
-    let run_store_for_task = primary_agent.read(|a| a.run_store().cloned()).await;
-    let run_id_for_task = run_id.clone();
-    // The reviewer LLM is the primary agent's client — review gates use it to
-    // evaluate implementation/debugging task output against the domain checklist.
-    // (stage4 P4.1) cache_user_id read from single source by execute_run/review
-    // internally — only the reviewer_llm is needed here.
-    let reviewer_llm = primary_agent.read(|a| a.llm_client().cloned()).await;
-    // The memory layer manager sinks run completion/cancellation events into
-    // long-term memory through the single write_memory chokepoint. Created
-    // from ReviewIntegration when available (mirrors the primary agent's path).
-    let layer_manager = state
-        .app_state
-        .review_integration
-        .as_ref()
-        .map(|ri| std::sync::Arc::new(ri.create_layer_manager()));
-    let cancel = echo_agent::agent::CancellationToken::new();
-    let run_key = format!("__run__:{run_id}");
-    state
-        .app_state
-        .tasks
-        .run_cancel_tokens
-        .insert(run_key.clone(), cancel.clone());
-    let run_cancel_tokens = state.app_state.tasks.run_cancel_tokens.clone();
-    let trace_sink: echo_agent_app_core::tasks::task_runtime::ExecSink = Arc::new(move |ev| {
-        // Forward run-level lifecycle events to the unified
-        // `execution://event` channel (kind="run"). The frontend reads
-        // these to track run start/complete/fail/cancel transitions.
-        let mut payload = serde_json::Map::new();
-        payload.insert("kind".into(), "run".into());
-        payload.insert("run_id".into(), ev.run_id.into());
-        payload.insert("event".into(), ev.event.into());
-        if let serde_json::Value::Object(fields) = ev.payload {
-            for (k, v) in fields {
-                payload.insert(k, v);
-            }
-        }
-        let _ = app.emit("execution://event", serde_json::Value::Object(payload));
-    });
-
-    tokio::spawn(async move {
-        let outcome = echo_agent_app_core::tasks::task_runtime::execute_run(
-            store_for_task.clone(),
-            Some(primary_agent_for_task),
-            reviewer_llm,
-            layer_manager,
-            run_store_for_task,
-            Some(trace_sink),
-            &run_id_for_task,
-            cancel,
-            // B5.1: keep this GUI command's pre-B5.1 fire-and-forget memory write
-            // (resume_task_run / execute_task_run are the two callers that
-            // historically depended on execute_run's internal write).
-            echo_agent_app_core::tasks::task_runtime::MemoryPolicy::FireAndForget,
-        )
-        .await;
-        run_cancel_tokens.remove(&format!("__run__:{run_id_for_task}"));
-        match outcome {
-            Ok(echo_agent_app_core::tasks::task_runtime::RunOutcome::Completed) => {
-                tracing::info!(run_id = %run_id_for_task, "run completed");
-            }
-            Ok(other) => {
-                tracing::warn!(run_id = %run_id_for_task, ?other, "run ended non-completed");
-            }
-            Err(e) => {
-                tracing::error!(run_id = %run_id_for_task, error = %e, "run executor error");
-            }
-        }
-    });
-
-    Ok(serde_json::json!({
-        "kind": "executing",
-        "run_id": run_id,
-    }))
-}
-
 /// Cancel an executing run. Cancels every in-flight worker via the run's
 /// CancellationToken and lets the executor wind down (the run ends Cancelled).
 #[tauri::command]
@@ -517,27 +328,17 @@ pub async fn cancel_task_run(
     state: tauri::State<'_, TauriState>,
     run_id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let key = format!("__run__:{run_id}");
-    let cancelled = state
-        .app_state
-        .tasks
-        .run_cancel_tokens
-        .get(&key)
-        .map(|t| {
-            t.cancel();
-            true
-        })
-        .unwrap_or(false);
+    let store = store(&state)?;
+    let cancelled = store.request_cancel(&run_id).map_err(internal)?;
     Ok(serde_json::json!({
         "success": cancelled,
         "run_id": run_id,
     }))
 }
 
-/// Render the human-readable progress ledger for a run (plan §866-901).
-/// Derived from the canonical SQLite state; also written to
-/// `.eko/runtime/{run_id}/progress.md` for agent recovery context. If the two
-/// ever disagree, SQLite wins. Returns the rendered markdown.
+/// Render the human-readable progress ledger derived from canonical run files.
+/// It is also written to `.eko/runtime/{run_id}/progress.md` for compact agent
+/// recovery context.
 #[tauri::command]
 pub async fn get_progress_ledger(
     state: tauri::State<'_, TauriState>,

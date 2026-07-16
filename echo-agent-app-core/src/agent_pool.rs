@@ -793,7 +793,6 @@ impl AgentPool {
             // plan_execute per §10.2).
             task_runtime_store: self.shared.task_runtime_store.clone(),
             browser_runtime: self.shared.browser_runtime.clone(),
-            route: None,
         };
         let mut agent = infra::create_agent(&params, &app_config)
             .await

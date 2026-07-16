@@ -1,9 +1,8 @@
 //! Progress ledger export.
 //!
-//! Generates a human-readable `progress.md` from the canonical SQLite state.
-//! Per the plan (§866-901): SQLite is the source of truth; the markdown
-//! export is derived and may be shown to agents as compact recovery context.
-//! If the two ever disagree, SQLite wins.
+//! Generates a human-readable `progress.md` from canonical TaskRuntime files.
+//! The markdown export is a derived recovery view; run events and plan files
+//! remain authoritative.
 //!
 //! The export is written to `.eko/runtime/{run_id}/progress.md` and is also
 //! returned as a string so the GUI / IPC can render it without touching disk.

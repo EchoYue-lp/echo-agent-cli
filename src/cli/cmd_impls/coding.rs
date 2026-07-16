@@ -4,7 +4,7 @@
 
 use crate::cli::command::{CommandCategory, CommandContext, CommandOutcome, cmd};
 use crate::project::test_runner;
-use echo_agent_app_core::tasks::{BackgroundTaskKind, ResearchOutputFormat, TaskStatus};
+use echo_agent_app_core::tasks::{BackgroundTaskKind, ResearchOutputFormat};
 use std::sync::Arc;
 
 // ── PlanCommand ──────────────────────────────────────────────────────
@@ -60,14 +60,13 @@ async fn cmd_tasks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     let sub = args.first().copied().unwrap_or("");
     match sub {
         "list" | "" => {
-            let tasks = service.list(None);
+            let tasks = service.list_unified(None);
             if tasks.is_empty() {
                 println!("No background tasks.");
             } else {
                 println!("\nBackground Tasks:");
                 println!("{:-<90}", "");
                 for t in &tasks {
-                    let status = task_status_display(&t.status);
                     let deps = if t.dependencies.is_empty() {
                         String::new()
                     } else {
@@ -75,7 +74,7 @@ async fn cmd_tasks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                     };
                     println!(
                         "  [{:>12}] P{:<2} {} (id: {}{})",
-                        status, t.priority, t.description, t.id, deps
+                        t.status, t.priority, t.description, t.id, deps
                     );
                 }
             }
@@ -86,11 +85,11 @@ async fn cmd_tasks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 println!("Usage: /tasks status <id>");
                 return CommandOutcome::Continue;
             }
-            match service.get(id) {
-                Some((task, meta)) => {
+            match service.get_unified(id) {
+                Some(task) => {
                     println!("\nTask: {}", task.id);
                     println!("  Description: {}", task.description);
-                    println!("  Status: {}", task_status_display(&task.status));
+                    println!("  Status: {}", task.status);
                     println!("  Priority: {}", task.priority);
                     if !task.dependencies.is_empty() {
                         println!("  Dependencies: {}", task.dependencies.join(", "));
@@ -99,12 +98,8 @@ async fn cmd_tasks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                     if let Some(ref result) = task.result {
                         println!("  Result: {}", result);
                     }
-                    if let Some(ref meta) = meta {
-                        println!("  Type: {}", meta.kind.display_name());
-                        println!("  Progress: {}%", meta.progress);
-                        if let Some(ref msg) = meta.progress_message {
-                            println!("  Progress Message: {}", msg);
-                        }
+                    if let Some(ref kind) = task.kind {
+                        println!("  Type: {}", kind);
                     }
                     // Show real-time progress from cache
                     if let Some(p) = service.get_progress(id) {
@@ -160,13 +155,22 @@ async fn cmd_tasks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             }
         }
         "dag" => {
-            let manager = service.manager();
-            let tasks = manager.get_all_tasks();
+            let tasks = service.list_unified(None);
             if tasks.is_empty() {
                 println!("No tasks to visualize.");
             } else {
                 println!("\nTask Dependency Graph (Mermaid format):");
-                println!("{}", manager.visualize_dependencies());
+                println!("graph TD");
+                for task in &tasks {
+                    println!(
+                        "    {}[\"{}\"]",
+                        task.id,
+                        task.description.replace('"', "'")
+                    );
+                    for dependency in &task.dependencies {
+                        println!("    {} --> {}", dependency, task.id);
+                    }
+                }
                 println!("\nTask Details:");
                 for task in &tasks {
                     let deps = if task.dependencies.is_empty() {
@@ -188,21 +192,6 @@ async fn cmd_tasks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     CommandOutcome::Continue
 }
 
-/// Format a TaskStatus for display.
-fn task_status_display(status: &TaskStatus) -> &'static str {
-    match status {
-        TaskStatus::Pending => "Pending",
-        TaskStatus::InProgress => "InProgress",
-        TaskStatus::Completed => "Completed",
-        TaskStatus::Cancelled => "Cancelled",
-        TaskStatus::Failed(_) => "Failed",
-        TaskStatus::Blocked(_) => "Blocked",
-        TaskStatus::TimedOut { .. } => "TimedOut",
-        TaskStatus::Retrying { .. } => "Retrying",
-        TaskStatus::Skipped => "Skipped",
-        TaskStatus::Paused(_) => "Paused",
-    }
-}
 cmd!(
     TasksCommand,
     "tasks",

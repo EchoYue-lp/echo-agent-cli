@@ -2,6 +2,8 @@
 
 > 生成日期: 2026-06-09
 > 审查范围: echo-agent (框架) + echo-agent-cli (产品)
+>
+> **历史文档提示（2026-07-16）**：本文记录的是 6 月当时的架构，包含已经失效的 SQLite、路由和三端接入结论，不再作为当前实施依据。当前 Agent 生命周期事实、问题优先级和 M2 计划以 [2026-07-16-agent-lifecycle-audit.md](./2026-07-16-agent-lifecycle-audit.md) 与根目录 `docs/MASTER-PLAN.md` 为准。
 
 ---
 

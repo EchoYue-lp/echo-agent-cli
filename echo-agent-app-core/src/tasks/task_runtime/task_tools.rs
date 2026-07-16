@@ -13,12 +13,9 @@
 //! thread hop. `task_local!` is bound to the logical async task and survives
 //! `.await` across threads — correct for this use case.
 
-use std::sync::{Arc, LazyLock};
-
-use dashmap::DashMap;
 use echo_agent::prelude::*;
 use echo_agent::tools::{Tool, ToolResult};
-use tokio::sync::Notify;
+use std::sync::Arc;
 
 use super::executor::ExecEvent;
 use super::store::TaskRuntimeStore;
@@ -32,37 +29,6 @@ use super::types::{
 /// `CURRENT_TRACE_SINK` task_local predates the `ExecSink` name and several
 /// call sites still spell it as `TraceSink`.
 pub type TraceSink = Arc<dyn Fn(ExecEvent) + Send + Sync>;
-
-// ── Approval-signal registry (spec §10.5 ComplexRuntime) ──────────────────
-
-/// Shared map of approval signals for ComplexRuntime runs (spec §10.5).
-/// Stores `Arc<Notify>` handles keyed by `run_id` so the Tauri
-/// `resume_task_run` command can wake the waiting `plan_execute` tool instead
-/// of bypassing it (which would cause TWO concurrent execute_run calls).
-pub(crate) static APPROVAL_NOTIFIES: LazyLock<DashMap<String, Arc<Notify>>> =
-    LazyLock::new(DashMap::new);
-
-/// Register an approval signal so `resume_task_run` can find it.
-pub fn register_approval_signal(run_id: &str, signal: Arc<Notify>) {
-    APPROVAL_NOTIFIES.insert(run_id.to_string(), signal);
-}
-
-/// Remove an approval signal after the plan_execute tool has been woken.
-pub fn remove_approval_signal(run_id: &str) {
-    APPROVAL_NOTIFIES.remove(run_id);
-}
-
-/// Notify a waiting `plan_execute` tool to resume. Returns `true` if a signal
-/// was found and notified, `false` if the run_id has no registered signal
-/// (the caller should fall back to a direct execution path).
-pub fn notify_approval_signal(run_id: &str) -> bool {
-    if let Some(signal) = APPROVAL_NOTIFIES.get(run_id) {
-        signal.notify_one();
-        true
-    } else {
-        false
-    }
-}
 
 // ── Task-local run_id injection (async-safe) ──────────────────────────────
 
@@ -806,11 +772,10 @@ impl CreateComplexTaskTool {
                 "Failed to transition run to Running: {e}"
             )));
         }
-        // Independent cancel token (spec §5.5): background runs must NOT reuse
-        // the chat turn's token — the front-desk "stop" must not kill a
-        // background run. cancel_run / GUI task panel trigger this one.
+        // Independent cancel token: background runs must not reuse the chat
+        // turn's token. `drive_run_async` registers it in the single runtime
+        // cancellation registry before acquiring the isolated agent.
         let run_cancel = echo_agent::agent::CancellationToken::new();
-        store.register_run_cancel_token(&run_id, run_cancel.clone());
 
         let trace_sink = if priority == "foreground" {
             res.sink.worker_trace_sink()
@@ -970,10 +935,14 @@ impl CancelRunTool {
             Some(s) => s,
             None => return Ok(ToolResult::error("no TaskRuntimeStore available")),
         };
-        let cancelled = store.cancel_run(&run_id);
-        Ok(ToolResult::success(
-            serde_json::json!({"run_id": run_id, "cancelled": cancelled}).to_string(),
-        ))
+        match store.request_cancel(&run_id) {
+            Ok(cancelled) => Ok(ToolResult::success(
+                serde_json::json!({"run_id": run_id, "cancelled": cancelled}).to_string(),
+            )),
+            Err(error) => Ok(ToolResult::error(format!(
+                "Failed to cancel run {run_id}: {error}"
+            ))),
+        }
     }
 }
 

@@ -128,10 +128,10 @@ async fn cmd_papers(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         "list" | "ls" | "" => {
             // List research tasks from the background service
             if let Some(ref service) = ctx.task_service {
-                let tasks = service.list(None);
+                let tasks = service.list_unified(None);
                 let research_tasks: Vec<_> = tasks
                     .iter()
-                    .filter(|t| t.tags.iter().any(|tag| tag == "bg:kind:research"))
+                    .filter(|task| task.kind.as_deref() == Some("bg:kind:research"))
                     .collect();
 
                 if research_tasks.is_empty() {
@@ -141,16 +141,16 @@ async fn cmd_papers(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 } else {
                     println!("\n--- Research Tasks ({}) ---", research_tasks.len());
                     for task in research_tasks {
-                        let status_icon = match &task.status {
-                            echo_agent_app_core::tasks::TaskStatus::Completed => "✓",
-                            echo_agent_app_core::tasks::TaskStatus::Failed(_) => "✗",
-                            echo_agent_app_core::tasks::TaskStatus::InProgress => "▶",
-                            echo_agent_app_core::tasks::TaskStatus::Pending => "○",
-                            echo_agent_app_core::tasks::TaskStatus::Cancelled => "⊘",
+                        let status_icon = match task.status.as_str() {
+                            "completed" => "✓",
+                            "failed" => "✗",
+                            "in_progress" => "▶",
+                            "pending" => "○",
+                            "cancelled" => "⊘",
                             _ => "?",
                         };
                         println!(
-                            "  {} {} — {} ({:?})",
+                            "  {} {} — {} ({})",
                             status_icon, task.id, task.description, task.status
                         );
                         if let Some(ref result) = task.result {

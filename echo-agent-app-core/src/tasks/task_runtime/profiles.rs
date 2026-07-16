@@ -22,8 +22,7 @@ pub struct ProfileTemplate {
     /// Extra instructions appended to the plan-generation prompt to steer the
     /// LLM toward domain-appropriate tasks, artifacts, and verification.
     pub prompt_suffix: &'static str,
-    /// Review checklist items surfaced to the reviewer gate (PR 4) and to the
-    /// user in the plan-approval UI.
+    /// Review checklist items surfaced to the reviewer and plan UI.
     pub review_checklist: &'static [&'static str],
     /// Universal Superpowers-style methodology workflows enabled for this
     /// profile. The planner prompt references these so the LLM structures

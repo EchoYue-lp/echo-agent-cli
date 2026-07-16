@@ -21,7 +21,7 @@
 //!
 //! Guarantees:
 //! - the run transitions Running → (Completed | Failed | Cancelled | Paused);
-//! - every task boundary writes a TaskEvent + updates the todo projection;
+//! - every task boundary writes a RuntimeTaskEvent + updates the todo projection;
 //! - implementation/debugging tasks pass a review gate before being marked
 //!   Completed; a failing review either re-queues a fix task or trips the
 //!   circuit breaker (Paused);
@@ -167,7 +167,7 @@ pub enum ExecError {
     Other(String),
 }
 
-/// Execute an approved run to completion.
+/// Execute a planned run to completion.
 ///
 /// The caller (a Tauri command) holds the `AppState`, the store, and the
 /// optional `AgentPool`. Execution is driven on the provided runtime; the
@@ -188,36 +188,6 @@ pub async fn execute_run(
     let run = store
         .get_run(run_id)?
         .ok_or(ExecError::RunNotFound(run_id.to_string()))?;
-    // Zombie recovery: a run left in a non-terminal state (e.g. process crashed
-    // during shutdown) has no driver to finish it. Auto-transition to Failed so
-    // it doesn't block the run list forever.
-    //
-    // `Running` is intentionally excluded: if the run is already Running when
-    // the executor starts, it was either just transitioned by the IPC (resume
-    // path) or left behind by a crash. In both cases the executor can safely
-    // proceed — it re-reads the plan from the store and skips completed tasks.
-    if matches!(run.status, TaskRunStatus::Paused) {
-        let reason = format!(
-            "recovered from {} (interrupted by process restart)",
-            run.status.as_str()
-        );
-        let _ = store.note(run_id, None, &reason);
-        let _ = store.transition_run(run_id, TaskRunStatus::Failed);
-        save_trace(
-            run_store.as_ref(),
-            run_id,
-            &run.goal,
-            &run.conversation_id,
-            "failed",
-        );
-        return Ok(RunOutcome::Failed {
-            failed_task_id: "<none>".into(),
-            error: format!(
-                "run was in {} state (interrupted); auto-transitioned to Failed",
-                run.status.as_str()
-            ),
-        });
-    }
     // The caller must have transitioned Pending → Running before spawning
     // the executor. Here we only accept Running.
     if run.status != TaskRunStatus::Running {
@@ -414,12 +384,25 @@ pub async fn execute_run(
                     }),
                 ),
             );
-            // run_dag already transitioned Running → Paused. Record the reason.
-            let _ = store.note(
-                run_id,
-                Some(failed_task_id),
-                &format!("run paused: {error}"),
-            );
+            // run_dag or the control path already transitioned Running → Paused.
+            // Any worker that was in flight no longer exists after cancellation,
+            // so make it pending again for the resume drain.
+            if let Ok(todos) = store.list_todos(run_id) {
+                for todo in todos
+                    .into_iter()
+                    .filter(|todo| todo.status == TodoStatus::Running)
+                {
+                    let _ = store.set_task_status(
+                        run_id,
+                        &todo.task_id,
+                        TodoStatus::Pending,
+                        None,
+                        Some("paused; pending resume"),
+                    );
+                }
+            }
+            let task_id = (!failed_task_id.starts_with('<')).then_some(failed_task_id.as_str());
+            let _ = store.note(run_id, task_id, &format!("run paused: {error}"));
             save_trace(
                 run_store.as_ref(),
                 run_id,
@@ -602,7 +585,7 @@ async fn run_dag<W: TaskDispatcher + 'static>(
     // Loop until every task is resolved or the run aborts.
     loop {
         if parent_cancel.is_cancelled() {
-            return Ok(RunOutcome::Cancelled);
+            return Ok(interrupted_outcome(&store, run_id));
         }
         if let Some(id) = &failed_id {
             // A task failed: propagate Blocked to downstream dependents
@@ -626,7 +609,12 @@ async fn run_dag<W: TaskDispatcher + 'static>(
             let error = failed
                 .map(|t| format!("task '{}' failed", t.title))
                 .unwrap_or_else(|| "task failed".into());
-            if all_dead {
+            let unattended = store
+                .get_run(run_id)
+                .ok()
+                .flatten()
+                .is_some_and(|run| run.attended_mode == AttendedMode::Unattended);
+            if all_dead || unattended {
                 return Ok(RunOutcome::Failed {
                     failed_task_id: id.clone(),
                     error,
@@ -774,12 +762,15 @@ async fn run_dag<W: TaskDispatcher + 'static>(
                 }
             }
         }
+        if parent_cancel.is_cancelled() {
+            cancelled_mid_wave = true;
+        }
         if cancelled_mid_wave {
             // Abort any handles we didn't await so their workers stop ASAP.
             for handle in &mut handles {
                 handle.abort();
             }
-            return Ok(RunOutcome::Cancelled);
+            return Ok(interrupted_outcome(&store, run_id));
         }
 
         // Process wave results: first failure wins for the error message, but
@@ -867,23 +858,6 @@ async fn run_dag<W: TaskDispatcher + 'static>(
                     }
                 }
                 Err((id, err)) => {
-                    // Hitrisk fail-closed: the task was blocked by a pre-execution
-                    // high-risk safety check. The run was already transitioned to
-                    // Paused inside execute_task. Propagate up so execute_run
-                    // records the Paused outcome instead of treating it as Failed.
-                    if let Some(reason) = err.strip_prefix("SUSPEND:") {
-                        let _ = store.set_task_status(
-                            run_id,
-                            &id,
-                            TodoStatus::Pending,
-                            None,
-                            Some("blocked: hitrisk requires user approval"),
-                        );
-                        return Ok(RunOutcome::Paused {
-                            failed_task_id: id.clone(),
-                            error: reason.to_string(),
-                        });
-                    }
                     // Mark this task Failed and record it in wave_failed so
                     // the skip logic (top of loop) does NOT overwrite it to
                     // Skipped. failed_id keeps the FIRST failure for the
@@ -903,6 +877,22 @@ async fn run_dag<W: TaskDispatcher + 'static>(
                 }
             }
         }
+    }
+}
+
+fn interrupted_outcome(store: &TaskRuntimeStore, run_id: &str) -> RunOutcome {
+    let paused = store
+        .get_run(run_id)
+        .ok()
+        .flatten()
+        .is_some_and(|run| run.status == TaskRunStatus::Paused);
+    if paused {
+        RunOutcome::Paused {
+            failed_task_id: "<pause>".to_string(),
+            error: "paused by user".to_string(),
+        }
+    } else {
+        RunOutcome::Cancelled
     }
 }
 
@@ -1235,51 +1225,6 @@ async fn execute_task(
         task_id = %task_id,
         "task_runtime: acquired llm permit"
     );
-
-    // G10+G11: Pre-execution safety check — verify the task's tool calls
-    // are covered by an approval scope AND pass the high-risk arg check.
-    //
-    // Fail-closed: when a tool+args pair matches a high-risk pattern, we
-    // suspend the run immediately and require the user to either approve
-    // the specific call or edit the plan before the run can resume.
-    // Mirrors the review-gate Suspend path to avoid an unsafe "note-and-
-    // continue" gap.
-    //
-    // Args snapshot: we scan ALL task strings that may flow into a tool call —
-    // not just `title`. The `verification` field is the most important: it is
-    // injected into the worker prompt ("Run the listed verification when done")
-    // and Verification-kind tasks execute it under a shell permit, so a plan
-    // like `["rm -rf target && cargo test"]` must be caught here. `files` feeds
-    // the file-write tools; `description` is free-form and may carry commands.
-    if !task.allowed_tools.is_empty() {
-        let args_snapshot = build_hitrisk_args_snapshot(&task);
-        for tool in &task.allowed_tools {
-            if let Some(m) = super::hitrisk::check(tool, &args_snapshot) {
-                let reason = format!(
-                    "hitrisk flagged tool '{tool}' (pattern '{}': {}) for task '{}'; \
-                     Matched: {}",
-                    m.pattern, m.reason, task.title, m.snippet,
-                );
-                let _ = store.note(&run_id, Some(&task_id), &reason);
-
-                // U1c phase-1: Unattended runs must NOT pause (no human to
-                // resume). Terminal-fail instead. Attended runs keep the
-                // existing Paused behaviour (user can approve/edit/resume).
-                let attended_mode = store
-                    .get_run(&run_id)
-                    .ok()
-                    .flatten()
-                    .map(|r| r.attended_mode)
-                    .unwrap_or_default();
-                if attended_mode == AttendedMode::Unattended {
-                    let _ = store.transition_run(&run_id, TaskRunStatus::Failed);
-                    return Err((task_id.clone(), format!("HITRISK_REJECT:{reason}")));
-                }
-                let _ = store.transition_run(&run_id, TaskRunStatus::Paused);
-                return Err((task_id.clone(), format!("SUSPEND:{reason}")));
-            }
-        }
-    }
 
     // Summary Chain: gather the summaries of this task's completed
     // dependencies, so the worker gets compact upstream context instead of
@@ -2055,29 +2000,6 @@ fn append_suggested_tasks_to_plan(
             }
         }
     }
-}
-
-/// Pull the (title, summary) pairs for a task's completed dependencies.
-/// Build a JSON args snapshot covering every task string that may flow into a
-/// tool call, for the pre-execution high-risk check (G10+G11).
-///
-/// The snapshot intentionally includes:
-/// - `verification`: the most important field — Verification-kind tasks run
-///   these under a shell permit, and they are injected into every worker prompt
-///   ("Run the listed verification when done"), so `rm -rf target` here is real.
-/// - `files`: feeds file-write tools (write_file/edit_file/move_file/...).
-/// - `title` / `description`: free-form text the LLM may quote into a command.
-///
-/// This is broader than the old `{"task": title, "files": files}` snapshot,
-/// which only caught patterns literally present in the title.
-fn build_hitrisk_args_snapshot(task: &PlanTask) -> String {
-    serde_json::to_string(&serde_json::json!({
-        "title": task.title,
-        "description": task.description,
-        "files": task.files,
-        "verification": task.verification,
-    }))
-    .unwrap_or_default()
 }
 
 /// Prefers the structured TaskExecutionSummary (persisted by put_summary at
@@ -2921,10 +2843,9 @@ fn save_trace(
 /// the agent loop would leave the plan empty and the run would fail
 /// immediately. This mirrors how `launch_unified_run` (chat path) works.
 ///
-/// The run is created with `attended_mode = Unattended` so the preflight
-/// checks (CP A/B) and approval-gate skip activate inside `plan_execute` /
-/// `execute_task`.
-#[allow(clippy::too_many_arguments)] // run identity + agent + cancel + route all thread through; matches run_dag style
+/// The run is created with `attended_mode = Unattended` so the configured
+/// write preflight applies inside `plan_execute` / `execute_task`.
+#[allow(clippy::too_many_arguments)] // run identity + agent + cancel + write policy all thread through; matches run_dag style
 pub async fn launch_unattended_run(
     store: Arc<TaskRuntimeStore>,
     primary_agent: crate::agent_handle::AgentHandle,
@@ -2933,7 +2854,6 @@ pub async fn launch_unattended_run(
     fire_id: &str,
     prompt: &str,
     parent_cancel: CancellationToken,
-    route: super::router::TaskRouteKind,
     write_mode: UnattendedWriteMode,
     repo_root: Option<std::path::PathBuf>,
 ) -> Result<String, ExecError> {
@@ -2948,7 +2868,7 @@ pub async fn launch_unattended_run(
         "", // root_message_id — no chat message for unattended run
         DomainProfile::General,
         prompt,
-        route.as_str(), // explicit route (parameterized; caller picks)
+        "parallel_readonly_delegation",
         AttendedMode::Unattended,
     )?;
 
@@ -2998,6 +2918,9 @@ pub async fn drive_unattended_run(
     repo_root: Option<std::path::PathBuf>,
 ) -> Result<String, ExecError> {
     let child_cancel = parent_cancel.child_token();
+    let _cancel_registration = store
+        .register_run_cancellation(run_id, child_cancel.clone())
+        .map_err(|error| ExecError::Other(format!("register run cancellation: {error}")))?;
     let conversation_id_for_scope = store
         .get_run(run_id)
         .ok()
@@ -3097,7 +3020,7 @@ pub async fn drive_unattended_run(
     // Drive the agent's ReAct loop in the run's context. The agent will call
     // plan_create (to build the plan) and plan_execute (which internally calls
     // execute_run). The Unattended attended_mode (set by the caller at
-    // create_run) ensures preflight checks and approval-gate skip activate.
+    // create_run) ensures unattended preflight checks activate.
     let run_id_for_scope = run_id.to_string();
     let cancel_for_scope = child_cancel.clone();
     let prompt_owned = prompt.to_string();
@@ -3259,19 +3182,10 @@ pub async fn drive_unattended_run(
             );
         }
         Some(TaskRunStatus::Paused) => {
-            // Should not happen in unattended mode (approval gate skipped,
-            // hitrisk terminal-fail). Transition to Failed so the run
-            // doesn't hang forever waiting for a human.
-            tracing::error!(
+            tracing::info!(
                 source_id = %source_id,
                 run_id = %run_id,
-                "Unattended run unexpectedly Paused — transitioning to Failed"
-            );
-            let _ = store.transition_run(run_id, TaskRunStatus::Failed);
-            let _ = store.note(
-                run_id,
-                None,
-                "Unattended run unexpectedly Paused; auto-transitioned to Failed.",
+                "Unattended run paused and remains resumable"
             );
         }
         _ => {
@@ -3315,7 +3229,6 @@ pub async fn launch_cron_run(
         fire_id,
         prompt,
         parent_cancel,
-        super::router::TaskRouteKind::ParallelReadonlyDelegation,
         UnattendedWriteMode::default(), // D7 stage 2: Worktree (safe default)
         super::worktree::git_repo_root(std::path::Path::new(".")).ok(), // best-effort repo_root
     )
@@ -3939,7 +3852,6 @@ Read the runtime path and found one missing branch.
             "fire-1",
             "hello",
             cancel,
-            crate::tasks::task_runtime::TaskRouteKind::ParallelReadonlyDelegation,
             UnattendedWriteMode::Disabled,
             None,
         )
@@ -4115,92 +4027,6 @@ Read the runtime path and found one missing branch.
         let todos = store.list_todos("r1").unwrap();
         assert_eq!(todos[0].status, TodoStatus::Completed);
         assert!(todos[0].summary.as_deref() == Some("done"));
-    }
-
-    // ── hitrisk args-snapshot coverage (see G10+G11, build_hitrisk_args_snapshot) ──
-    // The old snapshot only scanned {task, files}; the new one also scans
-    // verification (executed under a shell permit) so destructive commands
-    // hidden in the plan's verification list are caught before dispatch.
-
-    #[test]
-    fn hitrisk_snapshot_includes_verification_field() {
-        let task = PlanTask {
-            id: "t1".into(),
-            title: "Clean and test".into(),
-            description: "run the test suite".into(),
-            kind: PlanTaskKind::Verification,
-            agent_role: "verifier".into(),
-            files: vec!["src/lib.rs".into()],
-            verification: vec!["rm -rf target && cargo test".into()],
-            allowed_tools: vec!["shell".into()],
-            ..Default::default()
-        };
-        let snap = build_hitrisk_args_snapshot(&task);
-        // The snapshot must carry the verification string verbatim.
-        assert!(snap.contains("rm -rf target && cargo test"));
-    }
-
-    #[test]
-    fn hitrisk_catches_destructive_command_in_verification() {
-        let task = PlanTask {
-            id: "t1".into(),
-            title: "Clean build".into(),
-            description: "tidy up".into(),
-            kind: PlanTaskKind::Verification,
-            agent_role: "verifier".into(),
-            files: vec![],
-            // A dangerous command placed in the verification list (which the
-            // worker is told to run). The old {task, files} snapshot missed this.
-            verification: vec!["rm -rf /".into()],
-            allowed_tools: vec!["shell".into()],
-            ..Default::default()
-        };
-        let snap = build_hitrisk_args_snapshot(&task);
-        assert!(
-            super::super::hitrisk::check("shell", &snap).is_some(),
-            "destructive command in verification must be flagged"
-        );
-    }
-
-    #[test]
-    fn hitrisk_catches_system_path_in_files() {
-        let task = PlanTask {
-            id: "t1".into(),
-            title: "Patch config".into(),
-            description: "update system config".into(),
-            kind: PlanTaskKind::Implementation,
-            agent_role: "implementer".into(),
-            // A write targeting /etc — must be caught by PATH_PATTERNS.
-            files: vec!["/etc/passwd".into()],
-            verification: vec![],
-            allowed_tools: vec!["write_file".into()],
-            ..Default::default()
-        };
-        let snap = build_hitrisk_args_snapshot(&task);
-        assert!(
-            super::super::hitrisk::check("write_file", &snap).is_some(),
-            "system-path write in files must be flagged"
-        );
-    }
-
-    #[test]
-    fn hitrisk_benign_task_is_not_flagged() {
-        let task = PlanTask {
-            id: "t1".into(),
-            title: "Run unit tests".into(),
-            description: "execute the test suite".into(),
-            kind: PlanTaskKind::Verification,
-            agent_role: "verifier".into(),
-            files: vec!["src/lib.rs".into()],
-            verification: vec!["cargo test".into()],
-            allowed_tools: vec!["shell".into()],
-            ..Default::default()
-        };
-        let snap = build_hitrisk_args_snapshot(&task);
-        assert!(
-            super::super::hitrisk::check("shell", &snap).is_none(),
-            "benign cargo test must not be flagged"
-        );
     }
 
     // ── run_dag integration tests with a scripted (mock) worker ──
@@ -4453,6 +4279,34 @@ Read the runtime path and found one missing branch.
         assert!(matches!(outcome, RunOutcome::Cancelled));
         // The worker must NOT have been dispatched into.
         assert!(worker.order().is_empty(), "task ran despite cancellation");
+    }
+
+    #[tokio::test]
+    async fn run_dag_cancellation_preserves_explicit_pause() -> Result<(), String> {
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let task = solo_readonly_task("a");
+        let run_id = seed_run(&store, vec![task.clone()]);
+        store
+            .transition_run(&run_id, TaskRunStatus::Paused)
+            .map_err(|error| error.to_string())?;
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let outcome = run_dag(
+            store,
+            ScriptedDispatcher::new(),
+            None,
+            &run_id,
+            vec![task],
+            ConcurrencyLimits::default(),
+            cancel,
+            None,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+        assert!(matches!(outcome, RunOutcome::Paused { .. }));
+        Ok(())
     }
 
     #[tokio::test]

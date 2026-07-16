@@ -9,6 +9,7 @@
 export type RuntimeEventKind =
   | 'run_created'
   | 'run_status_changed'
+  | 'run_attachments_updated'
   | 'plan_generated'
   | 'plan_edited'
   | 'task_started'
@@ -24,9 +25,6 @@ export type RuntimeEventKind =
   | 'review_passed'
   | 'review_needs_fix'
   | 'review_blocked'
-  | 'approval_requested'
-  | 'approval_resolved'
-  | 'approval_rejected'
   | 'circuit_breaker_tripped'
   | 'run_cancelled'
   | 'note';

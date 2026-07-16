@@ -1,9 +1,8 @@
 //! TUI event loop — handles keyboard input, terminal resize, and agent streaming.
 
 use super::{
-    ChatMessage, MessageRole, QueuedTurn, SubagentRuntimeView, TaskProgressEntry,
-    TaskRuntimeTaskView, TaskRuntimeView, TaskStripStatus, ToolExecutionMessage,
-    ToolExecutionStatus, TuiApp,
+    ChatMessage, MessageRole, QueuedTurn, SubagentRuntimeView, TaskRuntimeTaskView,
+    TaskRuntimeView, ToolExecutionMessage, ToolExecutionStatus, TuiApp,
 };
 use crate::agent_handle::AgentHandle;
 use crate::tui::clipboard;
@@ -22,12 +21,10 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 
 use echo_agent::agent::subagent::SubagentEvent;
-use echo_agent::tasks::TaskEvent;
 use echo_agent_app_core::context_window::ContextWindowSnapshot;
-use echo_agent_app_core::tasks::BackgroundTaskService;
 
 /// Poll interval for non-blocking event check.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -492,13 +489,8 @@ pub async fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut TuiApp,
     agent: AgentHandle,
-    task_service: Option<Arc<BackgroundTaskService>>,
 ) -> anyhow::Result<()> {
     let (agent_tx, mut agent_rx) = mpsc::unbounded_channel();
-
-    // Subscribe to task events for the parallel task progress strip.
-    let mut task_event_rx: Option<broadcast::Receiver<Arc<TaskEvent>>> =
-        task_service.as_ref().map(|svc| svc.subscribe_events());
     let mut subagent_event_rx = agent
         .read(|a| a.subagent_registry().event_bus().subscribe())
         .await;
@@ -507,12 +499,6 @@ pub async fn run_event_loop(
         .unwrap_or_else(Instant::now);
 
     loop {
-        // ── Drain task events into parallel_tasks ──────────────────────
-        if let Some(ref mut rx) = task_event_rx {
-            while let Ok(event) = rx.try_recv() {
-                update_parallel_tasks(app, &event);
-            }
-        }
         while let Ok(event) = subagent_event_rx.try_recv() {
             update_subagent_runs(app, &event);
         }
@@ -3520,25 +3506,31 @@ async fn handle_slash_command(
                 });
                 return;
             };
+            let layer_manager = app
+                .review_integration
+                .as_ref()
+                .map(|integration| Arc::new(integration.create_layer_manager()));
             let result = match action {
-                SlashCommand::TaskCancel => {
-                    if store.cancel_run(&run_id) {
-                        Ok("cancelled")
-                    } else {
-                        Err("run is not active or has no cancellation handle".to_string())
-                    }
-                }
+                SlashCommand::TaskCancel => store
+                    .request_cancel(&run_id)
+                    .map_err(|error| error.to_string())
+                    .and_then(|cancelled| {
+                        cancelled
+                            .then_some("cancelled")
+                            .ok_or_else(|| "run is not cancellable".to_string())
+                    }),
                 SlashCommand::TaskPause => store
-                    .transition_run(
-                        &run_id,
-                        echo_agent_app_core::tasks::task_runtime::TaskRunStatus::Paused,
-                    )
-                    .map(|_| "paused")
-                    .map_err(|error| error.to_string()),
-                SlashCommand::TaskResume => store
-                    .resume_task_run(&run_id)
-                    .map(|_| "resumed")
-                    .map_err(|error| error.to_string()),
+                    .request_pause(&run_id)
+                    .map_err(|error| error.to_string())
+                    .and_then(|paused| {
+                        paused
+                            .then_some("paused")
+                            .ok_or_else(|| "run is not actively pausable".to_string())
+                    }),
+                SlashCommand::TaskResume => {
+                    resume_tui_task_run(store.clone(), agent.clone(), run_id.clone(), layer_manager)
+                        .await
+                }
                 _ => Err("unsupported task action".to_string()),
             };
             app.messages.push(ChatMessage {
@@ -3724,6 +3716,56 @@ async fn handle_slash_command(
     if !app.is_processing {
         app.status_msg = "Ready".to_string();
     }
+}
+
+async fn resume_tui_task_run(
+    store: Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
+    agent: AgentHandle,
+    run_id: String,
+    layer_manager: Option<Arc<echo_agent::evolution::MemoryLayerManager>>,
+) -> Result<&'static str, String> {
+    if store
+        .get_plan(&run_id)
+        .map_err(|error| error.to_string())?
+        .is_none()
+    {
+        return Err("run has no persisted plan to resume".to_string());
+    }
+    store
+        .resume_task_run(&run_id)
+        .map_err(|error| error.to_string())?;
+    let cancel = echo_agent::agent::CancellationToken::new();
+    let cancel_registration = match store.register_run_cancellation(&run_id, cancel.clone()) {
+        Ok(registration) => registration,
+        Err(error) => {
+            let _ = store.transition_run(
+                &run_id,
+                echo_agent_app_core::tasks::task_runtime::TaskRunStatus::Paused,
+            );
+            return Err(error.to_string());
+        }
+    };
+    let reviewer_llm = agent.read(|value| value.llm_client().cloned()).await;
+    let run_store = agent.read(|value| value.run_store().cloned()).await;
+    tokio::spawn(async move {
+        let _cancel_registration = cancel_registration;
+        let result = echo_agent_app_core::tasks::task_runtime::execute_run(
+            store,
+            Some(agent),
+            reviewer_llm,
+            layer_manager,
+            run_store,
+            None,
+            &run_id,
+            cancel,
+            echo_agent_app_core::tasks::task_runtime::MemoryPolicy::FireAndForget,
+        )
+        .await;
+        if let Err(error) = result {
+            tracing::error!(%run_id, %error, "TUI resumed run failed");
+        }
+    });
+    Ok("resumed")
 }
 
 fn resolve_tui_workspace_file(value: &str) -> anyhow::Result<std::path::PathBuf> {
@@ -4073,125 +4115,6 @@ fn find_subagent_run_mut<'a>(
 }
 
 // ── Parallel task progress strip ────────────────────────────────────────
-
-/// Format elapsed time from an Instant to a human-readable label like "2m 8s".
-fn format_elapsed(start: Instant) -> String {
-    let secs = start.elapsed().as_secs();
-    if secs < 60 {
-        format!("{}s", secs)
-    } else {
-        format!("{}m {:02}s", secs / 60, secs % 60)
-    }
-}
-
-/// Process a TaskEvent and update `app.parallel_tasks` accordingly.
-///
-/// - `Created` → add a new entry with Pending status
-/// - `Updated` → update status (InProgress/Completed/Failed/Cancelled)
-/// - `Progress` → update percentage, phase, message
-/// - `Completed` → mark as Completed
-/// - `Failed` → mark as Failed
-fn update_parallel_tasks(app: &mut TuiApp, event: &TaskEvent) {
-    match event {
-        TaskEvent::Created { task } => {
-            // Only show if not already present
-            if app.parallel_tasks.iter().any(|e| e.task_id == task.id) {
-                return;
-            }
-            let name = if task.subject.is_empty() {
-                task.description.clone()
-            } else {
-                task.subject.clone()
-            };
-            app.parallel_tasks.push(TaskProgressEntry {
-                task_id: task.id.clone(),
-                name: crate::tui::widgets::task_strip::truncate_str(&name, 30),
-                status: TaskStripStatus::Pending,
-                progress_pct: 0.0,
-                phase: String::new(),
-                message: None,
-                started_at: Instant::now(),
-                elapsed_label: "0s".to_string(),
-            });
-        }
-
-        TaskEvent::Updated {
-            task_id,
-            new_status,
-            ..
-        } => {
-            if let Some(entry) = app
-                .parallel_tasks
-                .iter_mut()
-                .find(|e| e.task_id == *task_id)
-            {
-                use echo_agent::tasks::TaskStatus;
-                entry.status = match new_status {
-                    TaskStatus::InProgress => TaskStripStatus::Running,
-                    TaskStatus::Completed => TaskStripStatus::Completed,
-                    TaskStatus::Cancelled => TaskStripStatus::Cancelled,
-                    TaskStatus::Failed(e) => TaskStripStatus::Failed(e.clone()),
-                    TaskStatus::TimedOut { error } => {
-                        TaskStripStatus::Failed(format!("Timeout: {error}"))
-                    }
-                    _ => entry.status.clone(),
-                };
-                entry.elapsed_label = format_elapsed(entry.started_at);
-            }
-        }
-
-        TaskEvent::Progress { task_id, progress } => {
-            if let Some(entry) = app
-                .parallel_tasks
-                .iter_mut()
-                .find(|e| e.task_id == *task_id)
-            {
-                entry.progress_pct = progress.percentage;
-                entry.phase = progress.current_phase.clone();
-                entry.message = progress.message.clone();
-                entry.elapsed_label = format_elapsed(entry.started_at);
-                // If we get progress, it's definitely running
-                if entry.status == TaskStripStatus::Pending {
-                    entry.status = TaskStripStatus::Running;
-                }
-            }
-        }
-
-        TaskEvent::Completed { task_id, .. } => {
-            if let Some(entry) = app
-                .parallel_tasks
-                .iter_mut()
-                .find(|e| e.task_id == *task_id)
-            {
-                entry.status = TaskStripStatus::Completed;
-                entry.progress_pct = 100.0;
-                entry.elapsed_label = format_elapsed(entry.started_at);
-            }
-        }
-
-        TaskEvent::Failed { task_id, error, .. } => {
-            if let Some(entry) = app
-                .parallel_tasks
-                .iter_mut()
-                .find(|e| e.task_id == *task_id)
-            {
-                entry.status = TaskStripStatus::Failed(error.clone());
-                entry.elapsed_label = format_elapsed(entry.started_at);
-            }
-        }
-
-        _ => {} // Deleted, Assigned — ignore
-    }
-
-    // Prune completed/failed entries older than 30 seconds to keep the strip clean.
-    app.parallel_tasks.retain(|e| match e.status {
-        TaskStripStatus::Completed | TaskStripStatus::Cancelled => {
-            e.started_at.elapsed().as_secs() < 30
-        }
-        TaskStripStatus::Failed(_) => e.started_at.elapsed().as_secs() < 60,
-        _ => true,
-    });
-}
 
 /// Parse a user-supplied interaction-mode argument (`auto` / `chat` / `task`,
 /// case-insensitive) for the `/mode` command. Returns `None` for unknown or

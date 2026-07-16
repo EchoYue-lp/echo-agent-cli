@@ -203,14 +203,6 @@ export function handleChatEvent(event: ChatEvent, ctx: EventContext): void {
           ? (status as (typeof VALID_STATUSES)[number])
           : 'idle';
         store.setRunStatus(validated);
-        // Also update taskRuntimeStore so the right rail reflects terminal
-        // status. Without 'completed'/'failed'/'cancelled' in the allowlist,
-        // updateRunStatus would never see a terminal state and polling
-        // would never stop.
-        const taskStore = useTaskRuntimeStore.getState();
-        if (taskStore.activeRun) {
-          taskStore.updateRunStatus(validated);
-        }
       }
       break;
     }

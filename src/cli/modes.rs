@@ -19,19 +19,38 @@ fn repl_config_for(args: &Args) -> crate::cli::ReplConfig {
         scheduler_runner: None,
         review_integration: None,
         prompt_assembly: None,
+        pool: None,
+        task_runtime_store: None,
+        conversation_id: String::new(),
     }
 }
 
 /// 运行 CLI 模式
+#[allow(clippy::too_many_arguments)] // startup adapter wires the shared agent, pool, stores, and UI services once
 pub async fn run_cli_mode(
     agent: AgentHandle,
     hitl_dispatcher: std::sync::Arc<crate::state::HitlDispatcher>,
     args: &Args,
     app_config: &AppConfig,
-    task_store: std::sync::Arc<dyn echo_agent::memory::Store>,
     review_integration: Option<std::sync::Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
     prompt_assembly: echo_agent_app_core::project::prompt::PromptAssembly,
+    pool: std::sync::Arc<echo_agent_app_core::agent_pool::AgentPool>,
+    task_runtime_store: Option<
+        std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
+    >,
+    conversation_id: String,
 ) -> Result<()> {
+    let scheduler_store: std::sync::Arc<dyn echo_agent::memory::Store> = {
+        let file_path =
+            echo_agent_app_core::persistence::Persistence::base_dir().join("scheduler_store");
+        match echo_agent::memory::FileStore::new(&file_path) {
+            Ok(store) => std::sync::Arc::new(store),
+            Err(error) => {
+                tracing::warn!(%error, "failed to create scheduler store; using in-memory");
+                std::sync::Arc::new(echo_agent::memory::InMemoryStore::new())
+            }
+        }
+    };
     // Start BackgroundTaskService for CLI mode
     let (task_service, scheduler_runner) = {
         use crate::state::AppState;
@@ -41,8 +60,10 @@ pub async fn run_cli_mode(
             None,
             app_config.clone(),
         );
-        state.start_task_service(task_store.clone()).await;
-        state.start_scheduler_with_store(Some(task_store));
+        state.connection.pool = Some(pool.clone());
+        state.tasks.runtime = task_runtime_store.clone();
+        state.start_task_service().await;
+        state.start_scheduler_with_store(Some(scheduler_store));
         (state.tasks.service.clone(), state.scheduler.runner.clone())
     };
 
@@ -51,6 +72,9 @@ pub async fn run_cli_mode(
     repl_config.scheduler_runner = scheduler_runner;
     repl_config.review_integration = review_integration;
     repl_config.prompt_assembly = Some(prompt_assembly);
+    repl_config.pool = Some(pool);
+    repl_config.task_runtime_store = task_runtime_store;
+    repl_config.conversation_id = conversation_id;
 
     crate::cli::run_repl(agent, repl_config).await
 }

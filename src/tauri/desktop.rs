@@ -147,7 +147,6 @@ async fn run_desktop() -> anyhow::Result<()> {
         // `register_task_tools_on_agent` once AppState is built.
         task_runtime_store: None,
         browser_runtime: None,
-        route: None,
     };
 
     let runtime =
@@ -164,12 +163,10 @@ async fn run_desktop() -> anyhow::Result<()> {
         );
     }
 
-    // ── Task store ──
-    // U1c: EKO is local — no SQLite. File-backed store for the background-task
-    // KV backend; in-memory fallback only if the file store can't be opened.
-    let task_store: Arc<dyn echo_agent::memory::Store> = {
+    // Cron definitions are independent of TaskRun lifecycle state.
+    let scheduler_store: Arc<dyn echo_agent::memory::Store> = {
         let file_path =
-            echo_agent_app_core::persistence::Persistence::base_dir().join("tasks_store");
+            echo_agent_app_core::persistence::Persistence::base_dir().join("scheduler_store");
         match echo_agent::memory::FileStore::new(&file_path) {
             Ok(store) => Arc::new(store),
             Err(_) => Arc::new(echo_agent::memory::InMemoryStore::new()),
@@ -222,15 +219,8 @@ async fn run_desktop() -> anyhow::Result<()> {
 
     state_inner.set_pool(pool);
 
-    // Wire task hook bridge so YAML hooks see task lifecycle events
-    let task_hooks = runtime
-        .task_hook_bridge
-        .clone()
-        .map(|b| b as Arc<dyn echo_agent::workspace::orchestration::tasks::TaskHooks>);
-    state_inner
-        .start_task_service_with_hooks(task_store.clone(), task_hooks)
-        .await;
-    state_inner.start_scheduler_with_store(Some(task_store));
+    state_inner.start_task_service().await;
+    state_inner.start_scheduler_with_store(Some(scheduler_store));
     let state = Arc::new(state_inner);
 
     infra::spawn_mcp_health_check(state.clone(), cancel_token.clone());

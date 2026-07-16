@@ -151,13 +151,37 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
         working_dir: None,
         task_runtime_store: None,
         browser_runtime: None,
-        route: None,
     };
     // ── Bootstrap Agent Runtime (shared TUI/GUI initialization) ──
     let runtime =
         echo_agent_app_core::runtime::AgentRuntime::bootstrap(&app_config, params).await?;
     let agent_handle = runtime.agent_handle.clone();
     echo_agent_app_core::infra::inject_conversation_store(&agent_handle, &conversation_store);
+
+    // Every headless surface is a full Agent surface. Build one TaskRuntime
+    // store, register the same task tools on the primary agent, and inject the
+    // store into the shared pool before any pooled agent is created.
+    let task_runtime_store = build_task_runtime_store_for_headless();
+    if let Some(store) = task_runtime_store.clone() {
+        echo_agent_app_core::tasks::task_runtime::register_task_tools_on_agent(
+            &agent_handle,
+            store,
+        )
+        .await;
+    }
+    let pool = {
+        let mut pool = echo_agent_app_core::agent_pool::AgentPool::from_runtime(
+            &runtime,
+            echo_agent_app_core::agent_pool::PoolConfig::default(),
+        )
+        .await;
+        if let Some(store) = task_runtime_store.clone() {
+            pool.set_task_runtime_store(store);
+        }
+        let pool = std::sync::Arc::new(pool);
+        pool.spawn_cleanup_monitor().await;
+        pool
+    };
 
     if requested_conversation_id.is_some() {
         let store = conversation_store
@@ -197,79 +221,13 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
         );
     }
 
-    // ── Background task store (all modes) ──
-    // U1c: EKO is a local CoWork platform — no SQLite. Use the file-backed
-    // Store (persists across restarts) for the background-task KV backend;
-    // fall back to in-memory only if the file store cannot be opened.
-    let task_store: std::sync::Arc<dyn echo_agent::memory::Store> = {
-        let file_path =
-            echo_agent_app_core::persistence::Persistence::base_dir().join("tasks_store");
-        match echo_agent::memory::FileStore::new(&file_path) {
-            Ok(store) => std::sync::Arc::new(store),
-            Err(e) => {
-                tracing::warn!("Failed to create FileStore for tasks: {e}; using in-memory");
-                std::sync::Arc::new(echo_agent::memory::InMemoryStore::new())
-            }
-        }
-    };
-
     // ── User-facing TUI mode (default) ─────────────────────────────────
     #[cfg(feature = "tui")]
     if is_tui_entry {
-        // Initialize AgentPool for background task isolation.
-        // Background tasks get a dedicated agent from the pool so they
-        // don't block the user's TUI conversation (separate execution_mutex).
-        let pool = runtime
-            .init_pool(echo_agent_app_core::agent_pool::PoolConfig::default())
-            .await;
         tracing::info!(
             pool_size = pool.pool_size().await,
             "AgentPool initialized for TUI (background task isolation)"
         );
-
-        // TUI/GUI functional parity (AGENTS.md): TUI is a full Agent, not a
-        // lightweight chat — it gets the same TaskRuntimeStore as GUI so it can
-        // drive complex tasks (plan / worker / run lifecycle) via `drive_chat`.
-        let task_runtime_store = build_task_runtime_store_for_headless();
-
-        // TUI/GUI functional parity (AGENTS.md): register the task-management
-        // tools (create_complex_task / plan_execute / plan_create… / cancel_run)
-        // on the primary agent so TUI can drive complex tasks just like GUI
-        // (desktop.rs). plan_execute absorbs the single-step dispatch semantics
-        // via its inline `task` parameter (delegate_readonly tool removed).
-        if let Some(store) = task_runtime_store.clone() {
-            echo_agent_app_core::tasks::task_runtime::register_task_tools_on_agent(
-                &agent_handle,
-                store,
-            )
-            .await;
-        }
-
-        // Start BackgroundTaskService with the pool so independent
-        // background tasks can use distinct worker agents.
-        let tui_task_service = {
-            let cancel = echo_agent::agent::CancellationToken::new();
-            match echo_agent_app_core::tasks::BackgroundTaskService::with_pool(
-                pool.clone(),
-                task_store.clone(),
-                cancel,
-                None,
-                task_runtime_store.clone(),
-            )
-            .await
-            {
-                Ok(svc) => {
-                    let svc = std::sync::Arc::new(svc);
-                    svc.clone().spawn();
-                    tracing::info!("BackgroundTaskService started for TUI mode");
-                    Some(svc)
-                }
-                Err(e) => {
-                    tracing::warn!("BackgroundTaskService unavailable in TUI: {e}");
-                    None
-                }
-            }
-        };
 
         // Swap REPL provider → TUI provider (REPL blocks on stdin, incompatible
         // with the TUI alternate screen).
@@ -285,12 +243,11 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
 
         echo_agent_cli::tui::run_tui(
             agent_handle.clone(),
-            tui_task_service,
             &app_config.tui,
             "💬 通用",
             tui_pending,
-            pool,
-            task_runtime_store,
+            pool.clone(),
+            task_runtime_store.clone(),
             runtime.review_integration.clone(),
             conversation_store.clone(),
             conversation_id.clone(),
@@ -358,19 +315,15 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
     if run_channels {
         #[cfg(feature = "channels")]
         {
-            // Channel agent 经 AgentPool 全套接通(bootstrap 等价),per-sender 隔离。
-            let pool = runtime
-                .init_pool(echo_agent_app_core::agent_pool::PoolConfig::default())
-                .await;
             tracing::info!(
                 pool_size = pool.pool_size().await,
                 "AgentPool initialized for channels (IM per-sender agents)"
             );
 
             let channels_handle = tokio::spawn(cli::run_channels_mode(
-                pool,
+                pool.clone(),
                 app_config.clone(),
-                build_task_runtime_store_for_headless(),
+                task_runtime_store.clone(),
             ));
 
             if run_cli {
@@ -379,9 +332,11 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                     runtime.hitl_dispatcher.clone(),
                     &args,
                     &app_config,
-                    task_store.clone(),
                     runtime.review_integration.clone(),
                     runtime.prompt_assembly.clone(),
+                    pool.clone(),
+                    task_runtime_store.clone(),
+                    conversation_id.clone(),
                 )
                 .await?;
             } else {
@@ -405,9 +360,11 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             runtime.hitl_dispatcher.clone(),
             &args,
             &app_config,
-            task_store.clone(),
             runtime.review_integration.clone(),
             runtime.prompt_assembly.clone(),
+            pool,
+            task_runtime_store,
+            conversation_id,
         )
         .await?;
     } else {
@@ -467,7 +424,6 @@ mod tests {
             working_dir: None,
             task_runtime_store: None,
             browser_runtime: None,
-            route: None,
         };
         let app_config = config::AppConfig::default();
         let runtime = match tokio::runtime::Runtime::new() {

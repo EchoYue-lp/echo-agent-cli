@@ -383,18 +383,12 @@ pub struct TaskState {
     pub cancel_token: CancellationToken,
     /// TaskRuntime canonical file-backed store for complex-task runs, plans,
     /// todos, events, artifacts, reviews, and execution summaries.
-    /// Backs the `task://event` query commands. `None` only if both the
+    /// Backs TaskRuntime query commands. `None` only if both the
     /// on-disk open and the in-memory fallback failed (extreme OOM).
     pub runtime: Option<Arc<crate::tasks::task_runtime::TaskRuntimeStore>>,
-    /// Run-scoped cancellation tokens for executing TaskRuntime runs, keyed
-    /// `__run__:{run_id}`. Distinct from `cancel_token` (a single token for
-    /// the legacy background-task service) and from
-    /// `SessionState.cancel_token` (per-message chat tokens). cancel_task_run
-    /// looks up a run here and triggers it; execute_task_run inserts one
-    /// when it spawns the executor.
-    pub run_cancel_tokens: DashMap<String, CancellationToken>,
-    /// Manual interaction mode override (Chat/Task/Auto). `Auto` defers to
-    /// the router; `Chat` forces normal chat; `Task` forces TaskRuntime.
+    /// Manual interaction mode override (Chat/Task/Auto). `Auto` lets the
+    /// agent choose a path; `Chat` disables formal task tools for the turn;
+    /// `Task` requires a formal run and plan lifecycle.
     /// Toggleable at runtime via Tauri command.
     pub interaction_mode: std::sync::atomic::AtomicU8,
 }
@@ -532,29 +526,27 @@ impl AppState {
             tasks: TaskState {
                 service: None,
                 cancel_token: CancellationToken::new(),
-                runtime: Some({
-                    let store = crate::tasks::task_runtime::TaskRuntimeStore::new()
-                        .unwrap_or_else(|e| {
-                            tracing::warn!(
-                                "Failed to open task_runtime.db: {e}; falling back to in-memory store"
-                            );
-                            crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
-                                .expect("in-memory task_runtime store should always init — OOM?")
-                        });
-                    // P1-8: proactively recover runs interrupted by a previous
-                    // process crash, so zombie runs don't linger in an active
-                    // state until (if ever) they're next executed.
-                    let recovered = store.recover_incomplete();
-                    if recovered > 0 {
-                        tracing::info!(
-                            count = recovered,
-                            "Recovered interrupted task-runtime runs at boot"
+                runtime: {
+                    let store = crate::tasks::task_runtime::TaskRuntimeStore::new().or_else(|e| {
+                        tracing::warn!(
+                            "Failed to open file-backed TaskRuntime store: {e}; falling back to in-memory"
                         );
-                    }
-                    Arc::new(store)
-                }),
+                        crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory()
+                    });
+                    store.ok().map(|store| {
+                        // P1-8: proactively recover runs interrupted by a previous
+                        // process crash into resumable Paused runs.
+                        let recovered = store.recover_incomplete();
+                        if recovered > 0 {
+                            tracing::info!(
+                                count = recovered,
+                                "Recovered interrupted task-runtime runs at boot"
+                            );
+                        }
+                        Arc::new(store)
+                    })
+                },
                 interaction_mode: std::sync::atomic::AtomicU8::new(0), // 0 = Auto
-                run_cancel_tokens: DashMap::new(),
             },
             webhook: WebhookState {
                 emitter: crate::webhook::WebhookEmitter::with_endpoints(webhook_endpoints),
@@ -631,7 +623,6 @@ impl AppState {
             store,
             self.scheduler.cancel_token.clone(),
             self.connection.agent.clone(),
-            self.tasks.service.clone(),
             self.tasks.runtime.clone(),
             self.connection.pool.clone(),
         );
@@ -648,17 +639,7 @@ impl AppState {
     /// with foreground conversations.
     ///
     /// Call this **before** wrapping in `Arc`.
-    pub async fn start_task_service(&mut self, store_backend: Arc<dyn echo_agent::memory::Store>) {
-        self.start_task_service_with_hooks(store_backend, None)
-            .await;
-    }
-
-    /// Start task service with optional hook bridge for YAML hook integration.
-    pub async fn start_task_service_with_hooks(
-        &mut self,
-        store_backend: Arc<dyn echo_agent::memory::Store>,
-        task_hooks: Option<Arc<dyn echo_agent::workspace::orchestration::tasks::TaskHooks>>,
-    ) {
+    pub async fn start_task_service(&mut self) {
         if self.tasks.service.is_some() {
             return;
         }
@@ -666,18 +647,14 @@ impl AppState {
         let service_result = if let Some(ref pool) = self.connection.pool {
             crate::tasks::BackgroundTaskService::with_pool(
                 pool.clone(),
-                store_backend,
                 self.tasks.cancel_token.clone(),
-                task_hooks,
                 self.tasks.runtime.clone(),
             )
             .await
         } else {
-            crate::tasks::BackgroundTaskService::with_hooks(
+            crate::tasks::BackgroundTaskService::new(
                 self.connection.agent.clone(),
-                store_backend,
                 self.tasks.cancel_token.clone(),
-                task_hooks,
                 self.tasks.runtime.clone(),
             )
             .await
