@@ -339,4 +339,47 @@ M2 在 `echo-agent-cli` 应用层完成，不新增 TaskRun 状态，不给 CLI 
 - boot recovery 保留 completed todo，并把 orphaned Running todo 重置为 Pending。
 - pause 通过真实 driver token 停止执行，resume 重读持久 plan；用户暂停不会在重启时自动续跑。
 
-下一阶段是 M3：扩展 crash/pause/cancel conformance 到模型流、工具副作用、Subagent、HITL 和 call_id exactly-once 场景。
+## 12. M3 完成归档
+
+M3 在 M2 的单一 TaskRuntime 生命周期上补齐中断一致性，没有新增运行状态。架构取舍参考 Claude Code 的 tool/subagent/session hooks、Codex 的 JSONL item terminal、Temporal Activity 的幂等重试约束和 LangGraph checkpoint persistence：持久化开始/终止事实，完成结果直接复用；不能证明副作用状态时禁止自动重放。
+
+### 12.1 框架通用合同(`echo-agent`)
+
+- streaming snapshot 的 permission check 使用工具真实 permissions，并与 invocation cancellation token 竞争；取消时 approval future 立即结束。
+- `SubagentResult.cancelled` 成为显式 terminal fact，应用调用方不再把“Cancelled...”输出当成功。
+- `DispatchToolStarted/Completed` 保留模型生成的稳定 `call_id`，供所有消费者关联同一次工具调用。
+
+这些能力属于通用框架：任何复用 echo-agent 的应用都需要正确区分 Subagent success/cancel，并在取消 invocation 时停止权限等待。
+
+### 12.2 EKO 应用恢复台账(`echo-agent-cli`)
+
+- TaskRuntime 新增 worker/tool start、completed、failed durable events，以及 RecoveryBlocked/RecoveryResolved 事实。
+- worker identity 使用稳定 `{task_id}:{attempt}`；tool identity 保留 `call_id`，事件 payload 只记录 bounded preview。
+- restart 后已有 completed worker terminal 时直接复用 summary 并进入 review；不会重复 dispatch 已完成 worker。
+- unsafe worker/tool 只有 start 没有 terminal 时，Todo 变为 Blocked，run 保持 Paused；resume 和 background auto-resume 都被拒绝。
+- retry/skip 是用户对真实工作区检查后的显式决定，不是新状态机。Retry 回 Pending；Skip 进入 Skipped；两者都写 RecoveryResolved。
+
+### 12.3 三端与 HITL
+
+- GUI task panel 提供 pause/cancel/resume 和 recovery retry/skip，并直接显示应用层 blocker reason。
+- TUI 新增 `/task-recovery`、`/task-retry`、`/task-skip`；CLI `/tasks` 新增 pause/resume/recovery/retry/skip。
+- Tauri task pause/cancel 清理同一 root message 的 pending HITL；TUI approval request future 被取消时按 request_id 清理，避免陈旧卡片残留。
+
+### 12.4 合同测试
+
+- permission wait 在 invocation cancel 后及时返回 cancelled。
+- Subagent cancel result 不被标记成功。
+- completed worker summary 在 restart/resume 后复用，dispatcher 调用次数保持 0。
+- mutating in-doubt worker 阻塞 resume，直到 retry/skip；只读 orphan 仍可安全重放。
+- TUI approval request abort 后 pending approval 被清理。
+- 前端 pause/recovery action 走共享 TaskRuntime API，并展示 resume blocker error。
+
+### 12.5 验证结果
+
+- `echo-agent ./scripts/verify-all-crates.sh`：8 个 crate 测试、clippy 和 feature 矩阵全绿。
+- `echo-agent-cli cargo test --workspace`：app-core 483、runtime e2e 5、CLI lib 42、CLI main 9，零失败。
+- GUI tests 43，零失败；GUI target、`channels`、`tui+telemetry`、`gui+devtools` 编译通过。
+- workspace all-targets/all-features clippy 在 `-D warnings` 下通过。
+- 前端 TypeScript、49 个 Vitest、production build 和 Prettier check 通过。
+
+下一阶段是 M4：在同一 durable boundary 上统一 shell/file/search/Browser/MCP 的错误分类、有限重试、幂等/postcondition 和 partial-side-effect 诊断。

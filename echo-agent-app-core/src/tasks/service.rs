@@ -13,8 +13,9 @@ use echo_agent::tasks::progress::TaskProgress;
 
 use super::background::BackgroundTaskKind;
 use super::task_runtime::{
-    AttendedMode, DomainProfile, ExecutePlanTool, ExecutionMode, MemoryPolicy, PlanTask, TaskPlan,
-    TaskRun, TaskRunStatus, TaskRuntimeStore, TodoStatus, UnattendedWriteMode,
+    AttendedMode, DomainProfile, ExecutePlanTool, ExecutionMode, MemoryPolicy, PlanTask,
+    RecoveryBlocker, RecoveryDecision, TaskPlan, TaskRun, TaskRunStatus, TaskRuntimeStore,
+    TodoStatus, UnattendedWriteMode,
 };
 use crate::agent_handle::AgentHandle;
 
@@ -436,7 +437,54 @@ impl BackgroundTaskService {
     }
 
     pub async fn cancel(&self, id: &str) -> bool {
-        self.task_runtime_store.request_cancel(id).unwrap_or(false)
+        self.task_runtime_store
+            .request_cancel(id)
+            .is_ok_and(|cancelled| cancelled)
+    }
+
+    pub fn pause(&self, id: &str) -> anyhow::Result<bool> {
+        self.task_runtime_store
+            .request_pause(id)
+            .map_err(Into::into)
+    }
+
+    pub fn resume(&self, id: &str) -> anyhow::Result<()> {
+        let run = self
+            .task_runtime_store
+            .get_run(id)?
+            .ok_or_else(|| anyhow::anyhow!("task run not found: {id}"))?;
+        if !run.conversation_id.starts_with("background:") {
+            return Err(anyhow::anyhow!(
+                "task run is not owned by the background service: {id}"
+            ));
+        }
+        let metadata = trigger_metadata(&self.task_runtime_store, id);
+        let prompt = metadata.prompt.unwrap_or(run.goal);
+        self.task_runtime_store.resume_task_run(id)?;
+        if let Err(error) = self.start_run_driver(id.to_string(), prompt, metadata.dependencies) {
+            let _ = self
+                .task_runtime_store
+                .transition_run(id, TaskRunStatus::Paused);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn recovery_blockers(&self, id: &str) -> anyhow::Result<Vec<RecoveryBlocker>> {
+        self.task_runtime_store
+            .list_recovery_blockers(id)
+            .map_err(Into::into)
+    }
+
+    pub fn resolve_recovery_task(
+        &self,
+        id: &str,
+        task_id: &str,
+        decision: RecoveryDecision,
+    ) -> anyhow::Result<()> {
+        self.task_runtime_store
+            .resolve_recovery_task(id, task_id, decision)
+            .map_err(Into::into)
     }
 
     pub fn list_unified(&self, status_filter: Option<&str>) -> Vec<UnifiedTaskInfo> {
@@ -472,8 +520,22 @@ impl BackgroundTaskService {
                     || was_recovered_at_boot(&self.task_runtime_store, &run.run_id)
             })
         {
+            let blockers = self
+                .task_runtime_store
+                .list_recovery_blockers(&run.run_id)?;
+            if !blockers.is_empty() {
+                tracing::warn!(
+                    run_id = %run.run_id,
+                    blocker_count = blockers.len(),
+                    "background run requires recovery decision before resume"
+                );
+                continue;
+            }
             let metadata = trigger_metadata(&self.task_runtime_store, &run.run_id);
             let prompt = metadata.prompt.unwrap_or(run.goal);
+            if run.status == TaskRunStatus::Paused {
+                self.task_runtime_store.resume_task_run(&run.run_id)?;
+            }
             self.start_run_driver(run.run_id, prompt, metadata.dependencies)?;
             resumed = resumed.saturating_add(1);
         }

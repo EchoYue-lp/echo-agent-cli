@@ -3484,7 +3484,9 @@ async fn handle_slash_command(
         Some(SlashCommand::TaskCancel)
         | Some(SlashCommand::TaskPause)
         | Some(SlashCommand::TaskResume) => {
-            let action = slash_cmd.unwrap_or(SlashCommand::Tasks);
+            let Some(action) = slash_cmd else {
+                return;
+            };
             let Some(store) = app.task_runtime_store.as_ref() else {
                 app.messages.push(ChatMessage {
                     role: MessageRole::System,
@@ -3538,6 +3540,98 @@ async fn handle_slash_command(
                 content: match result {
                     Ok(label) => format!("Task run {run_id} {label}."),
                     Err(error) => format!("Task run action failed: {error}"),
+                },
+            });
+            refresh_task_runtime_view(app);
+        }
+        Some(SlashCommand::TaskRecovery) => {
+            let Some(store) = app.task_runtime_store.as_ref() else {
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: "Task runtime is unavailable.".to_string(),
+                });
+                return;
+            };
+            let run_id = if args.trim().is_empty() {
+                app.task_runtime_view
+                    .as_ref()
+                    .map(|view| view.run_id.clone())
+            } else {
+                Some(args.trim().to_string())
+            };
+            let Some(run_id) = run_id else {
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: "No active task run. Supply a run id explicitly.".to_string(),
+                });
+                return;
+            };
+            let content = match store.list_recovery_blockers(&run_id) {
+                Ok(blockers) if blockers.is_empty() => {
+                    format!("Task run {run_id} has no recovery blockers.")
+                }
+                Ok(blockers) => {
+                    let details = blockers
+                        .iter()
+                        .map(|blocker| format!("{}: {}", blocker.task_id, blocker.reason))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    format!(
+                        "Recovery blockers for {run_id}:\n{details}\nUse /task-retry <task-id> or /task-skip <task-id>."
+                    )
+                }
+                Err(error) => format!("Failed to read recovery blockers: {error}"),
+            };
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content,
+            });
+        }
+        Some(SlashCommand::TaskRetry) | Some(SlashCommand::TaskSkip) => {
+            let Some(action) = slash_cmd else {
+                return;
+            };
+            let Some(store) = app.task_runtime_store.as_ref() else {
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: "Task runtime is unavailable.".to_string(),
+                });
+                return;
+            };
+            let mut parts = args.split_whitespace();
+            let Some(task_id) = parts.next() else {
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: format!("Usage: {} <task-id> [run-id]", action.slash_name()),
+                });
+                return;
+            };
+            let run_id = parts.next().map(str::to_string).or_else(|| {
+                app.task_runtime_view
+                    .as_ref()
+                    .map(|view| view.run_id.clone())
+            });
+            let Some(run_id) = run_id else {
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: "No active task run. Supply a run id explicitly.".to_string(),
+                });
+                return;
+            };
+            let decision = if action == SlashCommand::TaskRetry {
+                echo_agent_app_core::tasks::task_runtime::RecoveryDecision::Retry
+            } else {
+                echo_agent_app_core::tasks::task_runtime::RecoveryDecision::Skip
+            };
+            let result = store.resolve_recovery_task(&run_id, task_id, decision);
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content: match result {
+                    Ok(()) => format!(
+                        "Recovery decision recorded for {run_id}/{task_id}: {}.",
+                        decision.as_str()
+                    ),
+                    Err(error) => format!("Failed to resolve recovery task: {error}"),
                 },
             });
             refresh_task_runtime_view(app);
@@ -4307,6 +4401,7 @@ mod tests {
             &SubagentEvent::DispatchToolStarted {
                 parent: "main".to_string(),
                 agent: "explorer".to_string(),
+                call_id: "call-1".to_string(),
                 name: "read_file".to_string(),
                 args: serde_json::json!({}),
                 execution_id: Some("task-1:1".to_string()),

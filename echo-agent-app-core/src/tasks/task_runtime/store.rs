@@ -39,6 +39,8 @@ pub enum StoreError {
     InvalidPlan(String),
     #[error("file shadow: {0}")]
     Shadow(#[from] super::file_shadow::ShadowError),
+    #[error("run {run_id} has unresolved recovery barriers: {details}")]
+    RecoveryBlocked { run_id: String, details: String },
 }
 
 /// File-backed TaskRuntime store. One instance per process; cheap to clone
@@ -81,6 +83,22 @@ pub struct RunCancellationRegistration {
     run_id: String,
     token: echo_agent::agent::CancellationToken,
     previous: Option<echo_agent::agent::CancellationToken>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveWorkerBoundary {
+    task_id: String,
+    execution_id: String,
+    replay_safe: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveToolBoundary {
+    task_id: String,
+    execution_id: Option<String>,
+    call_id: String,
+    tool_name: String,
+    replay_safe: bool,
 }
 
 impl Drop for RunCancellationRegistration {
@@ -310,6 +328,18 @@ impl TaskRuntimeStore {
     /// The caller (IPC layer) is responsible for re-launching the executor
     /// after this succeeds — the store only handles the state transition.
     pub fn resume_task_run(&self, run_id: &str) -> Result<TaskRun, StoreError> {
+        let blockers = self.list_recovery_blockers(run_id)?;
+        if !blockers.is_empty() {
+            let details = blockers
+                .iter()
+                .map(|blocker| format!("{}: {}", blocker.task_id, blocker.reason))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(StoreError::RecoveryBlocked {
+                run_id: run_id.to_string(),
+                details,
+            });
+        }
         self.transition_run(run_id, TaskRunStatus::Running)
     }
 
@@ -961,6 +991,98 @@ impl TaskRuntimeStore {
             .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")))
     }
 
+    fn active_worker_boundaries(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<ActiveWorkerBoundary>, StoreError> {
+        let mut active = std::collections::HashMap::<String, ActiveWorkerBoundary>::new();
+        for event in self.list_events(run_id, 0)? {
+            let Some(execution_id) = event.step_id.clone() else {
+                continue;
+            };
+            match event.event_type {
+                RuntimeEventKind::WorkerAssigned => {
+                    let Some(task_id) = event.task_id.clone() else {
+                        continue;
+                    };
+                    active.insert(
+                        execution_id.clone(),
+                        ActiveWorkerBoundary {
+                            task_id,
+                            execution_id,
+                            replay_safe: json_bool(&event.payload, "replay_safe", false),
+                        },
+                    );
+                }
+                RuntimeEventKind::WorkerReleased => {
+                    active.remove(&execution_id);
+                }
+                _ => {}
+            }
+        }
+        Ok(active.into_values().collect())
+    }
+
+    fn active_tool_boundaries(&self, run_id: &str) -> Result<Vec<ActiveToolBoundary>, StoreError> {
+        let mut active = std::collections::HashMap::<(String, String), ActiveToolBoundary>::new();
+        for event in self.list_events(run_id, 0)? {
+            let Some(task_id) = event.task_id.clone() else {
+                continue;
+            };
+            let call_id = json_string(&event.payload, "call_id")
+                .or_else(|| event.step_id.clone())
+                .unwrap_or_default();
+            if call_id.is_empty() {
+                continue;
+            }
+            let key = (task_id.clone(), call_id.clone());
+            match event.event_type {
+                RuntimeEventKind::ToolStarted => {
+                    active.insert(
+                        key,
+                        ActiveToolBoundary {
+                            task_id,
+                            execution_id: json_string(&event.payload, "execution_id"),
+                            call_id,
+                            tool_name: json_string(&event.payload, "tool_name")
+                                .unwrap_or_else(|| "unknown".to_string()),
+                            replay_safe: json_bool(&event.payload, "replay_safe", false),
+                        },
+                    );
+                }
+                RuntimeEventKind::ToolCompleted | RuntimeEventKind::ToolFailed => {
+                    active.remove(&key);
+                }
+                _ => {}
+            }
+        }
+        Ok(active.into_values().collect())
+    }
+
+    fn record_recovery_blocker(
+        &self,
+        run_id: &str,
+        task_id: &str,
+        execution_id: Option<&str>,
+        call_id: Option<&str>,
+        tool_name: Option<&str>,
+        reason: &str,
+    ) -> Result<(), StoreError> {
+        self.shadow.append_event_line(
+            run_id,
+            Some(task_id),
+            execution_id,
+            RuntimeEventKind::RecoveryBlocked,
+            serde_json::json!({
+                "execution_id": execution_id,
+                "call_id": call_id,
+                "tool_name": tool_name,
+                "reason": reason,
+            }),
+        )?;
+        Ok(())
+    }
+
     /// Boot-time recovery of runs interrupted by a process restart (P1-8).
     ///
     /// Boot-time recovery of runs interrupted by a process restart.
@@ -996,17 +1118,61 @@ impl TaskRuntimeStore {
             }
             match self.transition_run(&run.run_id, TaskRunStatus::Paused) {
                 Ok(_) => {
+                    let plan = self.get_plan(&run.run_id).ok().flatten();
+                    let active_workers = self
+                        .active_worker_boundaries(&run.run_id)
+                        .unwrap_or_default();
+                    let active_tools = self.active_tool_boundaries(&run.run_id).unwrap_or_default();
                     if let Ok(todos) = self.list_todos(&run.run_id) {
                         for todo in todos
                             .into_iter()
                             .filter(|todo| todo.status == TodoStatus::Running)
                         {
+                            let task = plan.as_ref().and_then(|plan| {
+                                plan.tasks.iter().find(|task| task.id == todo.task_id)
+                            });
+                            let execution_id = task.map(|task| {
+                                format!("{}:{}", task.id, task.retry_count.saturating_add(1))
+                            });
+                            let completed_worker = execution_id.as_deref().and_then(|id| {
+                                self.recoverable_worker_result(&run.run_id, &todo.task_id, id)
+                                    .ok()
+                                    .flatten()
+                            });
+
+                            let active_tool = active_tools
+                                .iter()
+                                .find(|boundary| {
+                                    boundary.task_id == todo.task_id && !boundary.replay_safe
+                                })
+                                .cloned();
+                            let active_worker = active_workers
+                                .iter()
+                                .find(|boundary| {
+                                    boundary.task_id == todo.task_id && !boundary.replay_safe
+                                })
+                                .cloned();
+
+                            let (next_status, summary) = if completed_worker.is_some() {
+                                (
+                                    TodoStatus::Pending,
+                                    "worker completed before interruption; pending review",
+                                )
+                            } else if active_tool.is_some() || active_worker.is_some() {
+                                (
+                                    TodoStatus::Blocked,
+                                    "mutating side effect is indeterminate after restart",
+                                )
+                            } else {
+                                (TodoStatus::Pending, "interrupted; pending resume")
+                            };
+
                             if let Err(error) = self.set_task_status(
                                 &run.run_id,
                                 &todo.task_id,
-                                TodoStatus::Pending,
+                                next_status,
                                 None,
-                                Some("interrupted; pending resume"),
+                                Some(summary),
                             ) {
                                 tracing::warn!(
                                     run_id = %run.run_id,
@@ -1014,6 +1180,37 @@ impl TaskRuntimeStore {
                                     %error,
                                     "recover_incomplete: failed to reset running task"
                                 );
+                                continue;
+                            }
+
+                            if next_status == TodoStatus::Blocked {
+                                let (boundary_execution_id, call_id, tool_name) =
+                                    if let Some(tool) = active_tool {
+                                        (
+                                            tool.execution_id,
+                                            Some(tool.call_id),
+                                            Some(tool.tool_name),
+                                        )
+                                    } else if let Some(worker) = active_worker {
+                                        (Some(worker.execution_id), None, None)
+                                    } else {
+                                        (execution_id, None, None)
+                                    };
+                                if let Err(error) = self.record_recovery_blocker(
+                                    &run.run_id,
+                                    &todo.task_id,
+                                    boundary_execution_id.as_deref(),
+                                    call_id.as_deref(),
+                                    tool_name.as_deref(),
+                                    summary,
+                                ) {
+                                    tracing::warn!(
+                                        run_id = %run.run_id,
+                                        task_id = %todo.task_id,
+                                        %error,
+                                        "recover_incomplete: failed to persist recovery blocker"
+                                    );
+                                }
                             }
                         }
                     }
@@ -1162,6 +1359,245 @@ impl TaskRuntimeStore {
         Ok(())
     }
 
+    /// Persist the boundary immediately before a task worker starts model/tool
+    /// execution. A matching [`record_worker_released`](Self::record_worker_released)
+    /// makes the worker result recoverable without dispatching it again.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_worker_assigned(
+        &self,
+        run_id: &str,
+        task_id: &str,
+        execution_id: &str,
+        agent_name: &str,
+        attempt: u32,
+        replay_safe: bool,
+    ) -> Result<(), StoreError> {
+        self.shadow.append_event_line(
+            run_id,
+            Some(task_id),
+            Some(execution_id),
+            RuntimeEventKind::WorkerAssigned,
+            serde_json::json!({
+                "execution_id": execution_id,
+                "agent_name": agent_name,
+                "attempt": attempt,
+                "replay_safe": replay_safe,
+            }),
+        )?;
+        Ok(())
+    }
+
+    /// Persist a worker terminal fact. `summary` is bounded because the full
+    /// structured result already lives in the task summary projection.
+    pub fn record_worker_released(
+        &self,
+        run_id: &str,
+        task_id: &str,
+        execution_id: &str,
+        status: &str,
+        summary: Option<&str>,
+    ) -> Result<(), StoreError> {
+        let summary = summary.map(|text| bounded_event_text(text, 2_000));
+        self.shadow.append_event_line(
+            run_id,
+            Some(task_id),
+            Some(execution_id),
+            RuntimeEventKind::WorkerReleased,
+            serde_json::json!({
+                "execution_id": execution_id,
+                "status": status,
+                "summary": summary,
+            }),
+        )?;
+        Ok(())
+    }
+
+    /// Persist a tool dispatch before execution. Raw arguments are deliberately
+    /// excluded from the durable event to avoid leaking secrets or inflating
+    /// the run file; `call_id` is the idempotency/correlation key.
+    pub fn record_tool_started(
+        &self,
+        run_id: &str,
+        task_id: &str,
+        execution_id: &str,
+        call_id: &str,
+        tool_name: &str,
+        replay_safe: bool,
+    ) -> Result<(), StoreError> {
+        self.shadow.append_event_line(
+            run_id,
+            Some(task_id),
+            Some(call_id),
+            RuntimeEventKind::ToolStarted,
+            serde_json::json!({
+                "execution_id": execution_id,
+                "call_id": call_id,
+                "tool_name": tool_name,
+                "replay_safe": replay_safe,
+            }),
+        )?;
+        Ok(())
+    }
+
+    /// Persist a tool terminal fact. The result preview is diagnostic only;
+    /// canonical tool output remains in the agent checkpoint/transcript.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_tool_finished(
+        &self,
+        run_id: &str,
+        task_id: &str,
+        execution_id: &str,
+        call_id: &str,
+        tool_name: &str,
+        success: bool,
+        result: &str,
+    ) -> Result<(), StoreError> {
+        let event_type = if success {
+            RuntimeEventKind::ToolCompleted
+        } else {
+            RuntimeEventKind::ToolFailed
+        };
+        self.shadow.append_event_line(
+            run_id,
+            Some(task_id),
+            Some(call_id),
+            event_type,
+            serde_json::json!({
+                "execution_id": execution_id,
+                "call_id": call_id,
+                "tool_name": tool_name,
+                "success": success,
+                "result_preview": bounded_event_text(result, 500),
+                "result_chars": result.chars().count(),
+            }),
+        )?;
+        Ok(())
+    }
+
+    /// Return a completed worker result for this exact attempt. A later
+    /// WorkerAssigned with the same id clears an older terminal fact, which is
+    /// how an explicitly confirmed retry avoids reusing stale output.
+    pub fn recoverable_worker_result(
+        &self,
+        run_id: &str,
+        task_id: &str,
+        execution_id: &str,
+    ) -> Result<Option<String>, StoreError> {
+        let mut result = None;
+        for event in self.list_events(run_id, 0)? {
+            if event.task_id.as_deref() != Some(task_id)
+                || event.step_id.as_deref() != Some(execution_id)
+            {
+                continue;
+            }
+            match event.event_type {
+                RuntimeEventKind::WorkerAssigned => result = None,
+                RuntimeEventKind::WorkerReleased => {
+                    result = (json_string(&event.payload, "status").as_deref()
+                        == Some("completed"))
+                    .then(|| json_string(&event.payload, "summary").unwrap_or_default());
+                }
+                _ => {}
+            }
+        }
+        Ok(result)
+    }
+
+    /// Current unresolved recovery barriers, folded from append-only events.
+    pub fn list_recovery_blockers(&self, run_id: &str) -> Result<Vec<RecoveryBlocker>, StoreError> {
+        let mut blockers = std::collections::BTreeMap::<String, RecoveryBlocker>::new();
+        for event in self.list_events(run_id, 0)? {
+            match event.event_type {
+                RuntimeEventKind::RecoveryBlocked => {
+                    let Some(task_id) = event.task_id.clone() else {
+                        continue;
+                    };
+                    blockers.insert(
+                        task_id.clone(),
+                        RecoveryBlocker {
+                            run_id: run_id.to_string(),
+                            task_id,
+                            execution_id: json_string(&event.payload, "execution_id"),
+                            call_id: json_string(&event.payload, "call_id"),
+                            tool_name: json_string(&event.payload, "tool_name"),
+                            reason: json_string(&event.payload, "reason")
+                                .unwrap_or_else(|| "mutating side effect is indeterminate".into()),
+                        },
+                    );
+                }
+                RuntimeEventKind::RecoveryResolved => {
+                    if let Some(task_id) = event.task_id.as_ref() {
+                        blockers.remove(task_id);
+                    }
+                }
+                _ => {}
+            }
+        }
+        // The blocked Todo projection is itself durable. If the dedicated
+        // RecoveryBlocked append was interrupted after TaskBlocked landed,
+        // synthesize the barrier so resume still fails closed.
+        for todo in self.list_todos(run_id)?.into_iter().filter(|todo| {
+            todo.status == TodoStatus::Blocked
+                && todo.summary.as_deref()
+                    == Some("mutating side effect is indeterminate after restart")
+        }) {
+            blockers
+                .entry(todo.task_id.clone())
+                .or_insert_with(|| RecoveryBlocker {
+                    run_id: run_id.to_string(),
+                    task_id: todo.task_id,
+                    execution_id: None,
+                    call_id: None,
+                    tool_name: None,
+                    reason: "mutating side effect is indeterminate after restart".to_string(),
+                });
+        }
+        Ok(blockers.into_values().collect())
+    }
+
+    /// Resolve one recovery barrier after the user inspects the workspace.
+    pub fn resolve_recovery_task(
+        &self,
+        run_id: &str,
+        task_id: &str,
+        decision: RecoveryDecision,
+    ) -> Result<(), StoreError> {
+        let blocker = self
+            .list_recovery_blockers(run_id)?
+            .into_iter()
+            .find(|blocker| blocker.task_id == task_id)
+            .ok_or_else(|| {
+                StoreError::InvalidPlan(format!(
+                    "task {task_id} has no unresolved recovery barrier"
+                ))
+            })?;
+
+        // Persist the user's decision first. If the process stops before the
+        // Todo mutation, the still-Blocked Todo synthesizes the barrier again
+        // on the next read, so recovery continues to fail closed.
+        self.shadow.append_event_line(
+            run_id,
+            Some(task_id),
+            blocker.execution_id.as_deref(),
+            RuntimeEventKind::RecoveryResolved,
+            serde_json::json!({
+                "decision": decision.as_str(),
+                "previous_reason": blocker.reason,
+            }),
+        )?;
+        match decision {
+            RecoveryDecision::Retry => self.set_task_status(
+                run_id,
+                task_id,
+                TodoStatus::Pending,
+                None,
+                Some("recovery retry confirmed by user"),
+            )?,
+            RecoveryDecision::Skip => self.remove_task(run_id, task_id)?,
+        }
+        Ok(())
+    }
+
     /// Persist a provider-reported LLM usage event for a subagent.
     ///
     /// This is intentionally a low-frequency structured event rather than raw
@@ -1236,6 +1672,14 @@ fn json_string(value: &serde_json::Value, key: &str) -> Option<String> {
         .and_then(|v| v.as_str())
         .filter(|s| !s.trim().is_empty())
         .map(|s| s.to_string())
+}
+
+fn bounded_event_text(value: &str, max_chars: usize) -> String {
+    let mut text = value.chars().take(max_chars).collect::<String>();
+    if value.chars().count() > max_chars {
+        text.push_str("...");
+    }
+    text
 }
 
 // The compile-time test that proves the transaction invariant:
@@ -1552,6 +1996,113 @@ mod tests {
             .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
         assert_eq!(todo.status, TodoStatus::Pending);
         assert_eq!(todo.summary.as_deref(), Some("interrupted; pending resume"));
+        Ok(())
+    }
+
+    #[test]
+    fn boot_recovery_reuses_completed_worker_without_redispatch() -> Result<(), StoreError> {
+        let store = fresh();
+        seed_plan(&store);
+        store.set_task_status("r1", "t1", TodoStatus::Running, Some("worker"), None)?;
+        store.record_worker_assigned("r1", "t1", "t1:1", "worker", 1, true)?;
+        store.record_worker_released("r1", "t1", "t1:1", "completed", Some("durable result"))?;
+
+        assert_eq!(store.recover_incomplete(), 1);
+        assert_eq!(
+            store.recoverable_worker_result("r1", "t1", "t1:1")?,
+            Some("durable result".to_string())
+        );
+        let todo = store
+            .list_todos("r1")?
+            .into_iter()
+            .find(|todo| todo.task_id == "t1")
+            .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
+        assert_eq!(todo.status, TodoStatus::Pending);
+        assert_eq!(
+            todo.summary.as_deref(),
+            Some("worker completed before interruption; pending review")
+        );
+        assert!(store.list_recovery_blockers("r1")?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn mutating_in_doubt_worker_blocks_resume_until_user_decides() -> Result<(), StoreError> {
+        let store = fresh();
+        seed_plan(&store);
+        store.update_task(
+            "r1",
+            "t1",
+            TaskPatch {
+                kind: Some(PlanTaskKind::Implementation),
+                ..Default::default()
+            },
+        )?;
+        store.set_task_status("r1", "t1", TodoStatus::Running, Some("worker"), None)?;
+        store.record_worker_assigned("r1", "t1", "t1:1", "worker", 1, false)?;
+        store.record_tool_started("r1", "t1", "t1:1", "call-write", "write_file", false)?;
+
+        assert_eq!(store.recover_incomplete(), 1);
+        let blockers = store.list_recovery_blockers("r1")?;
+        assert_eq!(blockers.len(), 1);
+        assert_eq!(
+            blockers.first().and_then(|b| b.call_id.as_deref()),
+            Some("call-write")
+        );
+        assert!(matches!(
+            store.resume_task_run("r1"),
+            Err(StoreError::RecoveryBlocked { .. })
+        ));
+
+        store.resolve_recovery_task("r1", "t1", RecoveryDecision::Retry)?;
+        assert!(store.list_recovery_blockers("r1")?.is_empty());
+        let todo = store
+            .list_todos("r1")?
+            .into_iter()
+            .find(|todo| todo.task_id == "t1")
+            .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
+        assert_eq!(todo.status, TodoStatus::Pending);
+        assert_eq!(store.resume_task_run("r1")?.status, TaskRunStatus::Running);
+        Ok(())
+    }
+
+    #[test]
+    fn blocked_todo_restores_barrier_if_resolution_crashes_before_mutation()
+    -> Result<(), StoreError> {
+        let store = fresh();
+        seed_plan(&store);
+        store.update_task(
+            "r1",
+            "t1",
+            TaskPatch {
+                kind: Some(PlanTaskKind::Implementation),
+                ..Default::default()
+            },
+        )?;
+        store.set_task_status("r1", "t1", TodoStatus::Running, Some("worker"), None)?;
+        store.record_worker_assigned("r1", "t1", "t1:1", "worker", 1, false)?;
+        assert_eq!(store.recover_incomplete(), 1);
+
+        // Simulate a process stop after RecoveryResolved was appended but
+        // before resolve_recovery_task changed the durable Blocked Todo.
+        store.shadow.append_event_line(
+            "r1",
+            Some("t1"),
+            Some("t1:1"),
+            RuntimeEventKind::RecoveryResolved,
+            serde_json::json!({ "decision": "retry" }),
+        )?;
+
+        let blockers = store.list_recovery_blockers("r1")?;
+        assert_eq!(blockers.len(), 1);
+        assert_eq!(
+            blockers.first().map(|blocker| blocker.task_id.as_str()),
+            Some("t1")
+        );
+        assert!(matches!(
+            store.resume_task_run("r1"),
+            Err(StoreError::RecoveryBlocked { .. })
+        ));
         Ok(())
     }
 

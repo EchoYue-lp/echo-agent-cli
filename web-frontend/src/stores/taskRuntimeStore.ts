@@ -18,7 +18,14 @@ let refreshInFlight = false;
 
 import { create } from 'zustand';
 import { taskRuntimeApi } from '../api/endpoints';
-import type { TaskRun, TaskPlan, TodoItem, RuntimeTaskEvent, RuntimeArtifact } from '../generated';
+import type {
+  TaskRun,
+  TaskPlan,
+  TodoItem,
+  RuntimeTaskEvent,
+  RuntimeArtifact,
+  RecoveryBlocker,
+} from '../generated';
 
 type RunSnapshot = {
   run: TaskRun;
@@ -51,6 +58,7 @@ async function loadConversationRunGroup(conversationId: string, focusedRun: Task
     .sort((a, b) => runTime(a.created_at) - runTime(b.created_at));
   const runs = groupRuns.length ? groupRuns : [focusedRun];
   const snapshots = await Promise.all(runs.map(loadRunSnapshot));
+  const recoveryBlockers = await taskRuntimeApi.listRecoveryBlockers(focusedRun.run_id);
   const basePlan = snapshots.find((snapshot) => snapshot.plan)?.plan ?? null;
   const plan = basePlan
     ? {
@@ -64,6 +72,7 @@ async function loadConversationRunGroup(conversationId: string, focusedRun: Task
     plan,
     todos: snapshots.flatMap((snapshot) => snapshot.todos),
     artifacts: snapshots.flatMap((snapshot) => snapshot.artifacts),
+    recoveryBlockers,
   };
 }
 
@@ -75,6 +84,7 @@ export interface TaskRuntimeState {
   todos: TodoItem[];
   events: RuntimeTaskEvent[];
   artifacts: RuntimeArtifact[];
+  recoveryBlockers: RecoveryBlocker[];
   /// Highest event seq we've already ingested (string per the seq-as-string
   /// transport contract). Used for incremental polling.
   lastSeq: string;
@@ -96,6 +106,7 @@ export interface TaskRuntimeState {
   refresh: (runId: string) => Promise<void>;
   loadByConversation: (conversationId: string) => Promise<void>;
   cancel: (runId: string) => Promise<void>;
+  pause: (runId: string) => Promise<void>;
   openInterruptPrompt: (data: { runId: string; goal: string; newMessage: string }) => void;
   dismissInterruptPrompt: () => void;
   // Dynamic task operations (Phase 2).
@@ -104,6 +115,7 @@ export interface TaskRuntimeState {
   updateTask: (taskId: string, patch: Record<string, unknown>) => Promise<void>;
   reorderTasks: (newOrder: string[]) => Promise<void>;
   resumeTaskRun: () => Promise<void>;
+  resolveRecoveryTask: (taskId: string, decision: 'retry' | 'skip') => Promise<void>;
   reset: () => void;
 }
 
@@ -113,6 +125,7 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
   todos: [],
   events: [],
   artifacts: [],
+  recoveryBlockers: [],
   lastSeq: '0',
   error: null,
   generatingPlan: false,
@@ -172,7 +185,10 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
         });
         return;
       }
-      const { plan, todos, artifacts } = await loadConversationRunGroup(run.conversation_id, run);
+      const { plan, todos, artifacts, recoveryBlockers } = await loadConversationRunGroup(
+        run.conversation_id,
+        run
+      );
       set({
         activeRun: run,
         plan,
@@ -181,6 +197,7 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
         // unbounded growth on long-running tasks (events are not rendered).
         events: [...get().events, ...events].slice(-MAX_EVENTS),
         artifacts,
+        recoveryBlockers,
         lastSeq,
         error: null,
       });
@@ -197,13 +214,17 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
       if (run) {
         // Reset event cursor when switching runs so we don't cross streams.
         set({ events: [], lastSeq: '0' });
-        const { plan, todos, artifacts } = await loadConversationRunGroup(conversationId, run);
+        const { plan, todos, artifacts, recoveryBlockers } = await loadConversationRunGroup(
+          conversationId,
+          run
+        );
         set({
           activeRun: run,
           plan,
           todos,
           events: [],
           artifacts,
+          recoveryBlockers,
           lastSeq: '0',
           error: null,
         });
@@ -214,6 +235,7 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
           todos: [],
           events: [],
           artifacts: [],
+          recoveryBlockers: [],
           lastSeq: '0',
         });
       }
@@ -225,6 +247,15 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
   cancel: async (runId: string) => {
     try {
       await taskRuntimeApi.cancelRun(runId);
+      await get().refresh(runId);
+    } catch (e) {
+      set({ error: e instanceof Error ? e.message : String(e) });
+    }
+  },
+
+  pause: async (runId: string) => {
+    try {
+      await taskRuntimeApi.pauseRun(runId);
       await get().refresh(runId);
     } catch (e) {
       set({ error: e instanceof Error ? e.message : String(e) });
@@ -265,9 +296,23 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
   resumeTaskRun: async () => {
     const runId = get().activeRun?.run_id;
     if (!runId) return;
-    await taskRuntimeApi.resumeRun(runId);
-    set({ interruptPrompt: null });
-    await get().refresh(runId);
+    try {
+      await taskRuntimeApi.resumeRun(runId);
+      set({ interruptPrompt: null });
+      await get().refresh(runId);
+    } catch (e) {
+      set({ error: e instanceof Error ? e.message : String(e) });
+    }
+  },
+  resolveRecoveryTask: async (taskId, decision) => {
+    const runId = get().activeRun?.run_id;
+    if (!runId) return;
+    try {
+      await taskRuntimeApi.resolveRecoveryTask(runId, taskId, decision);
+      await get().refresh(runId);
+    } catch (e) {
+      set({ error: e instanceof Error ? e.message : String(e) });
+    }
   },
 
   reset: () => {
@@ -278,6 +323,7 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
       todos: [],
       events: [],
       artifacts: [],
+      recoveryBlockers: [],
       lastSeq: '0',
       error: null,
       generatingPlan: false,

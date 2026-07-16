@@ -51,6 +51,7 @@ import type {
   RuntimeArtifact,
   ReviewResult,
   TaskExecutionSummary,
+  RecoveryBlocker,
 } from '../generated';
 
 type LoadSkillsResponse = {
@@ -557,6 +558,10 @@ export const taskRuntimeApi = {
     isTauri()
       ? apiInvoke<TaskExecutionSummary | null>('get_task_summary', { runId, taskId })
       : get<TaskExecutionSummary | null>(`/task_runtime/runs/${runId}/tasks/${taskId}/summary`),
+  listRecoveryBlockers: (runId: string) =>
+    isTauri()
+      ? apiInvoke<RecoveryBlocker[]>('list_recovery_blockers', { runId })
+      : get<RecoveryBlocker[]>(`/task_runtime/runs/${runId}/recovery_blockers`),
 
   cancelRun: (runId: string) =>
     isTauri()
@@ -564,12 +569,20 @@ export const taskRuntimeApi = {
           runId,
         })
       : post<{ success: boolean; run_id: string }>(`/task_runtime/runs/${runId}/cancel`),
+  pauseRun: (runId: string) =>
+    isTauri()
+      ? apiInvoke<{ success: boolean; run_id: string }>('pause_task_run', { runId })
+      : post<{ success: boolean; run_id: string }>(`/task_runtime/runs/${runId}/pause`),
 
   // ── Dynamic task operations ──────────────────────────────────────────
   resumeRun: (runId: string) =>
     isTauri()
       ? apiInvoke<{ kind: string; run_id: string }>('resume_task_run', { runId })
       : post(`/task_runtime/runs/${runId}/resume`),
+  resolveRecoveryTask: (runId: string, taskId: string, decision: 'retry' | 'skip') =>
+    isTauri()
+      ? apiInvoke<void>('resolve_recovery_task', { runId, taskId, decision })
+      : post(`/task_runtime/runs/${runId}/tasks/${taskId}/resolve_recovery`, { decision }),
   insertTask: (runId: string, afterTaskId: string | null, task: PlanTask) =>
     isTauri()
       ? apiInvoke<void>('insert_task', { runId, afterTaskId, task })

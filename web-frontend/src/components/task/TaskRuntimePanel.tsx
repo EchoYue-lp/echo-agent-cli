@@ -20,6 +20,9 @@ import {
   Trash2,
   Plus,
   Play,
+  Pause,
+  RotateCcw,
+  SkipForward,
   Edit3,
   X,
   AlertTriangle,
@@ -408,7 +411,18 @@ function displayedTodoStatus(
 
 export function TaskRuntimePanel() {
   const traceRuns = useSubagentRunStore((s) => s.runs);
-  const { activeRun, plan, todos, refresh, resumeTaskRun } = useTaskRuntimeStore();
+  const {
+    activeRun,
+    plan,
+    todos,
+    recoveryBlockers,
+    error,
+    refresh,
+    cancel,
+    pause,
+    resumeTaskRun,
+    resolveRecoveryTask,
+  } = useTaskRuntimeStore();
 
   const visibleTraceRuns = useMemo(
     () =>
@@ -466,15 +480,92 @@ export function TaskRuntimePanel() {
         {activeRun.goal}
       </div>
 
-      {activeRun.status === 'paused' && (
+      {activeRun.status === 'running' && (
+        <div className="mb-2 grid grid-cols-2 gap-1.5">
+          <button
+            onClick={() => pause(runId)}
+            className="flex items-center justify-center gap-1 rounded-md px-2 py-1.5 text-[11px] font-medium"
+            style={{ background: 'var(--bg-hover)', color: 'var(--text-primary)' }}
+            title="暂停任务运行"
+          >
+            <Pause size={12} /> 暂停
+          </button>
+          <button
+            onClick={() => cancel(runId)}
+            className="flex items-center justify-center gap-1 rounded-md px-2 py-1.5 text-[11px] font-medium"
+            style={{ background: 'var(--bg-hover)', color: 'var(--color-error)' }}
+            title="取消任务运行"
+          >
+            <Trash2 size={12} /> 取消
+          </button>
+        </div>
+      )}
+
+      {activeRun.status === 'paused' && recoveryBlockers.length === 0 && (
         <div className="mb-2">
           <button
             onClick={() => resumeTaskRun()}
-            className="w-full rounded-md px-3 py-1.5 text-[11px] font-medium"
+            className="flex w-full items-center justify-center gap-1 rounded-md px-3 py-1.5 text-[11px] font-medium"
             style={{ background: 'var(--accent)', color: 'var(--text-on-accent)' }}
           >
-            继续执行
+            <Play size={12} /> 继续执行
           </button>
+        </div>
+      )}
+
+      {recoveryBlockers.length > 0 && (
+        <div
+          className="mb-2 space-y-2 rounded-md px-2 py-2"
+          style={{ background: 'var(--bg-hover)', border: '1px solid var(--color-warning)' }}
+        >
+          <div
+            className="flex items-center gap-1 text-[10px] font-medium"
+            style={{ color: 'var(--color-warning)' }}
+          >
+            <AlertTriangle size={11} /> 需要确认恢复操作
+          </div>
+          {recoveryBlockers.map((blocker) => {
+            const todo = todos.find((item) => item.task_id === blocker.task_id);
+            return (
+              <div key={blocker.task_id} className="space-y-1">
+                <div
+                  className="truncate text-[10px] font-medium"
+                  style={{ color: 'var(--text-primary)' }}
+                  title={todo?.title ?? blocker.task_id}
+                >
+                  {todo?.title ?? blocker.task_id}
+                </div>
+                <div className="text-[9px] leading-snug" style={{ color: 'var(--text-secondary)' }}>
+                  {blocker.reason}
+                  {blocker.tool_name ? ` · ${blocker.tool_name}` : ''}
+                </div>
+                <div className="grid grid-cols-2 gap-1">
+                  <button
+                    onClick={() => resolveRecoveryTask(blocker.task_id, 'retry')}
+                    className="flex items-center justify-center gap-1 rounded-md px-2 py-1 text-[10px]"
+                    style={{ background: 'var(--bg-primary)', color: 'var(--text-primary)' }}
+                    title="确认工作区状态后重新执行"
+                  >
+                    <RotateCcw size={10} /> 重试
+                  </button>
+                  <button
+                    onClick={() => resolveRecoveryTask(blocker.task_id, 'skip')}
+                    className="flex items-center justify-center gap-1 rounded-md px-2 py-1 text-[10px]"
+                    style={{ background: 'var(--bg-primary)', color: 'var(--text-secondary)' }}
+                    title="保留当前工作区并跳过该任务"
+                  >
+                    <SkipForward size={10} /> 跳过
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {error && (
+        <div className="mb-2 text-[10px] leading-snug" style={{ color: 'var(--color-error)' }}>
+          {error}
         </div>
       )}
 

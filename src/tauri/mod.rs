@@ -134,12 +134,15 @@ pub fn build_tauri_app(
             commands::task_runtime::list_task_artifacts,
             commands::task_runtime::list_task_reviews,
             commands::task_runtime::get_task_summary,
+            commands::task_runtime::list_recovery_blockers,
+            commands::task_runtime::resolve_recovery_task,
             // TaskRuntime dynamic tasks (resume / insert / remove / update / reorder)
             commands::task_runtime::resume_task_run,
             commands::task_runtime::insert_task,
             commands::task_runtime::remove_task,
             commands::task_runtime::update_task,
             commands::task_runtime::reorder_tasks,
+            commands::task_runtime::pause_task_run,
             commands::task_runtime::cancel_task_run,
             // TaskRuntime progress ledger (PR 4)
             commands::task_runtime::get_progress_ledger,
@@ -487,6 +490,7 @@ pub fn build_tauri_app(
                                         SubagentEvent::DispatchToolStarted {
                                             parent: _,
                                             agent,
+                                            call_id,
                                             name: tool_name,
                                             args,
                                             execution_id,
@@ -497,6 +501,7 @@ pub fn build_tauri_app(
                                             run_id.clone(),
                                             agent.clone(),
                                             serde_json::json!({
+                                                "call_id": call_id,
                                                 "name": tool_name,
                                                 "args": args,
                                             }),
@@ -504,6 +509,7 @@ pub fn build_tauri_app(
                                         SubagentEvent::DispatchToolCompleted {
                                             parent: _,
                                             agent,
+                                            call_id,
                                             name: tool_name,
                                             result,
                                             success,
@@ -515,6 +521,7 @@ pub fn build_tauri_app(
                                             run_id.clone(),
                                             agent.clone(),
                                             serde_json::json!({
+                                                "call_id": call_id,
                                                 "name": tool_name,
                                                 "result": result,
                                                 "success": success,

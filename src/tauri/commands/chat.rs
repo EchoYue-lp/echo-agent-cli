@@ -237,6 +237,29 @@ enum PendingResponse {
     },
 }
 
+pub(crate) async fn cancel_pending_hitl(message_key: Option<&str>, reason: &str) -> usize {
+    let mut pending = PENDING_RESPONSES.lock().await;
+    let request_ids = pending
+        .iter()
+        .filter(|(_, request)| message_key.is_none_or(|key| request.message_key == key))
+        .map(|(request_id, _)| request_id.clone())
+        .collect::<Vec<_>>();
+    let mut cancelled = 0usize;
+    for request_id in request_ids {
+        let Some(request) = pending.remove(&request_id) else {
+            continue;
+        };
+        let _ = request.tx.send(PendingResponse::Approval {
+            approved: false,
+            reason: Some(reason.to_string()),
+            scope: None,
+        });
+        cancelled = cancelled.saturating_add(1);
+        tracing::debug!(%request_id, "cancelled pending HITL request");
+    }
+    cancelled
+}
+
 /// Tauri-based HumanLoopProvider — emits approval/input requests via Tauri events
 /// and awaits responses through the shared PENDING_RESPONSES map.
 struct TauriHumanLoopHandler {
@@ -794,35 +817,8 @@ pub async fn cancel_chat(
         state.app_state.session.cancel_token.clear();
     }
 
-    // Reject all pending approval requests so parked HITL futures unblock
-    // immediately instead of waiting up to 300s for a timeout.
-    let mut pending = PENDING_RESPONSES.lock().await;
-    let request_ids: Vec<String> = pending
-        .iter()
-        .filter_map(|(request_id, req)| {
-            if message_key
-                .as_ref()
-                .map(|key| &req.message_key == key)
-                .unwrap_or(true)
-            {
-                Some(request_id.clone())
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    for request_id in request_ids {
-        let Some(req) = pending.remove(&request_id) else {
-            continue;
-        };
-        let _ = req.tx.send(PendingResponse::Approval {
-            approved: false,
-            reason: Some("cancelled by user".to_string()),
-            scope: None,
-        });
-        tracing::debug!(%request_id, "cancelled pending approval on cancel_chat");
-    }
+    // Reject pending HITL requests so parked futures unblock immediately.
+    cancel_pending_hitl(message_key.as_deref(), "cancelled by user").await;
 
     Ok(serde_json::json!({"success": true}))
 }

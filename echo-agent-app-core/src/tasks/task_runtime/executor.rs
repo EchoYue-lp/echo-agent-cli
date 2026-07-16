@@ -349,6 +349,20 @@ pub async fn execute_run(
                     serde_json::json!({ "status": "cancelled" }),
                 ),
             );
+            if let Ok(todos) = store.list_todos(run_id) {
+                for todo in todos
+                    .into_iter()
+                    .filter(|todo| todo.status == TodoStatus::Running)
+                {
+                    let _ = store.set_task_status(
+                        run_id,
+                        &todo.task_id,
+                        TodoStatus::Skipped,
+                        None,
+                        Some("cancelled with parent run"),
+                    );
+                }
+            }
             let _ = store.transition_run(run_id, TaskRunStatus::Cancelled);
             save_trace(
                 run_store.as_ref(),
@@ -540,6 +554,8 @@ impl TaskDispatcher for RealTaskDispatcher {
     }
 }
 
+type TaskDispatchResult = Result<(String, Option<String>), (String, String)>;
+
 /// Core DAG loop. Maintains a frontier of ready tasks and dispatches them
 /// under the concurrency semaphores until all are done, the run is cancelled,
 /// or a task fails.
@@ -709,7 +725,33 @@ async fn run_dag<W: TaskDispatcher + 'static>(
         // mid-wave, we abort remaining handles before returning Cancelled so
         // no orphan tasks keep writing files.
         let mut handles: Vec<_> = Vec::new();
+        let mut wave_results: Vec<TaskDispatchResult> = Vec::new();
         for task in ready {
+            let execution_id = format!("{}:{}", task.id, task.retry_count.saturating_add(1));
+            match store.recoverable_worker_result(run_id, &task.id, &execution_id) {
+                Ok(Some(summary)) => {
+                    tracing::info!(
+                        run_id = %run_id,
+                        task_id = %task.id,
+                        execution_id,
+                        "task_runtime: reusing durable worker result after restart"
+                    );
+                    let _ = store.note(
+                        run_id,
+                        Some(&task.id),
+                        "reused completed worker result; continuing at review boundary",
+                    );
+                    wave_results.push(Ok((task.id.clone(), Some(summary))));
+                    continue;
+                }
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    run_id = %run_id,
+                    task_id = %task.id,
+                    %error,
+                    "failed to inspect durable worker result; dispatching normally"
+                ),
+            }
             let store = store.clone();
             let worker = worker.clone();
             let worker_sem = worker_sem.clone();
@@ -745,7 +787,6 @@ async fn run_dag<W: TaskDispatcher + 'static>(
         }
 
         // Await the wave. Collect results; on cancellation, abort stragglers.
-        let mut wave_results: Vec<_> = Vec::new();
         let mut cancelled_mid_wave = false;
         for handle in &mut handles {
             if parent_cancel.is_cancelled() {
@@ -1200,7 +1241,17 @@ async fn execute_task(
         // block here until the previous writer releases its guard.
         let mut guards: Vec<OwnedMutexGuard<()>> = Vec::with_capacity(per_file_mutexes.len());
         for mtx in per_file_mutexes {
-            guards.push(mtx.lock_owned().await);
+            let guard = tokio::select! {
+                biased;
+                _ = task_cancel.cancelled() => {
+                    return Err((
+                        task_id.clone(),
+                        "cancelled while waiting for file write lock".to_string(),
+                    ));
+                }
+                guard = mtx.lock_owned() => guard,
+            };
+            guards.push(guard);
         }
         Some(FileLockGuard { _guards: guards })
     } else {
@@ -1217,7 +1268,7 @@ async fn execute_task(
     );
     let _llm_permit = tokio::select! {
         biased;
-        _ = cancel.cancelled() => return Err((task_id.clone(), "cancelled while waiting for LLM permit".to_string())),
+        _ = task_cancel.cancelled() => return Err((task_id.clone(), "cancelled while waiting for LLM permit".to_string())),
         p = llm_sem.acquire() => p.map_err(|e| (task_id.clone(), e.to_string()))?,
     };
     tracing::info!(
@@ -1287,6 +1338,19 @@ async fn execute_task(
         .ok()
         .flatten()
         .map(|r| r.root_message_id);
+    if let Err(error) = store.record_worker_assigned(
+        &run_id,
+        &task_id,
+        &execution_id,
+        &task.agent_role,
+        attempt,
+        task.kind.is_read_only(),
+    ) {
+        return Err((
+            task_id,
+            format!("failed to persist worker start boundary: {error}"),
+        ));
+    }
     let (result, readonly_usage) = if is_read_only_task {
         tracing::info!(
             run_id = %run_id,
@@ -1308,6 +1372,15 @@ async fn execute_task(
         )
         .await;
         match dispatch_result {
+            Ok(sub_result) if sub_result.cancelled => {
+                tracing::info!(
+                    run_id = %run_id,
+                    task_id = %task_id,
+                    agent_role = %task.agent_role,
+                    "task_runtime: read-only subagent cancelled"
+                );
+                (Err("task cancelled".to_string()), sub_result.usage)
+            }
             Ok(sub_result) => {
                 tracing::info!(
                     run_id = %run_id,
@@ -1363,6 +1436,15 @@ async fn execute_task(
         )
         .await;
         match dispatch_result {
+            Ok(sub_result) if sub_result.cancelled => {
+                tracing::info!(
+                    run_id = %run_id,
+                    task_id = %task_id,
+                    agent_role = %task.agent_role,
+                    "task_runtime: writer subagent cancelled"
+                );
+                (Err("task cancelled".to_string()), sub_result.usage)
+            }
             Ok(sub_result) => {
                 tracing::info!(
                     run_id = %run_id,
@@ -1387,38 +1469,42 @@ async fn execute_task(
                 )
             }
             Err(e) => {
-                // Fallback: run in-place on the primary agent. Logged so the
-                // loss-of-isolation is visible (the run continues rather than
-                // failing the whole DAG over a missing worker config).
-                tracing::warn!(
-                    run_id = %run_id,
-                    task_id = %task_id,
-                    role = %task.agent_role,
-                    error = %e,
-                    "writer subagent dispatch failed; falling back to in-place main-agent execution"
-                );
-                emit_task_isolation_observed(
-                    trace_sink.as_ref(),
-                    &run_id,
-                    &worker_trace_id,
-                    &task,
-                    &contract,
-                    "primary-fallback",
-                );
-                (
-                    run_main_agent_task(
-                        &primary_agent,
-                        store.clone(),
+                if task_cancel.is_cancelled() {
+                    (Err("task cancelled".to_string()), None)
+                } else {
+                    // Fallback: run in-place on the primary agent. Logged so the
+                    // loss-of-isolation is visible (the run continues rather than
+                    // failing the whole DAG over a missing worker config).
+                    tracing::warn!(
+                        run_id = %run_id,
+                        task_id = %task_id,
+                        role = %task.agent_role,
+                        error = %e,
+                        "writer subagent dispatch failed; falling back to in-place main-agent execution"
+                    );
+                    emit_task_isolation_observed(
+                        trace_sink.as_ref(),
                         &run_id,
+                        &worker_trace_id,
                         &task,
-                        &prompt,
-                        task_cancel.clone(),
-                        trace_sink.clone(),
+                        &contract,
+                        "primary-fallback",
+                    );
+                    (
+                        run_main_agent_task(
+                            &primary_agent,
+                            store.clone(),
+                            &run_id,
+                            &task,
+                            &prompt,
+                            task_cancel.clone(),
+                            trace_sink.clone(),
+                        )
+                        .await
+                        .map(|text| (text.clone(), text)),
+                        None,
                     )
-                    .await
-                    .map(|text| (text.clone(), text)),
-                    None,
-                )
+                }
             }
         }
     } else {
@@ -1514,6 +1600,18 @@ async fn execute_task(
             }) {
                 tracing::warn!(task_id = %task_id, error = %e, "failed to persist TaskExecutionSummary");
             }
+            if let Err(error) = store.record_worker_released(
+                &run_id,
+                &task_id,
+                &execution_id,
+                "completed",
+                Some(parent_facing.trim()),
+            ) {
+                return Err((
+                    task_id,
+                    format!("worker completed but terminal boundary was not persisted: {error}"),
+                ));
+            }
             append_suggested_tasks_to_plan(&store, &run_id, &task, &suggested_tasks);
             emit_exec(
                 trace_sink.as_ref(),
@@ -1531,6 +1629,22 @@ async fn execute_task(
             Ok((task_id, Some(parent_facing.trim().to_string())))
         }
         Err(e) => {
+            let cancelled = task_cancel.is_cancelled() || e.contains("cancelled");
+            let release_status = if cancelled { "cancelled" } else { "failed" };
+            if let Err(error) = store.record_worker_released(
+                &run_id,
+                &task_id,
+                &execution_id,
+                release_status,
+                Some(&e),
+            ) {
+                tracing::warn!(
+                    run_id = %run_id,
+                    task_id = %task_id,
+                    %error,
+                    "failed to persist worker terminal boundary"
+                );
+            }
             tracing::warn!(
                 run_id = %run_id,
                 task_id = %task_id,
@@ -1543,7 +1657,7 @@ async fn execute_task(
                 ExecEvent::for_task(
                     run_id,
                     worker_trace_id,
-                    "failed",
+                    if cancelled { "cancelled" } else { "failed" },
                     serde_json::json!({ "error": &e }),
                 )
                 .with_agent(task.agent_role.clone())
@@ -2440,6 +2554,22 @@ async fn run_writer_worker(
 /// Cancellation: `Agent::execute` is not cancel-aware, so we race it against
 /// the cancel token. If the run is cancelled mid-task, we return an error and
 /// the task is marked Failed (the run then goes Cancelled/Failed).
+fn tool_call_is_replay_safe(agent: &echo_agent::agent::ReactAgent, tool_name: &str) -> bool {
+    let Some(tool) = agent.tool_manager().get_tool(tool_name) else {
+        return false;
+    };
+    let permissions = tool.permissions();
+    !permissions.iter().any(|permission| {
+        matches!(
+            permission,
+            echo_agent::prelude::ToolPermission::Write
+                | echo_agent::prelude::ToolPermission::Execute
+                | echo_agent::prelude::ToolPermission::Network
+                | echo_agent::prelude::ToolPermission::Sensitive
+        )
+    })
+}
+
 async fn run_main_agent_task(
     primary_agent: &crate::agent_handle::AgentHandle,
     store: Arc<TaskRuntimeStore>,
@@ -2453,6 +2583,7 @@ async fn run_main_agent_task(
     let task_id = task.id.clone();
     let agent_role = task.agent_role.clone();
     let title = task.title.clone();
+    let execution_id = format!("{}:{}", task.id, task.retry_count.saturating_add(1));
 
     // Rebuild a multimodal Message when the run carries user attachments, so
     // write-task workers see the same images/files as the main agent (#1b).
@@ -2471,13 +2602,15 @@ async fn run_main_agent_task(
         .read_async(|agent| {
             let prompt = prompt.to_string();
             let run_message = run_message.clone();
+            let execution_id = execution_id.clone();
             Box::pin(async move {
+                let event_cancel = cancel.clone();
                 let invocation = echo_core::agent::AgentInvocationContext {
                     runtime: Some(echo_core::tools::ExternalRunContext {
                         conversation_id,
                         run_id: Some(run_id.clone()),
                         turn_id: root_message_id.clone(),
-                        execution_id: Some(task_id.clone()),
+                        execution_id: Some(execution_id.clone()),
                         message_id: root_message_id,
                         cancel: Some(Arc::new(cancel.clone())),
                         trace_sink: worker_trace_sink_to_core(trace_sink.clone()),
@@ -2630,6 +2763,20 @@ async fn run_main_agent_task(
                             name,
                             args,
                         } => {
+                            let replay_safe = tool_call_is_replay_safe(agent, &name);
+                            if let Err(error) = store.record_tool_started(
+                                &run_id,
+                                &task_id,
+                                &execution_id,
+                                &call_id,
+                                &name,
+                                replay_safe,
+                            ) {
+                                event_cancel.cancel();
+                                return Err(format!(
+                                    "failed to persist tool start boundary for {name}: {error}"
+                                ));
+                            }
                             emit_exec(
                                 trace_sink.as_ref(),
                                 ExecEvent::for_task(
@@ -2651,6 +2798,20 @@ async fn run_main_agent_task(
                             name,
                             output: result,
                         } => {
+                            if let Err(error) = store.record_tool_finished(
+                                &run_id,
+                                &task_id,
+                                &execution_id,
+                                &call_id,
+                                &name,
+                                true,
+                                &result,
+                            ) {
+                                event_cancel.cancel();
+                                return Err(format!(
+                                    "tool {name} completed but its terminal boundary was not persisted: {error}"
+                                ));
+                            }
                             emit_exec(
                                 trace_sink.as_ref(),
                                 ExecEvent::for_task(
@@ -2673,6 +2834,20 @@ async fn run_main_agent_task(
                             name,
                             error,
                         } => {
+                            if let Err(store_error) = store.record_tool_finished(
+                                &run_id,
+                                &task_id,
+                                &execution_id,
+                                &call_id,
+                                &name,
+                                false,
+                                &error,
+                            ) {
+                                event_cancel.cancel();
+                                return Err(format!(
+                                    "tool {name} failed but its terminal boundary was not persisted: {store_error}"
+                                ));
+                            }
                             emit_exec(
                                 trace_sink.as_ref(),
                                 ExecEvent::for_task(
@@ -4180,6 +4355,48 @@ Read the runtime path and found one missing branch.
         assert!(matches!(outcome, RunOutcome::Completed));
         let todos = store.list_todos(&run_id).unwrap();
         assert_eq!(todos[0].status, TodoStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn run_dag_reuses_durable_worker_result_after_restart() -> Result<(), String> {
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let task = solo_readonly_task("a");
+        let run_id = seed_run(&store, vec![task.clone()]);
+        store
+            .record_worker_assigned(&run_id, "a", "a:1", "reviewer", 1, true)
+            .map_err(|error| error.to_string())?;
+        store
+            .record_worker_released(&run_id, "a", "a:1", "completed", Some("recovered summary"))
+            .map_err(|error| error.to_string())?;
+        let worker = ScriptedDispatcher::new();
+
+        let outcome = run_dag(
+            store.clone(),
+            worker.clone(),
+            None,
+            &run_id,
+            vec![task],
+            ConcurrencyLimits::default(),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+        assert!(matches!(outcome, RunOutcome::Completed));
+        assert!(
+            worker.order().is_empty(),
+            "durable worker was dispatched again"
+        );
+        let todo = store
+            .list_todos(&run_id)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|todo| todo.task_id == "a")
+            .ok_or_else(|| "todo a missing".to_string())?;
+        assert_eq!(todo.status, TodoStatus::Completed);
+        assert_eq!(todo.summary.as_deref(), Some("recovered summary"));
+        Ok(())
     }
 
     #[tokio::test]

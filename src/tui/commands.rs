@@ -91,6 +91,9 @@ pub enum SlashCommand {
     TaskCancel,
     TaskPause,
     TaskResume,
+    TaskRecovery,
+    TaskRetry,
+    TaskSkip,
     Test,
     CodeReview,
     Diff,
@@ -162,6 +165,9 @@ impl SlashCommand {
             Self::TaskCancel => "Cancel the current or specified task run",
             Self::TaskPause => "Pause the current or specified task run",
             Self::TaskResume => "Resume the current or specified task run",
+            Self::TaskRecovery => "Show unresolved recovery barriers",
+            Self::TaskRetry => "Confirm retry for an indeterminate task",
+            Self::TaskSkip => "Skip an indeterminate task",
             Self::Test => "Run tests",
             Self::CodeReview => "Request a code review",
             Self::Diff => "Show git or file diff",
@@ -225,6 +231,9 @@ impl SlashCommand {
             | Self::TaskCancel
             | Self::TaskPause
             | Self::TaskResume
+            | Self::TaskRecovery
+            | Self::TaskRetry
+            | Self::TaskSkip
             | Self::Test
             | Self::CodeReview
             | Self::Diff
@@ -267,6 +276,8 @@ impl SlashCommand {
             Self::Plan => "",
             Self::Mode => "[auto|chat|task]",
             Self::TaskCancel | Self::TaskPause | Self::TaskResume => "[run-id]",
+            Self::TaskRecovery => "[run-id]",
+            Self::TaskRetry | Self::TaskSkip => "<task-id> [run-id]",
             Self::Steer => "<instruction>",
             Self::Sessions => "[query]",
             Self::Resume => "<conversation-id>",
@@ -314,5 +325,29 @@ impl SlashCommand {
         SlashCommand::iter()
             .filter(|c| c.slash_name().starts_with(&q))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recovery_commands_are_first_class_coding_actions() -> Result<(), String> {
+        let retry = "task-retry"
+            .parse::<SlashCommand>()
+            .map_err(|error| error.to_string())?;
+        let skip = "task-skip"
+            .parse::<SlashCommand>()
+            .map_err(|error| error.to_string())?;
+        let recovery = "task-recovery"
+            .parse::<SlashCommand>()
+            .map_err(|error| error.to_string())?;
+
+        assert_eq!(retry.category(), Category::Coding);
+        assert_eq!(retry.usage(), "<task-id> [run-id]");
+        assert_eq!(skip.category(), Category::Coding);
+        assert_eq!(recovery.usage(), "[run-id]");
+        Ok(())
     }
 }

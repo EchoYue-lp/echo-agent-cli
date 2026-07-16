@@ -14,6 +14,9 @@ use tokio::sync::{Mutex, oneshot};
 
 /// Shared state for a pending approval request in the TUI.
 pub struct PendingApproval {
+    /// Stable identity used to clear only the request whose future was
+    /// cancelled, without racing a newer approval card.
+    pub request_id: String,
     /// Tool name requesting approval.
     pub tool_name: String,
     /// Pretty-printed arguments for display.
@@ -57,6 +60,30 @@ impl PendingApproval {
 pub struct TuiHumanLoopProvider {
     /// Shared pending approval state — the event loop reads this.
     pub pending: Arc<Mutex<Option<PendingApproval>>>,
+}
+
+struct PendingCleanup {
+    pending: Arc<Mutex<Option<PendingApproval>>>,
+    request_id: String,
+}
+
+impl Drop for PendingCleanup {
+    fn drop(&mut self) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let pending = self.pending.clone();
+        let request_id = self.request_id.clone();
+        runtime.spawn(async move {
+            let mut guard = pending.lock().await;
+            if guard
+                .as_ref()
+                .is_some_and(|approval| approval.request_id == request_id)
+            {
+                *guard = None;
+            }
+        });
+    }
 }
 
 impl TuiHumanLoopProvider {
@@ -112,6 +139,7 @@ impl TuiHumanLoopProvider {
         req: HumanLoopRequest,
     ) -> Result<HumanLoopResponse, echo_agent::error::ReactError> {
         let (tx, rx) = oneshot::channel();
+        let request_id = uuid::Uuid::new_v4().to_string();
 
         let tool_name = req
             .tool_name
@@ -125,6 +153,7 @@ impl TuiHumanLoopProvider {
         let risk_label = PendingApproval::risk_label(req.risk_level.as_ref());
 
         let pending = PendingApproval {
+            request_id: request_id.clone(),
             tool_name,
             args_display,
             risk_label,
@@ -142,6 +171,10 @@ impl TuiHumanLoopProvider {
             let mut guard = self.pending.lock().await;
             *guard = Some(pending);
         }
+        let _cleanup = PendingCleanup {
+            pending: self.pending.clone(),
+            request_id,
+        };
 
         // Wait for the TUI event loop to send a response (with timeout)
         let timeout = req.timeout.unwrap_or(std::time::Duration::from_secs(300));
@@ -167,5 +200,44 @@ impl TuiHumanLoopProvider {
                 Ok(HumanLoopResponse::Timeout)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use echo_agent::human_loop::HumanLoopProvider;
+
+    #[tokio::test]
+    async fn cancelling_request_clears_pending_approval() -> Result<(), String> {
+        let provider = Arc::new(TuiHumanLoopProvider::new());
+        let request_provider = provider.clone();
+        let request = HumanLoopRequest::approval("write_file", serde_json::json!({"path": "a"}));
+        let task = tokio::spawn(async move { request_provider.request(request).await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if provider.pending.lock().await.is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "approval was not published".to_string())?;
+
+        task.abort();
+        let _ = task.await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if provider.pending.lock().await.is_none() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "cancelled approval was not cleared".to_string())?;
+        Ok(())
     }
 }

@@ -145,6 +145,41 @@ pub async fn get_task_summary(
         .map_err(internal)
 }
 
+/// Recovery barriers created when a mutating worker/tool was interrupted
+/// between its durable start and terminal boundaries.
+#[tauri::command]
+pub async fn list_recovery_blockers(
+    state: tauri::State<'_, TauriState>,
+    run_id: String,
+) -> Result<Vec<RecoveryBlocker>, IpcError> {
+    store(&state)?
+        .list_recovery_blockers(&run_id)
+        .map_err(internal)
+}
+
+/// Resolve an indeterminate side effect after the user inspected the
+/// workspace. Supported decisions are `retry` and `skip`.
+#[tauri::command]
+pub async fn resolve_recovery_task(
+    state: tauri::State<'_, TauriState>,
+    run_id: String,
+    task_id: String,
+    decision: String,
+) -> Result<(), IpcError> {
+    let decision = match decision.as_str() {
+        "retry" => RecoveryDecision::Retry,
+        "skip" => RecoveryDecision::Skip,
+        _ => {
+            return Err(IpcError::Validation(
+                "recovery decision must be 'retry' or 'skip'".to_string(),
+            ));
+        }
+    };
+    store(&state)?
+        .resolve_recovery_task(&run_id, &task_id, decision)
+        .map_err(internal)
+}
+
 // ── Error mapping ────────────────────────────────────────────────────────
 
 fn internal<E: std::fmt::Display>(e: E) -> IpcError {
@@ -329,9 +364,38 @@ pub async fn cancel_task_run(
     run_id: String,
 ) -> Result<serde_json::Value, IpcError> {
     let store = store(&state)?;
+    let message_key = store
+        .get_run(&run_id)
+        .map_err(internal)?
+        .map(|run| run.root_message_id);
     let cancelled = store.request_cancel(&run_id).map_err(internal)?;
+    if cancelled {
+        super::chat::cancel_pending_hitl(message_key.as_deref(), "task run cancelled").await;
+    }
     Ok(serde_json::json!({
         "success": cancelled,
+        "run_id": run_id,
+    }))
+}
+
+/// Pause a running TaskRun through the same cancellation token that owns its
+/// executor. Unlike cancellation, completed work remains resumable.
+#[tauri::command]
+pub async fn pause_task_run(
+    state: tauri::State<'_, TauriState>,
+    run_id: String,
+) -> Result<serde_json::Value, IpcError> {
+    let store = store(&state)?;
+    let message_key = store
+        .get_run(&run_id)
+        .map_err(internal)?
+        .map(|run| run.root_message_id);
+    let paused = store.request_pause(&run_id).map_err(internal)?;
+    if paused {
+        super::chat::cancel_pending_hitl(message_key.as_deref(), "task run paused").await;
+    }
+    Ok(serde_json::json!({
+        "success": paused,
         "run_id": run_id,
     }))
 }

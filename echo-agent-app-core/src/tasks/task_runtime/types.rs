@@ -588,11 +588,16 @@ pub enum RuntimeEventKind {
     WorkerAssigned,
     WorkerReleased,
     WorkerLlmUsage,
+    ToolStarted,
+    ToolCompleted,
+    ToolFailed,
     ArtifactProduced,
     ReviewPassed,
     ReviewNeedsFix,
     ReviewBlocked,
     CircuitBreakerTripped,
+    RecoveryBlocked,
+    RecoveryResolved,
     RunCancelled,
     Note,
 }
@@ -615,11 +620,16 @@ impl RuntimeEventKind {
             WorkerAssigned => "worker_assigned",
             WorkerReleased => "worker_released",
             WorkerLlmUsage => "worker_llm_usage",
+            ToolStarted => "tool_started",
+            ToolCompleted => "tool_completed",
+            ToolFailed => "tool_failed",
             ArtifactProduced => "artifact_produced",
             ReviewPassed => "review_passed",
             ReviewNeedsFix => "review_needs_fix",
             ReviewBlocked => "review_blocked",
             CircuitBreakerTripped => "circuit_breaker_tripped",
+            RecoveryBlocked => "recovery_blocked",
+            RecoveryResolved => "recovery_resolved",
             RunCancelled => "run_cancelled",
             Note => "note",
         }
@@ -642,11 +652,16 @@ impl RuntimeEventKind {
             "worker_assigned" => WorkerAssigned,
             "worker_released" => WorkerReleased,
             "worker_llm_usage" => WorkerLlmUsage,
+            "tool_started" => ToolStarted,
+            "tool_completed" => ToolCompleted,
+            "tool_failed" => ToolFailed,
             "artifact_produced" => ArtifactProduced,
             "review_passed" => ReviewPassed,
             "review_needs_fix" => ReviewNeedsFix,
             "review_blocked" => ReviewBlocked,
             "circuit_breaker_tripped" => CircuitBreakerTripped,
+            "recovery_blocked" => RecoveryBlocked,
+            "recovery_resolved" => RecoveryResolved,
             "run_cancelled" => RunCancelled,
             "note" => Note,
             _ => return None,
@@ -831,6 +846,40 @@ pub struct RuntimeTaskEvent {
     #[serde(with = "echo_agent::utils::time::local_rfc3339")]
     #[ts(as = "String")]
     pub timestamp: DateTime<Utc>,
+}
+
+/// User decision for a mutating task whose side effects are indeterminate
+/// after a process interruption.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename = "RecoveryDecision")]
+pub enum RecoveryDecision {
+    /// The user inspected the workspace and accepts re-running the task.
+    Retry,
+    /// The user chooses not to execute the task again.
+    Skip,
+}
+
+impl RecoveryDecision {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Retry => "retry",
+            Self::Skip => "skip",
+        }
+    }
+}
+
+/// Durable recovery barrier for a task whose mutating side effect may have
+/// happened even though no terminal worker/tool event was persisted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, rename = "RecoveryBlocker")]
+pub struct RecoveryBlocker {
+    pub run_id: String,
+    pub task_id: String,
+    pub execution_id: Option<String>,
+    pub call_id: Option<String>,
+    pub tool_name: Option<String>,
+    pub reason: String,
 }
 
 fn serialize_seq_as_string<S: serde::Serializer>(seq: &i64, s: S) -> Result<S::Ok, S::Error> {

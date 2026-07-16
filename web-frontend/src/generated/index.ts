@@ -33,6 +33,8 @@ export * from './PlanTask';
 export * from './PlanTaskKind';
 export * from './QqConfigResponse';
 export * from './QqUpdate';
+export * from './RecoveryBlocker';
+export * from './RecoveryDecision';
 export * from './ReviewIssue';
 export * from './ReviewOutcome';
 export * from './ReviewResult';

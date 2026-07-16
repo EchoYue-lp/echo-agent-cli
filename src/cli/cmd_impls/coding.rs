@@ -4,6 +4,7 @@
 
 use crate::cli::command::{CommandCategory, CommandContext, CommandOutcome, cmd};
 use crate::project::test_runner;
+use echo_agent_app_core::tasks::task_runtime::RecoveryDecision;
 use echo_agent_app_core::tasks::{BackgroundTaskKind, ResearchOutputFormat};
 use std::sync::Arc;
 
@@ -112,6 +113,16 @@ async fn cmd_tasks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                             println!("  ETA: {}s", eta);
                         }
                     }
+                    match service.recovery_blockers(id) {
+                        Ok(blockers) if !blockers.is_empty() => {
+                            println!("  Recovery blockers:");
+                            for blocker in blockers {
+                                println!("    {}: {}", blocker.task_id, blocker.reason);
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(error) => println!("  Recovery status unavailable: {error}"),
+                    }
                 }
                 None => {
                     println!("Task not found: {}", id);
@@ -128,6 +139,66 @@ async fn cmd_tasks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 println!("Task cancelled: {}", id);
             } else {
                 println!("Failed to cancel task (not found or not running): {}", id);
+            }
+        }
+        "pause" => {
+            let id = args.get(1).copied().unwrap_or("");
+            if id.is_empty() {
+                println!("Usage: /tasks pause <id>");
+                return CommandOutcome::Continue;
+            }
+            match service.pause(id) {
+                Ok(true) => println!("Task paused: {id}"),
+                Ok(false) => println!("Failed to pause task (not running): {id}"),
+                Err(error) => println!("Failed to pause task: {error}"),
+            }
+        }
+        "resume" => {
+            let id = args.get(1).copied().unwrap_or("");
+            if id.is_empty() {
+                println!("Usage: /tasks resume <id>");
+                return CommandOutcome::Continue;
+            }
+            match service.resume(id) {
+                Ok(()) => println!("Task resumed: {id}"),
+                Err(error) => println!("Failed to resume task: {error}"),
+            }
+        }
+        "recovery" => {
+            let id = args.get(1).copied().unwrap_or("");
+            if id.is_empty() {
+                println!("Usage: /tasks recovery <id>");
+                return CommandOutcome::Continue;
+            }
+            match service.recovery_blockers(id) {
+                Ok(blockers) if blockers.is_empty() => println!("No recovery blockers: {id}"),
+                Ok(blockers) => {
+                    println!("Recovery blockers for {id}:");
+                    for blocker in blockers {
+                        println!("  {}: {}", blocker.task_id, blocker.reason);
+                    }
+                    println!(
+                        "Resolve with /tasks retry <id> <task-id> or /tasks skip <id> <task-id>"
+                    );
+                }
+                Err(error) => println!("Failed to read recovery blockers: {error}"),
+            }
+        }
+        "retry" | "skip" => {
+            let id = args.get(1).copied().unwrap_or("");
+            let task_id = args.get(2).copied().unwrap_or("");
+            if id.is_empty() || task_id.is_empty() {
+                println!("Usage: /tasks {sub} <id> <task-id>");
+                return CommandOutcome::Continue;
+            }
+            let decision = if sub == "retry" {
+                RecoveryDecision::Retry
+            } else {
+                RecoveryDecision::Skip
+            };
+            match service.resolve_recovery_task(id, task_id, decision) {
+                Ok(()) => println!("Recovery decision recorded: {id}/{task_id} -> {sub}"),
+                Err(error) => println!("Failed to resolve recovery task: {error}"),
             }
         }
         "research" => {
@@ -186,7 +257,9 @@ async fn cmd_tasks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             }
         }
         _ => {
-            println!("Usage: /tasks [list|status <id>|cancel <id>|research <topic>|dag]");
+            println!(
+                "Usage: /tasks [list|status <id>|pause <id>|resume <id>|cancel <id>|recovery <id>|retry <id> <task-id>|skip <id> <task-id>|research <topic>|dag]"
+            );
         }
     }
     CommandOutcome::Continue
