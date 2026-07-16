@@ -14,7 +14,10 @@ use echo_agent::human_loop::{
     HumanLoopKind, HumanLoopProvider, HumanLoopRequest, HumanLoopResponse,
 };
 use echo_agent::mcp::{McpClient, McpContent, McpToolCallResult};
-use echo_agent::prelude::{Tool, ToolParameters, ToolResult, ToolRiskLevel};
+use echo_agent::prelude::{
+    Tool, ToolFailure, ToolFailureCategory, ToolParameters, ToolResult, ToolRiskLevel,
+    ToolSideEffect,
+};
 use echo_core::tools::{ToolContext, ToolResultKind};
 use futures::future::BoxFuture;
 use serde_json::{Value, json};
@@ -884,6 +887,17 @@ impl BrowserRuntime {
         };
         match first_result {
             Ok(result) => mcp_tool_result(tool, result),
+            Err(first_error) if !browser_mcp_retry_safe(tool, &arguments) => {
+                tracing::warn!(
+                    tool,
+                    ?backend,
+                    error = %first_error,
+                    "Playwright MCP call failed after a possibly consequential action; not replaying"
+                );
+                self.invalidate_client(backend, &first).await;
+                first.close().await;
+                Err(BrowserError::Connection(first_error.to_string()))
+            }
             Err(first_error) => {
                 tracing::warn!(
                     tool,
@@ -1012,6 +1026,63 @@ fn mcp_tool_result(tool: &str, result: McpToolCallResult) -> BrowserResult<McpTo
         });
     }
     Ok(result)
+}
+
+fn browser_mcp_retry_safe(tool: &str, arguments: &Value) -> bool {
+    match tool {
+        "browser_get_config"
+        | "browser_snapshot"
+        | "browser_take_screenshot"
+        | "browser_console_messages"
+        | "browser_network_requests"
+        | "browser_find" => true,
+        "browser_tabs" => arguments
+            .get("action")
+            .and_then(Value::as_str)
+            .is_none_or(|action| action == "list"),
+        _ => false,
+    }
+}
+
+fn browser_action_retry_safe(action: BrowserAction, parameters: &ToolParameters) -> bool {
+    if action == BrowserAction::Tabs {
+        return parameters
+            .get("action")
+            .and_then(Value::as_str)
+            .is_none_or(|action| action == "list");
+    }
+    action.risk() == ToolRiskLevel::ReadOnly
+}
+
+fn browser_failure(retry_safe: bool, error: &BrowserError, context: &ToolContext) -> ToolFailure {
+    match error {
+        BrowserError::Cancelled => ToolFailure::new(ToolFailureCategory::Cancelled),
+        BrowserError::Disabled | BrowserError::Prerequisite(_) => {
+            ToolFailure::new(ToolFailureCategory::Unavailable)
+        }
+        BrowserError::Io(_) | BrowserError::Connection(_) if retry_safe => {
+            ToolFailure::new(ToolFailureCategory::Unavailable).retryable()
+        }
+        BrowserError::Io(_) | BrowserError::Connection(_) => {
+            let failure = ToolFailure::new(ToolFailureCategory::PartialSideEffect)
+                .with_side_effect(ToolSideEffect::Possible)
+                .with_postcondition(
+                    "take a fresh browser snapshot and verify page/tab state before retrying",
+                );
+            match context.call_id.as_ref() {
+                Some(call_id) => failure.with_idempotency_key(call_id.clone()),
+                None => failure,
+            }
+        }
+        BrowserError::Tool { .. } if retry_safe => {
+            ToolFailure::new(ToolFailureCategory::InvalidArguments)
+        }
+        BrowserError::Tool { .. } => ToolFailure::new(ToolFailureCategory::PartialSideEffect)
+            .with_side_effect(ToolSideEffect::Possible)
+            .with_postcondition(
+                "take a fresh browser snapshot and verify whether the requested action completed",
+            ),
+    }
 }
 
 fn locator_failure_key(
@@ -1420,13 +1491,15 @@ impl Tool for ManagedBrowserTool {
         parameters: ToolParameters,
     ) -> BoxFuture<'a, echo_agent::error::Result<ToolResult>> {
         Box::pin(async move {
+            let retry_safe = browser_action_retry_safe(self.action, &parameters);
             match self
                 .runtime
                 .call(self.action, parameters, &ToolContext::default(), self.actor)
                 .await
             {
                 Ok(result) => Ok(result),
-                Err(error) => Ok(ToolResult::error(error.to_string())),
+                Err(error) => Ok(ToolResult::error(error.to_string())
+                    .with_failure(browser_failure(retry_safe, &error, &ToolContext::default()))),
             }
         })
     }
@@ -1437,13 +1510,15 @@ impl Tool for ManagedBrowserTool {
         context: &'a ToolContext,
     ) -> BoxFuture<'a, echo_agent::error::Result<ToolResult>> {
         Box::pin(async move {
+            let retry_safe = browser_action_retry_safe(self.action, &parameters);
             match self
                 .runtime
                 .call(self.action, parameters, context, self.actor)
                 .await
             {
                 Ok(result) => Ok(result),
-                Err(error) => Ok(ToolResult::error(error.to_string())),
+                Err(error) => Ok(ToolResult::error(error.to_string())
+                    .with_failure(browser_failure(retry_safe, &error, context))),
             }
         })
     }
@@ -1765,6 +1840,49 @@ mod tests {
             },
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn browser_retry_contract_distinguishes_reads_from_consequential_actions() {
+        assert!(browser_mcp_retry_safe("browser_snapshot", &json!({})));
+        assert!(browser_mcp_retry_safe(
+            "browser_tabs",
+            &json!({"action": "list"})
+        ));
+        assert!(!browser_mcp_retry_safe(
+            "browser_click",
+            &json!({"target": "submit"})
+        ));
+
+        let context = ToolContext {
+            call_id: Some("call-browser-1".to_string()),
+            ..Default::default()
+        };
+        let read_failure = browser_failure(
+            browser_action_retry_safe(BrowserAction::Snapshot, &ToolParameters::new()),
+            &BrowserError::Connection("closed".to_string()),
+            &context,
+        );
+        let click_failure = browser_failure(
+            browser_action_retry_safe(
+                BrowserAction::Click,
+                &ToolParameters::from([("target".to_string(), json!("submit"))]),
+            ),
+            &BrowserError::Connection("closed".to_string()),
+            &context,
+        );
+
+        assert_eq!(read_failure.category, ToolFailureCategory::Unavailable);
+        assert!(read_failure.allows_automatic_retry());
+        assert_eq!(
+            click_failure.category,
+            ToolFailureCategory::PartialSideEffect
+        );
+        assert!(!click_failure.allows_automatic_retry());
+        assert_eq!(
+            click_failure.idempotency_key.as_deref(),
+            Some("call-browser-1")
+        );
     }
 
     #[test]

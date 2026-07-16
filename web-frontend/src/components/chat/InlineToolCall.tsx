@@ -43,6 +43,7 @@ export const InlineToolCall = memo(function InlineToolCall({
   const durationMs = Number(toolCall.metadata?.duration_ms);
   const duration = Number.isFinite(durationMs) ? durationMs / 1000 : elapsed;
   const exitCode = toolCall.metadata?.exit_code;
+  const failure = toolCall.failure;
   const failed = toolCall.status === 'failed';
   const running = toolCall.status === 'running';
   const fullOutput = [
@@ -124,6 +125,7 @@ export const InlineToolCall = memo(function InlineToolCall({
           )}
         </button>
         <span className="shrink-0 pt-0.5 tabular-nums text-[var(--text-tertiary)]">
+          {failure ? `${failure.category} · ` : ''}
           {duration.toFixed(1)}s{exitCode == null ? '' : ` · exit ${exitCode}`}
         </span>
         <button
@@ -151,6 +153,12 @@ export const InlineToolCall = memo(function InlineToolCall({
               </button>
             )}
           </div>
+          {failure && (
+            <div className="mb-2 border-l-2 border-[var(--color-error)] pl-2 text-[10px] leading-relaxed text-[var(--text-secondary)]">
+              <div>{failure.recovery}</div>
+              {failure.postcondition && <div>{failure.postcondition}</div>}
+            </div>
+          )}
           {outputSections.length > 0 ? (
             <div className="max-h-64 space-y-2 overflow-auto bg-[var(--bg-code)] p-2">
               {outputSections.map((section) => (

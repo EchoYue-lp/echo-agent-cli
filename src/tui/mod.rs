@@ -633,7 +633,8 @@ pub(crate) fn tool_metadata_label(tool: &ToolExecutionMessage) -> String {
         .get("exit_code")
         .map(|value| format!("exit {value}"));
     let truncated = tool.truncated.then(|| "truncated".to_string());
-    [duration, exit_code, truncated]
+    let failure = tool.metadata.get("failure_category").cloned();
+    [duration, exit_code, failure, truncated]
         .into_iter()
         .flatten()
         .collect::<Vec<_>>()

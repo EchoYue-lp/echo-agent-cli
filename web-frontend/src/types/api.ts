@@ -48,6 +48,31 @@ export type ChatRunStatus =
 
 export type ToolExecutionStatus = 'running' | 'succeeded' | 'failed' | 'cancelled';
 
+export type ToolFailureCategory =
+  | 'invalid_arguments'
+  | 'unavailable'
+  | 'timeout'
+  | 'cancelled'
+  | 'transient'
+  | 'permanent'
+  | 'partial_side_effect';
+
+export type ToolRecoveryAction =
+  | 'correct_arguments'
+  | 'retry'
+  | 'restore_then_retry'
+  | 'verify_then_retry'
+  | 'stop';
+
+export interface ToolFailure {
+  category: ToolFailureCategory;
+  recovery: ToolRecoveryAction;
+  side_effect: 'none' | 'possible' | 'confirmed';
+  retry_after_ms?: number;
+  idempotency_key?: string;
+  postcondition?: string;
+}
+
 export interface ToolExecution {
   id: string;
   name: string;
@@ -63,6 +88,7 @@ export interface ToolExecution {
   finishedAt?: number;
   truncated?: boolean;
   metadata?: Record<string, string>;
+  failure?: ToolFailure;
 }
 
 /**
@@ -105,8 +131,16 @@ export type ChatEvent = {
       success: boolean;
       metadata: Record<string, string>;
       truncated: boolean;
+      failure?: ToolFailure | null;
     }
-  | { type: 'tool_result'; call_id: string; name: string; result: string; success: boolean }
+  | {
+      type: 'tool_result';
+      call_id: string;
+      name: string;
+      result: string;
+      success: boolean;
+      failure?: ToolFailure | null;
+    }
   | { type: 'chart'; spec: unknown }
   | { type: 'final_answer'; data: string }
   | { type: 'cancelled' }

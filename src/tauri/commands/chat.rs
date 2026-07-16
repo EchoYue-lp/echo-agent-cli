@@ -9,7 +9,7 @@ use chrono::Utc;
 use echo_agent::agent::CancellationToken;
 use echo_agent::human_loop::{HumanLoopProvider, HumanLoopRequest, HumanLoopResponse};
 use echo_agent::prelude::AgentEvent;
-use echo_agent::tools::{ToolOutputChannel, ToolStreamEvent};
+use echo_agent::tools::{ToolFailure, ToolOutputChannel, ToolStreamEvent};
 use echo_agent_app_core::chat_driver::ChatSink;
 use echo_agent_app_core::observability::{TraceEvent, TraceKind};
 use echo_agent_app_core::tasks::task_runtime::executor::ExecEvent;
@@ -84,6 +84,7 @@ pub enum ChatEvent {
         success: bool,
         metadata: std::collections::HashMap<String, String>,
         truncated: bool,
+        failure: Option<ToolFailure>,
     },
     #[serde(rename = "tool_result")]
     ToolResult {
@@ -91,6 +92,7 @@ pub enum ChatEvent {
         name: String,
         result: String,
         success: bool,
+        failure: Option<ToolFailure>,
     },
     #[serde(rename = "tool_batch_start")]
     ToolBatchStart { tool_count: usize },
@@ -1232,6 +1234,7 @@ fn agent_event_to_chat_event(
             success: result.success,
             metadata: result.metadata.clone(),
             truncated: result.truncated,
+            failure: result.failure.clone(),
         }),
         AgentEvent::ToolResult {
             call_id,
@@ -1242,16 +1245,19 @@ fn agent_event_to_chat_event(
             name: name.clone(),
             result: output.clone(),
             success: true,
+            failure: None,
         }),
         AgentEvent::ToolError {
             call_id,
             name,
             error,
+            failure,
         } => Some(ChatEvent::ToolResult {
             call_id: call_id.clone(),
             name: name.clone(),
             result: error.clone(),
             success: false,
+            failure: Some(failure.clone()),
         }),
         AgentEvent::ToolBatchStart { tool_count } => Some(ChatEvent::ToolBatchStart {
             tool_count: *tool_count,
@@ -1391,6 +1397,7 @@ pub async fn get_cache_diagnostics(
 #[cfg(test)]
 mod tool_transport_tests {
     use super::ChatEvent;
+    use echo_agent::tools::{ToolFailure, ToolFailureCategory};
 
     #[test]
     fn tool_output_transport_preserves_call_id_and_channel() -> Result<(), String> {
@@ -1414,6 +1421,38 @@ mod tool_transport_tests {
                 Some(channel)
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn tool_failure_transport_preserves_recovery_contract() -> Result<(), String> {
+        let value = serde_json::to_value(ChatEvent::ToolResult {
+            call_id: "call-7".to_string(),
+            name: "web_search".to_string(),
+            result: "temporary outage".to_string(),
+            success: false,
+            failure: Some(
+                ToolFailure::new(ToolFailureCategory::Transient)
+                    .retryable()
+                    .with_retry_after(500),
+            ),
+        })
+        .map_err(|error| error.to_string())?;
+
+        assert_eq!(
+            value
+                .get("failure")
+                .and_then(|failure| failure.get("category"))
+                .and_then(serde_json::Value::as_str),
+            Some("transient")
+        );
+        assert_eq!(
+            value
+                .get("failure")
+                .and_then(|failure| failure.get("recovery"))
+                .and_then(serde_json::Value::as_str),
+            Some("retry")
+        );
         Ok(())
     }
 }

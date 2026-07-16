@@ -96,13 +96,19 @@ export function handleChatEvent(event: ChatEvent, ctx: EventContext): void {
     }
     case 'tool_complete': {
       if (ctx.isCancelledRef.current) break;
-      store.completeToolStream(event.call_id, event.success, event.metadata, event.truncated);
+      store.completeToolStream(
+        event.call_id,
+        event.success,
+        event.metadata,
+        event.truncated,
+        event.failure
+      );
       break;
     }
     case 'tool_result': {
       if (ctx.isCancelledRef.current) break;
       if (event.name) {
-        store.completeToolCall(event.call_id, event.result || '', event.success);
+        store.completeToolCall(event.call_id, event.result || '', event.success, event.failure);
       }
       break;
     }

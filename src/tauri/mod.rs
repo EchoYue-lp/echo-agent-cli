@@ -513,6 +513,7 @@ pub fn build_tauri_app(
                                             name: tool_name,
                                             result,
                                             success,
+                                            failure,
                                             execution_id,
                                             run_id,
                                         } => (
@@ -525,6 +526,7 @@ pub fn build_tauri_app(
                                                 "name": tool_name,
                                                 "result": result,
                                                 "success": success,
+                                                "failure": failure,
                                             }),
                                         ),
                                         SubagentEvent::DispatchLlmUsage {

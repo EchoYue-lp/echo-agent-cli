@@ -1451,6 +1451,7 @@ impl TaskRuntimeStore {
         tool_name: &str,
         success: bool,
         result: &str,
+        failure: Option<&echo_agent::tools::ToolFailure>,
     ) -> Result<(), StoreError> {
         let event_type = if success {
             RuntimeEventKind::ToolCompleted
@@ -1469,6 +1470,7 @@ impl TaskRuntimeStore {
                 "success": success,
                 "result_preview": bounded_event_text(result, 500),
                 "result_chars": result.chars().count(),
+                "failure": failure,
             }),
         )?;
         Ok(())
@@ -2063,6 +2065,51 @@ mod tests {
             .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
         assert_eq!(todo.status, TodoStatus::Pending);
         assert_eq!(store.resume_task_run("r1")?.status, TaskRunStatus::Running);
+        Ok(())
+    }
+
+    #[test]
+    fn tool_failure_boundary_persists_recovery_contract() -> Result<(), StoreError> {
+        let store = fresh();
+        seed_plan(&store);
+        let failure = echo_agent::tools::ToolFailure::new(
+            echo_agent::tools::ToolFailureCategory::PartialSideEffect,
+        )
+        .with_postcondition("verify target hash");
+
+        store.record_tool_started("r1", "t1", "t1:1", "call-1", "write_file", false)?;
+        store.record_tool_finished(
+            "r1",
+            "t1",
+            "t1:1",
+            "call-1",
+            "write_file",
+            false,
+            "write interrupted",
+            Some(&failure),
+        )?;
+
+        let event = store
+            .list_events("r1", 0)?
+            .into_iter()
+            .find(|event| event.event_type == RuntimeEventKind::ToolFailed)
+            .ok_or_else(|| StoreError::TaskNotFound("tool failure event".to_string()))?;
+        assert_eq!(
+            event
+                .payload
+                .get("failure")
+                .and_then(|failure| failure.get("category"))
+                .and_then(serde_json::Value::as_str),
+            Some("partial_side_effect")
+        );
+        assert_eq!(
+            event
+                .payload
+                .get("failure")
+                .and_then(|failure| failure.get("postcondition"))
+                .and_then(serde_json::Value::as_str),
+            Some("verify target hash")
+        );
         Ok(())
     }
 

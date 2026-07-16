@@ -2806,6 +2806,7 @@ async fn run_main_agent_task(
                                 &name,
                                 true,
                                 &result,
+                                None,
                             ) {
                                 event_cancel.cancel();
                                 return Err(format!(
@@ -2833,6 +2834,7 @@ async fn run_main_agent_task(
                             call_id,
                             name,
                             error,
+                            failure,
                         } => {
                             if let Err(store_error) = store.record_tool_finished(
                                 &run_id,
@@ -2842,6 +2844,7 @@ async fn run_main_agent_task(
                                 &name,
                                 false,
                                 &error,
+                                Some(&failure),
                             ) {
                                 event_cancel.cancel();
                                 return Err(format!(
@@ -2859,6 +2862,7 @@ async fn run_main_agent_task(
                                         "name": name,
                                         "result": error,
                                         "success": false,
+                                        "failure": failure,
                                     }),
                                 )
                                 .with_agent(agent_role.clone())

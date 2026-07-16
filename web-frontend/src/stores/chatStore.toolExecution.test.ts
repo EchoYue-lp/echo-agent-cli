@@ -63,6 +63,28 @@ describe('chat tool execution projection', () => {
     });
   });
 
+  it('preserves structured failure and recovery facts', () => {
+    const store = useChatStore.getState();
+    store.startAssistantMessage('assistant-failure');
+    store.setToolCall('call-failure', 'browser_click', { target: 'submit' });
+    store.completeToolCall('call-failure', 'connection closed', false, {
+      category: 'partial_side_effect',
+      recovery: 'verify_then_retry',
+      side_effect: 'possible',
+      idempotency_key: 'call-failure',
+      postcondition: 'take a fresh snapshot',
+    });
+
+    expect(useChatStore.getState().messages[0]?.toolCalls?.[0]).toMatchObject({
+      status: 'failed',
+      failure: {
+        category: 'partial_side_effect',
+        recovery: 'verify_then_retry',
+        postcondition: 'take a fresh snapshot',
+      },
+    });
+  });
+
   it('marks running tools failed when the stream aborts', () => {
     const store = useChatStore.getState();
     store.startAssistantMessage('assistant-error');

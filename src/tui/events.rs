@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use echo_agent::agent::subagent::SubagentEvent;
+use echo_agent::tools::ToolFailure;
 use echo_agent_app_core::context_window::ContextWindowSnapshot;
 
 /// Poll interval for non-blocking event check.
@@ -259,12 +260,14 @@ enum AgentEvent {
         success: bool,
         metadata: std::collections::HashMap<String, String>,
         truncated: bool,
+        failure: Option<ToolFailure>,
     },
     /// A tool execution completed.
     ToolResult {
         call_id: String,
         output: String,
         success: bool,
+        failure: Option<ToolFailure>,
     },
     /// An error occurred.
     Error(String),
@@ -653,9 +656,23 @@ pub async fn run_event_loop(
                 AgentEvent::ToolComplete {
                     call_id,
                     success,
-                    metadata,
+                    mut metadata,
                     truncated,
+                    failure,
                 } => {
+                    if let Some(failure) = failure {
+                        metadata.insert(
+                            "failure_category".to_string(),
+                            failure.category.as_str().to_string(),
+                        );
+                        metadata.insert(
+                            "recovery_action".to_string(),
+                            failure.recovery.as_str().to_string(),
+                        );
+                        if let Some(postcondition) = failure.postcondition {
+                            metadata.insert("postcondition".to_string(), postcondition);
+                        }
+                    }
                     if let Some(tool) = find_tool_mut(app, &call_id) {
                         tool.status = if success {
                             ToolExecutionStatus::Succeeded
@@ -675,9 +692,24 @@ pub async fn run_event_loop(
                     call_id,
                     output,
                     success,
+                    failure,
                 } => {
                     let mut diff_tool_name = None;
                     if let Some(tool) = find_tool_mut(app, &call_id) {
+                        if let Some(failure) = failure {
+                            tool.metadata.insert(
+                                "failure_category".to_string(),
+                                failure.category.as_str().to_string(),
+                            );
+                            tool.metadata.insert(
+                                "recovery_action".to_string(),
+                                failure.recovery.as_str().to_string(),
+                            );
+                            if let Some(postcondition) = failure.postcondition {
+                                tool.metadata
+                                    .insert("postcondition".to_string(), postcondition);
+                            }
+                        }
                         tool.status = if success {
                             ToolExecutionStatus::Succeeded
                         } else {
@@ -1875,6 +1907,7 @@ impl echo_agent_app_core::chat_driver::ChatSink for TuiChatSink {
                 success: result.success,
                 metadata: result.metadata,
                 truncated: result.truncated,
+                failure: result.failure,
             },
             echo_agent::agent::AgentEvent::ToolResult {
                 call_id, output, ..
@@ -1882,14 +1915,19 @@ impl echo_agent_app_core::chat_driver::ChatSink for TuiChatSink {
                 call_id,
                 output,
                 success: true,
+                failure: None,
             },
-            echo_agent::agent::AgentEvent::ToolError { call_id, error, .. } => {
-                AgentEvent::ToolResult {
-                    call_id,
-                    output: error,
-                    success: false,
-                }
-            }
+            echo_agent::agent::AgentEvent::ToolError {
+                call_id,
+                error,
+                failure,
+                ..
+            } => AgentEvent::ToolResult {
+                call_id,
+                output: error,
+                success: false,
+                failure: Some(failure),
+            },
             echo_agent::agent::AgentEvent::ContextCompressed {
                 before_count,
                 after_count,

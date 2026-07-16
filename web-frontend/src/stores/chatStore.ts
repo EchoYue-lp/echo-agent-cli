@@ -5,6 +5,7 @@ import type {
   ToolExecution,
   ExecutionRound,
   ChatRunStatus,
+  ToolFailure,
 } from '../types/api';
 import { useConversationStore } from './conversationStore';
 import { appendBoundedToolOutput } from '../lib/toolOutput';
@@ -82,9 +83,15 @@ interface ChatState {
     callId: string,
     success: boolean,
     metadata: Record<string, string>,
-    truncated: boolean
+    truncated: boolean,
+    failure?: ToolFailure | null
   ) => void;
-  completeToolCall: (callId: string, result: string, success: boolean) => void;
+  completeToolCall: (
+    callId: string,
+    result: string,
+    success: boolean,
+    failure?: ToolFailure | null
+  ) => void;
   startToolBatch: (toolCount: number) => void;
   endToolBatch: () => void;
   finalizeAssistantMessage: (id: string, content: string) => void;
@@ -357,7 +364,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     });
   },
 
-  completeToolStream: (callId, success, metadata, truncated) => {
+  completeToolStream: (callId, success, metadata, truncated, failure) => {
     set((s) => {
       const update = (tool: ToolExecution): ToolExecution =>
         tool.id === callId
@@ -367,6 +374,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
                 success,
                 status: success ? 'succeeded' : 'failed',
                 metadata,
+                failure: failure ?? tool.failure,
                 truncated: tool.truncated || truncated,
                 finishedAt: Date.now(),
               }
@@ -381,7 +389,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     });
   },
 
-  completeToolCall: (callId, result, success) => {
+  completeToolCall: (callId, result, success, failure) => {
     set((s) => {
       const update = (tool: ToolExecution): ToolExecution => {
         if (tool.id !== callId) return tool;
@@ -393,6 +401,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           finishedAt: tool.finishedAt ?? Date.now(),
           stdout: success && !tool.stdout ? result : tool.stdout,
           stderr: !success && !tool.stderr ? result : tool.stderr,
+          failure: failure ?? tool.failure,
         };
       };
       return {

@@ -642,8 +642,19 @@ async fn chat_with_agent(
                 output.print_tool_result(&name, &tool_output, true);
                 first_chunk = true;
             }
-            AgentEvent::ToolError { name, error, .. } => {
-                let err_text = format!("✗ {}: {}", name, error);
+            AgentEvent::ToolError {
+                name,
+                error,
+                failure,
+                ..
+            } => {
+                let err_text = format!(
+                    "✗ {} [{} → {}]: {}",
+                    name,
+                    failure.category.as_str(),
+                    failure.recovery.as_str(),
+                    error
+                );
                 let styled = nu_ansi_term::Color::Red.paint(&err_text);
                 println!("  {}", styled);
                 crate::webhook::emitter::emit_global(crate::webhook::WebhookEvent::ToolFailed {
