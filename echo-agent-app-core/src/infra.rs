@@ -236,6 +236,11 @@ pub async fn create_agent_with_diagnostics(
     };
     let max_tool_output_tokens =
         resolved_max_tool_output_tokens(app_config.agent.max_tool_output_tokens);
+    let sandbox_manager = Arc::new(echo_agent::sandbox::SandboxManager::local_sandbox());
+    let run_code_available = sandbox_manager.has_local_os_sandbox().await;
+    if !run_code_available {
+        tracing::warn!("OS sandbox unavailable; run_code will be disabled for this EKO runtime");
+    }
 
     // Use ReactAgentBuilder — mode is resolved at the CLI layer,
     // framework only receives model + system_prompt + tools.
@@ -258,9 +263,7 @@ pub async fn create_agent_with_diagnostics(
             timeout_ms: app_config.agent.tool_timeout_ms,
             ..Default::default()
         })
-        .sandbox_manager(Arc::new(
-            echo_agent::sandbox::SandboxManager::local_sandbox(),
-        ))
+        .sandbox_manager(sandbox_manager.clone())
         .enable_cot();
 
     // ── Pass the resolved configured model to the LLM client ──
@@ -406,6 +409,7 @@ pub async fn create_agent_with_diagnostics(
         tracing::error!("Failed to build agent: {e}");
         format!("Failed to initialize agent: {e}. Please check your configuration and try again.")
     })?;
+    configure_run_code_capability(&mut agent, run_code_available);
     agent.set_pre_model_context_projector(Some(std::sync::Arc::new(
         crate::tasks::task_runtime::compact_context::TaskRuntimeContextProjector::new(
             crate::tasks::task_runtime::compact_context::task_runtime_projection_registry(),
@@ -452,6 +456,8 @@ pub async fn create_agent_with_diagnostics(
         subagent_project_root.as_deref(),
         subagent_user_home.as_deref(),
         params.browser_runtime.clone(),
+        sandbox_manager,
+        run_code_available,
     )
     .await;
 
@@ -491,6 +497,18 @@ pub async fn create_agent_with_diagnostics(
         agent,
         prompt_assembly,
     })
+}
+
+fn configure_run_code_capability(agent: &mut ReactAgent, available: bool) {
+    if available {
+        return;
+    }
+    if agent.remove_tool("run_code").is_some() {
+        tracing::warn!(
+            agent = %agent.model_name(),
+            "run_code removed because no OS-level sandbox is available"
+        );
+    }
 }
 
 /// Resolve a worker model frontmatter value to a concrete model id.
@@ -537,6 +555,8 @@ async fn register_default_subagents(
     project_root: Option<&std::path::Path>,
     user_home: Option<&std::path::Path>,
     browser_runtime: Option<Arc<crate::browser::BrowserRuntime>>,
+    sandbox_manager: Arc<echo_agent::sandbox::SandboxManager>,
+    run_code_available: bool,
 ) {
     let workers = crate::subagent_loader::discover_subagents(project_root, user_home);
     tracing::info!(
@@ -601,6 +621,8 @@ async fn register_default_subagents(
                 worker_def.can_delegate,
                 max_iterations,
                 browser_runtime.clone(),
+                sandbox_manager.clone(),
+                run_code_available,
             )
         };
         match build_result {
@@ -761,6 +783,8 @@ fn build_writer_worker_agent(
     can_delegate: bool,
     max_iterations: usize,
     browser_runtime: Option<Arc<crate::browser::BrowserRuntime>>,
+    sandbox_manager: Arc<echo_agent::sandbox::SandboxManager>,
+    run_code_available: bool,
 ) -> std::result::Result<ReactAgent, echo_agent::error::ReactError> {
     // Mirror build_readonly_worker_agent, but OMIT `.readonly_tools()` → the
     // default `readonly_tools: false` triggers `register_all_tools`, giving the
@@ -785,7 +809,8 @@ fn build_writer_worker_agent(
         .tool_execution(echo_agent::tools::ToolExecutionConfig {
             timeout_ms: tool_timeout_ms,
             ..Default::default()
-        });
+        })
+        .sandbox_manager(sandbox_manager);
     if can_delegate {
         builder = builder.register_agent_dispatch_tool();
     }
@@ -807,6 +832,7 @@ fn build_writer_worker_agent(
     }
 
     let mut worker = builder.build()?;
+    configure_run_code_capability(&mut worker, run_code_available);
     if let Some(browser_runtime) = browser_runtime {
         browser_runtime.install_worker_tools(&mut worker);
     }
@@ -1834,9 +1860,12 @@ pub fn build_llm_config(
 #[cfg(test)]
 mod resolve_worker_model_tests {
     use super::{
-        DEFAULT_MAX_TOOL_OUTPUT_TOKENS, TASK_MANAGEMENT_GUIDE, resolve_worker_model,
-        resolved_max_tool_output_tokens,
+        DEFAULT_MAX_TOOL_OUTPUT_TOKENS, TASK_MANAGEMENT_GUIDE, build_writer_worker_agent,
+        configure_run_code_capability, resolve_worker_model, resolved_max_tool_output_tokens,
     };
+    use echo_agent::agent::ReactAgentBuilder;
+    use echo_agent::sandbox::SandboxManager;
+    use std::sync::Arc;
 
     #[test]
     fn stable_task_guide_stays_within_cache_budget() {
@@ -1878,5 +1907,44 @@ mod resolve_worker_model_tests {
             resolve_worker_model(Some("claude-haiku"), "parent"),
             "claude-haiku"
         );
+    }
+
+    #[test]
+    fn unavailable_os_sandbox_removes_run_code() -> echo_agent::error::Result<()> {
+        let mut agent = ReactAgentBuilder::new()
+            .model("test-model")
+            .enable_tools()
+            .build()?;
+        assert!(agent.list_tools().iter().any(|name| name == "run_code"));
+
+        configure_run_code_capability(&mut agent, false);
+        assert!(!agent.list_tools().iter().any(|name| name == "run_code"));
+        Ok(())
+    }
+
+    #[test]
+    fn writer_worker_inherits_sandbox_manager() -> echo_agent::error::Result<()> {
+        let sandbox = Arc::new(SandboxManager::local_sandbox());
+        let worker = build_writer_worker_agent(
+            "writer",
+            "write files",
+            "test-model",
+            None,
+            None,
+            None,
+            8_192,
+            30_000,
+            1_024,
+            "test-cache-user",
+            false,
+            1,
+            None,
+            sandbox,
+            true,
+        )?;
+
+        assert!(worker.sandbox_manager().is_some());
+        assert!(worker.list_tools().iter().any(|name| name == "run_code"));
+        Ok(())
     }
 }
