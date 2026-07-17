@@ -105,6 +105,7 @@ pub async fn run_channels_mode(
     task_runtime_store: Option<
         std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
     >,
+    review_integration: Option<std::sync::Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
 ) -> Result<()> {
     use std::sync::Arc;
 
@@ -180,10 +181,15 @@ pub async fn run_channels_mode(
         let session_config = session_config.clone();
         let pool = pool.clone();
         let store = task_runtime_store.clone();
+        let review_integration = review_integration.clone();
         Arc::new(SessionHandler::new(
             session_config,
             move || -> Box<dyn MessageHandler> {
-                Box::new(AppChannelMessageHandler::new(pool.clone(), store.clone()))
+                Box::new(AppChannelMessageHandler::new(
+                    pool.clone(),
+                    store.clone(),
+                    review_integration.clone(),
+                ))
             },
         ))
     };

@@ -333,6 +333,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
                 pool.clone(),
                 app_config.clone(),
                 task_runtime_store.clone(),
+                runtime.review_integration.clone(),
             ));
 
             if run_cli {

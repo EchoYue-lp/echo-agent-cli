@@ -47,7 +47,7 @@ pub struct ChatResources {
     /// (B5.1): `create_complex_task` forwards this into the background Run's
     /// payload so `execute_run` (Blocking policy) lands the
     /// `taskrun:completed:{run_id}` memory before returning. `None` when the
-    /// caller has no review/memory subsystem wired (TUI/channel/tests) — the
+    /// caller has no review/memory subsystem wired (minimal tests/embedders) — the
     /// write becomes a no-op.
     pub layer_manager: Option<Arc<MemoryLayerManager>>,
 }

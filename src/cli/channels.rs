@@ -15,6 +15,15 @@ use std::sync::Arc;
 #[cfg(feature = "channels")]
 use echo_agent_app_core::agent_pool::AgentPool;
 
+#[cfg(feature = "channels")]
+use echo_agent_app_core::hitl::{ChannelHumanLoopProvider, ChannelHumanLoopResolution};
+
+#[cfg(feature = "channels")]
+enum ChannelRenderEvent {
+    Driver(echo_agent_app_core::chat_driver::ChatDriverEvent),
+    Prompt(String),
+}
+
 /// IM channel 消息处理器：持 `AgentPool`，每 `handle` 从 pool 取/复用 per-sender agent。
 ///
 /// TUI/GUI functional parity (AGENTS.md): channels drive chat through the
@@ -26,6 +35,10 @@ use echo_agent_app_core::agent_pool::AgentPool;
 pub struct AppChannelMessageHandler {
     pool: Arc<AgentPool>,
     store: Option<Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
+    review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
+    hitl: Arc<ChannelHumanLoopProvider>,
+    interaction_mode:
+        tokio::sync::RwLock<echo_agent_app_core::tasks::task_runtime::InteractionMode>,
 }
 
 #[cfg(feature = "channels")]
@@ -33,8 +46,17 @@ impl AppChannelMessageHandler {
     pub fn new(
         pool: Arc<AgentPool>,
         store: Option<Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
+        review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
     ) -> Self {
-        Self { pool, store }
+        Self {
+            pool,
+            store,
+            review_integration,
+            hitl: Arc::new(ChannelHumanLoopProvider::new()),
+            interaction_mode: tokio::sync::RwLock::new(
+                echo_agent_app_core::tasks::task_runtime::InteractionMode::Auto,
+            ),
+        }
     }
 
     /// per-sender conversation_id（= pool key）。sender 维度隔离。
@@ -55,35 +77,22 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
         &self,
         msg: echo_agent::channels::InboundMessage,
     ) -> echo_core::error::Result<echo_agent::channels::OutboundMessage> {
-        use echo_agent::agent::Agent; // 提供 ReactAgent::chat（Agent trait 方法）
-        use echo_core::error::ChannelError;
+        use futures::StreamExt;
 
-        let conv = Self::conversation_id(&msg.channel_id, &msg.sender_id);
-        let cache_id = Self::cache_user_id(&msg.channel_id, &msg.sender_id);
-
-        // 1. 从 pool 取/复用 per-sender agent（bootstrap 等价全套已注入）。
-        //    PoolError -> ChannelError::SendError，再经 From<ChannelError> for ReactError 转。
-        let agent = self
-            .pool
-            .acquire(&conv)
-            .await
-            .map_err(|e| ChannelError::SendError(format!("AgentPool acquire failed: {e}")))?;
-
-        // 2. 设 per-sender cache_user_id（写锁短暂持有，不跨 chat）。
-        agent
-            .write(|a| a.config_mut().set_cache_user_id(&cache_id))
-            .await;
-
-        // 3. 非流式 chat。read 锁跨 chat：per-sender 无并发，
-        //    pool cleanup monitor 用 try_read 见忙即不驱逐（与 TUI repl.rs:394 同 pattern）。
-        let guard = agent.inner().read().await;
-        let reply = guard.chat(&msg.text).await?;
-
+        let channel_id = msg.channel_id.clone();
+        let to = msg.sender_id.clone();
+        let chat_type = msg.chat_type;
+        let mut stream = self.handle_stream(msg).await?;
+        let mut reply = String::new();
+        while let Some(item) = stream.next().await {
+            let message = item?;
+            if !reply.is_empty() && !reply.ends_with('\n') {
+                reply.push('\n');
+            }
+            reply.push_str(&message.text);
+        }
         Ok(echo_agent::channels::OutboundMessage::new(
-            &msg.channel_id,
-            &msg.sender_id,
-            msg.chat_type,
-            &reply,
+            channel_id, to, chat_type, reply,
         ))
     }
 
@@ -99,6 +108,23 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
         use echo_core::error::ChannelError;
         use futures::StreamExt;
 
+        let immediate = match self.hitl.resolve_message(&msg.text).await {
+            ChannelHumanLoopResolution::Resolved(message)
+            | ChannelHumanLoopResolution::Invalid(message) => Some(message),
+            ChannelHumanLoopResolution::NoPending => {
+                parse_channel_mode_command(&msg.text, &self.interaction_mode).await
+            }
+        };
+        if let Some(message) = immediate {
+            let outbound = echo_agent::channels::OutboundMessage::new(
+                &msg.channel_id,
+                &msg.sender_id,
+                msg.chat_type,
+                message,
+            );
+            return Ok(futures::stream::once(async move { Ok(outbound) }).boxed());
+        }
+
         let conv = Self::conversation_id(&msg.channel_id, &msg.sender_id);
         let cache_id = Self::cache_user_id(&msg.channel_id, &msg.sender_id);
 
@@ -113,21 +139,54 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
         agent
             .write(|a| a.config_mut().set_cache_user_id(&cache_id))
             .await;
+        let hitl = self.hitl.clone();
+        agent
+            .write_async(|agent| {
+                Box::pin(async move {
+                    agent.set_human_loop_provider_preserving_approvals(hitl);
+                })
+            })
+            .await;
+        if let Some(message) = channel_trace_response(&agent, &msg.text).await {
+            let outbound = echo_agent::channels::OutboundMessage::new(
+                &msg.channel_id,
+                &msg.sender_id,
+                msg.chat_type,
+                message,
+            );
+            return Ok(futures::stream::once(async move { Ok(outbound) }).boxed());
+        }
 
         // 3. Drive through the shared `drive_chat` entry (TUI/GUI parity,
         //    AGENTS.md): route the message (normal vs complex) and stream
         //    versioned agent events to a channel sink; per-sender isolation means no
         //    concurrency, so the read guard is held for the stream lifetime
         //    inside `drive_chat` (same as TUI send_to_agent).
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<echo_agent::agent::EventEnvelope>();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<
+            echo_agent_app_core::chat_driver::ChatDriverEvent,
+        >();
         let text = msg.text.clone();
-        // B5.4: convert IM-channel attachments (QQ/飞书 images/files) into a
-        // multimodal Message so the agent sees them — same path the GUI and
-        // TUI /attach use. None when there are no attachments (plain text turn).
-        let multimodal = build_channel_multimodal_message(&text, &msg.attachments);
+        // Persist IM attachments into the same durable reference contract as
+        // GUI/TUI so TaskRuntime workers can reconstruct the same message.
+        let attachment_refs = stage_channel_attachments(&msg.attachments);
+        let multimodal = if attachment_refs.is_empty() {
+            None
+        } else {
+            match echo_agent_app_core::attachments::build_message_from_refs(&text, &attachment_refs)
+            {
+                Ok(message) => Some(message),
+                Err(error) => {
+                    tracing::warn!(%error, "failed to rebuild channel attachments");
+                    None
+                }
+            }
+        };
         let agent_owned = agent.clone();
         let pool = self.pool.clone();
         let store = self.store.clone();
+        let review_integration = self.review_integration.clone();
+        let interaction_mode = *self.interaction_mode.read().await;
+        let mut prompt_rx = self.hitl.subscribe_prompts();
         let conv_owned = conv.clone();
         tokio::spawn(async move {
             use echo_agent_app_core::chat_driver::{ChannelChatSink, drive_chat};
@@ -145,30 +204,37 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
                 sink,
                 conv_id: Some(conv_owned.clone()),
                 root_message_id: uuid::Uuid::new_v4().to_string(),
-                attachments: vec![],
+                attachments: attachment_refs,
                 cancel,
-                // IM channels are always Auto (no mode selector): prompt-level
-                // classification, not a runtime state machine.
-                mode_hint: Some(
-                    echo_agent_app_core::tasks::task_runtime::InteractionMode::Auto
-                        .prompt_hint()
-                        .to_string(),
-                ),
-                interaction_mode: echo_agent_app_core::tasks::task_runtime::InteractionMode::Auto,
-                // B5.1: channels have no review/memory subsystem; autonomous run
-                // memory writes are no-ops (recall closure off).
-                layer_manager: None,
+                mode_hint: Some(interaction_mode.prompt_hint().to_string()),
+                interaction_mode,
+                layer_manager: review_integration
+                    .as_ref()
+                    .map(|integration| Arc::new(integration.create_layer_manager())),
             });
             if let Err(e) = drive_chat(&agent_owned, &text, multimodal.as_ref(), res).await {
                 tracing::warn!(error = %e, conv = %conv_owned, "channel drive_chat failed");
             }
         });
-        // Project each shared envelope payload into the existing sentence
-        // aggregator. Identity and ordering were already validated by drive_chat,
-        // which also normalized stream errors into terminal payloads.
-        let event_stream = futures::stream::unfold(rx, |mut rx| async move {
-            rx.recv().await.map(|item| (Ok(item.payload), rx))
-        })
+        // Project the complete shared product stream into channel text.
+        let event_stream = async_stream::stream! {
+            let mut rx = rx;
+            loop {
+                tokio::select! {
+                    event = rx.recv() => match event {
+                        Some(event) => yield Ok(ChannelRenderEvent::Driver(event)),
+                        None => break,
+                    },
+                    prompt = prompt_rx.recv() => match prompt {
+                        Ok(prompt) => yield Ok(ChannelRenderEvent::Prompt(prompt)),
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            tracing::warn!(skipped, "channel HITL prompt receiver lagged");
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
+                    }
+                }
+            }
+        }
         .boxed();
 
         // 4. 聚合成逐段 OutboundMessage 流
@@ -189,6 +255,76 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
     }
 }
 
+#[cfg(feature = "channels")]
+async fn parse_channel_mode_command(
+    message: &str,
+    mode: &tokio::sync::RwLock<echo_agent_app_core::tasks::task_runtime::InteractionMode>,
+) -> Option<String> {
+    use echo_agent_app_core::tasks::task_runtime::InteractionMode;
+
+    let mut parts = message.split_whitespace();
+    if parts.next()? != "/mode" {
+        return None;
+    }
+    let Some(value) = parts.next() else {
+        let current = mode.read().await;
+        return Some(format!(
+            "Current mode: {}. Usage: /mode chat|task|auto",
+            current.as_str()
+        ));
+    };
+    let next = match value.to_ascii_lowercase().as_str() {
+        "chat" => InteractionMode::Chat,
+        "task" => InteractionMode::Task,
+        "auto" => InteractionMode::Auto,
+        _ => return Some("Usage: /mode chat|task|auto".to_string()),
+    };
+    *mode.write().await = next;
+    Some(format!("Interaction mode set to {}.", next.as_str()))
+}
+
+#[cfg(feature = "channels")]
+async fn channel_trace_response(
+    agent: &echo_agent_app_core::agent_handle::AgentHandle,
+    message: &str,
+) -> Option<String> {
+    let mut parts = message.split_whitespace();
+    if parts.next()? != "/trace" {
+        return None;
+    }
+    let store = agent.read(|agent| agent.run_store.clone()).await;
+    let Some(store) = store else {
+        return Some("Run diagnostics are not configured.".to_string());
+    };
+    let diagnostic_id = match parts.next() {
+        Some(value) => value.to_string(),
+        None => {
+            match echo_agent_app_core::observability::list_diagnostic_runs(store.as_ref()).await {
+                Ok(runs) => match runs.first() {
+                    Some(run) => run.diagnostic_id.clone(),
+                    None => return Some("No durable run diagnostics available.".to_string()),
+                },
+                Err(error) => return Some(format!("Unable to list run diagnostics: {error}")),
+            }
+        }
+    };
+    Some(
+        match echo_agent_app_core::observability::load_run_diagnostics(
+            store.as_ref(),
+            &diagnostic_id,
+            None,
+        )
+        .await
+        {
+            Ok(Some(diagnostics)) => {
+                echo_agent_app_core::observability::format_run_diagnostics(&diagnostics)
+            }
+            Ok(None) => format!("Run diagnostics not found: {diagnostic_id}"),
+            Err(error) => format!("Unable to load run diagnostics: {error}"),
+        },
+    )
+}
+
 /// 将任意字符串清理为 DeepSeek `user_id` 合法形式 `[a-zA-Z0-9\-_]+`，最长 512 字符。
 ///
 /// UTF-8 安全：用 `chars()` 迭代，禁止字节截断（中文/emoji → 替换为 `-`）。
@@ -206,49 +342,63 @@ fn sanitize_cache_user_id(raw: &str) -> String {
         .collect()
 }
 
-/// Build a multimodal user `Message` from an IM channel's text + attachments
-/// (B5.4). Images become `ContentPart::ImageUrl` (inline base64 data URL); all
-/// other kinds (File/Audio/Video) become `ContentPart::File`. Returns `None`
-/// when there are no attachments (plain text turn — zero overhead, drive_chat
-/// builds `Message::user(text)` itself).
 #[cfg(feature = "channels")]
-fn build_channel_multimodal_message(
-    text: &str,
-    attachments: &[echo_agent::channels::MessageAttachment],
-) -> Option<echo_core::llm::types::Message> {
+fn channel_attachment_data(
+    index: usize,
+    attachment: &echo_agent::channels::MessageAttachment,
+) -> echo_agent_app_core::types::AttachmentData {
     use base64::Engine as _;
     use echo_agent::channels::AttachmentKind;
-    use echo_agent::llm::types::{ContentPart, ImageUrl};
 
-    if attachments.is_empty() {
-        return None;
-    }
-    let mut parts = Vec::with_capacity(attachments.len() + 1);
-    parts.push(ContentPart::Text {
-        text: text.to_string(),
-    });
-    for att in attachments {
-        let b64 = base64::engine::general_purpose::STANDARD.encode(&att.data);
-        match att.kind {
-            AttachmentKind::Image => {
-                // Image MIME inferred from the kind; providers parse the data URL.
-                parts.push(ContentPart::ImageUrl {
-                    image_url: ImageUrl {
-                        url: format!("data:image/png;base64,{b64}"),
-                        detail: None,
-                    },
-                });
-            }
+    let fallback_name = match attachment.kind {
+        AttachmentKind::Image => "image.png",
+        AttachmentKind::File => "attachment.bin",
+        AttachmentKind::Audio => "audio.bin",
+        AttachmentKind::Video => "video.bin",
+    };
+    let name = attachment
+        .filename
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{}-{fallback_name}", index.saturating_add(1)));
+    let inferred = echo_agent_app_core::attachments::infer_mime_type(&name);
+    let mime_type = if inferred != "application/octet-stream" {
+        inferred
+    } else {
+        match attachment.kind {
+            AttachmentKind::Image => "image/png",
             AttachmentKind::File | AttachmentKind::Audio | AttachmentKind::Video => {
-                let name = att
-                    .filename
-                    .clone()
-                    .unwrap_or_else(|| "attachment".to_string());
-                parts.push(ContentPart::File { name, content: b64 });
+                "application/octet-stream"
             }
         }
+    };
+    echo_agent_app_core::types::AttachmentData {
+        name,
+        mime_type: mime_type.to_string(),
+        data: base64::engine::general_purpose::STANDARD.encode(&attachment.data),
+        size: u64::try_from(attachment.data.len()).unwrap_or(u64::MAX),
     }
-    Some(echo_agent::llm::types::Message::user_multimodal(parts))
+}
+
+#[cfg(feature = "channels")]
+fn stage_channel_attachments(
+    attachments: &[echo_agent::channels::MessageAttachment],
+) -> Vec<echo_agent_app_core::attachments::AttachmentRef> {
+    attachments
+        .iter()
+        .enumerate()
+        .filter_map(|(index, attachment)| {
+            let data = channel_attachment_data(index, attachment);
+            match echo_agent_app_core::attachments::stage_attachment_data(&data, None) {
+                Ok(reference) => Some(reference),
+                Err(error) => {
+                    tracing::warn!(%error, name = %data.name, "skipping channel attachment");
+                    None
+                }
+            }
+        })
+        .collect()
 }
 
 #[cfg(feature = "channels")]
@@ -261,7 +411,7 @@ fn is_sentence_end(c: char) -> bool {
     matches!(c, '。' | '．' | '！' | '？' | '…' | '.' | '!' | '?')
 }
 
-/// 把 `AgentEvent` 流按句/段落聚合成逐段 `OutboundMessage` 流。
+/// 把共享 `ChatDriverEvent` 流按句/段落聚合成逐段 `OutboundMessage` 流。
 ///
 /// flush 条件(满足任一):
 /// 1. buf 含换行 → flush 到最后一个换行(含),保留换行后的剩余。
@@ -272,20 +422,18 @@ fn is_sentence_end(c: char) -> bool {
 /// Error 先 flush 剩余后 yield Err;其它事件忽略。
 ///
 /// 生命周期:返回流借用 'a(随 `events`),由 `try_stream!` 自然处理(宏生成的
-/// future 持有 `events` 的借用)。UTF-8 安全:全用 chars() 判长(AGENTS.md §1);
-/// 无 unwrap/expect(§2);换行切片见下方注释。
+/// future 持有 `events` 的借用)。UTF-8 安全:全用 chars() 判长和拆分
+/// (AGENTS.md §1);无 unwrap/expect(§2)。
 #[cfg(feature = "channels")]
 async fn aggregate_by_sentence<'a>(
-    mut events: futures::stream::BoxStream<
-        'a,
-        echo_core::error::Result<echo_core::agent::AgentEvent>,
-    >,
+    mut events: futures::stream::BoxStream<'a, echo_core::error::Result<ChannelRenderEvent>>,
     channel_id: String,
     to: String,
     chat_type: echo_agent::channels::ChatType,
 ) -> futures::stream::BoxStream<'a, echo_core::error::Result<echo_agent::channels::OutboundMessage>>
 {
     use echo_agent::channels::OutboundMessage;
+    use echo_agent_app_core::chat_driver::ChatDriverEvent;
     use echo_core::agent::AgentEvent;
     use echo_core::error::{ChannelError, ReactError};
     use futures::StreamExt;
@@ -303,16 +451,19 @@ async fn aggregate_by_sentence<'a>(
         }
         while let Some(ev) = events.next().await {
             match ev? {
+                ChannelRenderEvent::Prompt(prompt) => {
+                    flush_all!();
+                    yield OutboundMessage::new(&channel_id, &to, chat_type, &prompt);
+                }
+                ChannelRenderEvent::Driver(ChatDriverEvent::Agent(envelope)) => match envelope.payload {
                 AgentEvent::Token(t) => {
                     buf.push_str(&t);
-                    // 1. 换行 flush(到最后一个 \n 含)
-                    //    安全:`\n` 是 ASCII 单字节,`rfind('\n')` 返字节 idx,
-                    //    其位置必在完整 UTF-8 字符边界(\n 不出现在多字节字符中间),
-                    //    故 buf[..cut] / buf[cut..] 切在字符边界,不会 panic。
-                    if let Some(idx) = buf.rfind('\n') {
-                        let cut = idx + '\n'.len_utf8(); // = idx + 1
-                        let chunk: String = buf[..cut].to_string();
-                        buf = buf[cut..].to_string();
+                    // 1. 换行 flush(到最后一个 \n 含)。反向字符偏移表示换行后
+                    //    还有多少字符,因此 `cut` 是包含换行的字符数。
+                    if let Some(trailing_chars) = buf.chars().rev().position(|ch| ch == '\n') {
+                        let cut = buf.chars().count().saturating_sub(trailing_chars);
+                        let chunk: String = buf.chars().take(cut).collect();
+                        buf = buf.chars().skip(cut).collect();
                         yield OutboundMessage::new(&channel_id, &to, chat_type, &chunk);
                     }
                     // 2/3. 句末标点 或 阈值(chars().count() 非字节)→ flush 全 buf
@@ -335,7 +486,84 @@ async fn aggregate_by_sentence<'a>(
                         "agent stream error: {message}"
                     )))))?;
                 }
-                _ => {} // ToolCall/ThinkStart/LlmUsage 等本 Phase 忽略
+                AgentEvent::BudgetDecision { decision, reason, .. } => {
+                    flush_all!();
+                    yield OutboundMessage::new(
+                        &channel_id,
+                        &to,
+                        chat_type,
+                        format!("[budget] {decision:?}: {reason}"),
+                    );
+                }
+                AgentEvent::GuardTriggered { guard, blocked } => {
+                    flush_all!();
+                    yield OutboundMessage::new(
+                        &channel_id,
+                        &to,
+                        chat_type,
+                        format!("[guard] {guard} (blocked={blocked})"),
+                    );
+                }
+                AgentEvent::MemoryRecalled { count } => {
+                    tracing::debug!(count, "channel agent recalled memory");
+                }
+                AgentEvent::Chart { spec } => {
+                    flush_all!();
+                    let preview: String = spec.to_string().chars().take(500).collect();
+                    yield OutboundMessage::new(
+                        &channel_id,
+                        &to,
+                        chat_type,
+                        format!("[chart] {preview}"),
+                    );
+                }
+                AgentEvent::SafetyNotice { action, reason, risk, permission } => {
+                    flush_all!();
+                    yield OutboundMessage::new(
+                        &channel_id,
+                        &to,
+                        chat_type,
+                        format!("[safety] {action}: {reason} (risk={risk}, permission={permission})"),
+                    );
+                }
+                AgentEvent::ParameterError { tool, parameter, expected, got } => {
+                    flush_all!();
+                    yield OutboundMessage::new(
+                        &channel_id,
+                        &to,
+                        chat_type,
+                        format!("[parameter] {tool}.{parameter}: expected {expected}, got {got}"),
+                    );
+                }
+                _ => {}
+                },
+                ChannelRenderEvent::Driver(ChatDriverEvent::Execution(event)) => {
+                    if event.event.contains("failed")
+                        || event.event.contains("cancelled")
+                        || event.event.contains("artifact")
+                        || event.event.contains("merge_")
+                    {
+                        flush_all!();
+                        let detail: String = event.payload.to_string().chars().take(500).collect();
+                        yield OutboundMessage::new(
+                            &channel_id,
+                            &to,
+                            chat_type,
+                            format!("[task:{}] {}: {detail}", event.run_id, event.event),
+                        );
+                    }
+                }
+                ChannelRenderEvent::Driver(ChatDriverEvent::TurnStatus { .. })
+                | ChannelRenderEvent::Driver(ChatDriverEvent::ExecutionPath { .. }) => {}
+                ChannelRenderEvent::Driver(ChatDriverEvent::Interrupt { run_id, goal, new_message }) => {
+                    flush_all!();
+                    yield OutboundMessage::new(
+                        &channel_id,
+                        &to,
+                        chat_type,
+                        format!("[paused:{run_id}] {goal}; new instruction: {new_message}"),
+                    );
+                }
             }
         }
     };
@@ -395,67 +623,59 @@ mod tests {
         );
     }
 
-    // ── build_channel_multimodal_message 测试(需 channels feature)─────────
+    // ── channel attachment transport tests ──────────────────────────────
     #[cfg(feature = "channels")]
     mod multimodal {
-        use super::super::build_channel_multimodal_message;
+        use super::super::channel_attachment_data;
         use echo_agent::channels::{AttachmentKind, MessageAttachment};
-        use echo_core::llm::types::{ContentPart, MessageContent};
 
         #[test]
-        fn no_attachments_returns_none() {
-            assert!(build_channel_multimodal_message("hi", &[]).is_none());
-        }
-
-        #[test]
-        fn image_attachment_becomes_image_url() {
+        fn image_attachment_keeps_name_and_image_mime() {
             let att = MessageAttachment::new(AttachmentKind::Image, vec![1, 2, 3])
                 .with_filename("photo.png");
-            let msg =
-                build_channel_multimodal_message("look", &[att]).expect("Some for attachments");
-            let parts = match &msg.content {
-                MessageContent::Parts(p) => p.clone(),
-                other => panic!("expected Parts, got {other:?}"),
-            };
-            assert_eq!(parts.len(), 2, "text + 1 image");
-            assert!(matches!(parts[0], ContentPart::Text { .. }));
-            match &parts[1] {
-                ContentPart::ImageUrl { image_url } => {
-                    assert!(image_url.url.starts_with("data:image/png;base64,"));
-                }
-                other => panic!("expected ImageUrl, got {other:?}"),
-            }
+            let data = channel_attachment_data(0, &att);
+            assert_eq!(data.name, "photo.png");
+            assert_eq!(data.mime_type, "image/png");
+            assert_eq!(data.size, 3);
         }
 
         #[test]
-        fn file_attachment_becomes_file_part() {
+        fn file_attachment_keeps_inferred_text_mime() {
             let att = MessageAttachment::new(AttachmentKind::File, vec![9, 9, 9])
                 .with_filename("notes.txt");
-            let msg =
-                build_channel_multimodal_message("see", &[att]).expect("Some for attachments");
-            let parts = match &msg.content {
-                MessageContent::Parts(p) => p.clone(),
-                other => panic!("expected Parts, got {other:?}"),
-            };
-            match &parts[1] {
-                ContentPart::File { name, .. } => assert_eq!(name, "notes.txt"),
-                other => panic!("expected File, got {other:?}"),
-            }
+            let data = channel_attachment_data(0, &att);
+            assert_eq!(data.name, "notes.txt");
+            assert_eq!(data.mime_type, "text/plain");
+            assert_eq!(data.size, 3);
         }
     }
 
     // ── aggregate_by_sentence 测试(需 channels feature)──────────────────────
     #[cfg(feature = "channels")]
     mod aggregate {
-        use super::super::{FLUSH_THRESHOLD, aggregate_by_sentence};
+        use super::super::{ChannelRenderEvent, FLUSH_THRESHOLD, aggregate_by_sentence};
         use echo_agent::channels::{ChatType, OutboundMessage};
-        use echo_core::agent::AgentEvent;
+        use echo_core::agent::{AgentEvent, EventEnvelope, EventIdentity};
         use echo_core::error::Result;
         use futures::stream::{BoxStream, StreamExt};
         fn events_to_stream(
             events: Vec<Result<AgentEvent>>,
-        ) -> BoxStream<'static, Result<AgentEvent>> {
-            futures::stream::iter(events).boxed()
+        ) -> BoxStream<'static, Result<ChannelRenderEvent>> {
+            let identity = EventIdentity {
+                turn_id: "channel-test".to_string(),
+                ..EventIdentity::default()
+            };
+            futures::stream::iter(events.into_iter().enumerate().map(move |(index, event)| {
+                event.map(|payload| {
+                    let sequence = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
+                    ChannelRenderEvent::Driver(
+                        echo_agent_app_core::chat_driver::ChatDriverEvent::Agent(Box::new(
+                            EventEnvelope::new(&identity, sequence, None, payload),
+                        )),
+                    )
+                })
+            }))
+            .boxed()
         }
 
         async fn collect_texts(s: BoxStream<'_, Result<OutboundMessage>>) -> Vec<String> {
@@ -509,7 +729,7 @@ mod tests {
             let out = aggregate_by_sentence(evs, "qq".into(), "u1".into(), ChatType::Direct).await;
             let texts = collect_texts(out).await;
             assert_eq!(texts.len(), 1, "threshold flush yields 1");
-            assert_eq!(texts[0].chars().count(), n);
+            assert_eq!(texts.first().map(|text| text.chars().count()), Some(n));
         }
 
         #[tokio::test]
@@ -545,7 +765,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn error_flushes_then_propagates() {
+        async fn error_flushes_then_propagates() -> std::result::Result<(), String> {
             let evs = events_to_stream(vec![
                 Ok(AgentEvent::Token("partial".into())),
                 Ok(AgentEvent::Error {
@@ -556,12 +776,20 @@ mod tests {
             let out = aggregate_by_sentence(evs, "qq".into(), "u1".into(), ChatType::Direct).await;
             let mut s = out;
             // 第一条:flush 的 partial
-            let first = s.next().await.unwrap().unwrap();
+            let first = s
+                .next()
+                .await
+                .ok_or_else(|| "missing partial output".to_string())?
+                .map_err(|error| error.to_string())?;
             assert_eq!(first.text, "partial");
             // 之后:Error 事件 → yield Err
             let second = s.next().await;
             assert!(second.is_some(), "error propagated as stream item");
-            assert!(second.unwrap().is_err(), "error item is Err");
+            assert!(
+                second.is_some_and(|item| item.is_err()),
+                "error item is Err"
+            );
+            Ok(())
         }
 
         #[tokio::test]
