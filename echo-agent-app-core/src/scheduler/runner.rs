@@ -221,4 +221,28 @@ mod tests {
             "[plan] cron 应 strip marker 后建 1 个 Completed run"
         );
     }
+
+    #[tokio::test]
+    async fn cron_stream_failure_is_persisted_and_returned_as_error() -> Result<(), String> {
+        let llm = MockLlmClient::new().with_error(echo_agent::error::ReactError::Other(
+            "provider unavailable".to_string(),
+        ));
+        let agent = ReactAgentBuilder::new()
+            .llm_client(Arc::new(llm))
+            .system_prompt("test")
+            .build()
+            .map_err(|error| error.to_string())?;
+        let handle = AgentHandle::new(agent);
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let fire_fn = build_fire_fn(handle, Some(store.clone()), None);
+
+        let task = CronTask::new("failing", "*/5 * * * *", "run this");
+        let result = fire_fn(task).await;
+        assert!(result.is_err(), "failed cron run must not report success");
+        let failed = store
+            .list_runs_in(&[TaskRunStatus::Failed])
+            .map_err(|error| error.to_string())?;
+        assert_eq!(failed.len(), 1);
+        Ok(())
+    }
 }

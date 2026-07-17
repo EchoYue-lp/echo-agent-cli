@@ -114,9 +114,9 @@ impl ExecEvent {
     }
 }
 
-/// Sink closure that receives [`ExecEvent`]s. The GUI's `TauriChatSink` provides
-/// one that re-emits each event onto `execution://event`; non-GUI modes return
-/// `None` (events dropped, functionality unaffected).
+/// Sink closure that receives [`ExecEvent`]s. Interactive surfaces bridge this
+/// into their shared `ChatDriverEvent` stream; unattended runs rely on the
+/// append-only TaskRuntime store and may omit a live sink.
 pub type ExecSink = Arc<dyn Fn(ExecEvent) + Send + Sync>;
 
 /// Emit `ev` to `sink` if present. Single chokepoint so every emit site is
@@ -3436,7 +3436,7 @@ pub async fn launch_unattended_run(
     //    that own the run_id (e.g. submit_run in Phase 3.4) can drive a run
     //    they created themselves without re-generating the id.
     drive_unattended_run(
-        store,
+        store.clone(),
         primary_agent,
         &run_id,
         source_id,
@@ -3583,7 +3583,7 @@ pub async fn drive_unattended_run(
     let prompt_owned = prompt.to_string();
     let wt_path_for_scope = worktree.as_ref().map(|w| w.path.clone());
 
-    super::task_tools::with_run_context(
+    let stream_failure = super::task_tools::with_run_context(
         run_id_for_scope.clone(),
         cancel_for_scope.clone(),
         None, // trace_sink — no GUI event stream for unattended run
@@ -3630,7 +3630,18 @@ pub async fn drive_unattended_run(
                             break;
                         }
                         match event_result {
-                            Ok(_) => {}
+                            Ok(event) => {
+                                if let AgentEvent::Error { source, message } = event.payload {
+                                    let error = format!("{source}: {message}");
+                                    tracing::warn!(
+                                        source_id = %source_id,
+                                        run_id = %run_id_for_scope,
+                                        %error,
+                                        "Unattended agent emitted terminal error"
+                                    );
+                                    return Some(error);
+                                }
+                            }
                             Err(e) => {
                                 tracing::warn!(
                                     source_id = %source_id,
@@ -3638,10 +3649,11 @@ pub async fn drive_unattended_run(
                                     error = %e,
                                     "Unattended agent stream error"
                                 );
-                                break;
+                                return Some(e.to_string());
                             }
                         }
                     }
+                    None
                 }
                 Err(e) => {
                     tracing::error!(
@@ -3650,11 +3662,27 @@ pub async fn drive_unattended_run(
                         error = %e,
                         "Unattended agent failed to start stream"
                     );
+                    Some(e.to_string())
                 }
             }
         },
     )
     .await;
+
+    if let Some(error) = stream_failure
+        && !child_cancel.is_cancelled()
+    {
+        let message = format!("unattended agent stream failed: {error}");
+        let _ = store.note(run_id, None, &message);
+        if store
+            .get_run(run_id)
+            .ok()
+            .flatten()
+            .is_some_and(|run| run.status == TaskRunStatus::Running)
+        {
+            let _ = store.transition_run(run_id, TaskRunStatus::Failed);
+        }
+    }
 
     // Determine final outcome from the store (plan_execute/execute_run
     // may have already transitioned the run to a terminal state).
@@ -3789,8 +3817,8 @@ pub async fn launch_cron_run(
     prompt: &str,
     parent_cancel: CancellationToken,
 ) -> Result<String, ExecError> {
-    launch_unattended_run(
-        store,
+    let run_id = launch_unattended_run(
+        store.clone(),
         primary_agent,
         "cron",
         cron_task_id,
@@ -3800,7 +3828,27 @@ pub async fn launch_cron_run(
         UnattendedWriteMode::default(), // D7 stage 2: Worktree (safe default)
         super::worktree::git_repo_root(std::path::Path::new(".")).ok(), // best-effort repo_root
     )
-    .await
+    .await?;
+    let status = store
+        .get_run(&run_id)?
+        .map(|run| run.status)
+        .ok_or_else(|| ExecError::RunNotFound(run_id.clone()))?;
+    match status {
+        TaskRunStatus::Completed => Ok(run_id),
+        TaskRunStatus::Failed => Err(ExecError::Other(format!(
+            "cron run {run_id} finished with failed status"
+        ))),
+        TaskRunStatus::Cancelled => {
+            Err(ExecError::Other(format!("cron run {run_id} was cancelled")))
+        }
+        TaskRunStatus::Paused => Err(ExecError::Other(format!(
+            "cron run {run_id} paused and requires attention"
+        ))),
+        other => Err(ExecError::Other(format!(
+            "cron run {run_id} ended in non-terminal status {}",
+            other.as_str()
+        ))),
+    }
 }
 
 // ── Unattended preflight (dual-checkpoint, spec §4.2 v2) ───────────────

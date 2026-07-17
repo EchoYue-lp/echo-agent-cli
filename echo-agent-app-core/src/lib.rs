@@ -36,6 +36,8 @@ pub mod sessions;
 pub mod skills_hub;
 pub mod state;
 pub mod subagent_loader;
+#[cfg(test)]
+mod surface_contract;
 pub mod tasks;
 pub mod types;
 pub mod unified_memory;
