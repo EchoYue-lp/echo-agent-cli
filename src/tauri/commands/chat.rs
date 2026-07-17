@@ -9,6 +9,7 @@ use echo_agent::agent::CancellationToken;
 use echo_agent::human_loop::{HumanLoopProvider, HumanLoopRequest, HumanLoopResponse};
 use echo_agent::prelude::AgentEvent;
 use echo_agent::tools::{ToolFailure, ToolOutputChannel, ToolStreamEvent};
+use echo_agent_app_core::chat_driver::ChatDriverEvent;
 use echo_agent_app_core::chat_driver::ChatSink;
 use echo_agent_app_core::tasks::task_runtime::executor::ExecEvent;
 use futures::future::BoxFuture;
@@ -98,6 +99,17 @@ pub enum ChatEvent {
     Error { message: String },
     #[serde(rename = "run_status")]
     RunStatus { status: String },
+    #[serde(rename = "notice")]
+    Notice {
+        level: String,
+        code: String,
+        message: String,
+    },
+    #[serde(rename = "execution_path")]
+    ExecutionPath {
+        requested_mode: String,
+        observed_path: String,
+    },
     #[serde(rename = "approval_request")]
     ApprovalRequest {
         request_id: String,
@@ -612,11 +624,12 @@ pub async fn send_chat_message(
         app: app.clone(),
         message_key: message_key.clone(),
         conversation_id: conversation_id.clone(),
-        run_id: message_key.clone(),
     });
     // Signal the chat-turn lifecycle so the GUI shows the spinner / terminal
     // badge. Ordinary chat turns are not TaskRuntime runs.
-    sink.on_turn_status("running");
+    let _ = sink.on_event(ChatDriverEvent::TurnStatus {
+        status: "running".to_string(),
+    });
 
     let res = std::sync::Arc::new(echo_agent_app_core::chat_resources::ChatResources {
         pool: state.app_state.connection.pool.clone(),
@@ -677,7 +690,9 @@ pub async fn send_chat_message(
         }
         // Release all execution ownership before emitting Done. The frontend
         // may immediately dispatch the next queued turn when it receives it.
-        sink.on_turn_status(terminal_status);
+        let _ = sink.on_event(ChatDriverEvent::TurnStatus {
+            status: terminal_status.to_string(),
+        });
         agent_handle_clone
             .write_async(|agent| {
                 Box::pin(async move {
@@ -858,117 +873,109 @@ struct TauriChatSink {
     app: tauri::AppHandle,
     message_key: String,
     conversation_id: Option<String>,
-    run_id: String,
 }
 
 impl echo_agent_app_core::chat_driver::ChatSink for TauriChatSink {
-    fn on_agent_event(&self, event: echo_agent::agent::EventEnvelope) -> bool {
-        let chat_event = agent_event_to_chat_event(
-            &self.app,
-            &event.payload,
-            &self.message_key,
-            &self.conversation_id,
-        );
-        if let Some(ce) = chat_event {
-            emit_chat_event(&self.app, &ce, &self.message_key, &self.conversation_id)
-        } else {
-            true
-        }
-    }
-
-    fn on_turn_status(&self, status: &str) {
-        // A chat turn is not a TaskRuntime run. Only emit chat transport state;
-        // real run lifecycle events come from the TaskRuntime ExecSink.
-        if status == "running" {
-            emit_chat_event(
+    fn on_event(&self, event: ChatDriverEvent) -> bool {
+        match event {
+            ChatDriverEvent::Agent(event) => {
+                let chat_event = agent_event_to_chat_event(
+                    &self.app,
+                    &event.payload,
+                    &self.message_key,
+                    &self.conversation_id,
+                );
+                emit_chat_event(
+                    &self.app,
+                    &chat_event,
+                    &self.message_key,
+                    &self.conversation_id,
+                )
+            }
+            ChatDriverEvent::Execution(event) => {
+                emit_tauri_execution_event(&self.app, event);
+                true
+            }
+            ChatDriverEvent::TurnStatus { status } => {
+                let emitted = emit_chat_event(
+                    &self.app,
+                    &ChatEvent::RunStatus {
+                        status: status.clone(),
+                    },
+                    &self.message_key,
+                    &self.conversation_id,
+                );
+                if status == "running" {
+                    emitted
+                } else {
+                    emitted
+                        && emit_chat_event(
+                            &self.app,
+                            &ChatEvent::Done,
+                            &self.message_key,
+                            &self.conversation_id,
+                        )
+                }
+            }
+            ChatDriverEvent::ExecutionPath {
+                requested_mode,
+                observed_path,
+            } => emit_chat_event(
                 &self.app,
-                &ChatEvent::RunStatus {
-                    status: "running".to_string(),
+                &ChatEvent::ExecutionPath {
+                    requested_mode,
+                    observed_path,
                 },
                 &self.message_key,
                 &self.conversation_id,
-            );
-            return;
+            ),
+            ChatDriverEvent::Interrupt {
+                run_id,
+                goal,
+                new_message,
+            } => emit_chat_event(
+                &self.app,
+                &ChatEvent::InterruptPrompt {
+                    run_id,
+                    goal,
+                    new_message,
+                },
+                &self.message_key,
+                &self.conversation_id,
+            ),
         }
-        let _ = emit_chat_event(
-            &self.app,
-            &ChatEvent::RunStatus {
-                status: status.to_string(),
-            },
-            &self.message_key,
-            &self.conversation_id,
-        );
-        let _ = emit_chat_event(
-            &self.app,
-            &ChatEvent::Done,
-            &self.message_key,
-            &self.conversation_id,
-        );
-    }
-
-    fn on_execution_path(&self, _requested_mode: &str, _observed_path: &str) {}
-
-    fn worker_trace_sink(&self) -> Option<crate::tasks::task_runtime::task_tools::TraceSink> {
-        // Forward execution-flow events from `execute_run` (run lifecycle +
-        // main-agent task stream) to the unified `execution://event` channel.
-        // Run-level events (task_id None) → kind="run"; task-level events
-        // (task_id Some) → kind="subagent" keyed by the task_id (NOT a hardcoded
-        // "main"), so each subagent's lifecycle events aggregate with its own
-        // thinking/tool/usage stream (which the framework bridge emits under
-        // the same bare task_id). The old code hardcoded "main" here, which
-        // collided all subagents into one store record and broke the todo join.
-        // Note: the normal chat-turn thinking/tool stream does NOT go through
-        // this sink — it goes through `chat://event` via agent_event_to_chat_event.
-        // This sink only fires for events emitted by `execute_run` /
-        // `run_main_agent_task` (verification tasks run on the primary agent).
-        let app = self.app.clone();
-        let run_id = self.run_id.clone();
-        Some(std::sync::Arc::new(move |ev: ExecEvent| {
-            let task_id = ev.task_id.clone();
-            let agent = ev.agent.as_deref().unwrap_or("echo-assistant");
-            // subagent_run_id = bare task_id (matches framework bridge);
-            // "main" only for genuine run-level events (task_id None).
-            let subagent_run_id = task_id.as_deref().unwrap_or("main");
-            let kind = if task_id.is_some() { "subagent" } else { "run" };
-            let mut payload = ev.payload;
-            if let (Some(task_id), serde_json::Value::Object(fields)) = (&task_id, &mut payload) {
-                fields.insert("task_id".into(), task_id.clone().into());
-            }
-            emit_execution_event(
-                &app,
-                &run_id,
-                kind,
-                &ev.event,
-                agent,
-                subagent_run_id,
-                payload,
-            );
-        }))
-    }
-
-    fn trace_sink(&self) -> Option<echo_core::tools::TraceSinkFn> {
-        // Bridge the framework's Value-based trace_sink to worker_trace_sink
-        // so tools running inside a spawned task executor (e.g. plan_execute)
-        // can reach CURRENT_TRACE_SINK via scoped_with_ctx_run_id.
-        let ws = self.worker_trace_sink()?;
-        Some(std::sync::Arc::new(move |value: serde_json::Value| {
-            if let Ok(ev) = serde_json::from_value::<ExecEvent>(value) {
-                ws(ev);
-            }
-        }) as echo_core::tools::TraceSinkFn)
     }
 }
 
+fn emit_tauri_execution_event(app: &tauri::AppHandle, event: ExecEvent) {
+    let task_id = event.task_id.clone();
+    let agent = event.agent.as_deref().unwrap_or("echo-assistant");
+    let subagent_run_id = task_id.as_deref().unwrap_or("main");
+    let kind = if task_id.is_some() { "subagent" } else { "run" };
+    let mut payload = event.payload;
+    if let (Some(task_id), serde_json::Value::Object(fields)) = (&task_id, &mut payload) {
+        fields.insert("task_id".into(), task_id.clone().into());
+    }
+    emit_execution_event(
+        app,
+        &event.run_id,
+        kind,
+        &event.event,
+        agent,
+        subagent_run_id,
+        payload,
+    );
+}
+
 /// Map an AgentEvent to a ChatEvent.
-/// Returns None for events that should be silently ignored.
 fn agent_event_to_chat_event(
     app: &tauri::AppHandle,
     event: &AgentEvent,
     message_key: &str,
     conversation_id: &Option<String>,
-) -> Option<ChatEvent> {
+) -> ChatEvent {
     match event {
-        AgentEvent::Token(data) => Some(ChatEvent::Token { data: data.clone() }),
+        AgentEvent::Token(data) => ChatEvent::Token { data: data.clone() },
         AgentEvent::ThinkStart => {
             let _ = emit_chat_event(
                 app,
@@ -978,15 +985,15 @@ fn agent_event_to_chat_event(
                 message_key,
                 conversation_id,
             );
-            Some(ChatEvent::ThinkingStart)
+            ChatEvent::ThinkingStart
         }
         AgentEvent::ThinkEnd {
             prompt_tokens,
             completion_tokens,
-        } => Some(ChatEvent::ThinkingEnd {
+        } => ChatEvent::ThinkingEnd {
             prompt_tokens: *prompt_tokens,
             completion_tokens: *completion_tokens,
-        }),
+        },
         AgentEvent::LlmUsage {
             model,
             prompt_tokens,
@@ -995,7 +1002,7 @@ fn agent_event_to_chat_event(
             cached_prompt_tokens,
             cache_creation_prompt_tokens,
             usage_reported,
-        } => Some(ChatEvent::LlmUsage {
+        } => ChatEvent::LlmUsage {
             model: model.clone(),
             prompt_tokens: *prompt_tokens,
             completion_tokens: *completion_tokens,
@@ -1003,18 +1010,18 @@ fn agent_event_to_chat_event(
             cached_prompt_tokens: *cached_prompt_tokens,
             cache_creation_prompt_tokens: *cache_creation_prompt_tokens,
             usage_reported: *usage_reported,
-        }),
+        },
         AgentEvent::ContextCompressed {
             before_count,
             after_count,
             before_tokens,
             after_tokens,
-        } => Some(ChatEvent::ContextCompressed {
+        } => ChatEvent::ContextCompressed {
             before_count: *before_count,
             after_count: *after_count,
             before_tokens: *before_tokens,
             after_tokens: *after_tokens,
-        }),
+        },
         AgentEvent::ToolCall {
             call_id,
             name,
@@ -1028,26 +1035,26 @@ fn agent_event_to_chat_event(
                 message_key,
                 conversation_id,
             );
-            Some(ChatEvent::ToolStart {
+            ChatEvent::ToolStart {
                 call_id: call_id.clone(),
                 name: name.clone(),
                 args: args.clone(),
-            })
+            }
         }
         AgentEvent::ToolStream {
             call_id,
             event: ToolStreamEvent::Progress { message, percent },
             ..
-        } => Some(ChatEvent::ToolProgress {
+        } => ChatEvent::ToolProgress {
             call_id: call_id.clone(),
             message: message.clone(),
             percent: *percent,
-        }),
+        },
         AgentEvent::ToolStream {
             call_id,
             event: ToolStreamEvent::Output { channel, chunk },
             ..
-        } => Some(ChatEvent::ToolOutput {
+        } => ChatEvent::ToolOutput {
             call_id: call_id.clone(),
             channel: match channel {
                 ToolOutputChannel::Stdout => "stdout",
@@ -1056,52 +1063,101 @@ fn agent_event_to_chat_event(
             }
             .to_string(),
             chunk: chunk.clone(),
-        }),
+        },
         AgentEvent::ToolStream {
             call_id,
             event: ToolStreamEvent::Complete(result),
             ..
-        } => Some(ChatEvent::ToolComplete {
+        } => ChatEvent::ToolComplete {
             call_id: call_id.clone(),
             success: result.success,
             metadata: result.metadata.clone(),
             truncated: result.truncated,
             failure: result.failure.clone(),
-        }),
+        },
         AgentEvent::ToolResult {
             call_id,
             name,
             output,
-        } => Some(ChatEvent::ToolResult {
+        } => ChatEvent::ToolResult {
             call_id: call_id.clone(),
             name: name.clone(),
             result: output.clone(),
             success: true,
             failure: None,
-        }),
+        },
         AgentEvent::ToolError {
             call_id,
             name,
             error,
             failure,
-        } => Some(ChatEvent::ToolResult {
+        } => ChatEvent::ToolResult {
             call_id: call_id.clone(),
             name: name.clone(),
             result: error.clone(),
             success: false,
             failure: Some(failure.clone()),
-        }),
-        AgentEvent::ToolBatchStart { tool_count } => Some(ChatEvent::ToolBatchStart {
+        },
+        AgentEvent::ToolBatchStart { tool_count } => ChatEvent::ToolBatchStart {
             tool_count: *tool_count,
-        }),
-        AgentEvent::ToolBatchEnd => Some(ChatEvent::ToolBatchEnd),
-        AgentEvent::Chart { spec } => Some(ChatEvent::Chart { spec: spec.clone() }),
-        AgentEvent::FinalAnswer(data) => Some(ChatEvent::FinalAnswer { data: data.clone() }),
-        AgentEvent::Cancelled => Some(ChatEvent::Cancelled),
-        AgentEvent::Error { source, message } => Some(ChatEvent::Error {
+        },
+        AgentEvent::ToolBatchEnd => ChatEvent::ToolBatchEnd,
+        AgentEvent::BudgetDecision {
+            decision,
+            reason,
+            iteration,
+            ..
+        } => ChatEvent::Notice {
+            level: if matches!(decision, echo_core::agent::BudgetDecision::HardStop) {
+                "error"
+            } else {
+                "info"
+            }
+            .to_string(),
+            code: "budget_decision".to_string(),
+            message: format!("{decision:?} at iteration {iteration}: {reason}"),
+        },
+        AgentEvent::GuardTriggered { guard, blocked } => ChatEvent::Notice {
+            level: if *blocked { "warning" } else { "info" }.to_string(),
+            code: "guard_triggered".to_string(),
+            message: format!("Guard {guard} triggered (blocked={blocked})"),
+        },
+        AgentEvent::MemoryRecalled { count } => ChatEvent::Notice {
+            level: "info".to_string(),
+            code: "memory_recalled".to_string(),
+            message: format!("Recalled {count} memory item(s)"),
+        },
+        AgentEvent::Chart { spec } => ChatEvent::Chart { spec: spec.clone() },
+        AgentEvent::SafetyNotice {
+            action,
+            reason,
+            risk,
+            permission,
+        } => ChatEvent::Notice {
+            level: "warning".to_string(),
+            code: "safety_notice".to_string(),
+            message: format!("{action}: {reason} (risk={risk}, permission={permission})"),
+        },
+        AgentEvent::ParameterError {
+            tool,
+            parameter,
+            expected,
+            got,
+        } => ChatEvent::Notice {
+            level: "error".to_string(),
+            code: "parameter_error".to_string(),
+            message: format!("{tool}.{parameter}: expected {expected}, got {got}"),
+        },
+        AgentEvent::FinalAnswer(data) => ChatEvent::FinalAnswer { data: data.clone() },
+        AgentEvent::Cancelled => ChatEvent::Cancelled,
+        AgentEvent::Error { source, message } => ChatEvent::Error {
             message: format!("{source}: {message}"),
-        }),
-        _ => None,
+        },
+        other => ChatEvent::Notice {
+            level: "info".to_string(),
+            code: "unknown_agent_event".to_string(),
+            message: format!("{other:?}"),
+        },
     }
 }
 

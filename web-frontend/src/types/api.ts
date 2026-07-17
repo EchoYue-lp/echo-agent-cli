@@ -146,6 +146,8 @@ export type ChatEvent = {
   | { type: 'cancelled' }
   | { type: 'error'; message: string }
   | { type: 'run_status'; status: ChatRunStatus }
+  | { type: 'notice'; level: 'info' | 'warning' | 'error' | string; code: string; message: string }
+  | { type: 'execution_path'; requested_mode: string; observed_path: string }
   | {
       type: 'approval_request';
       request_id: string;

@@ -212,6 +212,21 @@ export function handleChatEvent(event: ChatEvent, ctx: EventContext): void {
       }
       break;
     }
+    case 'notice': {
+      if (ctx.isCancelledRef.current) break;
+      const prefix =
+        event.level === 'error' ? '[Error]' : event.level === 'warning' ? '[Warning]' : '[Info]';
+      store.appendLocalAssistantNote(`${prefix} ${event.message}`);
+      break;
+    }
+    case 'execution_path': {
+      if (event.requested_mode !== event.observed_path) {
+        store.appendLocalAssistantNote(
+          `[Info] Execution path: ${event.requested_mode} -> ${event.observed_path}`
+        );
+      }
+      break;
+    }
     case 'interrupt_prompt': {
       // An in-progress run was detected — the GUI should show a dialog
       // letting the user choose: resume / edit-and-resume / abandon.

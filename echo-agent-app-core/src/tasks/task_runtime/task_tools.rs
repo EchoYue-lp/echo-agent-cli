@@ -508,7 +508,7 @@ impl TaskCreateTool {
                     res.conv_id.clone(),
                     res.root_message_id.clone(),
                     res.attachments.clone(),
-                    res.sink.worker_trace_sink(),
+                    Some(crate::chat_driver::worker_trace_sink_for(&res.sink)),
                 ),
                 None => (None, run_id.to_string(), Vec::new(), None),
             };
@@ -805,7 +805,7 @@ impl CreateComplexTaskTool {
         let run_cancel = echo_agent::agent::CancellationToken::new();
 
         let trace_sink = if priority == "foreground" {
-            res.sink.worker_trace_sink()
+            Some(crate::chat_driver::worker_trace_sink_for(&res.sink))
         } else {
             None
         };

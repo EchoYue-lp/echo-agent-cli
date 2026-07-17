@@ -19,41 +19,60 @@ use futures::StreamExt;
 
 use crate::tasks::task_runtime::executor::ExecEvent;
 
+/// Complete product event stream consumed by every interactive surface.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "source", content = "event", rename_all = "snake_case")]
+pub enum ChatDriverEvent {
+    Agent(Box<EventEnvelope>),
+    Execution(ExecEvent),
+    TurnStatus {
+        status: String,
+    },
+    ExecutionPath {
+        requested_mode: String,
+        observed_path: String,
+    },
+    Interrupt {
+        run_id: String,
+        goal: String,
+        new_message: String,
+    },
+}
+
 /// Per-mode event consumer for the shared chat driver.
 ///
-/// Default methods are no-op; each mode overrides what it needs:
+/// Each mode provides one exhaustive product-event entry point:
 /// - GUI (`TauriChatSink`, in the Tauri layer) emits Tauri events.
 /// - TUI/CLI render the stream to the terminal.
 /// - channel aggregates by sentence + forwarding.
-///
-/// `on_agent_event` is the only required method — it consumes one event from
-/// the chat/run stream and returns `false` to stop early (e.g. on cancel).
 pub trait ChatSink: Send + Sync + 'static {
-    fn on_agent_event(&self, event: EventEnvelope) -> bool;
-    /// Report the lifecycle of the interactive chat turn. This is deliberately
-    /// separate from TaskRuntime run events: an ordinary turn has no TaskRun.
-    fn on_turn_status(&self, _status: &str) {}
-    fn on_execution_path(&self, _requested_mode: &str, _observed_path: &str) {}
-    fn on_interrupt(&self, _run_id: &str, _goal: &str, _new_message: &str) {}
-    /// Trace sink forwarded into the framework's external run context
-    /// (`ExternalRunContext.trace_sink`) so tools running inside a spawned
-    /// task executor (e.g. `plan_execute`) can still reach
-    /// `CURRENT_TRACE_SINK` via `scoped_with_ctx_run_id`. The framework
-    /// carries `serde_json::Value` (not the app's `ExecEvent`) to stay
-    /// decoupled; the app re-deserializes on the way back out. GUI provides a
-    /// Tauri-emitting closure, non-GUI modes return `None`.
-    fn trace_sink(&self) -> Option<TraceSinkFn> {
-        None
-    }
-    /// Trace sink scoped into the task_local run context (`with_run_context`)
-    /// so the **main agent's** task_tools (`plan_execute`) can emit
-    /// [`crate::tasks::task_runtime::executor::ExecEvent`]s during a complex run.
-    /// GUI provides a closure that rewrites the main-agent run_id + emits to
-    /// the frontend's unified `execution://event` channel; non-GUI modes
-    /// return `None` (trace events dropped, functionality unaffected).
-    fn worker_trace_sink(&self) -> Option<crate::tasks::task_runtime::task_tools::TraceSink> {
-        None
-    }
+    /// Return `false` to stop the current stream because the consumer closed.
+    fn on_event(&self, event: ChatDriverEvent) -> bool;
+}
+
+/// Build the EKO TaskRuntime sink carried through task-local run context.
+pub fn worker_trace_sink_for(
+    sink: &std::sync::Arc<dyn ChatSink>,
+) -> crate::tasks::task_runtime::task_tools::TraceSink {
+    let sink = std::sync::Arc::clone(sink);
+    std::sync::Arc::new(move |event| {
+        let _ = sink.on_event(ChatDriverEvent::Execution(event));
+    })
+}
+
+/// Bridge the framework's JSON trace transport into the same product stream.
+pub fn framework_trace_sink_for(sink: &std::sync::Arc<dyn ChatSink>) -> TraceSinkFn {
+    let sink = std::sync::Arc::clone(sink);
+    std::sync::Arc::new(
+        move |value| match serde_json::from_value::<ExecEvent>(value) {
+            Ok(event) => {
+                let _ = sink.on_event(ChatDriverEvent::Execution(event));
+            }
+            Err(error) => {
+                tracing::warn!(%error, "invalid TaskRuntime trace event");
+            }
+        },
+    )
 }
 
 /// Drive a chat turn through the single shared path (极简入口).
@@ -96,7 +115,7 @@ pub async fn drive_chat(
     let cancel = res.cancel.clone();
     let turn_cancel = cancel.clone();
     let sink = res.sink.clone();
-    let trace_sink = sink.worker_trace_sink();
+    let trace_sink = worker_trace_sink_for(&sink);
     let formal_run_id = crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(&turn_id);
     let interaction_mode = res.interaction_mode;
     let store = res.store.clone();
@@ -108,7 +127,7 @@ pub async fn drive_chat(
             &turn_id,
             message,
             &res.attachments,
-            trace_sink.as_ref(),
+            Some(&trace_sink),
         )?;
     }
     let _cancel_registration =
@@ -132,7 +151,7 @@ pub async fn drive_chat(
     let result = crate::tasks::task_runtime::task_tools::with_run_context(
         formal_run_id.clone(),
         cancel,
-        trace_sink.clone(),
+        Some(trace_sink.clone()),
         drive_chat_inner(agent, message, multimodal, res, turn_id_for_inner),
     )
     .await;
@@ -141,13 +160,16 @@ pub async fn drive_chat(
             store.as_ref(),
             &formal_run_id,
             turn_cancel.is_cancelled(),
-            trace_sink.as_ref(),
+            Some(&trace_sink),
         );
     }
     let requested_mode = interaction_mode.as_str();
     let observed_path =
         observe_execution_path(store.as_ref(), &formal_run_id, &turn_id, requested_mode);
-    sink.on_execution_path(requested_mode, observed_path);
+    let _ = sink.on_event(ChatDriverEvent::ExecutionPath {
+        requested_mode: requested_mode.to_string(),
+        observed_path: observed_path.to_string(),
+    });
     tracing::info!(
         requested_mode,
         observed_path,
@@ -376,7 +398,7 @@ async fn drive_chat_inner(
                 execution_id: None,
                 message_id: Some(turn_id),
                 cancel: Some(std::sync::Arc::new(cancel.clone())),
-                trace_sink: sink.trace_sink(),
+                trace_sink: Some(framework_trace_sink_for(&sink)),
                 delegation_policy: None,
             }),
             working_dir: None,
@@ -393,7 +415,7 @@ async fn drive_chat_inner(
                 // F1-5: 此前只 return Err 字符串, 不经 sink 发 Error 事件 →
                 // 前端 assistant 消息卡在 streaming。发 Error 让前端终止流式状态。
                 tracing::warn!(error = %e, "agent stream setup failed during chat");
-                let _ = sink.on_agent_event(EventEnvelope::new(
+                let _ = sink.on_event(ChatDriverEvent::Agent(Box::new(EventEnvelope::new(
                     &event_identity,
                     1,
                     None,
@@ -401,7 +423,7 @@ async fn drive_chat_inner(
                         source: "chat_driver".into(),
                         message: e.to_string(),
                     },
-                ));
+                ))));
                 return Err(e.to_string());
             }
         };
@@ -410,7 +432,7 @@ async fn drive_chat_inner(
             while let Some(event_result) = stream.next().await {
                 match event_result {
                     Ok(event) => {
-                        if !sink.on_agent_event(event) {
+                        if !sink.on_event(ChatDriverEvent::Agent(Box::new(event))) {
                             break;
                         }
                     }
@@ -430,25 +452,22 @@ async fn drive_chat_inner(
     .await
 }
 
-/// A `ChatSink` that forwards every `EventEnvelope` to an mpsc channel.
+/// A `ChatSink` that forwards every product event to an mpsc channel.
 ///
-/// Used by modes whose renderer consumes a stream of event envelopes over a
-/// channel — TUI (forwards to the UI render loop) and IM channels (aggregate
-/// by sentence). Other event kinds (run status / worker trace / interrupt)
-/// are no-op for these modes: they render the stream directly and don't need
-/// GUI-style side-event emission.
+/// Used by modes whose renderer consumes a channel and applies a
+/// surface-specific presentation after the shared transport boundary.
 pub struct ChannelChatSink {
-    tx: tokio::sync::mpsc::UnboundedSender<EventEnvelope>,
+    tx: tokio::sync::mpsc::UnboundedSender<ChatDriverEvent>,
 }
 
 impl ChannelChatSink {
-    pub fn new(tx: tokio::sync::mpsc::UnboundedSender<EventEnvelope>) -> Self {
+    pub fn new(tx: tokio::sync::mpsc::UnboundedSender<ChatDriverEvent>) -> Self {
         Self { tx }
     }
 }
 
 impl ChatSink for ChannelChatSink {
-    fn on_agent_event(&self, event: EventEnvelope) -> bool {
+    fn on_event(&self, event: ChatDriverEvent) -> bool {
         // Forward to the channel; if the receiver was dropped (UI quit /
         // channel closed), return false so the driver stops streaming.
         self.tx.send(event).is_ok()
@@ -504,19 +523,26 @@ mod tests {
     }
 
     impl ChatSink for MockChatSink {
-        fn on_agent_event(&self, event: EventEnvelope) -> bool {
-            self.events
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push(event);
+        fn on_event(&self, event: ChatDriverEvent) -> bool {
+            match event {
+                ChatDriverEvent::Agent(event) => self
+                    .events
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .push(*event),
+                ChatDriverEvent::ExecutionPath {
+                    requested_mode,
+                    observed_path,
+                } => self
+                    .execution_paths
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .push((requested_mode, observed_path)),
+                ChatDriverEvent::Execution(_)
+                | ChatDriverEvent::TurnStatus { .. }
+                | ChatDriverEvent::Interrupt { .. } => {}
+            }
             true
-        }
-
-        fn on_execution_path(&self, requested_mode: &str, observed_path: &str) {
-            self.execution_paths
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .push((requested_mode.to_string(), observed_path.to_string()));
         }
     }
 
@@ -906,45 +932,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn channel_chat_sink_forwards_events() {
+    async fn channel_chat_sink_forwards_events() -> Result<(), String> {
         use tokio::sync::mpsc;
 
-        let (tx, mut rx) = mpsc::unbounded_channel::<EventEnvelope>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<ChatDriverEvent>();
         let sink = ChannelChatSink::new(tx);
         let identity = EventIdentity {
             turn_id: "turn-1".to_string(),
             ..EventIdentity::default()
         };
 
-        // on_agent_event forwards each event to the channel and keeps going.
+        // on_event forwards each event to the channel and keeps going.
         assert!(
-            sink.on_agent_event(EventEnvelope::new(
+            sink.on_event(ChatDriverEvent::Agent(Box::new(EventEnvelope::new(
                 &identity,
                 1,
                 None,
                 AgentEvent::Token("hel".to_string()),
-            )),
-            "on_agent_event should return true to continue"
+            )))),
+            "on_event should return true to continue"
         );
         assert!(
-            sink.on_agent_event(EventEnvelope::new(
+            sink.on_event(ChatDriverEvent::Agent(Box::new(EventEnvelope::new(
                 &identity,
                 2,
                 None,
                 AgentEvent::Token("lo".to_string()),
-            )),
+            )))),
             "second event should also be accepted"
         );
 
-        let first = rx.recv().await.expect("first event should be forwarded");
-        let second = rx.recv().await.expect("second event should be forwarded");
+        let first = match rx.recv().await {
+            Some(ChatDriverEvent::Agent(event)) => event,
+            Some(other) => return Err(format!("first event was not agent event: {other:?}")),
+            None => return Err("first event was not forwarded".to_string()),
+        };
+        let second = match rx.recv().await {
+            Some(ChatDriverEvent::Agent(event)) => event,
+            Some(other) => return Err(format!("second event was not agent event: {other:?}")),
+            None => return Err("second event was not forwarded".to_string()),
+        };
         match first.payload {
             AgentEvent::Token(t) => assert_eq!(t, "hel"),
-            other => panic!("first should be Token(\"hel\"); got {other:?}"),
+            other => return Err(format!("first should be Token(hel); got {other:?}")),
         }
         match second.payload {
             AgentEvent::Token(t) => assert_eq!(t, "lo"),
-            other => panic!("second should be Token(\"lo\"); got {other:?}"),
+            other => return Err(format!("second should be Token(lo); got {other:?}")),
         }
+        Ok(())
     }
 }
