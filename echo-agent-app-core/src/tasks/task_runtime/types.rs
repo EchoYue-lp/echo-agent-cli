@@ -587,7 +587,6 @@ pub enum RuntimeEventKind {
     TodoUpdated,
     WorkerAssigned,
     WorkerReleased,
-    WorkerLlmUsage,
     ToolStarted,
     ToolCompleted,
     ToolFailed,
@@ -619,7 +618,6 @@ impl RuntimeEventKind {
             TodoUpdated => "todo_updated",
             WorkerAssigned => "worker_assigned",
             WorkerReleased => "worker_released",
-            WorkerLlmUsage => "worker_llm_usage",
             ToolStarted => "tool_started",
             ToolCompleted => "tool_completed",
             ToolFailed => "tool_failed",
@@ -651,7 +649,6 @@ impl RuntimeEventKind {
             "todo_updated" => TodoUpdated,
             "worker_assigned" => WorkerAssigned,
             "worker_released" => WorkerReleased,
-            "worker_llm_usage" => WorkerLlmUsage,
             "tool_started" => ToolStarted,
             "tool_completed" => ToolCompleted,
             "tool_failed" => ToolFailed,
@@ -1353,126 +1350,6 @@ impl SuggestedTask {
             risk: task.risk,
         }
     }
-}
-
-// ── Usage trend persistence ────────────────────────────────────────────
-
-/// A single in-process LLM usage record for trend analysis.
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export, rename = "UsageRecord")]
-pub struct UsageRecord {
-    pub id: String,
-    pub session_id: String,
-    pub run_id: Option<String>,
-    pub worker_id: Option<String>,
-    pub model: String,
-    pub provider: Option<String>,
-    pub route_kind: Option<String>,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cached_input_tokens: u64,
-    pub cache_creation_input_tokens: u64,
-    pub usage_reported: bool,
-    pub system_prompt_hash: Option<String>,
-    pub tools_schema_hash: Option<String>,
-    pub cwd_hash: Option<String>,
-    pub worker_prompt_hash: Option<String>,
-    #[serde(with = "echo_agent::utils::time::local_rfc3339")]
-    #[ts(as = "String")]
-    pub created_at: DateTime<Utc>,
-}
-
-/// Query filter for listing usage records.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
-#[ts(export, rename = "UsageQueryFilter")]
-pub struct UsageQueryFilter {
-    pub session_id: Option<String>,
-    pub run_id: Option<String>,
-    pub worker_id: Option<String>,
-    pub model: Option<String>,
-    pub provider: Option<String>,
-    pub route_kind: Option<String>,
-    #[serde(with = "echo_agent::utils::time::option_local_rfc3339")]
-    #[ts(as = "Option<String>")]
-    pub created_after: Option<DateTime<Utc>>,
-    #[serde(with = "echo_agent::utils::time::option_local_rfc3339")]
-    #[ts(as = "Option<String>")]
-    pub created_before: Option<DateTime<Utc>>,
-    pub limit: Option<u32>,
-    pub offset: Option<u32>,
-}
-
-/// Grouping dimension for aggregation queries.
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export, rename = "UsageGroupBy")]
-pub enum UsageGroupBy {
-    Model,
-    Provider,
-    RouteKind,
-    Session,
-    Worker,
-    TimeWindow,
-}
-
-/// Filter for aggregated usage queries.
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export, rename = "UsageAggregationFilter")]
-pub struct UsageAggregationFilter {
-    pub group_by: Vec<UsageGroupBy>,
-    #[serde(with = "echo_agent::utils::time::option_local_rfc3339")]
-    #[ts(as = "Option<String>")]
-    pub created_after: Option<DateTime<Utc>>,
-    #[serde(with = "echo_agent::utils::time::option_local_rfc3339")]
-    #[ts(as = "Option<String>")]
-    pub created_before: Option<DateTime<Utc>>,
-    pub model: Option<String>,
-    pub provider: Option<String>,
-    pub route_kind: Option<String>,
-    pub session_id: Option<String>,
-    pub window_seconds: Option<u64>,
-}
-
-/// Aggregated usage values for one group.
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export, rename = "UsageAggregation")]
-pub struct UsageAggregation {
-    pub group_key: Option<String>,
-    pub group_value: Option<String>,
-    pub window_start: Option<String>,
-    pub window_end: Option<String>,
-    pub llm_calls: u64,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cached_input_tokens: u64,
-    pub cache_creation_input_tokens: u64,
-    pub cache_read_rate: f64,
-    pub calls_missing_usage: u64,
-}
-
-/// Per-model breakdown in a run usage summary.
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export, rename = "ModelUsageSummary")]
-pub struct ModelUsageSummary {
-    pub model: String,
-    pub llm_calls: u64,
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cached_input_tokens: u64,
-}
-
-/// End-of-run usage summary displayed after TaskRuntime/chat completion.
-#[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export, rename = "RunUsageSummary")]
-pub struct RunUsageSummary {
-    pub run_id: Option<String>,
-    pub total_input_tokens: u64,
-    pub total_output_tokens: u64,
-    pub total_cached_input_tokens: u64,
-    pub total_cache_creation_input_tokens: u64,
-    pub cache_read_rate: f64,
-    pub llm_calls: u64,
-    pub model_breakdown: Vec<ModelUsageSummary>,
-    pub top_low_hit_reasons: Vec<String>,
 }
 
 #[cfg(test)]

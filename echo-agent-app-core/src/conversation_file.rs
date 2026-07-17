@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use echo_agent::memory::{
     Conversation, ConversationFilter, ConversationMeta, ConversationStore, NewConversation,
@@ -428,6 +428,13 @@ impl SessionSearchEngine {
         }
     }
 
+    fn lock_entries(&self) -> MutexGuard<'_, HashMap<String, IndexedSession>> {
+        self.entries.lock().unwrap_or_else(|poisoned| {
+            tracing::warn!("Session search index lock was poisoned; recovering stored entries");
+            poisoned.into_inner()
+        })
+    }
+
     /// Index (or re-index) a session. `messages` are the message contents.
     pub fn index_session(
         &self,
@@ -441,7 +448,7 @@ impl SessionSearchEngine {
             .map(|m| m.as_ref().to_string())
             .collect::<Vec<_>>()
             .join(" ");
-        let mut entries = self.entries.lock().expect("search engine lock");
+        let mut entries = self.lock_entries();
         entries.insert(
             session_id.to_string(),
             IndexedSession {
@@ -455,7 +462,7 @@ impl SessionSearchEngine {
 
     /// Remove a session from the index.
     pub fn remove_session(&self, session_id: &str) {
-        let mut entries = self.entries.lock().expect("search engine lock");
+        let mut entries = self.lock_entries();
         entries.remove(session_id);
     }
 
@@ -464,7 +471,7 @@ impl SessionSearchEngine {
     /// load-bearing for the sessions search UI).
     pub fn search(&self, query: &str, limit: usize) -> Vec<SessionSearchResult> {
         let needle = query.to_lowercase();
-        let entries = self.entries.lock().expect("search engine lock");
+        let entries = self.lock_entries();
         let mut results: Vec<SessionSearchResult> = entries
             .iter()
             .filter_map(|(id, s)| {

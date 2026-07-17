@@ -99,11 +99,12 @@ pub fn load_project_context(project_root: &Path) -> ProjectContext {
                 Ok(content) => {
                     if !content.trim().is_empty() {
                         tracing::info!("加载全局指令: {}", path.display());
+                        let source_name = path
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| path.display().to_string());
                         instructions.push(LoadedInstruction {
-                            source: format!(
-                                "~/.echo-agent/{}",
-                                path.file_name().unwrap().to_string_lossy()
-                            ),
+                            source: format!("~/.echo-agent/{source_name}"),
                             content,
                         });
                     }

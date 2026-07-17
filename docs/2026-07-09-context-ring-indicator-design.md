@@ -255,7 +255,7 @@ EKO · coding · gpt-5 · thinking · ◓ 15.2k/128k 12% · cache 98%
 
 - **不改 v1 的 snapshot 语义**：瞬时占用仍是覆盖式，缓存率走独立累加器——不混在一个结构里
 - **不用 `ContextCompressed.after_tokens` 写权威占用**（方案 B / interim 估算留给将来，须带「估算」标注）
-- **不新增 IPC**：缓存率走 LlmUsage 事件增量累加，不调 `get_cache_diagnostics`（那是右边栏按需用的）
+- **不新增 IPC**：缓存率走 LlmUsage 事件增量累加；完整单 run 诊断由 durable `RunStore` 的观测面板按需查询。
 - **不改右边栏**：ObservabilityPanel 的诊断逻辑（按需重算）保持不变，本功能是独立的常驻累加器
 - **TUI 不画真圆**：重构 status bar 单行布局成本太高，unicode 近似已足够（Claude Code 同款）
 - **不落盘**：accumulator 是运行时投影，重启无需保留（EKO 本地助理定位）

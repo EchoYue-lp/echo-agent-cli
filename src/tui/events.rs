@@ -3468,6 +3468,55 @@ async fn handle_slash_command(
                 ),
             });
         }
+        Some(SlashCommand::Trace) => {
+            let run_store = agent.read(|value| value.run_store().cloned()).await;
+            let content = match run_store {
+                None => "Run store not configured.".to_string(),
+                Some(store) => {
+                    let diagnostic_id = if args.trim().is_empty() {
+                        match echo_agent_app_core::observability::list_diagnostic_runs(
+                            store.as_ref(),
+                        )
+                        .await
+                        {
+                            Ok(runs) => Ok(runs.first().map(|run| run.diagnostic_id.clone())),
+                            Err(error) => Err(format!("Unable to list run diagnostics: {error}")),
+                        }
+                    } else {
+                        Ok(Some(args.trim().to_string()))
+                    };
+                    match diagnostic_id {
+                        Err(message) => message,
+                        Ok(None) => "No durable run diagnostics available.".to_string(),
+                        Ok(Some(diagnostic_id)) => {
+                            match echo_agent_app_core::observability::load_run_diagnostics(
+                                store.as_ref(),
+                                &diagnostic_id,
+                                app.prompt_assembly.clone(),
+                            )
+                            .await
+                            {
+                                Ok(Some(diagnostics)) => {
+                                    echo_agent_app_core::observability::format_run_diagnostics(
+                                        &diagnostics,
+                                    )
+                                }
+                                Ok(None) => {
+                                    format!("Run diagnostics not found: {diagnostic_id}")
+                                }
+                                Err(error) => {
+                                    format!("Unable to load run diagnostics: {error}")
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content,
+            });
+        }
         Some(SlashCommand::PromptDiagnostics) => {
             let context = agent.read(|value| value.context().clone()).await;
             let (message_count, estimated_tokens, protected_message_count, protected_tokens) = {

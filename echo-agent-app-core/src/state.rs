@@ -398,13 +398,8 @@ pub struct WebhookState {
     pub emitter: crate::webhook::WebhookEmitter,
 }
 
-/// Trace 观测状态
-pub struct TraceState {
-    /// TraceAnalyzer backed by the agent's RunStore.
-    /// None until infra initialization extracts the store from the agent.
-    pub analyzer: RwLock<Option<echo_agent::trace::TraceAnalyzer>>,
-    /// 实时追踪事件收集器。
-    pub collector: std::sync::Arc<crate::observability::TraceCollector>,
+/// Product-level observability inputs not owned by the framework run store.
+pub struct ObservabilityState {
     /// Static prompt-module report for the primary EKO agent.
     pub prompt_assembly: RwLock<Option<crate::project::prompt::PromptAssembly>>,
 }
@@ -439,8 +434,8 @@ pub struct AppState {
     pub tasks: TaskState,
     /// Webhook 事件回调
     pub webhook: WebhookState,
-    /// Trace 观测分析
-    pub trace: TraceState,
+    /// Run diagnostics product projection state.
+    pub observability: ObservabilityState,
     /// 工作区管理
     pub workspace: WorkspaceState,
     /// Skills Hub（本地技能市场）
@@ -551,18 +546,24 @@ impl AppState {
             webhook: WebhookState {
                 emitter: crate::webhook::WebhookEmitter::with_endpoints(webhook_endpoints),
             },
-            trace: TraceState {
-                analyzer: RwLock::new(None),
-                collector: std::sync::Arc::new(crate::observability::TraceCollector::new()),
+            observability: ObservabilityState {
                 prompt_assembly: RwLock::new(None),
             },
             workspace: WorkspaceState {
                 current: RwLock::new(None),
                 registry: Arc::new(WorkspaceRegistry::new().unwrap_or_else(|e| {
                     tracing::warn!("Failed to init workspace registry: {e}");
-                    // Fallback: use a temp directory registry
-                    WorkspaceRegistry::with_base_dir(std::env::temp_dir().join("echo-workspaces"))
-                        .expect("temp workspace registry should always init")
+                    let fallback_dir = std::env::temp_dir().join("echo-workspaces");
+                    WorkspaceRegistry::with_base_dir(fallback_dir.clone()).unwrap_or_else(
+                        |fallback_error| {
+                            tracing::warn!(
+                                error = %fallback_error,
+                                path = %fallback_dir.display(),
+                                "Failed to create fallback workspace directory; registry writes may fail"
+                            );
+                            WorkspaceRegistry::without_initialization(fallback_dir)
+                        },
+                    )
                 })),
             },
             skills_hub: Arc::new(RwLock::new(crate::skills_hub::SkillsHub::new())),
@@ -584,7 +585,7 @@ impl AppState {
         mut self,
         prompt_assembly: crate::project::prompt::PromptAssembly,
     ) -> Self {
-        *self.trace.prompt_assembly.get_mut() = Some(prompt_assembly);
+        *self.observability.prompt_assembly.get_mut() = Some(prompt_assembly);
         self
     }
 

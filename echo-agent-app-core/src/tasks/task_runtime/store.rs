@@ -45,9 +45,7 @@ pub enum StoreError {
 
 /// File-backed TaskRuntime store. One instance per process; cheap to clone
 /// behind `Arc`. The file system (plan.json + events.jsonl) is the read/write
-/// authority for all task/plan data. Usage records and conversation-replay
-/// events are kept in-memory (EKO is a local tool; these are ephemeral and
-/// need not survive a restart — see AGENTS.md "no compat/recovery" stance).
+/// authority for all task/plan data.
 pub struct TaskRuntimeStore {
     /// Per-task cancellation tokens (in-memory runtime state, not persisted).
     /// Key = `"{run_id}::{task_id}"`. `execute_task` registers a token when a
@@ -62,9 +60,6 @@ pub struct TaskRuntimeStore {
         std::sync::Mutex<std::collections::HashMap<String, echo_agent::agent::CancellationToken>>,
     /// File shadow (U1c phase-0/0bc). The read/write authority for all task data.
     shadow: std::sync::Arc<super::file_shadow::FileTaskShadow>,
-    /// In-memory LLM usage records (token spend per subagent call). Not persisted
-    /// —重启清零,符合 EKO 本地工具定位(usage 是参考指标,非账本)。
-    usage_records: std::sync::Mutex<Vec<super::types::UsageRecord>>,
     /// Per-run plan/state 写互斥锁 (F2-1 / F3-3 / F3-4)。
     ///
     /// insert_task / attach_plan / update_plan_task / transition_run 都是
@@ -119,7 +114,7 @@ impl TaskRuntimeStore {
     /// Create the store at the default location.
     ///
     /// task/plan data lives under the file shadow root (`~/.echo-agent/tasks/`);
-    /// usage/conversation-events are in-memory. No database is opened, so this
+    /// No database is opened, so this
     /// does not fail in practice — the `Result` is kept for call-site compat.
     pub fn new() -> anyhow::Result<Self> {
         Self::open()
@@ -136,7 +131,6 @@ impl TaskRuntimeStore {
             task_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
             run_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
             shadow,
-            usage_records: std::sync::Mutex::new(Vec::new()),
             plan_locks: dashmap::DashMap::new(),
         })
     }
@@ -162,7 +156,6 @@ impl TaskRuntimeStore {
             task_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
             run_cancel_tokens: std::sync::Mutex::new(std::collections::HashMap::new()),
             shadow,
-            usage_records: std::sync::Mutex::new(Vec::new()),
             plan_locks: dashmap::DashMap::new(),
         })
     }
@@ -1620,69 +1613,6 @@ impl TaskRuntimeStore {
         }
         Ok(())
     }
-
-    /// Persist a provider-reported LLM usage event for a subagent.
-    ///
-    /// This is intentionally a low-frequency structured event rather than raw
-    /// token streaming. The event goes to the file authority (events.jsonl) for
-    /// traceability; the usage record is held in memory for the GUI's token
-    /// metrics (EKO is a local tool — usage is an ephemeral reference, not a
-    /// ledger, and need not survive a restart).
-    pub fn record_worker_llm_usage(
-        &self,
-        run_id: &str,
-        task_id: &str,
-        worker_id: &str,
-        agent_name: &str,
-        title: &str,
-        payload: serde_json::Value,
-    ) -> Result<(), StoreError> {
-        // WorkerLlmUsage does not affect plan.json (the rebuilder ignores it),
-        // so we append the event for traceability but skip the plan rewrite.
-        self.shadow.append_event_line(
-            run_id,
-            Some(task_id),
-            Some(worker_id),
-            RuntimeEventKind::WorkerLlmUsage,
-            serde_json::json!({
-                "worker_id": worker_id,
-                "agent_name": agent_name,
-                "title": title,
-                "usage": payload.clone(),
-            }),
-        )?;
-        // Hold the usage record in memory for query_usage_records / summaries.
-        let record = super::types::UsageRecord {
-            id: uuid::Uuid::new_v4().to_string(),
-            session_id: json_string(&payload, "session_id").unwrap_or_else(|| run_id.to_string()),
-            run_id: Some(run_id.to_string()),
-            worker_id: Some(worker_id.to_string()),
-            model: json_string(&payload, "model").unwrap_or_else(|| "unknown".to_string()),
-            provider: json_string(&payload, "provider"),
-            route_kind: json_string(&payload, "route_kind")
-                .or_else(|| Some("task_runtime".to_string())),
-            input_tokens: json_u64(&payload, "prompt_tokens"),
-            output_tokens: json_u64(&payload, "completion_tokens"),
-            cached_input_tokens: json_u64(&payload, "cached_prompt_tokens"),
-            cache_creation_input_tokens: json_u64(&payload, "cache_creation_prompt_tokens"),
-            usage_reported: json_bool(&payload, "usage_reported", true),
-            system_prompt_hash: json_string(&payload, "system_prompt_hash"),
-            tools_schema_hash: json_string(&payload, "tools_schema_hash"),
-            cwd_hash: json_string(&payload, "cwd_hash"),
-            worker_prompt_hash: json_string(&payload, "worker_prompt_hash"),
-            created_at: Utc::now(),
-        };
-        if let Ok(mut records) = self.usage_records.lock() {
-            records.push(record);
-        }
-        Ok(())
-    }
-}
-
-// ── JSON helpers for usage-record extraction ────────────────────────────
-
-fn json_u64(value: &serde_json::Value, key: &str) -> u64 {
-    value.get(key).and_then(|v| v.as_u64()).unwrap_or(0)
 }
 
 fn json_bool(value: &serde_json::Value, key: &str, default: bool) -> bool {
@@ -2504,161 +2434,5 @@ mod tests {
             status: TodoStatus::Pending,
             sort_order: 0,
         }
-    }
-}
-
-// ── Usage records (in-memory) ──────────────────────────────────────────
-
-impl TaskRuntimeStore {
-    /// Insert a usage record (in-memory; not persisted across restarts).
-    pub fn insert_usage_record(
-        &self,
-        record: &super::types::UsageRecord,
-    ) -> Result<(), StoreError> {
-        if let Ok(mut records) = self.usage_records.lock() {
-            // INSERT OR REPLACE semantics: replace an existing record with the
-            // same id, else push. (Matches the old SQL `ON CONFLICT` behavior.)
-            if let Some(existing) = records.iter_mut().find(|r| r.id == record.id) {
-                *existing = record.clone();
-            } else {
-                records.push(record.clone());
-            }
-        }
-        Ok(())
-    }
-
-    /// Query usage records with optional filters. In-memory equivalent of the
-    /// old SQL `SELECT ... WHERE ... ORDER BY created_at DESC LIMIT/OFFSET`.
-    pub fn query_usage_records(
-        &self,
-        filter: &super::types::UsageQueryFilter,
-    ) -> Result<Vec<super::types::UsageRecord>, StoreError> {
-        let records = self
-            .usage_records
-            .lock()
-            .map_err(|_| StoreError::LockPoisoned)?;
-        let mut out: Vec<super::types::UsageRecord> = records
-            .iter()
-            .filter(|r| {
-                filter
-                    .session_id
-                    .as_deref()
-                    .is_none_or(|v| r.session_id == v)
-            })
-            .filter(|r| {
-                filter
-                    .run_id
-                    .as_deref()
-                    .is_none_or(|v| r.run_id.as_deref() == Some(v))
-            })
-            .filter(|r| filter.model.as_deref().is_none_or(|v| r.model == v))
-            .filter(|r| {
-                filter
-                    .provider
-                    .as_deref()
-                    .is_none_or(|v| r.provider.as_deref() == Some(v))
-            })
-            .filter(|r| {
-                filter
-                    .route_kind
-                    .as_deref()
-                    .is_none_or(|v| r.route_kind.as_deref() == Some(v))
-            })
-            .filter(|r| {
-                filter
-                    .created_after
-                    .is_none_or(|after| r.created_at >= after)
-            })
-            .filter(|r| {
-                filter
-                    .created_before
-                    .is_none_or(|before| r.created_at <= before)
-            })
-            .cloned()
-            .collect();
-        // ORDER BY created_at DESC (stable sort preserves insertion order on ties).
-        out.sort_by_key(|a| std::cmp::Reverse(a.created_at));
-        // LIMIT / OFFSET.
-        let offset = filter.offset.unwrap_or(0) as usize;
-        if offset >= out.len() {
-            return Ok(Vec::new());
-        }
-        let limited = if let Some(limit) = filter.limit {
-            out[offset..].iter().take(limit as usize).cloned().collect()
-        } else {
-            out[offset..].to_vec()
-        };
-        Ok(limited)
-    }
-
-    /// Get an end-of-run usage summary from persisted records.
-    pub fn get_run_usage_summary(
-        &self,
-        run_id: &str,
-    ) -> Result<Option<super::types::RunUsageSummary>, StoreError> {
-        use super::types::{ModelUsageSummary, RunUsageSummary};
-        let records = self.query_usage_records(&super::types::UsageQueryFilter {
-            run_id: Some(run_id.to_string()),
-            ..Default::default()
-        })?;
-
-        if records.is_empty() {
-            return Ok(None);
-        }
-
-        let mut total_input = 0u64;
-        let mut total_output = 0u64;
-        let mut total_cached = 0u64;
-        let mut total_cache_write = 0u64;
-        let mut model_map: std::collections::HashMap<String, (u64, u64, u64, u64)> =
-            std::collections::HashMap::new();
-
-        for r in &records {
-            total_input += r.input_tokens;
-            total_output += r.output_tokens;
-            total_cached += r.cached_input_tokens;
-            total_cache_write += r.cache_creation_input_tokens;
-
-            let entry = model_map.entry(r.model.clone()).or_insert((0, 0, 0, 0));
-            entry.0 += 1; // llm_calls
-            entry.1 += r.input_tokens;
-            entry.2 += r.output_tokens;
-            entry.3 += r.cached_input_tokens;
-        }
-
-        let cache_read_rate = if total_input > 0 {
-            total_cached as f64 / total_input as f64
-        } else {
-            0.0
-        };
-
-        let model_breakdown: Vec<ModelUsageSummary> = model_map
-            .into_iter()
-            .map(|(model, (calls, inp, out, cached))| ModelUsageSummary {
-                model,
-                llm_calls: calls,
-                input_tokens: inp,
-                output_tokens: out,
-                cached_input_tokens: cached,
-            })
-            .collect();
-
-        let top_low_hit_reasons = if cache_read_rate < 0.1 && total_input > 0 {
-            vec!["cache read rate below 10% — check system prompt stability and tools schema consistency".to_string()]
-        } else {
-            vec![]
-        };
-
-        Ok(Some(RunUsageSummary {
-            run_id: Some(run_id.to_string()),
-            total_input_tokens: total_input,
-            total_output_tokens: total_output,
-            total_cached_input_tokens: total_cached,
-            total_cache_creation_input_tokens: total_cache_write,
-            cache_read_rate,
-            llm_calls: records.len() as u64,
-            model_breakdown,
-            top_low_hit_reasons,
-        }))
     }
 }

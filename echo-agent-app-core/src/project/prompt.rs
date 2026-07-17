@@ -18,6 +18,7 @@
 use super::context::ProjectContext;
 use echo_core::tokenizer::{HeuristicTokenizer, Tokenizer};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 /// Stable product-level operating contract. Dynamic project, memory, mode, and
 /// task context follows this cache-friendly prefix.
@@ -91,6 +92,8 @@ pub struct PromptModuleUsage {
     pub estimated_tokens: usize,
     pub included: bool,
     pub truncated: bool,
+    pub content_hash: String,
+    pub stable_prefix: bool,
 }
 
 /// Prompt text plus budget diagnostics used by tests and observability.
@@ -148,6 +151,8 @@ impl PromptAssembler {
                     estimated_tokens: estimated,
                     included: true,
                     truncated: false,
+                    content_hash: content_hash(&module.content),
+                    stable_prefix: module.priority <= 4,
                 });
                 continue;
             }
@@ -164,6 +169,8 @@ impl PromptAssembler {
                     estimated_tokens: 0,
                     included: false,
                     truncated: false,
+                    content_hash: String::new(),
+                    stable_prefix: module.priority <= 4,
                 });
                 continue;
             }
@@ -183,16 +190,21 @@ impl PromptAssembler {
                     estimated_tokens: 0,
                     included: false,
                     truncated,
+                    content_hash: String::new(),
+                    stable_prefix: module.priority <= 4,
                 });
                 continue;
             }
             used_tokens = used_tokens.saturating_add(included_tokens);
+            let included_hash = content_hash(&content);
             parts.push(content);
             usages.push(PromptModuleUsage {
                 name: module.name.clone(),
                 estimated_tokens: included_tokens,
                 included: true,
                 truncated,
+                content_hash: included_hash,
+                stable_prefix: module.priority <= 4,
             });
         }
 
@@ -316,6 +328,15 @@ impl PromptAssembler {
             required: false,
         });
     }
+}
+
+fn content_hash(content: &str) -> String {
+    let digest = Sha256::digest(content.as_bytes());
+    digest
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn truncate_to_estimated_tokens(text: &str, max_tokens: usize) -> String {

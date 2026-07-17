@@ -416,28 +416,3 @@ pub async fn get_progress_ledger(
     echo_agent_app_core::tasks::task_runtime::write_progress(&store, &run_id, base.as_deref())
         .map_err(internal)
 }
-
-// ── Usage trend queries ───────────────────────────────────────────────
-
-#[tauri::command]
-pub async fn query_usage_records(
-    state: tauri::State<'_, TauriState>,
-    filter: echo_agent_app_core::tasks::task_runtime::UsageQueryFilter,
-) -> Result<Vec<serde_json::Value>, IpcError> {
-    let store = store(&state)?;
-    let records = store.query_usage_records(&filter).map_err(internal)?;
-    Ok(records
-        .into_iter()
-        .map(|r| serde_json::to_value(r).unwrap_or_default())
-        .collect())
-}
-
-#[tauri::command]
-pub async fn get_run_usage_summary(
-    state: tauri::State<'_, TauriState>,
-    run_id: String,
-) -> Result<Option<serde_json::Value>, IpcError> {
-    let store = store(&state)?;
-    let summary = store.get_run_usage_summary(&run_id).map_err(internal)?;
-    Ok(summary.map(|s| serde_json::to_value(s).unwrap_or_default()))
-}

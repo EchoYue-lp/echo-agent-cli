@@ -18,10 +18,15 @@ impl WorkspaceLayout {
 
     /// 工作区基础目录：`~/.echo-agent/workspaces/`
     ///
-    /// # Panics
-    /// 如果无法确定用户主目录，将 panic。
     pub fn base_dir() -> PathBuf {
-        let home = home_dir().expect("无法确定用户主目录 (HOME 环境变量未设置)");
+        let home = home_dir().unwrap_or_else(|| {
+            let fallback = std::env::temp_dir();
+            tracing::warn!(
+                path = %fallback.display(),
+                "HOME is unavailable; using the temporary directory for workspaces"
+            );
+            fallback
+        });
         home.join(".echo-agent").join("workspaces")
     }
 

@@ -248,7 +248,7 @@ pub fn rebuild_plan_from_events(events: &[RuntimeTaskEvent]) -> Result<RebuiltPl
                     *t = task;
                 }
             }
-            _ => {} // WorkerLlmUsage/ArtifactProduced/Review*/Approval*/Note(other) don't affect plan.json
+            _ => {} // ArtifactProduced/Review*/Approval*/Note(other) don't affect plan.json
         }
     }
 

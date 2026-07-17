@@ -609,95 +609,112 @@ export const taskRuntimeApi = {
     isTauri()
       ? apiInvoke<number>('get_interaction_mode')
       : get<number>('/task_runtime/interaction_mode'),
-  // Usage trends
-  queryUsageRecords: (filter: Record<string, unknown>) =>
-    isTauri()
-      ? apiInvoke<Record<string, unknown>[]>('query_usage_records', { filter })
-      : post<Record<string, unknown>[]>('/task_runtime/usage/query', filter),
-  getRunUsageSummary: (runId: string) =>
-    isTauri()
-      ? apiInvoke<Record<string, unknown> | null>('get_run_usage_summary', { runId })
-      : get<Record<string, unknown> | null>(`/task_runtime/runs/${runId}/usage`),
 };
 
-// ── Trace Events API ─────────────────────────────────────────────────
+// ── Durable run diagnostics API ──────────────────────────────────────
 
-export interface TraceEvent {
-  timestamp: string;
-  kind: TraceKind;
-  duration_ms?: number;
-  metadata?: Record<string, unknown>;
-}
-
-export type TraceKind =
-  | {
-      type: 'llm_call';
-      model: string;
-      input_tokens: number;
-      output_tokens: number;
-      cached_input_tokens: number;
-      cache_creation_input_tokens: number;
-      usage_reported: boolean;
-    }
-  | { type: 'tool_call'; tool: string; success: boolean; error?: string }
-  | { type: 'agent_step'; step_number: number; thought_preview?: string }
-  | { type: 'pipeline_stage'; pipeline: string; stage: string }
-  | { type: 'memory_access'; operation: string; results_count?: number }
-  | { type: 'mcp_call'; server: string; method: string }
-  | {
-      type: 'context_compression';
-      before_messages: number;
-      after_messages: number;
-      before_tokens: number;
-      after_tokens: number;
-    };
-
-export interface TraceSummary {
-  session_id: string;
-  total_duration_ms: number;
-  llm_calls: number;
+export interface DiagnosticRunSummary {
+  diagnostic_id: string;
+  parent_run_id?: string | null;
+  trace_count: number;
+  status: string;
+  input_preview: string;
+  started_at: string;
+  finished_at?: string | null;
+  agents: string[];
+  models: string[];
   total_input_tokens: number;
   total_output_tokens: number;
   total_cached_input_tokens: number;
-  total_cache_creation_input_tokens: number;
-  llm_calls_missing_usage: number;
-  tool_calls: number;
-  tool_success_rate: number;
-  agent_steps: number;
-  events: TraceEvent[];
-}
-
-// ── Cache Diagnostics types ───────────────────────────────────────────
-
-export interface CacheIssueData {
-  kind: string;
-  severity: 'info' | 'warning' | 'critical';
-  message: string;
-  affected_calls: number;
-}
-
-export interface RecentCallFingerprint {
-  model: string;
-  input_tokens: number;
-  cached_input_tokens: number;
-  system_prompt_hash?: string | null;
-  tools_schema_hash?: string | null;
-  cwd_hash?: string | null;
-  worker_prompt_hash?: string | null;
-  provider?: string | null;
-}
-
-export interface CacheDiagnosticsData {
-  overall_read_rate: number;
-  total_input_tokens: number;
-  total_cached_input_tokens: number;
-  total_cache_creation_input_tokens: number;
-  total_llm_calls: number;
+  llm_calls: number;
   calls_missing_usage: number;
-  distinct_models: number;
-  issues: CacheIssueData[];
-  suggested_fixes: string[];
-  recent_calls: RecentCallFingerprint[];
+}
+
+export interface LlmContextBreakdown {
+  system_tokens: number;
+  user_tokens: number;
+  assistant_tokens: number;
+  tool_tokens: number;
+  summary_tokens: number;
+  memory_tokens: number;
+}
+
+export interface LlmCallDiagnostic {
+  sequence: number;
+  source: 'provider' | 'estimated';
+  input_tokens?: number | null;
+  output_tokens?: number | null;
+  cached_input_tokens?: number | null;
+  cache_creation_input_tokens?: number | null;
+  estimated_context_tokens: number;
+  protected_context_tokens: number;
+  protected_message_count: number;
+  context_limit_tokens: number;
+  context_breakdown: LlmContextBreakdown;
+  stable_prefix_hash: string;
+  system_prefix_hash: string;
+  tools_schema_hash: string;
+  history_hash: string;
+  message_count: number;
+  tool_count: number;
+  duration_ms: number;
+}
+
+export interface TraceInvocationDiagnostic {
+  trace_run_id: string;
+  agent_name: string;
+  model: string;
+  provider?: string | null;
+  turn_id?: string | null;
+  execution_id?: string | null;
+  status: string;
+  started_at: string;
+  finished_at?: string | null;
+  llm_calls: LlmCallDiagnostic[];
+}
+
+export interface RunDiagnostics {
+  diagnostic_id: string;
+  parent_run_id?: string | null;
+  traces: TraceInvocationDiagnostic[];
+  usage: {
+    provider_reported_calls: number;
+    calls_missing_usage: number;
+    total_input_tokens: number;
+    total_output_tokens: number;
+    total_cached_input_tokens: number;
+    total_cache_creation_input_tokens: number;
+  };
+  cache: {
+    read_rate?: number | null;
+    system_prefix_hash_changes: number;
+    tools_schema_hash_changes: number;
+    stable_prefix_hash_changes: number;
+  };
+  context: {
+    latest_provider_input_tokens?: number | null;
+    latest_estimated_context_tokens: number;
+    latest_context_limit_tokens: number;
+    latest_breakdown: LlmContextBreakdown;
+    max_protected_context_tokens: number;
+    max_protected_message_count: number;
+  };
+  compressions: Array<{
+    trace_run_id: string;
+    sequence: number;
+    source: string;
+    before_messages: number;
+    after_messages: number;
+    before_tokens: number;
+    after_tokens: number;
+    protected_context_tokens: number;
+    protected_message_count: number;
+  }>;
+  issues: Array<{
+    kind: string;
+    severity: 'info' | 'warning' | 'critical';
+    message: string;
+  }>;
   prompt_assembly?: {
     estimated_tokens: number;
     modules: Array<{
@@ -705,46 +722,21 @@ export interface CacheDiagnosticsData {
       estimated_tokens: number;
       included: boolean;
       truncated: boolean;
+      content_hash: string;
+      stable_prefix: boolean;
     }>;
   } | null;
-  context_snapshot: {
-    message_count: number;
-    estimated_tokens: number;
-    protected_message_count: number;
-    protected_tokens: number;
-  };
-  fingerprint_changes: {
-    system_prompt_hash_changes: number;
-    tools_schema_hash_changes: number;
-    cwd_hash_changes: number;
-    worker_prompt_hash_changes: number;
-    distinct_providers: number;
-  };
 }
 
-export const traceEventsApi = {
-  listSessions: () =>
+export const runDiagnosticsApi = {
+  list: () =>
     isTauri()
-      ? apiInvoke<string[]>('list_trace_sessions')
-      : get<string[]>('/trace-events/sessions'),
-  getEvents: (sessionId: string) =>
+      ? apiInvoke<DiagnosticRunSummary[]>('list_diagnostic_runs')
+      : get<DiagnosticRunSummary[]>('/run-diagnostics'),
+  get: (diagnosticId: string) =>
     isTauri()
-      ? apiInvoke<TraceEvent[]>('get_trace_events', { session_id: sessionId })
-      : get<TraceEvent[]>(`/trace-events/${sessionId}`),
-  getSummary: (sessionId: string) =>
-    isTauri()
-      ? apiInvoke<TraceSummary>('get_trace_summary', { session_id: sessionId })
-      : get<TraceSummary>(`/trace-events/${sessionId}/summary`),
-  clearSession: (sessionId: string) =>
-    isTauri()
-      ? apiInvoke<{ cleared: string }>('clear_trace_session', { session_id: sessionId })
-      : del<{ cleared: string }>(`/trace-events/${sessionId}`),
-  getCacheDiagnostics: (sessionId?: string) =>
-    isTauri()
-      ? apiInvoke<CacheDiagnosticsData>('get_cache_diagnostics', { sessionId: sessionId ?? null })
-      : get<CacheDiagnosticsData>(
-          `/trace-events/diagnostics${sessionId ? `?session_id=${sessionId}` : ''}`
-        ),
+      ? apiInvoke<RunDiagnostics>('get_run_diagnostics', { diagnosticId })
+      : get<RunDiagnostics>(`/run-diagnostics/${diagnosticId}`),
 };
 
 // ── Files API ───────────────────────────────────────────────────────

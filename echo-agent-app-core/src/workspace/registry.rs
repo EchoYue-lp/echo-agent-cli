@@ -84,6 +84,14 @@ impl WorkspaceRegistry {
         Ok(Self { base_dir })
     }
 
+    /// Construct a registry after directory creation has already failed.
+    ///
+    /// Operations retain their normal `Result`-based I/O errors instead of
+    /// making application startup panic.
+    pub(crate) fn without_initialization(base_dir: PathBuf) -> Self {
+        Self { base_dir }
+    }
+
     /// 基础目录路径。
     pub fn base_dir(&self) -> &Path {
         &self.base_dir
@@ -348,12 +356,13 @@ impl WorkspaceRegistry {
             anyhow::bail!("Project root does not exist: {}", canonical.display());
         }
 
+        let project_display = canonical.display().to_string();
         workspace.project_root = Some(canonical);
         self.save_manifest(&workspace)?;
 
         tracing::info!(
             workspace = %id,
-            project = %workspace.project_root.as_ref().unwrap().display(),
+            project = %project_display,
             "Linked project to workspace"
         );
         Ok(workspace)
@@ -408,12 +417,6 @@ impl WorkspaceRegistry {
         let json = serde_json::to_string_pretty(workspace)?;
         fs::write(&manifest_path, json)?;
         Ok(())
-    }
-}
-
-impl Default for WorkspaceRegistry {
-    fn default() -> Self {
-        Self::new().expect("Failed to create workspace registry")
     }
 }
 

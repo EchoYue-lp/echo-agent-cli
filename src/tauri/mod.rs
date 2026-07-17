@@ -149,8 +149,6 @@ pub fn build_tauri_app(
             // TaskRuntime interaction mode (Chat/Task/Auto)
             commands::task_runtime::set_interaction_mode,
             commands::task_runtime::get_interaction_mode,
-            commands::task_runtime::query_usage_records,
-            commands::task_runtime::get_run_usage_summary,
             // Memory
             commands::memory::list_memory,
             commands::memory::add_memory,
@@ -245,11 +243,8 @@ pub fn build_tauri_app(
             commands::panels::get_history,
             commands::panels::export_history_markdown,
             commands::panels::export_history_json,
-            commands::panels::list_trace_sessions,
-            commands::panels::get_trace_events,
-            commands::panels::get_trace_summary,
-            commands::panels::clear_trace_session,
-            commands::chat::get_cache_diagnostics,
+            commands::panels::list_diagnostic_runs,
+            commands::panels::get_run_diagnostics,
             commands::panels::list_papers,
             commands::panels::get_paper,
             commands::panels::create_paper,

@@ -85,12 +85,18 @@ fn parse_key(key: &str) -> Option<(KeyModifiers, KeyCode)> {
         "Down" => KeyCode::Down,
         "Left" => KeyCode::Left,
         "Right" => KeyCode::Right,
-        s if s.len() == 1 => KeyCode::Char(s.chars().next().unwrap()),
-        s if s.starts_with('F') => {
-            let n: u8 = s[1..].parse().ok()?;
+        s if s.starts_with('F') && s.chars().count() > 1 => {
+            let n: u8 = s.strip_prefix('F')?.parse().ok()?;
             KeyCode::F(n)
         }
-        _ => return None,
+        s => {
+            let mut chars = s.chars();
+            let ch = chars.next()?;
+            if chars.next().is_some() {
+                return None;
+            }
+            KeyCode::Char(ch)
+        }
     };
 
     Some((mod_str, code))

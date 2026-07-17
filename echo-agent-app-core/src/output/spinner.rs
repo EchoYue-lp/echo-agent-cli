@@ -16,11 +16,11 @@ impl SpinnerHandle {
     /// 创建并启动一个 spinner
     pub fn new(message: &str) -> Self {
         let bar = ProgressBar::new_spinner();
-        bar.set_style(
-            ProgressStyle::with_template("{spinner:.green} {msg}")
-                .unwrap()
-                .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
-        );
+        let style = ProgressStyle::with_template("{spinner:.green} {msg}").unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "Invalid spinner template; using the default style");
+            ProgressStyle::default_spinner()
+        });
+        bar.set_style(style.tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]));
         bar.set_message(message.to_string());
         bar.enable_steady_tick(Duration::from_millis(80));
 

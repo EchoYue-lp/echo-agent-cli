@@ -234,13 +234,14 @@ async fn run_desktop() -> anyhow::Result<()> {
     }
 
     // ── Launch Tauri window ──
-    crate::tauri::build_tauri_app(state.clone(), runtime.browser_runtime.clone())
-        .run(tauri::generate_context!())
-        .expect("error while running Tauri application");
+    let tauri_result =
+        crate::tauri::build_tauri_app(state.clone(), runtime.browser_runtime.clone())
+            .run(tauri::generate_context!());
 
     // Tauri window closed → cancel background tasks
     cancel_token.cancel();
     runtime.browser_runtime.shutdown().await;
+    tauri_result.map_err(|e| anyhow::anyhow!("error while running Tauri application: {e}"))?;
 
     Ok(())
 }

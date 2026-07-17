@@ -5,29 +5,19 @@
 
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
-use chrono::Utc;
 use echo_agent::agent::CancellationToken;
 use echo_agent::human_loop::{HumanLoopProvider, HumanLoopRequest, HumanLoopResponse};
 use echo_agent::prelude::AgentEvent;
 use echo_agent::tools::{ToolFailure, ToolOutputChannel, ToolStreamEvent};
 use echo_agent_app_core::chat_driver::ChatSink;
-use echo_agent_app_core::observability::{TraceEvent, TraceKind};
 use echo_agent_app_core::tasks::task_runtime::executor::ExecEvent;
 use futures::future::BoxFuture;
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use tauri::Emitter;
 use tokio::sync::{Mutex, oneshot};
 use uuid::Uuid;
-
-/// Compute a content fingerprint hash (first 16 hex chars of SHA-256).
-fn compute_content_hash(content: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(content.as_bytes());
-    hex::encode(&hasher.finalize()[..8])
-}
 
 /// Event payload emitted to the frontend via `app.emit("chat://event", ...)`.
 #[derive(Clone, Serialize)]
@@ -605,30 +595,6 @@ pub async fn send_chat_message(
         .set_conversation_approval_provider(browser_approval_key.clone(), hitl_handler.clone())
         .await;
 
-    // Capture cache-diagnostic fingerprints BEFORE streaming (same as the
-    // pre-B4 inline normal path): they ride along in the sink so the unified
-    // `agent_event_to_chat_event` records usage/trace with cache diagnostics
-    // (B4.1 — fixes the drift where complex runs dropped observability).
-    let trace_collector = state.app_state.trace.collector.clone();
-    let usage_store = state.app_state.tasks.runtime.clone();
-    let trace_session_id = conversation_id
-        .clone()
-        .unwrap_or_else(|| message_key.clone());
-    let (sys_prompt_hash, tools_hash, cwd_hash, provider_name) = agent_handle
-        .read(|agent| {
-            let sys_prompt_hash = compute_content_hash(agent.config().get_system_prompt());
-            let mut tool_names: Vec<String> = agent.tool_names();
-            tool_names.sort();
-            let tools_hash = compute_content_hash(&tool_names.join(","));
-            let cwd_hash = std::env::current_dir()
-                .ok()
-                .map(|p| compute_content_hash(&p.display().to_string()));
-            let model_name = agent.config().get_model_name().to_string();
-            let provider_name = model_name.split('-').next().map(|s| s.to_string());
-            (sys_prompt_hash, tools_hash, cwd_hash, provider_name)
-        })
-        .await;
-
     use echo_agent_app_core::tasks::task_runtime::InteractionMode;
     let raw = state
         .app_state
@@ -646,15 +612,7 @@ pub async fn send_chat_message(
         app: app.clone(),
         message_key: message_key.clone(),
         conversation_id: conversation_id.clone(),
-        trace_session_id: trace_session_id.clone(),
-        trace_collector: trace_collector.clone(),
-        usage_store: usage_store.clone(),
         run_id: message_key.clone(),
-        route: format!("requested:{}", interaction_mode.as_str()),
-        sys_prompt_hash,
-        tools_hash,
-        cwd_hash,
-        provider_name,
     });
     // Signal the chat-turn lifecycle so the GUI shows the spinner / terminal
     // badge. Ordinary chat turns are not TaskRuntime runs.
@@ -900,19 +858,7 @@ struct TauriChatSink {
     app: tauri::AppHandle,
     message_key: String,
     conversation_id: Option<String>,
-    trace_session_id: String,
-    trace_collector: std::sync::Arc<echo_agent_app_core::observability::TraceCollector>,
-    usage_store: Option<std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
     run_id: String,
-    route: String,
-    // Cache-diagnostic fingerprints captured before streaming starts, so the
-    // unified `agent_event_to_chat_event` can record usage/trace exactly like
-    // the (now-removed) inline normal-chat match did (B4.1/B4.2 — fixes the
-    // drift where complex runs dropped usage/trace observability).
-    sys_prompt_hash: String,
-    tools_hash: String,
-    cwd_hash: Option<String>,
-    provider_name: Option<String>,
 }
 
 impl echo_agent_app_core::chat_driver::ChatSink for TauriChatSink {
@@ -922,15 +868,6 @@ impl echo_agent_app_core::chat_driver::ChatSink for TauriChatSink {
             &event.payload,
             &self.message_key,
             &self.conversation_id,
-            &self.trace_session_id,
-            &self.trace_collector,
-            self.usage_store.as_ref(),
-            &self.run_id,
-            &self.sys_prompt_hash,
-            &self.tools_hash,
-            &self.cwd_hash,
-            &self.provider_name,
-            &self.route,
         );
         if let Some(ce) = chat_event {
             emit_chat_event(&self.app, &ce, &self.message_key, &self.conversation_id)
@@ -969,29 +906,7 @@ impl echo_agent_app_core::chat_driver::ChatSink for TauriChatSink {
         );
     }
 
-    fn on_execution_path(&self, requested_mode: &str, observed_path: &str) {
-        let mut metadata = HashMap::new();
-        metadata.insert(
-            "requested_mode".to_string(),
-            serde_json::Value::String(requested_mode.to_string()),
-        );
-        metadata.insert(
-            "observed_path".to_string(),
-            serde_json::Value::String(observed_path.to_string()),
-        );
-        self.trace_collector.record_sync(
-            &self.trace_session_id,
-            TraceEvent {
-                timestamp: Utc::now(),
-                kind: TraceKind::PipelineStage {
-                    pipeline: "agent_route".to_string(),
-                    stage: observed_path.to_string(),
-                },
-                duration_ms: None,
-                metadata,
-            },
-        );
-    }
+    fn on_execution_path(&self, _requested_mode: &str, _observed_path: &str) {}
 
     fn worker_trace_sink(&self) -> Option<crate::tasks::task_runtime::task_tools::TraceSink> {
         // Forward execution-flow events from `execute_run` (run lifecycle +
@@ -1044,43 +959,14 @@ impl echo_agent_app_core::chat_driver::ChatSink for TauriChatSink {
     }
 }
 
-/// Map an AgentEvent to a ChatEvent, also emitting execution trace side effects.
+/// Map an AgentEvent to a ChatEvent.
 /// Returns None for events that should be silently ignored.
-///
-/// G1 fix: `run_id` is the TaskRuntime run_id. Subagent execution events for the
-/// main agent carry this run_id (not message_key) so the frontend aggregator
-/// (which filters by activeRun.run_id) sees the main agent's token/usage data.
-///
-/// B4.1: this unified mapper now ALSO records usage/trace (the work the
-/// removed inline normal-chat match used to do), so normal AND complex runs
-/// keep observability parity. The fingerprints (`sys_prompt_hash`/`tools_hash`
-/// /`cwd_hash`/`provider_name`) come from the `TauriChatSink`, captured before
-/// streaming started.
-#[allow(clippy::too_many_arguments)] // event mapping requires full context
 fn agent_event_to_chat_event(
     app: &tauri::AppHandle,
     event: &AgentEvent,
     message_key: &str,
     conversation_id: &Option<String>,
-    trace_session_id: &str,
-    trace_collector: &std::sync::Arc<echo_agent_app_core::observability::TraceCollector>,
-    usage_store: Option<
-        &std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
-    >,
-    run_id: &str,
-    sys_prompt_hash: &str,
-    tools_hash: &str,
-    cwd_hash: &Option<String>,
-    provider_name: &Option<String>,
-    route: &str,
 ) -> Option<ChatEvent> {
-    // Local helper removed (Phase 4c follow-up): the main agent's execution
-    // flow is already rendered via `chat://event` (ChatPanel). Emitting the
-    // same events onto `execution://event` (kind="subagent", id="main") caused
-    // duplicate rendering in SubagentStreamBlock AND a stale "running" card
-    // (main run had no `started`/`completed` lifecycle pairing). Main-agent
-    // cache diagnostics go through `trace_collector` + the file-backed runtime store via
-    // `get_cache_diagnostics`, not through the execution://event store.
     match event {
         AgentEvent::Token(data) => Some(ChatEvent::Token { data: data.clone() }),
         AgentEvent::ThinkStart => {
@@ -1109,69 +995,15 @@ fn agent_event_to_chat_event(
             cached_prompt_tokens,
             cache_creation_prompt_tokens,
             usage_reported,
-        } => {
-            // B4.1: record usage/trace exactly like the removed inline
-            // normal-chat match did, so normal AND complex runs keep cache
-            // diagnostics. Ported verbatim (field-for-field) from the pre-B4
-            // inline `LlmUsage` arm. Uses `record_sync` because this mapper
-            // runs inside the sync `ChatSink::on_agent_event`.
-            trace_collector.record_sync(
-                trace_session_id,
-                TraceEvent {
-                    timestamp: Utc::now(),
-                    kind: TraceKind::LlmCall {
-                        model: model.clone(),
-                        input_tokens: *prompt_tokens as u64,
-                        output_tokens: *completion_tokens as u64,
-                        cached_input_tokens: *cached_prompt_tokens as u64,
-                        cache_creation_input_tokens: *cache_creation_prompt_tokens as u64,
-                        usage_reported: *usage_reported,
-                        system_prompt_hash: Some(sys_prompt_hash.to_string()),
-                        tools_schema_hash: Some(tools_hash.to_string()),
-                        cwd_hash: cwd_hash.clone(),
-                        worker_prompt_hash: None,
-                        provider: provider_name.clone(),
-                    },
-                    duration_ms: None,
-                    metadata: HashMap::from([
-                        ("message_key".to_string(), serde_json::json!(message_key)),
-                        ("total_tokens".to_string(), serde_json::json!(total_tokens)),
-                    ]),
-                },
-            );
-            // Persist usage to the local file-backed runtime store for trend analysis.
-            if let Some(store) = usage_store {
-                let record = echo_agent_app_core::tasks::task_runtime::UsageRecord {
-                    id: uuid::Uuid::new_v4().to_string(),
-                    session_id: trace_session_id.to_string(),
-                    run_id: Some(run_id.to_string()),
-                    worker_id: Some("main".to_string()),
-                    model: model.clone(),
-                    provider: provider_name.clone(),
-                    route_kind: Some(route.to_string()),
-                    input_tokens: *prompt_tokens as u64,
-                    output_tokens: *completion_tokens as u64,
-                    cached_input_tokens: *cached_prompt_tokens as u64,
-                    cache_creation_input_tokens: *cache_creation_prompt_tokens as u64,
-                    usage_reported: *usage_reported,
-                    system_prompt_hash: Some(sys_prompt_hash.to_string()),
-                    tools_schema_hash: Some(tools_hash.to_string()),
-                    cwd_hash: cwd_hash.clone(),
-                    worker_prompt_hash: None,
-                    created_at: chrono::Utc::now(),
-                };
-                let _ = store.insert_usage_record(&record);
-            }
-            Some(ChatEvent::LlmUsage {
-                model: model.clone(),
-                prompt_tokens: *prompt_tokens,
-                completion_tokens: *completion_tokens,
-                total_tokens: *total_tokens,
-                cached_prompt_tokens: *cached_prompt_tokens,
-                cache_creation_prompt_tokens: *cache_creation_prompt_tokens,
-                usage_reported: *usage_reported,
-            })
-        }
+        } => Some(ChatEvent::LlmUsage {
+            model: model.clone(),
+            prompt_tokens: *prompt_tokens,
+            completion_tokens: *completion_tokens,
+            total_tokens: *total_tokens,
+            cached_prompt_tokens: *cached_prompt_tokens,
+            cache_creation_prompt_tokens: *cache_creation_prompt_tokens,
+            usage_reported: *usage_reported,
+        }),
         AgentEvent::ContextCompressed {
             before_count,
             after_count,
@@ -1271,127 +1103,6 @@ fn agent_event_to_chat_event(
         }),
         _ => None,
     }
-}
-
-/// Compute cache diagnostics for a session or across all sessions.
-#[tauri::command]
-pub async fn get_cache_diagnostics(
-    state: tauri::State<'_, TauriState>,
-    session_id: Option<String>,
-) -> Result<serde_json::Value, IpcError> {
-    use echo_agent_app_core::observability::compute_cache_diagnostics;
-
-    let collector = &state.app_state.trace.collector;
-    let mut events = if let Some(sid) = &session_id {
-        collector.get_events(sid).await
-    } else {
-        let sessions = collector.list_sessions().await;
-        let mut all = Vec::new();
-        for sid in &sessions {
-            all.extend(collector.get_events(sid).await);
-        }
-        all
-    };
-
-    // If the in-memory trace is empty (e.g. after restart), fall back to
-    // persisted usage records from the last 24h.
-    if events.is_empty()
-        && let Some(ref store) = state.app_state.tasks.runtime
-        && let Ok(records) = store.query_usage_records(
-            &echo_agent_app_core::tasks::task_runtime::UsageQueryFilter {
-                limit: Some(200),
-                ..Default::default()
-            },
-        )
-    {
-        for r in &records {
-            events.push(TraceEvent {
-                timestamp: r.created_at,
-                kind: TraceKind::LlmCall {
-                    model: r.model.clone(),
-                    input_tokens: r.input_tokens,
-                    output_tokens: r.output_tokens,
-                    cached_input_tokens: r.cached_input_tokens,
-                    cache_creation_input_tokens: r.cache_creation_input_tokens,
-                    usage_reported: r.usage_reported,
-                    system_prompt_hash: r.system_prompt_hash.clone(),
-                    tools_schema_hash: r.tools_schema_hash.clone(),
-                    cwd_hash: r.cwd_hash.clone(),
-                    worker_prompt_hash: r.worker_prompt_hash.clone(),
-                    provider: r.provider.clone(),
-                },
-                duration_ms: None,
-                metadata: std::collections::HashMap::new(),
-            });
-        }
-    }
-
-    let diagnostics = compute_cache_diagnostics(&events);
-    let prompt_assembly = state.app_state.trace.prompt_assembly.read().await.clone();
-    let context_handle = state
-        .app_state
-        .connection
-        .primary_agent()
-        .read(|agent| agent.context().clone())
-        .await;
-    let context_snapshot = {
-        let context = context_handle.lock().await;
-        serde_json::json!({
-            "message_count": context.messages().len(),
-            "estimated_tokens": context.token_estimate(),
-            "protected_message_count": context.protected_message_count(),
-            "protected_tokens": context.protected_token_estimate(),
-        })
-    };
-    let recent_calls: Vec<serde_json::Value> = events
-        .iter()
-        .rev()
-        .filter_map(|e| match &e.kind {
-            TraceKind::LlmCall {
-                model,
-                input_tokens,
-                cached_input_tokens: cached,
-                system_prompt_hash,
-                tools_schema_hash,
-                cwd_hash,
-                worker_prompt_hash,
-                provider,
-                ..
-            } => Some(serde_json::json!({
-                "model": model,
-                "input_tokens": input_tokens,
-                "cached_input_tokens": cached,
-                "system_prompt_hash": system_prompt_hash,
-                "tools_schema_hash": tools_schema_hash,
-                "cwd_hash": cwd_hash,
-                "worker_prompt_hash": worker_prompt_hash,
-                "provider": provider,
-            })),
-            _ => None,
-        })
-        .take(20)
-        .collect();
-
-    Ok(serde_json::json!({
-        "overall_read_rate": diagnostics.overall_read_rate,
-        "total_input_tokens": diagnostics.total_input_tokens,
-        "total_cached_input_tokens": diagnostics.total_cached_input_tokens,
-        "total_cache_creation_input_tokens": diagnostics.total_cache_creation_input_tokens,
-        "total_llm_calls": diagnostics.total_llm_calls,
-        "calls_missing_usage": diagnostics.calls_missing_usage,
-        "distinct_models": diagnostics.distinct_models,
-        "issues": diagnostics.issues.iter().map(|i| serde_json::json!({
-            "kind": i.kind,
-            "severity": i.severity,
-            "message": i.message,
-            "affected_calls": i.affected_calls,
-        })).collect::<Vec<_>>(),
-        "suggested_fixes": diagnostics.suggested_fixes,
-        "recent_calls": recent_calls,
-        "fingerprint_changes": diagnostics.fingerprint_changes,
-        "prompt_assembly": prompt_assembly,
-        "context_snapshot": context_snapshot,
-    }))
 }
 
 #[cfg(test)]

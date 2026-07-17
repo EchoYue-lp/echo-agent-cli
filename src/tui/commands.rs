@@ -122,6 +122,7 @@ pub enum SlashCommand {
     // -- Info --
     Tools,
     Cost,
+    Trace,
     PromptDiagnostics,
     EvolutionDashboard,
     Help,
@@ -192,6 +193,7 @@ impl SlashCommand {
 
             Self::Tools => "List available tools",
             Self::Cost => "Show token cost summary",
+            Self::Trace => "Show durable run diagnostics",
             Self::PromptDiagnostics => "Show prompt and protected-context diagnostics",
             Self::EvolutionDashboard => "Show on-demand evolution diagnostics",
             Self::Help => "Show help",
@@ -254,6 +256,7 @@ impl SlashCommand {
             | Self::SkillCandidates => Category::Scheduling,
             Self::Tools
             | Self::Cost
+            | Self::Trace
             | Self::PromptDiagnostics
             | Self::EvolutionDashboard
             | Self::Help => Category::Info,
@@ -296,6 +299,7 @@ impl SlashCommand {
             Self::EvidenceInbox => {
                 "[pending|expired|undoable|show|edit|accept|reject|undo] [candidate-id] [content]"
             }
+            Self::Trace => "[run-id]",
             _ => "",
         }
     }
@@ -352,6 +356,17 @@ mod tests {
         assert_eq!(retry.usage(), "<task-id> [run-id]");
         assert_eq!(skip.category(), Category::Coding);
         assert_eq!(recovery.usage(), "[run-id]");
+        Ok(())
+    }
+
+    #[test]
+    fn trace_is_a_first_class_info_command() -> Result<(), String> {
+        let trace = "trace"
+            .parse::<SlashCommand>()
+            .map_err(|error| error.to_string())?;
+        assert_eq!(trace.category(), Category::Info);
+        assert_eq!(trace.usage(), "[run-id]");
+        assert!(SlashCommand::complete("/tr").contains(&trace));
         Ok(())
     }
 }

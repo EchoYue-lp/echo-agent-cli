@@ -1,368 +1,612 @@
-//! Cache diagnostics — explains WHY cache hit rate is low.
-//!
-//! Computes per-session diagnostics from `TraceEvent` sequences by
-//! analysing content-fingerprint stability across LLM calls.
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use super::types::{TraceEvent, TraceKind};
-use serde::{Deserialize, Serialize};
+use echo_agent::trace::{Run, RunEvent, RunStatus, RunStore, RunSummary};
 
-/// Complete cache diagnostics for a session or time window.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CacheDiagnostics {
-    /// Overall cache read rate: cached_input_tokens / input_tokens.
-    pub overall_read_rate: f64,
-    /// Total input tokens across all calls.
-    pub total_input_tokens: u64,
-    /// Total cached (read) input tokens.
-    pub total_cached_input_tokens: u64,
-    /// Total cache-creation (write) input tokens.
-    pub total_cache_creation_input_tokens: u64,
-    /// Total LLM calls in this window.
-    pub total_llm_calls: usize,
-    /// Calls missing usage_reported.
-    pub calls_missing_usage: usize,
-    /// Distinct models observed (caches don't share across models).
-    pub distinct_models: usize,
-    /// Diagnostic issues found, ordered by severity.
-    pub issues: Vec<CacheIssue>,
-    /// Actionable fix suggestions.
-    pub suggested_fixes: Vec<String>,
-    /// Per-dimension fingerprint change counts (for cache diff diagnostics).
-    pub fingerprint_changes: CacheFingerprintChanges,
+use crate::project::prompt::PromptAssembly;
+
+use super::types::{
+    CacheDiagnostic, CompressionDiagnostic, ContextDiagnostic, DiagnosticIssue,
+    DiagnosticRunSummary, DiagnosticSeverity, LlmCallDiagnostic, RunDiagnostics,
+    RunUsageDiagnostic, TraceInvocationDiagnostic, UsageSource,
+};
+
+const MAX_LISTED_TRACES: usize = 500;
+const PROTECTED_ABSOLUTE_WARNING_TOKENS: usize = 32_000;
+
+pub async fn list_diagnostic_runs(
+    store: &dyn RunStore,
+) -> echo_agent::error::Result<Vec<DiagnosticRunSummary>> {
+    let summaries = store.list_all(MAX_LISTED_TRACES).await?;
+    let mut groups: BTreeMap<String, Vec<RunSummary>> = BTreeMap::new();
+    for summary in summaries {
+        let key = summary
+            .parent_run_id
+            .clone()
+            .unwrap_or_else(|| summary.run_id.clone());
+        groups.entry(key).or_default().push(summary);
+    }
+
+    let mut diagnostics = groups
+        .into_iter()
+        .filter_map(|(diagnostic_id, traces)| summarize_group(diagnostic_id, traces))
+        .collect::<Vec<_>>();
+    diagnostics.sort_by_key(|summary| std::cmp::Reverse(summary.started_at));
+    Ok(diagnostics)
 }
 
-/// Which dimensions changed across LLM calls (cache miss root cause).
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct CacheFingerprintChanges {
-    /// How many times the system prompt hash changed.
-    pub system_prompt_hash_changes: usize,
-    /// How many times the tools schema hash changed.
-    pub tools_schema_hash_changes: usize,
-    /// How many times the cwd hash changed.
-    pub cwd_hash_changes: usize,
-    /// How many times the subagent prompt hash changed.
-    pub worker_prompt_hash_changes: usize,
-    /// How many distinct providers were used.
-    pub distinct_providers: usize,
-}
-
-/// A single cache-stability issue detected in the trace.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CacheIssue {
-    pub kind: CacheIssueKind,
-    pub severity: IssueSeverity,
-    pub message: String,
-    /// How many LLM calls are affected by this issue.
-    pub affected_calls: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CacheIssueKind {
-    SystemPrefixChanged,
-    ToolsSchemaChanged,
-    CwdOrWorkspaceChanged,
-    WorkerPromptVariation,
-    MissingUsageData,
-    NearZeroCachedTokens,
-    MultiModelNoSharedCache,
-    CacheWriteHigherThanRead,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum IssueSeverity {
-    Info,
-    Warning,
-    Critical,
-}
-
-/// Compute cache diagnostics from a sequence of trace events.
-///
-/// The function groups consecutive `LlmCall` events, tracks fingerprint
-/// changes, and generates human-readable issues + fix suggestions.
-pub fn compute_cache_diagnostics(events: &[TraceEvent]) -> CacheDiagnostics {
-    let llm_calls: Vec<&TraceEvent> = events
-        .iter()
-        .filter(|e| matches!(e.kind, TraceKind::LlmCall { .. }))
-        .collect();
-
-    // ── Aggregate token counts ──────────────────────────────────────────
-    let mut total_input_tokens = 0u64;
-    let mut total_cached_input_tokens = 0u64;
-    let mut total_cache_creation_input_tokens = 0u64;
-    let mut calls_missing_usage = 0usize;
-    let mut models = std::collections::HashSet::new();
-    let mut near_zero_cached = 0usize;
-
-    let mut system_hashes = std::collections::HashSet::new();
-    let mut tools_hashes = std::collections::HashSet::new();
-    let mut cwd_hashes = std::collections::HashSet::new();
-    let mut worker_hashes = std::collections::HashSet::new();
-    let mut calls_with_worker_prompt = 0usize;
-    let mut calls_with_cache_write = 0usize;
-
-    for event in &llm_calls {
-        let TraceKind::LlmCall {
-            input_tokens,
-            cached_input_tokens,
-            cache_creation_input_tokens,
-            usage_reported,
-            model,
-            system_prompt_hash,
-            tools_schema_hash,
-            cwd_hash,
-            worker_prompt_hash,
-            ..
-        } = &event.kind
-        else {
-            continue;
-        };
-        total_input_tokens += *input_tokens;
-        total_cached_input_tokens += *cached_input_tokens;
-        total_cache_creation_input_tokens += *cache_creation_input_tokens;
-
-        if !usage_reported {
-            calls_missing_usage += 1;
-        }
-
-        models.insert(model.clone());
-
-        if *input_tokens >= 2000 && *cached_input_tokens < (*input_tokens / 20) {
-            near_zero_cached += 1;
-        }
-
-        if *cache_creation_input_tokens > 0 {
-            calls_with_cache_write += 1;
-        }
-
-        if let Some(h) = system_prompt_hash {
-            system_hashes.insert(h.clone());
-        }
-        if let Some(h) = tools_schema_hash {
-            tools_hashes.insert(h.clone());
-        }
-        if let Some(h) = cwd_hash {
-            cwd_hashes.insert(h.clone());
-        }
-        if let Some(h) = worker_prompt_hash {
-            worker_hashes.insert(h.clone());
-            calls_with_worker_prompt += 1;
+pub async fn load_run_diagnostics(
+    store: &dyn RunStore,
+    diagnostic_id: &str,
+    prompt_assembly: Option<PromptAssembly>,
+) -> echo_agent::error::Result<Option<RunDiagnostics>> {
+    let child_summaries = store.list_by_parent_run(diagnostic_id).await?;
+    let mut runs = Vec::new();
+    for summary in child_summaries {
+        if let Some(run) = store.load(summary.run_id.as_str()).await? {
+            runs.push(run);
         }
     }
-
-    let overall_read_rate = if total_input_tokens > 0 {
-        total_cached_input_tokens as f64 / total_input_tokens as f64
-    } else {
-        0.0
-    };
-
-    let total_llm_calls = llm_calls.len();
-
-    // ── Build issues ────────────────────────────────────────────────────
-    let mut issues = Vec::new();
-    let mut suggested_fixes = Vec::new();
-
-    // Missing usage data
-    if calls_missing_usage > 0 {
-        let all_missing = calls_missing_usage >= total_llm_calls;
-        let (severity, msg) = if all_missing {
-            (
-                IssueSeverity::Critical,
-                format!(
-                    "全部 {total_llm_calls} 次 LLM 调用都没有返回 provider usage 元数据。\
-                     缓存命中率无法计算。这通常意味着 provider 不支持 streaming \
-                     stream_options.include_usage，或 SSE 解析中丢弃了 usage chunk。"
-                ),
-            )
-        } else {
-            (
-                IssueSeverity::Warning,
-                format!("{calls_missing_usage} 次请求缺少 provider usage，缓存命中率可能被低估。"),
-            )
-        };
-        issues.push(CacheIssue {
-            kind: CacheIssueKind::MissingUsageData,
-            severity,
-            message: msg,
-            affected_calls: calls_missing_usage,
-        });
-        if all_missing {
-            suggested_fixes.push(
-                "检查 provider 是否支持 stream_options.include_usage；\
-                 若不支持，可切换到非 streaming 调用以获取 usage 数据。"
-                    .to_string(),
-            );
-        }
-    }
-
-    // System prefix changes
-    let sys_changes = system_hashes.len().saturating_sub(1);
-    if sys_changes > 0 {
-        let severity = if sys_changes > 3 {
-            IssueSeverity::Critical
-        } else {
-            IssueSeverity::Warning
-        };
-        issues.push(CacheIssue {
-            kind: CacheIssueKind::SystemPrefixChanged,
-            severity,
-            message: format!(
-                "System prompt 发生了 {sys_changes} 次变化（共 {total_llm_calls} 次调用）。\
-                 频繁变化的 system prompt 会阻止 provider 复用上一轮的 prefix cache。"
-            ),
-            affected_calls: sys_changes + 1,
-        });
-        suggested_fixes.push(
-            "稳定化 system prompt：检查是否每次调用都注入了变化的 cwd、memory 摘要或 hook 输出。\
-             将这些动态内容放入 user message 而非 system message。"
-                .to_string(),
-        );
-    }
-
-    // Tools schema changes
-    let tools_changes = tools_hashes.len().saturating_sub(1);
-    if tools_changes > 0 {
-        issues.push(CacheIssue {
-            kind: CacheIssueKind::ToolsSchemaChanged,
-            severity: IssueSeverity::Warning,
-            message: format!(
-                "Tools schema 发生了 {tools_changes} 次变化。Tools 定义顺序或参数的改变\
-                 会导致整个 prompt prefix 被视为不同，cache 无法命中。"
-            ),
-            affected_calls: tools_changes + 1,
-        });
-        suggested_fixes.push(
-            "确保 tools 列表的顺序固定（按名称排序），不要在每次调用时动态增删 tool。".to_string(),
-        );
-    }
-
-    // CWD/workspace changes
-    let cwd_changes = cwd_hashes.len().saturating_sub(1);
-    if cwd_changes > 0 {
-        issues.push(CacheIssue {
-            kind: CacheIssueKind::CwdOrWorkspaceChanged,
-            severity: IssueSeverity::Warning,
-            message: format!(
-                "工作目录在会话中变化了 {cwd_changes} 次。如果 cwd 信息被注入到 system \
-                 prompt 中，每次变化都会导致 cache miss。"
-            ),
-            affected_calls: cwd_changes + 1,
-        });
-        suggested_fixes.push(
-            "将 cwd/workspace 信息从 system prompt 移到第一条 user message 中，\
-             保持 system prefix 在不同目录间不变。"
-                .to_string(),
-        );
-    }
-
-    // Subagent prompt variation
-    let worker_variation = worker_hashes.len().saturating_sub(1);
-    if worker_variation > 0 && calls_with_worker_prompt > 1 {
-        issues.push(CacheIssue {
-            kind: CacheIssueKind::WorkerPromptVariation,
-            severity: IssueSeverity::Info,
-            message: format!(
-                "Subagent prompt 在 {calls_with_worker_prompt} 次调用中出现了 \
-                 {worker_variation} 种变化。不同的 subagent prompt 无法共享 cache。"
-            ),
-            affected_calls: calls_with_worker_prompt,
-        });
-    }
-
-    // Multi-model
-    if models.len() > 1 {
-        issues.push(CacheIssue {
-            kind: CacheIssueKind::MultiModelNoSharedCache,
-            severity: IssueSeverity::Info,
-            message: format!(
-                "时间窗口内使用了 {} 个不同模型：{:?}。不同模型的 cache 完全不互通。",
-                models.len(),
-                models.iter().collect::<Vec<_>>()
-            ),
-            affected_calls: total_llm_calls,
-        });
-    }
-
-    // Near-zero cached tokens
-    if near_zero_cached > 0 {
-        let ratio = near_zero_cached as f64 / total_llm_calls.max(1) as f64;
-        let severity = if ratio > 0.8 {
-            IssueSeverity::Critical
-        } else if ratio > 0.3 {
-            IssueSeverity::Warning
-        } else {
-            IssueSeverity::Info
-        };
-        issues.push(CacheIssue {
-            kind: CacheIssueKind::NearZeroCachedTokens,
-            severity,
-            message: format!(
-                "{near_zero_cached}/{total_llm_calls} 次调用的 cache 命中 token 接近 0。\
-                 即使 provider 支持 prompt caching（如 DeepSeek KVCache），cache 可能未生效。"
-            ),
-            affected_calls: near_zero_cached,
-        });
-        suggested_fixes.push(
-            "确认 provider 是否支持 prompt caching。DeepSeek 在相同 user_id + \
-             相同 system prefix 下会自动启用 KVCache。检查 user_id 和 system prefix 是否一致。"
-                .to_string(),
-        );
-    }
-
-    // Cache write higher than read
-    if total_cache_creation_input_tokens > total_cached_input_tokens
-        && total_cache_creation_input_tokens > 0
+    if runs.is_empty()
+        && let Some(run) = store.load(diagnostic_id).await?
     {
-        issues.push(CacheIssue {
-            kind: CacheIssueKind::CacheWriteHigherThanRead,
-            severity: IssueSeverity::Info,
-            message: "cache write 高于 cache read，说明 cache 主要在被创建而非被复用。\
-                 连续发送相似请求后 read rate 应上升；如果持续低则需要检查前缀稳定性。"
-                .to_string(),
-            affected_calls: calls_with_cache_write,
+        runs.push(run);
+    }
+    if runs.is_empty() {
+        return Ok(None);
+    }
+    runs.sort_by_key(|run| run.started_at);
+    Ok(Some(build_run_diagnostics(
+        diagnostic_id,
+        runs,
+        prompt_assembly,
+    )))
+}
+
+pub fn format_run_diagnostics(diagnostics: &RunDiagnostics) -> String {
+    let mut output = String::new();
+    output.push_str(&format!("Run diagnostics: {}\n", diagnostics.diagnostic_id));
+    output.push_str(&format!(
+        "  Traces: {} | provider usage calls: {} | missing usage: {}\n",
+        diagnostics.traces.len(),
+        diagnostics.usage.provider_reported_calls,
+        diagnostics.usage.calls_missing_usage,
+    ));
+    output.push_str(&format!(
+        "  Provider totals: input {} | output {} | cached {} | cache write {}\n",
+        diagnostics.usage.total_input_tokens,
+        diagnostics.usage.total_output_tokens,
+        diagnostics.usage.total_cached_input_tokens,
+        diagnostics.usage.total_cache_creation_input_tokens,
+    ));
+    let cache_rate = diagnostics
+        .cache
+        .read_rate
+        .map(|rate| format!("{:.1}%", rate * 100.0))
+        .unwrap_or_else(|| "unknown".to_string());
+    output.push_str(&format!(
+        "  Cache read: {} | system changes {} | tools changes {}\n",
+        cache_rate,
+        diagnostics.cache.system_prefix_hash_changes,
+        diagnostics.cache.tools_schema_hash_changes,
+    ));
+    output.push_str(&format!(
+        "  Latest context: provider {:?} | estimated ~{} / {} | protected max ~{} ({} messages)\n",
+        diagnostics.context.latest_provider_input_tokens,
+        diagnostics.context.latest_estimated_context_tokens,
+        diagnostics.context.latest_context_limit_tokens,
+        diagnostics.context.max_protected_context_tokens,
+        diagnostics.context.max_protected_message_count,
+    ));
+    if !diagnostics.compressions.is_empty() {
+        output.push_str("  Compressions:\n");
+        for compression in &diagnostics.compressions {
+            output.push_str(&format!(
+                "    {}: {} -> {} tokens ({} -> {} messages)\n",
+                compression.source,
+                compression.before_tokens,
+                compression.after_tokens,
+                compression.before_messages,
+                compression.after_messages,
+            ));
+        }
+    }
+    if !diagnostics.issues.is_empty() {
+        output.push_str("  Issues:\n");
+        for issue in &diagnostics.issues {
+            output.push_str(&format!("    {:?}: {}\n", issue.severity, issue.message));
+        }
+    }
+    output
+}
+
+fn summarize_group(diagnostic_id: String, traces: Vec<RunSummary>) -> Option<DiagnosticRunSummary> {
+    let first = traces.iter().min_by_key(|trace| trace.started_at)?;
+    let mut agents = BTreeSet::new();
+    let mut models = BTreeSet::new();
+    let mut total_input = 0u64;
+    let mut total_output = 0u64;
+    let mut total_cached = 0u64;
+    let mut llm_calls = 0usize;
+    let mut missing_usage = 0usize;
+    let mut finished_at = None;
+    for trace in &traces {
+        if !trace.agent_name.is_empty() {
+            agents.insert(trace.agent_name.clone());
+        }
+        if !trace.model.is_empty() {
+            models.insert(trace.model.clone());
+        }
+        total_input = total_input.saturating_add(u64::from(trace.token_usage.prompt_tokens));
+        total_output = total_output.saturating_add(u64::from(trace.token_usage.completion_tokens));
+        total_cached =
+            total_cached.saturating_add(u64::from(trace.token_usage.cached_prompt_tokens));
+        llm_calls = llm_calls.saturating_add(
+            trace.token_usage.usage_reported_calls as usize
+                + trace.token_usage.usage_missing_calls as usize,
+        );
+        missing_usage =
+            missing_usage.saturating_add(trace.token_usage.usage_missing_calls as usize);
+        if let Some(value) = trace.finished_at
+            && finished_at.is_none_or(|current| value > current)
+        {
+            finished_at = Some(value);
+        }
+    }
+    let status = aggregate_status(&traces);
+    Some(DiagnosticRunSummary {
+        parent_run_id: traces.first().and_then(|trace| trace.parent_run_id.clone()),
+        diagnostic_id,
+        trace_count: traces.len(),
+        status,
+        input_preview: first.input_preview.clone(),
+        started_at: first.started_at,
+        finished_at,
+        agents: agents.into_iter().collect(),
+        models: models.into_iter().collect(),
+        total_input_tokens: total_input,
+        total_output_tokens: total_output,
+        total_cached_input_tokens: total_cached,
+        llm_calls,
+        calls_missing_usage: missing_usage,
+    })
+}
+
+fn aggregate_status(traces: &[RunSummary]) -> String {
+    if traces
+        .iter()
+        .any(|trace| trace.status == RunStatus::Running)
+    {
+        return "running".to_string();
+    }
+    if traces.iter().any(|trace| trace.status == RunStatus::Failed) {
+        return "failed".to_string();
+    }
+    if traces
+        .iter()
+        .any(|trace| trace.status == RunStatus::Cancelled)
+    {
+        return "cancelled".to_string();
+    }
+    if traces
+        .iter()
+        .all(|trace| trace.status == RunStatus::Completed)
+    {
+        return "completed".to_string();
+    }
+    "pending".to_string()
+}
+
+fn build_run_diagnostics(
+    diagnostic_id: &str,
+    runs: Vec<Run>,
+    prompt_assembly: Option<PromptAssembly>,
+) -> RunDiagnostics {
+    let parent_run_id = runs.iter().find_map(|run| run.parent_run_id.clone());
+    let mut usage = RunUsageDiagnostic::default();
+    let mut context = ContextDiagnostic::default();
+    let mut compressions = Vec::new();
+    let mut trace_diagnostics = Vec::new();
+    let mut component_hashes: HashMap<String, ComponentHashes> = HashMap::new();
+
+    for run in runs {
+        let component_key = format!("{}:{}", run.agent_name, run.model);
+        let hashes = component_hashes.entry(component_key).or_default();
+        let mut llm_calls = Vec::new();
+        for (sequence, event) in run.events.iter().enumerate() {
+            match event {
+                RunEvent::LlmCall {
+                    messages,
+                    prompt_tokens,
+                    completion_tokens,
+                    cached_prompt_tokens,
+                    cache_creation_prompt_tokens,
+                    usage_reported,
+                    estimated_context_tokens,
+                    protected_context_tokens,
+                    protected_message_count,
+                    context_limit_tokens,
+                    context_breakdown,
+                    cache_fingerprint,
+                    duration_ms,
+                } => {
+                    if *usage_reported {
+                        usage.provider_reported_calls =
+                            usage.provider_reported_calls.saturating_add(1);
+                        usage.total_input_tokens = usage
+                            .total_input_tokens
+                            .saturating_add(u64::from(*prompt_tokens));
+                        usage.total_output_tokens = usage
+                            .total_output_tokens
+                            .saturating_add(u64::from(*completion_tokens));
+                        usage.total_cached_input_tokens = usage
+                            .total_cached_input_tokens
+                            .saturating_add(u64::from(*cached_prompt_tokens));
+                        usage.total_cache_creation_input_tokens = usage
+                            .total_cache_creation_input_tokens
+                            .saturating_add(u64::from(*cache_creation_prompt_tokens));
+                        context.latest_provider_input_tokens = Some(u64::from(*prompt_tokens));
+                    } else {
+                        usage.calls_missing_usage = usage.calls_missing_usage.saturating_add(1);
+                    }
+                    context.latest_estimated_context_tokens = *estimated_context_tokens;
+                    context.latest_context_limit_tokens = *context_limit_tokens;
+                    context.latest_breakdown = context_breakdown.clone();
+                    context.max_protected_context_tokens = context
+                        .max_protected_context_tokens
+                        .max(*protected_context_tokens);
+                    context.max_protected_message_count = context
+                        .max_protected_message_count
+                        .max(*protected_message_count);
+                    hashes
+                        .system
+                        .insert(cache_fingerprint.system_prefix_hash.clone());
+                    hashes
+                        .tools
+                        .insert(cache_fingerprint.tools_schema_hash.clone());
+                    hashes
+                        .stable
+                        .insert(cache_fingerprint.stable_prefix_hash.clone());
+                    llm_calls.push(LlmCallDiagnostic {
+                        sequence,
+                        source: if *usage_reported {
+                            UsageSource::Provider
+                        } else {
+                            UsageSource::Estimated
+                        },
+                        input_tokens: (*usage_reported).then_some(u64::from(*prompt_tokens)),
+                        output_tokens: (*usage_reported).then_some(u64::from(*completion_tokens)),
+                        cached_input_tokens: (*usage_reported)
+                            .then_some(u64::from(*cached_prompt_tokens)),
+                        cache_creation_input_tokens: (*usage_reported)
+                            .then_some(u64::from(*cache_creation_prompt_tokens)),
+                        estimated_context_tokens: *estimated_context_tokens,
+                        protected_context_tokens: *protected_context_tokens,
+                        protected_message_count: *protected_message_count,
+                        context_limit_tokens: *context_limit_tokens,
+                        context_breakdown: context_breakdown.clone(),
+                        stable_prefix_hash: cache_fingerprint.stable_prefix_hash.clone(),
+                        system_prefix_hash: cache_fingerprint.system_prefix_hash.clone(),
+                        tools_schema_hash: cache_fingerprint.tools_schema_hash.clone(),
+                        history_hash: cache_fingerprint.history_hash.clone(),
+                        message_count: *messages,
+                        tool_count: cache_fingerprint.tool_count,
+                        duration_ms: *duration_ms,
+                    });
+                }
+                RunEvent::ContextCompression {
+                    source,
+                    before_messages,
+                    after_messages,
+                    before_tokens,
+                    after_tokens,
+                    protected_context_tokens,
+                    protected_message_count,
+                } => compressions.push(CompressionDiagnostic {
+                    trace_run_id: run.run_id.clone(),
+                    sequence,
+                    source: source.clone(),
+                    before_messages: *before_messages,
+                    after_messages: *after_messages,
+                    before_tokens: *before_tokens,
+                    after_tokens: *after_tokens,
+                    protected_context_tokens: *protected_context_tokens,
+                    protected_message_count: *protected_message_count,
+                }),
+                _ => {}
+            }
+        }
+        trace_diagnostics.push(TraceInvocationDiagnostic {
+            trace_run_id: run.run_id,
+            agent_name: run.agent_name,
+            model: run.model,
+            provider: run.provider,
+            turn_id: run.turn_id,
+            execution_id: run.execution_id,
+            status: run_status_name(run.status).to_string(),
+            started_at: run.started_at,
+            finished_at: run.finished_at,
+            llm_calls,
         });
     }
 
-    // ── Default message when nothing obviously wrong ────────────────────
-    if issues.is_empty() && total_llm_calls > 0 {
-        issues.push(CacheIssue {
-            kind: CacheIssueKind::MissingUsageData,
-            severity: IssueSeverity::Info,
-            message: "当前数据未发现明显的 cache 问题。继续观察相同模型下的 read rate 趋势。"
-                .to_string(),
-            affected_calls: 0,
-        });
-    }
-    // If the only issue is the "no issues" placeholder, don't show it as a real problem.
-    // (Kept for backward compat — the frontend filters on severity.)
-    if issues.len() == 1 && issues[0].affected_calls == 0 {
-        issues.clear();
-    }
-
-    if suggested_fixes.is_empty() && total_llm_calls > 0 {
-        suggested_fixes
-            .push("暂无自动生成的修复建议。cache 表现正常或数据不足以诊断。".to_string());
-    }
-
-    let fingerprint_changes = CacheFingerprintChanges {
-        system_prompt_hash_changes: system_hashes.len().saturating_sub(1),
-        tools_schema_hash_changes: tools_hashes.len().saturating_sub(1),
-        cwd_hash_changes: cwd_hashes.len().saturating_sub(1),
-        worker_prompt_hash_changes: worker_hashes.len().saturating_sub(1),
-        distinct_providers: models.len(), // proxy: each model implies a provider
-    };
-
-    CacheDiagnostics {
-        overall_read_rate,
-        total_input_tokens,
-        total_cached_input_tokens,
-        total_cache_creation_input_tokens,
-        total_llm_calls,
-        calls_missing_usage,
-        distinct_models: models.len(),
+    let cache = build_cache_diagnostic(&usage, component_hashes.values());
+    let issues = build_issues(&usage, &cache, &context);
+    RunDiagnostics {
+        diagnostic_id: diagnostic_id.to_string(),
+        parent_run_id,
+        traces: trace_diagnostics,
+        usage,
+        cache,
+        context,
+        compressions,
         issues,
-        suggested_fixes,
-        fingerprint_changes,
+        prompt_assembly,
+    }
+}
+
+#[derive(Default)]
+struct ComponentHashes {
+    system: HashSet<String>,
+    tools: HashSet<String>,
+    stable: HashSet<String>,
+}
+
+fn build_cache_diagnostic<'a>(
+    usage: &RunUsageDiagnostic,
+    hashes: impl Iterator<Item = &'a ComponentHashes>,
+) -> CacheDiagnostic {
+    let mut diagnostic = CacheDiagnostic {
+        read_rate: (usage.total_input_tokens > 0)
+            .then(|| usage.total_cached_input_tokens as f64 / usage.total_input_tokens as f64),
+        ..Default::default()
+    };
+    for hash in hashes {
+        diagnostic.system_prefix_hash_changes = diagnostic
+            .system_prefix_hash_changes
+            .saturating_add(non_empty_change_count(&hash.system));
+        diagnostic.tools_schema_hash_changes = diagnostic
+            .tools_schema_hash_changes
+            .saturating_add(non_empty_change_count(&hash.tools));
+        diagnostic.stable_prefix_hash_changes = diagnostic
+            .stable_prefix_hash_changes
+            .saturating_add(non_empty_change_count(&hash.stable));
+    }
+    diagnostic
+}
+
+fn non_empty_change_count(values: &HashSet<String>) -> usize {
+    values
+        .iter()
+        .filter(|value| !value.is_empty())
+        .count()
+        .saturating_sub(1)
+}
+
+fn build_issues(
+    usage: &RunUsageDiagnostic,
+    cache: &CacheDiagnostic,
+    context: &ContextDiagnostic,
+) -> Vec<DiagnosticIssue> {
+    let mut issues = Vec::new();
+    if usage.calls_missing_usage > 0 {
+        issues.push(DiagnosticIssue {
+            kind: "missing_provider_usage".to_string(),
+            severity: DiagnosticSeverity::Warning,
+            message: format!(
+                "{} LLM calls omitted provider usage; exact totals exclude those calls",
+                usage.calls_missing_usage
+            ),
+        });
+    }
+    if cache.system_prefix_hash_changes > 0 {
+        issues.push(DiagnosticIssue {
+            kind: "system_prefix_changed".to_string(),
+            severity: DiagnosticSeverity::Warning,
+            message: format!(
+                "stable system/canonical prefix changed {} times within the same agent/model",
+                cache.system_prefix_hash_changes
+            ),
+        });
+    }
+    if cache.tools_schema_hash_changes > 0 {
+        issues.push(DiagnosticIssue {
+            kind: "tools_schema_changed".to_string(),
+            severity: DiagnosticSeverity::Warning,
+            message: format!(
+                "tool schema changed {} times within the same agent/model",
+                cache.tools_schema_hash_changes
+            ),
+        });
+    }
+    if cache.read_rate.is_some_and(|rate| rate < 0.2) && usage.total_input_tokens >= 1_024 {
+        issues.push(DiagnosticIssue {
+            kind: "low_cache_read_rate".to_string(),
+            severity: DiagnosticSeverity::Info,
+            message: "provider cache read rate is below 20%; inspect component hash changes"
+                .to_string(),
+        });
+    }
+    let relative_limit = context.latest_context_limit_tokens / 4;
+    let warning_limit = if relative_limit == 0 {
+        PROTECTED_ABSOLUTE_WARNING_TOKENS
+    } else {
+        relative_limit.min(PROTECTED_ABSOLUTE_WARNING_TOKENS)
+    };
+    if context.max_protected_context_tokens > warning_limit {
+        issues.push(DiagnosticIssue {
+            kind: "protected_context_over_budget".to_string(),
+            severity: DiagnosticSeverity::Warning,
+            message: format!(
+                "protected context peaked at ~{} tokens, above the ~{} token warning budget",
+                context.max_protected_context_tokens, warning_limit
+            ),
+        });
+    }
+    issues
+}
+
+fn run_status_name(status: RunStatus) -> &'static str {
+    match status {
+        RunStatus::Pending => "pending",
+        RunStatus::Running => "running",
+        RunStatus::Completed => "completed",
+        RunStatus::Failed => "failed",
+        RunStatus::Cancelled => "cancelled",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+    use echo_agent::trace::{InMemoryRunStore, LlmContextBreakdown, RunTimings, TokenUsage};
+    use echo_core::llm::cache::PromptCacheFingerprint;
+
+    fn run_with_calls(id: &str, events: Vec<RunEvent>) -> Run {
+        let mut run = Run {
+            run_id: id.to_string(),
+            parent_run_id: Some("task-run".to_string()),
+            agent_name: "main".to_string(),
+            model: "model".to_string(),
+            provider: Some("provider".to_string()),
+            turn_id: Some("turn".to_string()),
+            execution_id: None,
+            session_id: "session".to_string(),
+            status: RunStatus::Completed,
+            input: "input".to_string(),
+            events: Vec::new(),
+            final_output: Some("ok".to_string()),
+            error: None,
+            token_usage: TokenUsage::default(),
+            timings: RunTimings::default(),
+            started_at: Utc::now(),
+            finished_at: Some(Utc::now()),
+        };
+        for event in events {
+            run.push_event(event);
+        }
+        run
+    }
+
+    fn llm_event(usage_reported: bool, protected: usize) -> RunEvent {
+        RunEvent::LlmCall {
+            messages: 3,
+            prompt_tokens: 1_200,
+            completion_tokens: 80,
+            cached_prompt_tokens: 900,
+            cache_creation_prompt_tokens: 20,
+            usage_reported,
+            estimated_context_tokens: 1_100,
+            protected_context_tokens: protected,
+            protected_message_count: 2,
+            context_limit_tokens: 100_000,
+            context_breakdown: LlmContextBreakdown {
+                system_tokens: 200,
+                user_tokens: 300,
+                assistant_tokens: 300,
+                tool_tokens: 200,
+                summary_tokens: 50,
+                memory_tokens: 50,
+            },
+            cache_fingerprint: PromptCacheFingerprint {
+                stable_prefix_hash: "stable".to_string(),
+                system_prefix_hash: "system".to_string(),
+                tools_schema_hash: "tools".to_string(),
+                history_hash: "history".to_string(),
+                stable_prefix_message_count: 2,
+                tool_count: 4,
+            },
+            duration_ms: 10,
+        }
+    }
+
+    #[test]
+    fn provider_totals_exclude_missing_usage_estimates() {
+        let diagnostics = build_run_diagnostics(
+            "task-run",
+            vec![run_with_calls(
+                "trace-1",
+                vec![llm_event(true, 100), llm_event(false, 100)],
+            )],
+            None,
+        );
+
+        assert_eq!(diagnostics.usage.provider_reported_calls, 1);
+        assert_eq!(diagnostics.usage.calls_missing_usage, 1);
+        assert_eq!(diagnostics.usage.total_input_tokens, 1_200);
+        let second_call = diagnostics
+            .traces
+            .first()
+            .and_then(|trace| trace.llm_calls.get(1));
+        assert!(second_call.is_some_and(|call| call.input_tokens.is_none()));
+        assert_eq!(
+            second_call.map(|call| call.source),
+            Some(UsageSource::Estimated)
+        );
+    }
+
+    #[test]
+    fn protected_context_warning_uses_bounded_threshold() {
+        let diagnostics = build_run_diagnostics(
+            "task-run",
+            vec![run_with_calls("trace-1", vec![llm_event(true, 30_000)])],
+            None,
+        );
+
+        assert!(
+            diagnostics
+                .issues
+                .iter()
+                .any(|issue| issue.kind == "protected_context_over_budget")
+        );
+    }
+
+    #[tokio::test]
+    async fn parent_run_projection_uses_one_durable_diagnostic_contract()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = InMemoryRunStore::new();
+        let first = run_with_calls("trace-1", vec![llm_event(true, 100)]);
+        let mut changed_call = llm_event(true, 120);
+        if let RunEvent::LlmCall {
+            cache_fingerprint, ..
+        } = &mut changed_call
+        {
+            cache_fingerprint.system_prefix_hash = "system-changed".to_string();
+            cache_fingerprint.stable_prefix_hash = "stable-changed".to_string();
+        }
+        let second = run_with_calls(
+            "trace-2",
+            vec![
+                changed_call,
+                RunEvent::ContextCompression {
+                    source: "auto".to_string(),
+                    before_messages: 20,
+                    after_messages: 8,
+                    before_tokens: 8_000,
+                    after_tokens: 3_000,
+                    protected_context_tokens: 500,
+                    protected_message_count: 2,
+                },
+            ],
+        );
+        store.save(first).await?;
+        store.save(second).await?;
+
+        let summaries = list_diagnostic_runs(&store).await?;
+        let summary = summaries.first().ok_or("diagnostic summary missing")?;
+        assert_eq!(summary.diagnostic_id, "task-run");
+        assert_eq!(summary.trace_count, 2);
+
+        let diagnostics = load_run_diagnostics(&store, "task-run", None)
+            .await?
+            .ok_or("run diagnostics missing")?;
+        assert_eq!(diagnostics.traces.len(), 2);
+        assert_eq!(diagnostics.cache.system_prefix_hash_changes, 1);
+        assert_eq!(diagnostics.cache.stable_prefix_hash_changes, 1);
+        assert_eq!(diagnostics.compressions.len(), 1);
+        let formatted = format_run_diagnostics(&diagnostics);
+        assert!(formatted.contains("provider usage calls: 2"));
+        assert!(formatted.contains("8000 -> 3000 tokens"));
+        Ok(())
     }
 }

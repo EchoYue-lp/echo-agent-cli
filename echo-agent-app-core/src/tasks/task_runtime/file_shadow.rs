@@ -1,8 +1,7 @@
 //! File-based authoritative store (U1c phase-0/0bc).
 //!
 //! The file system (`events.jsonl` + `plan.json`) is the read/write authority
-//! for all task data. SQL was retired in 0bc step 5 (except tr_usage_records
-//! and tr_conversation_events).
+//! for all task data. SQL was retired in 0bc step 5.
 //!
 //! Layout: `{root}/{run_id}/events.jsonl` (append-only) + `plan.json` (snapshot).
 //! `root` defaults to `~/.echo-agent/tasks/` (global, spec §2 path A).

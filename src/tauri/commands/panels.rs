@@ -1126,71 +1126,54 @@ pub async fn export_history_json(
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// Trace Events
+// Run diagnostics
 // ════════════════════════════════════════════════════════════════════════════
 
 #[tauri::command]
-pub async fn list_trace_sessions(
+pub async fn list_diagnostic_runs(
     state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
-    let sessions = state.app_state.trace.collector.list_sessions().await;
-    Ok(json!(sessions))
-}
-
-#[tauri::command]
-pub async fn get_trace_events(
-    state: tauri::State<'_, TauriState>,
-    session_id: String,
-) -> Result<serde_json::Value, IpcError> {
-    let events = state
+    let run_store = state
         .app_state
-        .trace
-        .collector
-        .get_events(&session_id)
-        .await;
-    Ok(json!(events))
-}
-
-#[tauri::command]
-pub async fn get_trace_summary(
-    state: tauri::State<'_, TauriState>,
-    session_id: String,
-) -> Result<serde_json::Value, IpcError> {
-    if let Some(summary) = state
-        .app_state
-        .trace
-        .collector
-        .get_summary(&session_id)
+        .connection
+        .primary_agent()
+        .read(|agent| agent.run_store().cloned())
         .await
-    {
-        Ok(json!(summary))
-    } else {
-        Ok(json!({
-            "session_id": session_id,
-            "total_duration_ms": 0,
-            "llm_calls": 0,
-            "total_input_tokens": 0,
-            "total_output_tokens": 0,
-            "tool_calls": 0,
-            "tool_success_rate": 1.0,
-            "agent_steps": 0,
-            "events": [],
-        }))
-    }
+        .ok_or_else(|| IpcError::Internal("No run store configured".to_string()))?;
+    let summaries = echo_agent_app_core::observability::list_diagnostic_runs(run_store.as_ref())
+        .await
+        .map_err(|error| IpcError::Internal(error.to_string()))?;
+    serde_json::to_value(summaries).map_err(|error| IpcError::Internal(error.to_string()))
 }
 
 #[tauri::command]
-pub async fn clear_trace_session(
+pub async fn get_run_diagnostics(
     state: tauri::State<'_, TauriState>,
-    session_id: String,
+    diagnostic_id: String,
 ) -> Result<serde_json::Value, IpcError> {
-    state
+    let run_store = state
         .app_state
-        .trace
-        .collector
-        .clear_session(&session_id)
-        .await;
-    Ok(json!({"success": true, "cleared": session_id}))
+        .connection
+        .primary_agent()
+        .read(|agent| agent.run_store().cloned())
+        .await
+        .ok_or_else(|| IpcError::Internal("No run store configured".to_string()))?;
+    let prompt_assembly = state
+        .app_state
+        .observability
+        .prompt_assembly
+        .read()
+        .await
+        .clone();
+    let diagnostics = echo_agent_app_core::observability::load_run_diagnostics(
+        run_store.as_ref(),
+        &diagnostic_id,
+        prompt_assembly,
+    )
+    .await
+    .map_err(|error| IpcError::Internal(error.to_string()))?
+    .ok_or_else(|| IpcError::NotFound(format!("Run diagnostics not found: {diagnostic_id}")))?;
+    serde_json::to_value(diagnostics).map_err(|error| IpcError::Internal(error.to_string()))
 }
 
 // ════════════════════════════════════════════════════════════════════════════

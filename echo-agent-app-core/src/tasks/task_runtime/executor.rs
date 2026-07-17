@@ -1972,21 +1972,6 @@ async fn execute_task(
                 unavailable_llm_usage_payload("provider_returned_no_usage_for_readonly_subagent")
             }
         };
-        if let Err(error) = store.record_worker_llm_usage(
-            &run_id,
-            &task_id,
-            &worker_trace_id,
-            &task.agent_role,
-            &task.title,
-            usage_payload.clone(),
-        ) {
-            tracing::warn!(
-                run_id = %run_id,
-                task_id = %task_id,
-                error = %error,
-                "failed to persist read-only subagent LLM usage"
-            );
-        }
         emit_exec(
             trace_sink.as_ref(),
             ExecEvent::for_task(
@@ -3070,21 +3055,6 @@ async fn run_main_agent_task(
                                 "usage_reported": usage_reported,
                                 "usage_event_id": uuid::Uuid::new_v4().to_string(),
                             });
-                            if let Err(error) = store.record_worker_llm_usage(
-                                &run_id,
-                                &task_id,
-                                &task_id,
-                                &agent_role,
-                                &title,
-                                usage_payload.clone(),
-                            ) {
-                                tracing::warn!(
-                                    run_id = %run_id,
-                                    task_id = %task_id,
-                                    error = %error,
-                                    "failed to persist subagent LLM usage"
-                                );
-                            }
                             emit_exec(
                                 trace_sink.as_ref(),
                                 ExecEvent::for_task(
@@ -3377,6 +3347,11 @@ fn save_trace(
     let run = echo_agent::trace::Run {
         run_id: run_id.to_string(),
         parent_run_id: None,
+        agent_name: "task-runtime".to_string(),
+        model: String::new(),
+        provider: None,
+        turn_id: None,
+        execution_id: None,
         session_id: conversation_id.to_string(),
         status: match status {
             "completed" => echo_agent::trace::RunStatus::Completed,
