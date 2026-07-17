@@ -97,6 +97,12 @@ pub struct CommandContext {
     pub prompt_assembly: Option<echo_agent_app_core::project::prompt::PromptAssembly>,
     /// Workspace-bound review/evolution integration shared with the runtime.
     pub review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
+    /// Mutable Chat / Task / Auto interaction mode for subsequent turns.
+    pub interaction_mode:
+        Arc<tokio::sync::RwLock<echo_agent_app_core::tasks::task_runtime::InteractionMode>>,
+    /// Attachments staged for the next CLI chat turn.
+    pub staged_attachments:
+        Arc<tokio::sync::Mutex<Vec<echo_agent_app_core::attachments::AttachmentRef>>>,
 }
 
 impl CommandContext {
@@ -110,6 +116,10 @@ impl CommandContext {
             scheduler: None,
             prompt_assembly: None,
             review_integration: None,
+            interaction_mode: Arc::new(tokio::sync::RwLock::new(
+                echo_agent_app_core::tasks::task_runtime::InteractionMode::Auto,
+            )),
+            staged_attachments: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         }
     }
 

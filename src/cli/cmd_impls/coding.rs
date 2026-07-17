@@ -27,10 +27,11 @@ async fn cmd_plan(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 println!("Plan mode: {}", if is_plan { "ON" } else { "OFF" });
                 println!("Usage: /plan [on|off]");
             } else {
-                ctx.agent.write(|a| a.set_plan_mode(true)).await;
-                // TODO(v0.3): submit task via BackgroundTaskService
                 let task = args.join(" ");
-                println!("Plan mode ON. Task noted: {task}");
+                *ctx.interaction_mode.write().await =
+                    echo_agent_app_core::tasks::task_runtime::InteractionMode::Task;
+                println!("Interaction mode set to Task for this request.");
+                return CommandOutcome::Chat(task);
             }
         }
     }

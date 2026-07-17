@@ -158,13 +158,19 @@ pub async fn run_repl(agent: AgentHandle, config: ReplConfig) -> anyhow::Result<
         crate::project::coding_loop::CodingLoop::new(&project_root),
     ));
 
+    let interaction_mode = Arc::new(tokio::sync::RwLock::new(
+        echo_agent_app_core::tasks::task_runtime::InteractionMode::Auto,
+    ));
+    let staged_attachments = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let cmd_handler = CommandHandler::new(agent.clone())
         .with_registry(Arc::new(registry))
         .with_coding_loop(coding_loop)
         .with_task_service_opt(config.task_service.clone())
         .with_scheduler_opt(config.scheduler_runner.clone())
         .with_prompt_assembly(config.prompt_assembly.clone())
-        .with_review_integration(config.review_integration.clone());
+        .with_review_integration(config.review_integration.clone())
+        .with_interaction_mode(interaction_mode.clone())
+        .with_staged_attachments(staged_attachments.clone());
 
     let editor_config = EditorConfig {
         prompt: config.prompt.clone(),
@@ -189,7 +195,13 @@ pub async fn run_repl(agent: AgentHandle, config: ReplConfig) -> anyhow::Result<
                     CommandResult::Continue => {}
                     CommandResult::Exit => break,
                     CommandResult::Chat(message) => {
-                        chat_with_agent(&agent, &message, &output, &config).await;
+                        let mode = *interaction_mode.read().await;
+                        let attachments = {
+                            let mut staged = staged_attachments.lock().await;
+                            std::mem::take(&mut *staged)
+                        };
+                        chat_with_agent(&agent, &message, &output, &config, mode, attachments)
+                            .await;
                     }
                 }
             }
@@ -436,6 +448,8 @@ async fn chat_with_agent(
     message: &str,
     output: &OutputRenderer,
     config: &ReplConfig,
+    interaction_mode: echo_agent_app_core::tasks::task_runtime::InteractionMode,
+    attachments: Vec<echo_agent_app_core::attachments::AttachmentRef>,
 ) {
     output.print_user_message(message);
 
@@ -453,14 +467,24 @@ async fn chat_with_agent(
     } else {
         config.conversation_id.clone()
     };
-    let interaction_mode = echo_agent_app_core::tasks::task_runtime::InteractionMode::Auto;
+    let multimodal = if attachments.is_empty() {
+        None
+    } else {
+        match echo_agent_app_core::attachments::build_message_from_refs(message, &attachments) {
+            Ok(message) => Some(message),
+            Err(error) => {
+                output.print_error(&format!("Failed to read staged attachments: {error}"));
+                None
+            }
+        }
+    };
     let resources = Arc::new(echo_agent_app_core::chat_resources::ChatResources {
         pool: config.pool.clone(),
         store: config.task_runtime_store.clone(),
         sink,
         conv_id: Some(conversation_id),
         root_message_id: turn_id,
-        attachments: Vec::new(),
+        attachments,
         cancel: echo_agent::agent::CancellationToken::new(),
         mode_hint: Some(interaction_mode.prompt_hint().to_string()),
         interaction_mode,
@@ -472,8 +496,13 @@ async fn chat_with_agent(
     let agent_owned = agent.clone();
     let message_owned = message.to_string();
     let drive_task = tokio::spawn(async move {
-        echo_agent_app_core::chat_driver::drive_chat(&agent_owned, &message_owned, None, resources)
-            .await
+        echo_agent_app_core::chat_driver::drive_chat(
+            &agent_owned,
+            &message_owned,
+            multimodal.as_ref(),
+            resources,
+        )
+        .await
     });
 
     spinner.set_message("Waiting for response...");
@@ -493,8 +522,41 @@ async fn chat_with_agent(
         };
     }
 
-    while let Some(envelope) = rx.recv().await {
-        let event = envelope.payload;
+    while let Some(driver_event) = rx.recv().await {
+        let event = match driver_event {
+            echo_agent_app_core::chat_driver::ChatDriverEvent::Agent(envelope) => envelope.payload,
+            echo_agent_app_core::chat_driver::ChatDriverEvent::Execution(event) => {
+                clear_spinner!();
+                let detail: String = event.payload.to_string().chars().take(500).collect();
+                println!(
+                    "  TaskRuntime {} [{}]: {}",
+                    event.event, event.run_id, detail
+                );
+                continue;
+            }
+            echo_agent_app_core::chat_driver::ChatDriverEvent::TurnStatus { status } => {
+                if status != "running" {
+                    println!("  Turn status: {status}");
+                }
+                continue;
+            }
+            echo_agent_app_core::chat_driver::ChatDriverEvent::ExecutionPath {
+                requested_mode,
+                observed_path,
+            } => {
+                println!("  Execution path: {requested_mode} -> {observed_path}");
+                continue;
+            }
+            echo_agent_app_core::chat_driver::ChatDriverEvent::Interrupt {
+                run_id,
+                goal,
+                new_message,
+            } => {
+                clear_spinner!();
+                println!("  Run {run_id} paused ({goal}); new instruction: {new_message}");
+                continue;
+            }
+        };
         // Record trace entry for significant events
         {
             let (_etype, _detail) = match &event {
@@ -600,6 +662,32 @@ async fn chat_with_agent(
                 );
                 first_chunk = true;
             }
+            AgentEvent::BudgetDecision {
+                decision,
+                reason,
+                iteration,
+                ..
+            } => {
+                clear_spinner!();
+                println!("  Budget {decision:?} at iteration {iteration}: {reason}");
+                first_chunk = true;
+            }
+            AgentEvent::GuardTriggered { guard, blocked } => {
+                clear_spinner!();
+                println!("  Guard {guard} triggered (blocked={blocked})");
+                first_chunk = true;
+            }
+            AgentEvent::MemoryRecalled { count } => {
+                clear_spinner!();
+                println!("  Recalled {count} memory item(s)");
+                first_chunk = true;
+            }
+            AgentEvent::Chart { spec } => {
+                clear_spinner!();
+                let preview: String = spec.to_string().chars().take(500).collect();
+                println!("  Chart specification: {preview}");
+                first_chunk = true;
+            }
             AgentEvent::ToolCall { name, args, .. } => {
                 clear_spinner!();
                 tool_call_count += 1;
@@ -692,9 +780,6 @@ async fn chat_with_agent(
                 clear_spinner!();
                 output.print_warning("执行已取消");
             }
-            AgentEvent::MemoryRecalled { .. } => {}
-            AgentEvent::Chart { .. } => {}
-            AgentEvent::GuardTriggered { .. } => {}
             AgentEvent::Error { source, message } => {
                 clear_spinner!();
                 output.print_error(&format!("[{}] {}", source, message));
@@ -712,7 +797,9 @@ async fn chat_with_agent(
                 ));
                 println!("{}", styled);
             }
-            _ => {}
+            other => {
+                tracing::debug!(event = ?other, "CLI received unrecognized future agent event");
+            }
         }
     }
 

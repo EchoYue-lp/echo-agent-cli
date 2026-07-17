@@ -29,6 +29,10 @@ pub struct CommandHandler {
     scheduler: Option<Arc<echo_agent_app_core::scheduler::SchedulerRunner>>,
     prompt_assembly: Option<echo_agent_app_core::project::prompt::PromptAssembly>,
     review_integration: Option<Arc<echo_agent_app_core::evolution::ReviewIntegration>>,
+    interaction_mode:
+        Arc<tokio::sync::RwLock<echo_agent_app_core::tasks::task_runtime::InteractionMode>>,
+    staged_attachments:
+        Arc<tokio::sync::Mutex<Vec<echo_agent_app_core::attachments::AttachmentRef>>>,
 }
 
 impl CommandHandler {
@@ -42,6 +46,10 @@ impl CommandHandler {
             scheduler: None,
             prompt_assembly: None,
             review_integration: None,
+            interaction_mode: Arc::new(tokio::sync::RwLock::new(
+                echo_agent_app_core::tasks::task_runtime::InteractionMode::Auto,
+            )),
+            staged_attachments: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -108,6 +116,22 @@ impl CommandHandler {
         self
     }
 
+    pub fn with_interaction_mode(
+        mut self,
+        mode: Arc<tokio::sync::RwLock<echo_agent_app_core::tasks::task_runtime::InteractionMode>>,
+    ) -> Self {
+        self.interaction_mode = mode;
+        self
+    }
+
+    pub fn with_staged_attachments(
+        mut self,
+        attachments: Arc<tokio::sync::Mutex<Vec<echo_agent_app_core::attachments::AttachmentRef>>>,
+    ) -> Self {
+        self.staged_attachments = attachments;
+        self
+    }
+
     /// Process user input.
     pub async fn handle(&self, input: &str) -> CommandResult {
         let input = input.trim();
@@ -147,6 +171,8 @@ impl CommandHandler {
                 scheduler: self.scheduler.clone(),
                 prompt_assembly: self.prompt_assembly.clone(),
                 review_integration: self.review_integration.clone(),
+                interaction_mode: self.interaction_mode.clone(),
+                staged_attachments: self.staged_attachments.clone(),
             };
 
             if let Some(outcome) = registry.dispatch(cmd_name, &ctx, args).await {

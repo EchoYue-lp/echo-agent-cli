@@ -103,11 +103,43 @@ cmd!(
 
 // ── RememberCommand ────────────────────────────────────────────────────
 
-async fn cmd_remember(_: &CommandContext, args: &[&str]) -> CommandOutcome {
-    if args.len() < 2 {
-        println!("Usage: /remember [scope] <key> <value>");
+async fn cmd_remember(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
+    let content = args.join(" ");
+    if content.trim().is_empty() {
+        println!("Usage: /remember <fact>");
+        return CommandOutcome::Continue;
+    }
+    let layer_manager = ctx
+        .agent
+        .read(|agent| agent.memory_layer_manager().cloned())
+        .await;
+    let key = uuid::Uuid::new_v4().to_string();
+    if let Some(layer_manager) = layer_manager {
+        let meta = echo_agent::memory::MemoryMeta::new(
+            echo_agent::memory::MemoryType::ProjectFact,
+            echo_agent::memory::MemorySource::ExplicitSave,
+            "explicit",
+        );
+        match layer_manager.write_memory(&key, content.trim(), meta).await {
+            Ok(_) => println!("Memory saved with key: {key}"),
+            Err(error) => println!("Failed to save memory: {error}"),
+        }
     } else {
-        println!("Remembered: {}", args.join(" "));
+        let store = ctx.agent.read(|agent| agent.store().cloned()).await;
+        match store {
+            Some(store) => match store
+                .put(
+                    &["default", "memories"],
+                    &key,
+                    serde_json::Value::String(content.trim().to_string()),
+                )
+                .await
+            {
+                Ok(()) => println!("Memory saved with key: {key}"),
+                Err(error) => println!("Failed to save memory: {error}"),
+            },
+            None => println!("No long-term memory store is configured."),
+        }
     }
     CommandOutcome::Continue
 }
@@ -121,11 +153,59 @@ cmd!(
 
 // ── ForgetCommand ──────────────────────────────────────────────────────
 
-async fn cmd_forget(_: &CommandContext, args: &[&str]) -> CommandOutcome {
-    if args.is_empty() {
-        println!("Usage: /forget <key>");
+async fn cmd_forget(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
+    let query = args.join(" ");
+    if query.trim().is_empty() {
+        println!("Usage: /forget <key-or-query>");
+        return CommandOutcome::Continue;
+    }
+    let layer_manager = ctx
+        .agent
+        .read(|agent| agent.memory_layer_manager().cloned())
+        .await;
+    if let Some(layer_manager) = layer_manager {
+        let key = if layer_manager.locate(query.trim()).await.is_some() {
+            Some(query.trim().to_string())
+        } else {
+            match layer_manager.search_layered(query.trim(), 20).await {
+                Ok(matches) if matches.len() == 1 => {
+                    matches.into_iter().next().map(|(_, entry)| entry.key)
+                }
+                Ok(matches) if matches.len() > 1 => {
+                    let keys = matches
+                        .iter()
+                        .map(|(_, entry)| entry.key.chars().take(8).collect::<String>())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    println!("Multiple memories match; use a full key or prefix: {keys}");
+                    None
+                }
+                Ok(_) => None,
+                Err(error) => {
+                    println!("Failed to search memory: {error}");
+                    None
+                }
+            }
+        };
+        if let Some(key) = key {
+            match layer_manager.delete_memory(&key).await {
+                Ok(true) => println!("Removed memory: {key}"),
+                Ok(false) => println!("No matching memory found."),
+                Err(error) => println!("Failed to remove memory: {error}"),
+            }
+        } else {
+            println!("No unambiguous matching memory found.");
+        }
     } else {
-        println!("Forgotten: {}", args[0]);
+        let store = ctx.agent.read(|agent| agent.store().cloned()).await;
+        match store {
+            Some(store) => match store.delete(&["default", "memories"], query.trim()).await {
+                Ok(true) => println!("Removed memory: {}", query.trim()),
+                Ok(false) => println!("No matching memory found."),
+                Err(error) => println!("Failed to remove memory: {error}"),
+            },
+            None => println!("No long-term memory store is configured."),
+        }
     }
     CommandOutcome::Continue
 }
@@ -182,16 +262,17 @@ fn print_memory_tier(label: &str, path: &std::path::Path) {
         Ok(content) if !content.trim().is_empty() => {
             println!("  ── {} ({}) ──", label, path.display());
             // Show first 500 chars to avoid flooding the terminal
-            let preview = if content.len() > 500 {
-                format!("{}...", &content[..500])
+            let char_count = content.chars().count();
+            let preview = if char_count > 500 {
+                format!("{}...", content.chars().take(500).collect::<String>())
             } else {
                 content.clone()
             };
             for line in preview.lines() {
                 println!("    {}", line);
             }
-            if content.len() > 500 {
-                println!("    ({} chars total, truncated)", content.len());
+            if char_count > 500 {
+                println!("    ({char_count} chars total, truncated)");
             }
             println!();
         }
@@ -201,6 +282,80 @@ fn print_memory_tier(label: &str, path: &std::path::Path) {
         }
     }
 }
+
+async fn cmd_attach(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
+    let value = args.join(" ");
+    if value.trim().is_empty() {
+        let staged = ctx.staged_attachments.lock().await;
+        if staged.is_empty() {
+            println!("No attachments staged. Usage: /attach <path>");
+        } else {
+            println!("Staged attachments:");
+            for attachment in staged.iter() {
+                println!("  {} ({})", attachment.name, attachment.mime_type);
+            }
+        }
+        return CommandOutcome::Continue;
+    }
+    if value.trim().eq_ignore_ascii_case("clear") {
+        ctx.staged_attachments.lock().await.clear();
+        println!("Cleared staged attachments.");
+        return CommandOutcome::Continue;
+    }
+    let expanded = shellexpand::tilde(value.trim()).into_owned();
+    let path = std::path::PathBuf::from(expanded);
+    let workspace_root = find_project_root();
+    match echo_agent_app_core::attachments::stage_local_attachment(&path, workspace_root.as_deref())
+    {
+        Ok(attachment) => {
+            let name = attachment.name.clone();
+            let mime = attachment.mime_type.clone();
+            ctx.staged_attachments.lock().await.push(attachment);
+            println!("Staged attachment: {name} ({mime})");
+        }
+        Err(error) => println!("Failed to stage attachment: {error}"),
+    }
+    CommandOutcome::Continue
+}
+cmd!(
+    AttachCommand,
+    "attach",
+    CommandCategory::Context,
+    "Stage a file for the next chat turn",
+    cmd_attach
+);
+
+async fn cmd_interaction_mode(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
+    use echo_agent_app_core::tasks::task_runtime::InteractionMode;
+
+    let Some(value) = args.first() else {
+        let current = ctx.interaction_mode.read().await;
+        println!(
+            "Current interaction mode: {}. Usage: /mode chat|task|auto",
+            current.as_str()
+        );
+        return CommandOutcome::Continue;
+    };
+    let next = match value.to_ascii_lowercase().as_str() {
+        "chat" => InteractionMode::Chat,
+        "task" => InteractionMode::Task,
+        "auto" => InteractionMode::Auto,
+        _ => {
+            println!("Usage: /mode chat|task|auto");
+            return CommandOutcome::Continue;
+        }
+    };
+    *ctx.interaction_mode.write().await = next;
+    println!("Interaction mode set to {}.", next.as_str());
+    CommandOutcome::Continue
+}
+cmd!(
+    InteractionModeCommand,
+    "mode",
+    CommandCategory::Context,
+    "Set Chat, Task, or Auto interaction mode",
+    cmd_interaction_mode
+);
 
 fn find_project_root() -> Option<std::path::PathBuf> {
     let mut dir = std::env::current_dir().ok()?;
@@ -447,6 +602,8 @@ pub fn register_all(registry: &mut crate::cli::command::CommandRegistry) {
     registry.register(Arc::new(RememberCommand));
     registry.register(Arc::new(ForgetCommand));
     registry.register(Arc::new(MemoryCommand));
+    registry.register(Arc::new(AttachCommand));
+    registry.register(Arc::new(InteractionModeCommand));
     registry.register(Arc::new(ReflectCommand));
     registry.register(Arc::new(AutoMemoryCommand));
 }

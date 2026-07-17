@@ -26,13 +26,13 @@ use std::sync::Arc;
 async fn cmd_cron(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     let sub = args.first().copied().unwrap_or("help");
     match sub {
-        "create" | "add" | "new" => cmd_cron_create(ctx, &args[1..]).await,
-        "list" | "ls" => cmd_cron_list(ctx, &args[1..]).await,
-        "delete" | "rm" | "remove" => cmd_cron_delete(ctx, &args[1..]).await,
-        "pause" | "disable" => cmd_cron_pause(ctx, &args[1..]).await,
-        "resume" | "enable" => cmd_cron_resume(ctx, &args[1..]).await,
-        "run" | "trigger" => cmd_cron_run(ctx, &args[1..]).await,
-        "reload" => cmd_cron_reload(ctx, &args[1..]).await,
+        "create" | "add" | "new" => cmd_cron_create(ctx, args.get(1..).unwrap_or_default()).await,
+        "list" | "ls" => cmd_cron_list(ctx, args.get(1..).unwrap_or_default()).await,
+        "delete" | "rm" | "remove" => cmd_cron_delete(ctx, args.get(1..).unwrap_or_default()).await,
+        "pause" | "disable" => cmd_cron_pause(ctx, args.get(1..).unwrap_or_default()).await,
+        "resume" | "enable" => cmd_cron_resume(ctx, args.get(1..).unwrap_or_default()).await,
+        "run" | "trigger" => cmd_cron_run(ctx, args.get(1..).unwrap_or_default()).await,
+        "reload" => cmd_cron_reload(ctx, args.get(1..).unwrap_or_default()).await,
         _ => {
             print_cron_help();
             CommandOutcome::Continue
@@ -123,9 +123,7 @@ async fn cmd_cron_create(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
     let runner = match ctx.scheduler {
         Some(ref r) => r,
         None => {
-            println!(
-                "  Scheduler not available. Start with web mode or ensure scheduler is initialized."
-            );
+            println!("  Scheduler is not available in this runtime.");
             return CommandOutcome::Continue;
         }
     };
@@ -142,9 +140,13 @@ async fn cmd_cron_create(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
         return CommandOutcome::Continue;
     }
 
-    let cron_expr = args[0];
-    let name = args[1];
-    let prompt = args[2..].join(" ");
+    let Some(cron_expr) = args.first().copied() else {
+        return CommandOutcome::Continue;
+    };
+    let Some(name) = args.get(1).copied() else {
+        return CommandOutcome::Continue;
+    };
+    let prompt = args.get(2..).unwrap_or_default().join(" ");
 
     // Validate the cron expression early
     if let Err(e) = validate_cron_expr(cron_expr) {
@@ -159,7 +161,11 @@ async fn cmd_cron_create(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
 
     match runner.add_task(task).await {
         Ok(()) => {
-            println!("  Created cron task '{}' [{}]", task_name, &task_id[..8]);
+            println!(
+                "  Created cron task '{}' [{}]",
+                task_name,
+                short_id(&task_id)
+            );
             println!("  Schedule: {}", cron_expr);
             println!("  Prompt:   {}", prompt);
         }
@@ -196,11 +202,7 @@ async fn cmd_cron_list(ctx: &CommandContext, _args: &[&str]) -> CommandOutcome {
     println!("  {}", "-".repeat(96));
 
     for task in &tasks {
-        let id_short = if task.id.len() >= 8 {
-            &task.id[..8]
-        } else {
-            &task.id
-        };
+        let id_short = short_id(&task.id);
         let status_str = match task.status {
             CronTaskStatus::Enabled => "enabled",
             CronTaskStatus::Disabled => "paused",
@@ -263,11 +265,13 @@ async fn cmd_cron_delete(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
             println!("  No task found matching '{}'.", id_prefix);
         }
         1 => {
-            let task = matches[0];
+            let Some(task) = matches.first().copied() else {
+                return CommandOutcome::Continue;
+            };
             let full_id = task.id.clone();
             let name = task.name.clone();
             match runner.remove_task(&full_id).await {
-                Ok(true) => println!("  Deleted cron task '{}' [{}].", name, &full_id[..8]),
+                Ok(true) => println!("  Deleted cron task '{}' [{}].", name, short_id(&full_id)),
                 Ok(false) => println!("  Task not found (race condition?)."),
                 Err(e) => println!("  Failed to delete task: {}", e),
             }
@@ -279,7 +283,7 @@ async fn cmd_cron_delete(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
                 matches.len()
             );
             for t in &matches {
-                println!("    [{}] {}", &t.id[..8], t.name);
+                println!("    [{}] {}", short_id(&t.id), t.name);
             }
             println!("  Use a longer ID prefix to disambiguate.");
         }
@@ -337,7 +341,9 @@ async fn set_task_status(
             println!("  No task found matching '{}'.", id_prefix);
         }
         1 => {
-            let task = matches[0];
+            let Some(task) = matches.first().copied() else {
+                return CommandOutcome::Continue;
+            };
             let full_id = task.id.clone();
             let name = task.name.clone();
             match runner.set_status(&full_id, status).await {
@@ -345,7 +351,7 @@ async fn set_task_status(
                     "  {} cron task '{}' [{}].",
                     action_label,
                     name,
-                    &full_id[..8]
+                    short_id(&full_id)
                 ),
                 Ok(false) => println!("  Task not found (race condition?)."),
                 Err(e) => println!("  Failed to update task: {}", e),
@@ -358,7 +364,7 @@ async fn set_task_status(
                 matches.len()
             );
             for t in &matches {
-                println!("    [{}] {}", &t.id[..8], t.name);
+                println!("    [{}] {}", short_id(&t.id), t.name);
             }
         }
     }
@@ -395,10 +401,12 @@ async fn cmd_cron_run(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             println!("  No task found matching '{}'.", id_prefix);
         }
         1 => {
-            let task = matches[0];
+            let Some(task) = matches.first().copied() else {
+                return CommandOutcome::Continue;
+            };
             let full_id = task.id.clone();
             let name = task.name.clone();
-            println!("  Triggering '{}' [{}]...", name, &full_id[..8]);
+            println!("  Triggering '{}' [{}]...", name, short_id(&full_id));
             match runner.run_once(&full_id).await {
                 Ok(result) => {
                     let preview: String = result.chars().take(500).collect();
@@ -406,8 +414,9 @@ async fn cmd_cron_run(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                     for line in preview.lines() {
                         println!("    {}", line);
                     }
-                    if result.len() > 500 {
-                        println!("    ... ({} chars total)", result.len());
+                    let char_count = result.chars().count();
+                    if char_count > 500 {
+                        println!("    ... ({char_count} chars total)");
                     }
                 }
                 Err(e) => {
@@ -422,7 +431,7 @@ async fn cmd_cron_run(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 matches.len()
             );
             for t in &matches {
-                println!("    [{}] {}", &t.id[..8], t.name);
+                println!("    [{}] {}", short_id(&t.id), t.name);
             }
         }
     }
@@ -495,12 +504,16 @@ fn validate_cron_expr(expr: &str) -> Result<(), String> {
 
 /// Truncate a string to `max` chars, appending ".." if truncated.
 fn truncate_str(s: &str, max: usize) -> String {
-    if s.len() <= max {
+    if s.chars().count() <= max {
         s.to_string()
     } else {
         let truncated: String = s.chars().take(max.saturating_sub(2)).collect();
         format!("{}..", truncated)
     }
+}
+
+fn short_id(value: &str) -> String {
+    value.chars().take(8).collect()
 }
 
 /// Format an ISO 8601 timestamp as a relative time string.

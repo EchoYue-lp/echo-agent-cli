@@ -63,6 +63,62 @@ pub fn resolve_uploads_dir(workspace_root: Option<&Path>) -> PathBuf {
     }
 }
 
+/// Stage a local file for a terminal/chat turn and return its durable ref.
+pub fn stage_local_attachment(
+    source: &Path,
+    workspace_root: Option<&Path>,
+) -> Result<AttachmentRef> {
+    let bytes = std::fs::read(source).map_err(|source_error| AttachmentError::Read {
+        path: source.to_path_buf(),
+        source: source_error,
+    })?;
+    let name = source
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| AttachmentError::InvalidName {
+            name: source.display().to_string(),
+            reason: "path has no UTF-8 filename",
+        })?
+        .to_string();
+    let attachment = AttachmentData {
+        name: name.clone(),
+        mime_type: infer_mime_type(&name).to_string(),
+        data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        size: std::fs::metadata(source)
+            .map(|value| value.len())
+            .unwrap_or(0),
+    };
+    stage_attachment_data(&attachment, workspace_root)
+}
+
+/// Persist already-decoded transport data and return the shared durable ref.
+pub fn stage_attachment_data(
+    attachment: &AttachmentData,
+    workspace_root: Option<&Path>,
+) -> Result<AttachmentRef> {
+    let path = save_attachment(attachment, &resolve_uploads_dir(workspace_root))?;
+    Ok(AttachmentRef::from_saved(path, attachment))
+}
+
+/// Conservative MIME inference shared by terminal attachment commands.
+pub fn infer_mime_type(name: &str) -> &'static str {
+    let extension = name.rsplit('.').next().map(str::to_ascii_lowercase);
+    match extension.as_deref() {
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
+        Some("pdf") => "application/pdf",
+        Some("txt") | Some("md") | Some("rs") | Some("py") | Some("ts") | Some("js") => {
+            "text/plain"
+        }
+        Some("json") => "application/json",
+        Some("csv") => "text/csv",
+        _ => "application/octet-stream",
+    }
+}
+
 /// Sanitize an attachment filename into a path-safe base name.
 ///
 /// Rejects empty names, path separators, `..`, and NUL bytes. The returned
