@@ -38,7 +38,7 @@ async fn handle_approval_key(
     key: &KeyEvent,
 ) -> bool {
     use echo_agent::human_loop::HumanLoopResponse;
-    use echo_agent_app_core::hitl::PendingApproval;
+    use echo_agent_app_core::hitl::PendingHumanLoopKind;
 
     let mut guard = match pending_handle.try_lock() {
         Ok(g) => g,
@@ -53,25 +53,36 @@ async fn handle_approval_key(
         // ── Feedback input mode (for 拒绝/修改) ──
         match key.code {
             KeyCode::Esc => {
-                // Cancel input, go back to option selection
-                approval.input_mode = false;
-                approval.feedback_input.clear();
-                approval.feedback_cursor = 0;
+                if approval.kind == PendingHumanLoopKind::Input {
+                    if let Some(tx) = approval.response_tx.take() {
+                        let _ = tx.send(HumanLoopResponse::Rejected {
+                            reason: Some("User dismissed".to_string()),
+                        });
+                    }
+                } else {
+                    approval.input_mode = false;
+                    approval.feedback_input.clear();
+                    approval.feedback_cursor = 0;
+                }
                 true
             }
             KeyCode::Enter => {
-                // Submit feedback
-                let label = approval.input_label.clone();
                 let feedback = approval.feedback_input.clone();
-                let reason = if feedback.is_empty() {
-                    format!("用户{}", label)
+                let response = if approval.kind == PendingHumanLoopKind::Input {
+                    HumanLoopResponse::Text(feedback)
                 } else {
-                    format!("用户{}: {}", label, feedback)
+                    let label = approval.input_label.clone();
+                    let reason = if feedback.is_empty() {
+                        format!("用户{label}")
+                    } else {
+                        format!("用户{label}: {feedback}")
+                    };
+                    HumanLoopResponse::Rejected {
+                        reason: Some(reason),
+                    }
                 };
                 if let Some(tx) = approval.response_tx.take() {
-                    let _ = tx.send(HumanLoopResponse::Rejected {
-                        reason: Some(reason),
-                    });
+                    let _ = tx.send(response);
                 }
                 true
             }
@@ -135,25 +146,32 @@ async fn handle_approval_key(
             KeyCode::Left => {
                 if approval.selected_option > 0 {
                     approval.selected_option -= 1;
+                } else if approval.kind == PendingHumanLoopKind::Selection
+                    && approval.option_count() > 0
+                {
+                    approval.selected_option = approval.option_count().saturating_sub(1);
                 }
                 true
             }
             KeyCode::Right | KeyCode::Tab => {
-                approval.selected_option =
-                    (approval.selected_option + 1) % PendingApproval::OPTION_COUNT;
+                let option_count = approval.option_count();
+                if option_count > 0 {
+                    approval.selected_option =
+                        approval.selected_option.saturating_add(1) % option_count;
+                }
                 true
             }
             KeyCode::Enter => {
                 // Confirm selected option
-                send_approval_response(approval);
+                send_pending_response(approval);
                 true
             }
-            KeyCode::Char('y') => {
+            KeyCode::Char('y') if approval.kind == PendingHumanLoopKind::Approval => {
                 approval.selected_option = 0;
-                send_approval_response(approval);
+                send_pending_response(approval);
                 true
             }
-            KeyCode::Char('n') => {
+            KeyCode::Char('n') if approval.kind == PendingHumanLoopKind::Approval => {
                 approval.selected_option = 1;
                 approval.input_mode = true;
                 approval.input_label = "拒绝原因".to_string();
@@ -161,7 +179,7 @@ async fn handle_approval_key(
                 approval.feedback_cursor = 0;
                 true
             }
-            KeyCode::Char('m') => {
+            KeyCode::Char('m') if approval.kind == PendingHumanLoopKind::Approval => {
                 approval.selected_option = 2;
                 approval.input_mode = true;
                 approval.input_label = "修改意见".to_string();
@@ -169,9 +187,9 @@ async fn handle_approval_key(
                 approval.feedback_cursor = 0;
                 true
             }
-            KeyCode::Char('a') => {
+            KeyCode::Char('a') if approval.kind == PendingHumanLoopKind::Approval => {
                 approval.selected_option = 3;
-                send_approval_response(approval);
+                send_pending_response(approval);
                 true
             }
             KeyCode::Esc => {
@@ -189,31 +207,42 @@ async fn handle_approval_key(
 }
 
 /// Send the approval response based on the currently selected option.
-fn send_approval_response(approval: &mut echo_agent_app_core::hitl::PendingApproval) {
+fn send_pending_response(approval: &mut echo_agent_app_core::hitl::PendingApproval) {
     use echo_agent::human_loop::{ApprovalScope, HumanLoopResponse};
+    use echo_agent_app_core::hitl::PendingHumanLoopKind;
 
-    let response = match approval.selected_option {
-        0 => HumanLoopResponse::Approved,
-        1 => {
-            // Switch to input mode for rejection reason
-            approval.input_mode = true;
-            approval.input_label = "拒绝原因".to_string();
-            approval.feedback_input.clear();
-            approval.feedback_cursor = 0;
-            return; // Don't send yet
+    let response = match approval.kind {
+        PendingHumanLoopKind::Input => HumanLoopResponse::Text(approval.feedback_input.clone()),
+        PendingHumanLoopKind::Selection => {
+            let Some(selection) = approval.options.get(approval.selected_option).cloned() else {
+                return;
+            };
+            HumanLoopResponse::Selection {
+                selection,
+                instructions: None,
+            }
         }
-        2 => {
-            // Switch to input mode for modification feedback
-            approval.input_mode = true;
-            approval.input_label = "修改意见".to_string();
-            approval.feedback_input.clear();
-            approval.feedback_cursor = 0;
-            return; // Don't send yet
-        }
-        3 => HumanLoopResponse::ApprovedWithScope {
-            scope: ApprovalScope::SessionAllTools,
+        PendingHumanLoopKind::Approval => match approval.selected_option {
+            0 => HumanLoopResponse::Approved,
+            1 => {
+                approval.input_mode = true;
+                approval.input_label = "拒绝原因".to_string();
+                approval.feedback_input.clear();
+                approval.feedback_cursor = 0;
+                return;
+            }
+            2 => {
+                approval.input_mode = true;
+                approval.input_label = "修改意见".to_string();
+                approval.feedback_input.clear();
+                approval.feedback_cursor = 0;
+                return;
+            }
+            3 => HumanLoopResponse::ApprovedWithScope {
+                scope: ApprovalScope::SessionAllTools,
+            },
+            _ => HumanLoopResponse::Approved,
         },
-        _ => HumanLoopResponse::Approved,
     };
 
     if let Some(tx) = approval.response_tx.take() {
@@ -286,6 +315,18 @@ enum AgentEvent {
         cache_creation_prompt_tokens: usize,
         /// false = provider 未报 usage，勿更新 snapshot / accumulator。
         usage_reported: bool,
+    },
+    Notice(String),
+    Execution(echo_agent_app_core::tasks::task_runtime::executor::ExecEvent),
+    TurnStatus(String),
+    ExecutionPath {
+        requested_mode: String,
+        observed_path: String,
+    },
+    Interrupt {
+        run_id: String,
+        goal: String,
+        new_message: String,
     },
 }
 
@@ -813,6 +854,55 @@ pub async fn run_event_loop(
                         content: format!(
                             "🗜️ 上下文压缩: {}→{} 条 ({}→{} tokens, 节省 {})",
                             before_count, after_count, before_tokens, after_tokens, saved
+                        ),
+                    });
+                    app.rebuild_message_groups();
+                }
+                AgentEvent::Notice(message) => {
+                    app.messages.push(ChatMessage {
+                        role: MessageRole::System,
+                        content: message,
+                    });
+                    app.rebuild_message_groups();
+                }
+                AgentEvent::Execution(event) => {
+                    app.status_msg = format!("{}: {}", event.run_id, event.event);
+                    if event.event.contains("failed")
+                        || event.event.contains("cancelled")
+                        || event.event.contains("artifact")
+                        || event.event.contains("merge_")
+                    {
+                        let detail: String = event.payload.to_string().chars().take(500).collect();
+                        app.messages.push(ChatMessage {
+                            role: MessageRole::System,
+                            content: format!("TaskRuntime {}: {}", event.event, detail),
+                        });
+                        app.rebuild_message_groups();
+                    }
+                }
+                AgentEvent::TurnStatus(status) => {
+                    app.status_msg = status.clone();
+                    if matches!(status.as_str(), "completed" | "failed" | "cancelled") {
+                        app.is_processing = false;
+                        app.active_cancel = None;
+                        app.active_turn_id = None;
+                    }
+                }
+                AgentEvent::ExecutionPath {
+                    requested_mode,
+                    observed_path,
+                } => {
+                    app.status_msg = format!("{requested_mode} -> {observed_path}");
+                }
+                AgentEvent::Interrupt {
+                    run_id,
+                    goal,
+                    new_message,
+                } => {
+                    app.messages.push(ChatMessage {
+                        role: MessageRole::System,
+                        content: format!(
+                            "Run {run_id} is paused ({goal}). New instruction: {new_message}"
                         ),
                     });
                     app.rebuild_message_groups();
@@ -1873,127 +1963,180 @@ impl TuiChatSink {
 }
 
 impl echo_agent_app_core::chat_driver::ChatSink for TuiChatSink {
-    fn on_agent_event(&self, event: echo_agent::agent::EventEnvelope) -> bool {
-        let mapped = match event.payload {
-            echo_agent::agent::AgentEvent::Token(t) => AgentEvent::Token(t),
-            echo_agent::agent::AgentEvent::ThinkStart => AgentEvent::ThinkStart,
-            echo_agent::agent::AgentEvent::ThinkEnd {
-                prompt_tokens,
-                completion_tokens,
-            } => AgentEvent::ThinkEnd {
-                prompt_tokens,
-                completion_tokens,
+    fn on_event(&self, event: echo_agent_app_core::chat_driver::ChatDriverEvent) -> bool {
+        use echo_agent_app_core::chat_driver::ChatDriverEvent;
+
+        let mapped = match event {
+            ChatDriverEvent::Execution(event) => AgentEvent::Execution(event),
+            ChatDriverEvent::TurnStatus { status } => AgentEvent::TurnStatus(status),
+            ChatDriverEvent::ExecutionPath {
+                requested_mode,
+                observed_path,
+            } => AgentEvent::ExecutionPath {
+                requested_mode,
+                observed_path,
             },
-            echo_agent::agent::AgentEvent::ToolBatchStart { tool_count } => {
-                AgentEvent::ToolBatchStart { tool_count }
-            }
-            echo_agent::agent::AgentEvent::ToolBatchEnd => AgentEvent::ToolBatchEnd,
-            echo_agent::agent::AgentEvent::FinalAnswer(answer) => AgentEvent::FinalAnswer(answer),
-            echo_agent::agent::AgentEvent::Cancelled => AgentEvent::Cancelled,
-            echo_agent::agent::AgentEvent::ToolCall {
-                call_id,
-                name,
-                args,
-            } => AgentEvent::ToolCall {
-                call_id,
-                name,
-                args: args.to_string(),
+            ChatDriverEvent::Interrupt {
+                run_id,
+                goal,
+                new_message,
+            } => AgentEvent::Interrupt {
+                run_id,
+                goal,
+                new_message,
             },
-            echo_agent::agent::AgentEvent::ToolStream {
-                call_id,
-                event:
-                    echo_agent::tools::ToolStreamEvent::Progress {
-                        message,
-                        percent: _,
-                    },
-                ..
-            } => AgentEvent::ToolProgress { call_id, message },
-            echo_agent::agent::AgentEvent::ToolStream {
-                call_id,
-                event: echo_agent::tools::ToolStreamEvent::Output { channel, chunk },
-                ..
-            } => AgentEvent::ToolOutput {
-                call_id,
-                channel: match channel {
-                    echo_agent::tools::ToolOutputChannel::Stdout => ToolOutputChannel::Stdout,
-                    echo_agent::tools::ToolOutputChannel::Stderr => ToolOutputChannel::Stderr,
-                    echo_agent::tools::ToolOutputChannel::Log => ToolOutputChannel::Log,
-                },
-                chunk,
-            },
-            echo_agent::agent::AgentEvent::ToolStream {
-                call_id,
-                event: echo_agent::tools::ToolStreamEvent::Complete(result),
-                ..
-            } => AgentEvent::ToolComplete {
-                call_id,
-                success: result.success,
-                metadata: result.metadata,
-                truncated: result.truncated,
-                failure: result.failure,
-            },
-            echo_agent::agent::AgentEvent::ToolResult {
-                call_id, output, ..
-            } => AgentEvent::ToolResult {
-                call_id,
-                output,
-                success: true,
-                failure: None,
-            },
-            echo_agent::agent::AgentEvent::ToolError {
-                call_id,
-                error,
-                failure,
-                ..
-            } => AgentEvent::ToolResult {
-                call_id,
-                output: error,
-                success: false,
-                failure: Some(failure),
-            },
-            echo_agent::agent::AgentEvent::ContextCompressed {
-                before_count,
-                after_count,
-                before_tokens,
-                after_tokens,
-            } => AgentEvent::ContextCompressed {
-                before_count,
-                after_count,
-                before_tokens,
-                after_tokens,
-            },
-            echo_agent::agent::AgentEvent::Error { message, .. } => AgentEvent::Error(message),
-            echo_agent::agent::AgentEvent::LlmUsage {
-                prompt_tokens,
-                completion_tokens,
-                cached_prompt_tokens,
-                cache_creation_prompt_tokens,
-                usage_reported,
-                ..
-            } => {
-                // 透传给主循环：snapshot 更新需要 &mut TuiApp，主循环才拿得到。
-                // （sink 这里只有 &self，无法更新 app 状态。）
-                tracing::debug!(
+            ChatDriverEvent::Agent(event) => match event.payload {
+                echo_agent::agent::AgentEvent::Token(t) => AgentEvent::Token(t),
+                echo_agent::agent::AgentEvent::ThinkStart => AgentEvent::ThinkStart,
+                echo_agent::agent::AgentEvent::ThinkEnd {
                     prompt_tokens,
-                    cached_prompt_tokens,
-                    cache_creation_prompt_tokens,
-                    usage_reported,
-                    "TUI: LLM usage — forwarding to main loop for context snapshot"
-                );
-                AgentEvent::LlmUsage {
+                    completion_tokens,
+                } => AgentEvent::ThinkEnd {
+                    prompt_tokens,
+                    completion_tokens,
+                },
+                echo_agent::agent::AgentEvent::ToolBatchStart { tool_count } => {
+                    AgentEvent::ToolBatchStart { tool_count }
+                }
+                echo_agent::agent::AgentEvent::ToolBatchEnd => AgentEvent::ToolBatchEnd,
+                echo_agent::agent::AgentEvent::FinalAnswer(answer) => {
+                    AgentEvent::FinalAnswer(answer)
+                }
+                echo_agent::agent::AgentEvent::Cancelled => AgentEvent::Cancelled,
+                echo_agent::agent::AgentEvent::ToolCall {
+                    call_id,
+                    name,
+                    args,
+                } => AgentEvent::ToolCall {
+                    call_id,
+                    name,
+                    args: args.to_string(),
+                },
+                echo_agent::agent::AgentEvent::ToolStream {
+                    call_id,
+                    event:
+                        echo_agent::tools::ToolStreamEvent::Progress {
+                            message,
+                            percent: _,
+                        },
+                    ..
+                } => AgentEvent::ToolProgress { call_id, message },
+                echo_agent::agent::AgentEvent::ToolStream {
+                    call_id,
+                    event: echo_agent::tools::ToolStreamEvent::Output { channel, chunk },
+                    ..
+                } => AgentEvent::ToolOutput {
+                    call_id,
+                    channel: match channel {
+                        echo_agent::tools::ToolOutputChannel::Stdout => ToolOutputChannel::Stdout,
+                        echo_agent::tools::ToolOutputChannel::Stderr => ToolOutputChannel::Stderr,
+                        echo_agent::tools::ToolOutputChannel::Log => ToolOutputChannel::Log,
+                    },
+                    chunk,
+                },
+                echo_agent::agent::AgentEvent::ToolStream {
+                    call_id,
+                    event: echo_agent::tools::ToolStreamEvent::Complete(result),
+                    ..
+                } => AgentEvent::ToolComplete {
+                    call_id,
+                    success: result.success,
+                    metadata: result.metadata,
+                    truncated: result.truncated,
+                    failure: result.failure,
+                },
+                echo_agent::agent::AgentEvent::ToolResult {
+                    call_id, output, ..
+                } => AgentEvent::ToolResult {
+                    call_id,
+                    output,
+                    success: true,
+                    failure: None,
+                },
+                echo_agent::agent::AgentEvent::ToolError {
+                    call_id,
+                    error,
+                    failure,
+                    ..
+                } => AgentEvent::ToolResult {
+                    call_id,
+                    output: error,
+                    success: false,
+                    failure: Some(failure),
+                },
+                echo_agent::agent::AgentEvent::ContextCompressed {
+                    before_count,
+                    after_count,
+                    before_tokens,
+                    after_tokens,
+                } => AgentEvent::ContextCompressed {
+                    before_count,
+                    after_count,
+                    before_tokens,
+                    after_tokens,
+                },
+                echo_agent::agent::AgentEvent::Error { message, .. } => AgentEvent::Error(message),
+                echo_agent::agent::AgentEvent::LlmUsage {
                     prompt_tokens,
                     completion_tokens,
                     cached_prompt_tokens,
                     cache_creation_prompt_tokens,
                     usage_reported,
+                    ..
+                } => {
+                    // 透传给主循环：snapshot 更新需要 &mut TuiApp，主循环才拿得到。
+                    // （sink 这里只有 &self，无法更新 app 状态。）
+                    tracing::debug!(
+                        prompt_tokens,
+                        cached_prompt_tokens,
+                        cache_creation_prompt_tokens,
+                        usage_reported,
+                        "TUI: LLM usage — forwarding to main loop for context snapshot"
+                    );
+                    AgentEvent::LlmUsage {
+                        prompt_tokens,
+                        completion_tokens,
+                        cached_prompt_tokens,
+                        cache_creation_prompt_tokens,
+                        usage_reported,
+                    }
                 }
-            }
-            // Other framework events (GuardTriggered, MemoryRecalled,
-            // SafetyNotice, ParameterError, …) have no TUI rendering yet.
-            other => {
-                tracing::debug!(event = ?other, "TUI: unrendered agent event");
-                return true;
-            }
+                echo_agent::agent::AgentEvent::BudgetDecision {
+                    decision,
+                    reason,
+                    iteration,
+                    ..
+                } => AgentEvent::Notice(format!(
+                    "Budget {decision:?} at iteration {iteration}: {reason}"
+                )),
+                echo_agent::agent::AgentEvent::GuardTriggered { guard, blocked } => {
+                    AgentEvent::Notice(format!("Guard {guard} triggered (blocked={blocked})"))
+                }
+                echo_agent::agent::AgentEvent::MemoryRecalled { count } => {
+                    AgentEvent::Notice(format!("Recalled {count} memory item(s)"))
+                }
+                echo_agent::agent::AgentEvent::Chart { spec } => {
+                    let preview: String = spec.to_string().chars().take(500).collect();
+                    AgentEvent::Notice(format!("Chart specification: {preview}"))
+                }
+                echo_agent::agent::AgentEvent::SafetyNotice {
+                    action,
+                    reason,
+                    risk,
+                    permission,
+                } => AgentEvent::Notice(format!(
+                    "Safety: {action}: {reason} (risk={risk}, permission={permission})"
+                )),
+                echo_agent::agent::AgentEvent::ParameterError {
+                    tool,
+                    parameter,
+                    expected,
+                    got,
+                } => AgentEvent::Notice(format!(
+                    "Parameter error: {tool}.{parameter} expected {expected}, got {got}"
+                )),
+                other => AgentEvent::Notice(format!("Agent event: {other:?}")),
+            },
         };
         // If the UI dropped the receiver, stop streaming.
         self.tx.send(mapped).is_ok()
@@ -2019,6 +2162,142 @@ async fn send_to_agent(
             tracing::warn!(error = %e, "TUI drive_chat failed");
         }
     });
+}
+
+async fn handle_tui_cron(app: &TuiApp, args: &str) -> String {
+    use echo_agent_app_core::scheduler::{CronTask, CronTaskStatus};
+
+    let Some(runner) = app.scheduler.as_ref() else {
+        return "Scheduler is not available in this runtime.".to_string();
+    };
+    let tokens = match shell_words::split(args) {
+        Ok(tokens) => tokens,
+        Err(error) => return format!("Invalid cron command: {error}"),
+    };
+    let subcommand = tokens.first().map(String::as_str).unwrap_or("list");
+    let tail = tokens.get(1..).unwrap_or_default();
+    match subcommand {
+        "list" | "ls" => {
+            let tasks = runner.list_tasks().await;
+            if tasks.is_empty() {
+                return "No scheduled tasks.".to_string();
+            }
+            tasks
+                .iter()
+                .map(|task| {
+                    format!(
+                        "[{}] {} | {} | {}",
+                        short_identifier(&task.id),
+                        task.name,
+                        task.cron_expr,
+                        match task.status {
+                            CronTaskStatus::Enabled => "enabled",
+                            CronTaskStatus::Disabled => "paused",
+                        }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        "create" | "add" | "new" => {
+            let Some(expression) = tail.first() else {
+                return "Usage: /cron create \"*/5 * * * *\" <name> <prompt>".to_string();
+            };
+            let Some(name) = tail.get(1) else {
+                return "Usage: /cron create \"*/5 * * * *\" <name> <prompt>".to_string();
+            };
+            let prompt = tail.get(2..).unwrap_or_default().join(" ");
+            if prompt.trim().is_empty() {
+                return "Usage: /cron create \"*/5 * * * *\" <name> <prompt>".to_string();
+            }
+            if let Err(error) = validate_tui_cron_expression(expression) {
+                return format!("Invalid cron expression: {error}");
+            }
+            let task = CronTask::new(name, expression, &prompt);
+            let id = task.id.clone();
+            match runner.add_task(task).await {
+                Ok(()) => format!("Created cron task {name} [{}].", short_identifier(&id)),
+                Err(error) => format!("Failed to create cron task: {error}"),
+            }
+        }
+        "delete" | "remove" | "rm" => mutate_tui_cron_task(runner, tail.first(), "delete").await,
+        "pause" | "disable" => mutate_tui_cron_task(runner, tail.first(), "pause").await,
+        "resume" | "enable" => mutate_tui_cron_task(runner, tail.first(), "resume").await,
+        "run" | "trigger" => mutate_tui_cron_task(runner, tail.first(), "run").await,
+        "reload" => match runner.reload().await {
+            Ok(count) => format!("Reloaded {count} scheduled task(s)."),
+            Err(error) => format!("Failed to reload scheduled tasks: {error}"),
+        },
+        _ => "Usage: /cron [list|create|delete|pause|resume|run|reload]".to_string(),
+    }
+}
+
+async fn mutate_tui_cron_task(
+    runner: &echo_agent_app_core::scheduler::SchedulerRunner,
+    prefix: Option<&String>,
+    operation: &str,
+) -> String {
+    use echo_agent_app_core::scheduler::CronTaskStatus;
+
+    let Some(prefix) = prefix.map(String::as_str) else {
+        return format!("Usage: /cron {operation} <id>");
+    };
+    let tasks = runner.list_tasks().await;
+    let matches = tasks
+        .iter()
+        .filter(|task| task.id.starts_with(prefix))
+        .collect::<Vec<_>>();
+    let Some(task) = matches.first().copied() else {
+        return format!("No cron task matches {prefix}.");
+    };
+    if matches.len() > 1 {
+        let ids = matches
+            .iter()
+            .map(|task| short_identifier(&task.id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return format!("Ambiguous cron task prefix; matches: {ids}");
+    }
+    match operation {
+        "delete" => match runner.remove_task(&task.id).await {
+            Ok(true) => format!("Deleted cron task {}.", task.name),
+            Ok(false) => "Cron task was already removed.".to_string(),
+            Err(error) => format!("Failed to delete cron task: {error}"),
+        },
+        "pause" => match runner.set_status(&task.id, CronTaskStatus::Disabled).await {
+            Ok(true) => format!("Paused cron task {}.", task.name),
+            Ok(false) => "Cron task was not found.".to_string(),
+            Err(error) => format!("Failed to pause cron task: {error}"),
+        },
+        "resume" => match runner.set_status(&task.id, CronTaskStatus::Enabled).await {
+            Ok(true) => format!("Resumed cron task {}.", task.name),
+            Ok(false) => "Cron task was not found.".to_string(),
+            Err(error) => format!("Failed to resume cron task: {error}"),
+        },
+        "run" => match runner.run_once(&task.id).await {
+            Ok(result) => {
+                let preview: String = result.chars().take(1_000).collect();
+                format!("Cron task {} finished:\n{preview}", task.name)
+            }
+            Err(error) => format!("Cron task {} failed: {error}", task.name),
+        },
+        _ => format!("Unsupported cron operation: {operation}"),
+    }
+}
+
+fn validate_tui_cron_expression(expression: &str) -> Result<(), String> {
+    use std::str::FromStr;
+
+    if expression.split_whitespace().count() != 5 {
+        return Err("expected five fields".to_string());
+    }
+    cron::Schedule::from_str(&format!("0 {expression} *"))
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+fn short_identifier(value: &str) -> String {
+    value.chars().take(8).collect()
 }
 
 // ── Slash command handling ────────────────────────────────────────────
@@ -3912,12 +4191,19 @@ async fn handle_slash_command(
             }
             app.rebuild_message_groups();
         }
+        Some(SlashCommand::Cron) => {
+            let content = handle_tui_cron(app, args).await;
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content,
+            });
+            app.rebuild_message_groups();
+        }
         Some(SlashCommand::Test)
         | Some(SlashCommand::CodeReview)
         | Some(SlashCommand::Diff)
         | Some(SlashCommand::Git)
-        | Some(SlashCommand::Pipeline)
-        | Some(SlashCommand::Cron) => {
+        | Some(SlashCommand::Pipeline) => {
             let prompt = match slash_cmd.unwrap_or(SlashCommand::Status) {
                 SlashCommand::Test => format!(
                     "Run the relevant project tests{} and report failures with actionable fixes.",
@@ -3950,10 +4236,6 @@ async fn handle_slash_command(
                 SlashCommand::Pipeline => {
                     format!("Manage the requested pipeline operation: {}", args.trim())
                 }
-                SlashCommand::Cron => format!(
-                    "Manage the requested scheduled task operation: {}",
-                    args.trim()
-                ),
                 _ => String::new(),
             };
             dispatch_turn(

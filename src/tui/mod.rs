@@ -303,6 +303,8 @@ pub struct TuiApp {
     /// TaskRuntimeStore for create_run / cancel_run (Phase B3). Set by `run_tui`.
     pub task_runtime_store:
         Option<std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>>,
+    /// Shared scheduler used by direct `/cron` commands.
+    pub scheduler: Option<std::sync::Arc<echo_agent_app_core::scheduler::SchedulerRunner>>,
     /// Latest TaskRuntime projection for the current conversation.
     pub task_runtime_view: Option<TaskRuntimeView>,
     /// Live subagent dispatches observed from the framework event bus.
@@ -771,6 +773,7 @@ impl TuiApp {
             pending_approval: None,
             pool: None,
             task_runtime_store: None,
+            scheduler: None,
             task_runtime_view: None,
             subagent_runs: Vec::new(),
             pending_attachments: Vec::new(),
@@ -1789,6 +1792,7 @@ pub async fn run_tui(
     task_runtime_store: Option<
         std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
     >,
+    scheduler: Option<std::sync::Arc<echo_agent_app_core::scheduler::SchedulerRunner>>,
     review_integration: Option<std::sync::Arc<ReviewIntegration>>,
     conversation_store: Option<std::sync::Arc<dyn echo_agent::memory::ConversationStore>>,
     conversation_id: String,
@@ -1838,6 +1842,7 @@ pub async fn run_tui(
     app.pending_approval = Some(tui_pending);
     app.pool = Some(pool);
     app.task_runtime_store = task_runtime_store;
+    app.scheduler = scheduler;
     app.review_integration = review_integration;
     // One conversation id per TUI session (parity with GUI's per-conversation id):
     // binds this session's chat turns + TaskRuntime runs + transcript projection.

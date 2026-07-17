@@ -240,6 +240,14 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             tracing::info!("HITL: REPL provider swapped for TUI provider");
             pending
         };
+        let (_, tui_scheduler) = cli::start_headless_services(
+            agent_handle.clone(),
+            runtime.hitl_dispatcher.clone(),
+            &app_config,
+            pool.clone(),
+            task_runtime_store.clone(),
+        )
+        .await;
 
         echo_agent_cli::tui::run_tui(
             agent_handle.clone(),
@@ -248,6 +256,7 @@ async fn run_tui_or_cli_entry() -> anyhow::Result<()> {
             tui_pending,
             pool.clone(),
             task_runtime_store.clone(),
+            tui_scheduler,
             runtime.review_integration.clone(),
             conversation_store.clone(),
             conversation_id.clone(),

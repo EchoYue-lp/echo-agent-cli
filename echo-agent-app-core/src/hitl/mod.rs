@@ -9,4 +9,4 @@ pub mod tui_provider;
 
 pub use dispatcher::HitlDispatcher;
 pub use repl_provider::ReplHumanLoopProvider;
-pub use tui_provider::{PendingApproval, TuiHumanLoopProvider};
+pub use tui_provider::{PendingApproval, PendingHumanLoopKind, TuiHumanLoopProvider};

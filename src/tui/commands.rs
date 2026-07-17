@@ -277,7 +277,7 @@ impl SlashCommand {
             Self::Git => "<git-args>",
             Self::Pipeline => "[list|run <name>]",
             Self::Permission => "[ask|auto|deny]",
-            Self::Cron => "[list|add|remove]",
+            Self::Cron => "[list|create|delete|pause|resume|run|reload]",
             Self::Test => "[test-name]",
             Self::Plan => "",
             Self::Mode => "[auto|chat|task]",

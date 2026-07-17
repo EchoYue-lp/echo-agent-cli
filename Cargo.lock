@@ -1768,6 +1768,7 @@ dependencies = [
  "serde_yaml",
  "serde_yaml_ng",
  "sha2",
+ "shell-words",
  "shellexpand",
  "similar",
  "strum",

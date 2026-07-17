@@ -14,6 +14,7 @@ use tokio::sync::{Mutex, oneshot};
 
 /// Shared state for a pending approval request in the TUI.
 pub struct PendingApproval {
+    pub kind: PendingHumanLoopKind,
     /// Stable identity used to clear only the request whose future was
     /// cancelled, without racing a newer approval card.
     pub request_id: String,
@@ -25,6 +26,8 @@ pub struct PendingApproval {
     pub risk_label: String,
     /// The prompt text from the framework.
     pub prompt: String,
+    /// Options for Selection requests.
+    pub options: Vec<String>,
     /// Currently selected option index (0=同意, 1=拒绝, 2=修改, 3=全部同意).
     pub selected_option: usize,
     /// Whether we're in feedback input mode (for 拒绝/修改).
@@ -37,6 +40,13 @@ pub struct PendingApproval {
     pub feedback_cursor: usize,
     /// Oneshot sender to unblock the waiting agent.
     pub response_tx: Option<oneshot::Sender<HumanLoopResponse>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingHumanLoopKind {
+    Approval,
+    Input,
+    Selection,
 }
 
 impl PendingApproval {
@@ -54,6 +64,14 @@ impl PendingApproval {
     /// Option labels.
     pub const OPTION_LABELS: [&'static str; 4] =
         ["[y] 同意", "[n] 拒绝", "[m] 修改意见", "[a] 全部同意"];
+
+    pub fn option_count(&self) -> usize {
+        match self.kind {
+            PendingHumanLoopKind::Approval => Self::OPTION_COUNT,
+            PendingHumanLoopKind::Input => 0,
+            PendingHumanLoopKind::Selection => self.options.len(),
+        }
+    }
 }
 
 /// TUI-based HumanLoopProvider that integrates with ratatui event loop.
@@ -110,57 +128,60 @@ impl HumanLoopProvider for TuiHumanLoopProvider {
         &self,
         req: HumanLoopRequest,
     ) -> BoxFuture<'_, Result<HumanLoopResponse, echo_agent::error::ReactError>> {
-        Box::pin(async move {
-            match req.kind {
-                HumanLoopKind::Approval => self.handle_approval(req).await,
-                HumanLoopKind::Input => {
-                    // For non-approval requests, auto-approve (TUI doesn't support
-                    // arbitrary input dialogs yet).
-                    Ok(HumanLoopResponse::Approved)
-                }
-                HumanLoopKind::Selection => {
-                    if let Some(options) = req.options {
-                        Ok(HumanLoopResponse::Selection {
-                            selection: options.first().cloned().unwrap_or_default(),
-                            instructions: None,
-                        })
-                    } else {
-                        Ok(HumanLoopResponse::Approved)
-                    }
-                }
-            }
-        })
+        Box::pin(async move { self.handle_request(req).await })
     }
 }
 
 impl TuiHumanLoopProvider {
-    async fn handle_approval(
+    async fn handle_request(
         &self,
         req: HumanLoopRequest,
     ) -> Result<HumanLoopResponse, echo_agent::error::ReactError> {
         let (tx, rx) = oneshot::channel();
         let request_id = uuid::Uuid::new_v4().to_string();
 
-        let tool_name = req
-            .tool_name
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string());
+        let kind = match req.kind {
+            HumanLoopKind::Approval => PendingHumanLoopKind::Approval,
+            HumanLoopKind::Input => PendingHumanLoopKind::Input,
+            HumanLoopKind::Selection => PendingHumanLoopKind::Selection,
+        };
+        let tool_name = req.tool_name.clone().unwrap_or_else(|| match kind {
+            PendingHumanLoopKind::Approval => "unknown".to_string(),
+            PendingHumanLoopKind::Input => "User input".to_string(),
+            PendingHumanLoopKind::Selection => req
+                .phase
+                .clone()
+                .or_else(|| req.task_id.clone())
+                .unwrap_or_else(|| "Selection".to_string()),
+        });
         let args_display = req
             .args
             .as_ref()
             .map(|a| serde_json::to_string_pretty(a).unwrap_or_default())
+            .or_else(|| {
+                req.context
+                    .as_ref()
+                    .and_then(|value| serde_json::to_string_pretty(value).ok())
+            })
             .unwrap_or_default();
         let risk_label = PendingApproval::risk_label(req.risk_level.as_ref());
+        let options = req.options.clone().unwrap_or_default();
 
         let pending = PendingApproval {
+            kind,
             request_id: request_id.clone(),
             tool_name,
             args_display,
             risk_label,
             prompt: req.prompt.clone(),
+            options,
             selected_option: 0,
-            input_mode: false,
-            input_label: String::new(),
+            input_mode: kind == PendingHumanLoopKind::Input,
+            input_label: if kind == PendingHumanLoopKind::Input {
+                "Input".to_string()
+            } else {
+                String::new()
+            },
             feedback_input: String::new(),
             feedback_cursor: 0,
             response_tx: Some(tx),
@@ -239,5 +260,91 @@ mod tests {
         .await
         .map_err(|_| "cancelled approval was not cleared".to_string())?;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn input_request_waits_for_real_text_response() -> Result<(), String> {
+        let provider = Arc::new(TuiHumanLoopProvider::new());
+        let request_provider = provider.clone();
+        let task = tokio::spawn(async move {
+            request_provider
+                .request(HumanLoopRequest::input("What should change?"))
+                .await
+        });
+
+        let response_tx = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let mut guard = provider.pending.lock().await;
+                if let Some(pending) = guard.as_mut() {
+                    if pending.kind != PendingHumanLoopKind::Input || !pending.input_mode {
+                        return None;
+                    }
+                    return pending.response_tx.take();
+                }
+                drop(guard);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "input request was not published".to_string())?
+        .ok_or_else(|| "input request had no response channel".to_string())?;
+        response_tx
+            .send(HumanLoopResponse::Text("use the file store".to_string()))
+            .map_err(|_| "failed to send input response".to_string())?;
+
+        let response = task
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        match response {
+            HumanLoopResponse::Text(text) if text == "use the file store" => Ok(()),
+            other => Err(format!("unexpected input response: {other:?}")),
+        }
+    }
+
+    #[tokio::test]
+    async fn selection_request_waits_for_selected_option() -> Result<(), String> {
+        let provider = Arc::new(TuiHumanLoopProvider::new());
+        let request_provider = provider.clone();
+        let request = HumanLoopRequest::selection(
+            "task-1",
+            "Choose next step",
+            vec!["Retry".to_string(), "Skip".to_string()],
+        );
+        let task = tokio::spawn(async move { request_provider.request(request).await });
+
+        let response_tx = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let mut guard = provider.pending.lock().await;
+                if let Some(pending) = guard.as_mut() {
+                    if pending.kind != PendingHumanLoopKind::Selection
+                        || pending.options != ["Retry".to_string(), "Skip".to_string()]
+                    {
+                        return None;
+                    }
+                    return pending.response_tx.take();
+                }
+                drop(guard);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .map_err(|_| "selection request was not published".to_string())?
+        .ok_or_else(|| "selection request had no response channel".to_string())?;
+        response_tx
+            .send(HumanLoopResponse::Selection {
+                selection: "Skip".to_string(),
+                instructions: None,
+            })
+            .map_err(|_| "failed to send selection response".to_string())?;
+
+        let response = task
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        match response {
+            HumanLoopResponse::Selection { selection, .. } if selection == "Skip" => Ok(()),
+            other => Err(format!("unexpected selection response: {other:?}")),
+        }
     }
 }

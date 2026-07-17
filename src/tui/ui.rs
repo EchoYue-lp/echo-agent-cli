@@ -105,7 +105,7 @@ pub fn draw(f: &mut Frame, app: &TuiApp) {
 
 /// Render the approval request card as an inline overlay at the bottom of the chat area.
 fn render_approval_card(f: &mut Frame, app: &TuiApp, chat_area: Rect) {
-    use echo_agent_app_core::hitl::PendingApproval;
+    use echo_agent_app_core::hitl::{PendingApproval, PendingHumanLoopKind};
 
     // Check if there's a pending approval
     let pending_handle = match &app.pending_approval {
@@ -124,7 +124,14 @@ fn render_approval_card(f: &mut Frame, app: &TuiApp, chat_area: Rect) {
     let theme = &app.theme;
 
     // Compute card dimensions
-    let card_height = if approval.input_mode { 10u16 } else { 8u16 };
+    let selection_rows = u16::try_from(approval.options.len().min(4)).unwrap_or(0);
+    let card_height = if approval.input_mode {
+        10u16
+    } else if approval.kind == PendingHumanLoopKind::Selection {
+        8u16.saturating_add(selection_rows)
+    } else {
+        8u16
+    };
     let card_width = chat_area.width.min(70);
     let card_x = chat_area.x + (chat_area.width.saturating_sub(card_width)) / 2;
     let card_y = chat_area.y + chat_area.height.saturating_sub(card_height + 1);
@@ -135,8 +142,13 @@ fn render_approval_card(f: &mut Frame, app: &TuiApp, chat_area: Rect) {
     f.render_widget(Clear, card_area);
 
     // Card border
+    let title = match approval.kind {
+        PendingHumanLoopKind::Approval => format!(" {} 需要确认 ", approval.tool_name),
+        PendingHumanLoopKind::Input => " 需要输入 ".to_string(),
+        PendingHumanLoopKind::Selection => format!(" {} 需要选择 ", approval.tool_name),
+    };
     let block = Block::default()
-        .title(format!(" 🛡️ {} 需要确认 ", approval.tool_name))
+        .title(title)
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme.yellow));
@@ -156,11 +168,13 @@ fn render_approval_card(f: &mut Frame, app: &TuiApp, chat_area: Rect) {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     // Risk + prompt line
+    let prefix = if approval.kind == PendingHumanLoopKind::Approval {
+        format!("[{}] ", approval.risk_label)
+    } else {
+        String::new()
+    };
     lines.push(Line::from(vec![
-        Span::styled(
-            format!("[{}] ", approval.risk_label),
-            Style::default().fg(theme.subtext),
-        ),
+        Span::styled(prefix, Style::default().fg(theme.subtext)),
         Span::styled(approval.prompt.clone(), Style::default().fg(theme.text)),
     ]));
 
@@ -203,7 +217,19 @@ fn render_approval_card(f: &mut Frame, app: &TuiApp, chat_area: Rect) {
         )));
     } else {
         // ── Option selection mode ──
-        let options = PendingApproval::OPTION_LABELS;
+        let options = if approval.kind == PendingHumanLoopKind::Approval {
+            PendingApproval::OPTION_LABELS
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>()
+        } else {
+            approval
+                .options
+                .iter()
+                .enumerate()
+                .map(|(index, value)| format!("[{}] {value}", index.saturating_add(1)))
+                .collect::<Vec<_>>()
+        };
         let spans: Vec<Span<'static>> = options
             .iter()
             .enumerate()
@@ -225,7 +251,7 @@ fn render_approval_card(f: &mut Frame, app: &TuiApp, chat_area: Rect) {
             .collect();
         lines.push(Line::from(spans));
         lines.push(Line::from(Span::styled(
-            "  ←/→=选择  Enter=确认  Esc=拒绝",
+            "  Left/Right=select  Enter=confirm  Esc=reject",
             Style::default().fg(theme.subtext),
         )));
     }

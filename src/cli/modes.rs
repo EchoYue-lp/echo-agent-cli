@@ -25,6 +25,38 @@ fn repl_config_for(args: &Args) -> crate::cli::ReplConfig {
     }
 }
 
+pub async fn start_headless_services(
+    agent: AgentHandle,
+    hitl_dispatcher: std::sync::Arc<crate::state::HitlDispatcher>,
+    app_config: &AppConfig,
+    pool: std::sync::Arc<echo_agent_app_core::agent_pool::AgentPool>,
+    task_runtime_store: Option<
+        std::sync::Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
+    >,
+) -> (
+    Option<std::sync::Arc<echo_agent_app_core::tasks::BackgroundTaskService>>,
+    Option<std::sync::Arc<echo_agent_app_core::scheduler::SchedulerRunner>>,
+) {
+    let scheduler_store: std::sync::Arc<dyn echo_agent::memory::Store> = {
+        let file_path =
+            echo_agent_app_core::persistence::Persistence::base_dir().join("scheduler_store");
+        match echo_agent::memory::FileStore::new(&file_path) {
+            Ok(store) => std::sync::Arc::new(store),
+            Err(error) => {
+                tracing::warn!(%error, "failed to create scheduler store; using in-memory");
+                std::sync::Arc::new(echo_agent::memory::InMemoryStore::new())
+            }
+        }
+    };
+    use crate::state::AppState;
+    let mut state = AppState::from_shared(agent, hitl_dispatcher, None, app_config.clone());
+    state.connection.pool = Some(pool);
+    state.tasks.runtime = task_runtime_store;
+    state.start_task_service().await;
+    state.start_scheduler_with_store(Some(scheduler_store));
+    (state.tasks.service.clone(), state.scheduler.runner.clone())
+}
+
 /// 运行 CLI 模式
 #[allow(clippy::too_many_arguments)] // startup adapter wires the shared agent, pool, stores, and UI services once
 pub async fn run_cli_mode(
@@ -40,32 +72,14 @@ pub async fn run_cli_mode(
     >,
     conversation_id: String,
 ) -> Result<()> {
-    let scheduler_store: std::sync::Arc<dyn echo_agent::memory::Store> = {
-        let file_path =
-            echo_agent_app_core::persistence::Persistence::base_dir().join("scheduler_store");
-        match echo_agent::memory::FileStore::new(&file_path) {
-            Ok(store) => std::sync::Arc::new(store),
-            Err(error) => {
-                tracing::warn!(%error, "failed to create scheduler store; using in-memory");
-                std::sync::Arc::new(echo_agent::memory::InMemoryStore::new())
-            }
-        }
-    };
-    // Start BackgroundTaskService for CLI mode
-    let (task_service, scheduler_runner) = {
-        use crate::state::AppState;
-        let mut state = AppState::from_shared(
-            agent.clone(),
-            hitl_dispatcher.clone(),
-            None,
-            app_config.clone(),
-        );
-        state.connection.pool = Some(pool.clone());
-        state.tasks.runtime = task_runtime_store.clone();
-        state.start_task_service().await;
-        state.start_scheduler_with_store(Some(scheduler_store));
-        (state.tasks.service.clone(), state.scheduler.runner.clone())
-    };
+    let (task_service, scheduler_runner) = start_headless_services(
+        agent.clone(),
+        hitl_dispatcher,
+        app_config,
+        pool.clone(),
+        task_runtime_store.clone(),
+    )
+    .await;
 
     let mut repl_config = repl_config_for(args);
     repl_config.task_service = task_service;
