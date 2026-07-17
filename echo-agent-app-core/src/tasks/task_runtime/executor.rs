@@ -276,6 +276,20 @@ pub async fn execute_run(
 
         break outcome;
     };
+    let outcome = match outcome {
+        Ok(RunOutcome::Completed) => {
+            let blockers = run_completion_blockers(&store, run_id);
+            if blockers.is_empty() {
+                Ok(RunOutcome::Completed)
+            } else {
+                Ok(RunOutcome::Failed {
+                    failed_task_id: "<completion_gate>".to_string(),
+                    error: blockers.join("; "),
+                })
+            }
+        }
+        other => other,
+    };
 
     // Reflect the outcome on the run state. Each branch also writes a trace
     // Run record when a RunStore is available.
@@ -458,6 +472,142 @@ fn has_unresolved_tasks(store: &TaskRuntimeStore, run_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn run_completion_blockers(store: &TaskRuntimeStore, run_id: &str) -> Vec<String> {
+    let mut blockers = Vec::new();
+    let Some(plan) = store.get_plan(run_id).ok().flatten() else {
+        blockers.push("run has no plan".to_string());
+        return blockers;
+    };
+    for task in &plan.tasks {
+        match task.status {
+            TodoStatus::Completed => match store.get_summary(run_id, &task.id) {
+                Ok(Some(summary)) => {
+                    if let Err(issues) = validate_task_result(task, &summary.result) {
+                        blockers.push(format!("task '{}': {}", task.title, issues.join("; ")));
+                    }
+                }
+                Ok(None) => blockers.push(format!(
+                    "task '{}' completed without a structured result",
+                    task.title
+                )),
+                Err(error) => blockers.push(format!(
+                    "task '{}' result could not be read: {error}",
+                    task.title
+                )),
+            },
+            TodoStatus::Skipped => {}
+            status => blockers.push(format!("task '{}' is {}", task.title, status.as_str())),
+        }
+    }
+    match store.list_recovery_blockers(run_id) {
+        Ok(recovery) if !recovery.is_empty() => {
+            blockers.push(format!("{} unresolved recovery blocker(s)", recovery.len()))
+        }
+        Err(error) => blockers.push(format!("recovery blockers could not be read: {error}")),
+        _ => {}
+    }
+    blockers
+}
+
+fn validate_task_result(task: &PlanTask, result: &SubagentTaskResult) -> Result<(), Vec<String>> {
+    let mut issues = Vec::new();
+    if result.contract_version != 1 {
+        issues.push("missing versioned Subagent result contract".to_string());
+    }
+    if result.status != SubagentRunStatus::Completed {
+        issues.push(format!("terminal status is {}", result.status.as_str()));
+    }
+    if result.summary.trim().is_empty() {
+        issues.push("summary is empty".to_string());
+    }
+    if !result.remaining_work.is_empty() {
+        issues.push(format!(
+            "remaining work: {}",
+            result.remaining_work.join("; ")
+        ));
+    }
+    for verification in &result.verification {
+        if verification.status != SubagentVerificationStatus::Passed {
+            issues.push(format!(
+                "verification '{}' is {:?}",
+                verification.check, verification.status
+            ));
+        }
+    }
+    for required in &task.verification {
+        let matched = result.verification.iter().any(|verification| {
+            verification.source == SubagentVerificationSource::Observed
+                && verification.status == SubagentVerificationStatus::Passed
+                && verification_matches(required, &verification.check)
+        });
+        if !matched {
+            issues.push(format!(
+                "required verification has no observed pass: {required}"
+            ));
+        }
+    }
+    for required in &task.required_artifacts {
+        let matched = result.artifacts.iter().any(|artifact| {
+            artifact_matches(required, &artifact.path)
+                && artifact.available
+                && artifact
+                    .sha256
+                    .as_deref()
+                    .is_some_and(|hash| hash.chars().count() == 64)
+                && artifact
+                    .producer_execution_id
+                    .as_deref()
+                    .is_some_and(|id| !id.trim().is_empty())
+        });
+        if !matched {
+            issues.push(format!(
+                "required artifact is missing or lacks integrity metadata: {required}"
+            ));
+        }
+    }
+    if issues.is_empty() {
+        Ok(())
+    } else {
+        Err(issues)
+    }
+}
+
+fn verification_matches(required: &str, observed: &str) -> bool {
+    let required = required.split_whitespace().collect::<Vec<_>>().join(" ");
+    let observed = observed.split_whitespace().collect::<Vec<_>>().join(" ");
+    !required.is_empty() && required.eq_ignore_ascii_case(&observed)
+}
+
+fn artifact_matches(required: &str, actual: &str) -> bool {
+    let required = required.trim().replace('\\', "/");
+    let actual = actual.trim().replace('\\', "/");
+    !required.is_empty()
+        && (actual == required
+            || actual.ends_with(&format!("/{required}"))
+            || std::path::Path::new(&actual)
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy() == required))
+}
+
+fn build_contract_fix_task(task: &PlanTask, issues: &[String]) -> PlanTask {
+    let mut fix = task.clone();
+    fix.title = format!(
+        "{} (result fix #{})",
+        task.title,
+        task.retry_count.saturating_add(1)
+    );
+    fix.description = format!(
+        "The previous execution ended but its structured result did not satisfy the task contract. \
+         Resolve every issue and return a complete versioned result:\n- {}\n\nOriginal task: {}",
+        issues.join("\n- "),
+        task.description
+    );
+    fix.parallel_group = None;
+    fix.retry_count = task.retry_count.saturating_add(1);
+    fix.status = TodoStatus::Pending;
+    fix
+}
+
 /// Abstraction over how a single ready task is dispatched in the EKO runtime.
 ///
 /// `run_dag` depends on this trait (not on `execute_task` directly) so the
@@ -469,7 +619,7 @@ fn has_unresolved_tasks(store: &TaskRuntimeStore, run_id: &str) -> bool {
 /// The dispatcher is given the semaphores + file locks so it can honor the same
 /// concurrency limits as the real path; mocks usually ignore them.
 pub trait TaskDispatcher: Send + Sync {
-    /// Execute `task` for `run_id`. Returns `(task_id, summary)` on success or
+    /// Execute `task` for `run_id`. Returns `(task_id, structured result)` on success or
     /// `(task_id, error)` on failure (matching `execute_task`'s contract).
     #[allow(clippy::too_many_arguments, clippy::type_complexity)] // semaphores/locks passed so mocks honor the same limits; boxed-future return is the worker contract
     fn dispatch(
@@ -483,12 +633,7 @@ pub trait TaskDispatcher: Send + Sync {
         llm_sem: Arc<Semaphore>,
         file_write_locks: Arc<std::sync::Mutex<HashMap<String, Arc<TokioMutex<()>>>>>,
         trace_sink: Option<ExecSink>,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<(String, Option<String>), (String, String)>>
-                + Send,
-        >,
-    >;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TaskDispatchResult> + Send>>;
 }
 
 /// Production worker: delegates to [`execute_task`] against the primary agent.
@@ -512,12 +657,7 @@ impl TaskDispatcher for RealTaskDispatcher {
         llm_sem: Arc<Semaphore>,
         file_write_locks: Arc<std::sync::Mutex<HashMap<String, Arc<TokioMutex<()>>>>>,
         trace_sink: Option<ExecSink>,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<Output = Result<(String, Option<String>), (String, String)>>
-                + Send,
-        >,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TaskDispatchResult> + Send>> {
         let primary_agent = self.primary_agent.clone();
         Box::pin(async move {
             let run_id = context.run_id;
@@ -554,7 +694,7 @@ impl TaskDispatcher for RealTaskDispatcher {
     }
 }
 
-type TaskDispatchResult = Result<(String, Option<String>), (String, String)>;
+type TaskDispatchResult = Result<(String, SubagentTaskResult), (String, String)>;
 
 /// Core DAG loop. Maintains a frontier of ready tasks and dispatches them
 /// under the concurrency semaphores until all are done, the run is cancelled,
@@ -729,7 +869,7 @@ async fn run_dag<W: TaskDispatcher + 'static>(
         for task in ready {
             let execution_id = format!("{}:{}", task.id, task.retry_count.saturating_add(1));
             match store.recoverable_worker_result(run_id, &task.id, &execution_id) {
-                Ok(Some(summary)) => {
+                Ok(Some(result)) => {
                     tracing::info!(
                         run_id = %run_id,
                         task_id = %task.id,
@@ -741,7 +881,7 @@ async fn run_dag<W: TaskDispatcher + 'static>(
                         Some(&task.id),
                         "reused completed worker result; continuing at review boundary",
                     );
-                    wave_results.push(Ok((task.id.clone(), Some(summary))));
+                    wave_results.push(Ok((task.id.clone(), result)));
                     continue;
                 }
                 Ok(None) => {}
@@ -820,19 +960,56 @@ async fn run_dag<W: TaskDispatcher + 'static>(
         let mut wave_failed: Vec<String> = Vec::new();
         for result in wave_results {
             match result {
-                Ok((id, summary)) => {
+                Ok((id, result)) => {
                     // Review gate: implementation/debugging tasks must pass
                     // review before being marked Completed (plan §776-831).
                     // Read-only kinds are their own review → auto-pass.
                     let Some(task) = by_id.get(&id).cloned() else {
                         continue;
                     };
+                    if let Err(issues) = validate_task_result(&task, &result) {
+                        let reason = issues.join("; ");
+                        if task.retry_count < task.max_retries {
+                            let fix_task = build_contract_fix_task(&task, &issues);
+                            if let Err(error) = store.update_plan_task(run_id, &fix_task) {
+                                tracing::warn!(
+                                    task_id = %fix_task.id,
+                                    %error,
+                                    "failed to persist result-contract retry task"
+                                );
+                            }
+                            tasks_with_fixes.insert(id.clone(), fix_task.clone());
+                            let _ = store.set_task_status(
+                                run_id,
+                                &id,
+                                TodoStatus::Pending,
+                                Some(&task.agent_role),
+                                Some(&format!("result contract incomplete: {reason}")),
+                            );
+                            by_id.insert(id.clone(), fix_task);
+                        } else {
+                            let _ = store.set_task_status(
+                                run_id,
+                                &id,
+                                TodoStatus::Failed,
+                                Some(&task.agent_role),
+                                Some(&format!("result contract rejected: {reason}")),
+                            );
+                            wave_failed.push(id.clone());
+                            dag_state.failed.insert(id.clone());
+                            if failed_id.is_none() {
+                                failed_id = Some(id);
+                            }
+                        }
+                        continue;
+                    }
+                    let summary = result.summary.clone();
                     let passed = run_review_gate(
                         store.clone(),
                         reviewer_llm.clone(),
                         run_id,
                         &task,
-                        summary.as_deref().unwrap_or(""),
+                        &summary,
                     )
                     .await;
                     match passed {
@@ -842,7 +1019,7 @@ async fn run_dag<W: TaskDispatcher + 'static>(
                                 &id,
                                 TodoStatus::Completed,
                                 Some(&task.agent_role),
-                                summary.as_deref(),
+                                Some(&summary),
                             );
                             dag_state.completed.insert(id);
                         }
@@ -892,7 +1069,7 @@ async fn run_dag<W: TaskDispatcher + 'static>(
                                 &id,
                                 TodoStatus::Completed,
                                 Some(&task.agent_role),
-                                summary.as_deref(),
+                                Some(&summary),
                             );
                             dag_state.completed.insert(id);
                         }
@@ -1019,7 +1196,7 @@ async fn run_review_gate(
     }
 }
 
-/// Execute a single task on a pooled worker. Returns `(task_id, summary)` on
+/// Execute a single task on a pooled worker. Returns `(task_id, structured result)` on
 /// success or `(task_id, error)` on failure. Honors read vs write concurrency
 /// via the two semaphores.
 #[allow(clippy::too_many_arguments)] // store + semaphores + locks + sinks all thread through
@@ -1036,7 +1213,7 @@ async fn execute_task(
     task: PlanTask,
     cancel: CancellationToken,
     delegation_policy: echo_agent::tasks::NestedDelegationPolicy,
-) -> Result<(String, Option<String>), (String, String)> {
+) -> TaskDispatchResult {
     let task_id = task.id.clone();
     let is_write = !task.kind.is_read_only();
 
@@ -1372,7 +1549,10 @@ async fn execute_task(
         )
         .await;
         match dispatch_result {
-            Ok(sub_result) if sub_result.cancelled => {
+            Ok(sub_result)
+                if sub_result.outcome.status
+                    == echo_agent::agent::subagent::SubagentStatus::Cancelled =>
+            {
                 tracing::info!(
                     run_id = %run_id,
                     task_id = %task_id,
@@ -1393,11 +1573,7 @@ async fn execute_task(
                 );
                 (
                     Ok((
-                        if sub_result.summary.trim().is_empty() {
-                            sub_result.output.clone()
-                        } else {
-                            sub_result.summary.clone()
-                        },
+                        SubagentTaskResult::from_framework(&sub_result),
                         sub_result.output.clone(),
                     )),
                     sub_result.usage,
@@ -1436,7 +1612,10 @@ async fn execute_task(
         )
         .await;
         match dispatch_result {
-            Ok(sub_result) if sub_result.cancelled => {
+            Ok(sub_result)
+                if sub_result.outcome.status
+                    == echo_agent::agent::subagent::SubagentStatus::Cancelled =>
+            {
                 tracing::info!(
                     run_id = %run_id,
                     task_id = %task_id,
@@ -1451,61 +1630,27 @@ async fn execute_task(
                     task_id = %task_id,
                     agent_role = %task.agent_role,
                     output_chars = sub_result.output.chars().count(),
-                    summary_chars = sub_result.summary.chars().count(),
+                    summary_chars = sub_result.outcome.summary.chars().count(),
                     iterations = sub_result.iterations,
                     usage_reported = sub_result.usage.is_some(),
                     "task_runtime: writer subagent completed"
                 );
                 (
                     Ok((
-                        if sub_result.summary.trim().is_empty() {
-                            sub_result.output.clone()
-                        } else {
-                            sub_result.summary.clone()
-                        },
+                        SubagentTaskResult::from_framework(&sub_result),
                         sub_result.output.clone(),
                     )),
                     sub_result.usage,
                 )
             }
-            Err(e) => {
-                if task_cancel.is_cancelled() {
-                    (Err("task cancelled".to_string()), None)
+            Err(e) => (
+                Err(if task_cancel.is_cancelled() {
+                    "task cancelled".to_string()
                 } else {
-                    // Fallback: run in-place on the primary agent. Logged so the
-                    // loss-of-isolation is visible (the run continues rather than
-                    // failing the whole DAG over a missing worker config).
-                    tracing::warn!(
-                        run_id = %run_id,
-                        task_id = %task_id,
-                        role = %task.agent_role,
-                        error = %e,
-                        "writer subagent dispatch failed; falling back to in-place main-agent execution"
-                    );
-                    emit_task_isolation_observed(
-                        trace_sink.as_ref(),
-                        &run_id,
-                        &worker_trace_id,
-                        &task,
-                        &contract,
-                        "primary-fallback",
-                    );
-                    (
-                        run_main_agent_task(
-                            &primary_agent,
-                            store.clone(),
-                            &run_id,
-                            &task,
-                            &prompt,
-                            task_cancel.clone(),
-                            trace_sink.clone(),
-                        )
-                        .await
-                        .map(|text| (text.clone(), text)),
-                        None,
-                    )
-                }
-            }
+                    e
+                }),
+                None,
+            ),
         }
     } else {
         emit_task_isolation_observed(
@@ -1526,8 +1671,7 @@ async fn execute_task(
                 task_cancel.clone(),
                 trace_sink.clone(),
             )
-            .await
-            .map(|text| (text.clone(), text)),
+            .await,
             None,
         )
     };
@@ -1568,12 +1712,12 @@ async fn execute_task(
     }
 
     match result {
-        Ok((parent_facing, full_output)) => {
-            // Parent LLM / completed_work get the structured summary; extract
-            // suggested_tasks + evidence from the full output so JSON blocks
-            // outside ## Summary are not lost.
+        Ok((task_result, full_output)) => {
+            // The parent consumes the bounded structured summary; extract
+            // suggested_tasks from the full output because that optional block
+            // appears before the terminal ## Result contract.
             let suggested_tasks = extract_suggested_tasks_from_worker_output(&full_output);
-            let evidence_files = extract_evidence_paths_from_worker_output(&full_output);
+            let parent_facing = task_result.summary.trim().to_string();
             tracing::info!(
                 run_id = %run_id,
                 task_id = %task_id,
@@ -1588,12 +1732,8 @@ async fn execute_task(
                 run_id: run_id.clone(),
                 task_id: task_id.clone(),
                 worker_agent: task.agent_role.clone(),
-                completed_work: vec![parent_facing.trim().to_string()],
-                files_read: evidence_files,
-                files_changed: if is_write { task.files.clone() } else { vec![] },
+                result: task_result.clone(),
                 decisions: vec![],
-                failures: vec![],
-                verification: task.verification.clone(),
                 next_implications: vec![],
                 suggested_tasks: suggested_tasks.clone(),
                 created_at: chrono::Utc::now(),
@@ -1604,8 +1744,8 @@ async fn execute_task(
                 &run_id,
                 &task_id,
                 &execution_id,
-                "completed",
-                Some(parent_facing.trim()),
+                task_result.status.as_str(),
+                Some(&task_result),
             ) {
                 return Err((
                     task_id,
@@ -1621,22 +1761,50 @@ async fn execute_task(
                     "completed",
                     serde_json::json!({
                         "output": &parent_facing,
+                        "terminal_status": task_result.status.as_str(),
+                        "contract_version": task_result.contract_version,
+                        "summary": task_result.summary,
+                        "artifacts": task_result.artifacts,
+                        "verification": task_result.verification,
+                        "remaining_work": task_result.remaining_work,
+                        "touched_files": task_result.touched_files,
                     }),
                 )
                 .with_agent(task.agent_role.clone())
                 .with_title(task.title.clone()),
             );
-            Ok((task_id, Some(parent_facing.trim().to_string())))
+            Ok((task_id, task_result))
         }
         Err(e) => {
             let cancelled = task_cancel.is_cancelled() || e.contains("cancelled");
-            let release_status = if cancelled { "cancelled" } else { "failed" };
+            let status = if cancelled {
+                SubagentRunStatus::Cancelled
+            } else if e.to_ascii_lowercase().contains("timed out")
+                || e.to_ascii_lowercase().contains("timeout")
+            {
+                SubagentRunStatus::TimedOut
+            } else {
+                SubagentRunStatus::Failed
+            };
+            let task_result = SubagentTaskResult::terminal(status, e.clone(), vec![e.clone()]);
+            if let Err(error) = store.put_summary(&TaskExecutionSummary {
+                run_id: run_id.clone(),
+                task_id: task_id.clone(),
+                worker_agent: task.agent_role.clone(),
+                result: task_result.clone(),
+                decisions: Vec::new(),
+                next_implications: Vec::new(),
+                suggested_tasks: Vec::new(),
+                created_at: chrono::Utc::now(),
+            }) {
+                tracing::warn!(task_id = %task_id, %error, "failed to persist failed TaskExecutionSummary");
+            }
             if let Err(error) = store.record_worker_released(
                 &run_id,
                 &task_id,
                 &execution_id,
-                release_status,
-                Some(&e),
+                status.as_str(),
+                Some(&task_result),
             ) {
                 tracing::warn!(
                     run_id = %run_id,
@@ -1657,8 +1825,17 @@ async fn execute_task(
                 ExecEvent::for_task(
                     run_id,
                     worker_trace_id,
-                    if cancelled { "cancelled" } else { "failed" },
-                    serde_json::json!({ "error": &e }),
+                    status.as_str(),
+                    serde_json::json!({
+                        "error": &e,
+                        "terminal_status": status.as_str(),
+                        "contract_version": task_result.contract_version,
+                        "summary": task_result.summary,
+                        "artifacts": task_result.artifacts,
+                        "verification": task_result.verification,
+                        "remaining_work": task_result.remaining_work,
+                        "touched_files": task_result.touched_files,
+                    }),
                 )
                 .with_agent(task.agent_role.clone())
                 .with_title(task.title.clone()),
@@ -1669,7 +1846,6 @@ async fn execute_task(
 }
 
 const MAX_SUGGESTED_TASKS_PER_WORKER: usize = 5;
-const MAX_EVIDENCE_PATHS_PER_WORKER: usize = 24;
 
 #[derive(Debug, serde::Deserialize)]
 struct SuggestedTaskEnvelope {
@@ -1709,208 +1885,6 @@ fn extract_suggested_tasks_from_worker_output(text: &str) -> Vec<SuggestedTask> 
         }
     }
     out
-}
-
-fn extract_evidence_paths_from_worker_output(text: &str) -> Vec<String> {
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-
-    for raw in text.split(|ch: char| ch.is_whitespace() || matches!(ch, '，' | '、' | '；')) {
-        if out.len() >= MAX_EVIDENCE_PATHS_PER_WORKER {
-            break;
-        }
-        if let Some((_, destination_with_suffix)) = raw.split_once("](") {
-            let destination_with_closing =
-                destination_with_suffix.trim_end_matches([',', ';', '.', '。', '，', '；']);
-            if let Some(destination) = destination_with_closing.strip_suffix(')') {
-                push_evidence_path(destination, true, &mut seen, &mut out);
-            }
-            continue;
-        }
-        push_evidence_path(raw, false, &mut seen, &mut out);
-    }
-    out
-}
-
-fn push_evidence_path(
-    token: &str,
-    explicit_markdown_destination: bool,
-    seen: &mut HashSet<String>,
-    out: &mut Vec<String>,
-) {
-    if let Some(path) = normalize_evidence_path_token(token, explicit_markdown_destination)
-        && seen.insert(path.clone())
-    {
-        out.push(path);
-    }
-}
-
-fn normalize_evidence_path_token(
-    token: &str,
-    explicit_markdown_destination: bool,
-) -> Option<String> {
-    let trimmed = token
-        .trim()
-        .trim_start_matches(['`', '\'', '"', '(', '[', '{', '<'])
-        .trim_end_matches(|ch: char| {
-            matches!(
-                ch,
-                '`' | '\'' | '"' | ')' | ']' | '}' | '>' | ',' | ';' | '.' | '。'
-            )
-        });
-    let lower = trimmed.to_ascii_lowercase();
-    if trimmed.is_empty()
-        || trimmed.contains('@')
-        || (looks_like_uri(&lower)
-            && !is_explicit_markdown_line_reference(trimmed, explicit_markdown_destination))
-    {
-        return None;
-    }
-
-    let path = if let Some((path, location)) = trimmed.rsplit_once(':') {
-        if is_line_or_range(location) {
-            path
-        } else {
-            trimmed
-        }
-    } else {
-        trimmed
-    };
-    let path = path.trim_end_matches([':', '.', '。']);
-    if path.is_empty()
-        || looks_like_semantic_version(path)
-        || looks_like_hostname(path)
-        || (!explicit_markdown_destination && !looks_like_path(path))
-    {
-        return None;
-    }
-    Some(path.chars().take(240).collect())
-}
-
-fn looks_like_semantic_version(token: &str) -> bool {
-    let candidate = token
-        .strip_prefix('v')
-        .or_else(|| token.strip_prefix('V'))
-        .unwrap_or(token);
-    let parts: Vec<&str> = candidate.split('.').collect();
-    parts.len() >= 2
-        && parts
-            .iter()
-            .all(|part| !part.is_empty() && part.chars().all(|ch| ch.is_ascii_digit()))
-}
-
-fn looks_like_uri(token: &str) -> bool {
-    let Some((scheme, remainder)) = token.split_once(':') else {
-        return false;
-    };
-    if scheme.chars().count() == 1
-        && scheme.chars().all(|ch| ch.is_ascii_alphabetic())
-        && (remainder.starts_with('/') || remainder.starts_with('\\'))
-    {
-        return false;
-    }
-    let mut chars = scheme.chars();
-    chars.next().is_some_and(|ch| ch.is_ascii_alphabetic())
-        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.'))
-}
-
-fn is_explicit_markdown_line_reference(token: &str, explicit: bool) -> bool {
-    if !explicit {
-        return false;
-    }
-    let Some((path, location)) = token.rsplit_once(':') else {
-        return false;
-    };
-    !path.contains(':')
-        && is_line_or_range(location)
-        && (path == "README"
-            || path == "Makefile"
-            || path.starts_with('.')
-            || path.contains('/')
-            || path.contains('\\')
-            || path
-                .rsplit_once('.')
-                .is_some_and(|(_, extension)| is_credible_file_extension(extension)))
-}
-
-fn looks_like_hostname(token: &str) -> bool {
-    let normalized = token.trim_start_matches("//");
-    let authority = normalized.split(['/', '\\']).next().unwrap_or_default();
-    let Some((host, suffix)) = authority.rsplit_once('.') else {
-        return false;
-    };
-    if host.is_empty() || suffix.is_empty() {
-        return false;
-    }
-    let has_path = normalized.contains('/') || normalized.contains('\\');
-    has_path || !is_credible_file_extension(suffix)
-}
-
-fn is_credible_file_extension(extension: &str) -> bool {
-    matches!(
-        extension.to_ascii_lowercase().as_str(),
-        "c" | "cc"
-            | "cpp"
-            | "css"
-            | "csv"
-            | "go"
-            | "h"
-            | "hpp"
-            | "html"
-            | "ini"
-            | "java"
-            | "js"
-            | "json"
-            | "jsx"
-            | "kt"
-            | "lock"
-            | "md"
-            | "mjs"
-            | "py"
-            | "rb"
-            | "rs"
-            | "sh"
-            | "sql"
-            | "toml"
-            | "ts"
-            | "tsx"
-            | "txt"
-            | "xml"
-            | "yaml"
-            | "yml"
-            | "zig"
-    )
-}
-
-fn is_line_or_range(location: &str) -> bool {
-    if location.is_empty() {
-        return false;
-    }
-    if let Some((start, end)) = location.split_once('-') {
-        return !start.is_empty()
-            && !end.is_empty()
-            && start.chars().all(|ch| ch.is_ascii_digit())
-            && end.chars().all(|ch| ch.is_ascii_digit());
-    }
-    location.chars().all(|ch| ch.is_ascii_digit())
-}
-
-fn looks_like_path(token: &str) -> bool {
-    let has_explicit_prefix = token.starts_with("./")
-        || token.starts_with("../")
-        || token.starts_with('/')
-        || token.starts_with("~/")
-        || token.starts_with(".\\")
-        || token.starts_with("..\\")
-        || token.starts_with('\\');
-    has_explicit_prefix || has_filename_extension(token)
-}
-
-fn has_filename_extension(token: &str) -> bool {
-    let filename = token.rsplit(['/', '\\']).next().unwrap_or_default();
-    filename
-        .rsplit_once('.')
-        .is_some_and(|(stem, extension)| !stem.is_empty() && !extension.is_empty())
 }
 
 fn suggested_task_json_candidates(text: &str) -> Vec<String> {
@@ -2118,7 +2092,7 @@ fn append_suggested_tasks_to_plan(
 
 /// Prefers the structured TaskExecutionSummary (persisted by put_summary at
 /// task boundary) over the truncated todo.summary text, so downstream workers
-/// get full context: completed_work, files_changed, decisions, etc.
+/// get full context: summary, touched files, decisions, and remaining work.
 fn collect_dependency_summaries(
     store: &Arc<TaskRuntimeStore>,
     run_id: &str,
@@ -2145,11 +2119,14 @@ fn collect_dependency_summaries(
                     .flatten()
                     .map(|s| {
                         let mut parts: Vec<String> = Vec::new();
-                        if !s.completed_work.is_empty() {
-                            parts.push(format!("完成: {}", s.completed_work.join("; ")));
+                        if !s.result.summary.trim().is_empty() {
+                            parts.push(format!("完成: {}", s.result.summary));
                         }
-                        if !s.files_changed.is_empty() {
-                            parts.push(format!("修改文件: {}", s.files_changed.join(", ")));
+                        if !s.result.touched_files.written.is_empty() {
+                            parts.push(format!(
+                                "修改文件: {}",
+                                s.result.touched_files.written.join(", ")
+                            ));
                         }
                         if !s.decisions.is_empty() {
                             parts.push(format!("决策: {}", s.decisions.join("; ")));
@@ -2325,6 +2302,13 @@ fn build_task_prompt(
         }
         s.push('\n');
     }
+    if !task.required_artifacts.is_empty() {
+        s.push_str("Required artifacts (each must exist and be reported):\n");
+        for artifact in &task.required_artifacts {
+            s.push_str(&format!("- {artifact}\n"));
+        }
+        s.push('\n');
+    }
     if task.kind.is_read_only() {
         s.push_str(
             "Execution boundary: READ-ONLY. You may inspect files, metadata, logs, and other \
@@ -2362,15 +2346,18 @@ fn build_task_prompt(
          suggestions as a substitute for completing the assigned task.\n",
     );
     s.push_str(
-        "\nReturn contract:\n\
-         1) `## Summary` — at most 1200 characters; answer the assigned question or state the \
-         completed change, with the strongest evidence and any material limitation.\n\
-         2) `## Evidence` — concise bullets with path:line, source identifiers, calculations, or \
-         verification results when relevant.\n\
-         3) Optional `## Artifacts` — bullet paths to files actually produced.\n\
-         4) Optional suggested_tasks JSON block above.\n\
-         Detailed notes may follow, but the parent primarily consumes Summary, Evidence, \
-         Artifacts, and suggested tasks. Never claim an artifact or check that does not exist.\n",
+        "\nReturn contract: end with `## Result` followed by exactly one fenced JSON object:\n\
+         ```json\n\
+         {\"contract_version\":1,\"status\":\"completed\",\"summary\":\"at most 1200 characters\",\
+         \"artifacts\":[{\"path\":\"actual path\",\"kind\":\"file|report|chart|other\"}],\
+         \"verification\":[{\"check\":\"exact command or check\",\"status\":\"passed|failed|not_run\",\
+         \"details\":\"bounded evidence\",\"source\":\"reported\"}],\
+         \"remaining_work\":[],\"touched_files\":{\"read\":[],\"written\":[]}}\n\
+         ```\n\
+         Runtime owns the final status and artifact hash. Report exact checks and paths; never \
+         claim an artifact, changed file, or verification that does not exist. Put any incomplete \
+         or blocked work in remaining_work. Optional detailed notes and suggested_tasks may appear \
+         before `## Result`.\n",
     );
     s
 }
@@ -2570,6 +2557,49 @@ fn tool_call_is_replay_safe(agent: &echo_agent::agent::ReactAgent, tool_name: &s
     })
 }
 
+fn verification_check_from_agent_tool(name: &str, args: &serde_json::Value) -> Option<String> {
+    let normalized = name.to_ascii_lowercase().replace('-', "_");
+    if !matches!(
+        normalized.as_str(),
+        "shell" | "bash" | "terminal" | "run_code" | "execute_command"
+    ) {
+        return None;
+    }
+    ["command", "cmd", "code", "script"]
+        .iter()
+        .find_map(|key| args.get(*key).and_then(serde_json::Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn file_access_from_agent_tool(name: &str, args: &serde_json::Value) -> Option<(bool, String)> {
+    let normalized = name.to_ascii_lowercase().replace('-', "_");
+    let write = normalized.contains("write")
+        || normalized.contains("edit")
+        || normalized.contains("delete")
+        || normalized.contains("patch");
+    let read = normalized.contains("read")
+        || normalized.contains("search")
+        || normalized.contains("glob")
+        || normalized.contains("grep");
+    if !write && !read {
+        return None;
+    }
+    ["path", "file_path", "target", "directory"]
+        .iter()
+        .find_map(|key| args.get(*key).and_then(serde_json::Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|path| (write, path.to_string()))
+}
+
+fn push_unique_path(paths: &mut Vec<String>, path: String) {
+    if !path.is_empty() && !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
+}
+
 async fn run_main_agent_task(
     primary_agent: &crate::agent_handle::AgentHandle,
     store: Arc<TaskRuntimeStore>,
@@ -2578,7 +2608,7 @@ async fn run_main_agent_task(
     prompt: &str,
     cancel: CancellationToken,
     trace_sink: Option<ExecSink>,
-) -> Result<String, String> {
+) -> Result<(SubagentTaskResult, String), String> {
     let run_id = run_id.to_string();
     let task_id = task.id.clone();
     let agent_role = task.agent_role.clone();
@@ -2644,6 +2674,11 @@ async fn run_main_agent_task(
                 );
                 let mut output = String::new();
                 let mut in_thinking = false;
+                let mut pending_verification = HashMap::<String, String>::new();
+                let mut pending_file_access = HashMap::<String, (bool, String)>::new();
+                let mut observed_verification = Vec::new();
+                let mut observed_artifacts = Vec::new();
+                let mut touched_files = echo_agent::agent::subagent::SubagentTouchedFiles::default();
 
                 while let Some(event_result) = stream.next().await {
                     let event = event_result
@@ -2763,6 +2798,12 @@ async fn run_main_agent_task(
                             name,
                             args,
                         } => {
+                            if let Some(check) = verification_check_from_agent_tool(&name, &args) {
+                                pending_verification.insert(call_id.clone(), check);
+                            }
+                            if let Some(access) = file_access_from_agent_tool(&name, &args) {
+                                pending_file_access.insert(call_id.clone(), access);
+                            }
                             let replay_safe = tool_call_is_replay_safe(agent, &name);
                             if let Err(error) = store.record_tool_started(
                                 &run_id,
@@ -2798,6 +2839,23 @@ async fn run_main_agent_task(
                             name,
                             output: result,
                         } => {
+                            if let Some(check) = pending_verification.remove(&call_id) {
+                                observed_verification.push(
+                                    echo_agent::agent::subagent::SubagentVerification {
+                                        check,
+                                        status: echo_agent::agent::subagent::SubagentVerificationStatus::Passed,
+                                        details: result.chars().take(500).collect(),
+                                        source: echo_agent::agent::subagent::SubagentVerificationSource::Observed,
+                                    },
+                                );
+                            }
+                            if let Some((write, path)) = pending_file_access.remove(&call_id) {
+                                if write {
+                                    push_unique_path(&mut touched_files.written, path);
+                                } else {
+                                    push_unique_path(&mut touched_files.read, path);
+                                }
+                            }
                             if let Err(error) = store.record_tool_finished(
                                 &run_id,
                                 &task_id,
@@ -2836,6 +2894,17 @@ async fn run_main_agent_task(
                             error,
                             failure,
                         } => {
+                            if let Some(check) = pending_verification.remove(&call_id) {
+                                observed_verification.push(
+                                    echo_agent::agent::subagent::SubagentVerification {
+                                        check,
+                                        status: echo_agent::agent::subagent::SubagentVerificationStatus::Failed,
+                                        details: error.chars().take(500).collect(),
+                                        source: echo_agent::agent::subagent::SubagentVerificationSource::Observed,
+                                    },
+                                );
+                            }
+                            pending_file_access.remove(&call_id);
                             if let Err(store_error) = store.record_tool_finished(
                                 &run_id,
                                 &task_id,
@@ -2896,16 +2965,30 @@ async fn run_main_agent_task(
                                         "chunk": chunk,
                                     }))
                                 }
-                                echo_agent::tools::ToolStreamEvent::Complete(result) => (
-                                    "tool_completed",
-                                    serde_json::json!({
+                                echo_agent::tools::ToolStreamEvent::Complete(result) => {
+                                    if let Some(artifact) = echo_core::tools::artifact::ToolOutputArtifactRef::from_metadata(&result.metadata) {
+                                        observed_artifacts.push(
+                                            echo_agent::agent::subagent::SubagentArtifact {
+                                                path: artifact.path.to_string_lossy().to_string(),
+                                                kind: "tool_log".to_string(),
+                                                bytes: Some(artifact.artifact_bytes),
+                                                sha256: Some(artifact.sha256),
+                                                producer_execution_id: Some(execution_id.clone()),
+                                                available: artifact.path.is_file(),
+                                            },
+                                        );
+                                    }
+                                    (
+                                        "tool_completed",
+                                        serde_json::json!({
                                         "call_id": call_id,
                                         "name": name,
                                         "success": result.success,
                                         "metadata": result.metadata,
                                         "truncated": result.truncated,
-                                    }),
-                                ),
+                                        }),
+                                    )
+                                }
                             };
                             emit_exec(
                                 trace_sink.as_ref(),
@@ -2936,7 +3019,23 @@ async fn run_main_agent_task(
                     }
                 }
 
-                Ok(output)
+                let working_dir = agent.working_dir();
+                let mut outcome = echo_agent::agent::subagent::parse_subagent_outcome(
+                    &output,
+                    echo_agent::agent::subagent::SubagentStatus::Completed,
+                    Some(&execution_id),
+                    working_dir.as_deref(),
+                );
+                echo_agent::agent::subagent::merge_observed_evidence(
+                    &mut outcome,
+                    observed_verification,
+                    touched_files,
+                    observed_artifacts,
+                );
+                Ok((
+                    SubagentTaskResult::from_framework_outcome(&outcome),
+                    output,
+                ))
             })
         })
         .await
@@ -3368,14 +3467,25 @@ pub async fn drive_unattended_run(
             );
         }
         _ => {
-            // Still Running or unknown — the agent finished its stream
-            // without plan_execute transitioning the run to a terminal
-            // state (e.g. agent returned a direct answer without calling
-            // plan_execute). Mark as Completed or Cancelled.
+            // Still Running or unknown — the agent stream ending is not proof
+            // that the plan satisfied its result contract.
             if child_cancel.is_cancelled() {
                 let _ = store.transition_run(run_id, TaskRunStatus::Cancelled);
             } else {
-                let _ = store.transition_run(run_id, TaskRunStatus::Completed);
+                let blockers = run_completion_blockers(&store, run_id);
+                if blockers.is_empty() {
+                    let _ = store.transition_run(run_id, TaskRunStatus::Completed);
+                } else {
+                    let _ = store.note(
+                        run_id,
+                        None,
+                        &format!(
+                            "completion gate rejected unattended run: {}",
+                            blockers.join("; ")
+                        ),
+                    );
+                    let _ = store.transition_run(run_id, TaskRunStatus::Failed);
+                }
             }
             tracing::info!(
                 source_id = %source_id,
@@ -3535,6 +3645,7 @@ mod tests {
             parallel_group: None,
             files: Vec::new(),
             allowed_tools: tools.iter().map(|s| s.to_string()).collect(),
+            required_artifacts: Vec::new(),
             verification: verification.iter().map(|s| s.to_string()).collect(),
             retry_count: 0,
             max_retries: 0,
@@ -3542,121 +3653,6 @@ mod tests {
             status: TodoStatus::Pending,
             sort_order: 0,
         }
-    }
-
-    #[test]
-    fn evidence_path_extraction_keeps_file_refs_without_urls() -> Result<(), String> {
-        let text = "发现见 echo-agent/src/agent/react/mod.rs:2253，\
-            中文文件在 docs/设计/上下文.md:12；外部参考 https://example.com/a/b。";
-        let paths = extract_evidence_paths_from_worker_output(text);
-        if !paths.contains(&"echo-agent/src/agent/react/mod.rs".to_string()) {
-            return Err("expected Rust file path evidence".to_string());
-        }
-        if !paths.contains(&"docs/设计/上下文.md".to_string()) {
-            return Err("expected UTF-8 file path evidence".to_string());
-        }
-        if paths.iter().any(|path| path.starts_with("https://")) {
-            return Err("URL should not be treated as file evidence".to_string());
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn evidence_path_extraction_supports_markdown_links_and_line_ranges() -> Result<(), String> {
-        let text = "See [runtime code](echo-agent-app-core/src/tasks/task_runtime/executor.rs:1629-1684) \
-            and [design](./docs/设计/上下文.md:10-18).";
-        let paths = extract_evidence_paths_from_worker_output(text);
-        for expected in [
-            "echo-agent-app-core/src/tasks/task_runtime/executor.rs",
-            "./docs/设计/上下文.md",
-        ] {
-            if !paths.iter().any(|path| path == expected) {
-                return Err(format!("missing Markdown evidence destination: {expected}"));
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn evidence_path_extraction_rejects_urls_and_generic_slash_prose() -> Result<(), String> {
-        let text = "Use and/or when needed. Read [external](https://example.com/docs/file.rs:12) \
-            or visit http://example.test/a/b. This is prose/without/a/file.";
-        let paths = extract_evidence_paths_from_worker_output(text);
-        if !paths.is_empty() {
-            return Err(format!(
-                "URLs and generic slash prose must not become evidence: {paths:?}"
-            ));
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn evidence_markdown_accepts_extensionless_dotfiles_and_parentheses() -> Result<(), String> {
-        let text = "Read [overview](README), [build](Makefile:12), \
-            [config](.github/workflows/ci.yml:8-14), [.env](.env), and \
-            [nested design](docs/context(lifecycle).md:20-24).";
-        let paths = extract_evidence_paths_from_worker_output(text);
-        for expected in [
-            "README",
-            "Makefile",
-            ".github/workflows/ci.yml",
-            ".env",
-            "docs/context(lifecycle).md",
-        ] {
-            if !paths.iter().any(|path| path == expected) {
-                return Err(format!("missing explicit Markdown evidence: {expected}"));
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn evidence_bare_tokens_reject_non_file_lookalikes() -> Result<(), String> {
-        let text = "Contact dev@example.com or visit example.com docs.example.org and \
-            [host path](example.com/docs/file.rs). Versions 1.2.3 and v2.10.4 are not files; \
-            neither is choice/alternative.";
-        let paths = extract_evidence_paths_from_worker_output(text);
-        if !paths.is_empty() {
-            return Err(format!("non-file lookalikes must be rejected: {paths:?}"));
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn evidence_rejects_generic_uris_versions_and_uncommon_domains() -> Result<(), String> {
-        let text = "ftp://files.example.xyz/src/lib.rs ssh://host.internal/README.md \
-            custom://example.dev/Makefile versions 1.2 v1.2 10.20 and \
-            [domain path](docs.example.xyz/reference/file.rs).";
-        let paths = extract_evidence_paths_from_worker_output(text);
-        if !paths.is_empty() {
-            return Err(format!("URI/version/domain lookalikes leaked: {paths:?}"));
-        }
-
-        let credible =
-            extract_evidence_paths_from_worker_output("[source](src/lib.rs) [guide](README.md)");
-        if credible != ["src/lib.rs", "README.md"] {
-            return Err(format!(
-                "credible explicit file references were lost: {credible:?}"
-            ));
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn evidence_rejects_rfc_scheme_prefixes_but_keeps_windows_drives() -> Result<(), String> {
-        let text = "urn:isbn:9780143127796 file:///tmp/report.rs mailto:dev@example.com \
-            ssh:host/path.rs custom:value/path.ts C:\\repo\\src\\main.rs:12 \
-            D:/workspace/README.md:4-8";
-        let paths = extract_evidence_paths_from_worker_output(text);
-        if paths
-            != [
-                "C:\\repo\\src\\main.rs".to_string(),
-                "D:/workspace/README.md".to_string(),
-            ]
-        {
-            return Err(format!("scheme/drive classification was wrong: {paths:?}"));
-        }
-        Ok(())
     }
 
     #[test]
@@ -4081,8 +4077,9 @@ Read the runtime path and found one missing branch.
         assert!(p.contains("report root cause"));
         assert!(p.contains("Do not delegate this task to other agents"));
         assert!(p.contains("Return contract"));
-        assert!(p.contains("## Summary"));
-        assert!(p.contains("## Evidence"));
+        assert!(p.contains("## Result"));
+        assert!(p.contains("\"contract_version\":1"));
+        assert!(p.contains("\"touched_files\""));
     }
 
     #[test]
@@ -4221,7 +4218,7 @@ Read the runtime path and found one missing branch.
     /// answers instantly).
     struct ScriptedDispatcher {
         /// task_id → result to return. Missing id → generic success.
-        results: StdMutex<StdHashMap<String, Result<String, String>>>,
+        results: StdMutex<StdHashMap<String, Result<SubagentTaskResult, String>>>,
         /// Dispatch order, appended as tasks are picked up.
         order: StdMutex<Vec<String>>,
     }
@@ -4238,7 +4235,14 @@ Read the runtime path and found one missing branch.
             self.results
                 .lock()
                 .unwrap()
-                .insert(id.into(), Ok(summary.into()));
+                .insert(id.into(), Ok(successful_task_result(summary)));
+        }
+        /// Script a structured terminal result for `id`.
+        fn respond(self: &Arc<Self>, id: &str, result: SubagentTaskResult) {
+            self.results
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(id.into(), Ok(result));
         }
         /// Script a failure result for `id`.
         fn fail(self: &Arc<Self>, id: &str, err: &str) {
@@ -4264,12 +4268,8 @@ Read the runtime path and found one missing branch.
             _llm_sem: Arc<Semaphore>,
             _file_write_locks: Arc<std::sync::Mutex<HashMap<String, Arc<TokioMutex<()>>>>>,
             _trace_sink: Option<ExecSink>,
-        ) -> std::pin::Pin<
-            Box<
-                dyn std::future::Future<Output = Result<(String, Option<String>), (String, String)>>
-                    + Send,
-            >,
-        > {
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TaskDispatchResult> + Send>>
+        {
             let results = self.results.lock().unwrap().get(&task.id).cloned();
             self.order.lock().unwrap().push(task.id.clone());
             let task_id = task.id.clone();
@@ -4279,13 +4279,167 @@ Read the runtime path and found one missing branch.
                     return Err((task_id, "cancelled".into()));
                 }
                 match results {
-                    Some(Ok(summary)) => Ok((task_id, Some(summary))),
+                    Some(Ok(result)) => Ok((task_id, result)),
                     Some(Err(e)) => Err((task_id, e)),
                     // Default: generic success for unscripted tasks.
-                    None => Ok((task_id, Some("ok".into()))),
+                    None => Ok((task_id, successful_task_result("ok"))),
                 }
             })
         }
+    }
+
+    fn successful_task_result(summary: &str) -> SubagentTaskResult {
+        SubagentTaskResult {
+            contract_version: 1,
+            status: SubagentRunStatus::Completed,
+            summary: summary.to_string(),
+            artifacts: Vec::new(),
+            verification: Vec::new(),
+            remaining_work: Vec::new(),
+            touched_files: SubagentTouchedFiles::default(),
+        }
+    }
+
+    #[test]
+    fn task_result_contract_requires_observed_evidence_and_integrity() -> Result<(), String> {
+        assert!(!verification_matches(
+            "cargo test --workspace",
+            "echo cargo test --workspace"
+        ));
+        let task = PlanTask {
+            id: "contract".to_string(),
+            title: "Contract".to_string(),
+            verification: vec!["cargo test --workspace".to_string()],
+            required_artifacts: vec!["reports/result.json".to_string()],
+            ..PlanTask::default()
+        };
+        let mut result = successful_task_result("work finished");
+        result.remaining_work = vec!["write final report".to_string()];
+        result.verification.push(SubagentVerificationResult {
+            check: "cargo test --workspace".to_string(),
+            status: SubagentVerificationStatus::Passed,
+            details: "claimed by worker".to_string(),
+            source: SubagentVerificationSource::Reported,
+        });
+        result.artifacts.push(SubagentArtifactResult {
+            path: "reports/result.json".to_string(),
+            kind: "report".to_string(),
+            bytes: Some(12),
+            sha256: None,
+            producer_execution_id: None,
+            available: true,
+        });
+
+        let issues = validate_task_result(&task, &result)
+            .err()
+            .ok_or_else(|| "incomplete result unexpectedly passed".to_string())?;
+        assert!(issues.iter().any(|issue| issue.contains("remaining work")));
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("no observed pass"))
+        );
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("integrity metadata"))
+        );
+
+        result.remaining_work.clear();
+        if let Some(verification) = result.verification.first_mut() {
+            verification.source = SubagentVerificationSource::Observed;
+        }
+        if let Some(artifact) = result.artifacts.first_mut() {
+            artifact.sha256 = Some("a".repeat(64));
+            artifact.producer_execution_id = Some("contract:1".to_string());
+        }
+        assert!(validate_task_result(&task, &result).is_ok());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_dag_rejects_result_without_observed_required_verification() -> Result<(), String> {
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let task = PlanTask {
+            id: "verify".to_string(),
+            title: "Verify".to_string(),
+            kind: PlanTaskKind::ReadOnlyReview,
+            agent_role: "reviewer".to_string(),
+            verification: vec!["cargo test --workspace".to_string()],
+            max_retries: 0,
+            ..PlanTask::default()
+        };
+        let run_id = seed_run(&store, vec![task.clone()]);
+        let worker = ScriptedDispatcher::new();
+        let mut result = successful_task_result("tests claimed complete");
+        result.verification.push(SubagentVerificationResult {
+            check: "cargo test --workspace".to_string(),
+            status: SubagentVerificationStatus::Passed,
+            details: "worker report only".to_string(),
+            source: SubagentVerificationSource::Reported,
+        });
+        worker.respond(&task.id, result);
+
+        let outcome = run_dag(
+            store.clone(),
+            worker,
+            None,
+            &run_id,
+            vec![task],
+            ConcurrencyLimits::default(),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+
+        assert!(matches!(outcome, RunOutcome::Failed { .. }));
+        let todo = store
+            .list_todos(&run_id)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .find(|todo| todo.task_id == "verify")
+            .ok_or_else(|| "verify todo missing".to_string())?;
+        assert_eq!(todo.status, TodoStatus::Failed);
+        Ok(())
+    }
+
+    #[test]
+    fn run_completion_gate_requires_durable_structured_result() -> Result<(), String> {
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let task = solo_readonly_task("completed-task");
+        let run_id = seed_run(&store, vec![task.clone()]);
+        store
+            .set_task_status(
+                &run_id,
+                &task.id,
+                TodoStatus::Completed,
+                Some(&task.agent_role),
+                Some("claimed complete"),
+            )
+            .map_err(|error| error.to_string())?;
+
+        let blockers = run_completion_blockers(&store, &run_id);
+        assert!(
+            blockers
+                .iter()
+                .any(|blocker| blocker.contains("without a structured result"))
+        );
+
+        store
+            .put_summary(&TaskExecutionSummary {
+                run_id: run_id.clone(),
+                task_id: task.id.clone(),
+                worker_agent: task.agent_role.clone(),
+                result: successful_task_result("durable result"),
+                decisions: Vec::new(),
+                next_implications: Vec::new(),
+                suggested_tasks: Vec::new(),
+                created_at: chrono::Utc::now(),
+            })
+            .map_err(|error| error.to_string())?;
+        assert!(run_completion_blockers(&store, &run_id).is_empty());
+        Ok(())
     }
 
     /// Helper: a single-task plan (read-only, no review needed) that the
@@ -4369,8 +4523,9 @@ Read the runtime path and found one missing branch.
         store
             .record_worker_assigned(&run_id, "a", "a:1", "reviewer", 1, true)
             .map_err(|error| error.to_string())?;
+        let recovered_result = successful_task_result("recovered summary");
         store
-            .record_worker_released(&run_id, "a", "a:1", "completed", Some("recovered summary"))
+            .record_worker_released(&run_id, "a", "a:1", "completed", Some(&recovered_result))
             .map_err(|error| error.to_string())?;
         let worker = ScriptedDispatcher::new();
 
@@ -4688,7 +4843,7 @@ Read the runtime path and found one missing branch.
         .await
         .map_err(|error| format!("main agent task should complete: {error}"))?;
 
-        assert!(output.contains("42"));
+        assert!(output.1.contains("42"));
         let events = events
             .lock()
             .map_err(|error| format!("trace events lock poisoned: {error}"))?

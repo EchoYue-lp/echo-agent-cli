@@ -672,23 +672,41 @@ fn todo_summary(todo: &TodoItem) -> Option<String> {
 
 fn format_execution_summary(summary: &TaskExecutionSummary) -> String {
     let mut parts = Vec::new();
-    if !summary.completed_work.is_empty() {
-        parts.push(format!("完成: {}", summary.completed_work.join("; ")));
+    if !summary.result.summary.trim().is_empty() {
+        parts.push(format!("完成: {}", summary.result.summary));
     }
-    if !summary.files_read.is_empty() {
-        parts.push(format!("读取: {}", summary.files_read.join(", ")));
+    if !summary.result.touched_files.read.is_empty() {
+        parts.push(format!(
+            "读取: {}",
+            summary.result.touched_files.read.join(", ")
+        ));
     }
-    if !summary.files_changed.is_empty() {
-        parts.push(format!("修改: {}", summary.files_changed.join(", ")));
+    if !summary.result.touched_files.written.is_empty() {
+        parts.push(format!(
+            "修改: {}",
+            summary.result.touched_files.written.join(", ")
+        ));
     }
     if !summary.decisions.is_empty() {
         parts.push(format!("决策: {}", summary.decisions.join("; ")));
     }
-    if !summary.failures.is_empty() {
-        parts.push(format!("问题: {}", summary.failures.join("; ")));
+    if !summary.result.remaining_work.is_empty() {
+        parts.push(format!(
+            "未完成: {}",
+            summary.result.remaining_work.join("; ")
+        ));
     }
-    if !summary.verification.is_empty() {
-        parts.push(format!("验证: {}", summary.verification.join("; ")));
+    if !summary.result.verification.is_empty() {
+        parts.push(format!(
+            "验证: {}",
+            summary
+                .result
+                .verification
+                .iter()
+                .map(|item| format!("{}: {:?}", item.check, item.status))
+                .collect::<Vec<_>>()
+                .join("; ")
+        ));
     }
     if !summary.next_implications.is_empty() {
         parts.push(format!(
@@ -779,6 +797,9 @@ mod tests {
     use super::*;
     use crate::chat_driver::ChatSink;
     use crate::tasks::task_runtime::task_tools;
+    use crate::tasks::task_runtime::types::{
+        SubagentRunStatus, SubagentTaskResult, SubagentTouchedFiles,
+    };
     use echo_agent::prelude::*;
     use echo_agent::tools::ToolParameters;
 
@@ -931,12 +952,19 @@ mod tests {
                 run_id: "r1".to_string(),
                 task_id: "t1".to_string(),
                 worker_agent: "explorer".to_string(),
-                completed_work: vec!["梳理 runtime、agent_pool、task_runtime 的职责".to_string()],
-                files_read: vec!["echo-agent-app-core/src/runtime.rs".to_string()],
-                files_changed: Vec::new(),
+                result: SubagentTaskResult {
+                    contract_version: 1,
+                    status: SubagentRunStatus::Completed,
+                    summary: "梳理 runtime、agent_pool、task_runtime 的职责".to_string(),
+                    artifacts: Vec::new(),
+                    verification: Vec::new(),
+                    remaining_work: Vec::new(),
+                    touched_files: SubagentTouchedFiles {
+                        read: vec!["echo-agent-app-core/src/runtime.rs".to_string()],
+                        written: Vec::new(),
+                    },
+                },
                 decisions: vec!["core 层负责应用编排, framework 层负责 agent 能力".to_string()],
-                failures: Vec::new(),
-                verification: Vec::new(),
                 next_implications: Vec::new(),
                 suggested_tasks: Vec::new(),
                 created_at: chrono::Utc::now(),

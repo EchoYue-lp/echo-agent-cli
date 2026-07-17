@@ -27,7 +27,7 @@ const READ_TOOL_NAMES = new Set([
 ]);
 
 export interface SubagentProgress {
-  status: 'running' | 'completed' | 'failed' | 'cancelled';
+  status: 'running' | 'completed' | 'failed' | 'cancelled' | 'timed_out';
   toolCount: number;
   readCount: number;
   thinkingRounds: number;
@@ -56,7 +56,7 @@ export function computeSubagentProgress(run: SubagentRunState): SubagentProgress
 }
 
 export function progressSummary(p: SubagentProgress): string {
-  if (p.status === 'failed' || p.status === 'cancelled') {
+  if (p.status === 'failed' || p.status === 'cancelled' || p.status === 'timed_out') {
     // Status text is already shown by `statusLabel` next to this summary;
     // returning it here too would render "失败 · 失败". Return empty so only
     // the tool/read/thinking counts appear (or nothing for failed/cancelled).
@@ -79,5 +79,7 @@ export function statusLabel(status: SubagentProgress['status']): string {
       return '失败';
     case 'cancelled':
       return '已取消';
+    case 'timed_out':
+      return '已超时';
   }
 }

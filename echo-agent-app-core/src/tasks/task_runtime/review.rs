@@ -256,6 +256,7 @@ pub fn build_fix_task(original: &PlanTask, review: &ReviewResult) -> PlanTask {
         parallel_group: None, // fixes always serialize
         files: original.files.clone(),
         allowed_tools: original.allowed_tools.clone(),
+        required_artifacts: original.required_artifacts.clone(),
         verification: original.verification.clone(),
         retry_count: original.retry_count + 1,
         max_retries: original.max_retries,

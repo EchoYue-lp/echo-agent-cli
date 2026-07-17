@@ -19,6 +19,11 @@ export type PlanTask = {
   parallel_group: string | null;
   files: Array<string>;
   allowed_tools: Array<string>;
+  /**
+   * Artifact paths or suffixes that must be present and integrity-checked
+   * before this task may enter Completed.
+   */
+  required_artifacts: Array<string>;
   verification: Array<string>;
   retry_count: number;
   max_retries: number;

@@ -118,7 +118,7 @@ export const SubagentStreamBlock = memo(function SubagentStreamBlock({
       <Loader2 size={11} className="animate-spin" style={{ color: 'var(--color-info)' }} />
     ) : run.status === 'completed' ? (
       <CheckCircle2 size={11} style={{ color: 'var(--color-success)' }} />
-    ) : run.status === 'failed' ? (
+    ) : run.status === 'failed' || run.status === 'timed_out' ? (
       <AlertCircle size={11} style={{ color: 'var(--color-error)' }} />
     ) : (
       <Circle size={11} style={{ color: 'var(--text-tertiary)' }} />
@@ -259,8 +259,32 @@ export const SubagentStreamBlock = memo(function SubagentStreamBlock({
             )}
 
             {activeTab === 'result' &&
-              (result ? (
-                <MarkdownContent content={result} className="text-sm" maxHeight={400} />
+              (result || run.summary ? (
+                <div className="space-y-2 text-[11px] text-[var(--text-secondary)]">
+                  <MarkdownContent
+                    content={run.summary || result}
+                    className="text-sm"
+                    maxHeight={400}
+                  />
+                  {(run.verification ?? []).map((item) => (
+                    <div key={`${item.check}-${item.source}`}>
+                      <span className="font-medium text-[var(--text-primary)]">{item.check}</span>
+                      <span className="ml-1 text-[var(--text-tertiary)]">
+                        {item.status} · {item.source}
+                      </span>
+                    </div>
+                  ))}
+                  {(run.artifacts ?? []).map((artifact) => (
+                    <div key={artifact.path} className="break-all font-mono text-[10px]">
+                      {artifact.available ? 'available' : 'missing'} · {artifact.path}
+                    </div>
+                  ))}
+                  {(run.remainingWork ?? []).map((item) => (
+                    <div key={item} className="text-[var(--color-warning)]">
+                      {item}
+                    </div>
+                  ))}
+                </div>
               ) : (
                 <div className="text-[11px] text-[var(--text-tertiary)]">
                   {run.status === 'running' ? '正在等待执行结果' : '暂无结果'}

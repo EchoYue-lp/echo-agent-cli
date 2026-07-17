@@ -198,6 +198,39 @@ fn render_tasks_list(_f: &mut Frame, app: &TuiApp, area: Rect, t: &Theme) {
                     Style::default().fg(t.overlay0),
                 ),
             ])));
+            if !run.summary.trim().is_empty() {
+                items.push(ListItem::new(Line::from(Span::styled(
+                    format!(
+                        "    {}",
+                        super::task_strip::truncate_str(run.summary.trim(), 24)
+                    ),
+                    Style::default().fg(t.subtext),
+                ))));
+            }
+            let mut evidence = Vec::new();
+            if !run.artifacts.is_empty() {
+                evidence.push(format!("{} artifacts", run.artifacts.len()));
+            }
+            if !run.verification.is_empty() {
+                evidence.push(format!("{} checks", run.verification.len()));
+            }
+            if !run.remaining_work.is_empty() {
+                evidence.push(format!("{} remaining", run.remaining_work.len()));
+            }
+            if !run.files_read.is_empty() || !run.files_written.is_empty() {
+                evidence.push(format!(
+                    "{}r/{}w files",
+                    run.files_read.len(),
+                    run.files_written.len()
+                ));
+            }
+            if !evidence.is_empty() {
+                let evidence = evidence.join(" · ");
+                items.push(ListItem::new(Line::from(Span::styled(
+                    format!("    {}", super::task_strip::truncate_str(&evidence, 24)),
+                    Style::default().fg(t.overlay0),
+                ))));
+            }
         }
     }
 
@@ -209,7 +242,7 @@ fn task_icon(status: &str) -> &'static str {
     match status {
         "running" => "▶",
         "completed" => "✓",
-        "failed" => "×",
+        "failed" | "timed_out" => "×",
         "blocked" => "!",
         "skipped" => "-",
         _ => "○",
@@ -220,7 +253,7 @@ fn status_color(status: &str, t: &Theme) -> ratatui::style::Color {
     match status {
         "running" => t.yellow,
         "completed" => t.green,
-        "failed" | "blocked" | "cancelled" => t.red,
+        "failed" | "blocked" | "cancelled" | "timed_out" => t.red,
         _ => t.overlay0,
     }
 }

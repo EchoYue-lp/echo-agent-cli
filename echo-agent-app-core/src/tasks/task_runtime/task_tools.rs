@@ -357,6 +357,10 @@ impl Tool for TaskCreateTool {
                     "description": "Task kind"
                 },
                 "depends_on": { "type": "array", "items": { "type": "string" }, "description": "Task ids this depends on" },
+                "files": { "type": "array", "items": { "type": "string" }, "description": "Expected file ownership/read-write scope" },
+                "allowed_tools": { "type": "array", "items": { "type": "string" }, "description": "Tools allowed for this task" },
+                "required_artifacts": { "type": "array", "items": { "type": "string" }, "description": "Artifact paths or suffixes required for completion" },
+                "verification": { "type": "array", "items": { "type": "string" }, "description": "Checks that require observed successful execution" },
                 "after_task_id": { "type": "string", "description": "Insert after this task id (optional)" }
             },
             "required": ["title","description","kind"]
@@ -429,6 +433,25 @@ impl TaskCreateTool {
                     .collect()
             })
             .unwrap_or_default();
+        let string_array = |key: &str| -> Vec<String> {
+            params
+                .get(key)
+                .and_then(|value| value.as_array())
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|value| value.as_str())
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let files = string_array("files");
+        let allowed_tools = string_array("allowed_tools");
+        let required_artifacts = string_array("required_artifacts");
+        let verification = string_array("verification");
         let after_task_id = params
             .get("after_task_id")
             .and_then(|v| v.as_str())
@@ -447,6 +470,10 @@ impl TaskCreateTool {
             kind,
             agent_role: role_for_kind(kind).to_string(),
             depends_on,
+            files,
+            allowed_tools,
+            required_artifacts,
+            verification,
             status: TodoStatus::Pending,
             ..Default::default()
         };
@@ -968,7 +995,11 @@ impl Tool for TaskUpdateTool {
                 "title": { "type": "string", "description": "New title (optional)" },
                 "description": { "type": "string", "description": "New description (optional)" },
                 "kind": { "type": "string", "description": "New kind (optional)" },
-                "depends_on": { "type": "array", "items": { "type": "string" }, "description": "New deps (optional)" }
+                "depends_on": { "type": "array", "items": { "type": "string" }, "description": "New deps (optional)" },
+                "files": { "type": "array", "items": { "type": "string" }, "description": "New file scope (optional)" },
+                "allowed_tools": { "type": "array", "items": { "type": "string" }, "description": "New tool allowlist (optional)" },
+                "required_artifacts": { "type": "array", "items": { "type": "string" }, "description": "New required artifact list (optional)" },
+                "verification": { "type": "array", "items": { "type": "string" }, "description": "New required verification list (optional)" }
             },
             "required": ["task_id"]
         })
@@ -1005,6 +1036,10 @@ impl Tool for TaskUpdateTool {
                             .filter_map(|v| v.as_str().map(String::from))
                             .collect()
                     }),
+                files: optional_string_array(&params, "files"),
+                allowed_tools: optional_string_array(&params, "allowed_tools"),
+                required_artifacts: optional_string_array(&params, "required_artifacts"),
+                verification: optional_string_array(&params, "verification"),
                 ..Default::default()
             };
             match self.store.update_task(&run_id, &task_id, patch) {
@@ -1023,57 +1058,19 @@ impl Tool for TaskUpdateTool {
     }
 }
 
-// ── task_complete ─────────────────────────────────────────────────────────
-
-pub struct TaskCompleteTool {
-    pub store: Arc<TaskRuntimeStore>,
-}
-
-impl Tool for TaskCompleteTool {
-    fn name(&self) -> &str {
-        "task_complete"
-    }
-    fn description(&self) -> &str {
-        "Mark a task as completed."
-    }
-    fn parameters(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "task_id": { "type": "string", "description": "Task to complete" },
-                "summary": { "type": "string", "description": "Brief summary (optional)" }
-            },
-            "required": ["task_id"]
+fn optional_string_array(params: &ToolParameters, key: &str) -> Option<Vec<String>> {
+    params
+        .get(key)
+        .and_then(|value| value.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect()
         })
-    }
-    fn execute<'a>(
-        &'a self,
-        params: ToolParameters,
-    ) -> futures::future::BoxFuture<'a, echo_agent::error::Result<ToolResult>> {
-        Box::pin(async move {
-            let run_id = match require_run_id() {
-                Ok(id) => id,
-                Err(e) => return Ok(e),
-            };
-            let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
-            let summary = params.get("summary").and_then(|v| v.as_str());
-            match self
-                .store
-                .set_task_status(&run_id, task_id, TodoStatus::Completed, None, summary)
-            {
-                Ok(()) => Ok(ToolResult::success(format!("Completed task '{task_id}'"))),
-                Err(e) => Ok(ToolResult::error(format!("Failed: {e}"))),
-            }
-        })
-    }
-
-    fn execute_with_context<'a>(
-        &'a self,
-        params: ToolParameters,
-        ctx: &'a echo_core::tools::ToolContext,
-    ) -> futures::future::BoxFuture<'a, echo_agent::error::Result<ToolResult>> {
-        Box::pin(async move { scoped_with_ctx_run_id(ctx, || self.execute(params)).await })
-    }
 }
 
 // ── task_skip ─────────────────────────────────────────────────────────────

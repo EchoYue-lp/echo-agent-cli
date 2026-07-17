@@ -4210,10 +4210,30 @@ fn append_subagent_summary(content: &mut String, runs: &[SubagentRuntimeView]) {
             .tokens_used
             .map(|tokens| format!(", {tokens} tokens"))
             .unwrap_or_default();
+        let summary = if run.summary.trim().is_empty() {
+            String::new()
+        } else {
+            format!(" · {}", run.summary.chars().take(160).collect::<String>())
+        };
         content.push_str(&format!(
-            "\n  [{}] {} · {} tools{}",
-            run.status, run.agent, run.tool_calls, usage
+            "\n  [{}] {} · {} tools{}{}",
+            run.status, run.agent, run.tool_calls, usage, summary
         ));
+        if !run.verification.is_empty() {
+            content.push_str(&format!(
+                "\n    verification: {}",
+                run.verification.join("; ")
+            ));
+        }
+        if !run.artifacts.is_empty() {
+            content.push_str(&format!("\n    artifacts: {}", run.artifacts.join(", ")));
+        }
+        if !run.remaining_work.is_empty() {
+            content.push_str(&format!(
+                "\n    remaining: {}",
+                run.remaining_work.join("; ")
+            ));
+        }
     }
 }
 
@@ -4261,6 +4281,12 @@ fn update_subagent_runs(app: &mut TuiApp, event: &SubagentEvent) {
                     tokens_used: None,
                     duration_ms: None,
                     background: *background,
+                    summary: String::new(),
+                    artifacts: Vec::new(),
+                    verification: Vec::new(),
+                    remaining_work: Vec::new(),
+                    files_read: Vec::new(),
+                    files_written: Vec::new(),
                 });
             }
         }
@@ -4278,30 +4304,37 @@ fn update_subagent_runs(app: &mut TuiApp, event: &SubagentEvent) {
             execution_id,
             duration_ms,
             tokens_used,
+            result,
             ..
         } => {
             if let Some(run) = find_subagent_run_mut(app, execution_id.as_deref(), agent) {
-                run.status = "completed".to_string();
+                run.status = result.status.as_str().to_string();
                 run.duration_ms = Some(*duration_ms);
                 run.tokens_used = *tokens_used;
+                apply_subagent_result(run, result);
             }
         }
         SubagentEvent::DispatchFailed {
             agent,
             execution_id,
+            status,
+            result,
             ..
         } => {
             if let Some(run) = find_subagent_run_mut(app, execution_id.as_deref(), agent) {
-                run.status = "failed".to_string();
+                run.status = status.as_str().to_string();
+                apply_subagent_result(run, result);
             }
         }
         SubagentEvent::DispatchCancelled {
             agent,
             execution_id,
+            result,
             ..
         } => {
             if let Some(run) = find_subagent_run_mut(app, execution_id.as_deref(), agent) {
                 run.status = "cancelled".to_string();
+                apply_subagent_result(run, result);
             }
         }
         _ => {}
@@ -4310,6 +4343,26 @@ fn update_subagent_runs(app: &mut TuiApp, event: &SubagentEvent) {
         let remove = app.subagent_runs.len().saturating_sub(50);
         app.subagent_runs.drain(..remove);
     }
+}
+
+fn apply_subagent_result(
+    run: &mut SubagentRuntimeView,
+    result: &echo_agent::agent::subagent::SubagentOutcome,
+) {
+    run.summary = result.summary.clone();
+    run.artifacts = result
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.path.clone())
+        .collect();
+    run.verification = result
+        .verification
+        .iter()
+        .map(|item| format!("{}: {:?}", item.check, item.status))
+        .collect();
+    run.remaining_work = result.remaining_work.clone();
+    run.files_read = result.touched_files.read.clone();
+    run.files_written = result.touched_files.written.clone();
 }
 
 fn subagent_event_id(execution_id: Option<&str>, agent: &str) -> String {
@@ -4528,6 +4581,30 @@ mod tests {
                 run_id: Some("run-1".to_string()),
             },
         );
+        let terminal_result = echo_agent::agent::subagent::SubagentOutcome {
+            contract_version: 1,
+            status: echo_agent::agent::subagent::SubagentStatus::Completed,
+            summary: "done".to_string(),
+            artifacts: vec![echo_agent::agent::subagent::SubagentArtifact {
+                path: "report.json".to_string(),
+                kind: "report".to_string(),
+                bytes: Some(42),
+                sha256: Some("a".repeat(64)),
+                producer_execution_id: Some("task-1:1".to_string()),
+                available: true,
+            }],
+            verification: vec![echo_agent::agent::subagent::SubagentVerification {
+                check: "cargo test".to_string(),
+                status: echo_agent::agent::subagent::SubagentVerificationStatus::Passed,
+                details: "ok".to_string(),
+                source: echo_agent::agent::subagent::SubagentVerificationSource::Observed,
+            }],
+            remaining_work: Vec::new(),
+            touched_files: echo_agent::agent::subagent::SubagentTouchedFiles {
+                read: vec!["src/lib.rs".to_string()],
+                written: vec!["report.json".to_string()],
+            },
+        };
         update_subagent_runs(
             &mut app,
             &SubagentEvent::DispatchCompleted {
@@ -4537,6 +4614,7 @@ mod tests {
                 tokens_used: Some(42),
                 iterations: Some(1),
                 output: "done".to_string(),
+                result: terminal_result,
                 execution_id: Some("task-1:1".to_string()),
                 run_id: Some("run-1".to_string()),
             },
@@ -4547,5 +4625,10 @@ mod tests {
         assert_eq!(run.tool_calls, 1);
         assert_eq!(run.tokens_used, Some(42));
         assert_eq!(run.duration_ms, Some(120));
+        assert_eq!(run.summary, "done");
+        assert_eq!(run.artifacts, vec!["report.json".to_string()]);
+        assert_eq!(run.verification, vec!["cargo test: Passed".to_string()]);
+        assert_eq!(run.files_read, vec!["src/lib.rs".to_string()]);
+        assert_eq!(run.files_written, vec!["report.json".to_string()]);
     }
 }

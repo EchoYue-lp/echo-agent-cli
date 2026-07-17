@@ -330,10 +330,16 @@ fn task_sort_key(tasks: &[PlanTask], task_id: &str) -> i64 {
 
 fn format_summary(summary: &TaskExecutionSummary) -> String {
     let mut parts = Vec::new();
-    push_summary_field(&mut parts, "done", &summary.completed_work);
-    push_summary_field(&mut parts, "changed", &summary.files_changed);
+    if !summary.result.summary.trim().is_empty() {
+        push_summary_field(
+            &mut parts,
+            "done",
+            std::slice::from_ref(&summary.result.summary),
+        );
+    }
+    push_summary_field(&mut parts, "changed", &summary.result.touched_files.written);
     push_summary_field(&mut parts, "decisions", &summary.decisions);
-    push_summary_field(&mut parts, "failures", &summary.failures);
+    push_summary_field(&mut parts, "remaining", &summary.result.remaining_work);
     push_summary_field(&mut parts, "next", &summary.next_implications);
     truncate_chars(&parts.join(" | "), MAX_SUMMARY_CHARS)
 }
@@ -394,7 +400,8 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 mod tests {
     use super::*;
     use crate::tasks::task_runtime::types::{
-        AttendedMode, DomainProfile, ExecutionMode, PlanTaskKind, TaskPlan, TaskRunStatus,
+        AttendedMode, DomainProfile, ExecutionMode, PlanTaskKind, SubagentRunStatus,
+        SubagentTaskResult, SubagentTouchedFiles, TaskPlan, TaskRunStatus,
     };
     use chrono::Utc;
     use echo_agent::compression::{ContextManager, PreModelContextProjector, ProjectionContext};
@@ -507,12 +514,19 @@ mod tests {
                 run_id: "r1".to_string(),
                 task_id: "t1".to_string(),
                 worker_agent: "explorer".to_string(),
-                completed_work: vec!["确认 force_compress 不携带 TaskRuntime 状态".to_string()],
-                files_read: vec!["echo-state/src/compression/mod.rs".to_string()],
-                files_changed: Vec::new(),
+                result: SubagentTaskResult {
+                    contract_version: 1,
+                    status: SubagentRunStatus::Completed,
+                    summary: "确认 force_compress 不携带 TaskRuntime 状态".to_string(),
+                    artifacts: Vec::new(),
+                    verification: Vec::new(),
+                    remaining_work: Vec::new(),
+                    touched_files: SubagentTouchedFiles {
+                        read: vec!["echo-state/src/compression/mod.rs".to_string()],
+                        written: Vec::new(),
+                    },
+                },
                 decisions: vec!["恢复信息放应用层".to_string()],
-                failures: Vec::new(),
-                verification: Vec::new(),
                 next_implications: vec!["t2 需要保护 runtime capsule".to_string()],
                 suggested_tasks: Vec::new(),
                 created_at: Utc::now(),

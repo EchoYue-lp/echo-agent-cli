@@ -1389,17 +1389,16 @@ impl TaskRuntimeStore {
         Ok(())
     }
 
-    /// Persist a worker terminal fact. `summary` is bounded because the full
-    /// structured result already lives in the task summary projection.
+    /// Persist a worker terminal fact with the structured result needed for resume.
     pub fn record_worker_released(
         &self,
         run_id: &str,
         task_id: &str,
         execution_id: &str,
         status: &str,
-        summary: Option<&str>,
+        result: Option<&SubagentTaskResult>,
     ) -> Result<(), StoreError> {
-        let summary = summary.map(|text| bounded_event_text(text, 2_000));
+        let summary = result.map(|value| bounded_event_text(&value.summary, 2_000));
         self.shadow.append_event_line(
             run_id,
             Some(task_id),
@@ -1409,6 +1408,7 @@ impl TaskRuntimeStore {
                 "execution_id": execution_id,
                 "status": status,
                 "summary": summary,
+                "result": result,
             }),
         )?;
         Ok(())
@@ -1486,7 +1486,7 @@ impl TaskRuntimeStore {
         run_id: &str,
         task_id: &str,
         execution_id: &str,
-    ) -> Result<Option<String>, StoreError> {
+    ) -> Result<Option<SubagentTaskResult>, StoreError> {
         let mut result = None;
         for event in self.list_events(run_id, 0)? {
             if event.task_id.as_deref() != Some(task_id)
@@ -1497,9 +1497,16 @@ impl TaskRuntimeStore {
             match event.event_type {
                 RuntimeEventKind::WorkerAssigned => result = None,
                 RuntimeEventKind::WorkerReleased => {
-                    result = (json_string(&event.payload, "status").as_deref()
-                        == Some("completed"))
-                    .then(|| json_string(&event.payload, "summary").unwrap_or_default());
+                    result =
+                        if json_string(&event.payload, "status").as_deref() == Some("completed") {
+                            event
+                                .payload
+                                .get("result")
+                                .cloned()
+                                .and_then(|value| serde_json::from_value(value).ok())
+                        } else {
+                            None
+                        };
                 }
                 _ => {}
             }
@@ -1884,19 +1891,31 @@ mod tests {
             run_id: "r1".into(),
             task_id: "t1".into(),
             worker_agent: "code_reviewer".into(),
-            completed_work: vec!["read chat.rs".into()],
-            files_read: vec!["chat.rs".into()],
-            files_changed: vec![],
+            result: SubagentTaskResult {
+                contract_version: 1,
+                status: SubagentRunStatus::Completed,
+                summary: "read chat.rs".into(),
+                artifacts: Vec::new(),
+                verification: vec![SubagentVerificationResult {
+                    check: "cargo check".into(),
+                    status: SubagentVerificationStatus::Passed,
+                    details: String::new(),
+                    source: SubagentVerificationSource::Observed,
+                }],
+                remaining_work: Vec::new(),
+                touched_files: SubagentTouchedFiles {
+                    read: vec!["chat.rs".into()],
+                    written: Vec::new(),
+                },
+            },
             decisions: vec!["route via TaskRuntime".into()],
-            failures: vec![],
-            verification: vec!["cargo check".into()],
             next_implications: vec!["implement router".into()],
             suggested_tasks: vec![],
             created_at: Utc::now(),
         };
         s.put_summary(&sum).unwrap();
         let got = s.get_summary("r1", "t1").unwrap().unwrap();
-        assert_eq!(got.completed_work, vec!["read chat.rs".to_string()]);
+        assert_eq!(got.result.summary, "read chat.rs");
         assert_eq!(got.next_implications.len(), 1);
     }
 
@@ -2051,12 +2070,17 @@ mod tests {
         seed_plan(&store);
         store.set_task_status("r1", "t1", TodoStatus::Running, Some("worker"), None)?;
         store.record_worker_assigned("r1", "t1", "t1:1", "worker", 1, true)?;
-        store.record_worker_released("r1", "t1", "t1:1", "completed", Some("durable result"))?;
+        let result = SubagentTaskResult::terminal(
+            SubagentRunStatus::Completed,
+            "durable result",
+            Vec::new(),
+        );
+        store.record_worker_released("r1", "t1", "t1:1", "completed", Some(&result))?;
 
         assert_eq!(store.recover_incomplete(), 1);
         assert_eq!(
             store.recoverable_worker_result("r1", "t1", "t1:1")?,
-            Some("durable result".to_string())
+            Some(result)
         );
         let todo = store
             .list_todos("r1")?
@@ -2443,6 +2467,7 @@ mod tests {
             parallel_group: None,
             files: Vec::new(),
             allowed_tools: vec!["read_file".to_string()],
+            required_artifacts: Vec::new(),
             verification: Vec::new(),
             retry_count: 0,
             max_retries: 3,

@@ -380,13 +380,10 @@ pub fn build_tauri_app(
                                             tokens_used,
                                             iterations,
                                             output,
+                                            result,
                                             execution_id,
                                             run_id,
                                         } => {
-                                            let (summary, _) =
-                                                echo_agent::agent::subagent::split_subagent_output(
-                                                    output,
-                                                );
                                             (
                                                 "completed",
                                                 execution_id.clone(),
@@ -397,7 +394,13 @@ pub fn build_tauri_app(
                                                     "tokens_used": tokens_used,
                                                     "iteration_count": iterations,
                                                     "output": output.clone(),
-                                                    "summary": summary,
+                                                    "terminal_status": result.status.as_str(),
+                                                    "contract_version": result.contract_version,
+                                                    "summary": result.summary.clone(),
+                                                    "artifacts": result.artifacts.clone(),
+                                                    "verification": result.verification.clone(),
+                                                    "remaining_work": result.remaining_work.clone(),
+                                                    "touched_files": result.touched_files.clone(),
                                                 }),
                                             )
                                         },
@@ -405,20 +408,30 @@ pub fn build_tauri_app(
                                             parent: _,
                                             agent,
                                             error,
+                                            status,
+                                            result,
                                             execution_id,
                                             run_id,
                                         } => (
-                                            "failed",
+                                            status.as_str(),
                                             execution_id.clone(),
                                             run_id.clone(),
                                             agent.clone(),
                                             serde_json::json!({
                                                 "error": error.clone(),
+                                                "terminal_status": status.as_str(),
+                                                "contract_version": result.contract_version,
+                                                "summary": result.summary.clone(),
+                                                "artifacts": result.artifacts.clone(),
+                                                "verification": result.verification.clone(),
+                                                "remaining_work": result.remaining_work.clone(),
+                                                "touched_files": result.touched_files.clone(),
                                             }),
                                         ),
                                         SubagentEvent::DispatchCancelled {
                                             parent: _,
                                             agent,
+                                            result,
                                             execution_id,
                                             run_id,
                                         } => (
@@ -426,7 +439,15 @@ pub fn build_tauri_app(
                                             execution_id.clone(),
                                             run_id.clone(),
                                             agent.clone(),
-                                            serde_json::json!({}),
+                                            serde_json::json!({
+                                                "terminal_status": result.status.as_str(),
+                                                "contract_version": result.contract_version,
+                                                "summary": result.summary.clone(),
+                                                "artifacts": result.artifacts.clone(),
+                                                "verification": result.verification.clone(),
+                                                "remaining_work": result.remaining_work.clone(),
+                                                "touched_files": result.touched_files.clone(),
+                                            }),
                                         ),
                                         SubagentEvent::DispatchThinkingStarted {
                                             parent: _,

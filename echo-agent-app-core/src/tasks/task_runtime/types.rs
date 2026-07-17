@@ -736,6 +736,10 @@ pub struct PlanTask {
     pub parallel_group: Option<String>,
     pub files: Vec<String>,
     pub allowed_tools: Vec<String>,
+    /// Artifact paths or suffixes that must be present and integrity-checked
+    /// before this task may enter Completed.
+    #[serde(default)]
+    pub required_artifacts: Vec<String>,
     pub verification: Vec<String>,
     pub retry_count: u32,
     pub max_retries: u32,
@@ -761,6 +765,7 @@ impl Default for PlanTask {
             parallel_group: None,
             files: Vec::new(),
             allowed_tools: Vec::new(),
+            required_artifacts: Vec::new(),
             verification: Vec::new(),
             retry_count: 0,
             max_retries: 3,
@@ -803,6 +808,8 @@ pub struct TaskPatch {
     pub depends_on: Option<Vec<String>>,
     pub files: Option<Vec<String>>,
     pub allowed_tools: Option<Vec<String>>,
+    pub required_artifacts: Option<Vec<String>>,
+    pub verification: Option<Vec<String>>,
 }
 
 /// A todo row — the GUI-facing projection of a plan task's progress.
@@ -935,6 +942,7 @@ pub enum SubagentRunStatus {
     Completed,
     Failed,
     Cancelled,
+    TimedOut,
 }
 
 impl SubagentRunStatus {
@@ -944,6 +952,7 @@ impl SubagentRunStatus {
             SubagentRunStatus::Completed => "completed",
             SubagentRunStatus::Failed => "failed",
             SubagentRunStatus::Cancelled => "cancelled",
+            SubagentRunStatus::TimedOut => "timed_out",
         }
     }
 
@@ -954,8 +963,161 @@ impl SubagentRunStatus {
             "completed" => SubagentRunStatus::Completed,
             "failed" => SubagentRunStatus::Failed,
             "cancelled" => SubagentRunStatus::Cancelled,
+            "timed_out" => SubagentRunStatus::TimedOut,
             _ => return None,
         })
+    }
+}
+
+impl From<echo_agent::agent::subagent::SubagentStatus> for SubagentRunStatus {
+    fn from(status: echo_agent::agent::subagent::SubagentStatus) -> Self {
+        match status {
+            echo_agent::agent::subagent::SubagentStatus::Completed => Self::Completed,
+            echo_agent::agent::subagent::SubagentStatus::Failed => Self::Failed,
+            echo_agent::agent::subagent::SubagentStatus::Cancelled => Self::Cancelled,
+            echo_agent::agent::subagent::SubagentStatus::TimedOut => Self::TimedOut,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, rename = "SubagentArtifactResult")]
+pub struct SubagentArtifactResult {
+    pub path: String,
+    pub kind: String,
+    pub bytes: Option<u64>,
+    pub sha256: Option<String>,
+    pub producer_execution_id: Option<String>,
+    pub available: bool,
+}
+
+impl From<&echo_agent::agent::subagent::SubagentArtifact> for SubagentArtifactResult {
+    fn from(artifact: &echo_agent::agent::subagent::SubagentArtifact) -> Self {
+        Self {
+            path: artifact.path.clone(),
+            kind: artifact.kind.clone(),
+            bytes: artifact.bytes,
+            sha256: artifact.sha256.clone(),
+            producer_execution_id: artifact.producer_execution_id.clone(),
+            available: artifact.available,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename = "SubagentVerificationStatus")]
+pub enum SubagentVerificationStatus {
+    Passed,
+    Failed,
+    NotRun,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, rename = "SubagentVerificationSource")]
+pub enum SubagentVerificationSource {
+    Observed,
+    Reported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, rename = "SubagentVerificationResult")]
+pub struct SubagentVerificationResult {
+    pub check: String,
+    pub status: SubagentVerificationStatus,
+    pub details: String,
+    pub source: SubagentVerificationSource,
+}
+
+impl From<&echo_agent::agent::subagent::SubagentVerification> for SubagentVerificationResult {
+    fn from(verification: &echo_agent::agent::subagent::SubagentVerification) -> Self {
+        Self {
+            check: verification.check.clone(),
+            status: match verification.status {
+                echo_agent::agent::subagent::SubagentVerificationStatus::Passed => {
+                    SubagentVerificationStatus::Passed
+                }
+                echo_agent::agent::subagent::SubagentVerificationStatus::Failed => {
+                    SubagentVerificationStatus::Failed
+                }
+                echo_agent::agent::subagent::SubagentVerificationStatus::NotRun => {
+                    SubagentVerificationStatus::NotRun
+                }
+            },
+            details: verification.details.clone(),
+            source: match verification.source {
+                echo_agent::agent::subagent::SubagentVerificationSource::Observed => {
+                    SubagentVerificationSource::Observed
+                }
+                echo_agent::agent::subagent::SubagentVerificationSource::Reported => {
+                    SubagentVerificationSource::Reported
+                }
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, rename = "SubagentTouchedFiles")]
+pub struct SubagentTouchedFiles {
+    pub read: Vec<String>,
+    pub written: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, rename = "SubagentTaskResult")]
+pub struct SubagentTaskResult {
+    pub contract_version: u32,
+    pub status: SubagentRunStatus,
+    pub summary: String,
+    pub artifacts: Vec<SubagentArtifactResult>,
+    pub verification: Vec<SubagentVerificationResult>,
+    pub remaining_work: Vec<String>,
+    pub touched_files: SubagentTouchedFiles,
+}
+
+impl SubagentTaskResult {
+    pub fn from_framework(result: &echo_agent::agent::subagent::SubagentResult) -> Self {
+        Self::from_framework_outcome(&result.outcome)
+    }
+
+    pub fn from_framework_outcome(outcome: &echo_agent::agent::subagent::SubagentOutcome) -> Self {
+        Self {
+            contract_version: outcome.contract_version,
+            status: outcome.status.into(),
+            summary: outcome.summary.clone(),
+            artifacts: outcome.artifacts.iter().map(Into::into).collect(),
+            verification: outcome.verification.iter().map(Into::into).collect(),
+            remaining_work: outcome.remaining_work.clone(),
+            touched_files: SubagentTouchedFiles {
+                read: outcome.touched_files.read.clone(),
+                written: outcome.touched_files.written.clone(),
+            },
+        }
+    }
+
+    pub fn terminal(
+        status: SubagentRunStatus,
+        summary: impl Into<String>,
+        remaining_work: Vec<String>,
+    ) -> Self {
+        let summary: String = summary.into().chars().take(1_200).collect();
+        let remaining_work = remaining_work
+            .into_iter()
+            .map(|item| item.chars().take(500).collect())
+            .filter(|item: &String| !item.trim().is_empty())
+            .take(64)
+            .collect();
+        Self {
+            contract_version: 1,
+            status,
+            summary,
+            artifacts: Vec::new(),
+            verification: Vec::new(),
+            remaining_work,
+            touched_files: SubagentTouchedFiles::default(),
+        }
     }
 }
 
@@ -1004,8 +1166,8 @@ pub struct SubagentRun {
     pub status: SubagentRunStatus,
     /// Aggregate cost. Populated progressively; finalized on completion.
     pub usage: SubagentRunUsage,
-    /// Output returned to the Task on success (None while running).
-    pub result: Option<String>,
+    /// Structured output returned to the Task (None while running).
+    pub result: Option<SubagentTaskResult>,
 }
 
 impl SubagentRun {
@@ -1097,12 +1259,8 @@ pub struct TaskExecutionSummary {
     pub run_id: String,
     pub task_id: String,
     pub worker_agent: String,
-    pub completed_work: Vec<String>,
-    pub files_read: Vec<String>,
-    pub files_changed: Vec<String>,
+    pub result: SubagentTaskResult,
     pub decisions: Vec<String>,
-    pub failures: Vec<String>,
-    pub verification: Vec<String>,
     pub next_implications: Vec<String>,
     #[serde(default)]
     pub suggested_tasks: Vec<SuggestedTask>,
@@ -1118,12 +1276,28 @@ impl TaskExecutionSummary {
             run_id: self.run_id.clone(),
             task_id: self.task_id.clone(),
             worker_agent: self.worker_agent.clone(),
-            completed_work: self.completed_work.clone(),
-            files_read: self.files_read.clone(),
-            files_changed: self.files_changed.clone(),
+            completed_work: if self.result.summary.trim().is_empty() {
+                Vec::new()
+            } else {
+                vec![self.result.summary.clone()]
+            },
+            files_read: self.result.touched_files.read.clone(),
+            files_changed: self.result.touched_files.written.clone(),
             decisions: self.decisions.clone(),
-            failures: self.failures.clone(),
-            verification: self.verification.clone(),
+            failures: if self.result.status == SubagentRunStatus::Completed {
+                self.result.remaining_work.clone()
+            } else {
+                let mut failures =
+                    vec![format!("subagent status: {}", self.result.status.as_str())];
+                failures.extend(self.result.remaining_work.clone());
+                failures
+            },
+            verification: self
+                .result
+                .verification
+                .iter()
+                .map(|item| format!("{}: {:?}", item.check, item.status))
+                .collect(),
             next_implications: self.next_implications.clone(),
             suggested_tasks: self
                 .suggested_tasks
@@ -1379,6 +1553,7 @@ mod tests {
             parallel_group: Some("g1".to_string()),
             files: vec!["src/lib.rs".to_string()],
             allowed_tools: vec!["read_file".to_string()],
+            required_artifacts: Vec::new(),
             verification: vec!["cargo check".to_string()],
             retry_count: 1,
             max_retries: 2,
@@ -1408,12 +1583,19 @@ mod tests {
             run_id: "r1".to_string(),
             task_id: "t1".to_string(),
             worker_agent: "explorer".to_string(),
-            completed_work: vec!["Read runtime".to_string()],
-            files_read: vec!["runtime.rs".to_string()],
-            files_changed: Vec::new(),
+            result: SubagentTaskResult {
+                contract_version: 1,
+                status: SubagentRunStatus::Completed,
+                summary: "Read runtime".to_string(),
+                artifacts: Vec::new(),
+                verification: Vec::new(),
+                remaining_work: Vec::new(),
+                touched_files: SubagentTouchedFiles {
+                    read: vec!["runtime.rs".to_string()],
+                    written: Vec::new(),
+                },
+            },
             decisions: Vec::new(),
-            failures: Vec::new(),
-            verification: Vec::new(),
             next_implications: Vec::new(),
             suggested_tasks: vec![SuggestedTask {
                 title: "Extract DAG kernel".to_string(),
@@ -1434,6 +1616,22 @@ mod tests {
         assert_eq!(
             runtime.suggested_tasks.first().map(|task| task.kind),
             Some(echo_agent::tasks::RuntimeTaskKind::Implementation)
+        );
+    }
+
+    #[test]
+    fn terminal_subagent_result_bounds_utf8_failure_text() {
+        let long = "中".repeat(2_000);
+        let result =
+            SubagentTaskResult::terminal(SubagentRunStatus::TimedOut, long.clone(), vec![long; 70]);
+
+        assert_eq!(result.summary.chars().count(), 1_200);
+        assert_eq!(result.remaining_work.len(), 64);
+        assert!(
+            result
+                .remaining_work
+                .iter()
+                .all(|item| item.chars().count() == 500)
         );
     }
 

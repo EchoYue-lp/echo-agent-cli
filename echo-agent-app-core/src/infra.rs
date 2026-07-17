@@ -67,7 +67,7 @@ Choose the lightest mechanism that still gives the user a reliable result:
 ### Formal Plan Contract
 - Create tasks with a concrete outcome, kind, role, targets, dependencies, and verification. Avoid vague tasks such as "continue improving".
 - Independent read-only tasks may run in parallel. Writer tasks must declare their intended files or artifacts so the runtime can isolate and schedule them safely.
-- Keep the plan truthful as evidence changes: use `task_update`, `task_complete`, `task_skip`, and `task_list`. Do not mark work complete before its verification is addressed.
+- Keep the plan truthful as evidence changes: use `task_update`, `task_skip`, and `task_list`. Completion is written only by the runtime after result verification.
 - `plan_execute({task})` is only for inline single-subagent dispatch when that field exists in the active tool schema. Never use it as a substitute for the formal DAG in Task mode.
 - After execution, synthesize the worker evidence, resolve conflicts, and answer the user's original goal. Do not merely repeat worker summaries.
 
@@ -483,21 +483,18 @@ pub async fn create_agent_with_diagnostics(
     register_default_hooks(&mut agent);
 
     // Register task-management tools when a TaskRuntimeStore is available.
-    // These let the main agent autonomously create / update / complete / skip /
+    // These let the main agent autonomously create / update / skip /
     // list tasks during execution (mirrors Claude Code's TaskCreate/Update).
     // The store handle is threaded from AppState → SharedResources → params.
     if let Some(store) = &params.task_runtime_store {
         use crate::tasks::task_runtime::task_tools::{
-            TaskCompleteTool, TaskCreateTool, TaskListTool, TaskSkipTool, TaskUpdateTool,
+            TaskCreateTool, TaskListTool, TaskSkipTool, TaskUpdateTool,
         };
         let store = Arc::clone(store);
         agent.add_tool(Box::new(TaskCreateTool {
             store: Arc::clone(&store),
         }));
         agent.add_tool(Box::new(TaskUpdateTool {
-            store: Arc::clone(&store),
-        }));
-        agent.add_tool(Box::new(TaskCompleteTool {
             store: Arc::clone(&store),
         }));
         agent.add_tool(Box::new(TaskSkipTool {
@@ -507,7 +504,7 @@ pub async fn create_agent_with_diagnostics(
             store: Arc::clone(&store),
         }));
         tracing::info!(
-            "Registered 5 task-management tools (plan_create/task_update/task_complete/task_skip/task_list)"
+            "Registered 4 task-management tools (plan_create/task_update/task_skip/task_list)"
         );
     }
 

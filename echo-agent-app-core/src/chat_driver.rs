@@ -340,7 +340,6 @@ async fn drive_chat_inner(
                 [
                     "plan_create",
                     "task_update",
-                    "task_complete",
                     "task_skip",
                     "task_list",
                     "plan_execute",

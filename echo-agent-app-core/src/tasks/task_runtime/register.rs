@@ -20,8 +20,8 @@ use crate::agent_handle::AgentHandle;
 use crate::tasks::task_runtime::execute_plan_tool::ExecutePlanTool;
 use crate::tasks::task_runtime::store::TaskRuntimeStore;
 use crate::tasks::task_runtime::task_tools::{
-    CancelRunTool, CheckRunStatusTool, CreateComplexTaskTool, TaskCompleteTool, TaskCreateTool,
-    TaskListTool, TaskSkipTool, TaskUpdateTool,
+    CancelRunTool, CheckRunStatusTool, CreateComplexTaskTool, TaskCreateTool, TaskListTool,
+    TaskSkipTool, TaskUpdateTool,
 };
 
 /// Register the task-management tools + `plan_execute` (with store) on
@@ -36,9 +36,6 @@ pub async fn register_task_tools_on_agent(
                 store: store.clone(),
             }));
             agent.add_tool(Box::new(TaskUpdateTool {
-                store: store.clone(),
-            }));
-            agent.add_tool(Box::new(TaskCompleteTool {
                 store: store.clone(),
             }));
             agent.add_tool(Box::new(TaskSkipTool {

@@ -8,11 +8,32 @@ import type { TodoStatus } from "./TodoStatus";
  * scheduler (PR 3) builds adjacency indexes from it but `PlanTask` remains
  * the serialized node.
  */
-export type PlanTask = { id: string, title: string, description: string, kind: PlanTaskKind, agent_role: string, domain_profile: DomainProfile, depends_on: Array<string>, parallel_group: string | null, files: Array<string>, allowed_tools: Array<string>, verification: Array<string>, retry_count: number, max_retries: number, failure_fingerprint: string | null, status: TodoStatus, 
-/**
- * Stable sort key for display ordering. Set by plan generation (sequential
- * index) and updated by `reorder_tasks`. Separated from `parallel_group`
- * (which encodes parallel-fanout grouping, not display order) to avoid
- * semantic pollution.
- */
-sort_order: bigint, };
+export type PlanTask = {
+  id: string;
+  title: string;
+  description: string;
+  kind: PlanTaskKind;
+  agent_role: string;
+  domain_profile: DomainProfile;
+  depends_on: Array<string>;
+  parallel_group: string | null;
+  files: Array<string>;
+  allowed_tools: Array<string>;
+  /**
+   * Artifact paths or suffixes that must be present and integrity-checked
+   * before this task may enter Completed.
+   */
+  required_artifacts: Array<string>;
+  verification: Array<string>;
+  retry_count: number;
+  max_retries: number;
+  failure_fingerprint: string | null;
+  status: TodoStatus;
+  /**
+   * Stable sort key for display ordering. Set by plan generation (sequential
+   * index) and updated by `reorder_tasks`. Separated from `parallel_group`
+   * (which encodes parallel-fanout grouping, not display order) to avoid
+   * semantic pollution.
+   */
+  sort_order: bigint;
+};

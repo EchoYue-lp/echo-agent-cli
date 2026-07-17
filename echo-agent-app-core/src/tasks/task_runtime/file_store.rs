@@ -390,6 +390,7 @@ mod tests {
             parallel_group: None,
             files: vec!["src/a.rs".to_string()],
             allowed_tools: vec!["read_file".to_string()],
+            required_artifacts: Vec::new(),
             verification: Vec::new(),
             retry_count: 0,
             max_retries: 3,

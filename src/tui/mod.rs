@@ -187,6 +187,12 @@ pub struct SubagentRuntimeView {
     pub tokens_used: Option<u64>,
     pub duration_ms: Option<u64>,
     pub background: bool,
+    pub summary: String,
+    pub artifacts: Vec<String>,
+    pub verification: Vec<String>,
+    pub remaining_work: Vec<String>,
+    pub files_read: Vec<String>,
+    pub files_written: Vec<String>,
 }
 
 /// TUI application state.

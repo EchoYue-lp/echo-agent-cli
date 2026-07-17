@@ -232,6 +232,7 @@ mod tests {
             parallel_group: None,
             files: files.iter().map(|s| s.to_string()).collect(),
             allowed_tools: Vec::new(),
+            required_artifacts: Vec::new(),
             verification: Vec::new(),
             retry_count: 0,
             max_retries: 0,

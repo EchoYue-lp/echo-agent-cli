@@ -33,7 +33,29 @@ export type SubagentRunEventKind =
   | 'artifact'
   | 'completed'
   | 'failed'
+  | 'timed_out'
   | 'cancelled';
+
+export interface SubagentArtifactResult {
+  path: string;
+  kind: string;
+  bytes?: number;
+  sha256?: string;
+  producer_execution_id?: string;
+  available: boolean;
+}
+
+export interface SubagentVerificationResult {
+  check: string;
+  status: 'passed' | 'failed' | 'not_run';
+  details: string;
+  source: 'observed' | 'reported';
+}
+
+export interface SubagentTouchedFiles {
+  read: string[];
+  written: string[];
+}
 
 /** One raw event on the wire (the bridge emits these as a serde_json::Object). */
 export interface ExecutionEvent {
@@ -76,10 +98,16 @@ export interface ExecutionEvent {
   background?: boolean;
   /** Parent-facing summary on completed events. */
   summary?: string;
+  contract_version?: number;
+  terminal_status?: 'completed' | 'failed' | 'cancelled' | 'timed_out';
+  artifacts?: SubagentArtifactResult[];
+  verification?: SubagentVerificationResult[];
+  remaining_work?: string[];
+  touched_files?: SubagentTouchedFiles;
   [key: string]: unknown;
 }
 
-export type SubagentRunStatus = 'running' | 'completed' | 'failed' | 'cancelled';
+export type SubagentRunStatus = 'running' | 'completed' | 'failed' | 'cancelled' | 'timed_out';
 
 export interface SubagentRunState {
   subagentRunId: string;
@@ -112,8 +140,13 @@ export interface SubagentRunState {
   /** True when started via background dispatch (agent_tool background=true or
    * role is_background). Completion injects a finished note into chat. */
   background?: boolean;
-  /** Parent-facing summary from completed event (## Summary or truncated output). */
+  /** Parent-facing summary from the terminal structured result. */
   summary?: string;
+  contractVersion?: number;
+  artifacts?: SubagentArtifactResult[];
+  verification?: SubagentVerificationResult[];
+  remainingWork?: string[];
+  touchedFiles?: SubagentTouchedFiles;
   /** Accumulated LLM usage across all model calls in this run (for cache diagnostics). */
   usageEvents?: ExecutionEvent[];
   /** Append-only event log (thinking/tool/token deltas). Capped to bound memory. */
@@ -138,6 +171,8 @@ function statusFromEvent(event: SubagentRunEventKind): SubagentRunStatus | null 
       return 'completed';
     case 'failed':
       return 'failed';
+    case 'timed_out':
+      return 'timed_out';
     case 'cancelled':
       return 'cancelled';
     default:
@@ -205,6 +240,15 @@ export const useSubagentRunStore = create<SubagentRunStore>((set) => ({
         messageId: ev.message_id ?? run.messageId,
         background: typeof ev.background === 'boolean' ? ev.background : run.background,
         summary: typeof ev.summary === 'string' ? ev.summary : run.summary,
+        contractVersion:
+          typeof ev.contract_version === 'number' ? ev.contract_version : run.contractVersion,
+        artifacts: Array.isArray(ev.artifacts) ? ev.artifacts : run.artifacts,
+        verification: Array.isArray(ev.verification) ? ev.verification : run.verification,
+        remainingWork: Array.isArray(ev.remaining_work) ? ev.remaining_work : run.remainingWork,
+        touchedFiles:
+          ev.touched_files && typeof ev.touched_files === 'object'
+            ? ev.touched_files
+            : run.touchedFiles,
         usageEvents,
         events,
       };

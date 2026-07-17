@@ -5,4 +5,14 @@ import type { PlanTaskKind } from "./PlanTaskKind";
  * Partial update patch for a [`PlanTask`]. Only non-`None` fields are applied.
  * Used by [`TaskRuntimeStore::update_task`] for in-flight plan edits.
  */
-export type TaskPatch = { title: string | null, description: string | null, kind: PlanTaskKind | null, agent_role: string | null, depends_on: Array<string> | null, files: Array<string> | null, allowed_tools: Array<string> | null, };
+export type TaskPatch = {
+  title: string | null;
+  description: string | null;
+  kind: PlanTaskKind | null;
+  agent_role: string | null;
+  depends_on: Array<string> | null;
+  files: Array<string> | null;
+  allowed_tools: Array<string> | null;
+  required_artifacts: Array<string> | null;
+  verification: Array<string> | null;
+};
