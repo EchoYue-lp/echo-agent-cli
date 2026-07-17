@@ -597,9 +597,8 @@ async fn register_default_subagents(
         // get the readonly tool subset (physical no-write enforcement); writer
         // subagents get the full tool set (shell/file/git) and run inside an
         // isolated git worktree when `isolate_worktree` is set (Sprint 8 wiring).
-        // Writers are still serialized at run time by `write_sem` (default 1);
-        // the worktree gives each its own checkout so writes don't land in the
-        // main workspace.
+        // TaskRuntime may run disjoint exact owners concurrently; every writer
+        // still gets a separate checkout and a reviewed integration boundary.
         let worker_model = resolve_worker_model(worker_def.model.as_deref(), model);
         let worker_llm = llm_config.clone().map(|mut cfg| {
             cfg.model = worker_model.clone();
@@ -782,9 +781,8 @@ async fn register_default_subagents(
 /// Build a **writer** subagent (Sprint 9): same as the readonly subagent
 /// but with full write tools (shell/file/git) instead of the readonly subset.
 /// Used for `Implementation`/`Debugging` tasks that route to Fork subagents in
-/// isolated git worktrees. Writers are still serialized by `write_sem`
-/// (`max_concurrent_writes` = 1) — the worktree gives each its own checkout so
-/// writes don't land in the main workspace, but they don't run concurrently.
+/// isolated git worktrees. TaskRuntime runs disjoint exact owners concurrently,
+/// while overlapping or unknown ownership is split into separate write waves.
 #[allow(clippy::too_many_arguments)]
 fn build_writer_worker_agent(
     name: &str,

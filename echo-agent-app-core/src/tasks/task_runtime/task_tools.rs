@@ -356,8 +356,8 @@ impl Tool for TaskCreateTool {
                     "enum": ["implementation","debugging","verification","review","investigation","test_plan","summary","read_only_review"],
                     "description": "Task kind"
                 },
-                "depends_on": { "type": "array", "items": { "type": "string" }, "description": "Task ids this depends on" },
-                "files": { "type": "array", "items": { "type": "string" }, "description": "Expected file ownership/read-write scope" },
+                "depends_on": { "type": "array", "items": { "type": "string" }, "description": "Explicit prerequisite task ids; ordering is never inferred from prose" },
+                "files": { "type": "array", "items": { "type": "string" }, "description": "For writers: exact workspace-relative files exclusively owned by this task. Empty/glob/broad scopes are treated as unknown and serialized. For readers: inspection targets only." },
                 "allowed_tools": { "type": "array", "items": { "type": "string" }, "description": "Tools allowed for this task" },
                 "required_artifacts": { "type": "array", "items": { "type": "string" }, "description": "Artifact paths or suffixes required for completion" },
                 "verification": { "type": "array", "items": { "type": "string" }, "description": "Checks that require observed successful execution" },
@@ -996,7 +996,7 @@ impl Tool for TaskUpdateTool {
                 "description": { "type": "string", "description": "New description (optional)" },
                 "kind": { "type": "string", "description": "New kind (optional)" },
                 "depends_on": { "type": "array", "items": { "type": "string" }, "description": "New deps (optional)" },
-                "files": { "type": "array", "items": { "type": "string" }, "description": "New file scope (optional)" },
+                "files": { "type": "array", "items": { "type": "string" }, "description": "New exact workspace-relative ownership files (optional); broad/empty writer scopes serialize" },
                 "allowed_tools": { "type": "array", "items": { "type": "string" }, "description": "New tool allowlist (optional)" },
                 "required_artifacts": { "type": "array", "items": { "type": "string" }, "description": "New required artifact list (optional)" },
                 "verification": { "type": "array", "items": { "type": "string" }, "description": "New required verification list (optional)" }

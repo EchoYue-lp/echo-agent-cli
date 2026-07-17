@@ -734,6 +734,9 @@ pub struct PlanTask {
     pub domain_profile: DomainProfile,
     pub depends_on: Vec<String>,
     pub parallel_group: Option<String>,
+    /// Read targets for read-only tasks. For mutating tasks, exact
+    /// workspace-relative files are exclusive ownership; empty/broad/invalid
+    /// declarations are unknown ownership and serialize with every writer.
     pub files: Vec<String>,
     pub allowed_tools: Vec<String>,
     /// Artifact paths or suffixes that must be present and integrity-checked

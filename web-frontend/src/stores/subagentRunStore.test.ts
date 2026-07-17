@@ -52,4 +52,28 @@ describe('subagentRunStore terminal result', () => {
     expect(run?.remainingWork).toEqual(event.remaining_work);
     expect(run?.touchedFiles).toEqual(event.touched_files);
   });
+
+  it('keeps a reviewed writer running until worktree integration is terminal', () => {
+    const base = {
+      kind: 'subagent' as const,
+      subagent_run_id: 'task-merge',
+      run_id: 'run-merge',
+      task_id: 'task-merge',
+      agent: 'implementer',
+    };
+    useSubagentRunStore.getState().ingest({ ...base, event: 'completed' });
+    expect(useSubagentRunStore.getState().runs['task-merge']?.status).toBe('completed');
+
+    useSubagentRunStore.getState().ingest({ ...base, event: 'merge_started' });
+    expect(useSubagentRunStore.getState().runs['task-merge']?.status).toBe('running');
+
+    useSubagentRunStore.getState().ingest({
+      ...base,
+      event: 'merge_failed',
+      error: 'worktree merge conflict',
+    });
+    const failed = useSubagentRunStore.getState().runs['task-merge'];
+    expect(failed?.status).toBe('failed');
+    expect(failed?.error).toBe('worktree merge conflict');
+  });
 });

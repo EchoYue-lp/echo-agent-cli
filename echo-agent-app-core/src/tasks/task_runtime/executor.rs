@@ -634,6 +634,27 @@ pub trait TaskDispatcher: Send + Sync {
         file_write_locks: Arc<std::sync::Mutex<HashMap<String, Arc<TokioMutex<()>>>>>,
         trace_sink: Option<ExecSink>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TaskDispatchResult> + Send>>;
+
+    /// Integrate a reviewed writer result into the authoritative workspace.
+    /// Non-writer dispatchers use the default no-op implementation.
+    #[allow(clippy::too_many_arguments)]
+    fn integrate(
+        &self,
+        _store: Arc<TaskRuntimeStore>,
+        _run_id: String,
+        _task: PlanTask,
+        _execution_id: String,
+        _cancel: CancellationToken,
+        _trace_sink: Option<ExecSink>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<Option<super::worktree::WorktreeIntegrationOutcome>, String>,
+                > + Send,
+        >,
+    > {
+        Box::pin(async { Ok(None) })
+    }
 }
 
 /// Production worker: delegates to [`execute_task`] against the primary agent.
@@ -692,9 +713,176 @@ impl TaskDispatcher for RealTaskDispatcher {
             .await
         })
     }
+
+    fn integrate(
+        &self,
+        store: Arc<TaskRuntimeStore>,
+        run_id: String,
+        task: PlanTask,
+        execution_id: String,
+        cancel: CancellationToken,
+        trace_sink: Option<ExecSink>,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<Option<super::worktree::WorktreeIntegrationOutcome>, String>,
+                > + Send,
+        >,
+    > {
+        let primary_agent = self.primary_agent.clone();
+        Box::pin(async move {
+            if !matches!(
+                task.kind,
+                PlanTaskKind::Implementation | PlanTaskKind::Debugging
+            ) {
+                return Ok(None);
+            }
+            if cancel.is_cancelled() {
+                return Err("cancelled before worktree integration".to_string());
+            }
+
+            let working_dir = primary_agent
+                .read(|agent| agent.working_dir())
+                .await
+                .ok_or_else(|| "writer integration requires a Git working directory".to_string())?;
+            let repo_root =
+                tokio::task::spawn_blocking(move || super::worktree::git_repo_root(&working_dir))
+                    .await
+                    .map_err(|error| format!("failed to join repo-root lookup: {error}"))?
+                    .map_err(|error| error.to_string())?;
+            let merge_lock = super::worktree::repo_merge_lock(&repo_root);
+            let _merge_guard = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return Err("cancelled while waiting for worktree integration".to_string()),
+                guard = merge_lock.lock_owned() => guard,
+            };
+            if cancel.is_cancelled() {
+                return Err("cancelled before worktree integration started".to_string());
+            }
+
+            let label = format!("{}-{}", task.agent_role, execution_id);
+            let ownership = super::planner::file_ownership(&task);
+            let branch = super::worktree::fork_branch_name(&label);
+            let _ = store.note(
+                &run_id,
+                Some(&task.id),
+                &format!("worktree integration started: execution={execution_id}, branch={branch}"),
+            );
+            emit_exec(
+                trace_sink.as_ref(),
+                ExecEvent::for_task(
+                    run_id.clone(),
+                    task.id.clone(),
+                    "merge_started",
+                    serde_json::json!({
+                        "execution_id": execution_id,
+                        "branch": branch,
+                    }),
+                )
+                .with_agent(task.agent_role.clone())
+                .with_title(task.title.clone()),
+            );
+
+            let task_id = task.id.clone();
+            let execution_for_merge = execution_id.clone();
+            let repo_for_merge = repo_root.clone();
+            let label_for_merge = label.clone();
+            let outcome = tokio::task::spawn_blocking(move || {
+                super::worktree::integrate_fork_worktree(
+                    &repo_for_merge,
+                    &label_for_merge,
+                    &task_id,
+                    &execution_for_merge,
+                    &ownership,
+                )
+            })
+            .await
+            .map_err(|error| format!("failed to join worktree integration: {error}"))?;
+
+            match outcome {
+                Ok(outcome) => {
+                    let summary = outcome.summary();
+                    let _ = store.note(&run_id, Some(&task.id), &summary);
+                    if let Some(warning) = &outcome.cleanup_warning {
+                        let _ = store.note(
+                            &run_id,
+                            Some(&task.id),
+                            &format!("worktree cleanup warning: {warning}"),
+                        );
+                    }
+                    emit_exec(
+                        trace_sink.as_ref(),
+                        ExecEvent::for_task(
+                            run_id,
+                            task.id.clone(),
+                            "merge_completed",
+                            serde_json::json!({
+                                "execution_id": execution_id,
+                                "integration_status": outcome.status.as_str(),
+                                "branch": outcome.branch,
+                                "path": outcome.path,
+                                "changed_files": outcome.changed_files,
+                                "merge_commit": outcome.merge_commit,
+                                "cleanup_warning": outcome.cleanup_warning,
+                            }),
+                        )
+                        .with_agent(task.agent_role)
+                        .with_title(task.title),
+                    );
+                    Ok(Some(outcome))
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    let _ = store.note(
+                        &run_id,
+                        Some(&task.id),
+                        &format!("worktree integration failed: {message}"),
+                    );
+                    emit_exec(
+                        trace_sink.as_ref(),
+                        ExecEvent::for_task(
+                            run_id,
+                            task.id.clone(),
+                            "merge_failed",
+                            serde_json::json!({
+                                "execution_id": execution_id,
+                                "branch": branch,
+                                "error": message,
+                            }),
+                        )
+                        .with_agent(task.agent_role)
+                        .with_title(task.title),
+                    );
+                    Err(message)
+                }
+            }
+        })
+    }
 }
 
 type TaskDispatchResult = Result<(String, SubagentTaskResult), (String, String)>;
+
+/// Pick the largest deterministic subset of the ready frontier that has no
+/// writer ownership conflicts. Read-only tasks never consume ownership.
+fn select_ownership_safe_wave(ready: Vec<PlanTask>) -> Vec<PlanTask> {
+    let mut selected = Vec::new();
+    let mut selected_writers: Vec<super::planner::FileOwnership> = Vec::new();
+    for task in ready {
+        let ownership = super::planner::file_ownership(&task);
+        if matches!(ownership, super::planner::FileOwnership::ReadOnly) {
+            selected.push(task);
+            continue;
+        }
+        if selected_writers
+            .iter()
+            .all(|selected| !ownership.conflicts_with(selected))
+        {
+            selected_writers.push(ownership);
+            selected.push(task);
+        }
+    }
+    selected
+}
 
 /// Core DAG loop. Maintains a frontier of ready tasks and dispatches them
 /// under the concurrency semaphores until all are done, the run is cancelled,
@@ -845,10 +1033,13 @@ async fn run_dag<W: TaskDispatcher + 'static>(
                 error: "DAG stalled with unfinished tasks (cycle or blocked)".into(),
             });
         }
+        let ready_count = ready.len();
+        let ready = select_ownership_safe_wave(ready);
         let ready_ids: Vec<String> = ready.iter().map(|t| t.id.clone()).collect();
         tracing::info!(
             run_id = %run_id,
             ready_count = ready_ids.len(),
+            deferred_for_ownership = ready_count.saturating_sub(ready_ids.len()),
             ready_tasks = ?ready_ids,
             completed_count = dag_state.completed.len(),
             total_count = runtime_tasks.len(),
@@ -1012,17 +1203,8 @@ async fn run_dag<W: TaskDispatcher + 'static>(
                         &summary,
                     )
                     .await;
-                    match passed {
-                        ReviewGateOutcome::Pass => {
-                            let _ = store.set_task_status(
-                                run_id,
-                                &id,
-                                TodoStatus::Completed,
-                                Some(&task.agent_role),
-                                Some(&summary),
-                            );
-                            dag_state.completed.insert(id);
-                        }
+                    let approved = match passed {
+                        ReviewGateOutcome::Pass => true,
                         ReviewGateOutcome::NeedsFix(fix_task) => {
                             if let Err(e) = store.update_plan_task(run_id, &fix_task) {
                                 tracing::warn!(
@@ -1044,7 +1226,8 @@ async fn run_dag<W: TaskDispatcher + 'static>(
                                 ),
                                 Some("re-queued after review"),
                             );
-                            by_id.insert(id.clone(), tasks_with_fixes[&id].clone());
+                            by_id.insert(id.clone(), fix_task);
+                            false
                         }
                         ReviewGateOutcome::Suspend(reason) => {
                             let _ = store.note(
@@ -1064,14 +1247,50 @@ async fn run_dag<W: TaskDispatcher + 'static>(
                                 Some(&id),
                                 "no reviewer LLM; auto-passing review gate",
                             );
+                            true
+                        }
+                    };
+                    if !approved {
+                        continue;
+                    }
+
+                    let execution_id =
+                        format!("{}:{}", task.id, task.retry_count.saturating_add(1));
+                    match integrate_reviewed_task(
+                        worker.clone(),
+                        store.clone(),
+                        run_id,
+                        &task,
+                        &execution_id,
+                        &summary,
+                        parent_cancel.clone(),
+                        trace_sink.clone(),
+                    )
+                    .await
+                    {
+                        Ok(completion_summary) => {
                             let _ = store.set_task_status(
                                 run_id,
                                 &id,
                                 TodoStatus::Completed,
                                 Some(&task.agent_role),
-                                Some(&summary),
+                                Some(&completion_summary),
                             );
                             dag_state.completed.insert(id);
+                        }
+                        Err(error) => {
+                            let _ = store.set_task_status(
+                                run_id,
+                                &id,
+                                TodoStatus::Failed,
+                                Some(&task.agent_role),
+                                Some(&format!("worktree integration failed: {error}")),
+                            );
+                            wave_failed.push(id.clone());
+                            dag_state.failed.insert(id.clone());
+                            if failed_id.is_none() {
+                                failed_id = Some(id);
+                            }
                         }
                     }
                 }
@@ -1096,6 +1315,75 @@ async fn run_dag<W: TaskDispatcher + 'static>(
             }
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn integrate_reviewed_task<W: TaskDispatcher + 'static>(
+    worker: Arc<W>,
+    store: Arc<TaskRuntimeStore>,
+    run_id: &str,
+    task: &PlanTask,
+    execution_id: &str,
+    summary: &str,
+    cancel: CancellationToken,
+    trace_sink: Option<ExecSink>,
+) -> Result<String, String> {
+    let integration = match worker
+        .integrate(
+            store.clone(),
+            run_id.to_string(),
+            task.clone(),
+            execution_id.to_string(),
+            cancel,
+            trace_sink,
+        )
+        .await
+    {
+        Ok(integration) => integration,
+        Err(error) => {
+            if let Ok(Some(mut persisted)) = store.get_summary(run_id, &task.id) {
+                persisted.result.status = SubagentRunStatus::Failed;
+                let remaining = format!("worktree integration failed: {error}");
+                if !persisted.result.remaining_work.contains(&remaining) {
+                    persisted.result.remaining_work.push(remaining.clone());
+                }
+                if !persisted.decisions.contains(&remaining) {
+                    persisted.decisions.push(remaining);
+                }
+                if let Err(persist_error) = store.put_summary(&persisted) {
+                    tracing::warn!(
+                        run_id,
+                        task_id = %task.id,
+                        error = %persist_error,
+                        "failed to persist worktree integration failure"
+                    );
+                }
+            }
+            return Err(error);
+        }
+    };
+    let Some(integration) = integration else {
+        return Ok(summary.to_string());
+    };
+
+    let integration_summary = integration.summary();
+    if let Ok(Some(mut persisted)) = store.get_summary(run_id, &task.id) {
+        if !integration.changed_files.is_empty() {
+            persisted.result.touched_files.written = integration.changed_files.clone();
+        }
+        if !persisted.decisions.contains(&integration_summary) {
+            persisted.decisions.push(integration_summary.clone());
+        }
+        if let Err(error) = store.put_summary(&persisted) {
+            tracing::warn!(
+                run_id,
+                task_id = %task.id,
+                %error,
+                "failed to persist worktree integration summary"
+            );
+        }
+    }
+    Ok(format!("{summary} | {integration_summary}"))
 }
 
 fn interrupted_outcome(store: &TaskRuntimeStore, run_id: &str) -> RunOutcome {
@@ -1382,55 +1670,61 @@ async fn execute_task(
         (Some(wp), None, None)
     };
 
-    // G5: File-level write lock — claim the task's target files so two write
-    // tasks targeting the same file don't run concurrently. Uses per-file
-    // async mutexes: non-overlapping files run in parallel, overlapping files
-    // serialize (block on the same per-file mutex).
+    // Physical safety net below the ownership-safe DAG wave: exact file owners
+    // take the same normalized mutex keys. Unknown owners were already kept out
+    // of mixed writer waves and remain isolated in their own worktree.
     //
     // Two-layer concurrency:
     // - write_sem: global writer count cap (max_concurrent_writes=4)
     // - per-file TokioMutex: file-level mutual exclusion (1 permit per file)
-    let _file_lock_guard = if is_write && !task.files.is_empty() {
+    let ownership = super::planner::file_ownership(&task);
+    let _file_lock_guard = if is_write {
         // CRITICAL: sort files before acquiring locks to prevent classic
         // lock-ordering deadlock. Without this, two tasks declaring the same
         // files in different orders (e.g. [A,B] vs [B,A]) would deadlock when
         // both reach Step 2 concurrently (A waits for B while B waits for A).
         // Sorting guarantees all tasks acquire per-file locks in the same
         // canonical order, breaking any potential wait-for cycle.
-        let mut sorted_files = task.files.clone();
-        sorted_files.sort();
+        let sorted_files: Vec<String> = ownership
+            .known_files()
+            .map(|files| files.iter().cloned().collect())
+            .unwrap_or_default();
 
-        // Step 1: get-or-create per-file mutexes (outer lock held briefly).
-        let per_file_mutexes: Vec<Arc<TokioMutex<()>>> = {
-            let mut locks = file_write_locks.lock().unwrap_or_else(|e| e.into_inner());
-            sorted_files
-                .iter()
-                .map(|f| {
-                    locks
-                        .entry(f.clone())
-                        .or_insert_with(|| Arc::new(TokioMutex::new(())))
-                        .clone()
-                })
-                .collect()
-        }; // outer lock released here — brief, never held across awaits.
+        if sorted_files.is_empty() {
+            None
+        } else {
+            // Step 1: get-or-create per-file mutexes (outer lock held briefly).
+            let per_file_mutexes: Vec<Arc<TokioMutex<()>>> = {
+                let mut locks = file_write_locks.lock().unwrap_or_else(|e| e.into_inner());
+                sorted_files
+                    .iter()
+                    .map(|f| {
+                        locks
+                            .entry(f.clone())
+                            .or_insert_with(|| Arc::new(TokioMutex::new(())))
+                            .clone()
+                    })
+                    .collect()
+            }; // outer lock released here — brief, never held across awaits.
 
-        // Step 2: acquire all per-file locks asynchronously. Overlapping files
-        // block here until the previous writer releases its guard.
-        let mut guards: Vec<OwnedMutexGuard<()>> = Vec::with_capacity(per_file_mutexes.len());
-        for mtx in per_file_mutexes {
-            let guard = tokio::select! {
-                biased;
-                _ = task_cancel.cancelled() => {
-                    return Err((
-                        task_id.clone(),
-                        "cancelled while waiting for file write lock".to_string(),
-                    ));
-                }
-                guard = mtx.lock_owned() => guard,
-            };
-            guards.push(guard);
+            // Step 2: acquire all per-file locks asynchronously. Overlapping files
+            // block here until the previous writer releases its guard.
+            let mut guards: Vec<OwnedMutexGuard<()>> = Vec::with_capacity(per_file_mutexes.len());
+            for mtx in per_file_mutexes {
+                let guard = tokio::select! {
+                    biased;
+                    _ = task_cancel.cancelled() => {
+                        return Err((
+                            task_id.clone(),
+                            "cancelled while waiting for file write lock".to_string(),
+                        ));
+                    }
+                    guard = mtx.lock_owned() => guard,
+                };
+                guards.push(guard);
+            }
+            Some(FileLockGuard { _guards: guards })
         }
-        Some(FileLockGuard { _guards: guards })
     } else {
         None
     };
@@ -1484,14 +1778,9 @@ async fn execute_task(
     //   The child cancel token propagates parent-run cancellation.
     // - Code-writer kinds (implementation, debugging) → Sprint 9: delegate to
     //   the registered "implementer" Fork worker, which runs inside an isolated
-    //   git worktree (Sprint 8). Writers still serialize via write_sem
-    //   (max_concurrent_writes=1) — the worktree gives each its own checkout so
-    //   writes don't land in the main workspace; they don't run concurrently.
-    //   Falls back to run_main_agent_task (in-place) if the writer worker isn't
-    //   registered or its dispatch fails (keeps the run going; the worktree-
-    //   creation safety gate already hard-fails inside dispatch_fork when a
-    //   factory is present but can't create — this fallback only catches the
-    //   "no writer configured" case, e.g. a non-git repo with no factory).
+    //   git worktree. Disjoint exact owners may run concurrently; overlap and
+    //   unknown ownership are split into later DAG waves. Dispatch failure is
+    //   terminal — there is no in-place fallback that could duplicate writes.
     // - Verification (shell/build/test) → MAIN agent executes directly. These
     //   run against the workspace (testing just-written changes), so routing
     //   them to a separate worktree checkout would detach them from the work.
@@ -2288,8 +2577,13 @@ fn build_task_prompt(
         }
         s.push('\n');
     }
+    let ownership = super::planner::file_ownership(task);
     if !task.files.is_empty() {
-        s.push_str("Targets:\n");
+        if task.kind.is_read_only() {
+            s.push_str("Read targets:\n");
+        } else {
+            s.push_str("Declared exclusive write ownership:\n");
+        }
         for f in &task.files {
             s.push_str(&format!("- {f}\n"));
         }
@@ -2316,10 +2610,19 @@ fn build_task_prompt(
              dependencies, change repository state, or run commands with side effects.\n",
         );
     } else {
-        s.push_str(
-            "Execution boundary: SCOPED WRITE. Change only the targets required for this task, \
-             preserve unrelated user work, and run every listed verification that is available.\n",
-        );
+        match ownership {
+            super::planner::FileOwnership::Known(_) => s.push_str(
+                "Execution boundary: EXCLUSIVE SCOPED WRITE. Change only the declared ownership \
+                 files. Runtime validates the actual Git diff and rejects undeclared writes. \
+                 Preserve unrelated user work and run every listed verification that is available.\n",
+            ),
+            super::planner::FileOwnership::Unknown { reason } => s.push_str(&format!(
+                "Execution boundary: ISOLATED UNKNOWN-SCOPE WRITE ({reason}). This task is \
+                 serialized from other writers and runs in a worktree. Keep changes as narrow as \
+                 possible, preserve unrelated user work, and report every actual changed file.\n"
+            )),
+            super::planner::FileOwnership::ReadOnly => {}
+        }
     }
     s.push_str(
         "\nWork to the stated outcome and success evidence. Inspect before concluding, keep fact and \
@@ -2451,7 +2754,8 @@ fn worker_trace_sink_to_core(
 /// (eko-fork-<label>) — writes land in the worktree, not the main workspace.
 /// If no WorktreeFactory is configured, dispatch **hard-fails** (Phase 2 Task 13)
 /// rather than silently sharing the main tree.
-/// Writers still serialize via the caller's `write_sem`.
+/// Disjoint exact owners may run concurrently; the DAG scheduler separates
+/// overlapping and unknown ownership before dispatch.
 #[allow(clippy::too_many_arguments)] // handles + cancel + sink thread through; matches framework dispatch style
 async fn run_writer_worker(
     primary_agent: &crate::agent_handle::AgentHandle,
@@ -3655,6 +3959,45 @@ mod tests {
         }
     }
 
+    fn ownership_task(id: &str, kind: PlanTaskKind, files: &[&str]) -> PlanTask {
+        let mut task = preflight_task(id, kind, &[], &[]);
+        task.files = files.iter().map(|file| file.to_string()).collect();
+        task
+    }
+
+    #[test]
+    fn ownership_wave_runs_disjoint_writers_together() {
+        let wave = select_ownership_safe_wave(vec![
+            ownership_task("writer-a", PlanTaskKind::Implementation, &["src/a.rs"]),
+            ownership_task("writer-b", PlanTaskKind::Debugging, &["src/b.rs"]),
+            ownership_task("reader", PlanTaskKind::Investigation, &["src/a.rs"]),
+        ]);
+        let ids: Vec<&str> = wave.iter().map(|task| task.id.as_str()).collect();
+        assert_eq!(ids, vec!["writer-a", "writer-b", "reader"]);
+    }
+
+    #[test]
+    fn ownership_wave_defers_overlapping_writer() {
+        let wave = select_ownership_safe_wave(vec![
+            ownership_task("writer-a", PlanTaskKind::Implementation, &["src/shared.rs"]),
+            ownership_task("writer-b", PlanTaskKind::Debugging, &["src/shared.rs"]),
+            ownership_task("writer-c", PlanTaskKind::Implementation, &["src/c.rs"]),
+        ]);
+        let ids: Vec<&str> = wave.iter().map(|task| task.id.as_str()).collect();
+        assert_eq!(ids, vec!["writer-a", "writer-c"]);
+    }
+
+    #[test]
+    fn ownership_wave_unknown_writer_serializes_from_writers_but_not_readers() {
+        let wave = select_ownership_safe_wave(vec![
+            ownership_task("unknown", PlanTaskKind::Implementation, &[]),
+            ownership_task("writer", PlanTaskKind::Implementation, &["src/a.rs"]),
+            ownership_task("reader", PlanTaskKind::Review, &["src/a.rs"]),
+        ]);
+        let ids: Vec<&str> = wave.iter().map(|task| task.id.as_str()).collect();
+        assert_eq!(ids, vec!["unknown", "reader"]);
+    }
+
     #[test]
     fn runtime_contract_distinguishes_requested_and_observed_isolation() -> Result<(), String> {
         let contract = SubagentRuntimeContract {
@@ -4083,7 +4426,7 @@ Read the runtime path and found one missing branch.
     }
 
     #[test]
-    fn task_prompt_allows_edits_for_implementation() {
+    fn task_prompt_marks_empty_writer_scope_as_unknown() {
         let task = PlanTask {
             id: "t2".into(),
             title: "Apply fix".into(),
@@ -4098,7 +4441,8 @@ Read the runtime path and found one missing branch.
             None,
         );
         assert!(!p.contains("READ-ONLY"));
-        assert!(p.contains("SCOPED WRITE"));
+        assert!(p.contains("UNKNOWN-SCOPE WRITE"));
+        assert!(p.contains("serialized from other writers"));
     }
 
     #[test]
@@ -4221,6 +4565,8 @@ Read the runtime path and found one missing branch.
         results: StdMutex<StdHashMap<String, Result<SubagentTaskResult, String>>>,
         /// Dispatch order, appended as tasks are picked up.
         order: StdMutex<Vec<String>>,
+        /// task_id → integration error returned after review.
+        integration_failures: StdMutex<StdHashMap<String, String>>,
     }
 
     impl ScriptedDispatcher {
@@ -4228,6 +4574,7 @@ Read the runtime path and found one missing branch.
             Arc::new(Self {
                 results: StdMutex::new(StdHashMap::new()),
                 order: StdMutex::new(Vec::new()),
+                integration_failures: StdMutex::new(StdHashMap::new()),
             })
         }
         /// Script a success result for `id`.
@@ -4253,6 +4600,12 @@ Read the runtime path and found one missing branch.
         }
         fn order(&self) -> Vec<String> {
             self.order.lock().unwrap().clone()
+        }
+        fn fail_integration(self: &Arc<Self>, id: &str, error: &str) {
+            self.integration_failures
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(id.to_string(), error.to_string());
         }
     }
 
@@ -4283,6 +4636,40 @@ Read the runtime path and found one missing branch.
                     Some(Err(e)) => Err((task_id, e)),
                     // Default: generic success for unscripted tasks.
                     None => Ok((task_id, successful_task_result("ok"))),
+                }
+            })
+        }
+
+        fn integrate(
+            &self,
+            _store: Arc<TaskRuntimeStore>,
+            _run_id: String,
+            task: PlanTask,
+            _execution_id: String,
+            _cancel: CancellationToken,
+            _trace_sink: Option<ExecSink>,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            Option<
+                                crate::tasks::task_runtime::worktree::WorktreeIntegrationOutcome,
+                            >,
+                            String,
+                        >,
+                    > + Send,
+            >,
+        > {
+            let error = self
+                .integration_failures
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&task.id)
+                .cloned();
+            Box::pin(async move {
+                match error {
+                    Some(error) => Err(error),
+                    None => Ok(None),
                 }
             })
         }
@@ -4627,6 +5014,53 @@ Read the runtime path and found one missing branch.
         let todos = store.list_todos(&run_id).unwrap();
         let b_todo = todos.iter().find(|t| t.task_id == "b").unwrap();
         assert_eq!(b_todo.status, TodoStatus::Blocked);
+    }
+
+    #[tokio::test]
+    async fn run_dag_merge_failure_blocks_downstream() -> Result<(), String> {
+        let mut writer = solo_readonly_task("writer");
+        writer.kind = PlanTaskKind::Implementation;
+        writer.agent_role = "implementer".to_string();
+        writer.files = vec!["src/a.rs".to_string()];
+        let mut downstream = solo_readonly_task("downstream");
+        downstream.depends_on = vec![writer.id.clone()];
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let run_id = seed_run(&store, vec![writer.clone(), downstream.clone()]);
+        let worker = ScriptedDispatcher::new();
+        worker.succeed(&writer.id, "writer completed");
+        worker.fail_integration(&writer.id, "synthetic merge conflict");
+
+        let outcome = run_dag(
+            store.clone(),
+            worker,
+            None,
+            &run_id,
+            vec![writer, downstream],
+            ConcurrencyLimits::default(),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        if !matches!(outcome, RunOutcome::Failed { .. }) {
+            return Err(format!("expected failed run, got {outcome:?}"));
+        }
+        let todos = store
+            .list_todos(&run_id)
+            .map_err(|error| error.to_string())?;
+        let writer_status = todos
+            .iter()
+            .find(|todo| todo.task_id == "writer")
+            .map(|todo| todo.status)
+            .ok_or_else(|| "writer todo missing".to_string())?;
+        let downstream_status = todos
+            .iter()
+            .find(|todo| todo.task_id == "downstream")
+            .map(|todo| todo.status)
+            .ok_or_else(|| "downstream todo missing".to_string())?;
+        assert_eq!(writer_status, TodoStatus::Failed);
+        assert_eq!(downstream_status, TodoStatus::Blocked);
+        Ok(())
     }
 
     #[tokio::test]

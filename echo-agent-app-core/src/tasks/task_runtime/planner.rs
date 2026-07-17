@@ -2,20 +2,17 @@
 //!
 //! Contains:
 //! - `validate_plan_deps` — verify a plan has no dangling dependencies / cycles.
-//! - `analyze_file_ownership` (Sprint 7) — plan-time file-overlap analysis for
-//!   writer tasks. Pure function; reports which writer task pairs touch
-//!   overlapping files. This is the **foundation** for Phase 2 parallel-write
-//!   routing (Sprint 8 worktree isolation / Sprint 9 semaphore gating): those
-//!   will consult this report to decide parallel vs serialized scheduling.
-//!   Today it only emits a non-blocking advisory warning at plan mutation time
-//!   (the write semaphore already serializes all writers, so the overlap is
-//!   not a correctness hazard yet).
+//! - `file_ownership` / `analyze_file_ownership` — deterministic ownership
+//!   classification for writer tasks. Exact workspace-relative files may run
+//!   in parallel when disjoint; broad or invalid scopes are `Unknown` and must
+//!   serialize with every writer.
 //!
 //! Previous plan generation functions (`generate_parallel_readonly_plan`,
 //! `generate_plan`) have been removed as part of the L1 path cleanup. Plans
 //! are now produced by the main agent ReAct loop via `plan_create`.
 
 use super::types::PlanTask;
+use std::collections::BTreeSet;
 
 /// Validate dependency integrity and acyclicity for a set of tasks.
 ///
@@ -92,12 +89,44 @@ pub fn validate_plan_deps(tasks: &[PlanTask]) -> Result<(), Vec<String>> {
     }
 }
 
-// ── File Ownership Analysis (Sprint 7) ─────────────────────────────────────
+// ── File Ownership Analysis ────────────────────────────────────────────────
+
+/// Runtime meaning of a task's declared `files` list.
+///
+/// Writer parallelism is only allowed for exact, normalized workspace-relative
+/// paths. Anything broader or ambiguous remains executable, but is classified
+/// as `Unknown` and serialized with every other writer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileOwnership {
+    /// Read-only tasks never claim write ownership.
+    ReadOnly,
+    /// Exact exclusive file paths, normalized and deduplicated.
+    Known(BTreeSet<String>),
+    /// Empty, broad, absolute, or otherwise unsafe-to-compare scope.
+    Unknown { reason: &'static str },
+}
+
+impl FileOwnership {
+    pub fn conflicts_with(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::ReadOnly, _) | (_, Self::ReadOnly) => false,
+            (Self::Unknown { .. }, _) | (_, Self::Unknown { .. }) => true,
+            (Self::Known(left), Self::Known(right)) => left.intersection(right).next().is_some(),
+        }
+    }
+
+    pub fn known_files(&self) -> Option<&BTreeSet<String>> {
+        match self {
+            Self::Known(files) => Some(files),
+            Self::ReadOnly | Self::Unknown { .. } => None,
+        }
+    }
+}
 
 /// A pair of writer tasks whose declared `files` overlap.
 ///
-/// `shared` are the file paths both tasks claim (normalized, deduped, sorted
-/// for stable output).
+/// `shared` are normalized overlapping paths, or `<unknown ownership>` when a
+/// broad/empty scope forces serialization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileOverlapPair {
     pub task_a: String,
@@ -105,24 +134,14 @@ pub struct FileOverlapPair {
     pub shared: Vec<String>,
 }
 
-/// Plan-time report on which writer tasks touch overlapping files.
+/// Plan-time report on which writer tasks cannot run in the same write wave.
 ///
 /// Built by [`analyze_file_ownership`]. Only **writer** tasks
 /// (`!PlanTaskKind::is_read_only()`) are considered — read-only tasks never
 /// own files and can run concurrently without conflict.
 ///
-/// Semantics for Sprint 7 (foundation):
-/// - `overlap_pairs` is non-empty ⇒ those task pairs **must be serialized**
-///   once parallel writes are enabled (Sprint 9). Today the write semaphore
-///   already serializes every writer, so this is advisory only.
-/// - Two tasks with disjoint (or empty) `files` are safe to parallelize in
-///   separate worktrees (Sprint 8).
-///
-/// Precision caveat: path matching is string-based and normalized only by
-/// trimming + collapsing repeated separators. Equivalent paths written
-/// differently (`./a.rs` vs `a.rs`, absolute vs relative) may not match —
-/// accepted imprecision (the worktree isolation in Sprint 8 is the physical
-/// safety net; this analyzer is the scheduling hint).
+/// Exact disjoint ownership can run in parallel. Exact overlap, empty scope,
+/// glob/directory-like scope, absolute paths, and parent traversal serialize.
 #[derive(Debug, Clone, Default)]
 pub struct OwnershipReport {
     /// Every pair of writer tasks sharing ≥1 file. Unordered; each pair
@@ -137,72 +156,114 @@ impl OwnershipReport {
     }
 }
 
-/// Normalize a declared file path for comparison: trim whitespace and collapse
-/// repeated `/` (and treat `\` as `/` so Windows-style paths still compare).
-/// Does **not** touch the filesystem — pure string normalization.
-fn normalize_file(p: &str) -> String {
+/// Normalize one exact workspace-relative file path.
+///
+/// This intentionally rejects globs and directory-like declarations. Those
+/// are valid plan hints, but not precise enough to unlock parallel writers.
+pub fn normalize_owned_file(p: &str) -> Option<String> {
     let trimmed = p.trim();
-    let mut out = String::with_capacity(trimmed.len());
-    let mut prev_sep = false;
-    for ch in trimmed.chars() {
-        let is_sep = ch == '/' || ch == '\\';
-        if is_sep {
-            if !prev_sep {
-                out.push('/');
-            }
-            prev_sep = true;
-        } else {
-            out.push(ch);
-            prev_sep = false;
+    if trimmed.is_empty()
+        || trimmed.starts_with('/')
+        || trimmed.ends_with('/')
+        || trimmed.ends_with('\\')
+        || trimmed
+            .chars()
+            .any(|ch| matches!(ch, '*' | '?' | '[' | ']' | '{' | '}'))
+    {
+        return None;
+    }
+    let mut prefix = trimmed.chars();
+    if prefix.next().is_some_and(|ch| ch.is_ascii_alphabetic()) && prefix.next() == Some(':') {
+        return None;
+    }
+
+    let slashed: String = trimmed
+        .chars()
+        .map(|ch| if ch == '\\' { '/' } else { ch })
+        .collect();
+    let mut segments = Vec::new();
+    for segment in slashed.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => return None,
+            value => segments.push(value),
         }
     }
-    out
+    if segments.is_empty() {
+        None
+    } else {
+        Some(segments.join("/"))
+    }
+}
+
+/// Classify one task's file ownership declaration.
+pub fn file_ownership(task: &PlanTask) -> FileOwnership {
+    if task.kind.is_read_only() {
+        return FileOwnership::ReadOnly;
+    }
+    if task.files.is_empty() {
+        return FileOwnership::Unknown {
+            reason: "no files declared",
+        };
+    }
+
+    let mut files = BTreeSet::new();
+    for file in &task.files {
+        let Some(normalized) = normalize_owned_file(file) else {
+            return FileOwnership::Unknown {
+                reason: "scope is not an exact workspace-relative file",
+            };
+        };
+        files.insert(normalized);
+    }
+    if files.is_empty() {
+        FileOwnership::Unknown {
+            reason: "no exact files declared",
+        }
+    } else {
+        FileOwnership::Known(files)
+    }
 }
 
 /// Analyze file ownership across a plan, returning the writer-task pairs that
 /// declare overlapping files.
 ///
-/// Read-only tasks are ignored (they don't claim ownership). Tasks with no
-/// declared `files` are skipped too — a writer that declares no files can't
-/// be analyzed and is left to the runtime advisory check.
+/// Read-only tasks are ignored. Unknown writers conflict with every writer.
 pub fn analyze_file_ownership(tasks: &[PlanTask]) -> OwnershipReport {
-    // Map writer task id → normalized, deduped file set.
-    let mut writer_files: Vec<(&str, std::collections::BTreeSet<String>)> = Vec::new();
-    for t in tasks {
-        if t.kind.is_read_only() {
-            continue;
-        }
-        let set: std::collections::BTreeSet<String> = t
-            .files
-            .iter()
-            .map(|f| normalize_file(f))
-            .filter(|f| !f.is_empty())
-            .collect();
-        if !set.is_empty() {
-            writer_files.push((t.id.as_str(), set));
-        }
-    }
+    let writers: Vec<(&str, FileOwnership)> = tasks
+        .iter()
+        .filter(|task| !task.kind.is_read_only())
+        .map(|task| (task.id.as_str(), file_ownership(task)))
+        .collect();
 
-    // All-pairs intersection. n is small (plan task counts), O(n²) is fine.
     let mut overlap_pairs = Vec::new();
-    for i in 0..writer_files.len() {
-        for j in (i + 1)..writer_files.len() {
-            let (id_a, set_a) = &writer_files[i];
-            let (id_b, set_b) = &writer_files[j];
-            let shared: Vec<String> = set_a.intersection(set_b).cloned().collect();
-            if !shared.is_empty() {
-                // Stable ordering: lex-smaller id first.
-                let (a, b) = if id_a <= id_b {
-                    (*id_a, *id_b)
-                } else {
-                    (*id_b, *id_a)
-                };
-                overlap_pairs.push(FileOverlapPair {
-                    task_a: a.to_string(),
-                    task_b: b.to_string(),
-                    shared,
-                });
+    for i in 0..writers.len() {
+        for j in (i + 1)..writers.len() {
+            let Some((id_a, ownership_a)) = writers.get(i) else {
+                continue;
+            };
+            let Some((id_b, ownership_b)) = writers.get(j) else {
+                continue;
+            };
+            if !ownership_a.conflicts_with(ownership_b) {
+                continue;
             }
+            let shared = match (ownership_a, ownership_b) {
+                (FileOwnership::Known(left), FileOwnership::Known(right)) => {
+                    left.intersection(right).cloned().collect()
+                }
+                _ => vec!["<unknown ownership>".to_string()],
+            };
+            let (a, b) = if id_a <= id_b {
+                (*id_a, *id_b)
+            } else {
+                (*id_b, *id_a)
+            };
+            overlap_pairs.push(FileOverlapPair {
+                task_a: a.to_string(),
+                task_b: b.to_string(),
+                shared,
+            });
         }
     }
 
@@ -285,11 +346,14 @@ mod tests {
     }
 
     #[test]
-    fn writers_without_files_skipped() {
-        // A writer declaring no files can't be analyzed; doesn't pair up.
+    fn writer_without_files_conflicts_with_every_writer() {
         let plan = [writer("a", &["src/a.rs"]), writer("b", &[])];
         let report = analyze_file_ownership(&plan);
-        assert!(!report.has_overlap());
+        assert!(report.has_overlap());
+        assert_eq!(
+            report.overlap_pairs.first().map(|pair| pair.shared.clone()),
+            Some(vec!["<unknown ownership>".to_string()])
+        );
     }
 
     #[test]
@@ -298,6 +362,27 @@ mod tests {
         let plan = [writer("a", &["src//a.rs"]), writer("b", &["src/a.rs"])];
         let report = analyze_file_ownership(&plan);
         assert!(report.has_overlap());
+    }
+
+    #[test]
+    fn dot_prefix_normalizes_to_exact_file() {
+        let plan = [writer("a", &["./src/a.rs"]), writer("b", &["src/a.rs"])];
+        assert!(analyze_file_ownership(&plan).has_overlap());
+    }
+
+    #[test]
+    fn glob_scope_is_unknown_and_serializes() {
+        let plan = [writer("a", &["src/*.rs"]), writer("b", &["tests/b.rs"])];
+        assert!(analyze_file_ownership(&plan).has_overlap());
+    }
+
+    #[test]
+    fn parent_traversal_scope_is_unknown() {
+        let task = writer("a", &["../outside.rs"]);
+        assert!(matches!(
+            file_ownership(&task),
+            FileOwnership::Unknown { .. }
+        ));
     }
 
     #[test]

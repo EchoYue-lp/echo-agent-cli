@@ -31,6 +31,9 @@ export type SubagentRunEventKind =
   | 'tool_started'
   | 'tool_completed'
   | 'artifact'
+  | 'merge_started'
+  | 'merge_completed'
+  | 'merge_failed'
   | 'completed'
   | 'failed'
   | 'timed_out'
@@ -166,10 +169,13 @@ const MAX_EVENTS_PER_RUN = 300;
 function statusFromEvent(event: SubagentRunEventKind): SubagentRunStatus | null {
   switch (event) {
     case 'started':
+    case 'merge_started':
       return 'running';
     case 'completed':
+    case 'merge_completed':
       return 'completed';
     case 'failed':
+    case 'merge_failed':
       return 'failed';
     case 'timed_out':
       return 'timed_out';

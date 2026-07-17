@@ -1,4 +1,5 @@
-//! Worktree lifecycle primitives for unattended write runs (D7 stage 2).
+//! Worktree lifecycle and integration primitives for unattended runs and
+//! Fork-dispatched writer tasks.
 //!
 //! This module centralises the git-worktree operations that were previously
 //! scattered across Tauri `panels.rs` commands, so both the CLI and the GUI
@@ -20,8 +21,12 @@
 //!   `.claude/worktrees/` sibling-directory convention, and the existing
 //!   `default_worktree_path` helper in `panels.rs`).
 
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use tokio::sync::Mutex as TokioMutex;
 
 /// Branch-name prefix reserved for unattended-run worktrees.
 pub const BRANCH_PREFIX: &str = "eko-unattended-";
@@ -30,6 +35,62 @@ pub const BRANCH_PREFIX: &str = "eko-unattended-";
 /// Distinct from [`BRANCH_PREFIX`] so list/merge/discard can tell unattended-run
 /// worktrees apart from interactive Fork-subagent worktrees.
 pub const FORK_BRANCH_PREFIX: &str = "eko-fork-";
+
+static REPO_MERGE_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<TokioMutex<()>>>>> = OnceLock::new();
+
+/// Return the process-wide integration mutex for one repository.
+///
+/// The lock protects the shared Git index/refs when different TaskRuntime runs
+/// finish isolated writers at the same time. Cross-process races still fail
+/// through Git's own lock files and are surfaced as integration failures.
+pub fn repo_merge_lock(repo_root: &Path) -> Arc<TokioMutex<()>> {
+    let locks = REPO_MERGE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(lock) = locks.get(repo_root).and_then(Weak::upgrade) {
+        return lock;
+    }
+    let lock = Arc::new(TokioMutex::new(()));
+    locks.insert(repo_root.to_path_buf(), Arc::downgrade(&lock));
+    lock
+}
+
+/// Convert an arbitrary runtime identity into a legal, stable Git ref suffix.
+/// A short hash prevents collisions after punctuation is normalized.
+pub fn safe_branch_id(identity: &str) -> String {
+    let mut normalized = String::with_capacity(identity.len().min(96));
+    let mut previous_dash = false;
+    for ch in identity.chars().take(96) {
+        let safe = if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+            ch
+        } else {
+            '-'
+        };
+        if safe == '-' {
+            if previous_dash {
+                continue;
+            }
+            previous_dash = true;
+        } else {
+            previous_dash = false;
+        }
+        normalized.push(safe);
+    }
+    let normalized = normalized.trim_matches('-');
+    let stem = if normalized.is_empty() {
+        "task"
+    } else {
+        normalized
+    };
+    let digest = hex::encode(Sha256::digest(identity.as_bytes()));
+    let short_hash: String = digest.chars().take(12).collect();
+    format!("{stem}-{short_hash}")
+}
+
+pub fn fork_branch_name(label: &str) -> String {
+    format!("{FORK_BRANCH_PREFIX}{}", safe_branch_id(label))
+}
 
 /// A worktree descriptor as surfaced by `git worktree list --porcelain`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,21 +143,46 @@ impl From<std::io::Error> for WorktreeError {
 /// (blocking) — suitable for short-lived git ops; callers needing async may
 /// wrap via `tokio::task::spawn_blocking`.
 pub fn run_git(repo: &Path, args: &[&str]) -> Result<String, WorktreeError> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()?;
+    let output = git_output(repo, args)?;
     if output.status.success() {
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        Err(WorktreeError::new(if stderr.is_empty() {
-            format!("git {args:?} failed")
-        } else {
-            stderr
-        }))
+        Err(output_error(args, &output))
     }
+}
+
+fn git_output(repo: &Path, args: &[&str]) -> Result<Output, WorktreeError> {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .map_err(WorktreeError::from)
+}
+
+fn output_error(args: &[&str], output: &Output) -> WorktreeError {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        format!("git {args:?} failed with status {}", output.status)
+    };
+    WorktreeError::new(detail)
+}
+
+fn bounded_output(output: &Output, max_chars: usize) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let joined = match (stdout.trim().is_empty(), stderr.trim().is_empty()) {
+        (false, false) => format!("{}\n{}", stdout.trim(), stderr.trim()),
+        (false, true) => stdout.trim().to_string(),
+        (true, false) => stderr.trim().to_string(),
+        (true, true) => "no git diagnostic output".to_string(),
+    };
+    joined.chars().take(max_chars).collect()
 }
 
 /// Resolve the repository root (`git rev-parse --show-toplevel`) from any
@@ -251,18 +337,19 @@ pub fn parse_worktree_list(output: &str, repo_root: &Path) -> Vec<WorktreeInfo> 
 
 /// An in-progress worktree for an unattended write run.
 ///
-/// Holds the identity needed to generate a diff summary and to `keep` /
-/// `remove` the worktree after the run finishes (Q1: keep for review; no
-/// automatic merge).
+/// Holds the identity needed to generate a diff summary and to `keep`, unlock,
+/// integrate, or remove the worktree after execution.
 #[derive(Debug)]
 pub struct RunWorktree {
     /// The `run_id` this worktree serves.
     pub run_id: String,
+    /// Canonical repository checkout used for shared Git operations.
+    pub repo_root: PathBuf,
     /// Absolute path to the worktree checkout.
     pub path: PathBuf,
     /// Branch name (`eko-unattended-<run_id>`).
     pub branch: String,
-    /// Base ref the worktree branched from (typically `HEAD`).
+    /// Immutable base commit SHA resolved when the worktree was created.
     pub base: String,
 }
 
@@ -297,11 +384,15 @@ impl RunWorktree {
         repo_root: &Path,
         kind: &str,
     ) -> Result<Self, WorktreeError> {
-        let branch = format!("{prefix}{id}");
+        let branch = if prefix == FORK_BRANCH_PREFIX {
+            fork_branch_name(id)
+        } else {
+            format!("{prefix}{id}")
+        };
         validate_branch_name(repo_root, &branch)?;
         let path = default_worktree_path(repo_root, &branch)?;
         validate_worktree_target(repo_root, &path)?;
-        let base = "HEAD";
+        let base = run_git(repo_root, &["rev-parse", "HEAD"])?;
         let path_str = path
             .to_str()
             .ok_or_else(|| WorktreeError::new("worktree path is not valid UTF-8"))?;
@@ -309,7 +400,7 @@ impl RunWorktree {
         // Create worktree + branch in one step (matches panels.rs convention).
         run_git(
             repo_root,
-            &["worktree", "add", "-b", &branch, path_str, base],
+            &["worktree", "add", "-b", &branch, path_str, &base],
         )?;
 
         // Lock so concurrent cleanup won't touch it (Claude Code pattern).
@@ -326,9 +417,10 @@ impl RunWorktree {
 
         Ok(Self {
             run_id: id.to_string(),
+            repo_root: repo_root.to_path_buf(),
             path,
             branch,
-            base: base.to_string(),
+            base,
         })
     }
 
@@ -371,6 +463,24 @@ impl RunWorktree {
         self
     }
 
+    /// Release the lifecycle lock after the worker has stopped.
+    pub fn unlock(&self) -> Result<(), WorktreeError> {
+        let wt_path = self
+            .path
+            .to_str()
+            .ok_or_else(|| WorktreeError::new("worktree path is not valid UTF-8"))?;
+        let output = git_output(&self.repo_root, &["worktree", "unlock", wt_path])?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let diagnostic = bounded_output(&output, 2_000);
+        if diagnostic.contains("not locked") {
+            Ok(())
+        } else {
+            Err(WorktreeError::new(diagnostic))
+        }
+    }
+
     /// Discard the worktree: `git worktree remove --force` + prune.
     /// Callers (GUI or run-finalise) use this when the user decides to
     /// discard the unattended run's worktree.
@@ -379,13 +489,438 @@ impl RunWorktree {
             .path
             .to_str()
             .ok_or_else(|| WorktreeError::new("worktree path is not valid UTF-8"))?;
-        // `git worktree remove --force <worktree_path>` works from anywhere
-        // inside the main repo (or the worktree itself). We run it from
-        // `self.path` so `-C` isn't needed.
-        run_git(&self.path, &["worktree", "remove", "--force", wt_path])?;
-        run_git(&self.path, &["worktree", "prune"])?;
+        let _ = self.unlock();
+        run_git(&self.repo_root, &["worktree", "remove", "--force", wt_path])?;
+        run_git(&self.repo_root, &["worktree", "prune"])?;
         Ok(())
     }
+}
+
+// ── Fork worktree integration (M8) ────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorktreeIntegrationStatus {
+    Merged,
+    NoChanges,
+    AlreadyIntegrated,
+}
+
+impl WorktreeIntegrationStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Merged => "merged",
+            Self::NoChanges => "no_changes",
+            Self::AlreadyIntegrated => "already_integrated",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeIntegrationOutcome {
+    pub status: WorktreeIntegrationStatus,
+    pub branch: String,
+    pub path: Option<PathBuf>,
+    pub changed_files: Vec<String>,
+    pub merge_commit: Option<String>,
+    pub cleanup_warning: Option<String>,
+}
+
+impl WorktreeIntegrationOutcome {
+    pub fn summary(&self) -> String {
+        let commit = self
+            .merge_commit
+            .as_deref()
+            .map(|value| format!(" commit={value}"))
+            .unwrap_or_default();
+        format!(
+            "worktree integration={} branch={} files={}{}",
+            self.status.as_str(),
+            self.branch,
+            self.changed_files.len(),
+            commit
+        )
+    }
+}
+
+/// Integrate one completed/reviewed Fork writer into the authoritative local
+/// checkout. This function is blocking; async callers must use
+/// `tokio::task::spawn_blocking` and hold [`repo_merge_lock`].
+pub fn integrate_fork_worktree(
+    repo_root: &Path,
+    label: &str,
+    task_id: &str,
+    execution_id: &str,
+    ownership: &super::planner::FileOwnership,
+) -> Result<WorktreeIntegrationOutcome, WorktreeError> {
+    let branch = fork_branch_name(label);
+    let trailer = format!("EKO-Execution-Id: {execution_id}");
+
+    if let Some(commit) = find_integration_commit(repo_root, &trailer)? {
+        let path = find_worktree_path(repo_root, &branch)?;
+        let cleanup_warning = path
+            .as_deref()
+            .and_then(|path| cleanup_fork_worktree(repo_root, path, &branch).err());
+        return Ok(WorktreeIntegrationOutcome {
+            status: WorktreeIntegrationStatus::AlreadyIntegrated,
+            branch,
+            path,
+            changed_files: Vec::new(),
+            merge_commit: Some(commit),
+            cleanup_warning,
+        });
+    }
+
+    let path = find_worktree_path(repo_root, &branch)?.ok_or_else(|| {
+        WorktreeError::new(format!(
+            "writer worktree not found for execution {execution_id} (branch {branch})"
+        ))
+    })?;
+    let preserve_error = |message: String| {
+        let _ = unlock_worktree(repo_root, &path);
+        WorktreeError::new(format!(
+            "{message}; isolated work preserved at {} on branch {branch}",
+            path.display()
+        ))
+    };
+
+    if matches!(ownership, super::planner::FileOwnership::ReadOnly) {
+        return Err(preserve_error(
+            "read-only task cannot integrate a writer worktree".to_string(),
+        ));
+    }
+
+    run_git(&path, &["add", "-A"])
+        .map_err(|error| preserve_error(format!("failed to stage writer changes: {error}")))?;
+    let merge_base = run_git(repo_root, &["merge-base", "HEAD", &branch])
+        .map_err(|error| preserve_error(format!("failed to resolve merge base: {error}")))?;
+    let changed_files = git_nul_paths(
+        &path,
+        &["diff", "--cached", "--name-only", "-z", &merge_base],
+    )
+    .map_err(|error| preserve_error(format!("failed to inspect writer changes: {error}")))?;
+    validate_changed_files(ownership, &changed_files).map_err(preserve_error)?;
+
+    let staged_against_head = git_output(&path, &["diff", "--cached", "--quiet", "HEAD"])
+        .map_err(|error| preserve_error(format!("failed to inspect staged changes: {error}")))?;
+    match staged_against_head.status.code() {
+        Some(0) => {}
+        Some(1) => commit_writer_changes(&path, task_id, execution_id)
+            .map_err(|error| preserve_error(format!("failed to commit writer changes: {error}")))?,
+        _ => {
+            return Err(preserve_error(format!(
+                "failed to compare staged writer changes: {}",
+                bounded_output(&staged_against_head, 2_000)
+            )));
+        }
+    }
+
+    if changed_files.is_empty() {
+        let cleanup_warning = cleanup_fork_worktree(repo_root, &path, &branch).err();
+        return Ok(WorktreeIntegrationOutcome {
+            status: WorktreeIntegrationStatus::NoChanges,
+            branch,
+            path: Some(path),
+            changed_files,
+            merge_commit: None,
+            cleanup_warning,
+        });
+    }
+
+    let ancestor = git_output(repo_root, &["merge-base", "--is-ancestor", &branch, "HEAD"])
+        .map_err(|error| preserve_error(format!("failed to inspect ancestry: {error}")))?;
+    match ancestor.status.code() {
+        Some(0) => {
+            let commit = run_git(repo_root, &["rev-parse", "HEAD"]).ok();
+            let cleanup_warning = cleanup_fork_worktree(repo_root, &path, &branch).err();
+            return Ok(WorktreeIntegrationOutcome {
+                status: WorktreeIntegrationStatus::AlreadyIntegrated,
+                branch,
+                path: Some(path),
+                changed_files,
+                merge_commit: commit,
+                cleanup_warning,
+            });
+        }
+        Some(1) => {}
+        _ => {
+            return Err(preserve_error(format!(
+                "failed to inspect integration ancestry: {}",
+                bounded_output(&ancestor, 2_000)
+            )));
+        }
+    }
+
+    reject_active_git_operation(repo_root).map_err(preserve_error)?;
+    let staged = git_nul_paths(repo_root, &["diff", "--cached", "--name-only", "-z"])
+        .map_err(|error| preserve_error(format!("failed to inspect staged changes: {error}")))?;
+    if !staged.is_empty() {
+        return Err(preserve_error(format!(
+            "local checkout index is not clean; refusing to include user-staged files in an EKO merge commit: {}",
+            staged.join(", ")
+        )));
+    }
+    let dirty = main_dirty_paths(repo_root)
+        .map_err(|error| preserve_error(format!("failed to inspect local changes: {error}")))?;
+    let dirty_overlap: Vec<String> = changed_files
+        .iter()
+        .filter(|path| dirty.contains(path.as_str()))
+        .cloned()
+        .collect();
+    if !dirty_overlap.is_empty() {
+        return Err(preserve_error(format!(
+            "local checkout has uncommitted changes in writer-owned paths: {}",
+            dirty_overlap.join(", ")
+        )));
+    }
+
+    let preflight = git_output(
+        repo_root,
+        &[
+            "merge-tree",
+            "--write-tree",
+            "--name-only",
+            "--messages",
+            "HEAD",
+            &branch,
+        ],
+    )
+    .map_err(|error| preserve_error(format!("failed to start merge preflight: {error}")))?;
+    match preflight.status.code() {
+        Some(0) => {}
+        Some(1) => {
+            return Err(preserve_error(format!(
+                "worktree merge conflict: {}",
+                bounded_output(&preflight, 4_000)
+            )));
+        }
+        _ => {
+            return Err(preserve_error(format!(
+                "worktree merge preflight failed: {}",
+                bounded_output(&preflight, 4_000)
+            )));
+        }
+    }
+
+    let message = format!("Merge EKO task {task_id}\n\n{trailer}");
+    let merge = git_output(
+        repo_root,
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "user.name=EKO TaskRuntime",
+            "-c",
+            "user.email=eko@local",
+            "merge",
+            "--no-ff",
+            "--no-edit",
+            "-m",
+            &message,
+            &branch,
+        ],
+    )
+    .map_err(|error| preserve_error(format!("failed to start worktree merge: {error}")))?;
+    if !merge.status.success() {
+        let diagnostic = bounded_output(&merge, 4_000);
+        let abort_error = abort_own_merge(repo_root).err();
+        let abort_suffix = abort_error
+            .map(|error| format!("; merge abort also failed: {error}"))
+            .unwrap_or_default();
+        return Err(preserve_error(format!(
+            "worktree merge failed: {diagnostic}{abort_suffix}"
+        )));
+    }
+
+    let merge_commit = run_git(repo_root, &["rev-parse", "HEAD"]);
+    let mut cleanup_warning = cleanup_fork_worktree(repo_root, &path, &branch).err();
+    let merge_commit = match merge_commit {
+        Ok(commit) => Some(commit),
+        Err(error) => {
+            let warning = format!("merge succeeded but commit id lookup failed: {error}");
+            cleanup_warning = Some(match cleanup_warning {
+                Some(cleanup) => format!("{warning}; {cleanup}"),
+                None => warning,
+            });
+            None
+        }
+    };
+    Ok(WorktreeIntegrationOutcome {
+        status: WorktreeIntegrationStatus::Merged,
+        branch,
+        path: Some(path),
+        changed_files,
+        merge_commit,
+        cleanup_warning,
+    })
+}
+
+fn validate_changed_files(
+    ownership: &super::planner::FileOwnership,
+    changed_files: &[String],
+) -> Result<(), String> {
+    let super::planner::FileOwnership::Known(owned) = ownership else {
+        return Ok(());
+    };
+    let outside: Vec<String> = changed_files
+        .iter()
+        .filter(|path| !owned.contains(path.as_str()))
+        .cloned()
+        .collect();
+    if outside.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "writer changed files outside declared ownership: {}",
+            outside.join(", ")
+        ))
+    }
+}
+
+fn commit_writer_changes(
+    worktree: &Path,
+    task_id: &str,
+    execution_id: &str,
+) -> Result<(), WorktreeError> {
+    let message = format!("EKO task {task_id}\n\nEKO-Execution-Id: {execution_id}");
+    run_git(
+        worktree,
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "user.name=EKO TaskRuntime",
+            "-c",
+            "user.email=eko@local",
+            "commit",
+            "-m",
+            &message,
+        ],
+    )
+    .map(|_| ())
+}
+
+fn git_nul_paths(repo: &Path, args: &[&str]) -> Result<Vec<String>, WorktreeError> {
+    let output = git_output(repo, args)?;
+    if !output.status.success() {
+        return Err(output_error(args, &output));
+    }
+    let text = String::from_utf8(output.stdout)
+        .map_err(|_| WorktreeError::new("git returned a non-UTF-8 path"))?;
+    let mut paths = Vec::new();
+    for raw in text.split('\0').filter(|value| !value.is_empty()) {
+        let normalized = super::planner::normalize_owned_file(raw)
+            .ok_or_else(|| WorktreeError::new(format!("git returned unsafe path: {raw}")))?;
+        if !paths.contains(&normalized) {
+            paths.push(normalized);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+fn main_dirty_paths(repo_root: &Path) -> Result<std::collections::BTreeSet<String>, WorktreeError> {
+    let mut dirty = std::collections::BTreeSet::new();
+    for args in [
+        vec!["diff", "--name-only", "-z"],
+        vec!["ls-files", "--others", "--exclude-standard", "-z"],
+    ] {
+        dirty.extend(git_nul_paths(repo_root, &args)?);
+    }
+    Ok(dirty)
+}
+
+fn find_worktree_path(repo_root: &Path, branch: &str) -> Result<Option<PathBuf>, WorktreeError> {
+    let output = run_git(repo_root, &["worktree", "list", "--porcelain"])?;
+    Ok(parse_worktree_list(&output, repo_root)
+        .into_iter()
+        .find(|worktree| worktree.branch == branch)
+        .map(|worktree| PathBuf::from(worktree.path)))
+}
+
+fn find_integration_commit(
+    repo_root: &Path,
+    trailer: &str,
+) -> Result<Option<String>, WorktreeError> {
+    let output = run_git(
+        repo_root,
+        &[
+            "log",
+            "HEAD",
+            "--format=%H",
+            "--fixed-strings",
+            "--grep",
+            trailer,
+            "-n",
+            "1",
+        ],
+    )?;
+    let commit = output.trim();
+    Ok((!commit.is_empty()).then(|| commit.to_string()))
+}
+
+fn reject_active_git_operation(repo_root: &Path) -> Result<(), String> {
+    for marker in [
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "rebase-merge",
+        "rebase-apply",
+    ] {
+        let marker_path = run_git(repo_root, &["rev-parse", "--git-path", marker])
+            .map_err(|error| format!("failed to inspect Git operation state: {error}"))?;
+        let path = PathBuf::from(marker_path);
+        let path = if path.is_absolute() {
+            path
+        } else {
+            repo_root.join(path)
+        };
+        if path.exists() {
+            return Err(format!(
+                "repository already has an active Git operation ({marker}); integration refused"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn abort_own_merge(repo_root: &Path) -> Result<(), WorktreeError> {
+    let marker = run_git(repo_root, &["rev-parse", "--git-path", "MERGE_HEAD"])?;
+    let marker = PathBuf::from(marker);
+    let marker = if marker.is_absolute() {
+        marker
+    } else {
+        repo_root.join(marker)
+    };
+    if marker.exists() {
+        run_git(repo_root, &["merge", "--abort"]).map(|_| ())
+    } else {
+        Ok(())
+    }
+}
+
+fn unlock_worktree(repo_root: &Path, path: &Path) -> Result<(), WorktreeError> {
+    let path = path
+        .to_str()
+        .ok_or_else(|| WorktreeError::new("worktree path is not valid UTF-8"))?;
+    let output = git_output(repo_root, &["worktree", "unlock", path])?;
+    if output.status.success() || bounded_output(&output, 2_000).contains("not locked") {
+        Ok(())
+    } else {
+        Err(output_error(&["worktree", "unlock", path], &output))
+    }
+}
+
+fn cleanup_fork_worktree(repo_root: &Path, path: &Path, branch: &str) -> Result<(), String> {
+    let path_text = path
+        .to_str()
+        .ok_or_else(|| "worktree path is not valid UTF-8".to_string())?;
+    let _ = unlock_worktree(repo_root, path);
+    run_git(repo_root, &["worktree", "remove", "--force", path_text])
+        .map_err(|error| error.to_string())?;
+    run_git(repo_root, &["branch", "-D", branch]).map_err(|error| error.to_string())?;
+    run_git(repo_root, &["worktree", "prune"])
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 // ── Unattended worktree management (Phase D) ──────────────────────────
@@ -525,8 +1060,8 @@ pub fn discard_unattended_worktree(repo_root: &Path, run_id: &str) -> Result<(),
 /// EKO's application-layer implementation of the framework's
 /// `WorktreeFactory` trait. Constructs a git worktree per Fork-dispatched
 /// writer subagent (via [`RunWorktree::create_fork`]) and finalizes with a
-/// `git diff` summary (kept for human review — no auto-merge, Q1 alignment
-/// with the unattended path and Claude Code).
+/// `git diff` summary. TaskRuntime performs the later review/integration stage;
+/// the framework remains responsible only for isolated execution.
 ///
 /// Stored behind an `Arc` and injected into the framework's
 /// `AgentConfig.subagent_worktree_factory`, so the framework can create
@@ -561,16 +1096,20 @@ impl echo_agent::agent::subagent::worktree::WorktreeFactory for EkoWorktreeFacto
             branch = %wt.branch,
             "Created Fork-subagent worktree"
         );
-        // `finalize` owns `wt`: generates the diff summary (kept for review —
-        // no remove). The worktree stays on disk for the user to merge/discard
-        // via the Tauri list/merge/discard flow (to be extended to the
-        // `eko-fork-` prefix).
+        // `finalize` owns `wt`: generate the diff summary, then release the
+        // in-progress lock. The worktree stays on disk until TaskRuntime's
+        // explicit integration stage succeeds or a failure leaves it for review.
         Ok(echo_agent::agent::subagent::worktree::WorktreeHandle {
             path,
             finalize: Box::new(move || {
-                wt.diff_summary().map_err(|e| {
-                    echo_agent::agent::subagent::worktree::WorktreeError::new(e.message)
-                })
+                let summary = wt.diff_summary();
+                let unlock = wt.unlock();
+                match (summary, unlock) {
+                    (Ok(summary), Ok(())) => Ok(summary),
+                    (Err(error), _) | (_, Err(error)) => Err(
+                        echo_agent::agent::subagent::worktree::WorktreeError::new(error.message),
+                    ),
+                }
             }),
         })
     }
@@ -716,6 +1255,280 @@ mod tests {
 
     use super::*;
     use std::path::PathBuf;
+
+    fn init_repo() -> Result<(tempfile::TempDir, PathBuf), String> {
+        let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).map_err(|error| error.to_string())?;
+        run_git(&repo, &["init", "-b", "main"]).map_err(|error| error.to_string())?;
+        run_git(&repo, &["config", "user.name", "EKO Test"]).map_err(|error| error.to_string())?;
+        run_git(&repo, &["config", "user.email", "eko-test@local"])
+            .map_err(|error| error.to_string())?;
+        std::fs::write(repo.join("shared.txt"), "base\n").map_err(|error| error.to_string())?;
+        run_git(&repo, &["add", "shared.txt"]).map_err(|error| error.to_string())?;
+        run_git(
+            &repo,
+            &["-c", "commit.gpgsign=false", "commit", "-m", "initial"],
+        )
+        .map_err(|error| error.to_string())?;
+        Ok((temp, repo))
+    }
+
+    fn known_ownership(files: &[&str]) -> super::super::planner::FileOwnership {
+        super::super::planner::FileOwnership::Known(
+            files.iter().map(|file| file.to_string()).collect(),
+        )
+    }
+
+    #[test]
+    fn fork_branch_identity_is_valid_and_stable() -> Result<(), String> {
+        let (_temp, repo) = init_repo()?;
+        let label = "implementer-task:1 with spaces";
+        let first = fork_branch_name(label);
+        let second = fork_branch_name(label);
+        if first != second {
+            return Err("fork branch identity must be stable".to_string());
+        }
+        validate_branch_name(&repo, &first).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn disjoint_fork_worktrees_merge_into_main() -> Result<(), String> {
+        let (_temp, repo) = init_repo()?;
+        let label_a = "implementer-task-a:1";
+        let label_b = "implementer-task-b:1";
+        let wt_a = RunWorktree::create_fork(label_a, &repo).map_err(|error| error.to_string())?;
+        let wt_b = RunWorktree::create_fork(label_b, &repo).map_err(|error| error.to_string())?;
+        std::fs::write(wt_a.path.join("a.txt"), "a\n").map_err(|error| error.to_string())?;
+        std::fs::write(wt_b.path.join("b.txt"), "b\n").map_err(|error| error.to_string())?;
+
+        let outcome_a = integrate_fork_worktree(
+            &repo,
+            label_a,
+            "task-a",
+            "task-a:1",
+            &known_ownership(&["a.txt"]),
+        )
+        .map_err(|error| error.to_string())?;
+        let outcome_b = integrate_fork_worktree(
+            &repo,
+            label_b,
+            "task-b",
+            "task-b:1",
+            &known_ownership(&["b.txt"]),
+        )
+        .map_err(|error| error.to_string())?;
+
+        assert_eq!(outcome_a.status, WorktreeIntegrationStatus::Merged);
+        assert_eq!(outcome_b.status, WorktreeIntegrationStatus::Merged);
+        assert_eq!(
+            std::fs::read_to_string(repo.join("a.txt")).map_err(|error| error.to_string())?,
+            "a\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("b.txt")).map_err(|error| error.to_string())?,
+            "b\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ownership_violation_does_not_touch_main_checkout() -> Result<(), String> {
+        let (_temp, repo) = init_repo()?;
+        let label = "implementer-ownership:1";
+        let wt = RunWorktree::create_fork(label, &repo).map_err(|error| error.to_string())?;
+        std::fs::write(wt.path.join("outside.txt"), "outside\n")
+            .map_err(|error| error.to_string())?;
+        let error = integrate_fork_worktree(
+            &repo,
+            label,
+            "ownership",
+            "ownership:1",
+            &known_ownership(&["declared.txt"]),
+        )
+        .err()
+        .ok_or_else(|| "ownership violation should fail integration".to_string())?;
+        if !error.message.contains("outside declared ownership") {
+            return Err(format!("unexpected ownership error: {error}"));
+        }
+        if repo.join("outside.txt").exists() {
+            return Err("ownership violation leaked into main checkout".to_string());
+        }
+        if !wt.path.exists() {
+            return Err("failed integration must preserve the worktree".to_string());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn conflicting_worktree_fails_without_dirtying_main_index() -> Result<(), String> {
+        let (_temp, repo) = init_repo()?;
+        let label_a = "implementer-conflict-a:1";
+        let label_b = "implementer-conflict-b:1";
+        let wt_a = RunWorktree::create_fork(label_a, &repo).map_err(|error| error.to_string())?;
+        let wt_b = RunWorktree::create_fork(label_b, &repo).map_err(|error| error.to_string())?;
+        std::fs::write(wt_a.path.join("shared.txt"), "first\n")
+            .map_err(|error| error.to_string())?;
+        std::fs::write(wt_b.path.join("shared.txt"), "second\n")
+            .map_err(|error| error.to_string())?;
+        integrate_fork_worktree(
+            &repo,
+            label_a,
+            "conflict-a",
+            "conflict-a:1",
+            &known_ownership(&["shared.txt"]),
+        )
+        .map_err(|error| error.to_string())?;
+        let error = integrate_fork_worktree(
+            &repo,
+            label_b,
+            "conflict-b",
+            "conflict-b:1",
+            &known_ownership(&["shared.txt"]),
+        )
+        .err()
+        .ok_or_else(|| "second conflicting integration should fail".to_string())?;
+        if !error.message.contains("merge conflict") {
+            return Err(format!("unexpected conflict error: {error}"));
+        }
+        assert_eq!(
+            std::fs::read_to_string(repo.join("shared.txt"))
+                .map_err(|read_error| read_error.to_string())?,
+            "first\n"
+        );
+        let status = run_git(&repo, &["status", "--porcelain"])
+            .map_err(|status_error| status_error.to_string())?;
+        if !status.is_empty() {
+            return Err(format!(
+                "main checkout left dirty after preflight: {status}"
+            ));
+        }
+        if !wt_b.path.exists() {
+            return Err("conflicting worktree must be preserved".to_string());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn local_dirty_owned_path_blocks_integration() -> Result<(), String> {
+        let (_temp, repo) = init_repo()?;
+        let label = "implementer-local-dirty:1";
+        let wt = RunWorktree::create_fork(label, &repo).map_err(|error| error.to_string())?;
+        std::fs::write(wt.path.join("shared.txt"), "worker\n")
+            .map_err(|error| error.to_string())?;
+        std::fs::write(repo.join("shared.txt"), "local\n").map_err(|error| error.to_string())?;
+
+        let error = integrate_fork_worktree(
+            &repo,
+            label,
+            "local-dirty",
+            "local-dirty:1",
+            &known_ownership(&["shared.txt"]),
+        )
+        .err()
+        .ok_or_else(|| "local dirty ownership overlap should fail".to_string())?;
+        if !error.message.contains("uncommitted changes") {
+            return Err(format!("unexpected dirty-overlap error: {error}"));
+        }
+        assert_eq!(
+            std::fs::read_to_string(repo.join("shared.txt"))
+                .map_err(|read_error| read_error.to_string())?,
+            "local\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn staged_user_change_is_never_captured_by_merge_commit() -> Result<(), String> {
+        let (_temp, repo) = init_repo()?;
+        let label = "implementer-staged-user-change:1";
+        let wt = RunWorktree::create_fork(label, &repo).map_err(|error| error.to_string())?;
+        std::fs::write(wt.path.join("worker.txt"), "worker\n")
+            .map_err(|error| error.to_string())?;
+        std::fs::write(repo.join("user.txt"), "user\n").map_err(|error| error.to_string())?;
+        run_git(&repo, &["add", "user.txt"]).map_err(|error| error.to_string())?;
+
+        let error = integrate_fork_worktree(
+            &repo,
+            label,
+            "staged-user-change",
+            "staged-user-change:1",
+            &known_ownership(&["worker.txt"]),
+        )
+        .err()
+        .ok_or_else(|| "staged user change should block integration".to_string())?;
+        if !error.message.contains("index is not clean") {
+            return Err(format!("unexpected staged-index error: {error}"));
+        }
+        let staged = run_git(&repo, &["diff", "--cached", "--name-only"])
+            .map_err(|status_error| status_error.to_string())?;
+        assert_eq!(staged, "user.txt");
+        if repo.join("worker.txt").exists() {
+            return Err("blocked integration leaked worker file into main".to_string());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn committed_worker_diff_uses_fixed_creation_base() -> Result<(), String> {
+        let (_temp, repo) = init_repo()?;
+        let label = "implementer-committed:1";
+        let wt = RunWorktree::create_fork(label, &repo).map_err(|error| error.to_string())?;
+        std::fs::write(wt.path.join("committed.txt"), "committed\n")
+            .map_err(|error| error.to_string())?;
+        run_git(&wt.path, &["add", "committed.txt"]).map_err(|error| error.to_string())?;
+        run_git(
+            &wt.path,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "worker commit",
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        let diff = wt.diff_summary().map_err(|error| error.to_string())?;
+        if !diff.contains("committed.txt") {
+            return Err(format!("committed diff lost its creation base: {diff}"));
+        }
+        let outcome = integrate_fork_worktree(
+            &repo,
+            label,
+            "committed",
+            "committed:1",
+            &known_ownership(&["committed.txt"]),
+        )
+        .map_err(|error| error.to_string())?;
+        assert_eq!(outcome.status, WorktreeIntegrationStatus::Merged);
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_integration_detects_completed_execution() -> Result<(), String> {
+        let (_temp, repo) = init_repo()?;
+        let label = "implementer-resume:1";
+        let wt = RunWorktree::create_fork(label, &repo).map_err(|error| error.to_string())?;
+        std::fs::write(wt.path.join("resume.txt"), "done\n").map_err(|error| error.to_string())?;
+        integrate_fork_worktree(
+            &repo,
+            label,
+            "resume",
+            "resume:1",
+            &known_ownership(&["resume.txt"]),
+        )
+        .map_err(|error| error.to_string())?;
+        let second = integrate_fork_worktree(
+            &repo,
+            label,
+            "resume",
+            "resume:1",
+            &known_ownership(&["resume.txt"]),
+        )
+        .map_err(|error| error.to_string())?;
+        assert_eq!(second.status, WorktreeIntegrationStatus::AlreadyIntegrated);
+        Ok(())
+    }
 
     #[test]
     fn eko_worktree_factory_create_fails_outside_git_repo() {

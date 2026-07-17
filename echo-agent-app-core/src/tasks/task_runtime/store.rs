@@ -532,10 +532,8 @@ impl TaskRuntimeStore {
                 return Err(StoreError::InvalidPlan(errs.join("; ")));
             }
 
-            // Sprint 7: plan-time file-overlap advisory. Non-blocking — the write
-            // semaphore already serializes all writers, so this is a scheduling
-            // hint for when parallel writes are enabled (Sprint 8/9), surfaced
-            // early so the user sees the plan risk at edit time.
+            // Ownership conflicts are valid plans, but the scheduler will split
+            // them into separate write waves. Surface that decision at edit time.
             let report = super::planner::analyze_file_ownership(&new_tasks);
             if report.has_overlap() {
                 for pair in &report.overlap_pairs {
@@ -641,26 +639,40 @@ impl TaskRuntimeStore {
             TodoStatus::Running => {
                 #[allow(clippy::collapsible_match)]
                 // guard is a multi-field ||, not a single pattern; collapsing reads worse
-                if patch.kind.is_some() || patch.depends_on.is_some() || patch.agent_role.is_some()
+                if patch.kind.is_some()
+                    || patch.depends_on.is_some()
+                    || patch.agent_role.is_some()
+                    || patch.files.is_some()
+                    || patch.allowed_tools.is_some()
+                    || patch.required_artifacts.is_some()
+                    || patch.verification.is_some()
                 {
                     return Err(StoreError::InvalidPlan(
-                        "cannot change kind/depends_on/agent_role of a Running task".into(),
+                        "cannot change execution contract of a Running task".into(),
                     ));
                 }
             }
             _ => {} // Pending/Blocked: all fields mutable.
         }
 
-        // Re-validate cycle after changing deps.
-        if let Some(deps) = &patch.depends_on {
+        // Re-validate the explicit dependency and ownership contracts against
+        // the complete candidate plan before persisting either field.
+        if patch.depends_on.is_some() || patch.files.is_some() || patch.kind.is_some() {
             let mut tasks = plan.tasks.clone();
             if let Some(t) = tasks.iter_mut().find(|t| t.id == task_id) {
-                t.depends_on = deps.clone();
+                if let Some(deps) = &patch.depends_on {
+                    t.depends_on = deps.clone();
+                }
+                if let Some(files) = &patch.files {
+                    t.files = files.clone();
+                }
+                if let Some(kind) = patch.kind {
+                    t.kind = kind;
+                }
             }
             if let Err(errs) = super::planner::validate_plan_deps(&tasks) {
                 return Err(StoreError::InvalidPlan(errs.join("; ")));
             }
-            // Sprint 7: plan-time file-overlap advisory (non-blocking; see insert_task).
             let report = super::planner::analyze_file_ownership(&tasks);
             if report.has_overlap() {
                 for pair in &report.overlap_pairs {
@@ -2343,6 +2355,23 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, StoreError::InvalidPlan(_)));
+    }
+
+    #[test]
+    fn update_task_rejects_ownership_change_while_running() -> Result<(), StoreError> {
+        let store = fresh();
+        seed_plan(&store);
+        store.set_task_status("r1", "t1", TodoStatus::Running, Some("worker"), None)?;
+        let result = store.update_task(
+            "r1",
+            "t1",
+            TaskPatch {
+                files: Some(vec!["src/new-owner.rs".to_string()]),
+                ..Default::default()
+            },
+        );
+        assert!(matches!(result, Err(StoreError::InvalidPlan(_))));
+        Ok(())
     }
 
     // ── review #4: intent-visible tests that validation fires on the FILE
