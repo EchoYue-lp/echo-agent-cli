@@ -1,0 +1,82 @@
+# EKO Master Plan
+
+Last updated: 2026-07-18
+
+This file is the cross-session source of truth for the coding, data analysis,
+academic research, and medical research expansion. Detailed design rationale
+stays in the milestone documents; this file records only decisions, status,
+evidence, and the next bounded step.
+
+## Product Invariants
+
+- EKO is a local personal assistant. Do not add online multi-tenant security or
+  permission models to interactive local tools.
+- The product model is `TaskRun -> PlanTask -> SubagentRun`; all execution
+  roles, instances, events, and concurrency slots use Subagent terminology.
+- EKO persists conversations, analyses, research records, and projections as
+  ordinary files. `echo-agent-cli` does not enable SQLite.
+- TUI, GUI, CLI, and channels share the same Agent capabilities and differ only
+  in input, rendering, and event projection.
+- Plans, scripts, sources, evidence, and reports are inspectable artifacts. They
+  are not hidden runtime states.
+
+## Architecture Boundary
+
+| Responsibility | Owner |
+|---|---|
+| ReAct, tools, `run_code`, LSP client/discovery, AST symbol extraction, reusable workflow primitives | `echo-agent` |
+| Domain routing, TaskRuntime, file-backed analysis/research contracts, IPC, TUI/GUI/CLI/channel surfaces | `echo-agent-cli` |
+| Statistical inference | Persisted Python/R using SciPy, statsmodels, or mature R packages |
+| Exploratory statistics | Framework descriptive tooling, explicitly not formal inference |
+
+## Milestone Status
+
+| Milestone | Status | Evidence |
+|---|---|---|
+| DomainProfile propagation and complex Run plan creation | Complete | `docs/2026-07-17-domain-subagent-orchestration.md` |
+| Statistical inference correctness | Complete | `docs/2026-07-18-statistical-inference-correctness.md`; framework commit `5a2c8a8` |
+| Persisted script execution | Complete | framework commit `1e71b9a` |
+| File-backed analysis workbench and surface parity | Complete | `docs/2026-07-18-file-backed-analysis-workbench.md`; application commit `9699670` |
+| SourceRecord/EvidenceRecord and paper IPC | Complete | `echo-agent-app-core/src/research.rs`; application commit `dffe9d6` |
+| PaperPanel, evidence matrix, and systematic review workbench | Complete | `web-frontend/src/components/papers/ReviewWorkbench.tsx`; no browser `localStorage` persistence |
+| Medical PICO, screening, RoB, GRADE, and PRISMA | Complete | `ReviewRecord` contract and `ReviewWorkbench` medical mode |
+| LSP automatic discovery and AST-aware repo map | Complete | framework commit `1c6442e` |
+| Legacy framework DataPipeline migration | Complete | `../echo-agent/echo-orchestration/src/workflow/pipelines/data_pipeline.rs`; one tool-capable, code-first file contract |
+
+## Current Decisions
+
+### Data Analysis
+
+The persistent contract is `analysis/<id>/manifest.json` plus a reviewable
+`analysis.py` or `analysis.R`, `environment.json`, `result.json`, `outputs/`,
+immutable `runs/`, and `latest-run.json`. The saved script is executed through
+`run_code(script_path=...)`; inline duplicate code is not an acceptable run.
+
+This follows the common pattern documented by OpenAI Data Analysis, Jupyter's
+file-backed contents model, and Quarto execution: code and outputs remain
+inspectable, rerunnable, and attributable. EKO does not add a second notebook
+kernel, a statistical DSL, or framework-authored inference algorithms.
+
+### Research And Medicine
+
+Sources, claim-level evidence, protocols, screening decisions, RoB judgments,
+GRADE outcomes, and PRISMA counts are ordinary workspace JSON records. The GUI
+is a projection of those records; Agent/TUI/CLI/channel operations use the same
+application service and `research_library` tool.
+
+The medical extension follows PRISMA 2020, Cochrane RoB 2/ROBINS-I, and GRADE
+as quality contracts rather than adding a separate runtime state machine.
+
+### Coding
+
+LSP discovery only starts installed language servers detected for the current
+project; explicit global and project `.lsp.yaml` files override discovery. The
+repo map uses Tree-sitter for supported languages and a UTF-8-safe text fallback
+for unsupported files or parser failure.
+
+## Next Step
+
+The requested coding, analysis, academic research, and medical research scope is
+closed. Future work should start as a new milestone; likely candidates are
+Zotero/OpenAlex import-export, report export, and real-project LSP smoke
+fixtures.

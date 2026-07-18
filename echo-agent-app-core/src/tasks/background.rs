@@ -202,14 +202,17 @@ impl BackgroundTaskKind {
                      dataset '{dataset_path}'. Objective: {obj}. Use the analysis contract under \
                      analysis/<analysis-id>/: manifest.json, a persisted analysis.py or \
                      analysis.R script, outputs/, environment.json, result.json, runs/, and \
-                     latest-run.json. Put '{dataset_path}' in manifest input_paths, choose and \
-                     record a random seed, and perform all transformations, statistical methods, \
-                     diagnostics, and up to {max_charts} charts in the reviewable script. Execute \
-                     the persisted file with run_code using script_path, not inline code. Report \
-                     package/runtime versions, input and output hashes, assumptions, missing-data \
-                     handling, and diagnostics. Treat exploratory_statistics as exploratory only; \
-                     formal inference must use a mature pinned library. End with an executive \
-                     summary that points to the saved artifacts."
+                     latest-run.json. Set contract_version to 1, put '{dataset_path}' in manifest \
+                     input_paths, record structured parameters and a random seed, and resolve \
+                     generated paths from the script directory. Perform all transformations, \
+                     statistical methods, diagnostics, and up to {max_charts} charts in the \
+                     reviewable script. Execute the persisted file with run_code using \
+                     script_path, not inline code. Record package/runtime versions, script/input/\
+                     output SHA-256 hashes, exit status, assumptions, missing-data handling, \
+                     warnings, and diagnostics. Treat exploratory_statistics as exploratory only; \
+                     formal inference must use a mature pinned library. If execution or a \
+                     dependency fails, preserve a structured failed run instead of fabricating \
+                     results. End with an executive summary that points to the saved artifacts."
                 )
             }
 
@@ -249,7 +252,11 @@ mod tests {
         };
         assert_eq!(data.domain_profile(), DomainProfile::DataAnalysis);
         assert_eq!(research.domain_profile(), DomainProfile::AcademicResearch);
-        assert!(data.to_prompt().contains("run_code using script_path"));
+        let data_prompt = data.to_prompt();
+        assert!(data_prompt.contains("run_code using script_path"));
+        assert!(data_prompt.contains("contract_version to 1"));
+        assert!(data_prompt.contains("script/input/output SHA-256 hashes"));
+        assert!(data_prompt.contains("structured failed run"));
         assert!(research.to_prompt().contains("research_library"));
     }
 }

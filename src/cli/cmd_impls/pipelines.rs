@@ -1,7 +1,7 @@
 //! Data analysis and writing pipeline commands.
 //!
 //! Submits data/writing tasks to the BackgroundTaskService for execution
-//! via the Graph workflow pipelines.
+//! through the shared TaskRuntime and domain-aware Subagents.
 
 use crate::cli::command::{CommandCategory, CommandContext, CommandOutcome, cmd};
 use echo_agent_app_core::tasks::BackgroundTaskKind;
