@@ -229,8 +229,10 @@ transformations before inference. Preserve raw inputs; require reproducible \
 artifacts, row-count/quality checks, assumption tests, uncertainty, and at least \
 one sensitivity or reconciliation check for material conclusions. Separate \
 descriptive, predictive, and causal claims. Add research or coding tasks when \
-external evidence, scripts, notebooks, or packages are necessary.",
-    execution_guidance: "Preserve raw inputs and provenance. Make transformations reproducible, state metric definitions and assumptions, quantify uncertainty, and validate material results with reconciliation or sensitivity evidence.",
+external evidence, scripts, notebooks, or packages are necessary. Treat \
+`exploratory_statistics` as descriptive only; formal inference must use a \
+persisted SciPy/statsmodels/R script executed through `run_code`.",
+    execution_guidance: "Preserve raw inputs and provenance. Make transformations reproducible, state metric definitions and assumptions, and validate material results with reconciliation or sensitivity evidence. For formal inference, persist the exact Python/R script and record input hashes, package versions, seeds, missing-data handling, diagnostics, warnings, and result artifacts; do not hand-write statistical distributions or p-value approximations.",
     workflows: UNIVERSAL_WORKFLOWS,
     review_checklist: &[
         "Data source and provenance are clear?",
@@ -238,8 +240,9 @@ external evidence, scripts, notebooks, or packages are necessary.",
         "Metric definitions consistent across steps?",
         "Transformations reproducible from artifacts?",
         "Analysis not overfit to a convenient conclusion?",
+        "Formal inference uses a persisted mature-library script rather than an exploratory tool or hand-written approximation?",
         "Charts not misleading?",
-        "Notebook / pipeline rerunnable?",
+        "Script / notebook / pipeline rerunnable with input hash, package versions, seed, and result artifacts?",
     ],
 };
 
@@ -362,6 +365,25 @@ mod tests {
         assert_eq!(
             default_subagent_for(DomainProfile::MedicalResearch, PlanTaskKind::Review),
             "reviewer"
+        );
+    }
+
+    #[test]
+    fn data_profile_separates_exploration_from_formal_inference() {
+        let template = ProfileTemplate::for_profile(DomainProfile::DataAnalysis);
+        assert!(template.prompt_suffix.contains("exploratory_statistics"));
+        assert!(template.prompt_suffix.contains("SciPy/statsmodels/R"));
+        assert!(template.execution_guidance.contains("input hashes"));
+        assert!(
+            template
+                .execution_guidance
+                .contains("p-value approximations")
+        );
+        assert!(
+            template
+                .review_checklist
+                .iter()
+                .any(|item| item.contains("mature-library script"))
         );
     }
 }
