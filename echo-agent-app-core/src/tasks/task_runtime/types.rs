@@ -585,8 +585,8 @@ pub enum RuntimeEventKind {
     TaskSkipped,
     TaskBlocked,
     TodoUpdated,
-    WorkerAssigned,
-    WorkerReleased,
+    SubagentAssigned,
+    SubagentReleased,
     ToolStarted,
     ToolCompleted,
     ToolFailed,
@@ -616,8 +616,8 @@ impl RuntimeEventKind {
             TaskSkipped => "task_skipped",
             TaskBlocked => "task_blocked",
             TodoUpdated => "todo_updated",
-            WorkerAssigned => "worker_assigned",
-            WorkerReleased => "worker_released",
+            SubagentAssigned => "subagent_assigned",
+            SubagentReleased => "subagent_released",
             ToolStarted => "tool_started",
             ToolCompleted => "tool_completed",
             ToolFailed => "tool_failed",
@@ -647,8 +647,8 @@ impl RuntimeEventKind {
             "task_skipped" => TaskSkipped,
             "task_blocked" => TaskBlocked,
             "todo_updated" => TodoUpdated,
-            "worker_assigned" => WorkerAssigned,
-            "worker_released" => WorkerReleased,
+            "subagent_assigned" => SubagentAssigned,
+            "subagent_released" => SubagentReleased,
             "tool_started" => ToolStarted,
             "tool_completed" => ToolCompleted,
             "tool_failed" => ToolFailed,
@@ -877,7 +877,7 @@ impl RecoveryDecision {
 }
 
 /// Durable recovery barrier for a task whose mutating side effect may have
-/// happened even though no terminal worker/tool event was persisted.
+/// happened even though no terminal Subagent/tool event was persisted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export, rename = "RecoveryBlocker")]
 pub struct RecoveryBlocker {
@@ -1151,7 +1151,7 @@ pub struct SubagentRunUsage {
 #[ts(export, rename = "SubagentRun")]
 pub struct SubagentRun {
     /// Stable execution id, format "{task_id}:{attempt}". Aligns with
-    /// `SubagentEvent::execution_id`. Was the legacy "worker_id".
+    /// `SubagentEvent::execution_id`.
     pub subagent_run_id: String,
     /// Parent [`TaskRun`] id.
     pub run_id: String,
@@ -1258,7 +1258,7 @@ impl IssueSeverity {
 pub struct TaskExecutionSummary {
     pub run_id: String,
     pub task_id: String,
-    pub worker_agent: String,
+    pub subagent_name: String,
     pub result: SubagentTaskResult,
     pub decisions: Vec<String>,
     pub next_implications: Vec<String>,
@@ -1275,7 +1275,7 @@ impl TaskExecutionSummary {
         echo_agent::tasks::TaskExecutionSummary {
             run_id: self.run_id.clone(),
             task_id: self.task_id.clone(),
-            worker_agent: self.worker_agent.clone(),
+            subagent_name: self.subagent_name.clone(),
             completed_work: if self.result.summary.trim().is_empty() {
                 Vec::new()
             } else {
@@ -1462,7 +1462,7 @@ mod tests {
         let summary = TaskExecutionSummary {
             run_id: "r1".to_string(),
             task_id: "t1".to_string(),
-            worker_agent: "explorer".to_string(),
+            subagent_name: "explorer".to_string(),
             result: SubagentTaskResult {
                 contract_version: 1,
                 status: SubagentRunStatus::Completed,

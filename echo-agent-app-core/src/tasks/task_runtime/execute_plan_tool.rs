@@ -951,7 +951,7 @@ mod tests {
             .put_summary(&TaskExecutionSummary {
                 run_id: "r1".to_string(),
                 task_id: "t1".to_string(),
-                worker_agent: "explorer".to_string(),
+                subagent_name: "explorer".to_string(),
                 result: SubagentTaskResult {
                     contract_version: 1,
                     status: SubagentRunStatus::Completed,
@@ -995,7 +995,7 @@ mod tests {
         ];
 
         for outcome in &outcomes {
-            let text = plan_execute_outcome_text(outcome, "worker summary");
+            let text = plan_execute_outcome_text(outcome, "subagent summary");
             if text.contains(super::super::compact_context::RUNTIME_RECOVERY_MARKER) {
                 return Err(format!(
                     "plan_execute outcome must be ordinary status text: {outcome:?}"

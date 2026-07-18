@@ -81,7 +81,7 @@ pub struct RunCancellationRegistration {
 }
 
 #[derive(Debug, Clone)]
-struct ActiveWorkerBoundary {
+struct ActiveSubagentBoundary {
     task_id: String,
     execution_id: String,
     replay_safe: bool,
@@ -434,7 +434,7 @@ impl TaskRuntimeStore {
     }
 
     /// Pause an actively driven run. The status changes first, then the same
-    /// run-scoped token used for cancellation stops in-flight workers. The
+    /// run-scoped token used for cancellation stops in-flight Subagents. The
     /// executor observes the durable Paused status and leaves the run resumable.
     pub fn request_pause(&self, run_id: &str) -> Result<bool, StoreError> {
         let Some(run) = self.get_run(run_id)? else {
@@ -561,7 +561,7 @@ impl TaskRuntimeStore {
     /// Soft-delete a task: set its status to `Skipped`. The task remains in
     /// the plan (for audit) but is no longer scheduled. Emits `PlanEdited`.
     pub fn remove_task(&self, run_id: &str, task_id: &str) -> Result<(), StoreError> {
-        // If the task is currently running, cancel its worker FIRST (before
+        // If the task is currently running, cancel its Subagent FIRST (before
         // flipping status), so execution stops promptly instead of continuing
         // after the status says Skipped.
         let currently_running = self
@@ -998,30 +998,30 @@ impl TaskRuntimeStore {
             .map_err(|e| StoreError::InvalidPlan(format!("file read: {e}")))
     }
 
-    fn active_worker_boundaries(
+    fn active_subagent_boundaries(
         &self,
         run_id: &str,
-    ) -> Result<Vec<ActiveWorkerBoundary>, StoreError> {
-        let mut active = std::collections::HashMap::<String, ActiveWorkerBoundary>::new();
+    ) -> Result<Vec<ActiveSubagentBoundary>, StoreError> {
+        let mut active = std::collections::HashMap::<String, ActiveSubagentBoundary>::new();
         for event in self.list_events(run_id, 0)? {
             let Some(execution_id) = event.step_id.clone() else {
                 continue;
             };
             match event.event_type {
-                RuntimeEventKind::WorkerAssigned => {
+                RuntimeEventKind::SubagentAssigned => {
                     let Some(task_id) = event.task_id.clone() else {
                         continue;
                     };
                     active.insert(
                         execution_id.clone(),
-                        ActiveWorkerBoundary {
+                        ActiveSubagentBoundary {
                             task_id,
                             execution_id,
                             replay_safe: json_bool(&event.payload, "replay_safe", false),
                         },
                     );
                 }
-                RuntimeEventKind::WorkerReleased => {
+                RuntimeEventKind::SubagentReleased => {
                     active.remove(&execution_id);
                 }
                 _ => {}
@@ -1126,8 +1126,8 @@ impl TaskRuntimeStore {
             match self.transition_run(&run.run_id, TaskRunStatus::Paused) {
                 Ok(_) => {
                     let plan = self.get_plan(&run.run_id).ok().flatten();
-                    let active_workers = self
-                        .active_worker_boundaries(&run.run_id)
+                    let active_subagents = self
+                        .active_subagent_boundaries(&run.run_id)
                         .unwrap_or_default();
                     let active_tools = self.active_tool_boundaries(&run.run_id).unwrap_or_default();
                     if let Ok(todos) = self.list_todos(&run.run_id) {
@@ -1141,8 +1141,8 @@ impl TaskRuntimeStore {
                             let execution_id = task.map(|task| {
                                 format!("{}:{}", task.id, task.retry_count.saturating_add(1))
                             });
-                            let completed_worker = execution_id.as_deref().and_then(|id| {
-                                self.recoverable_worker_result(&run.run_id, &todo.task_id, id)
+                            let completed_subagent = execution_id.as_deref().and_then(|id| {
+                                self.recoverable_subagent_result(&run.run_id, &todo.task_id, id)
                                     .ok()
                                     .flatten()
                             });
@@ -1153,19 +1153,19 @@ impl TaskRuntimeStore {
                                     boundary.task_id == todo.task_id && !boundary.replay_safe
                                 })
                                 .cloned();
-                            let active_worker = active_workers
+                            let active_subagent = active_subagents
                                 .iter()
                                 .find(|boundary| {
                                     boundary.task_id == todo.task_id && !boundary.replay_safe
                                 })
                                 .cloned();
 
-                            let (next_status, summary) = if completed_worker.is_some() {
+                            let (next_status, summary) = if completed_subagent.is_some() {
                                 (
                                     TodoStatus::Pending,
-                                    "worker completed before interruption; pending review",
+                                    "Subagent completed before interruption; pending review",
                                 )
-                            } else if active_tool.is_some() || active_worker.is_some() {
+                            } else if active_tool.is_some() || active_subagent.is_some() {
                                 (
                                     TodoStatus::Blocked,
                                     "mutating side effect is indeterminate after restart",
@@ -1198,8 +1198,8 @@ impl TaskRuntimeStore {
                                             Some(tool.call_id),
                                             Some(tool.tool_name),
                                         )
-                                    } else if let Some(worker) = active_worker {
-                                        (Some(worker.execution_id), None, None)
+                                    } else if let Some(subagent) = active_subagent {
+                                        (Some(subagent.execution_id), None, None)
                                     } else {
                                         (execution_id, None, None)
                                     };
@@ -1366,11 +1366,11 @@ impl TaskRuntimeStore {
         Ok(())
     }
 
-    /// Persist the boundary immediately before a task worker starts model/tool
-    /// execution. A matching [`record_worker_released`](Self::record_worker_released)
-    /// makes the worker result recoverable without dispatching it again.
+    /// Persist the boundary immediately before a task Subagent starts model/tool
+    /// execution. A matching [`record_subagent_released`](Self::record_subagent_released)
+    /// makes the Subagent result recoverable without dispatching it again.
     #[allow(clippy::too_many_arguments)]
-    pub fn record_worker_assigned(
+    pub fn record_subagent_assigned(
         &self,
         run_id: &str,
         task_id: &str,
@@ -1383,7 +1383,7 @@ impl TaskRuntimeStore {
             run_id,
             Some(task_id),
             Some(execution_id),
-            RuntimeEventKind::WorkerAssigned,
+            RuntimeEventKind::SubagentAssigned,
             serde_json::json!({
                 "execution_id": execution_id,
                 "agent_name": agent_name,
@@ -1394,8 +1394,8 @@ impl TaskRuntimeStore {
         Ok(())
     }
 
-    /// Persist a worker terminal fact with the structured result needed for resume.
-    pub fn record_worker_released(
+    /// Persist a Subagent terminal fact with the structured result needed for resume.
+    pub fn record_subagent_released(
         &self,
         run_id: &str,
         task_id: &str,
@@ -1408,7 +1408,7 @@ impl TaskRuntimeStore {
             run_id,
             Some(task_id),
             Some(execution_id),
-            RuntimeEventKind::WorkerReleased,
+            RuntimeEventKind::SubagentReleased,
             serde_json::json!({
                 "execution_id": execution_id,
                 "status": status,
@@ -1483,10 +1483,10 @@ impl TaskRuntimeStore {
         Ok(())
     }
 
-    /// Return a completed worker result for this exact attempt. A later
-    /// WorkerAssigned with the same id clears an older terminal fact, which is
+    /// Return a completed Subagent result for this exact attempt. A later
+    /// SubagentAssigned with the same id clears an older terminal fact, which is
     /// how an explicitly confirmed retry avoids reusing stale output.
-    pub fn recoverable_worker_result(
+    pub fn recoverable_subagent_result(
         &self,
         run_id: &str,
         task_id: &str,
@@ -1500,8 +1500,8 @@ impl TaskRuntimeStore {
                 continue;
             }
             match event.event_type {
-                RuntimeEventKind::WorkerAssigned => result = None,
-                RuntimeEventKind::WorkerReleased => {
+                RuntimeEventKind::SubagentAssigned => result = None,
+                RuntimeEventKind::SubagentReleased => {
                     result =
                         if json_string(&event.payload, "status").as_deref() == Some("completed") {
                             event
@@ -1832,7 +1832,7 @@ mod tests {
         let sum = TaskExecutionSummary {
             run_id: "r1".into(),
             task_id: "t1".into(),
-            worker_agent: "code_reviewer".into(),
+            subagent_name: "code_reviewer".into(),
             result: SubagentTaskResult {
                 contract_version: 1,
                 status: SubagentRunStatus::Completed,
@@ -1976,7 +1976,7 @@ mod tests {
     fn pause_request_stops_driver_and_keeps_run_resumable() -> Result<(), StoreError> {
         let store = std::sync::Arc::new(fresh());
         seed_plan(&store);
-        store.set_task_status("r1", "t1", TodoStatus::Running, Some("worker"), None)?;
+        store.set_task_status("r1", "t1", TodoStatus::Running, Some("subagent"), None)?;
         let token = echo_agent::agent::CancellationToken::new();
         let _registration = store.register_run_cancellation("r1", token.clone())?;
 
@@ -1993,7 +1993,7 @@ mod tests {
     fn boot_recovery_requeues_orphaned_running_task() -> Result<(), StoreError> {
         let store = fresh();
         seed_plan(&store);
-        store.set_task_status("r1", "t1", TodoStatus::Running, Some("worker"), None)?;
+        store.set_task_status("r1", "t1", TodoStatus::Running, Some("subagent"), None)?;
 
         assert_eq!(store.recover_incomplete(), 1);
         let todo = store
@@ -2007,21 +2007,21 @@ mod tests {
     }
 
     #[test]
-    fn boot_recovery_reuses_completed_worker_without_redispatch() -> Result<(), StoreError> {
+    fn boot_recovery_reuses_completed_subagent_without_redispatch() -> Result<(), StoreError> {
         let store = fresh();
         seed_plan(&store);
-        store.set_task_status("r1", "t1", TodoStatus::Running, Some("worker"), None)?;
-        store.record_worker_assigned("r1", "t1", "t1:1", "worker", 1, true)?;
+        store.set_task_status("r1", "t1", TodoStatus::Running, Some("subagent"), None)?;
+        store.record_subagent_assigned("r1", "t1", "t1:1", "subagent", 1, true)?;
         let result = SubagentTaskResult::terminal(
             SubagentRunStatus::Completed,
             "durable result",
             Vec::new(),
         );
-        store.record_worker_released("r1", "t1", "t1:1", "completed", Some(&result))?;
+        store.record_subagent_released("r1", "t1", "t1:1", "completed", Some(&result))?;
 
         assert_eq!(store.recover_incomplete(), 1);
         assert_eq!(
-            store.recoverable_worker_result("r1", "t1", "t1:1")?,
+            store.recoverable_subagent_result("r1", "t1", "t1:1")?,
             Some(result)
         );
         let todo = store
@@ -2032,14 +2032,14 @@ mod tests {
         assert_eq!(todo.status, TodoStatus::Pending);
         assert_eq!(
             todo.summary.as_deref(),
-            Some("worker completed before interruption; pending review")
+            Some("Subagent completed before interruption; pending review")
         );
         assert!(store.list_recovery_blockers("r1")?.is_empty());
         Ok(())
     }
 
     #[test]
-    fn mutating_in_doubt_worker_blocks_resume_until_user_decides() -> Result<(), StoreError> {
+    fn mutating_in_doubt_subagent_blocks_resume_until_user_decides() -> Result<(), StoreError> {
         let store = fresh();
         seed_plan(&store);
         store.update_task(
@@ -2050,8 +2050,8 @@ mod tests {
                 ..Default::default()
             },
         )?;
-        store.set_task_status("r1", "t1", TodoStatus::Running, Some("worker"), None)?;
-        store.record_worker_assigned("r1", "t1", "t1:1", "worker", 1, false)?;
+        store.set_task_status("r1", "t1", TodoStatus::Running, Some("subagent"), None)?;
+        store.record_subagent_assigned("r1", "t1", "t1:1", "subagent", 1, false)?;
         store.record_tool_started("r1", "t1", "t1:1", "call-write", "write_file", false)?;
 
         assert_eq!(store.recover_incomplete(), 1);
@@ -2136,8 +2136,8 @@ mod tests {
                 ..Default::default()
             },
         )?;
-        store.set_task_status("r1", "t1", TodoStatus::Running, Some("worker"), None)?;
-        store.record_worker_assigned("r1", "t1", "t1:1", "worker", 1, false)?;
+        store.set_task_status("r1", "t1", TodoStatus::Running, Some("subagent"), None)?;
+        store.record_subagent_assigned("r1", "t1", "t1:1", "subagent", 1, false)?;
         assert_eq!(store.recover_incomplete(), 1);
 
         // Simulate a process stop after RecoveryResolved was appended but
@@ -2291,7 +2291,7 @@ mod tests {
     fn update_task_rejects_ownership_change_while_running() -> Result<(), StoreError> {
         let store = fresh();
         seed_plan(&store);
-        store.set_task_status("r1", "t1", TodoStatus::Running, Some("worker"), None)?;
+        store.set_task_status("r1", "t1", TodoStatus::Running, Some("subagent"), None)?;
         let result = store.update_task(
             "r1",
             "t1",

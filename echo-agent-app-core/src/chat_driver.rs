@@ -51,7 +51,7 @@ pub trait ChatSink: Send + Sync + 'static {
 }
 
 /// Build the EKO TaskRuntime sink carried through task-local run context.
-pub fn worker_trace_sink_for(
+pub fn subagent_trace_sink_for(
     sink: &std::sync::Arc<dyn ChatSink>,
 ) -> crate::tasks::task_runtime::task_tools::TraceSink {
     let sink = std::sync::Arc::clone(sink);
@@ -115,7 +115,7 @@ pub async fn drive_chat(
     let cancel = res.cancel.clone();
     let turn_cancel = cancel.clone();
     let sink = res.sink.clone();
-    let trace_sink = worker_trace_sink_for(&sink);
+    let trace_sink = subagent_trace_sink_for(&sink);
     let formal_run_id = crate::tasks::task_runtime::task_tools::formal_run_id_for_turn(&turn_id);
     let interaction_mode = res.interaction_mode;
     let store = res.store.clone();
@@ -379,7 +379,7 @@ async fn drive_chat_inner(
 
         // `with_run_context` is task-local and does not cross the framework's
         // forked subagent `tokio::spawn`; ExternalRunContext is the value-carried
-        // channel that keeps worker tools and run_id on this same run. The
+        // channel that keeps Subagent tools and run_id on this same run. The
         // `trace_sink` here is the framework-Value form; `scoped_with_ctx_run_id`
         // re-scopes it into `CURRENT_TRACE_SINK` for tools (e.g. plan_execute)
         // running inside the framework's spawned tool executor.

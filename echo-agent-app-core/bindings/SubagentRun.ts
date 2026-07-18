@@ -18,7 +18,7 @@ import type { SubagentTaskResult } from "./SubagentTaskResult";
 export type SubagentRun = {
   /**
    * Stable execution id, format "{task_id}:{attempt}". Aligns with
-   * `SubagentEvent::execution_id`. Was the legacy "worker_id".
+   * `SubagentEvent::execution_id`.
    */
   subagent_run_id: string;
   /**

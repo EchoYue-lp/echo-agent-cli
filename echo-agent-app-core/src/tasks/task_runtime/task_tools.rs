@@ -17,7 +17,8 @@ use echo_agent::prelude::*;
 use echo_agent::tools::{Tool, ToolResult};
 use std::sync::Arc;
 
-use super::executor::ExecEvent;
+use super::executor::{ExecEvent, RunPlanPolicy};
+use super::profiles::{ProfileTemplate, default_subagent_for, subagent_catalog_prompt};
 use super::store::TaskRuntimeStore;
 use super::types::{
     AttendedMode, DomainProfile, PlanTask, PlanTaskKind, TaskPatch, TaskRunStatus, TodoStatus,
@@ -199,7 +200,7 @@ mod tests {
     #[tokio::test]
     async fn run_id_survives_await_across_threads() {
         // Force a yield point so the scheduler has the opportunity to move us
-        // to a different runtime worker thread.
+        // to a different Tokio scheduler thread.
         let captured = with_run_id("run-xyz".to_string(), async {
             tokio::task::yield_now().await;
             // After yield, we may be on a different thread — task_local must
@@ -259,76 +260,6 @@ fn parse_kind(s: &str) -> PlanTaskKind {
     }
 }
 
-/// 按 task kind 推导默认 agent_role(映射到 infra.rs 注册的 subagent 角色)。
-///
-/// 必要性:PlanTask 的 agent_role 默认是 "general",但框架只注册了 13 个具体角色
-/// (project_explorer/code_reviewer/...),委派 "general" 必然 "Subagent not found"。
-/// 只读 kind(read_only_review/investigation/test_plan/review/summary)委派给对应
-/// 只读 subagent;变更 kind(implementation/debugging/verification)由主 agent 直接
-/// 执行(不委派 subagent),用 "primary" 占位(run_readonly_worker 不会触及)。
-/// Map a plan-task kind to the registered subagent name that should run it.
-///
-/// SA-3 collapsed the old 13 specialized subagents (`project_explorer` /
-/// `code_reviewer` / `test_planner` / `summary_writer` / …) into 4 generic
-/// ones registered in `infra.rs`: `explorer`, `reviewer`, `planner`,
-/// `summarizer`. This mapping must stay aligned with those registered names —
-/// otherwise `run_readonly_worker` dispatches to a non-existent subagent and
-/// every read-only plan task fails with "Subagent 'X' not found".
-///
-/// Read-only kinds (read_only_review / investigation / test_plan / review /
-/// summary) delegate to the matching generic subagent; mutating kinds
-/// (implementation / debugging / verification) are executed directly by the
-/// main agent (`executor.rs::run_main_agent_task`), so the role here is only
-/// a record label that `run_readonly_worker` never touches.
-fn role_for_kind(kind: PlanTaskKind) -> &'static str {
-    match kind {
-        PlanTaskKind::ReadOnlyReview | PlanTaskKind::Investigation | PlanTaskKind::TestPlan => {
-            "explorer"
-        }
-        PlanTaskKind::Review => "reviewer",
-        PlanTaskKind::Summary => "summarizer",
-        // Sprint 9: code-writing kinds route to the registered "implementer"
-        // Fork subagent (runs in an isolated worktree). The role string IS the
-        // registered subagent name (executor delegates by literal match).
-        PlanTaskKind::Implementation | PlanTaskKind::Debugging => "implementer",
-        // Verification (shell/build/test) stays on the primary agent: it runs
-        // read-only-ish shell commands against the workspace and routing it to
-        // a separate worktree checkout would detach it from the just-written
-        // changes. It takes the shell permit, not the writer path.
-        PlanTaskKind::Verification => "primary",
-    }
-}
-
-#[cfg(test)]
-mod role_routing_tests {
-    use super::*;
-
-    #[test]
-    fn readonly_kinds_route_to_explorer_reviewer_summarizer() {
-        assert_eq!(role_for_kind(PlanTaskKind::ReadOnlyReview), "explorer");
-        assert_eq!(role_for_kind(PlanTaskKind::Investigation), "explorer");
-        assert_eq!(role_for_kind(PlanTaskKind::TestPlan), "explorer");
-        assert_eq!(role_for_kind(PlanTaskKind::Review), "reviewer");
-        assert_eq!(role_for_kind(PlanTaskKind::Summary), "summarizer");
-    }
-
-    #[test]
-    fn code_writer_kinds_route_to_implementer() {
-        // Sprint 9: Implementation/Debugging dispatch to the registered writer
-        // subagent (runs in an isolated worktree).
-        assert_eq!(role_for_kind(PlanTaskKind::Implementation), "implementer");
-        assert_eq!(role_for_kind(PlanTaskKind::Debugging), "implementer");
-    }
-
-    #[test]
-    fn verification_stays_on_primary() {
-        // Verification (shell/build/test) runs in-place on the primary agent —
-        // it tests just-written changes against the workspace, so routing it to
-        // a separate worktree would detach it.
-        assert_eq!(role_for_kind(PlanTaskKind::Verification), "primary");
-    }
-}
-
 // ── plan_create ───────────────────────────────────────────────────────────
 
 pub struct TaskCreateTool {
@@ -356,6 +287,7 @@ impl Tool for TaskCreateTool {
                     "enum": ["implementation","debugging","verification","review","investigation","test_plan","summary","read_only_review"],
                     "description": "Task kind"
                 },
+                "subagent": { "type": "string", "description": "Optional registered Subagent name. Omit to use the domain-aware default; project/user custom Subagents are allowed." },
                 "depends_on": { "type": "array", "items": { "type": "string" }, "description": "Explicit prerequisite task ids; ordering is never inferred from prose" },
                 "files": { "type": "array", "items": { "type": "string" }, "description": "For writers: exact workspace-relative files exclusively owned by this task. Empty/glob/broad scopes are treated as unknown and serialized. For readers: inspection targets only." },
                 "allowed_tools": { "type": "array", "items": { "type": "string" }, "description": "Tools allowed for this task" },
@@ -452,6 +384,12 @@ impl TaskCreateTool {
         let allowed_tools = string_array("allowed_tools");
         let required_artifacts = string_array("required_artifacts");
         let verification = string_array("verification");
+        let requested_subagent = params
+            .get("subagent")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
         let after_task_id = params
             .get("after_task_id")
             .and_then(|v| v.as_str())
@@ -460,15 +398,31 @@ impl TaskCreateTool {
         if let Err(e) = self.ensure_run_exists(&run_id, &title, &description) {
             return Ok(e);
         }
+        let run = match self.store.get_run(&run_id) {
+            Ok(Some(run)) => run,
+            Ok(None) => {
+                return Ok(ToolResult::error(
+                    "Task run disappeared after plan_create bootstrap",
+                ));
+            }
+            Err(error) => {
+                return Ok(ToolResult::error(format!(
+                    "Failed to read task run domain: {error}"
+                )));
+            }
+        };
 
         let task_id = format!("task_{}", uuid::Uuid::new_v4().as_simple());
         let kind = parse_kind(kind_str);
+        let subagent = requested_subagent
+            .unwrap_or_else(|| default_subagent_for(run.domain_profile, kind).to_string());
         let task = PlanTask {
             id: task_id.clone(),
             title: title.clone(),
             description,
             kind,
-            agent_role: role_for_kind(kind).to_string(),
+            agent_role: subagent.clone(),
+            domain_profile: run.domain_profile,
             depends_on,
             files,
             allowed_tools,
@@ -479,7 +433,8 @@ impl TaskCreateTool {
         };
         match self.store.insert_task(&run_id, after_task_id, task) {
             Ok(()) => Ok(ToolResult::success(format!(
-                "Created task '{title}' (id: {task_id})"
+                "Created task '{title}' (id: {task_id}, subagent: {subagent}, domain: {})",
+                run.domain_profile.as_str()
             ))),
             Err(e) => Ok(ToolResult::error(format!("Failed to create task: {e}"))),
         }
@@ -508,7 +463,7 @@ impl TaskCreateTool {
                     res.conv_id.clone(),
                     res.root_message_id.clone(),
                     res.attachments.clone(),
-                    Some(crate::chat_driver::worker_trace_sink_for(&res.sink)),
+                    Some(crate::chat_driver::subagent_trace_sink_for(&res.sink)),
                 ),
                 None => (None, run_id.to_string(), Vec::new(), None),
             };
@@ -564,6 +519,40 @@ fn task_goal(title: &str, description: &str) -> String {
     } else {
         "Agent task plan".to_string()
     }
+}
+
+fn complex_run_prompt(
+    user_goal: &str,
+    reason: &str,
+    domain: DomainProfile,
+    plan_mode: &str,
+    initial_plan: &[String],
+) -> String {
+    let template = ProfileTemplate::for_profile(domain);
+    let plan_contract = if plan_mode == "direct_execute" {
+        "Complete the goal directly with ordinary tools when that remains the lightest reliable path. Do not create a placeholder plan merely for ceremony. If execution reveals real dependencies, parallel work, or separately verifiable outcomes, upgrade to a formal DAG with plan_create and plan_execute()."
+    } else {
+        "This run requires a formal, reviewable DAG. Materialize concrete PlanTask nodes with plan_create, assign an appropriate subagent to every delegated node, declare real dependencies, artifacts, files, and verification, then call plan_execute() without an inline task. Do not finish with a prose-only plan."
+    };
+    let initial = if initial_plan.is_empty() {
+        "None supplied; derive the smallest complete decomposition from evidence.".to_string()
+    } else {
+        initial_plan
+            .iter()
+            .map(|step| format!("- {step}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    format!(
+        "[complex_run]\nUser goal: {user_goal}\nComplexity rationale: {reason}\nDomain profile: {} ({})\nPlan mode: {plan_mode}\n\nRun contract:\n{plan_contract}\n\nDomain planning methodology:\n{}\n\nDomain execution standard:\n{}\n\nPreferred Subagents for this domain: {}\nAvailable builtin Subagents:\n{}\n\nInitial decomposition brief:\n{initial}\n[/complex_run]",
+        template.key,
+        template.label,
+        template.prompt_suffix,
+        template.execution_guidance,
+        template.default_subagent_roles.join(", "),
+        subagent_catalog_prompt(),
+    )
 }
 
 #[cfg(test)]
@@ -627,6 +616,118 @@ mod plan_create_tests {
         assert_eq!(plan.tasks.len(), 1);
         assert_eq!(plan.tasks[0].agent_role, "explorer");
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn plan_create_inherits_domain_and_routes_data_subagents()
+    -> std::result::Result<(), String> {
+        let shadow_root = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let store = Arc::new(
+            TaskRuntimeStore::new_in_memory_with_shadow_root(shadow_root.path())
+                .map_err(|error| error.to_string())?,
+        );
+        let run_id = "run_data_profile";
+        store
+            .create_run(
+                run_id,
+                "default",
+                "conversation:data",
+                "message:data",
+                DomainProfile::DataAnalysis,
+                "清洗并分析销售数据",
+                "agent_task_plan",
+                AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run(run_id, TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+        let tool = TaskCreateTool {
+            store: store.clone(),
+        };
+
+        let mut analysis = ToolParameters::new();
+        analysis.insert(
+            "title".to_string(),
+            serde_json::Value::String("分析指标".to_string()),
+        );
+        analysis.insert(
+            "description".to_string(),
+            serde_json::Value::String("计算核心指标并验证不确定性".to_string()),
+        );
+        analysis.insert(
+            "kind".to_string(),
+            serde_json::Value::String("implementation".to_string()),
+        );
+        let result = with_run_id(run_id.to_string(), tool.execute(analysis))
+            .await
+            .map_err(|error| error.to_string())?;
+        if !result.success {
+            return Err(format!("data plan_create failed: {:?}", result.error));
+        }
+
+        let mut shaping = ToolParameters::new();
+        shaping.insert(
+            "title".to_string(),
+            serde_json::Value::String("清洗数据".to_string()),
+        );
+        shaping.insert(
+            "description".to_string(),
+            serde_json::Value::String("画像 schema 并导出清洗结果".to_string()),
+        );
+        shaping.insert(
+            "kind".to_string(),
+            serde_json::Value::String("implementation".to_string()),
+        );
+        shaping.insert(
+            "subagent".to_string(),
+            serde_json::Value::String("data-shaper".to_string()),
+        );
+        let result = with_run_id(run_id.to_string(), tool.execute(shaping))
+            .await
+            .map_err(|error| error.to_string())?;
+        if !result.success {
+            return Err(format!(
+                "explicit subagent plan_create failed: {:?}",
+                result.error
+            ));
+        }
+
+        let plan = store
+            .get_plan(run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "expected data plan".to_string())?;
+        if plan.tasks.len() != 2 {
+            return Err(format!("expected 2 tasks, got {}", plan.tasks.len()));
+        }
+        assert!(
+            plan.tasks
+                .iter()
+                .all(|task| task.domain_profile == DomainProfile::DataAnalysis)
+        );
+        assert!(plan.tasks.iter().any(|task| task.agent_role == "analyst"));
+        assert!(
+            plan.tasks
+                .iter()
+                .any(|task| task.agent_role == "data-shaper")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn complex_run_prompt_encodes_domain_and_plan_policy() {
+        let prompt = complex_run_prompt(
+            "分析临床研究",
+            "multi_source synthesis",
+            DomainProfile::MedicalResearch,
+            "plan_then_execute",
+            &["检索指南: 形成证据表".to_string()],
+        );
+        assert!(prompt.contains("medical_research"));
+        assert!(prompt.contains("PICO"));
+        assert!(prompt.contains("formal, reviewable DAG"));
+        assert!(prompt.contains("Available builtin Subagents"));
+        assert!(prompt.contains("检索指南: 形成证据表"));
     }
 }
 
@@ -734,10 +835,15 @@ impl CreateComplexTaskTool {
             .unwrap_or("general");
         let domain = super::types::DomainProfile::from_str(domain_profile_str)
             .unwrap_or(super::types::DomainProfile::General);
-        let _plan_mode = params
+        let plan_mode = params
             .get("plan_mode")
             .and_then(|v| v.as_str())
             .unwrap_or("plan_then_execute");
+        let plan_policy = if plan_mode == "direct_execute" {
+            RunPlanPolicy::AllowDirect
+        } else {
+            RunPlanPolicy::RequirePlan
+        };
         let priority = params
             .get("priority")
             .and_then(|v| v.as_str())
@@ -748,9 +854,20 @@ impl CreateComplexTaskTool {
             .map(|a| {
                 a.iter()
                     .filter_map(|v| {
-                        v.get("step_name")
+                        let step_name = v
+                            .get("step_name")
                             .and_then(|s| s.as_str())
-                            .map(String::from)
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())?;
+                        let expected = v
+                            .get("expected_outcome")
+                            .and_then(|s| s.as_str())
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty());
+                        Some(match expected {
+                            Some(expected) => format!("{step_name}: {expected}"),
+                            None => step_name.to_string(),
+                        })
                     })
                     .collect()
             })
@@ -768,6 +885,7 @@ impl CreateComplexTaskTool {
                     .join("\n")
             )
         };
+        let run_prompt = complex_run_prompt(&user_goal, &reason, domain, plan_mode, &initial_plan);
 
         let run_id = uuid::Uuid::new_v4().to_string();
         let conv = res
@@ -805,7 +923,7 @@ impl CreateComplexTaskTool {
         let run_cancel = echo_agent::agent::CancellationToken::new();
 
         let trace_sink = if priority == "foreground" {
-            Some(crate::chat_driver::worker_trace_sink_for(&res.sink))
+            Some(crate::chat_driver::subagent_trace_sink_for(&res.sink))
         } else {
             None
         };
@@ -814,13 +932,14 @@ impl CreateComplexTaskTool {
             pool,
             store: store.clone(),
             cancel: run_cancel,
-            reviewer_llm: None,
             // B5.1: forward the chat turn's memory layer so the run's Blocking
             // memory write (drive_run_async → execute_run) actually lands the
             // taskrun:completed:{run_id} memory. None when no memory subsystem
             // is wired (then the Blocking write is a no-op).
             layer_manager: res.layer_manager.clone(),
             trace_sink,
+            prompt: run_prompt,
+            plan_policy,
         };
 
         if priority == "foreground" {

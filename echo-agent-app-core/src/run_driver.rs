@@ -10,32 +10,30 @@
 //!   `move`d into `tokio::spawn` for background runs (no borrowed refs).
 //! - `AgentPool::acquire` returns an **owned** `AgentHandle` (not a guard);
 //!   the pool's write-lock is held only during `create_agent` and released
-//!   before `execute_run` runs — so `execute_run` holds no pool lock. No
+//!   before the ReAct loop runs, so no pool lock spans model/tool execution. No
 //!   deadlock. (Current `agent_pool.rs:264` already does this; preserved.)
 //! - Background runs MUST use an independent `CancellationToken` (spec §5.5),
 //!   never the chat turn's token — the caller (`create_complex_task`) supplies
 //!   it via `RunPayload.cancel`.
 //!
-//! Result closure (emit-after-write) is added in Phase B5 (spec §6.1); here we
-//! only drive `execute_run`, which already handles 6-state transitions +
-//! fire-and-forget `memory_bridge`.
+//! Terminal status is read from TaskRuntime after the Agent loop; completed and
+//! cancelled chat-owned runs then perform the blocking memory write.
 
 use std::sync::Arc;
 
 use echo_agent::agent::CancellationToken;
 use echo_agent::evolution::MemoryLayerManager;
-use echo_agent::llm::LlmClient;
 
 use crate::agent_pool::AgentPool;
-use crate::tasks::task_runtime::executor::{ExecSink, RunOutcome, execute_run};
+use crate::tasks::task_runtime::executor::{ExecSink, RunOutcome, RunPlanPolicy, drive_agent_run};
+use crate::tasks::task_runtime::memory_bridge::{MemoryEvent, MemoryPolicy};
 use crate::tasks::task_runtime::store::TaskRuntimeStore;
+use crate::tasks::task_runtime::types::{TaskRunStatus, UnattendedWriteMode};
 
 /// Fully-owned payload for driving a Run in the background or foreground.
 ///
 /// Every field is owned or `Arc`'d so the whole struct is `Send + 'static`
-/// and can be `move`d into `tokio::spawn`. `brief` is intentionally absent —
-/// `execute_run` reads the run's goal/plan from the store, so the driver needs
-/// no copy of it.
+/// and can be moved into `tokio::spawn`.
 pub struct RunPayload {
     pub run_id: String,
     pub pool: Arc<AgentPool>,
@@ -44,51 +42,55 @@ pub struct RunPayload {
     /// background runs — see spec §5.5). Foreground runs may share the turn
     /// token, but using an independent one keeps the logic uniform.
     pub cancel: CancellationToken,
-    pub reviewer_llm: Option<Arc<dyn LlmClient>>,
     pub layer_manager: Option<Arc<MemoryLayerManager>>,
-    /// Execution-flow sink forwarded into `execute_run` so the main agent's
+    /// Execution-flow sink forwarded into the independent Agent so its
     /// thinking/tool/token events reach the frontend's `execution://event`
     /// channel. `Some` for foreground (inline streaming to the chat sink);
     /// `None` for background (events go via Tauri emit from the run path).
     pub trace_sink: Option<ExecSink>,
+    /// Full prompt for the independent primary Agent. Kept separate from the
+    /// persisted user-facing Run goal so domain methodology does not pollute UI.
+    pub prompt: String,
+    /// Whether this Run must materialize a formal plan before completion.
+    pub plan_policy: RunPlanPolicy,
 }
 
 /// Drive an already-created TaskRuntime run to completion on an isolated pool
-/// agent. Acquires a pool agent for `run_id`, hands it to `execute_run` as the
-/// `primary_agent`, and returns the run's terminal outcome.
-///
-/// `execute_run` internally performs the 6-state transitions
-/// (Running → Completed/Failed/Paused/Cancelled) and fires
-/// `memory_bridge::write_memory_candidate` at terminal states. This function
-/// adds only the pool-isolation wiring on top.
+/// agent. The isolated Agent first runs ReAct so it can materialize a formal
+/// plan through `plan_create` + `plan_execute`, or complete directly when the
+/// Run policy allows it.
 pub async fn drive_run_async(payload: RunPayload) -> Result<RunOutcome, String> {
     let _cancel_registration = payload
         .store
         .register_run_cancellation(&payload.run_id, payload.cancel.clone())
         .map_err(|error| format!("register run cancellation failed: {error}"))?;
-    // acquire returns an OWNED AgentHandle (not a guard); the pool write-lock
-    // is held only during create_agent and released here, so execute_run below
-    // runs without holding any pool lock (spec §5.6, no deadlock).
+    // acquire returns an owned AgentHandle; the pool lock is released before
+    // the long-running ReAct loop begins.
     let pool_agent = payload
         .pool
         .acquire(&payload.run_id)
         .await
         .map_err(|e| format!("pool acquire failed for run {}: {e}", payload.run_id))?;
-    let result = execute_run(
+    let execute_plan =
+        crate::tasks::task_runtime::ExecutePlanTool::new(payload.store.clone(), pool_agent.clone());
+    pool_agent
+        .write(|agent| {
+            agent.add_tool(Box::new(execute_plan));
+        })
+        .await;
+
+    let drive_result = drive_agent_run(
         payload.store.clone(),
-        Some(pool_agent),
-        payload.reviewer_llm.clone(),
-        payload.layer_manager.clone(),
-        None, // run_store (RunStore) — not wired from the chat path
-        payload.trace_sink.clone(),
+        pool_agent,
         &payload.run_id,
+        "create_complex_task",
+        &payload.run_id,
+        &payload.prompt,
         payload.cancel,
-        // B5.1: autonomous runs block the memory write so a Completed run has
-        // its taskrun:completed:{run_id} memory durable before any follow-up
-        // question can fire (eliminates the recall race, spec §6.1). layer_manager
-        // must be Some for the write to actually happen; if None the write is a
-        // no-op (blocking + None → returns immediately, same as before B5.1).
-        crate::tasks::task_runtime::memory_bridge::MemoryPolicy::Blocking,
+        UnattendedWriteMode::Disabled,
+        None,
+        payload.plan_policy,
+        payload.trace_sink.clone(),
     )
     .await;
     // Phase C: release the per-run pool entry so it doesn't linger until the
@@ -97,7 +99,59 @@ pub async fn drive_run_async(payload: RunPayload) -> Result<RunOutcome, String> 
     // fresh UUID per run, never reused), so release here is the defensive
     // choice — matches the cron path. No-op semantics if already evicted.
     payload.pool.release(&payload.run_id).await;
-    result.map_err(|e| format!("execute_run failed for run {}: {e}", payload.run_id))
+    drive_result.map_err(|error| {
+        format!(
+            "agent-driven run failed for run {}: {error}",
+            payload.run_id
+        )
+    })?;
+
+    let run = payload
+        .store
+        .get_run(&payload.run_id)
+        .map_err(|error| format!("read final run status failed: {error}"))?
+        .ok_or_else(|| format!("run {} disappeared after execution", payload.run_id))?;
+    let outcome = match run.status {
+        TaskRunStatus::Completed => RunOutcome::Completed,
+        TaskRunStatus::Cancelled => RunOutcome::Cancelled,
+        TaskRunStatus::Failed => RunOutcome::Failed {
+            failed_task_id: "<run>".to_string(),
+            error: "agent-driven run failed".to_string(),
+        },
+        TaskRunStatus::Paused => RunOutcome::Paused {
+            failed_task_id: "<run>".to_string(),
+            error: "agent-driven run paused".to_string(),
+        },
+        status => {
+            return Err(format!(
+                "run {} ended in non-terminal status {}",
+                payload.run_id,
+                status.as_str()
+            ));
+        }
+    };
+
+    let memory_event = match &outcome {
+        RunOutcome::Completed => Some(MemoryEvent::RunCompleted {
+            run_id: payload.run_id.clone(),
+            goal: run.goal.clone(),
+        }),
+        RunOutcome::Cancelled => Some(MemoryEvent::RunCancelledByUser {
+            run_id: payload.run_id.clone(),
+            goal: run.goal.clone(),
+        }),
+        RunOutcome::Failed { .. } | RunOutcome::Paused { .. } => None,
+    };
+    if let Some(event) = memory_event {
+        crate::tasks::task_runtime::memory_bridge::write_memory_candidate_dispatch(
+            MemoryPolicy::Blocking,
+            payload.layer_manager.as_ref(),
+            &payload.store,
+            event,
+        )
+        .await;
+    }
+    Ok(outcome)
 }
 
 #[cfg(test)]

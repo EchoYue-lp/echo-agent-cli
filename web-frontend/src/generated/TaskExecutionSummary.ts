@@ -11,7 +11,7 @@ import type { SuggestedTask } from './SuggestedTask';
 export type TaskExecutionSummary = {
   run_id: string;
   task_id: string;
-  worker_agent: string;
+  subagent_name: string;
   result: SubagentTaskResult;
   decisions: Array<string>;
   next_implications: Array<string>;

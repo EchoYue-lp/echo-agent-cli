@@ -22,9 +22,9 @@ use super::types::{PlanTask, TaskExecutionSummary, TodoItem, TodoStatus};
 /// Stable application marker identifying the run-level recovery projection.
 pub const RUNTIME_RECOVERY_MARKER: &str = "[eko_runtime_recovery_capsule]";
 
-/// Marker already present in worker prompts created by `build_task_prompt`.
-/// Protecting it keeps the per-task brief alive if a worker compact runs before
-/// the worker finishes.
+/// Marker already present in Subagent prompts created by `build_task_prompt`.
+/// Protecting it keeps the per-task brief alive if a Subagent compact runs
+/// before the Subagent finishes.
 pub const TASK_CONTEXT_MARKER: &str = "[task_context]";
 
 const MAX_GOAL_CHARS: usize = 420;
@@ -153,7 +153,7 @@ impl PreModelContextProjector for TaskRuntimeContextProjector {
     }
 }
 
-/// Protect the dynamic task brief for the current worker invocation.
+/// Protect the dynamic task brief for the current Subagent invocation.
 pub async fn install_task_context_protection(agent: &ReactAgent) {
     let mut ctx = agent.context().lock().await;
     ctx.add_replaceable_protected_marker(TASK_CONTEXT_MARKER.to_string());
@@ -408,10 +408,10 @@ mod tests {
     use std::sync::Arc;
 
     #[tokio::test]
-    async fn worker_task_context_protection_replaces_previous_brief() -> Result<(), String> {
+    async fn subagent_task_context_protection_replaces_previous_brief() -> Result<(), String> {
         let agent = ReactAgent::new(echo_agent::agent::AgentConfig::minimal(
             "test-model",
-            "worker",
+            "subagent",
         ));
         install_task_context_protection(&agent).await;
         let context_handle = agent.context();
@@ -513,7 +513,7 @@ mod tests {
             .put_summary(&TaskExecutionSummary {
                 run_id: "r1".to_string(),
                 task_id: "t1".to_string(),
-                worker_agent: "explorer".to_string(),
+                subagent_name: "explorer".to_string(),
                 result: SubagentTaskResult {
                     contract_version: 1,
                     status: SubagentRunStatus::Completed,

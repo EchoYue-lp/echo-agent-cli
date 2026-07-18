@@ -17,6 +17,11 @@ export type PlanTask = {
   domain_profile: DomainProfile;
   depends_on: Array<string>;
   parallel_group: string | null;
+  /**
+   * Read targets for read-only tasks. For mutating tasks, exact
+   * workspace-relative files are exclusive ownership; empty/broad/invalid
+   * declarations are unknown ownership and serialize with every writer.
+   */
   files: Array<string>;
   allowed_tools: Array<string>;
   /**
