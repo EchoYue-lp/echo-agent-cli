@@ -86,6 +86,13 @@ pub fn build_tauri_app(
             commands::browser::browser_set_backend,
             commands::browser::chrome_setup_status,
             commands::browser::chrome_open_extensions_page,
+            // File-backed data analysis
+            commands::analysis::list_analyses,
+            commands::analysis::create_analysis,
+            commands::analysis::get_analysis,
+            commands::analysis::save_analysis,
+            commands::analysis::run_analysis,
+            commands::analysis::cancel_analysis,
             // Config
             commands::config::get_config,
             commands::config::update_config,
@@ -302,8 +309,8 @@ pub fn build_tauri_app(
 
             // Subagent execution event bridge — forward every SubagentEventBus
             // event onto the unified `execution://event` Tauri channel. The
-            // legacy `worker://trace` + `subagent://event` channels and the
-            // temp-id HashMap were removed in Phase 4 of the Subagent
+            // pre-unification trace/event channels and the temp-id HashMap
+            // were removed in Phase 4 of the Subagent
             // unification; the frontend now reads exclusively from
             // `execution://event` (keyed by the stable `execution_id` carried
             // on the event itself, no bridge-side allocation).
@@ -602,10 +609,10 @@ pub fn build_tauri_app(
                                 // from subagent_run_id so retry attempts fold into
                                 // one frontend card (matches Claude Code/Codex
                                 // subagent display), and so the TaskRuntime bridge
-                                // (chat.rs worker_trace_sink, which only has the
-                                // bare task_id) emits the SAME key. P0.5 fix for the
+                                // chat bridge (which only has the bare task_id)
+                                // emits the SAME key. P0.5 fix for the
                                 // identity split bug (Q4): both bridges must agree
-                                // on the key or the frontend splits one worker into
+                                // on the key or the frontend splits one subagent into
                                 // two store records.
                                 let task_id_owned: Option<String> = execution_id
                                     .as_deref()
@@ -678,7 +685,7 @@ mod tests {
     fn thinking_ended_and_llm_usage_have_distinct_execution_event_names() {
         let thinking = SubagentEvent::DispatchThinkingEnded {
             parent: "main".to_string(),
-            agent: "worker".to_string(),
+            agent: "subagent".to_string(),
             prompt_tokens: 10,
             completion_tokens: 2,
             execution_id: Some("task:1".to_string()),
@@ -686,7 +693,7 @@ mod tests {
         };
         let usage = SubagentEvent::DispatchLlmUsage {
             parent: "main".to_string(),
-            agent: "worker".to_string(),
+            agent: "subagent".to_string(),
             model: "test".to_string(),
             prompt_tokens: 10,
             completion_tokens: 2,

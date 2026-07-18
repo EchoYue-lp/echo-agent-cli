@@ -231,7 +231,10 @@ one sensitivity or reconciliation check for material conclusions. Separate \
 descriptive, predictive, and causal claims. Add research or coding tasks when \
 external evidence, scripts, notebooks, or packages are necessary. Treat \
 `exploratory_statistics` as descriptive only; formal inference must use a \
-persisted SciPy/statsmodels/R script executed through `run_code`.",
+persisted SciPy/statsmodels/R script executed through `run_code.script_path`. \
+Durable user-facing analyses live under `analysis/<analysis-id>/` with a \
+versioned manifest whose id matches the directory; do not make \
+an in-memory-only notebook the source of truth.",
     execution_guidance: "Preserve raw inputs and provenance. Make transformations reproducible, state metric definitions and assumptions, and validate material results with reconciliation or sensitivity evidence. For formal inference, persist the exact Python/R script and record input hashes, package versions, seeds, missing-data handling, diagnostics, warnings, and result artifacts; do not hand-write statistical distributions or p-value approximations.",
     workflows: UNIVERSAL_WORKFLOWS,
     review_checklist: &[
@@ -243,6 +246,7 @@ persisted SciPy/statsmodels/R script executed through `run_code`.",
         "Formal inference uses a persisted mature-library script rather than an exploratory tool or hand-written approximation?",
         "Charts not misleading?",
         "Script / notebook / pipeline rerunnable with input hash, package versions, seed, and result artifacts?",
+        "The executed script is the same persisted file the user reviewed?",
     ],
 };
 

@@ -129,6 +129,7 @@ pub async fn run_repl(agent: AgentHandle, config: ReplConfig) -> anyhow::Result<
 
     // Build command registry with trait-based commands
     let mut registry = crate::cli::command::CommandRegistry::new();
+    crate::cli::cmd_impls::analysis::register_all(&mut registry);
     crate::cli::cmd_impls::coding::register_all(&mut registry);
     crate::cli::cmd_impls::diff_cmd::register_all(&mut registry);
     crate::cli::cmd_impls::git::register_all(&mut registry);

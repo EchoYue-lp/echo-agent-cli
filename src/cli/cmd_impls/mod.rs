@@ -5,6 +5,7 @@
 
 pub mod advanced;
 pub mod all;
+pub mod analysis;
 pub mod coding;
 pub mod context;
 pub mod cron;

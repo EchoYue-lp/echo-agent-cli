@@ -25,11 +25,14 @@ describe('rightWorkspaceWidthForViewport', () => {
 });
 
 describe('useRightWorkspaceStore', () => {
-  it('opens flat task, browser, and file views', () => {
+  it('opens flat task, analysis, browser, and file views', () => {
     const store = useRightWorkspaceStore.getState();
 
     store.openBrowser();
     expect(useRightWorkspaceStore.getState()).toMatchObject({ open: true, activeTab: 'browser' });
+
+    store.openAnalysis();
+    expect(useRightWorkspaceStore.getState()).toMatchObject({ open: true, activeTab: 'analysis' });
 
     store.openFiles();
     expect(useRightWorkspaceStore.getState()).toMatchObject({ open: true, activeTab: 'files' });

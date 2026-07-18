@@ -117,12 +117,9 @@ Your abstract here.
                 let data_dir = WorkspaceLayout::data(root);
                 fs::create_dir_all(data_dir.join("raw"))?;
                 fs::create_dir_all(data_dir.join("processed"))?;
-                fs::create_dir_all(root.join("notebooks"))?;
+                fs::create_dir_all(root.join("analysis"))?;
                 fs::create_dir_all(root.join("output/charts"))?;
                 fs::create_dir_all(root.join("output/reports"))?;
-
-                let analysis_template = "# Data Analysis\n\n## Objective\n\nDescribe your analysis goal.\n\n## Dataset\n\n- Source:\n- Size:\n- Format:\n\n## Steps\n\n1. Load data\n2. Explore & profile\n3. Clean & transform\n4. Analyze\n5. Visualize\n6. Summarize\n";
-                fs::write(root.join("notebooks/analysis.md"), analysis_template)?;
 
                 tracing::info!(workspace = %workspace.id, "Applied data project template");
             }

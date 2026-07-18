@@ -1,5 +1,12 @@
-import { useEffect, useRef, useState } from 'react';
-import { FileCode, Globe2, GripVertical, ListTodo, PanelRightClose } from 'lucide-react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
+import {
+  FileCode,
+  FlaskConical,
+  Globe2,
+  GripVertical,
+  ListTodo,
+  PanelRightClose,
+} from 'lucide-react';
 import {
   rightWorkspaceWidthForViewport,
   useRightWorkspaceStore,
@@ -7,6 +14,7 @@ import {
 import { useUiStore } from '../../stores/uiStore';
 import { BrowserPanel } from '../browser/BrowserPanel';
 import { FileBrowser } from '../file-browser/FileBrowser';
+import AnalysisPanel from '../analysis/AnalysisPanel';
 import { RightRail } from './RightRail';
 
 export function RightWorkspace() {
@@ -63,6 +71,12 @@ export function RightWorkspace() {
             onClick={() => store.setActiveTab('tasks')}
           />
           <WorkspaceTab
+            active={store.activeTab === 'analysis'}
+            icon={<FlaskConical size={13} />}
+            label="分析"
+            onClick={() => store.setActiveTab('analysis')}
+          />
+          <WorkspaceTab
             active={store.activeTab === 'browser'}
             icon={<Globe2 size={13} />}
             label="浏览器"
@@ -88,6 +102,8 @@ export function RightWorkspace() {
         <div className="min-h-0 flex-1">
           {store.activeTab === 'tasks' ? (
             <RightRail />
+          ) : store.activeTab === 'analysis' ? (
+            <AnalysisPanel />
           ) : store.activeTab === 'browser' ? (
             <BrowserPanel />
           ) : (
@@ -115,7 +131,7 @@ function WorkspaceTab({ active, icon, label, onClick }: TabButtonProps) {
 
 interface TabButtonProps {
   active: boolean;
-  icon: React.ReactNode;
+  icon: ReactNode;
   label: string;
   onClick: () => void;
 }

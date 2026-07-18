@@ -3747,6 +3747,16 @@ async fn handle_slash_command(
                 ),
             });
         }
+        Some(SlashCommand::Analysis) => {
+            let command_args: Vec<&str> = args.split_whitespace().collect();
+            let content =
+                crate::cli::cmd_impls::analysis::execute_analysis_command(agent, &command_args)
+                    .await;
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content,
+            });
+        }
         Some(SlashCommand::Trace) => {
             let run_store = agent.read(|value| value.run_store().cloned()).await;
             let content = match run_store {

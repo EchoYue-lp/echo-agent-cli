@@ -825,6 +825,131 @@ export const filesApi = {
       : get<WorkspaceChange[]>('/files/changes'),
 };
 
+// ── File-backed analysis API ───────────────────────────────────────
+
+export type AnalysisLanguage = 'python' | 'r';
+export type AnalysisRunStatus = 'succeeded' | 'failed' | 'cancelled' | 'timed_out';
+
+export interface AnalysisManifest {
+  contract_version: number;
+  analysis_id: string;
+  title: string;
+  language: AnalysisLanguage;
+  script_path: string;
+  input_paths: string[];
+  parameters: unknown;
+  random_seed?: number | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AnalysisFileFingerprint {
+  path: string;
+  available: boolean;
+  bytes?: number | null;
+  sha256?: string | null;
+}
+
+export interface AnalysisOutputArtifact {
+  path: string;
+  absolute_path: string;
+  kind: string;
+  bytes: number;
+  sha256: string;
+}
+
+export interface AnalysisRunRecord {
+  contract_version: number;
+  run_id: string;
+  analysis_id: string;
+  status: AnalysisRunStatus;
+  started_at: string;
+  finished_at: string;
+  duration_ms: number;
+  script: AnalysisFileFingerprint;
+  inputs: AnalysisFileFingerprint[];
+  parameters: unknown;
+  parameters_sha256: string;
+  random_seed?: number | null;
+  outputs: AnalysisOutputArtifact[];
+  environment: Record<string, string>;
+  exit_code?: number | null;
+  sandbox_type?: string | null;
+  output: string;
+  error?: string | null;
+  output_truncated: boolean;
+}
+
+export interface AnalysisSummary {
+  analysis_id: string;
+  title: string;
+  language: AnalysisLanguage;
+  script_path: string;
+  updated_at: string;
+  stale: boolean;
+  stale_reasons: string[];
+  last_run_status?: AnalysisRunStatus | null;
+  last_run_at?: string | null;
+}
+
+export interface AnalysisDocument {
+  manifest: AnalysisManifest;
+  script: string;
+  script_revision: string;
+  stale: boolean;
+  stale_reasons: string[];
+  last_run?: AnalysisRunRecord | null;
+  outputs: AnalysisOutputArtifact[];
+}
+
+export interface SaveAnalysisInput {
+  title: string;
+  script: string;
+  expectedScriptRevision: string;
+  inputPaths: string[];
+  parameters: unknown;
+  randomSeed?: number | null;
+}
+
+function analysisRequiresDesktop<T>(): Promise<T> {
+  return Promise.reject(new Error('文件化分析工作台需要 EKO 桌面运行时'));
+}
+
+export const analysisApi = {
+  list: () =>
+    isTauri()
+      ? apiInvoke<AnalysisSummary[]>('list_analyses')
+      : analysisRequiresDesktop<AnalysisSummary[]>(),
+  create: (title: string, language: AnalysisLanguage) =>
+    isTauri()
+      ? apiInvoke<AnalysisDocument>('create_analysis', { title, language })
+      : analysisRequiresDesktop<AnalysisDocument>(),
+  get: (analysisId: string) =>
+    isTauri()
+      ? apiInvoke<AnalysisDocument>('get_analysis', { analysisId })
+      : analysisRequiresDesktop<AnalysisDocument>(),
+  save: (analysisId: string, input: SaveAnalysisInput) =>
+    isTauri()
+      ? apiInvoke<AnalysisDocument>('save_analysis', {
+          analysisId,
+          title: input.title,
+          script: input.script,
+          expectedScriptRevision: input.expectedScriptRevision,
+          inputPaths: input.inputPaths,
+          parameters: input.parameters,
+          randomSeed: input.randomSeed ?? null,
+        })
+      : analysisRequiresDesktop<AnalysisDocument>(),
+  run: (analysisId: string) =>
+    isTauri()
+      ? apiInvoke<AnalysisDocument>('run_analysis', { analysisId })
+      : analysisRequiresDesktop<AnalysisDocument>(),
+  cancel: (analysisId: string) =>
+    isTauri()
+      ? apiInvoke<boolean>('cancel_analysis', { analysisId })
+      : analysisRequiresDesktop<boolean>(),
+};
+
 // ── Terminal API ────────────────────────────────────────────────────
 
 export interface TerminalSession {

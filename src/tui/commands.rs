@@ -101,6 +101,7 @@ pub enum SlashCommand {
     Preview,
     Edit,
     Browser,
+    Analysis,
 
     // -- Git --
     Git,
@@ -177,6 +178,7 @@ impl SlashCommand {
             Self::Preview => "Preview a workspace text file",
             Self::Edit => "Edit a workspace file in $VISUAL/$EDITOR",
             Self::Browser => "Show or switch the browser backend",
+            Self::Analysis => "Create, inspect, and run file-backed analyses",
 
             Self::Git => "Run a git command",
 
@@ -244,7 +246,8 @@ impl SlashCommand {
             | Self::Diff
             | Self::Preview
             | Self::Edit
-            | Self::Browser => Category::Coding,
+            | Self::Browser
+            | Self::Analysis => Category::Coding,
             Self::Git => Category::Git,
             Self::Pipeline => Category::Pipeline,
             Self::Permission => Category::Security,
@@ -274,6 +277,7 @@ impl SlashCommand {
             Self::Diff => "[file-path]",
             Self::Preview | Self::Edit => "<file-path>",
             Self::Browser => "[status|managed|chrome]",
+            Self::Analysis => "[list|create <python|r> <title>|show <id>|run <id>]",
             Self::Git => "<git-args>",
             Self::Pipeline => "[list|run <name>]",
             Self::Permission => "[ask|auto|deny]",

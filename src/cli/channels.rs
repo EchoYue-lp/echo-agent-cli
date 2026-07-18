@@ -156,6 +156,15 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
             );
             return Ok(futures::stream::once(async move { Ok(outbound) }).boxed());
         }
+        if let Some(message) = channel_analysis_response(&agent, &msg.text).await {
+            let outbound = echo_agent::channels::OutboundMessage::new(
+                &msg.channel_id,
+                &msg.sender_id,
+                msg.chat_type,
+                message,
+            );
+            return Ok(futures::stream::once(async move { Ok(outbound) }).boxed());
+        }
 
         // 3. Drive through the shared `drive_chat` entry (TUI/GUI parity,
         //    AGENTS.md): route the message (normal vs complex) and stream
@@ -167,7 +176,7 @@ impl echo_agent::channels::MessageHandler for AppChannelMessageHandler {
         >();
         let text = msg.text.clone();
         // Persist IM attachments into the same durable reference contract as
-        // GUI/TUI so TaskRuntime workers can reconstruct the same message.
+        // GUI/TUI so TaskRuntime subagents can reconstruct the same message.
         let attachment_refs = stage_channel_attachments(&msg.attachments);
         let multimodal = if attachment_refs.is_empty() {
             None
@@ -323,6 +332,19 @@ async fn channel_trace_response(
             Err(error) => format!("Unable to load run diagnostics: {error}"),
         },
     )
+}
+
+#[cfg(feature = "channels")]
+async fn channel_analysis_response(
+    agent: &echo_agent_app_core::agent_handle::AgentHandle,
+    message: &str,
+) -> Option<String> {
+    let mut parts = message.split_whitespace();
+    if parts.next()? != "/analysis" {
+        return None;
+    }
+    let args: Vec<&str> = parts.collect();
+    Some(crate::cli::cmd_impls::analysis::execute_analysis_command(agent, &args).await)
 }
 
 /// 将任意字符串清理为 DeepSeek `user_id` 合法形式 `[a-zA-Z0-9\-_]+`，最长 512 字符。
