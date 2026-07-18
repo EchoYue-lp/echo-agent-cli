@@ -136,6 +136,26 @@ export function PaperDetail({ paper, onClose, onUpdated }: PaperDetailProps) {
               s={s}
             />
           )}
+          {paper.zotero_key && (
+            <MetaItem icon={Hash} label="Zotero" value={paper.zotero_key} s={s} />
+          )}
+          {paper.clinical_trial_id && (
+            <MetaItem
+              icon={ExternalLink}
+              label="Clinical trial"
+              value={paper.clinical_trial_id}
+              link={`https://clinicaltrials.gov/study/${paper.clinical_trial_id}`}
+              s={s}
+            />
+          )}
+          {paper.europe_pmc?.full_text_path && (
+            <MetaItem
+              icon={FileText}
+              label="Full text"
+              value={paper.europe_pmc.full_text_path}
+              s={s}
+            />
+          )}
           {paper.pdf_path && <MetaItem icon={FileText} label="PDF" value={paper.pdf_path} s={s} />}
           <MetaItem
             icon={Calendar}
@@ -157,6 +177,34 @@ export function PaperDetail({ paper, onClose, onUpdated }: PaperDetailProps) {
             >
               {paper.abstract_text}
             </p>
+          </div>
+        )}
+
+        {paper.europe_pmc && (
+          <div>
+            <h3 className="mb-1.5 text-xs font-semibold" style={{ color: s.text }}>
+              Europe PMC
+            </h3>
+            <div className="space-y-2 border-y py-3" style={{ borderColor: s.border }}>
+              <div className="text-[11px]" style={{ color: s.textSec }}>
+                {paper.europe_pmc.citation_ids.length} citations ·{' '}
+                {paper.europe_pmc.reference_ids.length} references ·{' '}
+                {paper.europe_pmc.biomedical_entities.length} entities
+              </div>
+              {paper.europe_pmc.biomedical_entities.length > 0 && (
+                <div className="flex flex-wrap gap-1">
+                  {paper.europe_pmc.biomedical_entities.slice(0, 20).map((entity) => (
+                    <span
+                      key={`${entity.semantic_type ?? 'entity'}:${entity.name}`}
+                      className="rounded border px-1.5 py-0.5 text-[10px]"
+                      style={{ borderColor: s.border, color: s.textSec }}
+                    >
+                      {entity.name}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
         )}
 

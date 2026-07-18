@@ -3,7 +3,7 @@
 //! Research artifacts are ordinary workspace files under `research/` so they
 //! remain inspectable, versionable, and usable by GUI, TUI, CLI, and agents.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -17,6 +17,8 @@ const RESEARCH_ROOT: &str = "research";
 const SOURCES_DIR: &str = "sources";
 const EVIDENCE_DIR: &str = "evidence";
 const REVIEWS_DIR: &str = "reviews";
+const FULL_TEXT_DIR: &str = "fulltext";
+const REPORTS_DIR: &str = "reports";
 const REVIEW_FILE: &str = "review.json";
 const CONTRACT_VERSION: u32 = 1;
 const MAX_JSON_BYTES: u64 = 4 * 1024 * 1024;
@@ -33,6 +35,8 @@ pub enum ResearchError {
     Io(#[from] std::io::Error),
     #[error("research JSON failed: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("research integration failed: {0}")]
+    External(String),
 }
 
 pub type ResearchResult<T> = Result<T, ResearchError>;
@@ -74,6 +78,10 @@ pub struct SourceRecord {
     pub pmcid: Option<String>,
     pub arxiv_id: Option<String>,
     pub openalex_id: Option<String>,
+    #[serde(default)]
+    pub zotero_key: Option<String>,
+    #[serde(default)]
+    pub clinical_trial_id: Option<String>,
     pub year: Option<i32>,
     pub venue: Option<String>,
     pub url: Option<String>,
@@ -83,6 +91,8 @@ pub struct SourceRecord {
     pub notes: Option<String>,
     #[serde(default)]
     pub provenance: Vec<SourceProvenance>,
+    #[serde(default)]
+    pub europe_pmc: Option<EuropePmcSupplement>,
     pub added_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -99,6 +109,8 @@ pub struct CreateSourceRequest {
     pub pmcid: Option<String>,
     pub arxiv_id: Option<String>,
     pub openalex_id: Option<String>,
+    pub zotero_key: Option<String>,
+    pub clinical_trial_id: Option<String>,
     pub year: Option<i32>,
     pub venue: Option<String>,
     pub url: Option<String>,
@@ -108,6 +120,32 @@ pub struct CreateSourceRequest {
     pub notes: Option<String>,
     #[serde(default)]
     pub provenance: Vec<SourceProvenance>,
+    pub europe_pmc: Option<EuropePmcSupplement>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EuropePmcSupplement {
+    #[serde(default)]
+    pub citation_ids: Vec<String>,
+    #[serde(default)]
+    pub reference_ids: Vec<String>,
+    #[serde(default)]
+    pub biomedical_entities: Vec<BiomedicalEntity>,
+    pub full_text_path: Option<String>,
+    pub enriched_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BiomedicalEntity {
+    pub name: String,
+    pub semantic_type: Option<String>,
+    pub frequency: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceIngestResult {
+    pub source: SourceRecord,
+    pub created: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,6 +166,16 @@ pub struct EvidenceRecord {
     pub effect: Option<String>,
     pub limitations: Option<String>,
     pub certainty: Option<String>,
+    #[serde(default)]
+    pub harms: Vec<String>,
+    #[serde(default)]
+    pub contraindications: Vec<String>,
+    #[serde(default)]
+    pub conflicts_of_interest: Vec<String>,
+    #[serde(default)]
+    pub guideline_conflicts: Vec<String>,
+    #[serde(default)]
+    pub extrapolation_limits: Vec<String>,
     #[serde(default)]
     pub tags: Vec<String>,
     pub created_at: DateTime<Utc>,
@@ -152,6 +200,16 @@ pub struct UpsertEvidenceRequest {
     pub limitations: Option<String>,
     pub certainty: Option<String>,
     #[serde(default)]
+    pub harms: Vec<String>,
+    #[serde(default)]
+    pub contraindications: Vec<String>,
+    #[serde(default)]
+    pub conflicts_of_interest: Vec<String>,
+    #[serde(default)]
+    pub guideline_conflicts: Vec<String>,
+    #[serde(default)]
+    pub extrapolation_limits: Vec<String>,
+    #[serde(default)]
     pub tags: Vec<String>,
 }
 
@@ -167,6 +225,15 @@ pub enum ReviewDomain {
 pub struct PicoFramework {
     pub population: String,
     pub intervention: String,
+    pub comparator: String,
+    #[serde(default)]
+    pub outcomes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PecoFramework {
+    pub population: String,
+    pub exposure: String,
     pub comparator: String,
     #[serde(default)]
     pub outcomes: Vec<String>,
@@ -201,6 +268,24 @@ pub struct ReviewProtocol {
     #[serde(default)]
     pub eligibility: EligibilityCriteria,
     pub pico: Option<PicoFramework>,
+    #[serde(default)]
+    pub peco: Option<PecoFramework>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MedicalReviewContext {
+    #[serde(default)]
+    pub harms: Vec<String>,
+    #[serde(default)]
+    pub contraindications: Vec<String>,
+    #[serde(default)]
+    pub conflicts_of_interest: Vec<String>,
+    #[serde(default)]
+    pub guideline_conflicts: Vec<String>,
+    #[serde(default)]
+    pub extrapolation_limits: Vec<String>,
+    #[serde(default)]
+    pub guideline_source_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -343,6 +428,8 @@ pub struct ReviewRecord {
     pub grade: Vec<GradeAssessment>,
     #[serde(default)]
     pub prisma: PrismaSupplement,
+    #[serde(default)]
+    pub medical: Option<MedicalReviewContext>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -370,6 +457,66 @@ pub struct CreateReviewRequest {
     pub title: String,
     pub question: String,
     pub domain: ReviewDomain,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CitationAuditSeverity {
+    Error,
+    Warning,
+    Info,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CitationAuditIssue {
+    pub severity: CitationAuditSeverity,
+    pub code: String,
+    pub message: String,
+    pub source_id: Option<String>,
+    pub evidence_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CitationAuditReport {
+    pub review_id: String,
+    pub checked_at: DateTime<Utc>,
+    pub source_count: usize,
+    pub evidence_count: usize,
+    pub error_count: usize,
+    pub warning_count: usize,
+    #[serde(default)]
+    pub issues: Vec<CitationAuditIssue>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewExportFormat {
+    Markdown,
+    Json,
+    Csv,
+    Bibtex,
+    Ris,
+}
+
+impl ReviewExportFormat {
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Markdown => "md",
+            Self::Json => "json",
+            Self::Csv => "csv",
+            Self::Bibtex => "bib",
+            Self::Ris => "ris",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewExportArtifact {
+    pub review_id: String,
+    pub format: ReviewExportFormat,
+    pub path: String,
+    pub bytes: u64,
+    pub citation_audit: CitationAuditReport,
 }
 
 pub fn list_sources(
@@ -420,12 +567,11 @@ pub fn create_source(
         &["https://doi.org/", "http://doi.org/", "doi:"],
     );
     request.pmid = normalize_identifier(request.pmid, &["pmid:"]);
-    request.pmcid = normalize_identifier(request.pmcid, &["pmcid:"]);
+    request.pmcid = normalize_pmcid(request.pmcid);
     request.arxiv_id = normalize_identifier(request.arxiv_id, &["arxiv:"]);
-    request.openalex_id = normalize_identifier(
-        request.openalex_id,
-        &["https://openalex.org/", "http://openalex.org/"],
-    );
+    request.openalex_id = normalize_openalex_id(request.openalex_id);
+    request.zotero_key = normalize_reference_key(request.zotero_key, "zotero:");
+    request.clinical_trial_id = normalize_clinical_trial_id(request.clinical_trial_id);
     ensure_source_is_unique(workspace_root, &request)?;
     let now = Utc::now();
     let source = SourceRecord {
@@ -440,6 +586,8 @@ pub fn create_source(
         pmcid: request.pmcid,
         arxiv_id: request.arxiv_id,
         openalex_id: request.openalex_id,
+        zotero_key: request.zotero_key,
+        clinical_trial_id: request.clinical_trial_id,
         year: request.year,
         venue: clean_optional(request.venue),
         url: clean_optional(request.url),
@@ -447,11 +595,73 @@ pub fn create_source(
         tags: normalized_values(request.tags),
         notes: clean_optional(request.notes),
         provenance: request.provenance,
+        europe_pmc: request.europe_pmc,
         added_at: now,
         updated_at: now,
     };
     write_json(&source_path(workspace_root, &source.id)?, &source)?;
     Ok(source)
+}
+
+pub fn ingest_source(
+    workspace_root: &Path,
+    request: CreateSourceRequest,
+) -> ResearchResult<SourceIngestResult> {
+    if let Some(mut existing) = find_matching_source(workspace_root, &request)? {
+        merge_source(&mut existing, request);
+        existing.updated_at = Utc::now();
+        write_json(&source_path(workspace_root, &existing.id)?, &existing)?;
+        return Ok(SourceIngestResult {
+            source: existing,
+            created: false,
+        });
+    }
+    create_source(workspace_root, request).map(|source| SourceIngestResult {
+        source,
+        created: true,
+    })
+}
+
+pub fn save_europe_pmc_supplement(
+    workspace_root: &Path,
+    source_id: &str,
+    mut supplement: EuropePmcSupplement,
+) -> ResearchResult<SourceRecord> {
+    let mut source = get_source(workspace_root, source_id)?;
+    supplement.citation_ids = normalized_values(supplement.citation_ids);
+    supplement.reference_ids = normalized_values(supplement.reference_ids);
+    supplement
+        .biomedical_entities
+        .sort_by(|left, right| left.name.cmp(&right.name));
+    supplement.biomedical_entities.dedup_by(|left, right| {
+        left.name == right.name && left.semantic_type == right.semantic_type
+    });
+    supplement.full_text_path = clean_optional(supplement.full_text_path);
+    supplement.enriched_at = Some(Utc::now());
+    source.europe_pmc = Some(supplement);
+    source.updated_at = Utc::now();
+    write_json(&source_path(workspace_root, source_id)?, &source)?;
+    Ok(source)
+}
+
+pub fn write_full_text_xml(
+    workspace_root: &Path,
+    source_id: &str,
+    xml: &str,
+) -> ResearchResult<String> {
+    validate_record_id(source_id)?;
+    if xml.trim().is_empty() {
+        return Err(ResearchError::Invalid(
+            "Europe PMC full text is empty".to_string(),
+        ));
+    }
+    let path = research_dir(workspace_root)
+        .join(FULL_TEXT_DIR)
+        .join(format!("{source_id}.xml"));
+    atomic_write(&path, xml.as_bytes())?;
+    path.strip_prefix(workspace_root)
+        .map(|relative| relative.to_string_lossy().to_string())
+        .map_err(|_| ResearchError::Invalid("full-text path is outside workspace".to_string()))
 }
 
 pub fn update_source_notes(
@@ -579,6 +789,11 @@ pub fn upsert_evidence(
         effect: clean_optional(request.effect),
         limitations: clean_optional(request.limitations),
         certainty: clean_optional(request.certainty),
+        harms: normalized_values(request.harms),
+        contraindications: normalized_values(request.contraindications),
+        conflicts_of_interest: normalized_values(request.conflicts_of_interest),
+        guideline_conflicts: normalized_values(request.guideline_conflicts),
+        extrapolation_limits: normalized_values(request.extrapolation_limits),
         tags: normalized_values(request.tags),
         created_at: existing
             .as_ref()
@@ -654,12 +869,14 @@ pub fn create_review(
             search_strategies: Vec::new(),
             eligibility: EligibilityCriteria::default(),
             pico: (request.domain == ReviewDomain::Medical).then(PicoFramework::default),
+            peco: None,
         },
         source_ids: Vec::new(),
         screening: Vec::new(),
         risk_of_bias: Vec::new(),
         grade: Vec::new(),
         prisma: PrismaSupplement::default(),
+        medical: (request.domain == ReviewDomain::Medical).then(MedicalReviewContext::default),
         created_at: now,
         updated_at: now,
     };
@@ -699,6 +916,27 @@ pub fn save_review(
     record.source_ids = normalized_values(record.source_ids);
     for source_id in &record.source_ids {
         get_source(workspace_root, source_id)?;
+    }
+    if let Some(medical) = record.medical.as_mut() {
+        medical.harms = normalized_values(std::mem::take(&mut medical.harms));
+        medical.contraindications =
+            normalized_values(std::mem::take(&mut medical.contraindications));
+        medical.conflicts_of_interest =
+            normalized_values(std::mem::take(&mut medical.conflicts_of_interest));
+        medical.guideline_conflicts =
+            normalized_values(std::mem::take(&mut medical.guideline_conflicts));
+        medical.extrapolation_limits =
+            normalized_values(std::mem::take(&mut medical.extrapolation_limits));
+        medical.guideline_source_ids =
+            normalized_values(std::mem::take(&mut medical.guideline_source_ids));
+        for source_id in &medical.guideline_source_ids {
+            let source = get_source(workspace_root, source_id)?;
+            if source.source_kind != SourceKind::Guideline {
+                return Err(ResearchError::Invalid(format!(
+                    "medical guideline source {source_id} is not marked as a guideline"
+                )));
+            }
+        }
     }
     record.updated_at = Utc::now();
     write_json(&review_path(workspace_root, review_id)?, &record)?;
@@ -765,6 +1003,547 @@ pub fn prisma_flow(review: &ReviewRecord) -> PrismaFlow {
     }
 }
 
+pub fn audit_review(workspace_root: &Path, review_id: &str) -> ResearchResult<CitationAuditReport> {
+    let document = get_review(workspace_root, review_id)?;
+    let evidence = list_evidence(workspace_root, None, Some(review_id))?;
+    let sources = list_sources(workspace_root, None, None)?;
+    let source_by_id: BTreeMap<&str, &SourceRecord> = sources
+        .iter()
+        .map(|source| (source.id.as_str(), source))
+        .collect();
+    let mut issues = Vec::new();
+
+    for source_id in &document.record.source_ids {
+        if !source_by_id.contains_key(source_id.as_str()) {
+            issues.push(audit_issue(
+                CitationAuditSeverity::Error,
+                "missing_source",
+                format!("Review references missing source {source_id}"),
+                Some(source_id.clone()),
+                None,
+            ));
+        }
+    }
+
+    for record in &evidence {
+        if !source_by_id.contains_key(record.source_id.as_str()) {
+            issues.push(audit_issue(
+                CitationAuditSeverity::Error,
+                "orphan_evidence",
+                format!("Evidence {} references a missing source", record.id),
+                Some(record.source_id.clone()),
+                Some(record.id.clone()),
+            ));
+        }
+        if !document.record.source_ids.contains(&record.source_id) {
+            issues.push(audit_issue(
+                CitationAuditSeverity::Warning,
+                "evidence_outside_review",
+                "Evidence source is not included in the review source set".to_string(),
+                Some(record.source_id.clone()),
+                Some(record.id.clone()),
+            ));
+        }
+        if record.claim.trim().is_empty() {
+            issues.push(audit_issue(
+                CitationAuditSeverity::Error,
+                "empty_claim",
+                "Evidence claim is empty".to_string(),
+                Some(record.source_id.clone()),
+                Some(record.id.clone()),
+            ));
+        }
+        if record.excerpt.as_deref().is_none_or(str::is_empty)
+            && record.locator.as_deref().is_none_or(str::is_empty)
+        {
+            issues.push(audit_issue(
+                CitationAuditSeverity::Warning,
+                "missing_locator",
+                "Evidence has neither an excerpt nor a source locator".to_string(),
+                Some(record.source_id.clone()),
+                Some(record.id.clone()),
+            ));
+        }
+    }
+
+    for source_id in &document.record.source_ids {
+        let included = document.record.screening.iter().any(|decision| {
+            decision.source_id == *source_id
+                && decision.stage == ScreeningStage::FullText
+                && decision.decision == ScreeningDecisionValue::Include
+        });
+        if included && !evidence.iter().any(|record| record.source_id == *source_id) {
+            issues.push(audit_issue(
+                CitationAuditSeverity::Warning,
+                "included_without_evidence",
+                "Included full-text source has no extracted evidence".to_string(),
+                Some(source_id.clone()),
+                None,
+            ));
+        }
+    }
+
+    for decision in &document.record.screening {
+        if decision.decision == ScreeningDecisionValue::Exclude
+            && decision.reason.as_deref().is_none_or(str::is_empty)
+        {
+            issues.push(audit_issue(
+                CitationAuditSeverity::Warning,
+                "exclusion_without_reason",
+                "Excluded source has no exclusion reason".to_string(),
+                Some(decision.source_id.clone()),
+                None,
+            ));
+        }
+    }
+
+    let error_count = issues
+        .iter()
+        .filter(|issue| issue.severity == CitationAuditSeverity::Error)
+        .count();
+    let warning_count = issues
+        .iter()
+        .filter(|issue| issue.severity == CitationAuditSeverity::Warning)
+        .count();
+    Ok(CitationAuditReport {
+        review_id: review_id.to_string(),
+        checked_at: Utc::now(),
+        source_count: document.record.source_ids.len(),
+        evidence_count: evidence.len(),
+        error_count,
+        warning_count,
+        issues,
+    })
+}
+
+pub fn export_review(
+    workspace_root: &Path,
+    review_id: &str,
+    format: ReviewExportFormat,
+) -> ResearchResult<ReviewExportArtifact> {
+    let document = get_review(workspace_root, review_id)?;
+    let sources = document
+        .record
+        .source_ids
+        .iter()
+        .filter_map(|source_id| get_source(workspace_root, source_id).ok())
+        .collect::<Vec<_>>();
+    let evidence = list_evidence(workspace_root, None, Some(review_id))?;
+    let audit = audit_review(workspace_root, review_id)?;
+    let bytes = match format {
+        ReviewExportFormat::Markdown => {
+            render_review_markdown(&document, &sources, &evidence, &audit).into_bytes()
+        }
+        ReviewExportFormat::Json => serde_json::to_vec_pretty(&serde_json::json!({
+            "review": document,
+            "sources": sources,
+            "evidence": evidence,
+            "citation_audit": audit,
+        }))?,
+        ReviewExportFormat::Csv => render_evidence_csv(&sources, &evidence).into_bytes(),
+        ReviewExportFormat::Bibtex => render_bibtex(&sources).into_bytes(),
+        ReviewExportFormat::Ris => render_ris(&sources).into_bytes(),
+    };
+    let path = review_dir(workspace_root, review_id)?
+        .join(REPORTS_DIR)
+        .join(format!("systematic-review.{}", format.extension()));
+    atomic_write(&path, &bytes)?;
+    let relative = path
+        .strip_prefix(workspace_root)
+        .map_err(|_| ResearchError::Invalid("report path is outside workspace".to_string()))?
+        .to_string_lossy()
+        .to_string();
+    Ok(ReviewExportArtifact {
+        review_id: review_id.to_string(),
+        format,
+        path: relative,
+        bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        citation_audit: audit,
+    })
+}
+
+pub fn export_all_review_formats(
+    workspace_root: &Path,
+    review_id: &str,
+) -> ResearchResult<Vec<ReviewExportArtifact>> {
+    [
+        ReviewExportFormat::Markdown,
+        ReviewExportFormat::Json,
+        ReviewExportFormat::Csv,
+        ReviewExportFormat::Bibtex,
+        ReviewExportFormat::Ris,
+    ]
+    .into_iter()
+    .map(|format| export_review(workspace_root, review_id, format))
+    .collect()
+}
+
+fn audit_issue(
+    severity: CitationAuditSeverity,
+    code: &str,
+    message: String,
+    source_id: Option<String>,
+    evidence_id: Option<String>,
+) -> CitationAuditIssue {
+    CitationAuditIssue {
+        severity,
+        code: code.to_string(),
+        message,
+        source_id,
+        evidence_id,
+    }
+}
+
+fn render_review_markdown(
+    document: &ReviewDocument,
+    sources: &[SourceRecord],
+    evidence: &[EvidenceRecord],
+    audit: &CitationAuditReport,
+) -> String {
+    let record = &document.record;
+    let mut output = format!(
+        "# {}\n\n## Protocol\n\n**Question:** {}\n\n**Objective:** {}\n\n",
+        record.title, record.protocol.question, record.protocol.objective
+    );
+    if let Some(pico) = &record.protocol.pico {
+        output.push_str(&format!(
+            "### PICO\n\n- Population: {}\n- Intervention: {}\n- Comparator: {}\n- Outcomes: {}\n\n",
+            pico.population,
+            pico.intervention,
+            pico.comparator,
+            pico.outcomes.join("; ")
+        ));
+    }
+    if let Some(peco) = &record.protocol.peco {
+        output.push_str(&format!(
+            "### PECO\n\n- Population: {}\n- Exposure: {}\n- Comparator: {}\n- Outcomes: {}\n\n",
+            peco.population,
+            peco.exposure,
+            peco.comparator,
+            peco.outcomes.join("; ")
+        ));
+    }
+    output.push_str("## Search Strategy\n\n");
+    for search in &record.protocol.search_strategies {
+        output.push_str(&format!(
+            "- **{}**: `{}`; searched {}; results {}\n",
+            search.database,
+            search.query,
+            search
+                .searched_at
+                .map(|date| date.to_rfc3339())
+                .unwrap_or_else(|| "not recorded".to_string()),
+            search
+                .result_count
+                .map(|count| count.to_string())
+                .unwrap_or_else(|| "not recorded".to_string())
+        ));
+    }
+    let flow = &document.prisma_flow;
+    output.push_str(&format!(
+        "\n## PRISMA Flow\n\n- Records identified: {}\n- Duplicates removed: {}\n- Records screened: {}\n- Reports assessed: {}\n- Studies included: {}\n\n",
+        flow.records_identified,
+        flow.duplicates_removed,
+        flow.records_screened,
+        flow.reports_assessed,
+        flow.studies_included
+    ));
+    output.push_str("## Evidence\n\n| Source | Dimension | Claim | Locator | Certainty |\n|---|---|---|---|---|\n");
+    for item in evidence {
+        let title = sources
+            .iter()
+            .find(|source| source.id == item.source_id)
+            .map(|source| source.title.as_str())
+            .unwrap_or(item.source_id.as_str());
+        output.push_str(&format!(
+            "| {} | {} | {} | {} | {} |\n",
+            markdown_cell(title),
+            markdown_cell(&item.dimension),
+            markdown_cell(&item.claim),
+            markdown_cell(item.locator.as_deref().unwrap_or("")),
+            markdown_cell(item.certainty.as_deref().unwrap_or(""))
+        ));
+    }
+    output.push_str("\n## Risk Of Bias\n\n");
+    for assessment in &record.risk_of_bias {
+        output.push_str(&format!(
+            "- {}: {:?}. {}\n",
+            assessment.source_id, assessment.overall, assessment.rationale
+        ));
+    }
+    output.push_str("\n## GRADE Summary Of Findings\n\n");
+    for grade in &record.grade {
+        output.push_str(&format!(
+            "- {}: {:?}; relative effect {}; absolute effect {}; participants {}; studies {}; applicability {}\n",
+            grade.outcome,
+            grade.certainty,
+            grade.relative_effect.as_deref().unwrap_or("not reported"),
+            grade.absolute_effect.as_deref().unwrap_or("not reported"),
+            grade.participants.map(|value| value.to_string()).unwrap_or_else(|| "not reported".to_string()),
+            grade.studies.map(|value| value.to_string()).unwrap_or_else(|| "not reported".to_string()),
+            grade.applicability.as_deref().unwrap_or("not assessed")
+        ));
+    }
+    if let Some(medical) = &record.medical {
+        output.push_str(&format!(
+            "\n## Medical Applicability\n\n- Harms: {}\n- Contraindications: {}\n- Conflicts of interest: {}\n- Guideline conflicts: {}\n- Extrapolation limits: {}\n\n",
+            medical.harms.join("; "),
+            medical.contraindications.join("; "),
+            medical.conflicts_of_interest.join("; "),
+            medical.guideline_conflicts.join("; "),
+            medical.extrapolation_limits.join("; ")
+        ));
+    }
+    output.push_str(&format!(
+        "## Citation Audit\n\nErrors: {}; warnings: {}.\n\n",
+        audit.error_count, audit.warning_count
+    ));
+    for issue in &audit.issues {
+        output.push_str(&format!(
+            "- [{:?}] {}: {}\n",
+            issue.severity, issue.code, issue.message
+        ));
+    }
+    output
+}
+
+fn render_evidence_csv(sources: &[SourceRecord], evidence: &[EvidenceRecord]) -> String {
+    let mut rows = vec![
+        [
+            "source_id",
+            "title",
+            "dimension",
+            "claim",
+            "excerpt",
+            "locator",
+            "effect",
+            "certainty",
+            "limitations",
+            "harms",
+            "contraindications",
+            "conflicts_of_interest",
+            "guideline_conflicts",
+            "extrapolation_limits",
+        ]
+        .into_iter()
+        .map(csv_cell)
+        .collect::<Vec<_>>()
+        .join(","),
+    ];
+    for item in evidence {
+        let title = sources
+            .iter()
+            .find(|source| source.id == item.source_id)
+            .map(|source| source.title.as_str())
+            .unwrap_or("");
+        rows.push(
+            [
+                item.source_id.as_str(),
+                title,
+                item.dimension.as_str(),
+                item.claim.as_str(),
+                item.excerpt.as_deref().unwrap_or(""),
+                item.locator.as_deref().unwrap_or(""),
+                item.effect.as_deref().unwrap_or(""),
+                item.certainty.as_deref().unwrap_or(""),
+                item.limitations.as_deref().unwrap_or(""),
+                &item.harms.join("; "),
+                &item.contraindications.join("; "),
+                &item.conflicts_of_interest.join("; "),
+                &item.guideline_conflicts.join("; "),
+                &item.extrapolation_limits.join("; "),
+            ]
+            .into_iter()
+            .map(csv_cell)
+            .collect::<Vec<_>>()
+            .join(","),
+        );
+    }
+    format!("{}\n", rows.join("\n"))
+}
+
+fn render_bibtex(sources: &[SourceRecord]) -> String {
+    sources
+        .iter()
+        .map(|source| {
+            let key = citation_key(source);
+            format!(
+                "@article{{{key},\n  title = {{{}}},\n  author = {{{}}},\n  year = {{{}}},\n  journal = {{{}}},\n  doi = {{{}}},\n  url = {{{}}}\n}}",
+                source.title,
+                source.authors.join(" and "),
+                source.year.map(|year| year.to_string()).unwrap_or_default(),
+                source.venue.as_deref().unwrap_or(""),
+                source.doi.as_deref().unwrap_or(""),
+                source.url.as_deref().unwrap_or("")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn render_ris(sources: &[SourceRecord]) -> String {
+    sources
+        .iter()
+        .map(|source| {
+            let mut lines = vec!["TY  - JOUR".to_string(), format!("TI  - {}", source.title)];
+            lines.extend(
+                source
+                    .authors
+                    .iter()
+                    .map(|author| format!("AU  - {author}")),
+            );
+            if let Some(year) = source.year {
+                lines.push(format!("PY  - {year}"));
+            }
+            if let Some(venue) = &source.venue {
+                lines.push(format!("JO  - {venue}"));
+            }
+            if let Some(doi) = &source.doi {
+                lines.push(format!("DO  - {doi}"));
+            }
+            if let Some(url) = &source.url {
+                lines.push(format!("UR  - {url}"));
+            }
+            lines.push("ER  -".to_string());
+            lines.join("\n")
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn citation_key(source: &SourceRecord) -> String {
+    let author = source
+        .authors
+        .first()
+        .and_then(|name| name.split_whitespace().last())
+        .unwrap_or("source");
+    let year = source
+        .year
+        .map(|year| year.to_string())
+        .unwrap_or_else(|| "nd".to_string());
+    let raw = format!("{author}{year}");
+    raw.chars()
+        .filter(|character| character.is_ascii_alphanumeric() || *character == '_')
+        .collect()
+}
+
+fn markdown_cell(value: &str) -> String {
+    value.replace('|', "\\|").replace(['\r', '\n'], " ")
+}
+
+fn csv_cell(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn find_matching_source(
+    workspace_root: &Path,
+    request: &CreateSourceRequest,
+) -> ResearchResult<Option<SourceRecord>> {
+    let incoming_doi = normalize_identifier(
+        request.doi.clone(),
+        &["https://doi.org/", "http://doi.org/", "doi:"],
+    );
+    let incoming_pmid = normalize_identifier(request.pmid.clone(), &["pmid:"]);
+    let incoming_pmcid = normalize_pmcid(request.pmcid.clone());
+    let incoming_arxiv = normalize_identifier(request.arxiv_id.clone(), &["arxiv:"]);
+    let incoming_openalex = normalize_openalex_id(request.openalex_id.clone());
+    let incoming_zotero = normalize_reference_key(request.zotero_key.clone(), "zotero:");
+    let incoming_trial = normalize_clinical_trial_id(request.clinical_trial_id.clone());
+    let normalized_title = normalize_token(&request.title);
+    Ok(list_sources(workspace_root, None, None)?
+        .into_iter()
+        .find(|source| {
+            [
+                (incoming_doi.as_ref(), source.doi.as_ref()),
+                (incoming_pmid.as_ref(), source.pmid.as_ref()),
+                (incoming_pmcid.as_ref(), source.pmcid.as_ref()),
+                (incoming_arxiv.as_ref(), source.arxiv_id.as_ref()),
+                (incoming_openalex.as_ref(), source.openalex_id.as_ref()),
+                (incoming_zotero.as_ref(), source.zotero_key.as_ref()),
+                (incoming_trial.as_ref(), source.clinical_trial_id.as_ref()),
+            ]
+            .iter()
+            .any(|(incoming, existing)| incoming.is_some() && incoming == existing)
+                || (!normalized_title.is_empty()
+                    && normalize_token(&source.title) == normalized_title
+                    && request.year.is_some()
+                    && request.year == source.year)
+        }))
+}
+
+fn merge_source(source: &mut SourceRecord, request: CreateSourceRequest) {
+    if source.title.trim().is_empty() && !request.title.trim().is_empty() {
+        source.title = request.title.trim().to_string();
+    }
+    source.authors.extend(request.authors);
+    source.authors = normalized_values(std::mem::take(&mut source.authors));
+    source.abstract_text = source
+        .abstract_text
+        .take()
+        .or_else(|| clean_optional(request.abstract_text));
+    source.doi = source.doi.take().or_else(|| {
+        normalize_identifier(
+            request.doi,
+            &["https://doi.org/", "http://doi.org/", "doi:"],
+        )
+    });
+    source.pmid = source
+        .pmid
+        .take()
+        .or_else(|| normalize_identifier(request.pmid, &["pmid:"]));
+    source.pmcid = source
+        .pmcid
+        .take()
+        .or_else(|| normalize_pmcid(request.pmcid));
+    source.arxiv_id = source
+        .arxiv_id
+        .take()
+        .or_else(|| normalize_identifier(request.arxiv_id, &["arxiv:"]));
+    source.openalex_id = source
+        .openalex_id
+        .take()
+        .or_else(|| normalize_openalex_id(request.openalex_id));
+    source.zotero_key = source
+        .zotero_key
+        .take()
+        .or_else(|| normalize_reference_key(request.zotero_key, "zotero:"));
+    source.clinical_trial_id = source
+        .clinical_trial_id
+        .take()
+        .or_else(|| normalize_clinical_trial_id(request.clinical_trial_id));
+    source.year = source.year.or(request.year);
+    source.venue = source
+        .venue
+        .take()
+        .or_else(|| clean_optional(request.venue));
+    source.url = source.url.take().or_else(|| clean_optional(request.url));
+    source.pdf_path = source
+        .pdf_path
+        .take()
+        .or_else(|| clean_optional(request.pdf_path));
+    source.tags.extend(request.tags);
+    source.tags = normalized_values(std::mem::take(&mut source.tags));
+    source.notes = source
+        .notes
+        .take()
+        .or_else(|| clean_optional(request.notes));
+    source.provenance.extend(request.provenance);
+    source.provenance.sort_by(|left, right| {
+        left.provider
+            .cmp(&right.provider)
+            .then_with(|| left.record_url.cmp(&right.record_url))
+    });
+    source.provenance.dedup_by(|left, right| {
+        left.provider == right.provider && left.record_url == right.record_url
+    });
+    if source.europe_pmc.is_none() {
+        source.europe_pmc = request.europe_pmc;
+    }
+    if source.source_kind == SourceKind::Other {
+        source.source_kind = request.source_kind.unwrap_or_default();
+    }
+}
+
 fn ensure_source_is_unique(
     workspace_root: &Path,
     request: &CreateSourceRequest,
@@ -779,6 +1558,16 @@ fn ensure_source_is_unique(
                 "OpenAlex",
                 request.openalex_id.as_ref(),
                 source.openalex_id.as_ref(),
+            ),
+            (
+                "Zotero",
+                request.zotero_key.as_ref(),
+                source.zotero_key.as_ref(),
+            ),
+            (
+                "ClinicalTrials.gov",
+                request.clinical_trial_id.as_ref(),
+                source.clinical_trial_id.as_ref(),
             ),
         ] {
             if incoming.is_some() && incoming == existing {
@@ -804,9 +1593,17 @@ fn validate_review(record: &ReviewRecord, expected_id: &str) -> ResearchResult<(
             "review title cannot be empty".to_string(),
         ));
     }
-    if record.domain == ReviewDomain::Medical && record.protocol.pico.is_none() {
+    if record.domain == ReviewDomain::Medical
+        && record.protocol.pico.is_none()
+        && record.protocol.peco.is_none()
+    {
         return Err(ResearchError::Invalid(
-            "medical reviews require a PICO framework".to_string(),
+            "medical reviews require a PICO or PECO framework".to_string(),
+        ));
+    }
+    if record.domain == ReviewDomain::Medical && record.medical.is_none() {
+        return Err(ResearchError::Invalid(
+            "medical reviews require a medical evidence context".to_string(),
         ));
     }
     Ok(())
@@ -897,6 +1694,48 @@ fn normalize_identifier(value: Option<String>, prefixes: &[&str]) -> Option<Stri
     }
     let normalized = normalized.trim().to_lowercase();
     (!normalized.is_empty()).then_some(normalized)
+}
+
+fn normalize_reference_key(value: Option<String>, prefix: &str) -> Option<String> {
+    let value = value?;
+    let trimmed = value.trim();
+    let normalized = if trimmed.to_lowercase().starts_with(prefix) {
+        trimmed
+            .chars()
+            .skip(prefix.chars().count())
+            .collect::<String>()
+    } else {
+        trimmed.to_string()
+    };
+    clean_optional(Some(normalized))
+}
+
+fn normalize_clinical_trial_id(value: Option<String>) -> Option<String> {
+    normalize_reference_key(value, "nct:").map(|value| value.to_uppercase())
+}
+
+fn normalize_pmcid(value: Option<String>) -> Option<String> {
+    normalize_reference_key(value, "pmcid:").map(|value| value.to_uppercase())
+}
+
+fn normalize_openalex_id(value: Option<String>) -> Option<String> {
+    let value = value?;
+    let trimmed = value.trim();
+    let lower = trimmed.to_lowercase();
+    let normalized = if lower.starts_with("https://openalex.org/") {
+        trimmed
+            .chars()
+            .skip("https://openalex.org/".chars().count())
+            .collect::<String>()
+    } else if lower.starts_with("http://openalex.org/") {
+        trimmed
+            .chars()
+            .skip("http://openalex.org/".chars().count())
+            .collect::<String>()
+    } else {
+        trimmed.to_string()
+    };
+    clean_optional(Some(normalized)).map(|value| value.to_uppercase())
 }
 
 fn normalize_token(value: &str) -> String {
@@ -1051,7 +1890,7 @@ mod tests {
     }
 
     #[test]
-    fn medical_review_requires_pico_and_derives_prisma() -> ResearchResult<()> {
+    fn medical_review_accepts_peco_and_derives_prisma() -> ResearchResult<()> {
         let workspace = temp_workspace()?;
         let source = create_source(
             workspace.path(),
@@ -1069,6 +1908,13 @@ mod tests {
             },
         )?;
         assert!(document.record.protocol.pico.is_some());
+        document.record.protocol.pico = None;
+        document.record.protocol.peco = Some(PecoFramework {
+            population: "Adults".to_string(),
+            exposure: "Exposure".to_string(),
+            comparator: "No exposure".to_string(),
+            outcomes: vec!["Mortality".to_string()],
+        });
         document.record.source_ids.push(source.id.clone());
         document.record.screening.push(ScreeningDecision {
             source_id: source.id.clone(),
@@ -1094,6 +1940,66 @@ mod tests {
         )?;
         assert_eq!(saved.prisma_flow.records_identified, 1);
         assert_eq!(saved.prisma_flow.studies_included, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn citation_audit_and_all_report_formats_are_file_backed() -> ResearchResult<()> {
+        let workspace = temp_workspace()?;
+        let source = create_source(
+            workspace.path(),
+            CreateSourceRequest {
+                title: "Evidence paper".to_string(),
+                authors: vec!["A. Author".to_string()],
+                year: Some(2025),
+                doi: Some("10.1000/evidence".to_string()),
+                ..CreateSourceRequest::default()
+            },
+        )?;
+        let mut document = create_review(
+            workspace.path(),
+            CreateReviewRequest {
+                title: "Evidence review".to_string(),
+                question: "What is supported?".to_string(),
+                domain: ReviewDomain::Academic,
+            },
+        )?;
+        document.record.source_ids.push(source.id.clone());
+        document.record.screening.push(ScreeningDecision {
+            source_id: source.id.clone(),
+            stage: ScreeningStage::FullText,
+            decision: ScreeningDecisionValue::Include,
+            reason: Some("Meets criteria".to_string()),
+            reviewer: Some("reviewer".to_string()),
+            decided_at: Utc::now(),
+        });
+        let review_id = document.record.id.clone();
+        let saved = save_review(
+            workspace.path(),
+            &review_id,
+            document.record,
+            &document.revision,
+        )?;
+        upsert_evidence(
+            workspace.path(),
+            UpsertEvidenceRequest {
+                source_id: source.id,
+                review_id: Some(saved.record.id.clone()),
+                dimension: "outcome".to_string(),
+                claim: "The outcome improved".to_string(),
+                locator: Some("Results, table 2".to_string()),
+                ..UpsertEvidenceRequest::default()
+            },
+        )?;
+        let audit = audit_review(workspace.path(), &saved.record.id)?;
+        assert_eq!(audit.error_count, 0);
+        let artifacts = export_all_review_formats(workspace.path(), &saved.record.id)?;
+        assert_eq!(artifacts.len(), 5);
+        assert!(
+            artifacts
+                .iter()
+                .all(|artifact| workspace.path().join(&artifact.path).is_file())
+        );
         Ok(())
     }
 }

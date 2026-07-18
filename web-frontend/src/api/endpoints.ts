@@ -1004,6 +1004,8 @@ export interface Paper {
   pmcid?: string;
   arxiv_id?: string;
   openalex_id?: string;
+  zotero_key?: string;
+  clinical_trial_id?: string;
   year?: number;
   venue?: string;
   url?: string;
@@ -1016,6 +1018,17 @@ export interface Paper {
     retrieved_at: string;
     record_url?: string;
   }>;
+  europe_pmc?: {
+    citation_ids: string[];
+    reference_ids: string[];
+    biomedical_entities: Array<{
+      name: string;
+      semantic_type?: string;
+      frequency?: number;
+    }>;
+    full_text_path?: string;
+    enriched_at?: string;
+  };
   added_at: string;
   updated_at: string;
 }
@@ -1030,6 +1043,8 @@ export interface CreatePaperRequest {
   pmcid?: string;
   arxiv_id?: string;
   openalex_id?: string;
+  zotero_key?: string;
+  clinical_trial_id?: string;
   year?: number;
   venue?: string;
   url?: string;
@@ -1037,6 +1052,7 @@ export interface CreatePaperRequest {
   tags?: string[];
   notes?: string;
   provenance?: Paper['provenance'];
+  europe_pmc?: Paper['europe_pmc'];
 }
 
 export interface EvidenceRecord {
@@ -1056,6 +1072,11 @@ export interface EvidenceRecord {
   effect?: string;
   limitations?: string;
   certainty?: string;
+  harms?: string[];
+  contraindications?: string[];
+  conflicts_of_interest?: string[];
+  guideline_conflicts?: string[];
+  extrapolation_limits?: string[];
   tags: string[];
   created_at: string;
   updated_at: string;
@@ -1095,6 +1116,12 @@ export interface SystematicReviewRecord {
     pico?: {
       population: string;
       intervention: string;
+      comparator: string;
+      outcomes: string[];
+    };
+    peco?: {
+      population: string;
+      exposure: string;
       comparator: string;
       outcomes: string[];
     };
@@ -1138,6 +1165,14 @@ export interface SystematicReviewRecord {
     duplicates_removed: number;
     reports_not_retrieved: number;
   };
+  medical?: {
+    harms: string[];
+    contraindications: string[];
+    conflicts_of_interest: string[];
+    guideline_conflicts: string[];
+    extrapolation_limits: string[];
+    guideline_source_ids: string[];
+  };
   created_at: string;
   updated_at: string;
 }
@@ -1168,6 +1203,63 @@ export interface SystematicReviewSummary {
   source_count: number;
   included_count: number;
   updated_at: string;
+}
+
+export type ResearchProvider = 'openalex' | 'crossref' | 'europe_pmc';
+export interface ScholarlyIngestResult {
+  provider: ResearchProvider;
+  total?: number;
+  created: number;
+  updated: number;
+  sources: Paper[];
+}
+
+export interface ZoteroSyncRequest {
+  library_kind: 'user' | 'group';
+  library_id: string;
+  api_key: string;
+  limit?: number;
+  source_ids: string[];
+}
+
+export interface ZoteroSyncResult {
+  imported: number;
+  updated: number;
+  exported: number;
+  sources: Paper[];
+  provider_response?: unknown;
+}
+
+export interface EuropePmcEnrichmentResult {
+  source: Paper;
+  warnings: string[];
+}
+
+export interface CitationAuditIssue {
+  severity: 'error' | 'warning' | 'info';
+  code: string;
+  message: string;
+  source_id?: string;
+  evidence_id?: string;
+}
+
+export interface CitationAuditReport {
+  review_id: string;
+  checked_at: string;
+  source_count: number;
+  evidence_count: number;
+  error_count: number;
+  warning_count: number;
+  issues: CitationAuditIssue[];
+}
+
+export type ReviewExportFormat = 'markdown' | 'json' | 'csv' | 'bibtex' | 'ris' | 'all';
+export interface ReviewExportArtifact {
+  review_id: string;
+  format: Exclude<ReviewExportFormat, 'all'>;
+  path: string;
+  bytes: number;
+  citation_audit: CitationAuditReport;
 }
 
 function researchRequiresDesktop<T>(): Promise<T> {
@@ -1201,6 +1293,27 @@ export const papersApi = {
     isTauri()
       ? apiInvoke<Paper>('add_paper_tags', { id, tags })
       : post<Paper>(`/papers/${id}/tags`, { tags }),
+  search: (request: {
+    provider: ResearchProvider;
+    query: string;
+    limit?: number;
+    mailto?: string;
+  }) =>
+    isTauri()
+      ? apiInvoke<ScholarlyIngestResult>('search_scholarly_sources', { request })
+      : researchRequiresDesktop<ScholarlyIngestResult>(),
+  importZotero: (request: ZoteroSyncRequest) =>
+    isTauri()
+      ? apiInvoke<ZoteroSyncResult>('import_zotero_library', { request })
+      : researchRequiresDesktop<ZoteroSyncResult>(),
+  exportZotero: (request: ZoteroSyncRequest) =>
+    isTauri()
+      ? apiInvoke<ZoteroSyncResult>('export_zotero_library', { request })
+      : researchRequiresDesktop<ZoteroSyncResult>(),
+  enrichEuropePmc: (sourceId: string) =>
+    isTauri()
+      ? apiInvoke<EuropePmcEnrichmentResult>('enrich_paper_europe_pmc', { sourceId })
+      : researchRequiresDesktop<EuropePmcEnrichmentResult>(),
 };
 
 export const evidenceApi = {
@@ -1243,6 +1356,14 @@ export const systematicReviewsApi = {
     isTauri()
       ? apiInvoke<boolean>('delete_systematic_review', { reviewId })
       : researchRequiresDesktop<boolean>(),
+  audit: (reviewId: string) =>
+    isTauri()
+      ? apiInvoke<CitationAuditReport>('audit_systematic_review', { reviewId })
+      : researchRequiresDesktop<CitationAuditReport>(),
+  export: (reviewId: string, format: ReviewExportFormat) =>
+    isTauri()
+      ? apiInvoke<ReviewExportArtifact[]>('export_systematic_review', { reviewId, format })
+      : researchRequiresDesktop<ReviewExportArtifact[]>(),
 };
 
 // ── Workspace API ──

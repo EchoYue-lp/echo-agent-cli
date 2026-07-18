@@ -24,7 +24,7 @@ evidence, and the next bounded step.
 
 | Responsibility | Owner |
 |---|---|
-| ReAct, tools, `run_code`, LSP client/discovery, AST symbol extraction, reusable workflow primitives | `echo-agent` |
+| ReAct, tools, `run_code`, LSP client/discovery, AST symbol extraction, reusable scholarly API clients, workflow primitives | `echo-agent` |
 | Domain routing, TaskRuntime, file-backed analysis/research contracts, IPC, TUI/GUI/CLI/channel surfaces | `echo-agent-cli` |
 | Statistical inference | Persisted Python/R using SciPy, statsmodels, or mature R packages |
 | Exploratory statistics | Framework descriptive tooling, explicitly not formal inference |
@@ -42,6 +42,10 @@ evidence, and the next bounded step.
 | Medical PICO, screening, RoB, GRADE, and PRISMA | Complete | `ReviewRecord` contract and `ReviewWorkbench` medical mode |
 | LSP automatic discovery and AST-aware repo map | Complete | framework commit `1c6442e` |
 | Legacy framework DataPipeline migration | Complete | `../echo-agent/echo-orchestration/src/workflow/pipelines/data_pipeline.rs`; one tool-capable, code-first file contract |
+| Automatic scholarly ingestion and open metadata clients | Complete | `../echo-agent/echo-tools/src/research/clients.rs`; `echo-agent-app-core/src/research_connectors.rs` |
+| Zotero import/export and Europe PMC enrichment | Complete | PaperPanel connector controls; PMID/PMCID citation, reference, entity, and full-text enrichment |
+| Citation audit and systematic-review report export | Complete | File-backed Markdown, JSON, CSV, BibTeX, and RIS artifacts under each review's `reports/` directory |
+| Medical PECO and applicability risks | Complete | Structured harms, contraindications, conflicts of interest, guideline conflicts, and extrapolation limits |
 
 ## Current Decisions
 
@@ -64,6 +68,17 @@ GRADE outcomes, and PRISMA counts are ordinary workspace JSON records. The GUI
 is a projection of those records; Agent/TUI/CLI/channel operations use the same
 application service and `research_library` tool.
 
+Successful arXiv, Semantic Scholar, PubMed, and ClinicalTrials.gov tool results
+are now ingested before they return to the Agent. Direct OpenAlex, Crossref, and
+Europe PMC searches use reusable framework clients and the same idempotent
+`SourceRecord` merge path. Zotero Web API sync is explicit and never persists
+the API key in research records.
+
+Each systematic review can run a deterministic citation audit and export a
+Markdown report, complete JSON package, evidence CSV, BibTeX library, and RIS
+library. Europe PMC enrichment stores citation/reference identifiers and
+biomedical entities in the source record and saves available full text as XML.
+
 The medical extension follows PRISMA 2020, Cochrane RoB 2/ROBINS-I, and GRADE
 as quality contracts rather than adding a separate runtime state machine.
 
@@ -78,5 +93,5 @@ for unsupported files or parser failure.
 
 The requested coding, analysis, academic research, and medical research scope is
 closed. Future work should start as a new milestone; likely candidates are
-Zotero/OpenAlex import-export, report export, and real-project LSP smoke
-fixtures.
+real-provider integration smoke fixtures (using opt-in credentials), PDF/DOCX
+rendering of the exported Markdown report, and real-project LSP smoke fixtures.

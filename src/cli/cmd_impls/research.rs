@@ -4,10 +4,16 @@
 //! via the research pipeline Graph workflow.
 
 use crate::cli::command::{CommandCategory, CommandContext, CommandOutcome, cmd};
+use echo_agent::tools::research::ZoteroLibraryKind;
 use echo_agent_app_core::analysis::workspace_root_for_agent;
 use echo_agent_app_core::research::{
-    CreateReviewRequest, CreateSourceRequest, ReviewDomain, create_review, create_source,
-    get_review, get_source, list_evidence, list_reviews, list_sources,
+    CreateReviewRequest, CreateSourceRequest, ReviewDomain, ReviewExportFormat, audit_review,
+    create_review, create_source, export_all_review_formats, export_review, get_review, get_source,
+    list_evidence, list_reviews, list_sources,
+};
+use echo_agent_app_core::research_connectors::{
+    ResearchProvider, ScholarlySearchRequest, ZoteroSyncRequest, enrich_from_europe_pmc,
+    export_zotero, import_zotero, search_and_ingest,
 };
 use echo_agent_app_core::tasks::{BackgroundTaskKind, ResearchOutputFormat};
 use std::sync::Arc;
@@ -135,7 +141,7 @@ pub async fn execute_papers_command(
     agent: &echo_agent_app_core::agent_handle::AgentHandle,
     args: &[&str],
 ) -> String {
-    const USAGE: &str = "Usage: /papers list | show <source-id> | evidence [source-id] | reviews | review <review-id> | add-source <title> | create-review <academic|medical> <title>";
+    const USAGE: &str = "Usage: /papers list | show <source-id> | evidence [source-id] | reviews | review <review-id> | add-source <title> | create-review <academic|medical> <title> | search <openalex|crossref|europe-pmc> <query> | enrich <source-id> | audit <review-id> | export <review-id> <markdown|json|csv|bibtex|ris|all> | zotero-import <user|group> <library-id> | zotero-export <user|group> <library-id> <source-id,...> (Zotero uses ZOTERO_API_KEY)";
     let root = workspace_root_for_agent(agent).await;
     match args.first().copied().unwrap_or("list") {
         "list" | "ls" => match list_sources(&root, None, None) {
@@ -219,8 +225,111 @@ pub async fn execute_papers_command(
                 Err(error) => format!("Unable to create review: {error}"),
             }
         }
+        "search" => {
+            let provider = match args.get(1).copied() {
+                Some("openalex") => ResearchProvider::Openalex,
+                Some("crossref") => ResearchProvider::Crossref,
+                Some("europe-pmc") => ResearchProvider::EuropePmc,
+                _ => return USAGE.to_string(),
+            };
+            let query = args.get(2..).unwrap_or(&[]).join(" ");
+            match search_and_ingest(
+                &root,
+                ScholarlySearchRequest {
+                    provider,
+                    query,
+                    limit: Some(20),
+                    mailto: std::env::var("EKO_RESEARCH_MAILTO").ok(),
+                },
+            )
+            .await
+            {
+                Ok(result) => pretty_json(&result),
+                Err(error) => format!("Unable to search sources: {error}"),
+            }
+        }
+        "enrich" => match args.get(1) {
+            Some(source_id) => match enrich_from_europe_pmc(&root, source_id).await {
+                Ok(result) => pretty_json(&result),
+                Err(error) => format!("Unable to enrich source: {error}"),
+            },
+            None => USAGE.to_string(),
+        },
+        "audit" => match args.get(1) {
+            Some(review_id) => match audit_review(&root, review_id) {
+                Ok(report) => pretty_json(&report),
+                Err(error) => format!("Unable to audit review: {error}"),
+            },
+            None => USAGE.to_string(),
+        },
+        "export" => match (args.get(1), args.get(2).copied()) {
+            (Some(review_id), Some("all")) => match export_all_review_formats(&root, review_id) {
+                Ok(artifacts) => pretty_json(&artifacts),
+                Err(error) => format!("Unable to export review: {error}"),
+            },
+            (Some(review_id), Some(format)) => match parse_export_format(format) {
+                Some(format) => match export_review(&root, review_id, format) {
+                    Ok(artifact) => pretty_json(&artifact),
+                    Err(error) => format!("Unable to export review: {error}"),
+                },
+                None => USAGE.to_string(),
+            },
+            _ => USAGE.to_string(),
+        },
+        "zotero-import" => match zotero_request(args, false) {
+            Some(request) => match import_zotero(&root, request).await {
+                Ok(result) => pretty_json(&result),
+                Err(error) => format!("Unable to import Zotero library: {error}"),
+            },
+            None => USAGE.to_string(),
+        },
+        "zotero-export" => match zotero_request(args, true) {
+            Some(request) => match export_zotero(&root, request).await {
+                Ok(result) => pretty_json(&result),
+                Err(error) => format!("Unable to export to Zotero: {error}"),
+            },
+            None => USAGE.to_string(),
+        },
         _ => USAGE.to_string(),
     }
+}
+
+fn parse_export_format(value: &str) -> Option<ReviewExportFormat> {
+    match value {
+        "markdown" => Some(ReviewExportFormat::Markdown),
+        "json" => Some(ReviewExportFormat::Json),
+        "csv" => Some(ReviewExportFormat::Csv),
+        "bibtex" => Some(ReviewExportFormat::Bibtex),
+        "ris" => Some(ReviewExportFormat::Ris),
+        _ => None,
+    }
+}
+
+fn zotero_request(args: &[&str], export: bool) -> Option<ZoteroSyncRequest> {
+    let library_kind = match args.get(1).copied()? {
+        "user" => ZoteroLibraryKind::User,
+        "group" => ZoteroLibraryKind::Group,
+        _ => return None,
+    };
+    let library_id = args.get(2)?.to_string();
+    let source_ids = if export {
+        args.get(3)?
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let api_key = std::env::var("ZOTERO_API_KEY").ok()?;
+    Some(ZoteroSyncRequest {
+        library_kind,
+        library_id,
+        api_key,
+        limit: Some(1_000),
+        source_ids,
+    })
 }
 
 fn pretty_json<T: serde::Serialize>(value: &T) -> String {

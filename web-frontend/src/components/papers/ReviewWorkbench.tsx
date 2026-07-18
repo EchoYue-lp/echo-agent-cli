@@ -2,11 +2,13 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   papersApi,
   systematicReviewsApi,
+  type CitationAuditReport,
   type GradeConcern,
   type Paper,
   type PrismaFlow,
   type ReviewDomain,
   type RiskJudgment,
+  type ReviewExportFormat,
   type ScreeningDecisionValue,
   type ScreeningStage,
   type SystematicReviewDocument,
@@ -17,14 +19,16 @@ import {
   Activity,
   ClipboardCheck,
   FileSearch,
+  FileDown,
   Plus,
   Save,
+  ScanSearch,
   ShieldCheck,
   Trash2,
 } from 'lucide-react';
 import { ReviewMatrix } from './ReviewMatrix';
 
-type Section = 'protocol' | 'screening' | 'evidence' | 'quality' | 'prisma';
+type Section = 'protocol' | 'screening' | 'evidence' | 'quality' | 'prisma' | 'audit';
 
 const EMPTY_GRADE_DOMAIN = { concern: 'not_serious' as GradeConcern, explanation: '' };
 
@@ -54,6 +58,10 @@ export function ReviewWorkbench() {
   const [newQuestion, setNewQuestion] = useState('');
   const [newDomain, setNewDomain] = useState<ReviewDomain>('academic');
   const [saving, setSaving] = useState(false);
+  const [audit, setAudit] = useState<CitationAuditReport | null>(null);
+  const [exportFormat, setExportFormat] = useState<ReviewExportFormat>('all');
+  const [exporting, setExporting] = useState(false);
+  const [exportResult, setExportResult] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const refreshIndex = useCallback(async () => {
@@ -77,6 +85,8 @@ export function ReviewWorkbench() {
   const loadReview = async (reviewId: string) => {
     try {
       setDocument(await systematicReviewsApi.get(reviewId));
+      setAudit(null);
+      setExportResult(null);
       setSection('protocol');
       setError(null);
     } catch (reason) {
@@ -129,6 +139,31 @@ export function ReviewWorkbench() {
       await refreshIndex();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  };
+
+  const auditReview = async () => {
+    if (!document) return;
+    try {
+      setAudit(await systematicReviewsApi.audit(document.record.id));
+      setError(null);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  };
+
+  const exportReview = async () => {
+    if (!document) return;
+    setExporting(true);
+    try {
+      const artifacts = await systematicReviewsApi.export(document.record.id, exportFormat);
+      setExportResult(artifacts.map((artifact) => artifact.path).join(', '));
+      setAudit(artifacts[0]?.citation_audit ?? audit);
+      setError(null);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setExporting(false);
     }
   };
 
@@ -217,6 +252,13 @@ export function ReviewWorkbench() {
             save={() => void saveReview()}
             remove={() => void deleteReview()}
             saving={saving}
+            audit={audit}
+            runAudit={() => void auditReview()}
+            exportFormat={exportFormat}
+            setExportFormat={setExportFormat}
+            exportReview={() => void exportReview()}
+            exporting={exporting}
+            exportResult={exportResult}
           />
         )}
       </main>
@@ -233,6 +275,13 @@ function ReviewEditor({
   save,
   remove,
   saving,
+  audit,
+  runAudit,
+  exportFormat,
+  setExportFormat,
+  exportReview,
+  exporting,
+  exportResult,
 }: {
   document: SystematicReviewDocument;
   sources: Paper[];
@@ -242,6 +291,13 @@ function ReviewEditor({
   save: () => void;
   remove: () => void;
   saving: boolean;
+  audit: CitationAuditReport | null;
+  runAudit: () => void;
+  exportFormat: ReviewExportFormat;
+  setExportFormat: (format: ReviewExportFormat) => void;
+  exportReview: () => void;
+  exporting: boolean;
+  exportResult: string | null;
 }) {
   const record = document.record;
   const flow = useMemo(() => computePrismaFlow(record), [record]);
@@ -251,6 +307,7 @@ function ReviewEditor({
     { id: 'evidence', label: 'Evidence', icon: Activity },
     { id: 'quality', label: 'Quality', icon: ShieldCheck },
     { id: 'prisma', label: 'PRISMA', icon: Activity },
+    { id: 'audit', label: 'Audit', icon: ScanSearch },
   ];
 
   return (
@@ -276,7 +333,7 @@ function ReviewEditor({
           <Trash2 size={12} />
         </button>
       </header>
-      <div className="flex h-9 shrink-0 items-center border-b border-[var(--border-primary)] px-1">
+      <div className="flex h-9 shrink-0 items-center overflow-x-auto border-b border-[var(--border-primary)] px-1">
         {tabs.map(({ id, label, icon: Icon }) => (
           <button
             key={id}
@@ -287,8 +344,35 @@ function ReviewEditor({
             <Icon size={11} /> {label}
           </button>
         ))}
+        <div className="min-w-2 flex-1" />
+        <select
+          value={exportFormat}
+          onChange={(event) => setExportFormat(event.target.value as ReviewExportFormat)}
+          className="mr-1 h-7 shrink-0 rounded-md border border-[var(--border-primary)] bg-[var(--bg-input)] px-1 text-[10px] text-[var(--text-primary)]"
+          aria-label="Report export format"
+        >
+          <option value="all">All formats</option>
+          <option value="markdown">Markdown</option>
+          <option value="json">JSON</option>
+          <option value="csv">CSV</option>
+          <option value="bibtex">BibTeX</option>
+          <option value="ris">RIS</option>
+        </select>
+        <button
+          type="button"
+          onClick={exportReview}
+          disabled={exporting}
+          className="mr-1 flex h-7 shrink-0 items-center gap-1 rounded-md border border-[var(--border-primary)] px-2 text-[11px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)] disabled:opacity-50"
+        >
+          <FileDown size={11} /> {exporting ? 'Exporting...' : 'Export'}
+        </button>
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto">
+        {exportResult && (
+          <div className="border-b border-[var(--border-primary)] px-3 py-1.5 text-[10px] text-[var(--text-tertiary)]">
+            {exportResult}
+          </div>
+        )}
         {section === 'protocol' ? (
           <ProtocolEditor record={record} updateRecord={updateRecord} />
         ) : section === 'screening' ? (
@@ -297,8 +381,10 @@ function ReviewEditor({
           <ReviewMatrix reviewId={record.id} sourceIds={record.source_ids} />
         ) : section === 'quality' ? (
           <QualityEditor record={record} sources={sources} updateRecord={updateRecord} />
-        ) : (
+        ) : section === 'prisma' ? (
           <PrismaEditor flow={flow} record={record} updateRecord={updateRecord} />
+        ) : (
+          <CitationAuditPanel audit={audit} runAudit={runAudit} />
         )}
       </div>
     </div>
@@ -496,29 +582,119 @@ function ProtocolEditor({
           />
         </Field>
       </div>
-      {record.domain === 'medical' && record.protocol.pico && (
+      {record.domain === 'medical' && (
         <div className="border-t border-[var(--border-primary)] pt-4">
-          <div className="mb-3 text-xs font-semibold text-[var(--text-primary)]">PICO</div>
-          <div className="grid gap-3 md:grid-cols-2">
-            {(['population', 'intervention', 'comparator'] as const).map((field) => (
-              <Field key={field} label={field[0]?.toUpperCase() + field.slice(1)}>
-                <input
-                  value={record.protocol.pico?.[field] ?? ''}
-                  onChange={(event) =>
-                    setProtocol({
-                      pico: { ...record.protocol.pico!, [field]: event.target.value },
-                    })
-                  }
-                  className={inputClass}
-                />
-              </Field>
-            ))}
-            <LinesField
-              label="Outcomes"
-              values={record.protocol.pico.outcomes}
-              onChange={(outcomes) => setProtocol({ pico: { ...record.protocol.pico!, outcomes } })}
-            />
+          <div className="mb-3 flex items-center gap-1">
+            <button
+              type="button"
+              onClick={() =>
+                setProtocol({
+                  pico: record.protocol.pico ?? {
+                    population: '',
+                    intervention: '',
+                    comparator: '',
+                    outcomes: [],
+                  },
+                  peco: undefined,
+                })
+              }
+              className={`h-7 px-3 text-[11px] ${record.protocol.pico ? 'border-b-2 border-[var(--accent)] text-[var(--text-primary)]' : 'text-[var(--text-tertiary)]'}`}
+            >
+              PICO
+            </button>
+            <button
+              type="button"
+              onClick={() =>
+                setProtocol({
+                  pico: undefined,
+                  peco: record.protocol.peco ?? {
+                    population: '',
+                    exposure: '',
+                    comparator: '',
+                    outcomes: [],
+                  },
+                })
+              }
+              className={`h-7 px-3 text-[11px] ${record.protocol.peco ? 'border-b-2 border-[var(--accent)] text-[var(--text-primary)]' : 'text-[var(--text-tertiary)]'}`}
+            >
+              PECO
+            </button>
           </div>
+          {record.protocol.pico ? (
+            <div className="grid gap-3 md:grid-cols-2">
+              {(['population', 'intervention', 'comparator'] as const).map((field) => (
+                <Field key={field} label={field[0]?.toUpperCase() + field.slice(1)}>
+                  <input
+                    value={record.protocol.pico?.[field] ?? ''}
+                    onChange={(event) => {
+                      const pico = record.protocol.pico;
+                      if (pico) setProtocol({ pico: { ...pico, [field]: event.target.value } });
+                    }}
+                    className={inputClass}
+                  />
+                </Field>
+              ))}
+              <LinesField
+                label="Outcomes"
+                values={record.protocol.pico.outcomes}
+                onChange={(outcomes) => {
+                  const pico = record.protocol.pico;
+                  if (pico) setProtocol({ pico: { ...pico, outcomes } });
+                }}
+              />
+            </div>
+          ) : record.protocol.peco ? (
+            <div className="grid gap-3 md:grid-cols-2">
+              {(['population', 'exposure', 'comparator'] as const).map((field) => (
+                <Field key={field} label={field[0]?.toUpperCase() + field.slice(1)}>
+                  <input
+                    value={record.protocol.peco?.[field] ?? ''}
+                    onChange={(event) => {
+                      const peco = record.protocol.peco;
+                      if (peco) setProtocol({ peco: { ...peco, [field]: event.target.value } });
+                    }}
+                    className={inputClass}
+                  />
+                </Field>
+              ))}
+              <LinesField
+                label="Outcomes"
+                values={record.protocol.peco.outcomes}
+                onChange={(outcomes) => {
+                  const peco = record.protocol.peco;
+                  if (peco) setProtocol({ peco: { ...peco, outcomes } });
+                }}
+              />
+            </div>
+          ) : null}
+          {record.medical && (
+            <div className="mt-5 grid gap-3 md:grid-cols-2">
+              {(
+                [
+                  ['harms', 'Harms'],
+                  ['contraindications', 'Contraindications'],
+                  ['conflicts_of_interest', 'Conflicts of interest'],
+                  ['guideline_conflicts', 'Guideline conflicts'],
+                  ['extrapolation_limits', 'Extrapolation limits'],
+                  ['guideline_source_ids', 'Guideline source IDs'],
+                ] as const
+              ).map(([field, label]) => (
+                <LinesField
+                  key={field}
+                  label={label}
+                  values={record.medical?.[field] ?? []}
+                  onChange={(values) =>
+                    updateRecord((current) => ({
+                      ...current,
+                      medical: current.medical
+                        ? { ...current.medical, [field]: values }
+                        : undefined,
+                    }))
+                  }
+                />
+              ))}
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -988,6 +1164,66 @@ function PrismaEditor({
           </Field>
         ))}
       </div>
+    </div>
+  );
+}
+
+function CitationAuditPanel({
+  audit,
+  runAudit,
+}: {
+  audit: CitationAuditReport | null;
+  runAudit: () => void;
+}) {
+  return (
+    <div className="space-y-4 p-4">
+      <div className="flex items-center gap-2">
+        <button
+          type="button"
+          onClick={runAudit}
+          className="flex h-8 items-center gap-1 rounded-md bg-[var(--accent)] px-3 text-[11px] font-medium text-white"
+        >
+          <ScanSearch size={12} /> Run audit
+        </button>
+        {audit && (
+          <span className="text-[11px] text-[var(--text-tertiary)]">
+            {audit.error_count} errors · {audit.warning_count} warnings · {audit.evidence_count}{' '}
+            evidence records
+          </span>
+        )}
+      </div>
+      {audit && (
+        <div className="divide-y divide-[var(--border-primary)] border-y border-[var(--border-primary)]">
+          {audit.issues.length === 0 ? (
+            <div className="py-4 text-xs text-[var(--text-secondary)]">
+              No citation issues found.
+            </div>
+          ) : (
+            audit.issues.map((issue, index) => (
+              <div
+                key={`${issue.code}:${index}`}
+                className="grid grid-cols-[5rem_9rem_1fr] gap-2 py-2 text-[11px]"
+              >
+                <span
+                  className={
+                    issue.severity === 'error'
+                      ? 'text-red-500'
+                      : issue.severity === 'warning'
+                        ? 'text-amber-500'
+                        : 'text-[var(--text-tertiary)]'
+                  }
+                >
+                  {issue.severity}
+                </span>
+                <span className="font-mono text-[10px] text-[var(--text-tertiary)]">
+                  {issue.code}
+                </span>
+                <span className="text-[var(--text-secondary)]">{issue.message}</span>
+              </div>
+            ))
+          )}
+        </div>
+      )}
     </div>
   );
 }

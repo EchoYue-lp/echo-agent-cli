@@ -2,17 +2,23 @@
 
 use std::path::{Path, PathBuf};
 
+use echo_agent::tools::research::ZoteroLibraryKind;
 use echo_core::error::Result;
 use echo_core::tools::permission::ToolPermission;
 use echo_core::tools::{Tool, ToolParameters, ToolResult, ToolRiskLevel};
 use futures::future::BoxFuture;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::research::{
-    CreateReviewRequest, CreateSourceRequest, ReviewRecord, UpsertEvidenceRequest, create_review,
-    create_source, get_review, get_source, list_evidence, list_reviews, list_sources, save_review,
+    CreateReviewRequest, CreateSourceRequest, ReviewExportFormat, ReviewRecord,
+    UpsertEvidenceRequest, audit_review, create_review, create_source, export_all_review_formats,
+    export_review, get_review, get_source, list_evidence, list_reviews, list_sources, save_review,
     upsert_evidence,
+};
+use crate::research_connectors::{
+    ScholarlySearchRequest, ZoteroSyncRequest, enrich_from_europe_pmc, export_zotero,
+    import_zotero, search_and_ingest,
 };
 
 pub struct ResearchLibraryTool;
@@ -35,7 +41,9 @@ impl Tool for ResearchLibraryTool {
                     "enum": [
                         "list_sources", "get_source", "create_source",
                         "list_evidence", "upsert_evidence",
-                        "list_reviews", "get_review", "create_review", "save_review"
+                        "list_reviews", "get_review", "create_review", "save_review",
+                        "search_sources", "import_zotero", "export_zotero",
+                        "enrich_europe_pmc", "audit_review", "export_review"
                     ]
                 },
                 "source_id": { "type": "string" },
@@ -45,6 +53,9 @@ impl Tool for ResearchLibraryTool {
                 "source": { "type": "object" },
                 "evidence": { "type": "object" },
                 "review": { "type": "object" },
+                "search_request": { "type": "object" },
+                "zotero_request": { "type": "object" },
+                "format": { "type": "string", "enum": ["markdown", "json", "csv", "bibtex", "ris", "all"] },
                 "expected_revision": { "type": "string" }
             },
             "required": ["action"]
@@ -111,6 +122,64 @@ impl Tool for ResearchLibraryTool {
                         (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => Err(error),
                     }
                 }
+                "search_sources" => {
+                    match parse_object::<ScholarlySearchRequest>(&parameters, "search_request") {
+                        Ok(request) => search_and_ingest(&workspace_root, request)
+                            .await
+                            .and_then(success_json),
+                        Err(error) => Err(error),
+                    }
+                }
+                "import_zotero" => {
+                    match parse_object::<ZoteroToolRequest>(&parameters, "zotero_request") {
+                        Ok(request) => match request.into_sync_request() {
+                            Ok(request) => import_zotero(&workspace_root, request)
+                                .await
+                                .and_then(success_json),
+                            Err(error) => Err(error),
+                        },
+                        Err(error) => Err(error),
+                    }
+                }
+                "export_zotero" => {
+                    match parse_object::<ZoteroToolRequest>(&parameters, "zotero_request") {
+                        Ok(request) => match request.into_sync_request() {
+                            Ok(request) => export_zotero(&workspace_root, request)
+                                .await
+                                .and_then(success_json),
+                            Err(error) => Err(error),
+                        },
+                        Err(error) => Err(error),
+                    }
+                }
+                "enrich_europe_pmc" => match required_string(&parameters, "source_id") {
+                    Ok(source_id) => enrich_from_europe_pmc(&workspace_root, source_id)
+                        .await
+                        .and_then(success_json),
+                    Err(error) => Err(error),
+                },
+                "audit_review" => required_string(&parameters, "review_id")
+                    .and_then(|review_id| audit_review(&workspace_root, review_id))
+                    .and_then(success_json),
+                "export_review" => {
+                    let review_id = required_string(&parameters, "review_id");
+                    let format = parameters
+                        .get("format")
+                        .and_then(Value::as_str)
+                        .unwrap_or("markdown");
+                    review_id.and_then(|review_id| {
+                        if format == "all" {
+                            export_all_review_formats(&workspace_root, review_id)
+                                .and_then(success_json)
+                        } else {
+                            parse_export_format(format)
+                                .and_then(|format| {
+                                    export_review(&workspace_root, review_id, format)
+                                })
+                                .and_then(success_json)
+                        }
+                    })
+                }
                 _ => {
                     return Ok(ToolResult::invalid_arguments(format!(
                         "unsupported research_library action: {action}"
@@ -119,6 +188,45 @@ impl Tool for ResearchLibraryTool {
             };
             Ok(result.unwrap_or_else(|error| ToolResult::error(error.to_string())))
         })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ZoteroToolRequest {
+    library_kind: ZoteroLibraryKind,
+    library_id: String,
+    limit: Option<usize>,
+    #[serde(default)]
+    source_ids: Vec<String>,
+}
+
+impl ZoteroToolRequest {
+    fn into_sync_request(self) -> crate::research::ResearchResult<ZoteroSyncRequest> {
+        let api_key = std::env::var("ZOTERO_API_KEY").map_err(|_| {
+            crate::research::ResearchError::Invalid(
+                "ZOTERO_API_KEY is required for Agent-driven Zotero sync".to_string(),
+            )
+        })?;
+        Ok(ZoteroSyncRequest {
+            library_kind: self.library_kind,
+            library_id: self.library_id,
+            api_key,
+            limit: self.limit,
+            source_ids: self.source_ids,
+        })
+    }
+}
+
+fn parse_export_format(value: &str) -> crate::research::ResearchResult<ReviewExportFormat> {
+    match value {
+        "markdown" => Ok(ReviewExportFormat::Markdown),
+        "json" => Ok(ReviewExportFormat::Json),
+        "csv" => Ok(ReviewExportFormat::Csv),
+        "bibtex" => Ok(ReviewExportFormat::Bibtex),
+        "ris" => Ok(ReviewExportFormat::Ris),
+        _ => Err(crate::research::ResearchError::Invalid(format!(
+            "unsupported review export format: {value}"
+        ))),
     }
 }
 

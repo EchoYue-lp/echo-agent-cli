@@ -1,6 +1,22 @@
 import { useCallback, useEffect, useState } from 'react';
-import { papersApi, type CreatePaperRequest, type Paper } from '../../api/endpoints';
-import { BookOpen, Grid3X3, List, Plus, SearchCheck, X } from 'lucide-react';
+import {
+  papersApi,
+  type CreatePaperRequest,
+  type Paper,
+  type ResearchProvider,
+} from '../../api/endpoints';
+import {
+  BookOpen,
+  Database,
+  Download,
+  Grid3X3,
+  List,
+  Plus,
+  Search,
+  SearchCheck,
+  Upload,
+  X,
+} from 'lucide-react';
 import { PaperDetail } from './PaperDetail';
 import { PaperList } from './PaperList';
 import { ReviewMatrix } from './ReviewMatrix';
@@ -13,6 +29,7 @@ export function PaperPanel() {
   const [selectedPaper, setSelectedPaper] = useState<Paper | null>(null);
   const [viewMode, setViewMode] = useState<ViewMode>('library');
   const [showAddForm, setShowAddForm] = useState(false);
+  const [showConnectors, setShowConnectors] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [draft, setDraft] = useState<CreatePaperRequest>({
@@ -87,14 +104,24 @@ export function PaperPanel() {
         />
         <div className="flex-1" />
         {viewMode === 'library' && (
-          <button
-            type="button"
-            onClick={() => setShowAddForm((visible) => !visible)}
-            className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--text-tertiary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
-            title="Add source"
-          >
-            {showAddForm ? <X size={13} /> : <Plus size={13} />}
-          </button>
+          <>
+            <button
+              type="button"
+              onClick={() => setShowConnectors((visible) => !visible)}
+              className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--text-tertiary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+              title="Research connectors"
+            >
+              <Database size={13} />
+            </button>
+            <button
+              type="button"
+              onClick={() => setShowAddForm((visible) => !visible)}
+              className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--text-tertiary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+              title="Add source"
+            >
+              {showAddForm ? <X size={13} /> : <Plus size={13} />}
+            </button>
+          </>
         )}
       </header>
 
@@ -110,6 +137,13 @@ export function PaperPanel() {
           setDraft={setDraft}
           save={() => void handleAddPaper()}
           saving={saving}
+        />
+      )}
+      {showConnectors && viewMode === 'library' && (
+        <ResearchConnectors
+          selectedPaper={selectedPaper}
+          refresh={() => void fetchPapers()}
+          setError={setError}
         />
       )}
 
@@ -143,6 +177,152 @@ export function PaperPanel() {
           />
         )}
       </div>
+    </div>
+  );
+}
+
+function ResearchConnectors({
+  selectedPaper,
+  refresh,
+  setError,
+}: {
+  selectedPaper: Paper | null;
+  refresh: () => void;
+  setError: (error: string | null) => void;
+}) {
+  const [provider, setProvider] = useState<ResearchProvider>('openalex');
+  const [query, setQuery] = useState('');
+  const [libraryKind, setLibraryKind] = useState<'user' | 'group'>('user');
+  const [libraryId, setLibraryId] = useState('');
+  const [apiKey, setApiKey] = useState('');
+  const [busy, setBusy] = useState<string | null>(null);
+  const [result, setResult] = useState<string | null>(null);
+
+  const run = async (kind: string, action: () => Promise<string>) => {
+    setBusy(kind);
+    try {
+      setResult(await action());
+      setError(null);
+      refresh();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const zoteroRequest = (sourceIds: string[] = []) => ({
+    library_kind: libraryKind,
+    library_id: libraryId.trim(),
+    api_key: apiKey.trim(),
+    limit: 1000,
+    source_ids: sourceIds,
+  });
+
+  return (
+    <div className="space-y-2 border-b border-[var(--border-primary)] bg-[var(--bg-secondary)] p-3">
+      <div className="grid gap-2 sm:grid-cols-[8rem_minmax(0,1fr)_auto]">
+        <select
+          value={provider}
+          onChange={(event) => setProvider(event.target.value as ResearchProvider)}
+          className={`${inputClass} sm:w-32`}
+          aria-label="Scholarly provider"
+        >
+          <option value="openalex">OpenAlex</option>
+          <option value="crossref">Crossref</option>
+          <option value="europe_pmc">Europe PMC</option>
+        </select>
+        <input
+          value={query}
+          onChange={(event) => setQuery(event.target.value)}
+          className={`${inputClass} min-w-0 flex-1`}
+          placeholder="Search scholarly sources"
+        />
+        <button
+          type="button"
+          disabled={!query.trim() || busy !== null}
+          onClick={() =>
+            void run('search', async () => {
+              const response = await papersApi.search({ provider, query: query.trim(), limit: 25 });
+              return `${response.created} added, ${response.updated} updated`;
+            })
+          }
+          className={commandButtonClass}
+        >
+          <Search size={12} /> Search
+        </button>
+      </div>
+      <div className="grid grid-cols-2 gap-2 md:grid-cols-[7rem_1fr_1fr_auto_auto]">
+        <select
+          value={libraryKind}
+          onChange={(event) => setLibraryKind(event.target.value as 'user' | 'group')}
+          className={inputClass}
+          aria-label="Zotero library kind"
+        >
+          <option value="user">Zotero user</option>
+          <option value="group">Zotero group</option>
+        </select>
+        <input
+          value={libraryId}
+          onChange={(event) => setLibraryId(event.target.value)}
+          className={inputClass}
+          placeholder="Library ID"
+        />
+        <input
+          type="password"
+          value={apiKey}
+          onChange={(event) => setApiKey(event.target.value)}
+          className={inputClass}
+          placeholder="API key"
+        />
+        <button
+          type="button"
+          disabled={!libraryId.trim() || !apiKey.trim() || busy !== null}
+          onClick={() =>
+            void run('import', async () => {
+              const response = await papersApi.importZotero(zoteroRequest());
+              return `${response.imported} imported, ${response.updated} updated`;
+            })
+          }
+          className={commandButtonClass}
+        >
+          <Download size={12} /> Import
+        </button>
+        <button
+          type="button"
+          disabled={!selectedPaper || !libraryId.trim() || !apiKey.trim() || busy !== null}
+          onClick={() =>
+            selectedPaper &&
+            void run('export', async () => {
+              const response = await papersApi.exportZotero(zoteroRequest([selectedPaper.id]));
+              return `${response.exported} exported`;
+            })
+          }
+          className={commandButtonClass}
+        >
+          <Upload size={12} /> Export
+        </button>
+      </div>
+      {selectedPaper && (selectedPaper.pmid || selectedPaper.pmcid) && (
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            disabled={busy !== null}
+            onClick={() =>
+              void run('europe-pmc', async () => {
+                const response = await papersApi.enrichEuropePmc(selectedPaper.id);
+                return response.warnings.length
+                  ? `Enriched with ${response.warnings.length} warning(s)`
+                  : 'Europe PMC enrichment complete';
+              })
+            }
+            className={commandButtonClass}
+          >
+            <Database size={12} /> Enrich selected
+          </button>
+        </div>
+      )}
+      {result && <div className="text-[11px] text-[var(--text-tertiary)]">{result}</div>}
     </div>
   );
 }
@@ -297,5 +477,7 @@ function splitComma(value: string): string[] {
 
 const inputClass =
   'h-8 w-full rounded-md border border-[var(--border-primary)] bg-[var(--bg-input)] px-2 text-xs text-[var(--text-primary)] outline-none focus:border-[var(--accent)]';
+const commandButtonClass =
+  'flex h-8 shrink-0 items-center justify-center gap-1 rounded-md bg-[var(--accent)] px-3 text-[11px] font-medium text-white disabled:opacity-50';
 
 export default PaperPanel;

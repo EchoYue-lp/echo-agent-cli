@@ -306,6 +306,7 @@ impl AgentRuntime {
         // ── 10. File-backed research library ──
         agent_handle
             .write(|agent| {
+                crate::research_connectors::install_auto_ingest_tools(agent);
                 agent.add_tool(Box::new(crate::research_tool::ResearchLibraryTool));
             })
             .await;
