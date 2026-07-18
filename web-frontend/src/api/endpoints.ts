@@ -984,35 +984,200 @@ export const terminalApi = {
 // ── Papers API ──────────────────────────────────────────────────────
 
 export interface Paper {
+  contract_version: number;
   id: string;
+  source_kind:
+    | 'journal_article'
+    | 'preprint'
+    | 'conference_paper'
+    | 'book'
+    | 'dataset'
+    | 'guideline'
+    | 'trial_registration'
+    | 'web'
+    | 'other';
   title: string;
   authors: string[];
   abstract_text?: string;
   doi?: string;
+  pmid?: string;
+  pmcid?: string;
   arxiv_id?: string;
+  openalex_id?: string;
   year?: number;
   venue?: string;
+  url?: string;
   tags: string[];
   notes?: string;
   pdf_path?: string;
+  provenance: Array<{
+    provider: string;
+    query?: string;
+    retrieved_at: string;
+    record_url?: string;
+  }>;
   added_at: string;
+  updated_at: string;
 }
 
 export interface CreatePaperRequest {
+  source_kind?: Paper['source_kind'];
   title: string;
   authors?: string[];
   abstract_text?: string;
   doi?: string;
+  pmid?: string;
+  pmcid?: string;
   arxiv_id?: string;
+  openalex_id?: string;
   year?: number;
   venue?: string;
+  url?: string;
+  pdf_path?: string;
   tags?: string[];
+  notes?: string;
+  provenance?: Paper['provenance'];
+}
+
+export interface EvidenceRecord {
+  contract_version: number;
+  id: string;
+  source_id: string;
+  review_id?: string;
+  dimension: string;
+  claim: string;
+  excerpt?: string;
+  locator?: string;
+  evidence_type?: string;
+  population?: string;
+  intervention?: string;
+  comparator?: string;
+  outcome?: string;
+  effect?: string;
+  limitations?: string;
+  certainty?: string;
+  tags: string[];
+  created_at: string;
+  updated_at: string;
+}
+
+export type UpsertEvidenceRequest = Omit<
+  EvidenceRecord,
+  'contract_version' | 'id' | 'created_at' | 'updated_at'
+> & { id?: string };
+
+export type ReviewDomain = 'academic' | 'medical';
+export type ScreeningStage = 'title_abstract' | 'full_text';
+export type ScreeningDecisionValue = 'pending' | 'include' | 'exclude' | 'maybe';
+export type RiskJudgment = 'low' | 'some_concerns' | 'high';
+export type GradeCertainty = 'high' | 'moderate' | 'low' | 'very_low';
+export type GradeConcern = 'not_serious' | 'serious' | 'very_serious';
+
+export interface SystematicReviewRecord {
+  contract_version: number;
+  id: string;
+  title: string;
+  domain: ReviewDomain;
+  status: string;
+  protocol: {
+    objective: string;
+    question: string;
+    registration?: string;
+    date_range?: string;
+    databases: string[];
+    search_strategies: Array<{
+      database: string;
+      query: string;
+      searched_at?: string;
+      result_count?: number;
+    }>;
+    eligibility: { inclusion: string[]; exclusion: string[] };
+    pico?: {
+      population: string;
+      intervention: string;
+      comparator: string;
+      outcomes: string[];
+    };
+  };
+  source_ids: string[];
+  screening: Array<{
+    source_id: string;
+    stage: ScreeningStage;
+    decision: ScreeningDecisionValue;
+    reason?: string;
+    reviewer?: string;
+    decided_at: string;
+  }>;
+  risk_of_bias: Array<{
+    id: string;
+    source_id: string;
+    result_id?: string;
+    tool: 'rob2' | 'robins_i' | 'custom';
+    domains: Array<{ domain: string; judgment: RiskJudgment; rationale: string }>;
+    overall: RiskJudgment;
+    rationale: string;
+    assessed_at: string;
+  }>;
+  grade: Array<{
+    id: string;
+    outcome: string;
+    relative_effect?: string;
+    absolute_effect?: string;
+    participants?: number;
+    studies?: number;
+    certainty: GradeCertainty;
+    risk_of_bias: { concern: GradeConcern; explanation: string };
+    inconsistency: { concern: GradeConcern; explanation: string };
+    indirectness: { concern: GradeConcern; explanation: string };
+    imprecision: { concern: GradeConcern; explanation: string };
+    publication_bias: { concern: GradeConcern; explanation: string };
+    applicability?: string;
+  }>;
+  prisma: {
+    additional_identified: number;
+    duplicates_removed: number;
+    reports_not_retrieved: number;
+  };
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PrismaFlow {
+  records_identified: number;
+  duplicates_removed: number;
+  records_screened: number;
+  records_excluded: number;
+  reports_sought: number;
+  reports_not_retrieved: number;
+  reports_assessed: number;
+  reports_excluded: number;
+  studies_included: number;
+}
+
+export interface SystematicReviewDocument {
+  record: SystematicReviewRecord;
+  revision: string;
+  prisma_flow: PrismaFlow;
+}
+
+export interface SystematicReviewSummary {
+  id: string;
+  title: string;
+  domain: ReviewDomain;
+  status: string;
+  source_count: number;
+  included_count: number;
+  updated_at: string;
+}
+
+function researchRequiresDesktop<T>(): Promise<T> {
+  return Promise.reject(new Error('文件化研究工作台需要 EKO 桌面运行时'));
 }
 
 export const papersApi = {
   list: (params?: { tag?: string; search?: string }) =>
     isTauri()
-      ? apiInvoke<Paper[]>('list_papers')
+      ? apiInvoke<Paper[]>('list_papers', params)
       : (() => {
           const q = new URLSearchParams();
           if (params?.tag) q.set('tag', params.tag);
@@ -1023,9 +1188,7 @@ export const papersApi = {
   get: (id: string) =>
     isTauri() ? apiInvoke<Paper>('get_paper', { id }) : get<Paper>(`/papers/${id}`),
   create: (req: CreatePaperRequest) =>
-    isTauri()
-      ? apiInvoke<Paper>('create_paper', { title: req.title, authors: req.authors })
-      : post<Paper>('/papers', req),
+    isTauri() ? apiInvoke<Paper>('create_paper', { request: req }) : post<Paper>('/papers', req),
   delete: (id: string) =>
     isTauri()
       ? apiInvoke<{ deleted: string }>('delete_paper', { id })
@@ -1038,6 +1201,48 @@ export const papersApi = {
     isTauri()
       ? apiInvoke<Paper>('add_paper_tags', { id, tags })
       : post<Paper>(`/papers/${id}/tags`, { tags }),
+};
+
+export const evidenceApi = {
+  list: (params?: { sourceId?: string; reviewId?: string }) =>
+    isTauri()
+      ? apiInvoke<EvidenceRecord[]>('list_research_evidence', params)
+      : researchRequiresDesktop<EvidenceRecord[]>(),
+  upsert: (request: UpsertEvidenceRequest) =>
+    isTauri()
+      ? apiInvoke<EvidenceRecord>('upsert_research_evidence', { request })
+      : researchRequiresDesktop<EvidenceRecord>(),
+  delete: (evidenceId: string) =>
+    isTauri()
+      ? apiInvoke<boolean>('delete_research_evidence', { evidenceId })
+      : researchRequiresDesktop<boolean>(),
+};
+
+export const systematicReviewsApi = {
+  list: () =>
+    isTauri()
+      ? apiInvoke<SystematicReviewSummary[]>('list_systematic_reviews')
+      : researchRequiresDesktop<SystematicReviewSummary[]>(),
+  create: (request: { title: string; question: string; domain: ReviewDomain }) =>
+    isTauri()
+      ? apiInvoke<SystematicReviewDocument>('create_systematic_review', { request })
+      : researchRequiresDesktop<SystematicReviewDocument>(),
+  get: (reviewId: string) =>
+    isTauri()
+      ? apiInvoke<SystematicReviewDocument>('get_systematic_review', { reviewId })
+      : researchRequiresDesktop<SystematicReviewDocument>(),
+  save: (document: SystematicReviewDocument) =>
+    isTauri()
+      ? apiInvoke<SystematicReviewDocument>('save_systematic_review', {
+          reviewId: document.record.id,
+          record: document.record,
+          expectedRevision: document.revision,
+        })
+      : researchRequiresDesktop<SystematicReviewDocument>(),
+  delete: (reviewId: string) =>
+    isTauri()
+      ? apiInvoke<boolean>('delete_systematic_review', { reviewId })
+      : researchRequiresDesktop<boolean>(),
 };
 
 // ── Workspace API ──

@@ -4,6 +4,11 @@
 //! via the research pipeline Graph workflow.
 
 use crate::cli::command::{CommandCategory, CommandContext, CommandOutcome, cmd};
+use echo_agent_app_core::analysis::workspace_root_for_agent;
+use echo_agent_app_core::research::{
+    CreateReviewRequest, CreateSourceRequest, ReviewDomain, create_review, create_source,
+    get_review, get_source, list_evidence, list_reviews, list_sources,
+};
 use echo_agent_app_core::tasks::{BackgroundTaskKind, ResearchOutputFormat};
 use std::sync::Arc;
 
@@ -122,94 +127,111 @@ cmd!(
 // ── PapersCommand ───────────────────────────────────────────────────
 
 async fn cmd_papers(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
-    let sub = args.first().copied().unwrap_or("help");
+    println!("{}", execute_papers_command(&ctx.agent, args).await);
+    CommandOutcome::Continue
+}
 
-    match sub {
-        "list" | "ls" | "" => {
-            // List research tasks from the background service
-            if let Some(ref service) = ctx.task_service {
-                let tasks = service.list_unified(None);
-                let research_tasks: Vec<_> = tasks
-                    .iter()
-                    .filter(|task| task.kind.as_deref() == Some("bg:kind:research"))
-                    .collect();
-
-                if research_tasks.is_empty() {
-                    println!("\n--- Research Tasks ---");
-                    println!("  No research tasks found.");
-                    println!("  Use /search-papers <topic> to start a new research task.");
-                } else {
-                    println!("\n--- Research Tasks ({}) ---", research_tasks.len());
-                    for task in research_tasks {
-                        let status_icon = match task.status.as_str() {
-                            "completed" => "✓",
-                            "failed" => "✗",
-                            "in_progress" => "▶",
-                            "pending" => "○",
-                            "cancelled" => "⊘",
-                            _ => "?",
-                        };
-                        println!(
-                            "  {} {} — {} ({})",
-                            status_icon, task.id, task.description, task.status
-                        );
-                        if let Some(ref result) = task.result {
-                            let preview: String = result.chars().take(100).collect();
-                            println!("    Result: {}...", preview);
-                        }
-                    }
-                }
-            } else {
-                println!("\n--- Paper Workspace ---");
-                println!("  Use /search-papers <topic> to find papers");
-                println!("  Use /fetch-paper <url> to download and read a paper");
-                println!("  Use /papers tools to list available research tools");
+pub async fn execute_papers_command(
+    agent: &echo_agent_app_core::agent_handle::AgentHandle,
+    args: &[&str],
+) -> String {
+    const USAGE: &str = "Usage: /papers list | show <source-id> | evidence [source-id] | reviews | review <review-id> | add-source <title> | create-review <academic|medical> <title>";
+    let root = workspace_root_for_agent(agent).await;
+    match args.first().copied().unwrap_or("list") {
+        "list" | "ls" => match list_sources(&root, None, None) {
+            Ok(sources) if sources.is_empty() => "No sources in the research library.".to_string(),
+            Ok(sources) => sources
+                .iter()
+                .map(|source| {
+                    format!(
+                        "{}  {}{}",
+                        source.id,
+                        source.title,
+                        source
+                            .year
+                            .map(|year| format!(" ({year})"))
+                            .unwrap_or_default()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Err(error) => format!("Unable to list sources: {error}"),
+        },
+        "show" => match args.get(1) {
+            Some(source_id) => match get_source(&root, source_id) {
+                Ok(source) => pretty_json(&source),
+                Err(error) => format!("Unable to load source: {error}"),
+            },
+            None => USAGE.to_string(),
+        },
+        "evidence" => match list_evidence(&root, args.get(1).copied(), None) {
+            Ok(records) if records.is_empty() => "No evidence records found.".to_string(),
+            Ok(records) => pretty_json(&records),
+            Err(error) => format!("Unable to list evidence: {error}"),
+        },
+        "reviews" => match list_reviews(&root) {
+            Ok(reviews) if reviews.is_empty() => "No systematic reviews found.".to_string(),
+            Ok(reviews) => pretty_json(&reviews),
+            Err(error) => format!("Unable to list reviews: {error}"),
+        },
+        "review" => match args.get(1) {
+            Some(review_id) => match get_review(&root, review_id) {
+                Ok(review) => pretty_json(&review),
+                Err(error) => format!("Unable to load review: {error}"),
+            },
+            None => USAGE.to_string(),
+        },
+        "add-source" => {
+            let title = args.get(1..).unwrap_or(&[]).join(" ");
+            if title.trim().is_empty() {
+                return USAGE.to_string();
+            }
+            match create_source(
+                &root,
+                CreateSourceRequest {
+                    title,
+                    ..CreateSourceRequest::default()
+                },
+            ) {
+                Ok(source) => pretty_json(&source),
+                Err(error) => format!("Unable to create source: {error}"),
             }
         }
-        "tools" => {
-            println!("\n--- Research Tools ---");
-            println!("  arxiv_search              Search ArXiv (keyword, category, sort)");
-            println!("  semantic_scholar_search   Search Semantic Scholar (citations, fields)");
-            println!("  pdf_fetch                 Download + parse PDF from URL");
-            println!("  bibtex_generate           Generate BibTeX entries from paper metadata");
-            println!();
-            println!("  These tools are available when the agent is in research mode.");
-            println!("  Switch with: /mode research");
+        "create-review" => {
+            let domain = match args.get(1).copied() {
+                Some("academic") => ReviewDomain::Academic,
+                Some("medical") => ReviewDomain::Medical,
+                _ => return USAGE.to_string(),
+            };
+            let title = args.get(2..).unwrap_or(&[]).join(" ");
+            if title.trim().is_empty() {
+                return USAGE.to_string();
+            }
+            match create_review(
+                &root,
+                CreateReviewRequest {
+                    question: title.clone(),
+                    title,
+                    domain,
+                },
+            ) {
+                Ok(review) => pretty_json(&review),
+                Err(error) => format!("Unable to create review: {error}"),
+            }
         }
-        "bib" => {
-            println!("\n--- BibTeX Generation ---");
-            println!("  Ask the agent to generate BibTeX:");
-            println!("    \"Generate BibTeX for these papers: [list paper titles]\"");
-            println!();
-            println!("  Or use bibtex_generate tool with paper metadata from search results.");
-        }
-        "workflow" => {
-            println!("\n--- Paper Writing Workflow ---");
-            println!(
-                "  1. /search-papers <topic>    — Submit research task (search + synthesize + write)"
-            );
-            println!("  2. /fetch-paper <url>        — Download and read a specific paper");
-            println!("  3. /papers list              — Check research task status");
-            println!("  4. /tasks status <id>        — View detailed task progress");
-            println!("  5. /papers bib               — Generate BibTeX for references");
-            println!();
-            println!("  The research pipeline automatically:");
-            println!("    - Searches arxiv + Semantic Scholar in parallel");
-            println!("    - Fetches and analyzes top papers");
-            println!("    - Synthesizes a literature review");
-            println!("    - Generates a paper draft with citations");
-        }
-        _ => {
-            println!("Usage: /papers [list|tools|bib|workflow]");
-        }
+        _ => USAGE.to_string(),
     }
-    CommandOutcome::Continue
+}
+
+fn pretty_json<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_string_pretty(value)
+        .unwrap_or_else(|error| format!("Unable to format research record: {error}"))
 }
 cmd!(
     PapersCommand,
     "papers",
     CommandCategory::Advanced,
-    "Manage research papers (list/tools/bib/workflow)",
+    "Manage the file-backed research library and systematic reviews",
     cmd_papers
 );
 

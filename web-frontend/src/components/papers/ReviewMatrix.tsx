@@ -1,14 +1,6 @@
-import { useState, useEffect, useCallback } from 'react';
-import { papersApi, type Paper } from '../../api/endpoints';
-import { Grid3X3, Download, Sparkles, Plus, Trash2 } from 'lucide-react';
-
-/**
- * ReviewMatrix — paper comparison matrix.
- *
- * Papers are columns, dimensions (Method, Dataset, Key Finding, Limitation, …)
- * are rows.  Each cell is editable.  An "Agent Extract" button lets the agent
- * pre-fill cells, and the whole matrix can be exported to CSV.
- */
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { evidenceApi, papersApi, type EvidenceRecord, type Paper } from '../../api/endpoints';
+import { Download, Grid3X3, Plus, Trash2 } from 'lucide-react';
 
 interface Dimension {
   id: string;
@@ -23,320 +15,274 @@ const DEFAULT_DIMENSIONS: Dimension[] = [
   { id: 'contribution', label: 'Contribution' },
 ];
 
-/** matrixData[paperId][dimensionId] = cell text */
-type MatrixData = Record<string, Record<string, string>>;
-
-const STORAGE_KEY = 'echo-review-matrix';
-
-function loadMatrix(): MatrixData {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    return raw ? JSON.parse(raw) : {};
-  } catch {
-    return {};
-  }
+interface ReviewMatrixProps {
+  reviewId?: string;
+  sourceIds?: string[];
 }
 
-function saveMatrix(data: MatrixData) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-}
-
-export function ReviewMatrix() {
+export function ReviewMatrix({ reviewId, sourceIds }: ReviewMatrixProps) {
   const [papers, setPapers] = useState<Paper[]>([]);
-  const [matrix, setMatrix] = useState<MatrixData>(loadMatrix);
+  const [evidence, setEvidence] = useState<EvidenceRecord[]>([]);
   const [loading, setLoading] = useState(true);
-  const [editingCell, setEditingCell] = useState<{ paperId: string; dimId: string } | null>(null);
-  const [dimensions, setDimensions] = useState<Dimension[]>(DEFAULT_DIMENSIONS);
+  const [savingCell, setSavingCell] = useState<string | null>(null);
   const [newDimLabel, setNewDimLabel] = useState('');
   const [showAddDim, setShowAddDim] = useState(false);
+  const [customDimensions, setCustomDimensions] = useState<Dimension[]>([]);
+  const [error, setError] = useState<string | null>(null);
 
-  // Persist matrix on change
-  useEffect(() => {
-    saveMatrix(matrix);
-  }, [matrix]);
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [allPapers, records] = await Promise.all([
+        papersApi.list(),
+        evidenceApi.list(reviewId ? { reviewId } : undefined),
+      ]);
+      const selected = sourceIds?.length
+        ? allPapers.filter((paper) => sourceIds.includes(paper.id))
+        : allPapers;
+      setPapers(selected);
+      setEvidence(
+        records.filter((record) =>
+          reviewId ? record.review_id === reviewId : record.review_id == null
+        )
+      );
+      setError(null);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setLoading(false);
+    }
+  }, [reviewId, sourceIds]);
 
-  // Fetch papers
   useEffect(() => {
-    (async () => {
-      try {
-        const data = await papersApi.list();
-        setPapers(data);
-      } catch (e) {
-        console.error('Failed to fetch papers:', e);
-      } finally {
-        setLoading(false);
+    void refresh();
+  }, [refresh]);
+
+  const dimensions = useMemo(() => {
+    const known = new Map(DEFAULT_DIMENSIONS.map((dimension) => [dimension.id, dimension]));
+    for (const dimension of customDimensions) known.set(dimension.id, dimension);
+    for (const record of evidence) {
+      if (!known.has(record.dimension)) {
+        known.set(record.dimension, {
+          id: record.dimension,
+          label: record.dimension.replaceAll('_', ' '),
+        });
       }
-    })();
-  }, []);
+    }
+    return [...known.values()];
+  }, [customDimensions, evidence]);
 
-  const getCell = useCallback(
-    (paperId: string, dimId: string): string => matrix[paperId]?.[dimId] ?? '',
-    [matrix]
+  const evidenceFor = useCallback(
+    (sourceId: string, dimension: string) =>
+      evidence.find((record) => record.source_id === sourceId && record.dimension === dimension),
+    [evidence]
   );
 
-  const setCell = (paperId: string, dimId: string, value: string) => {
-    setMatrix((prev) => ({
-      ...prev,
-      [paperId]: { ...(prev[paperId] ?? {}), [dimId]: value },
-    }));
+  const saveCell = async (paperId: string, dimension: string, claim: string) => {
+    const existing = evidenceFor(paperId, dimension);
+    const cellKey = `${paperId}:${dimension}`;
+    setSavingCell(cellKey);
+    try {
+      const saved = await evidenceApi.upsert({
+        id: existing?.id,
+        source_id: paperId,
+        review_id: reviewId,
+        dimension,
+        claim,
+        tags: existing?.tags ?? [],
+        excerpt: existing?.excerpt,
+        locator: existing?.locator,
+        evidence_type: existing?.evidence_type,
+        population: existing?.population,
+        intervention: existing?.intervention,
+        comparator: existing?.comparator,
+        outcome: existing?.outcome,
+        effect: existing?.effect,
+        limitations: existing?.limitations,
+        certainty: existing?.certainty,
+      });
+      setEvidence((current) => [...current.filter((record) => record.id !== saved.id), saved]);
+      setError(null);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setSavingCell(null);
+    }
   };
 
-  // Add a custom dimension
   const addDimension = () => {
-    if (!newDimLabel.trim()) return;
-    const id = newDimLabel.trim().toLowerCase().replace(/\s+/g, '_');
-    if (dimensions.some((d) => d.id === id)) return;
-    setDimensions((prev) => [...prev, { id, label: newDimLabel.trim() }]);
+    const label = newDimLabel.trim();
+    if (!label) return;
+    const id = label
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '_')
+      .replace(/^_+|_+$/g, '');
+    if (!id || dimensions.some((dimension) => dimension.id === id)) return;
+    setCustomDimensions((current) => [...current, { id, label }]);
     setNewDimLabel('');
     setShowAddDim(false);
   };
 
-  const removeDimension = (dimId: string) => {
-    setDimensions((prev) => prev.filter((d) => d.id !== dimId));
-    setMatrix((prev) => {
-      const next = { ...prev };
-      for (const pid of Object.keys(next)) {
-        if (next[pid][dimId] !== undefined) {
-          next[pid] = { ...next[pid] };
-          delete next[pid][dimId];
-        }
-      }
-      return next;
-    });
+  const removeDimension = async (dimension: string) => {
+    const records = evidence.filter((record) => record.dimension === dimension);
+    try {
+      await Promise.all(records.map((record) => evidenceApi.delete(record.id)));
+      setEvidence((current) => current.filter((record) => record.dimension !== dimension));
+      setCustomDimensions((current) => current.filter((item) => item.id !== dimension));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
   };
 
-  // Agent extract — removed: paper analysis should be done through Agent conversation
-  const agentExtract = async (paperId: string) => {
-    const paper = papers.find((p) => p.id === paperId);
-    if (!paper) return;
-
-    // Paper analysis is now handled by the Agent through conversation
-    // Users should ask the Agent to analyze papers using tools like arxiv_search
-    alert(
-      '💡 论文分析请通过 Agent 对话使用研究工具。\n\n例如：\n- "分析这篇论文的方法和数据集"\n- "提取这篇论文的关键发现"\n- "总结这篇论文的贡献和局限性"'
-    );
-  };
-
-  // Export to CSV
   const exportCsv = () => {
-    const header = ['Dimension', ...papers.map((p) => `"${p.title.replace(/"/g, '""')}"`)].join(
-      ','
+    const quote = (value: string) => `"${value.replaceAll('"', '""')}"`;
+    const header = ['Dimension', ...papers.map((paper) => paper.title)].map(quote).join(',');
+    const rows = dimensions.map((dimension) =>
+      [dimension.label, ...papers.map((paper) => evidenceFor(paper.id, dimension.id)?.claim ?? '')]
+        .map(quote)
+        .join(',')
     );
-    const rows = dimensions.map((d) => {
-      const cells = papers.map((p) => `"${getCell(p.id, d.id).replace(/"/g, '""')}"`);
-      return [`"${d.label}"`, ...cells].join(',');
-    });
-    const csv = [header, ...rows].join('\n');
-    const blob = new Blob([csv], { type: 'text/csv' });
+    const blob = new Blob([[header, ...rows].join('\n')], { type: 'text/csv;charset=utf-8' });
     const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'review_matrix.csv';
-    a.click();
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = reviewId ? `${reviewId}-evidence-matrix.csv` : 'evidence-matrix.csv';
+    link.click();
     URL.revokeObjectURL(url);
   };
 
-  // Styles
-  const s = {
-    text: 'var(--text-primary)',
-    textSec: 'var(--text-secondary)',
-    textTer: 'var(--text-tertiary)',
-    border: 'var(--border-primary)',
-    bg: 'var(--bg-primary)',
-    bgHover: 'var(--bg-hover)',
-    bgCard: 'var(--bg-secondary)',
-  };
-
   if (loading) {
-    return (
-      <div className="p-4">
-        <p className="text-xs" style={{ color: s.textTer }}>
-          Loading papers…
-        </p>
-      </div>
-    );
-  }
-
-  if (papers.length === 0) {
-    return (
-      <div className="p-6 text-center">
-        <Grid3X3 size={24} className="mx-auto mb-2" style={{ color: s.textTer }} />
-        <p className="text-xs" style={{ color: s.textTer }}>
-          Add papers to use the review matrix
-        </p>
-      </div>
-    );
+    return <div className="p-4 text-xs text-[var(--text-tertiary)]">Loading evidence...</div>;
   }
 
   return (
-    <div className="p-3 space-y-3">
-      {/* Header */}
-      <div className="flex items-center justify-between flex-wrap gap-2">
-        <h3 className="text-sm font-semibold flex items-center gap-1.5" style={{ color: s.text }}>
-          <Grid3X3 size={14} />
-          Literature Review Matrix
-        </h3>
-        <div className="flex items-center gap-1.5">
-          <button
-            onClick={() => setShowAddDim((v) => !v)}
-            className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium transition-colors"
-            style={{ background: s.bgCard, color: s.textSec, border: `1px solid ${s.border}` }}
-            title="Add dimension row"
-          >
-            <Plus size={11} /> Dimension
-          </button>
-          <button
-            onClick={exportCsv}
-            className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] font-medium transition-colors"
-            style={{ background: s.bgCard, color: s.textSec, border: `1px solid ${s.border}` }}
-            title="Export to CSV"
-          >
-            <Download size={11} /> CSV
-          </button>
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="flex flex-wrap items-center gap-2 border-b border-[var(--border-primary)] px-3 py-2">
+        <div className="flex min-w-0 flex-1 items-center gap-1.5 text-xs font-semibold text-[var(--text-primary)]">
+          <Grid3X3 size={13} />
+          Evidence matrix
         </div>
+        <button
+          type="button"
+          onClick={() => setShowAddDim((visible) => !visible)}
+          className="flex h-7 items-center gap-1 rounded-md border border-[var(--border-primary)] px-2 text-[11px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
+          title="Add extraction dimension"
+        >
+          <Plus size={11} /> Dimension
+        </button>
+        <button
+          type="button"
+          onClick={exportCsv}
+          className="flex h-7 items-center gap-1 rounded-md border border-[var(--border-primary)] px-2 text-[11px] text-[var(--text-secondary)] hover:bg-[var(--bg-hover)]"
+          title="Export evidence matrix"
+        >
+          <Download size={11} /> CSV
+        </button>
       </div>
 
-      {/* Add dimension inline form */}
       {showAddDim && (
-        <div className="flex items-center gap-2">
+        <div className="flex gap-2 border-b border-[var(--border-primary)] p-2">
           <input
-            type="text"
             value={newDimLabel}
-            onChange={(e) => setNewDimLabel(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && addDimension()}
-            placeholder="New dimension label…"
-            className="flex-1 rounded-md border px-2 py-1 text-xs outline-none"
-            style={{ borderColor: s.border, background: s.bg, color: s.text }}
-            autoFocus
+            onChange={(event) => setNewDimLabel(event.target.value)}
+            onKeyDown={(event) => event.key === 'Enter' && addDimension()}
+            className="min-w-0 flex-1 rounded-md border border-[var(--border-primary)] bg-[var(--bg-input)] px-2 text-xs text-[var(--text-primary)] outline-none"
+            placeholder="Dimension name"
           />
           <button
+            type="button"
             onClick={addDimension}
-            className="px-2 py-1 rounded-md text-xs font-medium"
-            style={{ background: 'var(--color-primary, #3b82f6)', color: '#fff' }}
+            className="h-7 rounded-md bg-[var(--accent)] px-3 text-xs font-medium text-white"
           >
             Add
           </button>
         </div>
       )}
 
-      {/* Matrix table — papers as columns, dimensions as rows */}
-      <div className="overflow-x-auto rounded-lg border" style={{ borderColor: s.border }}>
-        <table className="w-full text-xs">
-          <thead>
-            <tr style={{ background: s.bgCard }}>
-              <th
-                className="text-left px-3 py-2 font-medium sticky left-0 z-10"
-                style={{
-                  color: s.text,
-                  background: s.bgCard,
-                  borderBottom: `1px solid ${s.border}`,
-                  minWidth: 110,
-                }}
-              >
-                Dimension
-              </th>
-              {papers.map((paper) => (
-                <th
-                  key={paper.id}
-                  className="px-3 py-2 text-left align-top"
-                  style={{ borderBottom: `1px solid ${s.border}`, minWidth: 180, maxWidth: 260 }}
-                >
-                  <p className="font-medium leading-snug" style={{ color: s.text }}>
-                    {paper.title}
-                  </p>
-                  <p className="text-[10px] mt-0.5 truncate" style={{ color: s.textTer }}>
-                    {paper.authors[0] ?? 'Unknown'}
-                    {paper.authors.length > 1 ? ' et al.' : ''}
-                    {paper.year ? ` (${paper.year})` : ''}
-                  </p>
-                  <button
-                    onClick={() => agentExtract(paper.id)}
-                    className="mt-1 flex items-center gap-0.5 text-[10px] transition-colors hover:opacity-80"
-                    style={{ color: 'var(--color-primary, #3b82f6)' }}
-                    title="Auto-extract from abstract"
-                  >
-                    <Sparkles size={9} /> Agent Extract
-                  </button>
+      {error && (
+        <div className="border-b border-[var(--border-primary)] bg-red-500/10 px-3 py-2 text-xs text-red-500">
+          {error}
+        </div>
+      )}
+
+      {papers.length === 0 ? (
+        <div className="flex flex-1 items-center justify-center p-6 text-center text-xs text-[var(--text-tertiary)]">
+          Add sources to begin evidence extraction.
+        </div>
+      ) : (
+        <div className="min-h-0 flex-1 overflow-auto">
+          <table className="min-w-full border-collapse text-xs">
+            <thead className="sticky top-0 z-20 bg-[var(--bg-secondary)]">
+              <tr>
+                <th className="sticky left-0 z-30 min-w-28 border-b border-r border-[var(--border-primary)] bg-[var(--bg-secondary)] px-3 py-2 text-left font-medium text-[var(--text-secondary)]">
+                  Dimension
                 </th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {dimensions.map((dim) => (
-              <tr key={dim.id} style={{ borderBottom: `1px solid ${s.border}` }}>
-                <td
-                  className="px-3 py-2 font-medium sticky left-0 z-10 flex items-center gap-1"
-                  style={{
-                    background: s.bgCard,
-                    borderBottom: `1px solid ${s.border}`,
-                    color: s.textSec,
-                  }}
-                >
-                  <span className="flex-1">{dim.label}</span>
-                  {!DEFAULT_DIMENSIONS.some((d) => d.id === dim.id) && (
-                    <button
-                      onClick={() => removeDimension(dim.id)}
-                      className="p-0.5 rounded-md transition-colors hover:text-red-500"
-                      style={{ color: s.textTer }}
-                      title="Remove dimension"
-                    >
-                      <Trash2 size={9} />
-                    </button>
-                  )}
-                </td>
-                {papers.map((paper) => {
-                  const isEditing =
-                    editingCell?.paperId === paper.id && editingCell?.dimId === dim.id;
-                  const value = getCell(paper.id, dim.id);
-
-                  return (
-                    <td
-                      key={paper.id}
-                      className="px-2 py-1.5 align-top"
-                      style={{ borderBottom: `1px solid ${s.border}` }}
-                    >
-                      {isEditing ? (
-                        <textarea
-                          value={value}
-                          onChange={(e) => setCell(paper.id, dim.id, e.target.value)}
-                          onBlur={() => setEditingCell(null)}
-                          className="w-full p-1.5 text-xs rounded-md border outline-none resize-y"
-                          style={{
-                            borderColor: 'var(--border-focus, var(--color-primary, #3b82f6))',
-                            background: s.bg,
-                            color: s.text,
-                            minHeight: 48,
-                          }}
-                          autoFocus
-                          rows={3}
-                        />
-                      ) : (
-                        <div
-                          onClick={() => setEditingCell({ paperId: paper.id, dimId: dim.id })}
-                          className="min-h-[32px] p-1.5 rounded-md cursor-text transition-colors whitespace-pre-wrap"
-                          style={{
-                            color: value ? s.text : s.textTer,
-                            background: value ? 'transparent' : s.bgCard,
-                          }}
-                          title="Click to edit"
-                        >
-                          {value || <span className="italic">—</span>}
-                        </div>
-                      )}
-                    </td>
-                  );
-                })}
+                {papers.map((paper) => (
+                  <th
+                    key={paper.id}
+                    className="min-w-48 max-w-64 border-b border-r border-[var(--border-primary)] px-3 py-2 text-left align-top"
+                  >
+                    <div className="line-clamp-2 font-medium text-[var(--text-primary)]">
+                      {paper.title}
+                    </div>
+                    <div className="mt-1 truncate text-[10px] font-normal text-[var(--text-tertiary)]">
+                      {paper.authors[0] ?? 'Unknown'} {paper.year ? `(${paper.year})` : ''}
+                    </div>
+                  </th>
+                ))}
               </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-
-      {/* Footer hint */}
-      <p className="text-[10px]" style={{ color: s.textTer }}>
-        Click any cell to edit. Use "Agent Extract" to auto-fill from paper abstracts. Data is saved
-        locally.
-      </p>
+            </thead>
+            <tbody>
+              {dimensions.map((dimension) => (
+                <tr key={dimension.id}>
+                  <td className="sticky left-0 z-10 border-b border-r border-[var(--border-primary)] bg-[var(--bg-secondary)] px-3 py-2 align-top text-[var(--text-secondary)]">
+                    <div className="flex items-center gap-1">
+                      <span className="min-w-0 flex-1">{dimension.label}</span>
+                      {!DEFAULT_DIMENSIONS.some((item) => item.id === dimension.id) && (
+                        <button
+                          type="button"
+                          onClick={() => void removeDimension(dimension.id)}
+                          className="flex h-5 w-5 items-center justify-center rounded text-[var(--text-tertiary)] hover:bg-red-500/10 hover:text-red-500"
+                          title="Delete dimension evidence"
+                        >
+                          <Trash2 size={10} />
+                        </button>
+                      )}
+                    </div>
+                  </td>
+                  {papers.map((paper) => {
+                    const record = evidenceFor(paper.id, dimension.id);
+                    const cellKey = `${paper.id}:${dimension.id}`;
+                    return (
+                      <td
+                        key={paper.id}
+                        className="border-b border-r border-[var(--border-primary)] p-1 align-top"
+                      >
+                        <textarea
+                          key={`${record?.id ?? cellKey}:${record?.updated_at ?? ''}`}
+                          defaultValue={record?.claim ?? ''}
+                          onBlur={(event) => {
+                            if (event.target.value !== (record?.claim ?? '')) {
+                              void saveCell(paper.id, dimension.id, event.target.value);
+                            }
+                          }}
+                          className="h-24 w-full resize-none rounded border border-transparent bg-transparent p-2 text-xs leading-relaxed text-[var(--text-primary)] outline-none hover:border-[var(--border-primary)] focus:border-[var(--accent)] focus:bg-[var(--bg-input)]"
+                          placeholder="Extract evidence..."
+                        />
+                        {savingCell === cellKey && (
+                          <div className="px-2 pb-1 text-[10px] text-[var(--text-tertiary)]">
+                            Saving...
+                          </div>
+                        )}
+                      </td>
+                    );
+                  })}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 }

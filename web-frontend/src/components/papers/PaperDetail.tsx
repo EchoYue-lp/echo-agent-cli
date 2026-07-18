@@ -116,12 +116,23 @@ export function PaperDetail({ paper, onClose, onUpdated }: PaperDetailProps) {
           {paper.year && <MetaItem icon={Calendar} label="Year" value={String(paper.year)} s={s} />}
           {paper.venue && <MetaItem icon={BookOpen} label="Venue" value={paper.venue} s={s} />}
           {paper.doi && <MetaItem icon={Hash} label="DOI" value={paper.doi} s={s} />}
+          {paper.pmid && <MetaItem icon={Hash} label="PMID" value={paper.pmid} s={s} />}
+          {paper.pmcid && <MetaItem icon={Hash} label="PMCID" value={paper.pmcid} s={s} />}
           {paper.arxiv_id && (
             <MetaItem
               icon={ExternalLink}
               label="arXiv"
               value={paper.arxiv_id}
               link={`https://arxiv.org/abs/${paper.arxiv_id}`}
+              s={s}
+            />
+          )}
+          {paper.openalex_id && (
+            <MetaItem
+              icon={ExternalLink}
+              label="OpenAlex"
+              value={paper.openalex_id}
+              link={`https://openalex.org/${paper.openalex_id}`}
               s={s}
             />
           )}

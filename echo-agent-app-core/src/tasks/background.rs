@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::task_runtime::DomainProfile;
+
 /// Tag prefix persisted in TaskRuntime trigger metadata.
 pub const BG_KIND_TAG_PREFIX: &str = "bg:kind:";
 
@@ -44,7 +46,7 @@ pub enum BackgroundTaskKind {
         writing_quality_threshold: u32,
     },
 
-    /// Data analysis pipeline: load -> profile -> analyze -> visualize -> summarize.
+    /// File-backed analysis pipeline: contract -> script -> execute -> lineage -> report.
     DataPipeline {
         /// Path to the dataset (CSV, JSON, etc.)
         dataset_path: String,
@@ -120,6 +122,16 @@ pub enum ResearchOutputFormat {
 }
 
 impl BackgroundTaskKind {
+    pub fn domain_profile(&self) -> DomainProfile {
+        match self {
+            Self::Research { .. } | Self::ResearchToWriting { .. } => {
+                DomainProfile::AcademicResearch
+            }
+            Self::DataPipeline { .. } => DomainProfile::DataAnalysis,
+            Self::WritingPipeline { .. } => DomainProfile::General,
+        }
+    }
+
     /// Return the tag string for this kind (used in `Task.tags`).
     pub fn tag(&self) -> String {
         let kind_name = match self {
@@ -150,10 +162,15 @@ impl BackgroundTaskKind {
             Self::Research {
                 topic, max_papers, ..
             } => format!(
-                "Research the following topic thoroughly. Find up to {max_papers} relevant \
-                 academic papers using arxiv_search and semantic_scholar_search, fetch and \
-                 read the most important ones, then write a comprehensive literature review \
-                 with proper citations.\n\nTopic: {topic}"
+                "Conduct a reproducible literature review on the topic below. Create an academic \
+                 systematic-review record with research_library before synthesis. Record the \
+                 question, eligibility criteria, databases, exact search queries, search dates, \
+                 and result counts. Find up to {max_papers} relevant sources, normalize DOI, \
+                 arXiv, PMID/PMCID, or OpenAlex identifiers, and persist every source with \
+                 research_library. Screen each source with explicit include/exclude reasons. \
+                 Persist claim-level evidence with quotations or section/page locators, then \
+                 write a cited review from those evidence records. Do not cite a source that is \
+                 absent from the library or make a claim without linked evidence.\n\nTopic: {topic}"
             ),
 
             Self::ResearchToWriting {
@@ -163,9 +180,11 @@ impl BackgroundTaskKind {
                 format,
                 ..
             } => format!(
-                "First, research the topic below by finding up to {max_papers} academic \
-                 papers. Then, write a {format} about it for {audience}. The final document \
-                 should be well-structured with proper citations and a reference list.\n\n\
+                "First build a reproducible academic review in research_library: define the \
+                 protocol, find and normalize up to {max_papers} sources, record searches and \
+                 screening reasons, and persist claim-level evidence with locators. Then write a \
+                 {format} for {audience} using only the persisted evidence. The final document \
+                 must have audited citations and a reference list.\n\n\
                  Topic: {topic}"
             ),
 
@@ -179,10 +198,18 @@ impl BackgroundTaskKind {
                                 trends, and insights",
                 );
                 format!(
-                    "Analyze the dataset at '{dataset_path}'. {obj}. Generate up to \
-                     {max_charts} charts to visualize the key findings. Use read_data to \
-                     load the dataset, profile_data for statistics, and generate_chart for \
-                     visualizations. End with an executive summary."
+                    "Create a reproducible file-backed analysis for the workspace-relative \
+                     dataset '{dataset_path}'. Objective: {obj}. Use the analysis contract under \
+                     analysis/<analysis-id>/: manifest.json, a persisted analysis.py or \
+                     analysis.R script, outputs/, environment.json, result.json, runs/, and \
+                     latest-run.json. Put '{dataset_path}' in manifest input_paths, choose and \
+                     record a random seed, and perform all transformations, statistical methods, \
+                     diagnostics, and up to {max_charts} charts in the reviewable script. Execute \
+                     the persisted file with run_code using script_path, not inline code. Report \
+                     package/runtime versions, input and output hashes, assumptions, missing-data \
+                     handling, and diagnostics. Treat exploratory_statistics as exploratory only; \
+                     formal inference must use a mature pinned library. End with an executive \
+                     summary that points to the saved artifacts."
                 )
             }
 
@@ -201,5 +228,28 @@ impl BackgroundTaskKind {
                  5. Finalize the document"
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn background_kinds_select_domain_profiles() {
+        let data = BackgroundTaskKind::DataPipeline {
+            dataset_path: "data.csv".to_string(),
+            objective: None,
+            max_charts: 2,
+        };
+        let research = BackgroundTaskKind::Research {
+            topic: "agents".to_string(),
+            max_papers: 5,
+            output_format: ResearchOutputFormat::Markdown,
+        };
+        assert_eq!(data.domain_profile(), DomainProfile::DataAnalysis);
+        assert_eq!(research.domain_profile(), DomainProfile::AcademicResearch);
+        assert!(data.to_prompt().contains("run_code using script_path"));
+        assert!(research.to_prompt().contains("research_library"));
     }
 }

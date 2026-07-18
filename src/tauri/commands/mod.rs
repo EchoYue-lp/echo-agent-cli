@@ -17,6 +17,7 @@ pub mod memory;
 pub mod panels;
 pub mod plugins;
 pub mod providers;
+pub mod research;
 pub mod scheduler;
 pub mod session;
 pub mod task_runtime;

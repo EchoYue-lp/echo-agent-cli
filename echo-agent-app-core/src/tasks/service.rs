@@ -36,6 +36,16 @@ impl Default for BackgroundTaskServiceConfig {
     }
 }
 
+struct PromptRunRequest<'a> {
+    prompt: &'a str,
+    description: &'a str,
+    source: &'a str,
+    task_kind: &'a str,
+    priority: u8,
+    dependencies: Vec<String>,
+    domain_profile: DomainProfile,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct UnifiedTaskInfo {
     pub id: String,
@@ -224,17 +234,19 @@ impl BackgroundTaskService {
         priority: Option<u8>,
         depends_on: Vec<String>,
     ) -> anyhow::Result<String> {
+        let domain_profile = kind.domain_profile();
         let prompt = kind.to_prompt();
         let task_kind = kind.tag();
         let source = submitted_via.unwrap_or_else(|| "background".to_string());
-        self.submit_prompt_run(
-            &prompt,
+        self.submit_prompt_run(PromptRunRequest {
+            prompt: &prompt,
             description,
-            &source,
-            &task_kind,
-            priority.unwrap_or(5),
-            depends_on,
-        )
+            source: &source,
+            task_kind: &task_kind,
+            priority: priority.unwrap_or(5),
+            dependencies: depends_on,
+            domain_profile,
+        })
         .await
     }
 
@@ -245,52 +257,50 @@ impl BackgroundTaskService {
         source_kind: &str,
         source_id: &str,
     ) -> anyhow::Result<String> {
-        self.submit_prompt_run(
+        let task_kind = format!("bg:kind:{source_kind}_agent_chat");
+        self.submit_prompt_run(PromptRunRequest {
             prompt,
             description,
-            source_id,
-            &format!("bg:kind:{source_kind}_agent_chat"),
-            5,
-            Vec::new(),
-        )
+            source: source_id,
+            task_kind: &task_kind,
+            priority: 5,
+            dependencies: Vec::new(),
+            domain_profile: DomainProfile::General,
+        })
         .await
     }
 
-    async fn submit_prompt_run(
-        &self,
-        prompt: &str,
-        description: &str,
-        source: &str,
-        task_kind: &str,
-        priority: u8,
-        dependencies: Vec<String>,
-    ) -> anyhow::Result<String> {
+    async fn submit_prompt_run(&self, request: PromptRunRequest<'_>) -> anyhow::Result<String> {
         let run_id = uuid::Uuid::new_v4().to_string();
-        let conversation_id = format!("background:{source}:{}", uuid::Uuid::new_v4());
-        let goal = if description.trim().is_empty() {
-            prompt
+        let conversation_id = format!("background:{}:{}", request.source, uuid::Uuid::new_v4());
+        let goal = if request.description.trim().is_empty() {
+            request.prompt
         } else {
-            description
+            request.description
         };
         self.task_runtime_store.create_run(
             &run_id,
             "default",
             &conversation_id,
             "",
-            DomainProfile::General,
+            request.domain_profile,
             goal,
-            task_kind,
+            request.task_kind,
             AttendedMode::Unattended,
         )?;
         self.task_runtime_store.record_trigger_metadata(
             &run_id,
-            source,
-            task_kind,
-            prompt,
-            priority,
-            &dependencies,
+            request.source,
+            request.task_kind,
+            request.prompt,
+            request.priority,
+            &request.dependencies,
         )?;
-        self.start_run_driver(run_id.clone(), prompt.to_string(), dependencies)?;
+        self.start_run_driver(
+            run_id.clone(),
+            request.prompt.to_string(),
+            request.dependencies,
+        )?;
         Ok(run_id)
     }
 

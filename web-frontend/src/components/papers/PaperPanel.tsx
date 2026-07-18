@@ -1,272 +1,301 @@
-import { useState, useCallback, useEffect } from 'react';
-import { papersApi, type Paper, type CreatePaperRequest } from '../../api/endpoints';
-import { BookOpen, Plus, X, Grid3X3, List } from 'lucide-react';
-import { PaperList } from './PaperList';
+import { useCallback, useEffect, useState } from 'react';
+import { papersApi, type CreatePaperRequest, type Paper } from '../../api/endpoints';
+import { BookOpen, Grid3X3, List, Plus, SearchCheck, X } from 'lucide-react';
 import { PaperDetail } from './PaperDetail';
+import { PaperList } from './PaperList';
 import { ReviewMatrix } from './ReviewMatrix';
+import { ReviewWorkbench } from './ReviewWorkbench';
 
-type ViewMode = 'list' | 'matrix';
+type ViewMode = 'library' | 'matrix' | 'reviews';
 
 export function PaperPanel() {
   const [papers, setPapers] = useState<Paper[]>([]);
   const [selectedPaper, setSelectedPaper] = useState<Paper | null>(null);
-  const [viewMode, setViewMode] = useState<ViewMode>('list');
+  const [viewMode, setViewMode] = useState<ViewMode>('library');
   const [showAddForm, setShowAddForm] = useState(false);
-  const [refreshKey, setRefreshKey] = useState(0);
-
-  // Add form state
-  const [addTitle, setAddTitle] = useState('');
-  const [addAuthors, setAddAuthors] = useState('');
-  const [addYear, setAddYear] = useState('');
-  const [addVenue, setAddVenue] = useState('');
-  const [addArxiv, setAddArxiv] = useState('');
-  const [addTags, setAddTags] = useState('');
-  const [addAbstract, setAddAbstract] = useState('');
   const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [draft, setDraft] = useState<CreatePaperRequest>({
+    title: '',
+    source_kind: 'journal_article',
+  });
 
-  const refresh = useCallback(() => {
-    setRefreshKey((k) => k + 1);
-  }, []);
-
-  // Fetch papers on mount and refresh
   const fetchPapers = useCallback(async () => {
     try {
       const list = await papersApi.list();
       setPapers(list);
-    } catch (e) {
-      console.error('Failed to fetch papers:', e);
+      setSelectedPaper((current) => list.find((paper) => paper.id === current?.id) ?? null);
+      setError(null);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
     }
   }, []);
 
   useEffect(() => {
-    fetchPapers();
-  }, [fetchPapers, refreshKey]);
+    void fetchPapers();
+  }, [fetchPapers]);
 
   const handleSelectPaper = async (paper: Paper) => {
-    // Fetch full details
     try {
-      const full = await papersApi.get(paper.id);
-      setSelectedPaper(full);
+      setSelectedPaper(await papersApi.get(paper.id));
     } catch {
       setSelectedPaper(paper);
     }
   };
 
   const handleAddPaper = async () => {
-    if (!addTitle.trim()) return;
+    if (!draft.title.trim()) return;
     setSaving(true);
     try {
-      const req: CreatePaperRequest = {
-        title: addTitle.trim(),
-        authors: addAuthors
-          ? addAuthors
-              .split(',')
-              .map((a) => a.trim())
-              .filter(Boolean)
-          : undefined,
-        year: addYear ? parseInt(addYear, 10) : undefined,
-        venue: addVenue || undefined,
-        arxiv_id: addArxiv || undefined,
-        tags: addTags
-          ? addTags
-              .split(',')
-              .map((t) => t.trim())
-              .filter(Boolean)
-          : undefined,
-        abstract_text: addAbstract || undefined,
-      };
-      const created = await papersApi.create(req);
+      const created = await papersApi.create({
+        ...draft,
+        title: draft.title.trim(),
+        authors: draft.authors?.filter(Boolean),
+        tags: draft.tags?.filter(Boolean),
+      });
       setSelectedPaper(created);
       setShowAddForm(false);
-      setAddTitle('');
-      setAddAuthors('');
-      setAddYear('');
-      setAddVenue('');
-      setAddArxiv('');
-      setAddTags('');
-      setAddAbstract('');
-      refresh();
-    } catch (e) {
-      console.error('Failed to add paper:', e);
+      setDraft({ title: '', source_kind: 'journal_article' });
+      await fetchPapers();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
       setSaving(false);
     }
   };
 
-  const s = {
-    text: 'var(--text-primary)',
-    textSec: 'var(--text-secondary)',
-    textTer: 'var(--text-tertiary)',
-    border: 'var(--border-primary)',
-    bg: 'var(--bg-primary)',
-    bgHover: 'var(--bg-hover)',
-    bgCard: 'var(--bg-secondary)',
-  };
-
   return (
-    <div className="flex flex-col h-full">
-      {/* Header */}
-      <div
-        className="flex items-center justify-between px-3 py-2.5"
-        style={{ borderBottom: `1px solid ${s.border}` }}
-      >
-        <h3 className="text-sm font-semibold flex items-center gap-1.5" style={{ color: s.text }}>
-          <BookOpen size={14} />
-          Papers
-        </h3>
-        <div className="flex items-center gap-1">
-          {/* View mode toggle */}
+    <div className="flex h-full min-h-0 flex-col">
+      <header className="flex min-h-10 items-center gap-1 border-b border-[var(--border-primary)] px-2">
+        <PanelMode
+          active={viewMode === 'library'}
+          icon={<List size={12} />}
+          label="Library"
+          onClick={() => setViewMode('library')}
+        />
+        <PanelMode
+          active={viewMode === 'matrix'}
+          icon={<Grid3X3 size={12} />}
+          label="Matrix"
+          onClick={() => setViewMode('matrix')}
+        />
+        <PanelMode
+          active={viewMode === 'reviews'}
+          icon={<SearchCheck size={12} />}
+          label="Reviews"
+          onClick={() => setViewMode('reviews')}
+        />
+        <div className="flex-1" />
+        {viewMode === 'library' && (
           <button
-            onClick={() => setViewMode('list')}
-            className="rounded-md p-1.5 transition-colors"
-            style={{ color: viewMode === 'list' ? 'var(--color-primary)' : s.textTer }}
-            title="List view"
+            type="button"
+            onClick={() => setShowAddForm((visible) => !visible)}
+            className="flex h-7 w-7 items-center justify-center rounded-md text-[var(--text-tertiary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]"
+            title="Add source"
           >
-            <List size={13} />
+            {showAddForm ? <X size={13} /> : <Plus size={13} />}
           </button>
-          <button
-            onClick={() => setViewMode('matrix')}
-            className="rounded-md p-1.5 transition-colors"
-            style={{ color: viewMode === 'matrix' ? 'var(--color-primary)' : s.textTer }}
-            title="Matrix view"
-          >
-            <Grid3X3 size={13} />
-          </button>
-          <button
-            onClick={() => setShowAddForm(true)}
-            className="rounded-md p-1.5 transition-colors"
-            style={{ color: s.textTer }}
-            title="Add paper"
-          >
-            <Plus size={13} />
-          </button>
-        </div>
-      </div>
+        )}
+      </header>
 
-      {/* Add paper form */}
-      {showAddForm && (
-        <div
-          className="p-3 space-y-2"
-          style={{ borderBottom: `1px solid ${s.border}`, background: s.bgCard }}
-        >
-          <div className="flex items-center justify-between mb-1">
-            <span className="text-xs font-medium" style={{ color: s.text }}>
-              Add Paper
-            </span>
-            <button
-              onClick={() => setShowAddForm(false)}
-              className="rounded-md p-1"
-              style={{ color: s.textTer }}
-            >
-              <X size={12} />
-            </button>
-          </div>
-          <input
-            type="text"
-            value={addTitle}
-            onChange={(e) => setAddTitle(e.target.value)}
-            placeholder="Title *"
-            className="w-full rounded-md border px-2 py-1 text-xs"
-            style={{ borderColor: s.border, background: s.bg, color: s.text }}
-          />
-          <input
-            type="text"
-            value={addAuthors}
-            onChange={(e) => setAddAuthors(e.target.value)}
-            placeholder="Authors (comma-separated)"
-            className="w-full rounded-md border px-2 py-1 text-xs"
-            style={{ borderColor: s.border, background: s.bg, color: s.text }}
-          />
-          <div className="grid grid-cols-2 gap-2">
-            <input
-              type="text"
-              value={addYear}
-              onChange={(e) => setAddYear(e.target.value)}
-              placeholder="Year"
-              className="rounded-md border px-2 py-1 text-xs"
-              style={{ borderColor: s.border, background: s.bg, color: s.text }}
-            />
-            <input
-              type="text"
-              value={addVenue}
-              onChange={(e) => setAddVenue(e.target.value)}
-              placeholder="Venue"
-              className="rounded-md border px-2 py-1 text-xs"
-              style={{ borderColor: s.border, background: s.bg, color: s.text }}
-            />
-          </div>
-          <input
-            type="text"
-            value={addArxiv}
-            onChange={(e) => setAddArxiv(e.target.value)}
-            placeholder="arXiv ID (e.g. 2301.12345)"
-            className="w-full rounded-md border px-2 py-1 text-xs"
-            style={{ borderColor: s.border, background: s.bg, color: s.text }}
-          />
-          <input
-            type="text"
-            value={addTags}
-            onChange={(e) => setAddTags(e.target.value)}
-            placeholder="Tags (comma-separated)"
-            className="w-full rounded-md border px-2 py-1 text-xs"
-            style={{ borderColor: s.border, background: s.bg, color: s.text }}
-          />
-          <textarea
-            value={addAbstract}
-            onChange={(e) => setAddAbstract(e.target.value)}
-            placeholder="Abstract (optional)"
-            className="w-full rounded-md border px-2 py-1 text-xs"
-            style={{ borderColor: s.border, background: s.bg, color: s.text }}
-            rows={3}
-          />
-          <button
-            onClick={handleAddPaper}
-            disabled={!addTitle.trim() || saving}
-            className="w-full rounded-md px-3 py-1.5 text-xs font-medium transition-colors"
-            style={{
-              background: addTitle.trim() ? 'var(--color-primary)' : s.bgHover,
-              color: addTitle.trim() ? '#fff' : s.textTer,
-            }}
-          >
-            {saving ? 'Adding...' : 'Add Paper'}
-          </button>
+      {error && (
+        <div className="border-b border-[var(--border-primary)] bg-red-500/10 px-3 py-2 text-xs text-red-500">
+          {error}
         </div>
       )}
 
-      {/* Content */}
-      <div className="flex-1 overflow-hidden">
+      {showAddForm && viewMode === 'library' && (
+        <SourceForm
+          draft={draft}
+          setDraft={setDraft}
+          save={() => void handleAddPaper()}
+          saving={saving}
+        />
+      )}
+
+      <div className="min-h-0 flex-1">
         {viewMode === 'matrix' ? (
-          <div className="h-full overflow-y-auto">
-            <ReviewMatrix />
-          </div>
+          <ReviewMatrix />
+        ) : viewMode === 'reviews' ? (
+          <ReviewWorkbench />
         ) : selectedPaper ? (
-          <div className="h-full flex flex-col md:flex-row">
-            {/* List side */}
-            <div
-              className="w-full md:w-1/2 h-1/2 md:h-full overflow-hidden"
-              style={{ borderRight: `1px solid ${s.border}` }}
-            >
+          <div className="flex h-full min-h-0 flex-col md:flex-row">
+            <div className="h-2/5 min-h-0 w-full border-b border-[var(--border-primary)] md:h-full md:w-2/5 md:border-b-0 md:border-r">
               <PaperList
                 papers={papers}
                 selectedId={selectedPaper.id}
-                onSelect={handleSelectPaper}
+                onSelect={(paper) => void handleSelectPaper(paper)}
               />
             </div>
-            {/* Detail side */}
-            <div className="w-full md:w-1/2 h-1/2 md:h-full overflow-y-auto">
+            <div className="min-h-0 flex-1">
               <PaperDetail
                 paper={selectedPaper}
                 onClose={() => setSelectedPaper(null)}
-                onUpdated={refresh}
+                onUpdated={() => void fetchPapers()}
               />
             </div>
           </div>
         ) : (
-          <PaperList papers={papers} selectedId={null} onSelect={handleSelectPaper} />
+          <PaperList
+            papers={papers}
+            selectedId={null}
+            onSelect={(paper) => void handleSelectPaper(paper)}
+          />
         )}
       </div>
     </div>
   );
 }
+
+function SourceForm({
+  draft,
+  setDraft,
+  save,
+  saving,
+}: {
+  draft: CreatePaperRequest;
+  setDraft: React.Dispatch<React.SetStateAction<CreatePaperRequest>>;
+  save: () => void;
+  saving: boolean;
+}) {
+  const set = (patch: Partial<CreatePaperRequest>) =>
+    setDraft((current) => ({ ...current, ...patch }));
+  return (
+    <div className="space-y-2 border-b border-[var(--border-primary)] bg-[var(--bg-secondary)] p-3">
+      <div className="flex items-center gap-1.5 text-xs font-semibold text-[var(--text-primary)]">
+        <BookOpen size={12} /> Add source
+      </div>
+      <input
+        value={draft.title}
+        onChange={(event) => set({ title: event.target.value })}
+        className={inputClass}
+        placeholder="Title"
+      />
+      <input
+        value={draft.authors?.join(', ') ?? ''}
+        onChange={(event) => set({ authors: splitComma(event.target.value) })}
+        className={inputClass}
+        placeholder="Authors, comma separated"
+      />
+      <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
+        <select
+          value={draft.source_kind ?? 'journal_article'}
+          onChange={(event) => set({ source_kind: event.target.value as Paper['source_kind'] })}
+          className={inputClass}
+        >
+          <option value="journal_article">Journal article</option>
+          <option value="preprint">Preprint</option>
+          <option value="conference_paper">Conference paper</option>
+          <option value="guideline">Guideline</option>
+          <option value="trial_registration">Trial registration</option>
+          <option value="dataset">Dataset</option>
+          <option value="other">Other</option>
+        </select>
+        <input
+          type="number"
+          value={draft.year ?? ''}
+          onChange={(event) =>
+            set({ year: event.target.value ? Number(event.target.value) : undefined })
+          }
+          className={inputClass}
+          placeholder="Year"
+        />
+        <input
+          value={draft.venue ?? ''}
+          onChange={(event) => set({ venue: event.target.value || undefined })}
+          className={inputClass}
+          placeholder="Venue"
+        />
+        <input
+          value={draft.doi ?? ''}
+          onChange={(event) => set({ doi: event.target.value || undefined })}
+          className={inputClass}
+          placeholder="DOI"
+        />
+      </div>
+      <div className="grid grid-cols-2 gap-2 md:grid-cols-4">
+        <input
+          value={draft.pmid ?? ''}
+          onChange={(event) => set({ pmid: event.target.value || undefined })}
+          className={inputClass}
+          placeholder="PMID"
+        />
+        <input
+          value={draft.pmcid ?? ''}
+          onChange={(event) => set({ pmcid: event.target.value || undefined })}
+          className={inputClass}
+          placeholder="PMCID"
+        />
+        <input
+          value={draft.arxiv_id ?? ''}
+          onChange={(event) => set({ arxiv_id: event.target.value || undefined })}
+          className={inputClass}
+          placeholder="arXiv"
+        />
+        <input
+          value={draft.openalex_id ?? ''}
+          onChange={(event) => set({ openalex_id: event.target.value || undefined })}
+          className={inputClass}
+          placeholder="OpenAlex ID"
+        />
+      </div>
+      <textarea
+        value={draft.abstract_text ?? ''}
+        onChange={(event) => set({ abstract_text: event.target.value || undefined })}
+        className={`${inputClass} min-h-16 resize-y py-2`}
+        placeholder="Abstract"
+      />
+      <div className="flex gap-2">
+        <input
+          value={draft.tags?.join(', ') ?? ''}
+          onChange={(event) => set({ tags: splitComma(event.target.value) })}
+          className={`${inputClass} min-w-0 flex-1`}
+          placeholder="Tags"
+        />
+        <button
+          type="button"
+          onClick={save}
+          disabled={!draft.title.trim() || saving}
+          className="h-8 rounded-md bg-[var(--accent)] px-4 text-xs font-medium text-white disabled:opacity-50"
+        >
+          {saving ? 'Adding...' : 'Add'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function PanelMode({
+  active,
+  icon,
+  label,
+  onClick,
+}: {
+  active: boolean;
+  icon: React.ReactNode;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={active}
+      className={`flex h-8 items-center gap-1 rounded-md px-2 text-[11px] ${active ? 'bg-[var(--bg-sidebar-active)] text-[var(--text-primary)]' : 'text-[var(--text-tertiary)] hover:bg-[var(--bg-hover)] hover:text-[var(--text-primary)]'}`}
+    >
+      {icon} {label}
+    </button>
+  );
+}
+
+function splitComma(value: string): string[] {
+  return value
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+const inputClass =
+  'h-8 w-full rounded-md border border-[var(--border-primary)] bg-[var(--bg-input)] px-2 text-xs text-[var(--text-primary)] outline-none focus:border-[var(--accent)]';
 
 export default PaperPanel;

@@ -303,13 +303,20 @@ impl AgentRuntime {
         // ── 9. Plugins ──
         load_plugins(&agent_handle).await;
 
-        // ── 10. LSP tools ──
+        // ── 10. File-backed research library ──
+        agent_handle
+            .write(|agent| {
+                agent.add_tool(Box::new(crate::research_tool::ResearchLibraryTool));
+            })
+            .await;
+
+        // ── 11. LSP tools ──
         register_lsp_tools(&agent_handle).await;
 
-        // ── 11. Startup hook ──
+        // ── 12. Startup hook ──
         infra::fire_startup_hook(&agent_handle).await;
 
-        // ── 12. ChainedClassifier (Keyword → LLM) + IntentRouter ──
+        // ── 13. ChainedClassifier (Keyword → LLM) + IntentRouter ──
         let mut keyword_classifier = KeywordClassifier::new();
         let mut skill_descriptions = Vec::new();
         {
@@ -633,66 +640,98 @@ async fn register_lsp_tools(agent_handle: &AgentHandle) {
     use std::sync::Arc;
     use tokio::sync::RwLock;
 
-    let mut lsp_manager = LspManager::new();
-    let mut lsp_configured = false;
+    let project_root = agent_handle
+        .read(|agent| agent.working_dir())
+        .await
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let mut config = LspConfig::discover(&project_root);
+    if !config.servers.is_empty() {
+        tracing::info!(
+            root = %project_root.display(),
+            languages = config.servers.len(),
+            "LSP servers auto-discovered"
+        );
+    }
 
-    // Try loading project-level .lsp.yaml
-    let project_lsp = std::env::current_dir().ok().and_then(|cwd| {
-        let mut dir = cwd.as_path();
+    // Global preferences override discovery defaults.
+    if let Some(home_dir) = std::env::var("HOME").ok().map(std::path::PathBuf::from) {
+        let global_lsp = home_dir.join(".echo-agent").join(".lsp.yaml");
+        if global_lsp.is_file() {
+            match LspConfig::from_file(&global_lsp) {
+                Ok(global) => config.merge(global),
+                Err(error) => {
+                    tracing::warn!(path = %global_lsp.display(), %error, "Failed to load global LSP config")
+                }
+            }
+        }
+    }
+
+    // The nearest project config has final precedence.
+    let project_lsp = {
+        let mut dir = project_root.as_path();
         loop {
             let candidate = dir.join(".lsp.yaml");
-            if candidate.exists() {
-                return Some(candidate);
+            if candidate.is_file() {
+                break Some(candidate);
             }
-            dir = dir.parent()?;
+            let Some(parent) = dir.parent() else {
+                break None;
+            };
+            dir = parent;
         }
-    });
+    };
 
-    if let Some(ref lsp_path) = project_lsp
-        && let Ok(config) = LspConfig::from_file(lsp_path)
-    {
-        lsp_manager.load_config(&config);
-        lsp_configured = true;
-        tracing::info!(path = %lsp_path.display(), languages = config.servers.len(), "LSP config loaded (project)");
-    }
-
-    // Try loading global ~/.echo-agent/.lsp.yaml
-    let home = std::env::var("HOME").ok().map(std::path::PathBuf::from);
-    if let Some(ref home_dir) = home {
-        let global_lsp = home_dir.join(".echo-agent").join(".lsp.yaml");
-        if global_lsp.exists()
-            && let Ok(config) = LspConfig::from_file(&global_lsp)
-        {
-            lsp_manager.load_config(&config);
-            lsp_configured = true;
-            tracing::info!(path = %global_lsp.display(), languages = config.servers.len(), "LSP config loaded (global)");
+    if let Some(ref lsp_path) = project_lsp {
+        match LspConfig::from_file(lsp_path) {
+            Ok(project) => {
+                let language_count = project.servers.len();
+                config.merge(project);
+                tracing::info!(path = %lsp_path.display(), languages = language_count, "LSP config loaded (project)");
+            }
+            Err(error) => {
+                tracing::warn!(path = %lsp_path.display(), %error, "Failed to load project LSP config");
+            }
         }
     }
 
-    if let Ok(cwd) = std::env::current_dir() {
-        lsp_manager.set_project_root(&cwd);
+    if config.servers.is_empty() {
+        tracing::debug!(root = %project_root.display(), "No installed LSP server matched the project");
+        return;
     }
 
-    if lsp_configured {
-        let shared_lsp = Arc::new(RwLock::new(lsp_manager));
-        agent_handle
-            .write_async(|a| {
-                let shared_lsp = shared_lsp.clone();
-                Box::pin(async move {
-                    use echo_agent::tools::lsp::{
-                        LspDiagnosticsTool, LspFindReferencesTool, LspGotoDefinitionTool,
-                        LspHoverTool, LspStatusTool,
-                    };
-                    a.add_tool(Box::new(LspDiagnosticsTool::new(shared_lsp.clone())));
-                    a.add_tool(Box::new(LspGotoDefinitionTool::new(shared_lsp.clone())));
-                    a.add_tool(Box::new(LspFindReferencesTool::new(shared_lsp.clone())));
-                    a.add_tool(Box::new(LspHoverTool::new(shared_lsp.clone())));
-                    a.add_tool(Box::new(LspStatusTool::new(shared_lsp)));
-                })
+    let mut lsp_manager = LspManager::new();
+    lsp_manager.load_config(&config);
+    lsp_manager.set_project_root(&project_root);
+    let languages: Vec<String> = lsp_manager
+        .configured_languages()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    for language in languages {
+        if let Err(error) = lsp_manager.start_server(&language).await {
+            tracing::warn!(%language, %error, "LSP server unavailable");
+        }
+    }
+
+    let shared_lsp = Arc::new(RwLock::new(lsp_manager));
+    agent_handle
+        .write_async(|a| {
+            let shared_lsp = shared_lsp.clone();
+            Box::pin(async move {
+                use echo_agent::tools::lsp::{
+                    LspDiagnosticsTool, LspFindReferencesTool, LspGotoDefinitionTool, LspHoverTool,
+                    LspStatusTool,
+                };
+                a.add_tool(Box::new(LspDiagnosticsTool::new(shared_lsp.clone())));
+                a.add_tool(Box::new(LspGotoDefinitionTool::new(shared_lsp.clone())));
+                a.add_tool(Box::new(LspFindReferencesTool::new(shared_lsp.clone())));
+                a.add_tool(Box::new(LspHoverTool::new(shared_lsp.clone())));
+                a.add_tool(Box::new(LspStatusTool::new(shared_lsp)));
             })
-            .await;
-        tracing::info!("LSP tools registered");
-    }
+        })
+        .await;
+    tracing::info!("LSP tools registered");
 }
 
 #[cfg(test)]
@@ -712,67 +751,71 @@ mod tests {
     }
 
     #[test]
-    fn test_classifier_routes_coding_query() {
+    fn test_classifier_routes_coding_query() -> anyhow::Result<()> {
         let c = make_test_classifier();
-        let intent = tokio::runtime::Runtime::new()
-            .unwrap()
-            .block_on(c.classify("帮我写代码实现排序", &[]));
+        let intent =
+            tokio::runtime::Runtime::new()?.block_on(c.classify("帮我写代码实现排序", &[]));
         assert!(
             matches!(intent, echo_agent::intent::Intent::SkillRequired { ref skill_name, .. } if skill_name == "coding"),
             "Should route to coding, got {:?}",
             intent
         );
+        Ok(())
     }
 
     #[test]
-    fn test_classifier_routes_research_query() {
+    fn test_classifier_routes_research_query() -> anyhow::Result<()> {
         let c = make_test_classifier();
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = tokio::runtime::Runtime::new()?;
         let intent = rt.block_on(c.classify("帮我搜索 arxiv 上的论文", &[]));
         assert!(
             matches!(intent, echo_agent::intent::Intent::SkillRequired { ref skill_name, .. } if skill_name == "paper-search"),
             "arxiv should match paper-search, got {:?}",
             intent
         );
+        Ok(())
     }
 
     #[test]
-    fn test_classifier_routes_medical_query() {
+    fn test_classifier_routes_medical_query() -> anyhow::Result<()> {
         let c = make_test_classifier();
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = tokio::runtime::Runtime::new()?;
         let intent = rt.block_on(c.classify("搜索 pubmed 上关于骨质疏松的文献", &[]));
         assert!(
             matches!(intent, echo_agent::intent::Intent::SkillRequired { ref skill_name, .. } if skill_name == "evidence-medicine"),
             "PubMed should route to evidence-medicine, got {:?}",
             intent
         );
+        Ok(())
     }
 
     #[test]
-    fn test_classifier_no_match_returns_fallback() {
+    fn test_classifier_no_match_returns_fallback() -> anyhow::Result<()> {
         let c = make_test_classifier();
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = tokio::runtime::Runtime::new()?;
         let intent = rt.block_on(c.classify("今天天气怎么样", &[]));
         assert!(
             matches!(intent, echo_agent::intent::Intent::Fallback),
             "Weather should be Fallback, got {:?}",
             intent
         );
+        Ok(())
     }
 
     #[test]
-    fn test_classifier_empty_returns_fallback() {
+    fn test_classifier_empty_returns_fallback() -> anyhow::Result<()> {
         let c = KeywordClassifier::new();
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = tokio::runtime::Runtime::new()?;
         let intent = rt.block_on(c.classify("帮我写代码", &[]));
         assert!(matches!(intent, echo_agent::intent::Intent::Fallback));
+        Ok(())
     }
 
     #[test]
-    fn test_classifier_word_boundary_no_false_positive() {
+    fn test_classifier_word_boundary_no_false_positive() -> anyhow::Result<()> {
         let mut c = KeywordClassifier::new();
         c.add_skill_keywords("coding", &["bug"]);
-        let rt = tokio::runtime::Runtime::new().unwrap();
+        let rt = tokio::runtime::Runtime::new()?;
         let intent = rt.block_on(c.classify("I am debugging the code", &[]));
         assert!(
             matches!(intent, echo_agent::intent::Intent::Fallback),
@@ -785,5 +828,6 @@ mod tests {
             "Standalone 'bug' should trigger coding, got {:?}",
             intent
         );
+        Ok(())
     }
 }

@@ -1177,60 +1177,6 @@ pub async fn get_run_diagnostics(
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-// Papers
-// ════════════════════════════════════════════════════════════════════════════
-
-#[tauri::command]
-pub async fn list_papers(
-    _state: tauri::State<'_, TauriState>,
-) -> Result<serde_json::Value, IpcError> {
-    Err(IpcError::NotImplemented("论文列表功能尚未实现".into()))
-}
-
-#[tauri::command]
-pub async fn get_paper(
-    _state: tauri::State<'_, TauriState>,
-    _id: String,
-) -> Result<serde_json::Value, IpcError> {
-    Err(IpcError::NotImplemented("论文查询功能尚未实现".into()))
-}
-
-#[tauri::command]
-pub async fn create_paper(
-    _state: tauri::State<'_, TauriState>,
-    _title: String,
-    _authors: Option<Vec<String>>,
-) -> Result<serde_json::Value, IpcError> {
-    Err(IpcError::NotImplemented("论文创建功能尚未实现".into()))
-}
-
-#[tauri::command]
-pub async fn delete_paper(
-    _state: tauri::State<'_, TauriState>,
-    _id: String,
-) -> Result<serde_json::Value, IpcError> {
-    Err(IpcError::NotImplemented("论文删除功能尚未实现".into()))
-}
-
-#[tauri::command]
-pub async fn update_paper_notes(
-    _state: tauri::State<'_, TauriState>,
-    _id: String,
-    _notes: String,
-) -> Result<serde_json::Value, IpcError> {
-    Err(IpcError::NotImplemented("论文笔记更新功能尚未实现".into()))
-}
-
-#[tauri::command]
-pub async fn add_paper_tags(
-    _state: tauri::State<'_, TauriState>,
-    _id: String,
-    _tags: Vec<String>,
-) -> Result<serde_json::Value, IpcError> {
-    Err(IpcError::NotImplemented("论文标签添加功能尚未实现".into()))
-}
-
-// ════════════════════════════════════════════════════════════════════════════
 // Evolution
 // ════════════════════════════════════════════════════════════════════════════
 

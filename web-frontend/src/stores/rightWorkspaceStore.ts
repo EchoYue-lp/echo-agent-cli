@@ -1,6 +1,6 @@
 import { create } from 'zustand';
 
-export type RightWorkspaceTab = 'tasks' | 'analysis' | 'browser' | 'files';
+export type RightWorkspaceTab = 'tasks' | 'analysis' | 'research' | 'browser' | 'files';
 
 interface RightWorkspaceState {
   open: boolean;
@@ -9,6 +9,7 @@ interface RightWorkspaceState {
   openWorkspace: () => void;
   openTasks: () => void;
   openAnalysis: () => void;
+  openResearch: () => void;
   openBrowser: () => void;
   openFiles: () => void;
   close: () => void;
@@ -46,6 +47,7 @@ export const useRightWorkspaceStore = create<RightWorkspaceState>((set) => ({
   openWorkspace: () => set({ open: true }),
   openTasks: () => set({ open: true, activeTab: 'tasks' }),
   openAnalysis: () => set({ open: true, activeTab: 'analysis' }),
+  openResearch: () => set({ open: true, activeTab: 'research' }),
   openBrowser: () => set({ open: true, activeTab: 'browser' }),
   openFiles: () => set({ open: true, activeTab: 'files' }),
   close: () => set({ open: false }),

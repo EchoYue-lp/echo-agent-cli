@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import {
+  BookOpen,
   FileCode,
   FlaskConical,
   Globe2,
@@ -15,6 +16,7 @@ import { useUiStore } from '../../stores/uiStore';
 import { BrowserPanel } from '../browser/BrowserPanel';
 import { FileBrowser } from '../file-browser/FileBrowser';
 import AnalysisPanel from '../analysis/AnalysisPanel';
+import { PaperPanel } from '../papers/PaperPanel';
 import { RightRail } from './RightRail';
 
 export function RightWorkspace() {
@@ -77,6 +79,12 @@ export function RightWorkspace() {
             onClick={() => store.setActiveTab('analysis')}
           />
           <WorkspaceTab
+            active={store.activeTab === 'research'}
+            icon={<BookOpen size={13} />}
+            label="研究"
+            onClick={() => store.setActiveTab('research')}
+          />
+          <WorkspaceTab
             active={store.activeTab === 'browser'}
             icon={<Globe2 size={13} />}
             label="浏览器"
@@ -104,6 +112,8 @@ export function RightWorkspace() {
             <RightRail />
           ) : store.activeTab === 'analysis' ? (
             <AnalysisPanel />
+          ) : store.activeTab === 'research' ? (
+            <PaperPanel />
           ) : store.activeTab === 'browser' ? (
             <BrowserPanel />
           ) : (

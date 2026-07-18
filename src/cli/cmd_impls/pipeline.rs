@@ -57,7 +57,7 @@ impl SlashCommand for PipelineCommand {
     ) -> Pin<Box<dyn Future<Output = CommandOutcome> + Send + 'a>> {
         Box::pin(async move {
             let subcommand = args.first().copied().unwrap_or("help");
-            let sub_args = if args.is_empty() { args } else { &args[1..] };
+            let sub_args = args.get(1..).unwrap_or(&[]);
 
             match subcommand {
                 "research" | "r" => pipeline_research(ctx, sub_args).await,
@@ -193,7 +193,7 @@ async fn pipeline_data(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         println!("Usage: /pipeline data <dataset-path>");
         println!("  Example: /pipeline data data/sales_2024.csv");
         println!(
-            "  This will run a full data analysis pipeline: load -> profile -> analyze -> visualize -> summarize"
+            "  This creates a reviewable analysis script, executes it, and records lineage and artifacts"
         );
         return CommandOutcome::Continue;
     }

@@ -14,7 +14,7 @@ async fn cmd_analyze(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         println!("Usage: /analyze <dataset-path>");
         println!("  Example: /analyze data/sales_2024.csv");
         println!(
-            "  This will run a full data analysis pipeline: load -> profile -> analyze -> visualize -> summarize"
+            "  This creates a reviewable analysis script, executes it, and records lineage and artifacts"
         );
         return CommandOutcome::Continue;
     }
