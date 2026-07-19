@@ -243,8 +243,20 @@ impl SkillsHub {
         // Extract metadata sub-map. The frontmatter parser flattens YAML
         // nested maps: `metadata:\n  category: x` → key `category` = `x`.
         let metadata_category = frontmatter.get("category").cloned().unwrap_or_default();
-        let metadata_source = frontmatter.get("source").cloned();
-        let upstream_version = frontmatter.get("upstream-version").cloned();
+        let source_record = super::install::read_source_record(dir).ok().flatten();
+        let metadata_source = source_record
+            .as_ref()
+            .map(|record| {
+                record.subdir.as_ref().map_or_else(
+                    || format!("git:{}", record.repo_url),
+                    |subdir| format!("git:{}#{subdir}", record.repo_url),
+                )
+            })
+            .or_else(|| frontmatter.get("source").cloned());
+        let upstream_version = source_record
+            .as_ref()
+            .map(|record| record.revision.chars().take(12).collect::<String>())
+            .or_else(|| frontmatter.get("upstream-version").cloned());
 
         // Determine baseline status from enabled-skills.json (checked later)
         let is_baseline = match metadata_category.as_str() {

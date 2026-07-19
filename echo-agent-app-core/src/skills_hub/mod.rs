@@ -7,4 +7,8 @@ pub mod install;
 pub mod registry;
 
 pub use enabled_skills::EnabledSkillsConfig;
+pub use install::{
+    SkillSourceRecord, SkillSyncResult, SkillUpdateState, SkillUpdateStatus, check_updates,
+    sync_skills,
+};
 pub use registry::{SkillHubEntry, SkillsHub};

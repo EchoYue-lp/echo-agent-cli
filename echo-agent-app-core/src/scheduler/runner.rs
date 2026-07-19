@@ -78,9 +78,9 @@ pub fn build_fire_fn(
             // reused), so the worktree working_dir binding in
             // drive_unattended_run is per-run and can't be clobbered by an
             // overlapping run. Pooled agents don't get ExecutePlanTool at
-            // construction (built for workers, §10.2), so register it here —
+            // construction (built for subagents, §10.2), so register it here —
             // a cron run's agent plays the primary role (drives plan_create +
-            // plan_execute), not a worker role.
+            // plan_execute), not a subagent role.
             let run_agent: AgentHandle = match &pool {
                 Some(pool) => {
                     let run_key = format!("__cron__:{}:{fire_id}", task.id);
@@ -118,7 +118,7 @@ pub fn build_fire_fn(
 
 /// Register the `plan_execute` tool on a cron run's pool-acquired agent
 /// (Phase C). Mirrors `desktop.rs`'s primary-agent registration. Pooled agents
-/// are built without it (worker stance, §10.2), but a cron run's agent drives
+/// are built without it (subagent stance, §10.2), but a cron run's agent drives
 /// plan_create + plan_execute and needs it.
 async fn register_plan_execute_on_agent(agent_handle: &AgentHandle, store: Arc<TaskRuntimeStore>) {
     use crate::tasks::task_runtime::ExecutePlanTool;

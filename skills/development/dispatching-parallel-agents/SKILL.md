@@ -32,6 +32,6 @@ Use parallel subagents when two or more bounded tasks are genuinely independent 
 2. Confirm no data dependency, overlapping write target, shared mutable state, or approval sequence.
 3. Choose the most specific roles and dispatch only the useful fan-out; keep dependent work local or sequential.
 4. Inspect results for failures, duplication, and conflicts. Re-run only the missing line of evidence.
-5. Synthesize against the parent goal; do not paste worker summaries as the final answer.
+5. Synthesize against the parent goal; do not paste subagent summaries as the final answer.
 
 Avoid parallel dispatch for tiny tasks, tightly coupled debugging, overlapping file edits, or work whose outputs cannot be reconciled reliably.

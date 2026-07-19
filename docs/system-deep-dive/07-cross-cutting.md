@@ -148,7 +148,7 @@ pub struct SubagentHookBridge { /* SubagentStart/Stop/Cancelled → echo-core ho
 
 | | |
 |---|---|
-| 现象 | `AgentRole::Orchestrator` vs `Worker` 仅在 `TaskExecutor::build_execute_fn`（`src/agent/react/planning.rs:236`）分支；`ReactAgent::run_core_loop` 完全不读这字段 |
+| 现象 | `AgentRole::Orchestrator` vs `Subagent` 仅在 `TaskExecutor::build_execute_fn`（`src/agent/react/planning.rs:236`）分支；`ReactAgent::run_core_loop` 完全不读这字段 |
 | 后果 | 仅设 `role(AgentRole::Orchestrator)` 跑 ReAct 循环不会有任何区别；要让 Orchestrator 真正"只编排不干活"必须走 `TaskExecutor` + `enable_subagent` + `agent_tool` |
 | 文件:行 | `src/agent/config.rs:31`（enum）、`src/agent/react/planning.rs:236`（唯一使用点）；`config.rs:25-29` 注释自己也明示这个事实 |
 | 详见 | [03-subagent.md §1](./03-subagent.md#§1-️-agentrole--当前仅在-taskexecutor-生效) |

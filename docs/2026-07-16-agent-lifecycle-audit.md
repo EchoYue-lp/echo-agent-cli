@@ -353,10 +353,10 @@ M3 在 M2 的单一 TaskRuntime 生命周期上补齐中断一致性，没有新
 
 ### 12.2 EKO 应用恢复台账(`echo-agent-cli`)
 
-- TaskRuntime 新增 worker/tool start、completed、failed durable events，以及 RecoveryBlocked/RecoveryResolved 事实。
-- worker identity 使用稳定 `{task_id}:{attempt}`；tool identity 保留 `call_id`，事件 payload 只记录 bounded preview。
-- restart 后已有 completed worker terminal 时直接复用 summary 并进入 review；不会重复 dispatch 已完成 worker。
-- unsafe worker/tool 只有 start 没有 terminal 时，Todo 变为 Blocked，run 保持 Paused；resume 和 background auto-resume 都被拒绝。
+- TaskRuntime 新增 subagent/tool start、completed、failed durable events，以及 RecoveryBlocked/RecoveryResolved 事实。
+- subagent identity 使用稳定 `{task_id}:{attempt}`；tool identity 保留 `call_id`，事件 payload 只记录 bounded preview。
+- restart 后已有 completed subagent terminal 时直接复用 summary 并进入 review；不会重复 dispatch 已完成 subagent。
+- unsafe subagent/tool 只有 start 没有 terminal 时，Todo 变为 Blocked，run 保持 Paused；resume 和 background auto-resume 都被拒绝。
 - retry/skip 是用户对真实工作区检查后的显式决定，不是新状态机。Retry 回 Pending；Skip 进入 Skipped；两者都写 RecoveryResolved。
 
 ### 12.3 三端与 HITL
@@ -369,8 +369,8 @@ M3 在 M2 的单一 TaskRuntime 生命周期上补齐中断一致性，没有新
 
 - permission wait 在 invocation cancel 后及时返回 cancelled。
 - Subagent cancel result 不被标记成功。
-- completed worker summary 在 restart/resume 后复用，dispatcher 调用次数保持 0。
-- mutating in-doubt worker 阻塞 resume，直到 retry/skip；只读 orphan 仍可安全重放。
+- completed subagent summary 在 restart/resume 后复用，dispatcher 调用次数保持 0。
+- mutating in-doubt subagent 阻塞 resume，直到 retry/skip；只读 orphan 仍可安全重放。
 - TUI approval request abort 后 pending approval 被清理。
 - 前端 pause/recovery action 走共享 TaskRuntime API，并展示 resume blocker error。
 

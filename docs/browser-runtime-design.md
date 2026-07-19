@@ -159,15 +159,15 @@ Environment overrides:
 - Identity is layered rather than collapsed: `conversation_id` is stable across
   turns, `turn_id` identifies one user prompt, `run_id` exists only for an
   actual formal/background/inline task run, and `execution_id` identifies a
-  concrete worker execution. An ordinary chat turn does not create a
+  concrete subagent execution. An ordinary chat turn does not create a
   `TaskRuntimeStore` run record.
 - `conversation_id` owns one logical `BrowserSession`.
 - The main agent always leases the conversation's main tab across turns. A
-  worker leases a separate tab keyed by `execution_id`, falling back to the
+  subagent leases a separate tab keyed by `execution_id`, falling back to the
   formal run or turn id only for legacy callers.
 - Playwright MCP's stdio connection exposes one selected tab for the whole
   browser context. EKO therefore holds a context-level atomic operation lock
-  around select-tab plus action. This safely prevents a worker from redirecting
+  around select-tab plus action. This safely prevents a subagent from redirecting
   the main agent's action, but does not claim true same-context tab concurrency.
   Per-tab concurrent writes require a future driver with independent page
   handles/contexts (the DOM/CDP phase), not additional mutex bookkeeping.

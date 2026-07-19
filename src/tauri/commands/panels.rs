@@ -370,8 +370,8 @@ fn hub_skill_json(entry: &echo_agent_app_core::skills_hub::SkillHubEntry) -> ser
         // 缺失的系统二进制(scan 时探测 requires-binaries 得出)。
         // 前端 SkillsPanel 据此显示 ⚠️ AlertTriangle + tooltip。
         "missing_dependencies": entry.missing_dependencies,
-        // has_updates: 需 upstream registry + git fetch 比对(P6 sync 未实现),
-        // 暂返回 false。
+        // Update state is fetched explicitly by `check_skill_updates`; listing
+        // skills never performs a network request.
         "has_updates": false,
     })
 }
@@ -491,6 +491,45 @@ pub async fn get_skill(
 }
 
 #[tauri::command]
+pub async fn check_skill_updates(
+    state: tauri::State<'_, TauriState>,
+    target: Option<String>,
+) -> Result<serde_json::Value, IpcError> {
+    let root = state.app_state.skills_hub.read().await.root().to_path_buf();
+    let hub = echo_agent_app_core::skills_hub::SkillsHub::with_root(root);
+    let statuses = echo_agent_app_core::skills_hub::check_updates(&hub, target.as_deref())
+        .await
+        .map_err(IpcError::Internal)?;
+    serde_json::to_value(statuses).map_err(|error| IpcError::Internal(error.to_string()))
+}
+
+#[tauri::command]
+pub async fn sync_skills(
+    state: tauri::State<'_, TauriState>,
+    target: Option<String>,
+    force: bool,
+) -> Result<serde_json::Value, IpcError> {
+    let root = state.app_state.skills_hub.read().await.root().to_path_buf();
+    let mut hub = echo_agent_app_core::skills_hub::SkillsHub::with_root(root.clone());
+    let results = echo_agent_app_core::skills_hub::sync_skills(&mut hub, target.as_deref(), force)
+        .await
+        .map_err(IpcError::Internal)?;
+    state
+        .app_state
+        .connection
+        .primary_agent()
+        .write_async(|agent| {
+            let root = root.clone();
+            Box::pin(async move { agent.load_skills_from_dir(root).await })
+        })
+        .await
+        .map_err(|error| IpcError::Internal(error.to_string()))?;
+    refresh_skill_hub_loaded_state(&state).await;
+    refresh_pool_skill_descriptors(&state).await;
+    serde_json::to_value(results).map_err(|error| IpcError::Internal(error.to_string()))
+}
+
+#[tauri::command]
 pub async fn load_skill(
     state: tauri::State<'_, TauriState>,
     name: String,
@@ -502,25 +541,9 @@ pub async fn load_skill(
 
     let path = std::path::PathBuf::from(raw);
 
-    // P1-6: confine the skill directory to an allowed root. Previously any
-    // absolute path the frontend supplied was loaded as a skill — a single XSS
-    // could point the agent at an attacker-controlled SKILL.md anywhere on disk
-    // (e.g. a temp dir) and have it executed with the agent's privileges. We
-    // canonicalize the resolved path and require it to live under the current
-    // workspace root or the user's home directory (where legitimate skill
-    // bundles — project-local `.echo-agent/skills` or the global skills dir —
-    // already reside).
     let canonical = path
         .canonicalize()
         .map_err(|_| IpcError::NotFound(format!("技能目录不存在: {}", path.display())))?;
-    let allowed_roots = allowed_skill_roots(&state).await;
-    if !allowed_roots.iter().any(|root| canonical.starts_with(root)) {
-        return Err(IpcError::Validation(format!(
-            "技能目录不在允许范围内（须位于当前工作区或用户主目录下）: {}",
-            path.display()
-        )));
-    }
-
     if !canonical.is_dir() {
         return Err(IpcError::Validation(format!(
             "技能路径不是目录: {}",
@@ -531,7 +554,7 @@ pub async fn load_skill(
     let agent = state.app_state.connection.primary_agent();
     let loaded = agent
         .write_async(|agent| {
-            let path = path.clone();
+            let path = canonical.clone();
             Box::pin(async move { agent.load_skills_from_dir(path).await })
         })
         .await
@@ -1093,36 +1116,6 @@ pub async fn get_context_stats(
         "message_count": message_count,
         "token_count": token_count,
     }))
-}
-
-// ════════════════════════════════════════════════════════════════════════════
-// History
-// ════════════════════════════════════════════════════════════════════════════
-
-#[tauri::command]
-pub async fn get_history(
-    _state: tauri::State<'_, TauriState>,
-    _limit: Option<usize>,
-) -> Result<serde_json::Value, IpcError> {
-    Err(IpcError::NotImplemented("对话历史查询功能尚未实现".into()))
-}
-
-#[tauri::command]
-pub async fn export_history_markdown(
-    _state: tauri::State<'_, TauriState>,
-) -> Result<serde_json::Value, IpcError> {
-    Err(IpcError::NotImplemented(
-        "对话历史 Markdown 导出功能尚未实现".into(),
-    ))
-}
-
-#[tauri::command]
-pub async fn export_history_json(
-    _state: tauri::State<'_, TauriState>,
-) -> Result<serde_json::Value, IpcError> {
-    Err(IpcError::NotImplemented(
-        "对话历史 JSON 导出功能尚未实现".into(),
-    ))
 }
 
 // ════════════════════════════════════════════════════════════════════════════

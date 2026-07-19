@@ -133,7 +133,7 @@ pub fn export_todos_json(store: &TaskRuntimeStore, run_id: &str) -> Result<Strin
     Ok(serde_json::to_string_pretty(&todos).unwrap_or_else(|_| "[]".to_string()))
 }
 
-/// Archive raw worker output as a trace artifact (plan §1057-1061).
+/// Archive raw subagent output as a trace artifact (plan §1057-1061).
 /// Writes to `{base}/.eko/runtime/{run_id}/artifacts/traces/{task_id}.txt`.
 pub fn archive_trace(run_id: &str, task_id: &str, output: &str, base: Option<&std::path::Path>) {
     let root = base

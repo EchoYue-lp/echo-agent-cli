@@ -58,6 +58,8 @@ These GUI surfaces are visible and backed by real Tauri IPC or runtime state:
 | Chrome browser backend | Connected through the official Playwright Extension, setup/status UI, and explicit backend selection |
 | Project file preview | Connected: tree, Git changes, text/image/PDF/binary states, and diff |
 | Controlled file editing | Connected: CodeMirror text editing, dirty tabs, save shortcut, atomic write, and revision conflict protection |
+| Papers and systematic reviews | Connected: file-backed sources/evidence, review workbench, provider/Zotero connectors, citation audit, and report export |
+| Skill upstream sync | Connected: explicit check/sync, local-change protection, and runtime refresh |
 
 ## Hidden Or Partial GUI Features
 
@@ -68,8 +70,6 @@ These surfaces must not be presented as finished GUI features:
 | `workflow` | List/create/delete exist; execute is wired to framework workflow graph YAML/JSON | May be shown when the UI collects framework graph definitions; simplified app-only workflow definitions are validation-only |
 | `sandbox` | Config read/write and execution are wired to the framework sandbox manager | Show only behind clear permission/error UX; GUI must not reimplement sandbox execution |
 | `extract` | JSON schema validation and extraction are wired to framework LLM structured extraction | Show when model configuration is available; GUI only collects schema/input and renders errors |
-| `papers` | Frontend components exist; Tauri IPC returns `NotImplemented` | Not mounted; research workflow can remain CLI/chat driven |
-| Legacy history export | IPC still returns `NotImplemented` | Use conversations export instead |
 
 ## Review Notes
 

@@ -9,7 +9,7 @@
 
 The current TaskRuntime implementation in `echo-agent-app-core` contains both:
 
-- reusable agent orchestration ideas, such as DAG scheduling, worker traits,
+- reusable agent orchestration ideas, such as DAG scheduling, subagent traits,
   concurrency limits, subagent execution summaries, and bounded follow-up task
   suggestions;
 - EKO-specific product behavior, such as `events.jsonl` / `plan.json`,
@@ -26,13 +26,13 @@ adapter.
 - Claude Code: subagents have isolated context and explicit tool permissions;
   nested subagents are supported only when the `Agent` tool is available and
   depth is bounded. Takeaway: nested delegation is a capability gate, not a
-  default right of every worker.
-- Codex: subagents are mainly parallel workers. The main thread owns task
-  decomposition, waits for workers, and synthesizes results. Takeaway: keep one
+  default right of every subagent.
+- Codex: subagents are mainly parallel subagents. The main thread owns task
+  decomposition, waits for subagents, and synthesizes results. Takeaway: keep one
   authoritative planner / integrator.
 - Cursor: public material emphasizes product-level multiple agents / background
   agents, not arbitrary recursive task-runtime ownership. Takeaway: parallelism
-  can be surfaced at product level without making every worker a new planner.
+  can be surfaced at product level without making every subagent a new planner.
 
 EKO adopts a hybrid:
 
@@ -82,13 +82,13 @@ These are reusable framework capabilities:
 - DAG executor kernel:
   frontier computation, dependency satisfaction, in-flight detection, wave
   dispatch, join aggregation, cancellation propagation.
-- Worker abstraction:
-  a generic `TaskWorker` trait that receives a task and returns a typed
+- Subagent abstraction:
+  a generic `TaskSubagent` trait that receives a task and returns a typed
   `TaskExecutionSummary`.
 - Runtime concurrency model:
-  `ConcurrencyLimits`, worker/write/shell/LLM semaphores as generic knobs.
+  `ConcurrencyLimits`, subagent/write/shell/LLM semaphores as generic knobs.
 - Follow-up suggestions:
-  `SuggestedTask` and structured worker summaries, with app-owned append
+  `SuggestedTask` and structured subagent summaries, with app-owned append
   policy.
 - Nested delegation policy:
   `can_spawn_subagents`, `delegate_depth`, `max_delegate_depth`, and allowed
@@ -110,7 +110,7 @@ not use them.
   in CLI if it is meant to drive the EKO task panel / TaskRuntime.
 - `AgentDispatchTool`:
   Keep the generic delegate tool in framework. CLI decides whether a given
-  worker role receives it.
+  subagent role receives it.
 
 ## Target Architecture
 
@@ -119,7 +119,7 @@ echo-agent
   task_runtime/
     types.rs          # generic task graph + summaries + suggested tasks
     executor.rs       # generic DAG executor kernel
-    worker.rs         # TaskWorker trait
+    subagent.rs         # TaskSubagent trait
     policy.rs         # generic nested delegation policy
     events.rs         # generic runtime lifecycle events
 
@@ -150,7 +150,7 @@ Commits:
 - `701f1f6` (`echo-agent`): generic runtime primitives.
 - `a530875` (`echo-agent-cli`): EKO-to-framework conversions.
 - `00acb40` (`echo-agent-cli`): reuse framework concurrency limits.
-- `ef8f02d` (`echo-agent`): `TaskWorkerContext`.
+- `ef8f02d` (`echo-agent`): `TaskSubagentContext`.
 
 Goal: add framework types without changing runtime behavior.
 
@@ -159,7 +159,7 @@ Move or duplicate-then-adapt into `echo-agent`:
 - `SuggestedTask`
 - a generic `TaskExecutionSummary`
 - `ConcurrencyLimits`
-- `TaskWorker` trait
+- `TaskSubagent` trait
 - terminal-status helpers
 - nested delegation policy structs
 
@@ -231,14 +231,14 @@ Commits:
 - `2c74839` (`echo-agent-cli`): app runtime uses framework DAG kernel.
 - `4c33fa9` (`echo-agent-cli`): dispatcher naming cleanup.
 - `fb44e35` (`echo-agent-cli`): dispatcher receives framework
-  `TaskWorkerContext`.
+  `TaskSubagentContext`.
 
 Goal: app-core `executor.rs` becomes an adapter around framework runtime.
 
 Expected app-core responsibilities after this phase:
 
 - convert `PlanTask` to framework task view;
-- pass a `TaskWorker` implementation that invokes EKO subagents;
+- pass a `TaskSubagent` implementation that invokes EKO subagents;
 - handle review gate and `SuggestedTask` append policy;
 - map generic lifecycle events to `ExecEvent` / `execution://event`;
 - persist status through `TaskRuntimeStore`.
@@ -286,7 +286,7 @@ Actions:
 3. Move app-specific concrete tools to CLI.
 4. Leave framework traits / registries intact when they are valid public API.
 5. Update registration so main agent and subagents receive tools by capability:
-   default worker, suggested-task worker, and optional nested-delegate worker.
+   default subagent, suggested-task subagent, and optional nested-delegate subagent.
 
 ## Non-Goals
 
@@ -302,8 +302,8 @@ Actions:
   `echo-agent-cli`.
 - `echo-agent-cli` behavior remains unchanged for user task -> plan -> parallel
   subagent execution.
-- Worker `suggested_tasks` still append only through EKO TaskRuntime.
-- GUI task list still joins workers by `task_id`.
+- Subagent `suggested_tasks` still append only through EKO TaskRuntime.
+- GUI task list still joins subagents by `task_id`.
 - Both TUI and GUI retain feature parity.
 - Verification passes in both repositories before any migration commit:
 

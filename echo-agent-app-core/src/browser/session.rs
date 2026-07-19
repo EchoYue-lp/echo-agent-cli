@@ -549,16 +549,16 @@ mod tests {
         let manager = BrowserSessionManager::new(temp.path().to_path_buf(), 32);
         let main = manager.lease_tab("conv-1", MAIN_TAB_OWNER, None).await;
         let main_again = manager.lease_tab("conv-1", MAIN_TAB_OWNER, None).await;
-        let worker = manager.lease_tab("conv-1", "exec-1", Some("run-1")).await;
-        let worker_again = manager.lease_tab("conv-1", "exec-1", Some("run-1")).await;
+        let subagent = manager.lease_tab("conv-1", "exec-1", Some("run-1")).await;
+        let subagent_again = manager.lease_tab("conv-1", "exec-1", Some("run-1")).await;
 
         assert_eq!(main.session_id, main_again.session_id);
         assert_eq!(main.tab_id, main_again.tab_id);
-        assert_ne!(main.tab_id, worker.tab_id);
-        assert_eq!(worker.tab_id, worker_again.tab_id);
-        assert_eq!(worker.tab_index, 1);
-        assert!(worker.opened);
-        assert!(!worker_again.opened);
+        assert_ne!(main.tab_id, subagent.tab_id);
+        assert_eq!(subagent.tab_id, subagent_again.tab_id);
+        assert_eq!(subagent.tab_index, 1);
+        assert!(subagent.opened);
+        assert!(!subagent_again.opened);
         Ok::<(), String>(())
     }
 
@@ -595,7 +595,7 @@ mod tests {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let manager = BrowserSessionManager::new(temp.path().to_path_buf(), 32);
         manager.lease_tab("conv-1", MAIN_TAB_OWNER, None).await;
-        manager.open_tab("conv-1", "worker", Some("run-1")).await;
+        manager.open_tab("conv-1", "subagent", Some("run-1")).await;
 
         let session = manager
             .switch_backend("conv-1", BrowserBackend::Chrome)
@@ -613,7 +613,7 @@ mod tests {
         let temp = tempfile::tempdir().map_err(|error| error.to_string())?;
         let manager = BrowserSessionManager::new(temp.path().to_path_buf(), 32);
         let main = manager.lease_tab("conv-1", MAIN_TAB_OWNER, None).await;
-        manager.open_tab("conv-1", "worker", Some("run-1")).await;
+        manager.open_tab("conv-1", "subagent", Some("run-1")).await;
 
         let session = manager
             .switch_backend("conv-1", BrowserBackend::Managed)

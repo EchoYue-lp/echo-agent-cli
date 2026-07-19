@@ -200,6 +200,29 @@ export interface SkillInfo {
   missing_dependencies?: string[];
 }
 
+export type SkillUpdateState =
+  | 'up_to_date'
+  | 'update_available'
+  | 'local_changes'
+  | 'untracked'
+  | 'error';
+
+export interface SkillUpdateStatus {
+  name: string;
+  state: SkillUpdateState;
+  current_revision?: string | null;
+  remote_revision?: string | null;
+  message: string;
+}
+
+export interface SkillSyncResult {
+  name: string;
+  success: boolean;
+  updated: boolean;
+  revision?: string | null;
+  message: string;
+}
+
 /** Category display names (i18n). */
 export const CATEGORY_LABELS: Record<string, string> = {
   methodology: '方法论',
@@ -335,23 +358,6 @@ export interface ApprovalRequest {
 }
 
 // History types (matching backend MessageItem)
-export interface HistoryMessage {
-  role: string;
-  content: string | null;
-  tool_calls?: HistoryToolCall[];
-}
-
-export interface HistoryToolCall {
-  id: string;
-  name: string;
-  arguments: string;
-}
-
-export interface HistoryResponse {
-  messages: HistoryMessage[];
-  total: number;
-}
-
 // Snapshot metadata for localStorage cache
 export interface SnapshotMeta {
   title: string;

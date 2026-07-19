@@ -99,7 +99,7 @@ pub fn rebuild_plan_from_events(events: &[RuntimeTaskEvent]) -> Result<RebuiltPl
                 }
             }
             K::RunAttachmentsUpdated => {
-                // Attachments bound to the run (so plan-level workers see the
+                // Attachments bound to the run (so plan-level subagents see the
                 // same user uploads as the main agent). Decoded the same way as
                 // the RunCreated `attachments` field above.
                 if let Some(r) = run.as_mut() {

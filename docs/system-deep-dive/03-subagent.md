@@ -1,7 +1,7 @@
 # 03 · Task / Subagent / AgentPool
 
 > **归属**:框架提供 Subagent 原语与 `agent_tool`;EKO 应用层负责 TaskRuntime、角色 frontmatter、UI 投影和 AgentPool。
-> **当前事实**:产品模型只保留 Task + Subagent。旧 Worker 协议、`worker://trace`、`WorkerTraceEvent` 和前端 worker store 已删除;`worker` 只作为内部调度实现词保留,例如 `TaskWorker` trait、semaphore、pool slot。
+> **当前事实**:产品模型只保留 Task + Subagent。旧 Subagent 协议、`subagent://trace`、`SubagentTraceEvent` 和前端 subagent store 已删除;`subagent` 只作为内部调度实现词保留,例如 `TaskSubagent` trait、semaphore、pool slot。
 
 本文记录 EKO 当前的多 agent 执行模型:Task 负责目标拆解和状态流转;Subagent 负责专业角色执行;AgentPool 提供多会话/后台隔离。
 
@@ -51,8 +51,8 @@ can_delegate: false
 
 - `readonly: true`:应用层用 readonly builder 注册,工具集物理只读。
 - `model`: `inherit`/缺省 → 父模型；`fast` → `EKO_FAST_MODEL`（未设则回退父模型）；其它字符串 → 具体 model id。
-- `max_turns`:写入 `SubagentDefinition.max_iterations` 与 worker ReactAgent builder。
-- `is_background`:写入 `SubagentDefinition.is_background`。为 true 时（或 `agent_tool` 传 `background: true`）走框架 `dispatch_background`：立即返回 `{status:"started", execution_id, agent_name}`，worker 在后台跑；`DispatchStarted.background=true` 经 `execution://event` 到 GUI 卡片；完成后向主会话插入 `[subagent {name} finished]\n{summary}` 注记（不打断父 ReAct 当前 turn）。TUI 回灌延期。
+- `max_turns`:写入 `SubagentDefinition.max_iterations` 与 subagent ReactAgent builder。
+- `is_background`:写入 `SubagentDefinition.is_background`。为 true 时（或 `agent_tool` 传 `background: true`）走框架 `dispatch_background`：立即返回 `{status:"started", execution_id, agent_name}`，subagent 在后台跑；`DispatchStarted.background=true` 经 `execution://event` 到 GUI 卡片；完成后向主会话插入 `[subagent {name} finished]\n{summary}` 注记（不打断父 ReAct 当前 turn）。TUI 回灌延期。
 - `worktree: true`:writer role 通过框架 Fork worktree 隔离写入。
 - `workspace: true`:data/research role 使用无 git 的隔离数据工作区。
 - `can_delegate: true`:该 role 显式获得 `agent_tool`,并注册 child subagent registry。
@@ -100,11 +100,11 @@ EKO **不**把 `agent_tool` 默认发给所有 subagent。只有 `.md` 显式 `c
 
 - 类型定义在 `echo_core::tools::NestedDelegationPolicy`。
 - `echo_agent::tasks::NestedDelegationPolicy` 继续 re-export 同一个类型。
-- `ExternalRunContext.delegation_policy` 把当前 worker policy 跨 `tokio::spawn` 注入 worker agent。
+- `ExternalRunContext.delegation_policy` 把当前 subagent policy 跨 `tokio::spawn` 注入 subagent。
 - `ToolContext.delegation_policy` 在工具执行阶段传给 `agent_tool`。
 - `agent_tool` 每次调用都会用 `child_policy()` 推进深度;超过上限直接返回工具错误,不再派发。
 
-EKO 首层 PlanTask worker 使用 depth 0,默认 max depth 2。普通 role 即使拿到 policy,也没有 `agent_tool`,所以不能嵌套委派。
+EKO 首层 PlanTask subagent 使用 depth 0,默认 max depth 2。普通 role 即使拿到 policy,也没有 `agent_tool`,所以不能嵌套委派。
 
 ---
 
@@ -121,11 +121,11 @@ EKO 首层 PlanTask worker 使用 depth 0,默认 max depth 2。普通 role 即�
 
 旧链路已删除:
 
-- `worker://trace`
+- `subagent://trace`
 - `subagent://event` 作为单独 UI 数据源
-- `WorkerTraceEvent` / `WorkerTraceEventKind`
-- `workerTraceStore` / `workerDetailStore`
-- `WorkerStreamBlock` / `WorkerDetailView`
+- `SubagentTraceEvent` / `SubagentTraceEventKind`
+- `subagentTraceStore` / `subagentDetailStore`
+- `SubagentStreamBlock` / `SubagentDetailView`
 
 `SubagentRun.subagentRunId` 是稳定 execution id,通常为 `{task_id}:{attempt}`。聊天流和右栏都基于同一份 `subagentRunStore` 渲染,只是展示位置不同。
 
@@ -143,7 +143,7 @@ TaskRuntime 仍是全局 run 状态的唯一 owner:
 框架提供通用原语:
 
 - `RuntimeTask`
-- `TaskWorkerContext`
+- `TaskSubagentContext`
 - `ConcurrencyLimits`
 - `NestedDelegationPolicy`
 - `SubagentExecutor`
@@ -182,23 +182,23 @@ AgentPool 不改变 Subagent 协议;它只是决定某个入口使用哪个 Reac
 
 ---
 
-## 6. 保留的内部 worker 命名
+## 6. 保留的内部 subagent 命名
 
 以下名字可以保留,因为它们是内部执行抽象,不是产品概念:
 
-- `TaskWorker` trait
-- `TaskWorkerContext`
+- `TaskSubagent` trait
+- `TaskSubagentContext`
 - `RealTaskDispatcher` / test dispatcher
-- tokio worker thread / worker semaphore
-- framework team 模式里的 `ManagerWorkerOrchestrator`
-- generated schema 中已持久化的 usage 字段如 `worker_id`、`worker_prompt_hash`
+- Tokio execution task / subagent concurrency permit
+- framework team 模式里的 `ManagerSubagentOrchestrator`
+- generated schema 中已持久化的 usage 字段如 `subagent_id`、`subagent_prompt_hash`
 
 不要重新引入以下产品/协议概念:
 
-- `WorkerTraceEvent`
-- `worker://trace`
-- `workerTraceStore`
-- `WorkerStreamBlock`
-- “Worker 状态”作为 UI 一等入口
+- `SubagentTraceEvent`
+- `subagent://trace`
+- `subagentTraceStore`
+- `SubagentStreamBlock`
+- “Subagent 状态”作为 UI 一等入口
 
 后续如果要扩展执行树,统一扩 `SubagentRun` / `ExecutionEvent`。

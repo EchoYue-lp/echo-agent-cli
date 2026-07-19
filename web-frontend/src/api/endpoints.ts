@@ -6,6 +6,8 @@ import type { SessionInfo, ContextStats } from '../generated';
 import type {
   ToolInfo,
   SkillInfo,
+  SkillSyncResult,
+  SkillUpdateStatus,
   McpServerInfo,
   McpConfig,
   MemoryEntry,
@@ -15,7 +17,6 @@ import type {
   PermissionRule,
   AuditLog,
   WorkflowInfo,
-  HistoryResponse,
   SandboxStatus,
   SandboxConfig,
   SandboxExecuteRequest,
@@ -133,25 +134,6 @@ export const sessionApi = {
       : post<{ success: boolean; restored_to?: string }>(`/session/restore/${id}`),
 };
 
-export const historyApi = {
-  getHistory: () =>
-    isTauri() ? apiInvoke<HistoryResponse>('get_history') : get<HistoryResponse>('/history'),
-  exportMarkdown: () =>
-    isTauri()
-      ? apiInvoke<{ format: string; content: string; message_count: number }>(
-          'export_history_markdown'
-        )
-      : get<{ format: string; content: string; message_count: number }>(
-          '/history/export?format=markdown'
-        ),
-  exportJson: () =>
-    isTauri()
-      ? apiInvoke<{ format: string; content: string; message_count: number }>('export_history_json')
-      : get<{ format: string; content: string; message_count: number }>(
-          '/history/export?format=json'
-        ),
-};
-
 export const toolsApi = {
   list: () => (isTauri() ? apiInvoke<ToolInfo[]>('list_tools') : get<ToolInfo[]>('/tools')),
   get: (name: string) =>
@@ -199,6 +181,14 @@ export const skillsApi = {
           root_dir: rootDir,
           files,
         }),
+  checkUpdates: (target = 'all') =>
+    isTauri()
+      ? apiInvoke<SkillUpdateStatus[]>('check_skill_updates', { target })
+      : get<SkillUpdateStatus[]>(`/skills/updates?target=${encodeURIComponent(target)}`),
+  sync: (target = 'all', force = false) =>
+    isTauri()
+      ? apiInvoke<SkillSyncResult[]>('sync_skills', { target, force })
+      : post<SkillSyncResult[]>('/skills/sync', { target, force }),
 };
 
 export const mcpApi = {
@@ -1253,7 +1243,15 @@ export interface CitationAuditReport {
   issues: CitationAuditIssue[];
 }
 
-export type ReviewExportFormat = 'markdown' | 'json' | 'csv' | 'bibtex' | 'ris' | 'all';
+export type ReviewExportFormat =
+  | 'markdown'
+  | 'pdf'
+  | 'docx'
+  | 'json'
+  | 'csv'
+  | 'bibtex'
+  | 'ris'
+  | 'all';
 export interface ReviewExportArtifact {
   review_id: string;
   format: Exclude<ReviewExportFormat, 'all'>;

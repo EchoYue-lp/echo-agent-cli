@@ -3,6 +3,84 @@
 use crate::cli::command::{CommandCategory, CommandContext, CommandOutcome, cmd};
 use std::sync::Arc;
 
+pub async fn execute_skill_update_command(
+    agent: &echo_agent_app_core::agent_handle::AgentHandle,
+    args: &[&str],
+) -> Option<String> {
+    let subcommand = args.first().copied()?;
+    match subcommand {
+        "check-updates" | "check" => {
+            let target = args.get(1).copied().or(Some("all"));
+            let hub = crate::skills_hub::SkillsHub::new();
+            Some(match crate::skills_hub::check_updates(&hub, target).await {
+                Ok(statuses) if statuses.is_empty() => "No skills found.".to_string(),
+                Ok(statuses) => statuses
+                    .into_iter()
+                    .map(|status| {
+                        format!("[{:?}] {} - {}", status.state, status.name, status.message)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                Err(error) => format!("Skill update check failed: {error}"),
+            })
+        }
+        "sync" => {
+            let force = args.contains(&"--force");
+            let target = args
+                .iter()
+                .skip(1)
+                .copied()
+                .find(|value| *value != "--force")
+                .or(Some("all"));
+            let mut hub = crate::skills_hub::SkillsHub::new();
+            Some(
+                match crate::skills_hub::sync_skills(&mut hub, target, force).await {
+                    Ok(results) => {
+                        let summary = if results.is_empty() {
+                            "No skills found.".to_string()
+                        } else {
+                            results
+                                .iter()
+                                .map(|result| {
+                                    format!(
+                                        "[{}] {} - {}",
+                                        if !result.success {
+                                            "failed"
+                                        } else if result.updated {
+                                            "updated"
+                                        } else {
+                                            "unchanged"
+                                        },
+                                        result.name,
+                                        result.message
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        };
+                        let root = hub.root().to_path_buf();
+                        match agent
+                            .write_async(|value| {
+                                Box::pin(async move { value.load_skills_from_dir(root).await })
+                            })
+                            .await
+                        {
+                            Ok(_) => summary,
+                            Err(error) => {
+                                format!(
+                                    "{summary}\nSkills synced, but runtime reload failed: {error}"
+                                )
+                            }
+                        }
+                    }
+                    Err(error) => format!("Skill sync failed: {error}"),
+                },
+            )
+        }
+        _ => None,
+    }
+}
+
 // ── SkillsCommand ──────────────────────────────────────────────────────
 
 async fn cmd_skills(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
@@ -131,8 +209,15 @@ async fn cmd_skills(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             hub.refresh();
             println!("Skills Hub refreshed ({} entries).", hub.list().len());
         }
+        "check-updates" | "check" | "sync" => {
+            if let Some(output) = execute_skill_update_command(&ctx.agent, args).await {
+                println!("{output}");
+            }
+        }
         _ => {
-            println!("Usage: /skills [list|search|install|uninstall|info|refresh] [args]");
+            println!(
+                "Usage: /skills [list|search|install|uninstall|info|refresh|check-updates|sync] [args]"
+            );
         }
     }
     CommandOutcome::Continue
@@ -140,9 +225,9 @@ async fn cmd_skills(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
 cmd!(
     SkillsCommand,
     "skills",
-    ["sk"],
+    ["sk", "skill"],
     CommandCategory::Info,
-    "List and manage skills (list/search/install/uninstall/info/refresh)",
+    "List and manage skills, including explicit upstream checks and sync",
     cmd_skills
 );
 

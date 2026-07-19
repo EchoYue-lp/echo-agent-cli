@@ -106,8 +106,8 @@ impl BrowserRuntime {
         self.install_tools_for(agent, BrowserActor::Main);
     }
 
-    pub fn install_worker_tools(&self, agent: &mut echo_agent::agent::ReactAgent) {
-        self.install_tools_for(agent, BrowserActor::Worker);
+    pub fn install_subagent_tools(&self, agent: &mut echo_agent::agent::ReactAgent) {
+        self.install_tools_for(agent, BrowserActor::Subagent);
     }
 
     fn install_tools_for(&self, agent: &mut echo_agent::agent::ReactAgent, actor: BrowserActor) {
@@ -315,12 +315,12 @@ impl BrowserRuntime {
         }
         let owner_id = match actor {
             BrowserActor::Main => MAIN_TAB_OWNER.to_string(),
-            BrowserActor::Worker => context
+            BrowserActor::Subagent => context
                 .execution_id
                 .clone()
                 .or_else(|| context.run_id.clone())
                 .or_else(|| context.turn_id.clone())
-                .unwrap_or_else(|| format!("worker-{}", uuid::Uuid::new_v4())),
+                .unwrap_or_else(|| format!("subagent-{}", uuid::Uuid::new_v4())),
         };
         let tabs_command = if action == BrowserAction::Tabs {
             params
@@ -1164,7 +1164,7 @@ pub enum BrowserAction {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BrowserActor {
     Main,
-    Worker,
+    Subagent,
 }
 
 impl BrowserAction {
@@ -1977,18 +1977,18 @@ mod tests {
             .name("primary")
             .system_prompt("test")
             .build()?;
-        let mut worker = ReactAgentBuilder::new()
+        let mut subagent = ReactAgentBuilder::new()
             .model("test-model")
-            .name("worker")
+            .name("subagent")
             .system_prompt("test")
             .build()?;
 
         runtime.install_tools(&mut primary);
-        runtime.install_tools(&mut worker);
+        runtime.install_tools(&mut subagent);
 
         for action in BrowserAction::ALL {
             assert!(primary.list_tools().contains(&action.name().to_string()));
-            assert!(worker.list_tools().contains(&action.name().to_string()));
+            assert!(subagent.list_tools().contains(&action.name().to_string()));
         }
         runtime.shutdown().await;
         Ok(())

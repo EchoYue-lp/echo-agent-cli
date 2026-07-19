@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { skillsApi } from '../../api/endpoints';
-import type { SkillInfo } from '../../types/api';
+import type { SkillInfo, SkillUpdateStatus } from '../../types/api';
 import { CATEGORY_LABELS } from '../../types/api';
 import {
   BookOpen,
@@ -12,6 +12,8 @@ import {
   Search,
   Star,
   AlertTriangle,
+  Download,
+  RefreshCw,
 } from 'lucide-react';
 import { useToastStore } from '../../stores/toastStore';
 import { fileSystem, isTauri } from '../../lib/tauri-bridge';
@@ -33,10 +35,13 @@ export function SkillsPanel() {
   const [uploading, setUploading] = useState(false);
   const [query, setQuery] = useState('');
   const [busySkill, setBusySkill] = useState<string | null>(null);
+  const [checkingUpdates, setCheckingUpdates] = useState(false);
+  const [syncingSkills, setSyncingSkills] = useState(false);
+  const [updateStatuses, setUpdateStatuses] = useState<Record<string, SkillUpdateStatus>>({});
   const [collapsedCategories, setCollapsedCategories] = useState<Set<string>>(new Set());
   const fileInputRef = useRef<HTMLInputElement>(null);
   const addToast = useToastStore((s) => s.addToast);
-  const loadingAny = loading || uploading;
+  const loadingAny = loading || uploading || checkingUpdates || syncingSkills;
 
   const filteredSkills = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -143,6 +148,47 @@ export function SkillsPanel() {
     }
   };
 
+  const checkUpdates = async () => {
+    if (loadingAny) return;
+    setCheckingUpdates(true);
+    try {
+      const statuses = await skillsApi.checkUpdates();
+      setUpdateStatuses(Object.fromEntries(statuses.map((status) => [status.name, status])));
+      const available = statuses.filter((status) => status.state === 'update_available').length;
+      const localChanges = statuses.filter((status) => status.state === 'local_changes').length;
+      addToast(
+        available > 0 || localChanges > 0 ? 'info' : 'success',
+        `检查完成：${available} 个更新，${localChanges} 个存在本地修改`
+      );
+    } catch (e: any) {
+      addToast('error', `检查技能更新失败: ${e?.message || String(e)}`);
+    } finally {
+      setCheckingUpdates(false);
+    }
+  };
+
+  const syncSkill = async (name: string, force = false) => {
+    if (loadingAny || busySkill) return;
+    setBusySkill(name);
+    setSyncingSkills(true);
+    try {
+      const results = await skillsApi.sync(name, force);
+      const result = results[0];
+      await refreshSkills();
+      const statuses = await skillsApi.checkUpdates();
+      setUpdateStatuses(Object.fromEntries(statuses.map((status) => [status.name, status])));
+      addToast(
+        result?.success === false ? 'error' : result?.updated ? 'success' : 'info',
+        result?.message || `${name} 无需更新`
+      );
+    } catch (e: any) {
+      addToast('error', `同步技能失败: ${e?.message || String(e)}`);
+    } finally {
+      setBusySkill(null);
+      setSyncingSkills(false);
+    }
+  };
+
   const handleBrowse = async () => {
     if (loadingAny) return;
 
@@ -213,10 +259,21 @@ export function SkillsPanel() {
 
   return (
     <div className="p-3 space-y-3">
-      <div className="flex items-center justify-between">
+      <div className="flex items-center justify-between gap-2">
         <h3 className="text-sm font-semibold" style={{ color: s.text }}>
           技能 ({skills.length})
         </h3>
+        <button
+          type="button"
+          onClick={checkUpdates}
+          disabled={loadingAny}
+          className="flex h-7 items-center gap-1 rounded-md border px-2 text-[10px] disabled:opacity-50"
+          style={{ borderColor: s.border, color: s.textSec }}
+          title="检查 Git 安装技能的上游更新"
+        >
+          <RefreshCw size={11} className={checkingUpdates ? 'animate-spin' : ''} />
+          检查更新
+        </button>
       </div>
 
       <div className="flex gap-2">
@@ -365,6 +422,43 @@ export function SkillsPanel() {
                       {sk.loaded ? '禁用' : '启用'}
                     </button>
                   </div>
+                  {updateStatuses[sk.name] && (
+                    <div
+                      className="mt-2 flex items-center gap-2 border-t pt-2 text-[10px]"
+                      style={{ borderColor: s.border, color: s.textTer }}
+                    >
+                      <span
+                        className="min-w-0 flex-1 truncate"
+                        title={updateStatuses[sk.name].message}
+                      >
+                        {updateStatuses[sk.name].message}
+                      </span>
+                      {(updateStatuses[sk.name].state === 'update_available' ||
+                        updateStatuses[sk.name].state === 'local_changes') && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            syncSkill(sk.name, updateStatuses[sk.name].state === 'local_changes')
+                          }
+                          disabled={loadingAny || Boolean(busySkill)}
+                          className="flex h-6 shrink-0 items-center gap-1 rounded-md border px-2 disabled:opacity-50"
+                          style={{ borderColor: s.border, color: s.accent }}
+                          title={
+                            updateStatuses[sk.name].state === 'local_changes'
+                              ? '覆盖本地修改并同步上游版本'
+                              : '同步上游版本'
+                          }
+                        >
+                          {busySkill === sk.name ? (
+                            <Loader2 size={10} className="animate-spin" />
+                          ) : (
+                            <Download size={10} />
+                          )}
+                          {updateStatuses[sk.name].state === 'local_changes' ? '强制同步' : '同步'}
+                        </button>
+                      )}
+                    </div>
+                  )}
                   {sk.tags && sk.tags.length > 0 && (
                     <div className="mt-1.5 flex flex-wrap gap-1">
                       {sk.tags.map((tag) => (

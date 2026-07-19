@@ -287,19 +287,19 @@ useEffect(() => {
 
 ### 其他（2个）
 
-#### P1-13. Agent Pool slot 计数包含 task worker
+#### P1-13. Agent Pool slot 计数包含 task subagent
 
 - **文件**：`echo-agent-cli/echo-agent-app-core/src/agent_pool.rs:275`
 - **类型**：功能缺陷
 
-Pool slot 计数（`active_count`）仅排除 `__background__`，不排除 `__task__:*` task worker agent。导致 task worker 占用用户交互 agent 的并发槽位——后台任务多了，用户发消息可能被拒绝。应将 `__task__:*` 前缀的 agent 一并排除。
+Pool slot 计数（`active_count`）仅排除 `__background__`，不排除 `__task__:*` task subagent。导致 task subagent 占用用户交互 agent 的并发槽位——后台任务多了，用户发消息可能被拒绝。应将 `__task__:*` 前缀的 agent 一并排除。
 
 #### P1-14. Git worktree 创建阻塞 async executor
 
 - **文件**：`echo-agent-cli/echo-agent-app-core/src/tasks/task_runtime/executor.rs:~2284`
 - **类型**：性能
 
-`super::worktree::RunWorktree::create(run_id, root)` 调用 `git worktree add` 子进程，在 async 上下文中同步执行（非 `spawn_blocking`）。这会阻塞 tokio worker 线程，所有其他 agent 的 I/O 在此期间无法执行。应包裹在 `tokio::task::spawn_blocking()` 中。
+`super::worktree::RunWorktree::create(run_id, root)` 调用 `git worktree add` 子进程，在 async 上下文中同步执行（非 `spawn_blocking`）。这会阻塞 tokio subagent 线程，所有其他 agent 的 I/O 在此期间无法执行。应包裹在 `tokio::task::spawn_blocking()` 中。
 
 ---
 
@@ -362,7 +362,7 @@ Pool slot 计数（`active_count`）仅排除 `__background__`，不排除 `__ta
 #### P2-9. skill_telemetry 在 tokio::spawn 中做同步文件 I/O
 
 - **文件**：`echo-agent/src/agent/react/run/execution.rs:136-154`
-- **问题**：`record_skill_telemetry` 通过 `tokio::spawn` 启动，但内部 `curator.touch_skill()` 是同步文件锁操作，阻塞 tokio worker 线程。
+- **问题**：`record_skill_telemetry` 通过 `tokio::spawn` 启动，但内部 `curator.touch_skill()` 是同步文件锁操作，阻塞 tokio subagent 线程。
 - **建议**：改用 `tokio::task::spawn_blocking()`。
 
 ---

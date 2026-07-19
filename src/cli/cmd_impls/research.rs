@@ -141,7 +141,7 @@ pub async fn execute_papers_command(
     agent: &echo_agent_app_core::agent_handle::AgentHandle,
     args: &[&str],
 ) -> String {
-    const USAGE: &str = "Usage: /papers list | show <source-id> | evidence [source-id] | reviews | review <review-id> | add-source <title> | create-review <academic|medical> <title> | search <openalex|crossref|europe-pmc> <query> | enrich <source-id> | audit <review-id> | export <review-id> <markdown|json|csv|bibtex|ris|all> | zotero-import <user|group> <library-id> | zotero-export <user|group> <library-id> <source-id,...> (Zotero uses ZOTERO_API_KEY)";
+    const USAGE: &str = "Usage: /papers list | show <source-id> | evidence [source-id] | reviews | review <review-id> | add-source <title> | create-review <academic|medical> <title> | search <openalex|crossref|europe-pmc> <query> | enrich <source-id> | audit <review-id> | export <review-id> <markdown|pdf|docx|json|csv|bibtex|ris|all> | zotero-import <user|group> <library-id> | zotero-export <user|group> <library-id> <source-id,...> (Zotero uses ZOTERO_API_KEY)";
     let root = workspace_root_for_agent(agent).await;
     match args.first().copied().unwrap_or("list") {
         "list" | "ls" => match list_sources(&root, None, None) {
@@ -297,6 +297,8 @@ pub async fn execute_papers_command(
 fn parse_export_format(value: &str) -> Option<ReviewExportFormat> {
     match value {
         "markdown" => Some(ReviewExportFormat::Markdown),
+        "pdf" => Some(ReviewExportFormat::Pdf),
+        "docx" => Some(ReviewExportFormat::Docx),
         "json" => Some(ReviewExportFormat::Json),
         "csv" => Some(ReviewExportFormat::Csv),
         "bibtex" => Some(ReviewExportFormat::Bibtex),

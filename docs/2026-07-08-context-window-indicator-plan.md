@@ -1,6 +1,6 @@
 # 上下文窗口占用指示器 实现计划
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic subagents:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 在 EKO 的 TUI status bar 和 Web ChatInput footer 增加始终可见的上下文窗口占用指示器（百分比 + 进度条 + 颜色分级），数据源用最近一次 LLM 响应的真实 `prompt_tokens`。
 

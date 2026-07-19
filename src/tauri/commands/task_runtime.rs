@@ -1,7 +1,7 @@
 //! Tauri IPC commands for the TaskRuntime.
 //!
 //! Read-only query commands, mutations for creating/managing task runs,
-//! worker execution, and route feedback learning.
+//! subagent execution, and route feedback learning.
 
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
@@ -132,8 +132,8 @@ pub async fn list_task_reviews(
         .map_err(internal)
 }
 
-/// The execution summary a worker produced for a task — used by the Summary
-/// Chain (downstream workers consume this instead of raw chat history).
+/// The execution summary a subagent produced for a task — used by the Summary
+/// Chain (downstream subagents consume this instead of raw chat history).
 #[tauri::command]
 pub async fn get_task_summary(
     state: tauri::State<'_, TauriState>,
@@ -145,7 +145,7 @@ pub async fn get_task_summary(
         .map_err(internal)
 }
 
-/// Recovery barriers created when a mutating worker/tool was interrupted
+/// Recovery barriers created when a mutating subagent/tool was interrupted
 /// between its durable start and terminal boundaries.
 #[tauri::command]
 pub async fn list_recovery_blockers(
@@ -356,7 +356,7 @@ pub async fn reorder_tasks(
     Ok(())
 }
 
-/// Cancel an executing run. Cancels every in-flight worker via the run's
+/// Cancel an executing run. Cancels every in-flight subagent via the run's
 /// CancellationToken and lets the executor wind down (the run ends Cancelled).
 #[tauri::command]
 pub async fn cancel_task_run(

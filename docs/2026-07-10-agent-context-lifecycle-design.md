@@ -32,10 +32,10 @@ model-call boundary.
    context and can replace a tagged projection immediately before
    `ContextManager::prepare`. The framework knows nothing about EKO runs,
    plans, or TaskRuntimeStore.
-2. Make Fork dispatch clear prior worker conversation state while preserving
+2. Make Fork dispatch clear prior subagent conversation state while preserving
    canonical/system configuration and explicitly inherited parent context.
-   Reusing the worker implementation must not imply reusing the previous
-   worker task transcript.
+   Reusing the subagent implementation must not imply reusing the previous
+   subagent task transcript.
 3. Make canonical re-injection idempotent and update compression checkpoints
    from the final post-injection context.
 4. Expose generic protected-message diagnostics from ContextManager so the GUI
@@ -50,7 +50,7 @@ model-call boundary.
 2. Stop embedding protected capsules into `task_create` and `plan_execute`
    ToolResults. Tool results remain ordinary conversational evidence.
 3. Keep `[task_context]` scoped to one fresh Fork invocation rather than
-   accumulating it in reusable worker history.
+   accumulating it in reusable subagent history.
 4. Report isolation as requested/observed state. A fallback must never be
    displayed as successful worktree isolation.
 5. Parse evidence only from credible file-reference forms and support

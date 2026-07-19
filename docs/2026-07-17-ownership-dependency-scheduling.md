@@ -2,12 +2,12 @@
 
 ## 目标
 
-M8 让 TaskRuntime 只依据显式 `depends_on` 和文件 ownership 决定并行度。写任务在独立 worktree 执行；worker 完成、结构化结果验收和 review 通过后，还必须经过可观察的 Git 集成阶段，集成成功后 task 才能进入 `completed`。描述文本、任务排列顺序和模型自报“已合并”都不构成调度或完成依据。
+M8 让 TaskRuntime 只依据显式 `depends_on` 和文件 ownership 决定并行度。写任务在独立 worktree 执行；subagent 完成、结构化结果验收和 review 通过后，还必须经过可观察的 Git 集成阶段，集成成功后 task 才能进入 `completed`。描述文本、任务排列顺序和模型自报“已合并”都不构成调度或完成依据。
 
 ## 业界依据
 
 - [Claude Code worktrees](https://code.claude.com/docs/en/worktrees)：并行 session/subagent 使用独立 Git worktree，避免文件编辑互相触碰；无改动的临时 subagent worktree 可自动清理，有改动的 worktree 保留给后续处理；worktree 基线是显式的 default branch 或 local `HEAD`。
-- [OpenAI Codex worktrees](https://learn.chatgpt.com/docs/environments/git-worktrees)：并行 task 使用独立 checkout；Local 是前台权威工作区，Worktree 是后台隔离环境；Handoff 用明确 Git 操作把代码安全移回 Local，而不是把 worker 结束等同于代码已进入主工作区。
+- [OpenAI Codex worktrees](https://learn.chatgpt.com/docs/environments/git-worktrees)：并行 task 使用独立 checkout；Local 是前台权威工作区，Worktree 是后台隔离环境；Handoff 用明确 Git 操作把代码安全移回 Local，而不是把 subagent 结束等同于代码已进入主工作区。
 - [Git `merge-tree`](https://git-scm.com/docs/git-merge-tree)：`git merge-tree --write-tree` 执行与真实 merge 相同的三方合并和 rename/directory-file 冲突处理，但不读写工作树或 index；退出码明确区分 clean merge、conflict 和执行错误。
 - [Git worktree](https://git-scm.com/docs/git-worktree)：每个 linked worktree 有独立 working tree/index/HEAD，同时共享对象库和 refs；同一 branch 不能在两个 worktree 同时 checkout，分支更新必须有唯一权威工作副本。
 
@@ -15,10 +15,10 @@ M8 让 TaskRuntime 只依据显式 `depends_on` 和文件 ownership 决定并行
 
 ## 现状审计
 
-- `PlanTask` 已有 `depends_on`、`files` 和 `parallel_group`；`depends_on` 已是 DAG 权威边，`files` 已进入 worker prompt、planner overlap 分析和 per-file lock。M8 不新增平行 ownership 类型。
+- `PlanTask` 已有 `depends_on`、`files` 和 `parallel_group`；`depends_on` 已是 DAG 权威边，`files` 已进入 subagent prompt、planner overlap 分析和 per-file lock。M8 不新增平行 ownership 类型。
 - `run_dag` 已只按依赖计算 ready frontier，`max_concurrent_writes` 默认是 4，per-file mutex 可让完全相同的文件名串行；但 planner overlap 仍被标成“advisory”，空 `files` 的未知 writer 会与其它 writer 并行。
 - overlap 当前只做规范化后的精确字符串交集，且 update task 只有修改 `depends_on` 时才重新分析 ownership；glob、绝对路径和未知 scope 没有保守语义。
-- writer 已在 `eko-fork-*` worktree 中运行，但 worktree branch 直接拼接含 `:` 的 execution id，真实 Git ref 可能非法；base 只保存字符串 `HEAD`，worker commit 后 diff 基线会漂移。
+- writer 已在 `eko-fork-*` worktree 中运行，但 worktree branch 直接拼接含 `:` 的 execution id，真实 Git ref 可能非法；base 只保存字符串 `HEAD`，subagent commit 后 diff 基线会漂移。
 - framework finalize 只把 diff 追加到 Subagent output，并保留 worktree；TaskRuntime review 通过后直接把 task 标成 Completed。主工作区没有收到代码，下游 verification 可能测试旧代码，merge failure 也没有进入 task 终态。
 - 已有 unattended worktree merge helper 会直接 checkout/merge main，未先做无副作用冲突预检，也没有覆盖 fork writer 的 `eko-fork-*` 生命周期。
 
@@ -45,12 +45,12 @@ M8 让 TaskRuntime 只依据显式 `depends_on` 和文件 ownership 决定并行
 1. `src/a.rs`、`tests/a_test.rs` 等可规范化的相对路径是已知 exclusive owner；两个 task 只有精确 scope 交集时冲突。
 2. 空列表、`*.rs`、`src/**`、绝对路径、`../outside`、目录式尾随分隔符是 unknown；允许执行，但本轮不与其它 writer 并行。
 3. read-only task 的 `files` 只是阅读目标，不取得 write ownership。
-4. worker 实际改动以 Git index/base diff 为准，不信任模型 `touched_files.written`。已知 ownership 下出现未声明文件时拒绝 integration。
+4. subagent 实际改动以 Git index/base diff 为准，不信任模型 `touched_files.written`。已知 ownership 下出现未声明文件时拒绝 integration。
 5. ownership 只决定能否并行，不制造隐式依赖。需要“先 A 后 B”的语义必须写入 `depends_on`。
 
 ## Integration 顺序
 
-1. worker 在 isolated worktree 返回 versioned structured result；runtime 持久化 `WorkerReleased`。
+1. subagent 在 isolated worktree 返回 versioned structured result；runtime 持久化 `SubagentReleased`。
 2. M7 completion contract 通过；implementation/debugging review 通过或明确使用既有 no-review fallback。
 3. 获取 repo 级 integration mutex，防同一进程多个 run 同时写主 Git index。
 4. 如果 execution trailer 已存在于当前 `HEAD`，返回 `already_integrated`。
@@ -63,9 +63,9 @@ M8 让 TaskRuntime 只依据显式 `depends_on` 和文件 ownership 决定并行
 
 ## 失败与恢复
 
-- 同一 wave 多 worker 部分成功：每个结果独立验收和 integration；成功 task 可 Completed，冲突 task Failed；下一轮按已有 failure propagation 阻塞 dependents。
+- 同一 wave 多 subagent 部分成功：每个结果独立验收和 integration；成功 task 可 Completed，冲突 task Failed；下一轮按已有 failure propagation 阻塞 dependents。
 - review/contract 未通过：不合并该 worktree；retry 使用新的 execution id 和 worktree，旧 worktree保留用于诊断。
-- merge 后进程退出：resume 复用 durable worker result，integration 用 execution trailer 返回 already integrated，再补 TaskCompleted。
+- merge 后进程退出：resume 复用 durable subagent result，integration 用 execution trailer 返回 already integrated，再补 TaskCompleted。
 - merge conflict：主 checkout 不进入 conflicted index；worktree branch/path 留存，task error 是权威终态。
 - 用户 staged 或同路径 dirty：在 merge 前失败，避免把 staged 内容提交进 EKO merge commit或覆盖未提交工作。这是本地场景仍成立的数据丢失防护，不是 agent permission gate。
 
@@ -74,8 +74,8 @@ M8 让 TaskRuntime 只依据显式 `depends_on` 和文件 ownership 决定并行
 - 两个不相交 writer 在同一 DAG wave 并行执行，并能顺序、无冲突地集成到主 checkout。
 - 相交 writer 和 unknown writer 不在同一 write wave；无 description/排序推断。
 - 未完成 dependency 的下游不启动；上游 integration 失败时下游进入 Blocked。
-- worker 改动未声明文件时 integration 失败，主 checkout 不变。
+- subagent 改动未声明文件时 integration 失败，主 checkout 不变。
 - 两个从同一 base 修改同一文件的 worktree：首个可合并，第二个由 `merge-tree` 报 conflict；主 index/工作树不残留 conflict。
 - merge 成功但 TaskCompleted 尚未持久化的恢复路径不重复 merge。
 - branch label 含 `:`/空格等字符时仍生成合法、稳定、不碰撞的 Git ref；diff 使用固定 base SHA。
-- GUI/TUI/CLI 继续消费同一 TaskCompleted/TaskFailed 与 summary；merge 失败不被 worker 的 completed 文本掩盖。
+- GUI/TUI/CLI 继续消费同一 TaskCompleted/TaskFailed 与 summary；merge 失败不被 subagent 的 completed 文本掩盖。

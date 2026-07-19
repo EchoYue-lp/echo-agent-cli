@@ -3047,6 +3047,17 @@ async fn handle_slash_command(
                         Err(error) => format!("Skill refresh failed: {error}"),
                     }
                 }
+                "check-updates" | "check" | "sync" => {
+                    let update_args = std::iter::once(sub)
+                        .chain(rest.split_whitespace())
+                        .collect::<Vec<_>>();
+                    crate::cli::cmd_impls::skills::execute_skill_update_command(
+                        agent,
+                        &update_args,
+                    )
+                    .await
+                    .unwrap_or_else(|| "Invalid skill update command".to_string())
+                }
                 "install" if !rest.is_empty() => {
                     let result = if rest.starts_with("https://") || rest.ends_with(".git") {
                         crate::skills_hub::install::install_from_git(&rest, None, &mut hub).await
@@ -3088,7 +3099,8 @@ async fn handle_slash_command(
                     }
                 }
                 _ => {
-                    "Usage: /skills [list|search|install|uninstall|info|refresh] [args]".to_string()
+                    "Usage: /skills [list|search|install|uninstall|info|refresh|check-updates|sync] [args]"
+                        .to_string()
                 }
             };
             app.messages.push(ChatMessage {

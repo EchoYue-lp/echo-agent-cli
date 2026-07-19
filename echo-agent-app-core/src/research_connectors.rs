@@ -611,4 +611,78 @@ mod tests {
         assert_eq!(second.first().map(|record| record.created), Some(false));
         Ok(())
     }
+
+    #[tokio::test]
+    #[ignore = "opt-in live provider ingestion smoke test; set EKO_PROVIDER_SMOKE=1"]
+    async fn live_open_provider_results_are_persisted() -> ResearchResult<()> {
+        if std::env::var("EKO_PROVIDER_SMOKE").as_deref() != Ok("1") {
+            return Err(ResearchError::Invalid(
+                "set EKO_PROVIDER_SMOKE=1 before running ignored provider smoke tests".to_string(),
+            ));
+        }
+        let workspace = tempfile::tempdir().map_err(ResearchError::Io)?;
+        for provider in [
+            ResearchProvider::Openalex,
+            ResearchProvider::Crossref,
+            ResearchProvider::EuropePmc,
+        ] {
+            let result = search_and_ingest(
+                workspace.path(),
+                ScholarlySearchRequest {
+                    provider,
+                    query: "systematic review".to_string(),
+                    limit: Some(1),
+                    mailto: std::env::var("OPENALEX_MAILTO").ok(),
+                },
+            )
+            .await?;
+            if result.sources.is_empty() {
+                return Err(ResearchError::External(format!(
+                    "provider {provider:?} returned no persisted sources"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires ZOTERO_API_KEY and ZOTERO_LIBRARY_ID"]
+    async fn live_zotero_import_persists_source_records() -> ResearchResult<()> {
+        let api_key = std::env::var("ZOTERO_API_KEY").map_err(|_| {
+            ResearchError::Invalid("ZOTERO_API_KEY is required for the Zotero smoke test".into())
+        })?;
+        let library_id = std::env::var("ZOTERO_LIBRARY_ID").map_err(|_| {
+            ResearchError::Invalid("ZOTERO_LIBRARY_ID is required for the Zotero smoke test".into())
+        })?;
+        let library_kind = match std::env::var("ZOTERO_LIBRARY_KIND")
+            .unwrap_or_else(|_| "user".to_string())
+            .as_str()
+        {
+            "user" => ZoteroLibraryKind::User,
+            "group" => ZoteroLibraryKind::Group,
+            value => {
+                return Err(ResearchError::Invalid(format!(
+                    "ZOTERO_LIBRARY_KIND must be user or group, got {value}"
+                )));
+            }
+        };
+        let workspace = tempfile::tempdir().map_err(ResearchError::Io)?;
+        let result = import_zotero(
+            workspace.path(),
+            ZoteroSyncRequest {
+                library_kind,
+                library_id,
+                api_key,
+                limit: Some(1),
+                source_ids: Vec::new(),
+            },
+        )
+        .await?;
+        if result.sources.is_empty() {
+            return Err(ResearchError::External(
+                "Zotero library returned no importable source records".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }

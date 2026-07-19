@@ -1,6 +1,6 @@
 //! Subagent `.md` hot-loader (Sprint 6).
 //!
-//! Replaces the hardcoded `WORKER_DEFINITIONS` array in `infra.rs`. Subagent
+//! Replaces the hardcoded `SUBAGENT_DEFINITIONS` array in `infra.rs`. Subagent
 //! prompts now live in `.md` files (frontmatter + markdown body) and can be
 //! edited without recompiling.
 //!
@@ -21,7 +21,7 @@
 //! (kept as a published capability). Per deep-iteration-plan §六, the loader
 //! lives in the app layer because the `.md` directory layout and EKO's
 //! `.eko/` convention are product-form-specific. The loader emits plain
-//! `WorkerDefinition` values consumed by `register_default_subagents`.
+//! `SubagentDefinition` values consumed by `register_default_subagents`.
 
 use std::path::{Path, PathBuf};
 
@@ -32,7 +32,7 @@ use serde::Deserialize;
 /// Sourced from `src/subagents/coding/*.md`. These are the fallback used when
 /// no project/user `.md` files override them. Order matters: this defines the
 /// default registration order.
-const BUILTIN_WORKER_FILES: &[(&str, &str)] = &[
+const BUILTIN_SUBAGENT_FILES: &[(&str, &str)] = &[
     ("explorer", include_str!("subagents/coding/explorer.md")),
     ("reviewer", include_str!("subagents/coding/reviewer.md")),
     ("planner", include_str!("subagents/coding/planner.md")),
@@ -66,7 +66,7 @@ const SKIP_DIRS: &[&str] = &[".git", "node_modules", "target", ".worktrees"];
 /// (a fallback name from the filename can fill it); `description` is required.
 /// The rest fall back to sensible defaults so a minimal `.md` still loads.
 #[derive(Debug, Clone, Deserialize)]
-struct WorkerFrontmatter {
+struct SubagentFrontmatter {
     #[serde(default)]
     name: Option<String>,
     description: String,
@@ -103,7 +103,7 @@ struct WorkerFrontmatter {
     #[serde(default)]
     is_background: bool,
     /// Sprint 11: declare this subagent as a team-mode dispatcher. Only
-    /// `"manager-worker"` is the compatibility wire value via frontmatter (other strategies are
+    /// `"manager-subagent"` is the supported wire value via frontmatter (other strategies are
     /// programmatic-only — they carry inline agent-name data).
     #[serde(default)]
     team_strategy: Option<String>,
@@ -114,12 +114,12 @@ struct WorkerFrontmatter {
     /// Sprint 11: subagent team member names (each must be separately registered).
     /// Required (non-empty) when `team_strategy` is set.
     #[serde(default)]
-    team_workers: Vec<String>,
+    team_subagents: Vec<String>,
 }
 
 /// A resolved subagent definition ready for registration.
 #[derive(Debug, Clone)]
-pub struct WorkerDefinition {
+pub struct SubagentDefinition {
     pub name: String,
     pub description: String,
     pub system_prompt: String,
@@ -162,14 +162,14 @@ pub struct WorkerDefinition {
 pub fn discover_subagents(
     project_root: Option<&Path>,
     user_home: Option<&Path>,
-) -> Vec<WorkerDefinition> {
+) -> Vec<SubagentDefinition> {
     // name → definition, later inserts (lower priority) don't overwrite.
-    let mut by_name: std::collections::HashMap<String, WorkerDefinition> =
+    let mut by_name: std::collections::HashMap<String, SubagentDefinition> =
         std::collections::HashMap::new();
 
     // 1. Builtin defaults (lowest priority — inserted first, never overwritten).
-    for (builtin_name, content) in BUILTIN_WORKER_FILES {
-        match parse_worker_md(content, Some(*builtin_name)) {
+    for (builtin_name, content) in BUILTIN_SUBAGENT_FILES {
+        match parse_subagent_md(content, Some(*builtin_name)) {
             Ok(def) => {
                 by_name.entry(def.name.clone()).or_insert(def);
             }
@@ -197,9 +197,9 @@ pub fn discover_subagents(
 
     // Preserve builtin order for stable registration, then append any
     // extra (user/project-only) subagents at the end.
-    let mut result: Vec<WorkerDefinition> = Vec::with_capacity(by_name.len());
+    let mut result: Vec<SubagentDefinition> = Vec::with_capacity(by_name.len());
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (builtin_name, _) in BUILTIN_WORKER_FILES {
+    for (builtin_name, _) in BUILTIN_SUBAGENT_FILES {
         if let Some(def) = by_name.get(*builtin_name)
             && seen.insert(def.name.clone())
         {
@@ -219,11 +219,11 @@ pub fn discover_subagents(
 /// Format discovered subagent roles for injection into the main agent system prompt.
 ///
 /// Drives description-based auto-delegation via `agent_tool` (Claude/Cursor pattern).
-pub fn format_subagent_catalog(defs: &[WorkerDefinition]) -> String {
+pub fn format_subagent_catalog(defs: &[SubagentDefinition]) -> String {
     let mut out = String::from(
         "\n## Available subagents (agent_tool)\n\
          Use agent_tool for noisy/bounded side work. Prefer plan_execute for multi-step DAGs.\n\
-         Default context is fresh; set mode=fork only when the worker needs shared session background.\n",
+         Default context is fresh; set mode=fork only when the subagent needs shared session background.\n",
     );
     for d in defs {
         let flags = [
@@ -250,7 +250,7 @@ pub fn format_subagent_catalog(defs: &[WorkerDefinition]) -> String {
 /// later (builtins first → user → project), so the last write wins, giving
 /// project > user > builtin precedence.
 fn merge_scope(
-    by_name: &mut std::collections::HashMap<String, WorkerDefinition>,
+    by_name: &mut std::collections::HashMap<String, SubagentDefinition>,
     scope: &str,
     dir: &Path,
 ) {
@@ -260,7 +260,7 @@ fn merge_scope(
     let mut found = Vec::new();
     scan_directory(dir, 0, &mut found);
     for (path, content) in found {
-        match parse_worker_md(&content, None) {
+        match parse_subagent_md(&content, None) {
             Ok(mut def) => {
                 def.source = format!("{scope}:{}", path.display());
                 by_name.insert(def.name.clone(), def);
@@ -313,7 +313,7 @@ fn scan_directory(dir: &Path, depth: usize, out: &mut Vec<(PathBuf, String)>) {
     }
 }
 
-/// Parse a subagent `.md` file into a [`WorkerDefinition`].
+/// Parse a subagent `.md` file into a [`SubagentDefinition`].
 ///
 /// Format:
 /// ```text
@@ -328,12 +328,12 @@ fn scan_directory(dir: &Path, depth: usize, out: &mut Vec<(PathBuf, String)>) {
 ///
 /// `fallback_name` (when `Some`) overrides an empty/missing `name` field —
 /// used for builtin files where the filename is authoritative.
-pub fn parse_worker_md(
+pub fn parse_subagent_md(
     content: &str,
     fallback_name: Option<&str>,
-) -> Result<WorkerDefinition, String> {
+) -> Result<SubagentDefinition, String> {
     let (fm_str, body) = split_frontmatter(content)?;
-    let fm: WorkerFrontmatter = if fm_str.trim().is_empty() {
+    let fm: SubagentFrontmatter = if fm_str.trim().is_empty() {
         return Err("frontmatter is empty (missing name/description)".into());
     } else {
         serde_yaml::from_str(fm_str).map_err(|e| format!("frontmatter parse error: {e}"))?
@@ -381,26 +381,26 @@ pub fn parse_worker_md(
     let isolate_workspace = fm.workspace && !isolate_worktree;
 
     // Sprint 11: parse team frontmatter into a TeamSpec (the wire value
-    // remains `manager-worker` for compatibility). Validate that manager +
+    // uses `manager-subagent`. Validate that manager +
     // non-empty subagent team members are given.
     let team = if let Some(strategy) = fm.team_strategy.as_deref() {
-        if strategy != "manager-worker" {
+        if strategy != "manager-subagent" {
             return Err(format!(
-                "subagent `{name}`: team_strategy '{strategy}' unsupported via frontmatter (only 'manager-worker')"
+                "subagent `{name}`: team_strategy '{strategy}' unsupported via frontmatter (only 'manager-subagent')"
             ));
         }
         let manager = fm.team_manager.clone().ok_or_else(|| {
             format!("subagent `{name}`: team_strategy set but team_manager missing")
         })?;
-        if fm.team_workers.is_empty() {
+        if fm.team_subagents.is_empty() {
             return Err(format!(
-                "subagent `{name}`: team_strategy set but team_workers empty"
+                "subagent `{name}`: team_strategy set but team_subagents empty"
             ));
         }
         Some(echo_agent::agent::subagent::types::TeamSpec {
-            strategy: echo_agent::agent::subagent::team::strategy::TeamStrategy::ManagerWorker,
+            strategy: echo_agent::agent::subagent::team::strategy::TeamStrategy::ManagerSubagent,
             manager,
-            workers: fm.team_workers.clone(),
+            subagents: fm.team_subagents.clone(),
             config: echo_agent::agent::subagent::team::TeamConfig::default(),
         })
     } else {
@@ -413,7 +413,7 @@ pub fn parse_worker_md(
         .map(|m| m.trim().to_string())
         .filter(|m| !m.is_empty() && m != "inherit");
 
-    Ok(WorkerDefinition {
+    Ok(SubagentDefinition {
         source: fallback_name
             .map(|name| format!("builtin:{name}"))
             .unwrap_or_else(|| "file:<unknown>".to_string()),
@@ -483,8 +483,8 @@ mod tests {
     #[test]
     fn parse_minimal_md_with_fallback_name() {
         let md = "---\ndescription: \"a subagent\"\n---\nDo the thing.";
-        let def = parse_worker_md(md, Some("worker1")).unwrap();
-        assert_eq!(def.name, "worker1");
+        let def = parse_subagent_md(md, Some("subagent1")).unwrap();
+        assert_eq!(def.name, "subagent1");
         assert_eq!(def.description, "a subagent");
         assert_eq!(def.system_prompt, "Do the thing.");
         assert!(!def.readonly);
@@ -493,7 +493,7 @@ mod tests {
     #[test]
     fn parse_full_frontmatter() {
         let md = "---\nname: explorer\ndescription: \"探索\"\nreadonly: true\ntags: [\"custom\"]\n---\n你是 explorer。";
-        let def = parse_worker_md(md, None).unwrap();
+        let def = parse_subagent_md(md, None).unwrap();
         assert_eq!(def.name, "explorer");
         assert_eq!(def.description, "探索");
         assert!(def.readonly);
@@ -507,7 +507,7 @@ mod tests {
     #[test]
     fn parse_model_max_turns_is_background() {
         let md = "---\nname: explorer\ndescription: \"x\"\nreadonly: true\nmodel: fast\nmax_turns: 30\nis_background: true\n---\nbody";
-        let def = parse_worker_md(md, None).unwrap();
+        let def = parse_subagent_md(md, None).unwrap();
         assert_eq!(def.model.as_deref(), Some("fast"));
         assert_eq!(def.max_turns, Some(30));
         assert!(def.is_background);
@@ -516,7 +516,7 @@ mod tests {
     #[test]
     fn parse_model_inherit_becomes_none() {
         let md = "---\nname: explorer\ndescription: \"x\"\nmodel: inherit\n---\nbody";
-        let def = parse_worker_md(md, None).unwrap();
+        let def = parse_subagent_md(md, None).unwrap();
         assert!(def.model.is_none());
         assert!(!def.is_background);
         assert!(def.max_turns.is_none());
@@ -525,27 +525,27 @@ mod tests {
     #[test]
     fn parse_missing_name_without_fallback_errors() {
         let md = "---\ndescription: \"x\"\n---\nbody";
-        let err = parse_worker_md(md, None).unwrap_err();
+        let err = parse_subagent_md(md, None).unwrap_err();
         assert!(err.contains("name"));
     }
 
     #[test]
     fn parse_missing_leading_delimiter_errors() {
         let md = "name: x\ndescription: y\n---\nbody";
-        assert!(parse_worker_md(md, None).is_err());
+        assert!(parse_subagent_md(md, None).is_err());
     }
 
     #[test]
     fn parse_empty_body_errors() {
         let md = "---\nname: x\ndescription: y\n---\n";
-        assert!(parse_worker_md(md, None).is_err());
+        assert!(parse_subagent_md(md, None).is_err());
     }
 
     #[test]
     fn parse_worktree_flag_for_writer_only() {
         // Sprint 8: `worktree: true` sets isolate_worktree on a writer.
         let md = "---\nname: refactorer\ndescription: \"writes code\"\nreadonly: false\nworktree: true\n---\nYou refactor code.";
-        let def = parse_worker_md(md, None).unwrap();
+        let def = parse_subagent_md(md, None).unwrap();
         assert!(!def.readonly);
         assert!(def.isolate_worktree, "writer with worktree:true → isolate");
     }
@@ -555,7 +555,7 @@ mod tests {
         // Sprint 8: a readonly subagent declaring worktree:true is ignored —
         // readonly subagents don't mutate files, so isolation is meaningless.
         let md = "---\nname: explorer\ndescription: \"reads\"\nreadonly: true\nworktree: true\n---\nYou explore.";
-        let def = parse_worker_md(md, None).unwrap();
+        let def = parse_subagent_md(md, None).unwrap();
         assert!(def.readonly);
         assert!(
             !def.isolate_worktree,
@@ -566,7 +566,7 @@ mod tests {
     #[test]
     fn parse_worktree_defaults_false() {
         let md = "---\nname: w\ndescription: \"d\"\nreadonly: false\n---\nbody";
-        let def = parse_worker_md(md, None).unwrap();
+        let def = parse_subagent_md(md, None).unwrap();
         assert!(!def.isolate_worktree);
     }
 
@@ -608,7 +608,7 @@ mod tests {
         // Sprint 9: the writer subagent is non-readonly + requests worktree isolation.
         // Phase 2 Task 13: hard-gate — builtin implementer.md must keep worktree: true
         // so multi-implementer dispatches never share the main tree.
-        let implementer_md = BUILTIN_WORKER_FILES
+        let implementer_md = BUILTIN_SUBAGENT_FILES
             .iter()
             .find(|(name, _)| *name == "implementer")
             .map(|(_, content)| *content)
@@ -645,7 +645,7 @@ mod tests {
     fn parse_workspace_flag() {
         // Sprint 10: `workspace: true` sets isolate_workspace.
         let md = "---\nname: data-shaper\ndescription: \"d\"\nworkspace: true\n---\nbody";
-        let def = parse_worker_md(md, None).unwrap();
+        let def = parse_subagent_md(md, None).unwrap();
         assert!(def.isolate_workspace);
         assert!(!def.isolate_worktree);
     }
@@ -656,7 +656,7 @@ mod tests {
         // workspace is cleared (mutually exclusive — worktree also provides
         // disjoint FS, avoid double-isolation).
         let md = "---\nname: w\ndescription: \"d\"\nreadonly: false\nworktree: true\nworkspace: true\n---\nbody";
-        let def = parse_worker_md(md, None).unwrap();
+        let def = parse_subagent_md(md, None).unwrap();
         assert!(def.isolate_worktree);
         assert!(
             !def.isolate_workspace,
@@ -666,67 +666,67 @@ mod tests {
 
     #[test]
     fn parse_team_frontmatter_builds_team_spec() {
-        // Sprint 11: team_strategy + team_manager + team_workers → TeamSpec.
+        // Sprint 11: team_strategy + team_manager + team_subagents → TeamSpec.
         let md = "---\n\
 name: team-research\n\
 description: \"team dispatcher\"\n\
-team_strategy: manager-worker\n\
+team_strategy: manager-subagent\n\
 team_manager: planner\n\
-team_workers: [\"explorer\", \"summarizer\"]\n\
+team_subagents: [\"explorer\", \"summarizer\"]\n\
 ---\nbody";
-        let def = parse_worker_md(md, None).unwrap();
+        let def = parse_subagent_md(md, None).unwrap();
         let spec = def.team.expect("team spec should be built");
         assert_eq!(spec.manager, "planner");
         assert_eq!(
-            spec.workers,
+            spec.subagents,
             vec!["explorer".to_string(), "summarizer".to_string()]
         );
         assert_eq!(
             spec.strategy,
-            echo_agent::agent::subagent::team::strategy::TeamStrategy::ManagerWorker
+            echo_agent::agent::subagent::team::strategy::TeamStrategy::ManagerSubagent
         );
     }
 
     #[test]
     fn parse_team_frontmatter_rejects_missing_manager() {
-        let md = "---\nname: t\ndescription: \"d\"\nteam_strategy: manager-worker\nteam_workers: [\"w\"]\n---\nbody";
-        let err = parse_worker_md(md, None).unwrap_err();
+        let md = "---\nname: t\ndescription: \"d\"\nteam_strategy: manager-subagent\nteam_subagents: [\"w\"]\n---\nbody";
+        let err = parse_subagent_md(md, None).unwrap_err();
         assert!(err.contains("team_manager missing"), "got: {err}");
     }
 
     #[test]
-    fn parse_team_frontmatter_rejects_empty_workers() {
-        let md = "---\nname: t\ndescription: \"d\"\nteam_strategy: manager-worker\nteam_manager: m\n---\nbody";
-        let err = parse_worker_md(md, None).unwrap_err();
-        assert!(err.contains("team_workers empty"), "got: {err}");
+    fn parse_team_frontmatter_rejects_empty_subagents() {
+        let md = "---\nname: t\ndescription: \"d\"\nteam_strategy: manager-subagent\nteam_manager: m\n---\nbody";
+        let err = parse_subagent_md(md, None).unwrap_err();
+        assert!(err.contains("team_subagents empty"), "got: {err}");
     }
 
     #[test]
     fn parse_team_frontmatter_rejects_unsupported_strategy() {
-        let md = "---\nname: t\ndescription: \"d\"\nteam_strategy: swarm\nteam_manager: m\nteam_workers: [\"w\"]\n---\nbody";
-        let err = parse_worker_md(md, None).unwrap_err();
-        assert!(err.contains("only 'manager-worker'"), "got: {err}");
+        let md = "---\nname: t\ndescription: \"d\"\nteam_strategy: swarm\nteam_manager: m\nteam_subagents: [\"w\"]\n---\nbody";
+        let err = parse_subagent_md(md, None).unwrap_err();
+        assert!(err.contains("only 'manager-subagent'"), "got: {err}");
     }
 
     #[test]
     fn parse_team_frontmatter_absent_yields_no_team() {
         // Normal subagent without team_strategy → team is None.
         let md = "---\nname: w\ndescription: \"d\"\nreadonly: true\n---\nbody";
-        let def = parse_worker_md(md, None).unwrap();
+        let def = parse_subagent_md(md, None).unwrap();
         assert!(def.team.is_none());
     }
 
     #[test]
     fn parse_can_delegate_defaults_false() {
         let md = "---\nname: w\ndescription: \"d\"\nreadonly: true\n---\nbody";
-        let def = parse_worker_md(md, None).unwrap();
+        let def = parse_subagent_md(md, None).unwrap();
         assert!(!def.can_delegate);
     }
 
     #[test]
     fn parse_can_delegate_frontmatter() {
         let md = "---\nname: manager\ndescription: \"d\"\ncan_delegate: true\n---\nbody";
-        let def = parse_worker_md(md, None).unwrap();
+        let def = parse_subagent_md(md, None).unwrap();
         assert!(def.can_delegate);
     }
 
@@ -751,18 +751,18 @@ team_workers: [\"explorer\", \"summarizer\"]\n\
     }
 
     #[test]
-    fn user_scope_adds_new_worker() {
+    fn user_scope_adds_new_subagent() {
         let home = tempdir().unwrap();
         let sub = home.path().join(".echo-agent").join("subagents");
         fs::create_dir_all(&sub).unwrap();
         fs::write(
-            sub.join("custom-worker.md"),
-            "---\nname: custom-worker\ndescription: \"extra\"\nreadonly: false\n---\nCustom body",
+            sub.join("custom-subagent.md"),
+            "---\nname: custom-subagent\ndescription: \"extra\"\nreadonly: false\n---\nCustom body",
         )
         .unwrap();
 
         let defs = discover_subagents(None, Some(home.path()));
-        let custom = defs.iter().find(|d| d.name == "custom-worker").unwrap();
+        let custom = defs.iter().find(|d| d.name == "custom-subagent").unwrap();
         assert_eq!(custom.system_prompt, "Custom body");
         assert!(!custom.readonly);
         // Builtins still there.

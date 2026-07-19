@@ -1,6 +1,6 @@
 # Agent Context Lifecycle Repair Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic subagents:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make main-agent recovery state replaceable and current at every model call, preserve clean subagent task isolation, and make GUI context/usage diagnostics accurate and inexpensive.
 
@@ -13,7 +13,7 @@
 - EKO-specific run/plan/todo concepts remain in `echo-agent-cli`; framework APIs contain no EKO types.
 - No SQLite dependency or schema.
 - All Rust string truncation remains UTF-8 safe and no new panic-prone APIs are introduced.
-- Fork workers already enter through `StreamMode::Execute`, which clears prior messages before each invocation. Add regression coverage; do not add a post-run reset that can race the next dispatch.
+- Fork subagents already enter through `StreamMode::Execute`, which clears prior messages before each invocation. Add regression coverage; do not add a post-run reset that can race the next dispatch.
 - Do not create a git commit unless the user explicitly requests one.
 
 ---

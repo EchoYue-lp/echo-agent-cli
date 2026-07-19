@@ -1,6 +1,6 @@
 # EKO Master Plan
 
-Last updated: 2026-07-18
+Last updated: 2026-07-19
 
 This file is the cross-session source of truth for the coding, data analysis,
 academic research, and medical research expansion. Detailed design rationale
@@ -46,6 +46,12 @@ evidence, and the next bounded step.
 | Zotero import/export and Europe PMC enrichment | Complete | PaperPanel connector controls; PMID/PMCID citation, reference, entity, and full-text enrichment |
 | Citation audit and systematic-review report export | Complete | File-backed Markdown, JSON, CSV, BibTeX, and RIS artifacts under each review's `reports/` directory |
 | Medical PECO and applicability risks | Complete | Structured harms, contraindications, conflicts of interest, guideline conflicts, and extrapolation limits |
+| Global Subagent terminology migration | Complete | The legacy parallel-executor term is removed; team contracts use `ManagerSubagent`, `TeamRole::Subagent`, and `TeamSpec.subagents` |
+| Team Subagent usage aggregation | Complete | Generic Agent usage snapshots aggregate member token/cache/call totals into `SubagentResult` |
+| Skill upstream check and sync | Complete | File-backed source records, local-change protection, atomic replacement, and CLI/TUI/GUI/channel parity |
+| PDF/DOCX systematic-review rendering | Complete | Pandoc/Quarto discovery with selectable PDF engine and portable-format fallback |
+| Real-provider and LSP smoke fixtures | Complete | Explicit ignored tests gated by credentials/environment variables |
+| Legacy history placeholder IPC removal | Complete | Duplicate history commands/types removed; conversation export remains canonical |
 
 ## Current Decisions
 
@@ -89,9 +95,36 @@ project; explicit global and project `.lsp.yaml` files override discovery. The
 repo map uses Tree-sitter for supported languages and a UTF-8-safe text fallback
 for unsupported files or parser failure.
 
+### Skills And Report Rendering
+
+Skill updates follow Claude Code's explicit marketplace refresh model: users
+initiate the network operation, existing Git credentials are reused, and the
+last good local copy remains available when an update fails. EKO adds a
+file-backed source record and refuses to overwrite local edits unless the user
+passes `--force`. Reference: <https://code.claude.com/docs/en/plugin-marketplaces>.
+
+Systematic-review PDF/DOCX output delegates conversion to Pandoc (or Quarto,
+which bundles the same document pipeline) instead of implementing layout in the
+Agent framework. Reference: <https://pandoc.org/MANUAL.html>.
+
+### 2026-07-19 Real-Environment Verification
+
+- OpenAlex, Crossref, and Europe PMC live search passed, and the application
+  persisted their results through the file-backed source library.
+- An installed LSP server was discovered, initialized against a real
+  multi-language project fixture, and shut down cleanly. Broken executable
+  proxies are rejected by a bounded version probe.
+- Pandoc 3.9.0.2 plus Typst 0.14.2 produced real systematic-review DOCX and PDF
+  artifacts through the application export path.
+- Zotero credential smoke tests are implemented and ignored by default. They
+  were not executed because `ZOTERO_API_KEY` and `ZOTERO_LIBRARY_ID` were not
+  present in the environment; no credentials are stored by EKO.
+
 ## Next Step
 
-The requested coding, analysis, academic research, and medical research scope is
-closed. Future work should start as a new milestone; likely candidates are
-real-provider integration smoke fixtures (using opt-in credentials), PDF/DOCX
-rendering of the exported Markdown report, and real-project LSP smoke fixtures.
+The requested coding, analysis, academic research, medical research, Subagent
+terminology, Skill sync, document rendering, and smoke-fixture implementation
+scope is closed. The only environment-dependent check left is running the
+Zotero smoke test with user-supplied credentials.
+Future work should start as a new milestone backed by a concrete user workflow
+or measured reliability gap rather than another parallel runtime abstraction.

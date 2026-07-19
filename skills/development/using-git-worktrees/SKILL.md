@@ -29,7 +29,7 @@ Use git worktrees when isolated writes materially protect the current workspace 
 
 1. Inspect status, branches, existing worktrees, ignore rules, and the repository's required worktree location.
 2. Create a clearly named branch/worktree without overwriting an existing path. Record any temporary dependency-path changes.
-3. Work and verify inside the worktree. Do not modify the main checkout or another worker's worktree.
+3. Work and verify inside the worktree. Do not modify the main checkout or another subagent's worktree.
 4. Before integration, merge/reconcile the current main branch as required and restore portable relative dependency paths.
 5. Verify the integrated result, then remove/prune the worktree and delete the branch only after confirming no unique work remains.
 

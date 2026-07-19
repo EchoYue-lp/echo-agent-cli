@@ -3,15 +3,15 @@
  * (spec: docs/subagent-unification-plan.md §6).
  *
  * Consumes the unified `execution://event` channel (kind="subagent"). The
- * legacy `worker://trace` / `subagent://event` channels and their stores
- * (`workerTraceStore`, `subagentStore`) were deleted in Phase 4c; this is now
+ * legacy `subagent://trace` / `subagent://event` channels and their stores
+ * (`subagentTraceStore`, `subagentStore`) were deleted in Phase 4c; this is now
  * the single source of truth for subagent execution-flow events.
  *
  * Aggregation key is `subagent_run_id`. Both bridges emit the **bare task_id**
  * (NOT "{task_id}:{attempt}" — the attempt suffix was dropped in the P0.5
  * identity-unification fix so retry attempts fold into one card, and so the
  * framework bridge `src/tauri/mod.rs` and the TaskRuntime bridge
- * `src/tauri/commands/chat.rs::worker_trace_sink` agree on the key). "main" is
+ * `src/tauri/commands/chat.rs::subagent_trace_sink` agree on the key). "main" is
  * used only for run-level events with no owning task. The todo join
  * (`traceRunForTodo`) matches on `run.taskId === todo.task_id`, which comes from
  * the `task_id` field — independent of `subagent_run_id`.

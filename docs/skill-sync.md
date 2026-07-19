@@ -10,7 +10,7 @@ EKO SkillsHub 支持从 git remote 安装和更新技能。内置技能随产品
 | 类型 | 位置 | 更新方式 |
 |---|---|---|
 | **内置技能** | `<echo-agent-cli>/skills/<category>/` | 随产品版本升级 |
-| **用户安装技能** | `~/.echo-agent/skills/` | 上游同步（git pull） |
+| **用户安装技能** | `~/.echo-agent/skills/` | 显式检查并通过 staging 原子同步 |
 
 ## enabled-skills.json
 
@@ -32,30 +32,38 @@ EKO SkillsHub 支持从 git remote 安装和更新技能。内置技能随产品
 
 ## 上游同步
 
-> **当前状态:未实现。** 下列 `check-updates` / `sync` 命令尚在规划中,
-> 当前版本的 `/skills` 子命令仅支持 `list|search|install|uninstall|info|refresh`。
-> 用户安装技能的更新暂需手动:删除后用 `install --git <url>` 重新安装。
-> 此段保留作为后续实现的设计参考。
+从 Git 安装时,EKO 在技能目录写入 `.eko-skill-source.json`,记录仓库 URL、
+子目录、revision、内容哈希和同步时间。该记录不进入 `SKILL.md`,也不影响
+技能加载。
 
-### 规划:检查更新
-
-```bash
-echo-agent skill check-updates   # 规划中,尚未实现
-```
-
-### 规划:同步
+### 检查更新
 
 ```bash
-echo-agent skill sync --source superpowers   # 规划中,尚未实现
+/skills check-updates             # 全部技能
+/skills check-updates paper-reader
 ```
 
-预期行为:git pull → 复制更新的 SKILL.md/scripts → 更新 last_synced。
+检查通过 `git ls-remote` 获取上游 HEAD。结果区分:已是最新、存在更新、检测到
+本地修改、非 Git 安装和远程错误。GUI SkillsPanel 提供同一操作。
 
-## 安全约束(install --git 已实现的部分)
+### 同步
 
-- `install --git <url>` 走 SSRF 校验:只允许 HTTPS URL,拒绝 SSH/git file:///私网 IP
-- 安装操作需用户确认
-- 不自动后台拉取
+```bash
+/skills sync paper-reader
+/skills sync all
+/skills sync paper-reader --force
+```
+
+同步会先克隆到同文件系统的 staging 目录,验证 `SKILL.md`,计算内容哈希,再原子
+替换当前技能。检测到本地修改时默认不覆盖;只有显式 `--force` 才会替换。同步
+完成后 CLI、TUI、GUI 和 channel 都会刷新当前 Agent 的技能目录。
+
+## 本地应用约束
+
+- Git 地址只接受 HTTPS,拒绝明文 HTTP、SSH 和 `file://` 等明显错误输入。
+- EKO 是用户自己的本地助理,允许用户配置可信的内网 Git 服务。
+- 更新和同步均为显式命令,不自动后台拉取。
+- Git 操作使用用户现有凭据并设置 120 秒超时。
 
 ## 编写带依赖的技能
 

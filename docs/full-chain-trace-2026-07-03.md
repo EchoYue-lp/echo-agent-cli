@@ -43,7 +43,7 @@
   │   │       └─ run_dag()                            [executor.rs:559]
   │   │           ├─ 构建 DAG (depends_on)
   │   │           ├─ Wave 调度器
-  │   │           ├─ 并行派发只读任务 → worker agents
+  │   │           ├─ 并行派发只读任务 → subagent instances
   │   │           ├─ 串行执行变更任务 → primary agent
   │   │           └─ 返回 RunOutcome
   │   │
@@ -211,13 +211,13 @@ DAG 调度核心循环：
 5. 计算 frontier（依赖全部满足 + 未完成 + 不在 in_flight）
 6. 若 frontier 空 + in_flight 非空 → sleep 250ms 重试
 7. 若 frontier 空 + 无 in_flight + 未全部完成 → DAG stall → Failed
-8. 派发 wave：每个就绪任务 spawn 到 worker
+8. 派发 wave：每个就绪任务 spawn 到 subagent
 9. 等待 wave 完成（支持中途中止）
 10. 处理结果 → review gate → Completed/Failed/Paused
 ```
 
 **并发控制（4 个信号量）**：
-- `worker_sem`: 最大并发只读 worker（默认 4）
+- `subagent_sem`: 最大并发只读 subagent（默认 4）
 - `write_sem`: 最大并发写操作（默认 4）
 - `shell_sem`: 最大并发 shell（默认 1）
 - `llm_sem`: 最大并行 LLM 调用（默认 4）
@@ -236,11 +236,11 @@ DAG 调度核心循环：
 
 ---
 
-## 五、阶段 4：任务执行（Worker Agent）
+## 五、阶段 4：任务执行（Subagent Agent）
 
-### 5.1 Worker 派发
+### 5.1 Subagent 派发
 
-**`RealTaskWorker::dispatch()`** (`executor.rs:504-553`)：
+**`RealTaskSubagent::dispatch()`** (`executor.rs:504-553`)：
 ```
 dispatch(task)
   → with_run_context { execute_task() }
@@ -248,14 +248,14 @@ dispatch(task)
     → 子 cancel token (child_token)
     → TokenGuard RAII (自动注销)
     → 标记 Running + emit started
-    → 获取并发许可 (worker_sem / write_sem / shell_sem)
+    → 获取并发许可 (subagent_sem / write_sem / shell_sem)
     → 文件级写锁 (按文件名排序防死锁)
     → LLM 速率限制
     → Hitrisk 安全检查
     → 构建 prompt (workspace + task_context + 依赖摘要)
     → 按 kind 派发:
-        ├─ ReadOnly → run_readonly_worker() → agent.delegate_to_agent_with_parent_and_cancel()
-        ├─ Implementation/Debugging → run_writer_worker() → 同上
+        ├─ ReadOnly → run_readonly_subagent() → agent.delegate_to_agent_with_parent_and_cancel()
+        ├─ Implementation/Debugging → run_writer_subagent() → 同上
         └─ Verification → run_main_agent_task() → agent.execute_stream_with_cancel()
     → 持久化 TaskExecutionSummary
     → emit completed/failed 事件
@@ -271,7 +271,7 @@ dispatch(task)
 |------|----------|----------|------|
 | 对话 Agent | `"conv-{id}"` | 长生命周期，30min 空闲超时淘汰 | 用户交互 |
 | 后台 Agent | `"__background__"` | 永不淘汰 | 后台任务 |
-| Worker Agent | `"__task__:{key}"` | 短生命周期，任务完成即释放 | 任务执行 |
+| Subagent Agent | `"__task__:{key}"` | 短生命周期，任务完成即释放 | 任务执行 |
 
 **`acquire()` 流程** (`agent_pool.rs:264-334`)：
 1. 获取 `agents.write()` 锁（**持有整个操作，包括 async create_agent**）
@@ -279,7 +279,7 @@ dispatch(task)
 3. 池满 → 淘汰最老的非执行中 agent
 4. 创建新 agent → 注入共享资源 → 注册工具
 
-**Worker Agent 关键设计**：**不注册 `ExecutePlanTool`**（`agent_pool.rs:740-742`）——防止 worker 递归派生子任务导致死锁（§10.2）。
+**Subagent Agent 关键设计**：**不注册 `ExecutePlanTool`**（`agent_pool.rs:740-742`）——防止 subagent 递归派生子任务导致死锁（§10.2）。
 
 **清理**：每 300s 扫描一次，淘汰空闲 >30min 的非执行中 agent。
 
@@ -317,7 +317,7 @@ emit_exec(trace_sink, ev)
 | # | 严重度 | 位置 | 问题 |
 |---|--------|------|------|
 | F4-1 | 🟡 | `agent_pool.rs:265` | `acquire()` 持有 `agents.write()` 跨 async `create_agent()`——高负载下可能造成显著锁竞争 |
-| F4-2 | 🟡 | `executor.rs:811-816` | Worker panic 后 task 状态停留 `Running`——`JoinError` 被捕获但 task 不自动失败，阻塞 DAG |
+| F4-2 | 🟡 | `executor.rs:811-816` | Subagent panic 后 task 状态停留 `Running`——`JoinError` 被捕获但 task 不自动失败，阻塞 DAG |
 | F4-3 | 🟡 | `agent_pool.rs:528-533` | 前台预留仅 1 slot（`max_agents - 1`）。多个 GUI 会话时后台任务可能饿死 |
 | F4-4 | 🟢 | `executor.rs:673-713` | 兄弟 `run_dag` 通过 store 协调——依赖存储层的事务隔离性保证正确性 |
 | F4-5 | 🟢 | `executor.rs:1240-1241` | 文件锁排序防死锁——正确实现 ✅ |
@@ -425,13 +425,13 @@ check_tool_approval()
 | G5 | 🟡 | 4 | `file_write_locks` 永不清理（之前报告 P1-2） |
 | G6 | 🟡 | 5 | `APPROVAL_NOTIFIES` 未消费时泄漏（之前报告 P1-3） |
 
-### 7.3 Worker 生命周期完整性
+### 7.3 Subagent 生命周期完整性
 
 | # | 严重度 | 涉及阶段 | 问题 |
 |---|--------|----------|------|
-| G7 | 🟡 | 4 | Worker panic 后 task 状态不自动失败——`JoinError` 捕获但未触发状态转换 |
+| G7 | 🟡 | 4 | Subagent panic 后 task 状态不自动失败——`JoinError` 捕获但未触发状态转换 |
 | G8 | 🟢 | 4 | `TaskAgentLease::Drop` 安全网在 runtime shutdown 时可能不执行——进程退出则可接受 |
-| G9 | 🟢 | 4 | Worker 不注册 `ExecutePlanTool`（防死锁设计 ✅）——但依赖隐式契约，未来维护者可能误加 |
+| G9 | 🟢 | 4 | Subagent 不注册 `ExecutePlanTool`（防死锁设计 ✅）——但依赖隐式契约，未来维护者可能误加 |
 
 ---
 
@@ -451,7 +451,7 @@ check_tool_approval()
 |---|------|------|
 | F1-4/F1-5 | Stream 错误传播到前端 | 在 `catch` 块 emit `Error` ChatEvent |
 | F3-3/G3 | 原子状态转换 | store 层加版本号或 CAS |
-| F4-2/G7 | Worker panic → task 自动失败 | `JoinError` 处理中调用 `mark_task_failed` |
+| F4-2/G7 | Subagent panic → task 自动失败 | `JoinError` 处理中调用 `mark_task_failed` |
 | F5-2 | 多 provider 超时并行化 | 改为 `select!` 而非串行迭代 |
 | G4-6 | 内存泄漏清理 | 各静态 map 加 TTL 或完成时清理 |
 
@@ -459,9 +459,9 @@ check_tool_approval()
 
 ## 九、值得肯定的设计
 
-1. **Agent Pool 设计**：Worker agent 和对话 agent 共用池但生命周期独立，`TaskAgentLease` 的 `Drop` 安全网防止泄漏
+1. **Agent Pool 设计**：Subagent agent 和对话 agent 共用池但生命周期独立，`TaskAgentLease` 的 `Drop` 安全网防止泄漏
 2. **DAG 调度器**：4 信号量并发控制 + 文件锁排序防死锁 + 兄弟 `run_dag` 协调——成熟的并行调度
-3. **Worker 递归防护**：`ExecutePlanTool` 不注册到 worker agent（§10.2）——显式防死锁设计
+3. **Subagent 递归防护**：`ExecutePlanTool` 不注册到 subagent（§10.2）——显式防死锁设计
 4. **HITL 多层防护**：Hook → PermissionService → HitlDispatcher → Provider → 前端 ApprovalCard，每层都有 fallback
 5. **事件流完整性**：`AgentEvent` → `ChatEvent` → Tauri event → 前端 store，类型转换链完整
 6. **审批回退安全**：全部 provider 超时/失败 → 自动拒绝（非自动通过）——fail-closed 安全策略

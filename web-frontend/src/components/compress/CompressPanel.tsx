@@ -108,7 +108,7 @@ export function CompressPanel() {
                 上下文运行态
               </span>
               <span className="text-[10px]" style={{ color: 'var(--text-tertiary)' }}>
-                main / worker
+                main / subagent
               </span>
             </div>
           </div>

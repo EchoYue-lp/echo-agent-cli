@@ -61,7 +61,7 @@ Interactive terminal and shell UI actions are outside this table because they ar
 - Docker and Kubernetes timeout/cancellation paths clean up the specific container or Pod.
 - Output limiting uses a shared UTF-8-safe budget.
 - Trusted sandbox policy still honors a command-level minimum isolation requirement.
-- EKO removes `run_code` when OS sandbox probing fails and Writer workers inherit the configured manager.
+- EKO removes `run_code` when OS sandbox probing fails and Writer subagents inherit the configured manager.
 
 ## Deferred Work
 

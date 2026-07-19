@@ -55,7 +55,7 @@ impl Tool for ResearchLibraryTool {
                 "review": { "type": "object" },
                 "search_request": { "type": "object" },
                 "zotero_request": { "type": "object" },
-                "format": { "type": "string", "enum": ["markdown", "json", "csv", "bibtex", "ris", "all"] },
+                "format": { "type": "string", "enum": ["markdown", "pdf", "docx", "json", "csv", "bibtex", "ris", "all"] },
                 "expected_revision": { "type": "string" }
             },
             "required": ["action"]
@@ -220,6 +220,8 @@ impl ZoteroToolRequest {
 fn parse_export_format(value: &str) -> crate::research::ResearchResult<ReviewExportFormat> {
     match value {
         "markdown" => Ok(ReviewExportFormat::Markdown),
+        "pdf" => Ok(ReviewExportFormat::Pdf),
+        "docx" => Ok(ReviewExportFormat::Docx),
         "json" => Ok(ReviewExportFormat::Json),
         "csv" => Ok(ReviewExportFormat::Csv),
         "bibtex" => Ok(ReviewExportFormat::Bibtex),

@@ -2,7 +2,7 @@
 
 /**
  * Durable recovery barrier for a task whose mutating side effect may have
- * happened even though no terminal worker/tool event was persisted.
+ * happened even though no terminal subagent/tool event was persisted.
  */
 export type RecoveryBlocker = {
   run_id: string;

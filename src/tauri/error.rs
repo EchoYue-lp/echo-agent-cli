@@ -74,7 +74,6 @@ pub enum IpcError {
     NotFound(String),
     Validation(String),
     Internal(String),
-    NotImplemented(String),
 }
 
 impl IpcError {
@@ -84,7 +83,6 @@ impl IpcError {
             IpcError::NotFound(_) => "not_found",
             IpcError::Validation(_) => "validation",
             IpcError::Internal(_) => "internal",
-            IpcError::NotImplemented(_) => "not_implemented",
         }
     }
 }
@@ -95,7 +93,6 @@ impl fmt::Display for IpcError {
             IpcError::NotFound(msg) => write!(f, "{}", msg),
             IpcError::Validation(msg) => write!(f, "{}", msg),
             IpcError::Internal(msg) => write!(f, "{}", msg),
-            IpcError::NotImplemented(msg) => write!(f, "Not implemented: {}", msg),
         }
     }
 }

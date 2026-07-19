@@ -463,7 +463,7 @@ impl RunWorktree {
         self
     }
 
-    /// Release the lifecycle lock after the worker has stopped.
+    /// Release the lifecycle lock after the subagent has stopped.
     pub fn unlock(&self) -> Result<(), WorktreeError> {
         let wt_path = self
             .path
@@ -1091,7 +1091,7 @@ impl echo_agent::agent::subagent::worktree::WorktreeFactory for EkoWorktreeFacto
             .map_err(|e| echo_agent::agent::subagent::worktree::WorktreeError::new(e.message))?;
         let path = wt.path.clone();
         tracing::info!(
-            worker_label = label,
+            subagent_label = label,
             worktree = %path.display(),
             branch = %wt.branch,
             "Created Fork-subagent worktree"
@@ -1190,7 +1190,7 @@ impl echo_agent::agent::subagent::workspace::DataWorkspaceFactory for EkoDataWor
         let final_path = dir.keep();
 
         tracing::info!(
-            worker_label = label,
+            subagent_label = label,
             workspace = %final_path.display(),
             "Created Fork-data-subagent workspace (tmpdir, kept for collect)"
         );
@@ -1200,9 +1200,9 @@ impl echo_agent::agent::subagent::workspace::DataWorkspaceFactory for EkoDataWor
             echo_agent::agent::subagent::workspace::DataWorkspaceHandle {
                 path: final_path,
                 finalize: Box::new(move || {
-                    // List the files the worker generated (non-recursive top-level
+                    // List the files the subagent generated (non-recursive top-level
                     // entries; data tools typically write flat outputs). The
-                    // orchestrator/analyst reads this to find each worker's shards
+                    // orchestrator/analyst reads this to find each subagent's shards
                     // for concat+synthesize.
                     let mut entries: Vec<String> = std::fs::read_dir(&path_for_finalize)
                         .map_err(|e| {
@@ -1229,12 +1229,12 @@ impl echo_agent::agent::subagent::workspace::DataWorkspaceFactory for EkoDataWor
 }
 
 impl EkoDataWorkspaceFactory {
-    /// Construct a factory that creates worker tmpdirs under the OS temp dir.
+    /// Construct a factory that creates subagent tmpdirs under the OS temp dir.
     pub fn new() -> Self {
         Self { base_dir: None }
     }
 
-    /// Create worker tmpdirs under the given base directory (for debuggable
+    /// Create subagent tmpdirs under the given base directory (for debuggable
     /// placement / consolidated cleanup).
     pub fn with_base_dir(base_dir: PathBuf) -> Self {
         Self {
@@ -1414,7 +1414,7 @@ mod tests {
         let (_temp, repo) = init_repo()?;
         let label = "implementer-local-dirty:1";
         let wt = RunWorktree::create_fork(label, &repo).map_err(|error| error.to_string())?;
-        std::fs::write(wt.path.join("shared.txt"), "worker\n")
+        std::fs::write(wt.path.join("shared.txt"), "subagent\n")
             .map_err(|error| error.to_string())?;
         std::fs::write(repo.join("shared.txt"), "local\n").map_err(|error| error.to_string())?;
 
@@ -1443,7 +1443,7 @@ mod tests {
         let (_temp, repo) = init_repo()?;
         let label = "implementer-staged-user-change:1";
         let wt = RunWorktree::create_fork(label, &repo).map_err(|error| error.to_string())?;
-        std::fs::write(wt.path.join("worker.txt"), "worker\n")
+        std::fs::write(wt.path.join("subagent.txt"), "subagent\n")
             .map_err(|error| error.to_string())?;
         std::fs::write(repo.join("user.txt"), "user\n").map_err(|error| error.to_string())?;
         run_git(&repo, &["add", "user.txt"]).map_err(|error| error.to_string())?;
@@ -1453,7 +1453,7 @@ mod tests {
             label,
             "staged-user-change",
             "staged-user-change:1",
-            &known_ownership(&["worker.txt"]),
+            &known_ownership(&["subagent.txt"]),
         )
         .err()
         .ok_or_else(|| "staged user change should block integration".to_string())?;
@@ -1463,14 +1463,14 @@ mod tests {
         let staged = run_git(&repo, &["diff", "--cached", "--name-only"])
             .map_err(|status_error| status_error.to_string())?;
         assert_eq!(staged, "user.txt");
-        if repo.join("worker.txt").exists() {
-            return Err("blocked integration leaked worker file into main".to_string());
+        if repo.join("subagent.txt").exists() {
+            return Err("blocked integration leaked subagent file into main".to_string());
         }
         Ok(())
     }
 
     #[test]
-    fn committed_worker_diff_uses_fixed_creation_base() -> Result<(), String> {
+    fn committed_subagent_diff_uses_fixed_creation_base() -> Result<(), String> {
         let (_temp, repo) = init_repo()?;
         let label = "implementer-committed:1";
         let wt = RunWorktree::create_fork(label, &repo).map_err(|error| error.to_string())?;
@@ -1484,7 +1484,7 @@ mod tests {
                 "commit.gpgsign=false",
                 "commit",
                 "-m",
-                "worker commit",
+                "subagent commit",
             ],
         )
         .map_err(|error| error.to_string())?;
@@ -1545,7 +1545,7 @@ mod tests {
 
     #[test]
     fn eko_data_workspace_factory_create_and_finalize() {
-        // Sprint 10: EkoDataWorkspaceFactory creates a real tmpdir, the worker
+        // Sprint 10: EkoDataWorkspaceFactory creates a real tmpdir, the subagent
         // writes a file into it, and finalize lists the generated files.
         use std::io::Write;
         let factory = EkoDataWorkspaceFactory::new();
@@ -1563,7 +1563,7 @@ mod tests {
                 .unwrap_or(false),
             "workspace dir should carry the label-derived prefix"
         );
-        // Simulate the worker writing a disjoint output file.
+        // Simulate the subagent writing a disjoint output file.
         let out = handle.path.join("run_001_clean.parquet");
         std::fs::File::create(&out)
             .unwrap()

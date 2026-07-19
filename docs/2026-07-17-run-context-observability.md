@@ -13,16 +13,16 @@ M9 将 provider usage、prompt cache、上下文预算、protected context 和 c
 - [Claude Code status line](https://code.claude.com/docs/en/statusline)：`context_window.total_input_tokens/total_output_tokens` 来自最近一次 API 响应，不是会话累计值；status line 在 assistant response 和 `/compact` 后刷新。客户端估算成本明确标注可能与账单不同。
 - [OpenTelemetry traces](https://opentelemetry.io/docs/concepts/signals/traces/)：一次端到端操作用 trace correlation 关联多个独立 span；每个执行单元有自己的 identity，通过 parent/link 表达层级，不能把业务 run id 与并发执行 span id 混成同一个可写记录。
 
-跨系统共性：provider response 是准确 usage 的来源；当前上下文快照、会话累计成本和本地估算必须分开展示；压缩是有时间意义的事件；并行 worker 使用独立 trace identity，再按业务 run 关联聚合。
+跨系统共性：provider response 是准确 usage 的来源；当前上下文快照、会话累计成本和本地估算必须分开展示；压缩是有时间意义的事件；并行 subagent 使用独立 trace identity，再按业务 run 关联聚合。
 
 ## 现状审计
 
 - `echo-core::llm::Usage` 已归一 OpenAI-compatible、Anthropic 和 DeepSeek 的 prompt/cache 语义，并有 provider fixture；缺口是 OpenAI token details 的 `cache_write_tokens` 尚未读取。
 - framework `RunEvent::LlmCall` 已持久化 provider token、estimated context、protected token/message 数，`JsonlRunStore` 可跨重启；但没有 model/provider、cache fingerprint、角色 token breakdown、context limit 和 compression event。
 - framework 已有 `PromptCacheLayout`、SHA-256 `stable_prefix_hash` 和 `PromptCacheShape` 日志。后者又使用一套 FNV hash，形成重复指纹实现；实际指纹没有进入 durable trace。
-- external TaskRuntime run id 当前被复用为 trace run id。并行 worker 因而可能写同一个 read-modify-write `Run`，而且 external run 已存在时 `start_trace_run` 不创建 framework trace，正式 TaskRuntime run 的 durable trace 可能为空。
+- external TaskRuntime run id 当前被复用为 trace run id。并行 subagent 因而可能写同一个 read-modify-write `Run`，而且 external run 已存在时 `start_trace_run` 不创建 framework trace，正式 TaskRuntime run 的 durable trace 可能为空。
 - EKO GUI 另有内存 `TraceCollector`，只记录部分 main-agent 事件；重启即丢失，tool/agent/compression 统计大多不可达。CLI `/trace` 读取 framework run store，GUI 与 CLI 不是同一事实。
-- TaskRuntime 又维护内存 `UsageRecord`、`query_usage_records`、`RunUsageSummary` 和 `WorkerLlmUsage` 事件。注释一处称“持久化”，另一处明确“重启丢失”；main usage 不写 runtime events，worker usage重复写两套。
+- TaskRuntime 又维护内存 `UsageRecord`、`query_usage_records`、`RunUsageSummary` 和 `SubagentLlmUsage` 事件。注释一处称“持久化”，另一处明确“重启丢失”；main usage 不写 runtime events，subagent usage重复写两套。
 - GUI `UsageTrendsPanel` 是跨时间窗口指标面板，与总纲“只做单 run 诊断、不建设指标平台”冲突。
 - `PromptAssembly` 已报告模块估算与截断，ContextManager 已有 latest-wins projection、role breakdown、protected count/tokens 和 compression metrics；这些能力尚未与 run trace 串联。
 
@@ -54,7 +54,7 @@ M9 将 provider usage、prompt cache、上下文预算、protected context 和 c
 
 1. 每次具体 Agent invocation 创建唯一 `trace_run_id`，无论是否带 external runtime context。
 2. TaskRuntime `run_id`、turn id、execution id 作为 correlation metadata 写入 trace run；工具仍使用 external runtime run id，不受 trace identity 影响。
-3. 一个 TaskRuntime run 可关联多个 main/worker trace；每个 trace 文件只有一个执行者，避免并行 read-modify-write 丢事件。
+3. 一个 TaskRuntime run 可关联多个 main/subagent trace；每个 trace 文件只有一个执行者，避免并行 read-modify-write 丢事件。
 4. GUI 按 parent run 聚合；普通 chat 没有 parent run 时按 trace run 展示。
 5. provider usage、LLM call context 和 compression 全部写入 framework JSONL，重启后可重建；实时 UI 事件只负责增量渲染，不成为权威。
 
@@ -81,7 +81,7 @@ M9 将 provider usage、prompt cache、上下文预算、protected context 和 c
 ## 删除与归一
 
 - 删除 app `TraceCollector` 及其 in-memory session API。
-- 删除 TaskRuntime `UsageRecord`、aggregation/query/summary、`WorkerLlmUsage` 和对应 Tauri/TS 绑定。
+- 删除 TaskRuntime `UsageRecord`、aggregation/query/summary、`SubagentLlmUsage` 和对应 Tauri/TS 绑定。
 - 删除 GUI `UsageTrendsPanel`，Observability 改为 durable single-run inspector。
 - 删除 Tauri main-agent 自算 system/tools/cwd hash 和 usage 双写；fingerprint 在真实 LLM request 边界统一计算。
 - 删除 framework `PromptCacheShape` 的 FNV hash，复用 `echo-core::llm::cache` 的 canonical SHA-256 实现。
@@ -96,7 +96,7 @@ M9 将 provider usage、prompt cache、上下文预算、protected context 和 c
 ## 验收
 
 - OpenAI cached/cache-write、Anthropic cache read/write、DeepSeek hit/miss fixture 全绿；provider totals 与 estimate 分离。
-- 带 external TaskRuntime run id 的 main/worker 各自生成唯一 trace，parent correlation 一致，并行事件不丢失。
+- 带 external TaskRuntime run id 的 main/subagent 各自生成唯一 trace，parent correlation 一致，并行事件不丢失。
 - 相同 system/tools 的连续 call 保持 component hash；改变 tool schema 或 system/canonical prefix 能定位到具体维度。
 - auto/manual compression 都进入 durable timeline；重启后仍可查询。
 - protected context 超阈值给出明确 warning，未超阈值不误报。

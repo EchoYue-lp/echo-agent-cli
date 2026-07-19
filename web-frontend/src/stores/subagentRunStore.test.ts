@@ -16,7 +16,7 @@ describe('subagentRunStore terminal result', () => {
       event: 'timed_out',
       terminal_status: 'timed_out',
       contract_version: 1,
-      summary: 'worker timed out after writing a partial report',
+      summary: 'subagent timed out after writing a partial report',
       artifacts: [
         {
           path: '/tmp/report.json',

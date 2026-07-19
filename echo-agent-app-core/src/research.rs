@@ -492,6 +492,8 @@ pub struct CitationAuditReport {
 #[serde(rename_all = "snake_case")]
 pub enum ReviewExportFormat {
     Markdown,
+    Pdf,
+    Docx,
     Json,
     Csv,
     Bibtex,
@@ -502,6 +504,8 @@ impl ReviewExportFormat {
     fn extension(self) -> &'static str {
         match self {
             Self::Markdown => "md",
+            Self::Pdf => "pdf",
+            Self::Docx => "docx",
             Self::Json => "json",
             Self::Csv => "csv",
             Self::Bibtex => "bib",
@@ -1130,9 +1134,11 @@ pub fn export_review(
         .collect::<Vec<_>>();
     let evidence = list_evidence(workspace_root, None, Some(review_id))?;
     let audit = audit_review(workspace_root, review_id)?;
+    let markdown = render_review_markdown(&document, &sources, &evidence, &audit);
     let bytes = match format {
-        ReviewExportFormat::Markdown => {
-            render_review_markdown(&document, &sources, &evidence, &audit).into_bytes()
+        ReviewExportFormat::Markdown => markdown.into_bytes(),
+        ReviewExportFormat::Pdf | ReviewExportFormat::Docx => {
+            render_review_document(&markdown, format)?
         }
         ReviewExportFormat::Json => serde_json::to_vec_pretty(&serde_json::json!({
             "review": document,
@@ -1166,16 +1172,174 @@ pub fn export_all_review_formats(
     workspace_root: &Path,
     review_id: &str,
 ) -> ResearchResult<Vec<ReviewExportArtifact>> {
-    [
+    let mut formats = vec![
         ReviewExportFormat::Markdown,
         ReviewExportFormat::Json,
         ReviewExportFormat::Csv,
         ReviewExportFormat::Bibtex,
         ReviewExportFormat::Ris,
+    ];
+    if document_renderer_available() {
+        formats.push(ReviewExportFormat::Docx);
+        if pdf_renderer_available() {
+            formats.push(ReviewExportFormat::Pdf);
+        }
+    }
+    formats
+        .into_iter()
+        .map(|format| export_review(workspace_root, review_id, format))
+        .collect()
+}
+
+pub fn document_renderer_available() -> bool {
+    resolve_document_renderer().is_some()
+}
+
+fn pdf_renderer_available() -> bool {
+    match resolve_document_renderer() {
+        Some(DocumentRenderer::Quarto(_)) => true,
+        Some(DocumentRenderer::Pandoc { pdf_engine, .. }) => pdf_engine.is_some(),
+        None => false,
+    }
+}
+
+#[derive(Debug, Clone)]
+enum DocumentRenderer {
+    Pandoc {
+        binary: PathBuf,
+        pdf_engine: Option<String>,
+    },
+    Quarto(PathBuf),
+}
+
+fn resolve_document_renderer() -> Option<DocumentRenderer> {
+    if let Some(path) = configured_executable("EKO_PANDOC") {
+        return Some(DocumentRenderer::Pandoc {
+            binary: path,
+            pdf_engine: preferred_pdf_engine(),
+        });
+    }
+    if executable_available(Path::new("pandoc")) {
+        return Some(DocumentRenderer::Pandoc {
+            binary: PathBuf::from("pandoc"),
+            pdf_engine: preferred_pdf_engine(),
+        });
+    }
+    if let Some(path) = configured_executable("EKO_QUARTO") {
+        return Some(DocumentRenderer::Quarto(path));
+    }
+    executable_available(Path::new("quarto"))
+        .then(|| DocumentRenderer::Quarto(PathBuf::from("quarto")))
+}
+
+fn configured_executable(variable: &str) -> Option<PathBuf> {
+    std::env::var_os(variable)
+        .map(PathBuf::from)
+        .filter(|path| executable_available(path))
+}
+
+fn executable_available(path: &Path) -> bool {
+    std::process::Command::new(path)
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn render_review_document(markdown: &str, format: ReviewExportFormat) -> ResearchResult<Vec<u8>> {
+    let renderer = resolve_document_renderer().ok_or_else(|| {
+        ResearchError::External(
+            "PDF/DOCX export requires Pandoc or Quarto on PATH; EKO_PANDOC/EKO_QUARTO may point to a custom executable"
+                .to_string(),
+        )
+    })?;
+    render_review_document_with_renderer(markdown, format, renderer)
+}
+
+fn render_review_document_with_renderer(
+    markdown: &str,
+    format: ReviewExportFormat,
+    renderer: DocumentRenderer,
+) -> ResearchResult<Vec<u8>> {
+    let temp = tempfile::Builder::new()
+        .prefix("eko-systematic-review-")
+        .tempdir()
+        .map_err(ResearchError::Io)?;
+    let input = temp.path().join("systematic-review.md");
+    let output = temp
+        .path()
+        .join(format!("systematic-review.{}", format.extension()));
+    fs::write(&input, markdown)?;
+
+    let command_output = match renderer {
+        DocumentRenderer::Pandoc { binary, pdf_engine } => {
+            let mut command = std::process::Command::new(binary);
+            command.arg(&input).arg("--from=gfm").arg("--standalone");
+            if format == ReviewExportFormat::Docx {
+                command.arg("--to=docx");
+            }
+            command.arg("--output").arg(&output);
+            if format == ReviewExportFormat::Pdf {
+                let engine = pdf_engine.ok_or_else(|| {
+                    ResearchError::External(
+                        "Pandoc PDF export requires typst, weasyprint, wkhtmltopdf, xelatex, lualatex, or pdflatex; EKO_PDF_ENGINE may select another supported engine"
+                            .to_string(),
+                    )
+                })?;
+                command.arg(format!("--pdf-engine={engine}"));
+            }
+            command.output()
+        }
+        DocumentRenderer::Quarto(binary) => {
+            let mut command = std::process::Command::new(binary);
+            command
+                .arg("render")
+                .arg(&input)
+                .arg("--to")
+                .arg(format.extension())
+                .arg("--output")
+                .arg(output.file_name().ok_or_else(|| {
+                    ResearchError::Invalid("document output filename is unavailable".to_string())
+                })?)
+                .current_dir(temp.path());
+            command.output()
+        }
+    }
+    .map_err(|error| ResearchError::External(format!("document renderer failed: {error}")))?;
+
+    if !command_output.status.success() {
+        let stderr = String::from_utf8_lossy(&command_output.stderr)
+            .chars()
+            .take(2_000)
+            .collect::<String>();
+        return Err(ResearchError::External(format!(
+            "document renderer exited with {}: {}",
+            command_output.status,
+            stderr.trim()
+        )));
+    }
+    fs::read(&output).map_err(ResearchError::Io)
+}
+
+fn preferred_pdf_engine() -> Option<String> {
+    if let Ok(engine) = std::env::var("EKO_PDF_ENGINE")
+        && !engine.trim().is_empty()
+    {
+        return Some(engine);
+    }
+    [
+        "typst",
+        "weasyprint",
+        "wkhtmltopdf",
+        "xelatex",
+        "lualatex",
+        "pdflatex",
     ]
     .into_iter()
-    .map(|format| export_review(workspace_root, review_id, format))
-    .collect()
+    .find(|engine| executable_available(Path::new(engine)))
+    .map(str::to_string)
 }
 
 fn audit_issue(
@@ -1994,12 +2158,50 @@ mod tests {
         let audit = audit_review(workspace.path(), &saved.record.id)?;
         assert_eq!(audit.error_count, 0);
         let artifacts = export_all_review_formats(workspace.path(), &saved.record.id)?;
-        assert_eq!(artifacts.len(), 5);
+        assert!(artifacts.len() >= 5);
+        for format in [
+            ReviewExportFormat::Markdown,
+            ReviewExportFormat::Json,
+            ReviewExportFormat::Csv,
+            ReviewExportFormat::Bibtex,
+            ReviewExportFormat::Ris,
+        ] {
+            assert!(artifacts.iter().any(|artifact| artifact.format == format));
+        }
         assert!(
             artifacts
                 .iter()
                 .all(|artifact| workspace.path().join(&artifact.path).is_file())
         );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pandoc_renderer_produces_pdf_and_docx_bytes() -> ResearchResult<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = temp_workspace()?;
+        let binary = temp.path().join("pandoc-fixture");
+        fs::write(
+            &binary,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then exit 0; fi\nout=\"\"\nprev=\"\"\nfor arg in \"$@\"; do\n  if [ \"$prev\" = \"--output\" ]; then out=\"$arg\"; fi\n  prev=\"$arg\"\ndone\nprintf 'rendered-document' > \"$out\"\n",
+        )?;
+        let mut permissions = fs::metadata(&binary)?.permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&binary, permissions)?;
+
+        for format in [ReviewExportFormat::Pdf, ReviewExportFormat::Docx] {
+            let bytes = render_review_document_with_renderer(
+                "# Review\n",
+                format,
+                DocumentRenderer::Pandoc {
+                    binary: binary.clone(),
+                    pdf_engine: Some("fixture-engine".to_string()),
+                },
+            )?;
+            assert_eq!(bytes, b"rendered-document");
+        }
         Ok(())
     }
 }

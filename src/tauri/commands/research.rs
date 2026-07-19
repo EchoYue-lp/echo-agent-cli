@@ -257,6 +257,8 @@ pub async fn export_systematic_review(
 fn parse_export_format(value: &str) -> Result<ReviewExportFormat, IpcError> {
     match value {
         "markdown" => Ok(ReviewExportFormat::Markdown),
+        "pdf" => Ok(ReviewExportFormat::Pdf),
+        "docx" => Ok(ReviewExportFormat::Docx),
         "json" => Ok(ReviewExportFormat::Json),
         "csv" => Ok(ReviewExportFormat::Csv),
         "bibtex" => Ok(ReviewExportFormat::Bibtex),

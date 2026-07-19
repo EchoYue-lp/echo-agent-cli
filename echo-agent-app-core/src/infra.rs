@@ -69,7 +69,7 @@ Choose the lightest mechanism that still gives the user a reliable result:
 - Independent read-only tasks may run in parallel. Writer tasks must declare their intended files or artifacts so the runtime can isolate and schedule them safely.
 - Keep the plan truthful as evidence changes: use `task_update`, `task_skip`, and `task_list`. Completion is written only by the runtime after result verification.
 - `plan_execute({task})` is only for inline single-subagent dispatch when that field exists in the active tool schema. Never use it as a substitute for the formal DAG in Task mode.
-- After execution, synthesize the worker evidence, resolve conflicts, and answer the user's original goal. Do not merely repeat worker summaries.
+- After execution, synthesize the subagent evidence, resolve conflicts, and answer the user's original goal. Do not merely repeat subagent summaries.
 
 ### Complex Run Contract
 Use `create_complex_task` only when at least one material complexity signal applies: expensive multi-step work, multi-file or architectural implementation, long-lived/cross-turn state, or multi-source synthesis. Put the signals and why they matter in `reason`.
@@ -526,12 +526,12 @@ fn configure_run_code_capability(agent: &mut ReactAgent, available: bool) {
     }
 }
 
-/// Resolve a worker model frontmatter value to a concrete model id.
+/// Resolve a subagent model frontmatter value to a concrete model id.
 ///
 /// - `None` / omitted → parent model
 /// - `"fast"` → `EKO_FAST_MODEL` env if set, else parent model
 /// - any other string → used as-is
-pub fn resolve_worker_model(spec: Option<&str>, parent_model: &str) -> String {
+pub fn resolve_subagent_model(spec: Option<&str>, parent_model: &str) -> String {
     match spec {
         None => parent_model.to_string(),
         Some("fast") => std::env::var("EKO_FAST_MODEL")
@@ -573,15 +573,15 @@ async fn register_default_subagents(
     sandbox_manager: Arc<echo_agent::sandbox::SandboxManager>,
     run_code_available: bool,
 ) {
-    let workers = crate::subagent_loader::discover_subagents(project_root, user_home);
+    let subagents = crate::subagent_loader::discover_subagents(project_root, user_home);
     let tool_output_artifacts = agent.tool_output_artifacts();
     tracing::info!(
-        count = workers.len(),
-        names = ?workers.iter().map(|w| w.name.as_str()).collect::<Vec<_>>(),
+        count = subagents.len(),
+        names = ?subagents.iter().map(|w| w.name.as_str()).collect::<Vec<_>>(),
         "Loaded subagent definitions from .md (project/user/builtin)"
     );
 
-    struct BuiltWorker {
+    struct BuiltSubagent {
         definition: echo_agent::agent::subagent::SubagentDefinition,
         handle: crate::agent_handle::AgentHandle,
         readonly: bool,
@@ -591,49 +591,49 @@ async fn register_default_subagents(
         tags: Vec<String>,
     }
 
-    let mut built_workers: Vec<BuiltWorker> = Vec::with_capacity(workers.len());
-    for worker_def in &workers {
+    let mut built_subagents: Vec<BuiltSubagent> = Vec::with_capacity(subagents.len());
+    for subagent_def in &subagents {
         // Sprint 9: register BOTH readonly and writer subagents. Readonly subagents
         // get the readonly tool subset (physical no-write enforcement); writer
         // subagents get the full tool set (shell/file/git) and run inside an
         // isolated git worktree when `isolate_worktree` is set (Sprint 8 wiring).
         // TaskRuntime may run disjoint exact owners concurrently; every writer
         // still gets a separate checkout and a reviewed integration boundary.
-        let worker_model = resolve_worker_model(worker_def.model.as_deref(), model);
-        let worker_llm = llm_config.clone().map(|mut cfg| {
-            cfg.model = worker_model.clone();
+        let subagent_model = resolve_subagent_model(subagent_def.model.as_deref(), model);
+        let subagent_llm = llm_config.clone().map(|mut cfg| {
+            cfg.model = subagent_model.clone();
             cfg
         });
-        let max_iterations = worker_def.max_turns.unwrap_or(0);
-        let build_result = if worker_def.readonly {
-            build_readonly_worker_agent(
-                &worker_def.name,
-                &worker_def.system_prompt,
-                &worker_model,
-                worker_llm,
+        let max_iterations = subagent_def.max_turns.unwrap_or(0);
+        let build_result = if subagent_def.readonly {
+            build_readonly_subagent_agent(
+                &subagent_def.name,
+                &subagent_def.system_prompt,
+                &subagent_model,
+                subagent_llm,
                 temperature,
                 max_tokens,
                 token_limit,
                 tool_timeout_ms,
                 max_tool_output_tokens,
                 cache_user_id,
-                worker_def.can_delegate,
+                subagent_def.can_delegate,
                 max_iterations,
                 browser_runtime.clone(),
             )
         } else {
-            build_writer_worker_agent(
-                &worker_def.name,
-                &worker_def.system_prompt,
-                &worker_model,
-                worker_llm,
+            build_writer_subagent_agent(
+                &subagent_def.name,
+                &subagent_def.system_prompt,
+                &subagent_model,
+                subagent_llm,
                 temperature,
                 max_tokens,
                 token_limit,
                 tool_timeout_ms,
                 max_tool_output_tokens,
                 cache_user_id,
-                worker_def.can_delegate,
+                subagent_def.can_delegate,
                 max_iterations,
                 browser_runtime.clone(),
                 sandbox_manager.clone(),
@@ -641,25 +641,25 @@ async fn register_default_subagents(
             )
         };
         match build_result {
-            Ok(worker) => {
-                worker.set_tool_output_artifacts(tool_output_artifacts.clone());
+            Ok(subagent) => {
+                subagent.set_tool_output_artifacts(tool_output_artifacts.clone());
                 crate::tasks::task_runtime::compact_context::install_task_context_protection(
-                    &worker,
+                    &subagent,
                 )
                 .await;
-                let worker_handle = crate::agent_handle::AgentHandle::new(worker);
+                let subagent_handle = crate::agent_handle::AgentHandle::new(subagent);
 
-                let mut builder = SubagentBuilder::new(&worker_def.name)
-                    .description(&worker_def.description)
+                let mut builder = SubagentBuilder::new(&subagent_def.name)
+                    .description(&subagent_def.description)
                     .fork_mode();
-                if let Some(path) = worker_def
+                if let Some(path) = subagent_def
                     .source
                     .strip_prefix("project:")
-                    .or_else(|| worker_def.source.strip_prefix("user:"))
+                    .or_else(|| subagent_def.source.strip_prefix("user:"))
                 {
                     builder = builder.custom(path);
                 }
-                if worker_def.can_delegate {
+                if subagent_def.can_delegate {
                     builder = builder.can_delegate();
                 }
                 // Sprint 8/9: honor the frontmatter `worktree: true` flag (only
@@ -667,61 +667,61 @@ async fn register_default_subagents(
                 // by the loader since they don't mutate files). This makes the
                 // framework's dispatch_fork create an isolated worktree for the
                 // writer (eko-fork-<label> branch).
-                if worker_def.isolate_worktree {
+                if subagent_def.isolate_worktree {
                     builder = builder.isolate_worktree();
                 }
                 // Sprint 10: honor the frontmatter `workspace: true` flag for
                 // data/research subagents (per-subagent tmpdir, disjoint outputs).
                 // Loader clears it when worktree is active (mutually exclusive).
-                if worker_def.isolate_workspace {
+                if subagent_def.isolate_workspace {
                     builder = builder.isolate_workspace();
                 }
                 // Sprint 11: if this .md declares a team (team_strategy +
                 // manager + subagent team members), override execution_mode to Team and
                 // attach the TeamSpec. dispatch_team resolves the named
                 // manager/subagents from the registry at dispatch time.
-                if let Some(spec) = worker_def.team.clone() {
+                if let Some(spec) = subagent_def.team.clone() {
                     builder = builder.team(spec);
                 }
-                if let Some(ref m) = worker_def.model {
+                if let Some(ref m) = subagent_def.model {
                     builder = builder.model(m);
                 }
-                if let Some(max_turns) = worker_def.max_turns {
+                if let Some(max_turns) = subagent_def.max_turns {
                     builder = builder.max_iterations(max_turns);
                 }
-                if worker_def.is_background {
+                if subagent_def.is_background {
                     builder = builder.background().tag("background");
                 }
-                builder = builder.tag(format!("prompt_source:{}", worker_def.source));
-                builder = builder.tag(if worker_def.readonly {
+                builder = builder.tag(format!("prompt_source:{}", subagent_def.source));
+                builder = builder.tag(if subagent_def.readonly {
                     "capability:readonly"
                 } else {
                     "capability:writer"
                 });
-                builder = builder.tag(if worker_def.isolate_worktree {
+                builder = builder.tag(if subagent_def.isolate_worktree {
                     "isolation:worktree"
-                } else if worker_def.isolate_workspace {
+                } else if subagent_def.isolate_workspace {
                     "isolation:workspace"
                 } else {
                     "isolation:context"
                 });
-                for tag in &worker_def.tags {
+                for tag in &subagent_def.tags {
                     builder = builder.tag(tag);
                 }
                 let def = builder.build();
-                built_workers.push(BuiltWorker {
+                built_subagents.push(BuiltSubagent {
                     definition: def,
-                    handle: worker_handle,
-                    readonly: worker_def.readonly,
-                    isolate_worktree: worker_def.isolate_worktree,
-                    isolate_workspace: worker_def.isolate_workspace,
-                    has_team: worker_def.team.is_some(),
-                    tags: worker_def.tags.clone(),
+                    handle: subagent_handle,
+                    readonly: subagent_def.readonly,
+                    isolate_worktree: subagent_def.isolate_worktree,
+                    isolate_workspace: subagent_def.isolate_workspace,
+                    has_team: subagent_def.team.is_some(),
+                    tags: subagent_def.tags.clone(),
                 });
             }
             Err(err) => tracing::warn!(
-                subagent = %worker_def.name,
-                readonly = worker_def.readonly,
+                subagent = %subagent_def.name,
+                readonly = subagent_def.readonly,
                 error = %err,
                 "Failed to build default subagent"
             ),
@@ -729,7 +729,7 @@ async fn register_default_subagents(
     }
 
     // Register every subagent on the primary agent.
-    for built in &built_workers {
+    for built in &built_subagents {
         agent.register_subagent_with_definition(
             built.definition.clone(),
             built.handle.to_boxed_agent().await,
@@ -751,25 +751,26 @@ async fn register_default_subagents(
     // ordinary subagents can complete their current task or suggest follow-ups
     // without becoming recursive planners.
     //
-    for parent in built_workers
+    for parent in built_subagents
         .iter()
-        .filter(|worker| worker.definition.can_delegate)
+        .filter(|subagent| subagent.definition.can_delegate)
     {
-        for child in built_workers
+        for child in built_subagents
             .iter()
             .filter(|child| child.definition.name != parent.definition.name)
         {
             let child_agent = child.handle.to_boxed_agent().await;
             parent
                 .handle
-                .write(|worker| {
-                    worker.register_subagent_with_definition(child.definition.clone(), child_agent);
+                .write(|subagent| {
+                    subagent
+                        .register_subagent_with_definition(child.definition.clone(), child_agent);
                 })
                 .await;
         }
         tracing::info!(
             subagent = %parent.definition.name,
-            child_count = built_workers
+            child_count = built_subagents
                 .iter()
                 .filter(|child| child.definition.name != parent.definition.name)
                 .count(),
@@ -784,7 +785,7 @@ async fn register_default_subagents(
 /// isolated git worktrees. TaskRuntime runs disjoint exact owners concurrently,
 /// while overlapping or unknown ownership is split into separate write waves.
 #[allow(clippy::too_many_arguments)]
-fn build_writer_worker_agent(
+fn build_writer_subagent_agent(
     name: &str,
     prompt: &str,
     model: &str,
@@ -801,7 +802,7 @@ fn build_writer_worker_agent(
     sandbox_manager: Arc<echo_agent::sandbox::SandboxManager>,
     run_code_available: bool,
 ) -> std::result::Result<ReactAgent, echo_agent::error::ReactError> {
-    // Mirror build_readonly_worker_agent, but OMIT `.readonly_tools()` → the
+    // Mirror build_readonly_subagent_agent, but OMIT `.readonly_tools()` → the
     // default `readonly_tools: false` triggers `register_all_tools`, giving the
     // writer shell/file/git write capability. Isolation is enforced physically
     // by the worktree (Sprint 8): the subagent's working_dir is bound to its own
@@ -833,7 +834,7 @@ fn build_writer_worker_agent(
     let has_llm_config = llm_config.is_some();
     if let Some(config) = llm_config {
         tracing::info!(
-            worker_name = name,
+            subagent_name = name,
             model = %config.model,
             has_auth = !config.api_key.is_empty(),
             "writer subagent: injecting LlmConfig"
@@ -841,31 +842,31 @@ fn build_writer_worker_agent(
         builder = builder.llm_config(config);
     } else {
         tracing::warn!(
-            worker_name = name,
+            subagent_name = name,
             "writer subagent: NO LlmConfig injected — will fall back to env vars / models.yaml"
         );
     }
 
-    let mut worker = builder.build()?;
-    configure_run_code_capability(&mut worker, run_code_available);
+    let mut subagent = builder.build()?;
+    configure_run_code_capability(&mut subagent, run_code_available);
     if let Some(browser_runtime) = browser_runtime {
-        browser_runtime.install_worker_tools(&mut worker);
+        browser_runtime.install_subagent_tools(&mut subagent);
     }
-    let has_client = worker.llm_client().is_some();
+    let has_client = subagent.llm_client().is_some();
     tracing::info!(
-        worker_name = name,
+        subagent_name = name,
         has_llm_config,
         has_llm_client = has_client,
-        model = %worker.model_name(),
+        model = %subagent.model_name(),
         "writer subagent built: LLM client status (full write tools)"
     );
-    worker.config_mut().set_cache_user_id(cache_user_id);
-    worker.set_plan_mode(true);
-    Ok(worker)
+    subagent.config_mut().set_cache_user_id(cache_user_id);
+    subagent.set_plan_mode(true);
+    Ok(subagent)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_readonly_worker_agent(
+fn build_readonly_subagent_agent(
     name: &str,
     prompt: &str,
     model: &str,
@@ -905,7 +906,7 @@ fn build_readonly_worker_agent(
     let has_llm_config = llm_config.is_some();
     if let Some(config) = llm_config {
         tracing::info!(
-            worker_name = name,
+            subagent_name = name,
             model = %config.model,
             has_auth = !config.api_key.is_empty(),
             "subagent: injecting LlmConfig"
@@ -913,26 +914,26 @@ fn build_readonly_worker_agent(
         builder = builder.llm_config(config);
     } else {
         tracing::warn!(
-            worker_name = name,
+            subagent_name = name,
             "subagent: NO LlmConfig injected — will fall back to env vars / models.yaml"
         );
     }
 
-    let mut worker = builder.build()?;
+    let mut subagent = builder.build()?;
     if let Some(browser_runtime) = browser_runtime {
-        browser_runtime.install_worker_tools(&mut worker);
+        browser_runtime.install_subagent_tools(&mut subagent);
     }
-    let has_client = worker.llm_client().is_some();
+    let has_client = subagent.llm_client().is_some();
     tracing::info!(
-        worker_name = name,
+        subagent_name = name,
         has_llm_config,
         has_llm_client = has_client,
-        model = %worker.model_name(),
+        model = %subagent.model_name(),
         "subagent built: LLM client status"
     );
-    worker.config_mut().set_cache_user_id(cache_user_id);
-    worker.set_plan_mode(true);
-    Ok(worker)
+    subagent.config_mut().set_cache_user_id(cache_user_id);
+    subagent.set_plan_mode(true);
+    Ok(subagent)
 }
 
 /// Register sensible default hooks for the CLI agent.
@@ -1351,7 +1352,7 @@ pub fn load_shell_env() {
         // SAFETY: `std::env::set_var` is not thread-safe in Rust. We use a
         // `std::sync::Once` to guarantee this block runs at most once per
         // process lifetime, and it must be called early in `main()` / app
-        // startup before any worker threads are spawned.
+        // startup before background threads are spawned.
         static SHELL_ENV_LOADED: std::sync::Once = std::sync::Once::new();
         let mut loaded = Vec::new();
         SHELL_ENV_LOADED.call_once(|| {
@@ -1873,10 +1874,10 @@ pub fn build_llm_config(
 }
 
 #[cfg(test)]
-mod resolve_worker_model_tests {
+mod resolve_subagent_model_tests {
     use super::{
-        DEFAULT_MAX_TOOL_OUTPUT_TOKENS, TASK_MANAGEMENT_GUIDE, build_writer_worker_agent,
-        configure_run_code_capability, resolve_worker_model, resolved_max_tool_output_tokens,
+        DEFAULT_MAX_TOOL_OUTPUT_TOKENS, TASK_MANAGEMENT_GUIDE, build_writer_subagent_agent,
+        configure_run_code_capability, resolve_subagent_model, resolved_max_tool_output_tokens,
     };
     use echo_agent::agent::ReactAgentBuilder;
     use echo_agent::sandbox::SandboxManager;
@@ -1898,13 +1899,13 @@ mod resolve_worker_model_tests {
 
     #[test]
     fn none_inherits_parent() {
-        assert_eq!(resolve_worker_model(None, "parent-model"), "parent-model");
+        assert_eq!(resolve_subagent_model(None, "parent-model"), "parent-model");
     }
 
     #[test]
     fn fast_falls_back_to_parent_without_env() {
         // Do not assert env-dependent path; only the no-env fallback.
-        let got = resolve_worker_model(Some("fast"), "parent-model");
+        let got = resolve_subagent_model(Some("fast"), "parent-model");
         // If EKO_FAST_MODEL is set in the environment, honor it; otherwise parent.
         if let Ok(fast) = std::env::var("EKO_FAST_MODEL") {
             let trimmed = fast.trim();
@@ -1919,7 +1920,7 @@ mod resolve_worker_model_tests {
     #[test]
     fn concrete_model_passthrough() {
         assert_eq!(
-            resolve_worker_model(Some("claude-haiku"), "parent"),
+            resolve_subagent_model(Some("claude-haiku"), "parent"),
             "claude-haiku"
         );
     }
@@ -1938,9 +1939,9 @@ mod resolve_worker_model_tests {
     }
 
     #[test]
-    fn writer_worker_inherits_sandbox_manager() -> echo_agent::error::Result<()> {
+    fn writer_subagent_inherits_sandbox_manager() -> echo_agent::error::Result<()> {
         let sandbox = Arc::new(SandboxManager::local_sandbox());
-        let worker = build_writer_worker_agent(
+        let subagent = build_writer_subagent_agent(
             "writer",
             "write files",
             "test-model",
@@ -1958,8 +1959,8 @@ mod resolve_worker_model_tests {
             true,
         )?;
 
-        assert!(worker.sandbox_manager().is_some());
-        assert!(worker.list_tools().iter().any(|name| name == "run_code"));
+        assert!(subagent.sandbox_manager().is_some());
+        assert!(subagent.list_tools().iter().any(|name| name == "run_code"));
         Ok(())
     }
 }

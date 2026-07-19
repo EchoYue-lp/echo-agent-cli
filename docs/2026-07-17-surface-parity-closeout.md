@@ -76,14 +76,14 @@ All M10 implementation belongs to `echo-agent-cli`:
 8. TUI `/cron` sends prose to the agent instead of controlling the scheduler.
 9. Cron stream setup/terminal errors can leave a run reported as completed.
 10. Channel attachments reach the main agent but are not persisted as refs for
-    TaskRuntime workers.
+    TaskRuntime subagents.
 
 ## 5. Target Contract
 
 `drive_chat` emits a single `ChatDriverEvent` enum:
 
 - `Agent(EventEnvelope)` for framework/model/tool events.
-- `Execution(ExecEvent)` for TaskRuntime and worker facts.
+- `Execution(ExecEvent)` for TaskRuntime and subagent facts.
 - `TurnStatus`, `ExecutionPath`, and `Interrupt` for product turn facts.
 
 `ChatSink` has one required exhaustive entry point. Helper sinks bridge
@@ -113,7 +113,7 @@ tests.
   use the installed layered memory manager, with the raw Store as fallback.
 - Channel turns receive the existing `ReviewIntegration` layer manager.
 - Channel attachments are staged as the same durable `AttachmentRef` used by
-  GUI/TUI so TaskRuntime workers can reconstruct the multimodal message.
+  GUI/TUI so TaskRuntime subagents can reconstruct the multimodal message.
 - TUI controls the real scheduler directly; cron failures persist a Failed run
   and return an error instead of being reported as success.
 

@@ -282,7 +282,7 @@ impl AgentPool {
     /// `last_used` timestamp). Otherwise, a new agent is created and added
     /// to the pool.
     ///
-    /// Pool 容量计数 (`max_agents`) 只计**对话 agent**, 不计 task worker
+    /// Pool 容量计数 (`max_agents`) 只计**对话 agent**, 不计 task subagent
     /// (`__task__:` 前缀) 和 `__background__` (P1-13 修复)。否则后台任务多了
     /// 会挤占用户交互 agent 的并发槽位, 导致用户发消息被拒。
     fn is_conversation_agent(key: &str) -> bool {
@@ -302,7 +302,7 @@ impl AgentPool {
         }
 
         // Enforce pool limit — evict oldest idle agent that is NOT executing
-        // P1-13: 只计对话 agent, 排除 __background__ 和 __task__ worker。
+        // P1-13: 只计对话 agent, 排除 __background__ 和 __task__ subagent。
         let active_count = agents
             .keys()
             .filter(|k| Self::is_conversation_agent(k))
@@ -732,7 +732,7 @@ impl AgentPool {
 
                 // Second pass: only evict agents that are NOT currently executing.
                 // Uses the same try_lock(execution_mutex) check as the acquire() path
-                // so long-running tasks (e.g. TaskRuntime DAG workers) aren't killed.
+                // so long-running tasks (e.g. TaskRuntime DAG subagents) aren't killed.
                 let to_remove: Vec<String> = timed_out
                     .into_iter()
                     .filter(|id| {
@@ -802,7 +802,7 @@ impl AgentPool {
             working_dir: None,
             // Thread the TaskRuntimeStore so pooled agents get task-management
             // tools registered (matches the primary agent wiring).
-            // route is intentionally None for pooled agents (workers never get
+            // route is intentionally None for pooled agents (subagents never get
             // plan_execute per §10.2).
             task_runtime_store: self.shared.task_runtime_store.clone(),
             browser_runtime: self.shared.browser_runtime.clone(),
@@ -906,7 +906,7 @@ impl AgentPool {
         let handle = AgentHandle::new(agent);
 
         // (delegate_readonly 工具已删除:单步派发内联进 plan_execute。
-        // worker 不再注册 plan_execute——§10.2 防死锁;故 worker 无派发工具,
+        // subagent 不再注册 plan_execute——§10.2 防死锁;故 subagent 无派发工具,
         // 需要子任务时自己用文件工具完成。)
 
         // 5. Configure HITL for this agent.
@@ -1268,7 +1268,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_task_workers_are_isolated_and_have_memory_runtime() {
+    async fn test_task_subagents_are_isolated_and_have_memory_runtime() {
         let pool = create_test_pool_with_review_integration().await;
 
         let task_a = pool.acquire("__task__:task-a").await.unwrap();
@@ -1276,7 +1276,7 @@ mod tests {
 
         assert!(
             !Arc::ptr_eq(task_a.inner(), task_b.inner()),
-            "parallel background tasks must use distinct subagent agents"
+            "parallel background tasks must use distinct subagent instances"
         );
 
         let task_a_has_memory = task_a.read(|agent| agent.has_memory_layer_manager()).await;
@@ -1286,7 +1286,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_released_task_worker_frees_pool_capacity() {
+    async fn test_released_task_subagent_frees_pool_capacity() {
         let pool = create_test_pool(1, false).await;
 
         let _task_a = pool.acquire("__task__:task-a").await.unwrap();
