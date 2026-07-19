@@ -141,7 +141,7 @@ impl AgentRuntime {
         // bootstrap), so BOTH entry points call `register_task_tools_on_agent`
         // (in app-core `tasks/task_runtime/register.rs`) post-hoc once the store
         // is ready. TUI/GUI functional parity (AGENTS.md).
-        // (delegate_readonly tool 已删除:单步派发能力内联进 plan_execute 的 inline task 参数。)
+        // 单个临时子任务由 agent_tool 负责;正式 DAG 由 plan_create + plan_execute 负责。
         // ── 4. HITL dispatcher ──
         let hitl_dispatcher = {
             let dispatcher = Arc::new(HitlDispatcher::new());

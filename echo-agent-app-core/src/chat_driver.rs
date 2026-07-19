@@ -305,8 +305,6 @@ fn observe_execution_path(
         "formal_plan"
     } else if matching.iter().any(|run| run.route == "agent_autonomous") {
         "detached_background"
-    } else if matching.iter().any(|run| run.route == "agent_inline_task") {
-        "inline_subagent"
     } else {
         "direct"
     };

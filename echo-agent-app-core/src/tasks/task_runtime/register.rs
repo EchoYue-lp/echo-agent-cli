@@ -79,6 +79,5 @@ pub async fn register_task_tools_on_agent(
         );
     }
 
-    // (delegate_readonly 工具已删除,其单步派发能力由 plan_execute 的 inline task
-    // 参数吸收。无需在此 re-register。)
+    // 单个临时子任务由 agent_tool 负责;plan_execute 只执行已物化的正式 DAG。
 }

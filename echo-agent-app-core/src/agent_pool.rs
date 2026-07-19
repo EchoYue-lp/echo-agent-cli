@@ -905,8 +905,8 @@ impl AgentPool {
         // 4. Wrap in AgentHandle
         let handle = AgentHandle::new(agent);
 
-        // (delegate_readonly 工具已删除:单步派发内联进 plan_execute。
-        // subagent 不再注册 plan_execute——§10.2 防死锁;故 subagent 无派发工具,
+        // subagent 不注册 agent_tool 或 plan_execute——§10.2 防止递归派发;
+        // 因此 subagent 本身没有继续派发工具,
         // 需要子任务时自己用文件工具完成。)
 
         // 5. Configure HITL for this agent.

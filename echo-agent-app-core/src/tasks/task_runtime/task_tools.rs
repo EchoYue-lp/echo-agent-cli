@@ -272,8 +272,11 @@ impl Tool for TaskCreateTool {
     }
 
     fn description(&self) -> &str {
-        "Create or append a PlanTask in the current formal plan. Use this to \
-         materialize a task plan before calling plan_execute."
+        "Create exactly one PlanTask in the current formal plan. For N intended \
+         subagent tasks, call plan_create N times and wait for every result. Then \
+         call task_list and pass its exact Tasks (N) count to plan_execute. The \
+         TaskRun already represents the user goal, so never create a wrapper or \
+         placeholder task for the overall goal."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -432,10 +435,25 @@ impl TaskCreateTool {
             ..Default::default()
         };
         match self.store.insert_task(&run_id, after_task_id, task) {
-            Ok(()) => Ok(ToolResult::success(format!(
-                "Created task '{title}' (id: {task_id}, subagent: {subagent}, domain: {})",
-                run.domain_profile.as_str()
-            ))),
+            Ok(()) => {
+                let task_count = self
+                    .store
+                    .get_plan(&run_id)
+                    .ok()
+                    .flatten()
+                    .map(|plan| plan.tasks.len());
+                let count_text = task_count.map_or_else(
+                    || {
+                        "Persisted plan count is unavailable; call task_list before execution."
+                            .to_string()
+                    },
+                    |count| format!("Persisted plan now contains {count} task(s)."),
+                );
+                Ok(ToolResult::success(format!(
+                    "Created exactly one PlanTask '{title}' (id: {task_id}, subagent: {subagent}, domain: {}). {count_text} Create one PlanTask per intended subagent, then call task_list and pass its exact Tasks (N) count to plan_execute.",
+                    run.domain_profile.as_str()
+                )))
+            }
             Err(e) => Ok(ToolResult::error(format!("Failed to create task: {e}"))),
         }
     }
@@ -530,9 +548,9 @@ fn complex_run_prompt(
 ) -> String {
     let template = ProfileTemplate::for_profile(domain);
     let plan_contract = if plan_mode == "direct_execute" {
-        "Complete the goal directly with ordinary tools when that remains the lightest reliable path. Do not create a placeholder plan merely for ceremony. If execution reveals real dependencies, parallel work, or separately verifiable outcomes, upgrade to a formal DAG with plan_create and plan_execute()."
+        "Complete the goal directly with ordinary tools when that remains the lightest reliable path. Do not create a placeholder plan merely for ceremony. If execution reveals real dependencies, parallel work, or separately verifiable outcomes, upgrade to a formal DAG with one plan_create call per node, verify the count with task_list, and call plan_execute with expected_task_count."
     } else {
-        "This run requires a formal, reviewable DAG. Materialize concrete PlanTask nodes with plan_create, assign an appropriate subagent to every delegated node, declare real dependencies, artifacts, files, and verification, then call plan_execute() without an inline task. Do not finish with a prose-only plan."
+        "This run requires a formal, reviewable DAG. The TaskRun already represents the overall goal, so do not create a wrapper, placeholder, or prose-only summary PlanTask for it. Each plan_create call materializes exactly one executable node: create one node per intended subagent and wait for every result. Assign an appropriate subagent to every node, declare real dependencies, artifacts, files, and verification, then call task_list and pass its exact Tasks (N) count as expected_task_count to plan_execute. Do not claim tasks were dispatched before plan_execute starts."
     };
     let initial = if initial_plan.is_empty() {
         "None supplied; derive the smallest complete decomposition from evidence.".to_string()
@@ -599,6 +617,15 @@ mod plan_create_tests {
             return Err(
                 "plan_create result must not embed the runtime recovery capsule".to_string(),
             );
+        }
+        if !result
+            .output
+            .contains("Persisted plan now contains 1 task(s)")
+        {
+            return Err(format!(
+                "plan_create must report the materialized task count: {}",
+                result.output
+            ));
         }
 
         let events = store.list_events(run_id, 0).map_err(|e| e.to_string())?;
@@ -692,6 +719,15 @@ mod plan_create_tests {
                 result.error
             ));
         }
+        if !result
+            .output
+            .contains("Persisted plan now contains 2 task(s)")
+        {
+            return Err(format!(
+                "second plan_create must report two materialized tasks: {}",
+                result.output
+            ));
+        }
 
         let plan = store
             .get_plan(run_id)
@@ -726,6 +762,7 @@ mod plan_create_tests {
         assert!(prompt.contains("medical_research"));
         assert!(prompt.contains("PICO"));
         assert!(prompt.contains("formal, reviewable DAG"));
+        assert!(prompt.contains("do not create a wrapper"));
         assert!(prompt.contains("Available builtin Subagents"));
         assert!(prompt.contains("检索指南: 形成证据表"));
     }

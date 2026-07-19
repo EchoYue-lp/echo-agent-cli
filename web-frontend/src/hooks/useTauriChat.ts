@@ -121,7 +121,7 @@ export function useTauriChat() {
             }
           }
         } else if (kind === 'run' && payload.event === 'run_started') {
-          // inline task / 自主 run 通过 run_started 事件激活右侧面板。
+          // 正式 plan / 自主 run 通过 run_started 事件激活右侧面板。
           const convId =
             (payload.conversation_id as string | undefined) ??
             useConversationStore.getState().activeId;

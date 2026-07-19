@@ -52,6 +52,7 @@ evidence, and the next bounded step.
 | PDF/DOCX systematic-review rendering | Complete | Pandoc/Quarto discovery with selectable PDF engine and portable-format fallback |
 | Real-provider and LSP smoke fixtures | Complete | Explicit ignored tests gated by credentials/environment variables |
 | Legacy history placeholder IPC removal | Complete | Duplicate history commands/types removed; conversation export remains canonical |
+| Formal plan materialization count contract | Complete | `docs/2026-07-19-formal-plan-materialization.md`; `plan_execute` rejects inline/empty/partial plans and executes only the persisted PlanTask DAG |
 
 ## Current Decisions
 
@@ -94,6 +95,17 @@ LSP discovery only starts installed language servers detected for the current
 project; explicit global and project `.lsp.yaml` files override discovery. The
 repo map uses Tree-sitter for supported languages and a UTF-8-safe text fallback
 for unsupported files or parser failure.
+
+### Formal Plan Execution
+
+The canonical parallel path is now `plan_create` once per PlanTask, followed by
+`task_list` and one `plan_execute(expected_task_count=N)`. The runtime rejects
+inline tasks, empty plans, and count mismatches before dispatch. `agent_tool`
+remains the single ad-hoc Subagent mechanism. The TaskRun itself represents the
+user goal, so a formal plan contains no extra wrapper/placeholder task. Main-chat
+tool rows and the right task panel therefore project the same persisted PlanTask
+set instead of hidden one-task Runs. See
+`docs/2026-07-19-formal-plan-materialization.md`.
 
 ### Skills And Report Rendering
 

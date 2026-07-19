@@ -24,21 +24,18 @@ use echo_agent::tools::{Tool, ToolParameters, ToolResult};
 use futures::future::BoxFuture;
 use tokio::sync::Mutex as TokioMutex;
 
-use super::executor::{ExecEvent, RunOutcome, execute_run, preflight_unattended_plan};
+use super::executor::{RunOutcome, execute_run, preflight_unattended_plan};
 use super::store::TaskRuntimeStore;
 use super::types::{
-    AttendedMode, DomainProfile, ExecutionMode, InteractionMode, PlanTask, PlanTaskKind,
-    TaskExecutionSummary, TaskPlan, TaskRunStatus, TodoItem, TodoStatus, UnattendedWriteMode,
+    AttendedMode, TaskExecutionSummary, TaskRunStatus, TodoItem, TodoStatus, UnattendedWriteMode,
 };
 use crate::agent_handle::AgentHandle;
 
 /// One active execute_run driver per run_id.
 ///
-/// Inline plan_execute calls can be emitted by the model as a parallel tool
-/// batch. Without this guard, every call appends one task and then starts a
-/// full DAG driver over the same run, so earlier tasks are dispatched multiple
-/// times. Serializing per run lets the first call execute what is ready; later
-/// calls re-read the persisted plan and skip tasks already marked Completed.
+/// Duplicate plan_execute calls can be emitted by the model or a resumed turn.
+/// Serializing per run keeps one authoritative DAG driver and lets later calls
+/// re-read terminal task state instead of dispatching completed nodes again.
 static RUN_EXECUTION_LOCKS: LazyLock<DashMap<String, Arc<TokioMutex<()>>>> =
     LazyLock::new(DashMap::new);
 
@@ -126,19 +123,7 @@ impl Tool for ExecutePlanTool {
     }
 
     fn description(&self) -> &str {
-        "派 subagent 执行任务并返回结果。两种用法:\n\
-         \n\
-         1. 单步派发 (传 task): 临时调研/分析/审查,直接派一个只读 subagent。\
-         subagent 在独立上下文跑 ReAct,只回传结论摘要,保持主会话干净 (防 context 污染)。\n\
-         可用 agent_role: explorer(探索代码库/数据/文档)、reviewer(审查 bug/方法/证据)、\
-         planner(规划验证/测试路径)、summarizer(汇总多源发现)。\n\
-         \n\
-         2. 多 subagent 编排 (不传 task,先用 plan_create 拆 plan): 有依赖关系的多步任务,\
-         先 plan_create 拆成带 depends_on 的子任务,再调本工具。\
-         引擎 (run_dag) 按依赖自动并行/串行调度,统一收集 token 统计。\n\
-         \n\
-         适用场景: 大范围代码库检索、多文件架构梳理、冗长日志分析、多源调研综合等高噪声任务。\
-         简单问答/单文件小改直接回复即可,不要调用本工具。"
+        "Execute the current persisted PlanTask DAG with subagents. First create every node with one plan_create call per task, then call task_list. Pass the exact returned task count as expected_task_count. The runtime rejects missing or partial plans. For one ad-hoc isolated subtask use agent_tool instead; plan_execute never accepts an inline task."
     }
 
     /// plan_execute 派 subagent 跑独立 ReAct(延迟远高于普通文件/shell 工具)。
@@ -149,245 +134,70 @@ impl Tool for ExecutePlanTool {
     }
 
     fn parameters(&self) -> serde_json::Value {
-        if !inline_task_schema_available() {
-            return serde_json::json!({
-                "type": "object",
-                "properties": {}
-            });
-        }
         serde_json::json!({
             "type": "object",
             "properties": {
-                "task": {
-                    "type": "object",
-                    "description": "可选: 内联单步只读任务。提供时直接派一个 subagent (无需先 plan_create),不提供时执行当前 formal plan。",
-                    "properties": {
-                        "agent_role": {
-                            "type": "string",
-                            "enum": ["explorer", "reviewer", "planner", "summarizer"],
-                            "description": "subagent 角色名,必须从 enum 中精确选择。"
-                        },
-                        "description": {
-                            "type": "string",
-                            "description": "给 subagent 的任务 prompt,含相关路径/范围/约束/需要的结果格式。"
-                        }
-                    },
-                    "required": ["agent_role", "description"]
+                "expected_task_count": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Exact Tasks (N) count returned by task_list after every plan_create call has completed. Execution is rejected when the persisted plan count differs."
                 }
-            }
+            },
+            "required": ["expected_task_count"]
         })
     }
 
     fn execute<'a>(&'a self, params: ToolParameters) -> BoxFuture<'a, error::Result<ToolResult>> {
         Box::pin(async move {
-            // ── 从 task_local 读取 run_id (§10.1) ──
-            // drive_chat 为普通 chat turn scope 了独立 formal run id
-            // (`taskrun:<turn_id>`)，故这里总能拿到值；TaskRun 仍按需创建。
-            //
-            // P1.0: `mut` — inline 分支会重新赋值为独立的 inline_<uuid> run_id,
-            // 让后续 route_str/lock/execute_run/build_run_summaries 全部用 inline
-            // run(而非共享的 root_message_id)。之前的 `let` shadow 只在 if 块内
-            // 有效,块外的代码仍读旧 run_id → task_count=0 → subagent 不跑。
-            let mut run_id = match super::task_tools::require_run_id() {
+            let run_id = match super::task_tools::require_run_id() {
                 Ok(id) => id,
                 Err(e) => return Ok(e),
             };
-            let root_message_id = crate::chat_resources::current_chat_resources()
-                .map(|resources| resources.root_message_id.clone())
-                .unwrap_or_else(|| run_id.clone());
             tracing::info!(
                 run_id = %run_id,
-                has_inline_task = params.contains_key("task"),
+                param_keys = ?params.keys().cloned().collect::<Vec<_>>(),
                 "plan_execute: start"
             );
+
+            if params.contains_key("task") {
+                return Ok(ToolResult::error(
+                    "plan_execute no longer accepts an inline task. Use agent_tool for one isolated subtask, or create every formal PlanTask with plan_create before executing the DAG.",
+                ));
+            }
+            let expected_task_count = params
+                .get("expected_task_count")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|count| usize::try_from(count).ok())
+                .filter(|count| *count > 0);
+            let Some(expected_task_count) = expected_task_count else {
+                return Ok(ToolResult::error(
+                    "plan_execute requires expected_task_count from the latest task_list result.",
+                ));
+            };
+            let materialized_plan = match self.store.get_plan(&run_id) {
+                Ok(Some(plan)) if !plan.tasks.is_empty() => plan,
+                Ok(_) => {
+                    return Ok(ToolResult::error(
+                        "plan_execute requires a non-empty persisted plan. Create one concrete PlanTask per intended subagent with plan_create, then call task_list.",
+                    ));
+                }
+                Err(error) => {
+                    return Ok(ToolResult::error(format!(
+                        "Failed to read the persisted plan before execution: {error}"
+                    )));
+                }
+            };
+            let plan_task_count = materialized_plan.tasks.len();
+            if plan_task_count != expected_task_count {
+                return Ok(ToolResult::error(format!(
+                    "Plan task count mismatch: task_list declared {expected_task_count}, but the persisted plan contains {plan_task_count}. Finish all plan_create calls, run task_list again, and only then call plan_execute."
+                )));
+            }
 
             // ── §10.1: cancel 透传 ──
             let cancel = super::task_tools::CURRENT_CANCEL
                 .try_with(|c| c.clone())
                 .unwrap_or_else(|_| tokio_util::sync::CancellationToken::new());
-
-            // ── inline task 路径 (吸收原 delegate_readonly 语义) ──
-            // 当 LLM 传入 task 对象时,组装单任务 plan 直接走 execute_run,
-            // 继承全部可见性 (started/completed/usage) + 调度 + 统计。
-            // 普通 chat turn 不预建 TaskRun；inline 路径会创建自己的独立 run。
-            if params.contains_key("task") {
-                if crate::chat_resources::current_chat_resources()
-                    .is_some_and(|res| res.interaction_mode == super::types::InteractionMode::Task)
-                {
-                    return Ok(ToolResult::error(
-                        "Task 模式不允许 plan_execute({task}) 单步派发。请先用 plan_create 拆分 \
-                         PlanTask，然后调用 plan_execute() 执行整个 DAG。"
-                            .to_string(),
-                    ));
-                }
-                let (role, task_desc) = match parse_inline_task_params(&params) {
-                    Ok(task) => task,
-                    Err(reason) => {
-                        tracing::warn!(
-                            run_id = %run_id,
-                            reason = %reason,
-                            param_keys = ?params.keys().cloned().collect::<Vec<_>>(),
-                            "plan_execute: invalid inline task params"
-                        );
-                        return Ok(ToolResult::error(reason));
-                    }
-                };
-                if role.is_empty() || task_desc.is_empty() {
-                    tracing::warn!(
-                        run_id = %run_id,
-                        role_empty = role.is_empty(),
-                        description_empty = task_desc.is_empty(),
-                        "plan_execute: inline task missing required fields"
-                    );
-                    return Ok(ToolResult::error(
-                        "inline task 的 agent_role 和 description 不能为空",
-                    ));
-                }
-                // conv_id 既用于建 run,也用于 RunStarted 事件通知前端激活面板,
-                // 故提到 if 外层(事件发射处也要用)。
-                let conv = crate::chat_resources::current_chat_resources()
-                    .and_then(|r| r.conv_id.clone())
-                    .unwrap_or_else(|| format!("message:{run_id}"));
-                // P1.0: 每个 inline 派发用**独立 run_id**,不共享本轮 root_message_id。
-                // 原因:模型在同 turn 并发发多个 inline plan_execute(ReAct join_all),
-                // 若共享 run_id,第 1 个跑完把 run 推到 Completed(terminal,不可复活),
-                // 后续 inline 的 task 虽 insert 成功但 execute_run 被 NotRunning 拒绝
-                // (日志已确认此死锁)。独立 run_id 让每个 inline subagent 有
-                // 自己的生命周期(started/running/completed 各自闭合),对标 Claude Code
-                // 的"独立 subagent 实例"。下游所有 run_id 引用(insert/lock/execute_run/
-                // summary)都用 reassign 后的这个值(外层 `mut run_id`,不是 let shadow,
-                // 否则 if 块外仍读旧 run_id)。
-                run_id = format!("inline_{}", uuid::Uuid::new_v4().as_simple());
-                // 建 ad-hoc run(create_run 幂等性在此不再关键,因 run_id 已唯一)。
-                let run = match self.store.create_run(
-                    &run_id,
-                    "default",
-                    &conv,
-                    &root_message_id,
-                    DomainProfile::General,
-                    &task_desc,
-                    "agent_inline_task",
-                    AttendedMode::Attended,
-                ) {
-                    Ok(run) => run,
-                    Err(e) => {
-                        tracing::warn!(
-                            run_id = %run_id,
-                            error = %e,
-                            "plan_execute: failed to create ad-hoc inline run"
-                        );
-                        return Ok(ToolResult::error(format!(
-                            "plan_execute: 建 ad-hoc run 失败: {e}"
-                        )));
-                    }
-                };
-                if run.status == TaskRunStatus::Pending
-                    && let Err(e) = self.store.transition_run(&run_id, TaskRunStatus::Running)
-                {
-                    tracing::warn!(
-                        run_id = %run_id,
-                        error = %e,
-                        "plan_execute: failed to transition ad-hoc inline run to Running"
-                    );
-                    return Ok(ToolResult::error(format!(
-                        "plan_execute: run 转 Running 失败: {e}"
-                    )));
-                }
-                // 组装单任务 (用 LLM 传入的 role/desc,kind=ReadOnlyReview)。
-                // 用 insert_task(追加语义)而非 attach_plan(覆盖语义):
-                // 多次 inline 调用时 attach_plan 的 PlanGenerated 会覆盖整个
-                // task 列表(event_rebuild.rs 赋值非追加),导致前面的 inline
-                // task 在重建后丢失 → execute_task 报 task not found。
-                // insert_task 追加到现有 plan,每个 inline task 都存活。
-                let task_id = format!("inline_{}", uuid::Uuid::new_v4().as_simple());
-                let title: String = task_desc.chars().take(80).collect();
-                let task = PlanTask {
-                    id: task_id.clone(),
-                    title,
-                    description: task_desc.to_string(),
-                    kind: PlanTaskKind::ReadOnlyReview,
-                    agent_role: role.to_string(),
-                    ..Default::default()
-                };
-                if let Err(e) = self.store.insert_task(&run_id, None, task) {
-                    tracing::warn!(
-                        run_id = %run_id,
-                        role = %role,
-                        error = %e,
-                        "plan_execute: failed to insert inline task"
-                    );
-                    return Ok(ToolResult::error(format!(
-                        "plan_execute: insert inline task 失败: {e}"
-                    )));
-                }
-                // 通知前端 run 已激活(send_chat_message 返回值不带 run_id,
-                // 前端靠此 RunStarted 事件触发 loadByConversation → 激活
-                // activeRun,否则 subagent 卡片/任务进度/Token 面板全空)。
-                let inline_trace_sink = super::task_tools::CURRENT_TRACE_SINK
-                    .try_with(|s| s.clone())
-                    .ok()
-                    .flatten();
-                if let Some(sink) = inline_trace_sink.as_ref() {
-                    sink(ExecEvent::run(
-                        run_id.clone(),
-                        "run_started",
-                        serde_json::json!({
-                            "conversation_id": conv,
-                            "message_id": root_message_id,
-                            "mode": "inline_task",
-                            "run_id": run_id.clone(),
-                            "route": "inline",
-                            "goal": task_desc,
-                        }),
-                    ));
-                }
-                // plan 已就绪,落到下面的公共 execute_run 路径。
-            } else {
-                // ── 兜底: 若主 agent 跳过了 plan_create 直接调 plan_execute ──
-                // LLM 可能不遵守 system prompt 的两阶段顺序。若 plan 为空,
-                // 从 run goal 动态生成一个单 task plan,保证执行始终经过 run_dag
-                // (有 wave 调度 + 信号量限流 + 失败传播保护)。
-                let plan_exists = self
-                    .store
-                    .get_plan(&run_id)
-                    .ok()
-                    .flatten()
-                    .map(|p| !p.tasks.is_empty())
-                    .unwrap_or(false);
-                if !plan_exists {
-                    let goal = self
-                        .store
-                        .get_run(&run_id)
-                        .ok()
-                        .flatten()
-                        .map(|r| r.goal)
-                        .unwrap_or_default();
-                    let task_id = format!("auto_{}", uuid::Uuid::new_v4().as_simple());
-                    let task = PlanTask {
-                        id: task_id.clone(),
-                        title: goal.chars().take(80).collect(),
-                        description: goal.clone(),
-                        kind: PlanTaskKind::ReadOnlyReview,
-                        agent_role: "explorer".to_string(),
-                        ..Default::default()
-                    };
-                    let plan = TaskPlan {
-                        plan_id: uuid::Uuid::new_v4().to_string(),
-                        run_id: run_id.clone(),
-                        domain_profile: DomainProfile::General,
-                        goal: goal.clone(),
-                        assumptions: Vec::new(),
-                        risks: Vec::new(),
-                        execution_mode: ExecutionMode::Parallel,
-                        tasks: vec![task],
-                    };
-                    if let Err(e) = self.store.attach_plan(&plan) {
-                        return Ok(ToolResult::error(format!(
-                            "plan_execute: 自动生成 plan 失败: {e}"
-                        )));
-                    }
-                }
-            }
 
             // ── Read attended mode once for unattended preflight ──
             let attended_mode = self
@@ -403,8 +213,8 @@ impl Tool for ExecutePlanTool {
             // write tasks / write tools / shell commands and terminal-fail
             // on violation. Chat runs (Attended) skip this entirely.
             if attended_mode == AttendedMode::Unattended
-                && let Some(ref plan) = self.store.get_plan(&run_id).ok().flatten()
-                && let Err(rejection) = preflight_unattended_plan(&plan.tasks, self.write_mode)
+                && let Err(rejection) =
+                    preflight_unattended_plan(&materialized_plan.tasks, self.write_mode)
             {
                 let _ = self.store.transition_run(&run_id, TaskRunStatus::Failed);
                 let _ = self.store.note(
@@ -436,13 +246,6 @@ impl Tool for ExecutePlanTool {
                 .try_with(|s| s.clone())
                 .ok()
                 .flatten();
-            let plan_task_count = self
-                .store
-                .get_plan(&run_id)
-                .ok()
-                .flatten()
-                .map(|p| p.tasks.len())
-                .unwrap_or(0);
             tracing::info!(
                 run_id = %run_id,
                 task_count = plan_task_count,
@@ -730,116 +533,69 @@ fn format_execution_summary(summary: &TaskExecutionSummary) -> String {
     }
 }
 
-fn inline_task_schema_available() -> bool {
-    !crate::chat_resources::current_chat_resources()
-        .is_some_and(|res| res.interaction_mode == InteractionMode::Task)
-}
-
-fn parse_inline_task_params(
-    params: &ToolParameters,
-) -> std::result::Result<(String, String), String> {
-    let task_value = params
-        .get("task")
-        .ok_or_else(|| "inline task 参数缺少 task 字段".to_string())?;
-
-    let task_json = if let Some(s) = task_value.as_str() {
-        serde_json::from_str::<serde_json::Value>(s)
-            .ok()
-            .filter(|v| v.is_object())
-            .unwrap_or_else(|| serde_json::json!({ "description": s }))
-    } else {
-        task_value.clone()
-    };
-
-    let role = string_field(&task_json, &["agent_role", "role", "agent"])
-        .or_else(|| string_param(params, &["agent_role", "role", "agent"]))
-        .unwrap_or_else(|| "explorer".to_string());
-    let description = string_field(
-        &task_json,
-        &["description", "prompt", "task", "query", "goal"],
-    )
-    .or_else(|| string_param(params, &["description", "prompt", "query", "goal"]))
-    .unwrap_or_default();
-
-    let description = description.trim().to_string();
-    if description.is_empty() {
-        return Err("inline task 的 description/prompt/task/query/goal 不能为空".to_string());
-    }
-    Ok((role.trim().to_string(), description))
-}
-
-fn string_field(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
-    for key in keys {
-        if let Some(s) = value.get(*key).and_then(|v| v.as_str()) {
-            let s = s.trim();
-            if !s.is_empty() {
-                return Some(s.to_string());
-            }
-        }
-    }
-    None
-}
-
-fn string_param(params: &ToolParameters, keys: &[&str]) -> Option<String> {
-    for key in keys {
-        if let Some(s) = params.get(*key).and_then(|v| v.as_str()) {
-            let s = s.trim();
-            if !s.is_empty() {
-                return Some(s.to_string());
-            }
-        }
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chat_driver::ChatSink;
     use crate::tasks::task_runtime::task_tools;
     use crate::tasks::task_runtime::types::{
-        SubagentRunStatus, SubagentTaskResult, SubagentTouchedFiles,
+        DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, SubagentRunStatus,
+        SubagentTaskResult, SubagentTouchedFiles, TaskPlan,
     };
     use echo_agent::prelude::*;
     use echo_agent::tools::ToolParameters;
 
-    struct NoopChatSink;
+    fn test_tool(store: Arc<TaskRuntimeStore>) -> std::result::Result<ExecutePlanTool, String> {
+        let agent = ReactAgentBuilder::new()
+            .model("test-model")
+            .system_prompt("test agent for plan_execute tool")
+            .build()
+            .map_err(|error| error.to_string())?;
+        Ok(ExecutePlanTool::new(
+            store,
+            crate::agent_handle::AgentHandle::new(agent),
+        ))
+    }
 
-    impl ChatSink for NoopChatSink {
-        fn on_event(&self, _event: crate::chat_driver::ChatDriverEvent) -> bool {
-            true
+    fn one_task_plan(run_id: &str) -> TaskPlan {
+        TaskPlan {
+            plan_id: format!("plan_{run_id}"),
+            run_id: run_id.to_string(),
+            domain_profile: DomainProfile::General,
+            goal: "分析项目架构".to_string(),
+            assumptions: Vec::new(),
+            risks: Vec::new(),
+            execution_mode: ExecutionMode::Parallel,
+            tasks: vec![PlanTask {
+                id: "task_1".to_string(),
+                title: "项目结构".to_string(),
+                kind: PlanTaskKind::ReadOnlyReview,
+                agent_role: "explorer".to_string(),
+                ..Default::default()
+            }],
         }
     }
 
     /// 验证无 task_local run_id 时 plan_execute 返回 error。
     #[tokio::test]
-    async fn plan_execute_requires_run_id() {
-        let store = Arc::new(TaskRuntimeStore::new_in_memory().unwrap());
-        let agent = ReactAgentBuilder::new()
-            .model("test-model")
-            .system_prompt("test agent for plan_execute tool")
-            .build()
-            .expect("Failed to create test agent");
-        let handle = crate::agent_handle::AgentHandle::new(agent);
-        let tool = ExecutePlanTool::new(store, handle);
-        let result = tool.execute(ToolParameters::default()).await.unwrap();
+    async fn plan_execute_requires_run_id() -> std::result::Result<(), String> {
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let tool = test_tool(store)?;
+        let result = tool
+            .execute(ToolParameters::default())
+            .await
+            .map_err(|error| error.to_string())?;
         assert!(
             !result.success,
             "expected error but got success: {}",
             result.output
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn task_mode_rejects_inline_plan_execute_task() {
-        let store = Arc::new(TaskRuntimeStore::new_in_memory().unwrap());
-        let agent = ReactAgentBuilder::new()
-            .model("test-model")
-            .system_prompt("test agent for plan_execute tool")
-            .build()
-            .expect("Failed to create test agent");
-        let handle = crate::agent_handle::AgentHandle::new(agent);
-        let tool = ExecutePlanTool::new(store.clone(), handle);
+    async fn plan_execute_rejects_inline_task_in_every_mode() -> std::result::Result<(), String> {
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let tool = test_tool(store)?;
         let mut params = ToolParameters::new();
         params.insert(
             "task".to_string(),
@@ -848,69 +604,95 @@ mod tests {
                 "description": "分析当前项目结构"
             }),
         );
-        let resources = Arc::new(crate::chat_resources::ChatResources {
-            pool: None,
-            store: Some(store),
-            sink: Arc::new(NoopChatSink),
-            conv_id: Some("conv1".to_string()),
-            root_message_id: "msg1".to_string(),
-            attachments: Vec::new(),
-            cancel: CancellationToken::new(),
-            mode_hint: None,
-            interaction_mode: InteractionMode::Task,
-            layer_manager: None,
-        });
-        let result = crate::chat_resources::with_chat_resources(resources, async {
-            task_tools::with_run_context(
-                "msg1".to_string(),
-                tokio_util::sync::CancellationToken::new(),
-                None,
-                tool.execute(params),
-            )
+        params.insert("expected_task_count".to_string(), serde_json::json!(1));
+        let result = task_tools::with_run_id("msg1".to_string(), tool.execute(params))
             .await
-        })
-        .await
-        .expect("plan_execute should return a ToolResult");
+            .map_err(|error| error.to_string())?;
         assert!(!result.success);
         let error = result.error.unwrap_or_default();
         assert!(
-            error.contains("Task 模式不允许 plan_execute({task})"),
+            error.contains("no longer accepts an inline task"),
             "unexpected error: {error}"
         );
+        Ok(())
     }
 
-    #[tokio::test]
-    async fn task_mode_plan_execute_schema_hides_inline_task() {
-        let store = Arc::new(TaskRuntimeStore::new_in_memory().unwrap());
-        let agent = ReactAgentBuilder::new()
-            .model("test-model")
-            .system_prompt("test agent for plan_execute tool")
-            .build()
-            .expect("Failed to create test agent");
-        let handle = crate::agent_handle::AgentHandle::new(agent);
-        let tool = ExecutePlanTool::new(store.clone(), handle);
-        let resources = Arc::new(crate::chat_resources::ChatResources {
-            pool: None,
-            store: Some(store),
-            sink: Arc::new(NoopChatSink),
-            conv_id: Some("conv1".to_string()),
-            root_message_id: "msg1".to_string(),
-            attachments: Vec::new(),
-            cancel: CancellationToken::new(),
-            mode_hint: None,
-            interaction_mode: InteractionMode::Task,
-            layer_manager: None,
-        });
-        let schema =
-            crate::chat_resources::with_chat_resources(resources, async { tool.parameters() })
-                .await;
+    #[test]
+    fn plan_execute_schema_requires_persisted_task_count() -> std::result::Result<(), String> {
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let tool = test_tool(store)?;
+        let schema = tool.parameters();
         assert!(
             schema
                 .get("properties")
                 .and_then(|props| props.get("task"))
                 .is_none(),
-            "Task mode plan_execute schema must not expose inline task: {schema}"
+            "plan_execute schema must not expose inline task: {schema}"
         );
+        assert!(
+            schema
+                .get("properties")
+                .and_then(|props| props.get("expected_task_count"))
+                .is_some(),
+            "plan_execute schema must expose expected_task_count: {schema}"
+        );
+        assert_eq!(
+            schema.get("required"),
+            Some(&serde_json::json!(["expected_task_count"]))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn plan_execute_requires_non_empty_materialized_plan() -> std::result::Result<(), String>
+    {
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let tool = test_tool(store)?;
+        let mut params = ToolParameters::new();
+        params.insert("expected_task_count".to_string(), serde_json::json!(1));
+        let result = task_tools::with_run_id("run_without_plan".to_string(), tool.execute(params))
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("non-empty persisted plan")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn plan_execute_rejects_task_count_mismatch() -> std::result::Result<(), String> {
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let run_id = "run_count_mismatch";
+        store
+            .create_run(
+                run_id,
+                "default",
+                "conversation:count",
+                "message:count",
+                DomainProfile::General,
+                "分析项目架构",
+                "agent_task_plan",
+                AttendedMode::Attended,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .attach_plan(&one_task_plan(run_id))
+            .map_err(|error| error.to_string())?;
+        let tool = test_tool(store)?;
+        let mut params = ToolParameters::new();
+        params.insert("expected_task_count".to_string(), serde_json::json!(6));
+        let result = task_tools::with_run_id(run_id.to_string(), tool.execute(params))
+            .await
+            .map_err(|error| error.to_string())?;
+        assert!(!result.success);
+        let error = result.error.unwrap_or_default();
+        assert!(error.contains("declared 6"), "unexpected error: {error}");
+        assert!(error.contains("contains 1"), "unexpected error: {error}");
+        Ok(())
     }
 
     #[test]
@@ -1005,67 +787,14 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn parse_inline_task_accepts_object_task() -> std::result::Result<(), String> {
-        let mut params = ToolParameters::new();
-        params.insert(
-            "task".to_string(),
-            serde_json::json!({
-                "agent_role": "reviewer",
-                "description": "审查 subagent 执行链路"
-            }),
-        );
-        let (role, desc) = parse_inline_task_params(&params)?;
-        assert_eq!(role, "reviewer");
-        assert_eq!(desc, "审查 subagent 执行链路");
-        Ok(())
-    }
-
-    #[test]
-    fn parse_inline_task_accepts_string_task_with_root_role() -> std::result::Result<(), String> {
-        let mut params = ToolParameters::new();
-        params.insert(
-            "task".to_string(),
-            serde_json::Value::String("分析当前项目架构".to_string()),
-        );
-        params.insert(
-            "agent_role".to_string(),
-            serde_json::Value::String("planner".to_string()),
-        );
-        let (role, desc) = parse_inline_task_params(&params)?;
-        assert_eq!(role, "planner");
-        assert_eq!(desc, "分析当前项目架构");
-        Ok(())
-    }
-
-    #[test]
-    fn parse_inline_task_defaults_role_to_explorer() -> std::result::Result<(), String> {
-        let mut params = ToolParameters::new();
-        params.insert(
-            "task".to_string(),
-            serde_json::json!({
-                "prompt": "梳理仓库模块边界"
-            }),
-        );
-        let (role, desc) = parse_inline_task_params(&params)?;
-        assert_eq!(role, "explorer");
-        assert_eq!(desc, "梳理仓库模块边界");
-        Ok(())
-    }
-
     /// 验证 tool 的 name/description/parameters 基本属性。
     #[test]
-    fn basic_properties() {
-        let store = Arc::new(TaskRuntimeStore::new_in_memory().unwrap());
-        let agent = ReactAgentBuilder::new()
-            .model("test-model")
-            .system_prompt("test agent for plan_execute tool")
-            .build()
-            .expect("Failed to create agent");
-        let handle = crate::agent_handle::AgentHandle::new(agent);
-        let tool = ExecutePlanTool::new(store, handle);
+    fn basic_properties() -> std::result::Result<(), String> {
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let tool = test_tool(store)?;
         assert_eq!(tool.name(), "plan_execute");
         assert!(!tool.description().is_empty());
         assert!(tool.parameters().is_object());
+        Ok(())
     }
 }

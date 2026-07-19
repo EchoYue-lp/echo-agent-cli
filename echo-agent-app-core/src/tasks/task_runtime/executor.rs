@@ -265,11 +265,10 @@ pub async fn execute_run(
         .await;
 
         if matches!(outcome, Ok(RunOutcome::Completed)) && has_unresolved_tasks(&store, run_id) {
-            // Inline plan_execute calls in the same LLM tool batch can append
-            // tasks while this executor is already running. The holder of the
-            // per-run execution lock is the authoritative drainer, so it must
-            // re-read the plan and keep going instead of handing the tail to a
-            // later plan_execute call.
+            // A plan may be updated while this executor is already running.
+            // The holder of the per-run execution lock is the authoritative
+            // drainer, so it re-reads the plan and keeps going instead of
+            // leaving newly appended tasks unresolved.
             drain_cycle = drain_cycle.saturating_add(1);
             tracing::info!(
                 run_id = %run_id,
@@ -5301,10 +5300,9 @@ Read the runtime path and found one missing branch.
 
     #[tokio::test]
     async fn run_dag_does_not_redispatch_in_flight_running_tasks() {
-        // Regression: when the model emits several `plan_execute` calls as a
-        // parallel tool batch, `RUN_EXECUTION_LOCKS` serializes them. The 2nd
-        // call enters run_dag while an earlier task is still `Running`
-        // (dispatched by the previous run_dag instance). Without the in_flight
+        // Regression: when execution is resumed while an earlier task is still
+        // `Running`, a later run_dag driver must not dispatch that task again.
+        // Without the in_flight
         // guard, the ready filter would re-dispatch the Running task, causing
         // duplicate subagent work. Verify the Running task is left alone, the
         // genuinely-pending sibling is dispatched, and run_dag WAITS for the

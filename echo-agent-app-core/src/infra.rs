@@ -58,25 +58,27 @@ pub(crate) const TASK_MANAGEMENT_GUIDE: &str = r#"
 
 ## Task And Delegation Tools
 
-Choose the lightest mechanism that still gives the user a reliable result:
-- Direct work: simple questions, narrow edits, and short tool sequences.
-- `agent_tool`: one bounded, high-noise subtask needing isolated context. Use a matching role. Fresh is default; fork only when history is required. Task mode hides this tool; use `plan_execute()`.
-- `plan_create` + `plan_execute()`: a reviewable multi-step DAG with dependencies, parallel work, writer tasks, or explicit verification. In Task mode, this is the required execution path.
-- `create_complex_task`: a long-lived foreground/background Run for work that should survive the current chat turn or requires substantial multi-step orchestration.
+Choose the lightest reliable mechanism:
+- Direct work: simple questions, narrow edits, short tool sequences.
+- `agent_tool`: one bounded subtask needing isolated context. Fresh is default; fork only when history is required. Task mode requires a formal plan instead.
+- `plan_create` + `task_list` + `plan_execute({expected_task_count: N})`: a reviewable DAG for dependencies, parallel work, writers, or verification. Task mode requires this path.
+- `create_complex_task`: a long-lived Run that must survive the chat turn or needs substantial orchestration.
 
 ### Formal Plan Contract
-- Create tasks with a concrete outcome, kind, role, targets, dependencies, and verification. Avoid vague tasks such as "continue improving".
-- Independent read-only tasks may run in parallel. Writer tasks must declare their intended files or artifacts so the runtime can isolate and schedule them safely.
-- Keep the plan truthful as evidence changes: use `task_update`, `task_skip`, and `task_list`. Completion is written only by the runtime after result verification.
-- `plan_execute({task})` is only for inline single-subagent dispatch when that field exists in the active tool schema. Never use it as a substitute for the formal DAG in Task mode.
+- Give each task a concrete outcome, kind, role, targets, dependencies, and verification.
+- The TaskRun already represents the user goal. Do not create a wrapper, placeholder, or prose-only summary task for that goal; materialize only work a Subagent will actually execute.
+- One `plan_create` creates one PlanTask. For N subagents, make N calls and await all results. Call `task_list`, then pass its exact `Tasks (N)` as `expected_task_count`.
+- Read-only tasks may run in parallel. Writers must declare owned files or artifacts.
+- Keep plans truthful with `task_update`, `task_skip`, and `task_list`. Only the runtime marks completion.
+- Do not claim dispatch before `plan_execute` accepts the full plan.
 - Background `agent_tool` finishes through events. Never poll its `execution_id` with task-status tools.
-- After execution, synthesize the subagent evidence, resolve conflicts, and answer the user's original goal. Do not merely repeat subagent summaries.
+- After execution, synthesize evidence and answer the original goal.
 
 ### Complex Run Contract
-Use `create_complex_task` only when at least one material complexity signal applies: expensive multi-step work, multi-file or architectural implementation, long-lived/cross-turn state, or multi-source synthesis. Put the signals and why they matter in `reason`.
-- Prefer `priority=background` when the user can continue without the result. Use foreground only when the result is needed in the current reply and the run is expected to finish promptly.
-- Do not create a complex Run for ordinary Q&A, a narrow edit, or a one-shot lookup.
-- Use `check_run_status` for a requested status check and `cancel_run` when the Run is no longer wanted. Do not busy-poll.
+Use `create_complex_task` only for expensive multi-step work, architectural/multi-file implementation, cross-turn state, or multi-source synthesis. Explain why in `reason`.
+- Prefer background unless the current reply needs a prompt result.
+- Do not use it for ordinary Q&A, a narrow edit, or one lookup.
+- Use `check_run_status` only when requested; use `cancel_run` when no longer needed. Do not busy-poll.
 "#;
 
 /// Agent creation parameters (extracted from CLI args or config).

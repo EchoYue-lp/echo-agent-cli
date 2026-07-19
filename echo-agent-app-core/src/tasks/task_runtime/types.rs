@@ -108,7 +108,7 @@ pub enum InteractionMode {
     Chat,
     /// Create a formal TaskRuntime run and require a reviewable plan lifecycle.
     Task,
-    /// Agent-selected direct/inline/formal execution (default).
+    /// Agent-selected direct/ad-hoc/formal execution (default).
     #[default]
     Auto,
 }
@@ -154,10 +154,10 @@ impl InteractionMode {
                 "Chat mode. TaskRuntime tools are unavailable for this turn. Resolve the request directly with ordinary conversation and available non-task tools. Do not claim to create, execute, or update a formal plan."
             }
             InteractionMode::Task => {
-                "Task mode. Use a formal, reviewable DAG: create concrete PlanTask items with plan_create, then call plan_execute() without a task argument. Keep task status and verification current. Do not use inline plan_execute({task}) dispatch in this mode."
+                "Task mode. Use a formal, reviewable DAG. The TaskRun already represents the overall goal, so never create a wrapper or placeholder PlanTask for it. Each plan_create call creates exactly one executable node: create one per intended subagent and wait for every result. Then call task_list and pass its exact Tasks (N) count as expected_task_count to plan_execute. Keep task status and verification current. Do not claim dispatch before plan_execute starts."
             }
             InteractionMode::Auto => {
-                "Auto mode. Choose the lightest reliable path: answer or act directly for simple work; use one isolated subagent for a bounded high-noise investigation; use plan_create plus plan_execute() for multi-step, multi-file, dependent, or long-running work."
+                "Auto mode. Choose the lightest reliable path: answer or act directly for simple work; use agent_tool for one isolated bounded investigation; for multi-step, multi-file, dependent, or parallel work, create exactly one PlanTask per intended subagent with plan_create, wait for every result, call task_list, and pass its exact Tasks (N) count as expected_task_count to plan_execute."
             }
         }
     }
@@ -1364,8 +1364,11 @@ mod tests {
 
         assert!(chat.contains("TaskRuntime tools are unavailable"));
         assert!(task.contains("plan_create"));
-        assert!(task.contains("plan_execute()"));
+        assert!(task.contains("expected_task_count"));
+        assert!(task.contains("never create a wrapper"));
         assert!(auto.contains("lightest reliable path"));
+        assert!(auto.contains("agent_tool"));
+        assert!(auto.contains("task_list"));
         assert_ne!(chat, task);
         assert_ne!(task, auto);
     }
