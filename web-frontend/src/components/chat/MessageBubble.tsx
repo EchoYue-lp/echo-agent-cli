@@ -54,11 +54,12 @@ interface FlatStep {
   toolIndex: number;
 }
 
-function flattenSteps(message: ChatMessage): { steps: FlatStep[]; thinkingTotal: number } {
+export function flattenSteps(message: ChatMessage): { steps: FlatStep[]; thinkingTotal: number } {
   const steps: FlatStep[] = [];
   let thinkingTotal = 0;
 
   if (!message.isStreaming && message.executionRounds && message.executionRounds.length > 0) {
+    const renderedToolIds = new Set<string>();
     message.executionRounds.forEach((round: ExecutionRound) => {
       if (round.thinking && round.thinking.content.trim()) {
         steps.push({ type: 'thinking', thinkingContent: round.thinking.content, toolIndex: 0 });
@@ -67,9 +68,22 @@ function flattenSteps(message: ChatMessage): { steps: FlatStep[]; thinkingTotal:
       round.toolCallIds.forEach((callId) => {
         const tc = message.toolCalls?.find((tool) => tool.id === callId);
         if (tc && !isSubagentDispatchTool(tc.name)) {
+          renderedToolIds.add(callId);
           steps.push({ type: 'tool', toolCall: tc, toolIndex: steps.length });
         }
       });
+    });
+
+    // A final tool batch may not have reached executionRounds when the chat
+    // stream hands off to TaskRuntime. executionSteps is written at tool_start,
+    // so append only calls that the completed rounds did not already project.
+    message.executionSteps?.forEach((step) => {
+      if (step.type !== 'tool' || renderedToolIds.has(step.callId)) return;
+      const tc = message.toolCalls?.find((tool) => tool.id === step.callId);
+      if (tc && !isSubagentDispatchTool(tc.name)) {
+        renderedToolIds.add(step.callId);
+        steps.push({ type: 'tool', toolCall: tc, toolIndex: steps.length });
+      }
     });
   } else if (message.executionSteps && message.executionSteps.length > 0) {
     message.executionSteps.forEach((step) => {

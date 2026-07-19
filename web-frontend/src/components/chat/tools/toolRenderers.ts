@@ -139,7 +139,7 @@ function describeTask(tool: ToolExecution): ToolRenderDescriptor {
             ? `Execute with ${role}`
             : 'Execute plan'
           : tool.name === 'plan_create'
-            ? 'Create plan task'
+            ? 'plan_create'
             : tool.name === 'task_update'
               ? 'Update plan task'
               : tool.name === 'task_skip'

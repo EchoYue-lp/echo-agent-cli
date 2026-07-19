@@ -181,6 +181,38 @@ export function finalToolProjection(tool: ToolExecution): ToolExecution {
   };
 }
 
+export function mergeRestoredToolCalls(
+  restoredTools: ToolExecution[] | undefined,
+  savedTools: { id: string; name: string; arguments: string }[],
+  now = Date.now()
+): ToolExecution[] {
+  const restoredById = new Map((restoredTools || []).map((tool) => [tool.id, tool]));
+  return savedTools.map((saved) => {
+    const restored = restoredById.get(saved.id);
+    if (restored) return restored;
+
+    let args: unknown;
+    try {
+      args = JSON.parse(saved.arguments);
+    } catch {
+      args = saved.arguments;
+    }
+    return {
+      id: saved.id,
+      name: saved.name,
+      args,
+      result: '',
+      success: true,
+      status: 'succeeded',
+      stdout: '',
+      stderr: '',
+      log: '',
+      startedAt: now,
+      finishedAt: now,
+    };
+  });
+}
+
 // ── Store ──
 
 export const useConversationStore = create<ConversationState>((set, get) => ({
@@ -349,32 +381,11 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
           base.toolCalls = [...restoredTools.values()];
         }
 
-        // Restore tool calls on assistant messages
-        if (
-          !base.toolCalls?.length &&
-          m.role === 'assistant' &&
-          m.tool_calls &&
-          m.tool_calls.length > 0
-        ) {
-          base.toolCalls = m.tool_calls.map((tc) => ({
-            id: tc.id,
-            name: tc.name,
-            args: (() => {
-              try {
-                return JSON.parse(tc.arguments);
-              } catch {
-                return tc.arguments;
-              }
-            })(),
-            result: '',
-            success: true,
-            status: 'succeeded',
-            stdout: '',
-            stderr: '',
-            log: '',
-            startedAt: Date.now(),
-            finishedAt: Date.now(),
-          }));
+        // Restore every stable tool call. execution_rounds may omit the final
+        // batch when a chat hands off to TaskRuntime, so use its rich records
+        // where available and fill any missing calls from tool_calls.
+        if (m.role === 'assistant' && m.tool_calls && m.tool_calls.length > 0) {
+          base.toolCalls = mergeRestoredToolCalls(base.toolCalls, m.tool_calls);
         }
 
         // Restore chronological order. New records reference stable call IDs;

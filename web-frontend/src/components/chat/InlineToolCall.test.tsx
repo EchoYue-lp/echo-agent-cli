@@ -52,7 +52,7 @@ describe('InlineToolCall', () => {
       />
     );
 
-    expect(html).toContain('Create plan task');
+    expect(html).toContain('plan_create');
     expect(html).toContain('Core 库模块架构分析');
     expect(html).toContain('whitespace-nowrap');
     expect(html).not.toContain('allowed_tools');

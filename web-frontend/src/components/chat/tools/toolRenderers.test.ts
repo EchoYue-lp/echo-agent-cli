@@ -113,7 +113,7 @@ describe('tool renderer registry', () => {
 
     expect(descriptor).toMatchObject({
       kind: 'task',
-      title: 'Create plan task',
+      title: 'plan_create',
       detail: 'Core 库模块架构分析',
     });
     expect(descriptor.detail).not.toContain('allowed_tools');
