@@ -354,28 +354,9 @@ async fn drive_chat_inner(
         // stream borrows the agent (same pattern as the GUI's normal chat path).
         let inner = agent.inner().clone();
         let guard = inner.read().await;
-        // Chat 模式下物理隐藏任务管理工具(不只是 prompt hint)。工具排除属于
-        // invocation 值,不会修改 pooled agent 的共享状态。
-        use crate::tasks::task_runtime::InteractionMode;
-        let disabled_tools = if interaction_mode == InteractionMode::Chat {
-            Some(
-                [
-                    "plan_create",
-                    "task_update",
-                    "task_skip",
-                    "task_list",
-                    "plan_execute",
-                    "create_complex_task",
-                    "check_run_status",
-                    "cancel_run",
-                ]
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
-            )
-        } else {
-            None
-        };
+        // Tool visibility is invocation-scoped, so pooled agents keep one
+        // registry while each interaction mode gets its own product surface.
+        let disabled_tools = Some(disabled_tools_for_mode(interaction_mode));
 
         // `with_run_context` is task-local and does not cross the framework's
         // forked subagent `tokio::spawn`; ExternalRunContext is the value-carried
@@ -452,6 +433,53 @@ async fn drive_chat_inner(
     .await
 }
 
+fn disabled_tools_for_mode(
+    interaction_mode: crate::tasks::task_runtime::InteractionMode,
+) -> std::collections::HashSet<String> {
+    use crate::tasks::task_runtime::InteractionMode;
+
+    // These belong to the framework's independent background-task store.
+    // EKO uses TaskRuntime and must not expose two incompatible task ID spaces.
+    let mut disabled = [
+        "spawn_background_task",
+        "check_task_status",
+        "list_background_tasks",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect::<std::collections::HashSet<_>>();
+
+    match interaction_mode {
+        InteractionMode::Chat => disabled.extend(
+            [
+                "plan_create",
+                "task_update",
+                "task_skip",
+                "task_list",
+                "plan_execute",
+                "create_complex_task",
+                "check_run_status",
+                "cancel_run",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        ),
+        InteractionMode::Task => disabled.extend(
+            [
+                "agent_tool",
+                "create_complex_task",
+                "check_run_status",
+                "cancel_run",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        ),
+        InteractionMode::Auto => {}
+    }
+
+    disabled
+}
+
 /// A `ChatSink` that forwards every product event to an mpsc channel.
 ///
 /// Used by modes whose renderer consumes a channel and applies a
@@ -477,6 +505,26 @@ impl ChatSink for ChannelChatSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_mode_uses_only_task_runtime_dispatch_tools() {
+        let disabled = disabled_tools_for_mode(crate::tasks::task_runtime::InteractionMode::Task);
+        assert!(disabled.contains("agent_tool"));
+        assert!(disabled.contains("create_complex_task"));
+        assert!(disabled.contains("check_task_status"));
+        assert!(!disabled.contains("plan_create"));
+        assert!(!disabled.contains("plan_execute"));
+    }
+
+    #[test]
+    fn auto_mode_hides_incompatible_framework_task_ids() {
+        let disabled = disabled_tools_for_mode(crate::tasks::task_runtime::InteractionMode::Auto);
+        assert!(disabled.contains("spawn_background_task"));
+        assert!(disabled.contains("check_task_status"));
+        assert!(disabled.contains("list_background_tasks"));
+        assert!(!disabled.contains("agent_tool"));
+        assert!(!disabled.contains("plan_execute"));
+    }
 
     struct CountingTool {
         calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,

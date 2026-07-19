@@ -27,6 +27,15 @@ interface InlineToolCallProps {
   index: number;
 }
 
+function formatToolArgs(args: unknown): string {
+  if (args == null) return '';
+  try {
+    return JSON.stringify(args, null, 2) ?? String(args);
+  } catch {
+    return String(args);
+  }
+}
+
 export const InlineToolCall = memo(function InlineToolCall({
   toolCall,
   index: _index,
@@ -58,6 +67,10 @@ export const InlineToolCall = memo(function InlineToolCall({
   const artifactHash = toolCall.metadata?.artifact_sha256?.slice(0, 12);
   const failed = toolCall.status === 'failed';
   const running = toolCall.status === 'running';
+  const argsText = useMemo(() => formatToolArgs(toolCall.args), [toolCall.args]);
+  const summaryText = descriptor.detail
+    ? `${descriptor.title} ${descriptor.detail}`
+    : descriptor.title;
   const fullOutput = [
     toolCall.stdout && `stdout\n${toolCall.stdout}`,
     toolCall.stderr && `stderr\n${toolCall.stderr}`,
@@ -140,12 +153,15 @@ export const InlineToolCall = memo(function InlineToolCall({
         <button
           type="button"
           onClick={() => setExpanded((value) => !value)}
-          className="min-w-0 flex-1 break-words text-left leading-5 text-[var(--text-primary)]"
+          className="min-w-0 flex-1 overflow-hidden whitespace-nowrap text-left leading-5 text-[var(--text-primary)]"
+          title={summaryText}
         >
-          <span>{descriptor.title}</span>
-          {descriptor.detail && (
-            <span className="ml-1.5 text-[var(--text-tertiary)]">{descriptor.detail}</span>
-          )}
+          <span className="block truncate">
+            <span>{descriptor.title}</span>
+            {descriptor.detail && (
+              <span className="ml-1.5 text-[var(--text-tertiary)]">{descriptor.detail}</span>
+            )}
+          </span>
         </button>
         <span className="shrink-0 pt-0.5 tabular-nums text-[var(--text-tertiary)]">
           {failure ? `${failure.category} · ` : ''}
@@ -173,6 +189,24 @@ export const InlineToolCall = memo(function InlineToolCall({
 
       {expanded && (
         <div className="ml-[46px] mt-1 min-w-0 border-l border-[var(--border-primary)] pl-2">
+          {argsText && (
+            <div className="mb-2">
+              <div className="mb-1 flex items-center justify-between text-[9px] uppercase text-[var(--text-tertiary)]">
+                <span>参数</span>
+                <button
+                  type="button"
+                  onClick={() => copyText(argsText, 'args')}
+                  className="flex items-center gap-1 normal-case hover:text-[var(--text-primary)]"
+                >
+                  {copied === 'args' ? <Check size={10} /> : <Copy size={10} />}
+                  {copied === 'args' ? '已复制' : '复制'}
+                </button>
+              </div>
+              <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-words bg-[var(--bg-code)] p-2 text-[10px] leading-relaxed text-[var(--color-code-text)]">
+                {argsText}
+              </pre>
+            </div>
+          )}
           <div className="mb-1 flex items-center justify-between text-[9px] uppercase text-[var(--text-tertiary)]">
             <span>{toolCall.truncated ? '输出 · 已截断' : '输出'}</span>
             {fullOutput && (

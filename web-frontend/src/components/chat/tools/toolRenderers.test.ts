@@ -101,6 +101,24 @@ describe('tool renderer registry', () => {
     });
   });
 
+  it('summarizes plan creation without exposing the full JSON payload', () => {
+    const descriptor = describeToolExecution(
+      tool('plan_create', {
+        title: 'Core 库模块架构分析',
+        description: 'A very long description that belongs in the expanded parameters view',
+        allowed_tools: ['read_file', 'glob', 'code_search', 'grep', 'repo_map'],
+        files: ['echo-agent-app-core/src/lib.rs', 'echo-agent-app-core/src/runtime.rs'],
+      })
+    );
+
+    expect(descriptor).toMatchObject({
+      kind: 'task',
+      title: 'Create plan task',
+      detail: 'Core 库模块架构分析',
+    });
+    expect(descriptor.detail).not.toContain('allowed_tools');
+  });
+
   it('identifies dispatch tools that are represented by subagent panels', () => {
     expect(isSubagentDispatchTool('agent_tool')).toBe(true);
     expect(isSubagentDispatchTool('plan_execute')).toBe(true);

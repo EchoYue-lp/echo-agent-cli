@@ -124,9 +124,11 @@ function describeTask(tool: ToolExecution): ToolRenderDescriptor {
     args.task && typeof args.task === 'object' ? (args.task as Record<string, unknown>) : undefined;
   const role = textArg(args, 'agent_name') || (inlineTask && textArg(inlineTask, 'agent_role'));
   const task =
+    textArg(args, 'title') ||
     textArg(args, 'user_goal') ||
     (typeof args.task === 'string' ? args.task : undefined) ||
-    (inlineTask && textArg(inlineTask, 'description'));
+    (inlineTask && textArg(inlineTask, 'description')) ||
+    textArg(args, 'description', 'task_id', 'run_id');
   const title =
     tool.name === 'agent_tool'
       ? `Subagent ${role || 'dispatch'}`
@@ -136,7 +138,19 @@ function describeTask(tool: ToolExecution): ToolRenderDescriptor {
           ? role
             ? `Execute with ${role}`
             : 'Execute plan'
-          : tool.name.replaceAll('_', ' ');
+          : tool.name === 'plan_create'
+            ? 'Create plan task'
+            : tool.name === 'task_update'
+              ? 'Update plan task'
+              : tool.name === 'task_skip'
+                ? 'Skip plan task'
+                : tool.name === 'task_list'
+                  ? 'List plan tasks'
+                  : tool.name === 'check_run_status'
+                    ? 'Check task run'
+                    : tool.name === 'cancel_run'
+                      ? 'Cancel task run'
+                      : tool.name.replaceAll('_', ' ');
   return {
     kind: 'task',
     title,
@@ -206,7 +220,19 @@ export function describeToolExecution(tool: ToolExecution): ToolRenderDescriptor
   if (['grep', 'glob', 'code_search', 'search_text'].includes(tool.name))
     return describeSearch(tool);
   if (tool.name.startsWith('browser_')) return describeBrowser(tool);
-  if (['agent_tool', 'plan_execute', 'create_complex_task'].includes(tool.name))
+  if (
+    [
+      'agent_tool',
+      'plan_execute',
+      'plan_create',
+      'task_update',
+      'task_skip',
+      'task_list',
+      'create_complex_task',
+      'check_run_status',
+      'cancel_run',
+    ].includes(tool.name)
+  )
     return describeTask(tool);
   const mcp = mcpIdentity(tool);
   if (mcp) return describeMcp(tool, mcp);

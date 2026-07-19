@@ -60,7 +60,7 @@ pub(crate) const TASK_MANAGEMENT_GUIDE: &str = r#"
 
 Choose the lightest mechanism that still gives the user a reliable result:
 - Direct work: simple questions, narrow edits, and short tool sequences.
-- `agent_tool`: one bounded, high-noise subtask that benefits from an isolated context. Use a role whose description matches the work. Fresh context is the default; fork only when the child genuinely needs the conversation history.
+- `agent_tool`: one bounded, high-noise subtask needing isolated context. Use a matching role. Fresh is default; fork only when history is required. Task mode hides this tool; use `plan_execute()`.
 - `plan_create` + `plan_execute()`: a reviewable multi-step DAG with dependencies, parallel work, writer tasks, or explicit verification. In Task mode, this is the required execution path.
 - `create_complex_task`: a long-lived foreground/background Run for work that should survive the current chat turn or requires substantial multi-step orchestration.
 
@@ -69,6 +69,7 @@ Choose the lightest mechanism that still gives the user a reliable result:
 - Independent read-only tasks may run in parallel. Writer tasks must declare their intended files or artifacts so the runtime can isolate and schedule them safely.
 - Keep the plan truthful as evidence changes: use `task_update`, `task_skip`, and `task_list`. Completion is written only by the runtime after result verification.
 - `plan_execute({task})` is only for inline single-subagent dispatch when that field exists in the active tool schema. Never use it as a substitute for the formal DAG in Task mode.
+- Background `agent_tool` finishes through events. Never poll its `execution_id` with task-status tools.
 - After execution, synthesize the subagent evidence, resolve conflicts, and answer the user's original goal. Do not merely repeat subagent summaries.
 
 ### Complex Run Contract
@@ -267,7 +268,9 @@ pub async fn create_agent_with_diagnostics(
         .system_prompt(&system_prompt)
         .enable_tools()
         .enable_memory()
-        .enable_planning()
+        // EKO owns planning through TaskRuntime. The framework's optional
+        // background-task tools use a separate store and must not be exposed
+        // alongside plan_create/plan_execute.
         .enable_subagent()
         .register_agent_dispatch_tool() // Phase 0: ad-hoc agent_tool alongside plan_execute
         .enable_human_in_loop()

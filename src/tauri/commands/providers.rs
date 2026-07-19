@@ -142,8 +142,8 @@ pub async fn list_model_templates() -> Result<serde_json::Value, IpcError> {
 pub async fn list_configured_models(
     state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
-    let mut cfg = state.app_state.config.app_config.write().await;
-    let models = model_config::configured_model_views(&mut cfg);
+    let cfg = state.app_state.config.app_config.read().await;
+    let models = model_config::configured_model_views(&cfg);
     let default_model_id = cfg.model.default_model_id.clone();
     Ok(serde_json::json!({
         "models": models,

@@ -96,7 +96,36 @@ pub fn provider_templates() -> Vec<ProviderTemplate> {
         .collect()
 }
 
-pub fn configured_model_views(config: &mut AppConfig) -> Vec<ConfiguredModelView> {
+pub fn configured_model_views(config: &AppConfig) -> Vec<ConfiguredModelView> {
+    if config.configured_models.is_empty() {
+        let legacy = ConfiguredModel {
+            id: stable_model_id(&config.model.provider, &config.model.name),
+            display_name: display_name_from_model(&config.model.name),
+            provider: config.model.provider.clone(),
+            model: config.model.name.clone(),
+            enabled: true,
+            max_tokens: config.model.max_tokens,
+            temperature: config.model.temperature,
+            context_window: config.model.context_window,
+            thinking: config.model.thinking.clone(),
+        };
+        let runtime = resolve_runtime_model(config, None);
+        return vec![ConfiguredModelView {
+            id: legacy.id.clone(),
+            display_name: legacy.display_name.clone(),
+            provider: legacy.provider.clone(),
+            model: legacy.model.clone(),
+            enabled: true,
+            is_default: true,
+            has_auth_token: runtime.auth_token.is_some(),
+            auth_source: runtime.auth_source,
+            base_url: runtime.base_url,
+            temperature: legacy.temperature,
+            max_tokens: legacy.max_tokens,
+            context_window: Some(effective_context_window(&legacy)),
+        }];
+    }
+
     let default_id = config.model.default_model_id.clone();
     config
         .configured_models
@@ -366,5 +395,23 @@ mod tests {
     fn effective_context_window_uses_framework_default_for_unknown_models() {
         let model = configured_model("custom", "local-model", None);
         assert_eq!(effective_context_window(&model), DEFAULT_CONTEXT_WINDOW);
+    }
+
+    #[test]
+    fn legacy_model_is_projected_as_the_default_configured_model() -> Result<(), String> {
+        let mut config = AppConfig::default();
+        config.model.provider = "deepseek".to_string();
+        config.model.name = "deepseek-v4-flash".to_string();
+        config.model.context_window = Some(128_000);
+
+        let views = configured_model_views(&config);
+        let view = views
+            .first()
+            .ok_or_else(|| "legacy model view was not created".to_string())?;
+        assert_eq!(views.len(), 1);
+        assert_eq!(view.model, "deepseek-v4-flash");
+        assert!(view.is_default);
+        assert_eq!(view.context_window, Some(128_000));
+        Ok(())
     }
 }
