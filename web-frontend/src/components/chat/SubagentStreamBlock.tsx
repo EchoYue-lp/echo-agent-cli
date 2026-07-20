@@ -22,6 +22,7 @@ interface SubagentStreamBlockProps {
   run: SubagentRunState;
   /** All execution traces in this run (for recursive child lookup). */
   allRuns: SubagentRunState[];
+  taskTitle?: string;
 }
 
 type SubagentTab = 'task' | 'process' | 'result';
@@ -90,6 +91,7 @@ function subagentResult(run: SubagentRunState): string {
 export const SubagentStreamBlock = memo(function SubagentStreamBlock({
   run,
   allRuns,
+  taskTitle,
 }: SubagentStreamBlockProps) {
   const [expanded, setExpanded] = useState(run.status === 'running');
   const [activeTab, setActiveTab] = useState<SubagentTab>('process');
@@ -142,9 +144,15 @@ export const SubagentStreamBlock = memo(function SubagentStreamBlock({
           className="flex min-w-0 flex-1 items-center gap-1.5 rounded-md px-1 py-0.5 text-left transition-colors hover:bg-[var(--bg-hover)]"
         >
           {statusIcon}
-          <span className="truncate font-medium text-[var(--text-primary)]">
-            {run.agent || run.subagentRunId}
+          <span className="shrink-0 font-medium text-[var(--text-primary)]">子智能体</span>
+          <span className="shrink-0 text-[var(--text-secondary)]">
+            {run.agent === 'explorer'
+              ? 'Explore'
+              : (run.agent || run.subagentRunId).replace(/^./, (value) => value.toUpperCase())}
           </span>
+          {taskTitle ? (
+            <span className="truncate font-medium text-[var(--text-primary)]">{taskTitle}</span>
+          ) : null}
           {run.background ? (
             <span
               className="shrink-0 rounded px-1 text-[9px] font-medium uppercase tracking-wide"

@@ -4,11 +4,12 @@
 
 use std::sync::Arc;
 
-use echo_agent::agent::subagent::SubagentBuilder;
+use echo_agent::agent::subagent::{AgentFactory, FnAgentFactory, SubagentBuilder};
 use echo_agent::llm::LlmConfig;
 use echo_agent::memory::ConversationStore;
 use echo_agent::prelude::*;
 use echo_agent::state::RuntimeStateStore;
+use futures::future::BoxFuture;
 
 use crate::agent_handle::AgentHandle;
 use crate::config::AppConfig;
@@ -589,6 +590,7 @@ async fn register_default_subagents(
     struct BuiltSubagent {
         definition: echo_agent::agent::subagent::SubagentDefinition,
         handle: crate::agent_handle::AgentHandle,
+        fork_factory: Option<Arc<dyn AgentFactory>>,
         readonly: bool,
         isolate_worktree: bool,
         isolate_workspace: bool,
@@ -615,7 +617,7 @@ async fn register_default_subagents(
                 &subagent_def.name,
                 &subagent_def.system_prompt,
                 &subagent_model,
-                subagent_llm,
+                subagent_llm.clone(),
                 temperature,
                 max_tokens,
                 token_limit,
@@ -631,7 +633,7 @@ async fn register_default_subagents(
                 &subagent_def.name,
                 &subagent_def.system_prompt,
                 &subagent_model,
-                subagent_llm,
+                subagent_llm.clone(),
                 temperature,
                 max_tokens,
                 token_limit,
@@ -714,9 +716,76 @@ async fn register_default_subagents(
                     builder = builder.tag(tag);
                 }
                 let def = builder.build();
+                let fork_factory = if subagent_def.can_delegate {
+                    None
+                } else {
+                    let factory_def = subagent_def.clone();
+                    let factory_model = subagent_model.clone();
+                    let factory_llm = subagent_llm.clone();
+                    let factory_cache_user_id = cache_user_id.to_string();
+                    let factory_browser_runtime = browser_runtime.clone();
+                    let factory_sandbox_manager = sandbox_manager.clone();
+                    let factory_tool_output_artifacts = tool_output_artifacts.clone();
+                    Some(Arc::new(FnAgentFactory::new(
+                        move || -> BoxFuture<'static, echo_agent::error::Result<Box<dyn Agent>>> {
+                            let subagent_def = factory_def.clone();
+                            let model = factory_model.clone();
+                            let llm = factory_llm.clone();
+                            let cache_user_id = factory_cache_user_id.clone();
+                            let browser_runtime = factory_browser_runtime.clone();
+                            let sandbox_manager = factory_sandbox_manager.clone();
+                            let tool_output_artifacts = factory_tool_output_artifacts.clone();
+                            Box::pin(async move {
+                                let max_iterations = subagent_def.max_turns.unwrap_or(0);
+                                let subagent = if subagent_def.readonly {
+                                    build_readonly_subagent_agent(
+                                        &subagent_def.name,
+                                        &subagent_def.system_prompt,
+                                        &model,
+                                        llm,
+                                        temperature,
+                                        max_tokens,
+                                        token_limit,
+                                        tool_timeout_ms,
+                                        max_tool_output_tokens,
+                                        &cache_user_id,
+                                        subagent_def.can_delegate,
+                                        max_iterations,
+                                        browser_runtime,
+                                    )?
+                                } else {
+                                    build_writer_subagent_agent(
+                                        &subagent_def.name,
+                                        &subagent_def.system_prompt,
+                                        &model,
+                                        llm,
+                                        temperature,
+                                        max_tokens,
+                                        token_limit,
+                                        tool_timeout_ms,
+                                        max_tool_output_tokens,
+                                        &cache_user_id,
+                                        subagent_def.can_delegate,
+                                        max_iterations,
+                                        browser_runtime,
+                                        sandbox_manager,
+                                        run_code_available,
+                                    )?
+                                };
+                                subagent.set_tool_output_artifacts(tool_output_artifacts);
+                                crate::tasks::task_runtime::compact_context::install_task_context_protection(
+                                    &subagent,
+                                )
+                                .await;
+                                Ok(Box::new(subagent) as Box<dyn Agent>)
+                            })
+                        },
+                    )) as Arc<dyn AgentFactory>)
+                };
                 built_subagents.push(BuiltSubagent {
                     definition: def,
                     handle: subagent_handle,
+                    fork_factory,
                     readonly: subagent_def.readonly,
                     isolate_worktree: subagent_def.isolate_worktree,
                     isolate_workspace: subagent_def.isolate_workspace,
@@ -739,6 +808,9 @@ async fn register_default_subagents(
             built.definition.clone(),
             built.handle.to_boxed_agent().await,
         );
+        if let Some(factory) = &built.fork_factory {
+            agent.register_subagent_factory(built.definition.clone(), factory.clone());
+        }
         tracing::info!(
             subagent = %built.definition.name,
             readonly = built.readonly,

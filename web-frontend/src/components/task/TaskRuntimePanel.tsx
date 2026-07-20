@@ -391,16 +391,22 @@ function traceRunForTodo(todo: { task_id: string }, runs: SubagentRunState[]) {
     .sort((a, b) => b.startedAt - a.startedAt)[0];
 }
 
-function displayedTodoStatus(
+export function displayedTodoStatus(
   todo: { status: TodoStatus; task_id: string },
   runs: SubagentRunState[]
 ): TodoStatus {
   const run = traceRunForTodo(todo, runs);
   if (!run) return todo.status;
+  if (run.status === 'running' && todo.status === ('pending' as TodoStatus)) {
+    return 'running' as TodoStatus;
+  }
   if (run.status === 'completed' && todo.status !== ('completed' as TodoStatus)) {
     return 'completed' as TodoStatus;
   }
   if (run.status === 'failed' && todo.status !== ('failed' as TodoStatus)) {
+    return 'failed' as TodoStatus;
+  }
+  if (run.status === 'timed_out' && todo.status !== ('failed' as TodoStatus)) {
     return 'failed' as TodoStatus;
   }
   if (run.status === 'cancelled' && todo.status !== ('skipped' as TodoStatus)) {

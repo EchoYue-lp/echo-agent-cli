@@ -15,9 +15,14 @@ describe('SubagentStreamBlock', () => {
       events: [],
     };
 
-    const html = renderToStaticMarkup(<SubagentStreamBlock run={run} allRuns={[run]} />);
+    const html = renderToStaticMarkup(
+      <SubagentStreamBlock run={run} allRuns={[run]} taskTitle="核证 Agent 实例并发问题" />
+    );
 
     expect(html.match(/role="tablist"/g)).toHaveLength(1);
+    expect(html).toContain('子智能体');
+    expect(html).toContain('Explore');
+    expect(html).toContain('核证 Agent 实例并发问题');
     expect(html).toContain('提示词 / 任务');
     expect(html).toContain('执行细节');
     expect(html).toContain('结果');

@@ -55,6 +55,7 @@ export const ParallelExecutionBlock = memo(function ParallelExecutionBlock({
   messageId,
 }: ParallelExecutionBlockProps) {
   const activeRun = useTaskRuntimeStore((s) => s.activeRun);
+  const plan = useTaskRuntimeStore((s) => s.plan);
   const runs = useSubagentRunStore((s) => s.runs);
   const lastAssistantMessageId = useChatStore((s) => {
     for (let i = s.messages.length - 1; i >= 0; i -= 1) {
@@ -76,6 +77,7 @@ export const ParallelExecutionBlock = memo(function ParallelExecutionBlock({
           key={w.subagentRunId}
           run={w}
           allRuns={Object.values(runs).filter((x) => x.runId === w.runId)}
+          taskTitle={plan?.tasks.find((task) => task.id === w.taskId)?.title}
         />
       ))}
     </>
