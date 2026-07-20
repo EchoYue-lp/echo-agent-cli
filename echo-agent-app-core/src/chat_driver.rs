@@ -472,7 +472,9 @@ fn disabled_tools_for_mode(
             .into_iter()
             .map(str::to_string),
         ),
-        InteractionMode::Auto => {}
+        InteractionMode::Auto => {
+            disabled.insert("agent_tool".to_string());
+        }
     }
 
     disabled
@@ -515,13 +517,14 @@ mod tests {
     }
 
     #[test]
-    fn auto_mode_hides_incompatible_framework_task_ids() {
+    fn auto_mode_requires_task_runtime_for_delegation() {
         let disabled = disabled_tools_for_mode(crate::tasks::task_runtime::InteractionMode::Auto);
         assert!(disabled.contains("spawn_background_task"));
         assert!(disabled.contains("check_task_status"));
         assert!(disabled.contains("list_background_tasks"));
-        assert!(!disabled.contains("agent_tool"));
+        assert!(disabled.contains("agent_tool"));
         assert!(!disabled.contains("plan_execute"));
+        assert!(!disabled.contains("create_complex_task"));
     }
 
     struct CountingTool {

@@ -54,6 +54,7 @@ evidence, and the next bounded step.
 | Legacy history placeholder IPC removal | Complete | Duplicate history commands/types removed; conversation export remains canonical |
 | Formal plan materialization count contract | Complete | `docs/2026-07-19-formal-plan-materialization.md`; `plan_execute` rejects inline/empty/partial plans and executes only the persisted PlanTask DAG |
 | Formal plan execution identity and timeout reliability | Complete | Long-running dispatch tools own their deadline; `plan_create` preserves the originating conversation/message identity so GUI Subagent cards and TaskRuntime use the same run |
+| Parallel Subagent instance and TaskRuntime routing | Complete | Sync/Fork/Teammate dispatches use fresh factory instances; Auto/Task delegation is forced through the formal plan so the right panel cannot be bypassed |
 
 ## Current Decisions
 
@@ -102,11 +103,22 @@ for unsupported files or parser failure.
 The canonical parallel path is now `plan_create` once per PlanTask, followed by
 `task_list` and one `plan_execute(expected_task_count=N)`. The runtime rejects
 inline tasks, empty plans, and count mismatches before dispatch. `agent_tool`
-remains the single ad-hoc Subagent mechanism. The TaskRun itself represents the
-user goal, so a formal plan contains no extra wrapper/placeholder task. Main-chat
-tool rows and the right task panel therefore project the same persisted PlanTask
-set instead of hidden one-task Runs. See
+remains the single ad-hoc Subagent mechanism in Chat mode. Auto and Task mode
+physically hide it, so any delegated work must materialize a formal plan and
+therefore appears in the right task panel. The TaskRun itself represents the
+user goal, so a formal plan contains no extra wrapper/placeholder task.
+Main-chat tool rows and the right task panel therefore project the same
+persisted PlanTask set instead of hidden one-task Runs. See
 `docs/2026-07-19-formal-plan-materialization.md`.
+
+Factory-backed Sync, Fork, and one-shot Teammate dispatches construct an
+independent Agent per invocation. This is required because ReactAgent serializes
+one instance for its entire execution lifetime; reusing the registry singleton
+made concurrently submitted same-role Subagents queue behind one mutex. These
+modes also propagate an invocation child cancellation token, including explicit
+cancellation when their internal deadline expires. TeamAgent's persistent
+member/mailbox lifecycle remains a separate path and retains its own identity
+semantics.
 
 Long-running formal execution is not governed by the ordinary 120-second tool
 deadline. `plan_execute` and other timeout-exempt tools use their own bounded

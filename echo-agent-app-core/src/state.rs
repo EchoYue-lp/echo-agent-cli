@@ -386,9 +386,9 @@ pub struct TaskState {
     /// Backs TaskRuntime query commands. `None` only if both the
     /// on-disk open and the in-memory fallback failed (extreme OOM).
     pub runtime: Option<Arc<crate::tasks::task_runtime::TaskRuntimeStore>>,
-    /// Manual interaction mode override (Chat/Task/Auto). `Auto` lets the
-    /// agent choose a path; `Chat` disables formal task tools for the turn;
-    /// `Task` requires a formal run and plan lifecycle.
+    /// Manual interaction mode override (Chat/Task/Auto). `Auto` chooses
+    /// between direct work and a formal run; `Chat` disables formal task tools
+    /// for the turn; `Task` requires a formal run and plan lifecycle.
     /// Toggleable at runtime via Tauri command.
     pub interaction_mode: std::sync::atomic::AtomicU8,
 }

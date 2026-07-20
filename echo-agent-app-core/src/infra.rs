@@ -61,8 +61,8 @@ pub(crate) const TASK_MANAGEMENT_GUIDE: &str = r#"
 
 Choose the lightest reliable mechanism:
 - Direct work: simple questions, narrow edits, short tool sequences.
-- `agent_tool`: one bounded subtask needing isolated context. Fresh is default; fork only when history is required. Task mode requires a formal plan instead.
-- `plan_create` + `task_list` + `plan_execute({expected_task_count: N})`: a reviewable DAG for dependencies, parallel work, writers, or verification. Task mode requires this path.
+- `agent_tool`: one bounded ad-hoc subtask in Chat mode. It does not create a TaskRun or appear in the TaskRuntime panel. Fresh is default; fork only when history is required.
+- `plan_create` + `task_list` + `plan_execute({expected_task_count: N})`: the required path for any delegated work in Auto or Task mode, and for dependencies, parallel work, writers, or verification.
 - `create_complex_task`: a long-lived Run that must survive the chat turn or needs substantial orchestration.
 
 ### Formal Plan Contract

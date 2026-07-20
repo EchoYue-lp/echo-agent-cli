@@ -108,7 +108,7 @@ pub enum InteractionMode {
     Chat,
     /// Create a formal TaskRuntime run and require a reviewable plan lifecycle.
     Task,
-    /// Agent-selected direct/ad-hoc/formal execution (default).
+    /// Agent-selected direct or formal TaskRuntime execution (default).
     #[default]
     Auto,
 }
@@ -157,7 +157,7 @@ impl InteractionMode {
                 "Task mode. Use a formal, reviewable DAG. The TaskRun already represents the overall goal, so never create a wrapper or placeholder PlanTask for it. Each plan_create call creates exactly one executable node: create one per intended subagent and wait for every result. Then call task_list and pass its exact Tasks (N) count as expected_task_count to plan_execute. Keep task status and verification current. Do not claim dispatch before plan_execute starts."
             }
             InteractionMode::Auto => {
-                "Auto mode. Choose the lightest reliable path: answer or act directly for simple work; use agent_tool for one isolated bounded investigation; for multi-step, multi-file, dependent, or parallel work, create exactly one PlanTask per intended subagent with plan_create, wait for every result, call task_list, and pass its exact Tasks (N) count as expected_task_count to plan_execute."
+                "Auto mode. Choose between direct work and formal TaskRuntime execution. Answer or act directly for simple work. If any Subagent delegation is needed, or the work is multi-step, multi-file, dependent, or parallel, create exactly one PlanTask per intended Subagent with plan_create, wait for every result, call task_list, and pass its exact Tasks (N) count as expected_task_count to plan_execute. Do not dispatch ad-hoc Subagents in Auto mode."
             }
         }
     }
@@ -1366,8 +1366,9 @@ mod tests {
         assert!(task.contains("plan_create"));
         assert!(task.contains("expected_task_count"));
         assert!(task.contains("never create a wrapper"));
-        assert!(auto.contains("lightest reliable path"));
-        assert!(auto.contains("agent_tool"));
+        assert!(auto.contains("Choose between direct work"));
+        assert!(auto.contains("formal TaskRuntime execution"));
+        assert!(auto.contains("Do not dispatch ad-hoc Subagents"));
         assert!(auto.contains("task_list"));
         assert_ne!(chat, task);
         assert_ne!(task, auto);

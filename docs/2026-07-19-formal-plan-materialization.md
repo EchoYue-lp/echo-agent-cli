@@ -45,7 +45,10 @@ plan-count or task-panel contract.
 4. Multi-task planning must await every `plan_create`, call `task_list`, and
    pass the exact `Tasks (N)` value as `expected_task_count`.
 5. `plan_execute` rejects empty plans and count mismatches before dispatch.
-6. One ad-hoc isolated subtask remains the responsibility of `agent_tool`.
+6. One ad-hoc isolated subtask remains the responsibility of `agent_tool` in
+   Chat mode. Auto and Task mode hide `agent_tool`; any delegation in those
+   modes must use the formal plan so TaskRuntime and the right panel remain the
+   canonical execution view.
 7. The Agent must not claim dispatch before `plan_execute` accepts the complete
    plan.
 
