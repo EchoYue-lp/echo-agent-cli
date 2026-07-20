@@ -3,6 +3,31 @@ import { describe, expect, it } from 'vitest';
 import { InlineToolCall } from './InlineToolCall';
 
 describe('InlineToolCall', () => {
+  it('keeps the read tool name visible before a long path', () => {
+    const html = renderToStaticMarkup(
+      <InlineToolCall
+        index={0}
+        toolCall={{
+          id: 'call-read',
+          name: 'read_file',
+          args: { path: './echo-agent-app-core/src/tasks/task_runtime/types.rs', offset: 1 },
+          result: 'content',
+          success: true,
+          status: 'succeeded',
+          stdout: 'content',
+          stderr: '',
+          log: '',
+          startedAt: 1,
+          finishedAt: 2,
+        }}
+      />
+    );
+
+    expect(html).toContain('Read ./echo-agent-app-core/src/tasks/task_runtime/types.rs');
+    expect(html).toContain('· from line 1');
+    expect(html).toContain('from line 1');
+  });
+
   it('does not render tool output while collapsed', () => {
     const html = renderToStaticMarkup(
       <InlineToolCall
@@ -23,7 +48,7 @@ describe('InlineToolCall', () => {
       />
     );
 
-    expect(html).toContain('printf visible-title');
+    expect(html).toContain('Shell printf visible-title');
     expect(html).not.toContain('hidden result');
     expect(html).not.toContain('hidden stdout');
   });

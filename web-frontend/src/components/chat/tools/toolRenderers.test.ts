@@ -22,13 +22,20 @@ describe('tool renderer registry', () => {
   it('describes read ranges without exposing JSON args', () => {
     expect(
       describeToolExecution(tool('read_file', { path: 'src/main.rs', offset: 10, limit: 20 }))
-    ).toMatchObject({ kind: 'read', title: 'src/main.rs', detail: 'lines 10-29' });
+    ).toMatchObject({ kind: 'read', title: 'Read src/main.rs', detail: 'lines 10-29' });
   });
 
   it('summarizes file writes with path and line count', () => {
     expect(
       describeToolExecution(tool('write_file', { path: 'a.ts', content: 'one\ntwo' }))
     ).toMatchObject({ kind: 'write', title: 'Write a.ts', detail: '2 lines' });
+  });
+
+  it('prefixes shell commands with the tool name', () => {
+    expect(describeToolExecution(tool('shell', { command: 'cargo test' }))).toMatchObject({
+      kind: 'shell',
+      title: 'Shell cargo test',
+    });
   });
 
   it('summarizes search scope and result count', () => {
@@ -38,16 +45,54 @@ describe('tool renderer registry', () => {
       )
     ).toMatchObject({
       kind: 'search',
-      title: 'Search “ToolResult”',
+      title: 'Grep “ToolResult”',
       detail: 'in src · 12 matches',
+    });
+  });
+
+  it('uses the concrete search tool name with its query summary', () => {
+    expect(describeToolExecution(tool('glob', { pattern: '**/*.rs', path: 'src' }))).toMatchObject({
+      kind: 'search',
+      title: 'Glob “**/*.rs”',
+      detail: 'in src',
+    });
+    expect(
+      describeToolExecution(tool('code_search', { query: 'TaskRuntime', path: 'src' }))
+    ).toMatchObject({
+      kind: 'search',
+      title: 'Code Search “TaskRuntime”',
+      detail: 'in src',
     });
   });
 
   it('falls back to a generic descriptor for unknown tools', () => {
     expect(describeToolExecution(tool('custom_tool', { value: 1 }))).toMatchObject({
       kind: 'generic',
-      title: 'custom_tool',
-      detail: '{"value":1}',
+      title: 'Custom tool',
+      detail: undefined,
+    });
+  });
+
+  it('summarizes generic tool paths without exposing raw JSON', () => {
+    expect(
+      describeToolExecution(tool('repo_map', { format: 'tree', max_depth: 4, path: '.' }))
+    ).toMatchObject({
+      kind: 'generic',
+      title: 'Repo map',
+      detail: '.',
+    });
+  });
+
+  it('summarizes generic path and query argument variants', () => {
+    expect(describeToolExecution(tool('list_dir', { directory: 'src/components' }))).toMatchObject({
+      kind: 'generic',
+      title: 'List dir',
+      detail: 'src/components',
+    });
+    expect(describeToolExecution(tool('web_search', { q: 'Rust async channels' }))).toMatchObject({
+      kind: 'generic',
+      title: 'Web search',
+      detail: '“Rust async channels”',
     });
   });
 
@@ -68,14 +113,14 @@ describe('tool renderer registry', () => {
     expect(describeToolExecution(tool('mcp__github__list_issues', {}, '[{"id":1}]'))).toMatchObject(
       {
         kind: 'mcp',
-        title: 'github · list_issues',
-        detail: 'JSON array',
+        title: 'List issues',
+        detail: 'github · JSON array',
       }
     );
   });
 
   it('uses MCP result metadata from the framework adapter', () => {
-    const execution = tool('list_issues', {}, '{"items":[]}');
+    const execution = tool('list_issues', { query: 'is:open label:bug' }, '{"items":[]}');
     execution.metadata = {
       tool_source: 'mcp',
       mcp_server: 'github',
@@ -84,8 +129,8 @@ describe('tool renderer registry', () => {
     };
     expect(describeToolExecution(execution)).toMatchObject({
       kind: 'mcp',
-      title: 'github · list_issues',
-      detail: 'JSON result',
+      title: 'List issues',
+      detail: 'github · “is:open label:bug” · JSON result',
     });
   });
 
@@ -96,7 +141,7 @@ describe('tool renderer registry', () => {
       )
     ).toMatchObject({
       kind: 'task',
-      title: 'Subagent reviewer',
+      title: 'Agent Tool reviewer',
       detail: 'Review the browser renderer',
     });
   });

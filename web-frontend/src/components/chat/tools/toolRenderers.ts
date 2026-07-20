@@ -20,6 +20,35 @@ export function isSubagentDispatchTool(name: string): boolean {
   return name === 'agent_tool' || name === 'plan_execute';
 }
 
+function displayToolName(name: string): string {
+  const labels: Record<string, string> = {
+    shell: 'Shell',
+    read_file: 'Read',
+    edit_file: 'Edit',
+    write_file: 'Write',
+    create_file: 'Create',
+    grep: 'Grep',
+    glob: 'Glob',
+    code_search: 'Code Search',
+    search_text: 'Search Text',
+    browser_navigate: 'Navigate',
+    browser_snapshot: 'Snapshot',
+    agent_tool: 'Agent Tool',
+    plan_execute: 'Plan Execute',
+    plan_create: 'plan_create',
+    task_update: 'Task Update',
+    task_skip: 'Task Skip',
+    task_list: 'Task List',
+    create_complex_task: 'Create Complex Task',
+    check_run_status: 'Check Run Status',
+    cancel_run: 'Cancel Run',
+  };
+  const known = labels[name];
+  if (known) return known;
+  const words = name.replace(/^browser_/, '').replaceAll('_', ' ');
+  return `${words.charAt(0).toUpperCase()}${words.slice(1)}`;
+}
+
 function argsRecord(tool: ToolExecution): Record<string, unknown> {
   return tool.args && typeof tool.args === 'object' ? (tool.args as Record<string, unknown>) : {};
 }
@@ -45,6 +74,15 @@ function resultCount(result: string): string | undefined {
   return match?.[1] ? `${match[1]} matches` : undefined;
 }
 
+function genericArgSummary(args: Record<string, unknown>): string | undefined {
+  const path = textArg(args, 'path', 'file_path', 'file', 'directory', 'root', 'cwd');
+  const query = textArg(args, 'query', 'q', 'pattern', 'glob', 'symbol', 'search', 'term');
+  if (query && path) return `“${query}” · in ${path}`;
+  if (query) return `“${query}”`;
+  if (path) return path;
+  return textArg(args, 'command', 'url', 'target', 'name', 'task_id', 'run_id', 'id');
+}
+
 function browserDomain(value: string | undefined): string | undefined {
   if (!value) return undefined;
   try {
@@ -61,13 +99,13 @@ function describeBrowser(tool: ToolExecution): ToolRenderDescriptor {
   const domain = browserDomain(observedUrl);
   const pageTitle = tool.metadata?.browser_title;
   const target = textArg(args, 'target', 'element', 'selector', 'ref');
-  const action = tool.name.replace(/^browser_/, '').replaceAll('_', ' ');
+  const action = displayToolName(tool.name);
   const title =
     tool.name === 'browser_navigate'
-      ? `Open ${domain || 'page'}`
+      ? `${action} ${domain || 'page'}`
       : tool.name === 'browser_snapshot'
-        ? `Inspect ${domain || 'page'}`
-        : `${action.charAt(0).toUpperCase()}${action.slice(1)}`;
+        ? `${action} ${domain || 'page'}`
+        : action;
   const detail = [
     pageTitle,
     observedUrl && domain !== observedUrl ? observedUrl : undefined,
@@ -111,10 +149,17 @@ function describeMcp(
   tool: ToolExecution,
   identity: { server?: string; name: string }
 ): ToolRenderDescriptor {
+  const detail = [
+    identity.server,
+    genericArgSummary(argsRecord(tool)),
+    tool.status === 'running' ? undefined : mcpResultType(tool),
+  ]
+    .filter(Boolean)
+    .join(' · ');
   return {
     kind: 'mcp',
-    title: identity.server ? `${identity.server} · ${identity.name}` : identity.name,
-    detail: tool.status === 'running' ? undefined : mcpResultType(tool),
+    title: displayToolName(identity.name),
+    detail: detail || undefined,
   };
 }
 
@@ -130,27 +175,11 @@ function describeTask(tool: ToolExecution): ToolRenderDescriptor {
     (inlineTask && textArg(inlineTask, 'description')) ||
     textArg(args, 'description', 'task_id', 'run_id');
   const title =
-    tool.name === 'agent_tool'
-      ? `Subagent ${role || 'dispatch'}`
-      : tool.name === 'create_complex_task'
-        ? 'Start task run'
-        : tool.name === 'plan_execute'
-          ? role
-            ? `Execute with ${role}`
-            : 'Execute plan'
-          : tool.name === 'plan_create'
-            ? 'plan_create'
-            : tool.name === 'task_update'
-              ? 'Update plan task'
-              : tool.name === 'task_skip'
-                ? 'Skip plan task'
-                : tool.name === 'task_list'
-                  ? 'List plan tasks'
-                  : tool.name === 'check_run_status'
-                    ? 'Check task run'
-                    : tool.name === 'cancel_run'
-                      ? 'Cancel task run'
-                      : tool.name.replaceAll('_', ' ');
+    tool.name === 'agent_tool' && role
+      ? `${displayToolName(tool.name)} ${role}`
+      : tool.name === 'plan_execute' && role
+        ? `${displayToolName(tool.name)} ${role}`
+        : displayToolName(tool.name);
   return {
     kind: 'task',
     title,
@@ -169,14 +198,13 @@ function describeRead(tool: ToolExecution): ToolRenderDescriptor {
       : limit < 0
         ? `preview from line ${offset}`
         : `lines ${offset}-${Math.max(offset, offset + limit - 1)}`;
-  return { kind: 'read', title: path, detail: range };
+  return { kind: 'read', title: `${displayToolName(tool.name)} ${path}`, detail: range };
 }
 
 function describeWrite(tool: ToolExecution): ToolRenderDescriptor {
   const args = argsRecord(tool);
   const path = textArg(args, 'path', 'file_path') || 'file';
-  const action =
-    tool.name === 'edit_file' ? 'Edit' : tool.name === 'create_file' ? 'Create' : 'Write';
+  const action = displayToolName(tool.name);
   const details: string[] = [];
   if (args.dry_run === true) details.push('dry run');
   const content = textArg(args, 'content', 'new_content');
@@ -203,7 +231,7 @@ function describeSearch(tool: ToolExecution): ToolRenderDescriptor {
   const count = resultCount(tool.result || tool.stdout);
   return {
     kind: 'search',
-    title: `${tool.name === 'glob' ? 'Find' : 'Search'} “${query}”`,
+    title: `${displayToolName(tool.name)} “${query}”`,
     detail:
       [path !== '.' ? `in ${path}` : undefined, filter, count].filter(Boolean).join(' · ') ||
       undefined,
@@ -213,7 +241,7 @@ function describeSearch(tool: ToolExecution): ToolRenderDescriptor {
 export function describeToolExecution(tool: ToolExecution): ToolRenderDescriptor {
   if (tool.name === 'shell') {
     const command = textArg(argsRecord(tool), 'command') || 'shell';
-    return { kind: 'shell', title: command };
+    return { kind: 'shell', title: `${displayToolName(tool.name)} ${command}` };
   }
   if (tool.name === 'read_file') return describeRead(tool);
   if (['edit_file', 'write_file', 'create_file'].includes(tool.name)) return describeWrite(tool);
@@ -237,10 +265,9 @@ export function describeToolExecution(tool: ToolExecution): ToolRenderDescriptor
   const mcp = mcpIdentity(tool);
   if (mcp) return describeMcp(tool, mcp);
 
-  const args = tool.args == null ? '' : JSON.stringify(tool.args);
   return {
     kind: 'generic',
-    title: tool.name,
-    detail: args || undefined,
+    title: displayToolName(tool.name),
+    detail: genericArgSummary(argsRecord(tool)),
   };
 }

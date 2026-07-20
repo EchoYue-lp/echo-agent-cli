@@ -159,7 +159,7 @@ export const InlineToolCall = memo(function InlineToolCall({
           <span className="block truncate">
             <span>{descriptor.title}</span>
             {descriptor.detail && (
-              <span className="ml-1.5 text-[var(--text-tertiary)]">{descriptor.detail}</span>
+              <span className="ml-1.5 text-[var(--text-tertiary)]">· {descriptor.detail}</span>
             )}
           </span>
         </button>
