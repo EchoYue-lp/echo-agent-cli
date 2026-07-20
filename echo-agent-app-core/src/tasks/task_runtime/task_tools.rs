@@ -139,6 +139,17 @@ pub(crate) fn run_id_from_ctx_or_local(
         .ok_or_else(|| ToolResult::error("no active run — run_id not in ToolContext or task_local"))
 }
 
+fn trace_sink_from_tool_context(ctx: &echo_core::tools::ToolContext) -> Option<TraceSink> {
+    ctx.trace_sink.as_ref().map(|sink| {
+        let sink = sink.clone();
+        Arc::new(move |event: ExecEvent| {
+            if let Ok(value) = serde_json::to_value(event) {
+                sink(value);
+            }
+        }) as TraceSink
+    })
+}
+
 /// 在 ToolContext.run_id/trace_sink(若有)的 task_local 覆盖作用域内执行 f。
 ///
 /// 这样工具既有的 `execute`(读 task_local 的 require_run_id)无需改动即可在
@@ -169,14 +180,7 @@ where
                 .as_ref()
                 .map(|c| (**c).clone())
                 .unwrap_or_default();
-            let trace_sink = ctx.trace_sink.as_ref().map(|sink| {
-                let sink = sink.clone();
-                Arc::new(move |event: ExecEvent| {
-                    if let Ok(value) = serde_json::to_value(event) {
-                        sink(value);
-                    }
-                }) as TraceSink
-            });
+            let trace_sink = trace_sink_from_tool_context(ctx);
             CURRENT_CANCEL
                 .scope(
                     cancel,
@@ -227,6 +231,32 @@ mod tests {
         })
         .await;
         assert_eq!(inner.as_deref(), Some("inner"));
+    }
+
+    #[tokio::test]
+    async fn tool_context_scopes_run_and_cancellation_together() -> std::result::Result<(), String>
+    {
+        let parent_cancel = tokio_util::sync::CancellationToken::new();
+        let ctx = echo_core::tools::ToolContext {
+            run_id: Some("run-context".to_string()),
+            cancel: Some(Arc::new(parent_cancel.clone())),
+            ..Default::default()
+        };
+
+        let (run_id, scoped_cancel) = scoped_with_ctx_run_id(&ctx, || async {
+            let run_id = current_run_id();
+            let cancel = CURRENT_CANCEL
+                .try_with(Clone::clone)
+                .map_err(|error| error.to_string())?;
+            Ok::<_, String>((run_id, cancel))
+        })
+        .await?;
+
+        assert_eq!(run_id.as_deref(), Some("run-context"));
+        assert!(!scoped_cancel.is_cancelled());
+        parent_cancel.cancel();
+        assert!(scoped_cancel.is_cancelled());
+        Ok(())
     }
 
     // ── stage4 P4.1: cache_user_id single-source ────────────────────────────
@@ -311,7 +341,7 @@ impl Tool for TaskCreateTool {
                 Ok(id) => id,
                 Err(e) => return Ok(e),
             };
-            self.create_task(run_id, params).await
+            self.create_task(run_id, params, None).await
         })
     }
 
@@ -325,7 +355,7 @@ impl Tool for TaskCreateTool {
                 Ok(id) => id,
                 Err(e) => return Ok(e),
             };
-            self.create_task(run_id, params).await
+            self.create_task(run_id, params, Some(ctx)).await
         })
     }
 }
@@ -335,6 +365,7 @@ impl TaskCreateTool {
         &self,
         run_id: String,
         params: ToolParameters,
+        bootstrap_ctx: Option<&echo_core::tools::ToolContext>,
     ) -> echo_agent::error::Result<ToolResult> {
         let description = params
             .get("description")
@@ -398,7 +429,7 @@ impl TaskCreateTool {
             .and_then(|v| v.as_str())
             .map(String::from);
 
-        if let Err(e) = self.ensure_run_exists(&run_id, &title, &description) {
+        if let Err(e) = self.ensure_run_exists(&run_id, &title, &description, bootstrap_ctx) {
             return Ok(e);
         }
         let run = match self.store.get_run(&run_id) {
@@ -464,6 +495,7 @@ impl TaskCreateTool {
         run_id: &str,
         title: &str,
         description: &str,
+        bootstrap_ctx: Option<&echo_core::tools::ToolContext>,
     ) -> std::result::Result<(), ToolResult> {
         match self.store.get_run(run_id) {
             Ok(Some(_)) => return Ok(()),
@@ -475,16 +507,29 @@ impl TaskCreateTool {
             }
         }
 
-        let (conversation_id, root_message_id, attachments, trace_sink) =
-            match crate::chat_resources::current_chat_resources() {
-                Some(res) => (
-                    res.conv_id.clone(),
-                    res.root_message_id.clone(),
-                    res.attachments.clone(),
-                    Some(crate::chat_driver::subagent_trace_sink_for(&res.sink)),
-                ),
-                None => (None, run_id.to_string(), Vec::new(), None),
-            };
+        let chat_resources = crate::chat_resources::current_chat_resources();
+        let conversation_id = bootstrap_ctx
+            .and_then(|ctx| ctx.conversation_id.clone())
+            .or_else(|| chat_resources.as_ref().and_then(|res| res.conv_id.clone()));
+        let root_message_id = bootstrap_ctx
+            .and_then(|ctx| ctx.message_id.clone().or_else(|| ctx.turn_id.clone()))
+            .or_else(|| {
+                chat_resources
+                    .as_ref()
+                    .map(|res| res.root_message_id.clone())
+            })
+            .unwrap_or_else(|| run_id.to_string());
+        let attachments = chat_resources
+            .as_ref()
+            .map(|res| res.attachments.clone())
+            .unwrap_or_default();
+        let trace_sink = bootstrap_ctx
+            .and_then(trace_sink_from_tool_context)
+            .or_else(|| {
+                chat_resources
+                    .as_ref()
+                    .map(|res| crate::chat_driver::subagent_trace_sink_for(&res.sink))
+            });
         let conversation_id = conversation_id.unwrap_or_else(|| format!("message:{run_id}"));
         let goal = task_goal(title, description);
 
@@ -642,6 +687,56 @@ mod plan_create_tests {
             .ok_or_else(|| "expected bootstrapped plan".to_string())?;
         assert_eq!(plan.tasks.len(), 1);
         assert_eq!(plan.tasks[0].agent_role, "explorer");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn plan_create_bootstrap_preserves_chat_identity_from_tool_context()
+    -> std::result::Result<(), String> {
+        let shadow_root = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let store = Arc::new(
+            TaskRuntimeStore::new_in_memory_with_shadow_root(shadow_root.path())
+                .map_err(|error| error.to_string())?,
+        );
+        let tool = TaskCreateTool {
+            store: store.clone(),
+        };
+        let run_id = "taskrun:message-identity";
+        let mut params = ToolParameters::new();
+        params.insert(
+            "title".to_string(),
+            serde_json::Value::String("并行架构分析".to_string()),
+        );
+        params.insert(
+            "description".to_string(),
+            serde_json::Value::String("由多个 Subagent 分析当前项目".to_string()),
+        );
+        params.insert(
+            "kind".to_string(),
+            serde_json::Value::String("read_only_review".to_string()),
+        );
+        let ctx = echo_core::tools::ToolContext {
+            conversation_id: Some("conversation-identity".to_string()),
+            run_id: Some(run_id.to_string()),
+            turn_id: Some("turn-identity".to_string()),
+            message_id: Some("assistant-message-identity".to_string()),
+            ..Default::default()
+        };
+
+        let result = tool
+            .execute_with_context(params, &ctx)
+            .await
+            .map_err(|error| error.to_string())?;
+        if !result.success {
+            return Err(format!("plan_create failed: {:?}", result.error));
+        }
+
+        let run = store
+            .get_run(run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "expected bootstrapped run".to_string())?;
+        assert_eq!(run.conversation_id, "conversation-identity");
+        assert_eq!(run.root_message_id, "assistant-message-identity");
         Ok(())
     }
 

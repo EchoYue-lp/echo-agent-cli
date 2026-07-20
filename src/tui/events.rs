@@ -4918,6 +4918,7 @@ mod tests {
                 task: "inspect TUI".to_string(),
                 execution_id: Some("task-1:1".to_string()),
                 run_id: Some("run-1".to_string()),
+                conversation_id: Some("conversation-1".to_string()),
                 message_id: None,
                 background: false,
             },

@@ -1,6 +1,6 @@
 # EKO Master Plan
 
-Last updated: 2026-07-19
+Last updated: 2026-07-20
 
 This file is the cross-session source of truth for the coding, data analysis,
 academic research, and medical research expansion. Detailed design rationale
@@ -53,6 +53,7 @@ evidence, and the next bounded step.
 | Real-provider and LSP smoke fixtures | Complete | Explicit ignored tests gated by credentials/environment variables |
 | Legacy history placeholder IPC removal | Complete | Duplicate history commands/types removed; conversation export remains canonical |
 | Formal plan materialization count contract | Complete | `docs/2026-07-19-formal-plan-materialization.md`; `plan_execute` rejects inline/empty/partial plans and executes only the persisted PlanTask DAG |
+| Formal plan execution identity and timeout reliability | Complete | Long-running dispatch tools own their deadline; `plan_create` preserves the originating conversation/message identity so GUI Subagent cards and TaskRuntime use the same run |
 
 ## Current Decisions
 
@@ -106,6 +107,18 @@ user goal, so a formal plan contains no extra wrapper/placeholder task. Main-cha
 tool rows and the right task panel therefore project the same persisted PlanTask
 set instead of hidden one-task Runs. See
 `docs/2026-07-19-formal-plan-materialization.md`.
+
+Long-running formal execution is not governed by the ordinary 120-second tool
+deadline. `plan_execute` and other timeout-exempt tools use their own bounded
+execution policy, including the Subagent dispatch deadline, in both streaming
+and non-streaming ReAct paths. The framework also carries the originating
+conversation and `message_id` through
+`ExternalRunContext -> AgentRunSnapshot -> ToolContext/SubagentEvent`.
+When `plan_create` lazily materializes a TaskRun in Auto mode, it persists that
+conversation/message identity instead of substituting the internal
+`taskrun:<turn>` id. The right task panel and the inline main-chat Subagent
+stream therefore resolve the same formal run and remain visible while the plan
+executes.
 
 ### Skills And Report Rendering
 

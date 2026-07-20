@@ -1,6 +1,7 @@
 import { useMemo, memo } from 'react';
+import type { TaskRun } from '../../generated';
 import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
-import { useSubagentRunStore } from '../../stores/subagentRunStore';
+import { useSubagentRunStore, type SubagentRunState } from '../../stores/subagentRunStore';
 import { useChatStore } from '../../stores/chatStore';
 import { SubagentStreamBlock } from './SubagentStreamBlock';
 
@@ -23,6 +24,33 @@ interface ParallelExecutionBlockProps {
   messageId: string;
 }
 
+export function visibleSubagentRuns(
+  runs: readonly SubagentRunState[],
+  activeRun: Pick<TaskRun, 'run_id' | 'conversation_id'> | null,
+  messageId: string,
+  lastAssistantMessageId: string | null
+): SubagentRunState[] {
+  const isLatestAssistant = messageId === lastAssistantMessageId;
+  return runs
+    .filter((run) => {
+      if (run.subagentRunId === 'main' || (run.parent && run.parent !== run.runId)) {
+        return false;
+      }
+      if (run.messageId === messageId) {
+        return true;
+      }
+      if (run.messageId || !isLatestAssistant) {
+        return false;
+      }
+      return (
+        !activeRun ||
+        run.runId === activeRun.run_id ||
+        run.conversationId === activeRun.conversation_id
+      );
+    })
+    .sort((a, b) => a.startedAt - b.startedAt);
+}
+
 export const ParallelExecutionBlock = memo(function ParallelExecutionBlock({
   messageId,
 }: ParallelExecutionBlockProps) {
@@ -36,24 +64,7 @@ export const ParallelExecutionBlock = memo(function ParallelExecutionBlock({
   });
 
   const visibleRuns = useMemo(() => {
-    const isLatestAssistant = messageId === lastAssistantMessageId;
-    const allRuns = Object.values(runs);
-    return allRuns
-      .filter(
-        (w) =>
-          // Skip the synthetic "main" run — the main agent's thinking/tool
-          // stream is already rendered via `chat://event` (ChatPanel), so
-          // showing it again as a SubagentStreamBlock would duplicate. The
-          // "main" entry is still kept in the store for cache diagnostics.
-          w.subagentRunId !== 'main' &&
-          (!activeRun ||
-            w.runId === activeRun.run_id ||
-            w.conversationId === activeRun.conversation_id) &&
-          (w.messageId === messageId || (!w.messageId && isLatestAssistant)) &&
-          // Top-level subagents: parent is empty OR equals the run_id.
-          (!w.parent || w.parent === w.runId)
-      )
-      .sort((a, b) => a.startedAt - b.startedAt);
+    return visibleSubagentRuns(Object.values(runs), activeRun, messageId, lastAssistantMessageId);
   }, [activeRun, runs, messageId, lastAssistantMessageId]);
 
   if (visibleRuns.length === 0) return null;

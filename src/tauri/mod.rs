@@ -359,6 +359,7 @@ pub fn build_tauri_app(
                                             task,
                                             execution_id,
                                             run_id,
+                                            conversation_id,
                                             message_id,
                                             background,
                                         } => (
@@ -369,6 +370,7 @@ pub fn build_tauri_app(
                                             serde_json::json!({
                                                 "mode": format!("{:?}", mode),
                                                 "task": task.clone(),
+                                                "conversation_id": conversation_id.clone(),
                                                 "message_id": message_id.clone(),
                                                 "background": background,
                                             }),

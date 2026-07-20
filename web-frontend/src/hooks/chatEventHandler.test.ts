@@ -78,4 +78,36 @@ describe('chat and TaskRuntime lifecycle separation', () => {
     );
     expect(useChatStore.getState().messages.at(-1)?.content).toContain('task -> chat');
   });
+
+  it('projects reported LLM usage into the context indicator state', () => {
+    handleChatEvent(
+      {
+        type: 'llm_usage',
+        model: 'deepseek-v4-flash',
+        prompt_tokens: 32_000,
+        completion_tokens: 800,
+        total_tokens: 32_800,
+        cached_prompt_tokens: 28_000,
+        cache_creation_prompt_tokens: 0,
+        usage_reported: true,
+      },
+      {
+        assistantIdRef: { current: null },
+        currentMessageKeyRef: { current: null },
+        currentMessageIdRef: { current: null },
+        isCancelledRef: { current: false },
+        currentThinkingIdRef: { current: null },
+      }
+    );
+
+    expect(useChatStore.getState().contextWindow).toMatchObject({
+      inputTokens: 32_000,
+      cachedTokens: 28_000,
+      usageReported: true,
+    });
+    expect(useChatStore.getState().usageAccumulator).toEqual({
+      totalInput: 32_000,
+      totalCached: 28_000,
+    });
+  });
 });
