@@ -1,5 +1,12 @@
 # Formal Plan Materialization Count Contract
 
+Status: Superseded on 2026-07-21 by
+`docs/2026-07-21-dynamic-plan-runtime.md`.
+
+The count handshake described below fixed the hidden-dispatch bug, but the
+current contract replaces repeated per-node creation with one atomic DAG and
+uses `plan_revision` for optimistic concurrency and exact execution identity.
+
 ## Problem
 
 The main Agent could say it was dispatching N parallel Subagents while the
@@ -37,14 +44,14 @@ plan-count or task-panel contract.
 
 1. `plan_execute` executes only the current persisted PlanTask DAG. The inline
    `task` parameter and implicit one-task fallback are deleted.
-2. One `plan_create` call materializes exactly one PlanTask and reports the
-   current persisted task count.
+2. One `plan_create` call materializes the complete initial PlanTask DAG and
+   reports revision 1.
 3. The TaskRun already owns the user goal. Planning must not add a wrapper or
    placeholder PlanTask for that goal; every node represents actual Subagent
    work.
-4. Multi-task planning must await every `plan_create`, call `task_list`, and
-   pass the exact `Tasks (N)` value as `expected_task_count`.
-5. `plan_execute` rejects empty plans and count mismatches before dispatch.
+4. Planning calls `task_list` and passes the exact committed revision as
+   `plan_revision`; later changes use `plan_patch(base_revision=...)`.
+5. `plan_execute` rejects empty plans and revision mismatches before dispatch.
 6. One ad-hoc isolated subtask remains the responsibility of `agent_tool` in
    Chat mode. Auto and Task mode hide `agent_tool`; any delegation in those
    modes must use the formal plan so TaskRuntime and the right panel remain the

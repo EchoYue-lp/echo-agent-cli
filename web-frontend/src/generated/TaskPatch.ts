@@ -2,8 +2,7 @@
 import type { PlanTaskKind } from './PlanTaskKind';
 
 /**
- * Partial update patch for a [`PlanTask`]. Only non-`None` fields are applied.
- * Used by [`TaskRuntimeStore::update_task`] for in-flight plan edits.
+ * Partial specification update used by a revisioned [`PlanPatchOperation`].
  */
 export type TaskPatch = {
   title: string | null;
@@ -16,4 +15,5 @@ export type TaskPatch = {
   required_artifacts: Array<string> | null;
   execution_checks: Array<string> | null;
   acceptance_criteria: Array<string> | null;
+  max_retries: number | null;
 };

@@ -4,9 +4,9 @@
 //! (`run` header + `plan` envelope + `tasks[]` with runtime fields). This is
 //! the proof that `events.jsonl` can authoritatively rebuild `plan.json`.
 //!
-//! Precondition: events must carry enriched payloads (see store.rs enrichment
-//! comments — RunCreated/PlanGenerated/PlanEdited{insert,update,reorder}/
-//! Task*/Note{summary_persisted}). Without enrichment, rebuild is partial.
+//! Precondition: events must carry enriched payloads. Plan specifications are
+//! replaced only by atomic `PlanRevisionCommitted` events; task events update
+//! the separate execution projection.
 
 use chrono::DateTime;
 use chrono::Utc;
@@ -14,8 +14,9 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use super::types::{
-    AttendedMode, DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, RuntimeEventKind,
-    RuntimeTaskEvent, TaskPlan, TaskRun, TaskRunStatus, TodoStatus,
+    AttendedMode, DomainProfile, ExecutionMode, PlanRevision, PlanTask, RunStateSnapshot,
+    RuntimeEventKind, RuntimeTaskEvent, TaskExecution, TaskPlan, TaskRun, TaskRunStatus,
+    TodoStatus,
 };
 
 /// Rebuilt plan snapshot — the shape `plan.json` will take.
@@ -24,6 +25,29 @@ pub struct RebuiltPlan {
     pub run: TaskRun,
     pub plan: TaskPlan,
     pub tasks: Vec<PlanTask>,
+}
+
+impl RebuiltPlan {
+    pub fn plan_revision(&self) -> PlanRevision {
+        PlanRevision {
+            plan_id: self.plan.plan_id.clone(),
+            run_id: self.plan.run_id.clone(),
+            revision: self.plan.revision,
+            domain_profile: self.plan.domain_profile,
+            goal: self.plan.goal.clone(),
+            assumptions: self.plan.assumptions.clone(),
+            risks: self.plan.risks.clone(),
+            execution_mode: self.plan.execution_mode,
+            tasks: self.tasks.iter().map(PlanTask::spec).collect(),
+        }
+    }
+
+    pub fn run_state(&self) -> RunStateSnapshot {
+        RunStateSnapshot {
+            run: self.run.clone(),
+            tasks: self.tasks.iter().map(PlanTask::execution).collect(),
+        }
+    }
 }
 
 /// Fold a run's events (in seq order) into a snapshot.
@@ -71,7 +95,7 @@ pub fn rebuild_plan_from_events(events: &[RuntimeTaskEvent]) -> Result<RebuiltPl
                         .and_then(|v| v.as_str())
                         .unwrap_or_default()
                         .to_string(),
-                    plan_id: None, // set by PlanGenerated below
+                    plan_id: None, // set by PlanRevisionCommitted below
                     route: p
                         .get("route")
                         .and_then(|v| v.as_str())
@@ -111,103 +135,69 @@ pub fn rebuild_plan_from_events(events: &[RuntimeTaskEvent]) -> Result<RebuiltPl
                     r.updated_at = ev.timestamp;
                 }
             }
-            K::PlanGenerated => {
+            K::PlanRevisionCommitted => {
                 let p = &ev.payload;
-                let plan_id = p
-                    .get("plan_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                if let Some(r) = run.as_mut() {
-                    r.plan_id = Some(plan_id.clone());
-                }
-                plan = Some(TaskPlan {
-                    plan_id,
-                    run_id: ev.run_id.clone(),
-                    domain_profile: p
-                        .get("domain_profile")
-                        .and_then(|v| v.as_str())
-                        .and_then(DomainProfile::from_str)
-                        .unwrap_or_default(),
-                    goal: p
-                        .get("goal")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string(),
-                    assumptions: decode_str_vec(p, "assumptions"),
-                    risks: decode_str_vec(p, "risks"),
-                    execution_mode: p
-                        .get("execution_mode")
-                        .and_then(|v| v.as_str())
-                        .and_then(ExecutionMode::from_str)
-                        .unwrap_or_default(),
-                    tasks: Vec::new(),
-                });
-                // attach_plan path: PlanGenerated carries the full task bodies (insert_plan_task_tx
-                // doesn't emit PlanEdited{insert}). Bootstrap path has empty tasks.
-                if let Some(arr) = p.get("tasks").and_then(|v| v.as_array()) {
-                    tasks = arr
+                if let Some(committed) = p
+                    .get("plan")
+                    .and_then(|value| serde_json::from_value::<PlanRevision>(value.clone()).ok())
+                {
+                    if let Some(r) = run.as_mut() {
+                        r.plan_id = Some(committed.plan_id.clone());
+                    }
+                    let previous_execution = tasks
                         .iter()
-                        .filter_map(|v| serde_json::from_value::<PlanTask>(v.clone()).ok())
+                        .map(|task| (task.id.clone(), task.execution()))
+                        .collect::<std::collections::HashMap<_, _>>();
+                    tasks = committed
+                        .tasks
+                        .iter()
+                        .cloned()
+                        .map(|spec| {
+                            let execution = previous_execution
+                                .get(&spec.id)
+                                .cloned()
+                                .unwrap_or_else(|| TaskExecution::pending(spec.id.clone()));
+                            PlanTask::from_parts(spec, execution)
+                        })
                         .collect();
-                }
-            }
-            K::PlanEdited => {
-                let action = ev
-                    .payload
-                    .get("action")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                match action {
-                    "insert" => {
-                        if let Some(task) = decode_task(&ev.payload, "task") {
-                            tasks.push(task);
-                        }
-                    }
-                    "update" => {
-                        if let Some(task_id) = ev
-                            .payload
-                            .get("task_id")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string)
-                        {
-                            #[allow(clippy::collapsible_if)]
-                            // nested let-Option guard reads clearer than a let-chain
-                            if let Some(t) = tasks.iter_mut().find(|t| t.id == task_id) {
-                                apply_patch(t, &ev.payload);
-                            }
-                        }
-                    }
-                    "remove" => {
-                        // `remove_task` is a SOFT delete: it sets the task's
-                        // status to Skipped (via set_task_status) and then
-                        // emits PlanEdited{remove}. The task row stays in the
-                        // plan so the UI can still show it as skipped. Match
-                        // that semantics here — flip status to Skipped rather
-                        // than dropping the task. (Hard-deleting would diverge
-                        // from SQL `list_todos`, which keeps the row.)
-                        if let Some(task_id) = ev
-                            .payload
-                            .get("task_id")
-                            .and_then(|v| v.as_str())
-                            .map(str::to_string)
-                            && let Some(t) = tasks.iter_mut().find(|t| t.id == task_id)
-                        {
-                            t.status = TodoStatus::Skipped;
-                        }
-                    }
-                    "reorder" => {
-                        if let Some(new_order) =
-                            ev.payload.get("new_order").and_then(|v| v.as_array())
-                        {
-                            let order: Vec<String> = new_order
+                    let skipped = p
+                        .get("skipped_task_ids")
+                        .and_then(|value| value.as_array())
+                        .map(|values| {
+                            values
                                 .iter()
-                                .filter_map(|v| v.as_str().map(str::to_string))
-                                .collect();
-                            reorder_tasks(&mut tasks, &order);
+                                .filter_map(|value| value.as_str())
+                                .collect::<std::collections::HashSet<_>>()
+                        })
+                        .unwrap_or_default();
+                    let reset = p
+                        .get("reset_task_ids")
+                        .and_then(|value| value.as_array())
+                        .map(|values| {
+                            values
+                                .iter()
+                                .filter_map(|value| value.as_str())
+                                .collect::<std::collections::HashSet<_>>()
+                        })
+                        .unwrap_or_default();
+                    for task in &mut tasks {
+                        if skipped.contains(task.id.as_str()) {
+                            task.status = TodoStatus::Skipped;
+                        } else if reset.contains(task.id.as_str()) {
+                            task.status = TodoStatus::Pending;
                         }
                     }
-                    _ => {}
+                    plan = Some(TaskPlan {
+                        plan_id: committed.plan_id,
+                        run_id: committed.run_id,
+                        revision: committed.revision,
+                        domain_profile: committed.domain_profile,
+                        goal: committed.goal,
+                        assumptions: committed.assumptions,
+                        risks: committed.risks,
+                        execution_mode: committed.execution_mode,
+                        tasks: Vec::new(),
+                    });
                 }
             }
             K::TaskStarted
@@ -229,23 +219,23 @@ pub fn rebuild_plan_from_events(events: &[RuntimeTaskEvent]) -> Result<RebuiltPl
                             t.status = status;
                         }
                     }
+                    if let Some(retry_count) = ev
+                        .payload
+                        .get("retry_count")
+                        .and_then(|value| value.as_u64())
+                        .and_then(|value| u32::try_from(value).ok())
+                        && let Some(task) = tasks.iter_mut().find(|task| &task.id == task_id)
+                    {
+                        task.retry_count = retry_count;
+                    }
+                    if let Some(value) = ev.payload.get("failure_fingerprint")
+                        && let Some(task) = tasks.iter_mut().find(|task| &task.id == task_id)
+                    {
+                        task.failure_fingerprint = value.as_str().map(str::to_string);
+                    }
                     // started_at/completed_at/owner_agent/summary live in tr_todos (not PlanTask).
                     // They are not rebuilt onto PlanTask in 0a; the parity test compares them
                     // separately via list_todos. They land on plan.json tasks[] in 0b.
-                }
-            }
-            K::Note => {
-                // summary_persisted carries a full TaskExecutionSummary; PlanTask has no field for
-                // it today (tr_summaries stays authoritative until 0c). No plan.json mutation.
-                //
-                // fix_task_persisted (update_plan_task, review gate) carries a full
-                // task body — replace the matching task so plan.json reflects the
-                // retry/fingerprint/title/status update.
-                if ev.payload.get("kind").and_then(|v| v.as_str()) == Some("fix_task_persisted")
-                    && let Some(task) = decode_task(&ev.payload, "task")
-                    && let Some(t) = tasks.iter_mut().find(|t| t.id == task.id)
-                {
-                    *t = task;
                 }
             }
             _ => {} // ArtifactProduced/Review*/Approval*/Note(other) don't affect plan.json
@@ -261,78 +251,6 @@ pub fn rebuild_plan_from_events(events: &[RuntimeTaskEvent]) -> Result<RebuiltPl
 pub enum RebuildError {
     #[error("event stream has no RunCreated event")]
     NoRunCreated,
-}
-
-fn decode_task(payload: &serde_json::Value, key: &str) -> Option<PlanTask> {
-    payload.get(key).and_then(|v| {
-        serde_json::from_value::<PlanTask>(v.clone())
-            .map_err(|e| tracing::debug!(error = %e, "decode_task: not a PlanTask, skipping"))
-            .ok()
-    })
-}
-
-fn apply_patch(task: &mut PlanTask, payload: &serde_json::Value) {
-    if let Some(patch) = payload.get("patch") {
-        if let Some(title) = patch.get("title").and_then(|v| v.as_str()) {
-            task.title = title.to_string();
-        }
-        if let Some(desc) = patch.get("description").and_then(|v| v.as_str()) {
-            task.description = desc.to_string();
-        }
-        if let Some(kind) = patch
-            .get("kind")
-            .and_then(|v| v.as_str())
-            .and_then(PlanTaskKind::from_str)
-        {
-            task.kind = kind;
-        }
-        if let Some(role) = patch.get("agent_role").and_then(|v| v.as_str()) {
-            task.agent_role = role.to_string();
-        }
-        if patch.get("depends_on").is_some() {
-            task.depends_on = decode_str_vec(patch, "depends_on");
-        }
-        if patch.get("files").is_some() {
-            task.files = decode_str_vec(patch, "files");
-        }
-        if patch.get("allowed_tools").is_some() {
-            task.allowed_tools = decode_str_vec(patch, "allowed_tools");
-        }
-        if patch.get("required_artifacts").is_some() {
-            task.required_artifacts = decode_str_vec(patch, "required_artifacts");
-        }
-        if patch.get("execution_checks").is_some() {
-            task.execution_checks = decode_str_vec(patch, "execution_checks");
-        }
-        if patch.get("acceptance_criteria").is_some() {
-            task.acceptance_criteria = decode_str_vec(patch, "acceptance_criteria");
-        }
-    }
-}
-
-fn reorder_tasks(tasks: &mut [PlanTask], order: &[String]) {
-    tasks.sort_by_key(|t| {
-        order
-            .iter()
-            .position(|id| id == &t.id)
-            .map(|i| i as i64)
-            .unwrap_or(i64::MAX)
-    });
-    for (i, t) in tasks.iter_mut().enumerate() {
-        t.sort_order = i as i64;
-    }
-}
-
-fn decode_str_vec(payload: &serde_json::Value, key: &str) -> Vec<String> {
-    payload
-        .get(key)
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 fn parse_event_dt(
@@ -357,6 +275,7 @@ fn empty_plan_for(run: &TaskRun) -> TaskPlan {
     TaskPlan {
         plan_id: String::new(),
         run_id: run.run_id.clone(),
+        revision: 0,
         domain_profile: run.domain_profile,
         goal: run.goal.clone(),
         assumptions: Vec::new(),
@@ -371,7 +290,8 @@ mod tests {
     use super::*;
     use crate::tasks::task_runtime::store::TaskRuntimeStore;
     use crate::tasks::task_runtime::types::{
-        DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, TaskPatch, TaskPlan, TodoStatus,
+        DomainProfile, ExecutionMode, PlanPatchOperation, PlanPatchRequest, PlanTask, PlanTaskKind,
+        TaskPatch, TaskPlan, TodoStatus,
     };
 
     fn fresh() -> TaskRuntimeStore {
@@ -427,6 +347,7 @@ mod tests {
         let plan = TaskPlan {
             plan_id: "p1".to_string(),
             run_id: "r1".to_string(),
+            revision: 1,
             domain_profile: DomainProfile::AiCoding,
             goal: "review runtime".to_string(),
             assumptions: vec!["repo is small".to_string()],
@@ -492,7 +413,7 @@ mod tests {
         assert_eq!(rebuilt_t1.status, TodoStatus::Running);
     }
 
-    /// update_task path: a patch applied to a task must be visible in the rebuild.
+    /// A committed revision patch must be visible in the rebuilt specification.
     #[test]
     fn rebuild_reflects_task_patch() {
         let s = fresh();
@@ -507,22 +428,39 @@ mod tests {
             AttendedMode::Attended,
         )
         .unwrap();
-        s.insert_task("r1", None, sample_task("t1", PlanTaskKind::Investigation))
-            .unwrap();
-        s.update_task(
+        s.attach_plan(&TaskPlan {
+            plan_id: "p1".to_string(),
+            run_id: "r1".to_string(),
+            revision: 1,
+            domain_profile: DomainProfile::General,
+            goal: "g".to_string(),
+            assumptions: Vec::new(),
+            risks: Vec::new(),
+            execution_mode: ExecutionMode::Parallel,
+            tasks: vec![sample_task("t1", PlanTaskKind::Investigation)],
+        })
+        .unwrap();
+        s.patch_plan(
             "r1",
-            "t1",
-            TaskPatch {
-                title: Some("renamed".to_string()),
-                description: Some("new desc".to_string()),
-                kind: Some(PlanTaskKind::ReadOnlyReview),
-                agent_role: Some("explorer".to_string()),
-                depends_on: None,
-                files: Some(vec!["b.rs".to_string()]),
-                allowed_tools: None,
-                required_artifacts: None,
-                execution_checks: None,
-                acceptance_criteria: None,
+            &PlanPatchRequest {
+                base_revision: 1,
+                reason: "refine investigation".to_string(),
+                operations: vec![PlanPatchOperation::Update {
+                    task_id: "t1".to_string(),
+                    patch: TaskPatch {
+                        title: Some("renamed".to_string()),
+                        description: Some("new desc".to_string()),
+                        kind: Some(PlanTaskKind::ReadOnlyReview),
+                        agent_role: Some("explorer".to_string()),
+                        depends_on: None,
+                        files: Some(vec!["b.rs".to_string()]),
+                        allowed_tools: None,
+                        required_artifacts: None,
+                        execution_checks: None,
+                        acceptance_criteria: None,
+                        max_retries: None,
+                    },
+                }],
             },
         )
         .unwrap();

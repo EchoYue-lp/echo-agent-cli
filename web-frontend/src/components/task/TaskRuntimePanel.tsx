@@ -591,7 +591,7 @@ export function TaskRuntimePanel() {
         <div className="mb-2">
           <div className="mb-1 flex items-center justify-between">
             <span className="text-[10px] font-medium" style={{ color: 'var(--text-tertiary)' }}>
-              任务列表
+              任务列表{plan ? ` · r${plan.revision}` : ''}
             </span>
             <span className="text-[10px]" style={{ color: 'var(--text-tertiary)' }}>
               {completedCount}/{todos.length}
@@ -601,8 +601,11 @@ export function TaskRuntimePanel() {
             {todos.map((todo) => {
               const task = plan?.tasks.find((t) => t.id === todo.task_id);
               const status = displayedTodoStatus(todo, visibleTraceRuns);
-              const isEditable =
-                status === 'pending' || status === 'blocked' || status === 'failed';
+              const canPatch = status === 'pending' || status === 'blocked';
+              const canRetry =
+                (status === 'blocked' || status === 'failed') &&
+                (activeRun?.status === 'paused' || activeRun?.status === 'failed') &&
+                (task?.retry_count ?? 0) < (task?.max_retries ?? 0);
               return (
                 <div
                   key={todo.id}
@@ -633,47 +636,48 @@ export function TaskRuntimePanel() {
                       <span>· {TODO_LABEL[status] ?? status}</span>
                     </div>
                   </div>
-                  {/* Edit/delete buttons — visible on hover, only for editable tasks */}
-                  {isEditable && (
+                  {(canPatch || canRetry) && (
                     <div className="flex gap-0.5">
-                      {(status === 'blocked' || status === 'failed') &&
-                        (activeRun?.status === 'paused' || activeRun?.status === 'failed') &&
-                        (task?.retry_count ?? 0) < (task?.max_retries ?? 0) && (
+                      {canRetry && (
+                        <button
+                          className="rounded-md p-0.5 hover:bg-[var(--bg-active)]"
+                          title={`重试(当前 attempt ${(task?.retry_count ?? 0) + 1}/${(task?.max_retries ?? 0) + 1})`}
+                          onClick={() => {
+                            useTaskRuntimeStore.getState().retryBlockedTask(todo.task_id);
+                          }}
+                        >
+                          <RotateCcw size={10} style={{ color: 'var(--color-info)' }} />
+                        </button>
+                      )}
+                      {canPatch && (
+                        <>
                           <button
                             className="rounded-md p-0.5 hover:bg-[var(--bg-active)]"
-                            title={`重试(当前 attempt ${(task?.retry_count ?? 0) + 1}/${(task?.max_retries ?? 0) + 1})`}
+                            title="编辑"
                             onClick={() => {
-                              useTaskRuntimeStore.getState().retryBlockedTask(todo.task_id);
+                              const newTitle = prompt('新标题', todo.title);
+                              if (newTitle && newTitle !== todo.title) {
+                                useTaskRuntimeStore
+                                  .getState()
+                                  .updateTask(todo.task_id, { title: newTitle });
+                              }
                             }}
                           >
-                            <RotateCcw size={10} style={{ color: 'var(--color-info)' }} />
+                            <Pencil size={10} style={{ color: 'var(--text-tertiary)' }} />
                           </button>
-                        )}
-                      <button
-                        className="rounded-md p-0.5 hover:bg-[var(--bg-active)]"
-                        title="编辑"
-                        onClick={() => {
-                          const newTitle = prompt('新标题', todo.title);
-                          if (newTitle && newTitle !== todo.title) {
-                            useTaskRuntimeStore
-                              .getState()
-                              .updateTask(todo.task_id, { title: newTitle });
-                          }
-                        }}
-                      >
-                        <Pencil size={10} style={{ color: 'var(--text-tertiary)' }} />
-                      </button>
-                      <button
-                        className="rounded-md p-0.5 hover:bg-[var(--bg-active)]"
-                        title="删除"
-                        onClick={() => {
-                          if (confirm(`确定删除任务「${todo.title}」？`)) {
-                            useTaskRuntimeStore.getState().removeTask(todo.task_id);
-                          }
-                        }}
-                      >
-                        <Trash2 size={10} style={{ color: 'var(--color-error)' }} />
-                      </button>
+                          <button
+                            className="rounded-md p-0.5 hover:bg-[var(--bg-active)]"
+                            title="跳过"
+                            onClick={() => {
+                              if (confirm(`确定跳过任务「${todo.title}」？`)) {
+                                useTaskRuntimeStore.getState().skipTask(todo.task_id);
+                              }
+                            }}
+                          >
+                            <SkipForward size={10} style={{ color: 'var(--color-warning)' }} />
+                          </button>
+                        </>
+                      )}
                     </div>
                   )}
                 </div>
@@ -681,33 +685,42 @@ export function TaskRuntimePanel() {
             })}
           </div>
           {/* Add task button */}
-          <button
-            className="mt-1 flex w-full items-center justify-center gap-1 rounded-md px-2 py-1 text-[10px] hover:bg-[var(--bg-hover)]"
-            style={{ color: 'var(--text-tertiary)', border: '1px dashed var(--border-secondary)' }}
-            onClick={() => {
-              const title = prompt('新任务标题');
-              if (title) {
-                const lastId = todos.length > 0 ? todos[todos.length - 1].task_id : null;
-                useTaskRuntimeStore.getState().insertTask(lastId, {
-                  id: `task_${Date.now()}`,
-                  title,
-                  description: '',
-                  kind: 'implementation',
-                  agent_role: 'general',
-                  domain_profile: 'general',
-                  depends_on: [],
-                  files: [],
-                  allowed_tools: [],
-                  verification: [],
-                  retry_count: 0,
-                  max_retries: 3,
-                  status: 'pending',
-                });
-              }
-            }}
-          >
-            <Plus size={10} /> 新增任务
-          </button>
+          {plan && !['completed', 'cancelled'].includes(activeRun.status) && (
+            <button
+              className="mt-1 flex w-full items-center justify-center gap-1 rounded-md px-2 py-1 text-[10px] hover:bg-[var(--bg-hover)]"
+              style={{
+                color: 'var(--text-tertiary)',
+                border: '1px dashed var(--border-secondary)',
+              }}
+              onClick={() => {
+                const title = prompt('新任务标题');
+                if (title) {
+                  const lastTask = plan.tasks.at(-1);
+                  const sortOrder =
+                    plan.tasks.reduce((max, task) => Math.max(max, task.sort_order), 0) + 10;
+                  useTaskRuntimeStore.getState().insertTask(lastTask?.id ?? null, {
+                    id: `task_${Date.now()}`,
+                    title,
+                    description: `执行任务：${title}`,
+                    kind: 'implementation',
+                    agent_role: 'general-purpose',
+                    domain_profile: plan.domain_profile,
+                    depends_on: [],
+                    parallel_group: null,
+                    files: [],
+                    allowed_tools: [],
+                    required_artifacts: [],
+                    execution_checks: [],
+                    acceptance_criteria: [],
+                    max_retries: 3,
+                    sort_order: sortOrder,
+                  });
+                }
+              }}
+            >
+              <Plus size={10} /> 新增任务
+            </button>
+          )}
         </div>
       )}
 

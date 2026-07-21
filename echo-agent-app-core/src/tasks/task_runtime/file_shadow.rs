@@ -8,8 +8,8 @@
 
 use std::path::{Path, PathBuf};
 
-use super::event_rebuild::{RebuiltPlan, rebuild_plan_from_events};
-use super::types::RuntimeTaskEvent;
+use super::event_rebuild::rebuild_plan_from_events;
+use super::types::{PlanRevision, RunStateSnapshot, RuntimeEventKind, RuntimeTaskEvent};
 
 /// Shadow writer for one root directory. Cheap to clone (wraps a root path; the
 /// append lock is per-run via the `events.jsonl` file handle being held briefly).
@@ -64,6 +64,10 @@ impl FileTaskShadow {
 
     fn plan_path(&self, run_id: &str) -> PathBuf {
         self.run_dir(run_id).join("plan.json")
+    }
+
+    fn run_state_path(&self, run_id: &str) -> PathBuf {
+        self.run_dir(run_id).join("run-state.json")
     }
 
     // ── 0bc step-2: file-authority write path (replaces SQL INSERT + flush) ──
@@ -148,9 +152,12 @@ impl FileTaskShadow {
             .clone()
     }
 
-    /// Rebuild `plan.json` for `run_id` from its full `events.jsonl` stream.
-    /// Called by store write methods after `append_event_line` to refresh the
-    /// snapshot. Uses tmp+rename (atomic on the same filesystem).
+    /// Refresh the projections affected by the latest event.
+    ///
+    /// The method keeps its historical name while callers migrate, but
+    /// `plan.json` now contains only the plan specification and
+    /// `run-state.json` contains mutable execution state. Events that affect
+    /// neither projection (tool traces, reviews, artifacts) perform no rewrite.
     ///
     /// If the event stream has no `RunCreated` yet (e.g. an orphan review
     /// written before the run was created — SQL tolerated this), there is no
@@ -166,6 +173,29 @@ impl FileTaskShadow {
 
         let events = self.read_events(run_id)?;
         if events.is_empty() {
+            return Ok(());
+        }
+        let Some(latest) = events.last() else {
+            return Ok(());
+        };
+        let note_kind = latest.payload.get("kind").and_then(|value| value.as_str());
+        let affects_plan = latest.event_type == RuntimeEventKind::PlanRevisionCommitted;
+        let affects_run_state = matches!(
+            latest.event_type,
+            RuntimeEventKind::RunCreated
+                | RuntimeEventKind::RunStatusChanged
+                | RuntimeEventKind::RunAttachmentsUpdated
+                | RuntimeEventKind::RunCancelled
+                | RuntimeEventKind::PlanRevisionCommitted
+                | RuntimeEventKind::TaskStarted
+                | RuntimeEventKind::TaskCompleted
+                | RuntimeEventKind::TaskFailed
+                | RuntimeEventKind::TaskSkipped
+                | RuntimeEventKind::TaskBlocked
+                | RuntimeEventKind::TodoUpdated
+        ) || (latest.event_type == RuntimeEventKind::Note
+            && matches!(note_kind, Some("summary_persisted")));
+        if !affects_plan && !affects_run_state {
             return Ok(());
         }
         let rebuilt = match rebuild_plan_from_events(&events) {
@@ -188,12 +218,20 @@ impl FileTaskShadow {
                 return Ok(());
             }
         };
-        let plan_json = serde_json::to_string_pretty(&rebuilt)
-            .map_err(|e| ShadowError::Encode(e.to_string()))?;
         std::fs::create_dir_all(self.run_dir(run_id))
             .map_err(|e| ShadowError::Io(e.to_string()))?;
-        atomic_write(&self.plan_path(run_id), plan_json.as_bytes())
-            .map_err(|e| ShadowError::Io(e.to_string()))?;
+        if affects_plan {
+            let plan_json = serde_json::to_string_pretty(&rebuilt.plan_revision())
+                .map_err(|e| ShadowError::Encode(e.to_string()))?;
+            atomic_write(&self.plan_path(run_id), plan_json.as_bytes())
+                .map_err(|e| ShadowError::Io(e.to_string()))?;
+        }
+        if affects_run_state {
+            let state_json = serde_json::to_string_pretty(&rebuilt.run_state())
+                .map_err(|e| ShadowError::Encode(e.to_string()))?;
+            atomic_write(&self.run_state_path(run_id), state_json.as_bytes())
+                .map_err(|e| ShadowError::Io(e.to_string()))?;
+        }
         Ok(())
     }
 
@@ -236,7 +274,8 @@ impl FileTaskShadow {
             // A run dir is one that has events.jsonl or plan.json.
             let has_events = path.join("events.jsonl").exists();
             let has_plan = path.join("plan.json").exists();
-            if !has_events && !has_plan {
+            let has_run_state = path.join("run-state.json").exists();
+            if !has_events && !has_plan && !has_run_state {
                 continue;
             }
             if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
@@ -253,15 +292,26 @@ impl FileTaskShadow {
     }
 
     /// Read the shadow plan.json for parity comparison. Returns None if not yet written.
-    pub fn read_plan(&self, run_id: &str) -> Result<Option<RebuiltPlan>, ShadowError> {
+    pub fn read_plan(&self, run_id: &str) -> Result<Option<PlanRevision>, ShadowError> {
         let path = self.plan_path(run_id);
         if !path.exists() {
             return Ok(None);
         }
         let text = std::fs::read_to_string(&path).map_err(|e| ShadowError::Io(e.to_string()))?;
-        let plan: RebuiltPlan =
+        let plan: PlanRevision =
             serde_json::from_str(&text).map_err(|e| ShadowError::Decode(e.to_string()))?;
         Ok(Some(plan))
+    }
+
+    pub fn read_run_state(&self, run_id: &str) -> Result<Option<RunStateSnapshot>, ShadowError> {
+        let path = self.run_state_path(run_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let text = std::fs::read_to_string(&path).map_err(|e| ShadowError::Io(e.to_string()))?;
+        let state: RunStateSnapshot =
+            serde_json::from_str(&text).map_err(|e| ShadowError::Decode(e.to_string()))?;
+        Ok(Some(state))
     }
 
     /// Read the shadow events.jsonl for parity comparison.
@@ -346,8 +396,9 @@ mod tests {
     use super::*;
     use crate::tasks::task_runtime::store::TaskRuntimeStore;
     use crate::tasks::task_runtime::types::{
-        AttendedMode, DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, RuntimeEventKind,
-        TaskPatch, TaskPlan, TaskRunStatus, TodoStatus,
+        AttendedMode, DomainProfile, ExecutionMode, PlanPatchOperation, PlanPatchRequest,
+        PlanRevision, PlanTask, PlanTaskKind, RuntimeEventKind, TaskPatch, TaskPlan, TaskRunStatus,
+        TodoStatus,
     };
     use std::sync::Arc;
 
@@ -399,6 +450,7 @@ mod tests {
         let plan = TaskPlan {
             plan_id: "p1".to_string(),
             run_id: "r1".to_string(),
+            revision: 1,
             domain_profile: DomainProfile::AiCoding,
             goal: "review runtime".to_string(),
             assumptions: vec!["small repo".to_string()],
@@ -411,20 +463,18 @@ mod tests {
         };
         store.attach_plan(&plan).unwrap();
         store
-            .update_task(
+            .patch_plan(
                 "r1",
-                "t1",
-                TaskPatch {
-                    title: Some("renamed t1".to_string()),
-                    description: None,
-                    kind: None,
-                    agent_role: None,
-                    depends_on: None,
-                    files: None,
-                    allowed_tools: None,
-                    required_artifacts: None,
-                    execution_checks: None,
-                    acceptance_criteria: None,
+                &PlanPatchRequest {
+                    base_revision: 1,
+                    reason: "rename task".to_string(),
+                    operations: vec![PlanPatchOperation::Update {
+                        task_id: "t1".to_string(),
+                        patch: TaskPatch {
+                            title: Some("renamed t1".to_string()),
+                            ..Default::default()
+                        },
+                    }],
                 },
             )
             .unwrap();
@@ -450,18 +500,27 @@ mod tests {
 
         // Parity 3: file plan.json matches SQL-rebuilt plan (via the shadow's own rebuild).
         let file_plan = shadow.read_plan("r1").unwrap().expect("plan.json written");
+        let file_state = shadow
+            .read_run_state("r1")
+            .unwrap()
+            .expect("run-state.json written");
         let rebuilt = rebuild_plan_from_events(&sql_events).unwrap();
-        assert_eq!(file_plan.run.run_id, rebuilt.run.run_id);
-        assert_eq!(file_plan.run.goal, rebuilt.run.goal);
-        assert_eq!(file_plan.run.route, rebuilt.run.route);
-        assert_eq!(file_plan.plan.plan_id, rebuilt.plan.plan_id);
-        assert_eq!(file_plan.plan.execution_mode, rebuilt.plan.execution_mode);
+        assert_eq!(file_state.run.run_id, rebuilt.run.run_id);
+        assert_eq!(file_state.run.goal, rebuilt.run.goal);
+        assert_eq!(file_state.run.route, rebuilt.run.route);
+        assert_eq!(file_plan.plan_id, rebuilt.plan.plan_id);
+        assert_eq!(file_plan.execution_mode, rebuilt.plan.execution_mode);
         assert_eq!(file_plan.tasks.len(), rebuilt.tasks.len());
         let ft1 = file_plan.tasks.iter().find(|t| t.id == "t1").unwrap();
         let rt1 = rebuilt.tasks.iter().find(|t| t.id == "t1").unwrap();
         assert_eq!(ft1.title, rt1.title);
         assert_eq!(ft1.title, "renamed t1");
-        assert_eq!(ft1.status, rt1.status);
+        let state_t1 = file_state
+            .tasks
+            .iter()
+            .find(|task| task.task_id == "t1")
+            .unwrap();
+        assert_eq!(state_t1.status, rt1.status);
     }
 
     /// Helper: assert file shadow plan matches SQL-rebuilt plan on the fields the
@@ -485,20 +544,26 @@ mod tests {
             );
         }
         let file_plan = shadow.read_plan(run_id).unwrap();
+        let file_state = shadow.read_run_state(run_id).unwrap();
         let rebuilt = rebuild_plan_from_events(&sql_events).unwrap();
-        let file_plan = file_plan.expect("plan.json written");
+        let file_state = file_state.expect("run-state.json written");
         assert_eq!(
-            file_plan.run.run_id, rebuilt.run.run_id,
+            file_state.run.run_id, rebuilt.run.run_id,
             "[{run_id}] run_id"
         );
-        assert_eq!(file_plan.run.goal, rebuilt.run.goal, "[{run_id}] goal");
-        assert_eq!(file_plan.run.route, rebuilt.run.route, "[{run_id}] route");
+        assert_eq!(file_state.run.goal, rebuilt.run.goal, "[{run_id}] goal");
+        assert_eq!(file_state.run.route, rebuilt.run.route, "[{run_id}] route");
         assert_eq!(
-            file_plan.run.status, rebuilt.run.status,
+            file_state.run.status, rebuilt.run.status,
             "[{run_id}] run status"
         );
+        if rebuilt.plan.revision == 0 {
+            assert!(file_plan.is_none(), "[{run_id}] no plan revision committed");
+            return;
+        }
+        let file_plan = file_plan.expect("plan.json written");
         assert_eq!(
-            file_plan.plan.plan_id, rebuilt.plan.plan_id,
+            file_plan.plan_id, rebuilt.plan.plan_id,
             "[{run_id}] plan_id"
         );
         assert_eq!(
@@ -510,7 +575,16 @@ mod tests {
             assert_eq!(ft.id, rt.id, "[{run_id}] task id");
             assert_eq!(ft.title, rt.title, "[{run_id}] task {} title", ft.id);
             assert_eq!(ft.kind, rt.kind, "[{run_id}] task {} kind", ft.id);
-            assert_eq!(ft.status, rt.status, "[{run_id}] task {} status", ft.id);
+            let execution = file_state
+                .tasks
+                .iter()
+                .find(|task| task.task_id == ft.id)
+                .expect("task execution written");
+            assert_eq!(
+                execution.status, rt.status,
+                "[{run_id}] task {} status",
+                ft.id
+            );
             assert_eq!(
                 ft.sort_order, rt.sort_order,
                 "[{run_id}] task {} sort_order",
@@ -542,6 +616,7 @@ mod tests {
         let plan = TaskPlan {
             plan_id: "p1".to_string(),
             run_id: "r1".to_string(),
+            revision: 1,
             domain_profile: DomainProfile::General,
             goal: "g".to_string(),
             assumptions: Vec::new(),
@@ -556,24 +631,44 @@ mod tests {
         store.attach_plan(&plan).unwrap();
         // Reorder: move t3 to front.
         store
-            .reorder_tasks(
+            .patch_plan(
                 "r1",
-                vec!["t3".to_string(), "t1".to_string(), "t2".to_string()],
+                &PlanPatchRequest {
+                    base_revision: 1,
+                    reason: "prioritize t3".to_string(),
+                    operations: vec![PlanPatchOperation::Reorder {
+                        task_ids: vec!["t3".to_string(), "t1".to_string(), "t2".to_string()],
+                    }],
+                },
             )
             .unwrap();
         assert_parity(&store, &shadow, "r1");
-        // Remove t2 — soft delete: the task stays in the plan but is marked
-        // Skipped (matching SQL `remove_task`, which sets status=Skipped and
-        // keeps the row). Hard-deleting would diverge from `list_todos`.
-        store.remove_task("r1", "t2").unwrap();
+        store
+            .patch_plan(
+                "r1",
+                &PlanPatchRequest {
+                    base_revision: 2,
+                    reason: "t2 is no longer required".to_string(),
+                    operations: vec![PlanPatchOperation::Skip {
+                        task_id: "t2".to_string(),
+                    }],
+                },
+            )
+            .unwrap();
         assert_parity(&store, &shadow, "r1");
         let file_plan = shadow.read_plan("r1").unwrap().unwrap();
         assert_eq!(file_plan.tasks.len(), 3, "soft delete keeps the task");
-        let t2 = file_plan
+        let _t2 = file_plan
             .tasks
             .iter()
             .find(|t| t.id == "t2")
             .expect("t2 still present after soft delete");
+        let state = shadow.read_run_state("r1").unwrap().unwrap();
+        let t2 = state
+            .tasks
+            .iter()
+            .find(|task| task.task_id == "t2")
+            .unwrap();
         assert_eq!(t2.status, TodoStatus::Skipped);
     }
 
@@ -600,6 +695,7 @@ mod tests {
             let plan = TaskPlan {
                 plan_id: format!("p_{rid}"),
                 run_id: rid.to_string(),
+                revision: 1,
                 domain_profile: DomainProfile::AiCoding,
                 goal: format!("goal {rid}"),
                 assumptions: Vec::new(),
@@ -645,39 +741,8 @@ mod tests {
             .unwrap();
         assert_parity(&store, &shadow, "r1");
         // Final status in file plan must be Completed.
-        let p = shadow.read_plan("r1").unwrap().unwrap();
-        assert_eq!(p.run.status, TaskRunStatus::Completed);
-    }
-
-    /// Parity with a bootstrap plan (insert_task without attach_plan) — the
-    /// lazy-bootstrap path that creates a PlanGenerated event with empty tasks.
-    #[test]
-    fn shadow_parity_bootstrap_plan_via_insert_task() {
-        let tmp = tempfile::tempdir().unwrap();
-        let shadow = Arc::new(FileTaskShadow::new(tmp.path()));
-        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(tmp.path()).unwrap();
-
-        store
-            .create_run(
-                "r1",
-                "ws",
-                "c1",
-                "m1",
-                DomainProfile::General,
-                "g",
-                "",
-                AttendedMode::Attended,
-            )
-            .unwrap();
-        // insert_task triggers lazy bootstrap (no prior attach_plan).
-        store
-            .insert_task("r1", None, task("t1", PlanTaskKind::Investigation))
-            .unwrap();
-        assert_parity(&store, &shadow, "r1");
-        // File plan should have the 1 task from insert.
-        let p = shadow.read_plan("r1").unwrap().unwrap();
-        assert_eq!(p.tasks.len(), 1);
-        assert_eq!(p.tasks[0].id, "t1");
+        let state = shadow.read_run_state("r1").unwrap().unwrap();
+        assert_eq!(state.run.status, TaskRunStatus::Completed);
     }
 
     // ── 0bc step-2: incremental append API (file becomes write authority) ──
@@ -710,15 +775,26 @@ mod tests {
                 "r1",
                 None,
                 None,
-                RuntimeEventKind::PlanGenerated,
+                RuntimeEventKind::PlanRevisionCommitted,
                 serde_json::json!({
-                    "plan_id": "p1", "task_count": 0,
-                    "domain_profile": "general", "goal": "g",
-                    "assumptions": [], "risks": [],
-                    "execution_mode": "parallel", "tasks": [],
+                    "reason": "initial plan",
+                    "base_revision": 0,
+                    "skipped_task_ids": [],
+                    "plan": PlanRevision {
+                        plan_id: "p1".to_string(),
+                        run_id: "r1".to_string(),
+                        revision: 1,
+                        domain_profile: DomainProfile::General,
+                        goal: "g".to_string(),
+                        assumptions: Vec::new(),
+                        risks: Vec::new(),
+                        execution_mode: ExecutionMode::Parallel,
+                        tasks: Vec::new(),
+                    },
                 }),
             )
             .unwrap();
+        shadow.rewrite_plan("r1").unwrap();
         let e3 = shadow
             .append_event_line(
                 "r1",
@@ -743,9 +819,10 @@ mod tests {
         // rewrite_plan produces a plan.json reflecting the event stream.
         shadow.rewrite_plan("r1").unwrap();
         let plan = shadow.read_plan("r1").unwrap().unwrap();
-        assert_eq!(plan.run.run_id, "r1");
-        assert_eq!(plan.run.goal, "g");
-        assert_eq!(plan.plan.plan_id, "p1");
+        let state = shadow.read_run_state("r1").unwrap().unwrap();
+        assert_eq!(state.run.run_id, "r1");
+        assert_eq!(state.run.goal, "g");
+        assert_eq!(plan.plan_id, "p1");
     }
 
     #[test]

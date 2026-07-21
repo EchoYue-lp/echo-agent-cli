@@ -264,7 +264,18 @@ pub async fn execute_run(
             })
             .count();
         if unresolved_count == 0 {
-            break Ok(RunOutcome::Completed);
+            let blockers = run_completion_blockers(&store, run_id);
+            if !blockers.is_empty() {
+                break Ok(RunOutcome::Failed {
+                    failed_task_id: "<completion_gate>".to_string(),
+                    error: blockers.join("; "),
+                });
+            }
+            if store.complete_run_if_quiescent(run_id)? {
+                break Ok(RunOutcome::Completed);
+            }
+            drain_cycle = drain_cycle.saturating_add(1);
+            continue;
         }
         tracing::info!(
             run_id = %run_id,
@@ -288,11 +299,10 @@ pub async fn execute_run(
         )
         .await;
 
-        if matches!(outcome, Ok(RunOutcome::Completed)) && has_unresolved_tasks(&store, run_id) {
-            // A plan may be updated while this executor is already running.
-            // The holder of the per-run execution lock is the authoritative
-            // drainer, so it re-reads the plan and keeps going instead of
-            // leaving newly appended tasks unresolved.
+        if matches!(outcome, Ok(RunOutcome::Completed)) {
+            // Always return to the locked completion gate. This closes the
+            // race where a plan patch commits after the last wave snapshot but
+            // before the run is marked Completed.
             drain_cycle = drain_cycle.saturating_add(1);
             tracing::info!(
                 run_id = %run_id,
@@ -304,21 +314,6 @@ pub async fn execute_run(
 
         break outcome;
     };
-    let outcome = match outcome {
-        Ok(RunOutcome::Completed) => {
-            let blockers = run_completion_blockers(&store, run_id);
-            if blockers.is_empty() {
-                Ok(RunOutcome::Completed)
-            } else {
-                Ok(RunOutcome::Failed {
-                    failed_task_id: "<completion_gate>".to_string(),
-                    error: blockers.join("; "),
-                })
-            }
-        }
-        other => other,
-    };
-
     // Reflect the outcome on the run state. Each branch also writes a trace
     // Run record when a RunStore is available.
     match &outcome {
@@ -331,7 +326,8 @@ pub async fn execute_run(
                     serde_json::json!({ "status": "completed" }),
                 ),
             );
-            let _ = store.transition_run(run_id, TaskRunStatus::Completed);
+            // Completion was already committed atomically by
+            // complete_run_if_quiescent inside the drain loop.
             save_trace(
                 run_store.as_ref(),
                 run_id,
@@ -482,22 +478,6 @@ pub async fn execute_run(
         }
     }
     outcome
-}
-
-fn has_unresolved_tasks(store: &TaskRuntimeStore, run_id: &str) -> bool {
-    store
-        .get_plan(run_id)
-        .ok()
-        .flatten()
-        .map(|plan| {
-            plan.tasks.iter().any(|task| {
-                !matches!(
-                    task.status,
-                    TodoStatus::Completed | TodoStatus::Failed | TodoStatus::Skipped
-                )
-            })
-        })
-        .unwrap_or(false)
 }
 
 fn run_completion_blockers(store: &TaskRuntimeStore, run_id: &str) -> Vec<String> {
@@ -969,15 +949,23 @@ async fn run_dag<W: TaskDispatcher + 'static>(
 ) -> Result<RunOutcome, ExecError> {
     // Wrap the dispatcher in an Arc so each spawned task can clone the handle.
     let dispatcher = Arc::new(dispatcher);
-    // Index tasks by id.
+    // Start from one coherent persisted revision whenever it exists. Reading
+    // the revision number separately from the caller-provided task snapshot
+    // could pair a newly committed revision with stale task bodies.
+    let persisted_plan = store.get_plan(run_id).ok().flatten();
+    let tasks = persisted_plan
+        .as_ref()
+        .map(|plan| plan.tasks.clone())
+        .unwrap_or(tasks);
     let mut by_id: HashMap<String, PlanTask> =
         tasks.iter().map(|t| (t.id.clone(), t.clone())).collect();
-    let runtime_tasks: Vec<echo_agent::tasks::RuntimeTask> =
+    let mut runtime_tasks: Vec<echo_agent::tasks::RuntimeTask> =
         tasks.iter().map(PlanTask::to_runtime_task).collect();
 
     // Generic DAG bookkeeping lives in the framework. App-core still owns
     // store writes, review gates, event emission, and Subagent dispatch.
     let mut dag_state = echo_agent::tasks::DagExecutionState::from_tasks(&runtime_tasks);
+    let mut active_revision = persisted_plan.map(|plan| plan.revision).unwrap_or(1);
     let mut failed_id: Option<String> = None;
     // Delayed-stop signal: when a task inside a wave resolves to Paused/Failed
     // (acceptance pending, review needs_fix, reviewer unavailable), we must
@@ -1004,6 +992,27 @@ async fn run_dag<W: TaskDispatcher + 'static>(
     loop {
         if parent_cancel.is_cancelled() {
             return Ok(interrupted_outcome(&store, run_id));
+        }
+        // Scheduler safe point. A running wave reaches this loop only after
+        // all of its handles have been joined, so a committed plan revision
+        // can replace pending/blocked task specs without tearing active work.
+        if let Some(latest) = store.get_plan(run_id).ok().flatten()
+            && latest.revision != active_revision
+        {
+            tracing::info!(
+                run_id,
+                from_revision = active_revision,
+                to_revision = latest.revision,
+                "task_runtime: applying committed plan revision at safe point"
+            );
+            by_id = latest
+                .tasks
+                .iter()
+                .map(|task| (task.id.clone(), task.clone()))
+                .collect();
+            runtime_tasks = latest.tasks.iter().map(PlanTask::to_runtime_task).collect();
+            dag_state = echo_agent::tasks::DagExecutionState::from_tasks(&runtime_tasks);
+            active_revision = latest.revision;
         }
         if let Some(id) = &failed_id {
             // A task failed: propagate Blocked to downstream dependents
@@ -1262,11 +1271,9 @@ async fn run_dag<W: TaskDispatcher + 'static>(
                                         b = next_retry,
                                     ),
                                 );
-                                // retry_count bump happens via update_plan_task below
-                                // (title/description unchanged).
                                 let mut retry_task = task.clone();
                                 retry_task.retry_count = next_retry;
-                                if let Err(error) = store.update_plan_task(run_id, &retry_task) {
+                                if let Err(error) = store.increment_retry_count(run_id, &id, None) {
                                     tracing::warn!(
                                         task_id = %retry_task.id,
                                         %error,
@@ -2019,6 +2026,7 @@ async fn execute_task(
             root_message_id.as_deref(),
             &task.agent_role,
             &prompt,
+            task.allowed_tools.clone(),
             task_cancel.clone(),
             delegation_policy,
             trace_sink.clone(),
@@ -2082,6 +2090,7 @@ async fn execute_task(
             &execution_id,
             &task.agent_role,
             &prompt,
+            task.allowed_tools.clone(),
             task_cancel.clone(),
             delegation_policy,
             trace_sink.clone(),
@@ -2217,7 +2226,7 @@ async fn execute_task(
             // (see put_summary above). They are NOT auto-inserted into the plan —
             // doing so caused unbounded plan expansion + dependent tasks to wait
             // forever on looping parents. The primary agent / user can promote a
-            // suggestion via plan_create when desired. Record a Note so the
+            // suggestion via plan_patch when desired. Record a Note so the
             // suggestions are visible in the event stream regardless.
             if !suggested_tasks.is_empty() {
                 let titles: Vec<&str> = suggested_tasks.iter().map(|s| s.title.as_str()).collect();
@@ -2226,7 +2235,7 @@ async fn execute_task(
                     Some(&task_id),
                     &format!(
                         "subagent suggested {} follow-up task(s): [{}]. \
-                         Not auto-inserted into plan; promote via plan_create if desired.",
+                         Not auto-inserted into plan; promote via plan_patch if desired.",
                         suggested_tasks.len(),
                         titles.join("; "),
                     ),
@@ -2720,6 +2729,7 @@ async fn run_readonly_subagent(
     message_id: Option<&str>,
     role: &str,
     prompt: &str,
+    allowed_tools: Vec<String>,
     cancel: CancellationToken,
     delegation_policy: echo_agent::tasks::NestedDelegationPolicy,
     trace_sink: Option<ExecSink>,
@@ -2744,13 +2754,14 @@ async fn run_readonly_subagent(
                     delegation_policy: Some(delegation_policy),
                 });
                 agent
-                    .delegate_to_agent_with_parent_context_and_cancel(
+                    .delegate_to_agent_with_parent_context_cancel_and_tools(
                         &role,
                         &prompt,
                         &run_id,
                         cancel,
                         0,
                         runtime_context,
+                        Some(allowed_tools),
                     )
                     .await
                     .map_err(|e| format!("subagent dispatch failed: {e}"))
@@ -2803,6 +2814,7 @@ async fn run_writer_subagent(
     execution_id: &str,
     role: &str,
     prompt: &str,
+    allowed_tools: Vec<String>,
     cancel: CancellationToken,
     delegation_policy: echo_agent::tasks::NestedDelegationPolicy,
     trace_sink: Option<ExecSink>,
@@ -2842,7 +2854,7 @@ async fn run_writer_subagent(
                 });
                 if let Some(msg) = run_message {
                     agent
-                        .delegate_to_agent_with_parent_context_cancel_and_message(
+                        .delegate_to_agent_with_parent_context_cancel_message_and_tools(
                             &role,
                             &prompt,
                             msg,
@@ -2850,17 +2862,19 @@ async fn run_writer_subagent(
                             cancel,
                             0,
                             runtime_context,
+                            Some(allowed_tools.clone()),
                         )
                         .await
                 } else {
                     agent
-                        .delegate_to_agent_with_parent_context_and_cancel(
+                        .delegate_to_agent_with_parent_context_cancel_and_tools(
                             &role,
                             &prompt,
                             &run_id,
                             cancel,
                             0,
                             runtime_context,
+                            Some(allowed_tools),
                         )
                         .await
                 }
@@ -3963,8 +3977,6 @@ const UNATTENDED_READONLY_TOOLS: &[&str] = &[
     "glob",
     "code_search",
     "task_list",
-    "plan_create", // plan construction only (not execution)
-    "task_update",
     "plan_execute", // plan materialisation trigger
     // Read-only network (§A = A2)
     "web_search",
@@ -4605,6 +4617,7 @@ Read the runtime path and found one missing branch.
         let plan = TaskPlan {
             plan_id: "p1".into(),
             run_id: "r1".into(),
+            revision: 1,
             domain_profile: DomainProfile::AiCoding,
             goal: "g".into(),
             assumptions: vec![],
@@ -4664,6 +4677,7 @@ Read the runtime path and found one missing branch.
         order: StdMutex<Vec<String>>,
         /// task_id → integration error returned after review.
         integration_failures: StdMutex<StdHashMap<String, String>>,
+        delays_ms: StdMutex<StdHashMap<String, u64>>,
     }
 
     impl ScriptedDispatcher {
@@ -4672,6 +4686,7 @@ Read the runtime path and found one missing branch.
                 results: StdMutex::new(StdHashMap::new()),
                 order: StdMutex::new(Vec::new()),
                 integration_failures: StdMutex::new(StdHashMap::new()),
+                delays_ms: StdMutex::new(StdHashMap::new()),
             })
         }
         /// Script a success result for `id`.
@@ -4704,6 +4719,12 @@ Read the runtime path and found one missing branch.
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(id.to_string(), error.to_string());
         }
+        fn delay(self: &Arc<Self>, id: &str, delay_ms: u64) {
+            self.delays_ms
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(id.to_string(), delay_ms);
+        }
     }
 
     impl TaskDispatcher for Arc<ScriptedDispatcher> {
@@ -4721,9 +4742,19 @@ Read the runtime path and found one missing branch.
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TaskDispatchResult> + Send>>
         {
             let results = self.results.lock().unwrap().get(&task.id).cloned();
+            let delay_ms = self
+                .delays_ms
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&task.id)
+                .copied()
+                .unwrap_or(0);
             self.order.lock().unwrap().push(task.id.clone());
             let task_id = task.id.clone();
             Box::pin(async move {
+                if delay_ms > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                }
                 // Honor cancellation even in the mock.
                 if context.cancel.is_cancelled() {
                     return Err((task_id, "cancelled".into()));
@@ -5008,6 +5039,7 @@ Read the runtime path and found one missing branch.
         let plan = TaskPlan {
             plan_id: format!("plan_{}", run_id),
             run_id: run_id.clone(),
+            revision: 1,
             domain_profile: DomainProfile::General,
             goal: "test goal".into(),
             assumptions: vec![],
@@ -5189,6 +5221,81 @@ Read the runtime path and found one missing branch.
     }
 
     #[tokio::test]
+    async fn run_dag_applies_inserted_revision_after_active_wave() -> Result<(), String> {
+        let first = solo_readonly_task("first");
+        let mut second = solo_readonly_task("second");
+        second.depends_on = vec![first.id.clone()];
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let run_id = seed_run(&store, vec![first.clone()]);
+        let dispatcher = ScriptedDispatcher::new();
+        dispatcher.succeed("first", "first done");
+        dispatcher.succeed("second", "second done");
+        dispatcher.delay("first", 300);
+
+        let execution_store = store.clone();
+        let execution_dispatcher = dispatcher.clone();
+        let execution_run_id = run_id.clone();
+        let execution = tokio::spawn(async move {
+            run_dag(
+                execution_store,
+                execution_dispatcher,
+                None,
+                &execution_run_id,
+                vec![first],
+                ConcurrencyLimits::default(),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+        });
+
+        let mut first_started = false;
+        for _ in 0..100 {
+            if dispatcher.order().iter().any(|task_id| task_id == "first") {
+                first_started = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        if !first_started {
+            return Err("first task did not enter the active wave".to_string());
+        }
+
+        store
+            .patch_plan(
+                &run_id,
+                &PlanPatchRequest {
+                    base_revision: 1,
+                    reason: "runtime evidence discovered a required follow-up".to_string(),
+                    operations: vec![PlanPatchOperation::Insert {
+                        after_task_id: Some("first".to_string()),
+                        task: second.spec(),
+                    }],
+                },
+            )
+            .map_err(|error| error.to_string())?;
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), execution)
+            .await
+            .map_err(|_| "run_dag timed out after plan revision".to_string())?
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string())?;
+        assert!(matches!(outcome, RunOutcome::Completed));
+        assert_eq!(dispatcher.order(), vec!["first", "second"]);
+        let plan = store
+            .get_plan(&run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "plan disappeared".to_string())?;
+        assert_eq!(plan.revision, 2);
+        assert!(
+            plan.tasks
+                .iter()
+                .all(|task| task.status == TodoStatus::Completed)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn run_dag_failure_propagates_and_blocks_downstream() {
         // a fails; b depends on a and must be Blocked, run ends Failed
         // (because all non-terminal tasks are Failed/Blocked).
@@ -5332,46 +5439,40 @@ Read the runtime path and found one missing branch.
         Ok(())
     }
 
-    #[tokio::test]
-    async fn run_dag_detects_cycle_as_stall() {
-        // a depends on b, b depends on a → neither can ever become ready →
-        // stall. (validate_plan would normally reject this, but run_dag must
-        // still be robust to a malformed plan reaching it.)
+    #[test]
+    fn invalid_cycle_is_rejected_before_scheduler_dispatch() {
         let mut a = solo_readonly_task("a");
         a.depends_on = vec!["b".into()];
         let mut b = solo_readonly_task("b");
         b.depends_on = vec!["a".into()];
         let store = Arc::new(TaskRuntimeStore::new_in_memory().unwrap());
-        let run_id = seed_run(&store, vec![a.clone(), b.clone()]);
-        let dispatcher = ScriptedDispatcher::new();
-
-        let outcome = run_dag(
-            store.clone(),
-            dispatcher.clone(),
-            None,
-            &run_id,
-            vec![a, b],
-            ConcurrencyLimits::default(),
-            CancellationToken::new(),
-            None,
-        )
-        .await
-        .unwrap();
-
-        match outcome {
-            RunOutcome::Failed { error, .. } => {
-                assert!(
-                    error.contains("stalled"),
-                    "expected stall message, got: {error}"
-                );
-            }
-            other => panic!("expected Failed (stall), got {:?}", other),
-        }
-        // Nothing should have been dispatched.
-        assert!(
-            dispatcher.order().is_empty(),
-            "subagent ran on a cyclic plan"
-        );
+        let run_id = format!("run_{}", uuid::Uuid::new_v4());
+        store
+            .create_run(
+                &run_id,
+                "ws_test",
+                "conv_test",
+                "msg_test",
+                DomainProfile::General,
+                "test goal",
+                "",
+                AttendedMode::Attended,
+            )
+            .unwrap();
+        let error = store
+            .attach_plan(&TaskPlan {
+                plan_id: format!("plan_{run_id}"),
+                run_id,
+                revision: 1,
+                domain_profile: DomainProfile::General,
+                goal: "test goal".to_string(),
+                assumptions: Vec::new(),
+                risks: Vec::new(),
+                execution_mode: ExecutionMode::Parallel,
+                tasks: vec![a, b],
+            })
+            .unwrap_err();
+        assert!(matches!(error, StoreError::InvalidPlan(message) if message.contains("cycle")));
     }
 
     #[tokio::test]
@@ -5385,10 +5486,19 @@ Read the runtime path and found one missing branch.
         // in_flight task to reach Completed in the store (simulating the
         // sibling instance finishing it) before returning Completed.
         let mut in_flight = solo_readonly_task("in_flight");
-        in_flight.status = TodoStatus::Running;
         let pending = solo_readonly_task("pending");
         let store = Arc::new(TaskRuntimeStore::new_in_memory().unwrap());
         let run_id = seed_run(&store, vec![in_flight.clone(), pending.clone()]);
+        store
+            .set_task_status(
+                &run_id,
+                "in_flight",
+                TodoStatus::Running,
+                Some("explorer"),
+                None,
+            )
+            .unwrap();
+        in_flight.status = TodoStatus::Running;
         let dispatcher = ScriptedDispatcher::new();
         dispatcher.succeed("pending", "done");
 

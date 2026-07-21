@@ -62,7 +62,7 @@ pub(crate) const TASK_MANAGEMENT_GUIDE: &str = r#"
 Choose the lightest reliable mechanism:
 - Direct work: simple questions, narrow edits, short tool sequences.
 - `agent_tool`: one bounded ad-hoc subtask in Chat mode. It does not create a TaskRun or appear in the TaskRuntime panel. Fresh is default; fork only when history is required.
-- `plan_create` + `task_list` + `plan_execute({expected_task_count: N})`: the required path for any delegated work in Auto or Task mode, and for dependencies, parallel work, writers, or verification.
+- `plan_create` + `task_list` + `plan_execute({plan_revision: N})`: the required path for any delegated work in Auto or Task mode, and for dependencies, parallel work, writers, or verification.
 - `create_complex_task`: a long-lived Run that must survive the chat turn or needs substantial orchestration.
 
 ### Formal Plan Contract
@@ -70,9 +70,9 @@ Choose the lightest reliable mechanism:
 - Verification splits into `execution_checks` (shell commands requiring observed pass, e.g. `cargo test`) and `acceptance_criteria` (semantic statements a reviewer judges against the output). Never declare acceptance passed yourself.
 - A completed Subagent is not a completed PlanTask. Tasks Blocked on acceptance pause the run for an explicit retry, never auto-redispatch.
 - The TaskRun already represents the user goal. Do not create a wrapper, placeholder, or prose-only summary task for that goal; materialize only work a Subagent will actually execute.
-- One `plan_create` creates one PlanTask. For N subagents, make N calls and await all results. Call `task_list`, then pass its exact `Tasks (N)` as `expected_task_count`.
+- One `plan_create` atomically creates the complete initial DAG. Give every task a stable ID, submit all dependencies in that call, then pass the returned revision to `plan_execute`.
 - Read-only tasks may run in parallel. Writers must declare owned files or artifacts.
-- Keep plans truthful with `task_update`, `task_skip`, and `task_list`. Only the runtime marks completion.
+- Keep plans truthful with `plan_patch` and `task_list`. A patch must include the latest `base_revision`; only the runtime marks completion.
 - Do not claim dispatch before `plan_execute` accepts the full plan.
 - Background `agent_tool` finishes through events. Never poll its `execution_id` with task-status tools.
 - After execution, synthesize evidence and answer the original goal.
@@ -491,28 +491,35 @@ pub async fn create_agent_with_diagnostics(
     register_default_hooks(&mut agent);
 
     // Register task-management tools when a TaskRuntimeStore is available.
-    // These let the main agent autonomously create / update / skip /
-    // list tasks during execution (mirrors Claude Code's TaskCreate/Update).
+    // These let the main Agent atomically create, revise, and inspect plans.
     // The store handle is threaded from AppState → SharedResources → params.
     if let Some(store) = &params.task_runtime_store {
         use crate::tasks::task_runtime::task_tools::{
-            TaskCreateTool, TaskListTool, TaskSkipTool, TaskUpdateTool,
+            PlanCapabilityCatalog, PlanPatchTool, TaskCreateTool, TaskListTool,
         };
         let store = Arc::clone(store);
+        let tool_names = agent.tool_names();
+        let subagent_names = agent
+            .subagent_registry()
+            .list_available()
+            .await
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
+        let capabilities = Arc::new(PlanCapabilityCatalog::new(subagent_names, tool_names));
         agent.add_tool(Box::new(TaskCreateTool {
             store: Arc::clone(&store),
+            capabilities: capabilities.clone(),
         }));
-        agent.add_tool(Box::new(TaskUpdateTool {
+        agent.add_tool(Box::new(PlanPatchTool {
             store: Arc::clone(&store),
-        }));
-        agent.add_tool(Box::new(TaskSkipTool {
-            store: Arc::clone(&store),
+            capabilities,
         }));
         agent.add_tool(Box::new(TaskListTool {
             store: Arc::clone(&store),
         }));
         tracing::info!(
-            "Registered 4 task-management tools (plan_create/task_update/task_skip/task_list)"
+            "Registered revisioned task-management tools (plan_create/plan_patch/task_list)"
         );
     }
 

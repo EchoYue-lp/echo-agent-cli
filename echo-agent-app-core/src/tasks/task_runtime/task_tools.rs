@@ -15,14 +15,97 @@
 
 use echo_agent::prelude::*;
 use echo_agent::tools::{Tool, ToolResult};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::executor::{ExecEvent, RunPlanPolicy};
 use super::profiles::{ProfileTemplate, default_subagent_for, subagent_catalog_prompt};
 use super::store::TaskRuntimeStore;
 use super::types::{
-    AttendedMode, DomainProfile, PlanTask, PlanTaskKind, TaskPatch, TaskRunStatus, TodoStatus,
+    AttendedMode, DomainProfile, ExecutionMode, PlanPatchOperation, PlanPatchRequest, PlanTask,
+    PlanTaskKind, TaskExecution, TaskPlan, TaskRunStatus, TodoStatus,
 };
+
+#[derive(Debug, Clone, Default)]
+pub struct PlanCapabilityCatalog {
+    subagents: HashSet<String>,
+    tools: HashSet<String>,
+}
+
+impl PlanCapabilityCatalog {
+    const PLAN_CONTROL_TOOLS: [&'static str; 4] =
+        ["plan_create", "plan_patch", "task_list", "plan_execute"];
+
+    pub fn new(
+        subagents: impl IntoIterator<Item = String>,
+        tools: impl IntoIterator<Item = String>,
+    ) -> Self {
+        Self {
+            subagents: subagents.into_iter().collect(),
+            tools: tools.into_iter().collect(),
+        }
+    }
+
+    fn validate_task(&self, task: &PlanTask) -> std::result::Result<(), String> {
+        if !self.subagents.contains(&task.agent_role) {
+            let mut available = self.subagents.iter().cloned().collect::<Vec<_>>();
+            available.sort();
+            return Err(format!(
+                "unknown Subagent '{}'; available: {}",
+                task.agent_role,
+                available.join(", ")
+            ));
+        }
+        for tool in &task.allowed_tools {
+            if Self::PLAN_CONTROL_TOOLS.contains(&tool.as_str()) {
+                return Err(format!(
+                    "task '{}' cannot delegate plan-control tool '{}' to a Subagent",
+                    task.id, tool
+                ));
+            }
+            if !self.tools.contains(tool) {
+                return Err(format!(
+                    "task '{}' declares unknown tool '{}'",
+                    task.id, tool
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_patch_operation(
+        &self,
+        operation: &PlanPatchOperation,
+    ) -> std::result::Result<(), String> {
+        match operation {
+            PlanPatchOperation::Insert { task, .. } => self.validate_task(&PlanTask::from_parts(
+                task.clone(),
+                TaskExecution::pending(task.id.clone()),
+            )),
+            PlanPatchOperation::Update { patch, .. } => {
+                if let Some(role) = &patch.agent_role
+                    && !self.subagents.contains(role)
+                {
+                    return Err(format!("unknown Subagent '{role}'"));
+                }
+                if let Some(tools) = &patch.allowed_tools {
+                    for tool in tools {
+                        if Self::PLAN_CONTROL_TOOLS.contains(&tool.as_str()) {
+                            return Err(format!(
+                                "plan-control tool '{tool}' cannot be delegated to a Subagent"
+                            ));
+                        }
+                        if !self.tools.contains(tool) {
+                            return Err(format!("unknown tool '{tool}'"));
+                        }
+                    }
+                }
+                Ok(())
+            }
+            PlanPatchOperation::Skip { .. } | PlanPatchOperation::Reorder { .. } => Ok(()),
+        }
+    }
+}
 
 /// Convenience alias for a trace-sink callback that forwards execution-flow
 /// events out of the task-runtime executor. Same shape as
@@ -276,24 +359,191 @@ mod tests {
     }
 }
 
-fn parse_kind(s: &str) -> PlanTaskKind {
-    match s {
-        "read_only_review" => PlanTaskKind::ReadOnlyReview,
-        "investigation" => PlanTaskKind::Investigation,
-        "test_plan" => PlanTaskKind::TestPlan,
-        "implementation" => PlanTaskKind::Implementation,
-        "debugging" => PlanTaskKind::Debugging,
-        "review" => PlanTaskKind::Review,
-        "summary" => PlanTaskKind::Summary,
-        "verification" => PlanTaskKind::Verification,
-        _ => PlanTaskKind::Implementation,
+fn parse_kind(s: &str) -> std::result::Result<PlanTaskKind, String> {
+    PlanTaskKind::from_str(s).ok_or_else(|| format!("unknown task kind '{s}'"))
+}
+
+fn string_array_from(params: &ToolParameters, key: &str) -> Vec<String> {
+    params
+        .get(key)
+        .and_then(|value| value.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn string_array_in(value: &serde_json::Value, key: &str) -> Vec<String> {
+    value
+        .get(key)
+        .and_then(|item| item.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| item.as_str())
+                .map(str::trim)
+                .filter(|item| !item.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn parse_plan_task(
+    value: &serde_json::Value,
+    index: usize,
+    domain_profile: DomainProfile,
+) -> std::result::Result<PlanTask, String> {
+    let field = |key: &str| {
+        value
+            .get(key)
+            .and_then(|item| item.as_str())
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| format!("tasks[{index}].{key} is required"))
+    };
+    let id = field("id")?;
+    let title = field("title")?;
+    let description = field("description")?;
+    let kind_name = field("kind")?;
+    let kind = parse_kind(&kind_name)?;
+    let agent_role = value
+        .get("subagent")
+        .and_then(|item| item.as_str())
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| default_subagent_for(domain_profile, kind).to_string());
+    let max_retries = value
+        .get("max_retries")
+        .and_then(|item| item.as_u64())
+        .and_then(|count| u32::try_from(count).ok())
+        .unwrap_or(3);
+    let sort_order = i64::try_from(index).unwrap_or(i64::MAX);
+    Ok(PlanTask {
+        id,
+        title,
+        description,
+        kind,
+        agent_role,
+        domain_profile,
+        depends_on: string_array_in(value, "depends_on"),
+        parallel_group: value
+            .get("parallel_group")
+            .and_then(|item| item.as_str())
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(str::to_string),
+        files: string_array_in(value, "files"),
+        allowed_tools: string_array_in(value, "allowed_tools"),
+        required_artifacts: string_array_in(value, "required_artifacts"),
+        execution_checks: string_array_in(value, "execution_checks"),
+        acceptance_criteria: string_array_in(value, "acceptance_criteria"),
+        retry_count: 0,
+        max_retries,
+        failure_fingerprint: None,
+        status: TodoStatus::Pending,
+        sort_order,
+    })
+}
+
+fn plan_task_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "id": { "type": "string", "description": "Stable task id unique within this run" },
+            "title": { "type": "string" },
+            "description": { "type": "string" },
+            "kind": { "type": "string", "enum": ["implementation","debugging","verification","review","investigation","test_plan","summary","read_only_review"] },
+            "subagent": { "type": "string", "description": "Registered Subagent role; omit for the domain default" },
+            "depends_on": { "type": "array", "items": { "type": "string" } },
+            "parallel_group": { "type": "string" },
+            "files": { "type": "array", "items": { "type": "string" } },
+            "allowed_tools": { "type": "array", "items": { "type": "string" } },
+            "required_artifacts": { "type": "array", "items": { "type": "string" } },
+            "execution_checks": { "type": "array", "items": { "type": "string" } },
+            "acceptance_criteria": { "type": "array", "items": { "type": "string" } },
+            "max_retries": { "type": "integer", "minimum": 0, "maximum": 10 }
+        },
+        "required": ["id", "title", "description", "kind"]
+    })
+}
+
+fn plan_patch_operations_from(
+    value: &serde_json::Value,
+    domain_profile: DomainProfile,
+) -> std::result::Result<Vec<PlanPatchOperation>, String> {
+    let operations = value
+        .as_array()
+        .ok_or_else(|| "plan_patch operations must be an array".to_string())?;
+    let mut parsed = Vec::with_capacity(operations.len());
+    for (index, operation) in operations.iter().enumerate() {
+        let op = operation
+            .get("op")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("operations[{index}].op is required"))?;
+        let parsed_operation = match op {
+            "insert" => {
+                let task = operation
+                    .get("task")
+                    .ok_or_else(|| format!("operations[{index}].task is required"))?;
+                PlanPatchOperation::Insert {
+                    after_task_id: operation
+                        .get("after_task_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                    task: parse_plan_task(task, index, domain_profile)?.spec(),
+                }
+            }
+            "update" => PlanPatchOperation::Update {
+                task_id: operation
+                    .get("task_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|task_id| !task_id.is_empty())
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("operations[{index}].task_id is required"))?,
+                patch: operation
+                    .get("patch")
+                    .cloned()
+                    .ok_or_else(|| format!("operations[{index}].patch is required"))
+                    .and_then(|patch| {
+                        serde_json::from_value(patch)
+                            .map_err(|error| format!("operations[{index}].patch: {error}"))
+                    })?,
+            },
+            "skip" => PlanPatchOperation::Skip {
+                task_id: operation
+                    .get("task_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|task_id| !task_id.is_empty())
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("operations[{index}].task_id is required"))?,
+            },
+            "reorder" => PlanPatchOperation::Reorder {
+                task_ids: string_array_in(operation, "task_ids"),
+            },
+            other => return Err(format!("operations[{index}] has unknown op '{other}'")),
+        };
+        parsed.push(parsed_operation);
     }
+    Ok(parsed)
 }
 
 // ── plan_create ───────────────────────────────────────────────────────────
 
 pub struct TaskCreateTool {
     pub store: Arc<TaskRuntimeStore>,
+    pub capabilities: Arc<PlanCapabilityCatalog>,
 }
 
 impl Tool for TaskCreateTool {
@@ -302,34 +552,25 @@ impl Tool for TaskCreateTool {
     }
 
     fn description(&self) -> &str {
-        "Create exactly one PlanTask in the current formal plan. For N intended \
-         subagent tasks, call plan_create N times and wait for every result. Then \
-         call task_list and pass its exact Tasks (N) count to plan_execute. The \
-         TaskRun already represents the user goal, so never create a wrapper or \
-         placeholder task for the overall goal."
+        "Atomically create the complete formal PlanTask DAG as revision 1. Submit every intended task in one call with stable ids and explicit dependencies. The TaskRun already represents the user goal, so do not create a wrapper task."
     }
 
     fn parameters(&self) -> serde_json::Value {
+        let task_schema = plan_task_input_schema();
         serde_json::json!({
             "type": "object",
             "properties": {
-                "title": { "type": "string", "description": "Short task title" },
-                "description": { "type": "string", "description": "What this task should accomplish" },
-                "kind": {
-                    "type": "string",
-                    "enum": ["implementation","debugging","verification","review","investigation","test_plan","summary","read_only_review"],
-                    "description": "Task kind"
+                "tasks": {
+                    "type": "array",
+                    "minItems": 1,
+                    "description": "The complete DAG. All dependency ids must refer to tasks in this array.",
+                    "items": task_schema
                 },
-                "subagent": { "type": "string", "description": "Optional registered Subagent name. Omit to use the domain-aware default; project/user custom Subagents are allowed." },
-                "depends_on": { "type": "array", "items": { "type": "string" }, "description": "Explicit prerequisite task ids; ordering is never inferred from prose" },
-                "files": { "type": "array", "items": { "type": "string" }, "description": "For writers: exact workspace-relative files exclusively owned by this task. Empty/glob/broad scopes are treated as unknown and serialized. For readers: inspection targets only." },
-                "allowed_tools": { "type": "array", "items": { "type": "string" }, "description": "Tools allowed for this task" },
-                "required_artifacts": { "type": "array", "items": { "type": "string" }, "description": "Artifact paths or suffixes required for completion" },
-                "execution_checks": { "type": "array", "items": { "type": "string" }, "description": "Executable checks (shell commands, e.g. 'cargo test --lib'). Each requires an observed pass from runtime tool events; Subagent prose alone never satisfies them." },
-                "acceptance_criteria": { "type": "array", "items": { "type": "string" }, "description": "Semantic acceptance criteria (e.g. 'module boundary is clear'). Judged by the reviewer LLM against the Subagent output, never auto-passed." },
-                "after_task_id": { "type": "string", "description": "Insert after this task id (optional)" }
+                "assumptions": { "type": "array", "items": { "type": "string" } },
+                "risks": { "type": "array", "items": { "type": "string" } },
+                "execution_mode": { "type": "string", "enum": ["parallel", "sequential"] }
             },
-            "required": ["title","description","kind"]
+            "required": ["tasks"]
         })
     }
 
@@ -368,72 +609,28 @@ impl TaskCreateTool {
         params: ToolParameters,
         bootstrap_ctx: Option<&echo_core::tools::ToolContext>,
     ) -> echo_agent::error::Result<ToolResult> {
-        let description = params
-            .get("description")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        // title 兜底:LLM 偶尔漏传 title,用 description 首行(前 60 字符)代替,
-        // 避免右侧栏显示空标题(日志里 "Created task ''")。
-        let title = params
-            .get("title")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .map(String::from)
-            .unwrap_or_else(|| {
-                if description.is_empty() {
-                    "未命名任务".to_string()
-                } else {
-                    description.chars().take(60).collect()
-                }
-            });
-        let kind_str = params
-            .get("kind")
-            .and_then(|v| v.as_str())
-            .unwrap_or("implementation");
-        let depends_on: Vec<String> = params
-            .get("depends_on")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let string_array = |key: &str| -> Vec<String> {
-            params
-                .get(key)
-                .and_then(|value| value.as_array())
-                .map(|values| {
-                    values
-                        .iter()
-                        .filter_map(|value| value.as_str())
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty())
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default()
+        let Some(raw_tasks) = params.get("tasks").and_then(|value| value.as_array()) else {
+            return Ok(ToolResult::error(
+                "plan_create requires a non-empty tasks array",
+            ));
         };
-        let files = string_array("files");
-        let allowed_tools = string_array("allowed_tools");
-        let required_artifacts = string_array("required_artifacts");
-        // Execution checks are shell commands the Subagent must run; acceptance
-        // criteria are prose judged by the reviewer LLM.
-        let execution_checks = string_array("execution_checks");
-        let acceptance_criteria = string_array("acceptance_criteria");
-        let requested_subagent = params
-            .get("subagent")
+        let Some(first) = raw_tasks.first() else {
+            return Ok(ToolResult::error("plan_create requires at least one task"));
+        };
+        let bootstrap_title = first
+            .get("title")
             .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string);
-        let after_task_id = params
-            .get("after_task_id")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-
-        if let Err(e) = self.ensure_run_exists(&run_id, &title, &description, bootstrap_ctx) {
+            .unwrap_or("Complex task");
+        let bootstrap_description = first
+            .get("description")
+            .and_then(|value| value.as_str())
+            .unwrap_or(bootstrap_title);
+        if let Err(e) = self.ensure_run_exists(
+            &run_id,
+            bootstrap_title,
+            bootstrap_description,
+            bootstrap_ctx,
+        ) {
             return Ok(e);
         }
         let run = match self.store.get_run(&run_id) {
@@ -450,47 +647,39 @@ impl TaskCreateTool {
             }
         };
 
-        let task_id = format!("task_{}", uuid::Uuid::new_v4().as_simple());
-        let kind = parse_kind(kind_str);
-        let subagent = requested_subagent
-            .unwrap_or_else(|| default_subagent_for(run.domain_profile, kind).to_string());
-        let task = PlanTask {
-            id: task_id.clone(),
-            title: title.clone(),
-            description,
-            kind,
-            agent_role: subagent.clone(),
-            domain_profile: run.domain_profile,
-            depends_on,
-            files,
-            allowed_tools,
-            required_artifacts,
-            execution_checks,
-            acceptance_criteria,
-            status: TodoStatus::Pending,
-            ..Default::default()
-        };
-        match self.store.insert_task(&run_id, after_task_id, task) {
-            Ok(()) => {
-                let task_count = self
-                    .store
-                    .get_plan(&run_id)
-                    .ok()
-                    .flatten()
-                    .map(|plan| plan.tasks.len());
-                let count_text = task_count.map_or_else(
-                    || {
-                        "Persisted plan count is unavailable; call task_list before execution."
-                            .to_string()
-                    },
-                    |count| format!("Persisted plan now contains {count} task(s)."),
-                );
-                Ok(ToolResult::success(format!(
-                    "Created exactly one PlanTask '{title}' (id: {task_id}, subagent: {subagent}, domain: {}). {count_text} Create one PlanTask per intended subagent, then call task_list and pass its exact Tasks (N) count to plan_execute.",
-                    run.domain_profile.as_str()
-                )))
+        let mut tasks = Vec::with_capacity(raw_tasks.len());
+        for (index, value) in raw_tasks.iter().enumerate() {
+            let task = match parse_plan_task(value, index, run.domain_profile) {
+                Ok(task) => task,
+                Err(error) => return Ok(ToolResult::error(error)),
+            };
+            if let Err(error) = self.capabilities.validate_task(&task) {
+                return Ok(ToolResult::error(error));
             }
-            Err(e) => Ok(ToolResult::error(format!("Failed to create task: {e}"))),
+            tasks.push(task);
+        }
+        let execution_mode = params
+            .get("execution_mode")
+            .and_then(|value| value.as_str())
+            .and_then(ExecutionMode::from_str)
+            .unwrap_or(ExecutionMode::Parallel);
+        let plan = TaskPlan {
+            plan_id: format!("plan_{}", uuid::Uuid::new_v4().as_simple()),
+            run_id: run_id.clone(),
+            revision: 1,
+            domain_profile: run.domain_profile,
+            goal: run.goal,
+            assumptions: string_array_from(&params, "assumptions"),
+            risks: string_array_from(&params, "risks"),
+            execution_mode,
+            tasks,
+        };
+        match self.store.attach_plan(&plan) {
+            Ok(()) => Ok(ToolResult::success(format!(
+                "Created plan revision 1 with {} task(s). Call plan_execute with plan_revision=1.",
+                plan.tasks.len()
+            ))),
+            Err(error) => Ok(ToolResult::error(format!("Failed to create plan: {error}"))),
         }
     }
 
@@ -579,6 +768,168 @@ impl TaskCreateTool {
     }
 }
 
+// ── plan_patch ────────────────────────────────────────────────────────────
+
+pub struct PlanPatchTool {
+    pub store: Arc<TaskRuntimeStore>,
+    pub capabilities: Arc<PlanCapabilityCatalog>,
+}
+
+impl Tool for PlanPatchTool {
+    fn name(&self) -> &str {
+        "plan_patch"
+    }
+
+    fn description(&self) -> &str {
+        "Atomically revise the current formal plan using optimistic concurrency. Only pending or blocked task specifications may change while a run is active."
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        let task_schema = plan_task_input_schema();
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "base_revision": { "type": "integer", "minimum": 1 },
+                "reason": { "type": "string", "description": "Why runtime evidence requires this revision" },
+                "operations": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "oneOf": [
+                            {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "properties": {
+                                    "op": { "const": "insert" },
+                                    "after_task_id": { "type": ["string", "null"] },
+                                    "task": task_schema
+                                },
+                                "required": ["op", "task"]
+                            },
+                            {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "properties": {
+                                    "op": { "const": "update" },
+                                    "task_id": { "type": "string" },
+                                    "patch": {
+                                        "type": "object",
+                                        "additionalProperties": false,
+                                        "properties": {
+                                            "title": { "type": "string" },
+                                            "description": { "type": "string" },
+                                            "kind": { "type": "string", "enum": ["implementation","debugging","verification","review","investigation","test_plan","summary","read_only_review"] },
+                                            "agent_role": { "type": "string" },
+                                            "depends_on": { "type": "array", "items": { "type": "string" } },
+                                            "files": { "type": "array", "items": { "type": "string" } },
+                                            "allowed_tools": { "type": "array", "items": { "type": "string" } },
+                                            "required_artifacts": { "type": "array", "items": { "type": "string" } },
+                                            "execution_checks": { "type": "array", "items": { "type": "string" } },
+                                            "acceptance_criteria": { "type": "array", "items": { "type": "string" } },
+                                            "max_retries": { "type": "integer", "minimum": 0, "maximum": 10 }
+                                        }
+                                    }
+                                },
+                                "required": ["op", "task_id", "patch"]
+                            },
+                            {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "properties": {
+                                    "op": { "const": "skip" },
+                                    "task_id": { "type": "string" }
+                                },
+                                "required": ["op", "task_id"]
+                            },
+                            {
+                                "type": "object",
+                                "additionalProperties": false,
+                                "properties": {
+                                    "op": { "const": "reorder" },
+                                    "task_ids": { "type": "array", "items": { "type": "string" } }
+                                },
+                                "required": ["op", "task_ids"]
+                            }
+                        ]
+                    }
+                }
+            },
+            "required": ["base_revision", "reason", "operations"]
+        })
+    }
+
+    fn execute<'a>(
+        &'a self,
+        params: ToolParameters,
+    ) -> futures::future::BoxFuture<'a, echo_agent::error::Result<ToolResult>> {
+        Box::pin(async move {
+            let run_id = match require_run_id() {
+                Ok(id) => id,
+                Err(error) => return Ok(error),
+            };
+            let Some(base_revision) = params.get("base_revision").and_then(|value| value.as_u64())
+            else {
+                return Ok(ToolResult::error("plan_patch requires base_revision"));
+            };
+            let reason = params
+                .get("reason")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let current_plan = match self.store.get_plan(&run_id) {
+                Ok(Some(plan)) => plan,
+                Ok(None) => return Ok(ToolResult::error("plan_patch requires an existing plan")),
+                Err(error) => {
+                    return Ok(ToolResult::error(format!(
+                        "Failed to read current plan: {error}"
+                    )));
+                }
+            };
+            let Some(raw_operations) = params.get("operations") else {
+                return Ok(ToolResult::error("plan_patch requires operations"));
+            };
+            let operations =
+                match plan_patch_operations_from(raw_operations, current_plan.domain_profile) {
+                    Ok(operations) => operations,
+                    Err(error) => return Ok(ToolResult::error(error)),
+                };
+            for operation in &operations {
+                if let Err(error) = self.capabilities.validate_patch_operation(operation) {
+                    return Ok(ToolResult::error(error));
+                }
+            }
+            let request = PlanPatchRequest {
+                base_revision,
+                reason,
+                operations,
+            };
+            match self.store.patch_plan(&run_id, &request) {
+                Ok(plan) => Ok(ToolResult::success(format!(
+                    "Committed plan revision {} with {} task(s)",
+                    plan.revision,
+                    plan.tasks.len()
+                ))),
+                Err(error) => Ok(ToolResult::error(format!("Failed to patch plan: {error}"))),
+            }
+        })
+    }
+
+    fn execute_with_context<'a>(
+        &'a self,
+        params: ToolParameters,
+        ctx: &'a echo_core::tools::ToolContext,
+    ) -> futures::future::BoxFuture<'a, echo_agent::error::Result<ToolResult>> {
+        Box::pin(async move {
+            let run_id = match run_id_from_ctx_or_local(ctx) {
+                Ok(id) => id,
+                Err(error) => return Ok(error),
+            };
+            with_run_id(run_id, self.execute(params)).await
+        })
+    }
+}
+
 fn task_goal(title: &str, description: &str) -> String {
     if !description.trim().is_empty() {
         description.to_string()
@@ -598,9 +949,9 @@ fn complex_run_prompt(
 ) -> String {
     let template = ProfileTemplate::for_profile(domain);
     let plan_contract = if plan_mode == "direct_execute" {
-        "Complete the goal directly with ordinary tools when that remains the lightest reliable path. Do not create a placeholder plan merely for ceremony. If execution reveals real dependencies, parallel work, or separately verifiable outcomes, upgrade to a formal DAG with one plan_create call per node, verify the count with task_list, and call plan_execute with expected_task_count."
+        "Complete the goal directly with ordinary tools when that remains the lightest reliable path. Do not create a placeholder plan merely for ceremony. If execution reveals real dependencies, parallel work, or separately verifiable outcomes, upgrade by submitting the complete DAG in one plan_create call and execute its returned revision."
     } else {
-        "This run requires a formal, reviewable DAG. The TaskRun already represents the overall goal, so do not create a wrapper, placeholder, or prose-only summary PlanTask for it. Each plan_create call materializes exactly one executable node: create one node per intended subagent and wait for every result. Assign an appropriate subagent to every node, declare real dependencies, artifacts, files, and verification. Verification splits into `execution_checks` (shell commands requiring observed pass, e.g. `cargo test`) and `acceptance_criteria` (semantic statements a reviewer will judge, e.g. `module boundary is clear`). A Subagent completing is not the PlanTask completing — tasks blocked on acceptance pause the run and wait for an explicit retry; they are never auto-redispatched. Then call task_list and pass its exact Tasks (N) count as expected_task_count to plan_execute. Do not claim tasks were dispatched before plan_execute starts."
+        "This run requires a formal, reviewable DAG. The TaskRun already represents the overall goal, so do not create a wrapper, placeholder, or prose-only summary PlanTask for it. Submit every executable node together in one plan_create call with stable ids and explicit dependencies. Assign an appropriate Subagent to every node and declare artifacts, files, executable checks, and semantic acceptance criteria. A Subagent completing is not the PlanTask completing — tasks blocked on acceptance pause the run and wait for explicit retry. Execute exactly the committed revision returned by plan_create or plan_patch."
     };
     let initial = if initial_plan.is_empty() {
         "None supplied; derive the smallest complete decomposition from evidence.".to_string()
@@ -629,6 +980,23 @@ mod plan_create_tests {
     use super::super::types::RuntimeEventKind;
     use super::*;
 
+    fn test_capabilities() -> Arc<PlanCapabilityCatalog> {
+        Arc::new(PlanCapabilityCatalog::new(
+            [
+                "explorer".to_string(),
+                "analyst".to_string(),
+                "data-shaper".to_string(),
+            ],
+            Vec::<String>::new(),
+        ))
+    }
+
+    fn one_task_params(task: serde_json::Value) -> ToolParameters {
+        let mut params = ToolParameters::new();
+        params.insert("tasks".to_string(), serde_json::json!([task]));
+        params
+    }
+
     #[tokio::test]
     async fn plan_create_bootstraps_run_before_plan_events() -> std::result::Result<(), String> {
         let shadow_root = tempfile::tempdir().map_err(|e| e.to_string())?;
@@ -638,21 +1006,15 @@ mod plan_create_tests {
         );
         let tool = TaskCreateTool {
             store: store.clone(),
+            capabilities: test_capabilities(),
         };
         let run_id = "run_plan_create_bootstrap";
-        let mut params = ToolParameters::new();
-        params.insert(
-            "title".to_string(),
-            serde_json::Value::String("分析当前项目架构".to_string()),
-        );
-        params.insert(
-            "description".to_string(),
-            serde_json::Value::String("并行分析当前项目架构并汇总结果".to_string()),
-        );
-        params.insert(
-            "kind".to_string(),
-            serde_json::Value::String("read_only_review".to_string()),
-        );
+        let params = one_task_params(serde_json::json!({
+            "id": "architecture-review",
+            "title": "分析当前项目架构",
+            "description": "并行分析当前项目架构并汇总结果",
+            "kind": "read_only_review"
+        }));
 
         let result = with_run_id(run_id.to_string(), tool.execute(params))
             .await
@@ -670,7 +1032,7 @@ mod plan_create_tests {
         }
         if !result
             .output
-            .contains("Persisted plan now contains 1 task(s)")
+            .contains("Created plan revision 1 with 1 task(s)")
         {
             return Err(format!(
                 "plan_create must report the materialized task count: {}",
@@ -705,21 +1067,15 @@ mod plan_create_tests {
         );
         let tool = TaskCreateTool {
             store: store.clone(),
+            capabilities: test_capabilities(),
         };
         let run_id = "taskrun:message-identity";
-        let mut params = ToolParameters::new();
-        params.insert(
-            "title".to_string(),
-            serde_json::Value::String("并行架构分析".to_string()),
-        );
-        params.insert(
-            "description".to_string(),
-            serde_json::Value::String("由多个 Subagent 分析当前项目".to_string()),
-        );
-        params.insert(
-            "kind".to_string(),
-            serde_json::Value::String("read_only_review".to_string()),
-        );
+        let params = one_task_params(serde_json::json!({
+            "id": "parallel-review",
+            "title": "并行架构分析",
+            "description": "由多个 Subagent 分析当前项目",
+            "kind": "read_only_review"
+        }));
         let ctx = echo_core::tools::ToolContext {
             conversation_id: Some("conversation-identity".to_string()),
             run_id: Some(run_id.to_string()),
@@ -771,57 +1127,39 @@ mod plan_create_tests {
             .map_err(|error| error.to_string())?;
         let tool = TaskCreateTool {
             store: store.clone(),
+            capabilities: test_capabilities(),
         };
-
-        let mut analysis = ToolParameters::new();
-        analysis.insert(
-            "title".to_string(),
-            serde_json::Value::String("分析指标".to_string()),
+        let mut params = ToolParameters::new();
+        params.insert(
+            "tasks".to_string(),
+            serde_json::json!([
+                {
+                    "id": "analyze-metrics",
+                    "title": "分析指标",
+                    "description": "计算核心指标并验证不确定性",
+                    "kind": "implementation"
+                },
+                {
+                    "id": "shape-data",
+                    "title": "清洗数据",
+                    "description": "画像 schema 并导出清洗结果",
+                    "kind": "implementation",
+                    "subagent": "data-shaper"
+                }
+            ]),
         );
-        analysis.insert(
-            "description".to_string(),
-            serde_json::Value::String("计算核心指标并验证不确定性".to_string()),
-        );
-        analysis.insert(
-            "kind".to_string(),
-            serde_json::Value::String("implementation".to_string()),
-        );
-        let result = with_run_id(run_id.to_string(), tool.execute(analysis))
-            .await
-            .map_err(|error| error.to_string())?;
-        if !result.success {
-            return Err(format!("data plan_create failed: {:?}", result.error));
-        }
-
-        let mut shaping = ToolParameters::new();
-        shaping.insert(
-            "title".to_string(),
-            serde_json::Value::String("清洗数据".to_string()),
-        );
-        shaping.insert(
-            "description".to_string(),
-            serde_json::Value::String("画像 schema 并导出清洗结果".to_string()),
-        );
-        shaping.insert(
-            "kind".to_string(),
-            serde_json::Value::String("implementation".to_string()),
-        );
-        shaping.insert(
-            "subagent".to_string(),
-            serde_json::Value::String("data-shaper".to_string()),
-        );
-        let result = with_run_id(run_id.to_string(), tool.execute(shaping))
+        let result = with_run_id(run_id.to_string(), tool.execute(params))
             .await
             .map_err(|error| error.to_string())?;
         if !result.success {
             return Err(format!(
-                "explicit subagent plan_create failed: {:?}",
+                "atomic data plan_create failed: {:?}",
                 result.error
             ));
         }
         if !result
             .output
-            .contains("Persisted plan now contains 2 task(s)")
+            .contains("Created plan revision 1 with 2 task(s)")
         {
             return Err(format!(
                 "second plan_create must report two materialized tasks: {}",
@@ -846,6 +1184,103 @@ mod plan_create_tests {
             plan.tasks
                 .iter()
                 .any(|task| task.agent_role == "data-shaper")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn plan_patch_insert_accepts_plan_create_task_shape() -> std::result::Result<(), String> {
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let capabilities = test_capabilities();
+        let create = TaskCreateTool {
+            store: store.clone(),
+            capabilities: capabilities.clone(),
+        };
+        let run_id = "run_patch_shape";
+        let created = with_run_id(
+            run_id.to_string(),
+            create.execute(one_task_params(serde_json::json!({
+                "id": "inspect",
+                "title": "Inspect runtime",
+                "description": "Inspect the current runtime evidence",
+                "kind": "investigation",
+                "subagent": "explorer"
+            }))),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        if !created.success {
+            return Err(format!("plan_create failed: {:?}", created.error));
+        }
+
+        let patch = PlanPatchTool {
+            store: store.clone(),
+            capabilities,
+        };
+        let mut params = ToolParameters::new();
+        params.insert("base_revision".to_string(), serde_json::json!(1));
+        params.insert(
+            "reason".to_string(),
+            serde_json::json!("inspection found a required verification"),
+        );
+        params.insert(
+            "operations".to_string(),
+            serde_json::json!([{
+                "op": "insert",
+                "after_task_id": "inspect",
+                "task": {
+                    "id": "verify",
+                    "title": "Verify runtime",
+                    "description": "Verify the discovered runtime contract",
+                    "kind": "verification",
+                    "subagent": "explorer",
+                    "depends_on": ["inspect"]
+                }
+            }]),
+        );
+        let result = with_run_id(run_id.to_string(), patch.execute(params))
+            .await
+            .map_err(|error| error.to_string())?;
+        if !result.success {
+            return Err(format!("plan_patch failed: {:?}", result.error));
+        }
+        let plan = store
+            .get_plan(run_id)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "patched plan missing".to_string())?;
+        assert_eq!(plan.revision, 2);
+        assert_eq!(plan.tasks.len(), 2);
+        assert_eq!(plan.tasks[1].agent_role, "explorer");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn plan_create_rejects_plan_control_tools_in_subagent_allowlist()
+    -> std::result::Result<(), String> {
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let tool = TaskCreateTool {
+            store,
+            capabilities: test_capabilities(),
+        };
+        let result = with_run_id(
+            "run_forbidden_tool".to_string(),
+            tool.execute(one_task_params(serde_json::json!({
+                "id": "bad-tools",
+                "title": "Bad tools",
+                "description": "Attempt to delegate plan control",
+                "kind": "investigation",
+                "subagent": "explorer",
+                "allowed_tools": ["plan_patch"]
+            }))),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .unwrap_or_default()
+                .contains("cannot delegate plan-control tool")
         );
         Ok(())
     }
@@ -1229,163 +1664,6 @@ impl CancelRunTool {
     }
 }
 
-// ── task_update ───────────────────────────────────────────────────────────
-
-pub struct TaskUpdateTool {
-    pub store: Arc<TaskRuntimeStore>,
-}
-
-impl Tool for TaskUpdateTool {
-    fn name(&self) -> &str {
-        "task_update"
-    }
-    fn description(&self) -> &str {
-        "Update an existing task's fields. Only pending/blocked tasks can be fully updated; \
-         running tasks can only change title/description."
-    }
-    fn parameters(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "task_id": { "type": "string", "description": "Task to update" },
-                "title": { "type": "string", "description": "New title (optional)" },
-                "description": { "type": "string", "description": "New description (optional)" },
-                "kind": { "type": "string", "description": "New kind (optional)" },
-                "depends_on": { "type": "array", "items": { "type": "string" }, "description": "New deps (optional)" },
-                "files": { "type": "array", "items": { "type": "string" }, "description": "New exact workspace-relative ownership files (optional); broad/empty writer scopes serialize" },
-                "allowed_tools": { "type": "array", "items": { "type": "string" }, "description": "New tool allowlist (optional)" },
-                "required_artifacts": { "type": "array", "items": { "type": "string" }, "description": "New required artifact list (optional)" },
-                "execution_checks": { "type": "array", "items": { "type": "string" }, "description": "New executable check list (optional). Each requires observed pass." },
-                "acceptance_criteria": { "type": "array", "items": { "type": "string" }, "description": "New semantic acceptance criteria (optional). Judged by reviewer LLM." }
-            },
-            "required": ["task_id"]
-        })
-    }
-    fn execute<'a>(
-        &'a self,
-        params: ToolParameters,
-    ) -> futures::future::BoxFuture<'a, echo_agent::error::Result<ToolResult>> {
-        Box::pin(async move {
-            let run_id = match require_run_id() {
-                Ok(id) => id,
-                Err(e) => return Ok(e),
-            };
-            let task_id = params
-                .get("task_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let patch = TaskPatch {
-                title: params
-                    .get("title")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-                description: params
-                    .get("description")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-                kind: params.get("kind").and_then(|v| v.as_str()).map(parse_kind),
-                depends_on: params
-                    .get("depends_on")
-                    .and_then(|v| v.as_array())
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect()
-                    }),
-                files: optional_string_array(&params, "files"),
-                allowed_tools: optional_string_array(&params, "allowed_tools"),
-                required_artifacts: optional_string_array(&params, "required_artifacts"),
-                execution_checks: optional_string_array(&params, "execution_checks"),
-                acceptance_criteria: optional_string_array(&params, "acceptance_criteria"),
-                ..Default::default()
-            };
-            match self.store.update_task(&run_id, &task_id, patch) {
-                Ok(()) => Ok(ToolResult::success(format!("Updated task '{task_id}'"))),
-                Err(e) => Ok(ToolResult::error(format!("Failed to update task: {e}"))),
-            }
-        })
-    }
-
-    fn execute_with_context<'a>(
-        &'a self,
-        params: ToolParameters,
-        ctx: &'a echo_core::tools::ToolContext,
-    ) -> futures::future::BoxFuture<'a, echo_agent::error::Result<ToolResult>> {
-        Box::pin(async move { scoped_with_ctx_run_id(ctx, || self.execute(params)).await })
-    }
-}
-
-fn optional_string_array(params: &ToolParameters, key: &str) -> Option<Vec<String>> {
-    params
-        .get(key)
-        .and_then(|value| value.as_array())
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(|value| value.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-}
-
-// ── task_skip ─────────────────────────────────────────────────────────────
-
-pub struct TaskSkipTool {
-    pub store: Arc<TaskRuntimeStore>,
-}
-
-impl Tool for TaskSkipTool {
-    fn name(&self) -> &str {
-        "task_skip"
-    }
-    fn description(&self) -> &str {
-        "Skip a task (soft-delete). Use when a task is no longer relevant."
-    }
-    fn parameters(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": {
-                "task_id": { "type": "string", "description": "Task to skip" },
-                "reason": { "type": "string", "description": "Why this task is being skipped" }
-            },
-            "required": ["task_id","reason"]
-        })
-    }
-    fn execute<'a>(
-        &'a self,
-        params: ToolParameters,
-    ) -> futures::future::BoxFuture<'a, echo_agent::error::Result<ToolResult>> {
-        Box::pin(async move {
-            let run_id = match require_run_id() {
-                Ok(id) => id,
-                Err(e) => return Ok(e),
-            };
-            let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("");
-            let reason = params
-                .get("reason")
-                .and_then(|v| v.as_str())
-                .unwrap_or("skipped by agent");
-            match self.store.remove_task(&run_id, task_id) {
-                Ok(()) => Ok(ToolResult::success(format!(
-                    "Skipped task '{task_id}': {reason}"
-                ))),
-                Err(e) => Ok(ToolResult::error(format!("Failed: {e}"))),
-            }
-        })
-    }
-
-    fn execute_with_context<'a>(
-        &'a self,
-        params: ToolParameters,
-        ctx: &'a echo_core::tools::ToolContext,
-    ) -> futures::future::BoxFuture<'a, echo_agent::error::Result<ToolResult>> {
-        Box::pin(async move { scoped_with_ctx_run_id(ctx, || self.execute(params)).await })
-    }
-}
-
 // ── task_list ─────────────────────────────────────────────────────────────
 
 pub struct TaskListTool {
@@ -1411,19 +1689,23 @@ impl Tool for TaskListTool {
                 Ok(id) => id,
                 Err(e) => return Ok(e),
             };
-            match self.store.list_todos(&run_id) {
-                Ok(todos) => {
+            match (self.store.get_plan(&run_id), self.store.list_todos(&run_id)) {
+                (Ok(Some(plan)), Ok(todos)) => {
                     let lines: Vec<String> = todos
                         .iter()
                         .map(|t| format!("[{}] {} — {}", t.status.as_str(), t.task_id, t.title))
                         .collect();
                     Ok(ToolResult::success(format!(
-                        "Tasks ({}):\n{}",
+                        "Plan revision {} — Tasks ({}):\n{}",
+                        plan.revision,
                         todos.len(),
                         lines.join("\n")
                     )))
                 }
-                Err(e) => Ok(ToolResult::error(format!("Failed: {e}"))),
+                (Ok(None), _) => Ok(ToolResult::error("No committed plan")),
+                (Err(error), _) | (_, Err(error)) => {
+                    Ok(ToolResult::error(format!("Failed: {error}")))
+                }
             }
         })
     }

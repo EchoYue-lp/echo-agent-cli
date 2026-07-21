@@ -405,62 +405,23 @@ pub async fn retry_blocked_task(
     }))
 }
 
-/// Insert a new task into a run's plan. Works in any run state. The task is
-/// inserted after `after_task_id` (or at the front if null). Validates
-/// dependency integrity and acyclicity.
+/// Atomically revise the plan against an expected revision.
 #[tauri::command]
-pub async fn insert_task(
+pub async fn patch_task_plan(
     state: tauri::State<'_, TauriState>,
     run_id: String,
-    after_task_id: Option<String>,
-    task: PlanTask,
-) -> Result<(), IpcError> {
+    request: PlanPatchRequest,
+) -> Result<TaskPlan, IpcError> {
     let store = store(&state)?;
     store
-        .insert_task(&run_id, after_task_id, task)
-        .map_err(internal)?;
-    Ok(())
-}
-
-/// Soft-delete a task from a run's plan (marks it Skipped).
-#[tauri::command]
-pub async fn remove_task(
-    state: tauri::State<'_, TauriState>,
-    run_id: String,
-    task_id: String,
-) -> Result<(), IpcError> {
-    let store = store(&state)?;
-    store.remove_task(&run_id, &task_id).map_err(internal)?;
-    Ok(())
-}
-
-/// Update a task with a partial patch. Only non-None fields are applied.
-/// Running tasks can only change title/description; terminal tasks reject
-/// any update.
-#[tauri::command]
-pub async fn update_task(
-    state: tauri::State<'_, TauriState>,
-    run_id: String,
-    task_id: String,
-    patch: echo_agent_app_core::tasks::task_runtime::types::TaskPatch,
-) -> Result<(), IpcError> {
-    let store = store(&state)?;
-    store
-        .update_task(&run_id, &task_id, patch)
-        .map_err(internal)?;
-    Ok(())
-}
-
-/// Reorder non-terminal tasks in a run's plan.
-#[tauri::command]
-pub async fn reorder_tasks(
-    state: tauri::State<'_, TauriState>,
-    run_id: String,
-    new_order: Vec<String>,
-) -> Result<(), IpcError> {
-    let store = store(&state)?;
-    store.reorder_tasks(&run_id, new_order).map_err(internal)?;
-    Ok(())
+        .patch_plan(&run_id, &request)
+        .map_err(|error| match error {
+            echo_agent_app_core::tasks::task_runtime::StoreError::PlanConflict { .. }
+            | echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(_) => {
+                IpcError::Validation(error.to_string())
+            }
+            other => internal(other),
+        })
 }
 
 /// Cancel an executing run. Cancels every in-flight subagent via the run's

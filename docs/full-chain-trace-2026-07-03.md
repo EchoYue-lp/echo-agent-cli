@@ -1,5 +1,9 @@
 # EKO 全链路任务生命周期追踪报告
 
+> Historical trace. The task-plan mutation path was replaced on 2026-07-21 by
+> atomic `plan_create`, revisioned `plan_patch`, and separate `plan.json` /
+> `run-state.json` projections. See `docs/2026-07-21-dynamic-plan-runtime.md`.
+
 **审查日期**：2026-07-03
 **追踪范围**：从 GUI 用户输入 → Agent ReAct 循环 → 任务计划/派发 → 任务执行 → HITL 审批，完整端到端链路。
 
@@ -32,8 +36,8 @@
   │                                                      │
   ├─ [Agent ReAct Loop] ─────────────────────────────────┘
   │   │
-  │   ├─ Agent 调用 task_create 工具                    [task_tools.rs:419]
-  │   │   └─ store.insert_task() → PlanEdited 事件 → plan.json
+  │   ├─ Agent 调用 plan_create / plan_patch
+  │   │   └─ PlanRevisionCommitted → plan.json + run-state.json
   │   │
   │   ├─ Agent 调用 execute_plan 工具                   [execute_plan_tool.rs:147]
   │   │   ├─ [Unattended] → CP A 预检 (拒绝写操作)
@@ -158,14 +162,14 @@ for iteration in 0..max_iterations:
 - **工具错误**：软化为 `[Error] {error}` 注入上下文，循环**继续**（可自我修正）
 - **LLM 错误**：通常**终端**——传播为 `Err` 结束 run
 
-### 3.2 任务创建（task_create 工具）
+### 3.2 任务创建（历史路径，已替换）
 
 **文件**：`task_tools.rs:419-484`
 
-Agent 调用 `task_create(title, description, kind, depends_on?, after_task_id?)`：
-1. `ensure_run_exists()` → bootstrap `TaskRun { status: Pending, route: "agent_task_plan" }` → transition `Running`
-2. 构建 `PlanTask { id: "task_<uuid>", kind, agent_role, status: Pending }`
-3. `store.insert_task(run_id, after_task_id, task)` → 追加 `PlanEdited` 事件 → 重写 `plan.json`
+当前路径一次提交完整 DAG：
+1. `ensure_run_exists()` → bootstrap `TaskRun` → transition `Running`
+2. `plan_create(tasks=[...])` 校验完整 DAG 并提交 revision 1
+3. 后续修改通过 `plan_patch(base_revision, operations, reason)` 原子提交
 
 **发现的问题：**
 

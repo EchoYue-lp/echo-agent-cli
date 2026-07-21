@@ -451,8 +451,7 @@ fn disabled_tools_for_mode(
         InteractionMode::Chat => disabled.extend(
             [
                 "plan_create",
-                "task_update",
-                "task_skip",
+                "plan_patch",
                 "task_list",
                 "plan_execute",
                 "create_complex_task",
@@ -805,6 +804,7 @@ mod tests {
             .attach_plan(&TaskPlan {
                 plan_id: "boundary-plan".to_string(),
                 run_id: run_id.clone(),
+                revision: 1,
                 domain_profile: DomainProfile::General,
                 goal: "boundary goal".to_string(),
                 assumptions: Vec::new(),

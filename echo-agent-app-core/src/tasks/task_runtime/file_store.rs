@@ -12,11 +12,10 @@
 
 use chrono::{DateTime, Utc};
 
-use super::event_rebuild::RebuiltPlan;
 use super::file_shadow::FileTaskShadow;
 use super::types::{
-    Artifact, ReviewResult, RuntimeEventKind, RuntimeTaskEvent, TaskExecutionSummary, TaskPlan,
-    TaskRun, TodoItem, TodoStatus,
+    Artifact, PlanRevision, PlanTask, ReviewResult, RunStateSnapshot, RuntimeEventKind,
+    RuntimeTaskEvent, TaskExecution, TaskExecutionSummary, TaskPlan, TaskRun, TodoItem, TodoStatus,
 };
 
 /// File-backed read store. Cheap to clone (wraps a `FileTaskShadow`).
@@ -39,15 +38,23 @@ impl FileTaskStore {
             .shadow
             .read_plan(run_id)
             .map_err(FileReadError::Shadow)?;
+        let state = self
+            .shadow
+            .read_run_state(run_id)
+            .map_err(FileReadError::Shadow)?;
         let events = self
             .shadow
             .read_events(run_id)
             .map_err(FileReadError::Shadow)?;
-        Ok(plan.map(|plan| Loaded { plan, events }))
+        Ok(state.map(|state| Loaded {
+            plan,
+            state,
+            events,
+        }))
     }
 
     pub fn get_run(&self, run_id: &str) -> Result<Option<TaskRun>, FileReadError> {
-        Ok(self.load(run_id)?.map(|l| l.plan.run))
+        Ok(self.load(run_id)?.map(|l| l.state.run))
     }
 
     /// Enumerate every run under root, returning the run headers ordered by
@@ -61,10 +68,8 @@ impl FileTaskStore {
     pub fn list_runs(&self) -> Result<Vec<TaskRun>, FileReadError> {
         let mut runs = Vec::new();
         for run_id in self.shadow.list_run_ids()? {
-            // plan.json already carries the run header (RebuiltPlan.run); no
-            // need to read events.jsonl + rebuild just to get the header.
-            if let Some(plan) = self.shadow.read_plan(&run_id)? {
-                runs.push(plan.run);
+            if let Some(state) = self.shadow.read_run_state(&run_id)? {
+                runs.push(state.run);
             }
         }
         // Descending by created_at (stable on ties, matching SQL behavior closely
@@ -117,12 +122,39 @@ impl FileTaskStore {
     }
 
     pub fn get_plan(&self, run_id: &str) -> Result<Option<TaskPlan>, FileReadError> {
-        Ok(self.load(run_id)?.map(|l| {
-            // RebuiltPlan.plan has tasks=empty; attach the rebuilt tasks so the
-            // caller gets the full plan with its tasks (matching SQL get_plan).
-            let mut p = l.plan.plan;
-            p.tasks = l.plan.tasks.clone();
-            p
+        let Some(loaded) = self.load(run_id)? else {
+            return Ok(None);
+        };
+        let Some(plan) = loaded.plan else {
+            return Ok(None);
+        };
+        let execution = loaded
+            .state
+            .tasks
+            .into_iter()
+            .map(|task| (task.task_id.clone(), task))
+            .collect::<std::collections::HashMap<_, _>>();
+        let tasks = plan
+            .tasks
+            .into_iter()
+            .map(|spec| {
+                let state = execution
+                    .get(&spec.id)
+                    .cloned()
+                    .unwrap_or_else(|| TaskExecution::pending(spec.id.clone()));
+                PlanTask::from_parts(spec, state)
+            })
+            .collect();
+        Ok(Some(TaskPlan {
+            plan_id: plan.plan_id,
+            run_id: plan.run_id,
+            revision: plan.revision,
+            domain_profile: plan.domain_profile,
+            goal: plan.goal,
+            assumptions: plan.assumptions,
+            risks: plan.risks,
+            execution_mode: plan.execution_mode,
+            tasks,
         }))
     }
 
@@ -132,16 +164,29 @@ impl FileTaskStore {
         let Some(loaded) = self.load(run_id)? else {
             return Ok(Vec::new());
         };
-        let mut todos = Vec::with_capacity(loaded.plan.tasks.len());
-        for t in &loaded.plan.tasks {
+        let Some(plan) = loaded.plan else {
+            return Ok(Vec::new());
+        };
+        let execution = loaded
+            .state
+            .tasks
+            .iter()
+            .map(|task| (task.task_id.as_str(), task))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut todos = Vec::with_capacity(plan.tasks.len());
+        for spec in &plan.tasks {
+            let default_status = execution
+                .get(spec.id.as_str())
+                .map(|task| task.status)
+                .unwrap_or(TodoStatus::Pending);
             // Fold this task's Task* events to recover the 4 runtime fields.
             let (owner, started, completed, summary, status) =
-                fold_task_runtime(&loaded.events, &t.id, t.status);
+                fold_task_runtime(&loaded.events, &spec.id, default_status);
             todos.push(TodoItem {
-                id: t.id.clone(),
-                run_id: loaded.plan.run.run_id.clone(),
-                task_id: t.id.clone(),
-                title: t.title.clone(),
+                id: spec.id.clone(),
+                run_id: loaded.state.run.run_id.clone(),
+                task_id: spec.id.clone(),
+                title: spec.title.clone(),
                 status,
                 owner_agent: owner,
                 started_at: started,
@@ -151,12 +196,10 @@ impl FileTaskStore {
         }
         // Sort by sort_order to match SQL's display ordering.
         todos.sort_by_key(|t| {
-            loaded
-                .plan
-                .tasks
+            plan.tasks
                 .iter()
-                .position(|p| p.id == t.task_id)
-                .map(|i| i as i64)
+                .find(|task| task.id == t.task_id)
+                .map(|task| task.sort_order)
                 .unwrap_or(i64::MAX)
         });
         Ok(todos)
@@ -280,7 +323,8 @@ impl FileTaskStore {
 }
 
 struct Loaded {
-    plan: RebuiltPlan,
+    plan: Option<PlanRevision>,
+    state: RunStateSnapshot,
     events: Vec<RuntimeTaskEvent>,
 }
 
@@ -424,6 +468,7 @@ mod tests {
         let plan = TaskPlan {
             plan_id: "p1".to_string(),
             run_id: "r1".to_string(),
+            revision: 1,
             domain_profile: DomainProfile::AiCoding,
             goal: "review".to_string(),
             assumptions: Vec::new(),

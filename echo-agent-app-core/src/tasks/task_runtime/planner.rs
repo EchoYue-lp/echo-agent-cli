@@ -89,6 +89,65 @@ pub fn validate_plan_deps(tasks: &[PlanTask]) -> Result<(), Vec<String>> {
     }
 }
 
+/// Validate the complete persisted plan contract before it becomes a new
+/// revision. Capability existence (registered Subagent roles/tools) is checked
+/// by the main-Agent plan tools, which own that runtime catalog.
+pub fn validate_plan(tasks: &[PlanTask]) -> Result<(), Vec<String>> {
+    let mut errors = Vec::new();
+    if tasks.is_empty() {
+        errors.push("plan must contain at least one task".to_string());
+    }
+
+    let mut ids = std::collections::HashSet::new();
+    for task in tasks {
+        let id = task.id.trim();
+        if id.is_empty() {
+            errors.push("task id must not be empty".to_string());
+        } else if !ids.insert(id.to_string()) {
+            errors.push(format!("duplicate task id '{id}'"));
+        }
+        if task.title.trim().is_empty() {
+            errors.push(format!("task '{}' title must not be empty", task.id));
+        }
+        if task.description.trim().is_empty() {
+            errors.push(format!("task '{}' description must not be empty", task.id));
+        }
+        if task.agent_role.trim().is_empty() {
+            errors.push(format!(
+                "task '{}' Subagent role must not be empty",
+                task.id
+            ));
+        }
+        if task.max_retries > 10 {
+            errors.push(format!(
+                "task '{}' max_retries {} exceeds the runtime limit 10",
+                task.id, task.max_retries
+            ));
+        }
+        if task
+            .depends_on
+            .iter()
+            .any(|dependency| dependency == &task.id)
+        {
+            errors.push(format!("task '{}' cannot depend on itself", task.id));
+        }
+        for tool in &task.allowed_tools {
+            if tool.trim().is_empty() {
+                errors.push(format!("task '{}' contains an empty tool name", task.id));
+            }
+        }
+    }
+
+    if let Err(dependency_errors) = validate_plan_deps(tasks) {
+        errors.extend(dependency_errors);
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
 // ── File Ownership Analysis ────────────────────────────────────────────────
 
 /// Runtime meaning of a task's declared `files` list.

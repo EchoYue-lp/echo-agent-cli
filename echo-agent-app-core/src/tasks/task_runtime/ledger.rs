@@ -207,6 +207,7 @@ mod tests {
         let plan = TaskPlan {
             plan_id: "p1".into(),
             run_id: "r1".into(),
+            revision: 1,
             domain_profile: DomainProfile::AiCoding,
             goal: "Build real runtime".into(),
             assumptions: vec!["runtime exists".into()],

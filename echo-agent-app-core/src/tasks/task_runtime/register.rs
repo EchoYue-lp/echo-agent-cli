@@ -7,8 +7,8 @@
 //! store is ready. Pooled agents instead get the tools via
 //! `SharedResources.task_runtime_store`.
 //!
-//! Registers: PlanCreate + TaskUpdate/Complete/Skip/List + CreateComplexTask /
-//! CheckRunStatus / CancelRun (8 task tools) + `plan_execute`.
+//! Registers the revisioned PlanCreate/PlanPatch/TaskList contract plus
+//! CreateComplexTask / CheckRunStatus / CancelRun and `plan_execute`.
 //!
 //! TUI/GUI functional parity (AGENTS.md): both entry points call this so the
 //! primary agent can drive complex tasks (plan / subagent / run lifecycle) via
@@ -20,8 +20,8 @@ use crate::agent_handle::AgentHandle;
 use crate::tasks::task_runtime::execute_plan_tool::ExecutePlanTool;
 use crate::tasks::task_runtime::store::TaskRuntimeStore;
 use crate::tasks::task_runtime::task_tools::{
-    CancelRunTool, CheckRunStatusTool, CreateComplexTaskTool, TaskCreateTool, TaskListTool,
-    TaskSkipTool, TaskUpdateTool,
+    CancelRunTool, CheckRunStatusTool, CreateComplexTaskTool, PlanCapabilityCatalog, PlanPatchTool,
+    TaskCreateTool, TaskListTool,
 };
 
 /// Register the task-management tools + `plan_execute` (with store) on
@@ -30,16 +30,26 @@ pub async fn register_task_tools_on_agent(
     agent_handle: &AgentHandle,
     store: Arc<TaskRuntimeStore>,
 ) {
+    let tool_names = agent_handle.read(|agent| agent.tool_names()).await;
+    let registry = agent_handle
+        .read(|agent| agent.subagent_registry().clone())
+        .await;
+    let subagent_names = registry
+        .list_available()
+        .await
+        .into_iter()
+        .map(|definition| definition.name)
+        .collect::<Vec<_>>();
+    let capabilities = Arc::new(PlanCapabilityCatalog::new(subagent_names, tool_names));
     let added = agent_handle
         .write(|agent| {
             agent.add_tool(Box::new(TaskCreateTool {
                 store: store.clone(),
+                capabilities: capabilities.clone(),
             }));
-            agent.add_tool(Box::new(TaskUpdateTool {
+            agent.add_tool(Box::new(PlanPatchTool {
                 store: store.clone(),
-            }));
-            agent.add_tool(Box::new(TaskSkipTool {
-                store: store.clone(),
+                capabilities: capabilities.clone(),
             }));
             agent.add_tool(Box::new(TaskListTool {
                 store: store.clone(),
@@ -54,7 +64,7 @@ pub async fn register_task_tools_on_agent(
         })
         .await;
     if added {
-        tracing::info!("Registered 8 task-management tools on primary agent");
+        tracing::info!("Registered revisioned task-management tools on primary agent");
     } else {
         tracing::warn!(
             "Failed to register task-management tools on primary agent (write lock poisoned)"

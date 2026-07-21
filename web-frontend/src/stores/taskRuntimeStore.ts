@@ -25,6 +25,9 @@ import type {
   RuntimeTaskEvent,
   RuntimeArtifact,
   RecoveryBlocker,
+  TaskSpec,
+  TaskPatch,
+  PlanPatchOperation,
 } from '../generated';
 
 type RunSnapshot = {
@@ -32,47 +35,32 @@ type RunSnapshot = {
   plan: TaskPlan | null;
   todos: TodoItem[];
   artifacts: RuntimeArtifact[];
+  recoveryBlockers: RecoveryBlocker[];
 };
 
-function runTime(value: string): number {
-  const time = Date.parse(value);
-  return Number.isFinite(time) ? time : 0;
-}
-
 async function loadRunSnapshot(run: TaskRun): Promise<RunSnapshot> {
-  const [plan, todos, artifacts] = await Promise.all([
+  const [plan, todos, artifacts, recoveryBlockers] = await Promise.all([
     taskRuntimeApi.getPlan(run.run_id),
     taskRuntimeApi.listTodos(run.run_id),
     taskRuntimeApi.listArtifacts(run.run_id),
+    taskRuntimeApi.listRecoveryBlockers(run.run_id),
   ]);
-  return { run, plan, todos, artifacts };
+  return { run, plan, todos, artifacts, recoveryBlockers };
 }
 
-async function loadConversationRunGroup(conversationId: string, focusedRun: TaskRun) {
-  const allRuns = await taskRuntimeApi.listRuns();
-  const groupRuns = allRuns
-    .filter(
-      (run) =>
-        run.conversation_id === conversationId && run.root_message_id === focusedRun.root_message_id
-    )
-    .sort((a, b) => runTime(a.created_at) - runTime(b.created_at));
-  const runs = groupRuns.length ? groupRuns : [focusedRun];
-  const snapshots = await Promise.all(runs.map(loadRunSnapshot));
-  const recoveryBlockers = await taskRuntimeApi.listRecoveryBlockers(focusedRun.run_id);
-  const basePlan = snapshots.find((snapshot) => snapshot.plan)?.plan ?? null;
-  const plan = basePlan
-    ? {
-        ...basePlan,
-        run_id: focusedRun.run_id,
-        goal: focusedRun.goal,
-        tasks: snapshots.flatMap((snapshot) => snapshot.plan?.tasks ?? []),
-      }
-    : null;
+function completeTaskPatch(patch: Partial<TaskPatch>): TaskPatch {
   return {
-    plan,
-    todos: snapshots.flatMap((snapshot) => snapshot.todos),
-    artifacts: snapshots.flatMap((snapshot) => snapshot.artifacts),
-    recoveryBlockers,
+    title: patch.title ?? null,
+    description: patch.description ?? null,
+    kind: patch.kind ?? null,
+    agent_role: patch.agent_role ?? null,
+    depends_on: patch.depends_on ?? null,
+    files: patch.files ?? null,
+    allowed_tools: patch.allowed_tools ?? null,
+    required_artifacts: patch.required_artifacts ?? null,
+    execution_checks: patch.execution_checks ?? null,
+    acceptance_criteria: patch.acceptance_criteria ?? null,
+    max_retries: patch.max_retries ?? null,
   };
 }
 
@@ -109,10 +97,10 @@ export interface TaskRuntimeState {
   pause: (runId: string) => Promise<void>;
   openInterruptPrompt: (data: { runId: string; goal: string; newMessage: string }) => void;
   dismissInterruptPrompt: () => void;
-  // Dynamic task operations (Phase 2).
-  insertTask: (afterTaskId: string | null, task: Record<string, unknown>) => Promise<void>;
-  removeTask: (taskId: string) => Promise<void>;
-  updateTask: (taskId: string, patch: Record<string, unknown>) => Promise<void>;
+  patchPlan: (reason: string, operations: PlanPatchOperation[]) => Promise<void>;
+  insertTask: (afterTaskId: string | null, task: TaskSpec) => Promise<void>;
+  skipTask: (taskId: string) => Promise<void>;
+  updateTask: (taskId: string, patch: Partial<TaskPatch>) => Promise<void>;
   reorderTasks: (newOrder: string[]) => Promise<void>;
   resumeTaskRun: () => Promise<void>;
   retryBlockedTask: (taskId: string) => Promise<void>;
@@ -186,10 +174,7 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
         });
         return;
       }
-      const { plan, todos, artifacts, recoveryBlockers } = await loadConversationRunGroup(
-        run.conversation_id,
-        run
-      );
+      const { plan, todos, artifacts, recoveryBlockers } = await loadRunSnapshot(run);
       set({
         activeRun: run,
         plan,
@@ -215,10 +200,7 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
       if (run) {
         // Reset event cursor when switching runs so we don't cross streams.
         set({ events: [], lastSeq: '0' });
-        const { plan, todos, artifacts, recoveryBlockers } = await loadConversationRunGroup(
-          conversationId,
-          run
-        );
+        const { plan, todos, artifacts, recoveryBlockers } = await loadRunSnapshot(run);
         set({
           activeRun: run,
           plan,
@@ -266,33 +248,41 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
   openInterruptPrompt: (data) => set({ interruptPrompt: data }),
   dismissInterruptPrompt: () => set({ interruptPrompt: null }),
 
-  insertTask: async (afterTaskId, task) => {
+  patchPlan: async (reason, operations) => {
     const runId = get().activeRun?.run_id;
-    if (!runId) return;
-    await taskRuntimeApi.insertTask(
-      runId,
-      afterTaskId,
-      task as unknown as import('../generated').PlanTask
-    );
-    await get().refresh(runId);
+    const baseRevision = get().plan?.revision;
+    if (!runId || baseRevision === undefined) {
+      set({ error: '当前任务计划尚未就绪，无法修改' });
+      return;
+    }
+    try {
+      const plan = await taskRuntimeApi.patchPlan(runId, {
+        base_revision: baseRevision,
+        reason,
+        operations,
+      });
+      set({ plan, error: null });
+      await get().refresh(runId);
+    } catch (e) {
+      await get().refresh(runId);
+      set({ error: e instanceof Error ? e.message : String(e) });
+    }
   },
-  removeTask: async (taskId) => {
-    const runId = get().activeRun?.run_id;
-    if (!runId) return;
-    await taskRuntimeApi.removeTask(runId, taskId);
-    await get().refresh(runId);
+  insertTask: async (afterTaskId, task) => {
+    await get().patchPlan(`新增任务：${task.title}`, [
+      { op: 'insert', after_task_id: afterTaskId, task },
+    ]);
+  },
+  skipTask: async (taskId) => {
+    await get().patchPlan(`跳过任务：${taskId}`, [{ op: 'skip', task_id: taskId }]);
   },
   updateTask: async (taskId, patch) => {
-    const runId = get().activeRun?.run_id;
-    if (!runId) return;
-    await taskRuntimeApi.updateTask(runId, taskId, patch);
-    await get().refresh(runId);
+    await get().patchPlan(`更新任务：${taskId}`, [
+      { op: 'update', task_id: taskId, patch: completeTaskPatch(patch) },
+    ]);
   },
   reorderTasks: async (newOrder) => {
-    const runId = get().activeRun?.run_id;
-    if (!runId) return;
-    await taskRuntimeApi.reorderTasks(runId, newOrder);
-    await get().refresh(runId);
+    await get().patchPlan('调整任务顺序', [{ op: 'reorder', task_ids: newOrder }]);
   },
   resumeTaskRun: async () => {
     const runId = get().activeRun?.run_id;

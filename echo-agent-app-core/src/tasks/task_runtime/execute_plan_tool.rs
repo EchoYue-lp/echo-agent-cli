@@ -162,7 +162,7 @@ impl Tool for ExecutePlanTool {
     }
 
     fn description(&self) -> &str {
-        "Execute the current persisted PlanTask DAG with subagents. First create every node with one plan_create call per task, then call task_list. Pass the exact returned task count as expected_task_count. The runtime rejects missing or partial plans. For one ad-hoc isolated subtask use agent_tool instead; plan_execute never accepts an inline task."
+        "Execute one exact committed plan revision with subagents. Create the complete DAG with one plan_create call, then pass its revision here. A stale or missing revision is rejected."
     }
 
     /// plan_execute 派 subagent 跑独立 ReAct(延迟远高于普通文件/shell 工具)。
@@ -176,13 +176,13 @@ impl Tool for ExecutePlanTool {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "expected_task_count": {
+                "plan_revision": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Exact Tasks (N) count returned by task_list after every plan_create call has completed. Execution is rejected when the persisted plan count differs."
+                    "description": "Exact committed plan revision returned by plan_create, plan_patch, or task_list."
                 }
             },
-            "required": ["expected_task_count"]
+            "required": ["plan_revision"]
         })
     }
 
@@ -200,24 +200,24 @@ impl Tool for ExecutePlanTool {
 
             if params.contains_key("task") {
                 return Ok(ToolResult::error(
-                    "plan_execute no longer accepts an inline task. Use agent_tool for one isolated subtask, or create every formal PlanTask with plan_create before executing the DAG.",
+                    "plan_execute no longer accepts an inline task; create the complete DAG with plan_create first.",
                 ));
             }
-            let expected_task_count = params
-                .get("expected_task_count")
+
+            let Some(plan_revision) = params
+                .get("plan_revision")
                 .and_then(serde_json::Value::as_u64)
-                .and_then(|count| usize::try_from(count).ok())
-                .filter(|count| *count > 0);
-            let Some(expected_task_count) = expected_task_count else {
+                .filter(|revision| *revision > 0)
+            else {
                 return Ok(ToolResult::error(
-                    "plan_execute requires expected_task_count from the latest task_list result.",
+                    "plan_execute requires the committed plan_revision.",
                 ));
             };
             let materialized_plan = match self.store.get_plan(&run_id) {
                 Ok(Some(plan)) if !plan.tasks.is_empty() => plan,
                 Ok(_) => {
                     return Ok(ToolResult::error(
-                        "plan_execute requires a non-empty persisted plan. Create one concrete PlanTask per intended subagent with plan_create, then call task_list.",
+                        "plan_execute requires a non-empty persisted plan. Submit the complete initial DAG with plan_create, then call task_list.",
                     ));
                 }
                 Err(error) => {
@@ -226,10 +226,10 @@ impl Tool for ExecutePlanTool {
                     )));
                 }
             };
-            let plan_task_count = materialized_plan.tasks.len();
-            if plan_task_count != expected_task_count {
+            if materialized_plan.revision != plan_revision {
                 return Ok(ToolResult::error(format!(
-                    "Plan task count mismatch: task_list declared {expected_task_count}, but the persisted plan contains {plan_task_count}. Finish all plan_create calls, run task_list again, and only then call plan_execute."
+                    "Plan revision mismatch: requested {plan_revision}, but the latest committed revision is {}. Refresh task_list and execute the latest revision.",
+                    materialized_plan.revision
                 )));
             }
 
@@ -287,7 +287,7 @@ impl Tool for ExecutePlanTool {
                 .flatten();
             tracing::info!(
                 run_id = %run_id,
-                task_count = plan_task_count,
+                task_count = materialized_plan.tasks.len(),
                 route = %route_str,
                 attended_mode = %attended_mode.as_str(),
                 has_trace_sink = trace_sink.is_some(),
@@ -608,6 +608,7 @@ mod tests {
         TaskPlan {
             plan_id: format!("plan_{run_id}"),
             run_id: run_id.to_string(),
+            revision: 1,
             domain_profile: DomainProfile::General,
             goal: "分析项目架构".to_string(),
             assumptions: Vec::new(),
@@ -652,7 +653,7 @@ mod tests {
                 "description": "分析当前项目结构"
             }),
         );
-        params.insert("expected_task_count".to_string(), serde_json::json!(1));
+        params.insert("plan_revision".to_string(), serde_json::json!(1));
         let result = task_tools::with_run_id("msg1".to_string(), tool.execute(params))
             .await
             .map_err(|error| error.to_string())?;
@@ -666,7 +667,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_execute_schema_requires_persisted_task_count() -> std::result::Result<(), String> {
+    fn plan_execute_schema_requires_committed_revision() -> std::result::Result<(), String> {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
         let tool = test_tool(store)?;
         let schema = tool.parameters();
@@ -680,13 +681,13 @@ mod tests {
         assert!(
             schema
                 .get("properties")
-                .and_then(|props| props.get("expected_task_count"))
+                .and_then(|props| props.get("plan_revision"))
                 .is_some(),
-            "plan_execute schema must expose expected_task_count: {schema}"
+            "plan_execute schema must expose plan_revision: {schema}"
         );
         assert_eq!(
             schema.get("required"),
-            Some(&serde_json::json!(["expected_task_count"]))
+            Some(&serde_json::json!(["plan_revision"]))
         );
         Ok(())
     }
@@ -697,7 +698,7 @@ mod tests {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
         let tool = test_tool(store)?;
         let mut params = ToolParameters::new();
-        params.insert("expected_task_count".to_string(), serde_json::json!(1));
+        params.insert("plan_revision".to_string(), serde_json::json!(1));
         let result = task_tools::with_run_id("run_without_plan".to_string(), tool.execute(params))
             .await
             .map_err(|error| error.to_string())?;
@@ -712,7 +713,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plan_execute_rejects_task_count_mismatch() -> std::result::Result<(), String> {
+    async fn plan_execute_rejects_stale_revision() -> std::result::Result<(), String> {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
         let run_id = "run_count_mismatch";
         store
@@ -732,14 +733,14 @@ mod tests {
             .map_err(|error| error.to_string())?;
         let tool = test_tool(store)?;
         let mut params = ToolParameters::new();
-        params.insert("expected_task_count".to_string(), serde_json::json!(6));
+        params.insert("plan_revision".to_string(), serde_json::json!(6));
         let result = task_tools::with_run_id(run_id.to_string(), tool.execute(params))
             .await
             .map_err(|error| error.to_string())?;
         assert!(!result.success);
         let error = result.error.unwrap_or_default();
-        assert!(error.contains("declared 6"), "unexpected error: {error}");
-        assert!(error.contains("contains 1"), "unexpected error: {error}");
+        assert!(error.contains("requested 6"), "unexpected error: {error}");
+        assert!(error.contains("revision is 1"), "unexpected error: {error}");
         Ok(())
     }
 
@@ -769,6 +770,7 @@ mod tests {
             .attach_plan(&TaskPlan {
                 plan_id: "p1".to_string(),
                 run_id: "r1".to_string(),
+                revision: 1,
                 domain_profile: DomainProfile::General,
                 goal: "分析项目架构".to_string(),
                 assumptions: Vec::new(),

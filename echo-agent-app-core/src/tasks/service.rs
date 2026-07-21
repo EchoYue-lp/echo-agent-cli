@@ -332,6 +332,7 @@ impl BackgroundTaskService {
         self.task_runtime_store.attach_plan(&TaskPlan {
             plan_id: uuid::Uuid::new_v4().to_string(),
             run_id: run_id.clone(),
+            revision: 1,
             domain_profile: DomainProfile::General,
             goal: goal.to_string(),
             assumptions: Vec::new(),
@@ -995,6 +996,7 @@ mod tests {
             .attach_plan(&TaskPlan {
                 plan_id: "retry-plan".to_string(),
                 run_id: "retry-run".to_string(),
+                revision: 1,
                 domain_profile: DomainProfile::General,
                 goal: "retry run".to_string(),
                 assumptions: Vec::new(),

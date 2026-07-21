@@ -154,10 +154,10 @@ impl InteractionMode {
                 "Chat mode. TaskRuntime tools are unavailable for this turn. Resolve the request directly with ordinary conversation and available non-task tools. Do not claim to create, execute, or update a formal plan."
             }
             InteractionMode::Task => {
-                "Task mode. Use a formal, reviewable DAG. The TaskRun already represents the overall goal, so never create a wrapper or placeholder PlanTask for it. Each plan_create call creates exactly one executable node: create one per intended subagent and wait for every result. Then call task_list and pass its exact Tasks (N) count as expected_task_count to plan_execute. Keep task status and verification current. Do not claim dispatch before plan_execute starts."
+                "Task mode. Use a formal, reviewable DAG. The TaskRun already represents the overall goal, so never create a wrapper or placeholder PlanTask for it. Submit the complete initial DAG in one plan_create call, inspect the returned revision with task_list, and pass it as plan_revision to plan_execute. Use plan_patch with the current base_revision for later changes. Keep task status and verification current. Do not claim dispatch before plan_execute starts."
             }
             InteractionMode::Auto => {
-                "Auto mode. Choose between direct work and formal TaskRuntime execution. Answer or act directly for simple work. If any Subagent delegation is needed, or the work is multi-step, multi-file, dependent, or parallel, create exactly one PlanTask per intended Subagent with plan_create, wait for every result, call task_list, and pass its exact Tasks (N) count as expected_task_count to plan_execute. Do not dispatch ad-hoc Subagents in Auto mode."
+                "Auto mode. Choose between direct work and formal TaskRuntime execution. Answer or act directly for simple work. If any Subagent delegation is needed, or the work is multi-step, multi-file, dependent, or parallel, submit the complete DAG in one plan_create call, inspect the revision with task_list, and pass it as plan_revision to plan_execute. Use plan_patch for later changes. Do not dispatch ad-hoc Subagents in Auto mode."
             }
         }
     }
@@ -577,8 +577,7 @@ pub enum RuntimeEventKind {
     /// User-uploaded attachments were bound to this run (so plan-level
     /// subagents can see the same images/files as the main agent).
     RunAttachmentsUpdated,
-    PlanGenerated,
-    PlanEdited,
+    PlanRevisionCommitted,
     TaskStarted,
     TaskCompleted,
     TaskFailed,
@@ -608,8 +607,7 @@ impl RuntimeEventKind {
             RunCreated => "run_created",
             RunStatusChanged => "run_status_changed",
             RunAttachmentsUpdated => "run_attachments_updated",
-            PlanGenerated => "plan_generated",
-            PlanEdited => "plan_edited",
+            PlanRevisionCommitted => "plan_revision_committed",
             TaskStarted => "task_started",
             TaskCompleted => "task_completed",
             TaskFailed => "task_failed",
@@ -639,8 +637,7 @@ impl RuntimeEventKind {
             "run_created" => RunCreated,
             "run_status_changed" => RunStatusChanged,
             "run_attachments_updated" => RunAttachmentsUpdated,
-            "plan_generated" => PlanGenerated,
-            "plan_edited" => PlanEdited,
+            "plan_revision_committed" => PlanRevisionCommitted,
             "task_started" => TaskStarted,
             "task_completed" => TaskCompleted,
             "task_failed" => TaskFailed,
@@ -709,12 +706,101 @@ pub struct TaskRun {
 pub struct TaskPlan {
     pub plan_id: String,
     pub run_id: String,
+    /// Monotonic committed plan revision. Revision 1 is the initial complete
+    /// DAG; every accepted dynamic patch increments it exactly once.
+    #[ts(type = "number")]
+    pub revision: u64,
     pub domain_profile: DomainProfile,
     pub goal: String,
     pub assumptions: Vec<String>,
     pub risks: Vec<String>,
     pub execution_mode: ExecutionMode,
     pub tasks: Vec<PlanTask>,
+}
+
+impl TaskPlan {
+    pub fn specification(&self) -> PlanRevision {
+        PlanRevision {
+            plan_id: self.plan_id.clone(),
+            run_id: self.run_id.clone(),
+            revision: self.revision,
+            domain_profile: self.domain_profile,
+            goal: self.goal.clone(),
+            assumptions: self.assumptions.clone(),
+            risks: self.risks.clone(),
+            execution_mode: self.execution_mode,
+            tasks: self.tasks.iter().map(PlanTask::spec).collect(),
+        }
+    }
+}
+
+/// Immutable task specification stored in `plan.json`.
+///
+/// Runtime state such as status, retry count, and failure fingerprints lives
+/// in [`TaskExecution`] and is projected separately into `run-state.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, rename = "TaskSpec")]
+pub struct TaskSpec {
+    pub id: String,
+    pub title: String,
+    pub description: String,
+    pub kind: PlanTaskKind,
+    pub agent_role: String,
+    pub domain_profile: DomainProfile,
+    pub depends_on: Vec<String>,
+    pub parallel_group: Option<String>,
+    pub files: Vec<String>,
+    pub allowed_tools: Vec<String>,
+    pub required_artifacts: Vec<String>,
+    pub execution_checks: Vec<String>,
+    pub acceptance_criteria: Vec<String>,
+    pub max_retries: u32,
+    #[ts(type = "number")]
+    pub sort_order: i64,
+}
+
+/// Mutable execution state for one task specification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, rename = "TaskExecution")]
+pub struct TaskExecution {
+    pub task_id: String,
+    pub status: TodoStatus,
+    pub retry_count: u32,
+    pub failure_fingerprint: Option<String>,
+}
+
+impl TaskExecution {
+    pub fn pending(task_id: impl Into<String>) -> Self {
+        Self {
+            task_id: task_id.into(),
+            status: TodoStatus::Pending,
+            retry_count: 0,
+            failure_fingerprint: None,
+        }
+    }
+}
+
+/// Canonical structured plan specification persisted in `plan.json`.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, rename = "PlanRevision")]
+pub struct PlanRevision {
+    pub plan_id: String,
+    pub run_id: String,
+    #[ts(type = "number")]
+    pub revision: u64,
+    pub domain_profile: DomainProfile,
+    pub goal: String,
+    pub assumptions: Vec<String>,
+    pub risks: Vec<String>,
+    pub execution_mode: ExecutionMode,
+    pub tasks: Vec<TaskSpec>,
+}
+
+/// Canonical execution projection persisted in `run-state.json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunStateSnapshot {
+    pub run: TaskRun,
+    pub tasks: Vec<TaskExecution>,
 }
 
 /// One node in the plan DAG. `depends_on` is the canonical edge list; the
@@ -757,6 +843,7 @@ pub struct PlanTask {
     /// index) and updated by `reorder_tasks`. Separated from `parallel_group`
     /// (which encodes parallel-fanout grouping, not display order) to avoid
     /// semantic pollution.
+    #[ts(type = "number")]
     pub sort_order: i64,
 }
 
@@ -765,7 +852,7 @@ impl Default for PlanTask {
         Self {
             id: String::new(),
             title: String::new(),
-            description: String::new(),
+            description: "Complete the assigned task".to_string(),
             kind: PlanTaskKind::ReadOnlyReview,
             agent_role: "general".to_string(),
             domain_profile: DomainProfile::General,
@@ -786,6 +873,58 @@ impl Default for PlanTask {
 }
 
 impl PlanTask {
+    pub fn spec(&self) -> TaskSpec {
+        TaskSpec {
+            id: self.id.clone(),
+            title: self.title.clone(),
+            description: self.description.clone(),
+            kind: self.kind,
+            agent_role: self.agent_role.clone(),
+            domain_profile: self.domain_profile,
+            depends_on: self.depends_on.clone(),
+            parallel_group: self.parallel_group.clone(),
+            files: self.files.clone(),
+            allowed_tools: self.allowed_tools.clone(),
+            required_artifacts: self.required_artifacts.clone(),
+            execution_checks: self.execution_checks.clone(),
+            acceptance_criteria: self.acceptance_criteria.clone(),
+            max_retries: self.max_retries,
+            sort_order: self.sort_order,
+        }
+    }
+
+    pub fn execution(&self) -> TaskExecution {
+        TaskExecution {
+            task_id: self.id.clone(),
+            status: self.status,
+            retry_count: self.retry_count,
+            failure_fingerprint: self.failure_fingerprint.clone(),
+        }
+    }
+
+    pub fn from_parts(spec: TaskSpec, execution: TaskExecution) -> Self {
+        Self {
+            id: spec.id,
+            title: spec.title,
+            description: spec.description,
+            kind: spec.kind,
+            agent_role: spec.agent_role,
+            domain_profile: spec.domain_profile,
+            depends_on: spec.depends_on,
+            parallel_group: spec.parallel_group,
+            files: spec.files,
+            allowed_tools: spec.allowed_tools,
+            required_artifacts: spec.required_artifacts,
+            execution_checks: spec.execution_checks,
+            acceptance_criteria: spec.acceptance_criteria,
+            retry_count: execution.retry_count,
+            max_retries: spec.max_retries,
+            failure_fingerprint: execution.failure_fingerprint,
+            status: execution.status,
+            sort_order: spec.sort_order,
+        }
+    }
+
     /// Convert to the framework's product-neutral runtime task view.
     pub fn to_runtime_task(&self) -> echo_agent::tasks::RuntimeTask {
         echo_agent::tasks::RuntimeTask {
@@ -814,8 +953,7 @@ impl PlanTask {
     }
 }
 
-/// Partial update patch for a [`PlanTask`]. Only non-`None` fields are applied.
-/// Used by [`TaskRuntimeStore::update_task`] for in-flight plan edits.
+/// Partial specification update used by a revisioned [`PlanPatchOperation`].
 #[derive(Debug, Clone, Default, Serialize, Deserialize, TS)]
 #[ts(export, rename = "TaskPatch")]
 pub struct TaskPatch {
@@ -829,6 +967,37 @@ pub struct TaskPatch {
     pub required_artifacts: Option<Vec<String>>,
     pub execution_checks: Option<Vec<String>>,
     pub acceptance_criteria: Option<Vec<String>>,
+    pub max_retries: Option<u32>,
+}
+
+/// One atomic operation in a revisioned plan patch.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(tag = "op", rename_all = "snake_case")]
+#[ts(export, rename = "PlanPatchOperation")]
+pub enum PlanPatchOperation {
+    Insert {
+        after_task_id: Option<String>,
+        task: TaskSpec,
+    },
+    Update {
+        task_id: String,
+        patch: TaskPatch,
+    },
+    Skip {
+        task_id: String,
+    },
+    Reorder {
+        task_ids: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[ts(export, rename = "PlanPatchRequest")]
+pub struct PlanPatchRequest {
+    #[ts(type = "number")]
+    pub base_revision: u64,
+    pub reason: String,
+    pub operations: Vec<PlanPatchOperation>,
 }
 
 /// A todo row — the GUI-facing projection of a plan task's progress.
@@ -1383,7 +1552,8 @@ mod tests {
 
         assert!(chat.contains("TaskRuntime tools are unavailable"));
         assert!(task.contains("plan_create"));
-        assert!(task.contains("expected_task_count"));
+        assert!(task.contains("plan_revision"));
+        assert!(task.contains("plan_patch"));
         assert!(task.contains("never create a wrapper"));
         assert!(auto.contains("Choose between direct work"));
         assert!(auto.contains("formal TaskRuntime execution"));

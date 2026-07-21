@@ -471,6 +471,7 @@ mod tests {
         let plan = TaskPlan {
             plan_id: "p1".to_string(),
             run_id: "r1".to_string(),
+            revision: 1,
             domain_profile: DomainProfile::AiCoding,
             goal: "修复上下文压缩继承".to_string(),
             assumptions: vec!["运行态来自文件 store".to_string()],
@@ -483,7 +484,7 @@ mod tests {
                     description: "读取 ContextManager 和 TaskRuntimeStore".to_string(),
                     kind: PlanTaskKind::Investigation,
                     agent_role: "explorer".to_string(),
-                    status: TodoStatus::Completed,
+                    status: TodoStatus::Pending,
                     sort_order: 0,
                     ..PlanTask::default()
                 },
@@ -494,7 +495,7 @@ mod tests {
                     kind: PlanTaskKind::Implementation,
                     agent_role: "implementer".to_string(),
                     depends_on: vec!["t1".to_string()],
-                    status: TodoStatus::Running,
+                    status: TodoStatus::Pending,
                     sort_order: 1,
                     ..PlanTask::default()
                 },
@@ -611,6 +612,7 @@ mod tests {
             .attach_plan(&TaskPlan {
                 plan_id: format!("plan-{run_id}"),
                 run_id: run_id.to_string(),
+                revision: 1,
                 domain_profile: DomainProfile::General,
                 goal: task_title.to_string(),
                 assumptions: Vec::new(),

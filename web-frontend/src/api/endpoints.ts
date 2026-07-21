@@ -46,7 +46,7 @@ import type {
 import type {
   TaskRun,
   TaskPlan,
-  PlanTask,
+  PlanPatchRequest,
   TodoItem,
   RuntimeTaskEvent,
   RuntimeArtifact,
@@ -580,22 +580,10 @@ export const taskRuntimeApi = {
     isTauri()
       ? apiInvoke<void>('resolve_recovery_task', { runId, taskId, decision })
       : post(`/task_runtime/runs/${runId}/tasks/${taskId}/resolve_recovery`, { decision }),
-  insertTask: (runId: string, afterTaskId: string | null, task: PlanTask) =>
+  patchPlan: (runId: string, request: PlanPatchRequest) =>
     isTauri()
-      ? apiInvoke<void>('insert_task', { runId, afterTaskId, task })
-      : post(`/task_runtime/runs/${runId}/tasks`, { afterTaskId, task }),
-  removeTask: (runId: string, taskId: string) =>
-    isTauri()
-      ? apiInvoke<void>('remove_task', { runId, taskId })
-      : post(`/task_runtime/runs/${runId}/tasks/${taskId}/remove`),
-  updateTask: (runId: string, taskId: string, patch: Record<string, unknown>) =>
-    isTauri()
-      ? apiInvoke<void>('update_task', { runId, taskId, patch })
-      : put(`/task_runtime/runs/${runId}/tasks/${taskId}`, patch),
-  reorderTasks: (runId: string, newOrder: string[]) =>
-    isTauri()
-      ? apiInvoke<void>('reorder_tasks', { runId, newOrder })
-      : put(`/task_runtime/runs/${runId}/tasks/reorder`, { newOrder }),
+      ? apiInvoke<TaskPlan>('patch_task_plan', { runId, request })
+      : post<TaskPlan>(`/task_runtime/runs/${runId}/plan/patch`, request),
 
   // ── Interaction mode ─────────────────────────────────────────────────
   setInteractionMode: (mode: number) =>

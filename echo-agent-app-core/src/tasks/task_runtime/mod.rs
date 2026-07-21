@@ -58,7 +58,7 @@ pub use memory_bridge::{
 };
 pub use planner::{
     FileOverlapPair, OwnershipReport, analyze_file_ownership, has_writer_file_overlap,
-    validate_plan_deps,
+    validate_plan, validate_plan_deps,
 };
 pub use profiles::ProfileTemplate;
 pub use register::register_task_tools_on_agent;

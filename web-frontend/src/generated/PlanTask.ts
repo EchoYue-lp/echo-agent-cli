@@ -30,14 +30,14 @@ export type PlanTask = {
    */
   required_artifacts: Array<string>;
   /**
-   * Executable checks (shell commands, e.g. `cargo test --lib`). Each
-   * requires an observed pass recorded from runtime tool events; Subagent
-   * prose alone never satisfies them.
+   * 可执行验证项(命令类)。Subagent 运行这些命令时,Runtime 从工具事件
+   * 记录 `observed` 证据;每个 execution_check 必须有 `observed + passed`
+   * 才能通过 execution 门禁。示例:`cargo test --lib`、`npm run build`。
    */
   execution_checks: Array<string>;
   /**
-   * Semantic acceptance criteria (e.g. `module boundary is clear`). Judged
-   * by the reviewer LLM against the Subagent output, never auto-passed.
+   * 语义验收标准(描述类)。由 Reviewer 基于 Subagent 输出判定,不要求
+   * 工具事件证据。示例:`模块边界清晰`、`前端组件层级合理`。
    */
   acceptance_criteria: Array<string>;
   retry_count: number;
@@ -50,5 +50,5 @@ export type PlanTask = {
    * (which encodes parallel-fanout grouping, not display order) to avoid
    * semantic pollution.
    */
-  sort_order: bigint;
+  sort_order: number;
 };

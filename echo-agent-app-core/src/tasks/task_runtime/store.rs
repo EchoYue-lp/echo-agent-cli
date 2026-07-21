@@ -1,12 +1,12 @@
 //! File-backed canonical store for the TaskRuntime.
 //!
-//! U1c phase-0/0bc: the file system (`plan.json` + `events.jsonl`) is the
-//! single source of truth for all task/plan data. Usage records and
+//! The file system (`events.jsonl` plus deterministic `plan.json` and
+//! `run-state.json` projections) is the source of truth for task/plan data. Usage records and
 //! conversation-replay events are held in memory (EKO is a local tool; these
 //! are ephemeral and need not survive a restart). No SQLite dependency.
 //!
 //! Every state mutation appends a [`RuntimeTaskEvent`] to `events.jsonl` and
-//! rebuilds `plan.json` from the full event stream.
+//! refreshes only the affected projection from the full event stream.
 
 use std::path::PathBuf;
 
@@ -37,6 +37,12 @@ pub enum StoreError {
     Json(#[from] serde_json::Error),
     #[error("invalid plan: {0}")]
     InvalidPlan(String),
+    #[error("plan revision conflict for run {run_id}: expected {expected}, current {current}")]
+    PlanConflict {
+        run_id: String,
+        expected: u64,
+        current: u64,
+    },
     #[error("file shadow: {0}")]
     Shadow(#[from] super::file_shadow::ShadowError),
     #[error("run {run_id} has unresolved recovery barriers: {details}")]
@@ -44,29 +50,26 @@ pub enum StoreError {
 }
 
 /// File-backed TaskRuntime store. One instance per process; cheap to clone
-/// behind `Arc`. The file system (plan.json + events.jsonl) is the read/write
-/// authority for all task/plan data.
+/// behind `Arc`. The event stream is authoritative; plan and execution files
+/// are deterministic read projections.
 pub struct TaskRuntimeStore {
     /// Per-task cancellation tokens (in-memory runtime state, not persisted).
     /// Key = `"{run_id}::{task_id}"`. `execute_task` registers a token when a
-    /// task starts and removes it on completion; `remove_task` cancels the
-    /// token of a running task so its subagent stops promptly (rather than the
-    /// status flipping to Skipped while execution continues).
+    /// task starts and removes it on completion; runtime control actions use
+    /// the token to stop that Subagent promptly.
     task_cancel_tokens:
         std::sync::Mutex<std::collections::HashMap<String, echo_agent::agent::CancellationToken>>,
     /// Active TaskRun driver tokens. Every entry point registers here so pause
     /// and cancel target the real executor instead of a surface-local map.
     run_cancel_tokens:
         std::sync::Mutex<std::collections::HashMap<String, echo_agent::agent::CancellationToken>>,
-    /// File shadow (U1c phase-0/0bc). The read/write authority for all task data.
+    /// File-backed event authority and deterministic projections.
     shadow: std::sync::Arc<super::file_shadow::FileTaskShadow>,
     /// Per-run plan/state 写互斥锁 (F2-1 / F3-3 / F3-4)。
     ///
-    /// insert_task / attach_plan / update_plan_task / transition_run 都是
-    /// "读文件 → 改 → 重写文件"三步, 此前无锁 → EKO 写工具默认并行执行
-    /// (react_loop.rs:415, 仅 approval 工具串行), plan_create + plan_execute
-    /// 可能并发覆写 plan.json。加 per-run Mutex 串行化同一 run 的所有 plan/run
-    /// 变更 (对标调研结论: 进程内 Mutex 兜底, 同时防崩溃中态)。不同 run 互不影响。
+    /// attach_plan / patch_plan / transition_run 都是
+    /// "读事件 → 校验 → 追加 → 重建投影"事务, 必须按 run 串行化。
+    /// Different runs keep independent locks.
     plan_locks: dashmap::DashMap<String, std::sync::Arc<std::sync::Mutex<()>>>,
 }
 
@@ -78,6 +81,42 @@ pub struct RunCancellationRegistration {
     run_id: String,
     token: echo_agent::agent::CancellationToken,
     previous: Option<echo_agent::agent::CancellationToken>,
+}
+
+fn apply_task_patch(task: &mut PlanTask, patch: &TaskPatch) {
+    if let Some(title) = &patch.title {
+        task.title = title.clone();
+    }
+    if let Some(description) = &patch.description {
+        task.description = description.clone();
+    }
+    if let Some(kind) = patch.kind {
+        task.kind = kind;
+    }
+    if let Some(agent_role) = &patch.agent_role {
+        task.agent_role = agent_role.clone();
+    }
+    if let Some(depends_on) = &patch.depends_on {
+        task.depends_on = depends_on.clone();
+    }
+    if let Some(files) = &patch.files {
+        task.files = files.clone();
+    }
+    if let Some(allowed_tools) = &patch.allowed_tools {
+        task.allowed_tools = allowed_tools.clone();
+    }
+    if let Some(required_artifacts) = &patch.required_artifacts {
+        task.required_artifacts = required_artifacts.clone();
+    }
+    if let Some(execution_checks) = &patch.execution_checks {
+        task.execution_checks = execution_checks.clone();
+    }
+    if let Some(acceptance_criteria) = &patch.acceptance_criteria {
+        task.acceptance_criteria = acceptance_criteria.clone();
+    }
+    if let Some(max_retries) = patch.max_retries {
+        task.max_retries = max_retries;
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -148,7 +187,7 @@ impl TaskRuntimeStore {
 
     /// In-memory store whose file shadow is rooted at `shadow_root`. Tests use
     /// this (with a `tempfile::tempdir()` root) so they can read the written
-    /// `events.jsonl` / `plan.json` back directly and so runs are isolated
+    /// `events.jsonl` / projection files back directly and so runs are isolated
     /// under a known directory. Replaces the old `attach_shadow` test hook.
     pub fn new_in_memory_with_shadow_root(shadow_root: impl Into<PathBuf>) -> anyhow::Result<Self> {
         let shadow = std::sync::Arc::new(super::file_shadow::FileTaskShadow::new(shadow_root));
@@ -165,8 +204,8 @@ impl TaskRuntimeStore {
     /// 用 closure 模式而非返回 Guard: std::sync::MutexGuard 借自 &Mutex, 而
     /// Mutex 在 Arc 内, Arc 作为局部变量时 Guard 跨函数返回即悬垂 (自引用
     /// struct 在 Rust 里无法直接表达)。closure 把锁的获取与释放封装在内部,
-    /// 闭包体内是临界区。insert_task / attach_plan / update_plan_task /
-    /// transition_run 用它包裹"读改写"全程。
+    /// 闭包体内是临界区。attach_plan / patch_plan / transition_run 用它包裹
+    /// "读事件 → 校验 → 追加 → 重建投影"全程。
     fn with_run_lock<R, E>(&self, run_id: &str, f: impl FnOnce() -> Result<R, E>) -> Result<R, E> {
         let arc = self
             .plan_locks
@@ -336,10 +375,49 @@ impl TaskRuntimeStore {
         self.transition_run(run_id, TaskRunStatus::Running)
     }
 
-    // ── Task-level cancellation (gap-2 fix) ───────────────────────────────
-    // These are in-memory runtime tokens, NOT persisted. They let remove_task
-    // stop a running task's subagent promptly instead of leaving it executing
-    // after the status has flipped to Skipped.
+    /// Atomically mark a running run completed only when the latest committed
+    /// revision is quiescent. A concurrent plan patch wins the same run lock
+    /// and makes this return `false`, causing the executor to drain again.
+    pub fn complete_run_if_quiescent(&self, run_id: &str) -> Result<bool, StoreError> {
+        self.with_run_lock(run_id, || {
+            let run = self
+                .get_run(run_id)?
+                .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+            if run.status == TaskRunStatus::Completed {
+                return Ok(true);
+            }
+            if run.status != TaskRunStatus::Running {
+                return Ok(false);
+            }
+            let plan = self
+                .get_plan(run_id)?
+                .ok_or_else(|| StoreError::PlanNotFound(run_id.to_string()))?;
+            if plan
+                .tasks
+                .iter()
+                .any(|task| !matches!(task.status, TodoStatus::Completed | TodoStatus::Skipped))
+            {
+                return Ok(false);
+            }
+            self.shadow.append_event_line(
+                run_id,
+                None,
+                None,
+                RuntimeEventKind::RunStatusChanged,
+                serde_json::json!({
+                    "from": TaskRunStatus::Running.as_str(),
+                    "to": TaskRunStatus::Completed.as_str(),
+                    "plan_revision": plan.revision,
+                }),
+            )?;
+            self.shadow.rewrite_plan(run_id)?;
+            Ok(true)
+        })
+    }
+
+    // ── Task-level cancellation ────────────────────────────────────────────
+    // These in-memory tokens let runtime control actions stop one Subagent
+    // promptly without changing the immutable task specification.
 
     /// Register a cancellation token for a task that is about to start running.
     /// Called by the executor before dispatching the subagent. The token is a
@@ -365,9 +443,7 @@ impl TaskRuntimeStore {
         }
     }
 
-    /// Cancel a specific task's subagent (if running). Called by remove_task /
-    /// update_task when a running task is being skipped or fundamentally
-    /// changed. No-op if the task isn't currently running (no token registered).
+    /// Cancel a specific task's Subagent if one is currently running.
     pub fn cancel_task(&self, run_id: &str, task_id: &str) {
         let key = format!("{run_id}::{task_id}");
         if let Ok(mut map) = self.task_cancel_tokens.lock() {
@@ -462,319 +538,210 @@ impl TaskRuntimeStore {
         Ok(true)
     }
 
-    /// Insert a new task into the plan, optionally after a given task id.
-    /// Works in any non-terminal run state.
-    /// Validates dependency integrity and acyclicity. Emits `PlanEdited`.
-    pub fn insert_task(
-        &self,
-        run_id: &str,
-        after_task_id: Option<String>,
-        task: PlanTask,
-    ) -> Result<(), StoreError> {
-        // F2-1: 串行化该 run 的 plan 变更, 防 plan_create 并发覆写 plan.json。
-        self.with_run_lock(run_id, || {
-            // U1c phase-0/0bc step-2: file authority. Read the current plan from
-            // the file (bootstrapping an empty plan if none exists), validate deps,
-            // then append PlanEdited{insert} + rewrite plan.json. No SQL write.
+    /// Commit the initial complete DAG as revision 1.
+    pub fn attach_plan(&self, plan: &TaskPlan) -> Result<(), StoreError> {
+        self.with_run_lock(&plan.run_id, || {
             let run = self
-                .get_run(run_id)?
-                .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
-            // Load current plan/tasks from the file (None if no plan yet).
-            let current_plan = self.get_plan(run_id)?;
-            let existing_tasks: Vec<PlanTask> = current_plan
-                .as_ref()
-                .map(|p| p.tasks.clone())
-                .unwrap_or_default();
-
-            // Lazy bootstrap: if no plan exists, emit a PlanGenerated first
-            // (matching the SQL path that creates an empty plan row). The run
-            // goal comes from the run header (already on file via create_run).
-            if current_plan.is_none() {
-                let new_plan_id = uuid::Uuid::new_v4().to_string();
-                self.shadow.append_event_line(
-                    run_id,
-                    None,
-                    None,
-                    RuntimeEventKind::PlanGenerated,
-                    serde_json::json!({
-                        "plan_id": new_plan_id,
-                        "task_count": 0,
-                        "bootstrapped": true,
-                        "domain_profile": run.domain_profile.as_str(),
-                        "goal": run.goal,
-                        "assumptions": Vec::<String>::new(),
-                        "risks": Vec::<String>::new(),
-                        "execution_mode": "parallel",
-                    }),
-                )?;
-            }
-
-            // Build the new task list: insert after `after_task_id` (or front).
-            let mut new_tasks = existing_tasks.clone();
-            let insert_pos = after_task_id
-                .as_ref()
-                .and_then(|id| new_tasks.iter().position(|t| &t.id == id))
-                .map(|i| i + 1)
-                .unwrap_or(0);
-            let mut task_with_order = task.clone();
-            task_with_order.sort_order = insert_pos as i64;
-            new_tasks.insert(insert_pos, task_with_order.clone());
-
-            // Validate deps (dangling refs + cycle detection).
-            if let Err(errs) = super::planner::validate_plan_deps(&new_tasks) {
-                return Err(StoreError::InvalidPlan(errs.join("; ")));
-            }
-
-            // Ownership conflicts are valid plans, but the scheduler will split
-            // them into separate write waves. Surface that decision at edit time.
-            let report = super::planner::analyze_file_ownership(&new_tasks);
-            if report.has_overlap() {
-                for pair in &report.overlap_pairs {
-                    tracing::warn!(
-                        run_id,
-                        task_a = %pair.task_a,
-                        task_b = %pair.task_b,
-                        shared = ?pair.shared,
-                        "plan: writer tasks share files (will serialize; disjoint files enable parallel worktrees)"
-                    );
-                }
-            }
-
-            self.shadow.append_event_line(
-                run_id,
-                None,
-                None,
-                RuntimeEventKind::PlanEdited,
-                serde_json::json!({
-                    "action": "insert",
-                    "task_id": task_with_order.id,
-                    "after_task_id": after_task_id,
-                    // Full PlanTask body so events.jsonl can rebuild plan.json.
-                    "task": task_with_order,
-                }),
-            )?;
-            self.shadow.rewrite_plan(run_id)?;
-            Ok(())
-        })
-    }
-
-    /// Soft-delete a task: set its status to `Skipped`. The task remains in
-    /// the plan (for audit) but is no longer scheduled. Emits `PlanEdited`.
-    pub fn remove_task(&self, run_id: &str, task_id: &str) -> Result<(), StoreError> {
-        // If the task is currently running, cancel its Subagent FIRST (before
-        // flipping status), so execution stops promptly instead of continuing
-        // after the status says Skipped.
-        let currently_running = self
-            .list_todos(run_id)
-            .ok()
-            .and_then(|todos| {
-                todos
-                    .into_iter()
-                    .find(|t| t.task_id == task_id)
-                    .map(|t| t.status == TodoStatus::Running)
-            })
-            .unwrap_or(false);
-        if currently_running {
-            self.cancel_task(run_id, task_id);
-        }
-        self.set_task_status(
-            run_id,
-            task_id,
-            TodoStatus::Skipped,
-            None,
-            Some("removed by user"),
-        )?;
-        // Emit PlanEdited (the set_task_status already emits TaskSkipped).
-        // U1c phase-0/0bc step-2: file authority — append + rewrite, no SQL.
-        self.shadow.append_event_line(
-            run_id,
-            None,
-            None,
-            RuntimeEventKind::PlanEdited,
-            serde_json::json!({ "action": "remove", "task_id": task_id }),
-        )?;
-        self.shadow.rewrite_plan(run_id)?;
-        Ok(())
-    }
-
-    /// Update a task with a partial patch. Only `Pending`/`Blocked` tasks can
-    /// be fully updated; `Running` tasks can only change `title`/`description`
-    /// (to avoid runtime tearing). `Completed`/`Failed`/`Skipped` tasks reject
-    /// any update. Emits `PlanEdited`.
-    pub fn update_task(
-        &self,
-        run_id: &str,
-        task_id: &str,
-        patch: TaskPatch,
-    ) -> Result<(), StoreError> {
-        self.with_run_lock(run_id, || {
-        // U1c phase-0/0bc step-2: file authority. Read the task status + plan
-        // from the file, validate (state guard + cycle on deps change), then
-        // append PlanEdited{update} + rewrite plan.json. No SQL write.
-        let plan = self
-            .get_plan(run_id)?
-            .ok_or(StoreError::PlanNotFound(run_id.to_string()))?;
-        let current_task = plan
-            .tasks
-            .iter()
-            .find(|t| t.id == task_id)
-            .ok_or_else(|| StoreError::TaskNotFound(task_id.to_string()))?;
-        let current_status = current_task.status;
-
-        // State guard.
-        match current_status {
-            TodoStatus::Completed | TodoStatus::Failed | TodoStatus::Skipped => {
+                .get_run(&plan.run_id)?
+                .ok_or_else(|| StoreError::RunNotFound(plan.run_id.clone()))?;
+            if matches!(
+                run.status,
+                TaskRunStatus::Completed | TaskRunStatus::Cancelled
+            ) {
                 return Err(StoreError::InvalidPlan(format!(
-                    "cannot update task in terminal status {:?}",
-                    current_status
+                    "cannot create a plan for terminal run {} ({:?})",
+                    plan.run_id, run.status
                 )));
             }
-            TodoStatus::Running => {
-                #[allow(clippy::collapsible_match)]
-                // guard is a multi-field ||, not a single pattern; collapsing reads worse
-                if patch.kind.is_some()
-                    || patch.depends_on.is_some()
-                    || patch.agent_role.is_some()
-                    || patch.files.is_some()
-                    || patch.allowed_tools.is_some()
-                    || patch.required_artifacts.is_some()
-                    || patch.execution_checks.is_some()
-                    || patch.acceptance_criteria.is_some()
-                {
-                    return Err(StoreError::InvalidPlan(
-                        "cannot change execution contract of a Running task".into(),
-                    ));
-                }
-            }
-            _ => {} // Pending/Blocked: all fields mutable.
-        }
-
-        // Re-validate the explicit dependency and ownership contracts against
-        // the complete candidate plan before persisting either field.
-        if patch.depends_on.is_some() || patch.files.is_some() || patch.kind.is_some() {
-            let mut tasks = plan.tasks.clone();
-            if let Some(t) = tasks.iter_mut().find(|t| t.id == task_id) {
-                if let Some(deps) = &patch.depends_on {
-                    t.depends_on = deps.clone();
-                }
-                if let Some(files) = &patch.files {
-                    t.files = files.clone();
-                }
-                if let Some(kind) = patch.kind {
-                    t.kind = kind;
-                }
-            }
-            if let Err(errs) = super::planner::validate_plan_deps(&tasks) {
-                return Err(StoreError::InvalidPlan(errs.join("; ")));
-            }
-            let report = super::planner::analyze_file_ownership(&tasks);
-            if report.has_overlap() {
-                for pair in &report.overlap_pairs {
-                    tracing::warn!(
-                        run_id,
-                        task_a = %pair.task_a,
-                        task_b = %pair.task_b,
-                        shared = ?pair.shared,
-                        "plan: writer tasks share files (will serialize; disjoint files enable parallel worktrees)"
-                    );
-                }
-            }
-        }
-
-        self.shadow.append_event_line(
-            run_id,
-            None,
-            None,
-            RuntimeEventKind::PlanEdited,
-            serde_json::json!({
-                "action": "update",
-                "task_id": task_id,
-                // Applied patch fields so events.jsonl can rebuild plan.json.
-                "patch": patch,
-            }),
-        )?;
-        self.shadow.rewrite_plan(run_id)?;
-        Ok(())
-        })
-    }
-
-    /// Reorder non-terminal tasks. `new_order` must be a permutation of all
-    /// task ids that are not in a terminal state (Completed/Failed/Skipped).
-    /// Emits `PlanEdited`.
-    pub fn reorder_tasks(&self, run_id: &str, new_order: Vec<String>) -> Result<(), StoreError> {
-        self.with_run_lock(run_id, || {
-            // U1c phase-0/0bc step-2: file authority. Read tasks from file,
-            // validate new_order is a permutation of non-terminal task ids, then
-            // append PlanEdited{reorder} + rewrite plan.json. No SQL write.
-            let plan = self
-                .get_plan(run_id)?
-                .ok_or(StoreError::PlanNotFound(run_id.to_string()))?;
-            let non_terminal: std::collections::HashSet<String> = plan
-                .tasks
-                .iter()
-                .filter(|t| {
-                    !matches!(
-                        t.status,
-                        TodoStatus::Completed | TodoStatus::Failed | TodoStatus::Skipped
-                    )
-                })
-                .map(|t| t.id.clone())
-                .collect();
-            let new_set: std::collections::HashSet<String> = new_order.iter().cloned().collect();
-
-            if non_terminal != new_set {
+            if self.get_plan(&plan.run_id)?.is_some() {
                 return Err(StoreError::InvalidPlan(
-                    "new_order must be a permutation of all non-terminal task ids".into(),
+                    "plan already exists; submit a revisioned plan_patch".to_string(),
                 ));
             }
-
-            self.shadow.append_event_line(
-                run_id,
-                None,
-                None,
-                RuntimeEventKind::PlanEdited,
-                serde_json::json!({
-                    "action": "reorder",
-                    // Full new ordering (task ids) so events.jsonl can rebuild plan.json.
-                    "new_order": new_order,
-                }),
-            )?;
-            self.shadow.rewrite_plan(run_id)?;
-            Ok(())
-        })
-    }
-
-    /// Attach a generated plan to a run, replacing any prior plan. Plan review
-    /// is an artifact/tool interaction and does not introduce run states.
-    pub fn attach_plan(&self, plan: &TaskPlan) -> Result<(), StoreError> {
-        // F2-1: 串行化 plan 变更。
-        self.with_run_lock(&plan.run_id, || {
-            self.get_run(&plan.run_id)?
-                .ok_or_else(|| StoreError::RunNotFound(plan.run_id.clone()))?;
-
-            // U1c phase-0/0bc step-2: file authority. PlanGenerated carries the
-            // full plan envelope + task bodies; the rebuilder reconstructs the
-            // plan from it. No SQL write.
+            if plan.tasks.iter().any(|task| {
+                task.status != TodoStatus::Pending
+                    || task.retry_count != 0
+                    || task.failure_fingerprint.is_some()
+            }) {
+                return Err(StoreError::InvalidPlan(
+                    "initial plan tasks must have pending execution state".to_string(),
+                ));
+            }
+            super::planner::validate_plan(&plan.tasks)
+                .map_err(|errors| StoreError::InvalidPlan(errors.join("; ")))?;
+            let mut committed = plan.clone();
+            committed.revision = 1;
             self.shadow.append_event_line(
                 plan.run_id.as_str(),
                 None,
                 None,
-                RuntimeEventKind::PlanGenerated,
+                RuntimeEventKind::PlanRevisionCommitted,
                 serde_json::json!({
-                    "plan_id": plan.plan_id,
-                    "task_count": plan.tasks.len(),
-                    "domain_profile": plan.domain_profile.as_str(),
-                    "goal": plan.goal,
-                    "assumptions": plan.assumptions,
-                    "risks": plan.risks,
-                    "execution_mode": plan.execution_mode,
-                    // Full task bodies: attach_plan is the authoritative plan-creation path
-                    // so PlanGenerated must carry the tasks for events.jsonl to rebuild plan.json.
-                    "tasks": plan.tasks,
+                    "base_revision": 0,
+                    "reason": "initial complete plan",
+                    "plan": committed.specification(),
                 }),
             )?;
             self.shadow.rewrite_plan(&plan.run_id)?;
             Ok(())
+        })
+    }
+
+    /// Atomically apply a dynamic plan patch against an expected revision.
+    pub fn patch_plan(
+        &self,
+        run_id: &str,
+        request: &PlanPatchRequest,
+    ) -> Result<TaskPlan, StoreError> {
+        self.with_run_lock(run_id, || {
+            let run = self
+                .get_run(run_id)?
+                .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+            if matches!(
+                run.status,
+                TaskRunStatus::Completed | TaskRunStatus::Cancelled
+            ) {
+                return Err(StoreError::InvalidPlan(format!(
+                    "cannot modify terminal run {} ({:?})",
+                    run_id, run.status
+                )));
+            }
+            let current = self
+                .get_plan(run_id)?
+                .ok_or_else(|| StoreError::PlanNotFound(run_id.to_string()))?;
+            if current.revision != request.base_revision {
+                return Err(StoreError::PlanConflict {
+                    run_id: run_id.to_string(),
+                    expected: request.base_revision,
+                    current: current.revision,
+                });
+            }
+            if request.operations.is_empty() {
+                return Err(StoreError::InvalidPlan(
+                    "plan_patch requires at least one operation".to_string(),
+                ));
+            }
+            if request.reason.trim().is_empty() {
+                return Err(StoreError::InvalidPlan(
+                    "plan_patch requires a non-empty reason".to_string(),
+                ));
+            }
+
+            let mut candidate = current.clone();
+            let mut skipped_task_ids = Vec::new();
+            let mut reset_task_ids = Vec::new();
+            for operation in &request.operations {
+                match operation {
+                    PlanPatchOperation::Insert {
+                        after_task_id,
+                        task,
+                    } => {
+                        if candidate
+                            .tasks
+                            .iter()
+                            .any(|existing| existing.id == task.id)
+                        {
+                            return Err(StoreError::InvalidPlan(format!(
+                                "task '{}' already exists",
+                                task.id
+                            )));
+                        }
+                        let position = match after_task_id {
+                            Some(after) => candidate
+                                .tasks
+                                .iter()
+                                .position(|existing| existing.id == *after)
+                                .map(|index| index.saturating_add(1))
+                                .ok_or_else(|| StoreError::TaskNotFound(after.clone()))?,
+                            None => candidate.tasks.len(),
+                        };
+                        candidate.tasks.insert(
+                            position,
+                            PlanTask::from_parts(
+                                task.clone(),
+                                TaskExecution::pending(task.id.clone()),
+                            ),
+                        );
+                    }
+                    PlanPatchOperation::Update { task_id, patch } => {
+                        let task = candidate
+                            .tasks
+                            .iter_mut()
+                            .find(|task| task.id == *task_id)
+                            .ok_or_else(|| StoreError::TaskNotFound(task_id.clone()))?;
+                        if !matches!(task.status, TodoStatus::Pending | TodoStatus::Blocked) {
+                            return Err(StoreError::InvalidPlan(format!(
+                                "cannot modify task '{}' in {:?}",
+                                task.id, task.status
+                            )));
+                        }
+                        if task.status == TodoStatus::Blocked {
+                            task.status = TodoStatus::Pending;
+                            reset_task_ids.push(task_id.clone());
+                        }
+                        apply_task_patch(task, patch);
+                    }
+                    PlanPatchOperation::Skip { task_id } => {
+                        let task = candidate
+                            .tasks
+                            .iter_mut()
+                            .find(|task| task.id == *task_id)
+                            .ok_or_else(|| StoreError::TaskNotFound(task_id.clone()))?;
+                        if !matches!(task.status, TodoStatus::Pending | TodoStatus::Blocked) {
+                            return Err(StoreError::InvalidPlan(format!(
+                                "cannot skip task '{}' in {:?}",
+                                task.id, task.status
+                            )));
+                        }
+                        task.status = TodoStatus::Skipped;
+                        skipped_task_ids.push(task_id.clone());
+                    }
+                    PlanPatchOperation::Reorder { task_ids } => {
+                        let expected = candidate
+                            .tasks
+                            .iter()
+                            .map(|task| task.id.clone())
+                            .collect::<std::collections::HashSet<_>>();
+                        let actual = task_ids
+                            .iter()
+                            .cloned()
+                            .collect::<std::collections::HashSet<_>>();
+                        if expected != actual || task_ids.len() != candidate.tasks.len() {
+                            return Err(StoreError::InvalidPlan(
+                                "reorder must contain every task id exactly once".to_string(),
+                            ));
+                        }
+                        candidate.tasks.sort_by_key(|task| {
+                            task_ids
+                                .iter()
+                                .position(|id| id == &task.id)
+                                .unwrap_or(usize::MAX)
+                        });
+                    }
+                }
+            }
+            for (index, task) in candidate.tasks.iter_mut().enumerate() {
+                task.sort_order = i64::try_from(index).unwrap_or(i64::MAX);
+            }
+            super::planner::validate_plan(&candidate.tasks)
+                .map_err(|errors| StoreError::InvalidPlan(errors.join("; ")))?;
+            candidate.revision = current.revision.saturating_add(1);
+            self.shadow.append_event_line(
+                run_id,
+                None,
+                None,
+                RuntimeEventKind::PlanRevisionCommitted,
+                serde_json::json!({
+                    "base_revision": current.revision,
+                    "reason": request.reason,
+                    "skipped_task_ids": skipped_task_ids,
+                    "reset_task_ids": reset_task_ids,
+                    "plan": candidate.specification(),
+                }),
+            )?;
+            self.shadow.rewrite_plan(run_id)?;
+            self.get_plan(run_id)?
+                .ok_or_else(|| StoreError::PlanNotFound(run_id.to_string()))
         })
     }
 
@@ -835,49 +802,7 @@ impl TaskRuntimeStore {
         })
     }
 
-    /// Update a plan task's mutable fields (title, description, retry_count,
-    /// failure_fingerprint, status) in place. Used by the review gate when a
-    /// NeedsFix outcome produces a fix variant of a task — the fix shape must
-    /// be persisted so a process restart doesn't lose retry progress or the
-    /// review-informed brief. The task id is unchanged so downstream
-    /// depends_on keeps resolving. Emits a `Note` event for traceability.
-    pub fn update_plan_task(&self, run_id: &str, task: &PlanTask) -> Result<(), StoreError> {
-        // F2-1: 串行化 plan 变更。
-        self.with_run_lock(run_id, || {
-            // U1c phase-0/0bc step-2: file authority. Validate the task exists, then
-            // emit Note{fix_task_persisted} carrying the full task body so the
-            // rebuilder can replace the task (see event_rebuild Note handler). No SQL.
-            let plan = self
-                .get_plan(run_id)?
-                .ok_or(StoreError::PlanNotFound(run_id.to_string()))?;
-            if !plan.tasks.iter().any(|t| t.id == task.id) {
-                return Err(StoreError::TaskNotFound(task.id.clone()));
-            }
-            self.shadow.append_event_line(
-                run_id,
-                Some(task.id.as_str()),
-                None,
-                RuntimeEventKind::Note,
-                serde_json::json!({
-                    "kind": "fix_task_persisted",
-                    "retry_count": task.retry_count,
-                    "failure_fingerprint": task.failure_fingerprint,
-                    // Full task body so events.jsonl can rebuild plan.json
-                    // (the rebuilder replaces the matching task).
-                    "task": task,
-                }),
-            )?;
-            self.shadow.rewrite_plan(run_id)?;
-            Ok(())
-        })
-    }
-
-    /// Bump `retry_count` on a task WITHOUT mutating its title/description.
-    /// Used by the executor's ExecutionFailed auto-retry path. Records a
-    /// single Note carrying the new retry_count + updated task body so the
-    /// rebuilder produces a plan.json where retry_count advanced (writing
-    /// the stale body first and the updated body second created an
-    /// inconsistent window on crash and emitted a redundant event).
+    /// Bump execution retry metadata without mutating the task specification.
     pub fn increment_retry_count(
         &self,
         run_id: &str,
@@ -894,19 +819,15 @@ impl TaskRuntimeStore {
                 .find(|t| t.id == task_id)
                 .ok_or_else(|| StoreError::TaskNotFound(task_id.to_string()))?;
             let next = task.retry_count.saturating_add(1);
-            let mut updated = task.clone();
-            updated.retry_count = next;
-            updated.failure_fingerprint = failure_fingerprint.map(str::to_string);
             self.shadow.append_event_line(
                 run_id,
                 Some(task_id),
                 None,
-                RuntimeEventKind::Note,
+                RuntimeEventKind::TodoUpdated,
                 serde_json::json!({
-                    "kind": "fix_task_persisted",
+                    "status": task.status.as_str(),
                     "retry_count": next,
                     "failure_fingerprint": failure_fingerprint,
-                    "task": updated,
                 }),
             )?;
             self.shadow.rewrite_plan(run_id)?;
@@ -964,21 +885,6 @@ impl TaskRuntimeStore {
             //    lock. Title/description unchanged; attempt id derives from
             //    retry_count+1 at dispatch time.
             let next = task.retry_count.saturating_add(1);
-            let mut updated = task.clone();
-            updated.retry_count = next;
-            updated.status = TodoStatus::Pending;
-            self.shadow.append_event_line(
-                run_id,
-                Some(task_id),
-                None,
-                RuntimeEventKind::Note,
-                serde_json::json!({
-                    "kind": "fix_task_persisted",
-                    "retry_count": next,
-                    "failure_fingerprint": task.failure_fingerprint,
-                    "task": updated,
-                }),
-            )?;
             self.shadow.append_event_line(
                 run_id,
                 Some(task_id),
@@ -989,6 +895,8 @@ impl TaskRuntimeStore {
                     "started_at": null,
                     "completed_at": null,
                     "status": "pending",
+                    "retry_count": next,
+                    "failure_fingerprint": task.failure_fingerprint,
                     "summary": format!("user-initiated retry (attempt {next})"),
                 }),
             )?;
@@ -1846,7 +1754,13 @@ impl TaskRuntimeStore {
                 None,
                 Some("recovery retry confirmed by user"),
             )?,
-            RecoveryDecision::Skip => self.remove_task(run_id, task_id)?,
+            RecoveryDecision::Skip => self.set_task_status(
+                run_id,
+                task_id,
+                TodoStatus::Skipped,
+                None,
+                Some("recovery skip confirmed by user"),
+            )?,
         }
         Ok(())
     }
@@ -2014,6 +1928,7 @@ mod tests {
         let plan = TaskPlan {
             plan_id: "p1".into(),
             run_id: "r1".into(),
+            revision: 1,
             domain_profile: DomainProfile::General,
             goal: "g".into(),
             assumptions: vec!["a".into()],
@@ -2143,6 +2058,7 @@ mod tests {
         let plan = TaskPlan {
             plan_id: "p1".into(),
             run_id: "r1".into(),
+            revision: 1,
             domain_profile: DomainProfile::General,
             goal: "g".into(),
             assumptions: vec![],
@@ -2199,6 +2115,7 @@ mod tests {
         store.attach_plan(&TaskPlan {
             plan_id: "retry-plan".to_string(),
             run_id: "retry-run".to_string(),
+            revision: 1,
             domain_profile: DomainProfile::General,
             goal: "retry a failed dependency chain".to_string(),
             assumptions: Vec::new(),
@@ -2382,12 +2299,18 @@ mod tests {
     fn mutating_in_doubt_subagent_blocks_resume_until_user_decides() -> Result<(), StoreError> {
         let store = fresh();
         seed_plan(&store);
-        store.update_task(
+        store.patch_plan(
             "r1",
-            "t1",
-            TaskPatch {
-                kind: Some(PlanTaskKind::Implementation),
-                ..Default::default()
+            &PlanPatchRequest {
+                base_revision: 1,
+                reason: "exercise mutating recovery".to_string(),
+                operations: vec![PlanPatchOperation::Update {
+                    task_id: "t1".to_string(),
+                    patch: TaskPatch {
+                        kind: Some(PlanTaskKind::Implementation),
+                        ..Default::default()
+                    },
+                }],
             },
         )?;
         store.set_task_status("r1", "t1", TodoStatus::Running, Some("subagent"), None)?;
@@ -2468,12 +2391,18 @@ mod tests {
     -> Result<(), StoreError> {
         let store = fresh();
         seed_plan(&store);
-        store.update_task(
+        store.patch_plan(
             "r1",
-            "t1",
-            TaskPatch {
-                kind: Some(PlanTaskKind::Implementation),
-                ..Default::default()
+            &PlanPatchRequest {
+                base_revision: 1,
+                reason: "exercise recovery barrier".to_string(),
+                operations: vec![PlanPatchOperation::Update {
+                    task_id: "t1".to_string(),
+                    patch: TaskPatch {
+                        kind: Some(PlanTaskKind::Implementation),
+                        ..Default::default()
+                    },
+                }],
             },
         )?;
         store.set_task_status("r1", "t1", TodoStatus::Running, Some("subagent"), None)?;
@@ -2532,112 +2461,197 @@ mod tests {
     }
 
     #[test]
-    fn insert_task_adds_to_plan_and_emits_plan_edited() {
+    fn plan_patch_inserts_task_and_commits_one_revision() {
         let s = fresh();
         seed_plan(&s);
-        // Plan has one task "t1". Insert "t2" after "t1".
         let t2 = PlanTask {
             id: "t2".into(),
             title: "Second task".into(),
+            description: "implement the second task".into(),
             kind: PlanTaskKind::Implementation,
+            agent_role: "implementer".into(),
             depends_on: vec!["t1".into()],
             ..Default::default()
         };
-        s.insert_task("r1", Some("t1".into()), t2).unwrap();
+        let before = s.list_events("r1", 0).unwrap().len();
+        let plan = s
+            .patch_plan(
+                "r1",
+                &PlanPatchRequest {
+                    base_revision: 1,
+                    reason: "new implementation dependency".to_string(),
+                    operations: vec![PlanPatchOperation::Insert {
+                        after_task_id: Some("t1".to_string()),
+                        task: t2.spec(),
+                    }],
+                },
+            )
+            .unwrap();
 
-        let plan = s.get_plan("r1").unwrap().unwrap();
+        assert_eq!(plan.revision, 2);
         assert_eq!(plan.tasks.len(), 2);
         assert_eq!(plan.tasks[0].id, "t1");
         assert_eq!(plan.tasks[1].id, "t2");
-
-        let todos = s.list_todos("r1").unwrap();
-        assert!(todos.iter().any(|t| t.task_id == "t2"));
-
         let evs = s.list_events("r1", 0).unwrap();
-        assert!(
-            evs.iter()
-                .any(|e| e.event_type == RuntimeEventKind::PlanEdited)
+        assert_eq!(evs.len(), before + 1);
+        assert_eq!(
+            evs.last().map(|event| event.event_type),
+            Some(RuntimeEventKind::PlanRevisionCommitted)
         );
     }
 
     #[test]
-    fn insert_task_rejects_missing_run() -> std::result::Result<(), String> {
+    fn plan_patch_rejects_missing_run() -> std::result::Result<(), String> {
         let s = TaskRuntimeStore::new_in_memory().map_err(|e| e.to_string())?;
-        let task = PlanTask {
-            id: "t1".into(),
-            title: "orphan task".into(),
-            kind: PlanTaskKind::Investigation,
-            ..Default::default()
-        };
-
         let err = s
-            .insert_task("missing-run", None, task)
+            .patch_plan(
+                "missing-run",
+                &PlanPatchRequest {
+                    base_revision: 1,
+                    reason: "invalid".to_string(),
+                    operations: vec![PlanPatchOperation::Reorder {
+                        task_ids: Vec::new(),
+                    }],
+                },
+            )
             .err()
-            .ok_or_else(|| "insert_task unexpectedly succeeded without a run".to_string())?;
+            .ok_or_else(|| "plan_patch unexpectedly succeeded without a run".to_string())?;
         assert!(matches!(err, StoreError::RunNotFound(run_id) if run_id == "missing-run"));
-
-        let events = s.list_events("missing-run", 0).map_err(|e| e.to_string())?;
-        assert!(events.is_empty());
         Ok(())
     }
 
     #[test]
-    fn remove_task_soft_deletes_via_skipped() {
+    fn plan_patch_rejects_stale_revision_without_appending_event() {
         let s = fresh();
         seed_plan(&s);
-        s.remove_task("r1", "t1").unwrap();
-        let todos = s.list_todos("r1").unwrap();
-        let t1 = todos.iter().find(|t| t.task_id == "t1").unwrap();
-        assert_eq!(t1.status, TodoStatus::Skipped);
-    }
-
-    #[test]
-    fn update_task_applies_title_patch() {
-        let s = fresh();
-        seed_plan(&s);
-        s.update_task(
-            "r1",
-            "t1",
-            TaskPatch {
-                title: Some("Updated title".into()),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        let plan = s.get_plan("r1").unwrap().unwrap();
-        assert_eq!(plan.tasks[0].title, "Updated title");
-    }
-
-    #[test]
-    fn update_task_rejects_terminal_status() {
-        let s = fresh();
-        seed_plan(&s);
-        s.set_task_status("r1", "t1", TodoStatus::Completed, None, None)
-            .unwrap();
-        let err = s
-            .update_task(
+        let before = s.list_events("r1", 0).unwrap().len();
+        let error = s
+            .patch_plan(
                 "r1",
-                "t1",
-                TaskPatch {
-                    title: Some("nope".into()),
-                    ..Default::default()
+                &PlanPatchRequest {
+                    base_revision: 0,
+                    reason: "stale edit".to_string(),
+                    operations: vec![PlanPatchOperation::Skip {
+                        task_id: "t1".to_string(),
+                    }],
                 },
             )
             .unwrap_err();
-        assert!(matches!(err, StoreError::InvalidPlan(_)));
+        assert!(matches!(error, StoreError::PlanConflict { .. }));
+        assert_eq!(s.list_events("r1", 0).unwrap().len(), before);
     }
 
     #[test]
-    fn update_task_rejects_ownership_change_while_running() -> Result<(), StoreError> {
+    fn plan_patch_skip_preserves_spec_and_updates_execution() {
+        let s = fresh();
+        seed_plan(&s);
+        let plan = s
+            .patch_plan(
+                "r1",
+                &PlanPatchRequest {
+                    base_revision: 1,
+                    reason: "task no longer required".to_string(),
+                    operations: vec![PlanPatchOperation::Skip {
+                        task_id: "t1".to_string(),
+                    }],
+                },
+            )
+            .unwrap();
+        assert_eq!(plan.revision, 2);
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].status, TodoStatus::Skipped);
+    }
+
+    #[test]
+    fn plan_patch_update_requeues_blocked_task() {
+        let s = fresh();
+        seed_plan(&s);
+        s.set_task_status(
+            "r1",
+            "t1",
+            TodoStatus::Blocked,
+            Some("reviewer"),
+            Some("needs a clearer brief"),
+        )
+        .unwrap();
+        let plan = s
+            .patch_plan(
+                "r1",
+                &PlanPatchRequest {
+                    base_revision: 1,
+                    reason: "clarify the blocked task".to_string(),
+                    operations: vec![PlanPatchOperation::Update {
+                        task_id: "t1".to_string(),
+                        patch: TaskPatch {
+                            description: Some("Review the clarified runtime boundary".to_string()),
+                            ..Default::default()
+                        },
+                    }],
+                },
+            )
+            .unwrap();
+        assert_eq!(plan.revision, 2);
+        assert_eq!(plan.tasks[0].status, TodoStatus::Pending);
+        assert_eq!(
+            plan.tasks[0].description,
+            "Review the clarified runtime boundary"
+        );
+    }
+
+    #[test]
+    fn completion_gate_rechecks_latest_plan_revision() -> Result<(), StoreError> {
+        let s = fresh();
+        seed_plan(&s);
+        s.set_task_status("r1", "t1", TodoStatus::Completed, Some("explorer"), None)?;
+        let follow_up = PlanTask {
+            id: "t2".to_string(),
+            title: "Verify follow-up".to_string(),
+            description: "Verify evidence discovered by t1".to_string(),
+            kind: PlanTaskKind::Verification,
+            agent_role: "explorer".to_string(),
+            depends_on: vec!["t1".to_string()],
+            ..Default::default()
+        };
+        s.patch_plan(
+            "r1",
+            &PlanPatchRequest {
+                base_revision: 1,
+                reason: "new evidence requires verification".to_string(),
+                operations: vec![PlanPatchOperation::Insert {
+                    after_task_id: Some("t1".to_string()),
+                    task: follow_up.spec(),
+                }],
+            },
+        )?;
+        assert!(!s.complete_run_if_quiescent("r1")?);
+        s.set_task_status("r1", "t2", TodoStatus::Completed, Some("explorer"), None)?;
+        assert!(s.complete_run_if_quiescent("r1")?);
+        assert_eq!(
+            s.get_run("r1")?
+                .ok_or_else(|| StoreError::RunNotFound("r1".to_string()))?
+                .status,
+            TaskRunStatus::Completed
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn plan_patch_rejects_running_task_contract_change() -> Result<(), StoreError> {
         let store = fresh();
         seed_plan(&store);
         store.set_task_status("r1", "t1", TodoStatus::Running, Some("subagent"), None)?;
-        let result = store.update_task(
+        let result = store.patch_plan(
             "r1",
-            "t1",
-            TaskPatch {
-                files: Some(vec!["src/new-owner.rs".to_string()]),
-                ..Default::default()
+            &PlanPatchRequest {
+                base_revision: 1,
+                reason: "change active ownership".to_string(),
+                operations: vec![PlanPatchOperation::Update {
+                    task_id: "t1".to_string(),
+                    patch: TaskPatch {
+                        files: Some(vec!["src/new-owner.rs".to_string()]),
+                        ..Default::default()
+                    },
+                }],
             },
         );
         assert!(matches!(result, Err(StoreError::InvalidPlan(_))));
@@ -2674,8 +2688,7 @@ mod tests {
         assert_eq!(s.list_events("r1", 0).unwrap().len(), before);
     }
 
-    /// `insert_task` rejects a dependency cycle on the file path and appends no
-    /// event. t1 depends on t2, t2 depends on t1 → cycle.
+    /// `plan_patch` rejects a dependency cycle and appends no revision event.
     #[test]
     fn file_path_rejects_dependency_cycle_and_appends_no_event() {
         let s = fresh();
@@ -2690,37 +2703,44 @@ mod tests {
             AttendedMode::Attended,
         )
         .unwrap();
-        // t1 with no deps (bootstraps the plan).
-        s.insert_task(
-            "r1",
-            None,
-            PlanTask {
-                id: "t1".into(),
-                depends_on: Vec::new(),
-                ..sample_task_body("t1")
-            },
-        )
-        .unwrap();
-        // t2 depends on t1 (legal).
-        s.insert_task(
-            "r1",
-            None,
-            PlanTask {
-                id: "t2".into(),
-                depends_on: vec!["t1".into()],
-                ..sample_task_body("t2")
-            },
-        )
+        s.attach_plan(&TaskPlan {
+            plan_id: "p1".to_string(),
+            run_id: "r1".to_string(),
+            revision: 1,
+            domain_profile: DomainProfile::General,
+            goal: "g".to_string(),
+            assumptions: Vec::new(),
+            risks: Vec::new(),
+            execution_mode: ExecutionMode::Parallel,
+            tasks: vec![
+                PlanTask {
+                    id: "t1".into(),
+                    depends_on: Vec::new(),
+                    ..sample_task_body("t1")
+                },
+                PlanTask {
+                    id: "t2".into(),
+                    depends_on: vec!["t1".into()],
+                    ..sample_task_body("t2")
+                },
+            ],
+        })
         .unwrap();
         let before = s.list_events("r1", 0).unwrap().len();
-        // Now make t1 depend on t2 → cycle. update_task must reject on the file path.
+        // Now make t1 depend on t2 → cycle.
         let err = s
-            .update_task(
+            .patch_plan(
                 "r1",
-                "t1",
-                TaskPatch {
-                    depends_on: Some(vec!["t2".into()]),
-                    ..Default::default()
+                &PlanPatchRequest {
+                    base_revision: 1,
+                    reason: "introduce invalid cycle".to_string(),
+                    operations: vec![PlanPatchOperation::Update {
+                        task_id: "t1".to_string(),
+                        patch: TaskPatch {
+                            depends_on: Some(vec!["t2".into()]),
+                            ..Default::default()
+                        },
+                    }],
                 },
             )
             .unwrap_err();
@@ -2733,17 +2753,7 @@ mod tests {
     #[test]
     fn file_path_rejects_unknown_task_and_appends_no_event() {
         let s = fresh();
-        s.create_run(
-            "r1",
-            "ws",
-            "c1",
-            "m1",
-            DomainProfile::General,
-            "g",
-            "",
-            AttendedMode::Attended,
-        )
-        .unwrap();
+        seed_plan(&s);
         let before = s.list_events("r1", 0).unwrap().len();
         let err = s
             .set_task_status("r1", "nope", TodoStatus::Running, None, None)
