@@ -22,11 +22,34 @@ describe('displayedTodoStatus', () => {
     ).toBe('running');
   });
 
-  it('projects a timed-out Subagent as failed', () => {
+  it('projects a cancelled Subagent onto a pending todo as skipped', () => {
     expect(
       displayedTodoStatus({ task_id: 'task-1', status: 'pending' as TodoStatus }, [
-        run('timed_out'),
+        run('cancelled'),
       ])
+    ).toBe('skipped');
+  });
+
+  it('does NOT overwrite a persisted Blocked status with Subagent completed', () => {
+    // M7: acceptance failure marks the task Blocked even though the
+    // Subagent trace says completed. Overwriting Blocked → completed hid
+    // the retry button. Persisted terminal statuses are authoritative.
+    expect(
+      displayedTodoStatus({ task_id: 'task-1', status: 'blocked' as TodoStatus }, [
+        run('completed'),
+      ])
+    ).toBe('blocked');
+  });
+
+  it('does NOT overwrite a persisted Failed status with Subagent completed', () => {
+    expect(
+      displayedTodoStatus({ task_id: 'task-1', status: 'failed' as TodoStatus }, [run('completed')])
     ).toBe('failed');
+  });
+
+  it('does NOT overwrite a persisted Completed status with a later Subagent failure', () => {
+    expect(
+      displayedTodoStatus({ task_id: 'task-1', status: 'completed' as TodoStatus }, [run('failed')])
+    ).toBe('completed');
   });
 });

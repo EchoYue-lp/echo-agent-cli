@@ -29,7 +29,7 @@
 //! - a failed task marks itself Failed but lets already-running siblings
 //!   finish (the run ends Failed); downstream tasks are skipped.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use echo_agent::agent::{Agent, AgentEvent, CancellationToken};
@@ -143,6 +143,30 @@ pub enum RunOutcome {
         failed_task_id: String,
         error: String,
     },
+}
+
+fn review_stop_outcome(
+    store: &TaskRuntimeStore,
+    run_id: &str,
+    failed_task_id: String,
+    error: String,
+) -> RunOutcome {
+    let unattended = store
+        .get_run(run_id)
+        .ok()
+        .flatten()
+        .is_some_and(|run| run.attended_mode == AttendedMode::Unattended);
+    if unattended {
+        RunOutcome::Failed {
+            failed_task_id,
+            error,
+        }
+    } else {
+        RunOutcome::Paused {
+            failed_task_id,
+            error,
+        }
+    }
 }
 
 /// Whether an Agent-driven Run must materialize a formal plan before it may
@@ -489,11 +513,26 @@ fn run_completion_blockers(store: &TaskRuntimeStore, run_id: &str) -> Vec<String
     for task in &plan.tasks {
         match task.status {
             TodoStatus::Completed => match store.get_summary(run_id, &task.id) {
-                Ok(Some(summary)) => {
-                    if let Err(issues) = validate_task_result(task, &summary.result) {
-                        blockers.push(format!("task '{}': {}", task.title, issues.join("; ")));
+                Ok(Some(summary)) => match assess_task_execution(task, &summary.result) {
+                    CompletionAssessment::Executed => {}
+                    CompletionAssessment::ExecutionFailed { reason } => {
+                        blockers.push(format!(
+                            "task '{}' execution incomplete: {reason}",
+                            task.title
+                        ));
                     }
-                }
+                    CompletionAssessment::AcceptancePending {
+                        missing_checks,
+                        missing_artifacts,
+                    } => {
+                        blockers.push(format!(
+                            "task '{}' acceptance pending: missing checks [{}], missing artifacts [{}]",
+                            task.title,
+                            missing_checks.join(", "),
+                            missing_artifacts.join(", "),
+                        ));
+                    }
+                },
                 Ok(None) => blockers.push(format!(
                     "task '{}' completed without a structured result",
                     task.title
@@ -517,43 +556,82 @@ fn run_completion_blockers(store: &TaskRuntimeStore, run_id: &str) -> Vec<String
     blockers
 }
 
-fn validate_task_result(task: &PlanTask, result: &SubagentTaskResult) -> Result<(), Vec<String>> {
-    let mut issues = Vec::new();
-    if result.contract_version != 1 {
-        issues.push("missing versioned Subagent result contract".to_string());
-    }
+/// Structured completion assessment. Separates "real execution failure"
+/// (retryable) from "completed but acceptance pending" (NOT retryable —
+/// must be blocked for review or user retry). contract_version=0 is no
+/// longer a failure condition (M7 does not require it).
+#[derive(Debug)]
+enum CompletionAssessment {
+    /// Subagent completed and all execution_checks / required_artifacts
+    /// have hard observed evidence. Acceptance criteria are NOT judged
+    /// here — that is the ReviewGate's job.
+    Executed,
+    /// Subagent genuinely failed (non-completed status, empty summary,
+    /// remaining_work non-empty, or self-reported failed verification).
+    /// This IS retryable within the retry budget.
+    ExecutionFailed { reason: String },
+    /// Subagent completed but execution evidence or artifacts are missing.
+    /// NOT retryable — would just reproduce the same gap. Block instead.
+    AcceptancePending {
+        missing_checks: Vec<String>,
+        missing_artifacts: Vec<String>,
+    },
+}
+
+/// Assess whether a task's execution result is acceptable on hard-evidence
+/// grounds (execution_checks must have observed pass; artifacts must be
+/// present with hash + producer id). Acceptance criteria are intentionally
+/// NOT judged here — they are reviewer-judged in the ReviewGate, never
+/// auto-passed.
+///
+/// M7 note: contract_version=0 is a valid fallback shape. We do not treat
+/// it as a failure. A plain-text summary is still legitimate execution
+/// evidence as long as execution_checks (which are shell commands) are
+/// empty or actually observed.
+fn assess_task_execution(task: &PlanTask, result: &SubagentTaskResult) -> CompletionAssessment {
+    // 1. Real execution failure: non-completed status, empty summary,
+    //    self-reported remaining work, or self-reported failed verification.
     if result.status != SubagentRunStatus::Completed {
-        issues.push(format!("terminal status is {}", result.status.as_str()));
+        return CompletionAssessment::ExecutionFailed {
+            reason: format!("terminal status is {}", result.status.as_str()),
+        };
     }
     if result.summary.trim().is_empty() {
-        issues.push("summary is empty".to_string());
+        return CompletionAssessment::ExecutionFailed {
+            reason: "summary is empty".to_string(),
+        };
     }
     if !result.remaining_work.is_empty() {
-        issues.push(format!(
-            "remaining work: {}",
-            result.remaining_work.join("; ")
-        ));
+        return CompletionAssessment::ExecutionFailed {
+            reason: format!("remaining work: {}", result.remaining_work.join("; ")),
+        };
     }
     for verification in &result.verification {
         if verification.status != SubagentVerificationStatus::Passed {
-            issues.push(format!(
-                "verification '{}' is {:?}",
-                verification.check, verification.status
-            ));
+            return CompletionAssessment::ExecutionFailed {
+                reason: format!(
+                    "verification '{}' is {:?}",
+                    verification.check, verification.status
+                ),
+            };
         }
     }
-    for required in &task.verification {
+
+    // 2. execution_checks must have observed + passed evidence.
+    let mut missing_checks = Vec::new();
+    for required in &task.execution_checks {
         let matched = result.verification.iter().any(|verification| {
             verification.source == SubagentVerificationSource::Observed
                 && verification.status == SubagentVerificationStatus::Passed
                 && verification_matches(required, &verification.check)
         });
         if !matched {
-            issues.push(format!(
-                "required verification has no observed pass: {required}"
-            ));
+            missing_checks.push(required.clone());
         }
     }
+
+    // 3. required_artifacts must be present with hash + producer execution id.
+    let mut missing_artifacts = Vec::new();
     for required in &task.required_artifacts {
         let matched = result.artifacts.iter().any(|artifact| {
             artifact_matches(required, &artifact.path)
@@ -568,15 +646,17 @@ fn validate_task_result(task: &PlanTask, result: &SubagentTaskResult) -> Result<
                     .is_some_and(|id| !id.trim().is_empty())
         });
         if !matched {
-            issues.push(format!(
-                "required artifact is missing or lacks integrity metadata: {required}"
-            ));
+            missing_artifacts.push(required.clone());
         }
     }
-    if issues.is_empty() {
-        Ok(())
+
+    if missing_checks.is_empty() && missing_artifacts.is_empty() {
+        CompletionAssessment::Executed
     } else {
-        Err(issues)
+        CompletionAssessment::AcceptancePending {
+            missing_checks,
+            missing_artifacts,
+        }
     }
 }
 
@@ -595,25 +675,6 @@ fn artifact_matches(required: &str, actual: &str) -> bool {
             || std::path::Path::new(&actual)
                 .file_name()
                 .is_some_and(|name| name.to_string_lossy() == required))
-}
-
-fn build_contract_fix_task(task: &PlanTask, issues: &[String]) -> PlanTask {
-    let mut fix = task.clone();
-    fix.title = format!(
-        "{} (result fix #{})",
-        task.title,
-        task.retry_count.saturating_add(1)
-    );
-    fix.description = format!(
-        "The previous execution ended but its structured result did not satisfy the task contract. \
-         Resolve every issue and return a complete versioned result:\n- {}\n\nOriginal task: {}",
-        issues.join("\n- "),
-        task.description
-    );
-    fix.parallel_group = None;
-    fix.retry_count = task.retry_count.saturating_add(1);
-    fix.status = TodoStatus::Pending;
-    fix
 }
 
 /// Abstraction over how a single ready task is dispatched in the EKO runtime.
@@ -918,10 +979,15 @@ async fn run_dag<W: TaskDispatcher + 'static>(
     // store writes, review gates, event emission, and Subagent dispatch.
     let mut dag_state = echo_agent::tasks::DagExecutionState::from_tasks(&runtime_tasks);
     let mut failed_id: Option<String> = None;
-    // Fix-task overrides produced by review gates, keyed by task id. A task
-    // that fails review gets re-queued here with a bumped retry_count; the
-    // next wave picks it up and re-runs it (possibly with a richer brief).
-    let mut tasks_with_fixes: HashMap<String, PlanTask> = HashMap::new();
+    // Delayed-stop signal: when a task inside a wave resolves to Paused/Failed
+    // (acceptance pending, review needs_fix, reviewer unavailable), we must
+    // NOT return immediately — sibling tasks in the same wave have already
+    // produced results that deserve processing (Completed → persist, Failed
+    // → mark). Returning early left them in Running, and the resume path
+    // (execute_run:422) reset Running → Pending, causing the entire wave to
+    // be redispatched on the next attempt. We stash the outcome here, finish
+    // processing the rest of the wave, then return at the bottom of the loop.
+    let mut pending_outcome: Option<RunOutcome> = None;
 
     let subagent_sem = Arc::new(Semaphore::new(limits.max_concurrent_subagents));
     let write_sem = Arc::new(Semaphore::new(limits.max_concurrent_writes));
@@ -1012,12 +1078,7 @@ async fn run_dag<W: TaskDispatcher + 'static>(
         let ready: Vec<PlanTask> = dag_state
             .ready_task_ids(&runtime_tasks)
             .into_iter()
-            .filter_map(|id| {
-                tasks_with_fixes
-                    .get(&id)
-                    .cloned()
-                    .or_else(|| by_id.get(&id).cloned())
-            })
+            .filter_map(|id| by_id.get(&id).cloned())
             .collect();
 
         if ready.is_empty() {
@@ -1160,144 +1221,243 @@ async fn run_dag<W: TaskDispatcher + 'static>(
         for result in wave_results {
             match result {
                 Ok((id, result)) => {
-                    // Review gate: implementation/debugging tasks must pass
-                    // review before being marked Completed (plan §776-831).
-                    // Read-only kinds are their own review → auto-pass.
+                    // Three-track decision based on hard evidence:
+                    //   Executed        → run ReviewGate (acceptance judgement)
+                    //   ExecutionFailed → retry within budget (real failure)
+                    //   AcceptancePending → Block + Pause (NOT retryable)
+                    //
+                    // M7: contract_version=0 is a valid fallback shape and is
+                    // NOT a failure condition. A plain-text summary with no
+                    // execution_checks is legitimate execution evidence.
                     let Some(task) = by_id.get(&id).cloned() else {
                         continue;
                     };
-                    if let Err(issues) = validate_task_result(&task, &result) {
-                        let reason = issues.join("; ");
-                        if task.retry_count < task.max_retries {
-                            let fix_task = build_contract_fix_task(&task, &issues);
-                            if let Err(error) = store.update_plan_task(run_id, &fix_task) {
-                                tracing::warn!(
-                                    task_id = %fix_task.id,
-                                    %error,
-                                    "failed to persist result-contract retry task"
+                    match assess_task_execution(&task, &result) {
+                        CompletionAssessment::ExecutionFailed { reason } => {
+                            // Real failure (non-completed status, empty summary,
+                            // remaining_work, or self-reported failed verification).
+                            // This is the ONLY path that auto-retries, and only
+                            // within the retry budget. No title/description
+                            // mutation — retry history is in Note events.
+                            if task.retry_count < task.max_retries {
+                                let next_retry = task.retry_count.saturating_add(1);
+                                let _ = store.set_task_status(
+                                    run_id,
+                                    &id,
+                                    TodoStatus::Pending,
+                                    Some(&task.agent_role),
+                                    Some(&format!(
+                                        "execution failed (attempt {}): {reason}",
+                                        next_retry
+                                    )),
                                 );
-                            }
-                            tasks_with_fixes.insert(id.clone(), fix_task.clone());
-                            let _ = store.set_task_status(
-                                run_id,
-                                &id,
-                                TodoStatus::Pending,
-                                Some(&task.agent_role),
-                                Some(&format!("result contract incomplete: {reason}")),
-                            );
-                            by_id.insert(id.clone(), fix_task);
-                        } else {
-                            let _ = store.set_task_status(
-                                run_id,
-                                &id,
-                                TodoStatus::Failed,
-                                Some(&task.agent_role),
-                                Some(&format!("result contract rejected: {reason}")),
-                            );
-                            wave_failed.push(id.clone());
-                            dag_state.failed.insert(id.clone());
-                            if failed_id.is_none() {
-                                failed_id = Some(id);
-                            }
-                        }
-                        continue;
-                    }
-                    let summary = result.summary.clone();
-                    let passed = run_review_gate(
-                        store.clone(),
-                        reviewer_llm.clone(),
-                        run_id,
-                        &task,
-                        &summary,
-                    )
-                    .await;
-                    let approved = match passed {
-                        ReviewGateOutcome::Pass => true,
-                        ReviewGateOutcome::NeedsFix(fix_task) => {
-                            if let Err(e) = store.update_plan_task(run_id, &fix_task) {
-                                tracing::warn!(
-                                    task_id = %fix_task.id,
-                                    error = %e,
-                                    "failed to persist fix task; in-memory only"
+                                let _ = store.note(
+                                    run_id,
+                                    Some(&id),
+                                    &format!(
+                                        "attempt {n} failed: {reason}; auto-retrying (retry_count {a} → {b})",
+                                        n = next_retry,
+                                        reason = reason,
+                                        a = task.retry_count,
+                                        b = next_retry,
+                                    ),
                                 );
+                                // retry_count bump happens via update_plan_task below
+                                // (title/description unchanged).
+                                let mut retry_task = task.clone();
+                                retry_task.retry_count = next_retry;
+                                if let Err(error) = store.update_plan_task(run_id, &retry_task) {
+                                    tracing::warn!(
+                                        task_id = %retry_task.id,
+                                        %error,
+                                        "failed to persist retry_count bump"
+                                    );
+                                }
+                                by_id.insert(id.clone(), retry_task);
+                            } else {
+                                let _ = store.set_task_status(
+                                    run_id,
+                                    &id,
+                                    TodoStatus::Failed,
+                                    Some(&task.agent_role),
+                                    Some(&format!("execution failed after max retries: {reason}")),
+                                );
+                                wave_failed.push(id.clone());
+                                dag_state.failed.insert(id.clone());
+                                if failed_id.is_none() {
+                                    failed_id = Some(id);
+                                }
                             }
-                            tasks_with_fixes.insert(fix_task.id.clone(), fix_task.clone());
+                            continue;
+                        }
+                        CompletionAssessment::AcceptancePending {
+                            missing_checks,
+                            missing_artifacts,
+                        } => {
+                            // Completed but hard evidence is missing. Retrying
+                            // the Subagent would reproduce the same gap (the
+                            // Subagent already finished). Block the task and
+                            // pause/fail the run — never auto-redispatch.
+                            let reason = format!(
+                                "acceptance pending: missing execution checks [{}], missing artifacts [{}]",
+                                missing_checks.join(", "),
+                                missing_artifacts.join(", "),
+                            );
                             let _ = store.set_task_status(
                                 run_id,
                                 &id,
-                                TodoStatus::Pending,
-                                Some(
-                                    by_id
-                                        .get(&id)
-                                        .map(|t| t.agent_role.as_str())
-                                        .unwrap_or("unknown"),
-                                ),
-                                Some("re-queued after review"),
+                                TodoStatus::Blocked,
+                                Some(&task.agent_role),
+                                Some(&reason),
                             );
-                            by_id.insert(id.clone(), fix_task);
-                            false
+                            let _ = store.note(run_id, Some(&id), &reason);
+                            if pending_outcome.is_none() {
+                                pending_outcome = Some(review_stop_outcome(
+                                    store.as_ref(),
+                                    run_id,
+                                    id.clone(),
+                                    reason,
+                                ));
+                            }
+                            continue;
                         }
-                        ReviewGateOutcome::Suspend(reason) => {
-                            let _ = store.note(
+                        CompletionAssessment::Executed => {
+                            // Hard execution evidence is complete. Now judge
+                            // acceptance via the ReviewGate (LLM-based review
+                            // of acceptance_criteria, or auto-pass when there
+                            // is nothing semantic to review).
+                            let summary = result.summary.clone();
+                            let passed = run_review_gate(
+                                store.clone(),
+                                reviewer_llm.clone(),
                                 run_id,
-                                Some(&id),
-                                &format!("circuit breaker: {reason}"),
-                            );
-                            let _ = store.transition_run(run_id, TaskRunStatus::Paused);
-                            return Ok(RunOutcome::Paused {
-                                failed_task_id: id.clone(),
-                                error: reason,
-                            });
-                        }
-                        ReviewGateOutcome::Skipped => {
-                            let _ = store.note(
-                                run_id,
-                                Some(&id),
-                                "no reviewer LLM; auto-passing review gate",
-                            );
-                            true
-                        }
-                    };
-                    if !approved {
-                        continue;
-                    }
+                                &task,
+                                &summary,
+                            )
+                            .await;
+                            let approved = match passed {
+                                ReviewGateOutcome::Pass => true,
+                                ReviewGateOutcome::NeedsFix(_fix_task) => {
+                                    // Review found correctable issues. Per M7,
+                                    // do NOT auto-redispatch — the Subagent
+                                    // already finished. Block and stop for an
+                                    // explicit retry; attended mode pauses,
+                                    // unattended mode fails terminally.
+                                    let _ = store.set_task_status(
+                                        run_id,
+                                        &id,
+                                        TodoStatus::Blocked,
+                                        Some(&task.agent_role),
+                                        Some("review needs fix; awaiting explicit retry"),
+                                    );
+                                    let _ = store.note(
+                                        run_id,
+                                        Some(&id),
+                                        "review returned needs_fix; task blocked, run stopped",
+                                    );
+                                    if pending_outcome.is_none() {
+                                        pending_outcome = Some(review_stop_outcome(
+                                            store.as_ref(),
+                                            run_id,
+                                            id.clone(),
+                                            "review needs fix".to_string(),
+                                        ));
+                                    }
+                                    continue;
+                                }
+                                ReviewGateOutcome::Suspend(reason) => {
+                                    let _ = store.note(
+                                        run_id,
+                                        Some(&id),
+                                        &format!("circuit breaker: {reason}"),
+                                    );
+                                    let _ = store.set_task_status(
+                                        run_id,
+                                        &id,
+                                        TodoStatus::Blocked,
+                                        Some(&task.agent_role),
+                                        Some(&format!("review suspended: {reason}")),
+                                    );
+                                    if pending_outcome.is_none() {
+                                        pending_outcome = Some(review_stop_outcome(
+                                            store.as_ref(),
+                                            run_id,
+                                            id.clone(),
+                                            reason,
+                                        ));
+                                    }
+                                    continue;
+                                }
+                                ReviewGateOutcome::Skipped => {
+                                    // Reviewer unavailable. M7 forbids
+                                    // auto-pass. Block + pause so the user
+                                    // can intervene. Unattended runs fail
+                                    // terminally because no user is present.
+                                    let _ = store.note(
+                                        run_id,
+                                        Some(&id),
+                                        "no reviewer LLM; task blocked (no auto-pass per M7)",
+                                    );
+                                    let _ = store.set_task_status(
+                                        run_id,
+                                        &id,
+                                        TodoStatus::Blocked,
+                                        Some(&task.agent_role),
+                                        Some("reviewer unavailable; blocked pending LLM"),
+                                    );
+                                    if pending_outcome.is_none() {
+                                        pending_outcome = Some(review_stop_outcome(
+                                            store.as_ref(),
+                                            run_id,
+                                            id.clone(),
+                                            "reviewer unavailable".to_string(),
+                                        ));
+                                    }
+                                    continue;
+                                }
+                            };
+                            if !approved {
+                                continue;
+                            }
 
-                    let execution_id =
-                        format!("{}:{}", task.id, task.retry_count.saturating_add(1));
-                    match integrate_reviewed_task(
-                        dispatcher.clone(),
-                        store.clone(),
-                        run_id,
-                        &task,
-                        &execution_id,
-                        &summary,
-                        parent_cancel.clone(),
-                        trace_sink.clone(),
-                    )
-                    .await
-                    {
-                        Ok(completion_summary) => {
-                            let _ = store.set_task_status(
+                            let execution_id =
+                                format!("{}:{}", task.id, task.retry_count.saturating_add(1));
+                            match integrate_reviewed_task(
+                                dispatcher.clone(),
+                                store.clone(),
                                 run_id,
-                                &id,
-                                TodoStatus::Completed,
-                                Some(&task.agent_role),
-                                Some(&completion_summary),
-                            );
-                            dag_state.completed.insert(id);
-                        }
-                        Err(error) => {
-                            let _ = store.set_task_status(
-                                run_id,
-                                &id,
-                                TodoStatus::Failed,
-                                Some(&task.agent_role),
-                                Some(&format!("worktree integration failed: {error}")),
-                            );
-                            wave_failed.push(id.clone());
-                            dag_state.failed.insert(id.clone());
-                            if failed_id.is_none() {
-                                failed_id = Some(id);
+                                &task,
+                                &execution_id,
+                                &summary,
+                                parent_cancel.clone(),
+                                trace_sink.clone(),
+                            )
+                            .await
+                            {
+                                Ok(completion_summary) => {
+                                    let _ = store.set_task_status(
+                                        run_id,
+                                        &id,
+                                        TodoStatus::Completed,
+                                        Some(&task.agent_role),
+                                        Some(&completion_summary),
+                                    );
+                                    dag_state.completed.insert(id);
+                                }
+                                Err(error) => {
+                                    let _ = store.set_task_status(
+                                        run_id,
+                                        &id,
+                                        TodoStatus::Failed,
+                                        Some(&task.agent_role),
+                                        Some(&format!("worktree integration failed: {error}")),
+                                    );
+                                    wave_failed.push(id.clone());
+                                    dag_state.failed.insert(id.clone());
+                                    if failed_id.is_none() {
+                                        failed_id = Some(id);
+                                    }
+                                }
                             }
                         }
                     }
@@ -1321,6 +1481,25 @@ async fn run_dag<W: TaskDispatcher + 'static>(
                     }
                 }
             }
+        }
+
+        // Wave fully processed. If any task in this wave resolved to a
+        // terminal stop (Paused/Failed via acceptance/review), now is the
+        // time to transition the run and return — every sibling result has
+        // already been persisted (Completed stays Completed, Failed stays
+        // Failed, only Running leftovers get reset on resume). This prevents
+        // the next attempt from redispatching sibling Subagents that had
+        // already completed successfully.
+        if let Some(outcome) = pending_outcome.take() {
+            let next_status = match &outcome {
+                RunOutcome::Paused { .. } => TaskRunStatus::Paused,
+                RunOutcome::Failed { .. } => TaskRunStatus::Failed,
+                _ => TaskRunStatus::Running,
+            };
+            if next_status != TaskRunStatus::Running {
+                let _ = store.transition_run(run_id, next_status);
+            }
+            return Ok(outcome);
         }
     }
 }
@@ -1421,7 +1600,7 @@ enum ReviewGateOutcome {
     /// Circuit breaker tripped (retry budget exhausted or repeated fingerprint).
     /// The run should be Suspended.
     Suspend(String),
-    /// No reviewer LLM configured → auto-trust the task. Logged.
+    /// No reviewer LLM configured. M7 requires a stop rather than auto-pass.
     Skipped,
 }
 
@@ -1436,8 +1615,10 @@ async fn run_review_gate(
     task: &PlanTask,
     subagent_output: &str,
 ) -> ReviewGateOutcome {
-    // Read-only kinds are their own review — no gate.
-    if !super::review::requires_review(task.kind) {
+    // Skip the LLM gate when the task declares no acceptance criteria
+    // AND is not an implementation/debugging kind (those are always gated
+    // because prose about mutations cannot be trusted).
+    if !super::review::requires_review(task) {
         return ReviewGateOutcome::Pass;
     }
     let Some(llm) = reviewer_llm else {
@@ -2032,7 +2213,25 @@ async fn execute_task(
                     format!("Subagent completed but terminal boundary was not persisted: {error}"),
                 ));
             }
-            append_suggested_tasks_to_plan(&store, &run_id, &task, &suggested_tasks);
+            // Suggested tasks are persisted in TaskExecutionSummary.suggested_tasks
+            // (see put_summary above). They are NOT auto-inserted into the plan —
+            // doing so caused unbounded plan expansion + dependent tasks to wait
+            // forever on looping parents. The primary agent / user can promote a
+            // suggestion via plan_create when desired. Record a Note so the
+            // suggestions are visible in the event stream regardless.
+            if !suggested_tasks.is_empty() {
+                let titles: Vec<&str> = suggested_tasks.iter().map(|s| s.title.as_str()).collect();
+                let _ = store.note(
+                    &run_id,
+                    Some(&task_id),
+                    &format!(
+                        "subagent suggested {} follow-up task(s): [{}]. \
+                         Not auto-inserted into plan; promote via plan_create if desired.",
+                        suggested_tasks.len(),
+                        titles.join("; "),
+                    ),
+                );
+            }
             emit_exec(
                 trace_sink.as_ref(),
                 ExecEvent::for_task(
@@ -2208,166 +2407,6 @@ fn normalize_suggested_task(raw: RawSuggestedTask) -> Option<SuggestedTask> {
             .filter(|risk| !risk.trim().is_empty())
             .unwrap_or_else(|| "medium".to_string()),
     })
-}
-
-fn normalized_task_title_tokens(title: &str) -> HashSet<String> {
-    const STOP_WORDS: &[&str] = &[
-        "the",
-        "and",
-        "for",
-        "with",
-        "this",
-        "that",
-        "current",
-        "project",
-        "echo",
-        "agent",
-        "analyze",
-        "analysis",
-        "focus",
-        "architecture",
-    ];
-
-    let mut normalized = String::new();
-    let mut last_was_space = false;
-    for ch in title.chars() {
-        for lower in ch.to_lowercase() {
-            if lower.is_alphanumeric() {
-                normalized.push(lower);
-                last_was_space = false;
-            } else if !last_was_space {
-                normalized.push(' ');
-                last_was_space = true;
-            }
-        }
-    }
-
-    normalized
-        .split_whitespace()
-        .filter(|token| token.chars().count() >= 3)
-        .filter(|token| !STOP_WORDS.contains(token))
-        .map(ToString::to_string)
-        .collect()
-}
-
-fn normalized_task_title_text(title: &str) -> String {
-    let mut normalized = String::new();
-    let mut last_was_space = false;
-    for ch in title.chars() {
-        for lower in ch.to_lowercase() {
-            if lower.is_alphanumeric() {
-                normalized.push(lower);
-                last_was_space = false;
-            } else if !last_was_space {
-                normalized.push(' ');
-                last_was_space = true;
-            }
-        }
-    }
-    normalized.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn task_titles_look_duplicate(candidate: &str, existing: &str) -> bool {
-    let candidate_text = normalized_task_title_text(candidate);
-    let existing_text = normalized_task_title_text(existing);
-    if candidate_text.is_empty() || existing_text.is_empty() {
-        return false;
-    }
-    if candidate_text == existing_text
-        || candidate_text.contains(&existing_text)
-        || existing_text.contains(&candidate_text)
-    {
-        return true;
-    }
-
-    let candidate_tokens = normalized_task_title_tokens(candidate);
-    let existing_tokens = normalized_task_title_tokens(existing);
-    let min_tokens = candidate_tokens.len().min(existing_tokens.len());
-    if min_tokens < 2 {
-        return false;
-    }
-    let overlap = candidate_tokens.intersection(&existing_tokens).count();
-    overlap.saturating_mul(100) >= min_tokens.saturating_mul(60)
-}
-
-fn append_suggested_tasks_to_plan(
-    store: &Arc<TaskRuntimeStore>,
-    run_id: &str,
-    parent: &PlanTask,
-    suggestions: &[SuggestedTask],
-) {
-    if suggestions.is_empty() {
-        return;
-    }
-    let existing_tasks = store
-        .get_plan(run_id)
-        .ok()
-        .flatten()
-        .map(|plan| plan.tasks)
-        .unwrap_or_default();
-    let existing_ids: HashSet<String> = existing_tasks.iter().map(|task| task.id.clone()).collect();
-    let mut seen_titles: Vec<String> = existing_tasks
-        .iter()
-        .map(|task| task.title.clone())
-        .collect();
-    let mut after_task_id = Some(parent.id.clone());
-    for suggestion in suggestions.iter().take(MAX_SUGGESTED_TASKS_PER_SUBAGENT) {
-        if seen_titles
-            .iter()
-            .any(|title| task_titles_look_duplicate(&suggestion.title, title))
-        {
-            tracing::info!(
-                run_id = %run_id,
-                parent_task_id = %parent.id,
-                suggested_title = %suggestion.title,
-                "task_runtime: skipped duplicate subagent-suggested task"
-            );
-            continue;
-        }
-
-        let mut depends_on: Vec<String> = suggestion
-            .dependencies
-            .iter()
-            .filter(|dep| existing_ids.contains(dep.as_str()))
-            .cloned()
-            .collect();
-        if !depends_on.iter().any(|dep| dep == &parent.id) {
-            depends_on.push(parent.id.clone());
-        }
-        let new_task_id = format!("suggested_{}", uuid::Uuid::new_v4().as_simple());
-        let task = PlanTask {
-            id: new_task_id.clone(),
-            title: suggestion.title.clone(),
-            description: format!(
-                "{}\n\nWhy needed: {}\nRisk: {}",
-                suggestion.description, suggestion.why_needed, suggestion.risk
-            ),
-            kind: suggestion.kind,
-            agent_role: suggestion.agent_role.clone(),
-            depends_on,
-            ..Default::default()
-        };
-        match store.insert_task(run_id, after_task_id.clone(), task) {
-            Ok(()) => {
-                tracing::info!(
-                    run_id = %run_id,
-                    parent_task_id = %parent.id,
-                    suggested_task_id = %new_task_id,
-                    "task_runtime: appended subagent-suggested task"
-                );
-                after_task_id = Some(new_task_id);
-                seen_titles.push(suggestion.title.clone());
-            }
-            Err(e) => {
-                tracing::warn!(
-                    run_id = %run_id,
-                    parent_task_id = %parent.id,
-                    error = %e,
-                    "task_runtime: failed to append subagent-suggested task"
-                );
-            }
-        }
-    }
 }
 
 /// Prefers the structured TaskExecutionSummary (persisted by put_summary at
@@ -2585,9 +2624,16 @@ fn build_task_prompt(
         }
         s.push('\n');
     }
-    if !task.verification.is_empty() {
-        s.push_str("Verification (you must address each):\n");
-        for v in &task.verification {
+    if !task.execution_checks.is_empty() {
+        s.push_str("Execution checks (you must run each and report observed pass):\n");
+        for v in &task.execution_checks {
+            s.push_str(&format!("- {v}\n"));
+        }
+        s.push('\n');
+    }
+    if !task.acceptance_criteria.is_empty() {
+        s.push_str("Acceptance criteria (a reviewer will judge each against your output):\n");
+        for v in &task.acceptance_criteria {
             s.push_str(&format!("- {v}\n"));
         }
         s.push('\n');
@@ -3970,10 +4016,10 @@ pub fn preflight_unattended_plan(
             }
         }
         // Layer 3: no shell/test commands
-        if !t.verification.is_empty() {
+        if !t.execution_checks.is_empty() {
             return Err(PreflightRejection {
                 reason: format!(
-                    "task '{}' declares verification/shell commands — \
+                    "task '{}' declares execution_checks/shell commands — \
                      shell is DisabledByDefault in unattended mode",
                     t.id
                 ),
@@ -4018,7 +4064,8 @@ mod tests {
             files: Vec::new(),
             allowed_tools: tools.iter().map(|s| s.to_string()).collect(),
             required_artifacts: Vec::new(),
-            verification: verification.iter().map(|s| s.to_string()).collect(),
+            execution_checks: verification.iter().map(|s| s.to_string()).collect(),
+            acceptance_criteria: Vec::new(),
             retry_count: 0,
             max_retries: 0,
             failure_fingerprint: None,
@@ -4242,90 +4289,6 @@ Read the runtime path and found one missing branch.
     }
 
     #[test]
-    fn suggested_task_title_duplicate_detects_project_word_variation() {
-        assert!(task_titles_look_duplicate(
-            "Analyze the **task system** of echo-agent project. Focus on runtime todos.",
-            "Analyze the **task system** of echo-agent. Focus on task runtime."
-        ));
-        assert!(task_titles_look_duplicate(
-            "Analyze the **configuration and skills system** of echo-agent project.",
-            "Analyze the **configuration and skills system** of echo-agent."
-        ));
-        assert!(!task_titles_look_duplicate(
-            "Analyze the frontend runtime state.",
-            "Analyze the configuration and skills system."
-        ));
-    }
-
-    #[test]
-    fn append_suggested_tasks_skips_existing_plan_titles() -> Result<(), String> {
-        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|e| e.to_string())?);
-        store
-            .create_run(
-                "r-dedupe",
-                "ws",
-                "c1",
-                "m1",
-                DomainProfile::General,
-                "analyze project",
-                "",
-                AttendedMode::Attended,
-            )
-            .map_err(|e| e.to_string())?;
-
-        let parent = PlanTask {
-            id: "t-parent".into(),
-            title: "Analyze backend runtime".into(),
-            description: "Inspect runtime architecture.".into(),
-            kind: PlanTaskKind::Investigation,
-            agent_role: "explorer".into(),
-            ..Default::default()
-        };
-        let existing = PlanTask {
-            id: "t-task-system".into(),
-            title: "Analyze the **task system** of echo-agent. Focus on task runtime.".into(),
-            description: "Inspect plan creation and execution.".into(),
-            kind: PlanTaskKind::Investigation,
-            agent_role: "explorer".into(),
-            ..Default::default()
-        };
-        store
-            .attach_plan(&TaskPlan {
-                plan_id: "p-dedupe".into(),
-                run_id: "r-dedupe".into(),
-                domain_profile: DomainProfile::General,
-                goal: "analyze project".into(),
-                assumptions: vec![],
-                risks: vec![],
-                execution_mode: ExecutionMode::Parallel,
-                tasks: vec![parent.clone(), existing],
-            })
-            .map_err(|e| e.to_string())?;
-
-        append_suggested_tasks_to_plan(
-            &store,
-            "r-dedupe",
-            &parent,
-            &[SuggestedTask {
-                title: "Analyze the **task system** of echo-agent project. Focus on todos.".into(),
-                description: "Duplicate of an existing task-system analysis task.".into(),
-                kind: PlanTaskKind::Investigation,
-                agent_role: "explorer".into(),
-                dependencies: vec!["t-parent".into()],
-                why_needed: "Subagent thinks this is still needed.".into(),
-                risk: "low".into(),
-            }],
-        );
-
-        let plan = store
-            .get_plan("r-dedupe")
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "expected plan after append".to_string())?;
-        assert_eq!(plan.tasks.len(), 2);
-        Ok(())
-    }
-
-    #[test]
     fn preflight_disabled_rejects_write_tools() {
         // B1: under Disabled, tools outside the readonly allowlist are rejected.
         let task = preflight_task("t1", PlanTaskKind::Investigation, &["write_file"], &[]);
@@ -4348,12 +4311,12 @@ Read the runtime path and found one missing branch.
         let result = preflight_unattended_plan(&[task], UnattendedWriteMode::Disabled);
         assert!(
             result.is_err(),
-            "shell verification should be rejected under Disabled"
+            "execution_checks (shell commands) should be rejected under Disabled"
         );
         let reason = result.unwrap_err().reason;
         assert!(
-            reason.contains("verification/shell"),
-            "reason should mention shell, got {reason:?}"
+            reason.contains("execution_checks") || reason.contains("shell"),
+            "reason should mention execution_checks/shell, got {reason:?}"
         );
     }
 
@@ -4539,7 +4502,7 @@ Read the runtime path and found one missing branch.
             description: "find bugs".into(),
             kind: PlanTaskKind::ReadOnlyReview,
             files: vec!["chat.rs".into()],
-            verification: vec!["report root cause".into()],
+            acceptance_criteria: vec!["report root cause".into()],
             ..Default::default()
         };
         let p = build_task_prompt(
@@ -4822,7 +4785,7 @@ Read the runtime path and found one missing branch.
     }
 
     #[test]
-    fn task_result_contract_requires_observed_evidence_and_integrity() -> Result<(), String> {
+    fn execution_check_requires_observed_evidence_and_integrity() -> Result<(), String> {
         assert!(!verification_matches(
             "cargo test --workspace",
             "echo cargo test --workspace"
@@ -4830,12 +4793,26 @@ Read the runtime path and found one missing branch.
         let task = PlanTask {
             id: "contract".to_string(),
             title: "Contract".to_string(),
-            verification: vec!["cargo test --workspace".to_string()],
+            execution_checks: vec!["cargo test --workspace".to_string()],
+            acceptance_criteria: Vec::new(),
             required_artifacts: vec!["reports/result.json".to_string()],
             ..PlanTask::default()
         };
+
+        // (a) Real failure: remaining_work non-empty.
         let mut result = successful_task_result("work finished");
         result.remaining_work = vec!["write final report".to_string()];
+        match assess_task_execution(&task, &result) {
+            CompletionAssessment::ExecutionFailed { reason } => {
+                assert!(reason.contains("remaining work"), "got {reason:?}");
+            }
+            other => return Err(format!("expected ExecutionFailed, got {other:?}")),
+        }
+
+        // (b) AcceptancePending: completed but verification is Reported only,
+        //     and artifact lacks hash/producer. Must NOT be ExecutionFailed
+        //     (the Subagent completed) and must NOT pass.
+        result.remaining_work.clear();
         result.verification.push(SubagentVerificationResult {
             check: "cargo test --workspace".to_string(),
             status: SubagentVerificationStatus::Passed,
@@ -4850,23 +4827,24 @@ Read the runtime path and found one missing branch.
             producer_execution_id: None,
             available: true,
         });
+        match assess_task_execution(&task, &result) {
+            CompletionAssessment::AcceptancePending {
+                missing_checks,
+                missing_artifacts,
+            } => {
+                assert!(
+                    missing_checks.iter().any(|c| c == "cargo test --workspace"),
+                    "got {missing_checks:?}"
+                );
+                assert!(
+                    missing_artifacts.iter().any(|a| a == "reports/result.json"),
+                    "got {missing_artifacts:?}"
+                );
+            }
+            other => return Err(format!("expected AcceptancePending, got {other:?}")),
+        }
 
-        let issues = validate_task_result(&task, &result)
-            .err()
-            .ok_or_else(|| "incomplete result unexpectedly passed".to_string())?;
-        assert!(issues.iter().any(|issue| issue.contains("remaining work")));
-        assert!(
-            issues
-                .iter()
-                .any(|issue| issue.contains("no observed pass"))
-        );
-        assert!(
-            issues
-                .iter()
-                .any(|issue| issue.contains("integrity metadata"))
-        );
-
-        result.remaining_work.clear();
+        // (c) Executed: observed pass + integrity metadata present.
         if let Some(verification) = result.verification.first_mut() {
             verification.source = SubagentVerificationSource::Observed;
         }
@@ -4874,19 +4852,26 @@ Read the runtime path and found one missing branch.
             artifact.sha256 = Some("a".repeat(64));
             artifact.producer_execution_id = Some("contract:1".to_string());
         }
-        assert!(validate_task_result(&task, &result).is_ok());
+        match assess_task_execution(&task, &result) {
+            CompletionAssessment::Executed => {}
+            other => return Err(format!("expected Executed, got {other:?}")),
+        }
         Ok(())
     }
 
     #[tokio::test]
-    async fn run_dag_rejects_result_without_observed_required_verification() -> Result<(), String> {
+    async fn run_dag_blocks_completed_result_missing_observed_evidence() -> Result<(), String> {
+        // M7: a Subagent that returns a text summary but no observed execution
+        // evidence for a declared execution_check must NOT be auto-redispatched.
+        // The task goes to Blocked and the run to Paused for an explicit retry.
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
         let task = PlanTask {
             id: "verify".to_string(),
             title: "Verify".to_string(),
             kind: PlanTaskKind::ReadOnlyReview,
             agent_role: "reviewer".to_string(),
-            verification: vec!["cargo test --workspace".to_string()],
+            execution_checks: vec!["cargo test --workspace".to_string()],
+            acceptance_criteria: Vec::new(),
             max_retries: 0,
             ..PlanTask::default()
         };
@@ -4914,14 +4899,32 @@ Read the runtime path and found one missing branch.
         .await
         .map_err(|error| error.to_string())?;
 
-        assert!(matches!(outcome, RunOutcome::Failed { .. }));
+        // Attended run (default) → Blocked + Paused (NOT Failed, NOT auto-retried).
+        assert!(
+            matches!(outcome, RunOutcome::Paused { .. }),
+            "expected Paused, got {outcome:?}"
+        );
         let todo = store
             .list_todos(&run_id)
             .map_err(|error| error.to_string())?
             .into_iter()
             .find(|todo| todo.task_id == "verify")
             .ok_or_else(|| "verify todo missing".to_string())?;
-        assert_eq!(todo.status, TodoStatus::Failed);
+        assert_eq!(todo.status, TodoStatus::Blocked);
+        // Plan must still have exactly one task — no fix_task expansion.
+        let plan = store
+            .get_plan(&run_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "plan missing".to_string())?;
+        assert_eq!(
+            plan.tasks.len(),
+            1,
+            "plan must not expand on acceptance failure"
+        );
+        assert_eq!(
+            plan.tasks[0].retry_count, 0,
+            "retry_count must not bump on acceptance failure"
+        );
         Ok(())
     }
 
@@ -4981,6 +4984,14 @@ Read the runtime path and found one missing branch.
     /// Creates run (Pending), attaches plan (no status change), transitions
     /// Pending → Running so run_dag can start.
     fn seed_run(store: &Arc<TaskRuntimeStore>, tasks: Vec<PlanTask>) -> String {
+        seed_run_with_mode(store, tasks, AttendedMode::Attended)
+    }
+
+    fn seed_run_with_mode(
+        store: &Arc<TaskRuntimeStore>,
+        tasks: Vec<PlanTask>,
+        attended_mode: AttendedMode,
+    ) -> String {
         let run_id = format!("run_{}", uuid::Uuid::new_v4());
         store
             .create_run(
@@ -4991,7 +5002,7 @@ Read the runtime path and found one missing branch.
                 DomainProfile::General,
                 "test goal",
                 "",
-                AttendedMode::Attended,
+                attended_mode,
             )
             .unwrap();
         let plan = TaskPlan {
@@ -5009,6 +5020,70 @@ Read the runtime path and found one missing branch.
             .transition_run(&run_id, TaskRunStatus::Running)
             .unwrap();
         run_id
+    }
+
+    #[tokio::test]
+    async fn unattended_review_rejections_fail_instead_of_pause() -> Result<(), String> {
+        use echo_agent::testing::MockLlmClient;
+
+        for (label, verdict) in [
+            (
+                "needs-fix",
+                r#"{"outcome":"needs_fix","summary":"fix required","failure_fingerprint":"missing-evidence","issues":[]}"#,
+            ),
+            (
+                "blocked",
+                r#"{"outcome":"blocked","summary":"evidence unavailable","failure_fingerprint":"blocked","issues":[]}"#,
+            ),
+        ] {
+            let store =
+                Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+            let task = PlanTask {
+                id: label.to_string(),
+                title: label.to_string(),
+                description: "review this result".to_string(),
+                kind: PlanTaskKind::ReadOnlyReview,
+                agent_role: "reviewer".to_string(),
+                acceptance_criteria: vec!["evidence is complete".to_string()],
+                max_retries: 3,
+                ..PlanTask::default()
+            };
+            let run_id = seed_run_with_mode(&store, vec![task.clone()], AttendedMode::Unattended);
+            let dispatcher = ScriptedDispatcher::new();
+            dispatcher.respond(&task.id, successful_task_result("reviewable output"));
+            let reviewer = Arc::new(
+                MockLlmClient::new()
+                    .with_model_name("reviewer-test")
+                    .with_response(verdict),
+            );
+
+            let outcome = run_dag(
+                store.clone(),
+                dispatcher,
+                Some(reviewer),
+                &run_id,
+                vec![task],
+                ConcurrencyLimits::default(),
+                CancellationToken::new(),
+                None,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+
+            if !matches!(outcome, RunOutcome::Failed { .. }) {
+                return Err(format!(
+                    "{label} produced non-terminal outcome: {outcome:?}"
+                ));
+            }
+            let run = store
+                .get_run(&run_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("run missing for {label}"))?;
+            if run.status != TaskRunStatus::Failed {
+                return Err(format!("{label} left run in {:?}", run.status));
+            }
+        }
+        Ok(())
     }
 
     #[tokio::test]
@@ -5152,10 +5227,11 @@ Read the runtime path and found one missing branch.
 
     #[tokio::test]
     async fn run_dag_merge_failure_blocks_downstream() -> Result<(), String> {
-        let mut writer = solo_readonly_task("writer");
-        writer.kind = PlanTaskKind::Implementation;
-        writer.agent_role = "implementer".to_string();
-        writer.files = vec!["src/a.rs".to_string()];
+        // Use a read-only kind so the review gate auto-passes (no reviewer LLM
+        // in this test) and execution reaches integrate_reviewed_task, where
+        // the scripted merge failure marks the writer Failed. Downstream is
+        // then Blocked by the failed-dependency propagation.
+        let writer = solo_readonly_task("writer");
         let mut downstream = solo_readonly_task("downstream");
         downstream.depends_on = vec![writer.id.clone()];
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
@@ -5441,6 +5517,286 @@ Read the runtime path and found one missing branch.
                         .is_some_and(|text| text.contains("42"))
             }),
             "expected successful tool_completed with tool output, got {events:?}"
+        );
+        Ok(())
+    }
+
+    // ── M7 acceptance-contract regression tests ────────────────────────────
+    //
+    // These tests lock in the bug fixes for the contract-validation retry
+    // loop: a Subagent that returns a plain-text summary (contract_version=0,
+    // no verification array) must complete in exactly one attempt when the
+    // task declares no execution_checks, and must never auto-redispatch.
+
+    #[test]
+    fn plain_text_summary_passes_when_no_execution_checks() {
+        // Mirror of the production bug: 4 analysis tasks returned rich text
+        // summaries but contract_version=0 + verification=[]. With no
+        // execution_checks declared, this must assess as Executed (the
+        // ReviewGate then auto-passes because there are no acceptance_criteria
+        // either, so the task reaches Completed without redispatch).
+        let task = PlanTask {
+            id: "analysis".into(),
+            title: "Analyze frontend".into(),
+            kind: PlanTaskKind::ReadOnlyReview,
+            execution_checks: Vec::new(),
+            acceptance_criteria: Vec::new(),
+            ..PlanTask::default()
+        };
+        let result = SubagentTaskResult {
+            contract_version: 0, // plain-text fallback, NOT a failure
+            status: SubagentRunStatus::Completed,
+            summary: "Frontend uses React 19 + Zustand.".into(),
+            artifacts: Vec::new(),
+            verification: Vec::new(),
+            remaining_work: Vec::new(),
+            touched_files: SubagentTouchedFiles::default(),
+        };
+        assert!(matches!(
+            assess_task_execution(&task, &result),
+            CompletionAssessment::Executed
+        ));
+    }
+
+    #[test]
+    fn contract_version_zero_is_not_an_execution_failure() {
+        let task = PlanTask {
+            id: "t".into(),
+            execution_checks: vec!["cargo test".into()],
+            acceptance_criteria: Vec::new(),
+            ..PlanTask::default()
+        };
+        let result = SubagentTaskResult {
+            contract_version: 0,
+            status: SubagentRunStatus::Completed,
+            summary: "done".into(),
+            artifacts: Vec::new(),
+            verification: Vec::new(), // no observed pass for "cargo test"
+            remaining_work: Vec::new(),
+            touched_files: SubagentTouchedFiles::default(),
+        };
+        // cv=0 itself is fine; what blocks is the missing observed check.
+        // Crucially this is AcceptancePending, NOT ExecutionFailed — the
+        // Subagent completed, so auto-retry would just reproduce the gap.
+        match assess_task_execution(&task, &result) {
+            CompletionAssessment::AcceptancePending { missing_checks, .. } => {
+                assert_eq!(missing_checks, vec!["cargo test".to_string()]);
+            }
+            other => panic!("expected AcceptancePending, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_subagent_with_text_summary_runs_single_attempt() -> Result<(), String> {
+        // Reproduction of the original loop scenario: a task with semantic
+        // acceptance only (no execution_checks) must dispatch exactly once.
+        // Before the fix this looped up to max_retries because cv=0 was
+        // treated as a retryable contract failure.
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|e| e.to_string())?);
+        let task = PlanTask {
+            id: "analyze".into(),
+            title: "Analyze backend".into(),
+            kind: PlanTaskKind::ReadOnlyReview,
+            agent_role: "explorer".into(),
+            execution_checks: Vec::new(),
+            acceptance_criteria: Vec::new(),
+            max_retries: 3,
+            ..PlanTask::default()
+        };
+        let run_id = seed_run(&store, vec![task.clone()]);
+        let dispatcher = ScriptedDispatcher::new();
+        // Plain text result, no JSON contract — exactly what the production
+        // Subagents returned.
+        dispatcher.respond(
+            &task.id,
+            SubagentTaskResult {
+                contract_version: 0,
+                status: SubagentRunStatus::Completed,
+                summary: "Backend has 4 modules.".into(),
+                artifacts: Vec::new(),
+                verification: Vec::new(),
+                remaining_work: Vec::new(),
+                touched_files: SubagentTouchedFiles::default(),
+            },
+        );
+
+        let outcome = run_dag(
+            store.clone(),
+            dispatcher.clone(),
+            None,
+            &run_id,
+            vec![task],
+            ConcurrencyLimits::default(),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+        assert!(
+            matches!(outcome, RunOutcome::Completed),
+            "expected Completed, got {outcome:?}"
+        );
+        // No reviewer LLM, but no acceptance_criteria either → auto-pass.
+        // Exactly one dispatch happened.
+        assert_eq!(dispatcher.order().len(), 1, "expected single dispatch");
+        // Plan still has 1 task, retry_count 0.
+        let plan = store
+            .get_plan(&run_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "plan missing".to_string())?;
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].retry_count, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn real_execution_failure_retries_within_budget() -> Result<(), String> {
+        // Sanity check that the ExecutionFailed path still auto-retries.
+        // A Subagent returning remaining_work is a real failure (not a
+        // contract-format issue) and should retry up to max_retries.
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|e| e.to_string())?);
+        let task = PlanTask {
+            id: "flaky".into(),
+            title: "Flaky".into(),
+            kind: PlanTaskKind::ReadOnlyReview,
+            agent_role: "explorer".into(),
+            execution_checks: Vec::new(),
+            acceptance_criteria: Vec::new(),
+            max_retries: 2,
+            ..PlanTask::default()
+        };
+        let run_id = seed_run(&store, vec![task.clone()]);
+        let dispatcher = ScriptedDispatcher::new();
+        // Always report remaining_work → ExecutionFailed every time.
+        dispatcher.respond(
+            &task.id,
+            SubagentTaskResult {
+                contract_version: 1,
+                status: SubagentRunStatus::Completed,
+                summary: "partial".into(),
+                artifacts: Vec::new(),
+                verification: Vec::new(),
+                remaining_work: vec!["not done".into()],
+                touched_files: SubagentTouchedFiles::default(),
+            },
+        );
+
+        let outcome = run_dag(
+            store.clone(),
+            dispatcher.clone(),
+            None,
+            &run_id,
+            vec![task],
+            ConcurrencyLimits::default(),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+        // Exhausted budget → Failed.
+        assert!(
+            matches!(outcome, RunOutcome::Failed { .. }),
+            "expected Failed after retries, got {outcome:?}"
+        );
+        // Initial attempt + 2 retries = 3 dispatches.
+        assert_eq!(
+            dispatcher.order().len(),
+            3,
+            "expected 3 dispatches (1 + 2 retries)"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn wave_processes_all_results_when_one_task_blocks() -> Result<(), String> {
+        // Regression: when one task in a parallel wave resolves to Blocked
+        // (acceptance pending), sibling tasks that completed in the SAME wave
+        // must still be marked Completed and persisted. The early-return bug
+        // left siblings in Running, the resume path reset them to Pending,
+        // and the next attempt redispatched the entire wave — duplicating
+        // already-finished Subagent work.
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|e| e.to_string())?);
+        let clean = solo_readonly_task("clean"); // no execution_checks → Executed
+        let mut blocked = solo_readonly_task("blocked");
+        blocked.execution_checks = vec!["cargo test".to_string()];
+        blocked.acceptance_criteria = Vec::new();
+        let run_id = seed_run(&store, vec![clean.clone(), blocked.clone()]);
+        let dispatcher = ScriptedDispatcher::new();
+        dispatcher.respond(
+            &clean.id,
+            SubagentTaskResult {
+                contract_version: 1,
+                status: SubagentRunStatus::Completed,
+                summary: "clean run".into(),
+                artifacts: Vec::new(),
+                verification: Vec::new(),
+                remaining_work: Vec::new(),
+                touched_files: SubagentTouchedFiles::default(),
+            },
+        );
+        dispatcher.respond(
+            &blocked.id,
+            SubagentTaskResult {
+                contract_version: 1,
+                status: SubagentRunStatus::Completed,
+                summary: "blocked run".into(),
+                artifacts: Vec::new(),
+                verification: Vec::new(), // execution_check has no observed pass
+                remaining_work: Vec::new(),
+                touched_files: SubagentTouchedFiles::default(),
+            },
+        );
+
+        let outcome = run_dag(
+            store.clone(),
+            dispatcher.clone(),
+            None,
+            &run_id,
+            vec![clean.clone(), blocked.clone()],
+            ConcurrencyLimits::default(),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+
+        // Run Paused (acceptance failure on attended run).
+        assert!(
+            matches!(outcome, RunOutcome::Paused { .. }),
+            "expected Paused, got {outcome:?}"
+        );
+        // CRITICAL: the clean task must be Completed, not Running/Pending.
+        let todos = store.list_todos(&run_id).map_err(|e| e.to_string())?;
+        let clean_status = todos
+            .iter()
+            .find(|t| t.task_id == "clean")
+            .map(|t| t.status)
+            .ok_or_else(|| "clean todo missing".to_string())?;
+        assert_eq!(
+            clean_status,
+            TodoStatus::Completed,
+            "sibling completed task must persist as Completed, got {clean_status:?}"
+        );
+        // Blocked task is Blocked.
+        let blocked_status = todos
+            .iter()
+            .find(|t| t.task_id == "blocked")
+            .map(|t| t.status)
+            .ok_or_else(|| "blocked todo missing".to_string())?;
+        assert_eq!(blocked_status, TodoStatus::Blocked);
+        // Plan size unchanged.
+        let plan = store
+            .get_plan(&run_id)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "plan missing".to_string())?;
+        assert_eq!(plan.tasks.len(), 2);
+        // Exactly one dispatch per task — no redispatch.
+        assert_eq!(
+            dispatcher.order().len(),
+            2,
+            "each task dispatched exactly once"
         );
         Ok(())
     }

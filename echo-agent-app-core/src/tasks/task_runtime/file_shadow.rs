@@ -24,6 +24,14 @@ pub struct FileTaskShadow {
     /// a single `Mutex` serializing all writes (the in-memory usage/conv-event
     /// mutexes, not a DB connection).
     seq_cache: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, i64>>>,
+    /// Per-run write locks shared by event append and snapshot rewrite.
+    /// `append_event_line` holds the lock across seq allocation → append →
+    /// cache update; `rewrite_plan` acquires it again after append returns.
+    /// This prevents duplicate seq allocation and stale plan.json renames.
+    /// Different runs still run in parallel; only same-run writes serialize.
+    run_write_locks: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<()>>>>,
+    >,
 }
 
 impl FileTaskShadow {
@@ -32,6 +40,9 @@ impl FileTaskShadow {
         Self {
             root: root.into(),
             seq_cache: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            run_write_locks: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         }
     }
 
@@ -78,6 +89,15 @@ impl FileTaskShadow {
         event_type: super::types::RuntimeEventKind,
         payload: serde_json::Value,
     ) -> Result<RuntimeTaskEvent, ShadowError> {
+        // Hold the per-run write lock across seq alloc → append → cache bump.
+        // This closes the duplicate-seq race that arose when callers entered
+        // `next_seq` concurrently and each observed the same cached value
+        // before any append landed (observed in production events.jsonl as
+        // repeated seq 8/9/30/57/63-66). Different runs still run in
+        // parallel; only same-run writes serialize.
+        let lock = self.run_write_lock(run_id);
+        let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+
         let dir = self.run_dir(run_id);
         std::fs::create_dir_all(&dir).map_err(|e| ShadowError::Io(e.to_string()))?;
 
@@ -111,6 +131,23 @@ impl FileTaskShadow {
         Ok(event)
     }
 
+    /// Get-or-create the per-run write lock Arc. The map itself is guarded by
+    /// a short-lived Mutex so callers never see a torn HashMap. Entries are
+    /// never removed on Drop (no remove-on-drop race); they live as long as
+    /// the FileTaskShadow, which is fine because the keyspace is run_ids and
+    /// the map is bounded by total runs ever written.
+    fn run_write_lock(&self, run_id: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
+        // Mutex::lock only fails on poison; recover the inner guard rather than
+        // panicking (matches the existing seq_cache pattern in this module).
+        let mut map = self
+            .run_write_locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        map.entry(run_id.to_string())
+            .or_insert_with(|| std::sync::Arc::new(std::sync::Mutex::new(())))
+            .clone()
+    }
+
     /// Rebuild `plan.json` for `run_id` from its full `events.jsonl` stream.
     /// Called by store write methods after `append_event_line` to refresh the
     /// snapshot. Uses tmp+rename (atomic on the same filesystem).
@@ -120,6 +157,13 @@ impl FileTaskShadow {
     /// plan to snapshot, so this is a no-op rather than an error. The events
     /// themselves are still durably appended to `events.jsonl`.
     pub fn rewrite_plan(&self, run_id: &str) -> Result<(), ShadowError> {
+        // `append_event_line` releases its guard before returning, so this is
+        // not a re-entrant lock acquisition. Wait for any same-run append or
+        // rewrite to finish; proceeding after `try_lock` returns WouldBlock
+        // would rebuild and rename plan.json without serialization.
+        let lock = self.run_write_lock(run_id);
+        let _guard = lock.lock().unwrap_or_else(|error| error.into_inner());
+
         let events = self.read_events(run_id)?;
         if events.is_empty() {
             return Ok(());
@@ -320,7 +364,8 @@ mod tests {
             files: vec!["src/a.rs".to_string()],
             allowed_tools: vec!["read_file".to_string()],
             required_artifacts: Vec::new(),
-            verification: Vec::new(),
+            execution_checks: Vec::new(),
+            acceptance_criteria: Vec::new(),
             retry_count: 0,
             max_retries: 3,
             failure_fingerprint: None,
@@ -378,7 +423,8 @@ mod tests {
                     files: None,
                     allowed_tools: None,
                     required_artifacts: None,
-                    verification: None,
+                    execution_checks: None,
+                    acceptance_criteria: None,
                 },
             )
             .unwrap();
@@ -702,6 +748,54 @@ mod tests {
         assert_eq!(plan.plan.plan_id, "p1");
     }
 
+    #[test]
+    fn rewrite_plan_waits_for_same_run_write_lock() -> Result<(), String> {
+        let tmp = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let shadow = FileTaskShadow::new(tmp.path());
+        shadow
+            .append_event_line(
+                "locked-run",
+                None,
+                None,
+                RuntimeEventKind::RunCreated,
+                serde_json::json!({
+                    "goal": "g",
+                    "domain_profile": "general",
+                    "workspace_id": "ws",
+                    "conversation_id": "c1",
+                    "root_message_id": "m1",
+                    "route": "",
+                    "created_at": "2026-06-25T00:00:00Z",
+                }),
+            )
+            .map_err(|error| error.to_string())?;
+
+        let run_lock = shadow.run_write_lock("locked-run");
+        let guard = run_lock.lock().unwrap_or_else(|error| error.into_inner());
+        let writer = shadow.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let result = writer
+                .rewrite_plan("locked-run")
+                .map_err(|error| error.to_string());
+            let _ = tx.send(result);
+        });
+
+        match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Ok(_) => return Err("rewrite_plan proceeded without the same-run lock".to_string()),
+            Err(error) => return Err(format!("rewrite result channel failed: {error}")),
+        }
+
+        drop(guard);
+        rx.recv_timeout(std::time::Duration::from_secs(1))
+            .map_err(|error| format!("rewrite_plan did not resume after unlock: {error}"))??;
+        handle
+            .join()
+            .map_err(|_| "rewrite thread panicked".to_string())?;
+        Ok(())
+    }
+
     /// A second run's events must not perturb the first run's seq or plan —
     /// seq is per-run (each run has its own events.jsonl).
     #[test]
@@ -805,5 +899,68 @@ mod tests {
             vec!["plan.json".to_string()],
             "only plan.json should remain; got {leftovers:?}"
         );
+    }
+
+    /// Regression: concurrent append_event_line callers for the same run_id
+    /// must observe strictly unique, monotonically increasing seq values.
+    /// Before the per-run write lock was added, two callers could both read
+    /// the cached seq before either append landed, producing duplicate seq
+    /// numbers in events.jsonl (observed in production as repeated seq
+    /// 8/9/30/57/63-66). This test fires 100 concurrent appends and asserts
+    /// the resulting seq set is exactly 1..=100.
+    #[test]
+    fn concurrent_append_produces_unique_strictly_increasing_seq() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let shadow = FileTaskShadow::new(tmp.path().to_path_buf());
+        // Use a single shared run_id (the race only happens within one run).
+        let run_id = "r-concurrent";
+        shadow
+            .append_event_line(
+                run_id,
+                None,
+                None,
+                RuntimeEventKind::RunCreated,
+                serde_json::json!({"goal": "x"}),
+            )
+            .expect("seed RunCreated");
+
+        let threads = 8;
+        let per_thread = 12; // 8 * 12 = 96, plus RunCreated → 97 total events
+        let shadow = std::sync::Arc::new(shadow);
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let s = shadow.clone();
+                std::thread::spawn(move || {
+                    let mut local = Vec::new();
+                    for i in 0..per_thread {
+                        let ev = s
+                            .append_event_line(
+                                run_id,
+                                Some(&format!("t{i}")),
+                                None,
+                                RuntimeEventKind::Note,
+                                serde_json::json!({"i": i}),
+                            )
+                            .expect("append");
+                        local.push(ev.seq);
+                    }
+                    local
+                })
+            })
+            .collect();
+        let mut all_seqs: Vec<i64> = handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("thread"))
+            .collect();
+        all_seqs.sort();
+
+        // Each seq must appear exactly once.
+        let mut seen = std::collections::HashSet::new();
+        for &s in &all_seqs {
+            assert!(seen.insert(s), "duplicate seq {s} observed");
+        }
+        // Seqs are 2..=(97), because RunCreated took seq=1.
+        let expected: Vec<i64> = (2..=(1 + threads * per_thread) as i64).collect();
+        assert_eq!(all_seqs, expected, "seq must be strictly contiguous");
     }
 }

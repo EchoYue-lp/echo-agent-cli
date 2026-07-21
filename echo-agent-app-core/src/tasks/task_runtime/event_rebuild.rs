@@ -301,8 +301,11 @@ fn apply_patch(task: &mut PlanTask, payload: &serde_json::Value) {
         if patch.get("required_artifacts").is_some() {
             task.required_artifacts = decode_str_vec(patch, "required_artifacts");
         }
-        if patch.get("verification").is_some() {
-            task.verification = decode_str_vec(patch, "verification");
+        if patch.get("execution_checks").is_some() {
+            task.execution_checks = decode_str_vec(patch, "execution_checks");
+        }
+        if patch.get("acceptance_criteria").is_some() {
+            task.acceptance_criteria = decode_str_vec(patch, "acceptance_criteria");
         }
     }
 }
@@ -388,7 +391,8 @@ mod tests {
             files: vec!["src/a.rs".to_string()],
             allowed_tools: vec!["read_file".to_string()],
             required_artifacts: Vec::new(),
-            verification: Vec::new(),
+            execution_checks: Vec::new(),
+            acceptance_criteria: Vec::new(),
             retry_count: 0,
             max_retries: 3,
             failure_fingerprint: None,
@@ -517,7 +521,8 @@ mod tests {
                 files: Some(vec!["b.rs".to_string()]),
                 allowed_tools: None,
                 required_artifacts: None,
-                verification: None,
+                execution_checks: None,
+                acceptance_criteria: None,
             },
         )
         .unwrap();

@@ -145,6 +145,7 @@ pub fn build_tauri_app(
             commands::task_runtime::resolve_recovery_task,
             // TaskRuntime dynamic tasks (resume / insert / remove / update / reorder)
             commands::task_runtime::resume_task_run,
+            commands::task_runtime::retry_blocked_task,
             commands::task_runtime::insert_task,
             commands::task_runtime::remove_task,
             commands::task_runtime::update_task,

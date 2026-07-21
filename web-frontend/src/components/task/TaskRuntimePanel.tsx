@@ -397,19 +397,27 @@ export function displayedTodoStatus(
 ): TodoStatus {
   const run = traceRunForTodo(todo, runs);
   if (!run) return todo.status;
+  // Persisted authoritive statuses must NOT be overwritten by trace signals.
+  // A task that the executor marked Blocked (acceptance pending) or Failed
+  // (terminal) stays that way even if a SubagentRun trace later reports
+  // completed/failed — the executor already incorporated that signal when
+  // deciding the persisted status. Overwriting here hid the retry button
+  // for tasks that needed it most.
+  if (
+    todo.status === ('blocked' as TodoStatus) ||
+    todo.status === ('failed' as TodoStatus) ||
+    todo.status === ('completed' as TodoStatus) ||
+    todo.status === ('skipped' as TodoStatus)
+  ) {
+    return todo.status;
+  }
+  // Only pending/running todos get trace-driven projection (e.g. mark a
+  // pending todo as running when its Subagent has started, or reflect a
+  // cancelled Subagent as skipped when the executor hasn't yet persisted).
   if (run.status === 'running' && todo.status === ('pending' as TodoStatus)) {
     return 'running' as TodoStatus;
   }
-  if (run.status === 'completed' && todo.status !== ('completed' as TodoStatus)) {
-    return 'completed' as TodoStatus;
-  }
-  if (run.status === 'failed' && todo.status !== ('failed' as TodoStatus)) {
-    return 'failed' as TodoStatus;
-  }
-  if (run.status === 'timed_out' && todo.status !== ('failed' as TodoStatus)) {
-    return 'failed' as TodoStatus;
-  }
-  if (run.status === 'cancelled' && todo.status !== ('skipped' as TodoStatus)) {
+  if (run.status === 'cancelled' && todo.status === ('pending' as TodoStatus)) {
     return 'skipped' as TodoStatus;
   }
   return todo.status;
@@ -593,7 +601,8 @@ export function TaskRuntimePanel() {
             {todos.map((todo) => {
               const task = plan?.tasks.find((t) => t.id === todo.task_id);
               const status = displayedTodoStatus(todo, visibleTraceRuns);
-              const isEditable = status === 'pending' || status === 'blocked';
+              const isEditable =
+                status === 'pending' || status === 'blocked' || status === 'failed';
               return (
                 <div
                   key={todo.id}
@@ -627,6 +636,19 @@ export function TaskRuntimePanel() {
                   {/* Edit/delete buttons — visible on hover, only for editable tasks */}
                   {isEditable && (
                     <div className="flex gap-0.5">
+                      {(status === 'blocked' || status === 'failed') &&
+                        (activeRun?.status === 'paused' || activeRun?.status === 'failed') &&
+                        (task?.retry_count ?? 0) < (task?.max_retries ?? 0) && (
+                          <button
+                            className="rounded-md p-0.5 hover:bg-[var(--bg-active)]"
+                            title={`重试(当前 attempt ${(task?.retry_count ?? 0) + 1}/${(task?.max_retries ?? 0) + 1})`}
+                            onClick={() => {
+                              useTaskRuntimeStore.getState().retryBlockedTask(todo.task_id);
+                            }}
+                          >
+                            <RotateCcw size={10} style={{ color: 'var(--color-info)' }} />
+                          </button>
+                        )}
                       <button
                         className="rounded-md p-0.5 hover:bg-[var(--bg-active)]"
                         title="编辑"

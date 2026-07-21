@@ -3957,7 +3957,7 @@ async fn handle_slash_command(
             let Some(action) = slash_cmd else {
                 return;
             };
-            let Some(store) = app.task_runtime_store.as_ref() else {
+            let Some(store) = app.task_runtime_store.as_ref().cloned() else {
                 app.messages.push(ChatMessage {
                     role: MessageRole::System,
                     content: "Task runtime is unavailable.".to_string(),
@@ -4088,20 +4088,69 @@ async fn handle_slash_command(
                 });
                 return;
             };
-            let decision = if action == SlashCommand::TaskRetry {
-                echo_agent_app_core::tasks::task_runtime::RecoveryDecision::Retry
+            // For TaskSkip we always go through RecoveryBlocker resolution
+            // (skipping only makes sense for crash-recovery blockers).
+            // For TaskRetry we first try the new acceptance-retry path: it
+            // handles Blocked/Failed tasks on Paused/Failed runs (the states
+            // left by acceptance/review failure) atomically. If that guard
+            // rejects (no such task in a retryable state), fall back to the
+            // legacy RecoveryBlocker path so process-restart blockers still
+            // work. This keeps TUI on par with the GUI retry button.
+            let result = if action == SlashCommand::TaskRetry {
+                match store.retry_blocked_task(&run_id, task_id) {
+                    Ok(next_attempt) => {
+                        let layer_manager = app
+                            .review_integration
+                            .as_ref()
+                            .map(|integration| Arc::new(integration.create_layer_manager()));
+                        match start_tui_task_run_driver(
+                            store.clone(),
+                            agent.clone(),
+                            run_id.clone(),
+                            layer_manager,
+                        )
+                        .await
+                        {
+                            Ok(()) => Ok(format!(
+                                "Task {task_id} retried as attempt {next_attempt} on run {run_id}; executor started."
+                            )),
+                            Err(error) => Err(format!(
+                                "retry state was recorded but the executor could not start; run returned to Paused: {error}"
+                            )),
+                        }
+                    }
+                    Err(retry_err) => {
+                        // Fall back to legacy RecoveryBlocker resolution.
+                        match store.resolve_recovery_task(
+                            &run_id,
+                            task_id,
+                            echo_agent_app_core::tasks::task_runtime::RecoveryDecision::Retry,
+                        ) {
+                            Ok(()) => Ok(format!(
+                                "Recovery decision recorded for {run_id}/{task_id}: retry."
+                            )),
+                            Err(resolve_err) => Err(format!(
+                                "retry_blocked_task failed ({retry_err}); \
+                                 resolve_recovery_task also failed ({resolve_err})"
+                            )),
+                        }
+                    }
+                }
             } else {
-                echo_agent_app_core::tasks::task_runtime::RecoveryDecision::Skip
+                store
+                    .resolve_recovery_task(
+                        &run_id,
+                        task_id,
+                        echo_agent_app_core::tasks::task_runtime::RecoveryDecision::Skip,
+                    )
+                    .map(|()| format!("Recovery decision recorded for {run_id}/{task_id}: skip."))
+                    .map_err(|e| e.to_string())
             };
-            let result = store.resolve_recovery_task(&run_id, task_id, decision);
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
                 content: match result {
-                    Ok(()) => format!(
-                        "Recovery decision recorded for {run_id}/{task_id}: {}.",
-                        decision.as_str()
-                    ),
-                    Err(error) => format!("Failed to resolve recovery task: {error}"),
+                    Ok(msg) => msg,
+                    Err(error) => format!("Failed to retry/skip task: {error}"),
                 },
             });
             refresh_task_runtime_view(app);
@@ -4301,6 +4350,16 @@ async fn resume_tui_task_run(
     store
         .resume_task_run(&run_id)
         .map_err(|error| error.to_string())?;
+    start_tui_task_run_driver(store, agent, run_id, layer_manager).await?;
+    Ok("resumed")
+}
+
+async fn start_tui_task_run_driver(
+    store: Arc<echo_agent_app_core::tasks::task_runtime::TaskRuntimeStore>,
+    agent: AgentHandle,
+    run_id: String,
+    layer_manager: Option<Arc<echo_agent::evolution::MemoryLayerManager>>,
+) -> Result<(), String> {
     let cancel = echo_agent::agent::CancellationToken::new();
     let cancel_registration = match store.register_run_cancellation(&run_id, cancel.clone()) {
         Ok(registration) => registration,
@@ -4329,10 +4388,10 @@ async fn resume_tui_task_run(
         )
         .await;
         if let Err(error) = result {
-            tracing::error!(%run_id, %error, "TUI resumed run failed");
+            tracing::error!(%run_id, %error, "TUI task run driver failed");
         }
     });
-    Ok("resumed")
+    Ok(())
 }
 
 fn resolve_tui_workspace_file(value: &str) -> anyhow::Result<std::path::PathBuf> {

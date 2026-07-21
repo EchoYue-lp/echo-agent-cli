@@ -192,14 +192,33 @@ async fn cmd_tasks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                 println!("Usage: /tasks {sub} <id> <task-id>");
                 return CommandOutcome::Continue;
             }
-            let decision = if sub == "retry" {
-                RecoveryDecision::Retry
+            if sub == "retry" {
+                // New acceptance-retry path first (handles Blocked/Failed on
+                // Paused/Failed runs); legacy RecoveryBlocker path as fallback
+                // so process-restart blockers still work.
+                match service.retry_blocked_task(id, task_id) {
+                    Ok(attempt) => {
+                        println!("Task {task_id} retried as attempt {attempt} on run {id}.");
+                    }
+                    Err(retry_err) => {
+                        match service.resolve_recovery_task(id, task_id, RecoveryDecision::Retry) {
+                            Ok(()) => {
+                                println!("Recovery decision recorded: {id}/{task_id} -> retry");
+                            }
+                            Err(resolve_err) => {
+                                println!(
+                                    "Failed to retry: retry_blocked_task ({retry_err}); \
+                                 resolve_recovery_task ({resolve_err})"
+                                );
+                            }
+                        }
+                    }
+                }
             } else {
-                RecoveryDecision::Skip
-            };
-            match service.resolve_recovery_task(id, task_id, decision) {
-                Ok(()) => println!("Recovery decision recorded: {id}/{task_id} -> {sub}"),
-                Err(error) => println!("Failed to resolve recovery task: {error}"),
+                match service.resolve_recovery_task(id, task_id, RecoveryDecision::Skip) {
+                    Ok(()) => println!("Recovery decision recorded: {id}/{task_id} -> skip"),
+                    Err(error) => println!("Failed to resolve recovery task: {error}"),
+                }
             }
         }
         "research" => {

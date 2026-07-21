@@ -404,11 +404,16 @@ impl BackgroundTaskService {
                 }
             };
             let agent = lease.agent();
+            // Wire reviewer LLM from the background agent. Implementation/
+            // Debugging tasks (and any task with acceptance_criteria) now
+            // require a review pass; without a reviewer the Skipped branch
+            // would otherwise Paused the run forever (M7 forbids auto-pass).
+            let reviewer_llm = agent.read(|a| a.llm_client().cloned()).await;
             let result = match store.get_plan(&run_id) {
                 Ok(Some(_)) => super::task_runtime::execute_run(
                     store.clone(),
                     Some(agent),
-                    None,
+                    reviewer_llm,
                     None,
                     None,
                     None,
@@ -495,6 +500,34 @@ impl BackgroundTaskService {
         self.task_runtime_store
             .resolve_recovery_task(id, task_id, decision)
             .map_err(Into::into)
+    }
+
+    /// Atomically retry a Blocked/Failed task on a Paused/Failed run. Mirrors
+    /// the Tauri `retry_blocked_task` command and the GUI retry button so
+    /// CLI/TUI users get the same acceptance-retry semantics.
+    pub fn retry_blocked_task(&self, run_id: &str, task_id: &str) -> anyhow::Result<u32> {
+        let run = self
+            .task_runtime_store
+            .get_run(run_id)?
+            .ok_or_else(|| anyhow::anyhow!("task run not found: {run_id}"))?;
+        if !run.conversation_id.starts_with("background:") {
+            return Err(anyhow::anyhow!(
+                "task run is not owned by the background service: {run_id}"
+            ));
+        }
+        let metadata = trigger_metadata(&self.task_runtime_store, run_id);
+        let prompt = metadata.prompt.unwrap_or(run.goal);
+        let next = self
+            .task_runtime_store
+            .retry_blocked_task(run_id, task_id)?;
+        if let Err(error) = self.start_run_driver(run_id.to_string(), prompt, metadata.dependencies)
+        {
+            let _ = self
+                .task_runtime_store
+                .transition_run(run_id, TaskRunStatus::Paused);
+            return Err(error);
+        }
+        Ok(next)
     }
 
     pub fn list_unified(&self, status_filter: Option<&str>) -> Vec<UnifiedTaskInfo> {
@@ -823,6 +856,7 @@ async fn register_plan_execute(agent: &AgentHandle, store: Arc<TaskRuntimeStore>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tasks::task_runtime::PlanTaskKind;
 
     fn test_agent() -> Result<AgentHandle, String> {
         let llm = Arc::new(
@@ -918,6 +952,100 @@ mod tests {
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "run missing".to_string())?;
         assert_eq!(run.status, TaskRunStatus::Cancelled);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retry_registers_driver_immediately_instead_of_leaving_fake_running()
+    -> Result<(), String> {
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        store
+            .create_run(
+                "dependency",
+                "default",
+                "background:test:dependency",
+                "",
+                DomainProfile::General,
+                "dependency",
+                "bg:kind:test",
+                AttendedMode::Unattended,
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .create_run(
+                "retry-run",
+                "default",
+                "background:test:retry-run",
+                "",
+                DomainProfile::General,
+                "retry run",
+                "bg:kind:test",
+                AttendedMode::Unattended,
+            )
+            .map_err(|error| error.to_string())?;
+        let task = PlanTask {
+            id: "retry-task".to_string(),
+            title: "Retry task".to_string(),
+            kind: PlanTaskKind::Investigation,
+            agent_role: "researcher".to_string(),
+            max_retries: 2,
+            ..PlanTask::default()
+        };
+        store
+            .attach_plan(&TaskPlan {
+                plan_id: "retry-plan".to_string(),
+                run_id: "retry-run".to_string(),
+                domain_profile: DomainProfile::General,
+                goal: "retry run".to_string(),
+                assumptions: Vec::new(),
+                risks: Vec::new(),
+                execution_mode: ExecutionMode::Sequential,
+                tasks: vec![task],
+            })
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("retry-run", TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
+        store
+            .set_task_status(
+                "retry-run",
+                "retry-task",
+                TodoStatus::Failed,
+                Some("researcher"),
+                Some("execution failed"),
+            )
+            .map_err(|error| error.to_string())?;
+        store
+            .transition_run("retry-run", TaskRunStatus::Failed)
+            .map_err(|error| error.to_string())?;
+        store
+            .record_trigger_metadata(
+                "retry-run",
+                "test",
+                "research",
+                "retry run",
+                5,
+                &["dependency".to_string()],
+            )
+            .map_err(|error| error.to_string())?;
+
+        let service = BackgroundTaskService::new(
+            test_agent()?,
+            CancellationToken::new(),
+            Some(store.clone()),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let attempt = service
+            .retry_blocked_task("retry-run", "retry-task")
+            .map_err(|error| error.to_string())?;
+        assert_eq!(attempt, 1);
+        if !store
+            .request_pause("retry-run")
+            .map_err(|error| error.to_string())?
+        {
+            return Err("retry did not register an active run driver".to_string());
+        }
         Ok(())
     }
 

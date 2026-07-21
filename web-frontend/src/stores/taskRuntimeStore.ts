@@ -115,6 +115,7 @@ export interface TaskRuntimeState {
   updateTask: (taskId: string, patch: Record<string, unknown>) => Promise<void>;
   reorderTasks: (newOrder: string[]) => Promise<void>;
   resumeTaskRun: () => Promise<void>;
+  retryBlockedTask: (taskId: string) => Promise<void>;
   resolveRecoveryTask: (taskId: string, decision: 'retry' | 'skip') => Promise<void>;
   reset: () => void;
 }
@@ -298,6 +299,17 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
     if (!runId) return;
     try {
       await taskRuntimeApi.resumeRun(runId);
+      set({ interruptPrompt: null });
+      await get().refresh(runId);
+    } catch (e) {
+      set({ error: e instanceof Error ? e.message : String(e) });
+    }
+  },
+  retryBlockedTask: async (taskId) => {
+    const runId = get().activeRun?.run_id;
+    if (!runId) return;
+    try {
+      await taskRuntimeApi.retryBlockedTask(runId, taskId);
       set({ interruptPrompt: null });
       await get().refresh(runId);
     } catch (e) {

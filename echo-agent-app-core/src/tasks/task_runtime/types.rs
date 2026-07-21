@@ -740,7 +740,15 @@ pub struct PlanTask {
     /// before this task may enter Completed.
     #[serde(default)]
     pub required_artifacts: Vec<String>,
-    pub verification: Vec<String>,
+    /// 可执行验证项(命令类)。Subagent 运行这些命令时,Runtime 从工具事件
+    /// 记录 `observed` 证据;每个 execution_check 必须有 `observed + passed`
+    /// 才能通过 execution 门禁。示例:`cargo test --lib`、`npm run build`。
+    #[serde(default)]
+    pub execution_checks: Vec<String>,
+    /// 语义验收标准(描述类)。由 Reviewer 基于 Subagent 输出判定,不要求
+    /// 工具事件证据。示例:`模块边界清晰`、`前端组件层级合理`。
+    #[serde(default)]
+    pub acceptance_criteria: Vec<String>,
     pub retry_count: u32,
     pub max_retries: u32,
     pub failure_fingerprint: Option<String>,
@@ -766,7 +774,8 @@ impl Default for PlanTask {
             files: Vec::new(),
             allowed_tools: Vec::new(),
             required_artifacts: Vec::new(),
-            verification: Vec::new(),
+            execution_checks: Vec::new(),
+            acceptance_criteria: Vec::new(),
             retry_count: 0,
             max_retries: 3,
             failure_fingerprint: None,
@@ -788,7 +797,16 @@ impl PlanTask {
             depends_on: self.depends_on.clone(),
             files: self.files.clone(),
             allowed_tools: self.allowed_tools.clone(),
-            verification: self.verification.clone(),
+            // Framework RuntimeTask still carries a single verification list;
+            // flatten both check kinds into it so framework-side scheduling
+            // (which does not distinguish them) keeps working. EKO's stricter
+            // split lives in the app layer.
+            verification: self
+                .execution_checks
+                .iter()
+                .chain(self.acceptance_criteria.iter())
+                .cloned()
+                .collect(),
             retry_count: self.retry_count,
             max_retries: self.max_retries,
             status: self.status.to_runtime_status(),
@@ -809,7 +827,8 @@ pub struct TaskPatch {
     pub files: Option<Vec<String>>,
     pub allowed_tools: Option<Vec<String>>,
     pub required_artifacts: Option<Vec<String>>,
-    pub verification: Option<Vec<String>>,
+    pub execution_checks: Option<Vec<String>>,
+    pub acceptance_criteria: Option<Vec<String>>,
 }
 
 /// A todo row — the GUI-facing projection of a plan task's progress.
@@ -1438,7 +1457,8 @@ mod tests {
             files: vec!["src/lib.rs".to_string()],
             allowed_tools: vec!["read_file".to_string()],
             required_artifacts: Vec::new(),
-            verification: vec!["cargo check".to_string()],
+            execution_checks: vec!["cargo check".to_string()],
+            acceptance_criteria: Vec::new(),
             retry_count: 1,
             max_retries: 2,
             failure_fingerprint: None,

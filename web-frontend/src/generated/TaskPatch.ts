@@ -14,5 +14,6 @@ export type TaskPatch = {
   files: Array<string> | null;
   allowed_tools: Array<string> | null;
   required_artifacts: Array<string> | null;
-  verification: Array<string> | null;
+  execution_checks: Array<string> | null;
+  acceptance_criteria: Array<string> | null;
 };

@@ -569,6 +569,13 @@ export const taskRuntimeApi = {
     isTauri()
       ? apiInvoke<{ kind: string; run_id: string }>('resume_task_run', { runId })
       : post(`/task_runtime/runs/${runId}/resume`),
+  retryBlockedTask: (runId: string, taskId: string) =>
+    isTauri()
+      ? apiInvoke<{ kind: string; run_id: string; task_id: string; next_attempt: number }>(
+          'retry_blocked_task',
+          { runId, taskId }
+        )
+      : post(`/task_runtime/runs/${runId}/tasks/${taskId}/retry`),
   resolveRecoveryTask: (runId: string, taskId: string, decision: 'retry' | 'skip') =>
     isTauri()
       ? apiInvoke<void>('resolve_recovery_task', { runId, taskId, decision })

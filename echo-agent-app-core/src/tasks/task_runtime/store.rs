@@ -638,7 +638,8 @@ impl TaskRuntimeStore {
                     || patch.files.is_some()
                     || patch.allowed_tools.is_some()
                     || patch.required_artifacts.is_some()
-                    || patch.verification.is_some()
+                    || patch.execution_checks.is_some()
+                    || patch.acceptance_criteria.is_some()
                 {
                     return Err(StoreError::InvalidPlan(
                         "cannot change execution contract of a Running task".into(),
@@ -871,7 +872,243 @@ impl TaskRuntimeStore {
         })
     }
 
-    // ── Reviews, artifacts, summaries ───────────────────────────────────
+    /// Bump `retry_count` on a task WITHOUT mutating its title/description.
+    /// Used by the executor's ExecutionFailed auto-retry path. Records a
+    /// single Note carrying the new retry_count + updated task body so the
+    /// rebuilder produces a plan.json where retry_count advanced (writing
+    /// the stale body first and the updated body second created an
+    /// inconsistent window on crash and emitted a redundant event).
+    pub fn increment_retry_count(
+        &self,
+        run_id: &str,
+        task_id: &str,
+        failure_fingerprint: Option<&str>,
+    ) -> Result<u32, StoreError> {
+        self.with_run_lock(run_id, || {
+            let plan = self
+                .get_plan(run_id)?
+                .ok_or(StoreError::PlanNotFound(run_id.to_string()))?;
+            let task = plan
+                .tasks
+                .iter()
+                .find(|t| t.id == task_id)
+                .ok_or_else(|| StoreError::TaskNotFound(task_id.to_string()))?;
+            let next = task.retry_count.saturating_add(1);
+            let mut updated = task.clone();
+            updated.retry_count = next;
+            updated.failure_fingerprint = failure_fingerprint.map(str::to_string);
+            self.shadow.append_event_line(
+                run_id,
+                Some(task_id),
+                None,
+                RuntimeEventKind::Note,
+                serde_json::json!({
+                    "kind": "fix_task_persisted",
+                    "retry_count": next,
+                    "failure_fingerprint": failure_fingerprint,
+                    "task": updated,
+                }),
+            )?;
+            self.shadow.rewrite_plan(run_id)?;
+            Ok(next)
+        })
+    }
+
+    /// Atomically retry a Blocked/Failed task in a Paused/Failed run.
+    ///
+    /// Performs the full guard → retry_count bump → Pending → Running
+    /// transition under a single per-run write lock, so concurrent
+    /// retry_blocked_task callers cannot both pass the budget check and
+    /// double-bump retry_count. Returns the new attempt number on success,
+    /// or a StoreError on any precondition failure (run/task not in a
+    /// retryable state, retry budget exhausted). The caller is responsible
+    /// for spawning the executor after this returns Ok.
+    pub fn retry_blocked_task(&self, run_id: &str, task_id: &str) -> Result<u32, StoreError> {
+        self.with_run_lock(run_id, || {
+            // 1. Run must be Paused or Failed (the states acceptance failure
+            //    produces). Any other status is a concurrent retry / misuse.
+            let run = self
+                .get_run(run_id)?
+                .ok_or_else(|| StoreError::RunNotFound(run_id.to_string()))?;
+            if !matches!(run.status, TaskRunStatus::Paused | TaskRunStatus::Failed) {
+                return Err(StoreError::InvalidPlan(format!(
+                    "run {} is {:?}; retry requires Paused or Failed",
+                    run_id, run.status
+                )));
+            }
+            // 2. Task must be Blocked or Failed.
+            let plan = self
+                .get_plan(run_id)?
+                .ok_or_else(|| StoreError::PlanNotFound(run_id.to_string()))?;
+            let task = plan
+                .tasks
+                .iter()
+                .find(|t| t.id == task_id)
+                .cloned()
+                .ok_or_else(|| StoreError::TaskNotFound(task_id.to_string()))?;
+            if !matches!(task.status, TodoStatus::Blocked | TodoStatus::Failed) {
+                return Err(StoreError::InvalidPlan(format!(
+                    "task {} is {:?}; retry requires Blocked or Failed",
+                    task_id, task.status
+                )));
+            }
+            // 3. Budget check.
+            if task.retry_count >= task.max_retries {
+                return Err(StoreError::InvalidPlan(format!(
+                    "task {} retry budget exhausted ({}/{})",
+                    task_id, task.retry_count, task.max_retries
+                )));
+            }
+
+            // 4. Atomic retry_count bump + Pending transition under the same
+            //    lock. Title/description unchanged; attempt id derives from
+            //    retry_count+1 at dispatch time.
+            let next = task.retry_count.saturating_add(1);
+            let mut updated = task.clone();
+            updated.retry_count = next;
+            updated.status = TodoStatus::Pending;
+            self.shadow.append_event_line(
+                run_id,
+                Some(task_id),
+                None,
+                RuntimeEventKind::Note,
+                serde_json::json!({
+                    "kind": "fix_task_persisted",
+                    "retry_count": next,
+                    "failure_fingerprint": task.failure_fingerprint,
+                    "task": updated,
+                }),
+            )?;
+            self.shadow.append_event_line(
+                run_id,
+                Some(task_id),
+                None,
+                RuntimeEventKind::TodoUpdated,
+                serde_json::json!({
+                    "owner_agent": task.agent_role,
+                    "started_at": null,
+                    "completed_at": null,
+                    "status": "pending",
+                    "summary": format!("user-initiated retry (attempt {next})"),
+                }),
+            )?;
+
+            // A hard task failure propagates `Blocked` to its downstream
+            // dependents. Retrying only the failed node would leave those
+            // descendants permanently unschedulable because the DAG frontier
+            // accepts Pending tasks only. Reset precisely the descendants whose
+            // persisted blocker was created by that upstream-failure propagation;
+            // acceptance/review blockers keep their independent Blocked state.
+            let todos = self.list_todos(run_id)?;
+            let upstream_blocked: std::collections::HashSet<String> = todos
+                .iter()
+                .filter(|todo| {
+                    todo.status == TodoStatus::Blocked
+                        && todo.summary.as_deref() == Some("blocked: upstream task failed")
+                })
+                .map(|todo| todo.task_id.clone())
+                .collect();
+            let mut recovered = std::collections::HashSet::from([task_id.to_string()]);
+            let mut descendants = Vec::new();
+            loop {
+                let mut changed = false;
+                for candidate in &plan.tasks {
+                    if candidate.status != TodoStatus::Blocked
+                        || !upstream_blocked.contains(&candidate.id)
+                        || recovered.contains(&candidate.id)
+                        || !candidate
+                            .depends_on
+                            .iter()
+                            .any(|dep| recovered.contains(dep))
+                    {
+                        continue;
+                    }
+                    let still_blocked = candidate.depends_on.iter().any(|dep_id| {
+                        plan.tasks
+                            .iter()
+                            .find(|dep| dep.id == *dep_id)
+                            .is_some_and(|dep| {
+                                matches!(dep.status, TodoStatus::Failed | TodoStatus::Blocked)
+                                    && !recovered.contains(dep_id)
+                            })
+                    });
+                    if still_blocked {
+                        continue;
+                    }
+                    recovered.insert(candidate.id.clone());
+                    descendants.push(candidate.clone());
+                    changed = true;
+                }
+                if !changed {
+                    break;
+                }
+            }
+            for descendant in descendants {
+                self.shadow.append_event_line(
+                    run_id,
+                    Some(&descendant.id),
+                    None,
+                    RuntimeEventKind::TodoUpdated,
+                    serde_json::json!({
+                        "owner_agent": descendant.agent_role,
+                        "started_at": null,
+                        "completed_at": null,
+                        "status": "pending",
+                        "summary": format!("unblocked after retrying upstream task {task_id}"),
+                    }),
+                )?;
+            }
+            self.shadow.append_event_line(
+                run_id,
+                None,
+                None,
+                RuntimeEventKind::Note,
+                serde_json::json!({
+                    "message": format!("user retried blocked task {task_id} (attempt {next})"),
+                }),
+            )?;
+            self.shadow.rewrite_plan(run_id)?;
+
+            // 5. Run → Running (still under the lock so a racing caller sees
+            //    the new state and fails the run-status guard above).
+            self.transition_run_locked(run_id, TaskRunStatus::Running)?;
+            Ok(next)
+        })
+    }
+
+    /// Run-status transition without re-acquiring the per-run lock (for use
+    /// inside another `with_run_lock` closure). Validates the transition
+    /// and appends the event; does NOT itself call with_run_lock.
+    fn transition_run_locked(
+        &self,
+        run_id: &str,
+        next: TaskRunStatus,
+    ) -> Result<TaskRun, StoreError> {
+        let run = self
+            .get_run(run_id)?
+            .ok_or(StoreError::RunNotFound(run_id.to_string()))?;
+        let current = run.status;
+        if !current.can_transition_to(next) {
+            return Err(StoreError::IllegalTransition {
+                run_id: run_id.to_string(),
+                from: current.as_str().to_string(),
+                to: next.as_str().to_string(),
+            });
+        }
+        let now = chrono::Utc::now();
+        self.shadow.append_event_line(
+            run_id,
+            None,
+            None,
+            RuntimeEventKind::RunStatusChanged,
+            serde_json::json!({ "from": current.as_str(), "to": next.as_str() }),
+        )?;
+        self.shadow.rewrite_plan(run_id)?;
+        let mut run = run;
+        run.status = next;
+        run.updated_at = now;
+        Ok(run)
+    }
 
     pub fn add_review(&self, r: &ReviewResult) -> Result<(), StoreError> {
         self.with_run_lock(&r.run_id, || {
@@ -1946,6 +2183,109 @@ mod tests {
     }
 
     #[test]
+    fn retry_failed_upstream_restores_only_propagated_blocked_descendants() -> Result<(), StoreError>
+    {
+        let store = fresh();
+        store.create_run(
+            "retry-run",
+            "ws",
+            "c1",
+            "m1",
+            DomainProfile::General,
+            "retry a failed dependency chain",
+            "",
+            AttendedMode::Attended,
+        )?;
+        store.attach_plan(&TaskPlan {
+            plan_id: "retry-plan".to_string(),
+            run_id: "retry-run".to_string(),
+            domain_profile: DomainProfile::General,
+            goal: "retry a failed dependency chain".to_string(),
+            assumptions: Vec::new(),
+            risks: Vec::new(),
+            execution_mode: ExecutionMode::Sequential,
+            tasks: vec![
+                PlanTask {
+                    id: "upstream".to_string(),
+                    agent_role: "implementer".to_string(),
+                    max_retries: 2,
+                    ..sample_task_body("upstream")
+                },
+                PlanTask {
+                    id: "child".to_string(),
+                    agent_role: "reviewer".to_string(),
+                    depends_on: vec!["upstream".to_string()],
+                    ..sample_task_body("child")
+                },
+                PlanTask {
+                    id: "grandchild".to_string(),
+                    agent_role: "explorer".to_string(),
+                    depends_on: vec!["child".to_string()],
+                    ..sample_task_body("grandchild")
+                },
+                PlanTask {
+                    id: "acceptance-blocked".to_string(),
+                    agent_role: "reviewer".to_string(),
+                    ..sample_task_body("acceptance-blocked")
+                },
+            ],
+        })?;
+        store.transition_run("retry-run", TaskRunStatus::Running)?;
+        store.set_task_status(
+            "retry-run",
+            "upstream",
+            TodoStatus::Failed,
+            Some("implementer"),
+            Some("execution failed"),
+        )?;
+        for task_id in ["child", "grandchild"] {
+            store.set_task_status(
+                "retry-run",
+                task_id,
+                TodoStatus::Blocked,
+                None,
+                Some("blocked: upstream task failed"),
+            )?;
+        }
+        store.set_task_status(
+            "retry-run",
+            "acceptance-blocked",
+            TodoStatus::Blocked,
+            Some("reviewer"),
+            Some("review needs fix; awaiting explicit retry"),
+        )?;
+        store.transition_run("retry-run", TaskRunStatus::Failed)?;
+
+        assert_eq!(store.retry_blocked_task("retry-run", "upstream")?, 1);
+        let todos = store.list_todos("retry-run")?;
+        for task_id in ["upstream", "child", "grandchild"] {
+            let todo = todos
+                .iter()
+                .find(|todo| todo.task_id == task_id)
+                .ok_or_else(|| StoreError::TaskNotFound(task_id.to_string()))?;
+            assert_eq!(todo.status, TodoStatus::Pending, "{task_id}");
+        }
+        let upstream = todos
+            .iter()
+            .find(|todo| todo.task_id == "upstream")
+            .ok_or_else(|| StoreError::TaskNotFound("upstream".to_string()))?;
+        assert_eq!(upstream.owner_agent.as_deref(), Some("implementer"));
+        let independent = todos
+            .iter()
+            .find(|todo| todo.task_id == "acceptance-blocked")
+            .ok_or_else(|| StoreError::TaskNotFound("acceptance-blocked".to_string()))?;
+        assert_eq!(independent.status, TodoStatus::Blocked);
+        assert_eq!(
+            store
+                .get_run("retry-run")?
+                .ok_or_else(|| StoreError::RunNotFound("retry-run".to_string()))?
+                .status,
+            TaskRunStatus::Running
+        );
+        Ok(())
+    }
+
+    #[test]
     fn boot_recovery_pauses_run_and_preserves_completed_tasks() -> Result<(), StoreError> {
         let s = fresh();
         seed_plan(&s);
@@ -2427,7 +2767,8 @@ mod tests {
             files: Vec::new(),
             allowed_tools: vec!["read_file".to_string()],
             required_artifacts: Vec::new(),
-            verification: Vec::new(),
+            execution_checks: Vec::new(),
+            acceptance_criteria: Vec::new(),
             retry_count: 0,
             max_retries: 3,
             failure_fingerprint: None,

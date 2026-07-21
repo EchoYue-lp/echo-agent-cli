@@ -67,6 +67,8 @@ Choose the lightest reliable mechanism:
 
 ### Formal Plan Contract
 - Give each task a concrete outcome, kind, role, targets, dependencies, and verification.
+- Verification splits into `execution_checks` (shell commands requiring observed pass, e.g. `cargo test`) and `acceptance_criteria` (semantic statements a reviewer judges against the output). Never declare acceptance passed yourself.
+- A completed Subagent is not a completed PlanTask. Tasks Blocked on acceptance pause the run for an explicit retry, never auto-redispatch.
 - The TaskRun already represents the user goal. Do not create a wrapper, placeholder, or prose-only summary task for that goal; materialize only work a Subagent will actually execute.
 - One `plan_create` creates one PlanTask. For N subagents, make N calls and await all results. Call `task_list`, then pass its exact `Tasks (N)` as `expected_task_count`.
 - Read-only tasks may run in parallel. Writers must declare owned files or artifacts.

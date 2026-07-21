@@ -17,6 +17,11 @@ export type PlanTask = {
   domain_profile: DomainProfile;
   depends_on: Array<string>;
   parallel_group: string | null;
+  /**
+   * Read targets for read-only tasks. For mutating tasks, exact
+   * workspace-relative files are exclusive ownership; empty/broad/invalid
+   * declarations are unknown ownership and serialize with every writer.
+   */
   files: Array<string>;
   allowed_tools: Array<string>;
   /**
@@ -24,7 +29,17 @@ export type PlanTask = {
    * before this task may enter Completed.
    */
   required_artifacts: Array<string>;
-  verification: Array<string>;
+  /**
+   * Executable checks (shell commands, e.g. `cargo test --lib`). Each
+   * requires an observed pass recorded from runtime tool events; Subagent
+   * prose alone never satisfies them.
+   */
+  execution_checks: Array<string>;
+  /**
+   * Semantic acceptance criteria (e.g. `module boundary is clear`). Judged
+   * by the reviewer LLM against the Subagent output, never auto-passed.
+   */
+  acceptance_criteria: Array<string>;
   retry_count: number;
   max_retries: number;
   failure_fingerprint: string | null;

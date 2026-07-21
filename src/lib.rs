@@ -2,6 +2,10 @@ pub mod cli;
 pub mod logging;
 
 #[cfg(feature = "gui")]
+// `#[tauri::command]` expands to dispatch glue containing `unreachable!()`.
+// Keep the exception at the generated IPC boundary; application/core code
+// remains covered by the workspace's strict panic lint gate.
+#[allow(clippy::unreachable)]
 pub mod tauri;
 
 #[cfg(feature = "tui")]

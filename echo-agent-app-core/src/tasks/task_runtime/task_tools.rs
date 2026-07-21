@@ -325,7 +325,8 @@ impl Tool for TaskCreateTool {
                 "files": { "type": "array", "items": { "type": "string" }, "description": "For writers: exact workspace-relative files exclusively owned by this task. Empty/glob/broad scopes are treated as unknown and serialized. For readers: inspection targets only." },
                 "allowed_tools": { "type": "array", "items": { "type": "string" }, "description": "Tools allowed for this task" },
                 "required_artifacts": { "type": "array", "items": { "type": "string" }, "description": "Artifact paths or suffixes required for completion" },
-                "verification": { "type": "array", "items": { "type": "string" }, "description": "Checks that require observed successful execution" },
+                "execution_checks": { "type": "array", "items": { "type": "string" }, "description": "Executable checks (shell commands, e.g. 'cargo test --lib'). Each requires an observed pass from runtime tool events; Subagent prose alone never satisfies them." },
+                "acceptance_criteria": { "type": "array", "items": { "type": "string" }, "description": "Semantic acceptance criteria (e.g. 'module boundary is clear'). Judged by the reviewer LLM against the Subagent output, never auto-passed." },
                 "after_task_id": { "type": "string", "description": "Insert after this task id (optional)" }
             },
             "required": ["title","description","kind"]
@@ -417,7 +418,10 @@ impl TaskCreateTool {
         let files = string_array("files");
         let allowed_tools = string_array("allowed_tools");
         let required_artifacts = string_array("required_artifacts");
-        let verification = string_array("verification");
+        // Execution checks are shell commands the Subagent must run; acceptance
+        // criteria are prose judged by the reviewer LLM.
+        let execution_checks = string_array("execution_checks");
+        let acceptance_criteria = string_array("acceptance_criteria");
         let requested_subagent = params
             .get("subagent")
             .and_then(|value| value.as_str())
@@ -461,7 +465,8 @@ impl TaskCreateTool {
             files,
             allowed_tools,
             required_artifacts,
-            verification,
+            execution_checks,
+            acceptance_criteria,
             status: TodoStatus::Pending,
             ..Default::default()
         };
@@ -595,7 +600,7 @@ fn complex_run_prompt(
     let plan_contract = if plan_mode == "direct_execute" {
         "Complete the goal directly with ordinary tools when that remains the lightest reliable path. Do not create a placeholder plan merely for ceremony. If execution reveals real dependencies, parallel work, or separately verifiable outcomes, upgrade to a formal DAG with one plan_create call per node, verify the count with task_list, and call plan_execute with expected_task_count."
     } else {
-        "This run requires a formal, reviewable DAG. The TaskRun already represents the overall goal, so do not create a wrapper, placeholder, or prose-only summary PlanTask for it. Each plan_create call materializes exactly one executable node: create one node per intended subagent and wait for every result. Assign an appropriate subagent to every node, declare real dependencies, artifacts, files, and verification, then call task_list and pass its exact Tasks (N) count as expected_task_count to plan_execute. Do not claim tasks were dispatched before plan_execute starts."
+        "This run requires a formal, reviewable DAG. The TaskRun already represents the overall goal, so do not create a wrapper, placeholder, or prose-only summary PlanTask for it. Each plan_create call materializes exactly one executable node: create one node per intended subagent and wait for every result. Assign an appropriate subagent to every node, declare real dependencies, artifacts, files, and verification. Verification splits into `execution_checks` (shell commands requiring observed pass, e.g. `cargo test`) and `acceptance_criteria` (semantic statements a reviewer will judge, e.g. `module boundary is clear`). A Subagent completing is not the PlanTask completing — tasks blocked on acceptance pause the run and wait for an explicit retry; they are never auto-redispatched. Then call task_list and pass its exact Tasks (N) count as expected_task_count to plan_execute. Do not claim tasks were dispatched before plan_execute starts."
     };
     let initial = if initial_plan.is_empty() {
         "None supplied; derive the smallest complete decomposition from evidence.".to_string()
@@ -1250,7 +1255,8 @@ impl Tool for TaskUpdateTool {
                 "files": { "type": "array", "items": { "type": "string" }, "description": "New exact workspace-relative ownership files (optional); broad/empty writer scopes serialize" },
                 "allowed_tools": { "type": "array", "items": { "type": "string" }, "description": "New tool allowlist (optional)" },
                 "required_artifacts": { "type": "array", "items": { "type": "string" }, "description": "New required artifact list (optional)" },
-                "verification": { "type": "array", "items": { "type": "string" }, "description": "New required verification list (optional)" }
+                "execution_checks": { "type": "array", "items": { "type": "string" }, "description": "New executable check list (optional). Each requires observed pass." },
+                "acceptance_criteria": { "type": "array", "items": { "type": "string" }, "description": "New semantic acceptance criteria (optional). Judged by reviewer LLM." }
             },
             "required": ["task_id"]
         })
@@ -1290,7 +1296,8 @@ impl Tool for TaskUpdateTool {
                 files: optional_string_array(&params, "files"),
                 allowed_tools: optional_string_array(&params, "allowed_tools"),
                 required_artifacts: optional_string_array(&params, "required_artifacts"),
-                verification: optional_string_array(&params, "verification"),
+                execution_checks: optional_string_array(&params, "execution_checks"),
+                acceptance_criteria: optional_string_array(&params, "acceptance_criteria"),
                 ..Default::default()
             };
             match self.store.update_task(&run_id, &task_id, patch) {

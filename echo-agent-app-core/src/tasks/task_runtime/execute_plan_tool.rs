@@ -36,48 +36,87 @@ use crate::agent_handle::AgentHandle;
 /// Duplicate plan_execute calls can be emitted by the model or a resumed turn.
 /// Serializing per run keeps one authoritative DAG driver and lets later calls
 /// re-read terminal task state instead of dispatching completed nodes again.
-static RUN_EXECUTION_LOCKS: LazyLock<DashMap<String, Arc<TokioMutex<()>>>> =
+///
+/// Stored as `Weak<TokioMutex>`: when the last guard drops, the Weak
+/// automatically fails to upgrade, so the next acquire builds a fresh Arc.
+/// This avoids the remove-on-drop race that the prior `Arc` + `Drop::remove`
+/// implementation had: between `drop(guard)` and `map.remove()`, a racing
+/// `acquire` could clone the about-to-be-removed Arc, while a third caller
+/// arriving after `remove` built a brand-new Arc — two live Mutexes for the
+/// same run, mutual exclusion lost. Weak eliminates the window entirely:
+/// there is no remove step, and stale entries are reclaimed lazily on the
+/// next `acquire` (entry is replaced when upgrade fails).
+static RUN_EXECUTION_LOCKS: LazyLock<DashMap<String, std::sync::Weak<TokioMutex<()>>>> =
     LazyLock::new(DashMap::new);
 
-/// RAII guard: 持有 run 的执行锁, Drop 时同时从 `RUN_EXECUTION_LOCKS` 删除该 entry。
-///
-/// 修复 P1-1: 此前 entry 只 insert 不 remove, 每个唯一 run_id 永久占内存,
-/// Tauri 长期运行数月后累积数千无用 entry。用 guard 封装保证无论从哪条路径
-/// 返回 (提前 ? / 正常 return), lock 释放的同时 entry 被清理。
-///
-/// 用 `OwnedMutexGuard` (来自 `Arc<TokioMutex>::lock_owned`) 而非 `MutexGuard`,
-/// 这样 guard 不借用任何外部引用, 可自由移动、放入结构体, 无自引用 / 生命周期问题。
-/// Drop 顺序由字段声明顺序保证: Rust 按声明逆序 drop, 即先 drop `_guard` (释放锁),
-/// 再 drop `_lock_owned`(map 删除由显式 Drop impl 完成)。
+/// RAII guard holding a per-run execution lock. Releasing the guard drops
+/// the strong reference; the `DashMap` entry (Weak) then becomes inert and
+/// is replaced by the next `acquire_run_execution_lock` caller.
 struct RunExecutionGuard {
-    /// Owned guard 不借外部引用, 持有它即持有锁。Option 包裹以便 Drop 里 take。
+    /// Owned guard from `Arc<TokioMutex>::lock_owned`. Does not borrow any
+    /// external reference, so it can be moved freely. Held in `Option` so
+    /// the explicit `Drop` impl can `take()` it before the rest of `self`
+    /// is torn down.
     _guard: Option<tokio::sync::OwnedMutexGuard<()>>,
-    run_id: String,
+    /// Strong reference kept alive for the guard's lifetime so the DashMap
+    /// Weak keeps upgrading successfully for any racing caller that cloned
+    /// this same Arc before we dropped the guard.
+    _keep_alive: Arc<TokioMutex<()>>,
 }
 
 impl Drop for RunExecutionGuard {
     fn drop(&mut self) {
-        // 必须先释放锁再删 entry, 否则在"entry 已删 + 锁仍持有"的窗口内,
-        // 另一个 acquire 会建新 lock 并进入临界区, 破坏 per-run 互斥语义。
-        // take() 出 guard 显式 drop → 释放锁, 然后才删 map entry。
+        // Drop order: _guard first (release the mutex), then _keep_alive
+        // (decrement strong count). After this the DashMap entry's Weak can
+        // no longer upgrade — the next acquire replaces it with a fresh Arc.
         if let Some(g) = self._guard.take() {
             drop(g);
         }
-        let _ = RUN_EXECUTION_LOCKS.remove(&self.run_id);
     }
 }
 
-/// 获取 (并等待) 某个 run 的执行锁, 返回 RAII guard 负责释放锁 + 清理 entry。
+/// Acquire (and wait on) the per-run execution lock. Returns an RAII guard
+/// that releases the lock on drop. Concurrent callers for the same run_id
+/// share the same `Arc<TokioMutex>` (one waits while the other holds it).
 async fn acquire_run_execution_lock(run_id: &str) -> RunExecutionGuard {
-    let lock = RUN_EXECUTION_LOCKS
-        .entry(run_id.to_string())
-        .or_insert_with(|| Arc::new(TokioMutex::new(())))
-        .clone();
-    // lock_owned 需要 Arc<TokioMutex>, 返回 OwnedMutexGuard (不绑引用, 可自由移动)。
-    let guard = lock.lock_owned().await;
+    // Fast path: an entry exists and its Weak still upgrades — share it.
+    if let Some(arc) = RUN_EXECUTION_LOCKS
+        .get(run_id)
+        .and_then(|weak| weak.upgrade())
+    {
+        let guard = arc.clone().lock_owned().await;
+        return RunExecutionGuard {
+            _guard: Some(guard),
+            _keep_alive: arc,
+        };
+        // Weak was dead (previous holder fully dropped). Fall through to
+        // replace the stale entry.
+    }
+    // Build a fresh Arc and try to install it. Entry API makes this
+    // race-safe: if two callers race here, the loser sees the winner's
+    // entry via Occupied and shares that Arc instead.
+    let new_arc = Arc::new(TokioMutex::new(()));
+    let arc = match RUN_EXECUTION_LOCKS.entry(run_id.to_string()) {
+        dashmap::mapref::entry::Entry::Occupied(mut occ) => {
+            if let Some(existing_arc) = occ.get().upgrade() {
+                // Another caller installed a live entry between our get()
+                // and entry() — share theirs instead of replacing.
+                existing_arc
+            } else {
+                // Stale entry; replace with our fresh Weak.
+                occ.insert(Arc::downgrade(&new_arc));
+                new_arc
+            }
+        }
+        dashmap::mapref::entry::Entry::Vacant(vac) => {
+            vac.insert(Arc::downgrade(&new_arc));
+            new_arc
+        }
+    };
+    let guard = arc.clone().lock_owned().await;
     RunExecutionGuard {
         _guard: Some(guard),
-        run_id: run_id.to_string(),
+        _keep_alive: arc,
     }
 }
 
@@ -300,12 +339,21 @@ impl Tool for ExecutePlanTool {
                     )));
                 }
             };
+            // Wire the reviewer LLM from the primary agent. Without this the
+            // review gate falls through to Skipped, which (per M7) must NOT
+            // auto-pass — tasks with acceptance_criteria would block forever.
+            // Sharing the primary agent's client is fine: review calls are
+            // sequential per task and bounded by max_parallel_llm_calls.
+            let reviewer_llm = self
+                .primary_agent
+                .read(|agent| agent.llm_client().cloned())
+                .await;
             let outcome = super::task_tools::CURRENT_UNATTENDED_WRITE_MODE
                 .scope(write_mode, async {
                     execute_run(
                         self.store.clone(),
                         Some(self.primary_agent.clone()),
-                        None, // reviewer_llm — 暂时 None, 后续由上层配置
+                        reviewer_llm,
                         None, // layer_manager — 暂时 None
                         run_store,
                         trace_sink,

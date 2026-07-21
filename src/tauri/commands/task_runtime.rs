@@ -298,6 +298,113 @@ pub async fn resume_task_run(
     }))
 }
 
+/// Explicitly retry a Blocked (or Failed) task in a Paused (or Failed) run.
+///
+/// This is the only sanctioned way to re-run a task whose previous attempt
+/// completed but failed acceptance/review: the executor no longer
+/// auto-redispatches on acceptance failure (M7). Bumps `retry_count`,
+/// resets the task to Pending, transitions the run to Running, and spawns
+/// the executor. Title and description are preserved; the next attempt
+/// gets a fresh `execution_id = "{task_id}:{retry_count+1}"`.
+///
+/// Honors the `max_retries` budget: returns a validation error when
+/// `retry_count >= max_retries`.
+#[tauri::command]
+pub async fn retry_blocked_task(
+    state: tauri::State<'_, TauriState>,
+    app: tauri::AppHandle,
+    run_id: String,
+    task_id: String,
+) -> Result<serde_json::Value, IpcError> {
+    let store = store(&state)?;
+    // Single atomic per-run transaction: validate run is Paused/Failed,
+    // task is Blocked/Failed, retry_count < max_retries, then bump
+    // retry_count, set Pending, and transition run to Running — all under
+    // one lock so concurrent retry requests serialize.
+    let next_retry = store
+        .retry_blocked_task(&run_id, &task_id)
+        .map_err(|e| match e {
+            echo_agent_app_core::tasks::task_runtime::StoreError::InvalidPlan(msg) => {
+                IpcError::Validation(msg)
+            }
+            other => internal(other),
+        })?;
+    tracing::info!(run_id = %run_id, task_id = %task_id, attempt = next_retry, "blocked task retried atomically -> run Running");
+
+    // Resume the run via the standard execute_run path (mirrors resume_task_run).
+    let primary_agent = state.app_state.connection.primary_agent();
+    let store_for_task = store.clone();
+    let primary_agent_for_task = primary_agent.clone();
+    let run_store_for_task = primary_agent.read(|a| a.run_store().cloned()).await;
+    let reviewer_llm = primary_agent.read(|a| a.llm_client().cloned()).await;
+    let layer_manager = state
+        .app_state
+        .review_integration
+        .as_ref()
+        .map(|ri| std::sync::Arc::new(ri.create_layer_manager()));
+    let cancel = echo_agent::agent::CancellationToken::new();
+    let cancel_registration = match store.register_run_cancellation(&run_id, cancel.clone()) {
+        Ok(registration) => registration,
+        Err(error) => {
+            let _ = store.transition_run(
+                &run_id,
+                echo_agent_app_core::tasks::task_runtime::TaskRunStatus::Paused,
+            );
+            return Err(internal(error));
+        }
+    };
+    // Run was already transitioned to Running inside retry_blocked_task's
+    // atomic section. Skip resume_task_run here — it would re-attempt the
+    // Paused → Running transition and fail with IllegalTransition.
+    let trace_sink: echo_agent_app_core::tasks::task_runtime::ExecSink = Arc::new(move |ev| {
+        let mut payload = serde_json::Map::new();
+        payload.insert("kind".into(), "run".into());
+        payload.insert("run_id".into(), ev.run_id.into());
+        payload.insert("event".into(), ev.event.into());
+        if let serde_json::Value::Object(fields) = ev.payload {
+            for (k, v) in fields {
+                payload.insert(k, v);
+            }
+        }
+        let _ = app.emit("execution://event", serde_json::Value::Object(payload));
+    });
+    let run_id_for_task = run_id.clone();
+
+    tokio::spawn(async move {
+        let _cancel_registration = cancel_registration;
+        let outcome = echo_agent_app_core::tasks::task_runtime::execute_run(
+            store_for_task.clone(),
+            Some(primary_agent_for_task),
+            reviewer_llm,
+            layer_manager,
+            run_store_for_task,
+            Some(trace_sink),
+            &run_id_for_task,
+            cancel,
+            echo_agent_app_core::tasks::task_runtime::MemoryPolicy::FireAndForget,
+        )
+        .await;
+        match outcome {
+            Ok(echo_agent_app_core::tasks::task_runtime::RunOutcome::Completed) => {
+                tracing::info!(run_id = %run_id_for_task, "retried run completed");
+            }
+            Ok(other) => {
+                tracing::warn!(run_id = %run_id_for_task, ?other, "retried run ended non-completed");
+            }
+            Err(e) => {
+                tracing::error!(run_id = %run_id_for_task, error = %e, "retried run executor error");
+            }
+        }
+    });
+
+    Ok(serde_json::json!({
+        "kind": "retry_scheduled",
+        "run_id": run_id,
+        "task_id": task_id,
+        "next_attempt": next_retry,
+    }))
+}
+
 /// Insert a new task into a run's plan. Works in any run state. The task is
 /// inserted after `after_task_id` (or at the front if null). Validates
 /// dependency integrity and acyclicity.
