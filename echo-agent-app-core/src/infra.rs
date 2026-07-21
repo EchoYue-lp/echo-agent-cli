@@ -27,7 +27,7 @@ const DEFAULT_MAX_TOKENS: u32 = 8192;
 const DEFAULT_MAX_TOOL_OUTPUT_TOKENS: usize = 8_000;
 const TOOL_OUTPUT_ARTIFACT_MAX_AGE_SECS: u64 = 30 * 24 * 60 * 60;
 const SUBAGENT_LANGUAGE_GUIDE: &str = r#"# Response Language
-Use the same natural language as the user's request. Follow the assigned task's language when the original request is not present. An explicit request for another output language wins. Keep code, identifiers, paths, commands, protocol fields, the exact `## Result` heading, and verbatim logs unchanged."#;
+The user's original request is the only language anchor. Reply in that language for all natural-language prose — progress, summaries, task titles/descriptions, details, recommendations, and result sections. Do NOT follow the language of this role prompt, the assigned task template, structural labels (e.g. "Parent goal", "Task", "Read targets"), source code, tool output, or logs. If the current request is only code/paths/numbers/emoji with no clear natural language, use the language of the most recent clear user message in the conversation. An explicit requested output language always wins. Keep code, identifiers, paths, commands, protocol fields, the exact `## Result` heading, and verbatim logs unchanged."#;
 
 fn resolved_max_tool_output_tokens(configured: usize) -> usize {
     if configured > 0 {
@@ -1984,11 +1984,15 @@ mod resolve_subagent_model_tests {
     }
 
     #[test]
-    fn subagent_prompt_follows_user_and_assigned_task_language() {
+    fn subagent_prompt_anchors_language_to_user_request_only() {
         let prompt = compose_subagent_system_prompt("# Role\nInspect the assigned code.");
-        assert!(prompt.contains("same natural language as the user's request"));
-        assert!(prompt.contains("assigned task's language"));
+        assert!(prompt.contains("only language anchor"));
+        assert!(prompt.contains("Do NOT follow"));
         assert!(prompt.contains("exact `## Result` heading"));
+        // The old reverse rule ("follow the assigned task's language") must be
+        // gone — the assigned task template is English and would pull output
+        // back to English.
+        assert!(!prompt.contains("Follow the assigned task's language"));
     }
 
     #[test]

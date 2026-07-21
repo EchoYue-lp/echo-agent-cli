@@ -2609,7 +2609,12 @@ fn build_task_prompt(
         profile.key, profile.label, profile.execution_guidance
     ));
     if let Some(goal) = parent_goal.filter(|goal| !goal.trim().is_empty()) {
-        s.push_str(&format!("Parent goal: {goal}\n\n"));
+        // This goal is the user's original request and the only language
+        // anchor for this task. The structural labels and contract below are
+        // English; the subagent must not let them switch its output language.
+        s.push_str(&format!(
+            "User goal (this is the language anchor — reply in this language):\n{goal}\n\n"
+        ));
     }
     s.push_str(&format!("Task: {}\n\n{}\n\n", task.title, task.description));
     // Summary Chain: compact context from completed upstream tasks. Replaces
@@ -2698,6 +2703,12 @@ fn build_task_prompt(
          ```\n\
          Suggest only independently executable work necessary for the parent goal; do not use \
          suggestions as a substitute for completing the assigned task.\n",
+    );
+    s.push_str(
+        "\nLanguage: write all natural-language output (summary, details, progress, recommendations, \
+         suggested task prose) in the language of the User goal above. Ignore the English \
+         structural labels and contract in this prompt when choosing the language. Keep code, \
+         identifiers, paths, commands, and the exact `## Result` heading unchanged.\n",
     );
     s.push_str(
         "\nReturn contract: end with `## Result` followed by exactly one fenced JSON object:\n\
@@ -4523,7 +4534,11 @@ Read the runtime path and found one missing branch.
             echo_agent::tasks::NestedDelegationPolicy::default(),
             Some("Fix the GUI context runtime"),
         );
-        assert!(p.contains("Parent goal: Fix the GUI context runtime"));
+        assert!(p.contains("User goal (this is the language anchor"));
+        assert!(p.contains("Fix the GUI context runtime"));
+        // The language reminder must appear so the English structural labels
+        // do not switch the subagent's output language.
+        assert!(p.contains("Language: write all natural-language output"));
         assert!(p.contains("READ-ONLY"));
         assert!(p.contains("chat.rs"));
         assert!(p.contains("report root cause"));
