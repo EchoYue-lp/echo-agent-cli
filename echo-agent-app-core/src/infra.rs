@@ -26,6 +26,8 @@ const DEFAULT_MAX_TOKENS: u32 = 8192;
 /// framework keeps 0 as opt-out so other consumers choose their own budget.
 const DEFAULT_MAX_TOOL_OUTPUT_TOKENS: usize = 8_000;
 const TOOL_OUTPUT_ARTIFACT_MAX_AGE_SECS: u64 = 30 * 24 * 60 * 60;
+const SUBAGENT_LANGUAGE_GUIDE: &str = r#"# Response Language
+Use the same natural language as the user's request. Follow the assigned task's language when the original request is not present. An explicit request for another output language wins. Keep code, identifiers, paths, commands, protocol fields, the exact `## Result` heading, and verbatim logs unchanged."#;
 
 fn resolved_max_tool_output_tokens(configured: usize) -> usize {
     if configured > 0 {
@@ -33,6 +35,10 @@ fn resolved_max_tool_output_tokens(configured: usize) -> usize {
     } else {
         DEFAULT_MAX_TOOL_OUTPUT_TOKENS
     }
+}
+
+fn compose_subagent_system_prompt(role_prompt: &str) -> String {
+    format!("{}\n\n{}", role_prompt.trim(), SUBAGENT_LANGUAGE_GUIDE)
 }
 
 /// Product-owned storage policy for complete oversized tool output.
@@ -61,12 +67,12 @@ pub(crate) const TASK_MANAGEMENT_GUIDE: &str = r#"
 
 Choose the lightest reliable mechanism:
 - Direct work: simple questions, narrow edits, short tool sequences.
-- `agent_tool`: one bounded ad-hoc subtask in Chat mode. It does not create a TaskRun or appear in the TaskRuntime panel. Fresh is default; fork only when history is required.
+- `agent_tool`: one bounded Chat subtask. Fresh, no TaskRuntime entry; fork only for required history.
 - `plan_create` + `task_list` + `plan_execute({plan_revision: N})`: the required path for any delegated work in Auto or Task mode, and for dependencies, parallel work, writers, or verification.
-- `create_complex_task`: a long-lived Run that must survive the chat turn or needs substantial orchestration.
+- `create_complex_task`: a long-lived Run for cross-turn or substantial orchestration.
 
 ### Formal Plan Contract
-- Give each task a concrete outcome, kind, role, targets, dependencies, and verification.
+- Use the user's language for task titles, descriptions, and Subagent briefs; preserve technical identifiers. Give each task a concrete outcome, kind, role, targets, dependencies, and verification.
 - Verification splits into `execution_checks` (shell commands requiring observed pass, e.g. `cargo test`) and `acceptance_criteria` (semantic statements a reviewer judges against the output). Never declare acceptance passed yourself.
 - A completed Subagent is not a completed PlanTask. Tasks Blocked on acceptance pause the run for an explicit retry, never auto-redispatch.
 - The TaskRun already represents the user goal. Do not create a wrapper, placeholder, or prose-only summary task for that goal; materialize only work a Subagent will actually execute.
@@ -894,10 +900,11 @@ fn build_writer_subagent_agent(
     // by the worktree (Sprint 8): the subagent's working_dir is bound to its own
     // worktree checkout, so writes can't reach the main workspace even though
     // the tools could.
+    let system_prompt = compose_subagent_system_prompt(prompt);
     let mut builder = ReactAgentBuilder::new()
         .model(model)
         .name(name)
-        .system_prompt(prompt)
+        .system_prompt(&system_prompt)
         .enable_tools()
         // NO .readonly_tools() → full tool set (write capability).
         .enable_memory()
@@ -967,10 +974,11 @@ fn build_readonly_subagent_agent(
     max_iterations: usize,
     browser_runtime: Option<Arc<crate::browser::BrowserRuntime>>,
 ) -> std::result::Result<ReactAgent, echo_agent::error::ReactError> {
+    let system_prompt = compose_subagent_system_prompt(prompt);
     let mut builder = ReactAgentBuilder::new()
         .model(model)
         .name(name)
-        .system_prompt(prompt)
+        .system_prompt(&system_prompt)
         .enable_tools()
         .readonly_tools() // SA-2: physical enforcement — no shell/write tools
         .enable_memory()
@@ -1963,7 +1971,8 @@ pub fn build_llm_config(
 mod resolve_subagent_model_tests {
     use super::{
         DEFAULT_MAX_TOOL_OUTPUT_TOKENS, TASK_MANAGEMENT_GUIDE, build_writer_subagent_agent,
-        configure_run_code_capability, resolve_subagent_model, resolved_max_tool_output_tokens,
+        compose_subagent_system_prompt, configure_run_code_capability, resolve_subagent_model,
+        resolved_max_tool_output_tokens,
     };
     use echo_agent::agent::ReactAgentBuilder;
     use echo_agent::sandbox::SandboxManager;
@@ -1972,6 +1981,14 @@ mod resolve_subagent_model_tests {
     #[test]
     fn stable_task_guide_stays_within_cache_budget() {
         assert!(TASK_MANAGEMENT_GUIDE.chars().count() <= 2_400);
+    }
+
+    #[test]
+    fn subagent_prompt_follows_user_and_assigned_task_language() {
+        let prompt = compose_subagent_system_prompt("# Role\nInspect the assigned code.");
+        assert!(prompt.contains("same natural language as the user's request"));
+        assert!(prompt.contains("assigned task's language"));
+        assert!(prompt.contains("exact `## Result` heading"));
     }
 
     #[test]

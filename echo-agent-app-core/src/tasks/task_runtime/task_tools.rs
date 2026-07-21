@@ -460,8 +460,8 @@ fn plan_task_input_schema() -> serde_json::Value {
         "additionalProperties": false,
         "properties": {
             "id": { "type": "string", "description": "Stable task id unique within this run" },
-            "title": { "type": "string" },
-            "description": { "type": "string" },
+            "title": { "type": "string", "description": "User-visible task title in the user's current language; keep technical identifiers unchanged" },
+            "description": { "type": "string", "description": "Subagent brief in the user's current language; keep code, paths, commands, and technical identifiers unchanged" },
             "kind": { "type": "string", "enum": ["implementation","debugging","verification","review","investigation","test_plan","summary","read_only_review"] },
             "subagent": { "type": "string", "description": "Registered Subagent role; omit for the domain default" },
             "depends_on": { "type": "array", "items": { "type": "string" } },
@@ -816,8 +816,8 @@ impl Tool for PlanPatchTool {
                                         "type": "object",
                                         "additionalProperties": false,
                                         "properties": {
-                                            "title": { "type": "string" },
-                                            "description": { "type": "string" },
+                                            "title": { "type": "string", "description": "User-visible task title in the user's current language" },
+                                            "description": { "type": "string", "description": "Subagent brief in the user's current language" },
                                             "kind": { "type": "string", "enum": ["implementation","debugging","verification","review","investigation","test_plan","summary","read_only_review"] },
                                             "agent_role": { "type": "string" },
                                             "depends_on": { "type": "array", "items": { "type": "string" } },
@@ -995,6 +995,21 @@ mod plan_create_tests {
         let mut params = ToolParameters::new();
         params.insert("tasks".to_string(), serde_json::json!([task]));
         params
+    }
+
+    #[test]
+    fn plan_task_schema_keeps_generated_briefs_in_user_language() {
+        let schema = plan_task_input_schema();
+        let title = schema
+            .pointer("/properties/title/description")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let description = schema
+            .pointer("/properties/description/description")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert!(title.contains("user's current language"));
+        assert!(description.contains("user's current language"));
     }
 
     #[tokio::test]

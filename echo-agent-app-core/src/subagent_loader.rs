@@ -225,6 +225,9 @@ pub fn format_subagent_catalog(defs: &[SubagentDefinition]) -> String {
          Use agent_tool for noisy/bounded side work. Prefer plan_execute for multi-step DAGs.\n\
          Default context is fresh; set mode=fork only when the subagent needs shared session background.\n",
     );
+    out.push_str(
+        "Write each Subagent task brief in the user's current language; keep technical identifiers unchanged.\n",
+    );
     for d in defs {
         let flags = [
             d.readonly.then_some("readonly"),
