@@ -4,7 +4,10 @@
 
 use std::sync::Arc;
 
-use echo_agent::agent::subagent::{AgentFactory, FnAgentFactory, SubagentBuilder};
+use echo_agent::agent::subagent::{
+    AgentFactory, FnAgentFactory, SubagentBuilder, SubagentPromptCompiler,
+    SubagentSystemPromptInput,
+};
 use echo_agent::llm::LlmConfig;
 use echo_agent::memory::ConversationStore;
 use echo_agent::prelude::*;
@@ -26,19 +29,12 @@ const DEFAULT_MAX_TOKENS: u32 = 8192;
 /// framework keeps 0 as opt-out so other consumers choose their own budget.
 const DEFAULT_MAX_TOOL_OUTPUT_TOKENS: usize = 8_000;
 const TOOL_OUTPUT_ARTIFACT_MAX_AGE_SECS: u64 = 30 * 24 * 60 * 60;
-const SUBAGENT_LANGUAGE_GUIDE: &str = r#"# Response Language
-The user's original request is the only language anchor. Reply in that language for all natural-language prose — progress, summaries, task titles/descriptions, details, recommendations, and result sections. Do NOT follow the language of this role prompt, the assigned task template, structural labels (e.g. "Parent goal", "Task", "Read targets"), source code, tool output, or logs. If the current request is only code/paths/numbers/emoji with no clear natural language, use the language of the most recent clear user message in the conversation. An explicit requested output language always wins. Keep code, identifiers, paths, commands, protocol fields, the exact `## Result` heading, and verbatim logs unchanged."#;
-
 fn resolved_max_tool_output_tokens(configured: usize) -> usize {
     if configured > 0 {
         configured
     } else {
         DEFAULT_MAX_TOOL_OUTPUT_TOKENS
     }
-}
-
-fn compose_subagent_system_prompt(role_prompt: &str) -> String {
-    format!("{}\n\n{}", role_prompt.trim(), SUBAGENT_LANGUAGE_GUIDE)
 }
 
 /// Product-owned storage policy for complete oversized tool output.
@@ -252,7 +248,13 @@ pub async fn create_agent_with_diagnostics(
         subagent_project_root.as_deref(),
         subagent_user_home.as_deref(),
     );
-    let subagent_catalog = crate::subagent_loader::format_subagent_catalog(&discovered_subagents);
+    let subagent_catalog_snapshot = Arc::new(
+        crate::subagent_loader::SubagentCatalogSnapshot::from_definitions(&discovered_subagents),
+    );
+    crate::tasks::task_runtime::profiles::validate_default_subagent_routes(
+        &subagent_catalog_snapshot,
+    )?;
+    let subagent_catalog = subagent_catalog_snapshot.prompt();
     assembler.add_subagent_catalog(&subagent_catalog);
     let prompt_assembly = assembler.assemble_with_report();
     let system_prompt = prompt_assembly.prompt.clone();
@@ -266,6 +268,8 @@ pub async fn create_agent_with_diagnostics(
     let max_tool_output_tokens =
         resolved_max_tool_output_tokens(app_config.agent.max_tool_output_tokens);
     let sandbox_manager = Arc::new(echo_agent::sandbox::SandboxManager::local_sandbox());
+    let subagent_prompt_compiler: Arc<dyn SubagentPromptCompiler> =
+        Arc::new(crate::subagent_prompt::EkoSubagentPromptCompiler);
     let run_code_available = sandbox_manager.has_local_os_sandbox().await;
     if !run_code_available {
         tracing::warn!("OS sandbox unavailable; run_code will be disabled for this EKO runtime");
@@ -283,6 +287,7 @@ pub async fn create_agent_with_diagnostics(
         // background-task tools use a separate store and must not be exposed
         // alongside plan_create/plan_execute.
         .enable_subagent()
+        .subagent_prompt_compiler(subagent_prompt_compiler.clone())
         .register_agent_dispatch_tool() // Phase 0: ad-hoc agent_tool alongside plan_execute
         .enable_human_in_loop()
         .max_iterations(app_config.agent.max_iterations)
@@ -485,8 +490,8 @@ pub async fn create_agent_with_diagnostics(
         app_config.agent.tool_timeout_ms,
         max_tool_output_tokens,
         &cache_user_id,
-        subagent_project_root.as_deref(),
-        subagent_user_home.as_deref(),
+        &discovered_subagents,
+        subagent_prompt_compiler.clone(),
         params.browser_runtime.clone(),
         sandbox_manager,
         run_code_available,
@@ -505,14 +510,10 @@ pub async fn create_agent_with_diagnostics(
         };
         let store = Arc::clone(store);
         let tool_names = agent.tool_names();
-        let subagent_names = agent
-            .subagent_registry()
-            .list_available()
-            .await
-            .into_iter()
-            .map(|definition| definition.name)
-            .collect::<Vec<_>>();
-        let capabilities = Arc::new(PlanCapabilityCatalog::new(subagent_names, tool_names));
+        let capabilities = Arc::new(PlanCapabilityCatalog::new(
+            subagent_catalog_snapshot.clone(),
+            tool_names,
+        ));
         agent.add_tool(Box::new(TaskCreateTool {
             store: Arc::clone(&store),
             capabilities: capabilities.clone(),
@@ -588,13 +589,12 @@ async fn register_default_subagents(
     tool_timeout_ms: u64,
     max_tool_output_tokens: usize,
     cache_user_id: &str,
-    project_root: Option<&std::path::Path>,
-    user_home: Option<&std::path::Path>,
+    subagents: &[crate::subagent_loader::SubagentDefinition],
+    prompt_compiler: Arc<dyn SubagentPromptCompiler>,
     browser_runtime: Option<Arc<crate::browser::BrowserRuntime>>,
     sandbox_manager: Arc<echo_agent::sandbox::SandboxManager>,
     run_code_available: bool,
 ) {
-    let subagents = crate::subagent_loader::discover_subagents(project_root, user_home);
     let tool_output_artifacts = agent.tool_output_artifacts();
     tracing::info!(
         count = subagents.len(),
@@ -614,7 +614,7 @@ async fn register_default_subagents(
     }
 
     let mut built_subagents: Vec<BuiltSubagent> = Vec::with_capacity(subagents.len());
-    for subagent_def in &subagents {
+    for subagent_def in subagents {
         // Sprint 9: register BOTH readonly and writer subagents. Readonly subagents
         // get the readonly tool subset (physical no-write enforcement); writer
         // subagents get the full tool set (shell/file/git) and run inside an
@@ -627,10 +627,19 @@ async fn register_default_subagents(
             cfg
         });
         let max_iterations = subagent_def.max_turns.unwrap_or(0);
+        let isolation = crate::subagent_loader::subagent_isolation(subagent_def);
+        let compiled_system = prompt_compiler.compile_system(&SubagentSystemPromptInput {
+            name: &subagent_def.name,
+            description: &subagent_def.description,
+            role_prompt: &subagent_def.system_prompt,
+            readonly: subagent_def.readonly,
+            can_delegate: subagent_def.can_delegate,
+            isolation,
+        });
         let build_result = if subagent_def.readonly {
             build_readonly_subagent_agent(
                 &subagent_def.name,
-                &subagent_def.system_prompt,
+                &compiled_system.system_prompt,
                 &subagent_model,
                 subagent_llm.clone(),
                 temperature,
@@ -642,11 +651,12 @@ async fn register_default_subagents(
                 subagent_def.can_delegate,
                 max_iterations,
                 browser_runtime.clone(),
+                prompt_compiler.clone(),
             )
         } else {
             build_writer_subagent_agent(
                 &subagent_def.name,
-                &subagent_def.system_prompt,
+                &compiled_system.system_prompt,
                 &subagent_model,
                 subagent_llm.clone(),
                 temperature,
@@ -660,6 +670,7 @@ async fn register_default_subagents(
                 browser_runtime.clone(),
                 sandbox_manager.clone(),
                 run_code_available,
+                prompt_compiler.clone(),
             )
         };
         match build_result {
@@ -741,6 +752,8 @@ async fn register_default_subagents(
                     let factory_browser_runtime = browser_runtime.clone();
                     let factory_sandbox_manager = sandbox_manager.clone();
                     let factory_tool_output_artifacts = tool_output_artifacts.clone();
+                    let factory_prompt_compiler = prompt_compiler.clone();
+                    let factory_system_prompt = compiled_system.system_prompt.clone();
                     Some(Arc::new(FnAgentFactory::new(
                         move || -> BoxFuture<'static, echo_agent::error::Result<Box<dyn Agent>>> {
                             let subagent_def = factory_def.clone();
@@ -750,12 +763,14 @@ async fn register_default_subagents(
                             let browser_runtime = factory_browser_runtime.clone();
                             let sandbox_manager = factory_sandbox_manager.clone();
                             let tool_output_artifacts = factory_tool_output_artifacts.clone();
+                            let prompt_compiler = factory_prompt_compiler.clone();
+                            let system_prompt = factory_system_prompt.clone();
                             Box::pin(async move {
                                 let max_iterations = subagent_def.max_turns.unwrap_or(0);
                                 let subagent = if subagent_def.readonly {
                                     build_readonly_subagent_agent(
                                         &subagent_def.name,
-                                        &subagent_def.system_prompt,
+                                        &system_prompt,
                                         &model,
                                         llm,
                                         temperature,
@@ -767,11 +782,12 @@ async fn register_default_subagents(
                                         subagent_def.can_delegate,
                                         max_iterations,
                                         browser_runtime,
+                                        prompt_compiler,
                                     )?
                                 } else {
                                     build_writer_subagent_agent(
                                         &subagent_def.name,
-                                        &subagent_def.system_prompt,
+                                        &system_prompt,
                                         &model,
                                         llm,
                                         temperature,
@@ -785,6 +801,7 @@ async fn register_default_subagents(
                                         browser_runtime,
                                         sandbox_manager,
                                         run_code_available,
+                                        prompt_compiler,
                                     )?
                                 };
                                 subagent.set_tool_output_artifacts(tool_output_artifacts);
@@ -893,6 +910,7 @@ fn build_writer_subagent_agent(
     browser_runtime: Option<Arc<crate::browser::BrowserRuntime>>,
     sandbox_manager: Arc<echo_agent::sandbox::SandboxManager>,
     run_code_available: bool,
+    prompt_compiler: Arc<dyn SubagentPromptCompiler>,
 ) -> std::result::Result<ReactAgent, echo_agent::error::ReactError> {
     // Mirror build_readonly_subagent_agent, but OMIT `.readonly_tools()` → the
     // default `readonly_tools: false` triggers `register_all_tools`, giving the
@@ -900,16 +918,16 @@ fn build_writer_subagent_agent(
     // by the worktree (Sprint 8): the subagent's working_dir is bound to its own
     // worktree checkout, so writes can't reach the main workspace even though
     // the tools could.
-    let system_prompt = compose_subagent_system_prompt(prompt);
     let mut builder = ReactAgentBuilder::new()
         .model(model)
         .name(name)
-        .system_prompt(&system_prompt)
+        .system_prompt(prompt)
         .enable_tools()
         // NO .readonly_tools() → full tool set (write capability).
         .enable_memory()
         .enable_cot()
         .enable_subagent()
+        .subagent_prompt_compiler(prompt_compiler)
         .max_iterations(max_iterations)
         .token_limit(token_limit)
         .max_tool_output_tokens(max_tool_output_tokens)
@@ -973,17 +991,18 @@ fn build_readonly_subagent_agent(
     can_delegate: bool,
     max_iterations: usize,
     browser_runtime: Option<Arc<crate::browser::BrowserRuntime>>,
+    prompt_compiler: Arc<dyn SubagentPromptCompiler>,
 ) -> std::result::Result<ReactAgent, echo_agent::error::ReactError> {
-    let system_prompt = compose_subagent_system_prompt(prompt);
     let mut builder = ReactAgentBuilder::new()
         .model(model)
         .name(name)
-        .system_prompt(&system_prompt)
+        .system_prompt(prompt)
         .enable_tools()
         .readonly_tools() // SA-2: physical enforcement — no shell/write tools
         .enable_memory()
         .enable_cot()
         .enable_subagent()
+        .subagent_prompt_compiler(prompt_compiler)
         .max_iterations(max_iterations)
         .token_limit(token_limit)
         .max_tool_output_tokens(max_tool_output_tokens)
@@ -1971,8 +1990,7 @@ pub fn build_llm_config(
 mod resolve_subagent_model_tests {
     use super::{
         DEFAULT_MAX_TOOL_OUTPUT_TOKENS, TASK_MANAGEMENT_GUIDE, build_writer_subagent_agent,
-        compose_subagent_system_prompt, configure_run_code_capability, resolve_subagent_model,
-        resolved_max_tool_output_tokens,
+        configure_run_code_capability, resolve_subagent_model, resolved_max_tool_output_tokens,
     };
     use echo_agent::agent::ReactAgentBuilder;
     use echo_agent::sandbox::SandboxManager;
@@ -1981,18 +1999,6 @@ mod resolve_subagent_model_tests {
     #[test]
     fn stable_task_guide_stays_within_cache_budget() {
         assert!(TASK_MANAGEMENT_GUIDE.chars().count() <= 2_400);
-    }
-
-    #[test]
-    fn subagent_prompt_anchors_language_to_user_request_only() {
-        let prompt = compose_subagent_system_prompt("# Role\nInspect the assigned code.");
-        assert!(prompt.contains("only language anchor"));
-        assert!(prompt.contains("Do NOT follow"));
-        assert!(prompt.contains("exact `## Result` heading"));
-        // The old reverse rule ("follow the assigned task's language") must be
-        // gone — the assigned task template is English and would pull output
-        // back to English.
-        assert!(!prompt.contains("Follow the assigned task's language"));
     }
 
     #[test]
@@ -2064,6 +2070,7 @@ mod resolve_subagent_model_tests {
             None,
             sandbox,
             true,
+            Arc::new(crate::subagent_prompt::EkoSubagentPromptCompiler),
         )?;
 
         assert!(subagent.sandbox_manager().is_some());

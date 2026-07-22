@@ -57,6 +57,7 @@ evidence, and the next bounded step.
 | Parallel Subagent instance and TaskRuntime routing | Complete | Sync/Fork/Teammate dispatches use fresh factory instances; Auto/Task delegation is forced through the formal plan so the right panel cannot be bypassed |
 | Revisioned dynamic plan runtime | Complete | `docs/2026-07-21-dynamic-plan-runtime.md`; atomic DAG creation, optimistic patches, split projections, safe-point reloads, and capability-scoped Subagents |
 | Unattended worktree lifecycle and review parity | Complete | `docs/2026-07-22-unattended-worktree-lifecycle.md`; application commit `61c8350` |
+| Unified Subagent prompt compilation | Complete | framework commit `8f7904f`; `echo-agent-app-core/src/subagent_prompt.rs`; one registration-time system prompt and one typed invocation compiler across direct, planned, fork, teammate, and team dispatch |
 
 ## Current Decisions
 
@@ -129,6 +130,24 @@ cancellation when their internal deadline expires. TeamAgent's persistent
 member/mailbox lifecycle remains a separate path and retains its own identity
 semantics.
 
+### Subagent Prompt Compilation
+
+The framework exposes one product-injectable `SubagentPromptCompiler` for both
+registration-time system prompts and dispatch-time invocations. EKO compiles a
+cache-stable system prompt from role Markdown, common orchestration rules,
+frontmatter-derived capabilities, the optional follow-up policy, one language
+anchor, and the canonical result contract. Role Markdown owns only identity and
+role-specific method.
+
+Direct dispatch and TaskRuntime dispatch use the same compiler. TaskRuntime
+passes a typed payload containing the goal, domain, task, dependencies, files,
+checks, acceptance criteria, artifacts, boundary, and delegation facts. Fresh
+context is the default; Fork may transfer only filtered structured history and
+never embeds the parent system prompt as user text. The effective Subagent
+catalog is an immutable snapshot derived from the same definitions used for
+registration, including project and user roles, and startup validates every
+default route against it.
+
 ### Dynamic Plan Runtime
 
 The runtime accepts one atomic full-DAG `plan_create` and revisioned
@@ -181,6 +200,8 @@ Agent framework. Reference: <https://pandoc.org/MANUAL.html>.
 Observe real long-running GUI/TUI/CLI task runs for revision-conflict,
 safe-point, and writer-worktree lifecycle telemetry. Review the nine retained
 legacy `eko-unattended-*` branches through the new queue before explicitly
-cleaning them. Treat any UX or observability improvement discovered there as a
-new milestone; the revisioned dynamic plan runtime and worktree repair are
-complete.
+cleaning them. Also sample real direct, planned, fork, teammate, and team
+Subagent runs through prompt diagnostics to confirm the expected section
+cardinality and response-language behavior across providers. Treat any UX or
+observability improvement discovered there as a new milestone; the revisioned
+dynamic plan runtime, worktree repair, and unified prompt compiler are complete.

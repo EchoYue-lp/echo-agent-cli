@@ -34,13 +34,14 @@ pub async fn register_task_tools_on_agent(
     let registry = agent_handle
         .read(|agent| agent.subagent_registry().clone())
         .await;
-    let subagent_names = registry
-        .list_available()
-        .await
-        .into_iter()
-        .map(|definition| definition.name)
-        .collect::<Vec<_>>();
-    let capabilities = Arc::new(PlanCapabilityCatalog::new(subagent_names, tool_names));
+    let registered_subagents = registry.list_available().await;
+    let subagent_catalog = Arc::new(
+        crate::subagent_loader::SubagentCatalogSnapshot::from_registered(&registered_subagents),
+    );
+    let capabilities = Arc::new(PlanCapabilityCatalog::new(
+        subagent_catalog.clone(),
+        tool_names,
+    ));
     let added = agent_handle
         .write(|agent| {
             agent.add_tool(Box::new(TaskCreateTool {
@@ -57,7 +58,9 @@ pub async fn register_task_tools_on_agent(
             // Phase B3: agent-autonomous complex-task tools. These read
             // pool/store/sink from the chat turn's task_local
             // (current_chat_resources), so no store injection is needed.
-            agent.add_tool(Box::new(CreateComplexTaskTool));
+            agent.add_tool(Box::new(CreateComplexTaskTool {
+                subagent_catalog: subagent_catalog.clone(),
+            }));
             agent.add_tool(Box::new(CheckRunStatusTool));
             agent.add_tool(Box::new(CancelRunTool));
             true

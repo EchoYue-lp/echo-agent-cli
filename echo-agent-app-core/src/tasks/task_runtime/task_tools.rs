@@ -18,8 +18,10 @@ use echo_agent::tools::{Tool, ToolResult};
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use crate::subagent_loader::SubagentCatalogSnapshot;
+
 use super::executor::{ExecEvent, RunPlanPolicy};
-use super::profiles::{ProfileTemplate, default_subagent_for, subagent_catalog_prompt};
+use super::profiles::{ProfileTemplate, default_subagent_for};
 use super::store::TaskRuntimeStore;
 use super::types::{
     AttendedMode, DomainProfile, ExecutionMode, PlanPatchOperation, PlanPatchRequest, PlanTask,
@@ -28,7 +30,7 @@ use super::types::{
 
 #[derive(Debug, Clone, Default)]
 pub struct PlanCapabilityCatalog {
-    subagents: HashSet<String>,
+    subagents: Arc<SubagentCatalogSnapshot>,
     tools: HashSet<String>,
 }
 
@@ -37,18 +39,22 @@ impl PlanCapabilityCatalog {
         ["plan_create", "plan_patch", "task_list", "plan_execute"];
 
     pub fn new(
-        subagents: impl IntoIterator<Item = String>,
+        subagents: Arc<SubagentCatalogSnapshot>,
         tools: impl IntoIterator<Item = String>,
     ) -> Self {
         Self {
-            subagents: subagents.into_iter().collect(),
+            subagents,
             tools: tools.into_iter().collect(),
         }
     }
 
     fn validate_task(&self, task: &PlanTask) -> std::result::Result<(), String> {
         if !self.subagents.contains(&task.agent_role) {
-            let mut available = self.subagents.iter().cloned().collect::<Vec<_>>();
+            let mut available = self
+                .subagents
+                .names()
+                .map(str::to_string)
+                .collect::<Vec<_>>();
             available.sort();
             return Err(format!(
                 "unknown Subagent '{}'; available: {}",
@@ -946,6 +952,7 @@ fn complex_run_prompt(
     domain: DomainProfile,
     plan_mode: &str,
     initial_plan: &[String],
+    subagent_catalog: &SubagentCatalogSnapshot,
 ) -> String {
     let template = ProfileTemplate::for_profile(domain);
     let plan_contract = if plan_mode == "direct_execute" {
@@ -964,13 +971,13 @@ fn complex_run_prompt(
     };
 
     format!(
-        "[complex_run]\nUser goal: {user_goal}\nComplexity rationale: {reason}\nDomain profile: {} ({})\nPlan mode: {plan_mode}\n\nRun contract:\n{plan_contract}\n\nDomain planning methodology:\n{}\n\nDomain execution standard:\n{}\n\nPreferred Subagents for this domain: {}\nAvailable builtin Subagents:\n{}\n\nInitial decomposition brief:\n{initial}\n[/complex_run]",
+        "[complex_run]\nUser goal: {user_goal}\nComplexity rationale: {reason}\nDomain profile: {} ({})\nPlan mode: {plan_mode}\n\nRun contract:\n{plan_contract}\n\nDomain planning methodology:\n{}\n\nDomain execution standard:\n{}\n\nPreferred Subagents for this domain: {}\nAvailable Subagents:\n{}\n\nInitial decomposition brief:\n{initial}\n[/complex_run]",
         template.key,
         template.label,
         template.prompt_suffix,
         template.execution_guidance,
         template.default_subagent_roles.join(", "),
-        subagent_catalog_prompt(),
+        subagent_catalog.prompt(),
     )
 }
 
@@ -980,13 +987,14 @@ mod plan_create_tests {
     use super::super::types::RuntimeEventKind;
     use super::*;
 
+    fn test_subagent_catalog() -> Arc<SubagentCatalogSnapshot> {
+        let definitions = crate::subagent_loader::discover_subagents(None, None);
+        Arc::new(SubagentCatalogSnapshot::from_definitions(&definitions))
+    }
+
     fn test_capabilities() -> Arc<PlanCapabilityCatalog> {
         Arc::new(PlanCapabilityCatalog::new(
-            [
-                "explorer".to_string(),
-                "analyst".to_string(),
-                "data-shaper".to_string(),
-            ],
+            test_subagent_catalog(),
             Vec::<String>::new(),
         ))
     }
@@ -1308,13 +1316,41 @@ mod plan_create_tests {
             DomainProfile::MedicalResearch,
             "plan_then_execute",
             &["检索指南: 形成证据表".to_string()],
+            &test_subagent_catalog(),
         );
         assert!(prompt.contains("medical_research"));
         assert!(prompt.contains("PICO"));
         assert!(prompt.contains("formal, reviewable DAG"));
         assert!(prompt.contains("do not create a wrapper"));
-        assert!(prompt.contains("Available builtin Subagents"));
+        assert!(prompt.contains("Available Subagents"));
         assert!(prompt.contains("检索指南: 形成证据表"));
+    }
+
+    #[test]
+    fn complex_run_prompt_includes_project_subagent() -> std::result::Result<(), String> {
+        let project = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let directory = project.path().join(".eko").join("subagents");
+        std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
+        std::fs::write(
+            directory.join("domain-expert.md"),
+            "---\nname: domain-expert\ndescription: \"project specialist\"\nreadonly: true\n---\n# Role\nInspect domain evidence.",
+        )
+        .map_err(|error| error.to_string())?;
+        let definitions = crate::subagent_loader::discover_subagents(Some(project.path()), None);
+        let catalog = SubagentCatalogSnapshot::from_definitions(&definitions);
+
+        let prompt = complex_run_prompt(
+            "inspect",
+            "multi_source synthesis",
+            DomainProfile::General,
+            "plan_then_execute",
+            &[],
+            &catalog,
+        );
+
+        assert!(prompt.contains("domain-expert"));
+        assert!(prompt.contains("project specialist"));
+        Ok(())
     }
 }
 
@@ -1329,7 +1365,9 @@ mod plan_create_tests {
 // 主从异步). Default background (spec §4.1 Priority Trap).
 
 /// Create a background orchestrated Run for a complex multi-step task.
-pub struct CreateComplexTaskTool;
+pub struct CreateComplexTaskTool {
+    pub subagent_catalog: Arc<SubagentCatalogSnapshot>,
+}
 
 impl Tool for CreateComplexTaskTool {
     fn name(&self) -> &str {
@@ -1472,7 +1510,14 @@ impl CreateComplexTaskTool {
                     .join("\n")
             )
         };
-        let run_prompt = complex_run_prompt(&user_goal, &reason, domain, plan_mode, &initial_plan);
+        let run_prompt = complex_run_prompt(
+            &user_goal,
+            &reason,
+            domain,
+            plan_mode,
+            &initial_plan,
+            &self.subagent_catalog,
+        );
 
         let run_id = uuid::Uuid::new_v4().to_string();
         let conv = res

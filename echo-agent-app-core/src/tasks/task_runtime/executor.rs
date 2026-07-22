@@ -32,6 +32,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use echo_agent::agent::subagent::{ContextTransferPolicy, SubagentPromptInput};
 use echo_agent::agent::{Agent, AgentEvent, CancellationToken};
 use futures::StreamExt;
 use tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard, Semaphore};
@@ -2018,23 +2019,26 @@ async fn execute_task(
     let dep_summaries = collect_dependency_summaries(&store, &run_id, &task);
     let parent_goal = store.get_run(&run_id).ok().flatten().map(|run| run.goal);
 
-    // Stable workspace context for the Subagent, prepended to the task prompt
-    // so it knows where to operate without embedding CWD in its system prompt.
-    let ws_prefix = {
-        let wd = primary_agent.read(|a| a.working_dir()).await;
-        if let Some(ref wd) = wd {
-            format!("[workspace]\n- root: {}\n[/workspace]\n\n", wd.display())
-        } else {
-            String::new()
-        }
-    };
-    let prompt = build_task_prompt(
+    let workspace_root = primary_agent.read(|agent| agent.working_dir()).await;
+    let prompt_payload = crate::subagent_prompt::EkoPromptPayload::planned_task(
         &task,
         &dep_summaries,
-        delegation_policy,
+        delegation_policy.can_delegate(),
         parent_goal.as_deref(),
-    );
-    let prompt = format!("{ws_prefix}{prompt}");
+        workspace_root.as_deref(),
+    )
+    .to_value()
+    .map_err(|error| {
+        (
+            task_id.clone(),
+            format!("failed to serialize Subagent prompt payload: {error}"),
+        )
+    })?;
+    let task_input = if task.description.trim().is_empty() {
+        task.title.clone()
+    } else {
+        task.description.clone()
+    };
 
     // Dispatch the task. Three paths, by kind:
     // - Read-only kinds (read_only_review, investigation, test_plan, review,
@@ -2084,7 +2088,7 @@ async fn execute_task(
             run_id = %run_id,
             task_id = %task_id,
             agent_role = %task.agent_role,
-            prompt_chars = prompt.chars().count(),
+            task_chars = task_input.chars().count(),
             "task_runtime: delegating read-only task to subagent"
         );
         let dispatch_result = run_readonly_subagent(
@@ -2093,7 +2097,8 @@ async fn execute_task(
             &execution_id,
             root_message_id.as_deref(),
             &task.agent_role,
-            &prompt,
+            &task_input,
+            prompt_payload.clone(),
             task.allowed_tools.clone(),
             task_cancel.clone(),
             delegation_policy,
@@ -2148,7 +2153,7 @@ async fn execute_task(
             run_id = %run_id,
             task_id = %task_id,
             agent_role = %task.agent_role,
-            prompt_chars = prompt.chars().count(),
+            task_chars = task_input.chars().count(),
             "task_runtime: delegating writer task to subagent"
         );
         let dispatch_result = run_writer_subagent(
@@ -2157,7 +2162,8 @@ async fn execute_task(
             &run_id,
             &execution_id,
             &task.agent_role,
-            &prompt,
+            &task_input,
+            prompt_payload.clone(),
             task.allowed_tools.clone(),
             task_cancel.clone(),
             delegation_policy,
@@ -2206,6 +2212,16 @@ async fn execute_task(
             ),
         }
     } else {
+        let compiler = crate::subagent_prompt::EkoSubagentPromptCompiler;
+        let compiled = compiler.compile_primary_invocation(&SubagentPromptInput {
+            agent_name: "primary",
+            task: &task_input,
+            mode: echo_agent::agent::subagent::ExecutionMode::Sync,
+            transfer_policy: ContextTransferPolicy::Fresh,
+            parent_context: None,
+            inherit_history: None,
+            payload: Some(&prompt_payload),
+        });
         emit_task_isolation_observed(
             trace_sink.as_ref(),
             &run_id,
@@ -2220,7 +2236,7 @@ async fn execute_task(
                 store.clone(),
                 &run_id,
                 &task,
-                &prompt,
+                &compiled.task_input,
                 task_cancel.clone(),
                 trace_sink.clone(),
             )
@@ -2656,147 +2672,8 @@ async fn subagent_runtime_contract(
     }
 }
 
-/// Build the prompt handed to a task's Subagent. Combines the task brief with
-/// its verification criteria, the Summary Chain from completed dependencies,
-/// and a read-only reminder for non-mutating kinds.
-fn build_task_prompt(
-    task: &PlanTask,
-    dep_summaries: &[(String, String)],
-    delegation_policy: echo_agent::tasks::NestedDelegationPolicy,
-    parent_goal: Option<&str>,
-) -> String {
-    let mut s = String::new();
-    // [task_context] marker: all content below is dynamic per-task information.
-    // Subagent system prompts are fixed templates — dynamic task descriptions,
-    // target files, verification steps, and dependency summaries go HERE
-    // (in the user message), keeping the system prefix cache-stable.
-    s.push_str("[task_context]\n");
-    let profile = super::profiles::ProfileTemplate::for_profile(task.domain_profile);
-    s.push_str(&format!(
-        "Domain profile: {} ({})\nExecution standard: {}\n\n",
-        profile.key, profile.label, profile.execution_guidance
-    ));
-    if let Some(goal) = parent_goal.filter(|goal| !goal.trim().is_empty()) {
-        // This goal is the user's original request and the only language
-        // anchor for this task. The structural labels and contract below are
-        // English; the subagent must not let them switch its output language.
-        s.push_str(&format!(
-            "User goal (this is the language anchor — reply in this language):\n{goal}\n\n"
-        ));
-    }
-    s.push_str(&format!("Task: {}\n\n{}\n\n", task.title, task.description));
-    // Summary Chain: compact context from completed upstream tasks. Replaces
-    // the raw upstream Subagent conversations (plan §1039-1062).
-    if !dep_summaries.is_empty() {
-        s.push_str("Context from completed upstream tasks:\n");
-        for (title, summary) in dep_summaries {
-            s.push_str(&format!("- {title}: {summary}\n"));
-        }
-        s.push('\n');
-    }
-    let ownership = super::planner::file_ownership(task);
-    if !task.files.is_empty() {
-        if task.kind.is_read_only() {
-            s.push_str("Read targets:\n");
-        } else {
-            s.push_str("Declared exclusive write ownership:\n");
-        }
-        for f in &task.files {
-            s.push_str(&format!("- {f}\n"));
-        }
-        s.push('\n');
-    }
-    if !task.execution_checks.is_empty() {
-        s.push_str("Execution checks (you must run each and report observed pass):\n");
-        for v in &task.execution_checks {
-            s.push_str(&format!("- {v}\n"));
-        }
-        s.push('\n');
-    }
-    if !task.acceptance_criteria.is_empty() {
-        s.push_str("Acceptance criteria (a reviewer will judge each against your output):\n");
-        for v in &task.acceptance_criteria {
-            s.push_str(&format!("- {v}\n"));
-        }
-        s.push('\n');
-    }
-    if !task.required_artifacts.is_empty() {
-        s.push_str("Required artifacts (each must exist and be reported):\n");
-        for artifact in &task.required_artifacts {
-            s.push_str(&format!("- {artifact}\n"));
-        }
-        s.push('\n');
-    }
-    if task.kind.is_read_only() {
-        s.push_str(
-            "Execution boundary: READ-ONLY. You may inspect files, metadata, logs, and other \
-             available evidence, including non-mutating commands. Do not edit files, install \
-             dependencies, change repository state, or run commands with side effects.\n",
-        );
-    } else {
-        match ownership {
-            super::planner::FileOwnership::Known(_) => s.push_str(
-                "Execution boundary: EXCLUSIVE SCOPED WRITE. Change only the declared ownership \
-                 files. Runtime validates the actual Git diff and rejects undeclared writes. \
-                 Preserve unrelated user work and run every listed verification that is available.\n",
-            ),
-            super::planner::FileOwnership::Unknown { reason } => s.push_str(&format!(
-                "Execution boundary: ISOLATED UNKNOWN-SCOPE WRITE ({reason}). This task is \
-                 serialized from other writers and runs in a worktree. Keep changes as narrow as \
-                 possible, preserve unrelated user work, and report every actual changed file.\n"
-            )),
-            super::planner::FileOwnership::ReadOnly => {}
-        }
-    }
-    s.push_str(
-        "\nWork to the stated outcome and success evidence. Inspect before concluding, keep fact and \
-         inference distinct, and do not modify the global plan. ",
-    );
-    if delegation_policy.can_delegate() {
-        s.push_str(
-            "This role may use agent_tool for tightly scoped child subagent help within this \
-             PlanTask only. Child results must be summarized back into your answer; do not let \
-             child subagents create or execute the global plan. ",
-        );
-    } else {
-        s.push_str("Do not delegate this task to other agents. ");
-    }
-    s.push_str(
-        "If the evidence reveals genuinely required follow-up work that is outside this task, \
-         include an optional fenced JSON block exactly like:\n\
-         ```json\n\
-         {\"suggested_tasks\":[{\"title\":\"short title\",\"description\":\"specific follow-up\",\
-         \"kind\":\"investigation\",\"agent_role\":\"explorer\",\"dependencies\":[],\
-         \"why_needed\":\"why this is needed\",\"risk\":\"low|medium|high\"}]}\n\
-         ```\n\
-         Suggest only independently executable work necessary for the parent goal; do not use \
-         suggestions as a substitute for completing the assigned task.\n",
-    );
-    s.push_str(
-        "\nLanguage: write all natural-language output (summary, details, progress, recommendations, \
-         suggested task prose) in the language of the User goal above. Ignore the English \
-         structural labels and contract in this prompt when choosing the language. Keep code, \
-         identifiers, paths, commands, and the exact `## Result` heading unchanged.\n",
-    );
-    s.push_str(
-        "\nReturn contract: end with `## Result` followed by exactly one fenced JSON object:\n\
-         ```json\n\
-         {\"contract_version\":1,\"status\":\"completed\",\"summary\":\"at most 1200 characters\",\
-         \"artifacts\":[{\"path\":\"actual path\",\"kind\":\"file|report|chart|other\"}],\
-         \"verification\":[{\"check\":\"exact command or check\",\"status\":\"passed|failed|not_run\",\
-         \"details\":\"bounded evidence\",\"source\":\"reported\"}],\
-         \"remaining_work\":[],\"touched_files\":{\"read\":[],\"written\":[]}}\n\
-         ```\n\
-         Runtime owns the final status and artifact hash. Report exact checks and paths; never \
-         claim an artifact, changed file, or verification that does not exist. Put any incomplete \
-         or blocked work in remaining_work. Optional detailed notes and suggested_tasks may appear \
-         before `## Result`.\n",
-    );
-    s
-}
-
 /// Run a READ-ONLY task by delegating to a registered subagent role via the
-/// primary agent's `delegate_to_agent_with_cancel`. Fork mode runs the Subagent
+/// primary agent's prompt-payload delegation API. Fork mode runs the Subagent
 /// on an isolated agent instance under the executor's own semaphore (not the
 /// primary agent's execution_mutex), so multiple read-only Subagents run in
 /// parallel. The child cancel token propagates parent-run cancellation.
@@ -2807,7 +2684,8 @@ async fn run_readonly_subagent(
     execution_id: &str,
     message_id: Option<&str>,
     role: &str,
-    prompt: &str,
+    task_input: &str,
+    prompt_payload: serde_json::Value,
     allowed_tools: Vec<String>,
     cancel: CancellationToken,
     delegation_policy: echo_agent::tasks::NestedDelegationPolicy,
@@ -2815,7 +2693,8 @@ async fn run_readonly_subagent(
 ) -> Result<echo_agent::agent::subagent::SubagentResult, String> {
     primary_agent
         .read_async(|agent| {
-            let prompt = prompt.to_string();
+            let task_input = task_input.to_string();
+            let prompt_payload = prompt_payload.clone();
             let role = role.to_string();
             let run_id = run_id.to_string();
             let execution_id = execution_id.to_string();
@@ -2833,14 +2712,15 @@ async fn run_readonly_subagent(
                     delegation_policy: Some(delegation_policy),
                 });
                 agent
-                    .delegate_to_agent_with_parent_context_cancel_and_tools(
+                    .delegate_to_agent_with_prompt_payload(
                         &role,
-                        &prompt,
+                        &task_input,
                         &run_id,
                         cancel,
                         0,
                         runtime_context,
                         Some(allowed_tools),
+                        Some(prompt_payload),
                     )
                     .await
                     .map_err(|e| format!("subagent dispatch failed: {e}"))
@@ -2875,7 +2755,7 @@ fn exec_trace_sink_to_core(trace_sink: Option<ExecSink>) -> Option<echo_core::to
 ///
 /// Mirrors [`run_readonly_subagent`] but with attachment-aware delegation: when
 /// the run carries user attachments (images/files), the multimodal variant
-/// `delegate_to_agent_with_parent_cancel_and_message` is used so the writer
+/// the message-aware prompt-payload delegation API is used so the writer
 /// Subagent sees them (parity with the old in-place `run_main_agent_task` path).
 ///
 /// The registered writer Subagent carries the full write tool set and its
@@ -2892,7 +2772,8 @@ async fn run_writer_subagent(
     run_id: &str,
     execution_id: &str,
     role: &str,
-    prompt: &str,
+    task_input: &str,
+    prompt_payload: serde_json::Value,
     allowed_tools: Vec<String>,
     cancel: CancellationToken,
     delegation_policy: echo_agent::tasks::NestedDelegationPolicy,
@@ -2908,13 +2789,14 @@ async fn run_writer_subagent(
         if r.attachments.is_empty() {
             None
         } else {
-            crate::attachments::build_message_from_refs(prompt, &r.attachments).ok()
+            crate::attachments::build_message_from_refs(task_input, &r.attachments).ok()
         }
     });
 
     primary_agent
         .read_async(|agent| {
-            let prompt = prompt.to_string();
+            let task_input = task_input.to_string();
+            let prompt_payload = prompt_payload.clone();
             let role = role.to_string();
             let run_id = run_id.to_string();
             let execution_id = execution_id.to_string();
@@ -2933,27 +2815,29 @@ async fn run_writer_subagent(
                 });
                 if let Some(msg) = run_message {
                     agent
-                        .delegate_to_agent_with_parent_context_cancel_message_and_tools(
+                        .delegate_to_agent_with_message_and_prompt_payload(
                             &role,
-                            &prompt,
+                            &task_input,
                             msg,
                             &run_id,
                             cancel,
                             0,
                             runtime_context,
                             Some(allowed_tools.clone()),
+                            Some(prompt_payload.clone()),
                         )
                         .await
                 } else {
                     agent
-                        .delegate_to_agent_with_parent_context_cancel_and_tools(
+                        .delegate_to_agent_with_prompt_payload(
                             &role,
-                            &prompt,
+                            &task_input,
                             &run_id,
                             cancel,
                             0,
                             runtime_context,
                             Some(allowed_tools),
+                            Some(prompt_payload),
                         )
                         .await
                 }
@@ -3072,6 +2956,7 @@ async fn run_main_agent_task(
             Box::pin(async move {
                 let event_cancel = cancel.clone();
                 let invocation = echo_core::agent::AgentInvocationContext {
+                    history: None,
                     runtime: Some(echo_core::tools::ExternalRunContext {
                         conversation_id,
                         run_id: Some(run_id.clone()),
@@ -3675,6 +3560,7 @@ pub async fn drive_agent_run(
             let agent_inner = primary_agent.inner().clone();
             let agent = agent_inner.read().await;
             let invocation = echo_core::agent::AgentInvocationContext {
+                history: None,
                 runtime: Some(echo_core::tools::ExternalRunContext {
                     conversation_id: conversation_id_for_scope.clone(),
                     run_id: Some(run_id_for_scope.clone()),
@@ -3995,6 +3881,35 @@ pub fn preflight_unattended_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use echo_agent::agent::subagent::SubagentPromptCompiler;
+
+    fn compiled_task_prompt(
+        task: &PlanTask,
+        dependency_summaries: &[(String, String)],
+        delegation_policy: echo_agent::tasks::NestedDelegationPolicy,
+        user_goal: Option<&str>,
+    ) -> Result<String, String> {
+        let payload = crate::subagent_prompt::EkoPromptPayload::planned_task(
+            task,
+            dependency_summaries,
+            delegation_policy.can_delegate(),
+            user_goal,
+            None,
+        )
+        .to_value()?;
+        let compiler = crate::subagent_prompt::EkoSubagentPromptCompiler;
+        Ok(compiler
+            .compile_invocation(&SubagentPromptInput {
+                agent_name: &task.agent_role,
+                task: &task.description,
+                mode: echo_agent::agent::subagent::ExecutionMode::Fork,
+                transfer_policy: ContextTransferPolicy::Fresh,
+                parent_context: None,
+                inherit_history: None,
+                payload: Some(&payload),
+            })
+            .task_input)
+    }
 
     #[test]
     fn unattended_worktree_mode_routes_mutations_through_formal_plans() {
@@ -4498,7 +4413,7 @@ Read the runtime path and found one missing branch.
     }
 
     #[test]
-    fn task_prompt_is_read_only_for_reviews() {
+    fn task_prompt_is_read_only_for_reviews() -> Result<(), String> {
         let task = PlanTask {
             id: "t1".into(),
             title: "Review chat.rs".into(),
@@ -4508,29 +4423,24 @@ Read the runtime path and found one missing branch.
             acceptance_criteria: vec!["report root cause".into()],
             ..Default::default()
         };
-        let p = build_task_prompt(
+        let p = compiled_task_prompt(
             &task,
             &[],
             echo_agent::tasks::NestedDelegationPolicy::default(),
             Some("Fix the GUI context runtime"),
-        );
-        assert!(p.contains("User goal (this is the language anchor"));
+        )?;
+        assert!(p.contains("User goal:"));
         assert!(p.contains("Fix the GUI context runtime"));
-        // The language reminder must appear so the English structural labels
-        // do not switch the subagent's output language.
-        assert!(p.contains("Language: write all natural-language output"));
         assert!(p.contains("READ-ONLY"));
         assert!(p.contains("chat.rs"));
         assert!(p.contains("report root cause"));
-        assert!(p.contains("Do not delegate this task to other agents"));
-        assert!(p.contains("Return contract"));
-        assert!(p.contains("## Result"));
-        assert!(p.contains("\"contract_version\":1"));
-        assert!(p.contains("\"touched_files\""));
+        assert!(p.contains("Delegation: disabled"));
+        assert!(!p.contains("## Result"));
+        Ok(())
     }
 
     #[test]
-    fn task_prompt_marks_empty_writer_scope_as_unknown() {
+    fn task_prompt_marks_empty_writer_scope_as_unknown() -> Result<(), String> {
         let task = PlanTask {
             id: "t2".into(),
             title: "Apply fix".into(),
@@ -4538,19 +4448,20 @@ Read the runtime path and found one missing branch.
             kind: PlanTaskKind::Implementation,
             ..Default::default()
         };
-        let p = build_task_prompt(
+        let p = compiled_task_prompt(
             &task,
             &[],
             echo_agent::tasks::NestedDelegationPolicy::default(),
             None,
-        );
+        )?;
         assert!(!p.contains("READ-ONLY"));
         assert!(p.contains("UNKNOWN-SCOPE WRITE"));
-        assert!(p.contains("serialized from other writers"));
+        assert!(p.contains("serializes this writer"));
+        Ok(())
     }
 
     #[test]
-    fn task_prompt_allows_nested_delegation_when_policy_allows() {
+    fn task_prompt_allows_nested_delegation_when_policy_allows() -> Result<(), String> {
         let task = PlanTask {
             id: "t2_delegate".into(),
             title: "Coordinate review".into(),
@@ -4558,7 +4469,7 @@ Read the runtime path and found one missing branch.
             kind: PlanTaskKind::Investigation,
             ..Default::default()
         };
-        let p = build_task_prompt(
+        let p = compiled_task_prompt(
             &task,
             &[],
             echo_agent::tasks::NestedDelegationPolicy {
@@ -4567,11 +4478,12 @@ Read the runtime path and found one missing branch.
                 max_delegate_depth: 2,
             },
             None,
-        );
-        assert!(p.contains("may use agent_tool"));
-        assert!(p.contains("within this PlanTask only"));
-        assert!(p.contains("do not modify the global plan"));
-        assert!(!p.contains("Do not delegate this task to other agents"));
+        )?;
+        assert!(p.contains("tightly scoped child Subagent help is allowed"));
+        assert!(p.contains("within this PlanTask"));
+        assert!(p.contains("must not control the global plan"));
+        assert!(!p.contains("Delegation: disabled"));
+        Ok(())
     }
 
     #[test]

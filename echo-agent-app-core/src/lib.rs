@@ -40,6 +40,7 @@ pub mod sessions;
 pub mod skills_hub;
 pub mod state;
 pub mod subagent_loader;
+pub mod subagent_prompt;
 #[cfg(test)]
 mod surface_contract;
 pub mod tasks;

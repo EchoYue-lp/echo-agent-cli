@@ -9,6 +9,26 @@
 //! structured `TaskPlan`.
 
 use super::types::{DomainProfile, PlanTaskKind};
+use crate::subagent_loader::SubagentCatalogSnapshot;
+
+const DOMAIN_PROFILES: &[DomainProfile] = &[
+    DomainProfile::General,
+    DomainProfile::AiCoding,
+    DomainProfile::DataAnalysis,
+    DomainProfile::AcademicResearch,
+    DomainProfile::MedicalResearch,
+];
+
+const PLAN_TASK_KINDS: &[PlanTaskKind] = &[
+    PlanTaskKind::ReadOnlyReview,
+    PlanTaskKind::Investigation,
+    PlanTaskKind::TestPlan,
+    PlanTaskKind::Implementation,
+    PlanTaskKind::Debugging,
+    PlanTaskKind::Review,
+    PlanTaskKind::Summary,
+    PlanTaskKind::Verification,
+];
 
 /// Static template for a domain profile.
 pub struct ProfileTemplate {
@@ -95,60 +115,6 @@ pub const GENERAL_SUBAGENT_ROLES: &[&str] = &[
     "general-purpose",
 ];
 
-pub const ALL_BUILTIN_SUBAGENT_ROLES: &[&str] = &[
-    "explorer",
-    "reviewer",
-    "planner",
-    "summarizer",
-    "implementer",
-    "general-purpose",
-    "data-shaper",
-    "analyst",
-];
-
-pub const SUBAGENT_CAPABILITY_CATALOG: &[(&str, &str)] = &[
-    (
-        "explorer",
-        "read-only discovery: codebase structure, data sources, literature, configs, docs",
-    ),
-    (
-        "reviewer",
-        "read-only review: code bugs, analysis methods, evidence quality, safety boundaries",
-    ),
-    (
-        "planner",
-        "read-only planning: verification strategy, reproducibility paths, review structure",
-    ),
-    (
-        "summarizer",
-        "cross-subagent synthesis into conclusions, plan, or delivery notes",
-    ),
-    (
-        "implementer",
-        "isolated coding changes with a reviewable diff and verification evidence",
-    ),
-    (
-        "general-purpose",
-        "bounded workspace work that needs ordinary tools without worktree isolation",
-    ),
-    (
-        "data-shaper",
-        "isolated data profiling, schema alignment, cleaning, and reproducible export",
-    ),
-    (
-        "analyst",
-        "isolated statistical analysis, modeling, visualization, and reproducible reports",
-    ),
-];
-
-pub fn subagent_catalog_prompt() -> String {
-    SUBAGENT_CAPABILITY_CATALOG
-        .iter()
-        .map(|(role, capability)| format!("- {role}: {capability}"))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 /// Resolve the default Subagent for a PlanTask. An explicit `subagent`
 /// parameter may select any registered project, user, or builtin role.
 pub fn default_subagent_for(profile: DomainProfile, kind: PlanTaskKind) -> &'static str {
@@ -167,6 +133,21 @@ pub fn default_subagent_for(profile: DomainProfile, kind: PlanTaskKind) -> &'sta
         }
         PlanTaskKind::Verification => "primary",
     }
+}
+
+/// Validate every built-in routing target against the effective catalog.
+pub fn validate_default_subagent_routes(catalog: &SubagentCatalogSnapshot) -> Result<(), String> {
+    for profile in DOMAIN_PROFILES {
+        for kind in PLAN_TASK_KINDS {
+            let role = default_subagent_for(*profile, *kind);
+            if role != "primary" && !catalog.contains(role) {
+                return Err(format!(
+                    "default Subagent route {profile:?}/{kind:?} references unregistered role {role}"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub static GENERAL: ProfileTemplate = ProfileTemplate {
@@ -306,15 +287,9 @@ mod tests {
 
     #[test]
     fn every_profile_has_a_template() {
-        for p in [
-            DomainProfile::General,
-            DomainProfile::AiCoding,
-            DomainProfile::DataAnalysis,
-            DomainProfile::AcademicResearch,
-            DomainProfile::MedicalResearch,
-        ] {
-            let t = ProfileTemplate::for_profile(p);
-            assert_eq!(t.key, p.as_str());
+        for profile in DOMAIN_PROFILES {
+            let t = ProfileTemplate::for_profile(*profile);
+            assert_eq!(t.key, profile.as_str());
             assert!(!t.default_subagent_roles.is_empty());
             assert!(!t.prompt_suffix.is_empty());
             assert!(!t.execution_guidance.is_empty());
@@ -324,17 +299,14 @@ mod tests {
 
     #[test]
     fn every_profile_uses_registered_subagent_roles() {
-        for profile in [
-            DomainProfile::General,
-            DomainProfile::AiCoding,
-            DomainProfile::DataAnalysis,
-            DomainProfile::AcademicResearch,
-            DomainProfile::MedicalResearch,
-        ] {
-            let t = ProfileTemplate::for_profile(profile);
+        let definitions = crate::subagent_loader::discover_subagents(None, None);
+        let catalog =
+            crate::subagent_loader::SubagentCatalogSnapshot::from_definitions(&definitions);
+        for profile in DOMAIN_PROFILES {
+            let t = ProfileTemplate::for_profile(*profile);
             for required in t.default_subagent_roles {
                 assert!(
-                    ALL_BUILTIN_SUBAGENT_ROLES.iter().any(|r| r == required),
+                    catalog.contains(required),
                     "{profile:?} profile references unregistered subagent {required}"
                 );
             }
@@ -346,14 +318,11 @@ mod tests {
     }
 
     #[test]
-    fn catalog_lists_every_registered_subagent_once() {
-        for role in ALL_BUILTIN_SUBAGENT_ROLES {
-            let matches = SUBAGENT_CAPABILITY_CATALOG
-                .iter()
-                .filter(|(catalog_role, _)| catalog_role == role)
-                .count();
-            assert_eq!(matches, 1, "subagent {role} must be described exactly once");
-        }
+    fn every_default_route_resolves_in_the_effective_catalog() -> Result<(), String> {
+        let definitions = crate::subagent_loader::discover_subagents(None, None);
+        let catalog =
+            crate::subagent_loader::SubagentCatalogSnapshot::from_definitions(&definitions);
+        validate_default_subagent_routes(&catalog)
     }
 
     #[test]

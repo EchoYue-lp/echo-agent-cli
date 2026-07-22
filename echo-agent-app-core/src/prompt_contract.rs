@@ -125,20 +125,37 @@ mod tests {
     }
 
     #[test]
-    fn builtin_subagents_have_bounded_role_and_delivery_contracts() -> Result<(), String> {
+    fn builtin_subagents_leave_shared_sections_to_the_compiler() -> Result<(), String> {
         for subagent in discover_subagents(None, None) {
             assert_compliant(audit_prompt(
                 &PromptContractSpec {
                     name: subagent.name.as_str(),
                     max_tokens: 700,
-                    required_phrases: &["# Role", "# Delivery"],
+                    required_phrases: &["# Role"],
                     forbidden_phrases: DEMO_PHRASES,
                 },
                 subagent.system_prompt.as_str(),
             ))?;
-            if subagent.readonly && !subagent.system_prompt.contains("Read-only") {
+            for compiler_owned in [
+                "# Delivery",
+                "# Boundary",
+                "## Response Language",
+                "## Result",
+                "suggested_tasks",
+            ] {
+                if subagent.system_prompt.contains(compiler_owned) {
+                    return Err(format!(
+                        "{}: role markdown duplicates compiler-owned section {compiler_owned}",
+                        subagent.name
+                    ));
+                }
+            }
+            if !subagent.system_prompt.contains("# Method")
+                && !subagent.system_prompt.contains("# Execution")
+                && !subagent.system_prompt.contains("# Review Standard")
+            {
                 return Err(format!(
-                    "{}: readonly role does not state its boundary",
+                    "{}: role markdown does not define a role-specific method",
                     subagent.name
                 ));
             }

@@ -370,6 +370,7 @@ async fn drive_chat_inner(
             parent_event_id: None,
         };
         let invocation = echo_core::agent::AgentInvocationContext {
+            history: None,
             runtime: Some(echo_core::tools::ExternalRunContext {
                 conversation_id,
                 run_id: None,

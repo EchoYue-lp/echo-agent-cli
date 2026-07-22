@@ -22,7 +22,7 @@ use super::types::{PlanTask, TaskExecutionSummary, TodoItem, TodoStatus};
 /// Stable application marker identifying the run-level recovery projection.
 pub const RUNTIME_RECOVERY_MARKER: &str = "[eko_runtime_recovery_capsule]";
 
-/// Marker already present in Subagent prompts created by `build_task_prompt`.
+/// Marker emitted by the EKO Subagent prompt compiler for planned invocations.
 /// Protecting it keeps the per-task brief alive if a Subagent compact runs
 /// before the Subagent finishes.
 pub const TASK_CONTEXT_MARKER: &str = "[task_context]";

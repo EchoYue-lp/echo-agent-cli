@@ -151,6 +151,106 @@ pub struct SubagentDefinition {
     pub tags: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentCatalogEntry {
+    pub name: String,
+    pub description: String,
+    pub readonly: bool,
+    pub can_delegate: bool,
+    pub isolation: String,
+}
+
+/// Immutable catalog derived from the same definitions used for registration.
+#[derive(Debug, Clone, Default)]
+pub struct SubagentCatalogSnapshot {
+    entries: Vec<SubagentCatalogEntry>,
+}
+
+impl SubagentCatalogSnapshot {
+    pub fn from_definitions(definitions: &[SubagentDefinition]) -> Self {
+        Self {
+            entries: definitions
+                .iter()
+                .map(|definition| SubagentCatalogEntry {
+                    name: definition.name.clone(),
+                    description: definition.description.clone(),
+                    readonly: definition.readonly,
+                    can_delegate: definition.can_delegate,
+                    isolation: subagent_isolation(definition).to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    pub fn from_registered(
+        definitions: &[echo_agent::agent::subagent::SubagentDefinition],
+    ) -> Self {
+        Self {
+            entries: definitions
+                .iter()
+                .map(|definition| {
+                    let readonly = definition
+                        .tags
+                        .iter()
+                        .any(|tag| tag == "capability:readonly" || tag == "readonly");
+                    let isolation = definition
+                        .tags
+                        .iter()
+                        .find_map(|tag| tag.strip_prefix("isolation:"))
+                        .unwrap_or("context")
+                        .to_string();
+                    SubagentCatalogEntry {
+                        name: definition.name.clone(),
+                        description: definition.description.clone(),
+                        readonly,
+                        can_delegate: definition.can_delegate,
+                        isolation,
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.entries.iter().any(|entry| entry.name == name)
+    }
+
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().map(|entry| entry.name.as_str())
+    }
+
+    pub fn prompt(&self) -> String {
+        let mut output = String::from(
+            "\n## Available Subagents (agent_tool)\n\
+             Use agent_tool for bounded side work and plan_execute for formal DAG execution.\n\
+             Default context is fresh; use mode=fork only when recent conversation turns are required.\n",
+        );
+        for entry in &self.entries {
+            let access = if entry.readonly { "readonly" } else { "writer" };
+            let delegation = if entry.can_delegate {
+                "delegation=enabled"
+            } else {
+                "delegation=disabled"
+            };
+            output.push_str(&format!(
+                "- `{}`: {} [access={access}, isolation={}, {delegation}]\n",
+                entry.name, entry.description, entry.isolation
+            ));
+        }
+        output
+    }
+}
+
+pub fn subagent_isolation(definition: &SubagentDefinition) -> &'static str {
+    if definition.isolate_worktree {
+        "worktree"
+    } else if definition.isolate_workspace {
+        "workspace"
+    } else {
+        "context"
+    }
+}
+
 /// Discover subagent definitions across scopes + builtin fallback.
 ///
 /// `project_root` is the cwd or detected project root; `user_home` is the
@@ -214,38 +314,6 @@ pub fn discover_subagents(
     }
 
     result
-}
-
-/// Format discovered subagent roles for injection into the main agent system prompt.
-///
-/// Drives description-based auto-delegation via `agent_tool` (Claude/Cursor pattern).
-pub fn format_subagent_catalog(defs: &[SubagentDefinition]) -> String {
-    let mut out = String::from(
-        "\n## Available subagents (agent_tool)\n\
-         Use agent_tool for noisy/bounded side work. Prefer plan_execute for multi-step DAGs.\n\
-         Default context is fresh; set mode=fork only when the subagent needs shared session background.\n",
-    );
-    out.push_str(
-        "Write each Subagent task brief in the user's current language; keep technical identifiers unchanged.\n",
-    );
-    for d in defs {
-        let flags = [
-            d.readonly.then_some("readonly"),
-            d.isolate_worktree.then_some("worktree"),
-            d.isolate_workspace.then_some("workspace"),
-            d.can_delegate.then_some("can_delegate"),
-        ]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join(",");
-        if flags.is_empty() {
-            out.push_str(&format!("- `{}`: {}\n", d.name, d.description));
-        } else {
-            out.push_str(&format!("- `{}`: {} [{}]\n", d.name, d.description, flags));
-        }
-    }
-    out
 }
 
 /// Scan a scope directory and merge its parsed subagents into `by_name`,
@@ -809,7 +877,8 @@ team_subagents: [\"explorer\", \"summarizer\"]\n\
     #[test]
     fn catalog_lists_builtin_names_and_descriptions() {
         let defs = discover_subagents(None, None);
-        let text = format_subagent_catalog(&defs);
+        let catalog = SubagentCatalogSnapshot::from_definitions(&defs);
+        let text = catalog.prompt();
         assert!(text.contains("`explorer`"));
         assert!(text.contains("`implementer`"));
         assert!(text.contains("`general-purpose`"));
@@ -818,7 +887,7 @@ team_subagents: [\"explorer\", \"summarizer\"]\n\
             text.contains("探索") || text.contains("只读") || text.contains("Read"),
             "catalog should include explorer description text, got: {text}"
         );
-        assert!(text.contains("[readonly]") || text.contains("readonly"));
-        assert!(text.contains("[worktree]") || text.contains("worktree"));
+        assert!(text.contains("access=readonly"));
+        assert!(text.contains("isolation=worktree"));
     }
 }
