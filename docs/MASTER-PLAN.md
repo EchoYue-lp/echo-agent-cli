@@ -1,6 +1,6 @@
 # EKO Master Plan
 
-Last updated: 2026-07-21
+Last updated: 2026-07-22
 
 This file is the cross-session source of truth for the coding, data analysis,
 academic research, and medical research expansion. Detailed design rationale
@@ -56,6 +56,7 @@ evidence, and the next bounded step.
 | Formal plan execution identity and timeout reliability | Complete | Long-running dispatch tools own their deadline; `plan_create` preserves the originating conversation/message identity so GUI Subagent cards and TaskRuntime use the same run |
 | Parallel Subagent instance and TaskRuntime routing | Complete | Sync/Fork/Teammate dispatches use fresh factory instances; Auto/Task delegation is forced through the formal plan so the right panel cannot be bypassed |
 | Revisioned dynamic plan runtime | Complete | `docs/2026-07-21-dynamic-plan-runtime.md`; atomic DAG creation, optimistic patches, split projections, safe-point reloads, and capability-scoped Subagents |
+| Unattended worktree lifecycle and review parity | Complete | `docs/2026-07-22-unattended-worktree-lifecycle.md`; application commit `61c8350` |
 
 ## Current Decisions
 
@@ -98,6 +99,14 @@ LSP discovery only starts installed language servers detected for the current
 project; explicit global and project `.lsp.yaml` files override discovery. The
 repo map uses Tree-sitter for supported languages and a UTF-8-safe text fallback
 for unsupported files or parser failure.
+
+Unattended execution no longer creates a duplicate run-level
+`eko-unattended-*` checkout. Read-only primary-Agent work stays in the
+authoritative checkout; mutation is forced through a formal writer PlanTask,
+whose existing `eko-fork-*` worktree is created at Subagent dispatch and
+cleaned after successful/no-change integration. Retained legacy branches are
+managed by one app-core review path surfaced in both GUI and TUI. See
+`docs/2026-07-22-unattended-worktree-lifecycle.md`.
 
 ### Formal Plan Execution
 
@@ -169,7 +178,9 @@ Agent framework. Reference: <https://pandoc.org/MANUAL.html>.
 
 ## Next Step
 
-Observe real long-running GUI/TUI/CLI task runs for revision-conflict and
-safe-point telemetry. Treat any UX or observability improvement discovered
-there as a new milestone; the revisioned dynamic plan runtime itself is
+Observe real long-running GUI/TUI/CLI task runs for revision-conflict,
+safe-point, and writer-worktree lifecycle telemetry. Review the nine retained
+legacy `eko-unattended-*` branches through the new queue before explicitly
+cleaning them. Treat any UX or observability improvement discovered there as a
+new milestone; the revisioned dynamic plan runtime and worktree repair are
 complete.
