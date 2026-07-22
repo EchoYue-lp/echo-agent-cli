@@ -397,7 +397,7 @@ export function displayedTodoStatus(
 ): TodoStatus {
   const run = traceRunForTodo(todo, runs);
   if (!run) return todo.status;
-  // Persisted authoritive statuses must NOT be overwritten by trace signals.
+  // Persisted authoritative statuses must NOT be overwritten by trace signals.
   // A task that the executor marked Blocked (acceptance pending) or Failed
   // (terminal) stays that way even if a SubagentRun trace later reports
   // completed/failed — the executor already incorporated that signal when
@@ -411,14 +411,23 @@ export function displayedTodoStatus(
   ) {
     return todo.status;
   }
-  // Only pending/running todos get trace-driven projection (e.g. mark a
-  // pending todo as running when its Subagent has started, or reflect a
-  // cancelled Subagent as skipped when the executor hasn't yet persisted).
-  if (run.status === 'running' && todo.status === ('pending' as TodoStatus)) {
-    return 'running' as TodoStatus;
-  }
-  if (run.status === 'cancelled' && todo.status === ('pending' as TodoStatus)) {
-    return 'skipped' as TodoStatus;
+  // Inline Subagents spawned directly by the primary agent do not drive the
+  // TaskRuntime executor, so their matching plan todo can remain Pending for
+  // the whole run. Project the latest trace lifecycle while it is still
+  // Pending. Once the executor persists Running, review/integration may still
+  // be in progress, so the persisted status remains authoritative.
+  if (todo.status === ('pending' as TodoStatus)) {
+    switch (run.status) {
+      case 'running':
+        return 'running' as TodoStatus;
+      case 'completed':
+        return 'completed' as TodoStatus;
+      case 'failed':
+      case 'timed_out':
+        return 'failed' as TodoStatus;
+      case 'cancelled':
+        return 'skipped' as TodoStatus;
+    }
   }
   return todo.status;
 }

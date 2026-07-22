@@ -30,6 +30,31 @@ describe('displayedTodoStatus', () => {
     ).toBe('skipped');
   });
 
+  it('projects a completed inline Subagent onto a pending todo', () => {
+    expect(
+      displayedTodoStatus({ task_id: 'task-1', status: 'pending' as TodoStatus }, [
+        run('completed'),
+      ])
+    ).toBe('completed');
+  });
+
+  it.each(['failed', 'timed_out'] as const)(
+    'projects a %s inline Subagent onto a pending todo as failed',
+    (status) => {
+      expect(
+        displayedTodoStatus({ task_id: 'task-1', status: 'pending' as TodoStatus }, [run(status)])
+      ).toBe('failed');
+    }
+  );
+
+  it('does NOT mark an executor-owned running todo completed before review finishes', () => {
+    expect(
+      displayedTodoStatus({ task_id: 'task-1', status: 'running' as TodoStatus }, [
+        run('completed'),
+      ])
+    ).toBe('running');
+  });
+
   it('does NOT overwrite a persisted Blocked status with Subagent completed', () => {
     // M7: acceptance failure marks the task Blocked even though the
     // Subagent trace says completed. Overwriting Blocked → completed hid
