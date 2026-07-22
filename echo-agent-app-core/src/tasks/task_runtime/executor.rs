@@ -29,7 +29,7 @@
 //! - a failed task marks itself Failed but lets already-running siblings
 //!   finish (the run ends Failed); downstream tasks are skipped.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use echo_agent::agent::{Agent, AgentEvent, CancellationToken};
@@ -175,6 +175,74 @@ fn review_stop_outcome(
 pub enum RunPlanPolicy {
     RequirePlan,
     AllowDirect,
+}
+
+/// Workspace-mutating tools that an unattended primary Agent must not call
+/// directly unless the user explicitly selected `InPlace` mode.
+///
+/// Worktree isolation is owned by formal writer PlanTasks: their Subagent
+/// worktree is created only when the writer is dispatched, then integrated by
+/// the existing review/integration stage. Hiding these tools prevents a second
+/// run-level worktree mechanism from being required around the planning Agent.
+const UNATTENDED_DIRECT_MUTATION_TOOLS: [&str; 19] = [
+    "agent_tool",
+    "shell",
+    "run_code",
+    "create_file",
+    "write_file",
+    "append_file",
+    "update_file",
+    "move_file",
+    "delete_file",
+    "edit_file",
+    "git_branch",
+    "git_commit",
+    "enter_worktree",
+    "exit_worktree",
+    "write_excel",
+    "export_data",
+    "export_text",
+    "create_complex_task",
+    "spawn_background_task",
+];
+
+fn unattended_direct_disabled_tools(
+    attended_mode: AttendedMode,
+    write_mode: UnattendedWriteMode,
+) -> Option<HashSet<String>> {
+    if attended_mode != AttendedMode::Unattended || write_mode == UnattendedWriteMode::InPlace {
+        return None;
+    }
+    Some(
+        UNATTENDED_DIRECT_MUTATION_TOOLS
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+fn unattended_run_prompt(
+    prompt: &str,
+    attended_mode: AttendedMode,
+    write_mode: UnattendedWriteMode,
+) -> String {
+    if attended_mode != AttendedMode::Unattended || write_mode == UnattendedWriteMode::InPlace {
+        return prompt.to_string();
+    }
+
+    let write_guidance = match write_mode {
+        UnattendedWriteMode::Worktree => {
+            "For any workspace mutation, shell command, code execution, or Git write, create and execute a formal plan. Writer PlanTasks receive an isolated worktree only when their Subagent is actually dispatched. Read-only work may be completed directly without creating a worktree."
+        }
+        UnattendedWriteMode::Disabled => {
+            "This unattended run is read-only. Complete read-only work directly or with a read-only formal plan; do not propose or attempt workspace mutations, shell commands, code execution, or Git writes."
+        }
+        UnattendedWriteMode::InPlace => return prompt.to_string(),
+    };
+
+    format!(
+        "[unattended workspace policy]\n{write_guidance}\n[/unattended workspace policy]\n\n{prompt}"
+    )
 }
 
 /// Error returned by the executor.
@@ -3491,7 +3559,6 @@ pub async fn launch_unattended_run(
     prompt: &str,
     parent_cancel: CancellationToken,
     write_mode: UnattendedWriteMode,
-    repo_root: Option<std::path::PathBuf>,
 ) -> Result<String, ExecError> {
     let run_id = uuid::Uuid::new_v4().to_string();
     let conversation_id = format!("{source_kind}:{source_id}:{fire_id}");
@@ -3523,7 +3590,6 @@ pub async fn launch_unattended_run(
         prompt,
         parent_cancel,
         write_mode,
-        repo_root,
     )
     .await
 }
@@ -3538,7 +3604,6 @@ pub async fn drive_unattended_run(
     prompt: &str,
     parent_cancel: CancellationToken,
     write_mode: UnattendedWriteMode,
-    repo_root: Option<std::path::PathBuf>,
 ) -> Result<String, ExecError> {
     drive_agent_run(
         store,
@@ -3549,7 +3614,6 @@ pub async fn drive_unattended_run(
         prompt,
         parent_cancel,
         write_mode,
-        repo_root,
         RunPlanPolicy::AllowDirect,
         None,
     )
@@ -3560,8 +3624,9 @@ pub async fn drive_unattended_run(
 /// loop. The Agent may materialize a plan through `plan_create` +
 /// `plan_execute`; direct completion is controlled by [`RunPlanPolicy`].
 ///
-/// For unattended worktree mode this also provisions the isolated checkout,
-/// records its diff as an artifact, and preserves it for review.
+/// Unattended direct read-only work stays in the original checkout. Workspace
+/// mutation is routed through formal writer PlanTasks, whose existing Subagent
+/// integration path creates a worktree only when the writer is dispatched.
 #[allow(clippy::too_many_arguments)]
 pub async fn drive_agent_run(
     store: Arc<TaskRuntimeStore>,
@@ -3572,7 +3637,6 @@ pub async fn drive_agent_run(
     prompt: &str,
     parent_cancel: CancellationToken,
     write_mode: UnattendedWriteMode,
-    repo_root: Option<std::path::PathBuf>,
     plan_policy: RunPlanPolicy,
     trace_sink: Option<ExecSink>,
 ) -> Result<String, ExecError> {
@@ -3588,104 +3652,18 @@ pub async fn drive_agent_run(
         .as_ref()
         .map(|run| run.root_message_id.clone())
         .filter(|message_id| !message_id.trim().is_empty());
-
-    // D7 stage 2: attempt to provision an isolated git worktree for write
-    // operations. Lazy: only when mode is Worktree AND a repo_root is given
-    // AND the worktree can be created. Failure is a soft fallback to Disabled
-    // (logged as warn) so we never fail the whole run just because worktree
-    // setup failed — the user can still review why via the warn.
-    let worktree: Option<super::worktree::RunWorktree> = if write_mode
-        == UnattendedWriteMode::Worktree
-    {
-        if let Some(ref root) = repo_root {
-            // P1-14: RunWorktree::create 内部用 std::process::Command 同步执行
-            // `git worktree add`(worktree.rs:84), 在 async 上下文里直接调用会阻塞
-            // Tokio scheduler 线程。包进 spawn_blocking 把它丢到阻塞线程池。
-            let wt_run_id = run_id.to_string();
-            let wt_root = root.clone();
-            match tokio::task::spawn_blocking(move || {
-                super::worktree::RunWorktree::create(&wt_run_id, &wt_root)
-            })
-            .await
-            {
-                Ok(create_result) => match create_result {
-                    Ok(wt) => {
-                        tracing::info!(
-                            run_id = %run_id,
-                            branch = %wt.branch,
-                            path = %wt.path.display(),
-                            "U1c stage 2: unattended worktree provisioned"
-                        );
-                        Some(wt)
-                    }
-                    Err(e) => {
-                        // SAFETY (D7 stage 2): worktree creation failed under
-                        // Worktree mode. We must NOT silently continue — that
-                        // would allow writes to land in the main workspace
-                        // without isolation (the preflight loosens its write
-                        // ban under Worktree mode, expecting isolation to
-                        // provide safety). Fail the run hard so the user sees
-                        // the problem, rather than silently risking their
-                        // uncommitted work.
-                        let msg = format!(
-                            "Unattended worktree creation failed (mode=Worktree): {}. \
-                             Refusing to run without isolation — fix the git state \
-                             or set unattended_write_mode=disabled/in_place.",
-                            e.message
-                        );
-                        tracing::error!(
-                            run_id = %run_id,
-                            error = %e.message,
-                            "U1c stage 2: worktree creation failed — failing run (no silent fallback)"
-                        );
-                        let _ = store.transition_run(run_id, TaskRunStatus::Failed);
-                        let _ = store.note(run_id, None, &msg);
-                        return Err(ExecError::Other(msg));
-                    }
-                },
-                Err(join_err) => {
-                    // spawn_blocking 任务 panic (JoinError)。同等 fail-hard 处理。
-                    let msg = format!(
-                        "Unattended worktree creation panicked: {join_err}. \
-                         Refusing to run without isolation."
-                    );
-                    tracing::error!(
-                        run_id = %run_id,
-                        error = %join_err,
-                        "U1c stage 2: spawn_blocking join error"
-                    );
-                    let _ = store.transition_run(run_id, TaskRunStatus::Failed);
-                    let _ = store.note(run_id, None, &msg);
-                    return Err(ExecError::Other(msg));
-                }
-            }
-        } else {
-            // repo_root not available — same safety argument: don't run
-            // writes without isolation under Worktree mode.
-            let msg = "Unattended run requested Worktree mode but repo_root \
-                       could not be resolved. Refusing to run without isolation \
-                       — set unattended_write_mode=disabled/in_place or ensure \
-                       the run starts inside a git repo."
-                .to_string();
-            tracing::error!(
-                run_id = %run_id,
-                "U1c stage 2: no repo_root under Worktree mode — failing run"
-            );
-            let _ = store.transition_run(run_id, TaskRunStatus::Failed);
-            let _ = store.note(run_id, None, &msg);
-            return Err(ExecError::Other(msg));
-        }
-    } else {
-        None
-    };
+    let attended_mode = run_for_scope
+        .as_ref()
+        .map(|run| run.attended_mode)
+        .unwrap_or_default();
 
     // Drive the Agent's ReAct loop in the run's context. It may call
     // plan_create + plan_execute; attended_mode on the persisted run controls
     // whether unattended preflight applies.
     let run_id_for_scope = run_id.to_string();
     let cancel_for_scope = child_cancel.clone();
-    let prompt_owned = prompt.to_string();
-    let wt_path_for_scope = worktree.as_ref().map(|w| w.path.clone());
+    let prompt_owned = unattended_run_prompt(prompt, attended_mode, write_mode);
+    let disabled_tools = unattended_direct_disabled_tools(attended_mode, write_mode);
     let trace_sink_for_scope = trace_sink.clone();
     let core_trace_sink = exec_trace_sink_to_core(trace_sink);
 
@@ -3707,9 +3685,9 @@ pub async fn drive_agent_run(
                     trace_sink: core_trace_sink,
                     delegation_policy: None,
                 }),
-                working_dir: wt_path_for_scope,
+                working_dir: None,
                 cancel: None,
-                disabled_tools: None,
+                disabled_tools,
                 run_budget: None,
             };
             let event_identity = echo_core::agent::EventIdentity::from_invocation(&invocation);
@@ -3793,52 +3771,6 @@ pub async fn drive_agent_run(
     // Determine final outcome from the store (plan_execute/execute_run
     // may have already transitioned the run to a terminal state).
     let final_status = store.get_run(run_id).ok().flatten().map(|r| r.status);
-
-    // D7 stage 2: if we provisioned a worktree, record the diff as an
-    // artifact and keep the worktree for later human review (Q1 decision:
-    // no automatic merge, just preserve for inspection).
-    if let Some(wt) = worktree {
-        match wt.diff_summary() {
-            Ok(diff) => {
-                let artifact = Artifact {
-                    id: format!("worktree-diff-{run_id}"),
-                    run_id: run_id.to_string(),
-                    task_id: None,
-                    kind: ArtifactKind::Other,
-                    title: format!("Worktree diff for {}", wt.branch),
-                    path: Some(wt.path.to_string_lossy().to_string()),
-                    metadata: serde_json::json!({
-                        "diff": diff,
-                        "worktree_path": wt.path.to_string_lossy(),
-                        "branch": wt.branch,
-                    }),
-                };
-                if let Err(e) = store.add_artifact(&artifact) {
-                    tracing::warn!(
-                        run_id = %run_id,
-                        error = %e,
-                        "Failed to record worktree diff artifact"
-                    );
-                }
-            }
-            Err(e) => {
-                tracing::warn!(
-                    run_id = %run_id,
-                    error = %e.message,
-                    "Failed to generate worktree diff summary"
-                );
-            }
-        }
-        // Q1: keep the worktree, don't remove it. User can review and merge/discard later.
-        tracing::info!(
-            run_id = %run_id,
-            branch = %wt.branch,
-            path = %wt.path.display(),
-            "U1c stage 2: worktree kept for review (no automatic merge)"
-        );
-        // Drop worktree handle, but don't remove the directory.
-        drop(wt);
-    }
 
     match final_status {
         Some(TaskRunStatus::Completed) => {
@@ -3942,7 +3874,6 @@ pub async fn launch_cron_run(
         prompt,
         parent_cancel,
         UnattendedWriteMode::default(), // D7 stage 2: Worktree (safe default)
-        super::worktree::git_repo_root(std::path::Path::new(".")).ok(), // best-effort repo_root
     )
     .await?;
     let status = store
@@ -4064,6 +3995,57 @@ pub fn preflight_unattended_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unattended_worktree_mode_routes_mutations_through_formal_plans() {
+        let disabled = unattended_direct_disabled_tools(
+            AttendedMode::Unattended,
+            UnattendedWriteMode::Worktree,
+        )
+        .unwrap_or_default();
+
+        assert!(disabled.contains("shell"));
+        assert!(disabled.contains("write_file"));
+        assert!(disabled.contains("git_commit"));
+        assert!(!disabled.contains("read_file"));
+        assert!(!disabled.contains("plan_create"));
+        assert!(!disabled.contains("plan_execute"));
+
+        let prompt = unattended_run_prompt(
+            "update the implementation",
+            AttendedMode::Unattended,
+            UnattendedWriteMode::Worktree,
+        );
+        assert!(prompt.contains("formal plan"));
+        assert!(prompt.contains("only when their Subagent is actually dispatched"));
+        assert!(prompt.ends_with("update the implementation"));
+    }
+
+    #[test]
+    fn attended_and_in_place_runs_keep_direct_tools_available() {
+        assert!(
+            unattended_direct_disabled_tools(
+                AttendedMode::Attended,
+                UnattendedWriteMode::Worktree,
+            )
+            .is_none()
+        );
+        assert!(
+            unattended_direct_disabled_tools(
+                AttendedMode::Unattended,
+                UnattendedWriteMode::InPlace,
+            )
+            .is_none()
+        );
+        assert_eq!(
+            unattended_run_prompt(
+                "inspect the repository",
+                AttendedMode::Unattended,
+                UnattendedWriteMode::InPlace,
+            ),
+            "inspect the repository"
+        );
+    }
 
     // ── Preflight tests (Phase B) ─────────────────────────────────────────
 
@@ -4429,7 +4411,6 @@ Read the runtime path and found one missing branch.
             "hello",
             cancel,
             UnattendedWriteMode::Disabled,
-            None,
         )
         .await
         .map_err(|error| error.to_string())?;
@@ -4492,7 +4473,6 @@ Read the runtime path and found one missing branch.
             "materialize and execute a formal plan",
             CancellationToken::new(),
             UnattendedWriteMode::Disabled,
-            None,
             RunPlanPolicy::RequirePlan,
             None,
         )

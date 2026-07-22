@@ -88,7 +88,6 @@ pub async fn drive_run_async(payload: RunPayload) -> Result<RunOutcome, String> 
         &payload.prompt,
         payload.cancel,
         UnattendedWriteMode::Disabled,
-        None,
         payload.plan_policy,
         payload.trace_sink.clone(),
     )

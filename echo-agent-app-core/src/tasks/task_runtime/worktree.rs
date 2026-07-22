@@ -1,5 +1,5 @@
-//! Worktree lifecycle and integration primitives for unattended runs and
-//! Fork-dispatched writer tasks.
+//! Worktree lifecycle and integration primitives for Fork-dispatched writer
+//! tasks, plus cleanup/review support for legacy unattended-run worktrees.
 //!
 //! This module centralises the git-worktree operations that were previously
 //! scattered across Tauri `panels.rs` commands, so both the CLI and the GUI
@@ -14,9 +14,9 @@
 //!
 //! # Naming conventions
 //!
-//! * Branch prefix: `eko-unattended-` (unattended-run worktrees only; manual
-//!   user worktrees created via `panels.rs` use the existing `worktree-`
-//!   prefix so they stay distinct).
+//! * Legacy branch prefix: `eko-unattended-`. New unattended runs no longer
+//!   create this duplicate run-level checkout; the prefix remains so existing
+//!   reviewable work can be listed, integrated, or cleaned without data loss.
 //! * Path: `<repo_parent>/<repo_name>-<branch>` (matches Claude Code's
 //!   `.claude/worktrees/` sibling-directory convention, and the existing
 //!   `default_worktree_path` helper in `panels.rs`).
@@ -105,6 +105,10 @@ pub struct WorktreeInfo {
     pub managed: bool,
     /// First 12 chars of HEAD commit hash (display-only).
     pub head: String,
+    /// Whether Git currently protects this worktree from prune/remove.
+    pub locked: bool,
+    /// Optional reason recorded by `git worktree lock --reason`.
+    pub lock_reason: Option<String>,
 }
 
 /// Errors returned by worktree operations. String wrapper — the underlying
@@ -273,11 +277,15 @@ pub fn parse_worktree_list(output: &str, repo_root: &Path) -> Vec<WorktreeInfo> 
     let mut current_path: Option<PathBuf> = None;
     let mut current_head = String::new();
     let mut current_branch = String::new();
+    let mut current_locked = false;
+    let mut current_lock_reason: Option<String> = None;
 
     let flush = |items: &mut Vec<WorktreeInfo>,
                  path: &mut Option<PathBuf>,
                  head: &mut String,
-                 branch: &mut String| {
+                 branch: &mut String,
+                 locked: &mut bool,
+                 lock_reason: &mut Option<String>| {
         let Some(path_buf) = path.take() else {
             return;
         };
@@ -295,9 +303,12 @@ pub fn parse_worktree_list(output: &str, repo_root: &Path) -> Vec<WorktreeInfo> 
             branch: display_branch,
             managed: canonical != canonical_repo,
             head: head.chars().take(12).collect(),
+            locked: *locked,
+            lock_reason: lock_reason.take(),
         });
         head.clear();
         branch.clear();
+        *locked = false;
     };
 
     for line in output.lines() {
@@ -307,6 +318,8 @@ pub fn parse_worktree_list(output: &str, repo_root: &Path) -> Vec<WorktreeInfo> 
                 &mut current_path,
                 &mut current_head,
                 &mut current_branch,
+                &mut current_locked,
+                &mut current_lock_reason,
             );
             continue;
         }
@@ -316,12 +329,18 @@ pub fn parse_worktree_list(output: &str, repo_root: &Path) -> Vec<WorktreeInfo> 
                 &mut current_path,
                 &mut current_head,
                 &mut current_branch,
+                &mut current_locked,
+                &mut current_lock_reason,
             );
             current_path = Some(PathBuf::from(path));
         } else if let Some(head) = line.strip_prefix("HEAD ") {
             current_head = head.to_string();
         } else if let Some(branch) = line.strip_prefix("branch ") {
             current_branch = branch.to_string();
+        } else if let Some(reason) = line.strip_prefix("locked") {
+            current_locked = true;
+            let reason = reason.trim();
+            current_lock_reason = (!reason.is_empty()).then(|| reason.to_string());
         }
     }
     flush(
@@ -329,66 +348,37 @@ pub fn parse_worktree_list(output: &str, repo_root: &Path) -> Vec<WorktreeInfo> 
         &mut current_path,
         &mut current_head,
         &mut current_branch,
+        &mut current_locked,
+        &mut current_lock_reason,
     );
     items
 }
 
 // ── RunWorktree lifecycle (A3–A5) ──────────────────────────────────────
 
-/// An in-progress worktree for an unattended write run.
+/// An in-progress worktree for a Fork-dispatched writer Subagent.
 ///
-/// Holds the identity needed to generate a diff summary and to `keep`, unlock,
-/// integrate, or remove the worktree after execution.
+/// Holds the identity needed to generate a diff summary, unlock, and integrate
+/// the worktree after execution.
 #[derive(Debug)]
 pub struct RunWorktree {
-    /// The `run_id` this worktree serves.
-    pub run_id: String,
     /// Canonical repository checkout used for shared Git operations.
     pub repo_root: PathBuf,
     /// Absolute path to the worktree checkout.
     pub path: PathBuf,
-    /// Branch name (`eko-unattended-<run_id>`).
+    /// Branch name (`eko-fork-<safe-label>`).
     pub branch: String,
     /// Immutable base commit SHA resolved when the worktree was created.
     pub base: String,
 }
 
 impl RunWorktree {
-    /// Create a new unattended-run worktree.
-    ///
-    /// * `branch` = `eko-unattended-<run_id>`
-    /// * `path` = computed via [`default_worktree_path`]
-    /// * `base` = `repo_root` `HEAD` (default for local-first desktop;
-    ///   there is no remote assumption for unattended runs).
-    /// * After creation the worktree is `git worktree lock`ed so automatic
-    ///   cleanup (future `cleanupPeriodDays`-style sweeping) won't
-    ///   interfere while the run is active.
-    pub fn create(run_id: &str, repo_root: &Path) -> Result<Self, WorktreeError> {
-        Self::create_with_prefix(BRANCH_PREFIX, run_id, repo_root, "unattended run")
-    }
-
     /// Create a worktree for a Fork-dispatched subagent (Sprint 8).
     ///
-    /// Like [`create`](Self::create) but uses the [`FORK_BRANCH_PREFIX`]
-    /// namespace so Fork-subagent worktrees stay distinct from unattended-run
-    /// worktrees in `git worktree list`. `label` identifies the dispatch
-    /// (e.g. `"{agent_name}-{run_id}"`).
+    /// Uses the [`FORK_BRANCH_PREFIX`] namespace. `label` identifies the
+    /// dispatch (e.g. `"{agent_name}-{run_id}"`).
     pub fn create_fork(label: &str, repo_root: &Path) -> Result<Self, WorktreeError> {
-        Self::create_with_prefix(FORK_BRANCH_PREFIX, label, repo_root, "fork subagent")
-    }
-
-    /// Shared core for [`create`] and [`create_fork`].
-    fn create_with_prefix(
-        prefix: &str,
-        id: &str,
-        repo_root: &Path,
-        kind: &str,
-    ) -> Result<Self, WorktreeError> {
-        let branch = if prefix == FORK_BRANCH_PREFIX {
-            fork_branch_name(id)
-        } else {
-            format!("{prefix}{id}")
-        };
+        let branch = fork_branch_name(label);
         validate_branch_name(repo_root, &branch)?;
         let path = default_worktree_path(repo_root, &branch)?;
         validate_worktree_target(repo_root, &path)?;
@@ -411,12 +401,11 @@ impl RunWorktree {
                 "lock",
                 path_str,
                 "--reason",
-                &format!("{kind} {id} in progress"),
+                &format!("fork subagent {label} in progress"),
             ],
         )?;
 
         Ok(Self {
-            run_id: id.to_string(),
             repo_root: repo_root.to_path_buf(),
             path,
             branch,
@@ -452,15 +441,11 @@ impl RunWorktree {
                 .unwrap_or_else(|_| "(full diff unavailable)".to_string());
             (stat, full)
         };
-        Ok(format!("=== Stat ===\n{stat}\n\n=== Full diff ===\n{full}"))
-    }
-
-    /// Keep the worktree for later review (Q1). Returns `self` so the
-    /// caller can record `path`/`branch` in run metadata.
-    pub fn keep(self) -> Self {
-        // `git worktree lock` already applied at create time — it persists
-        // until an explicit `git worktree unlock`, so `keep` is a no-op.
-        self
+        let untracked = run_git(&self.path, &["ls-files", "--others", "--exclude-standard"])
+            .unwrap_or_else(|_| "(untracked file listing unavailable)".to_string());
+        Ok(format!(
+            "=== Stat ===\n{stat}\n\n=== Full diff ===\n{full}\n\n=== Untracked files ===\n{untracked}"
+        ))
     }
 
     /// Release the lifecycle lock after the subagent has stopped.
@@ -479,20 +464,6 @@ impl RunWorktree {
         } else {
             Err(WorktreeError::new(diagnostic))
         }
-    }
-
-    /// Discard the worktree: `git worktree remove --force` + prune.
-    /// Callers (GUI or run-finalise) use this when the user decides to
-    /// discard the unattended run's worktree.
-    pub fn remove(self) -> Result<(), WorktreeError> {
-        let wt_path = self
-            .path
-            .to_str()
-            .ok_or_else(|| WorktreeError::new("worktree path is not valid UTF-8"))?;
-        let _ = self.unlock();
-        run_git(&self.repo_root, &["worktree", "remove", "--force", wt_path])?;
-        run_git(&self.repo_root, &["worktree", "prune"])?;
-        Ok(())
     }
 }
 
@@ -559,7 +530,7 @@ pub fn integrate_fork_worktree(
         let path = find_worktree_path(repo_root, &branch)?;
         let cleanup_warning = path
             .as_deref()
-            .and_then(|path| cleanup_fork_worktree(repo_root, path, &branch).err());
+            .and_then(|path| cleanup_managed_worktree(repo_root, path, &branch).err());
         return Ok(WorktreeIntegrationOutcome {
             status: WorktreeIntegrationStatus::AlreadyIntegrated,
             branch,
@@ -575,6 +546,17 @@ pub fn integrate_fork_worktree(
             "writer worktree not found for execution {execution_id} (branch {branch})"
         ))
     })?;
+    integrate_existing_worktree(repo_root, branch, path, task_id, &trailer, ownership)
+}
+
+fn integrate_existing_worktree(
+    repo_root: &Path,
+    branch: String,
+    path: PathBuf,
+    task_id: &str,
+    trailer: &str,
+    ownership: &super::planner::FileOwnership,
+) -> Result<WorktreeIntegrationOutcome, WorktreeError> {
     let preserve_error = |message: String| {
         let _ = unlock_worktree(repo_root, &path);
         WorktreeError::new(format!(
@@ -604,7 +586,7 @@ pub fn integrate_fork_worktree(
         .map_err(|error| preserve_error(format!("failed to inspect staged changes: {error}")))?;
     match staged_against_head.status.code() {
         Some(0) => {}
-        Some(1) => commit_writer_changes(&path, task_id, execution_id)
+        Some(1) => commit_writer_changes(&path, task_id, trailer)
             .map_err(|error| preserve_error(format!("failed to commit writer changes: {error}")))?,
         _ => {
             return Err(preserve_error(format!(
@@ -615,7 +597,7 @@ pub fn integrate_fork_worktree(
     }
 
     if changed_files.is_empty() {
-        let cleanup_warning = cleanup_fork_worktree(repo_root, &path, &branch).err();
+        let cleanup_warning = cleanup_managed_worktree(repo_root, &path, &branch).err();
         return Ok(WorktreeIntegrationOutcome {
             status: WorktreeIntegrationStatus::NoChanges,
             branch,
@@ -631,7 +613,7 @@ pub fn integrate_fork_worktree(
     match ancestor.status.code() {
         Some(0) => {
             let commit = run_git(repo_root, &["rev-parse", "HEAD"]).ok();
-            let cleanup_warning = cleanup_fork_worktree(repo_root, &path, &branch).err();
+            let cleanup_warning = cleanup_managed_worktree(repo_root, &path, &branch).err();
             return Ok(WorktreeIntegrationOutcome {
                 status: WorktreeIntegrationStatus::AlreadyIntegrated,
                 branch,
@@ -732,7 +714,7 @@ pub fn integrate_fork_worktree(
     }
 
     let merge_commit = run_git(repo_root, &["rev-parse", "HEAD"]);
-    let mut cleanup_warning = cleanup_fork_worktree(repo_root, &path, &branch).err();
+    let mut cleanup_warning = cleanup_managed_worktree(repo_root, &path, &branch).err();
     let merge_commit = match merge_commit {
         Ok(commit) => Some(commit),
         Err(error) => {
@@ -779,9 +761,9 @@ fn validate_changed_files(
 fn commit_writer_changes(
     worktree: &Path,
     task_id: &str,
-    execution_id: &str,
+    trailer: &str,
 ) -> Result<(), WorktreeError> {
-    let message = format!("EKO task {task_id}\n\nEKO-Execution-Id: {execution_id}");
+    let message = format!("EKO task {task_id}\n\n{trailer}");
     run_git(
         worktree,
         &[
@@ -910,7 +892,7 @@ fn unlock_worktree(repo_root: &Path, path: &Path) -> Result<(), WorktreeError> {
     }
 }
 
-fn cleanup_fork_worktree(repo_root: &Path, path: &Path, branch: &str) -> Result<(), String> {
+fn cleanup_managed_worktree(repo_root: &Path, path: &Path, branch: &str) -> Result<(), String> {
     let path_text = path
         .to_str()
         .ok_or_else(|| "worktree path is not valid UTF-8".to_string())?;
@@ -930,129 +912,256 @@ fn cleanup_fork_worktree(repo_root: &Path, path: &Path, branch: &str) -> Result<
 pub struct UnattendedWorktreeInfo {
     pub run_id: String,
     pub branch: String,
-    pub path: PathBuf,
+    pub path: Option<PathBuf>,
     pub head: String,
-    pub status: String, // "pending", "merged", "discarded", or run status from store
+    pub status: String,
+    pub active: bool,
+    pub locked: bool,
+    pub lock_reason: Option<String>,
+    pub uncommitted_changes: bool,
+    pub ahead_commits: u32,
+    pub has_changes: bool,
+    pub orphan_branch: bool,
 }
 
-/// List all unattended worktrees (those with the "eko-unattended-" prefix).
-/// Returns worktrees that are still present on disk, along with their run status
-/// from the TaskRuntimeStore (if available).
+#[derive(Debug, Clone, Default)]
+pub struct UnattendedCleanupResult {
+    pub removed: Vec<String>,
+    pub unlocked: Vec<String>,
+    pub kept: Vec<String>,
+    pub errors: Vec<String>,
+}
+
+fn list_prefixed_branches(
+    repo_root: &Path,
+    prefix: &str,
+) -> Result<Vec<(String, String)>, WorktreeError> {
+    let pattern = format!("refs/heads/{prefix}*");
+    let output = run_git(
+        repo_root,
+        &[
+            "for-each-ref",
+            "--format=%(refname:short)%00%(objectname)",
+            &pattern,
+        ],
+    )?;
+    let mut branches = Vec::new();
+    for line in output.lines().filter(|line| !line.trim().is_empty()) {
+        let Some((branch, head)) = line.split_once('\0') else {
+            return Err(WorktreeError::new(format!(
+                "git returned malformed branch metadata: {line}"
+            )));
+        };
+        branches.push((branch.to_string(), head.to_string()));
+    }
+    branches.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(branches)
+}
+
+fn worktree_has_uncommitted_changes(path: &Path) -> Result<bool, WorktreeError> {
+    let status = run_git(path, &["status", "--porcelain=v1", "--untracked-files=all"])?;
+    Ok(!status.trim().is_empty())
+}
+
+fn branch_ahead_of_head(repo_root: &Path, branch: &str) -> Result<u32, WorktreeError> {
+    let count = run_git(
+        repo_root,
+        &["rev-list", "--count", &format!("HEAD..{branch}")],
+    )?;
+    count.trim().parse::<u32>().map_err(|error| {
+        WorktreeError::new(format!(
+            "git returned invalid commit count for {branch}: {error}"
+        ))
+    })
+}
+
+/// List every legacy `eko-unattended-*` branch, including orphan branches
+/// whose worktree directory is already gone. A branch is considered to hold
+/// work when its checkout is dirty or it contains commits not reachable from
+/// the authoritative checkout's current `HEAD`.
 pub fn list_unattended_worktrees(
     repo_root: &Path,
     store: Option<&crate::tasks::task_runtime::TaskRuntimeStore>,
 ) -> Result<Vec<UnattendedWorktreeInfo>, WorktreeError> {
     let output = run_git(repo_root, &["worktree", "list", "--porcelain"])?;
-    let all_worktrees = parse_worktree_list(&output, repo_root);
-
+    let worktrees = parse_worktree_list(&output, repo_root)
+        .into_iter()
+        .map(|worktree| (worktree.branch.clone(), worktree))
+        .collect::<HashMap<_, _>>();
     let mut unattended = Vec::new();
-    for wt in all_worktrees {
-        if wt.branch.starts_with(BRANCH_PREFIX) {
-            // Extract run_id from branch name: "eko-unattended-{run_id}"
-            let run_id = wt.branch.strip_prefix(BRANCH_PREFIX).unwrap_or(&wt.branch);
-
-            // Try to get status from store
-            let status = if let Some(store) = store {
-                match store.get_run(run_id) {
-                    Ok(Some(run)) => run.status.as_str().to_string(),
-                    Ok(None) => "unknown".to_string(),
-                    Err(_) => "unknown".to_string(),
-                }
-            } else {
-                "pending".to_string()
-            };
-
-            unattended.push(UnattendedWorktreeInfo {
-                run_id: run_id.to_string(),
-                branch: wt.branch,
-                path: PathBuf::from(&wt.path),
-                head: wt.head,
-                status,
-            });
-        }
+    for (branch, full_head) in list_prefixed_branches(repo_root, BRANCH_PREFIX)? {
+        let run_id = branch
+            .strip_prefix(BRANCH_PREFIX)
+            .unwrap_or(branch.as_str())
+            .to_string();
+        let worktree = worktrees.get(&branch);
+        let path = worktree.map(|item| PathBuf::from(&item.path));
+        let uncommitted_changes = match path.as_deref() {
+            Some(path) => worktree_has_uncommitted_changes(path)?,
+            None => false,
+        };
+        let ahead_commits = branch_ahead_of_head(repo_root, &branch)?;
+        let status = store
+            .and_then(|store| store.get_run(&run_id).ok().flatten())
+            .map(|run| run.status.as_str().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let active = store.is_some_and(|store| store.is_run_active(&run_id));
+        unattended.push(UnattendedWorktreeInfo {
+            run_id,
+            branch,
+            path: path.clone(),
+            head: full_head.chars().take(12).collect(),
+            status,
+            active,
+            locked: worktree.is_some_and(|item| item.locked),
+            lock_reason: worktree.and_then(|item| item.lock_reason.clone()),
+            uncommitted_changes,
+            ahead_commits,
+            has_changes: uncommitted_changes || ahead_commits > 0,
+            orphan_branch: path.is_none(),
+        });
     }
-
     Ok(unattended)
 }
 
-/// Merge an unattended worktree back to the main branch.
-/// This will:
-/// 1. Checkout the main branch in the main worktree
-/// 2. Merge the worktree branch
-/// 3. Optionally remove the worktree after successful merge
+fn unattended_worktree(
+    repo_root: &Path,
+    run_id: &str,
+    store: Option<&crate::tasks::task_runtime::TaskRuntimeStore>,
+) -> Result<UnattendedWorktreeInfo, WorktreeError> {
+    list_unattended_worktrees(repo_root, store)?
+        .into_iter()
+        .find(|worktree| worktree.run_id == run_id)
+        .ok_or_else(|| {
+            WorktreeError::new(format!("Unattended worktree for run {run_id} not found"))
+        })
+}
+
+/// Merge a retained legacy unattended worktree through the same safe
+/// integration boundary used by formal writer Subagents.
 pub fn merge_unattended_worktree(
     repo_root: &Path,
     run_id: &str,
-    remove_after_merge: bool,
-) -> Result<(), WorktreeError> {
-    let branch = format!("{BRANCH_PREFIX}{run_id}");
-
-    // Find the worktree path
-    let output = run_git(repo_root, &["worktree", "list", "--porcelain"])?;
-    let worktrees = parse_worktree_list(&output, repo_root);
-
-    let worktree = worktrees
-        .iter()
-        .find(|wt| wt.branch == branch)
-        .ok_or_else(|| WorktreeError::new(format!("Worktree for branch {} not found", branch)))?;
-
-    let worktree_path = PathBuf::from(&worktree.path);
-
-    // Ensure we're on main branch in the main worktree
-    run_git(repo_root, &["checkout", "main"])?;
-
-    // Merge the worktree branch
-    run_git(
+    store: Option<&crate::tasks::task_runtime::TaskRuntimeStore>,
+) -> Result<WorktreeIntegrationOutcome, WorktreeError> {
+    let worktree = unattended_worktree(repo_root, run_id, store)?;
+    if worktree.active {
+        return Err(WorktreeError::new(format!(
+            "run {run_id} is still active; refusing to integrate its worktree"
+        )));
+    }
+    let trailer = format!("EKO-Unattended-Run: {run_id}");
+    if let Some(commit) = find_integration_commit(repo_root, &trailer)? {
+        let cleanup_warning = worktree
+            .path
+            .as_deref()
+            .and_then(|path| cleanup_managed_worktree(repo_root, path, &worktree.branch).err());
+        return Ok(WorktreeIntegrationOutcome {
+            status: WorktreeIntegrationStatus::AlreadyIntegrated,
+            branch: worktree.branch,
+            path: worktree.path,
+            changed_files: Vec::new(),
+            merge_commit: Some(commit),
+            cleanup_warning,
+        });
+    }
+    let path = match worktree.path {
+        Some(path) => path,
+        None => {
+            let path = default_worktree_path(repo_root, &worktree.branch)?;
+            validate_worktree_target(repo_root, &path)?;
+            let path_text = path
+                .to_str()
+                .ok_or_else(|| WorktreeError::new("worktree path is not valid UTF-8"))?;
+            run_git(repo_root, &["worktree", "add", path_text, &worktree.branch])?;
+            path
+        }
+    };
+    integrate_existing_worktree(
         repo_root,
-        &[
-            "merge",
-            &branch,
-            "--no-ff",
-            "-m",
-            &format!("Merge unattended run {}", run_id),
-        ],
-    )?;
+        worktree.branch,
+        path,
+        &format!("unattended run {run_id}"),
+        &trailer,
+        &super::planner::FileOwnership::Unknown {
+            reason: "legacy unattended worktree",
+        },
+    )
+}
 
-    // Optionally remove the worktree
-    if remove_after_merge {
-        let wt_path_str = worktree_path
+fn remove_unattended_worktree(
+    repo_root: &Path,
+    worktree: &UnattendedWorktreeInfo,
+) -> Result<(), WorktreeError> {
+    if let Some(path) = worktree.path.as_deref() {
+        unlock_worktree(repo_root, path)?;
+        let path = path
             .to_str()
             .ok_or_else(|| WorktreeError::new("worktree path is not valid UTF-8"))?;
-        run_git(repo_root, &["worktree", "remove", "--force", wt_path_str])?;
-        run_git(repo_root, &["branch", "-d", &branch])?;
+        run_git(repo_root, &["worktree", "remove", "--force", path])?;
     }
-
+    run_git(repo_root, &["branch", "-D", &worktree.branch])?;
+    run_git(repo_root, &["worktree", "prune"])?;
     Ok(())
 }
 
-/// Discard an unattended worktree without merging.
-/// This will:
-/// 1. Remove the worktree
-/// 2. Delete the branch
-pub fn discard_unattended_worktree(repo_root: &Path, run_id: &str) -> Result<(), WorktreeError> {
-    let branch = format!("{BRANCH_PREFIX}{run_id}");
+/// Discard an unattended worktree and its branch after an explicit user
+/// decision. Active runs are never removed.
+pub fn discard_unattended_worktree(
+    repo_root: &Path,
+    run_id: &str,
+    store: Option<&crate::tasks::task_runtime::TaskRuntimeStore>,
+) -> Result<(), WorktreeError> {
+    let worktree = unattended_worktree(repo_root, run_id, store)?;
+    if worktree.active {
+        return Err(WorktreeError::new(format!(
+            "run {run_id} is still active; refusing to discard its worktree"
+        )));
+    }
+    remove_unattended_worktree(repo_root, &worktree)
+}
 
-    // Find the worktree path
-    let output = run_git(repo_root, &["worktree", "list", "--porcelain"])?;
-    let worktrees = parse_worktree_list(&output, repo_root);
-
-    let worktree = worktrees
-        .iter()
-        .find(|wt| wt.branch == branch)
-        .ok_or_else(|| WorktreeError::new(format!("Worktree for branch {} not found", branch)))?;
-
-    let worktree_path = PathBuf::from(&worktree.path);
-    let wt_path_str = worktree_path
-        .to_str()
-        .ok_or_else(|| WorktreeError::new("worktree path is not valid UTF-8"))?;
-
-    // Remove the worktree
-    run_git(repo_root, &["worktree", "remove", "--force", wt_path_str])?;
-
-    // Delete the branch
-    run_git(repo_root, &["branch", "-D", &branch])?;
-
-    Ok(())
+/// Unlock all inactive legacy worktrees and remove only those that provably
+/// contain no uncommitted files and no commits ahead of the authoritative
+/// checkout. Changed worktrees remain available for review.
+pub fn cleanup_unattended_worktrees(
+    repo_root: &Path,
+    store: Option<&crate::tasks::task_runtime::TaskRuntimeStore>,
+) -> Result<UnattendedCleanupResult, WorktreeError> {
+    let worktrees = list_unattended_worktrees(repo_root, store)?;
+    let mut result = UnattendedCleanupResult::default();
+    for worktree in worktrees {
+        if worktree.active {
+            result.kept.push(worktree.run_id);
+            continue;
+        }
+        if worktree.locked
+            && let Some(path) = worktree.path.as_deref()
+        {
+            match unlock_worktree(repo_root, path) {
+                Ok(()) => result.unlocked.push(worktree.run_id.clone()),
+                Err(error) => {
+                    result.errors.push(format!(
+                        "{}: failed to unlock worktree: {error}",
+                        worktree.run_id
+                    ));
+                    result.kept.push(worktree.run_id);
+                    continue;
+                }
+            }
+        }
+        if worktree.has_changes {
+            result.kept.push(worktree.run_id);
+            continue;
+        }
+        match remove_unattended_worktree(repo_root, &worktree) {
+            Ok(()) => result.removed.push(worktree.run_id),
+            Err(error) => result
+                .errors
+                .push(format!("{}: cleanup failed: {error}", worktree.run_id)),
+        }
+    }
+    Ok(result)
 }
 
 // ── Fork-subagent worktree factory (Sprint 8) ────────────────────────────
@@ -1278,6 +1387,28 @@ mod tests {
         super::super::planner::FileOwnership::Known(
             files.iter().map(|file| file.to_string()).collect(),
         )
+    }
+
+    fn create_legacy_unattended_worktree(repo: &Path, run_id: &str) -> Result<PathBuf, String> {
+        let branch = format!("{BRANCH_PREFIX}{run_id}");
+        let path = default_worktree_path(repo, &branch).map_err(|error| error.to_string())?;
+        let path_text = path
+            .to_str()
+            .ok_or_else(|| "legacy worktree path is not valid UTF-8".to_string())?;
+        run_git(repo, &["worktree", "add", "-b", &branch, path_text, "HEAD"])
+            .map_err(|error| error.to_string())?;
+        run_git(
+            repo,
+            &[
+                "worktree",
+                "lock",
+                path_text,
+                "--reason",
+                &format!("unattended run {run_id} in progress"),
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(path)
     }
 
     #[test]
@@ -1531,6 +1662,157 @@ mod tests {
     }
 
     #[test]
+    fn unattended_cleanup_removes_unchanged_worktree_and_orphan_branch() -> Result<(), String> {
+        let (_temp, repo) = init_repo()?;
+        let clean_path = create_legacy_unattended_worktree(&repo, "clean-run")?;
+        let orphan_branch = format!("{BRANCH_PREFIX}orphan-run");
+        run_git(&repo, &["branch", &orphan_branch, "HEAD"]).map_err(|error| error.to_string())?;
+
+        let result =
+            cleanup_unattended_worktrees(&repo, None).map_err(|error| error.to_string())?;
+        if !result.removed.iter().any(|run_id| run_id == "clean-run")
+            || !result.removed.iter().any(|run_id| run_id == "orphan-run")
+        {
+            return Err(format!("unexpected cleanup result: {result:?}"));
+        }
+        if clean_path.exists() {
+            return Err("unchanged worktree directory should be removed".to_string());
+        }
+        let remaining =
+            list_unattended_worktrees(&repo, None).map_err(|error| error.to_string())?;
+        if !remaining.is_empty() {
+            return Err(format!("unexpected remaining worktrees: {remaining:?}"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unattended_cleanup_preserves_changes_and_releases_stale_lock() -> Result<(), String> {
+        let (_temp, repo) = init_repo()?;
+        let path = create_legacy_unattended_worktree(&repo, "changed-run")?;
+        std::fs::write(path.join("review.txt"), "keep me\n").map_err(|error| error.to_string())?;
+
+        let result =
+            cleanup_unattended_worktrees(&repo, None).map_err(|error| error.to_string())?;
+        if !result.kept.iter().any(|run_id| run_id == "changed-run")
+            || !result.unlocked.iter().any(|run_id| run_id == "changed-run")
+        {
+            return Err(format!("unexpected cleanup result: {result:?}"));
+        }
+        let listed = list_unattended_worktrees(&repo, None).map_err(|error| error.to_string())?;
+        let item = listed
+            .into_iter()
+            .find(|item| item.run_id == "changed-run")
+            .ok_or_else(|| "changed worktree should remain listed".to_string())?;
+        if !item.has_changes || item.locked || item.orphan_branch {
+            return Err(format!("unexpected retained worktree state: {item:?}"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unattended_cleanup_skips_active_run() -> Result<(), String> {
+        let (temp, repo) = init_repo()?;
+        let path = create_legacy_unattended_worktree(&repo, "active-run")?;
+        let store = Arc::new(
+            crate::tasks::task_runtime::TaskRuntimeStore::new_in_memory_with_shadow_root(
+                temp.path().join("runtime"),
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        let _registration = store
+            .register_run_cancellation("active-run", echo_agent::agent::CancellationToken::new())
+            .map_err(|error| error.to_string())?;
+
+        let result = cleanup_unattended_worktrees(&repo, Some(store.as_ref()))
+            .map_err(|error| error.to_string())?;
+        if !result.kept.iter().any(|run_id| run_id == "active-run") || !path.exists() {
+            return Err(format!("active worktree was not preserved: {result:?}"));
+        }
+        let listed = list_unattended_worktrees(&repo, Some(store.as_ref()))
+            .map_err(|error| error.to_string())?;
+        let item = listed
+            .into_iter()
+            .find(|item| item.run_id == "active-run")
+            .ok_or_else(|| "active worktree should remain listed".to_string())?;
+        if !item.active || !item.locked {
+            return Err(format!("unexpected active worktree state: {item:?}"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unattended_merge_commits_untracked_work_before_integration() -> Result<(), String> {
+        let (_temp, repo) = init_repo()?;
+        let path = create_legacy_unattended_worktree(&repo, "merge-run")?;
+        std::fs::write(path.join("merged.txt"), "merged\n").map_err(|error| error.to_string())?;
+
+        let outcome = merge_unattended_worktree(&repo, "merge-run", None)
+            .map_err(|error| error.to_string())?;
+        if outcome.status != WorktreeIntegrationStatus::Merged {
+            return Err(format!("unexpected merge outcome: {outcome:?}"));
+        }
+        let merged =
+            std::fs::read_to_string(repo.join("merged.txt")).map_err(|error| error.to_string())?;
+        if merged != "merged\n" {
+            return Err(format!("unexpected merged content: {merged}"));
+        }
+        if path.exists() {
+            return Err("integrated unattended worktree should be removed".to_string());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unattended_merge_materializes_and_integrates_orphan_branch() -> Result<(), String> {
+        let (_tmp, repo) = init_repo()?;
+        let path = create_legacy_unattended_worktree(&repo, "orphan-merge")?;
+        std::fs::write(path.join("orphan.txt"), "orphan branch change\n")
+            .map_err(|error| error.to_string())?;
+        run_git(&path, &["add", "orphan.txt"]).map_err(|error| error.to_string())?;
+        run_git(
+            &path,
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=EKO Test",
+                "-c",
+                "user.email=eko-test@local",
+                "commit",
+                "-m",
+                "orphan change",
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        unlock_worktree(&repo, &path).map_err(|error| error.to_string())?;
+        let path_text = path.to_string_lossy().to_string();
+        run_git(&repo, &["worktree", "remove", &path_text]).map_err(|error| error.to_string())?;
+
+        let listed = list_unattended_worktrees(&repo, None).map_err(|error| error.to_string())?;
+        let orphan = listed
+            .iter()
+            .find(|item| item.run_id == "orphan-merge")
+            .ok_or_else(|| "orphan branch was not listed".to_string())?;
+        assert!(orphan.orphan_branch);
+        assert!(orphan.has_changes);
+
+        let outcome = merge_unattended_worktree(&repo, "orphan-merge", None)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(outcome.status, WorktreeIntegrationStatus::Merged);
+        assert_eq!(
+            std::fs::read_to_string(repo.join("orphan.txt")).map_err(|error| error.to_string())?,
+            "orphan branch change\n"
+        );
+        assert!(
+            list_unattended_worktrees(&repo, None)
+                .map_err(|error| error.to_string())?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn eko_worktree_factory_create_fails_outside_git_repo() {
         // Sprint 8: EkoWorktreeFactory implements the framework trait; on a
         // non-git directory, create() must surface an error (RunWorktree::create_fork
@@ -1597,6 +1879,7 @@ branch refs/heads/main
 worktree /abs/repo-wt
 HEAD 1111111111111111111111111111111111111111
 branch refs/heads/feature
+locked unattended run stale in progress
 
 ";
         let repo_root = PathBuf::from("/abs/repo");
@@ -1612,6 +1895,11 @@ branch refs/heads/feature
         assert_eq!(items[1].branch, "feature");
         assert_eq!(items[1].head, "111111111111");
         assert!(items[1].managed);
+        assert!(items[1].locked);
+        assert_eq!(
+            items[1].lock_reason.as_deref(),
+            Some("unattended run stale in progress")
+        );
     }
 
     #[test]

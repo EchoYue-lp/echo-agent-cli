@@ -2052,11 +2052,15 @@ pub async fn list_unattended_worktrees(
     // 任务运行时存储在 AppState.tasks.runtime(Option<Arc<TaskRuntimeStore>>);ConnectionState 无此字段。
     let store = state.app_state.tasks.runtime.clone();
 
-    let unattended = echo_agent_app_core::tasks::task_runtime::worktree::list_unattended_worktrees(
-        &repo_root,
-        store.as_deref(),
-    )
-    .map_err(|e| IpcError::Internal(format!("Failed to list unattended worktrees: {e}")))?;
+    let unattended = tokio::task::spawn_blocking(move || {
+        echo_agent_app_core::tasks::task_runtime::worktree::list_unattended_worktrees(
+            &repo_root,
+            store.as_deref(),
+        )
+    })
+    .await
+    .map_err(|error| IpcError::Internal(format!("Failed to join worktree listing: {error}")))?
+    .map_err(|error| IpcError::Internal(format!("Failed to list unattended worktrees: {error}")))?;
 
     let result: Vec<serde_json::Value> = unattended
         .into_iter()
@@ -2064,9 +2068,16 @@ pub async fn list_unattended_worktrees(
             json!({
                 "run_id": wt.run_id,
                 "branch": wt.branch,
-                "path": wt.path.to_string_lossy(),
+                "path": wt.path.map(|path| path.to_string_lossy().to_string()),
                 "head": wt.head,
                 "status": wt.status,
+                "active": wt.active,
+                "locked": wt.locked,
+                "lock_reason": wt.lock_reason,
+                "uncommitted_changes": wt.uncommitted_changes,
+                "ahead_commits": wt.ahead_commits,
+                "has_changes": wt.has_changes,
+                "orphan_branch": wt.orphan_branch,
             })
         })
         .collect();
@@ -2078,17 +2089,33 @@ pub async fn list_unattended_worktrees(
 pub async fn merge_unattended_worktree(
     state: tauri::State<'_, TauriState>,
     run_id: String,
-    remove_after_merge: Option<bool>,
 ) -> Result<serde_json::Value, IpcError> {
     let repo_root = workspace_project_root(&state).await?;
-    let remove = remove_after_merge.unwrap_or(true);
+    let store = state.app_state.tasks.runtime.clone();
+    let merge_lock =
+        echo_agent_app_core::tasks::task_runtime::worktree::repo_merge_lock(&repo_root);
+    let _merge_guard = merge_lock.lock().await;
+    let run_id_for_merge = run_id.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        echo_agent_app_core::tasks::task_runtime::worktree::merge_unattended_worktree(
+            &repo_root,
+            &run_id_for_merge,
+            store.as_deref(),
+        )
+    })
+    .await
+    .map_err(|error| IpcError::Internal(format!("Failed to join worktree merge: {error}")))?
+    .map_err(|error| IpcError::Internal(format!("Failed to merge unattended worktree: {error}")))?;
 
-    echo_agent_app_core::tasks::task_runtime::worktree::merge_unattended_worktree(
-        &repo_root, &run_id, remove,
-    )
-    .map_err(|e| IpcError::Internal(format!("Failed to merge unattended worktree: {e}")))?;
-
-    Ok(json!({"success": true, "merged": run_id}))
+    Ok(json!({
+        "success": true,
+        "run_id": run_id,
+        "status": outcome.status.as_str(),
+        "branch": outcome.branch,
+        "changed_files": outcome.changed_files,
+        "merge_commit": outcome.merge_commit,
+        "cleanup_warning": outcome.cleanup_warning,
+    }))
 }
 
 #[tauri::command]
@@ -2097,13 +2124,54 @@ pub async fn discard_unattended_worktree(
     run_id: String,
 ) -> Result<serde_json::Value, IpcError> {
     let repo_root = workspace_project_root(&state).await?;
-
-    echo_agent_app_core::tasks::task_runtime::worktree::discard_unattended_worktree(
-        &repo_root, &run_id,
-    )
-    .map_err(|e| IpcError::Internal(format!("Failed to discard unattended worktree: {e}")))?;
+    let store = state.app_state.tasks.runtime.clone();
+    let merge_lock =
+        echo_agent_app_core::tasks::task_runtime::worktree::repo_merge_lock(&repo_root);
+    let _merge_guard = merge_lock.lock().await;
+    let run_id_for_discard = run_id.clone();
+    tokio::task::spawn_blocking(move || {
+        echo_agent_app_core::tasks::task_runtime::worktree::discard_unattended_worktree(
+            &repo_root,
+            &run_id_for_discard,
+            store.as_deref(),
+        )
+    })
+    .await
+    .map_err(|error| IpcError::Internal(format!("Failed to join worktree discard: {error}")))?
+    .map_err(|error| {
+        IpcError::Internal(format!("Failed to discard unattended worktree: {error}"))
+    })?;
 
     Ok(json!({"success": true, "discarded": run_id}))
+}
+
+#[tauri::command]
+pub async fn cleanup_unattended_worktrees(
+    state: tauri::State<'_, TauriState>,
+) -> Result<serde_json::Value, IpcError> {
+    let repo_root = workspace_project_root(&state).await?;
+    let store = state.app_state.tasks.runtime.clone();
+    let merge_lock =
+        echo_agent_app_core::tasks::task_runtime::worktree::repo_merge_lock(&repo_root);
+    let _merge_guard = merge_lock.lock().await;
+    let result = tokio::task::spawn_blocking(move || {
+        echo_agent_app_core::tasks::task_runtime::worktree::cleanup_unattended_worktrees(
+            &repo_root,
+            store.as_deref(),
+        )
+    })
+    .await
+    .map_err(|error| IpcError::Internal(format!("Failed to join worktree cleanup: {error}")))?
+    .map_err(|error| {
+        IpcError::Internal(format!("Failed to clean unattended worktrees: {error}"))
+    })?;
+
+    Ok(json!({
+        "removed": result.removed,
+        "unlocked": result.unlocked,
+        "kept": result.kept,
+        "errors": result.errors,
+    }))
 }
 
 // ════════════════════════════════════════════════════════════════════════════

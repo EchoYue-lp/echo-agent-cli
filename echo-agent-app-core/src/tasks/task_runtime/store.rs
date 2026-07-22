@@ -475,6 +475,17 @@ impl TaskRuntimeStore {
         })
     }
 
+    /// Whether this process currently owns a live driver for `run_id`.
+    /// Persisted `Running` alone is insufficient because a killed/restarted
+    /// process can leave that status behind; cleanup uses this in-memory fact
+    /// to avoid touching a worktree that an active run still owns.
+    pub fn is_run_active(&self, run_id: &str) -> bool {
+        self.run_cancel_tokens
+            .lock()
+            .map(|map| map.contains_key(run_id))
+            .unwrap_or(false)
+    }
+
     fn cancel_active_run(&self, run_id: &str) -> bool {
         if let Ok(mut map) = self.run_cancel_tokens.lock() {
             #[allow(clippy::collapsible_if)]

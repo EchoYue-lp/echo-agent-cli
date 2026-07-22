@@ -285,6 +285,7 @@ pub fn build_tauri_app(
             commands::panels::list_unattended_worktrees,
             commands::panels::merge_unattended_worktree,
             commands::panels::discard_unattended_worktree,
+            commands::panels::cleanup_unattended_worktrees,
             commands::panels::get_mcp_server,
             // Terminal (PTY)
             terminal::create_terminal,

@@ -1766,6 +1766,38 @@ export interface WorktreeInfo {
   head: string;
 }
 
+export interface UnattendedWorktreeInfo {
+  run_id: string;
+  branch: string;
+  path: string | null;
+  head: string;
+  status: string;
+  active: boolean;
+  locked: boolean;
+  lock_reason: string | null;
+  uncommitted_changes: boolean;
+  ahead_commits: number;
+  has_changes: boolean;
+  orphan_branch: boolean;
+}
+
+export interface UnattendedWorktreeCleanupResult {
+  removed: string[];
+  unlocked: string[];
+  kept: string[];
+  errors: string[];
+}
+
+export interface UnattendedWorktreeMergeResult {
+  success: boolean;
+  run_id: string;
+  status: 'merged' | 'no_changes' | 'already_integrated';
+  branch: string;
+  changed_files: string[];
+  merge_commit: string | null;
+  cleanup_warning: string | null;
+}
+
 export const worktreeApi = {
   list: () =>
     isTauri() ? apiInvoke<WorktreeInfo[]>('list_worktrees') : get<WorktreeInfo[]>('/worktrees'),
@@ -1781,4 +1813,22 @@ export const worktreeApi = {
     isTauri()
       ? apiInvoke<{ success: boolean }>('remove_worktree', { path })
       : del<{ success: boolean }>(`/worktrees?path=${encodeURIComponent(path)}`),
+  listUnattended: () =>
+    isTauri()
+      ? apiInvoke<UnattendedWorktreeInfo[]>('list_unattended_worktrees')
+      : get<UnattendedWorktreeInfo[]>('/worktrees/unattended'),
+  mergeUnattended: (runId: string) =>
+    isTauri()
+      ? apiInvoke<UnattendedWorktreeMergeResult>('merge_unattended_worktree', { runId })
+      : post<UnattendedWorktreeMergeResult>(`/worktrees/unattended/${runId}/merge`, {}),
+  discardUnattended: (runId: string) =>
+    isTauri()
+      ? apiInvoke<{ success: boolean; discarded: string }>('discard_unattended_worktree', {
+          runId,
+        })
+      : del<{ success: boolean; discarded: string }>(`/worktrees/unattended/${runId}`),
+  cleanupUnattended: () =>
+    isTauri()
+      ? apiInvoke<UnattendedWorktreeCleanupResult>('cleanup_unattended_worktrees')
+      : post<UnattendedWorktreeCleanupResult>('/worktrees/unattended/cleanup', {}),
 };

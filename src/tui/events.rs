@@ -2232,6 +2232,158 @@ async fn handle_tui_cron(app: &TuiApp, args: &str) -> String {
     }
 }
 
+async fn handle_tui_worktrees(app: &TuiApp, args: &str) -> String {
+    use echo_agent_app_core::tasks::task_runtime::worktree::{
+        cleanup_unattended_worktrees, discard_unattended_worktree, git_repo_root,
+        list_unattended_worktrees, merge_unattended_worktree, repo_merge_lock,
+    };
+
+    let tokens = match shell_words::split(args) {
+        Ok(tokens) => tokens,
+        Err(error) => return format!("Invalid worktree command: {error}"),
+    };
+    let subcommand = tokens.first().map(String::as_str).unwrap_or("list");
+    let run_id = tokens.get(1).cloned();
+    let current_dir = match std::env::current_dir() {
+        Ok(path) => path,
+        Err(error) => return format!("Failed to resolve the current workspace: {error}"),
+    };
+    let repo_root = match git_repo_root(&current_dir) {
+        Ok(path) => path,
+        Err(error) => return format!("Current workspace is not a Git repository: {error}"),
+    };
+    let store = app.task_runtime_store.clone();
+
+    match subcommand {
+        "list" | "ls" => {
+            let result = tokio::task::spawn_blocking(move || {
+                list_unattended_worktrees(&repo_root, store.as_deref())
+            })
+            .await;
+            match result {
+                Ok(Ok(worktrees)) => format_unattended_worktrees(&worktrees),
+                Ok(Err(error)) => format!("Failed to list retained worktrees: {error}"),
+                Err(error) => format!("Failed to join worktree listing: {error}"),
+            }
+        }
+        "cleanup" | "clean" => {
+            let lock = repo_merge_lock(&repo_root);
+            let _guard = lock.lock().await;
+            let result = tokio::task::spawn_blocking(move || {
+                cleanup_unattended_worktrees(&repo_root, store.as_deref())
+            })
+            .await;
+            match result {
+                Ok(Ok(result)) => format!(
+                    "Worktree cleanup: removed={}, unlocked={}, kept={}, errors={}{}",
+                    result.removed.len(),
+                    result.unlocked.len(),
+                    result.kept.len(),
+                    result.errors.len(),
+                    if result.errors.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\n{}", result.errors.join("\n"))
+                    }
+                ),
+                Ok(Err(error)) => format!("Failed to clean retained worktrees: {error}"),
+                Err(error) => format!("Failed to join worktree cleanup: {error}"),
+            }
+        }
+        "merge" | "integrate" => {
+            let Some(run_id) = run_id else {
+                return "Usage: /worktrees merge <run-id>".to_string();
+            };
+            let lock = repo_merge_lock(&repo_root);
+            let _guard = lock.lock().await;
+            let run_id_for_merge = run_id.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                merge_unattended_worktree(&repo_root, &run_id_for_merge, store.as_deref())
+            })
+            .await;
+            match result {
+                Ok(Ok(outcome)) => {
+                    let files = if outcome.changed_files.is_empty() {
+                        "none".to_string()
+                    } else {
+                        outcome.changed_files.join(", ")
+                    };
+                    let warning = outcome
+                        .cleanup_warning
+                        .map(|warning| format!("\nCleanup warning: {warning}"))
+                        .unwrap_or_default();
+                    format!(
+                        "Worktree {run_id}: {}. Files: {files}{warning}",
+                        outcome.status.as_str()
+                    )
+                }
+                Ok(Err(error)) => format!("Failed to merge retained worktree: {error}"),
+                Err(error) => format!("Failed to join worktree merge: {error}"),
+            }
+        }
+        "discard" | "remove" | "rm" => {
+            let Some(run_id) = run_id else {
+                return "Usage: /worktrees discard <run-id>".to_string();
+            };
+            let lock = repo_merge_lock(&repo_root);
+            let _guard = lock.lock().await;
+            let run_id_for_discard = run_id.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                discard_unattended_worktree(&repo_root, &run_id_for_discard, store.as_deref())
+            })
+            .await;
+            match result {
+                Ok(Ok(())) => format!("Discarded retained worktree for run {run_id}."),
+                Ok(Err(error)) => format!("Failed to discard retained worktree: {error}"),
+                Err(error) => format!("Failed to join worktree discard: {error}"),
+            }
+        }
+        _ => "Usage: /worktrees [list|cleanup|merge <run-id>|discard <run-id>]".to_string(),
+    }
+}
+
+fn format_unattended_worktrees(
+    worktrees: &[echo_agent_app_core::tasks::task_runtime::worktree::UnattendedWorktreeInfo],
+) -> String {
+    if worktrees.is_empty() {
+        return "No retained EKO unattended worktrees.".to_string();
+    }
+    worktrees
+        .iter()
+        .map(|worktree| {
+            let mut flags = Vec::new();
+            flags.push(if worktree.has_changes {
+                "changes"
+            } else {
+                "unchanged"
+            });
+            if worktree.active {
+                flags.push("active");
+            }
+            if worktree.locked && !worktree.active {
+                flags.push("stale-lock");
+            }
+            if worktree.orphan_branch {
+                flags.push("orphan-branch");
+            }
+            let path = worktree
+                .path
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "no checkout".to_string());
+            format!(
+                "{} | {} | {} | {} | {}",
+                worktree.run_id,
+                flags.join(","),
+                worktree.head,
+                worktree.status,
+                path
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 async fn mutate_tui_cron_task(
     runner: &echo_agent_app_core::scheduler::SchedulerRunner,
     prefix: Option<&String>,
@@ -4262,6 +4414,14 @@ async fn handle_slash_command(
             }
             app.rebuild_message_groups();
         }
+        Some(SlashCommand::Worktrees) => {
+            let content = handle_tui_worktrees(app, args).await;
+            app.messages.push(ChatMessage {
+                role: MessageRole::System,
+                content,
+            });
+            app.rebuild_message_groups();
+        }
         Some(SlashCommand::Cron) => {
             let content = handle_tui_cron(app, args).await;
             app.messages.push(ChatMessage {
@@ -4814,9 +4974,10 @@ fn parse_interaction_mode(
 #[cfg(test)]
 mod tests {
     use super::{
-        complete_file_reference, delete_previous_word, format_task_runtime_view, handle_esc,
-        move_cursor_vertical, parse_interaction_mode, resolve_tui_workspace_file,
-        reverse_history_search, slash_command_allowed_while_busy, update_subagent_runs,
+        complete_file_reference, delete_previous_word, format_task_runtime_view,
+        format_unattended_worktrees, handle_esc, move_cursor_vertical, parse_interaction_mode,
+        resolve_tui_workspace_file, reverse_history_search, slash_command_allowed_while_busy,
+        update_subagent_runs,
     };
     use crate::tui::{TaskRuntimeTaskView, TaskRuntimeView, Theme, TuiApp};
     use echo_agent_app_core::tasks::task_runtime::types::InteractionMode;
@@ -4896,6 +5057,28 @@ mod tests {
         assert!(slash_command_allowed_while_busy("/steer focus on tests"));
         assert!(!slash_command_allowed_while_busy("/clear"));
         assert!(!slash_command_allowed_while_busy("/model other"));
+    }
+
+    #[test]
+    fn formats_retained_worktree_review_facts() {
+        let worktree = echo_agent_app_core::tasks::task_runtime::worktree::UnattendedWorktreeInfo {
+            run_id: "run-123".to_string(),
+            branch: "eko-unattended-run-123".to_string(),
+            path: None,
+            head: "abc123".to_string(),
+            status: "completed".to_string(),
+            active: false,
+            locked: true,
+            lock_reason: Some("in progress".to_string()),
+            uncommitted_changes: false,
+            ahead_commits: 0,
+            has_changes: false,
+            orphan_branch: true,
+        };
+
+        let formatted = format_unattended_worktrees(&[worktree]);
+        assert!(formatted.contains("unchanged,stale-lock,orphan-branch"));
+        assert!(formatted.contains("no checkout"));
     }
 
     #[test]

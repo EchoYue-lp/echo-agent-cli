@@ -203,9 +203,10 @@ impl AttendedMode {
 /// stage-1 `ReadOnlyPlanNoShell` blanket write ban: writes become possible,
 /// with safety coming from isolation rather than prohibition.
 ///
-/// * `Worktree` (default) — write tasks run inside an isolated git worktree
-///   branched from the main workspace; the main checkout is never touched.
-///   Created lazily: a read-only plan still runs in-place (zero overhead).
+/// * `Worktree` (default) — direct workspace mutation tools are hidden from
+///   the unattended planning Agent. Write PlanTasks create an isolated
+///   Subagent worktree only when the writer is dispatched, then pass through
+///   the shared review/integration stage. Read-only work creates no worktree.
 /// * `Disabled` — stage-1 behaviour: write tasks are rejected by preflight.
 /// * `InPlace` — user explicitly accepts the risk; writes go directly to the
 ///   main workspace with no isolation. Logged as a warning.

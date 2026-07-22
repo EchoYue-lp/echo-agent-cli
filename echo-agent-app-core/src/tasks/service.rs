@@ -435,8 +435,6 @@ impl BackgroundTaskService {
                         &prompt,
                         cancel,
                         UnattendedWriteMode::default(),
-                        super::task_runtime::worktree::git_repo_root(std::path::Path::new("."))
-                            .ok(),
                     )
                     .await
                 }

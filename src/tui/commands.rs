@@ -105,6 +105,7 @@ pub enum SlashCommand {
 
     // -- Git --
     Git,
+    Worktrees,
 
     // -- Pipeline --
     Pipeline,
@@ -181,6 +182,7 @@ impl SlashCommand {
             Self::Analysis => "Create, inspect, and run file-backed analyses",
 
             Self::Git => "Run a git command",
+            Self::Worktrees => "Review and clean retained EKO worktrees",
 
             Self::Pipeline => "Manage pipelines",
 
@@ -248,7 +250,7 @@ impl SlashCommand {
             | Self::Edit
             | Self::Browser
             | Self::Analysis => Category::Coding,
-            Self::Git => Category::Git,
+            Self::Git | Self::Worktrees => Category::Git,
             Self::Pipeline => Category::Pipeline,
             Self::Permission => Category::Security,
             Self::Cron
@@ -279,6 +281,7 @@ impl SlashCommand {
             Self::Browser => "[status|managed|chrome]",
             Self::Analysis => "[list|create <python|r> <title>|show <id>|run <id>]",
             Self::Git => "<git-args>",
+            Self::Worktrees => "[list|cleanup|merge <run-id>|discard <run-id>]",
             Self::Pipeline => "[list|run <name>]",
             Self::Permission => "[ask|auto|deny]",
             Self::Cron => "[list|create|delete|pause|resume|run|reload]",
@@ -371,6 +374,20 @@ mod tests {
         assert_eq!(trace.category(), Category::Info);
         assert_eq!(trace.usage(), "[run-id]");
         assert!(SlashCommand::complete("/tr").contains(&trace));
+        Ok(())
+    }
+
+    #[test]
+    fn worktrees_is_a_first_class_git_command() -> Result<(), String> {
+        let worktrees = "worktrees"
+            .parse::<SlashCommand>()
+            .map_err(|error| error.to_string())?;
+        assert_eq!(worktrees.category(), Category::Git);
+        assert_eq!(
+            worktrees.usage(),
+            "[list|cleanup|merge <run-id>|discard <run-id>]"
+        );
+        assert!(SlashCommand::complete("/work").contains(&worktrees));
         Ok(())
     }
 }
