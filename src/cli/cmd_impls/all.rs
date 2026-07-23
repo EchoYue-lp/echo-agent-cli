@@ -121,25 +121,27 @@ async fn cmd_remember(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             "explicit",
         );
         match layer_manager.write_memory(&key, content.trim(), meta).await {
-            Ok(_) => println!("Memory saved with key: {key}"),
+            Ok(promotion) => {
+                if promotion.is_some() {
+                    let root = ctx.agent.read(|agent| agent.working_dir()).await;
+                    ctx.agent
+                        .write_async(|agent| {
+                            Box::pin(async move {
+                                echo_agent_app_core::unified_memory::refresh_instruction_projection(
+                                    agent,
+                                    root.as_deref(),
+                                )
+                                .await;
+                            })
+                        })
+                        .await;
+                }
+                println!("Memory saved with key: {key}");
+            }
             Err(error) => println!("Failed to save memory: {error}"),
         }
     } else {
-        let store = ctx.agent.read(|agent| agent.store().cloned()).await;
-        match store {
-            Some(store) => match store
-                .put(
-                    &["default", "memories"],
-                    &key,
-                    serde_json::Value::String(content.trim().to_string()),
-                )
-                .await
-            {
-                Ok(()) => println!("Memory saved with key: {key}"),
-                Err(error) => println!("Failed to save memory: {error}"),
-            },
-            None => println!("No long-term memory store is configured."),
-        }
+        println!("Layered memory is not configured for this agent.");
     }
     CommandOutcome::Continue
 }
@@ -188,8 +190,25 @@ async fn cmd_forget(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             }
         };
         if let Some(key) = key {
+            let layer = layer_manager.locate(&key).await.map(|(layer, _)| layer);
             match layer_manager.delete_memory(&key).await {
-                Ok(true) => println!("Removed memory: {key}"),
+                Ok(true) => {
+                    if layer == Some(echo_agent::evolution::MemoryLayer::Hot) {
+                        let root = ctx.agent.read(|agent| agent.working_dir()).await;
+                        ctx.agent
+                            .write_async(|agent| {
+                                Box::pin(async move {
+                                    echo_agent_app_core::unified_memory::refresh_instruction_projection(
+                                        agent,
+                                        root.as_deref(),
+                                    )
+                                    .await;
+                                })
+                            })
+                            .await;
+                    }
+                    println!("Removed memory: {key}");
+                }
                 Ok(false) => println!("No matching memory found."),
                 Err(error) => println!("Failed to remove memory: {error}"),
             }
@@ -197,15 +216,7 @@ async fn cmd_forget(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             println!("No unambiguous matching memory found.");
         }
     } else {
-        let store = ctx.agent.read(|agent| agent.store().cloned()).await;
-        match store {
-            Some(store) => match store.delete(&["default", "memories"], query.trim()).await {
-                Ok(true) => println!("Removed memory: {}", query.trim()),
-                Ok(false) => println!("No matching memory found."),
-                Err(error) => println!("Failed to remove memory: {error}"),
-            },
-            None => println!("No long-term memory store is configured."),
-        }
+        println!("Layered memory is not configured for this agent.");
     }
     CommandOutcome::Continue
 }

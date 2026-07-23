@@ -1,12 +1,48 @@
-//! Tauri IPC commands for raw Store memory management.
+//! Tauri IPC commands for EKO's layered agent memory.
 //!
-//! These commands are a legacy/admin surface for arbitrary Store namespaces.
-//! Runtime-recallable agent memories should be written through
-//! `MemoryLayerManager::write_memory` via accepted evidence candidates, an
-//! explicitly accepted review candidate, or the layered `remember` tool.
+//! All product writes go through `MemoryLayerManager`, matching TUI and CLI.
+//! The raw Store remains a framework capability, not a second EKO write path.
 
 use crate::tauri::error::IpcError;
 use crate::tauri::state::TauriState;
+use echo_agent::evolution::MemoryLayer;
+use echo_agent::memory::{MemoryFilter, MemoryMeta, MemorySource, MemoryType, TypedMemoryEntry};
+
+const AGENT_MEMORY_NAMESPACE: &str = "agent/memories";
+
+fn namespace_supported(namespace: Option<&str>) -> bool {
+    namespace.is_none_or(|value| value.is_empty() || value == AGENT_MEMORY_NAMESPACE)
+}
+
+fn memory_content(value: &serde_json::Value) -> Option<String> {
+    if let Some(content) = value.as_str() {
+        return Some(content.to_string());
+    }
+    if let Some(content) = value.get("content").and_then(serde_json::Value::as_str) {
+        return Some(content.to_string());
+    }
+    serde_json::to_string(value).ok()
+}
+
+fn entry_json(layer: MemoryLayer, entry: TypedMemoryEntry) -> serde_json::Value {
+    let layer_name = match layer {
+        MemoryLayer::Hot => "hot",
+        MemoryLayer::Warm => "warm",
+        MemoryLayer::Cold => "cold",
+    };
+    serde_json::json!({
+        "namespace": AGENT_MEMORY_NAMESPACE,
+        "key": entry.key,
+        "value": entry.content,
+        "created_at": entry.raw.created_at,
+        "updated_at": entry.raw.updated_at,
+        "score": entry.raw.score,
+        "layer": layer_name,
+        "memory_type": entry.meta.memory_type,
+        "source": entry.meta.source,
+        "status": entry.meta.status,
+    })
+}
 
 #[tauri::command]
 pub async fn list_memory(
@@ -14,25 +50,36 @@ pub async fn list_memory(
     namespace: Option<String>,
     limit: Option<usize>,
 ) -> Result<serde_json::Value, IpcError> {
-    let ns = namespace.unwrap_or_else(|| "default".to_string());
-    let lim = limit.unwrap_or(100);
-    let result = state
+    if !namespace_supported(namespace.as_deref()) {
+        return Ok(serde_json::json!([]));
+    }
+    let limit = limit.unwrap_or(100);
+    let layer_manager = state
         .app_state
         .connection
         .agent
-        .read_async(|agent| {
-            Box::pin(async move {
-                match agent.store() {
-                    Some(store) => match store.search(&[&ns], "", lim).await {
-                        Ok(items) => serde_json::to_value(items).unwrap_or_default(),
-                        Err(e) => serde_json::json!({"error": e.to_string()}),
-                    },
-                    None => serde_json::json!({"error": "Memory store not initialized"}),
-                }
-            })
-        })
+        .read(|agent| agent.memory_layer_manager().cloned())
         .await;
-    Ok(result)
+    let Some(layer_manager) = layer_manager else {
+        return Ok(serde_json::json!([]));
+    };
+
+    let mut entries = layer_manager
+        .list_hot()
+        .into_iter()
+        .map(|entry| entry_json(MemoryLayer::Hot, entry))
+        .collect::<Vec<_>>();
+    match layer_manager.list_warm(&MemoryFilter::new()).await {
+        Ok(warm) => entries.extend(
+            warm.into_iter()
+                .map(|entry| entry_json(MemoryLayer::Warm, entry)),
+        ),
+        Err(error) => {
+            tracing::warn!(%error, "Failed to list warm memories");
+        }
+    }
+    entries.truncate(limit);
+    Ok(serde_json::Value::Array(entries))
 }
 
 #[tauri::command]
@@ -42,33 +89,71 @@ pub async fn add_memory(
     key: String,
     value: serde_json::Value,
 ) -> Result<serde_json::Value, IpcError> {
-    let result = state
+    if !namespace_supported(Some(&namespace)) {
+        return Ok(serde_json::json!({
+            "success": false,
+            "error": format!("Unsupported memory namespace: {namespace}"),
+        }));
+    }
+    let Some(content) = memory_content(&value).filter(|text| !text.trim().is_empty()) else {
+        return Ok(serde_json::json!({
+            "success": false,
+            "error": "Memory content cannot be empty",
+        }));
+    };
+    let key = if key.trim().is_empty() {
+        uuid::Uuid::new_v4().to_string()
+    } else {
+        key.trim().to_string()
+    };
+    let layer_manager = state
         .app_state
         .connection
         .agent
-        .read_async(|agent| {
-            Box::pin(async move {
-                match agent.store() {
-                    Some(store) => match store.put(&[&namespace], &key, value).await {
-                        Ok(_) => serde_json::json!({
-                            "success": true,
-                            "key": key,
-                            "message": "Memory added successfully",
-                        }),
-                        Err(e) => serde_json::json!({
-                            "success": false,
-                            "error": e.to_string(),
-                        }),
-                    },
-                    None => serde_json::json!({
-                        "success": false,
-                        "error": "Memory store not initialized",
-                    }),
-                }
-            })
-        })
+        .read(|agent| agent.memory_layer_manager().cloned())
         .await;
-    Ok(result)
+    let Some(layer_manager) = layer_manager else {
+        return Ok(serde_json::json!({
+            "success": false,
+            "error": "Layered memory is not configured",
+        }));
+    };
+    let meta = MemoryMeta::new(
+        MemoryType::ProjectFact,
+        MemorySource::ExplicitSave,
+        "explicit",
+    );
+    match layer_manager.write_memory(&key, content.trim(), meta).await {
+        Ok(promotion) => {
+            if promotion.is_some() {
+                let agent = state.app_state.connection.primary_agent();
+                let root = agent.read(|value| value.working_dir()).await;
+                agent
+                    .write_async(|value| {
+                        Box::pin(async move {
+                            echo_agent_app_core::unified_memory::refresh_instruction_projection(
+                                value,
+                                root.as_deref(),
+                            )
+                            .await;
+                        })
+                    })
+                    .await;
+                if let Some(pool) = &state.app_state.connection.pool {
+                    pool.refresh_instruction_context().await;
+                }
+            }
+            Ok(serde_json::json!({
+                "success": true,
+                "key": key,
+                "message": "Memory added successfully",
+            }))
+        }
+        Err(error) => Ok(serde_json::json!({
+            "success": false,
+            "error": error.to_string(),
+        })),
+    }
 }
 
 #[tauri::command]
@@ -77,24 +162,30 @@ pub async fn search_memory(
     query: String,
     namespace: Option<String>,
 ) -> Result<serde_json::Value, IpcError> {
-    let ns = namespace.unwrap_or_else(|| "default".to_string());
-    let result = state
+    if !namespace_supported(namespace.as_deref()) {
+        return Ok(serde_json::json!([]));
+    }
+    let layer_manager = state
         .app_state
         .connection
         .agent
-        .read_async(|agent| {
-            Box::pin(async move {
-                match agent.store() {
-                    Some(store) => match store.search(&[&ns], &query, 10).await {
-                        Ok(items) => serde_json::to_value(items).unwrap_or_default(),
-                        Err(e) => serde_json::json!({"error": e.to_string()}),
-                    },
-                    None => serde_json::json!({"error": "Memory store not initialized"}),
-                }
-            })
-        })
+        .read(|agent| agent.memory_layer_manager().cloned())
         .await;
-    Ok(result)
+    let Some(layer_manager) = layer_manager else {
+        return Ok(serde_json::json!([]));
+    };
+    match layer_manager.search_layered(query.trim(), 10).await {
+        Ok(entries) => Ok(serde_json::Value::Array(
+            entries
+                .into_iter()
+                .map(|(layer, entry)| entry_json(layer, entry))
+                .collect(),
+        )),
+        Err(error) => {
+            tracing::warn!(%error, "Failed to search layered memories");
+            Ok(serde_json::json!([]))
+        }
+    }
 }
 
 #[tauri::command]
@@ -103,53 +194,87 @@ pub async fn delete_memory(
     namespace: String,
     key: String,
 ) -> Result<serde_json::Value, IpcError> {
-    let result = state
+    if !namespace_supported(Some(&namespace)) {
+        return Ok(serde_json::json!({
+            "success": false,
+            "error": format!("Unsupported memory namespace: {namespace}"),
+        }));
+    }
+    let layer_manager = state
         .app_state
         .connection
         .agent
-        .read_async(|agent| {
-            Box::pin(async move {
-                match agent.store() {
-                    Some(store) => match store.delete(&[&namespace], &key).await {
-                        Ok(_) => serde_json::json!({
-                            "success": true,
-                            "message": "Memory deleted successfully",
-                        }),
-                        Err(e) => serde_json::json!({
-                            "success": false,
-                            "error": e.to_string(),
-                        }),
-                    },
-                    None => serde_json::json!({
-                        "success": false,
-                        "error": "Memory store not initialized",
-                    }),
-                }
-            })
-        })
+        .read(|agent| agent.memory_layer_manager().cloned())
         .await;
-    Ok(result)
+    let Some(layer_manager) = layer_manager else {
+        return Ok(serde_json::json!({
+            "success": false,
+            "error": "Layered memory is not configured",
+        }));
+    };
+    let layer = layer_manager
+        .locate(key.trim())
+        .await
+        .map(|(layer, _)| layer);
+    match layer_manager.delete_memory(key.trim()).await {
+        Ok(deleted) => {
+            if deleted && layer == Some(MemoryLayer::Hot) {
+                let agent = state.app_state.connection.primary_agent();
+                let root = agent.read(|value| value.working_dir()).await;
+                agent
+                    .write_async(|value| {
+                        Box::pin(async move {
+                            echo_agent_app_core::unified_memory::refresh_instruction_projection(
+                                value,
+                                root.as_deref(),
+                            )
+                            .await;
+                        })
+                    })
+                    .await;
+                if let Some(pool) = &state.app_state.connection.pool {
+                    pool.refresh_instruction_context().await;
+                }
+            }
+            Ok(serde_json::json!({
+                "success": deleted,
+                "message": if deleted { "Memory deleted successfully" } else { "Memory not found" },
+            }))
+        }
+        Err(error) => Ok(serde_json::json!({
+            "success": false,
+            "error": error.to_string(),
+        })),
+    }
 }
 
 #[tauri::command]
 pub async fn list_namespaces(
-    state: tauri::State<'_, TauriState>,
+    _state: tauri::State<'_, TauriState>,
 ) -> Result<serde_json::Value, IpcError> {
-    let result = state
-        .app_state
-        .connection
-        .agent
-        .read_async(|agent| {
-            Box::pin(async move {
-                match agent.store() {
-                    Some(store) => match store.list_namespaces(None).await {
-                        Ok(namespaces) => serde_json::json!({ "namespaces": namespaces }),
-                        Err(e) => serde_json::json!({"error": e.to_string()}),
-                    },
-                    None => serde_json::json!({"error": "Memory store not initialized"}),
-                }
-            })
-        })
-        .await;
-    Ok(result)
+    Ok(serde_json::json!({ "namespaces": [["agent", "memories"]] }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_accepts_strings_and_content_objects() {
+        assert_eq!(
+            memory_content(&serde_json::json!("remember me")),
+            Some("remember me".to_string())
+        );
+        assert_eq!(
+            memory_content(&serde_json::json!({"content": "remember me"})),
+            Some("remember me".to_string())
+        );
+    }
+
+    #[test]
+    fn only_layered_namespace_is_supported() {
+        assert!(namespace_supported(None));
+        assert!(namespace_supported(Some(AGENT_MEMORY_NAMESPACE)));
+        assert!(!namespace_supported(Some("default")));
+    }
 }

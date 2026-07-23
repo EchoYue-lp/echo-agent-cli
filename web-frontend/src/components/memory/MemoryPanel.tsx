@@ -8,13 +8,19 @@ import {
 import type { MemoryEntry } from '../../types/api';
 import { Brain, Loader2, Plus, Search, Sparkles, Trash2 } from 'lucide-react';
 
+const AGENT_MEMORY_NAMESPACE = 'agent/memories';
+
 export function MemoryPanel() {
   const [entries, setEntries] = useState<MemoryEntry[]>([]);
   const [namespaces, setNamespaces] = useState<string[]>([]);
   const [selectedNs, setSelectedNs] = useState<string>('');
   const [searchQuery, setSearchQuery] = useState('');
   const [showAdd, setShowAdd] = useState(false);
-  const [addForm, setAddForm] = useState({ namespace: 'default', key: '', value: '' });
+  const [addForm, setAddForm] = useState({
+    namespace: AGENT_MEMORY_NAMESPACE,
+    key: '',
+    value: '',
+  });
   const [autoStatus, setAutoStatus] = useState<AutoMemoryStatus | null>(null);
   const [autoPreview, setAutoPreview] = useState<AutoMemoryObservation[]>([]);
   const [autoBusy, setAutoBusy] = useState(false);
@@ -124,7 +130,7 @@ export function MemoryPanel() {
         value: parsedValue,
       });
       setShowAdd(false);
-      setAddForm({ namespace: 'default', key: '', value: '' });
+      setAddForm({ namespace: AGENT_MEMORY_NAMESPACE, key: '', value: '' });
       memoryApi
         .namespaces()
         .then((data) => setNamespaces(data.namespaces.map((ns) => ns.join('/'))))
@@ -289,13 +295,6 @@ export function MemoryPanel() {
           className="space-y-2 rounded-lg border p-3"
           style={{ borderColor: s.border, background: s.bgHover }}
         >
-          <input
-            value={addForm.namespace}
-            onChange={(e) => setAddForm({ ...addForm, namespace: e.target.value })}
-            className="w-full rounded-lg border px-2 py-1.5 text-xs"
-            style={{ background: s.bgInput, borderColor: s.border, color: s.text }}
-            placeholder="命名空间"
-          />
           <input
             value={addForm.key}
             onChange={(e) => setAddForm({ ...addForm, key: e.target.value })}

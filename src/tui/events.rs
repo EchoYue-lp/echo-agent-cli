@@ -2536,6 +2536,13 @@ fn open_artifact_path(path: &std::path::Path) -> Result<(), String> {
 }
 
 /// Handle slash commands locally in the TUI.
+fn push_system_message(app: &mut TuiApp, content: String) {
+    app.messages.push(ChatMessage {
+        role: MessageRole::System,
+        content,
+    });
+}
+
 async fn handle_slash_command(
     app: &mut TuiApp,
     agent: &AgentHandle,
@@ -2717,18 +2724,33 @@ async fn handle_slash_command(
             }
         }
         Some(SlashCommand::Memory) => {
-            let store = agent.read(|value| value.store().cloned()).await;
-            let content = match store {
-                Some(store) => match store.list(&["default", "memories"]).await {
-                    Ok(items) if items.is_empty() => "No long-term memories.".to_string(),
-                    Ok(items) => items
+            let layer_manager = agent
+                .read(|value| value.memory_layer_manager().cloned())
+                .await;
+            let content = match layer_manager {
+                Some(layer_manager) => {
+                    let mut items = layer_manager
+                        .list_hot()
                         .into_iter()
-                        .map(|item| format!("{}: {}", item.key, item.value))
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                    Err(error) => format!("Failed to list memories: {error}"),
-                },
-                None => "No long-term memory store is configured.".to_string(),
+                        .map(|entry| format!("[hot] {}: {}", entry.key, entry.content))
+                        .collect::<Vec<_>>();
+                    match layer_manager
+                        .list_warm(&echo_agent::memory::MemoryFilter::new())
+                        .await
+                    {
+                        Ok(warm) => items.extend(
+                            warm.into_iter()
+                                .map(|entry| format!("[warm] {}: {}", entry.key, entry.content)),
+                        ),
+                        Err(error) => items.push(format!("Failed to list warm memories: {error}")),
+                    }
+                    if items.is_empty() {
+                        "No long-term memories.".to_string()
+                    } else {
+                        items.join("\n")
+                    }
+                }
+                None => "Layered memory is not configured for this agent.".to_string(),
             };
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
@@ -2736,24 +2758,43 @@ async fn handle_slash_command(
             });
         }
         Some(SlashCommand::Remember) => {
-            let store = agent.read(|value| value.store().cloned()).await;
-            let content = match store {
+            let layer_manager = agent
+                .read(|value| value.memory_layer_manager().cloned())
+                .await;
+            let content = match layer_manager {
                 _ if args.trim().is_empty() => "Usage: /remember <fact>".to_string(),
-                Some(store) => {
+                Some(layer_manager) => {
                     let key = uuid::Uuid::new_v4().to_string();
-                    match store
-                        .put(
-                            &["default", "memories"],
-                            &key,
-                            serde_json::Value::String(args.trim().to_string()),
-                        )
-                        .await
-                    {
-                        Ok(()) => format!("Memory saved with key: {key}"),
+                    let meta = echo_agent::memory::MemoryMeta::new(
+                        echo_agent::memory::MemoryType::ProjectFact,
+                        echo_agent::memory::MemorySource::ExplicitSave,
+                        "explicit",
+                    );
+                    match layer_manager.write_memory(&key, args.trim(), meta).await {
+                        Ok(promotion) => {
+                            if promotion.is_some() {
+                                let root = agent.read(|value| value.working_dir()).await;
+                                agent
+                                    .write_async(|value| {
+                                        Box::pin(async move {
+                                            echo_agent_app_core::unified_memory::refresh_instruction_projection(
+                                                value,
+                                                root.as_deref(),
+                                            )
+                                            .await;
+                                        })
+                                    })
+                                    .await;
+                                if let Some(pool) = &app.pool {
+                                    pool.refresh_instruction_context().await;
+                                }
+                            }
+                            format!("Memory saved with key: {key}")
+                        }
                         Err(error) => format!("Failed to save memory: {error}"),
                     }
                 }
-                None => "No long-term memory store is configured.".to_string(),
+                None => "Layered memory is not configured for this agent.".to_string(),
             };
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
@@ -2761,31 +2802,74 @@ async fn handle_slash_command(
             });
         }
         Some(SlashCommand::Forget) => {
-            let store = agent.read(|value| value.store().cloned()).await;
-            let content = match store {
+            let layer_manager = agent
+                .read(|value| value.memory_layer_manager().cloned())
+                .await;
+            let content = match layer_manager {
                 _ if args.trim().is_empty() => "Usage: /forget <key-or-query>".to_string(),
-                Some(store) => {
+                Some(layer_manager) => {
                     let query = args.trim();
-                    let mut keys = match store.search(&["default", "memories"], query, 20).await {
-                        Ok(items) => items.into_iter().map(|item| item.key).collect::<Vec<_>>(),
-                        Err(_) => Vec::new(),
-                    };
-                    if keys.is_empty() {
-                        keys.push(query.to_string());
-                    }
-                    let mut removed = 0usize;
-                    for key in keys {
-                        if store
-                            .delete(&["default", "memories"], &key)
-                            .await
-                            .unwrap_or(false)
-                        {
-                            removed = removed.saturating_add(1);
+                    let key = if layer_manager.locate(query).await.is_some() {
+                        Some(query.to_string())
+                    } else {
+                        match layer_manager.search_layered(query, 20).await {
+                            Ok(matches) if matches.len() == 1 => {
+                                matches.into_iter().next().map(|(_, entry)| entry.key)
+                            }
+                            Ok(matches) if matches.len() > 1 => {
+                                let keys = matches
+                                    .iter()
+                                    .map(|(_, entry)| entry.key.chars().take(8).collect::<String>())
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                return push_system_message(
+                                    app,
+                                    format!(
+                                        "Multiple memories match; use a full key or prefix: {keys}"
+                                    ),
+                                );
+                            }
+                            Ok(_) => None,
+                            Err(error) => {
+                                return push_system_message(
+                                    app,
+                                    format!("Failed to search memory: {error}"),
+                                );
+                            }
                         }
+                    };
+                    match key {
+                        Some(key) => {
+                            let layer = layer_manager.locate(&key).await.map(|(layer, _)| layer);
+                            match layer_manager.delete_memory(&key).await {
+                                Ok(true) => {
+                                    if layer == Some(echo_agent::evolution::MemoryLayer::Hot) {
+                                        let root = agent.read(|value| value.working_dir()).await;
+                                        agent
+                                        .write_async(|value| {
+                                            Box::pin(async move {
+                                                echo_agent_app_core::unified_memory::refresh_instruction_projection(
+                                                    value,
+                                                    root.as_deref(),
+                                                )
+                                                .await;
+                                            })
+                                        })
+                                        .await;
+                                        if let Some(pool) = &app.pool {
+                                            pool.refresh_instruction_context().await;
+                                        }
+                                    }
+                                    format!("Removed memory: {key}")
+                                }
+                                Ok(false) => "No matching memory found.".to_string(),
+                                Err(error) => format!("Failed to remove memory: {error}"),
+                            }
+                        }
+                        None => "No unambiguous matching memory found.".to_string(),
                     }
-                    format!("Removed {removed} matching memory item(s).")
                 }
-                None => "No long-term memory store is configured.".to_string(),
+                None => "Layered memory is not configured for this agent.".to_string(),
             };
             app.messages.push(ChatMessage {
                 role: MessageRole::System,
@@ -3789,7 +3873,7 @@ async fn handle_slash_command(
                 .map(|integration| integration.echo_agent_dir())
                 .unwrap_or_else(echo_agent_app_core::evolution::discover_echo_agent_dir);
             let change_log = echo_agent::evolution::JsonlChangeLog::new(
-                echo_agent_dir.join("evolution").join("changelog.jsonl"),
+                echo_agent_dir.join("evolution").join("change-log.jsonl"),
             );
             let dashboard = echo_agent_app_core::evolution::Dashboard::new(store, change_log)
                 .with_run_store(run_store);
@@ -3799,50 +3883,38 @@ async fn handle_slash_command(
                 content: echo_agent_app_core::evolution::Dashboard::format_metrics(&metrics),
             });
         }
-        Some(SlashCommand::MemoryReview) => {
-            // Create ReviewIntegration on-the-fly from the agent's store
-            let store = agent.read(|a| a.store().cloned()).await;
-            match store {
-                Some(store) => {
-                    let review_integration = app.review_integration.clone().unwrap_or_else(|| {
-                        Arc::new(echo_agent_app_core::evolution::ReviewIntegration::new(
-                            echo_agent::evolution::ReviewConfig::default(),
-                            echo_agent_app_core::evolution::discover_echo_agent_dir(),
-                            store,
-                        ))
-                    });
+        Some(SlashCommand::MemoryReview) => match app.review_integration.as_ref() {
+            Some(review_integration) => {
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: "📋 Running memory review...".to_string(),
+                });
 
-                    app.messages.push(ChatMessage {
-                        role: MessageRole::System,
-                        content: "📋 Running memory review...".to_string(),
-                    });
-
-                    match review_integration.run_review().await {
-                        Ok(report) => {
-                            let formatted =
-                                echo_agent_app_core::evolution::format_review_report(&report);
-                            app.messages.push(ChatMessage {
-                                role: MessageRole::System,
-                                content: formatted,
-                            });
-                        }
-                        Err(e) => {
-                            app.messages.push(ChatMessage {
-                                role: MessageRole::System,
-                                content: format!("Memory review failed: {e}"),
-                            });
-                        }
+                match review_integration.run_review().await {
+                    Ok(report) => {
+                        let formatted =
+                            echo_agent_app_core::evolution::format_review_report(&report);
+                        app.messages.push(ChatMessage {
+                            role: MessageRole::System,
+                            content: formatted,
+                        });
+                    }
+                    Err(e) => {
+                        app.messages.push(ChatMessage {
+                            role: MessageRole::System,
+                            content: format!("Memory review failed: {e}"),
+                        });
                     }
                 }
-                None => {
-                    app.messages.push(ChatMessage {
-                        role: MessageRole::System,
-                        content: "No memory store configured. Cannot run memory review."
-                            .to_string(),
-                    });
-                }
             }
-        }
+            None => {
+                app.messages.push(ChatMessage {
+                    role: MessageRole::System,
+                    content: "Memory review integration is not configured for this agent."
+                        .to_string(),
+                });
+            }
+        },
         Some(SlashCommand::SkillCandidates) => {
             // List candidates and drafts from Curator state
             let curator = app

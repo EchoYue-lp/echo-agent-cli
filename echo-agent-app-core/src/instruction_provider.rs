@@ -9,11 +9,10 @@
 //!
 //! Also loads hot-layer memory from `.eko/MEMORY.md`.
 //!
-//! Static, file-only loader: no DB, no embeddings, no recall. Agent-learned
-//! dynamic memories are handled separately by `UnifiedMemory.memories`
-//! (the `Store` backend).
+//! Static, file-only loader: no DB, no embeddings, no recall. Query-dependent
+//! dynamic memories are handled separately by the layered memory store.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Layered instruction-file loader (user / project / agents / local `.md`).
 pub struct InstructionProvider {
@@ -29,11 +28,26 @@ pub struct InstructionProvider {
 impl InstructionProvider {
     /// Load every tier from disk.
     pub fn load() -> Self {
-        let project_level = Self::load_project_instructions();
+        let root = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| crate::utils::find_project_root(&cwd));
+        Self::load_for(root.as_deref())
+    }
+
+    /// Load every tier for one explicit workspace/project root.
+    ///
+    /// `None` means global context only: user instructions plus user-level
+    /// `MEMORY.md`. It intentionally does not consult process cwd, so exiting a
+    /// workspace can remove project-local instructions deterministically.
+    pub fn load_for(root: Option<&Path>) -> Self {
+        let project_root = root.map(|path| {
+            crate::utils::find_project_root(path).unwrap_or_else(|| path.to_path_buf())
+        });
+        let project_level = Self::load_project_instructions(project_root.as_deref());
         let user_level = Self::load_user_instructions();
-        let local_level = Self::load_local_instructions();
-        let agents_level = Self::load_agents_instructions();
-        let hot_memory = Self::load_hot_memory();
+        let local_level = Self::load_local_instructions(root);
+        let agents_level = Self::load_agents_instructions(project_root.as_deref());
+        let hot_memory = Self::load_hot_memory(project_root.as_deref());
 
         Self {
             project_level,
@@ -72,10 +86,8 @@ impl InstructionProvider {
     }
 
     /// Load project-level instructions from `<project-root>/.eko/project.md`.
-    fn load_project_instructions() -> Option<String> {
-        std::env::current_dir()
-            .ok()
-            .and_then(|pwd| crate::utils::find_project_root(&pwd))
+    fn load_project_instructions(project_root: Option<&Path>) -> Option<String> {
+        project_root
             .map(|root| root.join(".eko").join("project.md"))
             .filter(|path| path.exists())
             .and_then(|path| std::fs::read_to_string(path).ok())
@@ -89,10 +101,8 @@ impl InstructionProvider {
     }
 
     /// Load local-directory instructions from `<cwd>/.eko/local.md`.
-    fn load_local_instructions() -> Option<String> {
-        std::env::current_dir()
-            .ok()
-            .map(|pwd| pwd.join(".eko").join("local.md"))
+    fn load_local_instructions(root: Option<&Path>) -> Option<String> {
+        root.map(|path| path.join(".eko").join("local.md"))
             .filter(|path| path.exists())
             .and_then(|path| std::fs::read_to_string(path).ok())
     }
@@ -131,13 +141,12 @@ impl InstructionProvider {
     /// Load hot-layer memory content from `.eko/MEMORY.md`.
     ///
     /// Returns the body (frontmatter stripped) so it can be included in the system prompt.
-    fn load_hot_memory() -> Option<String> {
-        let raw = std::env::current_dir()
-            .ok()
-            .and_then(|pwd| crate::utils::find_project_root(&pwd))
-            .map(|root| root.join(".eko").join("MEMORY.md"))
+    fn load_hot_memory(project_root: Option<&Path>) -> Option<String> {
+        let project_path = project_root.map(|root| root.join(".eko").join("MEMORY.md"));
+        let path = project_path
             .filter(|path| path.exists())
-            .and_then(|path| std::fs::read_to_string(path).ok())?;
+            .unwrap_or_else(|| echo_agent::paths::user_data_path("MEMORY.md"));
+        let raw = std::fs::read_to_string(path).ok()?;
 
         Some(crate::utils::strip_yaml_frontmatter(&raw))
     }
@@ -147,10 +156,8 @@ impl InstructionProvider {
     /// This is the fourth instruction tier — between project-level and local-level.
     /// Contains rules that were automatically promoted from high-confidence memories
     /// by the evolution system's `RulePromoter`.
-    fn load_agents_instructions() -> Option<String> {
-        std::env::current_dir()
-            .ok()
-            .and_then(|pwd| crate::utils::find_project_root(&pwd))
+    fn load_agents_instructions(project_root: Option<&Path>) -> Option<String> {
+        project_root
             .map(|root| root.join(".eko").join("AGENTS.md"))
             .filter(|path| path.exists())
             .and_then(|path| std::fs::read_to_string(path).ok())

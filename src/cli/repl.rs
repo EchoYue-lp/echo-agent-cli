@@ -96,7 +96,12 @@ pub async fn run_repl(agent: AgentHandle, config: ReplConfig) -> anyhow::Result<
     // be feature-equivalent with GUI). Cancelled on session exit.
     let dreaming_cancel = config.review_integration.as_ref().map(|ri| {
         let cancel = tokio_util::sync::CancellationToken::new();
-        echo_agent_app_core::infra::spawn_dreaming_task(ri.clone(), cancel.clone());
+        echo_agent_app_core::infra::spawn_dreaming_task(
+            ri.clone(),
+            agent.clone(),
+            config.pool.clone(),
+            cancel.clone(),
+        );
         tracing::info!("Dreaming task spawned for CLI session");
         cancel
     });

@@ -14,6 +14,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tauri::Emitter;
 
+fn current_echo_agent_dir(state: &TauriState) -> PathBuf {
+    state
+        .app_state
+        .review_integration
+        .as_ref()
+        .map(|integration| integration.echo_agent_dir())
+        .unwrap_or_else(echo_agent_app_core::evolution::discover_echo_agent_dir)
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Permissions
 // ════════════════════════════════════════════════════════════════════════════
@@ -1234,7 +1243,7 @@ pub async fn review_run(
             .unwrap_or_else(|| {
                 std::sync::Arc::new(echo_agent_app_core::evolution::ReviewIntegration::new(
                     echo_agent::evolution::ReviewConfig::default(),
-                    echo_agent_app_core::evolution::discover_echo_agent_dir(),
+                    current_echo_agent_dir(state.inner()),
                     store,
                 ))
             });
@@ -1255,9 +1264,9 @@ pub async fn review_run(
             .capture_review_outcome(&outcome)
             .map_err(IpcError::Internal)?,
         None => echo_agent_app_core::evolution::capture_review_outcome(
-            &echo_agent_app_core::evolution::EvidenceStore::new(
-                echo_agent_app_core::evolution::discover_echo_agent_dir(),
-            ),
+            &echo_agent_app_core::evolution::EvidenceStore::new(current_echo_agent_dir(
+                state.inner(),
+            )),
             &outcome,
         )
         .map_err(IpcError::Internal)?,
@@ -1370,9 +1379,9 @@ pub async fn curator_action(
         .as_ref()
         .map(|integration| integration.curator())
         .unwrap_or_else(|| {
-            echo_agent_app_core::evolution::workspace_curator(
-                &echo_agent_app_core::evolution::discover_echo_agent_dir(),
-            )
+            echo_agent_app_core::evolution::workspace_curator(&current_echo_agent_dir(
+                state.inner(),
+            ))
         });
 
     match action.as_str() {
@@ -1465,7 +1474,7 @@ pub async fn get_evolution_dashboard(
         .map(|integration| integration.echo_agent_dir())
         .unwrap_or_else(echo_agent_app_core::evolution::discover_echo_agent_dir);
     let change_log = echo_agent::evolution::JsonlChangeLog::new(
-        echo_agent_dir.join("evolution").join("changelog.jsonl"),
+        echo_agent_dir.join("evolution").join("change-log.jsonl"),
     );
 
     let dashboard =
@@ -1528,9 +1537,9 @@ pub async fn promote_rule(
         })?;
 
     let change_log = echo_agent::evolution::JsonlChangeLog::new(
-        echo_agent_app_core::evolution::discover_echo_agent_dir()
+        current_echo_agent_dir(state.inner())
             .join("evolution")
-            .join("changelog.jsonl"),
+            .join("change-log.jsonl"),
     );
 
     promoter
@@ -1545,6 +1554,21 @@ pub async fn promote_rule(
         &memory_key,
     )
     .await;
+    let root = agent.read(|value| value.working_dir()).await;
+    agent
+        .write_async(|value| {
+            Box::pin(async move {
+                echo_agent_app_core::unified_memory::refresh_instruction_projection(
+                    value,
+                    root.as_deref(),
+                )
+                .await;
+            })
+        })
+        .await;
+    if let Some(pool) = &state.app_state.connection.pool {
+        pool.refresh_instruction_context().await;
+    }
 
     Ok(json!({
         "success": true,
@@ -1581,7 +1605,7 @@ pub async fn scan_skill_candidates(
         .await
         .map_err(|e| IpcError::Internal(format!("Failed to list candidates: {e}")))?;
 
-    let echo_agent_dir = echo_agent_app_core::evolution::discover_echo_agent_dir();
+    let echo_agent_dir = current_echo_agent_dir(state.inner());
     let candidates: Vec<serde_json::Value> = entries
         .into_iter()
         .map(|e| {
@@ -1647,9 +1671,9 @@ pub async fn generate_skill_draft(
         .await
         .ok_or_else(|| IpcError::Internal("No memory store configured".into()))?;
 
-    let echo_agent_dir = echo_agent_app_core::evolution::discover_echo_agent_dir();
+    let echo_agent_dir = current_echo_agent_dir(state.inner());
     let change_log = echo_agent::evolution::JsonlChangeLog::new(
-        echo_agent_dir.join("evolution").join("changelog.jsonl"),
+        echo_agent_dir.join("evolution").join("change-log.jsonl"),
     );
     let typed = echo_agent::memory::TypedMemoryStore::new(store);
 
@@ -1689,7 +1713,7 @@ pub async fn activate_skill_draft(
     name: String,
 ) -> Result<serde_json::Value, IpcError> {
     let agent = state.app_state.connection.primary_agent();
-    let echo_agent_dir = echo_agent_app_core::evolution::discover_echo_agent_dir();
+    let echo_agent_dir = current_echo_agent_dir(state.inner());
     let draft_dir = echo_agent_dir.join("skills").join("_drafts").join(&name);
     let target_dir = echo_agent_dir.join("skills").join(&name);
 

@@ -1,5 +1,5 @@
 //! Instruction-tier memory API — loads the user/project/local `.md` files
-//! and aggregates them for system-prompt injection.
+//! and projects them into model context.
 //!
 //! Dynamic agent-learned memories are managed by the layered
 //! `MemoryLayerManager` (written by accepted evidence candidates or the layered
@@ -13,8 +13,8 @@
 //! ```rust,ignore
 //! let memory = UnifiedMemory::load();
 //!
-//! // Get system prompt context (instructions suffix only)
-//! let ctx = memory.system_prompt_context();
+//! // Get the current instruction context.
+//! let suffix = memory.system_prompt_suffix();
 //!
 //! // Manage instructions
 //! memory.get_instructions(InstructionTier::Project);
@@ -23,6 +23,9 @@
 use std::path::PathBuf;
 
 use crate::instruction_provider::InstructionProvider;
+use echo_agent::llm::types::Message;
+
+const INSTRUCTION_CONTEXT_PROJECTION: &str = "eko:instruction-context";
 
 // ── Instruction tiers ───────────────────────────────────────────────
 
@@ -47,50 +50,6 @@ impl std::fmt::Display for InstructionTier {
     }
 }
 
-// ── Memory context ──────────────────────────────────────────────────
-
-/// Aggregated context for system prompt injection.
-#[derive(Debug, Clone)]
-pub struct MemoryContext {
-    /// Merged instructions from all tiers.
-    pub instructions: String,
-    /// Relevant memory summaries.
-    pub memories: Vec<String>,
-}
-
-impl MemoryContext {
-    /// Whether there is any context to inject.
-    pub fn is_empty(&self) -> bool {
-        self.instructions.is_empty() && self.memories.is_empty()
-    }
-
-    /// Format as a system prompt suffix.
-    pub fn to_prompt_suffix(&self) -> String {
-        if self.is_empty() {
-            return String::new();
-        }
-
-        let mut parts = Vec::new();
-
-        if !self.instructions.is_empty() {
-            parts.push(self.instructions.clone());
-        }
-
-        if !self.memories.is_empty() {
-            parts.push(format!(
-                "## Relevant memories\n{}",
-                self.memories
-                    .iter()
-                    .map(|m| format!("- {m}"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            ));
-        }
-
-        format!("\n\n{}", parts.join("\n\n"))
-    }
-}
-
 // ── Unified Memory ──────────────────────────────────────────────────
 
 /// Instructions manager — loads the user/project/local `.md` tiers and
@@ -99,18 +58,20 @@ impl MemoryContext {
 pub struct UnifiedMemory {
     /// Static file-based instructions (user/project/local .md files).
     instructions: InstructionProvider,
-    /// Hot layer content cached at load time (MEMORY.md body, frontmatter stripped).
-    hot_content: Option<String>,
 }
 
 impl UnifiedMemory {
     /// Create a new unified memory with just instructions loaded.
     pub fn load() -> Self {
-        let instructions = InstructionProvider::load();
-        let hot_content = load_hot_content();
         Self {
-            instructions,
-            hot_content,
+            instructions: InstructionProvider::load(),
+        }
+    }
+
+    /// Load instruction context for one explicit workspace root.
+    pub fn load_for(root: Option<&std::path::Path>) -> Self {
+        Self {
+            instructions: InstructionProvider::load_for(root),
         }
     }
 
@@ -158,59 +119,30 @@ impl UnifiedMemory {
 
     // ── Aggregated context ───────────────────────────────────────────
 
-    /// Get all context needed for system prompt injection.
-    ///
-    /// The instructions suffix (via `InstructionProvider`) already includes the
-    /// MEMORY.md hot layer. We do NOT re-read it here — that would duplicate
-    /// the same content under two different section headers (P0-5).
-    pub fn system_prompt_context(&self) -> MemoryContext {
-        MemoryContext {
-            instructions: self.instructions.get_system_prompt_suffix(),
-            memories: Vec::new(),
-        }
-    }
-
-    /// Refresh cached hot layer content (call after a review cycle or
-    /// explicit promotion/demotion).
-    pub fn refresh_hot(&mut self) {
-        self.hot_content = load_hot_content();
+    /// Get all instruction and hot-memory context for projection.
+    pub fn system_prompt_suffix(&self) -> String {
+        self.instructions.get_system_prompt_suffix()
     }
 }
 
-// ── Helpers ─────────────────────────────────────────────────────────
-
-/// Load the hot layer content from MEMORY.md (body only, frontmatter stripped).
-///
-/// Tries project-level `.eko/MEMORY.md` first, then user-level `~/.eko/MEMORY.md`.
-fn load_hot_content() -> Option<String> {
-    // Project-level
-    if let Ok(pwd) = std::env::current_dir()
-        && let Some(root) = crate::utils::find_project_root(&pwd)
-    {
-        let path = root.join(".eko").join("MEMORY.md");
-        if path.exists()
-            && let Ok(raw) = std::fs::read_to_string(&path)
-        {
-            return Some(crate::utils::strip_yaml_frontmatter(&raw));
-        }
-    }
-
-    // User-level
-    {
-        let path = echo_agent::paths::user_data_path("MEMORY.md");
-        if path.exists()
-            && let Ok(raw) = std::fs::read_to_string(&path)
-        {
-            return Some(crate::utils::strip_yaml_frontmatter(&raw));
-        }
-    }
-
-    None
+/// Replace the instruction/hot-memory projection for one agent.
+pub async fn refresh_instruction_projection(
+    agent: &mut echo_agent::agent::ReactAgent,
+    root: Option<&std::path::Path>,
+) {
+    let suffix = UnifiedMemory::load_for(root).system_prompt_suffix();
+    let message = (!suffix.trim().is_empty()).then(|| Message::system(suffix.trim().to_string()));
+    agent
+        .context()
+        .lock()
+        .await
+        .replace_projection(INSTRUCTION_CONTEXT_PROJECTION, message);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn test_instruction_tier_display() {
@@ -220,24 +152,49 @@ mod tests {
     }
 
     #[test]
-    fn test_memory_context_empty() {
-        let ctx = MemoryContext {
-            instructions: String::new(),
-            memories: Vec::new(),
+    fn system_prompt_suffix_contains_loaded_instructions() {
+        let memory = UnifiedMemory {
+            instructions: InstructionProvider {
+                project_level: Some("Use Rust".to_string()),
+                user_level: None,
+                local_level: None,
+                agents_level: None,
+                hot_memory: None,
+            },
         };
-        assert!(ctx.is_empty());
-        assert_eq!(ctx.to_prompt_suffix(), "");
+        let prompt = memory.system_prompt_suffix();
+        assert!(prompt.contains("Project-level instructions"));
+        assert!(prompt.contains("Use Rust"));
     }
 
-    #[test]
-    fn test_memory_context_with_instructions() {
-        let ctx = MemoryContext {
-            instructions: "## User-level instructions\nBe helpful".to_string(),
-            memories: vec!["User prefers Rust".to_string()],
-        };
-        assert!(!ctx.is_empty());
-        let prompt = ctx.to_prompt_suffix();
-        assert!(prompt.contains("User-level instructions"));
-        assert!(prompt.contains("User prefers Rust"));
+    #[tokio::test]
+    async fn instruction_projection_replaces_previous_workspace() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        std::fs::create_dir_all(first.join(".eko"))?;
+        std::fs::create_dir_all(second.join(".eko"))?;
+        std::fs::write(first.join(".eko/project.md"), "FIRST_WORKSPACE_RULE")?;
+        std::fs::write(second.join(".eko/project.md"), "SECOND_WORKSPACE_RULE")?;
+
+        let mut agent = echo_agent::agent::ReactAgentBuilder::new()
+            .llm_client(Arc::new(echo_agent::testing::MockLlmClient::new()))
+            .system_prompt("test")
+            .build()?;
+
+        refresh_instruction_projection(&mut agent, Some(&first)).await;
+        refresh_instruction_projection(&mut agent, Some(&second)).await;
+
+        let context = agent.context().lock().await;
+        let projected = context
+            .messages()
+            .iter()
+            .filter_map(|message| message.content.as_text_ref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(projected.contains("SECOND_WORKSPACE_RULE"));
+        assert!(!projected.contains("FIRST_WORKSPACE_RULE"));
+        assert_eq!(projected.matches(INSTRUCTION_CONTEXT_PROJECTION).count(), 1);
+        Ok(())
     }
 }

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 /// Find the project root by walking up from the given directory.
 ///
 /// Looks for `.eko` or `.git` markers — the same logic used by
-/// both `UnifiedMemory` and `InstructionProvider`.
+/// by `InstructionProvider` and project-context discovery.
 pub fn find_project_root(start: &Path) -> Option<PathBuf> {
     let mut dir = start;
     loop {
@@ -21,8 +21,8 @@ pub fn find_project_root(start: &Path) -> Option<PathBuf> {
 
 /// Strip YAML frontmatter (between `---` markers) from a MEMORY.md file.
 ///
-/// Both `UnifiedMemory::load_hot_content` and `InstructionProvider::load`
-/// parse MEMORY.md content and need the body without the frontmatter block.
+/// `InstructionProvider::load` parses MEMORY.md content and needs the body
+/// without the frontmatter block.
 pub fn strip_yaml_frontmatter(raw: &str) -> String {
     let trimmed = raw.trim_start();
     if !trimmed.starts_with("---") {

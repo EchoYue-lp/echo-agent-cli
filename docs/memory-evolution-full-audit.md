@@ -4,6 +4,7 @@
 > **范围**: echo-agent (框架) + echo-agent-cli (EKO 应用) 的全部记忆/进化/改善代码
 > **对比参考**: Hermes Agent (Nous Research)
 > **修订记录**:
+> - 2026-07-23 v1.6: 动态指令/hot memory 改为可替换上下文投影；Dreaming 在 GUI/TUI/CLI 启动后先执行一次再按日执行；EKO 三端手动记忆统一走 `MemoryLayerManager` 与 `agent/memories`；Curator/review/changelog 跟随共享工作区 integration；压缩两条事实抽取路径共用 content key。旧章节中的 boot-only、Dreaming 仅 Tauri、EKO 隐式启用 embedding 等表述由 `docs/2026-07-23-memory-self-evolution-closure.md` 取代。
 > - 2026-07-15 v1.5: EKO 删除 EvalRunner、行为 fixture、`improve`/TrajectorySaver 产品链路；BackgroundReviewer 改为严格 JSON 候选且默认不保存；MemoryReview 默认关闭 session-end 与语义合并；Curator 归属 `evolution`。当前优化路线见 `docs/2026-07-15-self-evolution-review-and-roadmap.md`。
 > - 2026-07-01 v1.4: 阶段 5（Critic 默认策略）、SkillPatcher apply_patch 已实施完成。阶段 4（Embedding/RAG）已决策：暂不支持（对标 Claude Code/Codex/Cursor/OpenClaw 均无 RAG）。迭代计划阶段 1-6 全部完成。
 > - 2026-07-01 v1.3: 阶段 1（SkillTelemetry 写入端）、阶段 2（Dreaming 多模式对等）、阶段 3（Evolution hook fire 点）、阶段 6（技能来源 curator 边界）已实施完成

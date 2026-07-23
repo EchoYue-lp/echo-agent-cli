@@ -586,22 +586,13 @@ cmd!(
 // ── MemoryReviewCommand ─────────────────────────────────────────────
 
 async fn cmd_memory_review(ctx: &CommandContext, _args: &[&str]) -> CommandOutcome {
-    // Get the store from the agent — needed to create ReviewIntegration
-    let store = ctx.agent.read(|a| a.store().cloned()).await;
-    let store = match store {
-        Some(s) => s,
+    let review_integration = match ctx.review_integration.as_ref() {
+        Some(integration) => integration,
         None => {
-            println!("No memory store configured. Cannot run memory review.");
+            println!("Memory review integration is not configured for this agent.");
             return CommandOutcome::Continue;
         }
     };
-
-    let echo_agent_dir = current_echo_agent_dir(ctx);
-    let review_integration = echo_agent_app_core::evolution::ReviewIntegration::new(
-        echo_agent::evolution::ReviewConfig::default(),
-        echo_agent_dir,
-        store,
-    );
 
     println!("\n📋 Running memory review...");
 
@@ -984,8 +975,10 @@ async fn cmd_skill_merge(ctx: &CommandContext, args: &[&str]) -> CommandOutcome 
 
     // Execute merge if two skill names provided
     if args.len() == 2 {
-        let skill_a = args[0];
-        let skill_b = args[1];
+        let (Some(skill_a), Some(skill_b)) = (args.first().copied(), args.get(1).copied()) else {
+            println!("Usage: /skill-merge <skill-a> <skill-b>");
+            return CommandOutcome::Continue;
+        };
 
         println!("Executing merge: {} ↔ {}...", skill_a, skill_b);
 
@@ -1191,7 +1184,10 @@ async fn cmd_skill_health(ctx: &CommandContext, args: &[&str]) -> CommandOutcome
         }
     } else {
         // Show detailed health for specific skill
-        let skill_name = args[0];
+        let Some(skill_name) = args.first().copied() else {
+            println!("Usage: /skill-health <name>");
+            return CommandOutcome::Continue;
+        };
         println!("Analyzing health of '{}'...", skill_name);
 
         match monitor.analyze_skill(skill_name).await {
@@ -1467,7 +1463,7 @@ async fn cmd_rule_promote(ctx: &CommandContext, args: &[&str]) -> CommandOutcome
                     let change_log = echo_agent::evolution::JsonlChangeLog::new(
                         current_echo_agent_dir(ctx)
                             .join("evolution")
-                            .join("changelog.jsonl"),
+                            .join("change-log.jsonl"),
                     );
 
                     match promoter.promote_rule(prop, &change_log).await {
@@ -1484,6 +1480,18 @@ async fn cmd_rule_promote(ctx: &CommandContext, args: &[&str]) -> CommandOutcome
                                 memory_key,
                             )
                             .await;
+                            let root = ctx.agent.read(|agent| agent.working_dir()).await;
+                            ctx.agent
+                                .write_async(|agent| {
+                                    Box::pin(async move {
+                                        echo_agent_app_core::unified_memory::refresh_instruction_projection(
+                                            agent,
+                                            root.as_deref(),
+                                        )
+                                        .await;
+                                    })
+                                })
+                                .await;
                         }
                         Err(e) => {
                             println!("✗ Failed to promote rule: {}", e);
@@ -1529,7 +1537,7 @@ async fn cmd_evolution_dashboard(ctx: &CommandContext, _args: &[&str]) -> Comman
     let change_log = echo_agent::evolution::JsonlChangeLog::new(
         current_echo_agent_dir(ctx)
             .join("evolution")
-            .join("changelog.jsonl"),
+            .join("change-log.jsonl"),
     );
 
     let dashboard =

@@ -20,6 +20,8 @@ use echo_core::tokenizer::{HeuristicTokenizer, Tokenizer};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
+const PROJECT_CONTEXT_PROJECTION: &str = "eko:project-context";
+
 /// Stable product-level operating contract. Dynamic project, memory, mode, and
 /// task context follows this cache-friendly prefix.
 pub const CORE_ASSISTANT_PROMPT: &str = r#"# EKO Operating Contract
@@ -256,50 +258,61 @@ impl PromptAssembler {
             });
         }
 
-        // P5: Project rules (high priority but can be truncated)
         if let Some(ctx) = project_ctx {
-            if !ctx.instructions.is_empty() {
-                let rules: String = ctx
-                    .instructions
-                    .iter()
-                    .map(|i| format!("### From: {}\n\n{}\n", i.source, i.content))
-                    .collect();
-                assembler.add_module(PromptModule {
-                    name: "project_rules".into(),
-                    content: format!("## Project Instructions\n\n{rules}"),
-                    priority: 5,
-                    token_budget: (model_window / 10).min(6_000),
-                    required: false,
-                });
-            }
-
-            // P6: Project structure
-            if !ctx.file_tree_summary.is_empty() {
-                assembler.add_module(PromptModule {
-                    name: "project_structure".into(),
-                    content: format!(
-                        "## Project Structure ({})\n\n```\n{}\n```",
-                        ctx.name, ctx.file_tree_summary
-                    ),
-                    priority: 6,
-                    token_budget: (model_window / 8).min(4_000),
-                    required: false,
-                });
-            }
-
-            // P7: Git context (low priority)
-            if let Some(git_ctx) = super::context::load_git_context(&ctx.root) {
-                assembler.add_module(PromptModule {
-                    name: "git_context".into(),
-                    content: format!("## Git Status\n\n{git_ctx}"),
-                    priority: 7,
-                    token_budget: (model_window / 12).min(1_500),
-                    required: false,
-                });
-            }
+            assembler.add_project_context(ctx);
         }
 
         assembler
+    }
+
+    /// Assemble only the replaceable project context modules.
+    pub fn project_context(ctx: &ProjectContext, model_window: usize) -> PromptAssembly {
+        let mut assembler = Self::new(model_window);
+        assembler.add_project_context(ctx);
+        assembler.assemble_with_report()
+    }
+
+    fn add_project_context(&mut self, ctx: &ProjectContext) {
+        // P5: Project rules (high priority but can be truncated)
+        if !ctx.instructions.is_empty() {
+            let rules: String = ctx
+                .instructions
+                .iter()
+                .map(|i| format!("### From: {}\n\n{}\n", i.source, i.content))
+                .collect();
+            self.add_module(PromptModule {
+                name: "project_rules".into(),
+                content: format!("## Project Instructions\n\n{rules}"),
+                priority: 5,
+                token_budget: (self.total_budget / 10).min(6_000),
+                required: false,
+            });
+        }
+
+        // P6: Project structure
+        if !ctx.file_tree_summary.is_empty() {
+            self.add_module(PromptModule {
+                name: "project_structure".into(),
+                content: format!(
+                    "## Project Structure ({})\n\n```\n{}\n```",
+                    ctx.name, ctx.file_tree_summary
+                ),
+                priority: 6,
+                token_budget: (self.total_budget / 8).min(4_000),
+                required: false,
+            });
+        }
+
+        // P7: Git context (low priority)
+        if let Some(git_ctx) = super::context::load_git_context(&ctx.root) {
+            self.add_module(PromptModule {
+                name: "git_context".into(),
+                content: format!("## Git Status\n\n{git_ctx}"),
+                priority: 7,
+                token_budget: (self.total_budget / 12).min(1_500),
+                required: false,
+            });
+        }
     }
 
     /// Add stable user/project/local instruction context as P3.
@@ -329,6 +342,24 @@ impl PromptAssembler {
             required: false,
         });
     }
+}
+
+/// Replace repository instructions, structure, and git context for one agent.
+pub async fn refresh_project_context_projection(
+    agent: &mut echo_agent::agent::ReactAgent,
+    root: Option<&std::path::Path>,
+) {
+    let message = root
+        .and_then(|path| super::context::discover_project_root(Some(path)))
+        .map(|project_root| super::context::load_project_context(&project_root))
+        .map(|context| PromptAssembler::project_context(&context, agent.config().get_token_limit()))
+        .filter(|assembly| !assembly.prompt.trim().is_empty())
+        .map(|assembly| echo_agent::llm::types::Message::system(assembly.prompt));
+    agent
+        .context()
+        .lock()
+        .await
+        .replace_projection(PROJECT_CONTEXT_PROJECTION, message);
 }
 
 fn content_hash(content: &str) -> String {

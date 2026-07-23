@@ -190,6 +190,8 @@ pub struct AgentPool {
     agents: RwLock<HashMap<String, PooledAgent>>,
     config: PoolConfig,
     app_config: RwLock<AppConfig>,
+    /// Working directory applied to existing and future pooled agents.
+    working_dir: RwLock<Option<std::path::PathBuf>>,
     runtime_llm_config: RwLock<Option<echo_agent::llm::LlmConfig>>,
     permission_mode: RwLock<String>,
     /// Skill descriptors extracted from the primary agent.
@@ -241,12 +243,14 @@ impl AgentPool {
             .read(|agent| agent.tool_output_artifacts())
             .await
             .unwrap_or_else(|| crate::infra::tool_output_artifact_config(None));
+        let working_dir = runtime.agent_handle.read(|agent| agent.working_dir()).await;
 
         let pool = Self {
             shared,
             agents: RwLock::new(HashMap::new()),
             config,
             app_config: RwLock::new(runtime.app_config.clone()),
+            working_dir: RwLock::new(working_dir),
             runtime_llm_config: RwLock::new(None),
             permission_mode: RwLock::new("default".to_string()),
             skill_descriptors: RwLock::new(skill_descriptors),
@@ -534,6 +538,7 @@ impl AgentPool {
     /// Called after a workspace switch so that background tasks and
     /// multi-conversation agents operate in the new workspace root.
     pub async fn apply_working_dir(&self, path: Option<std::path::PathBuf>) {
+        *self.working_dir.write().await = path.clone();
         let artifact_config = crate::infra::tool_output_artifact_config(path.as_deref());
         *self.tool_output_artifacts.write().await = artifact_config.clone();
         let agents: Vec<AgentHandle> = self
@@ -549,8 +554,9 @@ impl AgentPool {
             handle
                 .write_async(|agent| {
                     Box::pin(async move {
-                        agent.set_working_dir(path);
+                        agent.set_working_dir(path.clone());
                         agent.set_tool_output_artifacts(Some(artifact_config));
+                        crate::infra::refresh_dynamic_context(agent, path.as_deref()).await;
                     })
                 })
                 .await;
@@ -646,6 +652,11 @@ impl AgentPool {
         for handle in agents {
             let store_clone = store.clone();
             let dir_clone = echo_agent_dir.clone();
+            let skill_curator = self
+                .shared
+                .review_integration
+                .as_ref()
+                .map(|integration| integration.curator());
             handle
                 .write_async(|agent| {
                     Box::pin(async move {
@@ -656,6 +667,7 @@ impl AgentPool {
                         )
                         .build_layer_manager();
                         agent.install_memory_layer_manager(Arc::new(mgr));
+                        agent.set_skill_curator(skill_curator);
                     })
                 })
                 .await;
@@ -666,6 +678,32 @@ impl AgentPool {
             pooled_agents,
             "AgentPool: memory store applied"
         );
+    }
+
+    /// Refresh hot-memory and instruction projections on every existing agent.
+    pub async fn refresh_instruction_context(&self) {
+        let root = self.working_dir.read().await.clone();
+        let agents: Vec<AgentHandle> = self
+            .agents
+            .read()
+            .await
+            .values()
+            .map(|pooled| pooled.handle.clone())
+            .collect();
+        for handle in agents {
+            let root = root.clone();
+            handle
+                .write_async(|agent| {
+                    Box::pin(async move {
+                        crate::unified_memory::refresh_instruction_projection(
+                            agent,
+                            root.as_deref(),
+                        )
+                        .await;
+                    })
+                })
+                .await;
+        }
     }
 
     /// Current number of agents in the pool (including background).
@@ -788,6 +826,7 @@ impl AgentPool {
         //    agent never had a store wired in — `extract_from` would only ever
         //    see None and the runtime checkpoint loop silently no-op'd.)
         let app_config = self.app_config.read().await.clone();
+        let working_dir = self.working_dir.read().await.clone();
         let params = infra::AgentCreateParams {
             model: None, // will use app_config default
             system_prompt: None,
@@ -797,9 +836,7 @@ impl AgentPool {
             react_checkpoint_interval: None,
             state_store: self.shared.state_store.clone(),
             memory_context_suffix: None,
-            // Stage 2 will bind a per-conversation worktree here; for now the
-            // pooled agent runs in the process cwd.
-            working_dir: None,
+            working_dir,
             // Thread the TaskRuntimeStore so pooled agents get task-management
             // tools registered (matches the primary agent wiring).
             // route is intentionally None for pooled agents (subagents never get
@@ -877,6 +914,7 @@ impl AgentPool {
             agent.install_memory_layer_manager(layer_manager);
             agent.set_memory_trigger_sink(Some(review_integration.clone()));
             agent.set_skill_load_policy(Some(review_integration.clone()));
+            agent.set_skill_curator(Some(review_integration.curator()));
         }
         if let Some(ref ps) = self.shared.permission_service {
             agent.set_permission_service(ps.clone());
@@ -937,6 +975,8 @@ impl AgentPool {
 mod tests {
     use super::*;
 
+    type TestResult<T = ()> = Result<T, String>;
+
     #[test]
     fn test_pool_config_default() {
         let config = PoolConfig::default();
@@ -957,23 +997,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_pool_exposes_max_agents() {
-        let pool = create_test_pool(4, false).await;
+    async fn test_pool_exposes_max_agents() -> TestResult {
+        let pool = create_test_pool(4, false).await?;
         assert_eq!(pool.max_agents(), 4);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_pool_background_task_concurrency_is_conservative() {
-        let small = create_test_pool(1, false).await;
+    async fn test_pool_background_task_concurrency_is_conservative() -> TestResult {
+        let small = create_test_pool(1, false).await?;
         assert_eq!(small.background_task_concurrency(), 1);
 
-        let medium = create_test_pool(3, false).await;
+        let medium = create_test_pool(3, false).await?;
         assert_eq!(medium.background_task_concurrency(), 2);
 
-        let large = create_test_pool(10, false).await;
+        let large = create_test_pool(10, false).await?;
         assert_eq!(large.background_task_concurrency(), 4);
         assert_eq!(large.foreground_agent_reserve(), 1);
         assert_eq!(large.composite_parallelism(), 3);
+        Ok(())
     }
 
     #[test]
@@ -994,83 +1036,91 @@ mod tests {
     }
 
     #[test]
-    fn test_pooled_agent_timestamps() {
+    fn test_pooled_agent_timestamps() -> TestResult {
         // Verify PooledAgent records creation time
-        let mock_handle = create_test_agent_handle();
+        let mock_handle = create_test_agent_handle()?;
         let pa = PooledAgent::new(mock_handle, "test-conv".to_string());
         assert!(pa.created_at.elapsed().as_millis() < 100);
         assert!(pa.last_used.elapsed().as_millis() < 100);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_pool_acquire_creates_agent() {
-        let pool = create_test_pool(3, false).await;
+    async fn test_pool_acquire_creates_agent() -> TestResult {
+        let pool = create_test_pool(3, false).await?;
         assert_eq!(pool.pool_size().await, 0);
 
         let handle = pool.acquire("conv-1").await;
         assert!(handle.is_ok());
         assert_eq!(pool.pool_size().await, 1);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_pool_acquire_reuses_existing() {
-        let pool = create_test_pool(3, false).await;
+    async fn test_pool_acquire_reuses_existing() -> TestResult {
+        let pool = create_test_pool(3, false).await?;
 
-        let _h1 = pool.acquire("conv-1").await.unwrap();
-        let _h2 = pool.acquire("conv-1").await.unwrap();
+        let _h1 = pool.acquire("conv-1").await.map_err(|e| e.to_string())?;
+        let _h2 = pool.acquire("conv-1").await.map_err(|e| e.to_string())?;
 
         // Same conversation_id should return the same agent (pool size stays 1)
         assert_eq!(pool.pool_size().await, 1);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_pool_acquire_different_ids() {
-        let pool = create_test_pool(5, false).await;
+    async fn test_pool_acquire_different_ids() -> TestResult {
+        let pool = create_test_pool(5, false).await?;
 
-        let _h1 = pool.acquire("conv-1").await.unwrap();
-        let _h2 = pool.acquire("conv-2").await.unwrap();
-        let _h3 = pool.acquire("conv-3").await.unwrap();
+        let _h1 = pool.acquire("conv-1").await.map_err(|e| e.to_string())?;
+        let _h2 = pool.acquire("conv-2").await.map_err(|e| e.to_string())?;
+        let _h3 = pool.acquire("conv-3").await.map_err(|e| e.to_string())?;
 
         assert_eq!(pool.pool_size().await, 3);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_pool_release_removes_agent() {
-        let pool = create_test_pool(5, false).await;
+    async fn test_pool_release_removes_agent() -> TestResult {
+        let pool = create_test_pool(5, false).await?;
 
-        let _h = pool.acquire("conv-1").await.unwrap();
+        let _h = pool.acquire("conv-1").await.map_err(|e| e.to_string())?;
         assert_eq!(pool.pool_size().await, 1);
 
         pool.release("conv-1").await;
         assert_eq!(pool.pool_size().await, 0);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_pool_release_nonexistent_is_noop() {
-        let pool = create_test_pool(5, false).await;
+    async fn test_pool_release_nonexistent_is_noop() -> TestResult {
+        let pool = create_test_pool(5, false).await?;
         pool.release("nonexistent").await;
         assert_eq!(pool.pool_size().await, 0);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_pool_get_returns_none_for_unknown() {
-        let pool = create_test_pool(5, false).await;
+    async fn test_pool_get_returns_none_for_unknown() -> TestResult {
+        let pool = create_test_pool(5, false).await?;
         assert!(pool.get("unknown").await.is_none());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_pool_get_returns_some_for_known() {
-        let pool = create_test_pool(5, false).await;
-        let _h = pool.acquire("conv-1").await.unwrap();
+    async fn test_pool_get_returns_some_for_known() -> TestResult {
+        let pool = create_test_pool(5, false).await?;
+        let _h = pool.acquire("conv-1").await.map_err(|e| e.to_string())?;
         assert!(pool.get("conv-1").await.is_some());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_pool_evicts_idle_on_overflow() {
-        let pool = create_test_pool(2, false).await;
+    async fn test_pool_evicts_idle_on_overflow() -> TestResult {
+        let pool = create_test_pool(2, false).await?;
 
-        let _h1 = pool.acquire("conv-1").await.unwrap();
-        let _h2 = pool.acquire("conv-2").await.unwrap();
+        let _h1 = pool.acquire("conv-1").await.map_err(|e| e.to_string())?;
+        let _h2 = pool.acquire("conv-2").await.map_err(|e| e.to_string())?;
         assert_eq!(pool.pool_size().await, 2);
 
         // Pool is full — acquiring a 3rd should evict the oldest
@@ -1078,37 +1128,41 @@ mod tests {
         assert!(h3.is_ok());
         // Pool should still be at max capacity
         assert!(pool.pool_size().await <= 3);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_pool_background_agent_precreated() {
+    async fn test_pool_background_agent_precreated() -> TestResult {
         // Background agent pre-creation only happens in from_runtime().
         // With manual construction, no background agent exists until acquired.
-        let pool = create_test_pool(5, true).await;
+        let pool = create_test_pool(5, true).await?;
         // Manually created pool has no pre-created agents
         assert_eq!(pool.pool_size().await, 0);
         // But background_agent() returns None since __background__ wasn't pre-created
         assert!(pool.background_agent().await.is_none());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_pool_background_agent_not_created_when_disabled() {
-        let pool = create_test_pool(5, false).await;
+    async fn test_pool_background_agent_not_created_when_disabled() -> TestResult {
+        let pool = create_test_pool(5, false).await?;
         assert!(pool.background_agent().await.is_none());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_pool_background_agent_acquire_on_demand() {
-        let pool = create_test_pool(5, false).await;
+    async fn test_pool_background_agent_acquire_on_demand() -> TestResult {
+        let pool = create_test_pool(5, false).await?;
         // Can acquire __background__ on demand even without pre-creation
         let bg = pool.acquire("__background__").await;
         assert!(bg.is_ok());
         assert!(pool.background_agent().await.is_some());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_shared_resources_extraction() {
-        let agent = create_test_agent();
+    async fn test_shared_resources_extraction() -> TestResult {
+        let agent = create_test_agent()?;
         let handle = AgentHandle::new(agent);
         let shared = SharedResources::extract_from(&handle, None).await;
 
@@ -1120,16 +1174,20 @@ mod tests {
         assert!(shared.hook_registry.is_some());
         // TokenTracker should be extracted
         assert!(shared.token_tracker.is_some());
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_shared_resources_arc_sharing() {
-        let agent = create_test_agent();
+    async fn test_shared_resources_arc_sharing() -> TestResult {
+        let agent = create_test_agent()?;
         let handle = AgentHandle::new(agent);
         let shared = SharedResources::extract_from(&handle, None).await;
 
         // Verify Arc reference counts indicate sharing
-        let tm = shared.tool_manager.as_ref().unwrap();
+        let tm = shared
+            .tool_manager
+            .as_ref()
+            .ok_or_else(|| "tool manager should be extracted".to_string())?;
         // At least 2 references: one in original agent, one in shared
         assert!(
             Arc::strong_count(tm) >= 2,
@@ -1137,17 +1195,21 @@ mod tests {
             Arc::strong_count(tm)
         );
 
-        let tt = shared.token_tracker.as_ref().unwrap();
+        let tt = shared
+            .token_tracker
+            .as_ref()
+            .ok_or_else(|| "token tracker should be extracted".to_string())?;
         assert!(
             Arc::strong_count(tt) >= 2,
             "TokenUsageTracker Arc should be shared (count={})",
             Arc::strong_count(tt)
         );
+        Ok(())
     }
 
     // ── Helpers ──────────────────────────────────────────────────────
 
-    fn create_test_agent() -> echo_agent::agent::ReactAgent {
+    fn create_test_agent() -> TestResult<echo_agent::agent::ReactAgent> {
         use echo_agent::agent::ReactAgentBuilder;
         use echo_agent::testing::MockLlmClient;
 
@@ -1157,19 +1219,19 @@ mod tests {
             .model("test-model")
             .llm_client(mock_llm)
             .build()
-            .expect("test agent should build")
+            .map_err(|error| error.to_string())
     }
 
-    fn create_test_agent_handle() -> AgentHandle {
-        AgentHandle::new(create_test_agent())
+    fn create_test_agent_handle() -> TestResult<AgentHandle> {
+        create_test_agent().map(AgentHandle::new)
     }
 
-    async fn create_test_pool(max_agents: usize, enable_bg: bool) -> AgentPool {
-        let agent = create_test_agent();
+    async fn create_test_pool(max_agents: usize, enable_bg: bool) -> TestResult<AgentPool> {
+        let agent = create_test_agent()?;
         let handle = AgentHandle::new(agent);
         let shared = SharedResources::extract_from(&handle, None).await;
 
-        AgentPool {
+        Ok(AgentPool {
             shared,
             agents: RwLock::new(HashMap::new()),
             config: PoolConfig {
@@ -1178,6 +1240,7 @@ mod tests {
                 enable_background_agent: enable_bg,
             },
             app_config: RwLock::new(AppConfig::default()),
+            working_dir: RwLock::new(None),
             runtime_llm_config: RwLock::new(None),
             permission_mode: RwLock::new("default".to_string()),
             skill_descriptors: RwLock::new(vec![]),
@@ -1185,11 +1248,11 @@ mod tests {
             memory_store_override: RwLock::new(None),
             tool_output_artifacts: RwLock::new(crate::infra::tool_output_artifact_config(None)),
             workspace_kind: RwLock::new(WorkspaceKind::General),
-        }
+        })
     }
 
-    async fn create_test_pool_with_review_integration() -> AgentPool {
-        let agent = create_test_agent();
+    async fn create_test_pool_with_review_integration() -> TestResult<AgentPool> {
+        let agent = create_test_agent()?;
         let handle = AgentHandle::new(agent);
         let store = Arc::new(echo_agent::memory::InMemoryStore::new())
             as Arc<dyn echo_agent::memory::Store>;
@@ -1204,7 +1267,7 @@ mod tests {
         let mut shared = SharedResources::extract_from(&handle, Some(review_integration)).await;
         shared.store = Some(store);
 
-        AgentPool {
+        Ok(AgentPool {
             shared,
             agents: RwLock::new(HashMap::new()),
             config: PoolConfig {
@@ -1213,6 +1276,7 @@ mod tests {
                 enable_background_agent: false,
             },
             app_config: RwLock::new(AppConfig::default()),
+            working_dir: RwLock::new(None),
             runtime_llm_config: RwLock::new(None),
             permission_mode: RwLock::new("default".to_string()),
             skill_descriptors: RwLock::new(vec![]),
@@ -1220,12 +1284,12 @@ mod tests {
             memory_store_override: RwLock::new(None),
             tool_output_artifacts: RwLock::new(crate::infra::tool_output_artifact_config(None)),
             workspace_kind: RwLock::new(WorkspaceKind::General),
-        }
+        })
     }
 
     #[tokio::test]
     async fn workspace_routing_applies_to_existing_and_future_pool_agents() -> Result<(), String> {
-        let pool = create_test_pool(4, false).await;
+        let pool = create_test_pool(4, false).await?;
         let existing = pool
             .acquire("existing")
             .await
@@ -1256,23 +1320,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_pool_agent_installs_layered_memory_runtime() {
-        let pool = create_test_pool_with_review_integration().await;
-        let handle = pool.acquire("conv-memory").await.unwrap();
+    async fn working_dir_applies_to_existing_and_future_pool_agents() -> Result<(), String> {
+        let pool = create_test_pool(4, false).await?;
+        let existing = pool
+            .acquire("existing-working-dir")
+            .await
+            .map_err(|error| error.to_string())?;
+        let root = std::env::temp_dir().join("eko-pool-working-dir");
+
+        pool.apply_working_dir(Some(root.clone())).await;
+        assert_eq!(
+            existing.read(|agent| agent.working_dir()).await,
+            Some(root.clone())
+        );
+
+        let future = pool
+            .acquire("future-working-dir")
+            .await
+            .map_err(|error| error.to_string())?;
+        assert_eq!(future.read(|agent| agent.working_dir()).await, Some(root));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_pool_agent_installs_layered_memory_runtime() -> TestResult {
+        let pool = create_test_pool_with_review_integration().await?;
+        let handle = pool
+            .acquire("conv-memory")
+            .await
+            .map_err(|error| error.to_string())?;
 
         let has_layer_manager = handle.read(|agent| agent.has_memory_layer_manager()).await;
         assert!(
             has_layer_manager,
             "pooled agents must install MemoryLayerManager so TriggerDetector writes real memory"
         );
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_task_subagents_are_isolated_and_have_memory_runtime() {
-        let pool = create_test_pool_with_review_integration().await;
+    async fn test_task_subagents_are_isolated_and_have_memory_runtime() -> TestResult {
+        let pool = create_test_pool_with_review_integration().await?;
 
-        let task_a = pool.acquire("__task__:task-a").await.unwrap();
-        let task_b = pool.acquire("__task__:task-b").await.unwrap();
+        let task_a = pool
+            .acquire("__task__:task-a")
+            .await
+            .map_err(|error| error.to_string())?;
+        let task_b = pool
+            .acquire("__task__:task-b")
+            .await
+            .map_err(|error| error.to_string())?;
 
         assert!(
             !Arc::ptr_eq(task_a.inner(), task_b.inner()),
@@ -1283,13 +1380,17 @@ mod tests {
         let task_b_has_memory = task_b.read(|agent| agent.has_memory_layer_manager()).await;
         assert!(task_a_has_memory);
         assert!(task_b_has_memory);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_released_task_subagent_frees_pool_capacity() {
-        let pool = create_test_pool(1, false).await;
+    async fn test_released_task_subagent_frees_pool_capacity() -> TestResult {
+        let pool = create_test_pool(1, false).await?;
 
-        let _task_a = pool.acquire("__task__:task-a").await.unwrap();
+        let _task_a = pool
+            .acquire("__task__:task-a")
+            .await
+            .map_err(|error| error.to_string())?;
         assert_eq!(pool.pool_size().await, 1);
 
         pool.release("__task__:task-a").await;
@@ -1301,12 +1402,16 @@ mod tests {
             "released task subagent should free capacity for a later task"
         );
         assert_eq!(pool.pool_size().await, 1);
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_permission_mode_applies_to_existing_and_future_pool_agents() {
-        let pool = create_test_pool(3, false).await;
-        let first = pool.acquire("conv-a").await.unwrap();
+    async fn test_permission_mode_applies_to_existing_and_future_pool_agents() -> TestResult {
+        let pool = create_test_pool(3, false).await?;
+        let first = pool
+            .acquire("conv-a")
+            .await
+            .map_err(|error| error.to_string())?;
 
         pool.apply_permission_mode("full-auto".to_string()).await;
 
@@ -1315,10 +1420,14 @@ mod tests {
             .await;
         assert_eq!(first_mode, "full-auto");
 
-        let second = pool.acquire("conv-b").await.unwrap();
+        let second = pool
+            .acquire("conv-b")
+            .await
+            .map_err(|error| error.to_string())?;
         let second_mode = second
             .read(|agent| agent.get_permission_mode().to_string())
             .await;
         assert_eq!(second_mode, "full-auto");
+        Ok(())
     }
 }

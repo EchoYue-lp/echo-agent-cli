@@ -31,7 +31,6 @@ use echo_agent::intent::{
 pub struct AgentRuntime {
     pub agent_handle: AgentHandle,
     pub hitl_dispatcher: Arc<HitlDispatcher>,
-    pub unified_memory: crate::unified_memory::UnifiedMemory,
     pub app_config: AppConfig,
     pub keyword_classifier: KeywordClassifier,
     /// Hook bridge for forwarding task lifecycle events to the central HookRegistry.
@@ -101,21 +100,6 @@ impl AgentRuntime {
             }
         };
         params.browser_runtime = Some(browser_runtime.clone());
-
-        // ── 0b. Unified memory — load instruction files (user.md / project.md /
-        //       local.md) BEFORE building the agent so we can hand the assembled
-        //       instruction suffix to `PromptAssembler::add_instruction_context`.
-        //       Dynamic long-term memories remain query-dependent and are recalled
-        //       during each turn through the agent memory store. ──
-        let unified_memory = crate::unified_memory::UnifiedMemory::load();
-        let memory_suffix = unified_memory.system_prompt_context().to_prompt_suffix();
-        if params.memory_context_suffix.is_none() && !memory_suffix.is_empty() {
-            params.memory_context_suffix = Some(memory_suffix);
-        }
-        tracing::info!(
-            has_memory_context = params.memory_context_suffix.is_some(),
-            "Unified memory loaded"
-        );
 
         // ── 1. Create Agent ──
         let created = infra::create_agent_with_diagnostics(&params, app_config)
@@ -249,10 +233,6 @@ impl AgentRuntime {
         let subagent_hook_bridge = agent_handle.read(|a| a.create_subagent_hook_bridge()).await;
         tracing::info!("Hook bridges created");
 
-        // ── 8. Unified memory — already loaded in step 0b (instruction-only).
-        //       Dynamic agent-learned memories are managed by the layered
-        //       MemoryLayerManager, not UnifiedMemory. ──
-
         // ── 8b. Review integration — create when Store is available so
         //       /memory-review and session-end hooks can access it. ──
         // The `echo_agent_dir` MUST be the same root the memory store was
@@ -279,6 +259,7 @@ impl AgentRuntime {
             let layer_manager = Arc::new(review_integration.create_layer_manager());
             let trigger_sink = review_integration.clone();
             let skill_policy = review_integration.clone();
+            let skill_curator = review_integration.curator();
             let workspace_skills = review_echo_agent_dir.join("skills");
             agent_handle
                 .write_async(|a| {
@@ -286,6 +267,7 @@ impl AgentRuntime {
                         a.install_memory_layer_manager(layer_manager);
                         a.set_memory_trigger_sink(Some(trigger_sink));
                         a.set_skill_load_policy(Some(skill_policy));
+                        a.set_skill_curator(Some(skill_curator));
                         if workspace_skills.is_dir()
                             && let Err(error) = a.load_skills_from_dir(workspace_skills).await
                         {
@@ -381,7 +363,6 @@ impl AgentRuntime {
         Ok(Self {
             agent_handle,
             hitl_dispatcher,
-            unified_memory,
             app_config: app_config.clone(),
             keyword_classifier,
             task_hook_bridge: Some(Arc::new(task_hook_bridge)),

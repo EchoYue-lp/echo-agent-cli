@@ -226,12 +226,14 @@ async fn run_desktop() -> anyhow::Result<()> {
 
     infra::spawn_mcp_health_check(state.clone(), cancel_token.clone());
 
-    // (stage4 F1) Daily Dreaming pass — recall-frequency-driven self-evolution
-    // (promote high-recall → hot/MEMORY.md; demote stale low-recall → Archived).
-    // Replaces the old every-N-writes review trigger. GUI is long-running, so
-    // the daily cadence is meaningful here; CLI/TUI rely on session-end review.
+    // (stage4 F1) Dreaming runs once after boot and then daily in every mode.
     if let Some(ri) = state.review_integration.clone() {
-        infra::spawn_dreaming_task(ri, cancel_token.clone());
+        infra::spawn_dreaming_task(
+            ri,
+            agent_handle.clone(),
+            state.connection.pool.clone(),
+            cancel_token.clone(),
+        );
     }
 
     // ── Launch Tauri window ──

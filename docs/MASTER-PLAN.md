@@ -1,6 +1,6 @@
 # EKO Master Plan
 
-Last updated: 2026-07-22
+Last updated: 2026-07-23
 
 This file is the cross-session source of truth for the coding, data analysis,
 academic research, and medical research expansion. Detailed design rationale
@@ -58,6 +58,7 @@ evidence, and the next bounded step.
 | Revisioned dynamic plan runtime | Complete | `docs/2026-07-21-dynamic-plan-runtime.md`; atomic DAG creation, optimistic patches, split projections, safe-point reloads, and capability-scoped Subagents |
 | Unattended worktree lifecycle and review parity | Complete | `docs/2026-07-22-unattended-worktree-lifecycle.md`; application commit `61c8350` |
 | Unified Subagent prompt compilation | Complete | framework commit `8f7904f`; `echo-agent-app-core/src/subagent_prompt.rs`; one registration-time system prompt and one typed invocation compiler across direct, planned, fork, teammate, and team dispatch |
+| Memory and self-evolution seam closure | Complete | `docs/2026-07-23-memory-self-evolution-closure.md`; replaceable workspace/hot-memory projections, one layered EKO write path, workspace-bound Curator, shared review integration, and stable compression dedup keys |
 
 ## Current Decisions
 
@@ -182,6 +183,23 @@ Systematic-review PDF/DOCX output delegates conversion to Pandoc (or Quarto,
 which bundles the same document pipeline) instead of implementing layout in the
 Agent framework. Reference: <https://pandoc.org/MANUAL.html>.
 
+### Memory And Self-Evolution
+
+Instruction files and hot memory remain ordinary local files, but their model
+context is now a replaceable projection instead of a boot-only system-prompt
+suffix. Bootstrap, workspace switch/exit, Dreaming promotion, explicit hot
+memory mutation, and rule promotion refresh the primary Agent immediately;
+pooled Agents refresh too, and future pooled Agents inherit the current working
+directory. GUI, TUI, and CLI run the same Dreaming schedule.
+
+EKO product writes use one `MemoryLayerManager` path and the unified
+`agent/memories` namespace. Raw Store tools and the optional cold tier remain
+framework capabilities for other consumers. Memory review stays proposal-only;
+deterministic Dreaming maintenance does not authorize hidden semantic merges.
+Compression-time heuristic and LLM extraction share one content-derived key so
+the same fact is not persisted twice. See
+`docs/2026-07-23-memory-self-evolution-closure.md`.
+
 ### 2026-07-19 Real-Environment Verification
 
 - OpenAlex, Crossref, and Europe PMC live search passed, and the application
@@ -205,3 +223,6 @@ Subagent runs through prompt diagnostics to confirm the expected section
 cardinality and response-language behavior across providers. Treat any UX or
 observability improvement discovered there as a new milestone; the revisioned
 dynamic plan runtime, worktree repair, and unified prompt compiler are complete.
+Also sample workspace switching and long-lived sessions to verify instruction
+projection replacement, Dreaming's first post-boot pass, and hot-memory budget
+growth before adding entry-level limits or a more frequent idle trigger.

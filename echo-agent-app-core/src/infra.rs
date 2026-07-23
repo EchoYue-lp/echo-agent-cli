@@ -103,10 +103,9 @@ pub struct AgentCreateParams {
     /// Shared runtime state store (sqlite-backed). When supplied, the agent
     /// will save `AgentCheckpoint`s + TaskNode DAG entries every iteration.
     pub state_store: Option<Arc<dyn RuntimeStateStore>>,
-    /// Pre-computed instruction/profile context to inject into the system prompt
-    /// (for example, user/project/local EKO instruction files). Dynamic
-    /// long-term memories are recalled per turn through the agent memory store,
-    /// not baked into this boot-time suffix.
+    /// Optional caller-supplied stable context to inject into the root system
+    /// prompt. EKO's workspace instructions and hot memory use replaceable
+    /// projections instead so they can refresh without rebuilding the agent.
     pub memory_context_suffix: Option<String>,
     /// Session-bound working directory (worktree path). Propagated to
     /// `ReactAgent.config.working_dir`, which `ExecuteStage` injects into every
@@ -190,25 +189,6 @@ pub async fn create_agent_with_diagnostics(
         .as_deref()
         .unwrap_or(&app_config.agent.system_prompt);
 
-    // Load project context if available
-    let project_ctx = if let Some(ref project_dir) = params.project {
-        let project_root = std::path::Path::new(project_dir);
-        if project_root.exists() {
-            Some(crate::project::context::load_project_context(project_root))
-        } else {
-            tracing::warn!("项目目录不存在: {}", project_dir);
-            None
-        }
-    } else if let Some(project_root) = crate::project::context::discover_project_root(None) {
-        let ctx = crate::project::context::load_project_context(&project_root);
-        if !ctx.instructions.is_empty() {
-            Some(ctx)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
     // Use PromptAssembler for modular, budget-aware prompt construction
     let model_window = if app_config.agent.token_limit > 0 {
         app_config.agent.token_limit
@@ -218,7 +198,7 @@ pub async fn create_agent_with_diagnostics(
     let mut assembler = PromptAssembler::default(
         base_system_prompt,
         Some(TASK_MANAGEMENT_GUIDE),
-        project_ctx.as_ref(),
+        None,
         model_window,
     );
     // Inject the unified instruction/profile context so the agent's system prompt
@@ -437,6 +417,7 @@ pub async fn create_agent_with_diagnostics(
         tracing::error!("Failed to build agent: {e}");
         format!("Failed to initialize agent: {e}. Please check your configuration and try again.")
     })?;
+    refresh_dynamic_context(&mut agent, subagent_project_root.as_deref()).await;
     configure_run_code_capability(&mut agent, run_code_available);
     agent.set_pre_model_context_projector(Some(std::sync::Arc::new(
         crate::tasks::task_runtime::compact_context::TaskRuntimeContextProjector::new(
@@ -525,6 +506,12 @@ pub async fn create_agent_with_diagnostics(
         agent,
         prompt_assembly,
     })
+}
+
+/// Refresh every workspace-dependent context projection on an agent.
+pub async fn refresh_dynamic_context(agent: &mut ReactAgent, root: Option<&std::path::Path>) {
+    crate::unified_memory::refresh_instruction_projection(agent, root).await;
+    crate::project::prompt::refresh_project_context_projection(agent, root).await;
 }
 
 fn configure_run_code_capability(agent: &mut ReactAgent, available: bool) {
@@ -1128,7 +1115,7 @@ pub fn spawn_mcp_health_check(
     });
 }
 
-/// Spawn the Dreaming self-evolution pass on a daily cadence (stage4 F1).
+/// Spawn Dreaming after boot settles, then repeat it on a daily cadence.
 ///
 /// Replaces the old "every-N-writes triggers a full review" model with a
 /// recall-frequency-driven pass: promote high-recall memories (incl. Archived,
@@ -1136,17 +1123,25 @@ pub fn spawn_mcp_health_check(
 /// and batch-demote stale low-recall ones to Archived. Uses the shared
 /// `ReviewIntegration`'s layer manager (same store the agent recalls from, so
 /// revives/demotes land in the unified `["agent","memories"]` namespace).
-/// Best-effort — errors in a pass are logged and the next pass runs on the
-/// next tick.
+/// When a pass changes the hot layer, the primary and pooled agents refresh
+/// their replaceable instruction projection immediately. Best-effort: errors
+/// are logged and the next pass still runs.
 pub fn spawn_dreaming_task(
     review_integration: Arc<crate::evolution::ReviewIntegration>,
+    primary_agent: crate::agent_handle::AgentHandle,
+    pool: Option<Arc<crate::agent_pool::AgentPool>>,
     cancel: echo_agent::agent::CancellationToken,
 ) {
     tokio::spawn(async move {
         // Initial delay so boot-time activity isn't interrupted.
-        tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                tracing::info!("Dreaming task stopped before first pass");
+                return;
+            }
+            _ = tokio::time::sleep(tokio::time::Duration::from_secs(60)) => {}
+        }
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(86400));
-        interval.tick().await; // discard the immediate first tick
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => {
@@ -1154,25 +1149,52 @@ pub fn spawn_dreaming_task(
                     break;
                 }
                 _ = interval.tick() => {
-                    let lm = std::sync::Arc::new(review_integration.create_layer_manager());
-                    let dreaming = echo_agent::evolution::Dreaming::new(
-                        lm,
-                        echo_agent::evolution::DreamingConfig::default(),
-                    );
-                    match dreaming.run().await {
-                        Ok(report) => tracing::info!(
-                            scanned = report.scanned,
-                            promoted = report.promoted,
-                            revived = report.revived,
-                            demoted = report.demoted,
-                            "Dreaming pass completed"
-                        ),
+                    match run_dreaming_pass(&review_integration).await {
+                        Ok(report) => {
+                            tracing::info!(
+                                scanned = report.scanned,
+                                promoted = report.promoted,
+                                revived = report.revived,
+                                demoted = report.demoted,
+                                "Dreaming pass completed"
+                            );
+                            if report.promoted > 0 {
+                                let root = primary_agent
+                                    .read(|agent| agent.working_dir())
+                                    .await;
+                                primary_agent
+                                    .write_async(|agent| {
+                                        Box::pin(async move {
+                                            crate::unified_memory::refresh_instruction_projection(
+                                                agent,
+                                                root.as_deref(),
+                                            )
+                                            .await;
+                                        })
+                                    })
+                                    .await;
+                                if let Some(ref agent_pool) = pool {
+                                    agent_pool.refresh_instruction_context().await;
+                                }
+                            }
+                        }
                         Err(e) => tracing::warn!(error = %e, "Dreaming pass failed"),
                     }
                 }
             }
         }
     });
+}
+
+async fn run_dreaming_pass(
+    review_integration: &crate::evolution::ReviewIntegration,
+) -> anyhow::Result<echo_agent::evolution::DreamingReport> {
+    let layer_manager = std::sync::Arc::new(review_integration.create_layer_manager());
+    let dreaming = echo_agent::evolution::Dreaming::new(
+        layer_manager,
+        echo_agent::evolution::DreamingConfig::default(),
+    );
+    dreaming.run().await.map_err(anyhow::Error::from)
 }
 
 /// 创建对话持久化 Store（文件），失败时返回 None（禁用持久化）

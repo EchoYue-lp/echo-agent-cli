@@ -830,12 +830,19 @@ impl AppState {
 
         // 更新 agent 的 working_dir 配置（影响 project rules 注入等）
         let new_wd = Some(workspace.root.clone());
-        self.connection.agent.try_write(|a| {
-            a.set_working_dir(new_wd.clone());
-            a.set_tool_output_artifacts(Some(crate::infra::tool_output_artifact_config(
-                new_wd.as_deref(),
-            )));
-        });
+        let primary_root = workspace.root.clone();
+        self.connection
+            .agent
+            .write_async(|agent| {
+                Box::pin(async move {
+                    agent.set_working_dir(Some(primary_root.clone()));
+                    agent.set_tool_output_artifacts(Some(
+                        crate::infra::tool_output_artifact_config(Some(&primary_root)),
+                    ));
+                    crate::infra::refresh_dynamic_context(agent, Some(&primary_root)).await;
+                })
+            })
+            .await;
         // Propagate to all pooled agents so background tasks run in the new
         // workspace (P1-7).
         if let Some(ref pool) = self.connection.pool {
@@ -919,10 +926,12 @@ impl AppState {
             //     dreaming、session-end 都用新 workspace 的记忆）。
             if let Some(ref ri) = self.review_integration {
                 ri.rebind(echo_agent_dir.clone(), store.clone());
+                let curator = ri.curator();
                 self.connection
                     .agent
                     .write_async(|agent| {
                         Box::pin(async move {
+                            agent.set_skill_curator(Some(curator));
                             agent.reconcile_skill_load_policy().await;
                         })
                     })
@@ -1004,9 +1013,18 @@ impl AppState {
             *persistence = global_persistence;
         }
 
-        self.connection.agent.try_write(|agent| {
-            agent.set_tool_output_artifacts(Some(crate::infra::tool_output_artifact_config(None)));
-        });
+        self.connection
+            .agent
+            .write_async(|agent| {
+                Box::pin(async move {
+                    agent.set_working_dir(None);
+                    agent.set_tool_output_artifacts(Some(
+                        crate::infra::tool_output_artifact_config(None),
+                    ));
+                    crate::infra::refresh_dynamic_context(agent, None).await;
+                })
+            })
+            .await;
 
         // 重置 conversation_store 到全局默认路径（U1c：文件后端）
         let global_base = crate::persistence::Persistence::base_dir();
@@ -1051,10 +1069,12 @@ impl AppState {
                 .await;
             if let Some(ref ri) = self.review_integration {
                 ri.rebind(global_echo_dir.clone(), store.clone());
+                let curator = ri.curator();
                 self.connection
                     .agent
                     .write_async(|agent| {
                         Box::pin(async move {
+                            agent.set_skill_curator(Some(curator));
                             agent.reconcile_skill_load_policy().await;
                         })
                     })
