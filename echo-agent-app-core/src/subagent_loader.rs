@@ -7,7 +7,7 @@
 //! ## Resolution order (highest priority first)
 //!
 //! 1. **Project scope**: `<project_root>/.eko/subagents/**/*.md`
-//! 2. **User scope**: `~/.echo-agent/subagents/**/*.md`
+//! 2. **User scope**: `~/.eko/subagents/**/*.md`
 //! 3. **Builtin defaults**: compiled-in `.md` files via `include_str!`
 //!
 //! On name collisions, the higher-priority scope wins (mirrors the skills
@@ -283,9 +283,9 @@ pub fn discover_subagents(
         }
     }
 
-    // 2. User scope (~/.echo-agent/subagents/).
+    // 2. User scope (~/.eko/subagents/).
     if let Some(home) = user_home {
-        let user_dir = home.join(".echo-agent").join("subagents");
+        let user_dir = home.join(".eko").join("subagents");
         merge_scope(&mut by_name, "user", &user_dir);
     }
 
@@ -824,7 +824,7 @@ team_subagents: [\"explorer\", \"summarizer\"]\n\
     #[test]
     fn user_scope_adds_new_subagent() {
         let home = tempdir().unwrap();
-        let sub = home.path().join(".echo-agent").join("subagents");
+        let sub = home.path().join(".eko").join("subagents");
         fs::create_dir_all(&sub).unwrap();
         fs::write(
             sub.join("custom-subagent.md"),
@@ -843,7 +843,7 @@ team_subagents: [\"explorer\", \"summarizer\"]\n\
     #[test]
     fn project_scope_beats_user_scope() {
         let home = tempdir().unwrap();
-        let home_sub = home.path().join(".echo-agent").join("subagents");
+        let home_sub = home.path().join(".eko").join("subagents");
         fs::create_dir_all(&home_sub).unwrap();
         fs::write(
             home_sub.join("explorer.md"),

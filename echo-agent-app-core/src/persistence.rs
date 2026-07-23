@@ -5,7 +5,7 @@
 //! - 列出已保存的会话
 //! - 导出为 Markdown 格式
 //!
-//! 存储目录: `~/.echo-agent/sessions/`
+//! 存储目录: `~/.eko/sessions/`
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -176,8 +176,7 @@ impl Persistence {
 
     /// 获取基础存储目录
     pub fn base_dir() -> PathBuf {
-        let home = dirs_home();
-        PathBuf::from(home).join(".echo-agent").join("sessions")
+        echo_agent::paths::user_data_path("sessions")
     }
 
     // ── CLI 会话管理 ──
@@ -356,16 +355,6 @@ impl Persistence {
             attachments: None,
         }
     }
-}
-
-/// 获取用户 home 目录
-fn dirs_home() -> String {
-    // 优先使用 HOME 环境变量
-    if let Ok(home) = std::env::var("HOME") {
-        return home;
-    }
-    // 回退
-    "~".to_string()
 }
 
 #[cfg(test)]

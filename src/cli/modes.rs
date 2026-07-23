@@ -12,7 +12,9 @@ use crate::config::AppConfig;
 fn repl_config_for(args: &Args) -> crate::cli::ReplConfig {
     crate::cli::ReplConfig {
         prompt: "echo".to_string(),
-        history_file: "~/.echo-agent/history.txt".to_string(),
+        history_file: echo_agent::paths::user_data_path("history.txt")
+            .to_string_lossy()
+            .into_owned(),
         mode: "general".to_string(),
         project: args.project.clone(),
         task_service: None,

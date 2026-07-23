@@ -68,7 +68,9 @@ impl Default for ReplConfig {
     fn default() -> Self {
         Self {
             prompt: "echo".to_string(),
-            history_file: "~/.echo-agent/history.txt".to_string(),
+            history_file: echo_agent::paths::user_data_path("history.txt")
+                .to_string_lossy()
+                .into_owned(),
             mode: "general".to_string(),
             project: None,
             task_service: None,
@@ -305,7 +307,7 @@ async fn run_auto_memory_on_exit(
 /// Run lightweight reflection when the session ends.
 ///
 /// Generates a brief summary of session learnings and appends to
-/// `.echo-agent/memory/PROJECT.md`. Non-blocking: errors are silently
+/// `.eko/memory/PROJECT.md`. Non-blocking: errors are silently
 /// ignored to avoid disrupting exit flow.
 async fn run_reflection_on_exit(agent: &AgentHandle) {
     // Get LLM client from agent

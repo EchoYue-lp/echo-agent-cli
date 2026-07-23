@@ -10,12 +10,7 @@ use chrono;
 
 async fn cmd_save(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     let name = args.first().copied().unwrap_or("session");
-    let sessions_dir = std::env::var("HOME")
-        .ok()
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".echo-agent")
-        .join("sessions");
+    let sessions_dir = echo_agent::paths::user_data_path("sessions");
     let _ = std::fs::create_dir_all(&sessions_dir);
 
     let handle = ctx.agent.clone();
@@ -58,12 +53,7 @@ cmd!(
 
 async fn cmd_load(_ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
     let name = args.first().copied().unwrap_or("session");
-    let sessions_dir = std::env::var("HOME")
-        .ok()
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".echo-agent")
-        .join("sessions");
+    let sessions_dir = echo_agent::paths::user_data_path("sessions");
     let path = sessions_dir.join(format!("{}.json", name));
 
     if !path.exists() {
@@ -109,12 +99,7 @@ cmd!(
 // ── SessionsCommand ───────────────────────────────────────────────────
 
 async fn cmd_sessions(_ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
-    let sessions_dir = std::env::var("HOME")
-        .ok()
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("."))
-        .join(".echo-agent")
-        .join("sessions");
+    let sessions_dir = echo_agent::paths::user_data_path("sessions");
 
     println!("\n--- Saved Sessions ---");
     if !sessions_dir.exists() {
@@ -210,11 +195,7 @@ async fn cmd_export(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
         })
     }).await;
 
-    let export_dir = std::env::var("HOME")
-        .ok()
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
-    let export_dir = export_dir.join(".echo-agent").join("exports");
+    let export_dir = echo_agent::paths::user_data_path("exports");
     let _ = std::fs::create_dir_all(&export_dir);
 
     let ext = if fmt == "markdown" || fmt == "md" {
@@ -324,14 +305,11 @@ async fn cmd_doctor(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
     println!("\n--- Configuration Diagnostics ---\n");
 
     // Check config
-    let config_path = std::env::var("HOME")
-        .ok()
-        .map(std::path::PathBuf::from)
-        .map(|h| h.join(".echo-agent").join("echo-agent.yaml"));
-    match &config_path {
-        Some(p) if p.exists() => println!("  [OK] Config file: {}", p.display()),
-        Some(p) => println!("  [--] Config file not found: {}", p.display()),
-        None => println!("  [--] HOME not set, cannot check config"),
+    let config_path = echo_agent::paths::user_data_path("config.yaml");
+    if config_path.exists() {
+        println!("  [OK] Config file: {}", config_path.display());
+    } else {
+        println!("  [--] Config file not found: {}", config_path.display());
     }
 
     // Check git
@@ -365,11 +343,8 @@ async fn cmd_doctor(ctx: &CommandContext, _: &[&str]) -> CommandOutcome {
         .await;
 
     // Check sessions dir
-    let sessions_dir = std::env::var("HOME")
-        .ok()
-        .map(std::path::PathBuf::from)
-        .map(|h| h.join(".echo-agent").join("sessions"));
-    if let Some(d) = sessions_dir {
+    {
+        let d = echo_agent::paths::user_data_path("sessions");
         if d.exists() {
             let count = std::fs::read_dir(&d)
                 .map(|r| r.flatten().count())

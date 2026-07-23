@@ -1,7 +1,7 @@
 //! Enabled-skills.json configuration management.
 //!
 //! Manages per-skill enable state and baseline eligibility in
-//! `~/.echo-agent/enabled-skills.json`.  Methodology skills that are both
+//! `~/.eko/enabled-skills.json`.  Methodology skills that are both
 //! `enabled` and `baseline` have their full SKILL.md body injected into the
 //! system prompt at session start.
 
@@ -18,7 +18,7 @@ pub struct SkillEnableEntry {
     pub baseline: bool,
 }
 
-/// Root config for `~/.echo-agent/enabled-skills.json`.
+/// Root config for `~/.eko/enabled-skills.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnabledSkillsConfig {
     #[serde(default = "default_version")]

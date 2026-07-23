@@ -2457,7 +2457,7 @@ fn short_identifier(value: &str) -> String {
 /// Stage a local file as an attachment for the next TUI message (B5.3).
 ///
 /// Reads `path`, infers a MIME type from the extension, copies the file into
-/// the global uploads dir (`~/.echo-agent/uploads/`, since the TUI has no
+/// the global uploads dir (`~/.eko/uploads/`, since the TUI has no
 /// workspace concept), and appends an [`AttachmentRef`] to `out`. The caller
 /// (`handle_enter`) rebuilds a multimodal `Message` from the refs and passes it
 /// to `drive_chat`. Returns the display name + inferred MIME on success.
@@ -3106,7 +3106,7 @@ async fn handle_slash_command(
             // AttachmentRef onto pending_attachments. The next Enter sends it
             // alongside the typed text via drive_chat(multimodal=Some), then
             // drains the buffer. TUI has no workspace concept, so use the
-            // global ~/.echo-agent/uploads/ dir.
+            // global ~/.eko/uploads/ dir.
             if args.is_empty() {
                 app.messages.push(ChatMessage {
                     role: MessageRole::System,

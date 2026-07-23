@@ -376,11 +376,10 @@ fn hub_skill_json(entry: &echo_agent_app_core::skills_hub::SkillHubEntry) -> ser
     })
 }
 
-/// ~/.echo-agent/enabled-skills.json 路径(B3:enable/disable 同步写此文件,
+/// ~/.eko/enabled-skills.json 路径(B3:enable/disable 同步写此文件,
 /// 消除"SkillsHub 内存 / enabled-skills.json / is_baseline 硬编码"三套状态不同步)。
 fn enabled_skills_json_path() -> Option<std::path::PathBuf> {
-    let home = dirs::home_dir()?;
-    Some(home.join(".echo-agent").join("enabled-skills.json"))
+    Some(echo_agent::paths::user_data_path("enabled-skills.json"))
 }
 
 /// 同步 enabled-skills.json:确保 skill entry 存在(带 category),设置 enabled。

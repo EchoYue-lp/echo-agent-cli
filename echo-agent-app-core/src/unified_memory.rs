@@ -29,11 +29,11 @@ use crate::instruction_provider::InstructionProvider;
 /// Which tier of instructions to access.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstructionTier {
-    /// User-level instructions (`~/.echo-agent/user.md`).
+    /// User-level instructions (`~/.eko/user.md`).
     User,
-    /// Project-level instructions (`<project-root>/.echo-agent/project.md`).
+    /// Project-level instructions (`<project-root>/.eko/project.md`).
     Project,
-    /// Local directory instructions (`<cwd>/.echo-agent/local.md`).
+    /// Local directory instructions (`<cwd>/.eko/local.md`).
     Local,
 }
 
@@ -142,10 +142,7 @@ impl UnifiedMemory {
     /// Get the file path for a given instruction tier.
     fn instruction_path(&self, tier: InstructionTier) -> Result<PathBuf, String> {
         match tier {
-            InstructionTier::User => {
-                let home = dirs::home_dir().ok_or("Could not determine home directory")?;
-                Ok(home.join(".echo-agent").join("user.md"))
-            }
+            InstructionTier::User => Ok(echo_agent::paths::user_data_path("user.md")),
             InstructionTier::Project => {
                 let pwd = std::env::current_dir().map_err(|e| format!("Failed to get cwd: {e}"))?;
                 let root =
@@ -199,8 +196,8 @@ fn load_hot_content() -> Option<String> {
     }
 
     // User-level
-    if let Some(home) = dirs::home_dir() {
-        let path = home.join(".eko").join("MEMORY.md");
+    {
+        let path = echo_agent::paths::user_data_path("MEMORY.md");
         if path.exists()
             && let Ok(raw) = std::fs::read_to_string(&path)
         {

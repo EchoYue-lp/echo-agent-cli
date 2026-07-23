@@ -53,13 +53,12 @@ type Result<T> = std::result::Result<T, AttachmentError>;
 ///
 /// Prefers `{workspace_root}/.eko/uploads/` (per-workspace isolation). When no
 /// workspace is active (first-turn, global chats), falls back to the global
-/// `~/.echo-agent/uploads/`.
+/// `~/.eko/uploads/`.
 pub fn resolve_uploads_dir(workspace_root: Option<&Path>) -> PathBuf {
     if let Some(root) = workspace_root {
         crate::workspace::layout::WorkspaceLayout::uploads(root)
     } else {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(home).join(".echo-agent").join("uploads")
+        echo_agent::paths::user_data_path("uploads")
     }
 }
 

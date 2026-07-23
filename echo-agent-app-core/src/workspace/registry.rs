@@ -2,7 +2,7 @@
 //!
 //! 管理工作区的创建、发现、切换和删除。
 //! 支持两种工作区位置：
-//! - 默认：`~/.echo-agent/workspaces/{id}/`
+//! - 默认：`~/.eko/workspaces/{id}/`
 //! - 自定义：用户指定的任意目录
 //!
 //! 所有工作区通过 `registry.json` 索引文件统一追踪。
@@ -66,7 +66,7 @@ impl RegistryIndex {
 ///
 /// 管理所有工作区的生命周期，支持默认路径和自定义路径。
 pub struct WorkspaceRegistry {
-    /// 工作区基础目录，通常为 `~/.echo-agent/workspaces/`。
+    /// 工作区基础目录，通常为 `~/.eko/workspaces/`。
     base_dir: PathBuf,
 }
 

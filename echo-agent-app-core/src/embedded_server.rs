@@ -1,7 +1,7 @@
 //! Embedded axum server — always starts, even in CLI/TUI mode.
 //!
 //! Binds to `127.0.0.1:0` (OS-assigned port). Writes the actual port
-//! to `~/.echo-agent/server.pid` for cross-process discovery.
+//! to `~/.eko/server.pid` for cross-process discovery.
 //!
 //! This ensures all modes (web, cli, tui, tauri) have access to the
 //! REST API and background task management.

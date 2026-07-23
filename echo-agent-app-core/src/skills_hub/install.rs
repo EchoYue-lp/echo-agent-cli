@@ -1,6 +1,6 @@
 //! 技能安装器
 //!
-//! 支持从 Git 仓库或本地目录安装技能到 `~/.echo-agent/skills/`。
+//! 支持从 Git 仓库或本地目录安装技能到 `~/.eko/skills/`。
 
 use std::ffi::OsStr;
 use std::io::Read;

@@ -190,10 +190,7 @@ impl AgentRuntime {
         // verification / planning) directly into the system prompt so they
         // are always active without requiring explicit activate_skill calls.
         {
-            let echo_home =
-                std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string()))
-                    .join(".echo-agent");
-            let enabled_config_path = echo_home.join("enabled-skills.json");
+            let enabled_config_path = echo_agent::paths::user_data_path("enabled-skills.json");
             let enabled_config = crate::skills_hub::EnabledSkillsConfig::load(&enabled_config_path)
                 .unwrap_or_default();
             // 收集 baseline 名为 owned Vec<String>,move 进 async 闭包(闭包要 'static,
@@ -656,8 +653,8 @@ async fn register_lsp_tools(agent_handle: &AgentHandle) {
     }
 
     // Global preferences override discovery defaults.
-    if let Some(home_dir) = std::env::var("HOME").ok().map(std::path::PathBuf::from) {
-        let global_lsp = home_dir.join(".echo-agent").join(".lsp.yaml");
+    {
+        let global_lsp = echo_agent::paths::user_data_path(".lsp.yaml");
         if global_lsp.is_file() {
             match LspConfig::from_file(&global_lsp) {
                 Ok(global) => config.merge(global),

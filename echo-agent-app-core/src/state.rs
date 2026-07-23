@@ -891,7 +891,7 @@ impl AppState {
         }
 
         // 重新初始化 memory store 到工作区的存储目录（物理隔离：动态记忆
-        // 跟 workspace 走，不再共享全局 ~/.echo-agent/store.json）。
+        // 跟 workspace 走，不再共享全局 ~/.eko/store.json）。
         // hot 层 MEMORY.md 的 echo_agent_dir 与 warm 层 store.json 同根，
         // 都落在 {workspace.root}/.eko/，保证两层一致。
         let mem_root = workspace.root.clone();
@@ -1027,7 +1027,7 @@ impl AppState {
                 .try_write(|a| a.set_state_store(runtime_store));
         }
 
-        // 重置 memory store 到全局默认路径（~/.echo-agent/store.json）。
+        // 重置 memory store 到全局默认路径（~/.eko/store.json）。
         // 与 switch_workspace 的 memory 重载对称：exit 后动态记忆回到全局 store，
         // 不再读已退出 workspace 的 .eko/memory/。
         if let Some(store) = crate::infra::create_global_memory_store() {

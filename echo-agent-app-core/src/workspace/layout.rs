@@ -16,21 +16,13 @@ pub struct WorkspaceLayout;
 impl WorkspaceLayout {
     // ── 基础目录 ──
 
-    /// 工作区基础目录：`~/.echo-agent/workspaces/`
+    /// 工作区基础目录：`~/.eko/workspaces/`
     ///
     pub fn base_dir() -> PathBuf {
-        let home = home_dir().unwrap_or_else(|| {
-            let fallback = std::env::temp_dir();
-            tracing::warn!(
-                path = %fallback.display(),
-                "HOME is unavailable; using the temporary directory for workspaces"
-            );
-            fallback
-        });
-        home.join(".echo-agent").join("workspaces")
+        echo_agent::paths::user_data_path("workspaces")
     }
 
-    /// 工作区根目录：`~/.echo-agent/workspaces/{id}/`
+    /// 工作区根目录：`~/.eko/workspaces/{id}/`
     pub fn root(id: &WorkspaceId) -> PathBuf {
         Self::base_dir().join(id.as_path_segment())
     }
@@ -169,11 +161,6 @@ impl WorkspaceLayout {
     pub fn is_valid_workspace(root: &Path) -> bool {
         root.exists() && (Self::manifest(root).exists() || Self::legacy_manifest(root).exists())
     }
-}
-
-/// 获取用户 home 目录。
-fn home_dir() -> Option<PathBuf> {
-    dirs::home_dir()
 }
 
 // ── Tests ───────────────────────────────────────────────────────────

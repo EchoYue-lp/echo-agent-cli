@@ -6,7 +6,7 @@
 //! # 目录结构
 //!
 //! ```text
-//! ~/.echo-agent/workspaces/{id}/
+//! ~/.eko/workspaces/{id}/
 //! └── .eko/           # 系统数据（默认隐藏）
 //!     ├── workspace.json     # 清单文件
 //!     ├── sessions/          # 会话历史

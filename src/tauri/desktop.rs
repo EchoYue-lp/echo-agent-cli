@@ -10,10 +10,7 @@ use std::sync::Arc;
 /// Crash log path — written to when the app panics before Tauri starts.
 /// This is the only way to debug silent crashes on macOS (no terminal attached).
 fn crash_log_path() -> std::path::PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    std::path::PathBuf::from(home)
-        .join(".echo-agent")
-        .join("crash.log")
+    echo_agent::paths::user_data_path("crash.log")
 }
 
 /// Install a panic hook that writes the panic message to a crash log file.
@@ -67,6 +64,10 @@ fn install_panic_hook() {
 
 /// Run the Tauri desktop app and report startup failures to a crash log.
 pub async fn run_desktop_entry() -> anyhow::Result<()> {
+    // 统一全局根目录为 ~/.eko。必须在 crash_log_path()/init_logging 等任何路径
+    // 解析之前调用(dedicated echo-agent-tauri bin 直接进这里)。
+    let _ = echo_agent::paths::set_user_data_dir_name(".eko");
+
     install_panic_hook();
 
     // Log startup to crash log (overwrite previous crash)

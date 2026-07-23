@@ -5,14 +5,16 @@
 //!
 //! ## Config file inventory
 //!
+//! 全局用户目录根为 `~/.eko/`(由 `echo_agent::paths` 统一解析,应用启动时设置)。
+//!
 //! | File | Location | Purpose |
 //! |------|----------|---------|
-//! | `echo-agent.yaml` | Project root or `~/.echo-agent/` | Agent configuration |
-//! | `.mcp.json` | Project root or `~/.echo-agent/` | MCP server configuration |
-//! | `hooks.yaml` | Project root `.echo-agent/` or `~/.echo-agent/` | Hook definitions |
-//! | `user.md` | `~/.echo-agent/` | User-level instructions |
-//! | `project.md` | `<project-root>/.echo-agent/` | Project-level instructions |
-//! | `local.md` | `<cwd>/.echo-agent/` | Local directory instructions |
+//! | `echo-agent.yaml` | Project root or `~/.eko/` | Agent configuration |
+//! | `.mcp.json` | Project root or `~/.eko/` | MCP server configuration |
+//! | `hooks.yaml` | Project `.eko/` or `~/.eko/` | Hook definitions |
+//! | `user.md` | `~/.eko/` | User-level instructions |
+//! | `project.md` | `<project-root>/.eko/` | Project-level instructions |
+//! | `local.md` | `<cwd>/.eko/` | Local directory instructions |
 //! | `manifest.yaml` | Plugin directories | Plugin manifests |
 //! | `.workspace.json` | Workspace directories | Workspace metadata |
 //! | `.lsp.yaml` | Project root | LSP server configuration |
@@ -37,11 +39,11 @@ pub struct ConfigFile {
 /// Scope of a configuration file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigScope {
-    /// Global user configuration (`~/.echo-agent/`).
+    /// Global user configuration (`~/.eko/`).
     Global,
-    /// Project-level configuration (`.echo-agent/` in project root).
+    /// Project-level configuration (`.eko/` in project root).
     Project,
-    /// Local directory configuration (`.echo-agent/` in cwd).
+    /// Local directory configuration (`.eko/` in cwd).
     Local,
     /// Plugin-specific configuration.
     Plugin,
@@ -156,8 +158,8 @@ impl ConfigInventory {
 pub struct ConfigDiscovery {
     /// Project root directory (if detected).
     project_root: Option<PathBuf>,
-    /// User home directory.
-    home_dir: PathBuf,
+    /// Global user-data directory (`~/.eko/`, from `echo_agent::paths`).
+    data_root: PathBuf,
     /// Current working directory.
     cwd: PathBuf,
 }
@@ -165,7 +167,7 @@ pub struct ConfigDiscovery {
 impl ConfigDiscovery {
     /// Create a new discovery service.
     pub fn new() -> Self {
-        let home_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let data_root = echo_agent::paths::user_data_dir();
 
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
@@ -173,16 +175,17 @@ impl ConfigDiscovery {
 
         Self {
             project_root,
-            home_dir,
+            data_root,
             cwd,
         }
     }
 
-    /// Create with explicit paths (for testing).
+    /// Create with explicit paths (for testing). The global scope is placed
+    /// under `home_dir/.eko` to mirror the real [`Self::new`] layout.
     pub fn with_paths(home_dir: PathBuf, cwd: PathBuf, project_root: Option<PathBuf>) -> Self {
         Self {
             project_root,
-            home_dir,
+            data_root: home_dir.join(".eko"),
             cwd,
         }
     }
@@ -214,8 +217,8 @@ impl ConfigDiscovery {
     // ── Discovery methods ────────────────────────────────────────────
 
     fn discover_agent_configs(&self, inv: &mut ConfigInventory) {
-        // Global: ~/.echo-agent/echo-agent.yaml
-        let global = self.home_dir.join(".echo-agent").join("echo-agent.yaml");
+        // Global: ~/.eko/echo-agent.yaml
+        let global = self.data_root.join("echo-agent.yaml");
         inv.agent_configs.push(ConfigFile {
             name: "echo-agent.yaml (global)".into(),
             path: global.clone(),
@@ -238,8 +241,8 @@ impl ConfigDiscovery {
     }
 
     fn discover_mcp_configs(&self, inv: &mut ConfigInventory) {
-        // Global: ~/.echo-agent/mcp.json
-        let global = self.home_dir.join(".echo-agent").join("mcp.json");
+        // Global: ~/.eko/mcp.json
+        let global = self.data_root.join("mcp.json");
         inv.mcp_configs.push(ConfigFile {
             name: "mcp.json (global)".into(),
             path: global.clone(),
@@ -262,8 +265,8 @@ impl ConfigDiscovery {
     }
 
     fn discover_hooks_configs(&self, inv: &mut ConfigInventory) {
-        // Global: ~/.echo-agent/hooks.yaml
-        let global = self.home_dir.join(".echo-agent").join("hooks.yaml");
+        // Global: ~/.eko/hooks.yaml
+        let global = self.data_root.join("hooks.yaml");
         inv.hooks_configs.push(ConfigFile {
             name: "hooks.yaml (global)".into(),
             path: global.clone(),
@@ -286,8 +289,8 @@ impl ConfigDiscovery {
     }
 
     fn discover_instructions(&self, inv: &mut ConfigInventory) {
-        // User-level: ~/.echo-agent/user.md
-        let user = self.home_dir.join(".echo-agent").join("user.md");
+        // User-level: ~/.eko/user.md
+        let user = self.data_root.join("user.md");
         inv.instructions.push(ConfigFile {
             name: "user.md".into(),
             path: user.clone(),
@@ -322,10 +325,7 @@ impl ConfigDiscovery {
     fn discover_plugin_manifests(&self, inv: &mut ConfigInventory) {
         // Scan plugin directories in all scopes
         let scopes = [
-            (
-                ConfigScope::Global,
-                self.home_dir.join(".echo-agent").join("plugins"),
-            ),
+            (ConfigScope::Global, self.data_root.join("plugins")),
             (
                 ConfigScope::Project,
                 self.project_root
@@ -360,7 +360,7 @@ impl ConfigDiscovery {
     }
 
     fn discover_workspace_configs(&self, inv: &mut ConfigInventory) {
-        let ws_dir = self.home_dir.join(".echo-agent").join("workspaces");
+        let ws_dir = self.data_root.join("workspaces");
         if !ws_dir.exists() {
             return;
         }
@@ -393,8 +393,8 @@ impl ConfigDiscovery {
             });
         }
 
-        // Global: ~/.echo-agent/.lsp.yaml
-        let global = self.home_dir.join(".echo-agent").join(".lsp.yaml");
+        // Global: ~/.eko/.lsp.yaml
+        let global = self.data_root.join(".lsp.yaml");
         inv.lsp_configs.push(ConfigFile {
             name: ".lsp.yaml (global)".into(),
             path: global.clone(),

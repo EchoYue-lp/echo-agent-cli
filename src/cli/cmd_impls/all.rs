@@ -226,14 +226,8 @@ async fn cmd_memory(_: &CommandContext, args: &[&str]) -> CommandOutcome {
         "show" => {
             println!("\n📝 Project Memory\n");
 
-            // User-level: ~/.echo-agent/user.md
-            let user_path = std::env::var("HOME")
-                .map(|h| {
-                    std::path::PathBuf::from(h)
-                        .join(".echo-agent")
-                        .join("user.md")
-                })
-                .unwrap_or_default();
+            // User-level: ~/.eko/user.md
+            let user_path = echo_agent::paths::user_data_path("user.md");
             print_memory_tier("User", &user_path);
 
             // Project-level: <project-root>/.eko/project.md

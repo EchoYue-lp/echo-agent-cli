@@ -87,13 +87,12 @@ pub fn load_project_context(project_root: &Path) -> ProjectContext {
         }
     }
 
-    let home = std::env::var("HOME").unwrap_or_default();
+    let data_root = echo_agent::paths::user_data_dir();
     let home_instructions = [
-        format!("{}/.echo-agent/AGENTS.md", home),
-        format!("{}/.echo-agent/instructions.md", home),
+        data_root.join("AGENTS.md"),
+        data_root.join("instructions.md"),
     ];
-    for path_str in &home_instructions {
-        let path = Path::new(path_str);
+    for path in &home_instructions {
         if path.exists() {
             match std::fs::read_to_string(path) {
                 Ok(content) => {
@@ -104,7 +103,7 @@ pub fn load_project_context(project_root: &Path) -> ProjectContext {
                             .map(|name| name.to_string_lossy().into_owned())
                             .unwrap_or_else(|| path.display().to_string());
                         instructions.push(LoadedInstruction {
-                            source: format!("~/.echo-agent/{source_name}"),
+                            source: format!("~/.eko/{source_name}"),
                             content,
                         });
                     }

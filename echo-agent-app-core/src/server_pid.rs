@@ -1,6 +1,6 @@
 //! Server PID file management for cross-process discovery.
 //!
-//! Writes `{ pid, port, started_at }` to `~/.echo-agent/server.pid`.
+//! Writes `{ pid, port, started_at }` to `~/.eko/server.pid`.
 //! On startup, checks if an existing server is running. If so, the caller
 //! decides whether to connect to it or kill it.
 
@@ -16,10 +16,7 @@ pub struct ServerPid {
 
 /// Get the path to the PID file.
 fn pid_file_path() -> PathBuf {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".echo-agent").join("server.pid")
+    echo_agent::paths::user_data_path("server.pid")
 }
 
 /// Write PID info to disk.

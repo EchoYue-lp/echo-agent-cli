@@ -24,7 +24,7 @@ pub struct EditorConfig {
     pub keybinding_mode: KeybindingMode,
     /// 是否显示补全菜单
     pub show_completion_menu: bool,
-    /// 自定义键绑定文件路径 (`~/.echo-agent/keybindings.yaml`)。
+    /// 自定义键绑定文件路径 (`~/.eko/keybindings.yaml`)。
     /// 如果文件不存在或解析失败，则使用默认绑定。
     pub keybindings_path: Option<String>,
 }
@@ -33,11 +33,17 @@ impl Default for EditorConfig {
     fn default() -> Self {
         Self {
             prompt: "echo".to_string(),
-            history_file: "~/.echo-agent/history.txt".to_string(),
+            history_file: echo_agent::paths::user_data_path("history.txt")
+                .to_string_lossy()
+                .into_owned(),
             history_size: 10000,
             keybinding_mode: KeybindingMode::Emacs,
             show_completion_menu: true,
-            keybindings_path: Some("~/.echo-agent/keybindings.yaml".to_string()),
+            keybindings_path: Some(
+                echo_agent::paths::user_data_path("keybindings.yaml")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
         }
     }
 }

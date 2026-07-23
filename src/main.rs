@@ -61,6 +61,10 @@ async fn main() -> anyhow::Result<()> {
     // 加载 .env 文件
     dotenvy::dotenv().ok();
 
+    // 统一全局根目录为 ~/.eko(EKO 品牌)。必须在任何路径解析之前调用一次;
+    // 框架与应用随后都通过 echo_agent::paths::user_data_dir() 取同一个根。
+    let _ = echo_agent::paths::set_user_data_dir_name(".eko");
+
     // Tauri CLI builds the package-name binary (`echo-agent-cli`) and then
     // bundles/renames it. In a GUI-only build, route this binary to the
     // desktop runtime so the packaged app does not start the TUI path.

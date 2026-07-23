@@ -152,7 +152,7 @@ impl Drop for RunCancellationRegistration {
 impl TaskRuntimeStore {
     /// Create the store at the default location.
     ///
-    /// task/plan data lives under the file shadow root (`~/.echo-agent/tasks/`);
+    /// task/plan data lives under the file shadow root (`~/.eko/tasks/`);
     /// No database is opened, so this
     /// does not fail in practice — the `Result` is kept for call-site compat.
     pub fn new() -> anyhow::Result<Self> {

@@ -43,7 +43,7 @@ pub struct SymbolMatch {
 /// In-memory project file index.
 ///
 /// Built once at startup and refreshed on demand. Can be serialized
-/// to `~/.echo-agent/cache/{project_hash}.json` for persistence.
+/// to `~/.eko/cache/{project_hash}.json` for persistence.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProjectIndex {
     /// Project root directory.

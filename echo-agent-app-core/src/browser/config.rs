@@ -105,10 +105,7 @@ impl BrowserConfig {
 
 impl Default for BrowserConfig {
     fn default() -> Self {
-        let base_dir = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".echo-agent")
-            .join("browser");
+        let base_dir = echo_agent::paths::user_data_path("browser");
         Self {
             enabled: true,
             node_command: "node".to_string(),

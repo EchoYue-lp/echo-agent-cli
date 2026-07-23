@@ -20,7 +20,7 @@ pub enum KeybindingMode {
 
 // ── Custom keybindings YAML support ──────────────────────────────────────────
 
-/// A single custom keybinding entry from `~/.echo-agent/keybindings.yaml`.
+/// A single custom keybinding entry from `~/.eko/keybindings.yaml`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct KeybindingEntry {
     /// Human-readable key description, e.g. `Ctrl+L`, `Alt+Enter`, `F5`.

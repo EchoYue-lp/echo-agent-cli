@@ -4,7 +4,7 @@
 //! for all task data. SQL was retired in 0bc step 5.
 //!
 //! Layout: `{root}/{run_id}/events.jsonl` (append-only) + `plan.json` (snapshot).
-//! `root` defaults to `~/.echo-agent/tasks/` (global, spec §2 path A).
+//! `root` defaults to `~/.eko/tasks/` (global, spec §2 path A).
 
 use std::path::{Path, PathBuf};
 
@@ -46,12 +46,9 @@ impl FileTaskShadow {
         }
     }
 
-    /// Default shadow root: `~/.echo-agent/tasks/`.
+    /// Default shadow root: `~/.eko/tasks/`.
     pub fn default_root() -> PathBuf {
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".echo-agent")
-            .join("tasks")
+        echo_agent::paths::user_data_path("tasks")
     }
 
     fn run_dir(&self, run_id: &str) -> PathBuf {

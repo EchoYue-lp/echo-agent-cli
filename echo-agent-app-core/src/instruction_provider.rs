@@ -2,7 +2,7 @@
 //!
 //! Loads four tiers of instruction Markdown files and
 //! concatenates them as a system-prompt suffix:
-//! - `~/.echo-agent/user.md`              — user-level (cross-project)
+//! - `~/.eko/user.md`              — user-level (cross-project)
 //! - `<project-root>/.eko/project.md` — project-level
 //! - `<project-root>/.eko/AGENTS.md` — auto-promoted rules (evolution)
 //! - `<cwd>/.eko/local.md`         — local directory
@@ -81,10 +81,9 @@ impl InstructionProvider {
             .and_then(|path| std::fs::read_to_string(path).ok())
     }
 
-    /// Load user-level instructions from `~/.echo-agent/user.md`.
+    /// Load user-level instructions from `~/.eko/user.md`.
     fn load_user_instructions() -> Option<String> {
-        dirs::home_dir()
-            .map(|home| home.join(".echo-agent").join("user.md"))
+        Some(echo_agent::paths::user_data_path("user.md"))
             .filter(|path| path.exists())
             .and_then(|path| std::fs::read_to_string(path).ok())
     }
@@ -107,7 +106,7 @@ impl InstructionProvider {
         std::fs::write(path, content)
     }
 
-    /// Save user-level instructions to `~/.echo-agent/user.md`.
+    /// Save user-level instructions to `~/.eko/user.md`.
     pub fn save_user_instructions(content: &str) -> std::io::Result<()> {
         let path = Self::user_instructions_path();
         if let Some(parent) = path.parent() {
@@ -126,10 +125,7 @@ impl InstructionProvider {
 
     /// Path to the user-level instructions file.
     fn user_instructions_path() -> PathBuf {
-        dirs::home_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join(".echo-agent")
-            .join("user.md")
+        echo_agent::paths::user_data_path("user.md")
     }
 
     /// Load hot-layer memory content from `.eko/MEMORY.md`.

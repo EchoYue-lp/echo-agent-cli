@@ -1,6 +1,6 @@
 //! 档案管理器
 //!
-//! 提供档案的 CRUD 操作，数据存储在 `~/.echo-agent/profiles/`。
+//! 提供档案的 CRUD 操作，数据存储在 `~/.eko/profiles/`。
 
 use std::fs;
 use std::path::PathBuf;
@@ -22,8 +22,7 @@ impl ProfileManager {
 
     /// 存储基础路径
     pub fn base_dir() -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        PathBuf::from(home).join(".echo-agent").join("profiles")
+        echo_agent::paths::user_data_path("profiles")
     }
 
     // ── CRUD 操作 ────────────────────────────────────────

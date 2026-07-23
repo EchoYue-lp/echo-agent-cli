@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 /// 命名配置档案
 ///
 /// 每个档案保存一组完整的 Agent 配置参数，
-/// 存储在 `~/.echo-agent/profiles/<name>.json`。
+/// 存储在 `~/.eko/profiles/<name>.json`。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
     /// 档案名称（唯一标识）

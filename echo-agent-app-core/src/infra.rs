@@ -46,9 +46,7 @@ fn resolved_max_tool_output_tokens(configured: usize) -> usize {
 pub fn tool_output_artifact_config(
     _working_dir: Option<&std::path::Path>,
 ) -> echo_agent::tools::artifact::ToolOutputArtifactConfig {
-    let root_dir = crate::persistence::Persistence::base_dir()
-        .join("artifacts")
-        .join("tool-logs");
+    let root_dir = echo_agent::paths::user_data_path("artifacts").join("tool-logs");
     echo_agent::tools::artifact::ToolOutputArtifactConfig::new(root_dir, "conversation_or_30d")
         .max_age_secs(Some(TOOL_OUTPUT_ARTIFACT_MAX_AGE_SECS))
 }
@@ -139,12 +137,7 @@ pub fn default_primary_conversation_id() -> String {
 /// This id is shared by the primary agent and built-in subagents so repeated
 /// project prompts land in the same provider cache partition across sessions.
 pub fn load_or_create_cache_user_id() -> String {
-    let path = {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        std::path::PathBuf::from(home)
-            .join(".echo-agent")
-            .join("cache_user_id")
-    };
+    let path = echo_agent::paths::user_data_path("cache_user_id");
 
     if let Ok(existing) = std::fs::read_to_string(&path)
         && !existing.trim().is_empty()
@@ -342,7 +335,7 @@ pub async fn create_agent_with_diagnostics(
     }
 
     // Inject a workspace/project-scoped memory Store (FileStore). This OVERRIDES
-    // the framework's default global `~/.echo-agent/store.json` — dynamic
+    // the framework's default global `~/.eko/store.json` — dynamic
     // memories (remember / accepted evidence / L3 promotion / TaskRuntime bridge) are
     // physically isolated per project so they don't leak across projects,
     // mirroring how hot-layer `MEMORY.md` already follows the project root.
@@ -375,10 +368,8 @@ pub async fn create_agent_with_diagnostics(
     }
 
     // Initialize JSONL run store for trace persistence (before build)
-    if let Ok(home) = std::env::var("HOME") {
-        let run_dir = std::path::PathBuf::from(home)
-            .join(".echo-agent")
-            .join("runs");
+    {
+        let run_dir = echo_agent::paths::user_data_path("runs");
         match JsonlRunStore::new(&run_dir) {
             Ok(store) => {
                 builder = builder.with_run_store(Arc::new(store));
@@ -569,7 +560,7 @@ pub fn resolve_subagent_model(spec: Option<&str>, parent_model: &str) -> String 
 ///
 /// Subagent definitions are **hot-loaded from `.md` files** (Sprint 6): project
 /// scope `<root>/.eko/subagents/**/*.md` overrides user scope
-/// `~/.echo-agent/subagents/**/*.md`, which overrides the builtin defaults
+/// `~/.eko/subagents/**/*.md`, which overrides the builtin defaults
 /// compiled into the binary (`src/subagents/coding/*.md`). Editing a `.md`
 /// prompt therefore takes effect on next agent build without recompiling.
 ///
@@ -1058,8 +1049,8 @@ fn build_readonly_subagent_agent(
 /// built-in hooks that should always be present.
 ///
 /// The hook system uses YAML configuration files:
-/// - `~/.echo-agent/hooks.yaml` (global hooks)
-/// - `.echo-agent/hooks.yaml` (project-specific hooks)
+/// - `~/.eko/hooks.yaml` (global hooks)
+/// - `.eko/hooks.yaml` (project-specific hooks)
 ///
 /// Hooks can be defined for various events:
 /// - SessionStart, SessionEnd
@@ -1096,11 +1087,7 @@ pub async fn load_mcp_config(
         });
 
     // 默认路径（仅从用户目录加载，不从 CWD 加载以防止仓库注入）
-    let default_paths =
-        [
-            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".to_string()))
-                .join(".echo-agent/mcp.json"),
-        ];
+    let default_paths = [echo_agent::paths::user_data_path("mcp.json")];
 
     let config_path = config_path.or_else(|| default_paths.iter().find(|p| p.exists()).cloned());
 
@@ -1190,8 +1177,7 @@ pub fn spawn_dreaming_task(
 
 /// 创建对话持久化 Store（文件），失败时返回 None（禁用持久化）
 pub fn create_conversation_store() -> Option<Arc<dyn ConversationStore>> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let base = std::path::PathBuf::from(home).join(".echo-agent");
+    let base = echo_agent::paths::user_data_dir();
 
     match crate::conversation_file::FileConversationStore::new(&base) {
         Ok(store) => {
@@ -1222,8 +1208,7 @@ pub fn inject_conversation_store(agent: &AgentHandle, store: &Option<Arc<dyn Con
 /// Distinct from [`create_conversation_store`], which only stores user-visible
 /// transcript projections.
 pub fn create_runtime_state_store() -> Option<Arc<dyn RuntimeStateStore>> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    create_runtime_state_store_in(std::path::PathBuf::from(home).join(".echo-agent"))
+    create_runtime_state_store_in(echo_agent::paths::user_data_dir())
 }
 
 /// 创建指定 base dir 下的运行时状态 Store（U1c：文件后端，无 SQLite）。
@@ -1245,14 +1230,13 @@ pub fn create_runtime_state_store_in(
     }
 }
 
-/// 动态记忆 store 的全局默认路径：`~/.echo-agent/store.json`。
+/// 动态记忆 store 的全局默认路径：`~/.eko/store.json`。
 ///
 /// 当无 workspace/project 时使用（CLI 在非项目目录启动、GUI 未进入 workspace）。
 /// 与历史行为一致——框架默认就是这里。返回 (store_path, echo_agent_dir)：
-/// `echo_agent_dir` 是 hot 层 MEMORY.md 的落点（`.echo-agent/`），与 store 同根。
+/// `echo_agent_dir` 是 hot 层 MEMORY.md 的落点（`.eko/`），与 store 同根。
 pub fn global_memory_paths() -> (std::path::PathBuf, std::path::PathBuf) {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let echo_agent_dir = std::path::PathBuf::from(home).join(".echo-agent");
+    let echo_agent_dir = echo_agent::paths::user_data_dir();
     let store_path = echo_agent_dir.join("store.json");
     (store_path, echo_agent_dir)
 }
@@ -1261,8 +1245,8 @@ pub fn global_memory_paths() -> (std::path::PathBuf, std::path::PathBuf) {
 ///
 /// 优先级（与 hot 层 MEMORY.md 的 discover 逻辑一致）：
 /// 1. 给定 `workspace_root` → `{root}/.eko/memory/store.json`，echo_agent_dir = `{root}/.eko`
-/// 2. 从 `cwd` 向上发现项目根（含 `.git`/`.echo-agent`）→ `{root}/.eko/memory/store.json`
-/// 3. 回退全局 `~/.echo-agent/store.json`
+/// 2. 从 `cwd` 向上发现项目根（含 `.git`/`.eko`）→ `{root}/.eko/memory/store.json`
+/// 3. 回退全局 `~/.eko/store.json`
 ///
 /// `workspace_root` 用于已切换 workspace 的场景；CLI/TUI 启动时传 None 走 cwd discover。
 pub fn resolve_memory_store_paths(
@@ -1338,7 +1322,7 @@ pub fn create_memory_store_for_workspace(
     create_memory_store_at(&store_path)
 }
 
-/// 全局兜底 memory store（`~/.echo-agent/store.json`）。
+/// 全局兜底 memory store（`~/.eko/store.json`）。
 ///
 /// 用于无 workspace 时的 bootstrap，以及 exit_workspace 后的重置。
 pub fn create_global_memory_store() -> Option<Arc<dyn echo_agent::memory::Store>> {
@@ -1579,7 +1563,7 @@ pub fn init_logging_with_target(level: &str, target: LogTarget) {
                 LogTarget::Stderr => {
                     // Dual sink: keep the stderr console output (visible in the
                     // `cargo tauri dev` terminal) AND mirror to a rotating-ish
-                    // file at ~/.echo-agent/logs/app.log so issues can be
+                    // file at ~/.eko/logs/app.log so issues can be
                     // diagnosed after the fact without re-running. Append mode
                     // so restarts don't wipe the log.
                     use tracing_subscriber::layer::SubscriberExt;
@@ -1630,15 +1614,12 @@ fn tui_log_path() -> std::path::PathBuf {
         }
     }
 
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let dir = std::path::PathBuf::from(home)
-        .join(".echo-agent")
-        .join("logs");
+    let dir = echo_agent::paths::user_data_path("logs");
     let _ = std::fs::create_dir_all(&dir);
     dir.join("tui.log")
 }
 
-/// Open the shared GUI app log file for appending: `~/.echo-agent/logs/app.log`.
+/// Open the shared GUI app log file for appending: `~/.eko/logs/app.log`.
 ///
 /// Used by the Stderr log target as a second sink so that `cargo tauri dev`
 /// output is also persisted to disk (the stderr stream itself is lost once the
@@ -1646,10 +1627,7 @@ fn tui_log_path() -> std::path::PathBuf {
 /// restarts; rotate/truncate manually if it grows too large.
 #[cfg(not(feature = "telemetry"))]
 fn app_log_file() -> Option<std::fs::File> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let dir = std::path::PathBuf::from(home)
-        .join(".echo-agent")
-        .join("logs");
+    let dir = echo_agent::paths::user_data_path("logs");
     let _ = std::fs::create_dir_all(&dir);
     std::fs::OpenOptions::new()
         .create(true)
@@ -1765,7 +1743,8 @@ pub fn run_base_doctor_for_model_with_connectivity(
     let mut issues: Vec<String> = Vec::new();
     let mut checks: Vec<String> = Vec::new();
 
-    let home = std::env::var("HOME").unwrap_or_default();
+    let base = echo_agent::paths::user_data_dir();
+    let base_display = base.display();
 
     let provider = provider_from_model(model);
     let required_keys = provider_required_keys(provider);
@@ -1826,32 +1805,38 @@ pub fn run_base_doctor_for_model_with_connectivity(
         }
     }
 
-    let config_path = format!("{}/.echo-agent/config.yaml", home);
-    if std::path::Path::new(&config_path).exists() {
-        checks.push("✅ 配置文件: ~/.echo-agent/config.yaml".to_string());
+    let config_path = base.join("config.yaml");
+    if config_path.exists() {
+        checks.push(format!("✅ 配置文件: {}/config.yaml", base_display));
     } else {
-        issues.push("⚠️  未找到配置文件 ~/.echo-agent/config.yaml (使用默认配置)".to_string());
+        issues.push(format!(
+            "⚠️  未找到配置文件 {}/config.yaml (使用默认配置)",
+            base_display
+        ));
     }
 
-    let mcp_path = format!("{}/.echo-agent/mcp.json", home);
-    if std::path::Path::new(&mcp_path).exists() {
-        checks.push("✅ MCP 配置: ~/.echo-agent/mcp.json".to_string());
+    let mcp_path = base.join("mcp.json");
+    if mcp_path.exists() {
+        checks.push(format!("✅ MCP 配置: {}/mcp.json", base_display));
     } else {
-        checks.push("ℹ️  未找到 MCP 配置 (如需工具扩展可创建 ~/.echo-agent/mcp.json)".to_string());
+        checks.push(format!(
+            "ℹ️  未找到 MCP 配置 (如需工具扩展可创建 {}/mcp.json)",
+            base_display
+        ));
     }
 
-    let data_dir = format!("{}/.echo-agent", home);
-    if std::path::Path::new(&data_dir).exists() {
-        checks.push("✅ 数据目录: ~/.echo-agent/".to_string());
+    if base.exists() {
+        checks.push(format!("✅ 数据目录: {}/", base_display));
     } else {
-        issues.push(
-            "⚠️  数据目录 ~/.echo-agent/ 不存在 (运行 echo-agent-cli onboard 初始化)".to_string(),
-        );
+        issues.push(format!(
+            "⚠️  数据目录 {}/ 不存在 (运行 echo-agent-cli onboard 初始化)",
+            base_display
+        ));
     }
 
-    let conv_dir = format!("{}/.echo-agent/conversations", home);
-    if std::path::Path::new(&conv_dir).exists() {
-        checks.push("✅ 对话存储目录: ~/.echo-agent/conversations/".to_string());
+    let conv_dir = base.join("conversations");
+    if conv_dir.exists() {
+        checks.push(format!("✅ 对话存储目录: {}/conversations/", base_display));
     } else {
         checks.push("ℹ️  对话存储目录尚未创建 (首次对话后自动创建)".to_string());
     }

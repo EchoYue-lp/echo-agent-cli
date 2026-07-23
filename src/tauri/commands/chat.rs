@@ -515,7 +515,7 @@ pub async fn send_chat_message(
     // for prompt cache reuse across requests; without it, cache hit rate drops
     // to <1% because every request is treated as from a different user).
     //
-    // Persisted to ~/.echo-agent/cache_user_id — generated once, reused forever.
+    // Persisted to ~/.eko/cache_user_id — generated once, reused forever.
     {
         let cache_id = echo_agent_app_core::infra::load_or_create_cache_user_id();
         agent_handle

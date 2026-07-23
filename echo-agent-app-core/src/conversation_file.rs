@@ -496,10 +496,7 @@ impl SessionSearchEngine {
 
     /// Re-index all conversations from the canonical file-backed store.
     pub fn reindex_all(&self) -> std::io::Result<usize> {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        let dir = PathBuf::from(home)
-            .join(".echo-agent")
-            .join("conversations");
+        let dir = echo_agent::paths::user_data_path("conversations");
         if !dir.exists() {
             return Ok(0);
         }

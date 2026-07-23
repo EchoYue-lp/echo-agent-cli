@@ -1,6 +1,6 @@
 //! 本地技能注册表
 //!
-//! 扫描 `~/.echo-agent/skills/` 目录结构，索引每个子目录中的 SKILL.md，
+//! 扫描 `~/.eko/skills/` 目录结构，索引每个子目录中的 SKILL.md，
 //! 提供搜索和详情查询。
 
 use std::collections::HashMap;
@@ -74,7 +74,7 @@ impl Default for SkillsHub {
 }
 
 impl SkillsHub {
-    /// 创建新的 SkillsHub，指向 `~/.echo-agent/skills/`
+    /// 创建新的 SkillsHub，指向 `~/.eko/skills/`
     pub fn new() -> Self {
         let root = Self::default_skills_dir();
         let mut hub = Self {
@@ -99,11 +99,7 @@ impl SkillsHub {
 
     /// 默认技能目录
     pub fn default_skills_dir() -> PathBuf {
-        let home = std::env::var("HOME")
-            .ok()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        home.join(".echo-agent").join("skills")
+        echo_agent::paths::user_data_path("skills")
     }
 
     /// 重新扫描目录

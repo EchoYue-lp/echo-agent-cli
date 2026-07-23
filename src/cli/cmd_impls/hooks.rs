@@ -1,7 +1,7 @@
 //! Hooks management slash commands.
 //!
 //! `/hooks list` — list registered hook sources and rule counts
-//! `/hooks reload` — reload hooks from config files (~/.echo-agent/hooks.yaml, .echo-agent/hooks.yaml)
+//! `/hooks reload` — reload hooks from config files (~/.eko/hooks.yaml, .eko/hooks.yaml)
 //! `/hooks test <event>` — test if hooks are registered for a given event
 
 use crate::cli::command::{CommandCategory, CommandContext, CommandOutcome, cmd};
@@ -20,9 +20,7 @@ async fn cmd_hooks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
                         println!("\n--- Registered Hooks ({}) ---", sources.len());
                         if sources.is_empty() {
                             println!("  No hooks registered.");
-                            println!(
-                                "  Configure hooks in ~/.echo-agent/hooks.yaml or echo-agent.yaml"
-                            );
+                            println!("  Configure hooks in ~/.eko/hooks.yaml or echo-agent.yaml");
                         } else {
                             for (name, count) in &sources {
                                 println!("  * {} ({} rules)", name, count);
@@ -37,7 +35,7 @@ async fn cmd_hooks(ctx: &CommandContext, args: &[&str]) -> CommandOutcome {
             let load_result = echo_agent_app_core::hooks_config::load_hooks_files();
             if load_result.definition.is_empty() {
                 println!("No hooks found in config files.");
-                println!("  Searched: ~/.echo-agent/hooks.yaml, .echo-agent/hooks.yaml");
+                println!("  Searched: ~/.eko/hooks.yaml, .eko/hooks.yaml");
             } else {
                 let rule_count: usize =
                     load_result.definition.rules.values().map(|v| v.len()).sum();

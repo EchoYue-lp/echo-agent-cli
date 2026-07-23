@@ -1,8 +1,8 @@
 //! User hooks configuration loader.
 //!
 //! Discovers and loads hooks from YAML files:
-//! - `~/.echo-agent/hooks.yaml` (global)
-//! - `.echo-agent/hooks.yaml` (project-local)
+//! - `~/.eko/hooks.yaml` (global)
+//! - `.eko/hooks.yaml` (project-local)
 
 use echo_agent::skills::hooks::HooksDefinition;
 use std::path::{Path, PathBuf};
@@ -18,17 +18,17 @@ pub struct HooksLoadResult {
 /// Discover and load hooks from standard locations.
 ///
 /// Search order:
-/// 1. `~/.echo-agent/hooks.yaml` (global user hooks)
-/// 2. `.echo-agent/hooks.yaml` (project-local hooks, relative to cwd)
+/// 1. `~/.eko/hooks.yaml` (global user hooks)
+/// 2. `.eko/hooks.yaml` (project-local hooks, relative to cwd)
 ///
 /// Project hooks are merged on top of global hooks.
 pub fn load_hooks_files() -> HooksLoadResult {
     let mut definition = HooksDefinition::default();
     let mut loaded_from = Vec::new();
 
-    // Global hooks: ~/.echo-agent/hooks.yaml
-    if let Ok(home) = std::env::var("HOME") {
-        let global_path = PathBuf::from(home).join(".echo-agent").join("hooks.yaml");
+    // Global hooks: ~/.eko/hooks.yaml
+    {
+        let global_path = echo_agent::paths::user_data_path("hooks.yaml");
         if let Some(def) = try_load_yaml(&global_path) {
             definition.merge(def);
             loaded_from.push(global_path);
