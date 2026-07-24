@@ -52,14 +52,14 @@ can_delegate: false
 - `readonly: true`:应用层用 readonly builder 注册,工具集物理只读。
 - `model`: `inherit`/缺省 → 父模型；`fast` → `EKO_FAST_MODEL`（未设则回退父模型）；其它字符串 → 具体 model id。
 - `max_turns`:写入 `SubagentDefinition.max_iterations` 与 subagent ReactAgent builder。
-- `is_background`:写入 `SubagentDefinition.is_background`。为 true 时（或 `agent_tool` 传 `background: true`）走框架 `dispatch_background`：立即返回 `{status:"started", execution_id, agent_name}`，subagent 在后台跑；`DispatchStarted.background=true` 经 `execution://event` 到 GUI 卡片；完成后向主会话插入 `[subagent {name} finished]\n{summary}` 注记（不打断父 ReAct 当前 turn）。TUI 回灌延期。
+- `is_background`:写入 `SubagentDefinition.is_background`。为 true 时（或 `agent_tool` 传 `background: true`）走框架 `dispatch_background`：立即返回 `{status:"started", execution_id, agent_name}`，Subagent 在后台跑；`DispatchStarted.background=true` 经 `execution://event` 到执行卡片，完成后由 terminal event 更新同一卡片，GUI 只补充 toast，不再插入重复 assistant summary。
 - `worktree: true`:writer role 通过框架 Fork worktree 隔离写入。
 - `workspace: true`:data/research role 使用无 git 的隔离数据工作区。
 - `can_delegate: true`:该 role 显式获得 `agent_tool`,并注册 child subagent registry。
 
 内置 8 个角色：`explorer`（默认 `model: fast`）、`reviewer`、`planner`、`summarizer`、`implementer`、`general-purpose`、`data-shaper`、`analyst`。
 
-父 LLM 回传：`SubagentResult.summary`（从 `## Summary` 提取，缺省 UTF-8 安全截断 output）；`agent_tool` / TaskRuntime 父上下文优先吃 summary，全文保留在 `output` 供 UI。
+父 LLM 回传：`SubagentResult.summary`（从 `## Summary` 提取，缺省 UTF-8 安全截断 output）；`agent_tool` / TaskRuntime 父上下文优先吃 summary，全文保留在 `output` 供 UI 和 TaskRuntime review。TaskRuntime terminal boundary 持久化完整 output，重启后从 review boundary 继续时仍使用同一份证据。
 
 默认 subagent 只能完成当前 PlanTask,或在结果里返回结构化 `suggested_tasks`。这些 suggested tasks 只能由主 TaskRuntime 统一 append 到全局 plan。
 
@@ -125,9 +125,25 @@ EKO 首层 PlanTask subagent 使用 depth 0,默认 max depth 2。普通 role 即
 - `subagent://event` 作为单独 UI 数据源
 - `SubagentTraceEvent` / `SubagentTraceEventKind`
 - `subagentTraceStore` / `subagentDetailStore`
-- `SubagentStreamBlock` / `SubagentDetailView`
 
-`SubagentRun.subagentRunId` 是稳定 execution id,通常为 `{task_id}:{attempt}`。聊天流和右栏都基于同一份 `subagentRunStore` 渲染,只是展示位置不同。
+`SubagentRun.subagentRunId` 是一次执行 attempt 的稳定 execution id，通常为
+`{task_id}:{attempt}`；`task_id` 是 PlanTask 节点 identity。前端 store 保留每个
+attempt 的独立记录，面向 task 的默认视图选择最新 attempt，不在事件层截断或合并
+identity。
+
+事件按 owner 分流：框架派发路径由 `SubagentEvent` 唯一产生 Subagent lifecycle；
+主 Agent 直执行路径由 EKO 的 `ExecEventScope::Subagent` 产生；TaskRuntime 的任务与
+worktree 集成事件使用 `ExecEventScope::Task`，不能重开或覆盖 Subagent 终态。
+
+结果视图优先消费 terminal 完整 output，并去掉内部 `## Result` 协议；structured
+summary 是 fallback。若 terminal 只引用“上方”内容，最后一段有效 thinking 会被
+提升为结果并从过程视图移除。tool/usage/file access 属于执行过程，不跟在结果正文
+后面。一个 execution id terminal 后保持单调终态，retry 使用新的 attempt id。
+terminal records 不按时间 GC；TaskRuntime snapshot 加载后自动轮询至持久化终态，
+因此等待或 live trace 消失不能把 completed 任务重新显示成 Pending。
+TaskRuntime review gate 使用完整 output，不使用 1200 字 summary 代替 acceptance
+evidence。Todo 状态以 `run-state.json` 为权威，历史事件只补 runtime metadata；右侧栏
+分别展示 Subagent 执行与 Task 验收，因此“执行完成、评审未通过”是两个明确事实。
 
 ---
 
@@ -198,7 +214,5 @@ AgentPool 不改变 Subagent 协议;它只是决定某个入口使用哪个 Reac
 - `SubagentTraceEvent`
 - `subagent://trace`
 - `subagentTraceStore`
-- `SubagentStreamBlock`
-- “Subagent 状态”作为 UI 一等入口
 
 后续如果要扩展执行树,统一扩 `SubagentRun` / `ExecutionEvent`。

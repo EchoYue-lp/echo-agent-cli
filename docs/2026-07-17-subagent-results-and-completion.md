@@ -18,7 +18,7 @@ M7 将 Subagent 的“执行已经结束”和父任务的“需求已经满足�
 - 框架 `SubagentResult` 已有 output/summary/artifact path/cancelled/usage，但没有统一 status、verification、remaining_work 和 touched_files；timeout 仍以普通字符串错误传播。
 - 取消路径会先发 `DispatchCancelled`，随后 outer dispatch 又把 `Ok(cancelled result)` 发成 `DispatchCompleted`，终态不唯一。
 - EKO `TaskExecutionSummary` 已有 files/verification/failures 等相邻字段，但成功路径把 PlanTask 的 verification 要求直接复制成“已验证”，没有执行证据。
-- `SubagentReleased` 只保存 bounded summary，恢复后只能复用字符串，不能重新执行完成门禁。
+- `SubagentReleased` 同时保存 structured result 和完整最终 output；恢复后继续从 review boundary 执行，不重新派发已完成的 Subagent，也不把 bounded summary 当作完整评审证据。
 - `run_dag` 只看 todo 是否 Completed；unattended agent 流结束时还会把未收敛的 run 直接标成 Completed。
 
 ## 框架与应用边界
@@ -98,6 +98,45 @@ Skipped 是显式放弃的任务事实，不伪装成成功；存在 Skipped 时
 - process restart：按 execution id 读取 SubagentReleased structured result，重新执行 deterministic completion gate，不重新派发已经完整结束的 subagent。
 - indeterminate mutating side effect：沿用 RecoveryBlocked，必须人工确认 retry/skip，不因 Subagent 文本自称完成而清除。
 
+## 2026-07-24 展示与 identity 修正
+
+本轮修复锁定两个不同 identity：`task_id` 是稳定的 PlanTask 节点，
+`subagent_run_id = execution_id = {task_id}:{attempt}` 是一次真实执行。
+前端可以按 `task_id` 选择最新 attempt 展示，但 store、事件、usage、artifact
+和 terminal result 不得把多个 attempt 合并到同一个 key。否则旧 attempt 的
+迟到事件会覆盖新 attempt，或把已结束的 retry 重新显示为 running。
+
+事件所有权也按层次拆开：
+
+- TaskRuntime 的 task started/completed/failed 和 worktree merge 事件使用
+  `kind=task`，不进入 SubagentRun store。
+- 通过框架 `SubagentExecutor` 派发的执行，只由框架 `SubagentEvent` 产生
+  Subagent lifecycle、usage 和 terminal event。
+- verification 等主 Agent 直执行路径没有框架派发边界，由 EKO 应用层使用同一
+  attempt-scoped execution id 产生 Subagent 事件。
+- 一个 execution id 的 lifecycle 单调运行；terminal 后的重复或迟到事件不能
+  重新打开该 execution。retry 必须创建下一个 attempt id。
+
+UI 默认展示 terminal event 的完整 `output`，并移除末尾内部 `## Result` JSON
+协议块；`summary` 只作为没有完整 output 时的 fallback。若 provider 把完整交付物
+错误地放进最后一段 thinking，而 terminal output/summary 只写“见上方”或
+“see above”，应用提升该 thinking 段为结果，并从执行细节中移除同一段，避免结果
+为空或在两个 tab 重复。prompt compiler 同时要求 final answer 与 summary 都必须
+自包含，不得引用“上方”内容。
+
+`touched_files` 是执行过程元数据，展示在执行细节，不再跟在最终结果下面；
+verification/artifacts/remaining_work 仍属于结构化终态。Subagent terminal records
+不再按 5 分钟定时 GC，因为 TaskRuntime 的 Pending 投影可能依赖这些生命周期事实。
+TaskRuntime conversation snapshot 在 `run_started`、应用恢复和会话切换时统一启动
+轮询，直至读取到后端已持久化的 task/run terminal 状态。后台完成使用 toast 提醒，
+不再额外插入一条重复 assistant summary。
+
+TaskRuntime 的 review gate 使用完整 Subagent output 检查 acceptance criteria；1200 字
+structured summary 只服务父任务摘要、压缩上下文和列表预览。文件读模型以
+`run-state.json` 的 TaskExecution status 为权威，历史 Task 事件只恢复 owner、时间和
+summary，不能覆盖更晚 plan revision 的 skip/reset。右侧栏分别展示 Subagent 执行
+进度和 Task 验收进度，合法的“执行完成但评审未通过”不再伪装成同一个状态冲突。
+
 ## 验收
 
 - completed result 缺少 required artifact、artifact hash、producer id 或 required verification 时 task/run 均不能 completed。
@@ -106,3 +145,10 @@ Skipped 是显式放弃的任务事实，不伪装成成功；存在 Skipped 时
 - resume 复用 completed subagent result，并重复相同门禁；不重复 subagent 副作用。
 - unattended 流结束但 plan 未真实完成时不得直接 completed。
 - GUI/TUI/CLI 对同一 terminal fixture 展示相同 status、summary、verification、remaining_work 和 artifacts。
+- 同一 task 的 attempt 1/2 保持两条独立 SubagentRun；默认 UI 只投影最新 attempt。
+- merge/task 事件不能改变 Subagent terminal status；terminal execution 不能被重复 started 重开。
+- terminal output 中的内部 `## Result` 协议不出现在结果页；“见上方”终态会提升最后一段有效 thinking，且执行细节不再重复该段。
+- `touched_files` 只出现在执行细节；结果页只展示交付物和结构化终态信息。
+- 完成状态经过任意等待时间、TaskRuntime 自动刷新和 terminal store retention 后保持 completed，不得退回 Pending。
+- review prompt 必须包含 summary 边界之后的完整 output；重启恢复后使用持久化 output 得到相同评审输入。
+- plan revision 的 skip/reset 必须覆盖更早 TaskBlocked 事件；右侧栏同时标明执行与验收状态。

@@ -1,6 +1,6 @@
 # EKO Master Plan
 
-Last updated: 2026-07-23
+Last updated: 2026-07-24
 
 This file is the cross-session source of truth for the coding, data analysis,
 academic research, and medical research expansion. Detailed design rationale
@@ -59,6 +59,7 @@ evidence, and the next bounded step.
 | Unattended worktree lifecycle and review parity | Complete | `docs/2026-07-22-unattended-worktree-lifecycle.md`; application commit `61c8350` |
 | Unified Subagent prompt compilation | Complete | framework commit `8f7904f`; `echo-agent-app-core/src/subagent_prompt.rs`; one registration-time system prompt and one typed invocation compiler across direct, planned, fork, teammate, and team dispatch |
 | Memory and self-evolution seam closure | Complete | `docs/2026-07-23-memory-self-evolution-closure.md`; replaceable workspace/hot-memory projections, one layered EKO write path, workspace-bound Curator, shared review integration, and stable compression dedup keys |
+| Subagent result projection and attempt identity | Complete | `docs/2026-07-17-subagent-results-and-completion.md`; full terminal output is separated from process metadata and persisted for review/recovery, referential summaries are recovered from the final thinking segment, TaskRuntime snapshots auto-poll to authoritative plan/task state, the right rail separates execution from acceptance, and `subagent_run_id` remains `{task_id}:{attempt}` |
 
 ## Current Decisions
 
@@ -137,8 +138,10 @@ The framework exposes one product-injectable `SubagentPromptCompiler` for both
 registration-time system prompts and dispatch-time invocations. EKO compiles a
 cache-stable system prompt from role Markdown, common orchestration rules,
 frontmatter-derived capabilities, the optional follow-up policy, one language
-anchor, and the canonical result contract. Role Markdown owns only identity and
-role-specific method.
+anchor, a self-contained result-quality rule, and the canonical result contract.
+The final answer and structured summary cannot refer to reasoning or content
+"above" because the parent and each surface may consume terminal output without
+the thinking trace. Role Markdown owns only identity and role-specific method.
 
 Direct dispatch and TaskRuntime dispatch use the same compiler. TaskRuntime
 passes a typed payload containing the goal, domain, task, dependencies, files,
@@ -170,6 +173,25 @@ conversation/message identity instead of substituting the internal
 `taskrun:<turn>` id. The right task panel and the inline main-chat Subagent
 stream therefore resolve the same formal run and remain visible while the plan
 executes.
+
+Subagent execution identity is attempt-scoped. `task_id` identifies the stable
+PlanTask node; `subagent_run_id = execution_id = {task_id}:{attempt}` identifies
+one concrete dispatch. Framework-dispatched Subagents use framework lifecycle
+events, direct primary execution uses application Subagent events, and
+TaskRuntime integration events use a separate task scope. The frontend stores
+all attempts independently, keeps terminal state monotonic, and defaults to the
+latest attempt when rendering a task. The result view uses complete terminal
+output without its internal protocol envelope; a referential terminal answer
+promotes the final substantial thinking block and removes that block from process
+rendering. File access remains process metadata. Terminal records are retained
+until explicit clearing, and TaskRuntime loads start polling automatically so a
+completed backend snapshot cannot remain displayed as Pending after the live
+trace disappears. TaskRuntime review consumes the complete output rather than
+the bounded parent summary, and persists that output on the terminal boundary so
+restart recovery receives identical evidence. File-backed Todo reads take
+TaskExecution status from `run-state.json`; older Task events only restore
+metadata and cannot override a later plan skip/reset. The right rail reports
+Subagent execution progress separately from Task acceptance progress.
 
 ### Skills And Report Rendering
 

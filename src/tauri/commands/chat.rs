@@ -11,7 +11,7 @@ use echo_agent::prelude::AgentEvent;
 use echo_agent::tools::{ToolFailure, ToolOutputChannel, ToolStreamEvent};
 use echo_agent_app_core::chat_driver::ChatDriverEvent;
 use echo_agent_app_core::chat_driver::ChatSink;
-use echo_agent_app_core::tasks::task_runtime::executor::ExecEvent;
+use echo_agent_app_core::tasks::task_runtime::executor::{ExecEvent, ExecEventScope};
 use futures::future::BoxFuture;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -172,17 +172,14 @@ fn emit_chat_event(
     app.emit("chat://event", payload).is_ok()
 }
 
-/// Emit an event on the unified `execution://event` channel. `kind` is either
-/// "run" (TaskRun lifecycle: RunStarted/Completed/Failed/Cancelled/StatusChanged)
-/// or "subagent" (task-scoped execution flow: Thinking/Tool/Token/Usage).
+/// Emit an event on the unified `execution://event` channel. `kind` is `run`,
+/// `task`, or `subagent`.
 ///
 /// `subagent_run_id` is the aggregation key the frontend store uses to group a
-/// subagent's events into one card. It MUST match the framework bridge
-/// (`src/tauri/mod.rs`), which emits the bare `task_id` (NOT `"{task_id}:{attempt}"`
-/// — the attempt suffix was dropped so retry attempts fold into one card, matching
-/// how Claude Code/Codex display subagents). For `kind == "run"` (run-level
-/// events with no owning task), pass `""`; this function only attaches the field
-/// for `kind == "subagent"`.
+/// Subagent's events into one card. It is the concrete execution id
+/// (`{task_id}:{attempt}`), never the stable PlanTask id. For non-Subagent
+/// events pass `""`; this function only attaches the field for `kind ==
+/// "subagent"`.
 fn emit_execution_event(
     app: &tauri::AppHandle,
     run_id: &str,
@@ -948,21 +945,30 @@ impl echo_agent_app_core::chat_driver::ChatSink for TauriChatSink {
 }
 
 fn emit_tauri_execution_event(app: &tauri::AppHandle, event: ExecEvent) {
-    let task_id = event.task_id.clone();
-    let agent = event.agent.as_deref().unwrap_or("echo-assistant");
-    let subagent_run_id = task_id.as_deref().unwrap_or("main");
-    let kind = if task_id.is_some() { "subagent" } else { "run" };
-    let mut payload = event.payload;
+    let ExecEvent {
+        run_id,
+        scope,
+        task_id,
+        subagent_run_id,
+        event,
+        agent,
+        mut payload,
+    } = event;
+    let kind = match scope {
+        ExecEventScope::Run => "run",
+        ExecEventScope::Task => "task",
+        ExecEventScope::Subagent => "subagent",
+    };
     if let (Some(task_id), serde_json::Value::Object(fields)) = (&task_id, &mut payload) {
         fields.insert("task_id".into(), task_id.clone().into());
     }
     emit_execution_event(
         app,
-        &event.run_id,
+        &run_id,
         kind,
-        &event.event,
-        agent,
-        subagent_run_id,
+        &event,
+        agent.as_deref().unwrap_or("echo-assistant"),
+        subagent_run_id.as_deref().unwrap_or(""),
         payload,
     );
 }

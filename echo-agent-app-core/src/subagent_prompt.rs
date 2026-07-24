@@ -20,6 +20,9 @@ const COMMON_ORCHESTRATION_POLICY: &str = r#"## Assignment Policy
 - Do not create, modify, approve, or execute the parent TaskRuntime plan.
 - Preserve unrelated user work and report incomplete or blocked work plainly."#;
 
+const SUBAGENT_RESULT_QUALITY_POLICY: &str = r#"## Result Quality
+Put the complete user-facing deliverable in the final answer before `## Result`. The JSON `summary` must also be self-contained because the parent may consume it without the reasoning trace. Never use referential placeholders such as "see above", "as described above", "见上方", or "如上" as the final answer or summary."#;
+
 const SUGGESTED_TASKS_POLICY: &str = r#"## Optional Follow-up Suggestions
 If evidence reveals genuinely required work outside the assignment, you may place this optional fenced JSON block before `## Result`:
 ```json
@@ -50,11 +53,15 @@ impl EkoSubagentPromptCompiler {
             .record("language", "eko.language_policy");
         compiled
             .diagnostics
+            .record("result-quality", "eko.result_quality_policy");
+        compiled
+            .diagnostics
             .record("contract", "echo_agent.render_result_contract");
         compiled.task_input = [
             compiled.task_input,
             SUGGESTED_TASKS_POLICY.to_string(),
             SUBAGENT_LANGUAGE_POLICY.to_string(),
+            SUBAGENT_RESULT_QUALITY_POLICY.to_string(),
             render_result_contract(),
         ]
         .join("\n\n");
@@ -167,6 +174,7 @@ impl SubagentPromptCompiler for EkoSubagentPromptCompiler {
         diagnostics.record("capability", "subagent_definition.frontmatter");
         diagnostics.record("suggested-tasks", "eko.optional_follow_up_policy");
         diagnostics.record("language", "eko.language_policy");
+        diagnostics.record("result-quality", "eko.result_quality_policy");
         diagnostics.record("contract", "echo_agent.render_result_contract");
 
         let access = if input.readonly {
@@ -191,6 +199,7 @@ impl SubagentPromptCompiler for EkoSubagentPromptCompiler {
                 capabilities,
                 SUGGESTED_TASKS_POLICY.to_string(),
                 SUBAGENT_LANGUAGE_POLICY.to_string(),
+                SUBAGENT_RESULT_QUALITY_POLICY.to_string(),
                 render_result_contract(),
             ]
             .join("\n\n"),
@@ -421,6 +430,7 @@ mod tests {
             });
             assert_eq!(compiled.diagnostics.count("role"), 1);
             assert_eq!(compiled.diagnostics.count("language"), 1);
+            assert_eq!(compiled.diagnostics.count("result-quality"), 1);
             assert_eq!(compiled.diagnostics.count("contract"), 1);
         }
     }
@@ -527,11 +537,13 @@ mod tests {
 
         assert_eq!(compiled.diagnostics.count("user-goal"), 1);
         assert_eq!(compiled.diagnostics.count("language"), 1);
+        assert_eq!(compiled.diagnostics.count("result-quality"), 1);
         assert_eq!(compiled.diagnostics.count("contract"), 1);
         assert_eq!(
             compiled.task_input.matches("## Response Language").count(),
             1
         );
+        assert_eq!(compiled.task_input.matches("## Result Quality").count(), 1);
         assert_eq!(
             compiled
                 .task_input

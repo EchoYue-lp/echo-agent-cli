@@ -88,7 +88,9 @@ flowchart TD
 | `call_id` | 一次 tool invocation | framework tool event | resume/重试的副作用去重键 |
 | `event_id/sequence` | 稳定事件身份与顺序 | framework `EventEnvelope` | 已满足通用要求，应复用 |
 
-Subagent identity 还存在注释/DTO 漂移：后端 persisted `SubagentRun` 声明 `{task_id}:{attempt}`，Tauri/frontend 聚合明确使用 bare `task_id`。M2 不必改变 persisted identity，但要把 `execution_id` 与 `aggregation_id` 分开命名，避免重试 attempt 在展示层折叠后反向污染运行时事实。
+2026-07-24 已修正该漂移：Tauri/frontend 使用完整
+`subagent_run_id = execution_id = {task_id}:{attempt}`，`task_id` 单独作为 PlanTask
+关联键。展示层可选择最新 attempt，但不再反向改写运行时 identity。
 
 ## 5. 状态、终态与持久化
 
@@ -196,7 +198,7 @@ Research/Data/Writing pipeline 使用 framework `TaskManager/TaskExecutor`；Age
 
 - 修正 `canonical SQLite`、`task_runtime.db`、`resume from SQLite` 等过时注释和旧审计文档。
 - 删除 scheduler 已不使用的 `_task_service` 参数和确认无调用的 legacy persistence 投影。
-- 将 persisted `execution_id` 与 frontend `aggregation_id` 命名分离。
+- 已完成：frontend 聚合键恢复为 attempt-scoped `execution_id`，task 投影单独使用 `task_id`。
 - 审核 `ApprovalRequested/Resolved/Rejected` 事件变体的真实生产点；接通后删掉未使用旧桥。
 
 ## 7. M2 精确实施计划

@@ -28,6 +28,13 @@ fn subagent_usage_event_name(
     }
 }
 
+fn task_id_from_subagent_execution_id(execution_id: &str) -> Option<String> {
+    execution_id
+        .rsplit_once(':')
+        .filter(|(task_id, attempt)| !task_id.is_empty() && attempt.parse::<u32>().is_ok())
+        .map(|(task_id, _)| task_id.to_string())
+}
+
 pub fn build_tauri_app(
     app_state: Arc<AppState>,
     browser_runtime: Arc<BrowserRuntime>,
@@ -616,31 +623,16 @@ pub fn build_tauri_app(
                                     };
                                 let mut payload = serde_json::Map::new();
                                 payload.insert("kind".into(), "subagent".into());
-                                // Extract the bare task_id from the framework's
-                                // execution_id (format "{task_id}:{attempt}").
-                                // We emit the bare task_id as BOTH `task_id` and
-                                // `subagent_run_id` — the attempt suffix is dropped
-                                // from subagent_run_id so retry attempts fold into
-                                // one frontend card (matches Claude Code/Codex
-                                // subagent display), and so the TaskRuntime bridge
-                                // chat bridge (which only has the bare task_id)
-                                // emits the SAME key. P0.5 fix for the
-                                // identity split bug (Q4): both bridges must agree
-                                // on the key or the frontend splits one subagent into
-                                // two store records.
+                                // `task_id` identifies the stable plan node, while
+                                // `subagent_run_id` identifies this concrete attempt.
+                                // Keeping `{task_id}:{attempt}` intact prevents late
+                                // events from one retry overwriting another retry's
+                                // lifecycle, usage, or terminal result.
                                 let task_id_owned: Option<String> = execution_id
                                     .as_deref()
-                                    .and_then(|id| {
-                                        id.split_once(':')
-                                            .map(|(task_id, _)| task_id.to_string())
-                                            .filter(|task_id| !task_id.is_empty())
-                                    });
-                                // subagent_run_id = bare task_id; fall back to the
-                                // full execution_id only when it has no ':' (rare,
-                                // e.g. a synthetic id without attempt).
-                                let subagent_run_id_owned: String = task_id_owned
+                                    .and_then(task_id_from_subagent_execution_id);
+                                let subagent_run_id_owned: String = execution_id
                                     .clone()
-                                    .or_else(|| execution_id.clone())
                                     .unwrap_or_else(|| format!("{agent_name}:unknown"));
                                 let task_id = task_id_owned.as_deref();
                                 if let Some(task_id) = task_id {
@@ -692,7 +684,7 @@ pub fn build_tauri_app(
 
 #[cfg(test)]
 mod tests {
-    use super::subagent_usage_event_name;
+    use super::{subagent_usage_event_name, task_id_from_subagent_execution_id};
     use echo_agent::agent::subagent::SubagentEvent;
 
     #[test]
@@ -721,5 +713,16 @@ mod tests {
 
         assert_eq!(subagent_usage_event_name(&thinking), Some("thinking_ended"));
         assert_eq!(subagent_usage_event_name(&usage), Some("usage"));
+    }
+
+    #[test]
+    fn execution_attempt_keeps_full_identity_and_extracts_only_the_task_join_key() {
+        let execution_id = "phase:task-1:2";
+        assert_eq!(
+            task_id_from_subagent_execution_id(execution_id).as_deref(),
+            Some("phase:task-1")
+        );
+        assert_eq!(execution_id, "phase:task-1:2");
+        assert!(task_id_from_subagent_execution_id("phase:task-1").is_none());
     }
 }

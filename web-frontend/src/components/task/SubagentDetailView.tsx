@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   ArrowLeft,
   Brain,
@@ -9,6 +9,7 @@ import {
   TerminalSquare,
   Gauge,
   ClipboardList,
+  Files,
 } from 'lucide-react';
 import type { ExecutionEvent, SubagentRunState } from '../../stores/subagentRunStore';
 import { useSubagentDetailStore } from '../../stores/subagentDetailStore';
@@ -22,6 +23,8 @@ import {
   statusLabel,
 } from '../../utils/subagentProgress';
 import { isCanonicalUsageEvent } from '../compress/subagentUsage';
+import { SubagentResultView } from '../subagent/SubagentResultView';
+import { subagentResultPresentation, withoutPromotedThinking } from '../../utils/subagentResult';
 
 interface SubagentDetailViewProps {
   run: SubagentRunState;
@@ -30,7 +33,7 @@ interface SubagentDetailViewProps {
 }
 
 interface SubagentStep {
-  type: 'thinking' | 'tool' | 'text' | 'usage';
+  type: 'thinking' | 'tool' | 'usage';
   content?: string;
   toolStart?: ExecutionEvent;
   toolResult?: ExecutionEvent;
@@ -79,26 +82,11 @@ function reconstructSteps(events: ExecutionEvent[]): SubagentStep[] {
       steps.push({ type: 'tool', toolStart: start, toolResult: event });
       continue;
     }
-
-    if (event.event === 'token_delta') {
-      if (event.content) steps.push({ type: 'text', content: event.content });
-    }
   }
 
   flushThinking();
   for (const start of pendingTools) steps.push({ type: 'tool', toolStart: start });
   return steps;
-}
-
-function subagentResult(run: SubagentRunState): string {
-  // SubagentRunState carries the final output directly (and error on failure).
-  if (run.status === 'failed' && run.error) return run.error;
-  if (run.output) return run.output;
-  return run.events
-    .filter((event) => event.event === 'token_delta')
-    .map((event) => String(event.content ?? ''))
-    .join('')
-    .trim();
 }
 
 function statusIcon(run: SubagentRunState) {
@@ -135,13 +123,15 @@ function usageLine(event: ExecutionEvent): string {
 }
 
 export function SubagentDetailView({ run, allRuns, onBack }: SubagentDetailViewProps) {
-  const [activeTab, setActiveTab] = useState<'task' | 'process' | 'result'>('process');
+  const [activeTab, setActiveTab] = useState<'task' | 'process' | 'result'>(
+    run.status === 'running' ? 'process' : 'result'
+  );
   const selectSubagent = useSubagentDetailStore((state) => state.selectSubagent);
   const progress = useMemo(() => computeSubagentProgress(run), [run.events, run.status]);
-  const steps = useMemo(() => reconstructSteps(run.events), [run.events]);
-  const result = useMemo(
-    () => subagentResult(run),
-    [run.events, run.output, run.error, run.status]
+  const presentation = useMemo(() => subagentResultPresentation(run), [run]);
+  const steps = useMemo(
+    () => withoutPromotedThinking(reconstructSteps(run.events), presentation.promotedThinking),
+    [presentation.promotedThinking, run.events]
   );
   const childRuns = useMemo(
     () => allRuns.filter((candidate) => candidate.parent === run.subagentRunId),
@@ -149,6 +139,10 @@ export function SubagentDetailView({ run, allRuns, onBack }: SubagentDetailViewP
   );
   const cacheSummary = useMemo(() => cacheUsageForRuns([run, ...childRuns]), [run, childRuns]);
   const title = run.agent || run.subagentRunId;
+
+  useEffect(() => {
+    if (run.status !== 'running') setActiveTab('result');
+  }, [run.status]);
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-[var(--bg-primary)]">
@@ -228,8 +222,8 @@ export function SubagentDetailView({ run, allRuns, onBack }: SubagentDetailViewP
         {activeTab === 'result' && (
           <div className="mx-auto max-w-[880px]">
             <SectionTitle title="结果" subtitle="subagent 的最终摘要或输出流" />
-            {result ? (
-              <MarkdownContent content={result} className="text-sm" />
+            {run.result || presentation.text ? (
+              <SubagentResultView result={run.result} content={presentation.text} />
             ) : (
               <EmptyState text="还没有可展示的结果。" />
             )}
@@ -254,13 +248,6 @@ export function SubagentDetailView({ run, allRuns, onBack }: SubagentDetailViewP
                           <Brain size={13} />
                           思考
                         </div>
-                        <MarkdownContent content={step.content || ''} className="text-sm" />
-                      </div>
-                    );
-                  }
-                  if (step.type === 'text') {
-                    return (
-                      <div key={index} className="text-sm text-[var(--text-secondary)]">
                         <MarkdownContent content={step.content || ''} className="text-sm" />
                       </div>
                     );
@@ -306,6 +293,27 @@ export function SubagentDetailView({ run, allRuns, onBack }: SubagentDetailViewP
                 })}
               </div>
             )}
+
+            {run.result &&
+              (run.result.touched_files.read.length > 0 ||
+                run.result.touched_files.written.length > 0) && (
+                <div className="space-y-1.5 border-t border-[var(--border-primary)] pt-3">
+                  <div className="flex items-center gap-1.5 text-xs font-medium text-[var(--text-tertiary)]">
+                    <Files size={13} />
+                    文件访问
+                  </div>
+                  {run.result.touched_files.written.map((path) => (
+                    <div key={`written-${path}`} className="break-all font-mono text-[10px]">
+                      written · {path}
+                    </div>
+                  ))}
+                  {run.result.touched_files.read.map((path) => (
+                    <div key={`read-${path}`} className="break-all font-mono text-[10px]">
+                      read · {path}
+                    </div>
+                  ))}
+                </div>
+              )}
 
             {childRuns.length > 0 && (
               <div className="space-y-2 pt-2">

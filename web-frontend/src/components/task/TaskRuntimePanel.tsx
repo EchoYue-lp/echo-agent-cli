@@ -55,6 +55,14 @@ const TODO_LABEL: Record<string, string> = {
   skipped: '已跳过',
 };
 
+const SUBAGENT_STATUS_LABEL: Record<SubagentRunState['status'], string> = {
+  running: '执行中',
+  completed: '执行已完成',
+  failed: '执行失败',
+  cancelled: '执行已取消',
+  timed_out: '执行超时',
+};
+
 function statusColor(status: string): string {
   if (['completed'].includes(status)) return 'var(--color-success)';
   if (['running'].includes(status)) return 'var(--color-info)';
@@ -71,8 +79,9 @@ function TodoIcon({ status }: { status: string }) {
       return <Loader2 size={14} className="animate-spin" style={{ color: 'var(--color-info)' }} />;
     case 'failed':
       return <AlertCircle size={14} style={{ color: 'var(--color-error)' }} />;
-    case 'skipped':
     case 'blocked':
+      return <AlertCircle size={14} style={{ color: 'var(--color-warning)' }} />;
+    case 'skipped':
       return <Circle size={14} style={{ color: 'var(--text-tertiary)' }} />;
     default:
       return <Circle size={14} style={{ color: 'var(--text-tertiary)' }} />;
@@ -432,6 +441,35 @@ export function displayedTodoStatus(
   return todo.status;
 }
 
+export function todoStatusDescription(
+  todo: { status: TodoStatus; task_id: string },
+  runs: SubagentRunState[]
+): string {
+  const status = todo.status;
+  const execution = traceRunForTodo(todo, runs);
+  if (!execution) return TODO_LABEL[status] ?? status;
+  const executionLabel = SUBAGENT_STATUS_LABEL[execution.status];
+  if (execution.status === 'completed' && status === 'blocked') {
+    return `${executionLabel} · 评审未通过`;
+  }
+  if (execution.status === 'completed' && status === 'skipped') {
+    return `${executionLabel} · 任务已跳过`;
+  }
+  if (execution.status === 'completed' && status === 'failed') {
+    return `${executionLabel} · 任务失败`;
+  }
+  if (execution.status === 'completed' && status === 'completed') {
+    return '执行与验收已完成';
+  }
+  if (execution.status === 'completed' && status === 'running') {
+    return `${executionLabel} · 验收中`;
+  }
+  if (execution.status === 'running' && status === 'running') {
+    return executionLabel;
+  }
+  return `${executionLabel} · 任务${TODO_LABEL[status] ?? status}`;
+}
+
 export function TaskRuntimePanel() {
   const traceRuns = useSubagentRunStore((s) => s.runs);
   const {
@@ -471,9 +509,14 @@ export function TaskRuntimePanel() {
   // This right-rail panel serves as a compact status summary only.
   const runId = activeRun.run_id;
   const usageSummary = cacheUsageForRuns(visibleTraceRuns);
-  const completedCount = todos.filter(
-    (t) => displayedTodoStatus(t, visibleTraceRuns) === ('completed' as TodoStatus)
-  ).length;
+  const completedCount = todos.filter((todo) => todo.status === ('completed' as TodoStatus)).length;
+  const executionCompletedCount = todos.filter((todo) => {
+    const trace = traceRunForTodo(todo, visibleTraceRuns);
+    return (
+      trace?.status === 'completed' ||
+      displayedTodoStatus(todo, visibleTraceRuns) === ('completed' as TodoStatus)
+    );
+  }).length;
 
   return (
     <section className="border-b border-[var(--border-primary)] px-3 py-2.5">
@@ -603,13 +646,14 @@ export function TaskRuntimePanel() {
               任务列表{plan ? ` · r${plan.revision}` : ''}
             </span>
             <span className="text-[10px]" style={{ color: 'var(--text-tertiary)' }}>
-              {completedCount}/{todos.length}
+              执行 {executionCompletedCount}/{todos.length} · 验收 {completedCount}/{todos.length}
             </span>
           </div>
           <div className="space-y-0.5">
             {todos.map((todo) => {
               const task = plan?.tasks.find((t) => t.id === todo.task_id);
               const status = displayedTodoStatus(todo, visibleTraceRuns);
+              const statusDescription = todoStatusDescription(todo, visibleTraceRuns);
               const canPatch = status === 'pending' || status === 'blocked';
               const canRetry =
                 (status === 'blocked' || status === 'failed') &&
@@ -642,7 +686,7 @@ export function TaskRuntimePanel() {
                         </span>
                       )}
                       {todo.owner_agent && <span className="truncate">· {todo.owner_agent}</span>}
-                      <span>· {TODO_LABEL[status] ?? status}</span>
+                      <span>· {statusDescription}</span>
                     </div>
                   </div>
                   {(canPatch || canRetry) && (

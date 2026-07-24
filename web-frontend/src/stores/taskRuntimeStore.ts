@@ -1,8 +1,8 @@
 //! TaskRuntime store — the GUI's view of complex-task runs.
 //!
 //! Holds the active run, its plan, todos, artifacts, and event feed, keyed by
-//! run_id. Polling is driven by the component (RightRail panel) via
-//! `refresh(runId)`; the store just holds state and exposes mutators.
+//! run_id. Loading an active conversation owns the polling lifecycle so every
+//! surface observes the persisted terminal snapshot.
 //!
 //! This is deliberately separate from `chatStore` (which is a per-message
 //! streaming store) — a TaskRuntime run outlives any single chat turn and
@@ -195,6 +195,11 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
   },
 
   loadByConversation: async (conversationId: string) => {
+    // Loading a conversation is also the lifecycle boundary for polling. The
+    // run_started event and app restoration both enter through this method, so
+    // leaving polling to the chat command response can strand the panel on its
+    // initial Pending snapshot for the entire execution.
+    get().stopPolling();
     try {
       const run = await taskRuntimeApi.latestRunForConversation(conversationId);
       if (run) {
@@ -211,6 +216,9 @@ export const useTaskRuntimeStore = create<TaskRuntimeState>((set, get) => ({
           lastSeq: '0',
           error: null,
         });
+        if (run.status === 'pending' || run.status === 'running' || run.status === 'paused') {
+          get().startPolling(run.run_id);
+        }
       } else {
         set({
           activeRun: null,

@@ -1,7 +1,11 @@
 import { useMemo, memo } from 'react';
 import type { TaskRun } from '../../generated';
 import { useTaskRuntimeStore } from '../../stores/taskRuntimeStore';
-import { useSubagentRunStore, type SubagentRunState } from '../../stores/subagentRunStore';
+import {
+  latestSubagentRunsByTask,
+  useSubagentRunStore,
+  type SubagentRunState,
+} from '../../stores/subagentRunStore';
 import { useChatStore } from '../../stores/chatStore';
 import { SubagentStreamBlock } from './SubagentStreamBlock';
 
@@ -31,24 +35,23 @@ export function visibleSubagentRuns(
   lastAssistantMessageId: string | null
 ): SubagentRunState[] {
   const isLatestAssistant = messageId === lastAssistantMessageId;
-  return runs
-    .filter((run) => {
-      if (run.subagentRunId === 'main' || (run.parent && run.parent !== run.runId)) {
-        return false;
-      }
-      if (run.messageId === messageId) {
-        return true;
-      }
-      if (run.messageId || !isLatestAssistant) {
-        return false;
-      }
-      return (
-        !activeRun ||
-        run.runId === activeRun.run_id ||
-        run.conversationId === activeRun.conversation_id
-      );
-    })
-    .sort((a, b) => a.startedAt - b.startedAt);
+  const matchingRuns = runs.filter((run) => {
+    if (run.subagentRunId === 'main' || (run.parent && run.parent !== run.runId)) {
+      return false;
+    }
+    if (run.messageId === messageId) {
+      return true;
+    }
+    if (run.messageId || !isLatestAssistant) {
+      return false;
+    }
+    return (
+      !activeRun ||
+      run.runId === activeRun.run_id ||
+      run.conversationId === activeRun.conversation_id
+    );
+  });
+  return latestSubagentRunsByTask(matchingRuns).sort((a, b) => a.startedAt - b.startedAt);
 }
 
 export const ParallelExecutionBlock = memo(function ParallelExecutionBlock({

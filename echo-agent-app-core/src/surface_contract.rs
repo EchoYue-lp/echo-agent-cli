@@ -172,9 +172,10 @@ fn shared_driver_wire_contract_preserves_product_facts() -> Result<(), String> {
                 ),
             },
         ))),
-        ChatDriverEvent::Execution(ExecEvent::for_task(
+        ChatDriverEvent::Execution(ExecEvent::subagent(
             "run-1",
             "task-1",
+            "execution-1",
             "artifact_produced",
             serde_json::json!({
                 "execution_id": "execution-1",

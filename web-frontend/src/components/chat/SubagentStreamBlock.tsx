@@ -1,4 +1,4 @@
-import { useState, memo, useMemo } from 'react';
+import { useEffect, useRef, useState, memo, useMemo } from 'react';
 import {
   Loader2,
   CheckCircle2,
@@ -7,16 +7,19 @@ import {
   ChevronDown,
   ChevronRight,
   Brain,
+  Files,
 } from 'lucide-react';
 import type { SubagentRunState, ExecutionEvent } from '../../stores/subagentRunStore';
 import MarkdownContent from '../common/MarkdownContent';
 import { InlineToolCall } from './InlineToolCall';
 import { isSubagentDispatchTool } from './tools/toolRenderers';
+import { SubagentResultView } from '../subagent/SubagentResultView';
 import {
   computeSubagentProgress,
   progressSummary,
   statusLabel,
 } from '../../utils/subagentProgress';
+import { subagentResultPresentation, withoutPromotedThinking } from '../../utils/subagentResult';
 
 interface SubagentStreamBlockProps {
   run: SubagentRunState;
@@ -77,43 +80,47 @@ function reconstructSteps(events: ExecutionEvent[]): {
   return { steps, thinkingTotal };
 }
 
-function subagentResult(run: SubagentRunState): string {
-  // SubagentRunState carries the final output directly (no need to dig it out
-  // of a completed subagent event payload like the legacy store did).
-  if (run.output) return run.output;
-  return run.events
-    .filter((e) => e.event === 'token_delta')
-    .map((e) => String(e.content ?? ''))
-    .join('')
-    .trim();
-}
-
 export const SubagentStreamBlock = memo(function SubagentStreamBlock({
   run,
   allRuns,
   taskTitle,
 }: SubagentStreamBlockProps) {
   const [expanded, setExpanded] = useState(run.status === 'running');
-  const [activeTab, setActiveTab] = useState<SubagentTab>('process');
+  const [activeTab, setActiveTab] = useState<SubagentTab>(
+    run.status === 'running' ? 'process' : 'result'
+  );
+  const previousStatus = useRef(run.status);
+  const userControlledExpansion = useRef(false);
 
   const progress = useMemo(() => computeSubagentProgress(run), [run.events, run.status]);
   const summary = progressSummary(progress);
+  const presentation = useMemo(() => subagentResultPresentation(run), [run]);
   const { steps } = useMemo(() => reconstructSteps(run.events), [run.events]);
-  const visibleSteps = useMemo(
-    () =>
-      steps.filter(
-        (step) =>
-          step.type === 'thinking' ||
-          !isSubagentDispatchTool(String(step.toolStart?.name ?? step.toolResult?.name ?? 'tool'))
-      ),
-    [steps]
-  );
-  const result = useMemo(() => subagentResult(run), [run.events, run.output]);
-
+  const visibleSteps = useMemo(() => {
+    const processSteps = withoutPromotedThinking(steps, presentation.promotedThinking);
+    return processSteps.filter(
+      (step) =>
+        step.type === 'thinking' ||
+        !isSubagentDispatchTool(String(step.toolStart?.name ?? step.toolResult?.name ?? 'tool'))
+    );
+  }, [presentation.promotedThinking, steps]);
   const children = useMemo(
     () => allRuns.filter((w) => w.parent === run.subagentRunId),
     [allRuns, run.subagentRunId]
   );
+
+  useEffect(() => {
+    if (previousStatus.current === 'running' && run.status !== 'running') {
+      setActiveTab('result');
+      if (!userControlledExpansion.current) setExpanded(false);
+    }
+    previousStatus.current = run.status;
+  }, [run.status]);
+
+  const toggleExpanded = () => {
+    userControlledExpansion.current = true;
+    setExpanded((value) => !value);
+  };
 
   const statusIcon =
     run.status === 'running' ? (
@@ -132,7 +139,7 @@ export const SubagentStreamBlock = memo(function SubagentStreamBlock({
       <div className="flex w-full items-center gap-1.5 text-[12px]">
         <button
           type="button"
-          onClick={() => setExpanded((e) => !e)}
+          onClick={toggleExpanded}
           className="shrink-0 text-[var(--text-tertiary)] transition-colors hover:text-[var(--text-primary)]"
           aria-label={expanded ? '折叠 subagent' : '展开 subagent'}
         >
@@ -140,7 +147,7 @@ export const SubagentStreamBlock = memo(function SubagentStreamBlock({
         </button>
         <button
           type="button"
-          onClick={() => setExpanded((value) => !value)}
+          onClick={toggleExpanded}
           className="flex min-w-0 flex-1 items-center gap-1.5 rounded-md px-1 py-0.5 text-left transition-colors hover:bg-[var(--bg-hover)]"
         >
           {statusIcon}
@@ -263,36 +270,36 @@ export const SubagentStreamBlock = memo(function SubagentStreamBlock({
                     ))}
                   </div>
                 )}
+                {run.result &&
+                  (run.result.touched_files.read.length > 0 ||
+                    run.result.touched_files.written.length > 0) && (
+                    <div className="space-y-1 border-t border-[var(--border-primary)] pt-2">
+                      <div className="flex items-center gap-1 text-[9px] font-medium text-[var(--text-tertiary)]">
+                        <Files size={9} />
+                        文件访问
+                      </div>
+                      {run.result.touched_files.written.map((path) => (
+                        <div key={`written-${path}`} className="break-all font-mono text-[9px]">
+                          written · {path}
+                        </div>
+                      ))}
+                      {run.result.touched_files.read.map((path) => (
+                        <div key={`read-${path}`} className="break-all font-mono text-[9px]">
+                          read · {path}
+                        </div>
+                      ))}
+                    </div>
+                  )}
               </div>
             )}
 
             {activeTab === 'result' &&
-              (result || run.summary ? (
-                <div className="space-y-2 text-[11px] text-[var(--text-secondary)]">
-                  <MarkdownContent
-                    content={run.summary || result}
-                    className="text-sm"
-                    maxHeight={400}
-                  />
-                  {(run.verification ?? []).map((item) => (
-                    <div key={`${item.check}-${item.source}`}>
-                      <span className="font-medium text-[var(--text-primary)]">{item.check}</span>
-                      <span className="ml-1 text-[var(--text-tertiary)]">
-                        {item.status} · {item.source}
-                      </span>
-                    </div>
-                  ))}
-                  {(run.artifacts ?? []).map((artifact) => (
-                    <div key={artifact.path} className="break-all font-mono text-[10px]">
-                      {artifact.available ? 'available' : 'missing'} · {artifact.path}
-                    </div>
-                  ))}
-                  {(run.remainingWork ?? []).map((item) => (
-                    <div key={item} className="text-[var(--color-warning)]">
-                      {item}
-                    </div>
-                  ))}
-                </div>
+              (run.result || presentation.text ? (
+                <SubagentResultView
+                  result={run.result}
+                  content={presentation.text}
+                  maxHeight={400}
+                />
               ) : (
                 <div className="text-[11px] text-[var(--text-tertiary)]">
                   {run.status === 'running' ? '正在等待执行结果' : '暂无结果'}

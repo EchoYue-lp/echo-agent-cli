@@ -179,19 +179,22 @@ impl FileTaskStore {
                 .get(spec.id.as_str())
                 .map(|task| task.status)
                 .unwrap_or(TodoStatus::Pending);
-            // Fold this task's Task* events to recover the 4 runtime fields.
-            let (owner, started, completed, summary, status) =
-                fold_task_runtime(&loaded.events, &spec.id, default_status);
+            // Fold this task's Task* events to recover non-authoritative display metadata.
+            let runtime = fold_task_runtime(&loaded.events, &spec.id);
             todos.push(TodoItem {
                 id: spec.id.clone(),
                 run_id: loaded.state.run.run_id.clone(),
                 task_id: spec.id.clone(),
                 title: spec.title.clone(),
-                status,
-                owner_agent: owner,
-                started_at: started,
-                completed_at: completed,
-                summary,
+                // run-state.json is the authoritative execution projection.
+                // Historical Task* events only supply fields that are not
+                // stored in TaskExecution; otherwise an earlier Blocked event
+                // can overwrite a later plan skip/reset.
+                status: default_status,
+                owner_agent: runtime.owner_agent,
+                started_at: runtime.started_at,
+                completed_at: runtime.completed_at,
+                summary: runtime.summary,
             });
         }
         // Sort by sort_order to match SQL's display ordering.
@@ -328,26 +331,21 @@ struct Loaded {
     events: Vec<RuntimeTaskEvent>,
 }
 
-/// Fold a task's `Task*`/`TodoUpdated` events to recover the 4 tr_todos runtime
-/// fields. Returns (owner_agent, started_at, completed_at, summary, status),
-/// carrying forward the last non-None value of each (matching tr_todos semantics).
-#[allow(clippy::type_complexity)] // 5-tuple of runtime fields; factoring a struct adds noise here
-fn fold_task_runtime(
-    events: &[RuntimeTaskEvent],
-    task_id: &str,
-    default_status: TodoStatus,
-) -> (
-    Option<String>,
-    Option<DateTime<Utc>>,
-    Option<DateTime<Utc>>,
-    Option<String>,
-    TodoStatus,
-) {
+#[derive(Debug, Default)]
+struct TaskRuntimeMetadata {
+    owner_agent: Option<String>,
+    started_at: Option<DateTime<Utc>>,
+    completed_at: Option<DateTime<Utc>>,
+    summary: Option<String>,
+}
+
+/// Fold a task's `Task*`/`TodoUpdated` events to recover display metadata,
+/// carrying forward the last non-None value of each field.
+fn fold_task_runtime(events: &[RuntimeTaskEvent], task_id: &str) -> TaskRuntimeMetadata {
     let mut owner = None;
     let mut started = None;
     let mut completed = None;
     let mut summary = None;
-    let mut status = default_status;
     for e in events {
         if e.task_id.as_deref() != Some(task_id) {
             continue;
@@ -389,16 +387,13 @@ fn fold_task_runtime(
         {
             summary = Some(s.to_string());
         }
-        if let Some(s) = e
-            .payload
-            .get("status")
-            .and_then(|v| v.as_str())
-            .and_then(TodoStatus::from_str)
-        {
-            status = s;
-        }
     }
-    (owner, started, completed, summary, status)
+    TaskRuntimeMetadata {
+        owner_agent: owner,
+        started_at: started,
+        completed_at: completed,
+        summary,
+    }
 }
 
 fn parse_rfc3339(s: &str) -> Option<DateTime<Utc>> {
@@ -418,7 +413,8 @@ mod tests {
     use super::*;
     use crate::tasks::task_runtime::store::TaskRuntimeStore;
     use crate::tasks::task_runtime::types::{
-        AttendedMode, DomainProfile, ExecutionMode, PlanTask, PlanTaskKind, TaskPlan, TaskRunStatus,
+        AttendedMode, DomainProfile, ExecutionMode, PlanPatchOperation, PlanPatchRequest, PlanTask,
+        PlanTaskKind, TaskPlan, TaskRunStatus,
     };
     use std::sync::Arc;
 
@@ -532,6 +528,59 @@ mod tests {
         let sql_ev = store.list_events("r1", 0).unwrap();
         let file_ev = file.list_events("r1", 0).unwrap();
         assert_eq!(sql_ev.len(), file_ev.len());
+    }
+
+    #[test]
+    fn plan_patch_status_overrides_earlier_task_events() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = tempfile::tempdir()?;
+        let shadow = Arc::new(FileTaskShadow::new(tmp.path()));
+        let store = TaskRuntimeStore::new_in_memory_with_shadow_root(tmp.path())?;
+        store.create_run(
+            "r1",
+            "ws",
+            "c1",
+            "m1",
+            DomainProfile::General,
+            "review",
+            "complex",
+            AttendedMode::Attended,
+        )?;
+        store.attach_plan(&TaskPlan {
+            plan_id: "p1".to_string(),
+            run_id: "r1".to_string(),
+            revision: 1,
+            domain_profile: DomainProfile::General,
+            goal: "review".to_string(),
+            assumptions: Vec::new(),
+            risks: Vec::new(),
+            execution_mode: ExecutionMode::Sequential,
+            tasks: vec![task("t1", PlanTaskKind::Investigation)],
+        })?;
+        store.set_task_status(
+            "r1",
+            "t1",
+            TodoStatus::Blocked,
+            Some("reviewer"),
+            Some("review needs fix"),
+        )?;
+        store.patch_plan(
+            "r1",
+            &PlanPatchRequest {
+                base_revision: 1,
+                reason: "result already incorporated".to_string(),
+                operations: vec![PlanPatchOperation::Skip {
+                    task_id: "t1".to_string(),
+                }],
+            },
+        )?;
+
+        let todos = FileTaskStore::new((*shadow).clone()).list_todos("r1")?;
+        let todo = todos
+            .first()
+            .ok_or_else(|| std::io::Error::other("todo t1 missing"))?;
+        assert_eq!(todo.status, TodoStatus::Skipped);
+        assert_eq!(todo.summary.as_deref(), Some("review needs fix"));
+        Ok(())
     }
 
     // ── 0bc step-2: collection-query read API (replaces SQL WHERE/ORDER BY) ──

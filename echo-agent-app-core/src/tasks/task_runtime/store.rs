@@ -126,6 +126,12 @@ struct ActiveSubagentBoundary {
     replay_safe: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecoverableSubagentResult {
+    pub(crate) result: SubagentTaskResult,
+    pub(crate) full_output: String,
+}
+
 #[derive(Debug, Clone)]
 struct ActiveToolBoundary {
     task_id: String,
@@ -1558,6 +1564,7 @@ impl TaskRuntimeStore {
         execution_id: &str,
         status: &str,
         result: Option<&SubagentTaskResult>,
+        full_output: Option<&str>,
     ) -> Result<(), StoreError> {
         let summary = result.map(|value| bounded_event_text(&value.summary, 2_000));
         self.shadow.append_event_line(
@@ -1570,6 +1577,7 @@ impl TaskRuntimeStore {
                 "status": status,
                 "summary": summary,
                 "result": result,
+                "full_output": full_output,
             }),
         )?;
         Ok(())
@@ -1642,12 +1650,12 @@ impl TaskRuntimeStore {
     /// Return a completed Subagent result for this exact attempt. A later
     /// SubagentAssigned with the same id clears an older terminal fact, which is
     /// how an explicitly confirmed retry avoids reusing stale output.
-    pub fn recoverable_subagent_result(
+    pub(crate) fn recoverable_subagent_result(
         &self,
         run_id: &str,
         task_id: &str,
         execution_id: &str,
-    ) -> Result<Option<SubagentTaskResult>, StoreError> {
+    ) -> Result<Option<RecoverableSubagentResult>, StoreError> {
         let mut result = None;
         for event in self.list_events(run_id, 0)? {
             if event.task_id.as_deref() != Some(task_id)
@@ -1664,7 +1672,15 @@ impl TaskRuntimeStore {
                                 .payload
                                 .get("result")
                                 .cloned()
-                                .and_then(|value| serde_json::from_value(value).ok())
+                                .and_then(|value| {
+                                    serde_json::from_value::<SubagentTaskResult>(value).ok()
+                                })
+                                .map(|result| RecoverableSubagentResult {
+                                    full_output: json_string(&event.payload, "full_output")
+                                        .filter(|output| !output.trim().is_empty())
+                                        .unwrap_or_else(|| result.summary.clone()),
+                                    result,
+                                })
                         } else {
                             None
                         };
@@ -2285,12 +2301,22 @@ mod tests {
             "durable result",
             Vec::new(),
         );
-        store.record_subagent_released("r1", "t1", "t1:1", "completed", Some(&result))?;
+        store.record_subagent_released(
+            "r1",
+            "t1",
+            "t1:1",
+            "completed",
+            Some(&result),
+            Some("durable full output"),
+        )?;
 
         assert_eq!(store.recover_incomplete(), 1);
         assert_eq!(
             store.recoverable_subagent_result("r1", "t1", "t1:1")?,
-            Some(result)
+            Some(RecoverableSubagentResult {
+                result,
+                full_output: "durable full output".to_string(),
+            })
         );
         let todo = store
             .list_todos("r1")?

@@ -42,9 +42,17 @@ use super::types::*;
 
 pub use echo_agent::tasks::ConcurrencyLimits;
 
+/// Scope of an execution-flow event on the unified frontend channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecEventScope {
+    Run,
+    Task,
+    Subagent,
+}
+
 /// A lightweight execution-flow event emitted to the frontend via the unified
-/// `execution://event` Tauri channel (kind="subagent" for the main agent's
-/// thinking/tool/token stream, kind="run" for run lifecycle).
+/// `execution://event` Tauri channel.
 ///
 /// Replaces the pre-unification trace pair. The `event` field is a string (e.g.
 /// `"tool_started"`, `"run_completed"`) matching the frontend's
@@ -53,9 +61,12 @@ pub use echo_agent::tasks::ConcurrencyLimits;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ExecEvent {
     pub run_id: String,
-    /// `None` for run-level events (RunStarted/Completed/...), `Some(task_id)`
-    /// for task-scoped events (the main agent's thinking/tool/token stream).
+    pub scope: ExecEventScope,
+    /// Plan node identity. Present on task and Subagent events.
     pub task_id: Option<String>,
+    /// One concrete Subagent execution identity (`{task_id}:{attempt}`).
+    /// Present only when `scope == Subagent`.
+    pub subagent_run_id: Option<String>,
     pub event: String,
     pub agent: Option<String>,
     pub payload: serde_json::Value,
@@ -66,16 +77,17 @@ impl ExecEvent {
     pub fn run(run_id: impl Into<String>, event: &'static str, payload: serde_json::Value) -> Self {
         Self {
             run_id: run_id.into(),
+            scope: ExecEventScope::Run,
             task_id: None,
+            subagent_run_id: None,
             event: event.to_string(),
             agent: None,
             payload,
         }
     }
 
-    /// Construct a task-scoped event (carries task_id as the synthetic
-    /// subagent_run_id for the main agent's execution flow).
-    pub fn for_task(
+    /// Construct a plan-task event. These events never mutate Subagent state.
+    pub fn task(
         run_id: impl Into<String>,
         task_id: impl Into<String>,
         event: &'static str,
@@ -83,7 +95,28 @@ impl ExecEvent {
     ) -> Self {
         Self {
             run_id: run_id.into(),
+            scope: ExecEventScope::Task,
             task_id: Some(task_id.into()),
+            subagent_run_id: None,
+            event: event.to_string(),
+            agent: None,
+            payload,
+        }
+    }
+
+    /// Construct an event for one concrete Subagent execution attempt.
+    pub fn subagent(
+        run_id: impl Into<String>,
+        task_id: impl Into<String>,
+        subagent_run_id: impl Into<String>,
+        event: &'static str,
+        payload: serde_json::Value,
+    ) -> Self {
+        Self {
+            run_id: run_id.into(),
+            scope: ExecEventScope::Subagent,
+            task_id: Some(task_id.into()),
+            subagent_run_id: Some(subagent_run_id.into()),
             event: event.to_string(),
             agent: None,
             payload,
@@ -93,23 +126,6 @@ impl ExecEvent {
     /// Attach the agent/role name. Builder-style for call-site readability.
     pub fn with_agent(mut self, agent: impl Into<String>) -> Self {
         self.agent = Some(agent.into());
-        self
-    }
-
-    /// No-op kept for call-site compatibility with the old
-    /// pre-unification `with_title` chain. The frontend derives a display
-    /// label from `agent` (falling back to subagent_run_id), so a separate
-    /// title field is no longer needed on the wire.
-    #[allow(clippy::unused_self)]
-    pub fn with_title(self, _title: impl Into<String>) -> Self {
-        self
-    }
-
-    /// No-op kept for call-site compatibility (the old trace payload carried a
-    /// separate `task` field; the frontend now reads the task brief
-    /// from the run's plan, so this field is dropped on the wire).
-    #[allow(clippy::unused_self)]
-    pub fn with_task(self, _task: impl Into<String>) -> Self {
         self
     }
 }
@@ -125,6 +141,10 @@ fn emit_exec(sink: Option<&ExecSink>, ev: ExecEvent) {
     if let Some(sink) = sink {
         sink(ev);
     }
+}
+
+fn subagent_execution_id(task_id: &str, attempt: u32) -> String {
+    format!("{task_id}:{attempt}")
 }
 
 /// Outcome of executing a whole run.
@@ -736,9 +756,10 @@ fn artifact_matches(required: &str, actual: &str) -> bool {
 ///
 /// The dispatcher is given the semaphores + file locks so it can honor the same
 /// concurrency limits as the real path; mocks usually ignore them.
-pub trait TaskDispatcher: Send + Sync {
-    /// Execute `task` for `run_id`. Returns `(task_id, structured result)` on success or
-    /// `(task_id, error)` on failure (matching `execute_task`'s contract).
+trait TaskDispatcher: Send + Sync {
+    /// Execute `task` for `run_id`. Success carries both the bounded structured
+    /// result and the complete model output. The former feeds parent summaries;
+    /// the latter is the evidence reviewed against acceptance criteria.
     #[allow(clippy::too_many_arguments, clippy::type_complexity)] // semaphores/locks passed so mocks honor the same limits; boxed-future return is the dispatch contract
     fn dispatch(
         &self,
@@ -780,8 +801,8 @@ pub trait TaskDispatcher: Send + Sync {
 /// Note: the reviewer LLM is NOT held here — it is owned by `run_dag` itself
 /// (the review gate runs at the `run_dag` level, after a Subagent returns). The
 /// dispatcher only needs the agent + concurrency primitives.
-pub struct RealTaskDispatcher {
-    pub primary_agent: crate::agent_handle::AgentHandle,
+struct RealTaskDispatcher {
+    primary_agent: crate::agent_handle::AgentHandle,
 }
 
 impl TaskDispatcher for RealTaskDispatcher {
@@ -888,7 +909,7 @@ impl TaskDispatcher for RealTaskDispatcher {
             );
             emit_exec(
                 trace_sink.as_ref(),
-                ExecEvent::for_task(
+                ExecEvent::task(
                     run_id.clone(),
                     task.id.clone(),
                     "merge_started",
@@ -897,8 +918,7 @@ impl TaskDispatcher for RealTaskDispatcher {
                         "branch": branch,
                     }),
                 )
-                .with_agent(task.agent_role.clone())
-                .with_title(task.title.clone()),
+                .with_agent(task.agent_role.clone()),
             );
 
             let task_id = task.id.clone();
@@ -930,7 +950,7 @@ impl TaskDispatcher for RealTaskDispatcher {
                     }
                     emit_exec(
                         trace_sink.as_ref(),
-                        ExecEvent::for_task(
+                        ExecEvent::task(
                             run_id,
                             task.id.clone(),
                             "merge_completed",
@@ -944,8 +964,7 @@ impl TaskDispatcher for RealTaskDispatcher {
                                 "cleanup_warning": outcome.cleanup_warning,
                             }),
                         )
-                        .with_agent(task.agent_role)
-                        .with_title(task.title),
+                        .with_agent(task.agent_role),
                     );
                     Ok(Some(outcome))
                 }
@@ -958,7 +977,7 @@ impl TaskDispatcher for RealTaskDispatcher {
                     );
                     emit_exec(
                         trace_sink.as_ref(),
-                        ExecEvent::for_task(
+                        ExecEvent::task(
                             run_id,
                             task.id.clone(),
                             "merge_failed",
@@ -968,8 +987,7 @@ impl TaskDispatcher for RealTaskDispatcher {
                                 "error": message,
                             }),
                         )
-                        .with_agent(task.agent_role)
-                        .with_title(task.title),
+                        .with_agent(task.agent_role),
                     );
                     Err(message)
                 }
@@ -978,7 +996,14 @@ impl TaskDispatcher for RealTaskDispatcher {
     }
 }
 
-type TaskDispatchResult = Result<(String, SubagentTaskResult), (String, String)>;
+#[derive(Debug, Clone)]
+struct TaskDispatchSuccess {
+    task_id: String,
+    result: SubagentTaskResult,
+    full_output: String,
+}
+
+type TaskDispatchResult = Result<TaskDispatchSuccess, (String, String)>;
 
 /// Pick the largest deterministic subset of the ready frontier that has no
 /// writer ownership conflicts. Read-only tasks never consume ownership.
@@ -1207,7 +1232,7 @@ async fn run_dag<W: TaskDispatcher + 'static>(
         for task in ready {
             let execution_id = format!("{}:{}", task.id, task.retry_count.saturating_add(1));
             match store.recoverable_subagent_result(run_id, &task.id, &execution_id) {
-                Ok(Some(result)) => {
+                Ok(Some(recovered)) => {
                     tracing::info!(
                         run_id = %run_id,
                         task_id = %task.id,
@@ -1219,7 +1244,11 @@ async fn run_dag<W: TaskDispatcher + 'static>(
                         Some(&task.id),
                         "reused completed Subagent result; continuing at review boundary",
                     );
-                    wave_results.push(Ok((task.id.clone(), result)));
+                    wave_results.push(Ok(TaskDispatchSuccess {
+                        task_id: task.id.clone(),
+                        result: recovered.result,
+                        full_output: recovered.full_output,
+                    }));
                     continue;
                 }
                 Ok(None) => {}
@@ -1298,7 +1327,12 @@ async fn run_dag<W: TaskDispatcher + 'static>(
         let mut wave_failed: Vec<String> = Vec::new();
         for result in wave_results {
             match result {
-                Ok((id, result)) => {
+                Ok(dispatched) => {
+                    let TaskDispatchSuccess {
+                        task_id: id,
+                        result,
+                        full_output,
+                    } = dispatched;
                     // Three-track decision based on hard evidence:
                     //   Executed        → run ReviewGate (acceptance judgement)
                     //   ExecutionFailed → retry within budget (real failure)
@@ -1403,12 +1437,17 @@ async fn run_dag<W: TaskDispatcher + 'static>(
                             // of acceptance_criteria, or auto-pass when there
                             // is nothing semantic to review).
                             let summary = result.summary.clone();
+                            let review_output = if full_output.trim().is_empty() {
+                                summary.as_str()
+                            } else {
+                                full_output.as_str()
+                            };
                             let passed = run_review_gate(
                                 store.clone(),
                                 reviewer_llm.clone(),
                                 run_id,
                                 &task,
-                                &summary,
+                                review_output,
                             )
                             .await;
                             let approved = match passed {
@@ -1826,7 +1865,10 @@ async fn execute_task(
         task_id: task_id.clone(),
     };
 
-    let subagent_trace_id = task_id.clone();
+    // A PlanTask is a stable plan node; each dispatch attempt is a distinct
+    // SubagentRun. Never collapse retries back to the bare task id.
+    let attempt = task.retry_count.saturating_add(1);
+    let execution_id = subagent_execution_id(&task_id, attempt);
     let contract = subagent_runtime_contract(&primary_agent, &task.agent_role, &task.kind).await;
     tracing::info!(
         run_id = %run_id,
@@ -1852,7 +1894,7 @@ async fn execute_task(
     emit_task_started(
         trace_sink.as_ref(),
         &run_id,
-        &subagent_trace_id,
+        &execution_id,
         &task,
         &contract,
     );
@@ -2055,13 +2097,7 @@ async fn execute_task(
         task.kind,
         PlanTaskKind::Implementation | PlanTaskKind::Debugging
     );
-    // Stable execution id for this dispatch: "{task_id}:{attempt}". Aligns
-    // with SubagentRun.subagent_run_id and the framework's
-    // SubagentEvent.execution_id (via ExternalRunContext). Including the
-    // attempt ordinal (= retry_count + 1) keeps retries of the same task
-    // distinguishable, so the bridge/frontend never has to temp-allocate ids.
-    let attempt = task.retry_count.saturating_add(1);
-    let execution_id = format!("{task_id}:{attempt}");
+    let app_owns_subagent_events = !is_read_only_task && !is_writer_task;
     // Resolve the run's root_message_id so the framework can carry it on
     // SubagentEvent::DispatchStarted → execution://event, letting the frontend
     // pin the subagent stream to the right chat message block.
@@ -2083,7 +2119,7 @@ async fn execute_task(
             format!("failed to persist Subagent start boundary: {error}"),
         ));
     }
-    let (result, readonly_usage) = if is_read_only_task {
+    let result = if is_read_only_task {
         tracing::info!(
             run_id = %run_id,
             task_id = %task_id,
@@ -2116,7 +2152,7 @@ async fn execute_task(
                     agent_role = %task.agent_role,
                     "task_runtime: read-only subagent cancelled"
                 );
-                (Err("task cancelled".to_string()), sub_result.usage)
+                Err("task cancelled".to_string())
             }
             Ok(sub_result) => {
                 tracing::info!(
@@ -2128,13 +2164,10 @@ async fn execute_task(
                     usage_reported = sub_result.usage.is_some(),
                     "task_runtime: read-only subagent completed"
                 );
-                (
-                    Ok((
-                        SubagentTaskResult::from_framework(&sub_result),
-                        sub_result.output.clone(),
-                    )),
-                    sub_result.usage,
-                )
+                Ok((
+                    SubagentTaskResult::from_framework(&sub_result),
+                    sub_result.output.clone(),
+                ))
             }
             Err(e) => {
                 tracing::warn!(
@@ -2144,7 +2177,7 @@ async fn execute_task(
                     error = %e,
                     "task_runtime: read-only subagent failed"
                 );
-                (Err(e), None)
+                Err(e)
             }
         }
     } else if is_writer_task {
@@ -2181,7 +2214,7 @@ async fn execute_task(
                     agent_role = %task.agent_role,
                     "task_runtime: writer subagent cancelled"
                 );
-                (Err("task cancelled".to_string()), sub_result.usage)
+                Err("task cancelled".to_string())
             }
             Ok(sub_result) => {
                 tracing::info!(
@@ -2194,22 +2227,16 @@ async fn execute_task(
                     usage_reported = sub_result.usage.is_some(),
                     "task_runtime: writer subagent completed"
                 );
-                (
-                    Ok((
-                        SubagentTaskResult::from_framework(&sub_result),
-                        sub_result.output.clone(),
-                    )),
-                    sub_result.usage,
-                )
+                Ok((
+                    SubagentTaskResult::from_framework(&sub_result),
+                    sub_result.output.clone(),
+                ))
             }
-            Err(e) => (
-                Err(if task_cancel.is_cancelled() {
-                    "task cancelled".to_string()
-                } else {
-                    e
-                }),
-                None,
-            ),
+            Err(e) => Err(if task_cancel.is_cancelled() {
+                "task cancelled".to_string()
+            } else {
+                e
+            }),
         }
     } else {
         let compiler = crate::subagent_prompt::EkoSubagentPromptCompiler;
@@ -2222,48 +2249,31 @@ async fn execute_task(
             inherit_history: None,
             payload: Some(&prompt_payload),
         });
-        emit_task_isolation_observed(
+        emit_primary_subagent_started(
             trace_sink.as_ref(),
             &run_id,
-            &subagent_trace_id,
+            &execution_id,
             &task,
             &contract,
-            "primary",
         );
-        (
-            run_main_agent_task(
-                &primary_agent,
-                store.clone(),
-                &run_id,
-                &task,
-                &compiled.task_input,
-                task_cancel.clone(),
-                trace_sink.clone(),
-            )
-            .await,
-            None,
-        )
-    };
-
-    if is_read_only_task && result.is_ok() {
-        let usage_payload = match &readonly_usage {
-            Some(stats) => stats.to_payload(&run_id),
-            None => {
-                unavailable_llm_usage_payload("provider_returned_no_usage_for_readonly_subagent")
-            }
-        };
-        emit_exec(
+        emit_primary_subagent_isolation_observed(
             trace_sink.as_ref(),
-            ExecEvent::for_task(
-                run_id.clone(),
-                subagent_trace_id.clone(),
-                "usage",
-                usage_payload,
-            )
-            .with_agent(task.agent_role.clone())
-            .with_title(task.title.clone()),
+            &run_id,
+            &execution_id,
+            &task,
+            &contract,
         );
-    }
+        run_main_agent_task(
+            &primary_agent,
+            store.clone(),
+            &run_id,
+            &task,
+            &compiled.task_input,
+            task_cancel.clone(),
+            trace_sink.clone(),
+        )
+        .await
+    };
 
     match result {
         Ok((task_result, full_output)) => {
@@ -2300,6 +2310,7 @@ async fn execute_task(
                 &execution_id,
                 task_result.status.as_str(),
                 Some(&task_result),
+                Some(&full_output),
             ) {
                 return Err((
                     task_id,
@@ -2325,27 +2336,45 @@ async fn execute_task(
                     ),
                 );
             }
+            let terminal_payload = serde_json::json!({
+                "execution_id": &execution_id,
+                "output": &full_output,
+                "terminal_status": task_result.status.as_str(),
+                "contract_version": task_result.contract_version,
+                "summary": &task_result.summary,
+                "artifacts": &task_result.artifacts,
+                "verification": &task_result.verification,
+                "remaining_work": &task_result.remaining_work,
+                "touched_files": &task_result.touched_files,
+            });
             emit_exec(
                 trace_sink.as_ref(),
-                ExecEvent::for_task(
+                ExecEvent::task(
                     run_id.clone(),
-                    subagent_trace_id.clone(),
-                    "completed",
-                    serde_json::json!({
-                        "output": &parent_facing,
-                        "terminal_status": task_result.status.as_str(),
-                        "contract_version": task_result.contract_version,
-                        "summary": task_result.summary,
-                        "artifacts": task_result.artifacts,
-                        "verification": task_result.verification,
-                        "remaining_work": task_result.remaining_work,
-                        "touched_files": task_result.touched_files,
-                    }),
+                    task_id.clone(),
+                    "task_completed",
+                    terminal_payload.clone(),
                 )
-                .with_agent(task.agent_role.clone())
-                .with_title(task.title.clone()),
+                .with_agent(task.agent_role.clone()),
             );
-            Ok((task_id, task_result))
+            if app_owns_subagent_events {
+                emit_exec(
+                    trace_sink.as_ref(),
+                    ExecEvent::subagent(
+                        run_id.clone(),
+                        task_id.clone(),
+                        execution_id.clone(),
+                        "completed",
+                        terminal_payload,
+                    )
+                    .with_agent(task.agent_role.clone()),
+                );
+            }
+            Ok(TaskDispatchSuccess {
+                task_id,
+                result: task_result,
+                full_output,
+            })
         }
         Err(e) => {
             let cancelled = task_cancel.is_cancelled() || e.contains("cancelled");
@@ -2377,6 +2406,7 @@ async fn execute_task(
                 &execution_id,
                 status.as_str(),
                 Some(&task_result),
+                Some(&e),
             ) {
                 tracing::warn!(
                     run_id = %run_id,
@@ -2392,26 +2422,40 @@ async fn execute_task(
                 error = %e,
                 "task_runtime: task failed"
             );
+            let terminal_payload = serde_json::json!({
+                "execution_id": &execution_id,
+                "error": &e,
+                "terminal_status": status.as_str(),
+                "contract_version": task_result.contract_version,
+                "summary": &task_result.summary,
+                "artifacts": &task_result.artifacts,
+                "verification": &task_result.verification,
+                "remaining_work": &task_result.remaining_work,
+                "touched_files": &task_result.touched_files,
+            });
             emit_exec(
                 trace_sink.as_ref(),
-                ExecEvent::for_task(
-                    run_id,
-                    subagent_trace_id,
-                    status.as_str(),
-                    serde_json::json!({
-                        "error": &e,
-                        "terminal_status": status.as_str(),
-                        "contract_version": task_result.contract_version,
-                        "summary": task_result.summary,
-                        "artifacts": task_result.artifacts,
-                        "verification": task_result.verification,
-                        "remaining_work": task_result.remaining_work,
-                        "touched_files": task_result.touched_files,
-                    }),
+                ExecEvent::task(
+                    run_id.clone(),
+                    task_id.clone(),
+                    "task_failed",
+                    terminal_payload.clone(),
                 )
-                .with_agent(task.agent_role.clone())
-                .with_title(task.title.clone()),
+                .with_agent(task.agent_role.clone()),
             );
+            if app_owns_subagent_events {
+                emit_exec(
+                    trace_sink.as_ref(),
+                    ExecEvent::subagent(
+                        run_id,
+                        task_id.clone(),
+                        execution_id,
+                        status.as_str(),
+                        terminal_payload,
+                    )
+                    .with_agent(task.agent_role.clone()),
+                );
+            }
             Err((task_id, e))
         }
     }
@@ -2562,8 +2606,17 @@ struct SubagentRuntimeContract {
     returns: String,
 }
 
-fn runtime_contract_started_payload(contract: &SubagentRuntimeContract) -> serde_json::Value {
+fn runtime_contract_started_payload(
+    contract: &SubagentRuntimeContract,
+    task: &PlanTask,
+    execution_id: &str,
+) -> serde_json::Value {
     serde_json::json!({
+        "execution_id": execution_id,
+        "kind": task.kind.as_str(),
+        "agent_role": task.agent_role,
+        "title": task.title,
+        "task": task.description,
         "prompt_source": contract.prompt_source,
         "isolation_requested": contract.isolation_requested,
         "context_in": contract.context_in,
@@ -2584,48 +2637,59 @@ fn runtime_isolation_observed_payload(
 fn emit_task_started(
     sink: Option<&ExecSink>,
     run_id: &str,
-    subagent_trace_id: &str,
+    execution_id: &str,
     task: &PlanTask,
     contract: &SubagentRuntimeContract,
 ) {
-    let mut payload = runtime_contract_started_payload(contract);
-    if let Some(payload) = payload.as_object_mut() {
-        payload.insert(
-            "kind".to_string(),
-            serde_json::Value::String(task.kind.as_str().to_string()),
-        );
-        payload.insert(
-            "agent_role".to_string(),
-            serde_json::Value::String(task.agent_role.clone()),
-        );
-    }
     emit_exec(
         sink,
-        ExecEvent::for_task(run_id, subagent_trace_id, "started", payload)
-            .with_agent(task.agent_role.clone())
-            .with_title(task.title.clone())
-            .with_task(task.description.clone()),
+        ExecEvent::task(
+            run_id,
+            task.id.clone(),
+            "task_started",
+            runtime_contract_started_payload(contract, task, execution_id),
+        )
+        .with_agent(task.agent_role.clone()),
     );
 }
 
-fn emit_task_isolation_observed(
+fn emit_primary_subagent_started(
     sink: Option<&ExecSink>,
     run_id: &str,
-    subagent_trace_id: &str,
+    execution_id: &str,
     task: &PlanTask,
     contract: &SubagentRuntimeContract,
-    isolation_observed: &str,
 ) {
     emit_exec(
         sink,
-        ExecEvent::for_task(
+        ExecEvent::subagent(
             run_id,
-            subagent_trace_id,
-            "isolation_observed",
-            runtime_isolation_observed_payload(contract, isolation_observed),
+            task.id.clone(),
+            execution_id,
+            "started",
+            runtime_contract_started_payload(contract, task, execution_id),
         )
-        .with_agent(task.agent_role.clone())
-        .with_title(task.title.clone()),
+        .with_agent(task.agent_role.clone()),
+    );
+}
+
+fn emit_primary_subagent_isolation_observed(
+    sink: Option<&ExecSink>,
+    run_id: &str,
+    execution_id: &str,
+    task: &PlanTask,
+    contract: &SubagentRuntimeContract,
+) {
+    emit_exec(
+        sink,
+        ExecEvent::subagent(
+            run_id,
+            task.id.clone(),
+            execution_id,
+            "isolation_observed",
+            runtime_isolation_observed_payload(contract, "primary"),
+        )
+        .with_agent(task.agent_role.clone()),
     );
 }
 
@@ -2932,8 +2996,7 @@ async fn run_main_agent_task(
     let run_id = run_id.to_string();
     let task_id = task.id.clone();
     let agent_role = task.agent_role.clone();
-    let title = task.title.clone();
-    let execution_id = format!("{}:{}", task.id, task.retry_count.saturating_add(1));
+    let execution_id = subagent_execution_id(&task.id, task.retry_count.saturating_add(1));
 
     // Rebuild a multimodal Message when the run carries user attachments, so
     // writer Subagents see the same images/files as the main agent (#1b).
@@ -3010,27 +3073,27 @@ async fn run_main_agent_task(
                             if in_thinking {
                                 emit_exec(
                                     trace_sink.as_ref(),
-                                    ExecEvent::for_task(
+                                    ExecEvent::subagent(
                                         run_id.clone(),
                                         task_id.clone(),
+                                        execution_id.clone(),
                                         "thinking_delta",
                                         serde_json::json!({ "content": content }),
                                     )
-                                    .with_agent(agent_role.clone())
-                                    .with_title(title.clone()),
+                                    .with_agent(agent_role.clone()),
                                 );
                             } else {
                                 output.push_str(&content);
                                 emit_exec(
                                     trace_sink.as_ref(),
-                                    ExecEvent::for_task(
+                                    ExecEvent::subagent(
                                         run_id.clone(),
                                         task_id.clone(),
+                                        execution_id.clone(),
                                         "token_delta",
                                         serde_json::json!({ "content": content }),
                                     )
-                                    .with_agent(agent_role.clone())
-                                    .with_title(title.clone()),
+                                    .with_agent(agent_role.clone()),
                                 );
                             }
                         }
@@ -3038,14 +3101,14 @@ async fn run_main_agent_task(
                             in_thinking = true;
                             emit_exec(
                                 trace_sink.as_ref(),
-                                ExecEvent::for_task(
+                                ExecEvent::subagent(
                                     run_id.clone(),
                                     task_id.clone(),
+                                    execution_id.clone(),
                                     "thinking_started",
                                     serde_json::json!({}),
                                 )
-                                .with_agent(agent_role.clone())
-                                .with_title(title.clone()),
+                                .with_agent(agent_role.clone()),
                             );
                         }
                         AgentEvent::ThinkEnd {
@@ -3055,17 +3118,17 @@ async fn run_main_agent_task(
                             in_thinking = false;
                             emit_exec(
                                 trace_sink.as_ref(),
-                                ExecEvent::for_task(
+                                ExecEvent::subagent(
                                     run_id.clone(),
                                     task_id.clone(),
+                                    execution_id.clone(),
                                     "thinking_ended",
                                     serde_json::json!({
                                         "prompt_tokens": prompt_tokens,
                                         "completion_tokens": completion_tokens,
                                     }),
                                 )
-                                .with_agent(agent_role.clone())
-                                .with_title(title.clone()),
+                                .with_agent(agent_role.clone()),
                             );
                         }
                         AgentEvent::LlmUsage {
@@ -3089,14 +3152,14 @@ async fn run_main_agent_task(
                             });
                             emit_exec(
                                 trace_sink.as_ref(),
-                                ExecEvent::for_task(
+                                ExecEvent::subagent(
                                     run_id.clone(),
                                     task_id.clone(),
+                                    execution_id.clone(),
                                     "usage",
                                     usage_payload,
                                 )
-                                .with_agent(agent_role.clone())
-                                .with_title(title.clone()),
+                                .with_agent(agent_role.clone()),
                             );
                         }
                         AgentEvent::ToolCall {
@@ -3126,9 +3189,10 @@ async fn run_main_agent_task(
                             }
                             emit_exec(
                                 trace_sink.as_ref(),
-                                ExecEvent::for_task(
+                                ExecEvent::subagent(
                                     run_id.clone(),
                                     task_id.clone(),
+                                    execution_id.clone(),
                                     "tool_started",
                                     serde_json::json!({
                                         "call_id": call_id,
@@ -3136,8 +3200,7 @@ async fn run_main_agent_task(
                                         "args": args,
                                     }),
                                 )
-                                .with_agent(agent_role.clone())
-                                .with_title(title.clone()),
+                                .with_agent(agent_role.clone()),
                             );
                         }
                         AgentEvent::ToolResult {
@@ -3179,9 +3242,10 @@ async fn run_main_agent_task(
                             }
                             emit_exec(
                                 trace_sink.as_ref(),
-                                ExecEvent::for_task(
+                                ExecEvent::subagent(
                                     run_id.clone(),
                                     task_id.clone(),
+                                    execution_id.clone(),
                                     "tool_completed",
                                     serde_json::json!({
                                         "call_id": call_id,
@@ -3190,8 +3254,7 @@ async fn run_main_agent_task(
                                         "success": true,
                                     }),
                                 )
-                                .with_agent(agent_role.clone())
-                                .with_title(title.clone()),
+                                .with_agent(agent_role.clone()),
                             );
                         }
                         AgentEvent::ToolError {
@@ -3228,9 +3291,10 @@ async fn run_main_agent_task(
                             }
                             emit_exec(
                                 trace_sink.as_ref(),
-                                ExecEvent::for_task(
+                                ExecEvent::subagent(
                                     run_id.clone(),
                                     task_id.clone(),
+                                    execution_id.clone(),
                                     "tool_completed",
                                     serde_json::json!({
                                         "call_id": call_id,
@@ -3240,8 +3304,7 @@ async fn run_main_agent_task(
                                         "failure": failure,
                                     }),
                                 )
-                                .with_agent(agent_role.clone())
-                                .with_title(title.clone()),
+                                .with_agent(agent_role.clone()),
                             );
                         }
                         AgentEvent::ToolStream {
@@ -3298,14 +3361,14 @@ async fn run_main_agent_task(
                             };
                             emit_exec(
                                 trace_sink.as_ref(),
-                                ExecEvent::for_task(
+                                ExecEvent::subagent(
                                     run_id.clone(),
                                     task_id.clone(),
+                                    execution_id.clone(),
                                     event_type,
                                     payload,
                                 )
-                                .with_agent(agent_role.clone())
-                                .with_title(title.clone()),
+                                .with_agent(agent_role.clone()),
                             );
                         }
                         AgentEvent::FinalAnswer(answer) => {
@@ -3345,19 +3408,6 @@ async fn run_main_agent_task(
             })
         })
         .await
-}
-
-fn unavailable_llm_usage_payload(reason: &'static str) -> serde_json::Value {
-    serde_json::json!({
-        "model": "unknown",
-        "prompt_tokens": 0,
-        "completion_tokens": 0,
-        "total_tokens": 0,
-        "cached_prompt_tokens": 0,
-        "cache_creation_prompt_tokens": 0,
-        "usage_reported": false,
-        "reason": reason,
-    })
 }
 
 /// RAII guard that releases file write locks when dropped (G5).
@@ -4041,7 +4091,15 @@ mod tests {
             context_in: "task context".to_string(),
             returns: "summary".to_string(),
         };
-        let started = runtime_contract_started_payload(&contract);
+        let task = PlanTask {
+            id: "task-1".to_string(),
+            title: "Implement change".to_string(),
+            description: "Update the runtime".to_string(),
+            kind: PlanTaskKind::Implementation,
+            agent_role: "implementer".to_string(),
+            ..PlanTask::default()
+        };
+        let started = runtime_contract_started_payload(&contract, &task, "task-1:2");
         if started.get("isolation").is_some() {
             return Err(
                 "legacy isolation field must not claim configured isolation happened".into(),
@@ -4056,6 +4114,9 @@ mod tests {
         }
         if started.get("isolation_observed").is_some() {
             return Err("started event must not invent observed isolation".into());
+        }
+        if started.get("execution_id").and_then(|value| value.as_str()) != Some("task-1:2") {
+            return Err("started event must preserve the attempt execution id".into());
         }
 
         let fallback = runtime_isolation_observed_payload(&contract, "primary-fallback");
@@ -4116,13 +4177,21 @@ mod tests {
             returns: "summary".to_string(),
         };
 
-        emit_task_started(Some(&sink), "run-1", "task-1", &task, &contract);
-        emit_task_isolation_observed(Some(&sink), "run-1", "task-1", &task, &contract, "primary");
+        emit_task_started(Some(&sink), "run-1", "task-1:1", &task, &contract);
+        emit_primary_subagent_started(Some(&sink), "run-1", "task-1:1", &task, &contract);
+        emit_primary_subagent_isolation_observed(
+            Some(&sink),
+            "run-1",
+            "task-1:1",
+            &task,
+            &contract,
+        );
         emit_exec(
             Some(&sink),
-            ExecEvent::for_task(
+            ExecEvent::subagent(
                 "run-1",
                 "task-1",
+                "task-1:1",
                 "completed",
                 serde_json::json!({"output": "done"}),
             ),
@@ -4130,15 +4199,24 @@ mod tests {
 
         let events = recorded.lock().unwrap_or_else(|error| error.into_inner());
         let event_names: Vec<&str> = events.iter().map(|event| event.event.as_str()).collect();
-        if event_names != ["started", "isolation_observed", "completed"] {
+        if event_names != ["task_started", "started", "isolation_observed", "completed"] {
             return Err(format!("unexpected event ordering: {event_names:?}"));
         }
         let started = events
-            .first()
+            .get(1)
             .ok_or_else(|| "missing started event".to_string())?;
         let observed = events
-            .get(1)
+            .get(2)
             .ok_or_else(|| "missing isolation observation".to_string())?;
+        if events.first().map(|event| event.scope) != Some(ExecEventScope::Task)
+            || events.get(1).map(|event| event.scope) != Some(ExecEventScope::Subagent)
+            || events
+                .get(1)
+                .and_then(|event| event.subagent_run_id.as_deref())
+                != Some("task-1:1")
+        {
+            return Err("task and Subagent event scopes were not separated".to_string());
+        }
         if started.payload.get("isolation").is_some() || observed.payload.get("isolation").is_some()
         {
             return Err("backend must not emit the legacy isolation field".to_string());
@@ -4574,12 +4652,14 @@ Read the runtime path and found one missing branch.
     use std::collections::HashMap as StdHashMap;
     use std::sync::Mutex as StdMutex;
 
+    type ScriptedDispatchResult = Result<(SubagentTaskResult, String), String>;
+
     /// A dispatcher that returns scripted results per task id and records the
     /// order tasks were dispatched. Semaphores/locks are ignored (the mock
     /// answers instantly).
     struct ScriptedDispatcher {
         /// task_id → result to return. Missing id → generic success.
-        results: StdMutex<StdHashMap<String, Result<SubagentTaskResult, String>>>,
+        results: StdMutex<StdHashMap<String, ScriptedDispatchResult>>,
         /// Dispatch order, appended as tasks are picked up.
         order: StdMutex<Vec<String>>,
         /// task_id → integration error returned after review.
@@ -4600,15 +4680,31 @@ Read the runtime path and found one missing branch.
         fn succeed(self: &Arc<Self>, id: &str, summary: &str) {
             self.results
                 .lock()
-                .unwrap()
-                .insert(id.into(), Ok(successful_task_result(summary)));
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(
+                    id.into(),
+                    Ok((successful_task_result(summary), summary.to_string())),
+                );
         }
         /// Script a structured terminal result for `id`.
         fn respond(self: &Arc<Self>, id: &str, result: SubagentTaskResult) {
+            let full_output = result.summary.clone();
             self.results
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .insert(id.into(), Ok(result));
+                .insert(id.into(), Ok((result, full_output)));
+        }
+        /// Script a bounded parent summary plus a distinct complete review output.
+        fn respond_with_output(
+            self: &Arc<Self>,
+            id: &str,
+            result: SubagentTaskResult,
+            full_output: &str,
+        ) {
+            self.results
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(id.into(), Ok((result, full_output.to_string())));
         }
         /// Script a failure result for `id`.
         fn fail(self: &Arc<Self>, id: &str, err: &str) {
@@ -4667,10 +4763,18 @@ Read the runtime path and found one missing branch.
                     return Err((task_id, "cancelled".into()));
                 }
                 match results {
-                    Some(Ok(result)) => Ok((task_id, result)),
+                    Some(Ok((result, full_output))) => Ok(TaskDispatchSuccess {
+                        task_id,
+                        result,
+                        full_output,
+                    }),
                     Some(Err(e)) => Err((task_id, e)),
                     // Default: generic success for unscripted tasks.
-                    None => Ok((task_id, successful_task_result("ok"))),
+                    None => Ok(TaskDispatchSuccess {
+                        task_id,
+                        result: successful_task_result("ok"),
+                        full_output: "ok".to_string(),
+                    }),
                 }
             })
         }
@@ -5026,6 +5130,65 @@ Read the runtime path and found one missing branch.
     }
 
     #[tokio::test]
+    async fn review_gate_receives_complete_output_instead_of_bounded_summary() -> Result<(), String>
+    {
+        use echo_agent::testing::MockLlmClient;
+
+        const FULL_OUTPUT_MARKER: &str = "COMPLETE-OUTPUT-AFTER-SUMMARY-BOUNDARY";
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let task = PlanTask {
+            id: "full-review".to_string(),
+            title: "Review complete analysis".to_string(),
+            description: "cover every requested section".to_string(),
+            kind: PlanTaskKind::Investigation,
+            agent_role: "explorer".to_string(),
+            acceptance_criteria: vec!["the final section is present".to_string()],
+            max_retries: 3,
+            ..PlanTask::default()
+        };
+        let run_id = seed_run(&store, vec![task.clone()]);
+        let dispatcher = ScriptedDispatcher::new();
+        let full_output = format!("{}\n{FULL_OUTPUT_MARKER}", "analysis ".repeat(180));
+        dispatcher.respond_with_output(
+            &task.id,
+            successful_task_result("bounded parent summary"),
+            &full_output,
+        );
+        let reviewer = Arc::new(MockLlmClient::new().with_response(
+            r#"{"outcome":"pass","summary":"complete","failure_fingerprint":null,"issues":[]}"#,
+        ));
+
+        let outcome = run_dag(
+            store,
+            dispatcher,
+            Some(reviewer.clone()),
+            &run_id,
+            vec![task],
+            ConcurrencyLimits::default(),
+            CancellationToken::new(),
+            None,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        if !matches!(outcome, RunOutcome::Completed) {
+            return Err(format!("reviewed run did not complete: {outcome:?}"));
+        }
+        let messages = reviewer
+            .last_messages()
+            .ok_or_else(|| "reviewer received no request".to_string())?;
+        let received_full_output = messages.iter().any(|message| {
+            message
+                .content
+                .as_text()
+                .is_some_and(|text| text.contains(FULL_OUTPUT_MARKER))
+        });
+        if !received_full_output {
+            return Err("review prompt omitted the complete Subagent output".to_string());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn run_dag_completes_single_task() {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().unwrap());
         let run_id = seed_run(&store, vec![solo_readonly_task("a")]);
@@ -5060,7 +5223,14 @@ Read the runtime path and found one missing branch.
             .map_err(|error| error.to_string())?;
         let recovered_result = successful_task_result("recovered summary");
         store
-            .record_subagent_released(&run_id, "a", "a:1", "completed", Some(&recovered_result))
+            .record_subagent_released(
+                &run_id,
+                "a",
+                "a:1",
+                "completed",
+                Some(&recovered_result),
+                Some("recovered full output"),
+            )
             .map_err(|error| error.to_string())?;
         let dispatcher = ScriptedDispatcher::new();
 
@@ -5517,7 +5687,9 @@ Read the runtime path and found one missing branch.
         assert!(
             events.iter().any(|event| {
                 event.event == "tool_started"
+                    && event.scope == ExecEventScope::Subagent
                     && event.task_id.as_deref() == Some("implementation-a")
+                    && event.subagent_run_id.as_deref() == Some("implementation-a:1")
                     && event.payload.get("name").and_then(|v| v.as_str()) == Some("mock_calc")
             }),
             "expected tool_started for mock_calc, got {events:?}"
@@ -5525,7 +5697,9 @@ Read the runtime path and found one missing branch.
         assert!(
             events.iter().any(|event| {
                 event.event == "tool_completed"
+                    && event.scope == ExecEventScope::Subagent
                     && event.task_id.as_deref() == Some("implementation-a")
+                    && event.subagent_run_id.as_deref() == Some("implementation-a:1")
                     && event.payload.get("success").and_then(|v| v.as_bool()) == Some(true)
                     && event
                         .payload

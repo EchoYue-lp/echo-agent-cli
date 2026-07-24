@@ -2,7 +2,7 @@
 //!
 //! These tests guard against regressions of the review findings:
 //!
-//! 1. `infra::create_runtime_state_store` actually creates a (file-backed)
+//! 1. `infra::create_runtime_state_store_in` actually creates a (file-backed)
 //!    runtime_state directory.
 //! 2. `AgentCreateParams::state_store + conversation_id` flow through the
 //!    builder so `agent.state_store()` is `Some` and `agent.conversation_id()`
@@ -33,24 +33,19 @@ fn make_app_config() -> AppConfig {
 }
 
 #[tokio::test]
-async fn create_runtime_state_store_creates_file_dir() {
-    // Override HOME so the helper writes into a tempdir and can't collide
-    // with the developer's real ~/.echo-agent/.
-    let tmp = tempfile::tempdir().unwrap();
-    // SAFETY: integration tests run in their own process; setting HOME here
-    // is constrained to this test binary's lifetime.
-    unsafe {
-        std::env::set_var("HOME", tmp.path());
+async fn create_runtime_state_store_creates_file_dir() -> Result<(), String> {
+    // Use the explicit base-dir entrypoint. Mutating HOME is process-global and
+    // races other integration tests that initialize the cached user data path.
+    let tmp = tempfile::tempdir().map_err(|error| error.to_string())?;
+    let base_dir = tmp.path().join(".echo-agent");
+    let _store = infra::create_runtime_state_store_in(&base_dir)
+        .ok_or_else(|| "create_runtime_state_store_in should succeed".to_string())?;
+
+    let dir = base_dir.join("runtime_state");
+    if !dir.is_dir() {
+        return Err("runtime_state/ dir must be created under the requested base path".to_string());
     }
-
-    let store = infra::create_runtime_state_store();
-    assert!(store.is_some(), "create_runtime_state_store should succeed");
-
-    let dir = tmp.path().join(".echo-agent/runtime_state");
-    assert!(
-        dir.exists(),
-        "runtime_state/ dir must be created at the canonical path"
-    );
+    Ok(())
 }
 
 #[tokio::test]

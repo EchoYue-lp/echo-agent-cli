@@ -1,10 +1,17 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
   pauseRun: vi.fn(),
   resumeRun: vi.fn(),
   resolveRecoveryTask: vi.fn(),
   patchPlan: vi.fn(),
+  latestRunForConversation: vi.fn(),
+  getPlan: vi.fn(),
+  listTodos: vi.fn(),
+  listArtifacts: vi.fn(),
+  listRecoveryBlockers: vi.fn(),
+  getRun: vi.fn(),
+  listEvents: vi.fn(),
 }));
 
 vi.mock('../api/endpoints', () => ({
@@ -13,6 +20,23 @@ vi.mock('../api/endpoints', () => ({
 
 import type { TaskPlan, TaskRun } from '../generated';
 import { useTaskRuntimeStore } from './taskRuntimeStore';
+
+function run(status: TaskRun['status']): TaskRun {
+  return {
+    run_id: 'run-1',
+    workspace_id: 'workspace-1',
+    conversation_id: 'conversation-1',
+    root_message_id: 'message-1',
+    domain_profile: 'ai_coding',
+    status,
+    goal: 'analyze project',
+    plan_id: 'plan-1',
+    route: 'formal_plan',
+    attended_mode: 'attended',
+    created_at: '2026-07-24T00:00:00Z',
+    updated_at: '2026-07-24T00:00:00Z',
+  };
+}
 
 describe('taskRuntimeStore recovery controls', () => {
   const refresh = vi.fn().mockResolvedValue(undefined);
@@ -85,5 +109,35 @@ describe('taskRuntimeStore recovery controls', () => {
       ],
     });
     expect(refresh).toHaveBeenCalledWith('run-1');
+  });
+});
+
+describe('taskRuntimeStore conversation loading', () => {
+  beforeEach(() => {
+    useTaskRuntimeStore.getState().reset();
+    vi.clearAllMocks();
+    mocks.getPlan.mockResolvedValue(null);
+    mocks.listTodos.mockResolvedValue([]);
+    mocks.listArtifacts.mockResolvedValue([]);
+    mocks.listRecoveryBlockers.mockResolvedValue([]);
+  });
+
+  afterEach(() => {
+    useTaskRuntimeStore.getState().reset();
+  });
+
+  it('starts polling for an active run and stops after loading its terminal snapshot', async () => {
+    mocks.latestRunForConversation.mockResolvedValueOnce(run('running'));
+
+    await useTaskRuntimeStore.getState().loadByConversation('conversation-1');
+
+    expect(useTaskRuntimeStore.getState().activeRun?.status).toBe('running');
+    expect(useTaskRuntimeStore.getState().pollingInterval).not.toBeNull();
+
+    mocks.latestRunForConversation.mockResolvedValueOnce(run('completed'));
+    await useTaskRuntimeStore.getState().loadByConversation('conversation-1');
+
+    expect(useTaskRuntimeStore.getState().activeRun?.status).toBe('completed');
+    expect(useTaskRuntimeStore.getState().pollingInterval).toBeNull();
   });
 });

@@ -14,6 +14,7 @@ describe('subagentRunStore terminal result', () => {
       task_id: 'task-1',
       agent: 'implementer',
       event: 'timed_out',
+      output: 'partial report body',
       terminal_status: 'timed_out',
       contract_version: 1,
       summary: 'subagent timed out after writing a partial report',
@@ -46,34 +47,56 @@ describe('subagentRunStore terminal result', () => {
 
     const run = useSubagentRunStore.getState().runs['task-1:1'];
     expect(run?.status).toBe('timed_out');
-    expect(run?.summary).toBe(event.summary);
-    expect(run?.artifacts).toEqual(event.artifacts);
-    expect(run?.verification).toEqual(event.verification);
-    expect(run?.remainingWork).toEqual(event.remaining_work);
-    expect(run?.touchedFiles).toEqual(event.touched_files);
+    expect(run?.finalOutput).toBe('partial report body');
+    expect(run?.result?.summary).toBe(event.summary);
+    expect(run?.result?.artifacts[0]?.path).toBe('/tmp/report.json');
+    expect(run?.result?.artifacts[0]?.bytes).toBe(42n);
+    expect(run?.result?.verification).toEqual(event.verification);
+    expect(run?.result?.remaining_work).toEqual(event.remaining_work);
+    expect(run?.result?.touched_files).toEqual(event.touched_files);
   });
 
-  it('keeps a reviewed writer running until worktree integration is terminal', () => {
+  it('keeps a terminal Subagent terminal when a duplicate started event arrives', () => {
     const base = {
       kind: 'subagent' as const,
-      subagent_run_id: 'task-merge',
+      subagent_run_id: 'task-merge:1',
       run_id: 'run-merge',
       task_id: 'task-merge',
       agent: 'implementer',
     };
-    useSubagentRunStore.getState().ingest({ ...base, event: 'completed' });
-    expect(useSubagentRunStore.getState().runs['task-merge']?.status).toBe('completed');
-
-    useSubagentRunStore.getState().ingest({ ...base, event: 'merge_started' });
-    expect(useSubagentRunStore.getState().runs['task-merge']?.status).toBe('running');
-
     useSubagentRunStore.getState().ingest({
       ...base,
-      event: 'merge_failed',
-      error: 'worktree merge conflict',
+      event: 'completed',
+      terminal_status: 'completed',
+      contract_version: 1,
+      summary: 'implementation finished',
+      artifacts: [],
+      verification: [],
+      remaining_work: [],
+      touched_files: { read: [], written: ['src/main.rs'] },
     });
-    const failed = useSubagentRunStore.getState().runs['task-merge'];
-    expect(failed?.status).toBe('failed');
-    expect(failed?.error).toBe('worktree merge conflict');
+    useSubagentRunStore.getState().ingest({ ...base, event: 'started' });
+
+    const completed = useSubagentRunStore.getState().runs['task-merge:1'];
+    expect(completed?.status).toBe('completed');
+    expect(completed?.result?.summary).toBe('implementation finished');
+  });
+
+  it('keeps retry attempts in separate SubagentRun records', () => {
+    const base = {
+      kind: 'subagent' as const,
+      run_id: 'run-retry',
+      task_id: 'task-retry',
+      agent: 'explorer',
+      event: 'started' as const,
+    };
+
+    useSubagentRunStore.getState().ingest({ ...base, subagent_run_id: 'task-retry:1' });
+    useSubagentRunStore.getState().ingest({ ...base, subagent_run_id: 'task-retry:2' });
+
+    expect(Object.keys(useSubagentRunStore.getState().runs).sort()).toEqual([
+      'task-retry:1',
+      'task-retry:2',
+    ]);
   });
 });

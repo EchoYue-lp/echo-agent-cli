@@ -106,18 +106,13 @@ export function useTauriChat() {
           const runId = String(payload.subagent_run_id ?? '');
           const prevStatus = runId ? useSubagentRunStore.getState().runs[runId]?.status : undefined;
           useSubagentRunStore.getState().ingest(payload as unknown as ExecutionEvent);
-          // Background subagent finished → inject a non-streaming chat note
-          // (Cursor/Claude Code style: don't interrupt the parent ReAct turn).
+          // Background Subagent completion is already represented by its
+          // message-bound execution card. Notify without appending a second
+          // assistant message that duplicates the terminal summary.
           if (runId && payload.event === 'completed') {
             const run = useSubagentRunStore.getState().runs[runId];
             if (run?.background && prevStatus !== 'completed') {
-              const summary =
-                (typeof payload.summary === 'string' && payload.summary.trim()) ||
-                (run.summary && run.summary.trim()) ||
-                (run.output && run.output.trim()) ||
-                '(no summary)';
-              const note = `[subagent ${run.agent || runId} finished]\n${summary}`;
-              useChatStore.getState().appendLocalAssistantNote(note);
+              useToastStore.getState().addToast('success', `Subagent ${run.agent || runId} 已完成`);
             }
           }
         } else if (kind === 'run' && payload.event === 'run_started') {
@@ -211,16 +206,6 @@ export function useTauriChat() {
         useTaskRuntimeStore
           .getState()
           .loadByConversation(conversation_id)
-          .then(() => {
-            const store = useTaskRuntimeStore.getState();
-            const run = store.activeRun;
-            if (
-              run &&
-              (run.status === 'pending' || run.status === 'running' || run.status === 'paused')
-            ) {
-              store.startPolling(run.run_id);
-            }
-          })
           .catch((e) => console.warn('[TauriChat] Failed to load task runtime:', e));
       }
     } catch (e) {

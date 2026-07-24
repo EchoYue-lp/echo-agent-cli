@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { TodoStatus } from '../../generated';
 import type { SubagentRunState } from '../../stores/subagentRunStore';
-import { displayedTodoStatus } from './TaskRuntimePanel';
+import { displayedTodoStatus, todoStatusDescription } from './TaskRuntimePanel';
 
 function run(status: SubagentRunState['status']): SubagentRunState {
   return {
@@ -64,6 +64,30 @@ describe('displayedTodoStatus', () => {
         run('completed'),
       ])
     ).toBe('blocked');
+  });
+
+  it('distinguishes completed Subagent execution from a blocked review', () => {
+    expect(
+      todoStatusDescription({ task_id: 'task-1', status: 'blocked' as TodoStatus }, [
+        run('completed'),
+      ])
+    ).toBe('执行已完成 · 评审未通过');
+  });
+
+  it('distinguishes completed Subagent execution from a later plan skip', () => {
+    expect(
+      todoStatusDescription({ task_id: 'task-1', status: 'skipped' as TodoStatus }, [
+        run('completed'),
+      ])
+    ).toBe('执行已完成 · 任务已跳过');
+  });
+
+  it('does not count a completed Subagent execution as task acceptance', () => {
+    expect(
+      todoStatusDescription({ task_id: 'task-1', status: 'pending' as TodoStatus }, [
+        run('completed'),
+      ])
+    ).toBe('执行已完成 · 任务待处理');
   });
 
   it('does NOT overwrite a persisted Failed status with Subagent completed', () => {
