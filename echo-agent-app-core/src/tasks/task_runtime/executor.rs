@@ -147,6 +147,14 @@ fn subagent_execution_id(task_id: &str, attempt: u32) -> String {
     format!("{task_id}:{attempt}")
 }
 
+fn task_isolation_id(run_id: &str, task_id: &str) -> String {
+    format!("{run_id}:{task_id}")
+}
+
+fn task_worktree_label(agent_role: &str, run_id: &str, task_id: &str) -> String {
+    format!("{agent_role}-{}", task_isolation_id(run_id, task_id))
+}
+
 /// Outcome of executing a whole run.
 #[derive(Debug, Clone)]
 pub enum RunOutcome {
@@ -899,7 +907,7 @@ impl TaskDispatcher for RealTaskDispatcher {
                 return Err("cancelled before worktree integration started".to_string());
             }
 
-            let label = format!("{}-{}", task.agent_role, execution_id);
+            let label = task_worktree_label(&task.agent_role, &run_id, &task.id);
             let ownership = super::planner::file_ownership(&task);
             let branch = super::worktree::fork_branch_name(&label);
             let _ = store.note(
@@ -2194,6 +2202,7 @@ async fn execute_task(
             store.clone(),
             &run_id,
             &execution_id,
+            &task_isolation_id(&run_id, &task_id),
             &task.agent_role,
             &task_input,
             prompt_payload.clone(),
@@ -2770,6 +2779,7 @@ async fn run_readonly_subagent(
                     run_id: Some(run_id.clone()),
                     turn_id: message_id.clone(),
                     execution_id: Some(execution_id),
+                    isolation_id: None,
                     message_id,
                     cancel: Some(Arc::new(cancel.clone())),
                     trace_sink: core_trace_sink,
@@ -2835,6 +2845,7 @@ async fn run_writer_subagent(
     store: Arc<TaskRuntimeStore>,
     run_id: &str,
     execution_id: &str,
+    isolation_id: &str,
     role: &str,
     task_input: &str,
     prompt_payload: serde_json::Value,
@@ -2864,6 +2875,7 @@ async fn run_writer_subagent(
             let role = role.to_string();
             let run_id = run_id.to_string();
             let execution_id = execution_id.to_string();
+            let isolation_id = isolation_id.to_string();
             let run_message = run_message.clone();
             let core_trace_sink = exec_trace_sink_to_core(trace_sink);
             Box::pin(async move {
@@ -2872,6 +2884,7 @@ async fn run_writer_subagent(
                     run_id: Some(run_id.clone()),
                     turn_id: root_message_id.clone(),
                     execution_id: Some(execution_id),
+                    isolation_id: Some(isolation_id),
                     message_id: root_message_id,
                     cancel: Some(Arc::new(cancel.clone())),
                     trace_sink: core_trace_sink,
@@ -3025,6 +3038,7 @@ async fn run_main_agent_task(
                         run_id: Some(run_id.clone()),
                         turn_id: root_message_id.clone(),
                         execution_id: Some(execution_id.clone()),
+                        isolation_id: None,
                         message_id: root_message_id,
                         cancel: Some(Arc::new(cancel.clone())),
                         trace_sink: exec_trace_sink_to_core(trace_sink.clone()),
@@ -3616,6 +3630,7 @@ pub async fn drive_agent_run(
                     run_id: Some(run_id_for_scope.clone()),
                     turn_id: message_id_for_scope.clone(),
                     execution_id: None,
+                    isolation_id: None,
                     message_id: message_id_for_scope.clone(),
                     cancel: Some(std::sync::Arc::new(cancel_for_scope.clone())),
                     trace_sink: core_trace_sink,

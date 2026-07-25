@@ -368,15 +368,66 @@ pub struct RunWorktree {
     pub path: PathBuf,
     /// Branch name (`eko-fork-<safe-label>`).
     pub branch: String,
-    /// Immutable base commit SHA resolved when the worktree was created.
+    /// Merge-base commit SHA resolved when the worktree was acquired.
     pub base: String,
 }
 
 impl RunWorktree {
+    /// Acquire the stable worktree for one logical writer task.
+    ///
+    /// A retained, unlocked checkout is reused across retries. An existing
+    /// branch whose checkout was pruned is materialized again. A locked
+    /// checkout is treated as active and is never shared concurrently.
+    pub fn acquire_fork(label: &str, repo_root: &Path) -> Result<Self, WorktreeError> {
+        let branch = fork_branch_name(label);
+        validate_branch_name(repo_root, &branch)?;
+
+        if let Some(existing) = find_worktree_info(repo_root, &branch)? {
+            if existing.locked {
+                return Err(WorktreeError::new(format!(
+                    "worktree for logical task {label} is already active at {}",
+                    existing.path
+                )));
+            }
+            let path = PathBuf::from(existing.path);
+            if path.exists() {
+                let base = run_git(repo_root, &["merge-base", "HEAD", &branch])?;
+                lock_worktree(repo_root, &path, label)?;
+                return Ok(Self {
+                    repo_root: repo_root.to_path_buf(),
+                    path,
+                    branch,
+                    base,
+                });
+            }
+            run_git(repo_root, &["worktree", "prune"])?;
+        }
+
+        if branch_exists(repo_root, &branch)? {
+            let path = default_worktree_path(repo_root, &branch)?;
+            validate_worktree_target(repo_root, &path)?;
+            let path_text = path
+                .to_str()
+                .ok_or_else(|| WorktreeError::new("worktree path is not valid UTF-8"))?;
+            run_git(repo_root, &["worktree", "add", path_text, &branch])?;
+            let path = path.canonicalize().unwrap_or(path);
+            let base = run_git(repo_root, &["merge-base", "HEAD", &branch])?;
+            lock_worktree(repo_root, &path, label)?;
+            return Ok(Self {
+                repo_root: repo_root.to_path_buf(),
+                path,
+                branch,
+                base,
+            });
+        }
+
+        Self::create_fork(label, repo_root)
+    }
+
     /// Create a worktree for a Fork-dispatched subagent (Sprint 8).
     ///
     /// Uses the [`FORK_BRANCH_PREFIX`] namespace. `label` identifies the
-    /// dispatch (e.g. `"{agent_name}-{run_id}"`).
+    /// logical task (e.g. `"{agent_name}-{run_id}:{task_id}"`).
     pub fn create_fork(label: &str, repo_root: &Path) -> Result<Self, WorktreeError> {
         let branch = fork_branch_name(label);
         validate_branch_name(repo_root, &branch)?;
@@ -392,18 +443,10 @@ impl RunWorktree {
             repo_root,
             &["worktree", "add", "-b", &branch, path_str, &base],
         )?;
+        let path = path.canonicalize().unwrap_or(path);
 
         // Lock so concurrent cleanup won't touch it (Claude Code pattern).
-        run_git(
-            repo_root,
-            &[
-                "worktree",
-                "lock",
-                path_str,
-                "--reason",
-                &format!("fork subagent {label} in progress"),
-            ],
-        )?;
+        lock_worktree(repo_root, &path, label)?;
 
         Ok(Self {
             repo_root: repo_root.to_path_buf(),
@@ -446,6 +489,13 @@ impl RunWorktree {
         Ok(format!(
             "=== Stat ===\n{stat}\n\n=== Full diff ===\n{full}\n\n=== Untracked files ===\n{untracked}"
         ))
+    }
+
+    /// Whether the checkout contains uncommitted files or commits not yet
+    /// reachable from the authoritative checkout.
+    pub fn has_changes(&self) -> Result<bool, WorktreeError> {
+        Ok(worktree_has_uncommitted_changes(&self.path)?
+            || branch_ahead_of_head(&self.repo_root, &self.branch)? > 0)
     }
 
     /// Release the lifecycle lock after the subagent has stopped.
@@ -541,11 +591,31 @@ pub fn integrate_fork_worktree(
         });
     }
 
-    let path = find_worktree_path(repo_root, &branch)?.ok_or_else(|| {
-        WorktreeError::new(format!(
-            "writer worktree not found for execution {execution_id} (branch {branch})"
-        ))
-    })?;
+    let path = find_worktree_path(repo_root, &branch)?;
+    let branch_exists = branch_exists(repo_root, &branch)?;
+    if !branch_exists && path.is_none() {
+        return Ok(WorktreeIntegrationOutcome {
+            status: WorktreeIntegrationStatus::NoChanges,
+            branch,
+            path: None,
+            changed_files: Vec::new(),
+            merge_commit: None,
+            cleanup_warning: None,
+        });
+    }
+
+    let path = match path {
+        Some(path) => path,
+        None => {
+            let path = default_worktree_path(repo_root, &branch)?;
+            validate_worktree_target(repo_root, &path)?;
+            let path_text = path
+                .to_str()
+                .ok_or_else(|| WorktreeError::new("worktree path is not valid UTF-8"))?;
+            run_git(repo_root, &["worktree", "add", path_text, &branch])?;
+            path.canonicalize().unwrap_or(path)
+        }
+    };
     integrate_existing_worktree(repo_root, branch, path, task_id, &trailer, ownership)
 }
 
@@ -812,11 +882,47 @@ fn main_dirty_paths(repo_root: &Path) -> Result<std::collections::BTreeSet<Strin
 }
 
 fn find_worktree_path(repo_root: &Path, branch: &str) -> Result<Option<PathBuf>, WorktreeError> {
+    Ok(find_worktree_info(repo_root, branch)?.map(|worktree| PathBuf::from(worktree.path)))
+}
+
+fn find_worktree_info(
+    repo_root: &Path,
+    branch: &str,
+) -> Result<Option<WorktreeInfo>, WorktreeError> {
     let output = run_git(repo_root, &["worktree", "list", "--porcelain"])?;
     Ok(parse_worktree_list(&output, repo_root)
         .into_iter()
-        .find(|worktree| worktree.branch == branch)
-        .map(|worktree| PathBuf::from(worktree.path)))
+        .find(|worktree| worktree.branch == branch))
+}
+
+fn branch_exists(repo_root: &Path, branch: &str) -> Result<bool, WorktreeError> {
+    let reference = format!("refs/heads/{branch}");
+    let output = git_output(repo_root, &["show-ref", "--verify", "--quiet", &reference])?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(output_error(
+            &["show-ref", "--verify", "--quiet", &reference],
+            &output,
+        )),
+    }
+}
+
+fn lock_worktree(repo_root: &Path, path: &Path, label: &str) -> Result<(), WorktreeError> {
+    let path = path
+        .to_str()
+        .ok_or_else(|| WorktreeError::new("worktree path is not valid UTF-8"))?;
+    run_git(
+        repo_root,
+        &[
+            "worktree",
+            "lock",
+            path,
+            "--reason",
+            &format!("fork subagent logical task {label} in progress"),
+        ],
+    )
+    .map(|_| ())
 }
 
 fn find_integration_commit(
@@ -897,8 +1003,13 @@ fn cleanup_managed_worktree(repo_root: &Path, path: &Path, branch: &str) -> Resu
         .to_str()
         .ok_or_else(|| "worktree path is not valid UTF-8".to_string())?;
     let _ = unlock_worktree(repo_root, path);
-    run_git(repo_root, &["worktree", "remove", "--force", path_text])
-        .map_err(|error| error.to_string())?;
+    run_git(repo_root, &["worktree", "remove", path_text]).map_err(|error| error.to_string())?;
+    let ahead = branch_ahead_of_head(repo_root, branch).map_err(|error| error.to_string())?;
+    if ahead > 0 {
+        return Err(format!(
+            "worktree removed but branch {branch} retained because it has {ahead} unique commit(s)"
+        ));
+    }
     run_git(repo_root, &["branch", "-D", branch]).map_err(|error| error.to_string())?;
     run_git(repo_root, &["worktree", "prune"])
         .map(|_| ())
@@ -1167,10 +1278,10 @@ pub fn cleanup_unattended_worktrees(
 // ── Fork-subagent worktree factory (Sprint 8) ────────────────────────────
 
 /// EKO's application-layer implementation of the framework's
-/// `WorktreeFactory` trait. Constructs a git worktree per Fork-dispatched
-/// writer subagent (via [`RunWorktree::create_fork`]) and finalizes with a
-/// `git diff` summary. TaskRuntime performs the later review/integration stage;
-/// the framework remains responsible only for isolated execution.
+/// `WorktreeFactory` trait. Acquires one git worktree per logical writer task
+/// (via [`RunWorktree::acquire_fork`]) and reuses it across retries. Finalize
+/// removes provably clean worktrees immediately and retains changed worktrees
+/// for TaskRuntime's later review/integration stage.
 ///
 /// Stored behind an `Arc` and injected into the framework's
 /// `AgentConfig.subagent_worktree_factory`, so the framework can create
@@ -1191,26 +1302,45 @@ impl echo_agent::agent::subagent::worktree::WorktreeFactory for EkoWorktreeFacto
         echo_agent::agent::subagent::worktree::WorktreeHandle,
         echo_agent::agent::subagent::worktree::WorktreeError,
     > {
-        // Build the worktree via the shared RunWorktree lifecycle. `create_fork`
+        // Build the worktree via the shared RunWorktree lifecycle. `acquire_fork`
         // runs blocking git subprocesses; Fork dispatch is already inside a
         // `tokio::spawn`, but the git ops themselves are short and synchronous
         // — acceptable. (If they ever block the runtime, wrap in
         // spawn_blocking inside the factory.)
-        let wt = RunWorktree::create_fork(label, &self.repo_root)
+        let wt = RunWorktree::acquire_fork(label, &self.repo_root)
             .map_err(|e| echo_agent::agent::subagent::worktree::WorktreeError::new(e.message))?;
         let path = wt.path.clone();
         tracing::info!(
             subagent_label = label,
             worktree = %path.display(),
             branch = %wt.branch,
-            "Created Fork-subagent worktree"
+            "Acquired Fork-subagent worktree"
         );
-        // `finalize` owns `wt`: generate the diff summary, then release the
-        // in-progress lock. The worktree stays on disk until TaskRuntime's
-        // explicit integration stage succeeds or a failure leaves it for review.
+        // `finalize` owns `wt`: clean checkouts are disposable and removed
+        // immediately; changed checkouts are summarized, unlocked, and retained
+        // for retry or review/integration.
         Ok(echo_agent::agent::subagent::worktree::WorktreeHandle {
             path,
             finalize: Box::new(move || {
+                let has_changes = match wt.has_changes() {
+                    Ok(has_changes) => has_changes,
+                    Err(error) => {
+                        let _ = wt.unlock();
+                        return Err(echo_agent::agent::subagent::worktree::WorktreeError::new(
+                            error.message,
+                        ));
+                    }
+                };
+                if !has_changes {
+                    cleanup_managed_worktree(&wt.repo_root, &wt.path, &wt.branch)
+                        .map_err(echo_agent::agent::subagent::worktree::WorktreeError::new)?;
+                    tracing::info!(
+                        worktree = %wt.path.display(),
+                        branch = %wt.branch,
+                        "Removed clean Fork-subagent worktree"
+                    );
+                    return Ok("(no worktree changes; clean checkout removed)".to_string());
+                }
                 let summary = wt.diff_summary();
                 let unlock = wt.unlock();
                 match (summary, unlock) {
@@ -1421,6 +1551,176 @@ mod tests {
             return Err("fork branch identity must be stable".to_string());
         }
         validate_branch_name(&repo, &first).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn fork_acquire_reuses_unlocked_dirty_worktree() -> Result<(), String> {
+        let (_temp, repo) = init_repo()?;
+        let label = "implementer-run-1:task-1";
+        let first = RunWorktree::acquire_fork(label, &repo).map_err(|error| error.to_string())?;
+        std::fs::write(first.path.join("retry.txt"), "first attempt\n")
+            .map_err(|error| error.to_string())?;
+        first.unlock().map_err(|error| error.to_string())?;
+
+        let second = RunWorktree::acquire_fork(label, &repo).map_err(|error| error.to_string())?;
+        if second.path != first.path || second.branch != first.branch {
+            return Err("retry acquired a different worktree".to_string());
+        }
+        let contents = std::fs::read_to_string(second.path.join("retry.txt"))
+            .map_err(|error| error.to_string())?;
+        if contents != "first attempt\n" {
+            return Err("retry did not preserve the previous attempt's changes".to_string());
+        }
+        second.unlock().map_err(|error| error.to_string())?;
+        std::fs::remove_file(second.path.join("retry.txt")).map_err(|error| error.to_string())?;
+        cleanup_managed_worktree(&repo, &second.path, &second.branch)
+    }
+
+    #[test]
+    fn clean_factory_finalize_removes_checkout_and_branch() -> Result<(), String> {
+        let (_temp, repo) = init_repo()?;
+        let label = "implementer-run-clean:task-clean";
+        let branch = fork_branch_name(label);
+        let factory = EkoWorktreeFactory::new(repo.clone());
+        let handle =
+            echo_agent::agent::subagent::worktree::WorktreeFactory::create(&factory, label)
+                .map_err(|error| error.to_string())?;
+        let path = handle.path.clone();
+        let summary = (handle.finalize)().map_err(|error| error.to_string())?;
+
+        if !summary.contains("clean checkout removed") {
+            return Err(format!("unexpected clean finalize summary: {summary}"));
+        }
+        if path.exists() {
+            return Err("clean worktree directory was retained".to_string());
+        }
+        if branch_exists(&repo, &branch).map_err(|error| error.to_string())? {
+            return Err("clean worktree branch was retained".to_string());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn dirty_factory_finalize_retains_and_unlocks_checkout() -> Result<(), String> {
+        let (_temp, repo) = init_repo()?;
+        let label = "implementer-run-dirty:task-dirty";
+        let factory = EkoWorktreeFactory::new(repo.clone());
+        let handle =
+            echo_agent::agent::subagent::worktree::WorktreeFactory::create(&factory, label)
+                .map_err(|error| error.to_string())?;
+        let path = handle.path.clone();
+        let dirty_path = path.join("dirty.txt");
+        std::fs::write(&dirty_path, "retain me\n").map_err(|error| error.to_string())?;
+        (handle.finalize)().map_err(|error| error.to_string())?;
+
+        let branch = fork_branch_name(label);
+        let info = find_worktree_info(&repo, &branch)
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "dirty worktree was removed".to_string())?;
+        if info.locked {
+            return Err("dirty worktree remained locked after finalize".to_string());
+        }
+        if !path.exists() {
+            return Err("dirty worktree directory was removed".to_string());
+        }
+        std::fs::remove_file(dirty_path).map_err(|error| error.to_string())?;
+        cleanup_managed_worktree(&repo, &path, &branch)
+    }
+
+    #[test]
+    fn automatic_cleanup_refuses_new_dirty_content() -> Result<(), String> {
+        let (_temp, repo) = init_repo()?;
+        let label = "implementer-cleanup-race";
+        let worktree = RunWorktree::create_fork(label, &repo).map_err(|error| error.to_string())?;
+        worktree.unlock().map_err(|error| error.to_string())?;
+        let dirty_path = worktree.path.join("late-change.txt");
+        std::fs::write(&dirty_path, "arrived after clean check\n")
+            .map_err(|error| error.to_string())?;
+
+        if cleanup_managed_worktree(&repo, &worktree.path, &worktree.branch).is_ok() {
+            return Err("automatic cleanup removed a dirty worktree".to_string());
+        }
+        if !dirty_path.exists() {
+            return Err("automatic cleanup lost newly written content".to_string());
+        }
+        std::fs::remove_file(dirty_path).map_err(|error| error.to_string())?;
+        cleanup_managed_worktree(&repo, &worktree.path, &worktree.branch)
+    }
+
+    #[test]
+    fn automatic_cleanup_retains_new_unique_commit() -> Result<(), String> {
+        let (_temp, repo) = init_repo()?;
+        let label = "implementer-cleanup-commit-race";
+        let worktree = RunWorktree::create_fork(label, &repo).map_err(|error| error.to_string())?;
+        worktree.unlock().map_err(|error| error.to_string())?;
+        std::fs::write(worktree.path.join("committed.txt"), "preserve commit\n")
+            .map_err(|error| error.to_string())?;
+        run_git(&worktree.path, &["add", "committed.txt"]).map_err(|error| error.to_string())?;
+        run_git(
+            &worktree.path,
+            &["-c", "commit.gpgsign=false", "commit", "-m", "late commit"],
+        )
+        .map_err(|error| error.to_string())?;
+
+        if cleanup_managed_worktree(&repo, &worktree.path, &worktree.branch).is_ok() {
+            return Err("automatic cleanup deleted a branch with unique commits".to_string());
+        }
+        if !branch_exists(&repo, &worktree.branch).map_err(|error| error.to_string())? {
+            return Err("automatic cleanup lost the unique commit branch".to_string());
+        }
+        if find_worktree_path(&repo, &worktree.branch)
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            return Err("clean committed checkout should have been released".to_string());
+        }
+        let outcome = integrate_fork_worktree(
+            &repo,
+            label,
+            "cleanup-commit-race",
+            "cleanup-commit-race:1",
+            &known_ownership(&["committed.txt"]),
+        )
+        .map_err(|error| error.to_string())?;
+        if outcome.status != WorktreeIntegrationStatus::Merged {
+            return Err(format!(
+                "orphan branch should integrate after materialization, got {:?}",
+                outcome.status
+            ));
+        }
+        if std::fs::read_to_string(repo.join("committed.txt")).map_err(|error| error.to_string())?
+            != "preserve commit\n"
+        {
+            return Err("orphan branch commit was not integrated".to_string());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cleaned_worktree_integrates_as_no_changes() -> Result<(), String> {
+        let (_temp, repo) = init_repo()?;
+        let label = "implementer-run-empty:task-empty";
+        let factory = EkoWorktreeFactory::new(repo.clone());
+        let handle =
+            echo_agent::agent::subagent::worktree::WorktreeFactory::create(&factory, label)
+                .map_err(|error| error.to_string())?;
+        (handle.finalize)().map_err(|error| error.to_string())?;
+
+        let outcome = integrate_fork_worktree(
+            &repo,
+            label,
+            "task-empty",
+            "task-empty:2",
+            &known_ownership(&["shared.txt"]),
+        )
+        .map_err(|error| error.to_string())?;
+        if outcome.status != WorktreeIntegrationStatus::NoChanges {
+            return Err(format!(
+                "cleaned worktree should integrate as no changes, got {:?}",
+                outcome.status
+            ));
+        }
+        Ok(())
     }
 
     #[test]

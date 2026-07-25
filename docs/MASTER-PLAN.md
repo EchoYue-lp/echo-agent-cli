@@ -1,6 +1,6 @@
 # EKO Master Plan
 
-Last updated: 2026-07-24
+Last updated: 2026-07-25
 
 This file is the cross-session source of truth for the coding, data analysis,
 academic research, and medical research expansion. Detailed design rationale
@@ -57,6 +57,7 @@ evidence, and the next bounded step.
 | Parallel Subagent instance and TaskRuntime routing | Complete | Sync/Fork/Teammate dispatches use fresh factory instances; Auto/Task delegation is forced through the formal plan so the right panel cannot be bypassed |
 | Revisioned dynamic plan runtime | Complete | `docs/2026-07-21-dynamic-plan-runtime.md`; atomic DAG creation, optimistic patches, split projections, safe-point reloads, and capability-scoped Subagents |
 | Unattended worktree lifecycle and review parity | Complete | `docs/2026-07-22-unattended-worktree-lifecycle.md`; application commit `61c8350` |
+| Logical-task worktree reuse and content-aware cleanup | Complete | `docs/2026-07-25-logical-task-worktree-reuse.md`; stable `{run_id}:{task_id}` isolation identity with attempt-scoped Subagent events |
 | Unified Subagent prompt compilation | Complete | framework commit `8f7904f`; `echo-agent-app-core/src/subagent_prompt.rs`; one registration-time system prompt and one typed invocation compiler across direct, planned, fork, teammate, and team dispatch |
 | Memory and self-evolution seam closure | Complete | `docs/2026-07-23-memory-self-evolution-closure.md`; replaceable workspace/hot-memory projections, one layered EKO write path, workspace-bound Curator, shared review integration, and stable compression dedup keys |
 | Subagent result projection and attempt identity | Complete | `docs/2026-07-17-subagent-results-and-completion.md`; full terminal output is separated from process metadata and persisted for review/recovery, referential summaries are recovered from the final thinking segment, TaskRuntime snapshots auto-poll to authoritative plan/task state, the right rail separates execution from acceptance, and `subagent_run_id` remains `{task_id}:{attempt}` |
@@ -106,10 +107,14 @@ for unsupported files or parser failure.
 Unattended execution no longer creates a duplicate run-level
 `eko-unattended-*` checkout. Read-only primary-Agent work stays in the
 authoritative checkout; mutation is forced through a formal writer PlanTask,
-whose existing `eko-fork-*` worktree is created at Subagent dispatch and
-cleaned after successful/no-change integration. Retained legacy branches are
-managed by one app-core review path surfaced in both GUI and TUI. See
-`docs/2026-07-22-unattended-worktree-lifecycle.md`.
+whose `eko-fork-*` worktree is keyed by `{run_id}:{task_id}` and reused across
+attempts. Attempt identity remains `{task_id}:{attempt}` for events and audit.
+Finalization removes a checkout immediately when Git proves it has no
+uncommitted files or unique commits; changed checkouts are unlocked and retained
+for retry, review, or integration. Retained legacy branches are managed by one
+app-core review path surfaced in both GUI and TUI. See
+`docs/2026-07-22-unattended-worktree-lifecycle.md` and
+`docs/2026-07-25-logical-task-worktree-reuse.md`.
 
 ### Formal Plan Execution
 
@@ -238,7 +243,7 @@ the same fact is not persisted twice. See
 ## Next Step
 
 Observe real long-running GUI/TUI/CLI task runs for revision-conflict,
-safe-point, and writer-worktree lifecycle telemetry. Review the nine retained
+safe-point, logical-task worktree reuse, and clean-finalize telemetry. Review the nine retained
 legacy `eko-unattended-*` branches through the new queue before explicitly
 cleaning them. Also sample real direct, planned, fork, teammate, and team
 Subagent runs through prompt diagnostics to confirm the expected section

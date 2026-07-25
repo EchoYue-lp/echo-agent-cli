@@ -376,6 +376,7 @@ async fn drive_chat_inner(
                 run_id: None,
                 turn_id: Some(turn_id.clone()),
                 execution_id: None,
+                isolation_id: None,
                 message_id: Some(turn_id),
                 cancel: Some(std::sync::Arc::new(cancel.clone())),
                 trace_sink: Some(framework_trace_sink_for(&sink)),
