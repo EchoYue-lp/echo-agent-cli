@@ -1,14 +1,6 @@
 import { create } from 'zustand';
-import type {
-  ChatMessage,
-  ApprovalRequest,
-  ToolExecution,
-  ExecutionRound,
-  ChatRunStatus,
-  ToolFailure,
-} from '../types/api';
+import type { ChatMessage, ApprovalRequest, ExecutionRound, ChatRunStatus } from '../types/api';
 import { useConversationStore } from './conversationStore';
-import { appendBoundedToolOutput } from '../lib/toolOutput';
 
 /** In-progress round being built during streaming */
 interface CurrentRound {
@@ -76,22 +68,7 @@ interface ChatState {
   appendToken: (id: string, token: string) => void;
   appendThinking: (id: string, token: string) => void;
   startThinkingSegment: (id: string) => void;
-  setToolCall: (callId: string, name: string, args: unknown) => void;
-  updateToolProgress: (callId: string, message: string, percent?: number) => void;
-  appendToolOutput: (callId: string, channel: 'stdout' | 'stderr' | 'log', chunk: string) => void;
-  completeToolStream: (
-    callId: string,
-    success: boolean,
-    metadata: Record<string, string>,
-    truncated: boolean,
-    failure?: ToolFailure | null
-  ) => void;
-  completeToolCall: (
-    callId: string,
-    result: string,
-    success: boolean,
-    failure?: ToolFailure | null
-  ) => void;
+  recordToolStart: (messageId: string, toolExecutionId: string) => void;
   startToolBatch: (toolCount: number) => void;
   endToolBatch: () => void;
   finalizeAssistantMessage: (id: string, content: string) => void;
@@ -102,7 +79,6 @@ interface ChatState {
   setThinking: (v: boolean) => void;
   setRunStatus: (status: ChatRunStatus) => void;
   markCancelled: () => void;
-  markRunningToolsFailed: (message: string) => void;
   setApprovalRequest: (r: ApprovalRequest | null) => void;
   setInputRequest: (r: { requestId: string; prompt?: string } | null) => void;
   setSelectionRequest: (r: ChatState['selectionRequest']) => void;
@@ -193,7 +169,6 @@ export const useChatStore = create<ChatState>((set, get) => ({
           role: 'assistant',
           content: '',
           thinkingSegments: [],
-          toolCalls: [],
           executionSteps: [],
           executionRounds: [],
           isStreaming: true,
@@ -217,10 +192,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         .filter((message) => {
           if (message.id !== assistantId || message.role !== 'assistant') return true;
           return Boolean(
-            message.content ||
-            message.thinkingSegments?.length ||
-            message.toolCalls?.length ||
-            message.executionSteps?.length
+            message.content || message.thinkingSegments?.length || message.executionSteps?.length
           );
         });
       return {
@@ -238,7 +210,6 @@ export const useChatStore = create<ChatState>((set, get) => ({
             role: 'assistant' as const,
             content: '',
             thinkingSegments: [],
-            toolCalls: [],
             executionSteps: [],
             executionRounds: [],
             isStreaming: true,
@@ -301,117 +272,32 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   setThinking: (v) => set({ isThinking: v, runStatus: v ? 'thinking' : get().runStatus }),
 
-  setToolCall: (callId, name, args) => {
+  recordToolStart: (messageId, toolExecutionId) => {
     set((s) => {
-      const tool: ToolExecution = {
-        id: callId,
-        name,
-        args,
-        result: '',
-        success: false,
-        status: 'running',
-        stdout: '',
-        stderr: '',
-        log: '',
-        startedAt: Date.now(),
-      };
-      // Record execution step NOW (at tool_start), not at tool_result time.
-      // This ensures correct chronological interleaving with thinking segments.
       const messages = s.messages.map((m) => {
-        if (!m.isStreaming) return m;
-        const toolCalls = [...(m.toolCalls || []), tool];
-        const executionSteps = [...(m.executionSteps || []), { type: 'tool' as const, callId }];
-        return { ...m, toolCalls, executionSteps };
+        if (m.id !== messageId) return m;
+        if (
+          m.executionSteps?.some((step) => step.type === 'tool' && step.callId === toolExecutionId)
+        ) {
+          return m;
+        }
+        const executionSteps = [
+          ...(m.executionSteps || []),
+          { type: 'tool' as const, callId: toolExecutionId },
+        ];
+        return { ...m, executionSteps };
       });
-      // Also add tool to current round for round-based rendering
       const currentRound = s.currentRound
-        ? { ...s.currentRound, toolCallIds: [...s.currentRound.toolCallIds, callId] }
-        : { toolCallIds: [callId] };
+        ? {
+            ...s.currentRound,
+            toolCallIds: s.currentRound.toolCallIds.includes(toolExecutionId)
+              ? s.currentRound.toolCallIds
+              : [...s.currentRound.toolCallIds, toolExecutionId],
+          }
+        : { toolCallIds: [toolExecutionId] };
       return { messages, currentRound, runStatus: 'using_tool' };
     });
-  },
-
-  updateToolProgress: (callId, message, percent) => {
-    set((s) => {
-      const update = (tool: ToolExecution) =>
-        tool.id === callId ? { ...tool, progress: { message, percent } } : tool;
-      return {
-        messages: s.messages.map((m) =>
-          m.isStreaming ? { ...m, toolCalls: (m.toolCalls || []).map(update) } : m
-        ),
-        currentRound: s.currentRound,
-      };
-    });
-  },
-
-  appendToolOutput: (callId, channel, chunk) => {
-    set((s) => {
-      const update = (tool: ToolExecution): ToolExecution => {
-        if (tool.id !== callId) return tool;
-        const appended = appendBoundedToolOutput(tool[channel], chunk);
-        return {
-          ...tool,
-          [channel]: appended.value,
-          truncated: tool.truncated || appended.truncated,
-        };
-      };
-      return {
-        messages: s.messages.map((m) =>
-          m.isStreaming ? { ...m, toolCalls: (m.toolCalls || []).map(update) } : m
-        ),
-        currentRound: s.currentRound,
-      };
-    });
-  },
-
-  completeToolStream: (callId, success, metadata, truncated, failure) => {
-    set((s) => {
-      const update = (tool: ToolExecution): ToolExecution =>
-        tool.id === callId
-          ? tool.status === 'running'
-            ? {
-                ...tool,
-                success,
-                status: success ? 'succeeded' : 'failed',
-                metadata,
-                failure: failure ?? tool.failure,
-                truncated: tool.truncated || truncated,
-                finishedAt: Date.now(),
-              }
-            : tool
-          : tool;
-      return {
-        messages: s.messages.map((m) =>
-          m.isStreaming ? { ...m, toolCalls: (m.toolCalls || []).map(update) } : m
-        ),
-        currentRound: s.currentRound,
-      };
-    });
-  },
-
-  completeToolCall: (callId, result, success, failure) => {
-    set((s) => {
-      const update = (tool: ToolExecution): ToolExecution => {
-        if (tool.id !== callId) return tool;
-        return {
-          ...tool,
-          result,
-          success: tool.status === 'running' ? success : tool.success,
-          status: tool.status === 'running' ? (success ? 'succeeded' : 'failed') : tool.status,
-          finishedAt: tool.finishedAt ?? Date.now(),
-          stdout: success && !tool.stdout ? result : tool.stdout,
-          stderr: !success && !tool.stderr ? result : tool.stderr,
-          failure: failure ?? tool.failure,
-        };
-      };
-      return {
-        messages: s.messages.map((m) => {
-          if (!m.isStreaming) return m;
-          return { ...m, toolCalls: (m.toolCalls || []).map(update) };
-        }),
-        currentRound: s.currentRound,
-      };
-    });
+    scheduleAutoSave();
   },
 
   /** Start a new tool batch (received tool_batch_start event from backend) */
@@ -449,6 +335,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         return { ...m, executionRounds };
       }),
     }));
+    scheduleAutoSave();
   },
 
   finalizeAssistantMessage: (id, content) => {
@@ -508,35 +395,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
               ...m,
               isStreaming: false,
               content: m.content || '',
-              toolCalls: (m.toolCalls || []).map((tool) =>
-                tool.status === 'running'
-                  ? { ...tool, status: 'cancelled' as const, finishedAt: Date.now() }
-                  : tool
-              ),
             }
           : m
       ),
     }));
     scheduleAutoSave();
-  },
-
-  markRunningToolsFailed: (message) => {
-    set((s) => ({
-      messages: s.messages.map((m) => ({
-        ...m,
-        toolCalls: (m.toolCalls || []).map((tool) =>
-          tool.status === 'running'
-            ? {
-                ...tool,
-                status: 'failed' as const,
-                success: false,
-                stderr: tool.stderr || message,
-                finishedAt: Date.now(),
-              }
-            : tool
-        ),
-      })),
-    }));
   },
 
   setApprovalRequest: (r) =>

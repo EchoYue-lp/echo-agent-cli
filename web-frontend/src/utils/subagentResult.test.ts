@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { SubagentRunState } from '../stores/subagentRunStore';
-import { subagentResultPresentation, withoutPromotedThinking } from './subagentResult';
+import { subagentResultPresentation } from './subagentResult';
 
 function completedRun(overrides: Partial<SubagentRunState> = {}): SubagentRunState {
   return {
@@ -44,53 +44,7 @@ describe('subagentResultPresentation', () => {
     });
   });
 
-  it('promotes the last substantial thinking block when the terminal output only refers above', () => {
-    const actualResult = '# Analysis result\n\n' + 'Evidence-backed detail. '.repeat(12);
-    const run = completedRun({
-      finalOutput: '见上方分析结果。',
-      result: {
-        contract_version: 0,
-        status: 'completed',
-        summary: '见上方分析结果。',
-        artifacts: [],
-        verification: [],
-        remaining_work: [],
-        touched_files: { read: [], written: [] },
-      },
-      events: [
-        {
-          kind: 'subagent',
-          subagent_run_id: 'task-1:1',
-          run_id: 'run-1',
-          task_id: 'task-1',
-          agent: 'explorer',
-          event: 'thinking_delta',
-          content: actualResult,
-        },
-        {
-          kind: 'subagent',
-          subagent_run_id: 'task-1:1',
-          run_id: 'run-1',
-          task_id: 'task-1',
-          agent: 'explorer',
-          event: 'thinking_ended',
-        },
-      ],
-    });
-
-    expect(subagentResultPresentation(run)).toEqual({
-      text: actualResult.trim(),
-      promotedThinking: actualResult.trim(),
-    });
-  });
-
-  it('removes only the promoted result block from execution steps', () => {
-    const steps = [
-      { type: 'thinking', content: 'initial reasoning' },
-      { type: 'tool', content: 'read files' },
-      { type: 'thinking', content: 'final report' },
-    ];
-
-    expect(withoutPromotedThinking(steps, 'final report')).toEqual(steps.slice(0, 2));
+  it('falls back to the terminal summary when no full output is available', () => {
+    expect(subagentResultPresentation(completedRun())).toEqual({ text: 'self-contained summary' });
   });
 });

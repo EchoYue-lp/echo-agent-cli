@@ -1,5 +1,11 @@
 # M6 超长工具日志 Artifact
 
+> 2026-07-25 更新:本文的框架 artifact writer、metadata 和 retention 合同继续有效。
+> GUI 会话投影、详情入口和读取策略已由
+> `docs/2026-07-25-gui-tool-execution-lazy-loading.md` 取代:前端只持有不透明
+> `detail_ref`,由应用层 repository 统一分页读取实时 JSONL 或框架 artifact,不再直接
+> 接收物理 `artifact_path`。
+
 ## 目标
 
 当 stdout、stderr 或通用工具结果超过 1 MiB 时，保留完整可访问日志，同时保证模型上下文、conversation 文件、trace 和三端 UI 只携带有界投影与 artifact 引用。artifact 缺失是存储状态，不改变原工具的成功/失败终态。

@@ -4,7 +4,7 @@ import type { SubagentRunState } from '../../stores/subagentRunStore';
 import { SubagentDetailView } from './SubagentDetailView';
 
 describe('SubagentDetailView', () => {
-  it('shows the complete terminal output without protocol or process metadata', () => {
+  it('shows the complete terminal output without protocol metadata', () => {
     const actualResult = '# Complete architecture report\n\n' + 'User-facing details. '.repeat(12);
     const run: SubagentRunState = {
       subagentRunId: 'task-1:1',
@@ -13,8 +13,7 @@ describe('SubagentDetailView', () => {
       agent: 'explorer',
       status: 'completed',
       startedAt: 1,
-      streamedText: 'streamed final text',
-      finalOutput: '见上方分析结果。',
+      finalOutput: `${actualResult}\n\n## Result\n\n\`\`\`json\n{"contract_version":1,"summary":"done"}\n\`\`\``,
       result: {
         contract_version: 0,
         status: 'completed',
@@ -24,35 +23,14 @@ describe('SubagentDetailView', () => {
         remaining_work: [],
         touched_files: { read: ['Cargo.toml'], written: [] },
       },
-      events: [
-        {
-          kind: 'subagent',
-          subagent_run_id: 'task-1:1',
-          run_id: 'run-1',
-          task_id: 'task-1',
-          agent: 'explorer',
-          event: 'thinking_delta',
-          content: actualResult,
-        },
-        {
-          kind: 'subagent',
-          subagent_run_id: 'task-1:1',
-          run_id: 'run-1',
-          task_id: 'task-1',
-          agent: 'explorer',
-          event: 'thinking_ended',
-        },
-      ],
+      events: [],
     };
 
-    const html = renderToStaticMarkup(
-      <SubagentDetailView run={run} allRuns={[run]} onBack={() => undefined} />
-    );
+    const html = renderToStaticMarkup(<SubagentDetailView run={run} onBack={() => undefined} />);
 
     expect(html).toContain('Complete architecture report');
     expect(html).toContain('User-facing details');
     expect(html).not.toContain('见上方分析结果');
-    expect(html).not.toContain('streamed final text');
     expect(html).not.toContain('## Result');
     expect(html).not.toContain('Cargo.toml');
   });

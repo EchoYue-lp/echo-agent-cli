@@ -1,5 +1,9 @@
 # M7 Subagent 结构化结果与真实完成判定
 
+> 2026-07-25 更新:完整 terminal output 仍是结果事实源,但 GUI 不再接收或保存
+> thinking/token 原文,也不再把 thinking 提升为结果。Subagent 的执行过程现在只展示
+> `docs/2026-07-25-gui-tool-execution-lazy-loading.md` 定义的统一工具行。
+
 ## 目标
 
 M7 将 Subagent 的“执行已经结束”和父任务的“需求已经满足”拆成两个独立事实。框架记录执行终态与结构化证据；EKO 根据 PlanTask 声明的必需产物、验证项和未解决问题决定 task/run 是否可以进入 `completed`。模型文本中出现“完成”不构成完成依据。
@@ -118,13 +122,11 @@ Skipped 是显式放弃的任务事实，不伪装成成功；存在 Skipped 时
   重新打开该 execution。retry 必须创建下一个 attempt id。
 
 UI 默认展示 terminal event 的完整 `output`，并移除末尾内部 `## Result` JSON
-协议块；`summary` 只作为没有完整 output 时的 fallback。若 provider 把完整交付物
-错误地放进最后一段 thinking，而 terminal output/summary 只写“见上方”或
-“see above”，应用提升该 thinking 段为结果，并从执行细节中移除同一段，避免结果
-为空或在两个 tab 重复。prompt compiler 同时要求 final answer 与 summary 都必须
-自包含，不得引用“上方”内容。
+协议块；`summary` 只作为没有完整 output 时的 fallback。GUI 不保存 thinking/token
+原文,因此不会从推理轨迹猜测或提升结果。prompt compiler 要求 final answer 与
+summary 都必须自包含,不得引用“上方”内容。
 
-`touched_files` 是执行过程元数据，展示在执行细节，不再跟在最终结果下面；
+`touched_files` 是结构化结果元数据,不混入工具执行过程；
 verification/artifacts/remaining_work 仍属于结构化终态。Subagent terminal records
 不再按 5 分钟定时 GC，因为 TaskRuntime 的 Pending 投影可能依赖这些生命周期事实。
 TaskRuntime conversation snapshot 在 `run_started`、应用恢复和会话切换时统一启动
@@ -147,8 +149,8 @@ summary，不能覆盖更晚 plan revision 的 skip/reset。右侧栏分别展�
 - GUI/TUI/CLI 对同一 terminal fixture 展示相同 status、summary、verification、remaining_work 和 artifacts。
 - 同一 task 的 attempt 1/2 保持两条独立 SubagentRun；默认 UI 只投影最新 attempt。
 - merge/task 事件不能改变 Subagent terminal status；terminal execution 不能被重复 started 重开。
-- terminal output 中的内部 `## Result` 协议不出现在结果页；“见上方”终态会提升最后一段有效 thinking，且执行细节不再重复该段。
-- `touched_files` 只出现在执行细节；结果页只展示交付物和结构化终态信息。
+- terminal output 中的内部 `## Result` 协议不出现在结果页；结果页不读取或提升 thinking。
+- 执行过程只展示统一工具行；`touched_files` 不混入该工具列表。
 - 完成状态经过任意等待时间、TaskRuntime 自动刷新和 terminal store retention 后保持 completed，不得退回 Pending。
 - review prompt 必须包含 summary 边界之后的完整 output；重启恢复后使用持久化 output 得到相同评审输入。
 - plan revision 的 skip/reset 必须覆盖更早 TaskBlocked 事件；右侧栏同时标明执行与验收状态。

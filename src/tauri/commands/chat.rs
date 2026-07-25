@@ -8,14 +8,17 @@ use crate::tauri::state::TauriState;
 use echo_agent::agent::CancellationToken;
 use echo_agent::human_loop::{HumanLoopProvider, HumanLoopRequest, HumanLoopResponse};
 use echo_agent::prelude::AgentEvent;
-use echo_agent::tools::{ToolFailure, ToolOutputChannel, ToolStreamEvent};
+use echo_agent::tools::{ToolOutputChannel, ToolStreamEvent};
 use echo_agent_app_core::chat_driver::ChatDriverEvent;
 use echo_agent_app_core::chat_driver::ChatSink;
 use echo_agent_app_core::tasks::task_runtime::executor::{ExecEvent, ExecEventScope};
+use echo_agent_app_core::tool_execution::{
+    ToolExecutionDetailChannel, ToolExecutionOwner, ToolExecutionSummary,
+};
 use futures::future::BoxFuture;
 use serde::Serialize;
-use std::collections::HashMap;
-use std::sync::{Arc, LazyLock};
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, LazyLock, Mutex as StdMutex, MutexGuard as StdMutexGuard};
 use tauri::Emitter;
 use tokio::sync::{Mutex, oneshot};
 use uuid::Uuid;
@@ -50,40 +53,6 @@ pub enum ChatEvent {
         after_count: usize,
         before_tokens: usize,
         after_tokens: usize,
-    },
-    #[serde(rename = "tool_start")]
-    ToolStart {
-        call_id: String,
-        name: String,
-        args: serde_json::Value,
-    },
-    #[serde(rename = "tool_progress")]
-    ToolProgress {
-        call_id: String,
-        message: String,
-        percent: Option<u8>,
-    },
-    #[serde(rename = "tool_output")]
-    ToolOutput {
-        call_id: String,
-        channel: String,
-        chunk: String,
-    },
-    #[serde(rename = "tool_complete")]
-    ToolComplete {
-        call_id: String,
-        success: bool,
-        metadata: std::collections::HashMap<String, String>,
-        truncated: bool,
-        failure: Option<ToolFailure>,
-    },
-    #[serde(rename = "tool_result")]
-    ToolResult {
-        call_id: String,
-        name: String,
-        result: String,
-        success: bool,
-        failure: Option<ToolFailure>,
     },
     #[serde(rename = "tool_batch_start")]
     ToolBatchStart { tool_count: usize },
@@ -180,7 +149,7 @@ fn emit_chat_event(
 /// (`{task_id}:{attempt}`), never the stable PlanTask id. For non-Subagent
 /// events pass `""`; this function only attaches the field for `kind ==
 /// "subagent"`.
-fn emit_execution_event(
+pub(crate) fn emit_execution_event(
     app: &tauri::AppHandle,
     run_id: &str,
     kind: &str,
@@ -210,6 +179,31 @@ fn emit_execution_event(
         }
     }
     let _ = app.emit("execution://event", serde_json::Value::Object(map));
+}
+
+pub(crate) fn emit_tool_execution_summary(
+    app: &tauri::AppHandle,
+    event: &str,
+    agent: &str,
+    summary: &ToolExecutionSummary,
+) -> bool {
+    let payload = match serde_json::to_value(summary) {
+        Ok(payload) => payload,
+        Err(error) => {
+            tracing::warn!(%error, "failed to serialize tool execution summary");
+            return false;
+        }
+    };
+    emit_execution_event(
+        app,
+        summary.run_id.as_deref().unwrap_or(""),
+        "tool",
+        event,
+        agent,
+        "",
+        payload,
+    );
+    true
 }
 
 /// Global pending map for approval/input responses.
@@ -621,6 +615,9 @@ pub async fn send_chat_message(
         app: app.clone(),
         message_key: message_key.clone(),
         conversation_id: conversation_id.clone(),
+        tool_executions: state.app_state.storage.tool_executions.clone(),
+        tool_completions: StdMutex::new(HashMap::new()),
+        active_tool_ids: StdMutex::new(HashSet::new()),
     });
     // Signal the chat-turn lifecycle so the GUI shows the spinner / terminal
     // badge. Ordinary chat turns are not TaskRuntime runs.
@@ -870,12 +867,200 @@ struct TauriChatSink {
     app: tauri::AppHandle,
     message_key: String,
     conversation_id: Option<String>,
+    tool_executions: Arc<echo_agent_app_core::tool_execution::ToolExecutionRepository>,
+    tool_completions: StdMutex<HashMap<String, PendingToolCompletion>>,
+    active_tool_ids: StdMutex<HashSet<String>>,
+}
+
+#[derive(Default)]
+struct PendingToolCompletion {
+    metadata: HashMap<String, String>,
+    truncated: bool,
+}
+
+impl TauriChatSink {
+    fn tool_owner(&self) -> ToolExecutionOwner {
+        ToolExecutionOwner::Chat {
+            message_id: self.message_key.clone(),
+        }
+    }
+
+    fn cancel_active_tools(&self, owner: &ToolExecutionOwner) {
+        let call_ids = lock_std(&self.active_tool_ids, "active GUI tools")
+            .drain()
+            .collect::<Vec<_>>();
+        for call_id in call_ids {
+            match self.tool_executions.cancel(owner, &call_id) {
+                Ok(summary) => {
+                    let _ = emit_tool_execution_summary(
+                        &self.app,
+                        "cancelled",
+                        "echo-assistant",
+                        &summary,
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(%error, %call_id, "failed to cancel persisted tool");
+                }
+            }
+        }
+    }
+
+    fn handle_tool_event(&self, event: &AgentEvent) -> Option<bool> {
+        let owner = self.tool_owner();
+        match event {
+            AgentEvent::ToolCall {
+                call_id,
+                name,
+                args,
+            } => {
+                let _ = emit_chat_event(
+                    &self.app,
+                    &ChatEvent::RunStatus {
+                        status: "using_tool".to_string(),
+                    },
+                    &self.message_key,
+                    &self.conversation_id,
+                );
+                let summary = match self.tool_executions.start(
+                    owner,
+                    self.conversation_id.as_deref(),
+                    Some(&self.message_key),
+                    call_id,
+                    name,
+                    args,
+                ) {
+                    Ok(summary) => summary,
+                    Err(error) => {
+                        tracing::warn!(%error, %call_id, %name, "failed to persist tool start");
+                        return Some(true);
+                    }
+                };
+                lock_std(&self.active_tool_ids, "active GUI tools").insert(call_id.clone());
+                Some(emit_tool_execution_summary(
+                    &self.app,
+                    "started",
+                    "echo-assistant",
+                    &summary,
+                ))
+            }
+            AgentEvent::ToolStream {
+                call_id,
+                event: ToolStreamEvent::Output { channel, chunk },
+                ..
+            } => {
+                let detail_channel = match channel {
+                    ToolOutputChannel::Stdout => ToolExecutionDetailChannel::Stdout,
+                    ToolOutputChannel::Stderr => ToolExecutionDetailChannel::Stderr,
+                    ToolOutputChannel::Log => ToolExecutionDetailChannel::Log,
+                };
+                if let Err(error) =
+                    self.tool_executions
+                        .append_output(&owner, call_id, detail_channel, chunk)
+                {
+                    tracing::warn!(%error, %call_id, "failed to persist tool output chunk");
+                }
+                Some(true)
+            }
+            AgentEvent::ToolStream {
+                call_id,
+                event: ToolStreamEvent::Complete(result),
+                ..
+            } => {
+                lock_std(&self.tool_completions, "GUI tool completions").insert(
+                    call_id.clone(),
+                    PendingToolCompletion {
+                        metadata: result.metadata.clone(),
+                        truncated: result.truncated,
+                    },
+                );
+                Some(true)
+            }
+            AgentEvent::ToolStream { .. } => Some(true),
+            AgentEvent::ToolResult {
+                call_id, output, ..
+            } => {
+                let completion = lock_std(&self.tool_completions, "GUI tool completions")
+                    .remove(call_id)
+                    .unwrap_or_default();
+                let summary = match self.tool_executions.finish(
+                    &owner,
+                    call_id,
+                    true,
+                    output,
+                    None,
+                    completion.metadata,
+                    completion.truncated,
+                ) {
+                    Ok(summary) => summary,
+                    Err(error) => {
+                        tracing::warn!(%error, %call_id, "failed to persist tool completion");
+                        return Some(true);
+                    }
+                };
+                lock_std(&self.active_tool_ids, "active GUI tools").remove(call_id);
+                Some(emit_tool_execution_summary(
+                    &self.app,
+                    "finished",
+                    "echo-assistant",
+                    &summary,
+                ))
+            }
+            AgentEvent::ToolError {
+                call_id,
+                error,
+                failure,
+                ..
+            } => {
+                let completion = lock_std(&self.tool_completions, "GUI tool completions")
+                    .remove(call_id)
+                    .unwrap_or_default();
+                let summary = match self.tool_executions.finish(
+                    &owner,
+                    call_id,
+                    false,
+                    error,
+                    Some(failure.clone()),
+                    completion.metadata,
+                    completion.truncated,
+                ) {
+                    Ok(summary) => summary,
+                    Err(persist_error) => {
+                        tracing::warn!(%persist_error, %call_id, "failed to persist tool failure");
+                        return Some(true);
+                    }
+                };
+                lock_std(&self.active_tool_ids, "active GUI tools").remove(call_id);
+                Some(emit_tool_execution_summary(
+                    &self.app,
+                    "finished",
+                    "echo-assistant",
+                    &summary,
+                ))
+            }
+            AgentEvent::Cancelled | AgentEvent::Error { .. } => {
+                self.cancel_active_tools(&owner);
+                None
+            }
+            _ => None,
+        }
+    }
+}
+
+fn lock_std<'a, T>(mutex: &'a StdMutex<T>, label: &str) -> StdMutexGuard<'a, T> {
+    mutex.lock().unwrap_or_else(|poisoned| {
+        tracing::warn!(%label, "GUI tool projection lock was poisoned; recovering state");
+        poisoned.into_inner()
+    })
 }
 
 impl echo_agent_app_core::chat_driver::ChatSink for TauriChatSink {
     fn on_event(&self, event: ChatDriverEvent) -> bool {
         match event {
             ChatDriverEvent::Agent(event) => {
+                if let Some(emitted) = self.handle_tool_event(&event.payload) {
+                    return emitted;
+                }
                 let chat_event = agent_event_to_chat_event(
                     &self.app,
                     &event.payload,
@@ -1028,81 +1213,13 @@ fn agent_event_to_chat_event(
             before_tokens: *before_tokens,
             after_tokens: *after_tokens,
         },
-        AgentEvent::ToolCall {
-            call_id,
-            name,
-            args,
-        } => {
-            let _ = emit_chat_event(
-                app,
-                &ChatEvent::RunStatus {
-                    status: "using_tool".to_string(),
-                },
-                message_key,
-                conversation_id,
-            );
-            ChatEvent::ToolStart {
-                call_id: call_id.clone(),
-                name: name.clone(),
-                args: args.clone(),
-            }
-        }
-        AgentEvent::ToolStream {
-            call_id,
-            event: ToolStreamEvent::Progress { message, percent },
-            ..
-        } => ChatEvent::ToolProgress {
-            call_id: call_id.clone(),
-            message: message.clone(),
-            percent: *percent,
-        },
-        AgentEvent::ToolStream {
-            call_id,
-            event: ToolStreamEvent::Output { channel, chunk },
-            ..
-        } => ChatEvent::ToolOutput {
-            call_id: call_id.clone(),
-            channel: match channel {
-                ToolOutputChannel::Stdout => "stdout",
-                ToolOutputChannel::Stderr => "stderr",
-                ToolOutputChannel::Log => "log",
-            }
-            .to_string(),
-            chunk: chunk.clone(),
-        },
-        AgentEvent::ToolStream {
-            call_id,
-            event: ToolStreamEvent::Complete(result),
-            ..
-        } => ChatEvent::ToolComplete {
-            call_id: call_id.clone(),
-            success: result.success,
-            metadata: result.metadata.clone(),
-            truncated: result.truncated,
-            failure: result.failure.clone(),
-        },
-        AgentEvent::ToolResult {
-            call_id,
-            name,
-            output,
-        } => ChatEvent::ToolResult {
-            call_id: call_id.clone(),
-            name: name.clone(),
-            result: output.clone(),
-            success: true,
-            failure: None,
-        },
-        AgentEvent::ToolError {
-            call_id,
-            name,
-            error,
-            failure,
-        } => ChatEvent::ToolResult {
-            call_id: call_id.clone(),
-            name: name.clone(),
-            result: error.clone(),
-            success: false,
-            failure: Some(failure.clone()),
+        AgentEvent::ToolCall { .. }
+        | AgentEvent::ToolStream { .. }
+        | AgentEvent::ToolResult { .. }
+        | AgentEvent::ToolError { .. } => ChatEvent::Notice {
+            level: "warning".to_string(),
+            code: "tool_event_projection_bypassed".to_string(),
+            message: "Tool event bypassed the durable execution projection".to_string(),
         },
         AgentEvent::ToolBatchStart { tool_count } => ChatEvent::ToolBatchStart {
             tool_count: *tool_count,
@@ -1164,68 +1281,5 @@ fn agent_event_to_chat_event(
             code: "unknown_agent_event".to_string(),
             message: format!("{other:?}"),
         },
-    }
-}
-
-#[cfg(test)]
-mod tool_transport_tests {
-    use super::ChatEvent;
-    use echo_agent::tools::{ToolFailure, ToolFailureCategory};
-
-    #[test]
-    fn tool_output_transport_preserves_call_id_and_channel() -> Result<(), String> {
-        for channel in ["stdout", "stderr", "log"] {
-            let value = serde_json::to_value(ChatEvent::ToolOutput {
-                call_id: "call-42".to_string(),
-                channel: channel.to_string(),
-                chunk: "你好🙂".to_string(),
-            })
-            .map_err(|error| error.to_string())?;
-            assert_eq!(
-                value.get("type").and_then(serde_json::Value::as_str),
-                Some("tool_output")
-            );
-            assert_eq!(
-                value.get("call_id").and_then(serde_json::Value::as_str),
-                Some("call-42")
-            );
-            assert_eq!(
-                value.get("channel").and_then(serde_json::Value::as_str),
-                Some(channel)
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn tool_failure_transport_preserves_recovery_contract() -> Result<(), String> {
-        let value = serde_json::to_value(ChatEvent::ToolResult {
-            call_id: "call-7".to_string(),
-            name: "web_search".to_string(),
-            result: "temporary outage".to_string(),
-            success: false,
-            failure: Some(
-                ToolFailure::new(ToolFailureCategory::Transient)
-                    .retryable()
-                    .with_retry_after(500),
-            ),
-        })
-        .map_err(|error| error.to_string())?;
-
-        assert_eq!(
-            value
-                .get("failure")
-                .and_then(|failure| failure.get("category"))
-                .and_then(serde_json::Value::as_str),
-            Some("transient")
-        );
-        assert_eq!(
-            value
-                .get("failure")
-                .and_then(|failure| failure.get("recovery"))
-                .and_then(serde_json::Value::as_str),
-            Some("retry")
-        );
-        Ok(())
     }
 }

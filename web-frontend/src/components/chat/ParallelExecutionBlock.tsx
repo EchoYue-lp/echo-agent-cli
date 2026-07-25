@@ -79,7 +79,6 @@ export const ParallelExecutionBlock = memo(function ParallelExecutionBlock({
         <SubagentStreamBlock
           key={w.subagentRunId}
           run={w}
-          allRuns={Object.values(runs).filter((x) => x.runId === w.runId)}
           taskTitle={plan?.tasks.find((task) => task.id === w.taskId)?.title}
         />
       ))}

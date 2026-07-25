@@ -1,9 +1,9 @@
 import { create } from 'zustand';
 import { useChatStore } from './chatStore';
-import { sessionApi, conversationApi } from '../api/endpoints';
+import { sessionApi, conversationApi, toolExecutionApi } from '../api/endpoints';
 import { useToastStore } from './toastStore';
-import type { ChatMessage, ExecutionStep, ToolExecution } from '../types/api';
-import { appendBoundedToolOutput } from '../lib/toolOutput';
+import { useToolExecutionStore } from './toolExecutionStore';
+import type { ChatMessage, ExecutionStep, SavedMessage } from '../types/api';
 
 // ── Types ──
 
@@ -91,24 +91,12 @@ function generateId(): string {
   return `conv-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
-function chatMessagesToSaved(messages: ChatMessage[]) {
-  const saved: {
-    role: string;
-    content: string;
-    tool_calls?: { id: string; name: string; arguments: string }[];
-    thinking_segments?: string[];
-    execution_steps?: { type: string; index?: number; call_id?: string }[];
-    execution_rounds?: {
-      thinking?: { content: string };
-      tools: NonNullable<ChatMessage['toolCalls']>;
-    }[];
-    tool_result?: string;
-    attachments?: { name: string; mime_type: string; url: string; size: number }[];
-  }[] = [];
+function chatMessagesToSaved(messages: ChatMessage[]): SavedMessage[] {
+  const saved: SavedMessage[] = [];
 
   for (const m of messages) {
     // Save the main message
-    const entry: (typeof saved)[0] = {
+    const entry: SavedMessage = {
       role: m.role,
       content: m.content,
     };
@@ -129,22 +117,9 @@ function chatMessagesToSaved(messages: ChatMessage[]) {
 
     // Save execution rounds (round-based model with thinking + parallel tools)
     if (m.executionRounds && m.executionRounds.length > 0) {
-      const toolsById = new Map((m.toolCalls || []).map((tool) => [tool.id, tool]));
       entry.execution_rounds = m.executionRounds.map((r) => ({
         thinking: r.thinking ? { content: r.thinking.content } : undefined,
-        tools: r.toolCallIds
-          .map((callId) => toolsById.get(callId))
-          .filter((tool): tool is ToolExecution => tool != null)
-          .map(finalToolProjection),
-      }));
-    }
-
-    // Save tool calls with stable IDs and results
-    if (m.toolCalls && m.toolCalls.length > 0) {
-      entry.tool_calls = m.toolCalls.map((tc, i) => ({
-        id: tc.id || `tc-${m.id}-${i}`,
-        name: tc.name,
-        arguments: typeof tc.args === 'string' ? tc.args : JSON.stringify(tc.args || {}),
+        tool_call_ids: [...r.toolCallIds],
       }));
     }
 
@@ -162,55 +137,6 @@ function chatMessagesToSaved(messages: ChatMessage[]) {
   }
 
   return saved;
-}
-
-export function finalToolProjection(tool: ToolExecution): ToolExecution {
-  const stdout = appendBoundedToolOutput('', tool.stdout);
-  const stderr = appendBoundedToolOutput('', tool.stderr);
-  const log = appendBoundedToolOutput('', tool.log);
-  const running = tool.status === 'running';
-  return {
-    ...tool,
-    status: running ? 'cancelled' : tool.status,
-    success: running ? false : tool.success,
-    stdout: stdout.value,
-    stderr: stderr.value,
-    log: log.value,
-    truncated: tool.truncated || stdout.truncated || stderr.truncated || log.truncated,
-    finishedAt: tool.finishedAt || Date.now(),
-  };
-}
-
-export function mergeRestoredToolCalls(
-  restoredTools: ToolExecution[] | undefined,
-  savedTools: { id: string; name: string; arguments: string }[],
-  now = Date.now()
-): ToolExecution[] {
-  const restoredById = new Map((restoredTools || []).map((tool) => [tool.id, tool]));
-  return savedTools.map((saved) => {
-    const restored = restoredById.get(saved.id);
-    if (restored) return restored;
-
-    let args: unknown;
-    try {
-      args = JSON.parse(saved.arguments);
-    } catch {
-      args = saved.arguments;
-    }
-    return {
-      id: saved.id,
-      name: saved.name,
-      args,
-      result: '',
-      success: true,
-      status: 'succeeded',
-      stdout: '',
-      stderr: '',
-      log: '',
-      startedAt: now,
-      finishedAt: now,
-    };
-  });
 }
 
 // ── Store ──
@@ -302,7 +228,11 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
     set({ isLoading: true });
 
     try {
-      const record = await conversationApi.get(id);
+      const [record, tools] = await Promise.all([
+        conversationApi.get(id),
+        toolExecutionApi.list(id),
+      ]);
+      useToolExecutionStore.getState().replaceAll(tools);
 
       // Restore agent context on the backend so conversation can continue
       try {
@@ -311,130 +241,61 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
         console.error('Failed to restore agent context:', e);
       }
 
-      // Convert saved messages to chat messages for frontend display.
-      // Include tool messages to show the full thinking chain (tool calls + results).
-      const chatMessages: ChatMessage[] = record.messages.map((m, idx) => {
-        const base: ChatMessage = {
-          // P2-7: 此前用 `loaded-${Date.now()}-${idx}`, 每次加载产生不同 id,
-          // React key 变化导致消息列表全量重渲染。改用会话 id + 索引, 同一会话
-          // 每次加载产生确定性 id, key 稳定。timestamp 仍用 now (无服务端时间)。
-          id: `loaded-${id}-${idx}`,
-          role: (m.role === 'tool' ? 'assistant' : m.role) as 'user' | 'assistant',
-          content: m.content || '',
-          isStreaming: false,
-          timestamp: Date.now(),
-        };
-
-        // Restore thinking segments
-        if (m.thinking_segments && m.thinking_segments.length > 0) {
-          base.thinkingSegments = m.thinking_segments.map((s) => ({ content: s }));
-        }
-
-        // Restore execution rounds (round-based model).
-        // Typed via the SavedMessage shape instead of `any` (P1-40).
-        if (m.execution_rounds && m.execution_rounds.length > 0) {
-          type ExecutionRoundTool = {
-            id?: string;
-            name: string;
-            args: unknown;
-            result: string;
-            success: boolean;
-            status?: 'running' | 'succeeded' | 'failed' | 'cancelled';
-            stdout?: string;
-            stderr?: string;
-            log?: string;
-            startedAt?: number;
-            finishedAt?: number;
-            truncated?: boolean;
-            metadata?: Record<string, string>;
+      // Convert user/assistant messages for display. Tool-role payloads stay in
+      // the agent context; the GUI renders tools from lightweight summaries.
+      const chatMessages: ChatMessage[] = record.messages
+        .filter((message) => message.role === 'user' || message.role === 'assistant')
+        .map((m, idx) => {
+          const base: ChatMessage = {
+            // P2-7: 此前用 `loaded-${Date.now()}-${idx}`, 每次加载产生不同 id,
+            // React key 变化导致消息列表全量重渲染。改用会话 id + 索引, 同一会话
+            // 每次加载产生确定性 id, key 稳定。timestamp 仍用 now (无服务端时间)。
+            id: `loaded-${id}-${idx}`,
+            role: m.role as 'user' | 'assistant',
+            content: m.content || '',
+            isStreaming: false,
+            timestamp: Date.now(),
           };
-          type ExecutionRound = {
-            thinking?: { content: string };
-            tools: ExecutionRoundTool[];
-          };
-          const restoredTools = new Map<string, ToolExecution>();
-          base.executionRounds = (m.execution_rounds as ExecutionRound[]).map((r, roundIndex) => {
-            const toolCallIds = (r.tools || []).map((t, toolIndex) => {
-              const id = t.id || `restored-${roundIndex}-${toolIndex}`;
-              restoredTools.set(id, {
-                id,
-                name: t.name,
-                args: t.args || {},
-                result: t.result || '',
-                success: t.success ?? true,
-                status: t.status === 'running' ? 'cancelled' : t.status || 'succeeded',
-                stdout: t.stdout || (t.success === false ? '' : t.result || ''),
-                stderr: t.stderr || (t.success === false ? t.result || '' : ''),
-                log: t.log || '',
-                startedAt: t.startedAt || Date.now(),
-                finishedAt: t.finishedAt || Date.now(),
-                truncated: t.truncated,
-                metadata: t.metadata,
-              });
-              return id;
-            });
-            return {
-              thinking: r.thinking ? { content: r.thinking.content } : undefined,
-              toolCallIds,
-            };
-          });
-          base.toolCalls = [...restoredTools.values()];
-        }
 
-        // Restore every stable tool call. execution_rounds may omit the final
-        // batch when a chat hands off to TaskRuntime, so use its rich records
-        // where available and fill any missing calls from tool_calls.
-        if (m.role === 'assistant' && m.tool_calls && m.tool_calls.length > 0) {
-          base.toolCalls = mergeRestoredToolCalls(base.toolCalls, m.tool_calls);
-        }
+          // Restore thinking segments
+          if (m.thinking_segments && m.thinking_segments.length > 0) {
+            base.thinkingSegments = m.thinking_segments.map((s) => ({ content: s }));
+          }
 
-        // Restore chronological order. New records reference stable call IDs;
-        // old records with tool indexes are converted at the boundary.
-        if (m.execution_steps && m.execution_steps.length > 0) {
-          base.executionSteps = m.execution_steps.reduce<ExecutionStep[]>((steps, step) => {
-            if (step.type === 'thinking' && step.index != null) {
-              steps.push({ type: 'thinking', index: step.index });
-            }
-            if (step.type === 'tool') {
-              const callId = step.call_id || base.toolCalls?.[step.index ?? -1]?.id;
-              if (callId) steps.push({ type: 'tool', callId });
-            }
-            return steps;
-          }, []);
-        }
+          // Restore execution rounds (round-based model).
+          // Typed via the SavedMessage shape instead of `any` (P1-40).
+          if (m.execution_rounds && m.execution_rounds.length > 0) {
+            base.executionRounds = m.execution_rounds.map((round) => ({
+              thinking: round.thinking ? { content: round.thinking.content } : undefined,
+              toolCallIds: [...round.tool_call_ids],
+            }));
+          }
 
-        // Restore attachments (data URLs) so images/files render on reload.
-        if (m.attachments && m.attachments.length > 0) {
-          base.attachments = m.attachments.map((a) => ({
-            name: a.name,
-            mime_type: a.mime_type,
-            url: a.url,
-            size: a.size,
-          }));
-        }
+          // Restore chronological order using stable tool execution IDs.
+          if (m.execution_steps && m.execution_steps.length > 0) {
+            base.executionSteps = m.execution_steps.reduce<ExecutionStep[]>((steps, step) => {
+              if (step.type === 'thinking' && step.index != null) {
+                steps.push({ type: 'thinking', index: step.index });
+              }
+              if (step.type === 'tool' && step.call_id) {
+                steps.push({ type: 'tool', callId: step.call_id });
+              }
+              return steps;
+            }, []);
+          }
 
-        // For tool result messages, show as assistant with tool result content
-        if (m.role === 'tool') {
-          base.content = m.tool_result || m.content || '';
-          base.toolCalls = [
-            {
-              id: `restored-tool-${Date.now()}`,
-              name: 'tool',
-              args: {},
-              result: m.tool_result || m.content || '',
-              success: true,
-              status: 'succeeded',
-              stdout: m.tool_result || m.content || '',
-              stderr: '',
-              log: '',
-              startedAt: Date.now(),
-              finishedAt: Date.now(),
-            },
-          ];
-        }
+          // Restore attachments (data URLs) so images/files render on reload.
+          if (m.attachments && m.attachments.length > 0) {
+            base.attachments = m.attachments.map((a) => ({
+              name: a.name,
+              mime_type: a.mime_type,
+              url: a.url,
+              size: a.size,
+            }));
+          }
 
-        return base;
-      });
+          return base;
+        });
 
       const chatStore = useChatStore.getState();
       chatStore.replaceMessages(chatMessages);
@@ -458,6 +319,7 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
       return;
     }
 
+    const wasActive = get().activeId === id;
     set((s) => {
       const conversations = s.conversations.filter((c) => c.id !== id);
       return {
@@ -465,6 +327,10 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
         activeId: s.activeId === id ? null : s.activeId,
       };
     });
+    if (wasActive) {
+      useChatStore.getState().clearMessages();
+      useToolExecutionStore.getState().clear();
+    }
   },
 
   renameConversation: async (id: string, title: string) => {
@@ -502,6 +368,7 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
 
     // Always clear — this is the user's expected outcome
     useChatStore.getState().clearMessages();
+    useToolExecutionStore.getState().clear();
     set({ activeId: null });
   },
 
@@ -513,6 +380,7 @@ export const useConversationStore = create<ConversationState>((set, get) => ({
     }
 
     useChatStore.getState().clearMessages();
+    useToolExecutionStore.getState().clear();
     set({ activeId: null });
   },
 

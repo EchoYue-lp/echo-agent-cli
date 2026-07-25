@@ -46,10 +46,10 @@ pub struct SavedMessage {
     /// for correct chronological interleaving when loading from history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_steps: Option<Vec<SavedExecutionStep>>,
-    /// Final UI projection for thinking/tool rounds. Incremental chunks are
-    /// folded into bounded terminal state before this value is persisted.
+    /// Lightweight UI ordering for thinking/tool rounds. Tool payloads live in
+    /// the application-owned tool execution repository; this stores IDs only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub execution_rounds: Option<serde_json::Value>,
+    pub execution_rounds: Option<Vec<SavedExecutionRound>>,
     /// User-uploaded attachments (images/documents) attached to this message.
     /// Stored as a data URL so the message renders identically on reload.
     /// None or empty for non-multimodal messages.
@@ -80,6 +80,19 @@ pub struct SavedExecutionStep {
     pub call_id: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct SavedExecutionRound {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<SavedRoundThinking>,
+    #[serde(default)]
+    pub tool_call_ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct SavedRoundThinking {
+    pub content: String,
+}
+
 /// Combined payload stored in attachments_json (backward compatible).
 /// Old format: `["thinking1", "thinking2"]` (plain array)
 /// New format: `{"thinking_segments": [...], "execution_steps": [...], "attachments": [...]}`
@@ -90,7 +103,7 @@ pub struct AttachmentsPayload {
     #[serde(default)]
     pub execution_steps: Vec<SavedExecutionStep>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub execution_rounds: Option<serde_json::Value>,
+    pub execution_rounds: Option<Vec<SavedExecutionRound>>,
     /// Real user-uploaded attachments (images/documents). Despite the column
     /// name `attachments_json` historically holding thinking segments, this key
     /// holds the actual attachment data URL so messages render on reload.
@@ -399,17 +412,13 @@ mod tests {
     }
 
     #[test]
-    fn attachments_payload_round_trips_tool_execution_projection() {
-        let rounds = serde_json::json!([{
-            "tools": [{
-                "id": "call-1",
-                "name": "shell",
-                "status": "succeeded",
-                "stdout": "done",
-                "stderr": "",
-                "metadata": {"exit_code": "0", "duration_ms": "1250"}
-            }]
-        }]);
+    fn attachments_payload_round_trips_tool_execution_ids() {
+        let rounds = vec![SavedExecutionRound {
+            thinking: Some(SavedRoundThinking {
+                content: "inspect".to_string(),
+            }),
+            tool_call_ids: vec!["detail-1".to_string()],
+        }];
         let payload = AttachmentsPayload {
             thinking_segments: Vec::new(),
             execution_steps: Vec::new(),

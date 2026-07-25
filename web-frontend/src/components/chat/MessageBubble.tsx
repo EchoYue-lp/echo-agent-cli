@@ -1,11 +1,10 @@
 import { useState, memo } from 'react';
-import type { ChatMessage, ExecutionRound, ToolExecution } from '../../types/api';
+import type { ChatMessage, ExecutionRound } from '../../types/api';
 import { Bot, Copy, Check, RefreshCw, Pencil, X, ArrowUp, File, Download } from 'lucide-react';
 import MarkdownContent from '../common/MarkdownContent';
 import { ThinkingSegment } from './ThinkingSegment';
 import { InlineToolCall } from './InlineToolCall';
 import { ParallelExecutionBlock } from './ParallelExecutionBlock';
-import { isSubagentDispatchTool } from './tools/toolRenderers';
 
 interface MessageBubbleProps {
   message: ChatMessage;
@@ -50,7 +49,7 @@ function isImageFile(mime: string): boolean {
 interface FlatStep {
   type: 'thinking' | 'tool';
   thinkingContent?: string;
-  toolCall?: ToolExecution;
+  toolId?: string;
   toolIndex: number;
 }
 
@@ -66,24 +65,18 @@ export function flattenSteps(message: ChatMessage): { steps: FlatStep[]; thinkin
         thinkingTotal++;
       }
       round.toolCallIds.forEach((callId) => {
-        const tc = message.toolCalls?.find((tool) => tool.id === callId);
-        if (tc && !isSubagentDispatchTool(tc.name)) {
-          renderedToolIds.add(callId);
-          steps.push({ type: 'tool', toolCall: tc, toolIndex: steps.length });
-        }
+        renderedToolIds.add(callId);
+        steps.push({ type: 'tool', toolId: callId, toolIndex: steps.length });
       });
     });
 
     // A final tool batch may not have reached executionRounds when the chat
-    // stream hands off to TaskRuntime. executionSteps is written at tool_start,
-    // so append only calls that the completed rounds did not already project.
+    // stream hands off to TaskRuntime. executionSteps records the started tool
+    // summary, so append only calls that completed rounds did not already project.
     message.executionSteps?.forEach((step) => {
       if (step.type !== 'tool' || renderedToolIds.has(step.callId)) return;
-      const tc = message.toolCalls?.find((tool) => tool.id === step.callId);
-      if (tc && !isSubagentDispatchTool(tc.name)) {
-        renderedToolIds.add(step.callId);
-        steps.push({ type: 'tool', toolCall: tc, toolIndex: steps.length });
-      }
+      renderedToolIds.add(step.callId);
+      steps.push({ type: 'tool', toolId: step.callId, toolIndex: steps.length });
     });
   } else if (message.executionSteps && message.executionSteps.length > 0) {
     message.executionSteps.forEach((step) => {
@@ -94,14 +87,11 @@ export function flattenSteps(message: ChatMessage): { steps: FlatStep[]; thinkin
           thinkingTotal++;
         }
       } else if (step.type === 'tool') {
-        const tc = message.toolCalls?.find((tool) => tool.id === step.callId);
-        if (tc && !isSubagentDispatchTool(tc.name)) {
-          steps.push({ type: 'tool', toolCall: tc, toolIndex: steps.length });
-        }
+        steps.push({ type: 'tool', toolId: step.callId, toolIndex: steps.length });
       }
     });
   } else {
-    // Fallback: thinkingSegments + toolCalls flat
+    // Fallback for messages without explicit execution order.
     const segs = (message.thinkingSegments || []).filter((s) => s.content.trim());
     segs.forEach((s) => {
       steps.push({ type: 'thinking', thinkingContent: s.content, toolIndex: 0 });
@@ -111,11 +101,6 @@ export function flattenSteps(message: ChatMessage): { steps: FlatStep[]; thinkin
       steps.push({ type: 'thinking', thinkingContent: message.thinkingContent, toolIndex: 0 });
       thinkingTotal++;
     }
-    (message.toolCalls || []).forEach((tc, i) => {
-      if (!isSubagentDispatchTool(tc.name)) {
-        steps.push({ type: 'tool', toolCall: tc, toolIndex: i });
-      }
-    });
   }
   return { steps, thinkingTotal };
 }
@@ -290,7 +275,7 @@ export const MessageBubble = memo(function MessageBubble({
                   return (
                     <InlineToolCall
                       key={`tool-${i}`}
-                      toolCall={step.toolCall!}
+                      toolId={step.toolId || ''}
                       index={step.toolIndex}
                     />
                   );

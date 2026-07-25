@@ -44,6 +44,7 @@ pub mod subagent_prompt;
 #[cfg(test)]
 mod surface_contract;
 pub mod tasks;
+pub mod tool_execution;
 pub mod types;
 pub mod unified_memory;
 pub mod utils;

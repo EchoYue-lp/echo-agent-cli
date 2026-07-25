@@ -363,6 +363,7 @@ pub struct StorageState {
     pub conversation_store: RwLock<Option<Arc<dyn ConversationStore>>>,
     pub persistence: RwLock<Persistence>,
     pub search_engine: crate::sessions::SessionSearchEngine,
+    pub tool_executions: Arc<crate::tool_execution::ToolExecutionRepository>,
 }
 
 /// 历史记录状态：审计日志 + 工作流
@@ -508,6 +509,34 @@ impl AppState {
                         Err(e) => tracing::warn!("Session search reindex failed: {e}"),
                     }
                     engine
+                },
+                tool_executions: {
+                    let root = crate::tool_execution::ToolExecutionRepository::default_root();
+                    let repository =
+                        crate::tool_execution::ToolExecutionRepository::open(root.clone())
+                            .or_else(|error| {
+                                tracing::warn!(
+                                    path = %root.display(),
+                                    %error,
+                                    "Failed to open tool execution repository; using temporary storage"
+                                );
+                                let fallback = std::env::temp_dir().join("eko-tool-executions");
+                                crate::tool_execution::ToolExecutionRepository::open(fallback.clone())
+                                    .map_err(|fallback_error| {
+                                        tracing::warn!(
+                                            path = %fallback.display(),
+                                            error = %fallback_error,
+                                            "Failed to open fallback tool execution repository"
+                                        );
+                                        fallback
+                                    })
+                            })
+                            .unwrap_or_else(|fallback| {
+                                crate::tool_execution::ToolExecutionRepository::without_initialization(
+                                    fallback,
+                                )
+                            });
+                    Arc::new(repository)
                 },
             },
             history: HistoryState {

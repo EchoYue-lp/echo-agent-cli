@@ -79,39 +79,6 @@ export function handleChatEvent(event: ChatEvent, ctx: EventContext): void {
       store.clearContextWindow();
       break;
     }
-    case 'tool_start': {
-      if (ctx.isCancelledRef.current) break;
-      if (event.name) store.setToolCall(event.call_id, event.name, event.args ?? undefined);
-      break;
-    }
-    case 'tool_progress': {
-      if (ctx.isCancelledRef.current) break;
-      store.updateToolProgress(event.call_id, event.message, event.percent ?? undefined);
-      break;
-    }
-    case 'tool_output': {
-      if (ctx.isCancelledRef.current) break;
-      store.appendToolOutput(event.call_id, event.channel, event.chunk);
-      break;
-    }
-    case 'tool_complete': {
-      if (ctx.isCancelledRef.current) break;
-      store.completeToolStream(
-        event.call_id,
-        event.success,
-        event.metadata,
-        event.truncated,
-        event.failure
-      );
-      break;
-    }
-    case 'tool_result': {
-      if (ctx.isCancelledRef.current) break;
-      if (event.name) {
-        store.completeToolCall(event.call_id, event.result || '', event.success, event.failure);
-      }
-      break;
-    }
     case 'tool_batch_start': {
       if (ctx.isCancelledRef.current) break;
       store.startToolBatch(event.tool_count ?? 0);
@@ -172,7 +139,6 @@ export function handleChatEvent(event: ChatEvent, ctx: EventContext): void {
     }
     case 'error': {
       ctx.isCancelledRef.current = true;
-      store.markRunningToolsFailed(event.message);
       store.setRunStatus('failed');
       if (ctx.assistantIdRef.current) {
         store.finalizeAssistantMessage(ctx.assistantIdRef.current, `[Error] ${event.message}`);

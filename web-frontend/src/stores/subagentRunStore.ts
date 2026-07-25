@@ -28,13 +28,8 @@ export type { SubagentRunStatus } from '../generated';
 /** Event variants carried on execution://event with kind="subagent". */
 export type SubagentRunEventKind =
   | 'started'
-  | 'thinking_started'
-  | 'thinking_delta'
-  | 'thinking_ended'
   | 'usage' // canonical DispatchLlmUsage event with provider/cache metadata
-  | 'token_delta'
-  | 'tool_started'
-  | 'tool_completed'
+  | 'isolation_observed'
   | 'artifact'
   | 'completed'
   | 'failed'
@@ -62,11 +57,6 @@ export interface ExecutionEvent {
   parent?: string;
   task?: string;
   mode?: string;
-  content?: string;
-  name?: string; // tool name
-  args?: unknown; // tool args
-  result?: string; // tool result/error text
-  success?: boolean;
   prompt_tokens?: number;
   completion_tokens?: number;
   duration_ms?: number;
@@ -118,8 +108,6 @@ export interface SubagentRunState {
   durationMs?: number;
   tokensUsed?: number;
   iterationCount?: number;
-  /** Live final-answer stream while the Subagent is running. */
-  streamedText?: string;
   /** Full terminal model output. The presentation layer removes the protocol envelope. */
   finalOutput?: string;
   error?: string;
@@ -138,7 +126,7 @@ export interface SubagentRunState {
   result?: SubagentTaskResult;
   /** Accumulated LLM usage across all model calls in this run (for cache diagnostics). */
   usageEvents?: ExecutionEvent[];
-  /** Append-only event log (thinking/tool/token deltas). Capped to bound memory. */
+  /** Bounded lifecycle and usage event log. Tool details live in toolExecutionStore. */
   events: ExecutionEvent[];
 }
 
@@ -298,10 +286,6 @@ export const useSubagentRunStore = create<SubagentRunStore>((set) => ({
       const usageEvents = isCanonicalUsageEvent(ev)
         ? [...(run.usageEvents ?? []), ev]
         : run.usageEvents;
-      const streamedText =
-        ev.event === 'token_delta' && typeof ev.content === 'string'
-          ? `${run.streamedText ?? ''}${ev.content}`
-          : run.streamedText;
       const result = terminalResult(ev, newStatus) ?? run.result;
       const next: SubagentRunState = {
         ...run,
@@ -315,7 +299,6 @@ export const useSubagentRunStore = create<SubagentRunStore>((set) => ({
         durationMs: ev.duration_ms ?? run.durationMs,
         tokensUsed: ev.tokens_used ?? run.tokensUsed,
         iterationCount: ev.iteration_count ?? run.iterationCount,
-        streamedText,
         finalOutput: ev.output ?? run.finalOutput,
         error: ev.error ?? run.error,
         promptSource: ev.prompt_source ?? run.promptSource,

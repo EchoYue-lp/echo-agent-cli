@@ -16,18 +16,6 @@ use state::TauriState;
 use std::sync::Arc;
 use tauri::Emitter;
 
-fn subagent_usage_event_name(
-    event: &echo_agent::agent::subagent::SubagentEvent,
-) -> Option<&'static str> {
-    use echo_agent::agent::subagent::SubagentEvent;
-
-    match event {
-        SubagentEvent::DispatchThinkingEnded { .. } => Some("thinking_ended"),
-        SubagentEvent::DispatchLlmUsage { .. } => Some("usage"),
-        _ => None,
-    }
-}
-
 fn task_id_from_subagent_execution_id(execution_id: &str) -> Option<String> {
     execution_id
         .rsplit_once(':')
@@ -172,6 +160,9 @@ pub fn build_tauri_app(
             commands::tools::get_tool,
             commands::tools::enable_tool,
             commands::tools::disable_tool,
+            commands::tool_executions::get_tool_execution_detail,
+            commands::tool_executions::read_tool_execution_output,
+            commands::tool_executions::list_tool_executions,
             // MCP
             commands::mcp::list_mcp_servers,
             commands::mcp::connect_mcp_server,
@@ -343,6 +334,7 @@ pub fn build_tauri_app(
                 let state = app.state::<TauriState>();
                 let agent = state.app_state.connection.agent.clone();
                 let task_runtime_store = state.app_state.tasks.runtime.clone();
+                let tool_executions = state.app_state.storage.tool_executions.clone();
                 tokio::spawn(async move {
                     let mut rx = agent
                         .read_async(|a| {
@@ -351,11 +343,179 @@ pub fn build_tauri_app(
                         .await;
                     let mut usage_sequence_by_execution =
                         std::collections::HashMap::<String, u64>::new();
+                    let mut subagent_context_by_execution =
+                        std::collections::HashMap::<String, Option<String>>::new();
+                    let mut active_tool_ids_by_execution = std::collections::HashMap::<
+                        String,
+                        std::collections::HashSet<String>,
+                    >::new();
                     loop {
                         match rx.recv().await {
                             Ok(event) => {
                                 use echo_agent::agent::subagent::SubagentEvent;
-                                let usage_event_type = subagent_usage_event_name(event.as_ref());
+                                if let SubagentEvent::DispatchStarted {
+                                    execution_id: Some(execution_id),
+                                    conversation_id,
+                                    ..
+                                } = event.as_ref()
+                                {
+                                    subagent_context_by_execution.insert(
+                                        execution_id.clone(),
+                                        conversation_id.clone(),
+                                    );
+                                }
+
+                                match event.as_ref() {
+                                    SubagentEvent::DispatchThinkingStarted { .. }
+                                    | SubagentEvent::DispatchThinkingDelta { .. }
+                                    | SubagentEvent::DispatchThinkingEnded { .. }
+                                    | SubagentEvent::DispatchTokenDelta { .. } => continue,
+                                    SubagentEvent::DispatchToolStarted {
+                                        agent,
+                                        call_id,
+                                        name,
+                                        args,
+                                        execution_id,
+                                        run_id,
+                                        ..
+                                    } => {
+                                        let subagent_run_id = execution_id
+                                            .clone()
+                                            .unwrap_or_else(|| format!("{agent}:unknown"));
+                                        let conversation_id = subagent_context_by_execution
+                                            .get(&subagent_run_id)
+                                            .cloned()
+                                            .flatten()
+                                            .or_else(|| {
+                                                run_id.as_deref().and_then(|run_id| {
+                                                    task_runtime_store
+                                                        .as_ref()
+                                                        .and_then(|store| store.get_run(run_id).ok())
+                                                        .flatten()
+                                                        .map(|run| run.conversation_id)
+                                                })
+                                            });
+                                        let owner = echo_agent_app_core::tool_execution::ToolExecutionOwner::Subagent {
+                                            subagent_run_id: subagent_run_id.clone(),
+                                        };
+                                        match tool_executions.start(
+                                            owner,
+                                            conversation_id.as_deref(),
+                                            run_id.as_deref(),
+                                            call_id,
+                                            name,
+                                            args,
+                                        ) {
+                                            Ok(summary) => {
+                                                active_tool_ids_by_execution
+                                                    .entry(subagent_run_id)
+                                                    .or_default()
+                                                    .insert(call_id.clone());
+                                                commands::chat::emit_tool_execution_summary(
+                                                    &app_handle,
+                                                    "started",
+                                                    agent,
+                                                    &summary,
+                                                );
+                                            }
+                                            Err(error) => {
+                                                tracing::warn!(%error, %call_id, %name, "failed to persist subagent tool start");
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                    SubagentEvent::DispatchToolCompleted {
+                                        agent,
+                                        call_id,
+                                        result,
+                                        success,
+                                        failure,
+                                        metadata,
+                                        truncated,
+                                        execution_id,
+                                        run_id: _,
+                                        ..
+                                    } => {
+                                        let subagent_run_id = execution_id
+                                            .clone()
+                                            .unwrap_or_else(|| format!("{agent}:unknown"));
+                                        let owner = echo_agent_app_core::tool_execution::ToolExecutionOwner::Subagent {
+                                            subagent_run_id: subagent_run_id.clone(),
+                                        };
+                                        match tool_executions.finish(
+                                            &owner,
+                                            call_id,
+                                            *success,
+                                            result,
+                                            failure.clone(),
+                                            metadata.clone(),
+                                            *truncated,
+                                        ) {
+                                            Ok(summary) => {
+                                                if let Some(call_ids) = active_tool_ids_by_execution
+                                                    .get_mut(&subagent_run_id)
+                                                {
+                                                    call_ids.remove(call_id);
+                                                    if call_ids.is_empty() {
+                                                        active_tool_ids_by_execution
+                                                            .remove(&subagent_run_id);
+                                                    }
+                                                }
+                                                commands::chat::emit_tool_execution_summary(
+                                                    &app_handle,
+                                                    "finished",
+                                                    agent,
+                                                    &summary,
+                                                );
+                                            }
+                                            Err(error) => {
+                                                tracing::warn!(%error, %call_id, "failed to persist subagent tool completion");
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                    SubagentEvent::DispatchCompleted {
+                                        execution_id,
+                                        agent,
+                                        ..
+                                    }
+                                    | SubagentEvent::DispatchFailed {
+                                        execution_id,
+                                        agent,
+                                        ..
+                                    }
+                                    | SubagentEvent::DispatchCancelled {
+                                        execution_id,
+                                        agent,
+                                        ..
+                                    } => {
+                                        if let Some(subagent_run_id) = execution_id {
+                                            let owner = echo_agent_app_core::tool_execution::ToolExecutionOwner::Subagent {
+                                                subagent_run_id: subagent_run_id.clone(),
+                                            };
+                                            if let Some(call_ids) = active_tool_ids_by_execution
+                                                .remove(subagent_run_id)
+                                            {
+                                                for call_id in call_ids {
+                                                    match tool_executions.cancel(&owner, &call_id) {
+                                                        Ok(summary) => {
+                                                            commands::chat::emit_tool_execution_summary(
+                                                                &app_handle,
+                                                                "cancelled",
+                                                                agent,
+                                                                &summary,
+                                                            );
+                                                        }
+                                                        Err(error) => {
+                                                            tracing::warn!(%error, %call_id, "failed to cancel persisted subagent tool");
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
                                 let (event_type, execution_id, run_id, agent_name, extra) =
                                     match event.as_ref() {
                                         SubagentEvent::DispatchStarted {
@@ -472,107 +632,12 @@ pub fn build_tauri_app(
                                                 "touched_files": result.touched_files.clone(),
                                             }),
                                         ),
-                                        SubagentEvent::DispatchThinkingStarted {
-                                            parent: _,
-                                            agent,
-                                            execution_id,
-                                            run_id,
-                                        } => (
-                                            "thinking_started",
-                                            execution_id.clone(),
-                                            run_id.clone(),
-                                            agent.clone(),
-                                            serde_json::json!({}),
-                                        ),
-                                        SubagentEvent::DispatchThinkingDelta {
-                                            parent: _,
-                                            agent,
-                                            content,
-                                            execution_id,
-                                            run_id,
-                                        } => (
-                                            "thinking_delta",
-                                            execution_id.clone(),
-                                            run_id.clone(),
-                                            agent.clone(),
-                                            serde_json::json!({
-                                                "content": content,
-                                            }),
-                                        ),
-                                        SubagentEvent::DispatchThinkingEnded {
-                                            parent: _,
-                                            agent,
-                                            prompt_tokens,
-                                            completion_tokens,
-                                            execution_id,
-                                            run_id,
-                                        } => (
-                                            usage_event_type.unwrap_or("thinking_ended"),
-                                            execution_id.clone(),
-                                            run_id.clone(),
-                                            agent.clone(),
-                                            serde_json::json!({
-                                                "prompt_tokens": prompt_tokens,
-                                                "completion_tokens": completion_tokens,
-                                            }),
-                                        ),
-                                        SubagentEvent::DispatchTokenDelta {
-                                            parent: _,
-                                            agent,
-                                            content,
-                                            execution_id,
-                                            run_id,
-                                        } => (
-                                            "token_delta",
-                                            execution_id.clone(),
-                                            run_id.clone(),
-                                            agent.clone(),
-                                            serde_json::json!({
-                                                "content": content,
-                                            }),
-                                        ),
-                                        SubagentEvent::DispatchToolStarted {
-                                            parent: _,
-                                            agent,
-                                            call_id,
-                                            name: tool_name,
-                                            args,
-                                            execution_id,
-                                            run_id,
-                                        } => (
-                                            "tool_started",
-                                            execution_id.clone(),
-                                            run_id.clone(),
-                                            agent.clone(),
-                                            serde_json::json!({
-                                                "call_id": call_id,
-                                                "name": tool_name,
-                                                "args": args,
-                                            }),
-                                        ),
-                                        SubagentEvent::DispatchToolCompleted {
-                                            parent: _,
-                                            agent,
-                                            call_id,
-                                            name: tool_name,
-                                            result,
-                                            success,
-                                            failure,
-                                            execution_id,
-                                            run_id,
-                                        } => (
-                                            "tool_completed",
-                                            execution_id.clone(),
-                                            run_id.clone(),
-                                            agent.clone(),
-                                            serde_json::json!({
-                                                "call_id": call_id,
-                                                "name": tool_name,
-                                                "result": result,
-                                                "success": success,
-                                                "failure": failure,
-                                            }),
-                                        ),
+                                        SubagentEvent::DispatchThinkingStarted { .. }
+                                        | SubagentEvent::DispatchThinkingDelta { .. }
+                                        | SubagentEvent::DispatchThinkingEnded { .. }
+                                        | SubagentEvent::DispatchTokenDelta { .. }
+                                        | SubagentEvent::DispatchToolStarted { .. }
+                                        | SubagentEvent::DispatchToolCompleted { .. } => continue,
                                         SubagentEvent::DispatchLlmUsage {
                                             parent: _,
                                             agent,
@@ -600,7 +665,7 @@ pub fn build_tauri_app(
                                             let usage_event_id =
                                                 format!("{usage_key}:usage:{sequence}");
                                             (
-                                                usage_event_type.unwrap_or("usage"),
+                                                "usage",
                                                 execution_id.clone(),
                                                 run_id.clone(),
                                                 agent.clone(),
@@ -668,6 +733,14 @@ pub fn build_tauri_app(
                                 }
                                 let _ = app_handle
                                     .emit("execution://event", serde_json::Value::Object(payload));
+                                if matches!(
+                                    event_type,
+                                    "completed" | "failed" | "cancelled" | "timed_out"
+                                ) {
+                                    subagent_context_by_execution.remove(&subagent_run_id_owned);
+                                    usage_sequence_by_execution.remove(&subagent_run_id_owned);
+                                    active_tool_ids_by_execution.remove(&subagent_run_id_owned);
+                                }
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                                 tracing::warn!("Subagent event receiver lagged by {} events", n);
@@ -684,36 +757,7 @@ pub fn build_tauri_app(
 
 #[cfg(test)]
 mod tests {
-    use super::{subagent_usage_event_name, task_id_from_subagent_execution_id};
-    use echo_agent::agent::subagent::SubagentEvent;
-
-    #[test]
-    fn thinking_ended_and_llm_usage_have_distinct_execution_event_names() {
-        let thinking = SubagentEvent::DispatchThinkingEnded {
-            parent: "main".to_string(),
-            agent: "subagent".to_string(),
-            prompt_tokens: 10,
-            completion_tokens: 2,
-            execution_id: Some("task:1".to_string()),
-            run_id: Some("run".to_string()),
-        };
-        let usage = SubagentEvent::DispatchLlmUsage {
-            parent: "main".to_string(),
-            agent: "subagent".to_string(),
-            model: "test".to_string(),
-            prompt_tokens: 10,
-            completion_tokens: 2,
-            total_tokens: 12,
-            cached_prompt_tokens: 0,
-            cache_creation_prompt_tokens: 0,
-            usage_reported: true,
-            execution_id: Some("task:1".to_string()),
-            run_id: Some("run".to_string()),
-        };
-
-        assert_eq!(subagent_usage_event_name(&thinking), Some("thinking_ended"));
-        assert_eq!(subagent_usage_event_name(&usage), Some("usage"));
-    }
+    use super::task_id_from_subagent_execution_id;
 
     #[test]
     fn execution_attempt_keeps_full_identity_and_extracts_only_the_task_join_key() {

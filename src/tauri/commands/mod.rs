@@ -22,5 +22,6 @@ pub mod scheduler;
 pub mod session;
 pub mod task_runtime;
 pub mod tasks;
+pub mod tool_executions;
 pub mod tools;
 pub mod workspace;

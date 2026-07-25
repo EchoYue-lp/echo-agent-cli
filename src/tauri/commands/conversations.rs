@@ -275,17 +275,32 @@ pub async fn delete_conversation(
         .await
         .map_err(|e| IpcError::Internal(e.to_string()))?;
 
+    if let Err(error) = state
+        .app_state
+        .storage
+        .tool_executions
+        .remove_conversation(&id)
+    {
+        tracing::warn!(conversation_id = %id, %error, "Failed to remove conversation tool execution details");
+    }
+
     let artifact_config = state
         .app_state
         .connection
         .agent
         .read(|agent| agent.tool_output_artifacts())
         .await;
-    if let Some(config) = artifact_config
-        && let Err(error) =
-            echo_agent::tools::artifact::cleanup_tool_output_scope(&config, &id, None)
-    {
-        tracing::warn!(conversation_id = %id, error = %error, "Failed to clean conversation tool artifacts");
+    if let Some(config) = artifact_config {
+        let conversation_id = id.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(error) = echo_agent::tools::artifact::cleanup_tool_output_scope(
+                &config,
+                &conversation_id,
+                None,
+            ) {
+                tracing::warn!(conversation_id = %conversation_id, %error, "Failed to clean conversation tool artifacts");
+            }
+        });
     }
 
     Ok(serde_json::json!({"success": true}))

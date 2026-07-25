@@ -1,115 +1,57 @@
-import { renderToStaticMarkup } from 'react-dom/server';
-import { describe, expect, it } from 'vitest';
-import { InlineToolCall } from './InlineToolCall';
+import { beforeEach, describe, expect, it } from 'vitest';
+import { useToolExecutionStore } from '../../stores/toolExecutionStore';
+import type { ToolExecution } from '../../types/api';
+import { toolSummaryText } from './InlineToolCall';
+
+function summary(overrides: Partial<ToolExecution> = {}): ToolExecution {
+  return {
+    id: 'detail-1',
+    call_id: 'call-1',
+    owner: { kind: 'chat', message_id: 'message-1' },
+    conversation_id: 'conversation-1',
+    run_id: 'run-1',
+    name: 'shell',
+    args_preview: '{"command":"printf hello"}',
+    status: 'succeeded',
+    started_at: 1_000,
+    finished_at: 2_000,
+    duration_ms: 1_000,
+    detail_ref: 'detail-1',
+    ...overrides,
+  };
+}
 
 describe('InlineToolCall', () => {
-  it('keeps the read tool name visible before a long path', () => {
-    const html = renderToStaticMarkup(
-      <InlineToolCall
-        index={0}
-        toolCall={{
-          id: 'call-read',
-          name: 'read_file',
-          args: { path: './echo-agent-app-core/src/tasks/task_runtime/types.rs', offset: 1 },
-          result: 'content',
-          success: true,
-          status: 'succeeded',
-          stdout: 'content',
-          stderr: '',
-          log: '',
-          startedAt: 1,
-          finishedAt: 2,
-        }}
-      />
-    );
-
-    expect(html).toContain('Read ./echo-agent-app-core/src/tasks/task_runtime/types.rs');
-    expect(html).toContain('· from line 1');
-    expect(html).toContain('from line 1');
+  beforeEach(() => {
+    useToolExecutionStore.getState().clear();
   });
 
-  it('does not render tool output while collapsed', () => {
-    const html = renderToStaticMarkup(
-      <InlineToolCall
-        index={0}
-        toolCall={{
-          id: 'call-1',
-          name: 'shell',
-          args: { command: 'printf visible-title' },
-          result: 'hidden result',
-          success: true,
-          status: 'succeeded',
-          stdout: 'hidden stdout',
-          stderr: '',
-          log: '',
-          startedAt: 1,
-          finishedAt: 2,
-        }}
-      />
-    );
+  it('keeps only summaries in the normalized store', () => {
+    useToolExecutionStore.getState().ingest(summary());
+    const tool = useToolExecutionStore.getState().tools['detail-1'];
 
-    expect(html).toContain('Shell printf visible-title');
-    expect(html).not.toContain('hidden result');
-    expect(html).not.toContain('hidden stdout');
+    expect(tool).toEqual(summary());
+    expect(toolSummaryText(tool?.name ?? '', tool?.args_preview ?? '')).toBe(
+      'shell · {"command":"printf hello"}'
+    );
   });
 
-  it('keeps plan_create collapsed to a concise one-line summary', () => {
-    const html = renderToStaticMarkup(
-      <InlineToolCall
-        index={0}
-        toolCall={{
-          id: 'call-plan',
-          name: 'plan_create',
-          args: {
-            title: 'Core 库模块架构分析',
-            description: 'Long plan description',
-            allowed_tools: ['read_file', 'glob', 'code_search', 'grep', 'repo_map'],
-          },
-          result: 'created',
-          success: true,
-          status: 'succeeded',
-          stdout: '',
-          stderr: '',
-          log: '',
-          startedAt: 1,
-          finishedAt: 2,
-        }}
-      />
+  it('uses the same row for a running subagent-owned tool', () => {
+    useToolExecutionStore.getState().ingest(
+      summary({
+        id: 'detail-subagent',
+        detail_ref: 'detail-subagent',
+        owner: { kind: 'subagent', subagent_run_id: 'task-1:1' },
+        name: 'read_file',
+        args_preview: '{"path":"README.md"}',
+        status: 'running',
+        finished_at: null,
+        duration_ms: null,
+      })
     );
+    const ownerIds = useToolExecutionStore.getState().idsByOwner['subagent:task-1:1'];
 
-    expect(html).toContain('plan_create');
-    expect(html).toContain('Core 库模块架构分析');
-    expect(html).toContain('whitespace-nowrap');
-    expect(html).not.toContain('allowed_tools');
-  });
-
-  it('renders the durable artifact entry independently from tool success', () => {
-    const html = renderToStaticMarkup(
-      <InlineToolCall
-        index={0}
-        toolCall={{
-          id: 'call-artifact',
-          name: 'shell',
-          args: { command: 'large-output' },
-          result: '',
-          success: true,
-          status: 'succeeded',
-          stdout: 'bounded preview',
-          stderr: '',
-          log: '',
-          startedAt: 1,
-          finishedAt: 2,
-          truncated: true,
-          metadata: {
-            artifact_path: '/tmp/tool.log',
-            artifact_bytes: String(10 * 1024 * 1024),
-            artifact_sha256: 'abcdef0123456789',
-          },
-        }}
-      />
-    );
-
-    expect(html).toContain('large-output');
-    expect(html).toContain('打开完整日志 artifact');
+    expect(ownerIds).toEqual(['detail-subagent']);
+    expect(useToolExecutionStore.getState().tools['detail-subagent']?.status).toBe('running');
   });
 });

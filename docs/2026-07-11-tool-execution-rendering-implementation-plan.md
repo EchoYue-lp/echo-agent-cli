@@ -4,6 +4,11 @@
 
 状态: Phase 0-10 全部完成,工具执行生命周期、GUI/TUI 渲染与历史恢复已闭环
 
+> 2026-07-25 更新:本文仍是框架 streaming、TUI 生命周期和基础 renderer 的历史
+> 依据。GUI 的“会话保存有界完整工具投影 + 展开内存 tail”方案已由
+> `docs/2026-07-25-gui-tool-execution-lazy-loading.md` 取代。当前 GUI 只保存工具 ID
+> 与 summary,完整参数/输出通过 `detail_ref` 从本地文件按 64 KiB cursor 页面读取。
+
 ## 0. 实施结果 (2026-07-11)
 
 本轮完成 Phase 0-10 的工具执行体验主路径:
@@ -22,7 +27,7 @@
 项目演进后的明确取舍:
 
 - WebSocket transport 已从 GUI 主路径移除,Tauri 是唯一实时 GUI transport；因此不保留两套 transport 的字段对齐成本,GUI/TUI 共享同一应用层事件语义与 reducer 合同。
-- 超长完整日志 artifact 仍是按需能力,本地会话默认只保存有界最终投影；当前产品没有必须永久保存完整日志的需求,不额外落盘。
+- GUI 工具详情现已统一持久化到应用层 JSONL/detail 文件;框架超长日志 artifact 仍作为通用完整载荷来源,通过同一 `detail_ref` 分页读取。
 
 M5 第一批完成 (2026-07-11):
 

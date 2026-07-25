@@ -60,7 +60,8 @@ evidence, and the next bounded step.
 | Logical-task worktree reuse and content-aware cleanup | Complete | `docs/2026-07-25-logical-task-worktree-reuse.md`; stable `{run_id}:{task_id}` isolation identity with attempt-scoped Subagent events |
 | Unified Subagent prompt compilation | Complete | framework commit `8f7904f`; `echo-agent-app-core/src/subagent_prompt.rs`; one registration-time system prompt and one typed invocation compiler across direct, planned, fork, teammate, and team dispatch |
 | Memory and self-evolution seam closure | Complete | `docs/2026-07-23-memory-self-evolution-closure.md`; replaceable workspace/hot-memory projections, one layered EKO write path, workspace-bound Curator, shared review integration, and stable compression dedup keys |
-| Subagent result projection and attempt identity | Complete | `docs/2026-07-17-subagent-results-and-completion.md`; full terminal output is separated from process metadata and persisted for review/recovery, referential summaries are recovered from the final thinking segment, TaskRuntime snapshots auto-poll to authoritative plan/task state, the right rail separates execution from acceptance, and `subagent_run_id` remains `{task_id}:{attempt}` |
+| Subagent result projection and attempt identity | Complete | `docs/2026-07-17-subagent-results-and-completion.md`; full terminal output is separated from process metadata and persisted for review/recovery, TaskRuntime snapshots auto-poll to authoritative plan/task state, the right rail separates execution from acceptance, and `subagent_run_id` remains `{task_id}:{attempt}` |
+| GUI tool execution lazy loading | Complete | `docs/2026-07-25-gui-tool-execution-lazy-loading.md`; framework commit `27bb5a4`; one main/Subagent summary path, opaque `detail_ref`, 64 KiB cursor pages, file/JSONL recovery, and complete Subagent prompt/result views |
 
 ## Current Decisions
 
@@ -186,9 +187,10 @@ events, direct primary execution uses application Subagent events, and
 TaskRuntime integration events use a separate task scope. The frontend stores
 all attempts independently, keeps terminal state monotonic, and defaults to the
 latest attempt when rendering a task. The result view uses complete terminal
-output without its internal protocol envelope; a referential terminal answer
-promotes the final substantial thinking block and removes that block from process
-rendering. File access remains process metadata. Terminal records are retained
+output without its internal protocol envelope; it never promotes a thinking
+trace into the result. The Subagent process view contains only the same lazy
+tool-execution rows used by the primary Agent. File access remains result
+metadata. Terminal records are retained
 until explicit clearing, and TaskRuntime loads start polling automatically so a
 completed backend snapshot cannot remain displayed as Pending after the live
 trace disappears. TaskRuntime review consumes the complete output rather than
@@ -253,3 +255,8 @@ dynamic plan runtime, worktree repair, and unified prompt compiler are complete.
 Also sample workspace switching and long-lived sessions to verify instruction
 projection replacement, Dreaming's first post-boot pass, and hot-memory budget
 growth before adding entry-level limits or a more frequent idle trigger.
+Run a real GUI smoke test with a large streaming shell result: confirm the
+collapsed row remains responsive, expanded output advances by cursor while
+running, completed output loads only one page at a time, history reload restores
+summaries without eager detail reads, and conversation deletion returns before
+background detail cleanup finishes.

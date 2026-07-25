@@ -28,6 +28,7 @@ const DEFAULT_MAX_TOKENS: u32 = 8192;
 /// EKO product default for one tool result returned to the model. The generic
 /// framework keeps 0 as opt-out so other consumers choose their own budget.
 const DEFAULT_MAX_TOOL_OUTPUT_TOKENS: usize = 8_000;
+const TOOL_OUTPUT_ARTIFACT_THRESHOLD_BYTES: usize = 32 * 1024;
 const TOOL_OUTPUT_ARTIFACT_MAX_AGE_SECS: u64 = 30 * 24 * 60 * 60;
 fn resolved_max_tool_output_tokens(configured: usize) -> usize {
     if configured > 0 {
@@ -48,6 +49,7 @@ pub fn tool_output_artifact_config(
 ) -> echo_agent::tools::artifact::ToolOutputArtifactConfig {
     let root_dir = echo_agent::paths::user_data_path("artifacts").join("tool-logs");
     echo_agent::tools::artifact::ToolOutputArtifactConfig::new(root_dir, "conversation_or_30d")
+        .threshold_bytes(TOOL_OUTPUT_ARTIFACT_THRESHOLD_BYTES)
         .max_age_secs(Some(TOOL_OUTPUT_ARTIFACT_MAX_AGE_SECS))
 }
 
@@ -583,7 +585,7 @@ async fn register_default_subagents(
     struct BuiltSubagent {
         definition: echo_agent::agent::subagent::SubagentDefinition,
         handle: crate::agent_handle::AgentHandle,
-        fork_factory: Option<Arc<dyn AgentFactory>>,
+        fork_factory: Arc<dyn AgentFactory>,
         readonly: bool,
         isolate_worktree: bool,
         isolate_workspace: bool,
@@ -611,7 +613,7 @@ async fn register_default_subagents(
             description: &subagent_def.description,
             role_prompt: &subagent_def.system_prompt,
             readonly: subagent_def.readonly,
-            can_delegate: subagent_def.can_delegate,
+            can_delegate: false,
             isolation,
         });
         let build_result = if subagent_def.readonly {
@@ -626,10 +628,8 @@ async fn register_default_subagents(
                 tool_timeout_ms,
                 max_tool_output_tokens,
                 cache_user_id,
-                subagent_def.can_delegate,
                 max_iterations,
                 browser_runtime.clone(),
-                prompt_compiler.clone(),
             )
         } else {
             build_writer_subagent_agent(
@@ -643,12 +643,10 @@ async fn register_default_subagents(
                 tool_timeout_ms,
                 max_tool_output_tokens,
                 cache_user_id,
-                subagent_def.can_delegate,
                 max_iterations,
                 browser_runtime.clone(),
                 sandbox_manager.clone(),
                 run_code_available,
-                prompt_compiler.clone(),
             )
         };
         match build_result {
@@ -669,9 +667,6 @@ async fn register_default_subagents(
                     .or_else(|| subagent_def.source.strip_prefix("user:"))
                 {
                     builder = builder.custom(path);
-                }
-                if subagent_def.can_delegate {
-                    builder = builder.can_delegate();
                 }
                 // Sprint 8/9: honor the frontmatter `worktree: true` flag (only
                 // set for non-readonly writers; readonly subagents have it cleared
@@ -720,78 +715,68 @@ async fn register_default_subagents(
                     builder = builder.tag(tag);
                 }
                 let def = builder.build();
-                let fork_factory = if subagent_def.can_delegate {
-                    None
-                } else {
-                    let factory_def = subagent_def.clone();
-                    let factory_model = subagent_model.clone();
-                    let factory_llm = subagent_llm.clone();
-                    let factory_cache_user_id = cache_user_id.to_string();
-                    let factory_browser_runtime = browser_runtime.clone();
-                    let factory_sandbox_manager = sandbox_manager.clone();
-                    let factory_tool_output_artifacts = tool_output_artifacts.clone();
-                    let factory_prompt_compiler = prompt_compiler.clone();
-                    let factory_system_prompt = compiled_system.system_prompt.clone();
-                    Some(Arc::new(FnAgentFactory::new(
-                        move || -> BoxFuture<'static, echo_agent::error::Result<Box<dyn Agent>>> {
-                            let subagent_def = factory_def.clone();
-                            let model = factory_model.clone();
-                            let llm = factory_llm.clone();
-                            let cache_user_id = factory_cache_user_id.clone();
-                            let browser_runtime = factory_browser_runtime.clone();
-                            let sandbox_manager = factory_sandbox_manager.clone();
-                            let tool_output_artifacts = factory_tool_output_artifacts.clone();
-                            let prompt_compiler = factory_prompt_compiler.clone();
-                            let system_prompt = factory_system_prompt.clone();
-                            Box::pin(async move {
-                                let max_iterations = subagent_def.max_turns.unwrap_or(0);
-                                let subagent = if subagent_def.readonly {
-                                    build_readonly_subagent_agent(
-                                        &subagent_def.name,
-                                        &system_prompt,
-                                        &model,
-                                        llm,
-                                        temperature,
-                                        max_tokens,
-                                        token_limit,
-                                        tool_timeout_ms,
-                                        max_tool_output_tokens,
-                                        &cache_user_id,
-                                        subagent_def.can_delegate,
-                                        max_iterations,
-                                        browser_runtime,
-                                        prompt_compiler,
-                                    )?
-                                } else {
-                                    build_writer_subagent_agent(
-                                        &subagent_def.name,
-                                        &system_prompt,
-                                        &model,
-                                        llm,
-                                        temperature,
-                                        max_tokens,
-                                        token_limit,
-                                        tool_timeout_ms,
-                                        max_tool_output_tokens,
-                                        &cache_user_id,
-                                        subagent_def.can_delegate,
-                                        max_iterations,
-                                        browser_runtime,
-                                        sandbox_manager,
-                                        run_code_available,
-                                        prompt_compiler,
-                                    )?
-                                };
-                                subagent.set_tool_output_artifacts(tool_output_artifacts);
-                                crate::tasks::task_runtime::compact_context::install_task_context_protection(
-                                    &subagent,
-                                )
-                                .await;
-                                Ok(Box::new(subagent) as Box<dyn Agent>)
-                            })
-                        },
-                    )) as Arc<dyn AgentFactory>)
-                };
+                let factory_def = subagent_def.clone();
+                let factory_model = subagent_model.clone();
+                let factory_llm = subagent_llm.clone();
+                let factory_cache_user_id = cache_user_id.to_string();
+                let factory_browser_runtime = browser_runtime.clone();
+                let factory_sandbox_manager = sandbox_manager.clone();
+                let factory_tool_output_artifacts = tool_output_artifacts.clone();
+                let factory_system_prompt = compiled_system.system_prompt.clone();
+                let fork_factory = Arc::new(FnAgentFactory::new(
+                    move || -> BoxFuture<'static, echo_agent::error::Result<Box<dyn Agent>>> {
+                        let subagent_def = factory_def.clone();
+                        let model = factory_model.clone();
+                        let llm = factory_llm.clone();
+                        let cache_user_id = factory_cache_user_id.clone();
+                        let browser_runtime = factory_browser_runtime.clone();
+                        let sandbox_manager = factory_sandbox_manager.clone();
+                        let tool_output_artifacts = factory_tool_output_artifacts.clone();
+                        let system_prompt = factory_system_prompt.clone();
+                        Box::pin(async move {
+                            let max_iterations = subagent_def.max_turns.unwrap_or(0);
+                            let subagent = if subagent_def.readonly {
+                                build_readonly_subagent_agent(
+                                    &subagent_def.name,
+                                    &system_prompt,
+                                    &model,
+                                    llm,
+                                    temperature,
+                                    max_tokens,
+                                    token_limit,
+                                    tool_timeout_ms,
+                                    max_tool_output_tokens,
+                                    &cache_user_id,
+                                    max_iterations,
+                                    browser_runtime,
+                                )?
+                            } else {
+                                build_writer_subagent_agent(
+                                    &subagent_def.name,
+                                    &system_prompt,
+                                    &model,
+                                    llm,
+                                    temperature,
+                                    max_tokens,
+                                    token_limit,
+                                    tool_timeout_ms,
+                                    max_tool_output_tokens,
+                                    &cache_user_id,
+                                    max_iterations,
+                                    browser_runtime,
+                                    sandbox_manager,
+                                    run_code_available,
+                                )?
+                            };
+                            subagent.set_tool_output_artifacts(tool_output_artifacts);
+                            crate::tasks::task_runtime::compact_context::install_task_context_protection(
+                                &subagent,
+                            )
+                            .await;
+                            Ok(Box::new(subagent) as Box<dyn Agent>)
+                        })
+                    },
+                )) as Arc<dyn AgentFactory>;
                 built_subagents.push(BuiltSubagent {
                     definition: def,
                     handle: subagent_handle,
@@ -818,50 +803,15 @@ async fn register_default_subagents(
             built.definition.clone(),
             built.handle.to_boxed_agent().await,
         );
-        if let Some(factory) = &built.fork_factory {
-            agent.register_subagent_factory(built.definition.clone(), factory.clone());
-        }
+        agent.register_subagent_factory(built.definition.clone(), built.fork_factory.clone());
         tracing::info!(
             subagent = %built.definition.name,
             readonly = built.readonly,
-            can_delegate = built.definition.can_delegate,
             isolate_worktree = built.isolate_worktree,
             isolate_workspace = built.isolate_workspace,
             has_team = built.has_team,
             tags = ?built.tags,
             "registered default subagent"
-        );
-    }
-
-    // Optional nested delegation: only roles that explicitly declare
-    // `can_delegate: true` receive a child registry. Defaults stay flat, so
-    // ordinary subagents can complete their current task or suggest follow-ups
-    // without becoming recursive planners.
-    //
-    for parent in built_subagents
-        .iter()
-        .filter(|subagent| subagent.definition.can_delegate)
-    {
-        for child in built_subagents
-            .iter()
-            .filter(|child| child.definition.name != parent.definition.name)
-        {
-            let child_agent = child.handle.to_boxed_agent().await;
-            parent
-                .handle
-                .write(|subagent| {
-                    subagent
-                        .register_subagent_with_definition(child.definition.clone(), child_agent);
-                })
-                .await;
-        }
-        tracing::info!(
-            subagent = %parent.definition.name,
-            child_count = built_subagents
-                .iter()
-                .filter(|child| child.definition.name != parent.definition.name)
-                .count(),
-            "registered nested-delegation child subagents"
         );
     }
 }
@@ -883,12 +833,10 @@ fn build_writer_subagent_agent(
     tool_timeout_ms: u64,
     max_tool_output_tokens: usize,
     cache_user_id: &str,
-    can_delegate: bool,
     max_iterations: usize,
     browser_runtime: Option<Arc<crate::browser::BrowserRuntime>>,
     sandbox_manager: Arc<echo_agent::sandbox::SandboxManager>,
     run_code_available: bool,
-    prompt_compiler: Arc<dyn SubagentPromptCompiler>,
 ) -> std::result::Result<ReactAgent, echo_agent::error::ReactError> {
     // Mirror build_readonly_subagent_agent, but OMIT `.readonly_tools()` → the
     // default `readonly_tools: false` triggers `register_all_tools`, giving the
@@ -904,8 +852,6 @@ fn build_writer_subagent_agent(
         // NO .readonly_tools() → full tool set (write capability).
         .enable_memory()
         .enable_cot()
-        .enable_subagent()
-        .subagent_prompt_compiler(prompt_compiler)
         .max_iterations(max_iterations)
         .token_limit(token_limit)
         .max_tool_output_tokens(max_tool_output_tokens)
@@ -916,9 +862,6 @@ fn build_writer_subagent_agent(
             ..Default::default()
         })
         .sandbox_manager(sandbox_manager);
-    if can_delegate {
-        builder = builder.register_agent_dispatch_tool();
-    }
 
     let has_llm_config = llm_config.is_some();
     if let Some(config) = llm_config {
@@ -966,10 +909,8 @@ fn build_readonly_subagent_agent(
     tool_timeout_ms: u64,
     max_tool_output_tokens: usize,
     cache_user_id: &str,
-    can_delegate: bool,
     max_iterations: usize,
     browser_runtime: Option<Arc<crate::browser::BrowserRuntime>>,
-    prompt_compiler: Arc<dyn SubagentPromptCompiler>,
 ) -> std::result::Result<ReactAgent, echo_agent::error::ReactError> {
     let mut builder = ReactAgentBuilder::new()
         .model(model)
@@ -979,8 +920,6 @@ fn build_readonly_subagent_agent(
         .readonly_tools() // SA-2: physical enforcement — no shell/write tools
         .enable_memory()
         .enable_cot()
-        .enable_subagent()
-        .subagent_prompt_compiler(prompt_compiler)
         .max_iterations(max_iterations)
         .token_limit(token_limit)
         .max_tool_output_tokens(max_tool_output_tokens)
@@ -990,9 +929,6 @@ fn build_readonly_subagent_agent(
             timeout_ms: tool_timeout_ms,
             ..Default::default()
         });
-    if can_delegate {
-        builder = builder.register_agent_dispatch_tool();
-    }
 
     let has_llm_config = llm_config.is_some();
     if let Some(config) = llm_config {
@@ -2072,16 +2008,20 @@ mod resolve_subagent_model_tests {
             30_000,
             1_024,
             "test-cache-user",
-            false,
             1,
             None,
             sandbox,
             true,
-            Arc::new(crate::subagent_prompt::EkoSubagentPromptCompiler),
         )?;
 
         assert!(subagent.sandbox_manager().is_some());
         assert!(subagent.list_tools().iter().any(|name| name == "run_code"));
+        assert!(
+            !subagent
+                .list_tools()
+                .iter()
+                .any(|name| name == "agent_tool")
+        );
         Ok(())
     }
 }

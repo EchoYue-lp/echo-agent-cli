@@ -48,6 +48,10 @@ export type ChatRunStatus =
 
 export type ToolExecutionStatus = 'running' | 'succeeded' | 'failed' | 'cancelled';
 
+export type ToolExecutionOwner =
+  | { kind: 'chat'; message_id: string }
+  | { kind: 'subagent'; subagent_run_id: string };
+
 export type ToolFailureCategory =
   | 'invalid_arguments'
   | 'unavailable'
@@ -75,20 +79,40 @@ export interface ToolFailure {
 
 export interface ToolExecution {
   id: string;
+  call_id: string;
+  owner: ToolExecutionOwner;
+  conversation_id?: string | null;
+  run_id?: string | null;
   name: string;
-  args: unknown;
-  result: string;
-  success: boolean;
+  args_preview: string;
   status: ToolExecutionStatus;
-  stdout: string;
-  stderr: string;
-  log: string;
-  progress?: { message: string; percent?: number };
-  startedAt: number;
-  finishedAt?: number;
-  truncated?: boolean;
-  metadata?: Record<string, string>;
-  failure?: ToolFailure;
+  started_at: number;
+  finished_at?: number | null;
+  duration_ms?: number | null;
+  detail_ref: string;
+}
+
+export interface ToolExecutionDetailManifest {
+  id: string;
+  args_full: unknown;
+  status: ToolExecutionStatus;
+  failure?: ToolFailure | null;
+  metadata: Record<string, string>;
+  truncated: boolean;
+  output_bytes: number;
+}
+
+export type ToolExecutionDetailChannel = 'stdout' | 'stderr' | 'log' | 'result';
+
+export interface ToolExecutionDetailChunk {
+  channel: ToolExecutionDetailChannel;
+  text: string;
+}
+
+export interface ToolExecutionDetailPage {
+  chunks: ToolExecutionDetailChunk[];
+  next_cursor?: string | null;
+  complete: boolean;
 }
 
 /**
@@ -121,25 +145,6 @@ export type ChatEvent = {
       after_count: number;
       before_tokens: number;
       after_tokens: number;
-    }
-  | { type: 'tool_start'; call_id: string; name: string; args: unknown }
-  | { type: 'tool_progress'; call_id: string; message: string; percent?: number | null }
-  | { type: 'tool_output'; call_id: string; channel: 'stdout' | 'stderr' | 'log'; chunk: string }
-  | {
-      type: 'tool_complete';
-      call_id: string;
-      success: boolean;
-      metadata: Record<string, string>;
-      truncated: boolean;
-      failure?: ToolFailure | null;
-    }
-  | {
-      type: 'tool_result';
-      call_id: string;
-      name: string;
-      result: string;
-      success: boolean;
-      failure?: ToolFailure | null;
     }
   | { type: 'chart'; spec: unknown }
   | { type: 'final_answer'; data: string }
@@ -340,7 +345,6 @@ export interface ChatMessage {
   thinkingContent?: string; // deprecated, kept for history display
   thinkingSegments?: { content: string }[];
   attachments?: { name: string; mime_type: string; url: string; size: number }[];
-  toolCalls?: ToolExecution[];
   chartSpecs?: unknown[];
   isStreaming?: boolean;
   timestamp: number;
@@ -422,7 +426,7 @@ export interface SavedMessage {
   execution_steps?: { type: string; index?: number; call_id?: string }[];
   execution_rounds?: {
     thinking?: { content: string };
-    tools: ToolExecution[];
+    tool_call_ids: string[];
   }[];
   tool_result?: string | null;
   /** User-uploaded attachments (images/documents) as data URLs, so the

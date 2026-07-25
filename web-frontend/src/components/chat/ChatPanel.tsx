@@ -41,9 +41,6 @@ export function ChatPanel() {
   const selectedSubagent = selectedSubagentRef
     ? subagentRuns[selectedSubagentRef.subagentRunId]
     : undefined;
-  const selectedRunSubagents = selectedSubagent
-    ? Object.values(subagentRuns).filter((run) => run.runId === selectedSubagent.runId)
-    : [];
 
   // ── 按需卡片状态 ──
   const [failureToastDismissed, setFailureToastDismissed] = useState(false);
@@ -159,11 +156,7 @@ export function ChatPanel() {
       </div>
       {selectedSubagent ? (
         <div className="min-h-0 flex-1">
-          <SubagentDetailView
-            run={selectedSubagent}
-            allRuns={selectedRunSubagents}
-            onBack={closeSubagentDetail}
-          />
+          <SubagentDetailView run={selectedSubagent} onBack={closeSubagentDetail} />
         </div>
       ) : (
         <div

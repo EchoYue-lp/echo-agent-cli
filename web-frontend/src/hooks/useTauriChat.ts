@@ -4,10 +4,11 @@ import { useConversationStore } from '../stores/conversationStore';
 import { useSubagentRunStore, type ExecutionEvent } from '../stores/subagentRunStore';
 import { useTaskRuntimeStore } from '../stores/taskRuntimeStore';
 import { useToastStore } from '../stores/toastStore';
+import { useToolExecutionStore } from '../stores/toolExecutionStore';
 import { isTauri, apiInvoke, errorMessage } from '../lib/tauri-bridge';
 import { handleChatEvent } from './chatEventHandler';
 import { reorderById } from './queuedChat';
-import type { Attachment, ChatEvent } from '../types/api';
+import type { Attachment, ChatEvent, ToolExecution } from '../types/api';
 
 export type QueuedChatInput = {
   id: string;
@@ -96,7 +97,8 @@ export function useTauriChat() {
       pendingCleanup.push(unlisten);
       // Unified execution://event channel (Subagent unification Phase 4).
       // Replaces the legacy subagent trace + subagent event channels.
-      // kind="subagent" → subagentRunStore (thinking/tool/token/usage flows);
+      // kind="subagent" → lifecycle, usage, and complete terminal result;
+      // kind="tool" → shared lightweight summaries for main/subagent tools;
       // kind="run" → run lifecycle (run_started triggers loadByConversation).
       const unlistenExec = await listen<Record<string, unknown>>('execution://event', (event) => {
         if (aborted) return;
@@ -114,6 +116,12 @@ export function useTauriChat() {
             if (run?.background && prevStatus !== 'completed') {
               useToastStore.getState().addToast('success', `Subagent ${run.agent || runId} 已完成`);
             }
+          }
+        } else if (kind === 'tool') {
+          const tool = payload as unknown as ToolExecution;
+          useToolExecutionStore.getState().ingest(tool);
+          if (payload.event === 'started' && tool.owner.kind === 'chat') {
+            useChatStore.getState().recordToolStart(tool.owner.message_id, tool.id);
           }
         } else if (kind === 'run' && payload.event === 'run_started') {
           // 正式 plan / 自主 run 通过 run_started 事件激活右侧面板。
