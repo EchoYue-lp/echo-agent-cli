@@ -55,6 +55,8 @@ EKO 是本地桌面应用,因此采用文件/JSONL 和 Tauri IPC,不增加网络
 EKO 应用层拥有 `ToolExecutionRepository`、文件生命周期、Tauri IPC、消息投影和
 React 渲染。这些都依赖本地桌面产品的审计与交互规则,不下沉到通用框架。
 
+实现提交:application commit `d8b2211`。
+
 ## 持久化合同
 
 默认根目录为 `~/.echo-agent/tool-executions/`,物理布局为:
@@ -134,7 +136,7 @@ API。
 
 - `echo-agent` (`27bb5a4`):fmt、两组 Clippy、all-targets/all-features 全量测试、
   no-default-features 和 12 个隔离 feature 组合全部通过。
-- `echo-agent-cli`:fmt、all-targets/all-features Clippy、workspace 全量测试、
+- `echo-agent-cli` (`d8b2211`):fmt、all-targets/all-features Clippy、workspace 全量测试、
   app-core no-default-features、GUI binary check 和 GUI feature 测试全部通过。
 - `web-frontend`:Prettier、19 个 Vitest 文件共 64 项测试、TypeScript/Vite production
   build 全部通过。

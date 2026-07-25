@@ -61,7 +61,7 @@ evidence, and the next bounded step.
 | Unified Subagent prompt compilation | Complete | framework commit `8f7904f`; `echo-agent-app-core/src/subagent_prompt.rs`; one registration-time system prompt and one typed invocation compiler across direct, planned, fork, teammate, and team dispatch |
 | Memory and self-evolution seam closure | Complete | `docs/2026-07-23-memory-self-evolution-closure.md`; replaceable workspace/hot-memory projections, one layered EKO write path, workspace-bound Curator, shared review integration, and stable compression dedup keys |
 | Subagent result projection and attempt identity | Complete | `docs/2026-07-17-subagent-results-and-completion.md`; full terminal output is separated from process metadata and persisted for review/recovery, TaskRuntime snapshots auto-poll to authoritative plan/task state, the right rail separates execution from acceptance, and `subagent_run_id` remains `{task_id}:{attempt}` |
-| GUI tool execution lazy loading | Complete | `docs/2026-07-25-gui-tool-execution-lazy-loading.md`; framework commit `27bb5a4`; one main/Subagent summary path, opaque `detail_ref`, 64 KiB cursor pages, file/JSONL recovery, and complete Subagent prompt/result views |
+| GUI tool execution lazy loading | Complete | `docs/2026-07-25-gui-tool-execution-lazy-loading.md`; framework commit `27bb5a4`; application commit `d8b2211`; one main/Subagent summary path, opaque `detail_ref`, 64 KiB cursor pages, file/JSONL recovery, and complete Subagent prompt/result views |
 
 ## Current Decisions
 
