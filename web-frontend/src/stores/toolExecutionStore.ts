@@ -9,8 +9,17 @@ interface ToolExecutionState {
   clear: () => void;
 }
 
+const EMPTY_TOOL_EXECUTION_IDS: readonly string[] = [];
+
 export function toolExecutionOwnerKey(owner: ToolExecutionOwner): string {
   return owner.kind === 'chat' ? `chat:${owner.message_id}` : `subagent:${owner.subagent_run_id}`;
+}
+
+export function toolExecutionIdsForOwner(
+  idsByOwner: Record<string, string[]>,
+  ownerKey: string
+): readonly string[] {
+  return idsByOwner[ownerKey] ?? EMPTY_TOOL_EXECUTION_IDS;
 }
 
 export const useToolExecutionStore = create<ToolExecutionState>((set) => ({

@@ -8,7 +8,11 @@ import {
   Loader2,
 } from 'lucide-react';
 import type { SubagentRunState } from '../../stores/subagentRunStore';
-import { toolExecutionOwnerKey, useToolExecutionStore } from '../../stores/toolExecutionStore';
+import {
+  toolExecutionIdsForOwner,
+  toolExecutionOwnerKey,
+  useToolExecutionStore,
+} from '../../stores/toolExecutionStore';
 import MarkdownContent from '../common/MarkdownContent';
 import { SubagentResultView } from '../subagent/SubagentResultView';
 import { statusLabel } from '../../utils/subagentProgress';
@@ -36,7 +40,9 @@ export const SubagentStreamBlock = memo(function SubagentStreamBlock({
     kind: 'subagent',
     subagent_run_id: run.subagentRunId,
   });
-  const toolIds = useToolExecutionStore((state) => state.idsByOwner[ownerKey] ?? []);
+  const toolIds = useToolExecutionStore((state) =>
+    toolExecutionIdsForOwner(state.idsByOwner, ownerKey)
+  );
   const summary = toolIds.length > 0 ? `${toolIds.length} 工具` : '';
   const presentation = subagentResultPresentation(run);
 

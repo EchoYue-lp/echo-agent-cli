@@ -10,7 +10,11 @@ import {
   TerminalSquare,
 } from 'lucide-react';
 import type { SubagentRunState } from '../../stores/subagentRunStore';
-import { toolExecutionOwnerKey, useToolExecutionStore } from '../../stores/toolExecutionStore';
+import {
+  toolExecutionIdsForOwner,
+  toolExecutionOwnerKey,
+  useToolExecutionStore,
+} from '../../stores/toolExecutionStore';
 import { statusLabel } from '../../utils/subagentProgress';
 import { subagentResultPresentation } from '../../utils/subagentResult';
 import MarkdownContent from '../common/MarkdownContent';
@@ -52,7 +56,9 @@ export function SubagentDetailView({ run, onBack }: SubagentDetailViewProps) {
     kind: 'subagent',
     subagent_run_id: run.subagentRunId,
   });
-  const toolIds = useToolExecutionStore((state) => state.idsByOwner[ownerKey] ?? []);
+  const toolIds = useToolExecutionStore((state) =>
+    toolExecutionIdsForOwner(state.idsByOwner, ownerKey)
+  );
 
   useEffect(() => {
     if (run.status !== 'running') setActiveTab('result');

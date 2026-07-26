@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { useToolExecutionStore } from '../../stores/toolExecutionStore';
+import { toolExecutionIdsForOwner, useToolExecutionStore } from '../../stores/toolExecutionStore';
 import type { ToolExecution } from '../../types/api';
 import { toolSummaryText } from './InlineToolCall';
 
@@ -53,5 +53,19 @@ describe('InlineToolCall', () => {
 
     expect(ownerIds).toEqual(['detail-subagent']);
     expect(useToolExecutionStore.getState().tools['detail-subagent']?.status).toBe('running');
+  });
+
+  it('returns a stable empty snapshot for an owner without tools', () => {
+    const selectMissingOwner = () =>
+      toolExecutionIdsForOwner(
+        useToolExecutionStore.getState().idsByOwner,
+        'subagent:without-tools'
+      );
+
+    const firstSnapshot = selectMissingOwner();
+    const secondSnapshot = selectMissingOwner();
+
+    expect(firstSnapshot).toBe(secondSnapshot);
+    expect(firstSnapshot).toEqual([]);
   });
 });
