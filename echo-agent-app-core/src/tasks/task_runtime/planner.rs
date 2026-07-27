@@ -1,152 +1,15 @@
-//! Lightweight DAG integrity checks for plan task graphs.
+//! EKO file-ownership policy for plan task graphs.
 //!
-//! Contains:
-//! - `validate_plan_deps` — verify a plan has no dangling dependencies / cycles.
-//! - `file_ownership` / `analyze_file_ownership` — deterministic ownership
+//! `file_ownership` / `analyze_file_ownership` provide deterministic ownership
 //!   classification for writer tasks. Exact workspace-relative files may run
 //!   in parallel when disjoint; broad or invalid scopes are `Unknown` and must
 //!   serialize with every writer.
 //!
-//! Previous plan generation functions (`generate_parallel_readonly_plan`,
-//! `generate_plan`) have been removed as part of the L1 path cleanup. Plans
-//! are now produced by the main agent ReAct loop via `plan_create`.
+//! Generic task identity, dependency, cycle, depth, and retry validation lives
+//! in `echo_orchestration::planning::PlanValidator`.
 
 use super::types::PlanTask;
 use std::collections::BTreeSet;
-
-/// Validate dependency integrity and acyclicity for a set of tasks.
-///
-/// This is a lightweight check used by dynamic plan operations (insert_task,
-/// update_task) to ensure the DAG remains valid after mutation. Unlike
-/// `validate_plan`, it skips structural quality checks (file lists, title
-/// length, etc.) and only verifies:
-///
-/// 1. Every `depends_on` references an existing task id.
-/// 2. The dependency graph has no cycles.
-pub fn validate_plan_deps(tasks: &[PlanTask]) -> Result<(), Vec<String>> {
-    let mut errors: Vec<String> = Vec::new();
-
-    // 1. Dangling dependency check.
-    let ids: std::collections::HashSet<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
-    for t in tasks {
-        for dep in &t.depends_on {
-            if !ids.contains(dep.as_str()) {
-                errors.push(format!(
-                    "task '{}' depends on '{}' which does not exist",
-                    t.id, dep
-                ));
-            }
-        }
-    }
-
-    // 2. Cycle detection via DFS.
-    {
-        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut stack: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let id_to_deps: std::collections::HashMap<String, Vec<String>> = tasks
-            .iter()
-            .map(|t| (t.id.clone(), t.depends_on.clone()))
-            .collect();
-        fn dfs(
-            node: &str,
-            id_to_deps: &std::collections::HashMap<String, Vec<String>>,
-            visited: &mut std::collections::HashSet<String>,
-            stack: &mut std::collections::HashSet<String>,
-        ) -> bool {
-            if stack.contains(node) {
-                return true;
-            }
-            if visited.contains(node) {
-                return false;
-            }
-            visited.insert(node.to_string());
-            stack.insert(node.to_string());
-            if let Some(deps) = id_to_deps.get(node) {
-                for dep in deps {
-                    if dfs(dep, id_to_deps, visited, stack) {
-                        return true;
-                    }
-                }
-            }
-            stack.remove(node);
-            false
-        }
-        for t in tasks {
-            if visited.contains(&t.id) {
-                continue;
-            }
-            if dfs(&t.id, &id_to_deps, &mut visited, &mut stack) {
-                errors.push(format!("dependency cycle involving task '{}'", t.id));
-                break;
-            }
-        }
-    }
-
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors)
-    }
-}
-
-/// Validate the complete persisted plan contract before it becomes a new
-/// revision. Capability existence (registered Subagent roles/tools) is checked
-/// by the main-Agent plan tools, which own that runtime catalog.
-pub fn validate_plan(tasks: &[PlanTask]) -> Result<(), Vec<String>> {
-    let mut errors = Vec::new();
-    if tasks.is_empty() {
-        errors.push("plan must contain at least one task".to_string());
-    }
-
-    let mut ids = std::collections::HashSet::new();
-    for task in tasks {
-        let id = task.id.trim();
-        if id.is_empty() {
-            errors.push("task id must not be empty".to_string());
-        } else if !ids.insert(id.to_string()) {
-            errors.push(format!("duplicate task id '{id}'"));
-        }
-        if task.title.trim().is_empty() {
-            errors.push(format!("task '{}' title must not be empty", task.id));
-        }
-        if task.description.trim().is_empty() {
-            errors.push(format!("task '{}' description must not be empty", task.id));
-        }
-        if task.agent_role.trim().is_empty() {
-            errors.push(format!(
-                "task '{}' Subagent role must not be empty",
-                task.id
-            ));
-        }
-        if task.max_retries > 10 {
-            errors.push(format!(
-                "task '{}' max_retries {} exceeds the runtime limit 10",
-                task.id, task.max_retries
-            ));
-        }
-        if task
-            .depends_on
-            .iter()
-            .any(|dependency| dependency == &task.id)
-        {
-            errors.push(format!("task '{}' cannot depend on itself", task.id));
-        }
-        for tool in &task.allowed_tools {
-            if tool.trim().is_empty() {
-                errors.push(format!("task '{}' contains an empty tool name", task.id));
-            }
-        }
-    }
-
-    if let Err(dependency_errors) = validate_plan_deps(tasks) {
-        errors.extend(dependency_errors);
-    }
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors)
-    }
-}
 
 // ── File Ownership Analysis ────────────────────────────────────────────────
 

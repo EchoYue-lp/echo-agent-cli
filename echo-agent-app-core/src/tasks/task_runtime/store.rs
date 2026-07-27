@@ -119,6 +119,16 @@ fn apply_task_patch(task: &mut PlanTask, patch: &TaskPatch) {
     }
 }
 
+fn validate_runtime_plan(tasks: &[PlanTask]) -> Result<(), StoreError> {
+    let runtime_tasks = tasks
+        .iter()
+        .map(PlanTask::to_runtime_task)
+        .collect::<Vec<_>>();
+    echo_agent::tasks::PlanValidator::default()
+        .validate_runtime_snapshot(&runtime_tasks)
+        .map_err(|errors| StoreError::InvalidPlan(errors.join("; ")))
+}
+
 #[derive(Debug, Clone)]
 struct ActiveSubagentBoundary {
     task_id: String,
@@ -584,8 +594,7 @@ impl TaskRuntimeStore {
                     "initial plan tasks must have pending execution state".to_string(),
                 ));
             }
-            super::planner::validate_plan(&plan.tasks)
-                .map_err(|errors| StoreError::InvalidPlan(errors.join("; ")))?;
+            validate_runtime_plan(&plan.tasks)?;
             let mut committed = plan.clone();
             committed.revision = 1;
             self.shadow.append_event_line(
@@ -740,8 +749,7 @@ impl TaskRuntimeStore {
             for (index, task) in candidate.tasks.iter_mut().enumerate() {
                 task.sort_order = i64::try_from(index).unwrap_or(i64::MAX);
             }
-            super::planner::validate_plan(&candidate.tasks)
-                .map_err(|errors| StoreError::InvalidPlan(errors.join("; ")))?;
+            validate_runtime_plan(&candidate.tasks)?;
             candidate.revision = current.revision.saturating_add(1);
             self.shadow.append_event_line(
                 run_id,

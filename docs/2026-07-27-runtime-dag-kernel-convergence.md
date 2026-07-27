@@ -8,10 +8,10 @@ Dynamic Agent plans use one framework-owned DAG execution loop. EKO supplies a
 controller/dispatcher adapter for product policy and persistence; it does not
 own a second ready-frontier loop.
 
-This is a staged convergence. The executor authority has moved, but the older
-framework `Task`/`PlanSpec` model and EKO `TaskPlan`/`PlanTask` model still
-overlap. That remaining model and validator convergence is the next phase, not
-a reason to retain two executors.
+This is a staged convergence. The executor and revisioned-runtime validator
+authorities have moved, but the older framework `Task`/authoring `PlanSpec`
+model still overlaps the canonical runtime model. That remaining legacy-model
+convergence is the next phase, not a reason to retain two executors.
 
 ## Evidence Before The Change
 
@@ -51,7 +51,8 @@ the generic frontier loop.
 
 | Framework (`echo-agent`) | EKO (`echo-agent-cli`) |
 |---|---|
-| Runtime task view and status | `TaskPlan` file/event projection |
+| Immutable runtime spec + mutable execution | `TaskPlan` file/event projection |
+| Structural `PlanValidator` | Subagent/tool capability validation |
 | Revision safe-point reload | `DomainProfile` and role routing |
 | Ready frontier and dependency blocking | Review and acceptance policy |
 | Bounded Subagent waves | Writer/shell/LLM resource limits |
@@ -78,24 +79,39 @@ DAG loop, dependency validator, or generic retry state machine.
 - Fixed skipped-plan nodes so they count as deliberately resolved instead of
   producing a false DAG stall.
 
+## Phase 2 Completed
+
+- Replaced the flat framework `RuntimeTask` shape with an immutable
+  `RuntimeTaskSpec` plus mutable `RuntimeTaskExecution` composition.
+- Preserved `required_artifacts`, executable `execution_checks`, and semantic
+  `acceptance_criteria` as distinct fields; removed the lossy verification-list
+  flattening from `PlanTask::to_runtime_task()`.
+- Added the generic metadata extension point and mapped only EKO-specific
+  `DomainProfile`, `parallel_group`, and `sort_order` through
+  `EkoTaskMetadata`.
+- Extended the existing framework `PlanValidator` to validate revisioned
+  runtime specs/snapshots: identity, duplicates, dependency existence, cycles,
+  depth, retry bounds, and spec/execution identity.
+- Deleted EKO's duplicate dependency/DFS validator. EKO retains only catalog
+  checks (Subagent roles/tools) and file-ownership policy.
+
 ## Remaining Convergence
 
-1. Split the framework runtime model into immutable task specification and
-   mutable task execution without creating a third model.
-2. Map EKO's separate execution checks, acceptance criteria, and required
-   artifacts without flattening them into one verification field.
-3. Consolidate duplicate plan/DAG validation into the framework validator with
-   EKO metadata validation supplied as product policy.
-4. Route the older framework `TaskExecutor` through the same runtime kernel, or
+1. Reconcile the older authoring `planning::TaskSpec` and mixed-state `Task`
+   with the canonical runtime spec/execution model without discarding their
+   reasonable public framework capabilities.
+2. Route the older framework `TaskExecutor` through the same runtime kernel, or
    delete the old mechanism only after the replacement covers its hooks,
    verifier, replanner, timeout, and public framework use cases.
-5. Remove obsolete EKO-labelled fields/comments from generic framework APIs
+3. Remove obsolete EKO-labelled fields/comments from generic framework APIs
    only when their generic meaning or replacement is clear.
 
 ## Verification
 
 - Framework runtime executor unit tests cover dependency order, safe-point plan
   revision, skipped tasks, downstream blocking, and terminal outcomes.
+- Framework `PlanValidator` tests cover acyclic runtime specs, dangling
+  dependencies, cycles, and spec/execution identity mismatch.
 - All 44 EKO executor tests pass, including durable result reuse, revision
   insertion, cancellation, review outcomes, sibling completion, worktree merge
   failure, and external in-flight observation.

@@ -1107,7 +1107,7 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
         context: echo_agent::tasks::TaskSubagentContext,
         runtime_task: echo_agent::tasks::RuntimeTask,
     ) -> echo_agent::error::Result<Self::DispatchOutput> {
-        let task = self.plan_task(&runtime_task.id)?;
+        let task = self.plan_task(&runtime_task.spec.id)?;
         let execution_id = subagent_execution_id(&task.id, task.retry_count.saturating_add(1));
         match self
             .store
@@ -1161,7 +1161,7 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
         runtime_task: echo_agent::tasks::RuntimeTask,
         dispatch: echo_agent::error::Result<Self::DispatchOutput>,
     ) -> echo_agent::error::Result<echo_agent::tasks::RuntimeTaskResolution> {
-        let task = self.plan_task(&runtime_task.id)?;
+        let task = self.plan_task(&runtime_task.spec.id)?;
         let dispatched = match dispatch {
             Ok(dispatched) => dispatched,
             Err(error) => {
@@ -1373,7 +1373,13 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
         reason: &str,
     ) -> echo_agent::error::Result<()> {
         self.store
-            .set_task_status(run_id, &task.id, TodoStatus::Blocked, None, Some(reason))
+            .set_task_status(
+                run_id,
+                &task.spec.id,
+                TodoStatus::Blocked,
+                None,
+                Some(reason),
+            )
             .map(|_| ())
             .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))
     }

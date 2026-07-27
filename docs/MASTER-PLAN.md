@@ -206,7 +206,11 @@ frontiers, bounded Subagent waves, cancellation, failure propagation, external
 in-flight polling, and stall detection. EKO injects file-backed snapshots,
 review, resource/file ownership policy, worktree integration, and events through
 `EkoRuntimeDagController`. The old 596-line application scheduling loop was
-deleted. See `docs/2026-07-27-runtime-dag-kernel-convergence.md`.
+deleted. The framework runtime model now separates immutable spec from mutable
+execution, preserves execution checks/acceptance/artifacts without flattening,
+and uses the existing framework `PlanValidator` as the sole structural DAG
+validator. EKO validates only its Subagent/tool catalog and file-ownership
+policy. See `docs/2026-07-27-runtime-dag-kernel-convergence.md`.
 
 ### Skills And Report Rendering
 
@@ -252,11 +256,10 @@ the same fact is not persisted twice. See
 
 ## Next Step
 
-Continue runtime convergence by splitting immutable framework task specs from
-mutable task execution, preserving EKO execution-check/acceptance/artifact
-semantics without flattening, consolidating plan validation, and routing the
-older framework `TaskExecutor` through the same kernel before removing any
-fully-covered old mechanism. Also observe real long-running GUI/TUI/CLI task runs for revision-conflict,
+Continue runtime convergence by reconciling the older authoring
+`planning::TaskSpec` / mixed-state `Task` with the canonical runtime model and
+routing the older framework `TaskExecutor` through the same kernel before
+removing any fully-covered old mechanism. Also observe real long-running GUI/TUI/CLI task runs for revision-conflict,
 safe-point, logical-task worktree reuse, and clean-finalize telemetry. Review the nine retained
 legacy `eko-unattended-*` branches through the new queue before explicitly
 cleaning them. Also sample real direct, planned, fork, teammate, and team

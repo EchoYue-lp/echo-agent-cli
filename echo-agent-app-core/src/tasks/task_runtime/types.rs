@@ -769,6 +769,14 @@ pub struct TaskExecution {
     pub failure_fingerprint: Option<String>,
 }
 
+/// EKO-only metadata carried through the framework runtime extension point.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EkoTaskMetadata {
+    pub domain_profile: DomainProfile,
+    pub parallel_group: Option<String>,
+    pub sort_order: i64,
+}
+
 impl TaskExecution {
     pub fn pending(task_id: impl Into<String>) -> Self {
         Self {
@@ -925,30 +933,47 @@ impl PlanTask {
         }
     }
 
-    /// Convert to the framework's product-neutral runtime task view.
+    /// Convert losslessly to the framework's canonical runtime task model.
     pub fn to_runtime_task(&self) -> echo_agent::tasks::RuntimeTask {
+        let metadata = serde_json::Value::Object(serde_json::Map::from_iter([
+            (
+                "domain_profile".to_string(),
+                serde_json::Value::String(self.domain_profile.as_str().to_string()),
+            ),
+            (
+                "parallel_group".to_string(),
+                self.parallel_group
+                    .clone()
+                    .map(serde_json::Value::String)
+                    .unwrap_or(serde_json::Value::Null),
+            ),
+            (
+                "sort_order".to_string(),
+                serde_json::Value::Number(self.sort_order.into()),
+            ),
+        ]));
         echo_agent::tasks::RuntimeTask {
-            id: self.id.clone(),
-            title: self.title.clone(),
-            description: self.description.clone(),
-            kind: self.kind.to_runtime_kind(),
-            agent_role: self.agent_role.clone(),
-            depends_on: self.depends_on.clone(),
-            files: self.files.clone(),
-            allowed_tools: self.allowed_tools.clone(),
-            // Framework RuntimeTask still carries a single verification list;
-            // flatten both check kinds into it so framework-side scheduling
-            // (which does not distinguish them) keeps working. EKO's stricter
-            // split lives in the app layer.
-            verification: self
-                .execution_checks
-                .iter()
-                .chain(self.acceptance_criteria.iter())
-                .cloned()
-                .collect(),
-            retry_count: self.retry_count,
-            max_retries: self.max_retries,
-            status: self.status.to_runtime_status(),
+            spec: echo_agent::tasks::RuntimeTaskSpec {
+                id: self.id.clone(),
+                title: self.title.clone(),
+                description: self.description.clone(),
+                kind: self.kind.to_runtime_kind(),
+                agent_role: self.agent_role.clone(),
+                depends_on: self.depends_on.clone(),
+                files: self.files.clone(),
+                allowed_tools: self.allowed_tools.clone(),
+                required_artifacts: self.required_artifacts.clone(),
+                execution_checks: self.execution_checks.clone(),
+                acceptance_criteria: self.acceptance_criteria.clone(),
+                max_retries: self.max_retries,
+                metadata,
+            },
+            execution: echo_agent::tasks::RuntimeTaskExecution {
+                task_id: self.id.clone(),
+                status: self.status.to_runtime_status(),
+                retry_count: self.retry_count,
+                failure_fingerprint: self.failure_fingerprint.clone(),
+            },
         }
     }
 }
@@ -1614,7 +1639,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_task_converts_to_framework_runtime_task() {
+    fn plan_task_converts_to_framework_runtime_task() -> Result<(), String> {
         let task = PlanTask {
             id: "t1".to_string(),
             title: "Inspect runtime".to_string(),
@@ -1626,29 +1651,46 @@ mod tests {
             parallel_group: Some("g1".to_string()),
             files: vec!["src/lib.rs".to_string()],
             allowed_tools: vec!["read_file".to_string()],
-            required_artifacts: Vec::new(),
+            required_artifacts: vec!["report.md".to_string()],
             execution_checks: vec!["cargo check".to_string()],
-            acceptance_criteria: Vec::new(),
+            acceptance_criteria: vec!["root cause is explained".to_string()],
             retry_count: 1,
             max_retries: 2,
-            failure_fingerprint: None,
+            failure_fingerprint: Some("failure-1".to_string()),
             status: TodoStatus::Running,
             sort_order: 10,
         };
 
         let runtime = task.to_runtime_task();
 
-        assert_eq!(runtime.id, "t1");
+        assert_eq!(runtime.spec.id, "t1");
         assert_eq!(
-            runtime.kind,
+            runtime.spec.kind,
             echo_agent::tasks::RuntimeTaskKind::Investigation
         );
         assert_eq!(
-            runtime.status,
+            runtime.execution.status,
             echo_agent::tasks::RuntimeTaskStatus::Running
         );
-        assert_eq!(runtime.depends_on, vec!["t0".to_string()]);
-        assert_eq!(runtime.max_retries, 2);
+        assert_eq!(runtime.spec.depends_on, vec!["t0".to_string()]);
+        assert_eq!(runtime.spec.required_artifacts, vec!["report.md"]);
+        assert_eq!(runtime.spec.execution_checks, vec!["cargo check"]);
+        assert_eq!(
+            runtime.spec.acceptance_criteria,
+            vec!["root cause is explained"]
+        );
+        assert_eq!(runtime.spec.max_retries, 2);
+        assert_eq!(runtime.execution.retry_count, 1);
+        assert_eq!(
+            runtime.execution.failure_fingerprint.as_deref(),
+            Some("failure-1")
+        );
+        let metadata: EkoTaskMetadata =
+            serde_json::from_value(runtime.spec.metadata).map_err(|error| error.to_string())?;
+        assert_eq!(metadata.domain_profile, DomainProfile::AiCoding);
+        assert_eq!(metadata.parallel_group.as_deref(), Some("g1"));
+        assert_eq!(metadata.sort_order, 10);
+        Ok(())
     }
 
     #[test]
