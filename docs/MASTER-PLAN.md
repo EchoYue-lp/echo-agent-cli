@@ -200,6 +200,14 @@ TaskExecution status from `run-state.json`; older Task events only restore
 metadata and cannot override a later plan skip/reset. The right rail reports
 Subagent execution progress separately from Task acceptance progress.
 
+As of 2026-07-27, dependency traversal is no longer an EKO-owned `run_dag`
+loop. `echo-orchestration::RuntimeDagExecutor` owns revision safe points, ready
+frontiers, bounded Subagent waves, cancellation, failure propagation, external
+in-flight polling, and stall detection. EKO injects file-backed snapshots,
+review, resource/file ownership policy, worktree integration, and events through
+`EkoRuntimeDagController`. The old 596-line application scheduling loop was
+deleted. See `docs/2026-07-27-runtime-dag-kernel-convergence.md`.
+
 ### Skills And Report Rendering
 
 Skill updates follow Claude Code's explicit marketplace refresh model: users
@@ -244,7 +252,11 @@ the same fact is not persisted twice. See
 
 ## Next Step
 
-Observe real long-running GUI/TUI/CLI task runs for revision-conflict,
+Continue runtime convergence by splitting immutable framework task specs from
+mutable task execution, preserving EKO execution-check/acceptance/artifact
+semantics without flattening, consolidating plan validation, and routing the
+older framework `TaskExecutor` through the same kernel before removing any
+fully-covered old mechanism. Also observe real long-running GUI/TUI/CLI task runs for revision-conflict,
 safe-point, logical-task worktree reuse, and clean-finalize telemetry. Review the nine retained
 legacy `eko-unattended-*` branches through the new queue before explicitly
 cleaning them. Also sample real direct, planned, fork, teammate, and team

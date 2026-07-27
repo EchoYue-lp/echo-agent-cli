@@ -916,7 +916,7 @@ mod tests {
     /// the other's tmp away, so the second `rename` failed with
     /// "No such file or directory". This reproduced as the
     /// `failed to mark task running ... file shadow: shadow io: No such file`
-    /// WARN spam during parallel readonly delegation (run_dag fans out N tasks,
+    /// WARN spam during parallel readonly delegation (the executor fans out N tasks,
     /// each `set_task_status` → `rewrite_plan` → `atomic_write` concurrently).
     ///
     /// With per-call unique tmp names (pid + counter + nanos), renames never

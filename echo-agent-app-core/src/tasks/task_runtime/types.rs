@@ -1,16 +1,15 @@
 //! TaskRuntime data model — the canonical types for complex-task execution.
 //!
-//! These types live in the application layer because the framework
-//! (`echo-agent`) intentionally holds no `AgentPool` / conversation-registry
-//! / complex-task runtime: those are product-layer concerns. The framework
-//! provides `Task` / `TaskExecutor` / `CheckpointStore` primitives, and this
-//! module composes a higher-level *run → plan → plan-task → todo → event*
-//! lifecycle on top of them.
+//! These types live in the application layer because `DomainProfile`, UI todo
+//! projections, conversations, artifacts, reviews, and file persistence are
+//! EKO product concerns. The framework owns the product-neutral runtime task
+//! view and the only dynamic DAG execution loop; this module adapts EKO plan
+//! and execution records to that kernel.
 //!
 //! Naming note: the framework already re-exports a `TaskEvent`
 //! (`crate::tasks::TaskEvent`). This module's event type is therefore named
-//! [`RuntimeTaskEvent`] and is stored on its own table; we never shadow the
-//! framework type.
+//! [`RuntimeTaskEvent`] and is stored in EKO's append-only file event stream;
+//! we never shadow the framework type.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

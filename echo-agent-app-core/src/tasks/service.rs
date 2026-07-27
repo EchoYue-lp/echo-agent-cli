@@ -1,9 +1,9 @@
 //! Background task trigger adapter backed exclusively by EKO TaskRuntime.
 //!
-//! The framework's generic `TaskManager`/`TaskExecutor` remain available to
-//! framework consumers, but EKO no longer runs a parallel product lifecycle.
 //! CLI, Tauri, cron-style background work and structured pipelines all create
-//! a TaskRun and use the same cancellation, recovery and terminal contracts.
+//! an EKO TaskRun and use the same product persistence, recovery, and terminal
+//! contracts. DAG execution itself is delegated to the framework's generic
+//! runtime executor.
 
 use std::sync::Arc;
 

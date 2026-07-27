@@ -140,7 +140,7 @@ tokio::task_local! {
     /// The unattended write mode for the currently executing run (D7 stage 2).
     /// Set by `ExecutePlanTool::execute` so CP B preflight in `execute_task`
     /// can read it without threading the mode through `execute_run` →
-    /// `run_dag` → `execute_task`. Defaults to `Disabled` when no scope is
+    /// runtime executor → EKO controller → `execute_task`. Defaults to `Disabled` when no scope is
     /// active (e.g. tests, attended runs).
     pub static CURRENT_UNATTENDED_WRITE_MODE: super::types::UnattendedWriteMode;
 }

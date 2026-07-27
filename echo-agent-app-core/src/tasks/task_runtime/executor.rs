@@ -1,16 +1,19 @@
-//! DAG scheduler for TaskRuntime runs.
+//! EKO adapter for the framework runtime DAG executor.
 //!
-//! Converts an approved `TaskPlan` into a dependency graph and executes it,
-//! honoring the plan's parallelism rules:
+//! Converts EKO `TaskPlan` snapshots into the framework's product-neutral task
+//! view, then injects EKO dispatch, review, persistence, worktree, and event
+//! policy. Dependency traversal, revision safe points, Subagent waves,
+//! cancellation, failure propagation, and stall detection live in
+//! `echo_orchestration::tasks::RuntimeDagExecutor`.
 //!
 //! - read-only tasks (read_only_review, investigation, test_plan, review,
 //!   summary) run concurrently up to the configured Subagent limit, each delegated
 //!   to a registered subagent role via `delegate_to_agent_with_cancel` (fork
 //!   mode → isolated instance under the executor's semaphore, NOT the primary
 //!   agent's execution_mutex, so they parallelize);
-//! - implementation / debugging / verification tasks serialize (acquire the
-//!   write lock) and run on the PRIMARY agent directly (never delegated to a
-//!   read-only Subagent);
+//! - implementation / debugging tasks use ownership-safe waves and writer
+//!   worktrees; verification tasks run on the primary Agent against the
+//!   authoritative workspace;
 //! - the overall Subagent count is capped by `ConcurrencyLimits`.
 //!
 //! Cancellation: each dispatched task gets a child of the parent run's
@@ -172,30 +175,6 @@ pub enum RunOutcome {
         failed_task_id: String,
         error: String,
     },
-}
-
-fn review_stop_outcome(
-    store: &TaskRuntimeStore,
-    run_id: &str,
-    failed_task_id: String,
-    error: String,
-) -> RunOutcome {
-    let unattended = store
-        .get_run(run_id)
-        .ok()
-        .flatten()
-        .is_some_and(|run| run.attended_mode == AttendedMode::Unattended);
-    if unattended {
-        RunOutcome::Failed {
-            failed_task_id,
-            error,
-        }
-    } else {
-        RunOutcome::Paused {
-            failed_task_id,
-            error,
-        }
-    }
 }
 
 /// Whether an Agent-driven Run must materialize a formal plan before it may
@@ -382,14 +361,13 @@ pub async fn execute_run(
             "task_runtime: drain plan snapshot"
         );
 
-        let outcome = run_dag(
+        let outcome = execute_runtime_plan(
             store.clone(),
             RealTaskDispatcher {
                 primary_agent: primary_agent.clone(),
             },
             reviewer_llm.clone(),
             run_id,
-            plan.tasks,
             limits,
             parent_cancel.clone(),
             trace_sink.clone(),
@@ -533,7 +511,7 @@ pub async fn execute_run(
                     }),
                 ),
             );
-            // run_dag or the control path already transitioned Running → Paused.
+            // The runtime adapter or control path already transitioned Running → Paused.
             // Any Subagent that was in flight no longer exists after cancellation,
             // so make it pending again for the resume drain.
             if let Ok(todos) = store.list_todos(run_id) {
@@ -756,25 +734,23 @@ fn artifact_matches(required: &str, actual: &str) -> bool {
 
 /// Abstraction over how a single ready task is dispatched in the EKO runtime.
 ///
-/// `run_dag` depends on this trait (not on `execute_task` directly) so the
-/// scheduling core — frontier computation, dependency resolution, failure
-/// propagation, cancellation, stall detection — can be unit-tested with a
-/// deterministic mock dispatcher instead of a real LLM-backed agent. The
+/// The framework runtime DAG controller depends on this trait (not on
+/// `execute_task` directly), so EKO dispatch and worktree integration can be
+/// tested with a deterministic mock instead of a real LLM-backed Agent. The
 /// production implementation ([`RealTaskDispatcher`]) wraps `execute_task`.
 ///
-/// The dispatcher is given the semaphores + file locks so it can honor the same
-/// concurrency limits as the real path; mocks usually ignore them.
+/// The dispatcher is given EKO-specific resource semaphores and file locks.
+/// The framework executor owns the global Subagent concurrency permit.
 trait TaskDispatcher: Send + Sync {
     /// Execute `task` for `run_id`. Success carries both the bounded structured
     /// result and the complete model output. The former feeds parent summaries;
     /// the latter is the evidence reviewed against acceptance criteria.
-    #[allow(clippy::too_many_arguments, clippy::type_complexity)] // semaphores/locks passed so mocks honor the same limits; boxed-future return is the dispatch contract
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)] // product resource limits + locks are the application dispatch contract
     fn dispatch(
         &self,
         store: Arc<TaskRuntimeStore>,
         context: echo_agent::tasks::TaskSubagentContext,
         task: PlanTask,
-        subagent_sem: Arc<Semaphore>,
         write_sem: Arc<Semaphore>,
         shell_sem: Arc<Semaphore>,
         llm_sem: Arc<Semaphore>,
@@ -806,9 +782,8 @@ trait TaskDispatcher: Send + Sync {
 
 /// Production dispatcher: delegates to [`execute_task`] against the primary agent.
 ///
-/// Note: the reviewer LLM is NOT held here — it is owned by `run_dag` itself
-/// (the review gate runs at the `run_dag` level, after a Subagent returns). The
-/// dispatcher only needs the agent + concurrency primitives.
+/// Review remains in the EKO runtime controller after a Subagent returns. The
+/// dispatcher only needs the Agent and product-specific concurrency primitives.
 struct RealTaskDispatcher {
     primary_agent: crate::agent_handle::AgentHandle,
 }
@@ -819,7 +794,6 @@ impl TaskDispatcher for RealTaskDispatcher {
         store: Arc<TaskRuntimeStore>,
         context: echo_agent::tasks::TaskSubagentContext,
         task: PlanTask,
-        subagent_sem: Arc<Semaphore>,
         write_sem: Arc<Semaphore>,
         shell_sem: Arc<Semaphore>,
         llm_sem: Arc<Semaphore>,
@@ -844,7 +818,6 @@ impl TaskDispatcher for RealTaskDispatcher {
                 execute_task(
                     store,
                     primary_agent,
-                    subagent_sem,
                     write_sem,
                     shell_sem,
                     llm_sem,
@@ -1035,596 +1008,477 @@ fn select_ownership_safe_wave(ready: Vec<PlanTask>) -> Vec<PlanTask> {
     selected
 }
 
-/// Core DAG loop. Maintains a frontier of ready tasks and dispatches them
-/// under the concurrency semaphores until all are done, the run is cancelled,
-/// or a task fails.
-#[allow(clippy::too_many_arguments)] // semaphores + stores + sinks all thread through; matches framework TaskExecutor style
-async fn run_dag<W: TaskDispatcher + 'static>(
+struct EkoRuntimeDagController<W: TaskDispatcher> {
+    store: Arc<TaskRuntimeStore>,
+    dispatcher: Arc<W>,
+    reviewer_llm: Option<Arc<dyn echo_agent::llm::LlmClient>>,
+    write_sem: Arc<Semaphore>,
+    shell_sem: Arc<Semaphore>,
+    llm_sem: Arc<Semaphore>,
+    file_write_locks: Arc<std::sync::Mutex<HashMap<String, Arc<TokioMutex<()>>>>>,
+    trace_sink: Option<ExecSink>,
+    cancel: CancellationToken,
+    plan_tasks: std::sync::Mutex<HashMap<String, PlanTask>>,
+}
+
+impl<W: TaskDispatcher> EkoRuntimeDagController<W> {
+    fn plan_task(&self, task_id: &str) -> echo_agent::error::Result<PlanTask> {
+        self.plan_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(task_id)
+            .cloned()
+            .ok_or_else(|| {
+                echo_agent::error::ReactError::Other(format!(
+                    "plan task '{task_id}' missing from active revision"
+                ))
+            })
+    }
+
+    fn review_stop_disposition(&self, run_id: &str) -> echo_agent::tasks::RuntimeStopDisposition {
+        let unattended = self
+            .store
+            .get_run(run_id)
+            .ok()
+            .flatten()
+            .is_some_and(|run| run.attended_mode == AttendedMode::Unattended);
+        if unattended {
+            echo_agent::tasks::RuntimeStopDisposition::Fail
+        } else {
+            echo_agent::tasks::RuntimeStopDisposition::Pause
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
+    for EkoRuntimeDagController<W>
+{
+    type DispatchOutput = TaskDispatchSuccess;
+
+    async fn load_snapshot(
+        &self,
+        run_id: &str,
+    ) -> echo_agent::error::Result<echo_agent::tasks::RuntimePlanSnapshot> {
+        let plan = self
+            .store
+            .get_plan(run_id)
+            .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))?
+            .ok_or_else(|| {
+                echo_agent::error::ReactError::Other(format!("run {run_id} has no plan"))
+            })?;
+        let runtime_tasks = plan.tasks.iter().map(PlanTask::to_runtime_task).collect();
+        let by_id = plan
+            .tasks
+            .into_iter()
+            .map(|task| (task.id.clone(), task))
+            .collect();
+        *self
+            .plan_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = by_id;
+        Ok(echo_agent::tasks::RuntimePlanSnapshot {
+            revision: plan.revision,
+            tasks: runtime_tasks,
+        })
+    }
+
+    fn select_ready_wave(
+        &self,
+        _tasks: &[echo_agent::tasks::RuntimeTask],
+        ready_task_ids: Vec<String>,
+    ) -> Vec<String> {
+        let by_id = self
+            .plan_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let ready = ready_task_ids
+            .into_iter()
+            .filter_map(|task_id| by_id.get(&task_id).cloned())
+            .collect();
+        select_ownership_safe_wave(ready)
+            .into_iter()
+            .map(|task| task.id)
+            .collect()
+    }
+
+    async fn dispatch_task(
+        &self,
+        context: echo_agent::tasks::TaskSubagentContext,
+        runtime_task: echo_agent::tasks::RuntimeTask,
+    ) -> echo_agent::error::Result<Self::DispatchOutput> {
+        let task = self.plan_task(&runtime_task.id)?;
+        let execution_id = subagent_execution_id(&task.id, task.retry_count.saturating_add(1));
+        match self
+            .store
+            .recoverable_subagent_result(&context.run_id, &task.id, &execution_id)
+        {
+            Ok(Some(recovered)) => {
+                tracing::info!(
+                    run_id = %context.run_id,
+                    task_id = %task.id,
+                    execution_id,
+                    "task_runtime: reusing durable Subagent result after restart"
+                );
+                let _ = self.store.note(
+                    &context.run_id,
+                    Some(&task.id),
+                    "reused completed Subagent result; continuing at review boundary",
+                );
+                return Ok(TaskDispatchSuccess {
+                    task_id: task.id,
+                    result: recovered.result,
+                    full_output: recovered.full_output,
+                });
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                run_id = %context.run_id,
+                task_id = %task.id,
+                %error,
+                "failed to inspect durable Subagent result; dispatching normally"
+            ),
+        }
+
+        self.dispatcher
+            .dispatch(
+                self.store.clone(),
+                context,
+                task,
+                self.write_sem.clone(),
+                self.shell_sem.clone(),
+                self.llm_sem.clone(),
+                self.file_write_locks.clone(),
+                self.trace_sink.clone(),
+            )
+            .await
+            .map_err(|(_, error)| echo_agent::error::ReactError::Other(error))
+    }
+
+    async fn resolve_dispatch(
+        &self,
+        run_id: &str,
+        runtime_task: echo_agent::tasks::RuntimeTask,
+        dispatch: echo_agent::error::Result<Self::DispatchOutput>,
+    ) -> echo_agent::error::Result<echo_agent::tasks::RuntimeTaskResolution> {
+        let task = self.plan_task(&runtime_task.id)?;
+        let dispatched = match dispatch {
+            Ok(dispatched) => dispatched,
+            Err(error) => {
+                let message = error.to_string();
+                self.store
+                    .set_task_status(
+                        run_id,
+                        &task.id,
+                        TodoStatus::Failed,
+                        Some(&task.agent_role),
+                        Some(&format!("error: {message}")),
+                    )
+                    .map_err(|store_error| {
+                        echo_agent::error::ReactError::Other(store_error.to_string())
+                    })?;
+                return Ok(echo_agent::tasks::RuntimeTaskResolution::Failed { error: message });
+            }
+        };
+
+        let TaskDispatchSuccess {
+            task_id,
+            result,
+            full_output,
+        } = dispatched;
+        if task_id != task.id {
+            return Err(echo_agent::error::ReactError::Other(format!(
+                "dispatcher returned task '{task_id}' for active task '{}'",
+                task.id
+            )));
+        }
+
+        match assess_task_execution(&task, &result) {
+            CompletionAssessment::ExecutionFailed { reason } => {
+                if task.retry_count < task.max_retries {
+                    let next_retry = task.retry_count.saturating_add(1);
+                    self.store
+                        .set_task_status(
+                            run_id,
+                            &task.id,
+                            TodoStatus::Pending,
+                            Some(&task.agent_role),
+                            Some(&format!(
+                                "execution failed (attempt {next_retry}): {reason}"
+                            )),
+                        )
+                        .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))?;
+                    let _ = self.store.note(
+                        run_id,
+                        Some(&task.id),
+                        &format!(
+                            "attempt {next_retry} failed: {reason}; auto-retrying (retry_count {} -> {next_retry})",
+                            task.retry_count
+                        ),
+                    );
+                    self.store
+                        .increment_retry_count(run_id, &task.id, None)
+                        .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))?;
+                    Ok(echo_agent::tasks::RuntimeTaskResolution::Pending)
+                } else {
+                    let error = format!("execution failed after max retries: {reason}");
+                    self.store
+                        .set_task_status(
+                            run_id,
+                            &task.id,
+                            TodoStatus::Failed,
+                            Some(&task.agent_role),
+                            Some(&error),
+                        )
+                        .map_err(|store_error| {
+                            echo_agent::error::ReactError::Other(store_error.to_string())
+                        })?;
+                    Ok(echo_agent::tasks::RuntimeTaskResolution::Failed { error })
+                }
+            }
+            CompletionAssessment::AcceptancePending {
+                missing_checks,
+                missing_artifacts,
+            } => {
+                let reason = format!(
+                    "acceptance pending: missing execution checks [{}], missing artifacts [{}]",
+                    missing_checks.join(", "),
+                    missing_artifacts.join(", "),
+                );
+                self.store
+                    .set_task_status(
+                        run_id,
+                        &task.id,
+                        TodoStatus::Blocked,
+                        Some(&task.agent_role),
+                        Some(&reason),
+                    )
+                    .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))?;
+                let _ = self.store.note(run_id, Some(&task.id), &reason);
+                Ok(echo_agent::tasks::RuntimeTaskResolution::Blocked {
+                    error: reason,
+                    disposition: self.review_stop_disposition(run_id),
+                })
+            }
+            CompletionAssessment::Executed => {
+                let summary = result.summary.clone();
+                let review_output = if full_output.trim().is_empty() {
+                    summary.as_str()
+                } else {
+                    full_output.as_str()
+                };
+                let review = run_review_gate(
+                    self.store.clone(),
+                    self.reviewer_llm.clone(),
+                    run_id,
+                    &task,
+                    review_output,
+                )
+                .await;
+                let block_reason = match review {
+                    ReviewGateOutcome::Pass => None,
+                    ReviewGateOutcome::NeedsFix(_fix_task) => {
+                        let _ = self.store.note(
+                            run_id,
+                            Some(&task.id),
+                            "review returned needs_fix; task blocked, run stopped",
+                        );
+                        Some("review needs fix; awaiting explicit retry".to_string())
+                    }
+                    ReviewGateOutcome::Suspend(reason) => {
+                        let _ = self.store.note(
+                            run_id,
+                            Some(&task.id),
+                            &format!("circuit breaker: {reason}"),
+                        );
+                        Some(format!("review suspended: {reason}"))
+                    }
+                    ReviewGateOutcome::Skipped => {
+                        let _ = self.store.note(
+                            run_id,
+                            Some(&task.id),
+                            "no reviewer LLM; task blocked (no auto-pass per M7)",
+                        );
+                        Some("reviewer unavailable; blocked pending LLM".to_string())
+                    }
+                };
+                if let Some(reason) = block_reason {
+                    self.store
+                        .set_task_status(
+                            run_id,
+                            &task.id,
+                            TodoStatus::Blocked,
+                            Some(&task.agent_role),
+                            Some(&reason),
+                        )
+                        .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))?;
+                    return Ok(echo_agent::tasks::RuntimeTaskResolution::Blocked {
+                        error: reason,
+                        disposition: self.review_stop_disposition(run_id),
+                    });
+                }
+
+                let execution_id =
+                    subagent_execution_id(&task.id, task.retry_count.saturating_add(1));
+                match integrate_reviewed_task(
+                    self.dispatcher.clone(),
+                    self.store.clone(),
+                    run_id,
+                    &task,
+                    &execution_id,
+                    &summary,
+                    self.cancel.clone(),
+                    self.trace_sink.clone(),
+                )
+                .await
+                {
+                    Ok(completion_summary) => {
+                        self.store
+                            .set_task_status(
+                                run_id,
+                                &task.id,
+                                TodoStatus::Completed,
+                                Some(&task.agent_role),
+                                Some(&completion_summary),
+                            )
+                            .map_err(|error| {
+                                echo_agent::error::ReactError::Other(error.to_string())
+                            })?;
+                        Ok(echo_agent::tasks::RuntimeTaskResolution::Completed)
+                    }
+                    Err(error) => {
+                        let error = format!("worktree integration failed: {error}");
+                        self.store
+                            .set_task_status(
+                                run_id,
+                                &task.id,
+                                TodoStatus::Failed,
+                                Some(&task.agent_role),
+                                Some(&error),
+                            )
+                            .map_err(|store_error| {
+                                echo_agent::error::ReactError::Other(store_error.to_string())
+                            })?;
+                        Ok(echo_agent::tasks::RuntimeTaskResolution::Failed { error })
+                    }
+                }
+            }
+        }
+    }
+
+    async fn block_task(
+        &self,
+        run_id: &str,
+        task: &echo_agent::tasks::RuntimeTask,
+        reason: &str,
+    ) -> echo_agent::error::Result<()> {
+        self.store
+            .set_task_status(run_id, &task.id, TodoStatus::Blocked, None, Some(reason))
+            .map(|_| ())
+            .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))
+    }
+
+    async fn failed_task_disposition(
+        &self,
+        run_id: &str,
+        _task: &echo_agent::tasks::RuntimeTask,
+        all_unfinished_failed_or_blocked: bool,
+    ) -> echo_agent::error::Result<echo_agent::tasks::RuntimeStopDisposition> {
+        if all_unfinished_failed_or_blocked {
+            Ok(echo_agent::tasks::RuntimeStopDisposition::Fail)
+        } else {
+            Ok(self.review_stop_disposition(run_id))
+        }
+    }
+
+    async fn interruption_outcome(
+        &self,
+        run_id: &str,
+    ) -> echo_agent::error::Result<echo_agent::tasks::RuntimeDagOutcome> {
+        let paused = self
+            .store
+            .get_run(run_id)
+            .ok()
+            .flatten()
+            .is_some_and(|run| run.status == TaskRunStatus::Paused);
+        Ok(if paused {
+            echo_agent::tasks::RuntimeDagOutcome::Paused {
+                failed_task_id: "<pause>".to_string(),
+                error: "paused by user".to_string(),
+            }
+        } else {
+            echo_agent::tasks::RuntimeDagOutcome::Cancelled
+        })
+    }
+
+    async fn note_stalled(&self, run_id: &str, reason: &str) -> echo_agent::error::Result<()> {
+        self.store
+            .note(run_id, None, reason)
+            .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_runtime_plan<W: TaskDispatcher + 'static>(
     store: Arc<TaskRuntimeStore>,
     dispatcher: W,
     reviewer_llm: Option<Arc<dyn echo_agent::llm::LlmClient>>,
     run_id: &str,
-    tasks: Vec<PlanTask>,
     limits: ConcurrencyLimits,
     parent_cancel: CancellationToken,
     trace_sink: Option<ExecSink>,
 ) -> Result<RunOutcome, ExecError> {
-    // Wrap the dispatcher in an Arc so each spawned task can clone the handle.
-    let dispatcher = Arc::new(dispatcher);
-    // Start from one coherent persisted revision whenever it exists. Reading
-    // the revision number separately from the caller-provided task snapshot
-    // could pair a newly committed revision with stale task bodies.
-    let persisted_plan = store.get_plan(run_id).ok().flatten();
-    let tasks = persisted_plan
-        .as_ref()
-        .map(|plan| plan.tasks.clone())
-        .unwrap_or(tasks);
-    let mut by_id: HashMap<String, PlanTask> =
-        tasks.iter().map(|t| (t.id.clone(), t.clone())).collect();
-    let mut runtime_tasks: Vec<echo_agent::tasks::RuntimeTask> =
-        tasks.iter().map(PlanTask::to_runtime_task).collect();
-
-    // Generic DAG bookkeeping lives in the framework. App-core still owns
-    // store writes, review gates, event emission, and Subagent dispatch.
-    let mut dag_state = echo_agent::tasks::DagExecutionState::from_tasks(&runtime_tasks);
-    let mut active_revision = persisted_plan.map(|plan| plan.revision).unwrap_or(1);
-    let mut failed_id: Option<String> = None;
-    // Delayed-stop signal: when a task inside a wave resolves to Paused/Failed
-    // (acceptance pending, review needs_fix, reviewer unavailable), we must
-    // NOT return immediately — sibling tasks in the same wave have already
-    // produced results that deserve processing (Completed → persist, Failed
-    // → mark). Returning early left them in Running, and the resume path
-    // (execute_run:422) reset Running → Pending, causing the entire wave to
-    // be redispatched on the next attempt. We stash the outcome here, finish
-    // processing the rest of the wave, then return at the bottom of the loop.
-    let mut pending_outcome: Option<RunOutcome> = None;
-
-    let subagent_sem = Arc::new(Semaphore::new(limits.max_concurrent_subagents));
-    let write_sem = Arc::new(Semaphore::new(limits.max_concurrent_writes));
-    let shell_sem = Arc::new(Semaphore::new(limits.max_concurrent_shells));
-    let llm_sem = Arc::new(Semaphore::new(limits.max_parallel_llm_calls));
-    // G5: Per-file async mutex map. Non-overlapping files run in parallel
-    // (max_concurrent_writes=4), overlapping files serialize on the same
-    // per-file TokioMutex. Files are sorted before locking (see execute_task)
-    // to prevent lock-ordering deadlocks.
-    let file_write_locks: Arc<std::sync::Mutex<HashMap<String, Arc<TokioMutex<()>>>>> =
-        Arc::new(std::sync::Mutex::new(HashMap::new()));
-
-    // Loop until every task is resolved or the run aborts.
-    loop {
-        if parent_cancel.is_cancelled() {
-            return Ok(interrupted_outcome(&store, run_id));
-        }
-        // Scheduler safe point. A running wave reaches this loop only after
-        // all of its handles have been joined, so a committed plan revision
-        // can replace pending/blocked task specs without tearing active work.
-        if let Some(latest) = store.get_plan(run_id).ok().flatten()
-            && latest.revision != active_revision
-        {
-            tracing::info!(
-                run_id,
-                from_revision = active_revision,
-                to_revision = latest.revision,
-                "task_runtime: applying committed plan revision at safe point"
-            );
-            by_id = latest
-                .tasks
-                .iter()
-                .map(|task| (task.id.clone(), task.clone()))
-                .collect();
-            runtime_tasks = latest.tasks.iter().map(PlanTask::to_runtime_task).collect();
-            dag_state = echo_agent::tasks::DagExecutionState::from_tasks(&runtime_tasks);
-            active_revision = latest.revision;
-        }
-        if let Some(id) = &failed_id {
-            // A task failed: propagate Blocked to downstream dependents
-            // (but NEVER overwrite a task that's already Failed).
-            for task_id in dag_state.blocked_by_failures(&runtime_tasks) {
-                if let Some(t) = by_id.get(&task_id) {
-                    let _ = store.set_task_status(
-                        run_id,
-                        &t.id,
-                        TodoStatus::Blocked,
-                        None,
-                        Some("blocked: upstream task failed"),
-                    );
-                }
-            }
-            // Check if ALL non-terminal tasks are Failed or Blocked — if so,
-            // the run is unrecoverable and should fail outright. Otherwise,
-            // pause for user/agent decision.
-            let all_dead = dag_state.all_unfinished_failed_or_blocked(&runtime_tasks);
-            let failed = by_id.get(id).cloned();
-            let error = failed
-                .map(|t| format!("task '{}' failed", t.title))
-                .unwrap_or_else(|| "task failed".into());
-            let unattended = store
-                .get_run(run_id)
-                .ok()
-                .flatten()
-                .is_some_and(|run| run.attended_mode == AttendedMode::Unattended);
-            if all_dead || unattended {
-                return Ok(RunOutcome::Failed {
-                    failed_task_id: id.clone(),
-                    error,
-                });
-            }
-            // Pause the run for decision rather than failing outright.
-            let _ = store.transition_run(run_id, TaskRunStatus::Paused);
-            return Ok(RunOutcome::Paused {
-                failed_task_id: id.clone(),
-                error,
-            });
-        }
-        if dag_state.all_completed(&runtime_tasks) {
-            return Ok(RunOutcome::Completed);
-        }
-
-        // Refresh in_flight tasks from the store: any that reached a terminal
-        // state (Completed/Failed/Skipped) while we were away are no longer
-        // in-flight. Completed ones move into `completed`; Failed/Skipped are
-        // treated as resolved (count toward the all_ids check). This is what
-        // lets a sibling run_dag instance finish a task and this instance
-        // observe it without re-dispatching.
-        if !dag_state.in_flight.is_empty() {
-            let live_plan = store.get_plan(run_id).ok().flatten();
-            if let Some(plan) = live_plan {
-                let live_runtime_tasks: Vec<echo_agent::tasks::RuntimeTask> =
-                    plan.tasks.iter().map(PlanTask::to_runtime_task).collect();
-                let refresh = dag_state.refresh_in_flight(&live_runtime_tasks);
-                for id in refresh.failed {
-                    if failed_id.is_none() {
-                        failed_id = Some(id);
-                    }
-                }
-            }
-            if dag_state.all_completed(&runtime_tasks) {
-                return Ok(RunOutcome::Completed);
-            }
-        }
-
-        // Find ready tasks: not completed, not in_flight, all deps completed.
-        // in_flight tasks are excluded so they aren't re-dispatched (they are
-        // being driven by a sibling run_dag instance).
-        let ready: Vec<PlanTask> = dag_state
-            .ready_task_ids(&runtime_tasks)
-            .into_iter()
-            .filter_map(|id| by_id.get(&id).cloned())
-            .collect();
-
-        if ready.is_empty() {
-            if !dag_state.in_flight.is_empty() {
-                // Nothing ready but sibling run_dag instances are still
-                // driving tasks. Wait briefly for them to make progress, then
-                // loop back to re-check the store. Without this wait the loop
-                // would spin hot.
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                continue;
-            }
-            // Nothing ready, nothing in-flight, and not all done → deadlock
-            // (cycle or all remaining are blocked by the failed one).
-            if dag_state.completed.len() + dag_state.failed.len() >= runtime_tasks.len() {
-                continue;
-            }
-            // Genuine stall: record and fail.
-            let _ = store.note(run_id, None, "DAG stalled: no ready tasks");
-            return Ok(RunOutcome::Failed {
-                failed_task_id: "<none>".into(),
-                error: "DAG stalled with unfinished tasks (cycle or blocked)".into(),
-            });
-        }
-        let ready_count = ready.len();
-        let ready = select_ownership_safe_wave(ready);
-        let ready_ids: Vec<String> = ready.iter().map(|t| t.id.clone()).collect();
-        tracing::info!(
-            run_id = %run_id,
-            ready_count = ready_ids.len(),
-            deferred_for_ownership = ready_count.saturating_sub(ready_ids.len()),
-            ready_tasks = ?ready_ids,
-            completed_count = dag_state.completed.len(),
-            total_count = runtime_tasks.len(),
-            "task_runtime: dispatching DAG wave"
-        );
-
-        // Dispatch each ready task. We run them concurrently up to the
-        // semaphores; join all before recomputing the frontier.
-        //
-        // Cancellation: each task gets parent_cancel.clone() (NOT child_token —
-        // child_token creates a separate subtree that parent cancellation does
-        // NOT propagate into). With clone, parent_cancel.cancel() immediately
-        // fires every Subagent's select! guard. If we detect cancellation
-        // mid-wave, we abort remaining handles before returning Cancelled so
-        // no orphan tasks keep writing files.
-        let mut handles: Vec<_> = Vec::new();
-        let mut wave_results: Vec<TaskDispatchResult> = Vec::new();
-        for task in ready {
-            let execution_id = format!("{}:{}", task.id, task.retry_count.saturating_add(1));
-            match store.recoverable_subagent_result(run_id, &task.id, &execution_id) {
-                Ok(Some(recovered)) => {
-                    tracing::info!(
-                        run_id = %run_id,
-                        task_id = %task.id,
-                        execution_id,
-                        "task_runtime: reusing durable Subagent result after restart"
-                    );
-                    let _ = store.note(
-                        run_id,
-                        Some(&task.id),
-                        "reused completed Subagent result; continuing at review boundary",
-                    );
-                    wave_results.push(Ok(TaskDispatchSuccess {
-                        task_id: task.id.clone(),
-                        result: recovered.result,
-                        full_output: recovered.full_output,
-                    }));
-                    continue;
-                }
-                Ok(None) => {}
-                Err(error) => tracing::warn!(
-                    run_id = %run_id,
-                    task_id = %task.id,
-                    %error,
-                    "failed to inspect durable Subagent result; dispatching normally"
-                ),
-            }
-            let store = store.clone();
-            let dispatcher = dispatcher.clone();
-            let subagent_sem = subagent_sem.clone();
-            let write_sem = write_sem.clone();
-            let shell_sem = shell_sem.clone();
-            let llm_sem = llm_sem.clone();
-            let file_write_locks = file_write_locks.clone();
-            let trace_sink = trace_sink.clone();
-            // clone shares the same cancellation tree — parent cancel fires here.
-            let context = echo_agent::tasks::TaskSubagentContext::new(run_id.to_string())
-                .with_cancel(parent_cancel.clone())
-                .with_concurrency_limits(limits)
-                .with_delegation_policy(echo_agent::tasks::NestedDelegationPolicy {
-                    can_spawn_subagents: true,
-                    delegate_depth: 0,
-                    max_delegate_depth: 2,
-                });
-            handles.push(tokio::spawn(async move {
-                dispatcher
-                    .dispatch(
-                        store,
-                        context,
-                        task,
-                        subagent_sem,
-                        write_sem,
-                        shell_sem,
-                        llm_sem,
-                        file_write_locks,
-                        trace_sink,
-                    )
-                    .await
-            }));
-        }
-
-        // Await the wave. Collect results; on cancellation, abort stragglers.
-        let mut cancelled_mid_wave = false;
-        for handle in &mut handles {
-            if parent_cancel.is_cancelled() {
-                cancelled_mid_wave = true;
-                break;
-            }
-            match handle.await {
-                Ok(r) => wave_results.push(r),
-                Err(join_err) => {
-                    wave_results.push(Err((
-                        "<join>".to_string(),
-                        format!("subagent task panicked: {join_err}"),
-                    )));
-                }
-            }
-        }
-        if parent_cancel.is_cancelled() {
-            cancelled_mid_wave = true;
-        }
-        if cancelled_mid_wave {
-            // Abort any handles we didn't await so their Subagents stop promptly.
-            for handle in &mut handles {
-                handle.abort();
-            }
-            return Ok(interrupted_outcome(&store, run_id));
-        }
-
-        // Process wave results: first failure wins for the error message, but
-        // ALL failed tasks are marked Failed (not later overwritten to Skipped
-        // by the skip logic, which now excludes the failed set).
-        let mut wave_failed: Vec<String> = Vec::new();
-        for result in wave_results {
-            match result {
-                Ok(dispatched) => {
-                    let TaskDispatchSuccess {
-                        task_id: id,
-                        result,
-                        full_output,
-                    } = dispatched;
-                    // Three-track decision based on hard evidence:
-                    //   Executed        → run ReviewGate (acceptance judgement)
-                    //   ExecutionFailed → retry within budget (real failure)
-                    //   AcceptancePending → Block + Pause (NOT retryable)
-                    //
-                    // M7: contract_version=0 is a valid fallback shape and is
-                    // NOT a failure condition. A plain-text summary with no
-                    // execution_checks is legitimate execution evidence.
-                    let Some(task) = by_id.get(&id).cloned() else {
-                        continue;
-                    };
-                    match assess_task_execution(&task, &result) {
-                        CompletionAssessment::ExecutionFailed { reason } => {
-                            // Real failure (non-completed status, empty summary,
-                            // remaining_work, or self-reported failed verification).
-                            // This is the ONLY path that auto-retries, and only
-                            // within the retry budget. No title/description
-                            // mutation — retry history is in Note events.
-                            if task.retry_count < task.max_retries {
-                                let next_retry = task.retry_count.saturating_add(1);
-                                let _ = store.set_task_status(
-                                    run_id,
-                                    &id,
-                                    TodoStatus::Pending,
-                                    Some(&task.agent_role),
-                                    Some(&format!(
-                                        "execution failed (attempt {}): {reason}",
-                                        next_retry
-                                    )),
-                                );
-                                let _ = store.note(
-                                    run_id,
-                                    Some(&id),
-                                    &format!(
-                                        "attempt {n} failed: {reason}; auto-retrying (retry_count {a} → {b})",
-                                        n = next_retry,
-                                        reason = reason,
-                                        a = task.retry_count,
-                                        b = next_retry,
-                                    ),
-                                );
-                                let mut retry_task = task.clone();
-                                retry_task.retry_count = next_retry;
-                                if let Err(error) = store.increment_retry_count(run_id, &id, None) {
-                                    tracing::warn!(
-                                        task_id = %retry_task.id,
-                                        %error,
-                                        "failed to persist retry_count bump"
-                                    );
-                                }
-                                by_id.insert(id.clone(), retry_task);
-                            } else {
-                                let _ = store.set_task_status(
-                                    run_id,
-                                    &id,
-                                    TodoStatus::Failed,
-                                    Some(&task.agent_role),
-                                    Some(&format!("execution failed after max retries: {reason}")),
-                                );
-                                wave_failed.push(id.clone());
-                                dag_state.failed.insert(id.clone());
-                                if failed_id.is_none() {
-                                    failed_id = Some(id);
-                                }
-                            }
-                            continue;
-                        }
-                        CompletionAssessment::AcceptancePending {
-                            missing_checks,
-                            missing_artifacts,
-                        } => {
-                            // Completed but hard evidence is missing. Retrying
-                            // the Subagent would reproduce the same gap (the
-                            // Subagent already finished). Block the task and
-                            // pause/fail the run — never auto-redispatch.
-                            let reason = format!(
-                                "acceptance pending: missing execution checks [{}], missing artifacts [{}]",
-                                missing_checks.join(", "),
-                                missing_artifacts.join(", "),
-                            );
-                            let _ = store.set_task_status(
-                                run_id,
-                                &id,
-                                TodoStatus::Blocked,
-                                Some(&task.agent_role),
-                                Some(&reason),
-                            );
-                            let _ = store.note(run_id, Some(&id), &reason);
-                            if pending_outcome.is_none() {
-                                pending_outcome = Some(review_stop_outcome(
-                                    store.as_ref(),
-                                    run_id,
-                                    id.clone(),
-                                    reason,
-                                ));
-                            }
-                            continue;
-                        }
-                        CompletionAssessment::Executed => {
-                            // Hard execution evidence is complete. Now judge
-                            // acceptance via the ReviewGate (LLM-based review
-                            // of acceptance_criteria, or auto-pass when there
-                            // is nothing semantic to review).
-                            let summary = result.summary.clone();
-                            let review_output = if full_output.trim().is_empty() {
-                                summary.as_str()
-                            } else {
-                                full_output.as_str()
-                            };
-                            let passed = run_review_gate(
-                                store.clone(),
-                                reviewer_llm.clone(),
-                                run_id,
-                                &task,
-                                review_output,
-                            )
-                            .await;
-                            let approved = match passed {
-                                ReviewGateOutcome::Pass => true,
-                                ReviewGateOutcome::NeedsFix(_fix_task) => {
-                                    // Review found correctable issues. Per M7,
-                                    // do NOT auto-redispatch — the Subagent
-                                    // already finished. Block and stop for an
-                                    // explicit retry; attended mode pauses,
-                                    // unattended mode fails terminally.
-                                    let _ = store.set_task_status(
-                                        run_id,
-                                        &id,
-                                        TodoStatus::Blocked,
-                                        Some(&task.agent_role),
-                                        Some("review needs fix; awaiting explicit retry"),
-                                    );
-                                    let _ = store.note(
-                                        run_id,
-                                        Some(&id),
-                                        "review returned needs_fix; task blocked, run stopped",
-                                    );
-                                    if pending_outcome.is_none() {
-                                        pending_outcome = Some(review_stop_outcome(
-                                            store.as_ref(),
-                                            run_id,
-                                            id.clone(),
-                                            "review needs fix".to_string(),
-                                        ));
-                                    }
-                                    continue;
-                                }
-                                ReviewGateOutcome::Suspend(reason) => {
-                                    let _ = store.note(
-                                        run_id,
-                                        Some(&id),
-                                        &format!("circuit breaker: {reason}"),
-                                    );
-                                    let _ = store.set_task_status(
-                                        run_id,
-                                        &id,
-                                        TodoStatus::Blocked,
-                                        Some(&task.agent_role),
-                                        Some(&format!("review suspended: {reason}")),
-                                    );
-                                    if pending_outcome.is_none() {
-                                        pending_outcome = Some(review_stop_outcome(
-                                            store.as_ref(),
-                                            run_id,
-                                            id.clone(),
-                                            reason,
-                                        ));
-                                    }
-                                    continue;
-                                }
-                                ReviewGateOutcome::Skipped => {
-                                    // Reviewer unavailable. M7 forbids
-                                    // auto-pass. Block + pause so the user
-                                    // can intervene. Unattended runs fail
-                                    // terminally because no user is present.
-                                    let _ = store.note(
-                                        run_id,
-                                        Some(&id),
-                                        "no reviewer LLM; task blocked (no auto-pass per M7)",
-                                    );
-                                    let _ = store.set_task_status(
-                                        run_id,
-                                        &id,
-                                        TodoStatus::Blocked,
-                                        Some(&task.agent_role),
-                                        Some("reviewer unavailable; blocked pending LLM"),
-                                    );
-                                    if pending_outcome.is_none() {
-                                        pending_outcome = Some(review_stop_outcome(
-                                            store.as_ref(),
-                                            run_id,
-                                            id.clone(),
-                                            "reviewer unavailable".to_string(),
-                                        ));
-                                    }
-                                    continue;
-                                }
-                            };
-                            if !approved {
-                                continue;
-                            }
-
-                            let execution_id =
-                                format!("{}:{}", task.id, task.retry_count.saturating_add(1));
-                            match integrate_reviewed_task(
-                                dispatcher.clone(),
-                                store.clone(),
-                                run_id,
-                                &task,
-                                &execution_id,
-                                &summary,
-                                parent_cancel.clone(),
-                                trace_sink.clone(),
-                            )
-                            .await
-                            {
-                                Ok(completion_summary) => {
-                                    let _ = store.set_task_status(
-                                        run_id,
-                                        &id,
-                                        TodoStatus::Completed,
-                                        Some(&task.agent_role),
-                                        Some(&completion_summary),
-                                    );
-                                    dag_state.completed.insert(id);
-                                }
-                                Err(error) => {
-                                    let _ = store.set_task_status(
-                                        run_id,
-                                        &id,
-                                        TodoStatus::Failed,
-                                        Some(&task.agent_role),
-                                        Some(&format!("worktree integration failed: {error}")),
-                                    );
-                                    wave_failed.push(id.clone());
-                                    dag_state.failed.insert(id.clone());
-                                    if failed_id.is_none() {
-                                        failed_id = Some(id);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                Err((id, err)) => {
-                    // Mark this task Failed and record it in wave_failed so
-                    // the skip logic (top of loop) does NOT overwrite it to
-                    // Skipped. failed_id keeps the FIRST failure for the
-                    // error message.
-                    let _ = store.set_task_status(
-                        run_id,
-                        &id,
-                        TodoStatus::Failed,
-                        None,
-                        Some(&format!("error: {err}")),
-                    );
-                    wave_failed.push(id.clone());
-                    dag_state.failed.insert(id.clone());
-                    if failed_id.is_none() {
-                        failed_id = Some(id);
-                    }
-                }
-            }
-        }
-
-        // Wave fully processed. If any task in this wave resolved to a
-        // terminal stop (Paused/Failed via acceptance/review), now is the
-        // time to transition the run and return — every sibling result has
-        // already been persisted (Completed stays Completed, Failed stays
-        // Failed, only Running leftovers get reset on resume). This prevents
-        // the next attempt from redispatching sibling Subagents that had
-        // already completed successfully.
-        if let Some(outcome) = pending_outcome.take() {
-            let next_status = match &outcome {
-                RunOutcome::Paused { .. } => TaskRunStatus::Paused,
-                RunOutcome::Failed { .. } => TaskRunStatus::Failed,
-                _ => TaskRunStatus::Running,
-            };
-            if next_status != TaskRunStatus::Running {
-                let _ = store.transition_run(run_id, next_status);
-            }
-            return Ok(outcome);
-        }
+    let run_store = store.clone();
+    let controller = Arc::new(EkoRuntimeDagController {
+        store,
+        dispatcher: Arc::new(dispatcher),
+        reviewer_llm,
+        write_sem: Arc::new(Semaphore::new(limits.max_concurrent_writes.max(1))),
+        shell_sem: Arc::new(Semaphore::new(limits.max_concurrent_shells.max(1))),
+        llm_sem: Arc::new(Semaphore::new(limits.max_parallel_llm_calls.max(1))),
+        file_write_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        trace_sink,
+        cancel: parent_cancel.clone(),
+        plan_tasks: std::sync::Mutex::new(HashMap::new()),
+    });
+    let executor = echo_agent::tasks::RuntimeDagExecutor::new(
+        controller,
+        echo_agent::tasks::RuntimeDagExecutorConfig {
+            concurrency_limits: limits,
+            ..Default::default()
+        },
+    );
+    let outcome = executor
+        .execute(run_id, parent_cancel)
+        .await
+        .map_err(|error| ExecError::Other(error.to_string()))?;
+    let terminal_status = match &outcome {
+        echo_agent::tasks::RuntimeDagOutcome::Failed { .. } => Some(TaskRunStatus::Failed),
+        echo_agent::tasks::RuntimeDagOutcome::Paused { .. } => Some(TaskRunStatus::Paused),
+        echo_agent::tasks::RuntimeDagOutcome::Completed
+        | echo_agent::tasks::RuntimeDagOutcome::Cancelled => None,
+    };
+    if let Some(status) = terminal_status {
+        let _ = run_store.transition_run(run_id, status);
     }
+    Ok(match outcome {
+        echo_agent::tasks::RuntimeDagOutcome::Completed => RunOutcome::Completed,
+        echo_agent::tasks::RuntimeDagOutcome::Failed {
+            failed_task_id,
+            error,
+        } => RunOutcome::Failed {
+            failed_task_id,
+            error,
+        },
+        echo_agent::tasks::RuntimeDagOutcome::Paused {
+            failed_task_id,
+            error,
+        } => RunOutcome::Paused {
+            failed_task_id,
+            error,
+        },
+        echo_agent::tasks::RuntimeDagOutcome::Cancelled => RunOutcome::Cancelled,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1694,22 +1548,6 @@ async fn integrate_reviewed_task<W: TaskDispatcher + 'static>(
         }
     }
     Ok(format!("{summary} | {integration_summary}"))
-}
-
-fn interrupted_outcome(store: &TaskRuntimeStore, run_id: &str) -> RunOutcome {
-    let paused = store
-        .get_run(run_id)
-        .ok()
-        .flatten()
-        .is_some_and(|run| run.status == TaskRunStatus::Paused);
-    if paused {
-        RunOutcome::Paused {
-            failed_task_id: "<pause>".to_string(),
-            error: "paused by user".to_string(),
-        }
-    } else {
-        RunOutcome::Cancelled
-    }
 }
 
 /// Outcome of the review gate over a freshly-completed task.
@@ -1796,14 +1634,14 @@ async fn run_review_gate(
     }
 }
 
-/// Execute a single task through a selected Subagent or the primary Agent. Returns `(task_id, structured result)` on
-/// success or `(task_id, error)` on failure. Honors read vs write concurrency
-/// via the two semaphores.
+/// Execute a single task through a selected Subagent or the primary Agent.
+///
+/// The framework executor already holds the global Subagent permit; this
+/// function enforces EKO write/shell/LLM and file-ownership limits.
 #[allow(clippy::too_many_arguments)] // store + semaphores + locks + sinks all thread through
 async fn execute_task(
     store: Arc<TaskRuntimeStore>,
     primary_agent: crate::agent_handle::AgentHandle,
-    subagent_sem: Arc<Semaphore>,
     write_sem: Arc<Semaphore>,
     shell_sem: Arc<Semaphore>,
     llm_sem: Arc<Semaphore>,
@@ -1907,13 +1745,14 @@ async fn execute_task(
         &contract,
     );
 
-    // Acquire concurrency permits with cancel awareness:
-    // - Read-only tasks take a Subagent permit (fan-out up to max_concurrent_subagents).
-    // - Write tasks (implementation/debugging) take ONLY the write permit.
+    // Acquire EKO product-resource permits with cancel awareness:
+    // - Read-only tasks need no additional permit; the framework executor
+    //   already owns the global Subagent permit.
+    // - Write tasks (implementation/debugging) take the write permit.
     // - Verification tasks (shell/build/test) take the write permit + the shell
     //   permit (default 1, plan §678-680 shell_concurrency = 1).
     let is_shell = matches!(task.kind, PlanTaskKind::Verification);
-    let (_subagent_permit, _write_permit, _shell_permit) = if is_shell {
+    let (_write_permit, _shell_permit) = if is_shell {
         tracing::info!(
             run_id = %run_id,
             task_id = %task_id,
@@ -1946,7 +1785,7 @@ async fn execute_task(
             task_id = %task_id,
             "task_runtime: acquired shell permit"
         );
-        (None, Some(wp), Some(sp))
+        (Some(wp), Some(sp))
     } else if is_write {
         tracing::info!(
             run_id = %run_id,
@@ -1964,25 +1803,9 @@ async fn execute_task(
             task_id = %task_id,
             "task_runtime: acquired write permit"
         );
-        (None, Some(wp), None)
+        (Some(wp), None)
     } else {
-        tracing::info!(
-            run_id = %run_id,
-            task_id = %task_id,
-            available = subagent_sem.available_permits(),
-            "task_runtime: waiting for subagent permit"
-        );
-        let wp = tokio::select! {
-            biased;
-            _ = task_cancel.cancelled() => return Err((task_id.clone(), "cancelled while waiting for subagent permit".to_string())),
-            p = subagent_sem.acquire() => p.map_err(|e| (task_id.clone(), e.to_string()))?,
-        };
-        tracing::info!(
-            run_id = %run_id,
-            task_id = %task_id,
-            "task_runtime: acquired subagent permit"
-        );
-        (Some(wp), None, None)
+        (None, None)
     };
 
     // Physical safety net below the ownership-safe DAG wave: exact file owners
@@ -3498,7 +3321,7 @@ fn save_trace(
 ///
 /// The run is created with `attended_mode = Unattended` so the configured
 /// write preflight applies inside `plan_execute` / `execute_task`.
-#[allow(clippy::too_many_arguments)] // run identity + agent + cancel + write policy all thread through; matches run_dag style
+#[allow(clippy::too_many_arguments)] // run identity + Agent + cancellation + write policy form the driver boundary
 pub async fn launch_unattended_run(
     store: Arc<TaskRuntimeStore>,
     primary_agent: crate::agent_handle::AgentHandle,
@@ -4601,7 +4424,7 @@ Read the runtime path and found one missing branch.
         use std::sync::Arc;
         let store = Arc::new(TaskRuntimeStore::new_in_memory().expect("in-memory store"));
         // Seed a run + plan via the public store API, then drive the state
-        // machine the way run_dag would.
+        // machine the way the runtime plan adapter would.
         store
             .create_run(
                 "r1",
@@ -4659,7 +4482,7 @@ Read the runtime path and found one missing branch.
         assert!(todos[0].summary.as_deref() == Some("done"));
     }
 
-    // ── run_dag integration tests with a scripted dispatcher ──
+    // ── Runtime DAG integration tests with a scripted dispatcher ──
     // These exercise the scheduling core — frontier computation, dependency
     // resolution, failure propagation, cancellation, stall detection — without
     // a real LLM. The dispatcher returns scripted results keyed by task id.
@@ -4751,7 +4574,6 @@ Read the runtime path and found one missing branch.
             _store: Arc<TaskRuntimeStore>,
             context: echo_agent::tasks::TaskSubagentContext,
             task: PlanTask,
-            _subagent_sem: Arc<Semaphore>,
             _write_sem: Arc<Semaphore>,
             _shell_sem: Arc<Semaphore>,
             _llm_sem: Arc<Semaphore>,
@@ -4917,7 +4739,8 @@ Read the runtime path and found one missing branch.
     }
 
     #[tokio::test]
-    async fn run_dag_blocks_completed_result_missing_observed_evidence() -> Result<(), String> {
+    async fn runtime_plan_blocks_completed_result_missing_observed_evidence() -> Result<(), String>
+    {
         // M7: a Subagent that returns a text summary but no observed execution
         // evidence for a declared execution_check must NOT be auto-redispatched.
         // The task goes to Blocked and the run to Paused for an explicit retry.
@@ -4943,12 +4766,11 @@ Read the runtime path and found one missing branch.
         });
         dispatcher.respond(&task.id, result);
 
-        let outcome = run_dag(
+        let outcome = execute_runtime_plan(
             store.clone(),
             dispatcher,
             None,
             &run_id,
-            vec![task],
             ConcurrencyLimits::default(),
             CancellationToken::new(),
             None,
@@ -5039,7 +4861,7 @@ Read the runtime path and found one missing branch.
     /// Build a run + plan in the store and return the run id.
     ///
     /// Creates run (Pending), attaches plan (no status change), transitions
-    /// Pending → Running so run_dag can start.
+    /// Pending → Running so runtime execution can start.
     fn seed_run(store: &Arc<TaskRuntimeStore>, tasks: Vec<PlanTask>) -> String {
         seed_run_with_mode(store, tasks, AttendedMode::Attended)
     }
@@ -5115,12 +4937,11 @@ Read the runtime path and found one missing branch.
                     .with_response(verdict),
             );
 
-            let outcome = run_dag(
+            let outcome = execute_runtime_plan(
                 store.clone(),
                 dispatcher,
                 Some(reviewer),
                 &run_id,
-                vec![task],
                 ConcurrencyLimits::default(),
                 CancellationToken::new(),
                 None,
@@ -5173,12 +4994,11 @@ Read the runtime path and found one missing branch.
             r#"{"outcome":"pass","summary":"complete","failure_fingerprint":null,"issues":[]}"#,
         ));
 
-        let outcome = run_dag(
+        let outcome = execute_runtime_plan(
             store,
             dispatcher,
             Some(reviewer.clone()),
             &run_id,
-            vec![task],
             ConcurrencyLimits::default(),
             CancellationToken::new(),
             None,
@@ -5204,18 +5024,17 @@ Read the runtime path and found one missing branch.
     }
 
     #[tokio::test]
-    async fn run_dag_completes_single_task() {
+    async fn runtime_plan_completes_single_task() {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().unwrap());
         let run_id = seed_run(&store, vec![solo_readonly_task("a")]);
         let dispatcher = ScriptedDispatcher::new();
         dispatcher.succeed("a", "reviewed");
 
-        let outcome = run_dag(
+        let outcome = execute_runtime_plan(
             store.clone(),
             dispatcher.clone(),
             None, // no reviewer LLM → read-only tasks auto-pass review
             &run_id,
-            vec![solo_readonly_task("a")],
             ConcurrencyLimits::default(),
             CancellationToken::new(),
             None,
@@ -5229,7 +5048,7 @@ Read the runtime path and found one missing branch.
     }
 
     #[tokio::test]
-    async fn run_dag_reuses_durable_subagent_result_after_restart() -> Result<(), String> {
+    async fn runtime_plan_reuses_durable_subagent_result_after_restart() -> Result<(), String> {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
         let task = solo_readonly_task("a");
         let run_id = seed_run(&store, vec![task.clone()]);
@@ -5249,12 +5068,11 @@ Read the runtime path and found one missing branch.
             .map_err(|error| error.to_string())?;
         let dispatcher = ScriptedDispatcher::new();
 
-        let outcome = run_dag(
+        let outcome = execute_runtime_plan(
             store.clone(),
             dispatcher.clone(),
             None,
             &run_id,
-            vec![task],
             ConcurrencyLimits::default(),
             CancellationToken::new(),
             None,
@@ -5279,7 +5097,7 @@ Read the runtime path and found one missing branch.
     }
 
     #[tokio::test]
-    async fn run_dag_respects_dependency_order() {
+    async fn runtime_plan_respects_dependency_order() {
         // b depends on a → a must be dispatched and completed before b.
         let mut a = solo_readonly_task("a");
         let mut b = solo_readonly_task("b");
@@ -5291,12 +5109,11 @@ Read the runtime path and found one missing branch.
         dispatcher.succeed("a", "done a");
         dispatcher.succeed("b", "done b");
 
-        let outcome = run_dag(
+        let outcome = execute_runtime_plan(
             store.clone(),
             dispatcher.clone(),
             None,
             &run_id,
-            vec![a, b],
             ConcurrencyLimits::default(),
             CancellationToken::new(),
             None,
@@ -5313,7 +5130,7 @@ Read the runtime path and found one missing branch.
     }
 
     #[tokio::test]
-    async fn run_dag_applies_inserted_revision_after_active_wave() -> Result<(), String> {
+    async fn runtime_plan_applies_inserted_revision_after_active_wave() -> Result<(), String> {
         let first = solo_readonly_task("first");
         let mut second = solo_readonly_task("second");
         second.depends_on = vec![first.id.clone()];
@@ -5328,12 +5145,11 @@ Read the runtime path and found one missing branch.
         let execution_dispatcher = dispatcher.clone();
         let execution_run_id = run_id.clone();
         let execution = tokio::spawn(async move {
-            run_dag(
+            execute_runtime_plan(
                 execution_store,
                 execution_dispatcher,
                 None,
                 &execution_run_id,
-                vec![first],
                 ConcurrencyLimits::default(),
                 CancellationToken::new(),
                 None,
@@ -5369,7 +5185,7 @@ Read the runtime path and found one missing branch.
 
         let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), execution)
             .await
-            .map_err(|_| "run_dag timed out after plan revision".to_string())?
+            .map_err(|_| "runtime plan timed out after plan revision".to_string())?
             .map_err(|error| error.to_string())?
             .map_err(|error| error.to_string())?;
         assert!(matches!(outcome, RunOutcome::Completed));
@@ -5388,7 +5204,7 @@ Read the runtime path and found one missing branch.
     }
 
     #[tokio::test]
-    async fn run_dag_failure_propagates_and_blocks_downstream() {
+    async fn runtime_plan_failure_propagates_and_blocks_downstream() {
         // a fails; b depends on a and must be Blocked, run ends Failed
         // (because all non-terminal tasks are Failed/Blocked).
         let a = solo_readonly_task("a");
@@ -5399,12 +5215,11 @@ Read the runtime path and found one missing branch.
         let dispatcher = ScriptedDispatcher::new();
         dispatcher.fail("a", "boom");
 
-        let outcome = run_dag(
+        let outcome = execute_runtime_plan(
             store.clone(),
             dispatcher.clone(),
             None,
             &run_id,
-            vec![a, b],
             ConcurrencyLimits::default(),
             CancellationToken::new(),
             None,
@@ -5425,7 +5240,7 @@ Read the runtime path and found one missing branch.
     }
 
     #[tokio::test]
-    async fn run_dag_merge_failure_blocks_downstream() -> Result<(), String> {
+    async fn runtime_plan_merge_failure_blocks_downstream() -> Result<(), String> {
         // Use a read-only kind so the review gate auto-passes (no reviewer LLM
         // in this test) and execution reaches integrate_reviewed_task, where
         // the scripted merge failure marks the writer Failed. Downstream is
@@ -5439,12 +5254,11 @@ Read the runtime path and found one missing branch.
         dispatcher.succeed(&writer.id, "writer completed");
         dispatcher.fail_integration(&writer.id, "synthetic merge conflict");
 
-        let outcome = run_dag(
+        let outcome = execute_runtime_plan(
             store.clone(),
             dispatcher,
             None,
             &run_id,
-            vec![writer, downstream],
             ConcurrencyLimits::default(),
             CancellationToken::new(),
             None,
@@ -5473,8 +5287,8 @@ Read the runtime path and found one missing branch.
     }
 
     #[tokio::test]
-    async fn run_dag_cancellation_propagates_to_cancelled_outcome() {
-        // Cancel BEFORE dispatching; run_dag should observe cancellation at the
+    async fn runtime_plan_cancellation_propagates_to_cancelled_outcome() {
+        // Cancel before dispatching; the framework executor observes it at the
         // top of its loop and return Cancelled without running any task.
         let store = Arc::new(TaskRuntimeStore::new_in_memory().unwrap());
         let run_id = seed_run(&store, vec![solo_readonly_task("a")]);
@@ -5482,12 +5296,11 @@ Read the runtime path and found one missing branch.
         let cancel = CancellationToken::new();
         cancel.cancel();
 
-        let outcome = run_dag(
+        let outcome = execute_runtime_plan(
             store.clone(),
             dispatcher.clone(),
             None,
             &run_id,
-            vec![solo_readonly_task("a")],
             ConcurrencyLimits::default(),
             cancel,
             None,
@@ -5504,7 +5317,7 @@ Read the runtime path and found one missing branch.
     }
 
     #[tokio::test]
-    async fn run_dag_cancellation_preserves_explicit_pause() -> Result<(), String> {
+    async fn runtime_plan_cancellation_preserves_explicit_pause() -> Result<(), String> {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
         let task = solo_readonly_task("a");
         let run_id = seed_run(&store, vec![task.clone()]);
@@ -5514,12 +5327,11 @@ Read the runtime path and found one missing branch.
         let cancel = CancellationToken::new();
         cancel.cancel();
 
-        let outcome = run_dag(
+        let outcome = execute_runtime_plan(
             store,
             ScriptedDispatcher::new(),
             None,
             &run_id,
-            vec![task],
             ConcurrencyLimits::default(),
             cancel,
             None,
@@ -5568,18 +5380,18 @@ Read the runtime path and found one missing branch.
     }
 
     #[tokio::test]
-    async fn run_dag_does_not_redispatch_in_flight_running_tasks() {
+    async fn runtime_plan_does_not_redispatch_in_flight_running_tasks() -> Result<(), String> {
         // Regression: when execution is resumed while an earlier task is still
-        // `Running`, a later run_dag driver must not dispatch that task again.
+        // `Running`, a later runtime driver must not dispatch that task again.
         // Without the in_flight
         // guard, the ready filter would re-dispatch the Running task, causing
         // duplicate subagent work. Verify the Running task is left alone, the
-        // genuinely-pending sibling is dispatched, and run_dag WAITS for the
+        // genuinely-pending sibling is dispatched, and the executor waits for the
         // in_flight task to reach Completed in the store (simulating the
         // sibling instance finishing it) before returning Completed.
         let mut in_flight = solo_readonly_task("in_flight");
         let pending = solo_readonly_task("pending");
-        let store = Arc::new(TaskRuntimeStore::new_in_memory().unwrap());
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
         let run_id = seed_run(&store, vec![in_flight.clone(), pending.clone()]);
         store
             .set_task_status(
@@ -5589,13 +5401,13 @@ Read the runtime path and found one missing branch.
                 Some("explorer"),
                 None,
             )
-            .unwrap();
+            .map_err(|error| error.to_string())?;
         in_flight.status = TodoStatus::Running;
         let dispatcher = ScriptedDispatcher::new();
         dispatcher.succeed("pending", "done");
 
-        // Simulate the sibling run_dag instance finishing `in_flight` shortly
-        // after `pending` is dispatched. Without this, run_dag's in_flight
+        // Simulate the sibling runtime instance finishing `in_flight` shortly
+        // after `pending` is dispatched. Without this, the in-flight
         // wait loop would never observe Completed and the test would time out
         // (correctly — it means the task really is still in-flight).
         let store_bg = store.clone();
@@ -5613,20 +5425,21 @@ Read the runtime path and found one missing branch.
 
         let outcome = tokio::time::timeout(
             std::time::Duration::from_secs(10),
-            run_dag(
+            execute_runtime_plan(
                 store.clone(),
                 dispatcher.clone(),
                 None,
                 &run_id,
-                vec![in_flight, pending],
                 ConcurrencyLimits::default(),
                 CancellationToken::new(),
                 None,
             ),
         )
         .await
-        .expect("run_dag did not complete within 10s (in_flight wait loop stuck)")
-        .unwrap();
+        .map_err(|_| {
+            "runtime plan did not complete within 10s (in_flight wait loop stuck)".to_string()
+        })?
+        .map_err(|error| error.to_string())?;
 
         // `in_flight` (Running) must NOT have been re-dispatched; only
         // `pending` should appear in the dispatch order.
@@ -5636,12 +5449,18 @@ Read the runtime path and found one missing branch.
             "Running task was re-dispatched (regression): {order:?}"
         );
         assert_eq!(order, vec!["pending".to_string()]);
-        // run_dag waited for the sibling instance to finish `in_flight`, so
+        // The executor waited for the sibling instance to finish `in_flight`, so
         // both tasks are now Completed and the run returns Completed.
         assert!(matches!(outcome, RunOutcome::Completed));
-        let todos = store.list_todos(&run_id).unwrap();
-        let in_flight_todo = todos.iter().find(|t| t.task_id == "in_flight").unwrap();
+        let todos = store
+            .list_todos(&run_id)
+            .map_err(|error| error.to_string())?;
+        let in_flight_todo = todos
+            .iter()
+            .find(|todo| todo.task_id == "in_flight")
+            .ok_or_else(|| "in_flight task missing from runtime store".to_string())?;
         assert_eq!(in_flight_todo.status, TodoStatus::Completed);
+        Ok(())
     }
 
     #[tokio::test]
@@ -5826,12 +5645,11 @@ Read the runtime path and found one missing branch.
             },
         );
 
-        let outcome = run_dag(
+        let outcome = execute_runtime_plan(
             store.clone(),
             dispatcher.clone(),
             None,
             &run_id,
-            vec![task],
             ConcurrencyLimits::default(),
             CancellationToken::new(),
             None,
@@ -5888,12 +5706,11 @@ Read the runtime path and found one missing branch.
             },
         );
 
-        let outcome = run_dag(
+        let outcome = execute_runtime_plan(
             store.clone(),
             dispatcher.clone(),
             None,
             &run_id,
-            vec![task],
             ConcurrencyLimits::default(),
             CancellationToken::new(),
             None,
@@ -5955,12 +5772,11 @@ Read the runtime path and found one missing branch.
             },
         );
 
-        let outcome = run_dag(
+        let outcome = execute_runtime_plan(
             store.clone(),
             dispatcher.clone(),
             None,
             &run_id,
-            vec![clean.clone(), blocked.clone()],
             ConcurrencyLimits::default(),
             CancellationToken::new(),
             None,

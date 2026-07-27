@@ -16,8 +16,8 @@
 //!   review checklist).
 //! - [`planner`] — structured plan generation via a JSON-mode LLM call, with
 //!   plan-quality validation.
-//! - [`executor`] — DAG scheduler that runs a plan on pooled
-//!   subagents with concurrency limits, write serialization, and cancellation.
+//! - [`executor`] — EKO controller/dispatcher adapter for the framework DAG
+//!   executor, including review, resource limits, worktrees, and event mapping.
 //! - [`review`] — review gates (spec + code quality) + retry circuit breaker.
 //! - [`ledger`] — progress.md export derived from canonical run files.
 //! - [`memory_bridge`] — sinks run/task lifecycle events into long-term

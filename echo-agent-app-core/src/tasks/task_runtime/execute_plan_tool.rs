@@ -1,4 +1,4 @@
-//! plan_execute 工具: L1 主 agent 把拆好的 plan 交给 L2 run_dag 并行执行。
+//! plan_execute 工具: L1 主 Agent 把拆好的 plan 交给框架 runtime DAG executor。
 //!
 //! # 设计意图 (spec §3.1.1)
 //!
@@ -120,7 +120,7 @@ async fn acquire_run_execution_lock(run_id: &str) -> RunExecutionGuard {
     }
 }
 
-/// L1→L2 桥接工具: 把 plan 提交给 run_dag 并行调度器。
+/// L1→L2 桥接工具: 把 plan 提交给共享 runtime DAG executor。
 ///
 /// 字段说明:
 /// - `store`: TaskRuntimeStore (用来读/写 run 状态)
@@ -292,7 +292,7 @@ impl Tool for ExecutePlanTool {
                 attended_mode = %attended_mode.as_str(),
                 has_trace_sink = trace_sink.is_some(),
                 write_mode = ?self.write_mode,
-                "plan_execute: dispatching run_dag"
+                "plan_execute: dispatching runtime DAG executor"
             );
             tracing::info!(run_id = %run_id, "plan_execute: waiting for run execution lock");
             // RAII guard: 持锁 + Drop 时清理 RUN_EXECUTION_LOCKS entry (P1-1 修复)。
@@ -325,7 +325,7 @@ impl Tool for ExecutePlanTool {
             // trace persistence (event-wiring #1残留).
             let run_store = self.primary_agent.read(|a| a.run_store.clone()).await;
             // D7 stage 2: scope the write mode into a task-local so CP B
-            // preflight in `execute_task` (deep inside execute_run → run_dag)
+            // preflight in `execute_task` (inside execute_run's EKO controller)
             // can read it without threading the mode through every signature.
             let write_mode = self.write_mode;
             let _cancel_registration = match self
