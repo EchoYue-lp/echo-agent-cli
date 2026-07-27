@@ -14,8 +14,8 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use super::types::{
-    AttendedMode, DomainProfile, ExecutionMode, PlanRevision, PlanTask, RunStateSnapshot,
-    RuntimeEventKind, RuntimeTaskEvent, TaskExecution, TaskPlan, TaskRun, TaskRunStatus,
+    AttendedMode, DomainProfile, EkoTaskExecution, ExecutionMode, PlanRevision, PlanTask,
+    RunStateSnapshot, RuntimeEventKind, RuntimeTaskEvent, TaskPlan, TaskRun, TaskRunStatus,
     TodoStatus,
 };
 
@@ -156,7 +156,7 @@ pub fn rebuild_plan_from_events(events: &[RuntimeTaskEvent]) -> Result<RebuiltPl
                             let execution = previous_execution
                                 .get(&spec.id)
                                 .cloned()
-                                .unwrap_or_else(|| TaskExecution::pending(spec.id.clone()));
+                                .unwrap_or_else(|| EkoTaskExecution::pending(spec.id.clone()));
                             PlanTask::from_parts(spec, execution)
                         })
                         .collect();

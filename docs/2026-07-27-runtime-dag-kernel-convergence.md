@@ -8,10 +8,10 @@ Dynamic Agent plans use one framework-owned DAG execution loop. EKO supplies a
 controller/dispatcher adapter for product policy and persistence; it does not
 own a second ready-frontier loop.
 
-This is a staged convergence. The executor and revisioned-runtime validator
-authorities have moved, but the older framework `Task`/authoring `PlanSpec`
-model still overlaps the canonical runtime model. That remaining legacy-model
-convergence is the next phase, not a reason to retain two executors.
+The staged convergence is complete. Framework DAG traversal, structural
+validation, task status, and immutable-spec/mutable-execution semantics now
+have one authority. EKO retains only product persistence/UI projections and a
+controller/dispatcher adapter.
 
 ## Evidence Before The Change
 
@@ -51,7 +51,7 @@ the generic frontier loop.
 
 | Framework (`echo-agent`) | EKO (`echo-agent-cli`) |
 |---|---|
-| Immutable runtime spec + mutable execution | `TaskPlan` file/event projection |
+| `TaskSpec` + `TaskExecution` + shared `TaskStatus` | `TaskPlan` file/event projection |
 | Structural `PlanValidator` | Subagent/tool capability validation |
 | Revision safe-point reload | `DomainProfile` and role routing |
 | Ready frontier and dependency blocking | Review and acceptance policy |
@@ -120,16 +120,35 @@ DAG loop, dependency validator, or generic retry state machine.
   tasks can transition directly to Blocked after an upstream failure, and a
   zero task timeout now correctly means no timeout.
 
-## Remaining Convergence
+## Phase 4 Completed
 
-1. Finish public model convergence: the older authoring
-   `planning::TaskSpec` name and mixed-state `Task` record still overlap the
-   canonical runtime spec/execution vocabulary even though neither owns DAG
-   traversal or structural validation now. Split or rename them without
-   discarding their authoring, hook, verifier, attempt-history, and store
-   capabilities.
-2. Remove obsolete EKO-labelled fields/comments from generic framework APIs
-   only when their generic meaning or replacement is clear.
+- Renamed the framework's canonical runtime model to `TaskSpec`,
+  `TaskExecution`, `TaskStatus`, `TaskKind`, and `Task`. The previous
+  `RuntimeTask*` names no longer coexist with another public task model.
+- Renamed the rich hooks/verifier/attempt/store record to `ManagedTask`. It
+  projects into canonical `Task` and does not own DAG traversal or structural
+  validation.
+- Renamed the LLM authoring artifact to `PlanTaskSpec`, so it cannot be
+  confused with the immutable runtime `TaskSpec`.
+- Merged the former managed/runtime status enums. `ManagedTask` and the DAG
+  kernel now use the same `TaskStatus`, including failure, blocked, timeout,
+  retry, pause, and cancellation detail.
+- Renamed EKO's Rust persistence/UI DTOs to `EkoTaskSpec` and
+  `EkoTaskExecution` while preserving their existing serialized and
+  TypeScript wire names. They are explicitly projections, not scheduler
+  authorities.
+- Added a checked `framework Task -> PlanTask` conversion. Unsupported EKO
+  status projections, mismatched spec/execution identities, invalid metadata,
+  and conflicting failure details return errors instead of being flattened.
+- Removed the last EKO-specific historical comment from generic framework task
+  checkpoint code.
+
+## Remaining Work
+
+No duplicate DAG executor, structural validator, runtime status model, or
+canonical task-spec name remains. Operational follow-up is limited to observing
+real long-running GUI/TUI/CLI/channel runs for revision conflicts, safe-point
+reload, cancellation, durable Subagent reuse, and worktree finalization.
 
 ## Verification
 
@@ -141,6 +160,9 @@ DAG loop, dependency validator, or generic retry state machine.
 - Framework `TaskExecutor` tests cover full-kernel dependency order, failure
   propagation, cancellation, disabled timeout, UTF-8-safe context projection,
   and the retained per-task execution capabilities.
+- Framework and EKO adapter tests cover shared status-detail preservation,
+  separated execution checks/acceptance criteria, EKO metadata, and checked
+  round trips through canonical `Task`.
 - All 44 EKO executor tests pass, including durable result reuse, revision
   insertion, cancellation, review outcomes, sibling completion, worktree merge
   failure, and external in-flight observation.

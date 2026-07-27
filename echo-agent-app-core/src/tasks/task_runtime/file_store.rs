@@ -14,8 +14,9 @@ use chrono::{DateTime, Utc};
 
 use super::file_shadow::FileTaskShadow;
 use super::types::{
-    Artifact, PlanRevision, PlanTask, ReviewResult, RunStateSnapshot, RuntimeEventKind,
-    RuntimeTaskEvent, TaskExecution, TaskExecutionSummary, TaskPlan, TaskRun, TodoItem, TodoStatus,
+    Artifact, EkoTaskExecution, PlanRevision, PlanTask, ReviewResult, RunStateSnapshot,
+    RuntimeEventKind, RuntimeTaskEvent, TaskExecutionSummary, TaskPlan, TaskRun, TodoItem,
+    TodoStatus,
 };
 
 /// File-backed read store. Cheap to clone (wraps a `FileTaskShadow`).
@@ -141,7 +142,7 @@ impl FileTaskStore {
                 let state = execution
                     .get(&spec.id)
                     .cloned()
-                    .unwrap_or_else(|| TaskExecution::pending(spec.id.clone()));
+                    .unwrap_or_else(|| EkoTaskExecution::pending(spec.id.clone()));
                 PlanTask::from_parts(spec, state)
             })
             .collect();
@@ -188,7 +189,7 @@ impl FileTaskStore {
                 title: spec.title.clone(),
                 // run-state.json is the authoritative execution projection.
                 // Historical Task* events only supply fields that are not
-                // stored in TaskExecution; otherwise an earlier Blocked event
+                // stored in EkoTaskExecution; otherwise an earlier Blocked event
                 // can overwrite a later plan skip/reset.
                 status: default_status,
                 owner_agent: runtime.owner_agent,

@@ -256,12 +256,11 @@ the same fact is not persisted twice. See
 
 ## Next Step
 
-Continue runtime convergence by finishing the public model split/rename for
-the older authoring `planning::TaskSpec` and mixed-state `Task` record. Their
-authoring, hook, verifier, attempt-history, scheduler, and store capabilities
-must remain, but canonical runtime spec/execution terminology should no longer
-overlap. Full DAG traversal and structural validation already use the shared
-framework kernel; do not reintroduce another loop or validator. Also observe real long-running GUI/TUI/CLI task runs for revision-conflict,
+Runtime DAG convergence is complete: the framework owns canonical
+`TaskSpec`/`TaskExecution`/`TaskStatus`, validation, and traversal; EKO owns
+only checked file/UI projections and product policy. Do not reintroduce another
+loop, validator, status model, or canonical task-spec name. Next, observe real
+long-running GUI/TUI/CLI task runs for revision-conflict,
 safe-point, logical-task worktree reuse, and clean-finalize telemetry. Review the nine retained
 legacy `eko-unattended-*` branches through the new queue before explicitly
 cleaning them. Also sample real direct, planned, fork, teammate, and team

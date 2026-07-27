@@ -1067,7 +1067,7 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
             .ok_or_else(|| {
                 echo_agent::error::ReactError::Other(format!("run {run_id} has no plan"))
             })?;
-        let runtime_tasks = plan.tasks.iter().map(PlanTask::to_runtime_task).collect();
+        let runtime_tasks = plan.tasks.iter().map(PlanTask::to_task).collect();
         let by_id = plan
             .tasks
             .into_iter()
@@ -1085,7 +1085,7 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
 
     fn select_ready_wave(
         &self,
-        _tasks: &[echo_agent::tasks::RuntimeTask],
+        _tasks: &[echo_agent::tasks::Task],
         ready_task_ids: Vec<String>,
     ) -> Vec<String> {
         let by_id = self
@@ -1105,7 +1105,7 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
     async fn dispatch_task(
         &self,
         context: echo_agent::tasks::TaskSubagentContext,
-        runtime_task: echo_agent::tasks::RuntimeTask,
+        runtime_task: echo_agent::tasks::Task,
     ) -> echo_agent::error::Result<Self::DispatchOutput> {
         let task = self.plan_task(&runtime_task.spec.id)?;
         let execution_id = subagent_execution_id(&task.id, task.retry_count.saturating_add(1));
@@ -1158,7 +1158,7 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
     async fn resolve_dispatch(
         &self,
         run_id: &str,
-        runtime_task: echo_agent::tasks::RuntimeTask,
+        runtime_task: echo_agent::tasks::Task,
         dispatch: echo_agent::error::Result<Self::DispatchOutput>,
     ) -> echo_agent::error::Result<echo_agent::tasks::RuntimeTaskResolution> {
         let task = self.plan_task(&runtime_task.spec.id)?;
@@ -1369,7 +1369,7 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
     async fn block_task(
         &self,
         run_id: &str,
-        task: &echo_agent::tasks::RuntimeTask,
+        task: &echo_agent::tasks::Task,
         reason: &str,
     ) -> echo_agent::error::Result<()> {
         self.store
@@ -1387,7 +1387,7 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
     async fn failed_task_disposition(
         &self,
         run_id: &str,
-        _task: &echo_agent::tasks::RuntimeTask,
+        _task: &echo_agent::tasks::Task,
         all_unfinished_failed_or_blocked: bool,
     ) -> echo_agent::error::Result<echo_agent::tasks::RuntimeStopDisposition> {
         if all_unfinished_failed_or_blocked {

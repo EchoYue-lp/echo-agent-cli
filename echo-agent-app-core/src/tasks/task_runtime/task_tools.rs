@@ -24,8 +24,8 @@ use super::executor::{ExecEvent, RunPlanPolicy};
 use super::profiles::{ProfileTemplate, default_subagent_for};
 use super::store::TaskRuntimeStore;
 use super::types::{
-    AttendedMode, DomainProfile, ExecutionMode, PlanPatchOperation, PlanPatchRequest, PlanTask,
-    PlanTaskKind, TaskExecution, TaskPlan, TaskRunStatus, TodoStatus,
+    AttendedMode, DomainProfile, EkoTaskExecution, ExecutionMode, PlanPatchOperation,
+    PlanPatchRequest, PlanTask, PlanTaskKind, TaskPlan, TaskRunStatus, TodoStatus,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -86,7 +86,7 @@ impl PlanCapabilityCatalog {
         match operation {
             PlanPatchOperation::Insert { task, .. } => self.validate_task(&PlanTask::from_parts(
                 task.clone(),
-                TaskExecution::pending(task.id.clone()),
+                EkoTaskExecution::pending(task.id.clone()),
             )),
             PlanPatchOperation::Update { patch, .. } => {
                 if let Some(role) = &patch.agent_role

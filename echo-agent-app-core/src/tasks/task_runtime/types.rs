@@ -331,29 +331,29 @@ impl PlanTaskKind {
         })
     }
 
-    pub fn to_runtime_kind(self) -> echo_agent::tasks::RuntimeTaskKind {
+    pub fn to_task_kind(self) -> echo_agent::tasks::TaskKind {
         match self {
-            PlanTaskKind::ReadOnlyReview => echo_agent::tasks::RuntimeTaskKind::ReadOnlyReview,
-            PlanTaskKind::Investigation => echo_agent::tasks::RuntimeTaskKind::Investigation,
-            PlanTaskKind::TestPlan => echo_agent::tasks::RuntimeTaskKind::TestPlan,
-            PlanTaskKind::Implementation => echo_agent::tasks::RuntimeTaskKind::Implementation,
-            PlanTaskKind::Debugging => echo_agent::tasks::RuntimeTaskKind::Debugging,
-            PlanTaskKind::Review => echo_agent::tasks::RuntimeTaskKind::Review,
-            PlanTaskKind::Summary => echo_agent::tasks::RuntimeTaskKind::Summary,
-            PlanTaskKind::Verification => echo_agent::tasks::RuntimeTaskKind::Verification,
+            PlanTaskKind::ReadOnlyReview => echo_agent::tasks::TaskKind::ReadOnlyReview,
+            PlanTaskKind::Investigation => echo_agent::tasks::TaskKind::Investigation,
+            PlanTaskKind::TestPlan => echo_agent::tasks::TaskKind::TestPlan,
+            PlanTaskKind::Implementation => echo_agent::tasks::TaskKind::Implementation,
+            PlanTaskKind::Debugging => echo_agent::tasks::TaskKind::Debugging,
+            PlanTaskKind::Review => echo_agent::tasks::TaskKind::Review,
+            PlanTaskKind::Summary => echo_agent::tasks::TaskKind::Summary,
+            PlanTaskKind::Verification => echo_agent::tasks::TaskKind::Verification,
         }
     }
 
-    pub fn from_runtime_kind(kind: echo_agent::tasks::RuntimeTaskKind) -> Self {
+    pub fn from_task_kind(kind: echo_agent::tasks::TaskKind) -> Self {
         match kind {
-            echo_agent::tasks::RuntimeTaskKind::ReadOnlyReview => PlanTaskKind::ReadOnlyReview,
-            echo_agent::tasks::RuntimeTaskKind::Investigation => PlanTaskKind::Investigation,
-            echo_agent::tasks::RuntimeTaskKind::TestPlan => PlanTaskKind::TestPlan,
-            echo_agent::tasks::RuntimeTaskKind::Implementation => PlanTaskKind::Implementation,
-            echo_agent::tasks::RuntimeTaskKind::Debugging => PlanTaskKind::Debugging,
-            echo_agent::tasks::RuntimeTaskKind::Review => PlanTaskKind::Review,
-            echo_agent::tasks::RuntimeTaskKind::Summary => PlanTaskKind::Summary,
-            echo_agent::tasks::RuntimeTaskKind::Verification => PlanTaskKind::Verification,
+            echo_agent::tasks::TaskKind::ReadOnlyReview => Self::ReadOnlyReview,
+            echo_agent::tasks::TaskKind::Investigation => Self::Investigation,
+            echo_agent::tasks::TaskKind::TestPlan => Self::TestPlan,
+            echo_agent::tasks::TaskKind::Implementation => Self::Implementation,
+            echo_agent::tasks::TaskKind::Debugging => Self::Debugging,
+            echo_agent::tasks::TaskKind::Review => Self::Review,
+            echo_agent::tasks::TaskKind::Summary => Self::Summary,
+            echo_agent::tasks::TaskKind::Verification => Self::Verification,
         }
     }
 }
@@ -399,26 +399,34 @@ impl TodoStatus {
         })
     }
 
-    pub fn to_runtime_status(self) -> echo_agent::tasks::RuntimeTaskStatus {
+    /// Project the persisted UI status into the framework's authoritative state.
+    pub fn to_task_status(self, detail: Option<&str>) -> echo_agent::tasks::TaskStatus {
+        let detail = detail.unwrap_or_else(|| self.as_str()).to_string();
         match self {
-            TodoStatus::Pending => echo_agent::tasks::RuntimeTaskStatus::Pending,
-            TodoStatus::Running => echo_agent::tasks::RuntimeTaskStatus::Running,
-            TodoStatus::Blocked => echo_agent::tasks::RuntimeTaskStatus::Blocked,
-            TodoStatus::Completed => echo_agent::tasks::RuntimeTaskStatus::Completed,
-            TodoStatus::Failed => echo_agent::tasks::RuntimeTaskStatus::Failed,
-            TodoStatus::Skipped => echo_agent::tasks::RuntimeTaskStatus::Skipped,
+            TodoStatus::Pending => echo_agent::tasks::TaskStatus::Pending,
+            TodoStatus::Running => echo_agent::tasks::TaskStatus::Running,
+            TodoStatus::Blocked => echo_agent::tasks::TaskStatus::Blocked(detail),
+            TodoStatus::Completed => echo_agent::tasks::TaskStatus::Completed,
+            TodoStatus::Failed => echo_agent::tasks::TaskStatus::Failed(detail),
+            TodoStatus::Skipped => echo_agent::tasks::TaskStatus::Skipped,
         }
     }
 
-    pub fn from_runtime_status(status: echo_agent::tasks::RuntimeTaskStatus) -> Self {
+    /// Convert framework state only when the EKO projection can represent it exactly.
+    pub fn try_from_task_status(status: &echo_agent::tasks::TaskStatus) -> Result<Self, String> {
         match status {
-            echo_agent::tasks::RuntimeTaskStatus::Pending => TodoStatus::Pending,
-            echo_agent::tasks::RuntimeTaskStatus::Running => TodoStatus::Running,
-            echo_agent::tasks::RuntimeTaskStatus::Blocked => TodoStatus::Blocked,
-            echo_agent::tasks::RuntimeTaskStatus::Completed => TodoStatus::Completed,
-            echo_agent::tasks::RuntimeTaskStatus::Failed => TodoStatus::Failed,
-            echo_agent::tasks::RuntimeTaskStatus::Skipped
-            | echo_agent::tasks::RuntimeTaskStatus::Cancelled => TodoStatus::Skipped,
+            echo_agent::tasks::TaskStatus::Pending => Ok(TodoStatus::Pending),
+            echo_agent::tasks::TaskStatus::Running => Ok(TodoStatus::Running),
+            echo_agent::tasks::TaskStatus::Blocked(_) => Ok(TodoStatus::Blocked),
+            echo_agent::tasks::TaskStatus::Completed => Ok(TodoStatus::Completed),
+            echo_agent::tasks::TaskStatus::Failed(_) => Ok(TodoStatus::Failed),
+            echo_agent::tasks::TaskStatus::Skipped => Ok(TodoStatus::Skipped),
+            echo_agent::tasks::TaskStatus::Cancelled
+            | echo_agent::tasks::TaskStatus::TimedOut { .. }
+            | echo_agent::tasks::TaskStatus::Retrying { .. }
+            | echo_agent::tasks::TaskStatus::Paused(_) => Err(format!(
+                "framework task status {status:?} has no lossless EKO todo projection"
+            )),
         }
     }
 }
@@ -734,13 +742,13 @@ impl TaskPlan {
     }
 }
 
-/// Immutable task specification stored in `plan.json`.
+/// EKO file/UI projection of the immutable framework task specification.
 ///
-/// Runtime state such as status, retry count, and failure fingerprints lives
-/// in [`TaskExecution`] and is projected separately into `run-state.json`.
+/// This DTO preserves EKO metadata for `plan.json` and generated TypeScript;
+/// framework validation and DAG scheduling never consume it directly.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export, rename = "TaskSpec")]
-pub struct TaskSpec {
+pub struct EkoTaskSpec {
     pub id: String,
     pub title: String,
     pub description: String,
@@ -759,10 +767,10 @@ pub struct TaskSpec {
     pub sort_order: i64,
 }
 
-/// Mutable execution state for one task specification.
+/// EKO file/UI projection of framework task execution state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export, rename = "TaskExecution")]
-pub struct TaskExecution {
+pub struct EkoTaskExecution {
     pub task_id: String,
     pub status: TodoStatus,
     pub retry_count: u32,
@@ -777,7 +785,7 @@ pub struct EkoTaskMetadata {
     pub sort_order: i64,
 }
 
-impl TaskExecution {
+impl EkoTaskExecution {
     pub fn pending(task_id: impl Into<String>) -> Self {
         Self {
             task_id: task_id.into(),
@@ -788,7 +796,7 @@ impl TaskExecution {
     }
 }
 
-/// Canonical structured plan specification persisted in `plan.json`.
+/// EKO's file-backed plan projection persisted in `plan.json`.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, rename = "PlanRevision")]
 pub struct PlanRevision {
@@ -801,19 +809,18 @@ pub struct PlanRevision {
     pub assumptions: Vec<String>,
     pub risks: Vec<String>,
     pub execution_mode: ExecutionMode,
-    pub tasks: Vec<TaskSpec>,
+    pub tasks: Vec<EkoTaskSpec>,
 }
 
-/// Canonical execution projection persisted in `run-state.json`.
+/// EKO's file-backed execution projection persisted in `run-state.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunStateSnapshot {
     pub run: TaskRun,
-    pub tasks: Vec<TaskExecution>,
+    pub tasks: Vec<EkoTaskExecution>,
 }
 
-/// One node in the plan DAG. `depends_on` is the canonical edge list; the
-/// scheduler (PR 3) builds adjacency indexes from it but `PlanTask` remains
-/// the serialized node.
+/// Materialized EKO plan node used by tools, persistence, review, and UI.
+/// Framework `Task` remains the authority for validation and DAG traversal.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, rename = "PlanTask")]
 pub struct PlanTask {
@@ -881,8 +888,8 @@ impl Default for PlanTask {
 }
 
 impl PlanTask {
-    pub fn spec(&self) -> TaskSpec {
-        TaskSpec {
+    pub fn spec(&self) -> EkoTaskSpec {
+        EkoTaskSpec {
             id: self.id.clone(),
             title: self.title.clone(),
             description: self.description.clone(),
@@ -901,8 +908,8 @@ impl PlanTask {
         }
     }
 
-    pub fn execution(&self) -> TaskExecution {
-        TaskExecution {
+    pub fn execution(&self) -> EkoTaskExecution {
+        EkoTaskExecution {
             task_id: self.id.clone(),
             status: self.status,
             retry_count: self.retry_count,
@@ -910,7 +917,7 @@ impl PlanTask {
         }
     }
 
-    pub fn from_parts(spec: TaskSpec, execution: TaskExecution) -> Self {
+    pub fn from_parts(spec: EkoTaskSpec, execution: EkoTaskExecution) -> Self {
         Self {
             id: spec.id,
             title: spec.title,
@@ -934,7 +941,7 @@ impl PlanTask {
     }
 
     /// Convert losslessly to the framework's canonical runtime task model.
-    pub fn to_runtime_task(&self) -> echo_agent::tasks::RuntimeTask {
+    pub fn to_task(&self) -> echo_agent::tasks::Task {
         let metadata = serde_json::Value::Object(serde_json::Map::from_iter([
             (
                 "domain_profile".to_string(),
@@ -952,12 +959,12 @@ impl PlanTask {
                 serde_json::Value::Number(self.sort_order.into()),
             ),
         ]));
-        echo_agent::tasks::RuntimeTask {
-            spec: echo_agent::tasks::RuntimeTaskSpec {
+        echo_agent::tasks::Task {
+            spec: echo_agent::tasks::TaskSpec {
                 id: self.id.clone(),
                 title: self.title.clone(),
                 description: self.description.clone(),
-                kind: self.kind.to_runtime_kind(),
+                kind: self.kind.to_task_kind(),
                 agent_role: self.agent_role.clone(),
                 depends_on: self.depends_on.clone(),
                 files: self.files.clone(),
@@ -968,13 +975,75 @@ impl PlanTask {
                 max_retries: self.max_retries,
                 metadata,
             },
-            execution: echo_agent::tasks::RuntimeTaskExecution {
+            execution: echo_agent::tasks::TaskExecution {
                 task_id: self.id.clone(),
-                status: self.status.to_runtime_status(),
+                status: self
+                    .status
+                    .to_task_status(self.failure_fingerprint.as_deref()),
                 retry_count: self.retry_count,
                 failure_fingerprint: self.failure_fingerprint.clone(),
             },
         }
+    }
+}
+
+impl TryFrom<echo_agent::tasks::Task> for PlanTask {
+    type Error = String;
+
+    fn try_from(task: echo_agent::tasks::Task) -> Result<Self, Self::Error> {
+        let echo_agent::tasks::Task { spec, execution } = task;
+        if spec.id != execution.task_id {
+            return Err(format!(
+                "framework task spec id '{}' does not match execution id '{}'",
+                spec.id, execution.task_id
+            ));
+        }
+        let metadata: EkoTaskMetadata = serde_json::from_value(spec.metadata)
+            .map_err(|error| format!("task '{}' has invalid EKO metadata: {error}", spec.id))?;
+        let status = TodoStatus::try_from_task_status(&execution.status)?;
+        let status_detail = match &execution.status {
+            echo_agent::tasks::TaskStatus::Blocked(detail)
+            | echo_agent::tasks::TaskStatus::Failed(detail) => Some(detail.clone()),
+            echo_agent::tasks::TaskStatus::Pending
+            | echo_agent::tasks::TaskStatus::Running
+            | echo_agent::tasks::TaskStatus::Completed
+            | echo_agent::tasks::TaskStatus::Skipped => None,
+            echo_agent::tasks::TaskStatus::Cancelled
+            | echo_agent::tasks::TaskStatus::TimedOut { .. }
+            | echo_agent::tasks::TaskStatus::Retrying { .. }
+            | echo_agent::tasks::TaskStatus::Paused(_) => None,
+        };
+        if let (Some(fingerprint), Some(detail)) = (
+            execution.failure_fingerprint.as_ref(),
+            status_detail.as_ref(),
+        ) && fingerprint != detail
+        {
+            return Err(format!(
+                "task '{}' status detail does not match failure fingerprint",
+                spec.id
+            ));
+        }
+
+        Ok(Self {
+            id: spec.id,
+            title: spec.title,
+            description: spec.description,
+            kind: PlanTaskKind::from_task_kind(spec.kind),
+            agent_role: spec.agent_role,
+            domain_profile: metadata.domain_profile,
+            depends_on: spec.depends_on,
+            parallel_group: metadata.parallel_group,
+            files: spec.files,
+            allowed_tools: spec.allowed_tools,
+            required_artifacts: spec.required_artifacts,
+            execution_checks: spec.execution_checks,
+            acceptance_criteria: spec.acceptance_criteria,
+            retry_count: execution.retry_count,
+            max_retries: spec.max_retries,
+            failure_fingerprint: execution.failure_fingerprint.or(status_detail),
+            status,
+            sort_order: metadata.sort_order,
+        })
     }
 }
 
@@ -1002,7 +1071,7 @@ pub struct TaskPatch {
 pub enum PlanPatchOperation {
     Insert {
         after_task_id: Option<String>,
-        task: TaskSpec,
+        task: EkoTaskSpec,
     },
     Update {
         task_id: String,
@@ -1543,7 +1612,7 @@ impl SuggestedTask {
         echo_agent::tasks::SuggestedTask {
             title: self.title.clone(),
             description: self.description.clone(),
-            kind: self.kind.to_runtime_kind(),
+            kind: self.kind.to_task_kind(),
             agent_role: self.agent_role.clone(),
             dependencies: self.dependencies.clone(),
             why_needed: self.why_needed.clone(),
@@ -1556,7 +1625,7 @@ impl SuggestedTask {
         Self {
             title: task.title,
             description: task.description,
-            kind: PlanTaskKind::from_runtime_kind(task.kind),
+            kind: PlanTaskKind::from_task_kind(task.kind),
             agent_role: task.agent_role,
             dependencies: task.dependencies,
             why_needed: task.why_needed,
@@ -1639,7 +1708,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_task_converts_to_framework_runtime_task() -> Result<(), String> {
+    fn plan_task_round_trips_through_framework_task() -> Result<(), String> {
         let task = PlanTask {
             id: "t1".to_string(),
             title: "Inspect runtime".to_string(),
@@ -1661,16 +1730,16 @@ mod tests {
             sort_order: 10,
         };
 
-        let runtime = task.to_runtime_task();
+        let runtime = task.to_task();
 
         assert_eq!(runtime.spec.id, "t1");
         assert_eq!(
             runtime.spec.kind,
-            echo_agent::tasks::RuntimeTaskKind::Investigation
+            echo_agent::tasks::TaskKind::Investigation
         );
         assert_eq!(
             runtime.execution.status,
-            echo_agent::tasks::RuntimeTaskStatus::Running
+            echo_agent::tasks::TaskStatus::Running
         );
         assert_eq!(runtime.spec.depends_on, vec!["t0".to_string()]);
         assert_eq!(runtime.spec.required_artifacts, vec!["report.md"]);
@@ -1685,12 +1754,58 @@ mod tests {
             runtime.execution.failure_fingerprint.as_deref(),
             Some("failure-1")
         );
-        let metadata: EkoTaskMetadata =
-            serde_json::from_value(runtime.spec.metadata).map_err(|error| error.to_string())?;
+        let metadata: EkoTaskMetadata = serde_json::from_value(runtime.spec.metadata.clone())
+            .map_err(|error| error.to_string())?;
         assert_eq!(metadata.domain_profile, DomainProfile::AiCoding);
         assert_eq!(metadata.parallel_group.as_deref(), Some("g1"));
         assert_eq!(metadata.sort_order, 10);
+
+        let round_trip = PlanTask::try_from(runtime)?;
+        assert_eq!(round_trip.id, task.id);
+        assert_eq!(round_trip.kind, task.kind);
+        assert_eq!(round_trip.domain_profile, task.domain_profile);
+        assert_eq!(round_trip.depends_on, task.depends_on);
+        assert_eq!(round_trip.required_artifacts, task.required_artifacts);
+        assert_eq!(round_trip.execution_checks, task.execution_checks);
+        assert_eq!(round_trip.acceptance_criteria, task.acceptance_criteria);
+        assert_eq!(round_trip.failure_fingerprint, task.failure_fingerprint);
+        assert_eq!(round_trip.status, task.status);
         Ok(())
+    }
+
+    #[test]
+    fn plan_task_status_projection_preserves_failure_detail() {
+        let task = PlanTask {
+            id: "failed-task".to_string(),
+            title: "Failed task".to_string(),
+            description: "Exercise status projection".to_string(),
+            kind: PlanTaskKind::Investigation,
+            agent_role: "explorer".to_string(),
+            domain_profile: DomainProfile::AiCoding,
+            depends_on: Vec::new(),
+            parallel_group: None,
+            files: Vec::new(),
+            allowed_tools: Vec::new(),
+            required_artifacts: Vec::new(),
+            execution_checks: Vec::new(),
+            acceptance_criteria: vec!["failure is persisted".to_string()],
+            retry_count: 2,
+            max_retries: 2,
+            failure_fingerprint: Some("compile-error".to_string()),
+            status: TodoStatus::Failed,
+            sort_order: 0,
+        };
+
+        let framework_task = task.to_task();
+
+        assert_eq!(
+            framework_task.execution.status,
+            echo_agent::tasks::TaskStatus::Failed("compile-error".to_string())
+        );
+        assert_eq!(
+            TodoStatus::try_from_task_status(&framework_task.execution.status),
+            Ok(TodoStatus::Failed)
+        );
     }
 
     #[test]
@@ -1731,7 +1846,7 @@ mod tests {
         assert_eq!(runtime.suggested_tasks.len(), 1);
         assert_eq!(
             runtime.suggested_tasks.first().map(|task| task.kind),
-            Some(echo_agent::tasks::RuntimeTaskKind::Implementation)
+            Some(echo_agent::tasks::TaskKind::Implementation)
         );
     }
 

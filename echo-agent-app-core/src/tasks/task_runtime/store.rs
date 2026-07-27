@@ -120,12 +120,9 @@ fn apply_task_patch(task: &mut PlanTask, patch: &TaskPatch) {
 }
 
 fn validate_runtime_plan(tasks: &[PlanTask]) -> Result<(), StoreError> {
-    let runtime_tasks = tasks
-        .iter()
-        .map(PlanTask::to_runtime_task)
-        .collect::<Vec<_>>();
+    let runtime_tasks = tasks.iter().map(PlanTask::to_task).collect::<Vec<_>>();
     echo_agent::tasks::PlanValidator::default()
-        .validate_runtime_snapshot(&runtime_tasks)
+        .validate_task_snapshot(&runtime_tasks)
         .map_err(|errors| StoreError::InvalidPlan(errors.join("; ")))
 }
 
@@ -685,7 +682,7 @@ impl TaskRuntimeStore {
                             position,
                             PlanTask::from_parts(
                                 task.clone(),
-                                TaskExecution::pending(task.id.clone()),
+                                EkoTaskExecution::pending(task.id.clone()),
                             ),
                         );
                     }
