@@ -4,6 +4,10 @@
 > policy-gated nested delegation are wired.
 > Scope: `echo-agent` is the reusable framework; `echo-agent-cli` is the EKO app.
 > Rule of thumb: extract framework kernels and traits, not EKO product state.
+> 2026-07-27 postscript: the historical `ConcurrencyLimits` proposal was
+> narrowed. The framework now owns only `max_concurrent_subagents`; EKO owns
+> writer/shell/LLM limits in `EkoExecutionLimits`. See
+> `docs/2026-07-27-runtime-dag-kernel-convergence.md`.
 
 ## Why This Exists
 

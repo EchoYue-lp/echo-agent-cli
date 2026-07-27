@@ -126,10 +126,11 @@ EKO 首层 PlanTask subagent 使用 depth 0,默认 max depth 2。普通 role 即
 - `SubagentTraceEvent` / `SubagentTraceEventKind`
 - `subagentTraceStore` / `subagentDetailStore`
 
-`SubagentRun.subagentRunId` 是一次执行 attempt 的稳定 execution id，通常为
-`{task_id}:{attempt}`；`task_id` 是 PlanTask 节点 identity。前端 store 保留每个
-attempt 的独立记录，面向 task 的默认视图选择最新 attempt，不在事件层截断或合并
-identity。
+`SubagentRun.subagentRunId` 是一次执行 attempt 的稳定 execution id。正式
+PlanTask 使用 `{task_id}:{plan_revision}:{attempt}`；`task_id` 是 PlanTask 节点
+identity。revision 维度阻止修改后的 TaskSpec 复用旧 durable result。前端 store
+保留每个 attempt 的独立记录，面向 task 的默认视图选择最新 attempt，不在事件层
+截断或合并 identity。
 
 事件按 owner 分流：框架派发路径由 `SubagentEvent` 唯一产生 Subagent lifecycle；
 主 Agent 直执行路径由 EKO 的 `ExecEventScope::Subagent` 产生；TaskRuntime 的任务与
@@ -158,9 +159,9 @@ TaskRuntime 仍是全局 run 状态的唯一 owner:
 
 框架提供通用原语:
 
-- `RuntimeTask`
+- `TaskSpec` / `TaskExecution` / `TaskStatus` / `TaskClaim`
 - `TaskSubagentContext`
-- `ConcurrencyLimits`
+- `RuntimeDagExecutor` 与 `max_concurrent_subagents`
 - `NestedDelegationPolicy`
 - `SubagentExecutor`
 - `agent_tool`
@@ -168,6 +169,8 @@ TaskRuntime 仍是全局 run 状态的唯一 owner:
 EKO 应用层保留产品逻辑:
 
 - file store / UI projection
+- atomic claim persistence and superseded-attempt rejection
+- `EkoExecutionLimits` for writer/shell/LLM policy
 - approval gate
 - `execute_plan`
 - `task_create/update/complete/skip/list`

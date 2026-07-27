@@ -4,9 +4,8 @@ import type { PlanTaskKind } from './PlanTaskKind';
 import type { TodoStatus } from './TodoStatus';
 
 /**
- * One node in the plan DAG. `depends_on` is the canonical edge list; the
- * scheduler (PR 3) builds adjacency indexes from it but `PlanTask` remains
- * the serialized node.
+ * Materialized EKO plan node used by tools, persistence, review, and UI.
+ * Framework `Task` remains the authority for validation and DAG traversal.
  */
 export type PlanTask = {
   id: string;
@@ -44,6 +43,11 @@ export type PlanTask = {
   max_retries: number;
   failure_fingerprint: string | null;
   status: TodoStatus;
+  /**
+   * Error/block reason carried by the shared status. This is deliberately
+   * independent from `failure_fingerprint`.
+   */
+  status_detail: string | null;
   /**
    * Stable sort key for display ordering. Set by plan generation (sequential
    * index) and updated by `reorder_tasks`. Separated from `parallel_group`

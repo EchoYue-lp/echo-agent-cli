@@ -183,8 +183,12 @@ pub fn rebuild_plan_from_events(events: &[RuntimeTaskEvent]) -> Result<RebuiltPl
                     for task in &mut tasks {
                         if skipped.contains(task.id.as_str()) {
                             task.status = TodoStatus::Skipped;
+                            task.status_detail = None;
+                            task.claim = None;
                         } else if reset.contains(task.id.as_str()) {
                             task.status = TodoStatus::Pending;
+                            task.status_detail = None;
+                            task.claim = None;
                         }
                     }
                     plan = Some(TaskPlan {
@@ -217,6 +221,12 @@ pub fn rebuild_plan_from_events(events: &[RuntimeTaskEvent]) -> Result<RebuiltPl
                         // nested let-Option guard reads clearer than a let-chain
                         if let Some(t) = tasks.iter_mut().find(|t| &t.id == task_id) {
                             t.status = status;
+                            if let Some(value) = ev.payload.get("status_detail") {
+                                t.status_detail = value.as_str().map(str::to_string);
+                            }
+                            if let Some(value) = ev.payload.get("claim") {
+                                t.claim = serde_json::from_value(value.clone()).ok();
+                            }
                         }
                     }
                     if let Some(retry_count) = ev
@@ -317,6 +327,8 @@ mod tests {
             max_retries: 3,
             failure_fingerprint: None,
             status: TodoStatus::Pending,
+            status_detail: None,
+            claim: None,
             sort_order: 0,
         }
     }

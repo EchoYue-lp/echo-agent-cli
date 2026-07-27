@@ -17,8 +17,10 @@ the execution result:
 - a locked checkout: reject concurrent reuse because another execution still
   owns it.
 
-`SubagentRun.execution_id` remains `{task_id}:{attempt}`. The new isolation key
-is `{run_id}:{task_id}` and is not used as an event identity.
+`SubagentRun.execution_id` is now
+`{task_id}:{plan_revision}:{attempt}` so a changed TaskSpec cannot reuse an old
+durable result when its retry counter is unchanged. The isolation key remains
+`{run_id}:{task_id}` and is not used as an event identity.
 
 ## Root Cause
 

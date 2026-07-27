@@ -17,7 +17,8 @@ import type { SubagentTaskResult } from './SubagentTaskResult';
  */
 export type SubagentRun = {
   /**
-   * Stable execution id, format "{task_id}:{attempt}". Aligns with
+   * Stable execution id. Formal PlanTasks use
+   * "{task_id}:{plan_revision}:{attempt}". Aligns with
    * `SubagentEvent::execution_id`.
    */
   subagent_run_id: string;

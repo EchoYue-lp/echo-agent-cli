@@ -14,7 +14,8 @@
 //! - implementation / debugging tasks use ownership-safe waves and writer
 //!   worktrees; verification tasks run on the primary Agent against the
 //!   authoritative workspace;
-//! - the overall Subagent count is capped by `ConcurrencyLimits`.
+//! - the overall Subagent count is capped by the framework executor; EKO owns
+//!   write, shell, and LLM resource policy separately.
 //!
 //! Cancellation: each dispatched task gets a child of the parent run's
 //! CancellationToken. Read-only delegation propagates cancel through
@@ -40,10 +41,29 @@ use echo_agent::agent::{Agent, AgentEvent, CancellationToken};
 use futures::StreamExt;
 use tokio::sync::{Mutex as TokioMutex, OwnedMutexGuard, Semaphore};
 
-use super::store::{StoreError, TaskRuntimeStore};
+use super::store::{ClaimWriteOutcome, StoreError, TaskRuntimeStore};
 use super::types::*;
 
-pub use echo_agent::tasks::ConcurrencyLimits;
+/// EKO product-resource limits. Only the Subagent cap is passed to the
+/// framework DAG kernel; write, shell, and LLM limits stay in the application.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EkoExecutionLimits {
+    pub max_concurrent_subagents: usize,
+    pub max_concurrent_writes: usize,
+    pub max_concurrent_shells: usize,
+    pub max_parallel_llm_calls: usize,
+}
+
+impl Default for EkoExecutionLimits {
+    fn default() -> Self {
+        Self {
+            max_concurrent_subagents: 4,
+            max_concurrent_writes: 4,
+            max_concurrent_shells: 1,
+            max_parallel_llm_calls: 4,
+        }
+    }
+}
 
 /// Scope of an execution-flow event on the unified frontend channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -67,7 +87,8 @@ pub struct ExecEvent {
     pub scope: ExecEventScope,
     /// Plan node identity. Present on task and Subagent events.
     pub task_id: Option<String>,
-    /// One concrete Subagent execution identity (`{task_id}:{attempt}`).
+    /// One concrete Subagent execution identity
+    /// (`{task_id}:{plan_revision}:{attempt}`).
     /// Present only when `scope == Subagent`.
     pub subagent_run_id: Option<String>,
     pub event: String,
@@ -146,8 +167,8 @@ fn emit_exec(sink: Option<&ExecSink>, ev: ExecEvent) {
     }
 }
 
-fn subagent_execution_id(task_id: &str, attempt: u32) -> String {
-    format!("{task_id}:{attempt}")
+fn subagent_execution_id(task_id: &str, claim: &echo_agent::tasks::TaskClaim) -> String {
+    claim.execution_id(task_id)
 }
 
 fn task_isolation_id(run_id: &str, task_id: &str) -> String {
@@ -322,7 +343,7 @@ pub async fn execute_run(
     );
 
     let primary_agent = primary_agent.ok_or(ExecError::NoAgent)?;
-    let limits = ConcurrencyLimits::default();
+    let limits = EkoExecutionLimits::default();
 
     let mut drain_cycle = 0usize;
     let outcome = loop {
@@ -750,6 +771,7 @@ trait TaskDispatcher: Send + Sync {
         &self,
         store: Arc<TaskRuntimeStore>,
         context: echo_agent::tasks::TaskSubagentContext,
+        claim: echo_agent::tasks::TaskClaim,
         task: PlanTask,
         write_sem: Arc<Semaphore>,
         shell_sem: Arc<Semaphore>,
@@ -793,6 +815,7 @@ impl TaskDispatcher for RealTaskDispatcher {
         &self,
         store: Arc<TaskRuntimeStore>,
         context: echo_agent::tasks::TaskSubagentContext,
+        claim: echo_agent::tasks::TaskClaim,
         task: PlanTask,
         write_sem: Arc<Semaphore>,
         shell_sem: Arc<Semaphore>,
@@ -824,6 +847,7 @@ impl TaskDispatcher for RealTaskDispatcher {
                     file_write_locks,
                     trace_sink,
                     run_id,
+                    claim,
                     task,
                     cancel,
                     delegation_policy,
@@ -1048,6 +1072,38 @@ impl<W: TaskDispatcher> EkoRuntimeDagController<W> {
             echo_agent::tasks::RuntimeStopDisposition::Pause
         }
     }
+
+    fn set_claimed_status(
+        &self,
+        run_id: &str,
+        task: &PlanTask,
+        claim: &echo_agent::tasks::TaskClaim,
+        status: TodoStatus,
+        summary: Option<&str>,
+    ) -> echo_agent::error::Result<bool> {
+        self.store
+            .set_claimed_task_status(
+                run_id,
+                &task.id,
+                claim,
+                status,
+                Some(&task.agent_role),
+                summary,
+            )
+            .map(|outcome| outcome == ClaimWriteOutcome::Applied)
+            .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))
+    }
+
+    fn claim_is_current(
+        &self,
+        run_id: &str,
+        task_id: &str,
+        claim: &echo_agent::tasks::TaskClaim,
+    ) -> echo_agent::error::Result<bool> {
+        self.store
+            .task_claim_is_current(run_id, task_id, claim)
+            .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))
+    }
 }
 
 #[async_trait::async_trait]
@@ -1083,6 +1139,17 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
         })
     }
 
+    async fn claim_task(
+        &self,
+        run_id: &str,
+        task: &echo_agent::tasks::Task,
+        expected_revision: u64,
+    ) -> echo_agent::error::Result<echo_agent::tasks::RuntimeTaskClaimOutcome> {
+        self.store
+            .claim_task(run_id, task, expected_revision)
+            .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))
+    }
+
     fn select_ready_wave(
         &self,
         _tasks: &[echo_agent::tasks::Task],
@@ -1105,10 +1172,11 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
     async fn dispatch_task(
         &self,
         context: echo_agent::tasks::TaskSubagentContext,
+        claim: echo_agent::tasks::TaskClaim,
         runtime_task: echo_agent::tasks::Task,
     ) -> echo_agent::error::Result<Self::DispatchOutput> {
         let task = self.plan_task(&runtime_task.spec.id)?;
-        let execution_id = subagent_execution_id(&task.id, task.retry_count.saturating_add(1));
+        let execution_id = subagent_execution_id(&task.id, &claim);
         match self
             .store
             .recoverable_subagent_result(&context.run_id, &task.id, &execution_id)
@@ -1144,6 +1212,7 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
             .dispatch(
                 self.store.clone(),
                 context,
+                claim,
                 task,
                 self.write_sem.clone(),
                 self.shell_sem.clone(),
@@ -1158,6 +1227,7 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
     async fn resolve_dispatch(
         &self,
         run_id: &str,
+        claim: echo_agent::tasks::TaskClaim,
         runtime_task: echo_agent::tasks::Task,
         dispatch: echo_agent::error::Result<Self::DispatchOutput>,
     ) -> echo_agent::error::Result<echo_agent::tasks::RuntimeTaskResolution> {
@@ -1166,17 +1236,15 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
             Ok(dispatched) => dispatched,
             Err(error) => {
                 let message = error.to_string();
-                self.store
-                    .set_task_status(
-                        run_id,
-                        &task.id,
-                        TodoStatus::Failed,
-                        Some(&task.agent_role),
-                        Some(&format!("error: {message}")),
-                    )
-                    .map_err(|store_error| {
-                        echo_agent::error::ReactError::Other(store_error.to_string())
-                    })?;
+                if !self.set_claimed_status(
+                    run_id,
+                    &task,
+                    &claim,
+                    TodoStatus::Failed,
+                    Some(&format!("error: {message}")),
+                )? {
+                    return Ok(echo_agent::tasks::RuntimeTaskResolution::Superseded);
+                }
                 return Ok(echo_agent::tasks::RuntimeTaskResolution::Failed { error: message });
             }
         };
@@ -1195,44 +1263,38 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
 
         match assess_task_execution(&task, &result) {
             CompletionAssessment::ExecutionFailed { reason } => {
-                if task.retry_count < task.max_retries {
-                    let next_retry = task.retry_count.saturating_add(1);
-                    self.store
-                        .set_task_status(
-                            run_id,
-                            &task.id,
-                            TodoStatus::Pending,
-                            Some(&task.agent_role),
-                            Some(&format!(
-                                "execution failed (attempt {next_retry}): {reason}"
-                            )),
-                        )
+                let claimed_retry_count = claim.attempt.saturating_sub(1);
+                if claimed_retry_count < task.max_retries {
+                    let next_retry = claimed_retry_count.saturating_add(1);
+                    let retry_summary =
+                        format!("execution failed (attempt {next_retry}): {reason}");
+                    let requeued = self
+                        .store
+                        .requeue_claimed_task(run_id, &task.id, &claim, None, &retry_summary)
                         .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))?;
+                    if requeued == ClaimWriteOutcome::Superseded {
+                        return Ok(echo_agent::tasks::RuntimeTaskResolution::Superseded);
+                    }
                     let _ = self.store.note(
-                        run_id,
-                        Some(&task.id),
-                        &format!(
-                            "attempt {next_retry} failed: {reason}; auto-retrying (retry_count {} -> {next_retry})",
-                            task.retry_count
-                        ),
-                    );
-                    self.store
-                        .increment_retry_count(run_id, &task.id, None)
-                        .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))?;
+                            run_id,
+                            Some(&task.id),
+                            &format!(
+                                "attempt {next_retry} failed: {reason}; auto-retrying (retry_count {} -> {next_retry})",
+                                claimed_retry_count
+                            ),
+                        );
                     Ok(echo_agent::tasks::RuntimeTaskResolution::Pending)
                 } else {
                     let error = format!("execution failed after max retries: {reason}");
-                    self.store
-                        .set_task_status(
-                            run_id,
-                            &task.id,
-                            TodoStatus::Failed,
-                            Some(&task.agent_role),
-                            Some(&error),
-                        )
-                        .map_err(|store_error| {
-                            echo_agent::error::ReactError::Other(store_error.to_string())
-                        })?;
+                    if !self.set_claimed_status(
+                        run_id,
+                        &task,
+                        &claim,
+                        TodoStatus::Failed,
+                        Some(&error),
+                    )? {
+                        return Ok(echo_agent::tasks::RuntimeTaskResolution::Superseded);
+                    }
                     Ok(echo_agent::tasks::RuntimeTaskResolution::Failed { error })
                 }
             }
@@ -1245,15 +1307,15 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                     missing_checks.join(", "),
                     missing_artifacts.join(", "),
                 );
-                self.store
-                    .set_task_status(
-                        run_id,
-                        &task.id,
-                        TodoStatus::Blocked,
-                        Some(&task.agent_role),
-                        Some(&reason),
-                    )
-                    .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))?;
+                if !self.set_claimed_status(
+                    run_id,
+                    &task,
+                    &claim,
+                    TodoStatus::Blocked,
+                    Some(&reason),
+                )? {
+                    return Ok(echo_agent::tasks::RuntimeTaskResolution::Superseded);
+                }
                 let _ = self.store.note(run_id, Some(&task.id), &reason);
                 Ok(echo_agent::tasks::RuntimeTaskResolution::Blocked {
                     error: reason,
@@ -1261,6 +1323,9 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                 })
             }
             CompletionAssessment::Executed => {
+                if !self.claim_is_current(run_id, &task.id, &claim)? {
+                    return Ok(echo_agent::tasks::RuntimeTaskResolution::Superseded);
+                }
                 let summary = result.summary.clone();
                 let review_output = if full_output.trim().is_empty() {
                     summary.as_str()
@@ -1303,23 +1368,25 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                     }
                 };
                 if let Some(reason) = block_reason {
-                    self.store
-                        .set_task_status(
-                            run_id,
-                            &task.id,
-                            TodoStatus::Blocked,
-                            Some(&task.agent_role),
-                            Some(&reason),
-                        )
-                        .map_err(|error| echo_agent::error::ReactError::Other(error.to_string()))?;
+                    if !self.set_claimed_status(
+                        run_id,
+                        &task,
+                        &claim,
+                        TodoStatus::Blocked,
+                        Some(&reason),
+                    )? {
+                        return Ok(echo_agent::tasks::RuntimeTaskResolution::Superseded);
+                    }
                     return Ok(echo_agent::tasks::RuntimeTaskResolution::Blocked {
                         error: reason,
                         disposition: self.review_stop_disposition(run_id),
                     });
                 }
 
-                let execution_id =
-                    subagent_execution_id(&task.id, task.retry_count.saturating_add(1));
+                if !self.claim_is_current(run_id, &task.id, &claim)? {
+                    return Ok(echo_agent::tasks::RuntimeTaskResolution::Superseded);
+                }
+                let execution_id = subagent_execution_id(&task.id, &claim);
                 match integrate_reviewed_task(
                     self.dispatcher.clone(),
                     self.store.clone(),
@@ -1333,32 +1400,28 @@ impl<W: TaskDispatcher + 'static> echo_agent::tasks::RuntimeDagController
                 .await
                 {
                     Ok(completion_summary) => {
-                        self.store
-                            .set_task_status(
-                                run_id,
-                                &task.id,
-                                TodoStatus::Completed,
-                                Some(&task.agent_role),
-                                Some(&completion_summary),
-                            )
-                            .map_err(|error| {
-                                echo_agent::error::ReactError::Other(error.to_string())
-                            })?;
+                        if !self.set_claimed_status(
+                            run_id,
+                            &task,
+                            &claim,
+                            TodoStatus::Completed,
+                            Some(&completion_summary),
+                        )? {
+                            return Ok(echo_agent::tasks::RuntimeTaskResolution::Superseded);
+                        }
                         Ok(echo_agent::tasks::RuntimeTaskResolution::Completed)
                     }
                     Err(error) => {
                         let error = format!("worktree integration failed: {error}");
-                        self.store
-                            .set_task_status(
-                                run_id,
-                                &task.id,
-                                TodoStatus::Failed,
-                                Some(&task.agent_role),
-                                Some(&error),
-                            )
-                            .map_err(|store_error| {
-                                echo_agent::error::ReactError::Other(store_error.to_string())
-                            })?;
+                        if !self.set_claimed_status(
+                            run_id,
+                            &task,
+                            &claim,
+                            TodoStatus::Failed,
+                            Some(&error),
+                        )? {
+                            return Ok(echo_agent::tasks::RuntimeTaskResolution::Superseded);
+                        }
                         Ok(echo_agent::tasks::RuntimeTaskResolution::Failed { error })
                     }
                 }
@@ -1430,7 +1493,7 @@ async fn execute_runtime_plan<W: TaskDispatcher + 'static>(
     dispatcher: W,
     reviewer_llm: Option<Arc<dyn echo_agent::llm::LlmClient>>,
     run_id: &str,
-    limits: ConcurrencyLimits,
+    limits: EkoExecutionLimits,
     parent_cancel: CancellationToken,
     trace_sink: Option<ExecSink>,
 ) -> Result<RunOutcome, ExecError> {
@@ -1450,7 +1513,7 @@ async fn execute_runtime_plan<W: TaskDispatcher + 'static>(
     let executor = echo_agent::tasks::RuntimeDagExecutor::new(
         controller,
         echo_agent::tasks::RuntimeDagExecutorConfig {
-            concurrency_limits: limits,
+            max_concurrent_subagents: limits.max_concurrent_subagents,
             ..Default::default()
         },
     );
@@ -1654,6 +1717,7 @@ async fn execute_task(
     file_write_locks: Arc<std::sync::Mutex<HashMap<String, Arc<TokioMutex<()>>>>>,
     trace_sink: Option<ExecSink>,
     run_id: String,
+    claim: echo_agent::tasks::TaskClaim,
     task: PlanTask,
     cancel: CancellationToken,
     delegation_policy: echo_agent::tasks::NestedDelegationPolicy,
@@ -1679,13 +1743,6 @@ async fn execute_task(
             let msg = format!(
                 "CP B preflight rejected task '{}': {}",
                 task_id, rejection.reason
-            );
-            let _ = store.set_task_status(
-                &run_id,
-                &task_id,
-                TodoStatus::Failed,
-                Some(&task.agent_role),
-                Some(&msg),
             );
             return Err((task_id.clone(), msg));
         }
@@ -1719,8 +1776,8 @@ async fn execute_task(
 
     // A PlanTask is a stable plan node; each dispatch attempt is a distinct
     // SubagentRun. Never collapse retries back to the bare task id.
-    let attempt = task.retry_count.saturating_add(1);
-    let execution_id = subagent_execution_id(&task_id, attempt);
+    let attempt = claim.attempt;
+    let execution_id = subagent_execution_id(&task_id, &claim);
     let contract = subagent_runtime_contract(&primary_agent, &task.agent_role, &task.kind).await;
     tracing::info!(
         run_id = %run_id,
@@ -1732,17 +1789,6 @@ async fn execute_task(
         "task_runtime: task dispatch start"
     );
 
-    // Mark the task running + emit TaskStarted (transactional with the todo
-    // projection update).
-    if let Err(e) = store.set_task_status(
-        &run_id,
-        &task_id,
-        TodoStatus::Running,
-        Some(&task.agent_role),
-        None,
-    ) {
-        tracing::warn!(task_id = %task_id, error = %e, "failed to mark task running");
-    }
     emit_task_started(
         trace_sink.as_ref(),
         &run_id,
@@ -2106,6 +2152,7 @@ async fn execute_task(
             store.clone(),
             &run_id,
             &task,
+            &execution_id,
             &compiled.task_input,
             task_cancel.clone(),
             trace_sink.clone(),
@@ -2826,11 +2873,13 @@ fn push_unique_path(paths: &mut Vec<String>, path: String) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_main_agent_task(
     primary_agent: &crate::agent_handle::AgentHandle,
     store: Arc<TaskRuntimeStore>,
     run_id: &str,
     task: &PlanTask,
+    execution_id: &str,
     prompt: &str,
     cancel: CancellationToken,
     trace_sink: Option<ExecSink>,
@@ -2838,7 +2887,7 @@ async fn run_main_agent_task(
     let run_id = run_id.to_string();
     let task_id = task.id.clone();
     let agent_role = task.agent_role.clone();
-    let execution_id = subagent_execution_id(&task.id, task.retry_count.saturating_add(1));
+    let execution_id = execution_id.to_string();
 
     // Rebuild a multimodal Message when the run carries user attachments, so
     // writer Subagents see the same images/files as the main agent (#1b).
@@ -3884,6 +3933,8 @@ mod tests {
             max_retries: 0,
             failure_fingerprint: None,
             status: TodoStatus::Pending,
+            status_detail: None,
+            claim: None,
             sort_order: 0,
         }
     }
@@ -3943,7 +3994,7 @@ mod tests {
             agent_role: "implementer".to_string(),
             ..PlanTask::default()
         };
-        let started = runtime_contract_started_payload(&contract, &task, "task-1:2");
+        let started = runtime_contract_started_payload(&contract, &task, "task-1:7:2");
         if started.get("isolation").is_some() {
             return Err(
                 "legacy isolation field must not claim configured isolation happened".into(),
@@ -3959,8 +4010,8 @@ mod tests {
         if started.get("isolation_observed").is_some() {
             return Err("started event must not invent observed isolation".into());
         }
-        if started.get("execution_id").and_then(|value| value.as_str()) != Some("task-1:2") {
-            return Err("started event must preserve the attempt execution id".into());
+        if started.get("execution_id").and_then(|value| value.as_str()) != Some("task-1:7:2") {
+            return Err("started event must preserve the revision-scoped execution id".into());
         }
 
         let fallback = runtime_isolation_observed_payload(&contract, "primary-fallback");
@@ -4409,15 +4460,16 @@ Read the runtime path and found one missing branch.
     }
 
     #[test]
-    fn run_outcome_failed_carries_task_id() {
+    fn run_outcome_failed_carries_task_id() -> Result<(), String> {
         let o = RunOutcome::Failed {
             failed_task_id: "t3".into(),
             error: "boom".into(),
         };
         match o {
             RunOutcome::Failed { failed_task_id, .. } => assert_eq!(failed_task_id, "t3"),
-            _ => panic!(),
+            other => return Err(format!("expected failed outcome, got {other:?}")),
         }
+        Ok(())
     }
 
     /// Integration-ish test: a 4-task read-only wave + 1 implementation
@@ -4426,9 +4478,9 @@ Read the runtime path and found one missing branch.
     /// store/state-machine side only (the dispatcher path is covered by the
     /// GUI walkthrough in PR 6 + an integration test).
     #[tokio::test]
-    async fn store_transitions_through_running_to_completed() {
+    async fn store_transitions_through_running_to_completed() -> Result<(), String> {
         use std::sync::Arc;
-        let store = Arc::new(TaskRuntimeStore::new_in_memory().expect("in-memory store"));
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
         // Seed a run + plan via the public store API, then drive the state
         // machine the way the runtime plan adapter would.
         store
@@ -4442,7 +4494,7 @@ Read the runtime path and found one missing branch.
                 "",
                 AttendedMode::Attended,
             )
-            .unwrap();
+            .map_err(|error| error.to_string())?;
         let plan = TaskPlan {
             plan_id: "p1".into(),
             run_id: "r1".into(),
@@ -4460,14 +4512,18 @@ Read the runtime path and found one missing branch.
                 ..Default::default()
             }],
         };
-        store.attach_plan(&plan).unwrap();
+        store
+            .attach_plan(&plan)
+            .map_err(|error| error.to_string())?;
 
         // Simulate the executor: Running, mark task running then
         // completed, then Running → Completed.
-        store.transition_run("r1", TaskRunStatus::Running).unwrap();
+        store
+            .transition_run("r1", TaskRunStatus::Running)
+            .map_err(|error| error.to_string())?;
         store
             .set_task_status("r1", "t1", TodoStatus::Running, Some("code_reviewer"), None)
-            .unwrap();
+            .map_err(|error| error.to_string())?;
         store
             .set_task_status(
                 "r1",
@@ -4476,16 +4532,21 @@ Read the runtime path and found one missing branch.
                 Some("code_reviewer"),
                 Some("done"),
             )
-            .unwrap();
+            .map_err(|error| error.to_string())?;
         store
             .transition_run("r1", TaskRunStatus::Completed)
-            .unwrap();
+            .map_err(|error| error.to_string())?;
 
-        let run = store.get_run("r1").unwrap().unwrap();
+        let run = store
+            .get_run("r1")
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "run r1 missing".to_string())?;
         assert_eq!(run.status, TaskRunStatus::Completed);
-        let todos = store.list_todos("r1").unwrap();
-        assert_eq!(todos[0].status, TodoStatus::Completed);
-        assert!(todos[0].summary.as_deref() == Some("done"));
+        let todos = store.list_todos("r1").map_err(|error| error.to_string())?;
+        let todo = todos.first().ok_or_else(|| "todo t1 missing".to_string())?;
+        assert_eq!(todo.status, TodoStatus::Completed);
+        assert!(todo.summary.as_deref() == Some("done"));
+        Ok(())
     }
 
     // ── Runtime DAG integration tests with a scripted dispatcher ──
@@ -4554,11 +4615,14 @@ Read the runtime path and found one missing branch.
         fn fail(self: &Arc<Self>, id: &str, err: &str) {
             self.results
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(id.into(), Err(err.into()));
         }
         fn order(&self) -> Vec<String> {
-            self.order.lock().unwrap().clone()
+            self.order
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
         }
         fn fail_integration(self: &Arc<Self>, id: &str, error: &str) {
             self.integration_failures
@@ -4579,6 +4643,7 @@ Read the runtime path and found one missing branch.
             &self,
             _store: Arc<TaskRuntimeStore>,
             context: echo_agent::tasks::TaskSubagentContext,
+            _claim: echo_agent::tasks::TaskClaim,
             task: PlanTask,
             _write_sem: Arc<Semaphore>,
             _shell_sem: Arc<Semaphore>,
@@ -4587,7 +4652,12 @@ Read the runtime path and found one missing branch.
             _trace_sink: Option<ExecSink>,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TaskDispatchResult> + Send>>
         {
-            let results = self.results.lock().unwrap().get(&task.id).cloned();
+            let results = self
+                .results
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&task.id)
+                .cloned();
             let delay_ms = self
                 .delays_ms
                 .lock()
@@ -4595,7 +4665,10 @@ Read the runtime path and found one missing branch.
                 .get(&task.id)
                 .copied()
                 .unwrap_or(0);
-            self.order.lock().unwrap().push(task.id.clone());
+            self.order
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(task.id.clone());
             let task_id = task.id.clone();
             Box::pin(async move {
                 if delay_ms > 0 {
@@ -4761,7 +4834,7 @@ Read the runtime path and found one missing branch.
             max_retries: 0,
             ..PlanTask::default()
         };
-        let run_id = seed_run(&store, vec![task.clone()]);
+        let run_id = seed_run(&store, vec![task.clone()])?;
         let dispatcher = ScriptedDispatcher::new();
         let mut result = successful_task_result("tests claimed complete");
         result.verification.push(SubagentVerificationResult {
@@ -4777,7 +4850,7 @@ Read the runtime path and found one missing branch.
             dispatcher,
             None,
             &run_id,
-            ConcurrencyLimits::default(),
+            EkoExecutionLimits::default(),
             CancellationToken::new(),
             None,
         )
@@ -4807,7 +4880,11 @@ Read the runtime path and found one missing branch.
             "plan must not expand on acceptance failure"
         );
         assert_eq!(
-            plan.tasks[0].retry_count, 0,
+            plan.tasks
+                .first()
+                .ok_or_else(|| "plan task missing".to_string())?
+                .retry_count,
+            0,
             "retry_count must not bump on acceptance failure"
         );
         Ok(())
@@ -4817,7 +4894,7 @@ Read the runtime path and found one missing branch.
     fn run_completion_gate_requires_durable_structured_result() -> Result<(), String> {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
         let task = solo_readonly_task("completed-task");
-        let run_id = seed_run(&store, vec![task.clone()]);
+        let run_id = seed_run(&store, vec![task.clone()])?;
         store
             .set_task_status(
                 &run_id,
@@ -4868,7 +4945,7 @@ Read the runtime path and found one missing branch.
     ///
     /// Creates run (Pending), attaches plan (no status change), transitions
     /// Pending → Running so runtime execution can start.
-    fn seed_run(store: &Arc<TaskRuntimeStore>, tasks: Vec<PlanTask>) -> String {
+    fn seed_run(store: &Arc<TaskRuntimeStore>, tasks: Vec<PlanTask>) -> Result<String, String> {
         seed_run_with_mode(store, tasks, AttendedMode::Attended)
     }
 
@@ -4876,7 +4953,7 @@ Read the runtime path and found one missing branch.
         store: &Arc<TaskRuntimeStore>,
         tasks: Vec<PlanTask>,
         attended_mode: AttendedMode,
-    ) -> String {
+    ) -> Result<String, String> {
         let run_id = format!("run_{}", uuid::Uuid::new_v4());
         store
             .create_run(
@@ -4889,7 +4966,7 @@ Read the runtime path and found one missing branch.
                 "",
                 attended_mode,
             )
-            .unwrap();
+            .map_err(|error| error.to_string())?;
         let plan = TaskPlan {
             plan_id: format!("plan_{}", run_id),
             run_id: run_id.clone(),
@@ -4901,11 +4978,13 @@ Read the runtime path and found one missing branch.
             execution_mode: ExecutionMode::Sequential,
             tasks,
         };
-        store.attach_plan(&plan).unwrap();
+        store
+            .attach_plan(&plan)
+            .map_err(|error| error.to_string())?;
         store
             .transition_run(&run_id, TaskRunStatus::Running)
-            .unwrap();
-        run_id
+            .map_err(|error| error.to_string())?;
+        Ok(run_id)
     }
 
     #[tokio::test]
@@ -4934,7 +5013,7 @@ Read the runtime path and found one missing branch.
                 max_retries: 3,
                 ..PlanTask::default()
             };
-            let run_id = seed_run_with_mode(&store, vec![task.clone()], AttendedMode::Unattended);
+            let run_id = seed_run_with_mode(&store, vec![task.clone()], AttendedMode::Unattended)?;
             let dispatcher = ScriptedDispatcher::new();
             dispatcher.respond(&task.id, successful_task_result("reviewable output"));
             let reviewer = Arc::new(
@@ -4948,7 +5027,7 @@ Read the runtime path and found one missing branch.
                 dispatcher,
                 Some(reviewer),
                 &run_id,
-                ConcurrencyLimits::default(),
+                EkoExecutionLimits::default(),
                 CancellationToken::new(),
                 None,
             )
@@ -4988,7 +5067,7 @@ Read the runtime path and found one missing branch.
             max_retries: 3,
             ..PlanTask::default()
         };
-        let run_id = seed_run(&store, vec![task.clone()]);
+        let run_id = seed_run(&store, vec![task.clone()])?;
         let dispatcher = ScriptedDispatcher::new();
         let full_output = format!("{}\n{FULL_OUTPUT_MARKER}", "analysis ".repeat(180));
         dispatcher.respond_with_output(
@@ -5005,7 +5084,7 @@ Read the runtime path and found one missing branch.
             dispatcher,
             Some(reviewer.clone()),
             &run_id,
-            ConcurrencyLimits::default(),
+            EkoExecutionLimits::default(),
             CancellationToken::new(),
             None,
         )
@@ -5030,9 +5109,9 @@ Read the runtime path and found one missing branch.
     }
 
     #[tokio::test]
-    async fn runtime_plan_completes_single_task() {
-        let store = Arc::new(TaskRuntimeStore::new_in_memory().unwrap());
-        let run_id = seed_run(&store, vec![solo_readonly_task("a")]);
+    async fn runtime_plan_completes_single_task() -> Result<(), String> {
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let run_id = seed_run(&store, vec![solo_readonly_task("a")])?;
         let dispatcher = ScriptedDispatcher::new();
         dispatcher.succeed("a", "reviewed");
 
@@ -5041,32 +5120,36 @@ Read the runtime path and found one missing branch.
             dispatcher.clone(),
             None, // no reviewer LLM → read-only tasks auto-pass review
             &run_id,
-            ConcurrencyLimits::default(),
+            EkoExecutionLimits::default(),
             CancellationToken::new(),
             None,
         )
         .await
-        .unwrap();
+        .map_err(|error| error.to_string())?;
 
         assert!(matches!(outcome, RunOutcome::Completed));
-        let todos = store.list_todos(&run_id).unwrap();
-        assert_eq!(todos[0].status, TodoStatus::Completed);
+        let todos = store
+            .list_todos(&run_id)
+            .map_err(|error| error.to_string())?;
+        let todo = todos.first().ok_or_else(|| "todo a missing".to_string())?;
+        assert_eq!(todo.status, TodoStatus::Completed);
+        Ok(())
     }
 
     #[tokio::test]
     async fn runtime_plan_reuses_durable_subagent_result_after_restart() -> Result<(), String> {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
         let task = solo_readonly_task("a");
-        let run_id = seed_run(&store, vec![task.clone()]);
+        let run_id = seed_run(&store, vec![task.clone()])?;
         store
-            .record_subagent_assigned(&run_id, "a", "a:1", "reviewer", 1, true)
+            .record_subagent_assigned(&run_id, "a", "a:1:1", "reviewer", 1, true)
             .map_err(|error| error.to_string())?;
         let recovered_result = successful_task_result("recovered summary");
         store
             .record_subagent_released(
                 &run_id,
                 "a",
-                "a:1",
+                "a:1:1",
                 "completed",
                 Some(&recovered_result),
                 Some("recovered full output"),
@@ -5079,7 +5162,7 @@ Read the runtime path and found one missing branch.
             dispatcher.clone(),
             None,
             &run_id,
-            ConcurrencyLimits::default(),
+            EkoExecutionLimits::default(),
             CancellationToken::new(),
             None,
         )
@@ -5103,14 +5186,14 @@ Read the runtime path and found one missing branch.
     }
 
     #[tokio::test]
-    async fn runtime_plan_respects_dependency_order() {
+    async fn runtime_plan_respects_dependency_order() -> Result<(), String> {
         // b depends on a → a must be dispatched and completed before b.
         let mut a = solo_readonly_task("a");
         let mut b = solo_readonly_task("b");
         b.depends_on = vec!["a".into()];
         let _ = &mut a; // silence unused_mut
-        let store = Arc::new(TaskRuntimeStore::new_in_memory().unwrap());
-        let run_id = seed_run(&store, vec![a.clone(), b.clone()]);
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let run_id = seed_run(&store, vec![a.clone(), b.clone()])?;
         let dispatcher = ScriptedDispatcher::new();
         dispatcher.succeed("a", "done a");
         dispatcher.succeed("b", "done b");
@@ -5120,19 +5203,26 @@ Read the runtime path and found one missing branch.
             dispatcher.clone(),
             None,
             &run_id,
-            ConcurrencyLimits::default(),
+            EkoExecutionLimits::default(),
             CancellationToken::new(),
             None,
         )
         .await
-        .unwrap();
+        .map_err(|error| error.to_string())?;
 
         assert!(matches!(outcome, RunOutcome::Completed));
         let order = dispatcher.order();
         // a must appear before b in the dispatch order.
-        let pos_a = order.iter().position(|x| x == "a").unwrap();
-        let pos_b = order.iter().position(|x| x == "b").unwrap();
+        let pos_a = order
+            .iter()
+            .position(|x| x == "a")
+            .ok_or_else(|| "task a was not dispatched".to_string())?;
+        let pos_b = order
+            .iter()
+            .position(|x| x == "b")
+            .ok_or_else(|| "task b was not dispatched".to_string())?;
         assert!(pos_a < pos_b, "dependency violated: b dispatched before a");
+        Ok(())
     }
 
     #[tokio::test]
@@ -5141,7 +5231,7 @@ Read the runtime path and found one missing branch.
         let mut second = solo_readonly_task("second");
         second.depends_on = vec![first.id.clone()];
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
-        let run_id = seed_run(&store, vec![first.clone()]);
+        let run_id = seed_run(&store, vec![first.clone()])?;
         let dispatcher = ScriptedDispatcher::new();
         dispatcher.succeed("first", "first done");
         dispatcher.succeed("second", "second done");
@@ -5156,7 +5246,7 @@ Read the runtime path and found one missing branch.
                 execution_dispatcher,
                 None,
                 &execution_run_id,
-                ConcurrencyLimits::default(),
+                EkoExecutionLimits::default(),
                 CancellationToken::new(),
                 None,
             )
@@ -5210,14 +5300,14 @@ Read the runtime path and found one missing branch.
     }
 
     #[tokio::test]
-    async fn runtime_plan_failure_propagates_and_blocks_downstream() {
+    async fn runtime_plan_failure_propagates_and_blocks_downstream() -> Result<(), String> {
         // a fails; b depends on a and must be Blocked, run ends Failed
         // (because all non-terminal tasks are Failed/Blocked).
         let a = solo_readonly_task("a");
         let mut b = solo_readonly_task("b");
         b.depends_on = vec!["a".into()];
-        let store = Arc::new(TaskRuntimeStore::new_in_memory().unwrap());
-        let run_id = seed_run(&store, vec![a.clone(), b.clone()]);
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let run_id = seed_run(&store, vec![a.clone(), b.clone()])?;
         let dispatcher = ScriptedDispatcher::new();
         dispatcher.fail("a", "boom");
 
@@ -5226,23 +5316,29 @@ Read the runtime path and found one missing branch.
             dispatcher.clone(),
             None,
             &run_id,
-            ConcurrencyLimits::default(),
+            EkoExecutionLimits::default(),
             CancellationToken::new(),
             None,
         )
         .await
-        .unwrap();
+        .map_err(|error| error.to_string())?;
 
         match outcome {
             RunOutcome::Failed { failed_task_id, .. } => {
                 assert_eq!(failed_task_id, "a");
             }
-            other => panic!("expected Failed, got {:?}", other),
+            other => return Err(format!("expected Failed, got {other:?}")),
         }
         // b must be Blocked (downstream of failed a).
-        let todos = store.list_todos(&run_id).unwrap();
-        let b_todo = todos.iter().find(|t| t.task_id == "b").unwrap();
+        let todos = store
+            .list_todos(&run_id)
+            .map_err(|error| error.to_string())?;
+        let b_todo = todos
+            .iter()
+            .find(|t| t.task_id == "b")
+            .ok_or_else(|| "todo b missing".to_string())?;
         assert_eq!(b_todo.status, TodoStatus::Blocked);
+        Ok(())
     }
 
     #[tokio::test]
@@ -5255,7 +5351,7 @@ Read the runtime path and found one missing branch.
         let mut downstream = solo_readonly_task("downstream");
         downstream.depends_on = vec![writer.id.clone()];
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
-        let run_id = seed_run(&store, vec![writer.clone(), downstream.clone()]);
+        let run_id = seed_run(&store, vec![writer.clone(), downstream.clone()])?;
         let dispatcher = ScriptedDispatcher::new();
         dispatcher.succeed(&writer.id, "writer completed");
         dispatcher.fail_integration(&writer.id, "synthetic merge conflict");
@@ -5265,7 +5361,7 @@ Read the runtime path and found one missing branch.
             dispatcher,
             None,
             &run_id,
-            ConcurrencyLimits::default(),
+            EkoExecutionLimits::default(),
             CancellationToken::new(),
             None,
         )
@@ -5293,11 +5389,11 @@ Read the runtime path and found one missing branch.
     }
 
     #[tokio::test]
-    async fn runtime_plan_cancellation_propagates_to_cancelled_outcome() {
+    async fn runtime_plan_cancellation_propagates_to_cancelled_outcome() -> Result<(), String> {
         // Cancel before dispatching; the framework executor observes it at the
         // top of its loop and return Cancelled without running any task.
-        let store = Arc::new(TaskRuntimeStore::new_in_memory().unwrap());
-        let run_id = seed_run(&store, vec![solo_readonly_task("a")]);
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
+        let run_id = seed_run(&store, vec![solo_readonly_task("a")])?;
         let dispatcher = ScriptedDispatcher::new();
         let cancel = CancellationToken::new();
         cancel.cancel();
@@ -5307,12 +5403,12 @@ Read the runtime path and found one missing branch.
             dispatcher.clone(),
             None,
             &run_id,
-            ConcurrencyLimits::default(),
+            EkoExecutionLimits::default(),
             cancel,
             None,
         )
         .await
-        .unwrap();
+        .map_err(|error| error.to_string())?;
 
         assert!(matches!(outcome, RunOutcome::Cancelled));
         // The Subagent must not have been dispatched.
@@ -5320,13 +5416,14 @@ Read the runtime path and found one missing branch.
             dispatcher.order().is_empty(),
             "task ran despite cancellation"
         );
+        Ok(())
     }
 
     #[tokio::test]
     async fn runtime_plan_cancellation_preserves_explicit_pause() -> Result<(), String> {
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
         let task = solo_readonly_task("a");
-        let run_id = seed_run(&store, vec![task.clone()]);
+        let run_id = seed_run(&store, vec![task.clone()])?;
         store
             .transition_run(&run_id, TaskRunStatus::Paused)
             .map_err(|error| error.to_string())?;
@@ -5338,7 +5435,7 @@ Read the runtime path and found one missing branch.
             ScriptedDispatcher::new(),
             None,
             &run_id,
-            ConcurrencyLimits::default(),
+            EkoExecutionLimits::default(),
             cancel,
             None,
         )
@@ -5350,12 +5447,12 @@ Read the runtime path and found one missing branch.
     }
 
     #[test]
-    fn invalid_cycle_is_rejected_before_scheduler_dispatch() {
+    fn invalid_cycle_is_rejected_before_scheduler_dispatch() -> Result<(), String> {
         let mut a = solo_readonly_task("a");
         a.depends_on = vec!["b".into()];
         let mut b = solo_readonly_task("b");
         b.depends_on = vec!["a".into()];
-        let store = Arc::new(TaskRuntimeStore::new_in_memory().unwrap());
+        let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
         let run_id = format!("run_{}", uuid::Uuid::new_v4());
         store
             .create_run(
@@ -5368,21 +5465,24 @@ Read the runtime path and found one missing branch.
                 "",
                 AttendedMode::Attended,
             )
-            .unwrap();
-        let error = store
-            .attach_plan(&TaskPlan {
-                plan_id: format!("plan_{run_id}"),
-                run_id,
-                revision: 1,
-                domain_profile: DomainProfile::General,
-                goal: "test goal".to_string(),
-                assumptions: Vec::new(),
-                risks: Vec::new(),
-                execution_mode: ExecutionMode::Parallel,
-                tasks: vec![a, b],
-            })
-            .unwrap_err();
+            .map_err(|error| error.to_string())?;
+        let attach_result = store.attach_plan(&TaskPlan {
+            plan_id: format!("plan_{run_id}"),
+            run_id,
+            revision: 1,
+            domain_profile: DomainProfile::General,
+            goal: "test goal".to_string(),
+            assumptions: Vec::new(),
+            risks: Vec::new(),
+            execution_mode: ExecutionMode::Parallel,
+            tasks: vec![a, b],
+        });
+        let error = match attach_result {
+            Ok(()) => return Err("cyclic plan was accepted".to_string()),
+            Err(error) => error,
+        };
         assert!(matches!(error, StoreError::InvalidPlan(message) if message.contains("cycle")));
+        Ok(())
     }
 
     #[tokio::test]
@@ -5398,7 +5498,7 @@ Read the runtime path and found one missing branch.
         let mut in_flight = solo_readonly_task("in_flight");
         let pending = solo_readonly_task("pending");
         let store = Arc::new(TaskRuntimeStore::new_in_memory().map_err(|error| error.to_string())?);
-        let run_id = seed_run(&store, vec![in_flight.clone(), pending.clone()]);
+        let run_id = seed_run(&store, vec![in_flight.clone(), pending.clone()])?;
         store
             .set_task_status(
                 &run_id,
@@ -5436,7 +5536,7 @@ Read the runtime path and found one missing branch.
                 dispatcher.clone(),
                 None,
                 &run_id,
-                ConcurrencyLimits::default(),
+                EkoExecutionLimits::default(),
                 CancellationToken::new(),
                 None,
             ),
@@ -5512,6 +5612,7 @@ Read the runtime path and found one missing branch.
             store,
             "run-trace",
             &task,
+            "implementation-a:1:1",
             "What is 6 times 7?",
             CancellationToken::new(),
             Some(sink),
@@ -5529,7 +5630,7 @@ Read the runtime path and found one missing branch.
                 event.event == "tool_started"
                     && event.scope == ExecEventScope::Subagent
                     && event.task_id.as_deref() == Some("implementation-a")
-                    && event.subagent_run_id.as_deref() == Some("implementation-a:1")
+                    && event.subagent_run_id.as_deref() == Some("implementation-a:1:1")
                     && event.payload.get("name").and_then(|v| v.as_str()) == Some("mock_calc")
             }),
             "expected tool_started for mock_calc, got {events:?}"
@@ -5539,7 +5640,7 @@ Read the runtime path and found one missing branch.
                 event.event == "tool_completed"
                     && event.scope == ExecEventScope::Subagent
                     && event.task_id.as_deref() == Some("implementation-a")
-                    && event.subagent_run_id.as_deref() == Some("implementation-a:1")
+                    && event.subagent_run_id.as_deref() == Some("implementation-a:1:1")
                     && event.payload.get("success").and_then(|v| v.as_bool()) == Some(true)
                     && event
                         .payload
@@ -5590,7 +5691,7 @@ Read the runtime path and found one missing branch.
     }
 
     #[test]
-    fn contract_version_zero_is_not_an_execution_failure() {
+    fn contract_version_zero_is_not_an_execution_failure() -> Result<(), String> {
         let task = PlanTask {
             id: "t".into(),
             execution_checks: vec!["cargo test".into()],
@@ -5613,8 +5714,9 @@ Read the runtime path and found one missing branch.
             CompletionAssessment::AcceptancePending { missing_checks, .. } => {
                 assert_eq!(missing_checks, vec!["cargo test".to_string()]);
             }
-            other => panic!("expected AcceptancePending, got {other:?}"),
+            other => return Err(format!("expected AcceptancePending, got {other:?}")),
         }
+        Ok(())
     }
 
     #[tokio::test]
@@ -5634,7 +5736,7 @@ Read the runtime path and found one missing branch.
             max_retries: 3,
             ..PlanTask::default()
         };
-        let run_id = seed_run(&store, vec![task.clone()]);
+        let run_id = seed_run(&store, vec![task.clone()])?;
         let dispatcher = ScriptedDispatcher::new();
         // Plain text result, no JSON contract — exactly what the production
         // Subagents returned.
@@ -5656,7 +5758,7 @@ Read the runtime path and found one missing branch.
             dispatcher.clone(),
             None,
             &run_id,
-            ConcurrencyLimits::default(),
+            EkoExecutionLimits::default(),
             CancellationToken::new(),
             None,
         )
@@ -5676,7 +5778,11 @@ Read the runtime path and found one missing branch.
             .map_err(|e| e.to_string())?
             .ok_or_else(|| "plan missing".to_string())?;
         assert_eq!(plan.tasks.len(), 1);
-        assert_eq!(plan.tasks[0].retry_count, 0);
+        let task = plan
+            .tasks
+            .first()
+            .ok_or_else(|| "plan task missing".to_string())?;
+        assert_eq!(task.retry_count, 0);
         Ok(())
     }
 
@@ -5696,7 +5802,7 @@ Read the runtime path and found one missing branch.
             max_retries: 2,
             ..PlanTask::default()
         };
-        let run_id = seed_run(&store, vec![task.clone()]);
+        let run_id = seed_run(&store, vec![task.clone()])?;
         let dispatcher = ScriptedDispatcher::new();
         // Always report remaining_work → ExecutionFailed every time.
         dispatcher.respond(
@@ -5717,7 +5823,7 @@ Read the runtime path and found one missing branch.
             dispatcher.clone(),
             None,
             &run_id,
-            ConcurrencyLimits::default(),
+            EkoExecutionLimits::default(),
             CancellationToken::new(),
             None,
         )
@@ -5751,7 +5857,7 @@ Read the runtime path and found one missing branch.
         let mut blocked = solo_readonly_task("blocked");
         blocked.execution_checks = vec!["cargo test".to_string()];
         blocked.acceptance_criteria = Vec::new();
-        let run_id = seed_run(&store, vec![clean.clone(), blocked.clone()]);
+        let run_id = seed_run(&store, vec![clean.clone(), blocked.clone()])?;
         let dispatcher = ScriptedDispatcher::new();
         dispatcher.respond(
             &clean.id,
@@ -5783,7 +5889,7 @@ Read the runtime path and found one missing branch.
             dispatcher.clone(),
             None,
             &run_id,
-            ConcurrencyLimits::default(),
+            EkoExecutionLimits::default(),
             CancellationToken::new(),
             None,
         )

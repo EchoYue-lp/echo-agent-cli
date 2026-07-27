@@ -53,7 +53,7 @@ describe('ParallelExecutionBlock visibility', () => {
 
   it('shows only the latest retry attempt for one PlanTask', () => {
     const first = run({
-      subagentRunId: 'task-1:1',
+      subagentRunId: 'task-1:3:1',
       runId: 'formal-run',
       taskId: 'task-1',
       messageId: 'assistant-message',
@@ -61,7 +61,7 @@ describe('ParallelExecutionBlock visibility', () => {
       startedAt: 10,
     });
     const retry = run({
-      subagentRunId: 'task-1:2',
+      subagentRunId: 'task-1:3:2',
       runId: 'formal-run',
       taskId: 'task-1',
       messageId: 'assistant-message',

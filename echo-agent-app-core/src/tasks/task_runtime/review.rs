@@ -269,6 +269,8 @@ pub fn build_fix_task(original: &PlanTask, review: &ReviewResult) -> PlanTask {
         max_retries: original.max_retries,
         failure_fingerprint: review.failure_fingerprint.clone(),
         status: TodoStatus::Pending,
+        status_detail: None,
+        claim: None,
         sort_order: original.sort_order,
     }
 }

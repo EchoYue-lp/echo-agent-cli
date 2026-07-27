@@ -8,9 +8,10 @@ Dynamic Agent plans use one framework-owned DAG execution loop. EKO supplies a
 controller/dispatcher adapter for product policy and persistence; it does not
 own a second ready-frontier loop.
 
-The staged convergence is complete. Framework DAG traversal, structural
-validation, task status, and immutable-spec/mutable-execution semantics now
-have one authority. EKO retains only product persistence/UI projections and a
+The staged convergence is complete after a correctness re-open. Framework DAG
+traversal, structural validation, task status, immutable-spec/mutable-execution
+semantics, and revision-safe dispatch claims now have one authority. EKO
+retains product persistence/UI projections, product resource limits, and a
 controller/dispatcher adapter.
 
 ## Evidence Before The Change
@@ -28,10 +29,10 @@ controller/dispatcher adapter.
 
 ## Reference Implementations
 
-Online official documentation could not be re-fetched in this environment: the
-web endpoint returned 404/403 and browser policy blocked the official Claude
-Code and OpenAI documentation domains. The decision was therefore cross-checked
-against the mature implementations already vendored in this workspace:
+The Codex manual helper was retried after network access was restored, but the
+official endpoint still returned HTTP 403. The decision was therefore
+cross-checked against the mature implementations already vendored in this
+workspace and the previously captured Claude Code/Codex lifecycle behavior:
 
 - OpenCode keeps Subagent session/background-job mechanics behind the task tool
   and services, while the tool adapts product permissions and parent-session
@@ -53,9 +54,9 @@ the generic frontier loop.
 |---|---|
 | `TaskSpec` + `TaskExecution` + shared `TaskStatus` | `TaskPlan` file/event projection |
 | Structural `PlanValidator` | Subagent/tool capability validation |
-| Revision safe-point reload | `DomainProfile` and role routing |
+| Revision safe-point reload and atomic task claim | `DomainProfile` and role routing |
 | Ready frontier and dependency blocking | Review and acceptance policy |
-| Bounded Subagent waves | Writer/shell/LLM resource limits |
+| `max_concurrent_subagents` wave bound | Writer/shell/LLM limits in `EkoExecutionLimits` |
 | Parent cancellation and join cleanup | Worktree and file ownership policy |
 | External in-flight observation | Durable Subagent result recovery |
 | Stall/deadlock outcome | GUI/TUI/CLI/channel event mapping |
@@ -143,17 +144,41 @@ DAG loop, dependency validator, or generic retry state machine.
 - Removed the last EKO-specific historical comment from generic framework task
   checkpoint code.
 
+## Correctness Re-open Completed
+
+- Added `TaskClaim { revision, attempt, spec_hash }`. The kernel acquires a
+  Subagent permit, atomically claims an exact Pending task revision, and only
+  then dispatches. Revision/status/spec conflicts return `ReloadSnapshot`; they
+  are never converted into task failures.
+- Every completion, failure, block, and retry write carries the claim. EKO
+  applies it only while the same claim is still Running; late results return
+  `Superseded` and cannot overwrite cancellation, retry, or a changed plan.
+- Subagent execution identity is now
+  `{task_id}:{plan_revision}:{attempt}`. Durable result lookup therefore cannot
+  reuse output produced for an older TaskSpec when a plan patch changes the
+  specification without increasing `retry_count`.
+- `run-state.json` persists the shared `TaskStatus` separately from
+  `failure_fingerprint`. Failed, timed-out, and blocked details survive restart
+  and feed terminal outcomes instead of degrading to generic titles or hashes.
+- Removed EKO write/shell/LLM limits from the framework API. The generic kernel
+  exposes only `max_concurrent_subagents`; EKO owns `EkoExecutionLimits` and
+  consumes its remaining semaphores in the application adapter.
+- Removed panic-prone `unwrap`, `expect`, direct indexing, and explicit panic
+  branches from the touched EKO executor tests.
+
 ## Remaining Work
 
-No duplicate DAG executor, structural validator, runtime status model, or
-canonical task-spec name remains. Operational follow-up is limited to observing
-real long-running GUI/TUI/CLI/channel runs for revision conflicts, safe-point
-reload, cancellation, durable Subagent reuse, and worktree finalization.
+No duplicate DAG executor, structural validator, runtime status model,
+canonical task-spec name, or unclaimed dispatch path remains. Operational
+follow-up is limited to observing real long-running GUI/TUI/CLI/channel runs for
+claim conflicts, safe-point reload, cancellation, durable Subagent reuse, and
+worktree finalization.
 
 ## Verification
 
 - Framework runtime executor unit tests cover dependency order, safe-point plan
-  revision, skipped tasks, downstream blocking, and terminal outcomes.
+  revision, claim-conflict reload, skipped tasks, downstream blocking, and
+  persisted Failed/TimedOut/Blocked details.
 - Framework `PlanValidator` tests cover acyclic runtime specs, dangling
   dependencies (including non-blocking authoring edges), cycles,
   spec/execution identity mismatch, and authoring-field preservation.
@@ -161,8 +186,11 @@ reload, cancellation, durable Subagent reuse, and worktree finalization.
   propagation, cancellation, disabled timeout, UTF-8-safe context projection,
   and the retained per-task execution capabilities.
 - Framework and EKO adapter tests cover shared status-detail preservation,
-  separated execution checks/acceptance criteria, EKO metadata, and checked
-  round trips through canonical `Task`.
+  fingerprint separation, separated execution checks/acceptance criteria, EKO
+  metadata, and checked round trips through canonical `Task`.
+- EKO store tests cover a plan patch winning before claim, stale completion
+  after cancellation, and changed TaskSpec output receiving a new execution id
+  without a retry-count bump.
 - All 44 EKO executor tests pass, including durable result reuse, revision
   insertion, cancellation, review outcomes, sibling completion, worktree merge
   failure, and external in-flight observation.

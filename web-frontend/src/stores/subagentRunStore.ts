@@ -8,7 +8,7 @@
  * the single source of truth for subagent execution-flow events.
  *
  * Aggregation key is the concrete execution id in `subagent_run_id` (normally
- * `{task_id}:{attempt}`). `task_id` remains the stable PlanTask join key. This
+ * `{task_id}:{plan_revision}:{attempt}`). `task_id` remains the stable PlanTask join key. This
  * separation keeps retries independent while still allowing task-oriented UI
  * to select the latest attempt.
  */
@@ -251,7 +251,7 @@ export const useSubagentRunStore = create<SubagentRunStore>((set) => ({
       const prev = s.runs[id];
       const newStatus = statusFromEvent(ev.event);
       // One execution id has one monotonic lifecycle. Retries use a new
-      // `{task_id}:{attempt}` id, so late/duplicate events must not reopen a
+      // `{task_id}:{plan_revision}:{attempt}` id, so late/duplicate events must not reopen a
       // terminal execution or overwrite its result.
       if (prev && prev.status !== 'running') {
         return s;

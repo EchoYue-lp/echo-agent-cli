@@ -418,6 +418,8 @@ mod tests {
             max_retries: 3,
             failure_fingerprint: None,
             status: TodoStatus::Pending,
+            status_detail: None,
+            claim: None,
             sort_order: 0,
         }
     }
@@ -517,7 +519,7 @@ mod tests {
             .iter()
             .find(|task| task.task_id == "t1")
             .unwrap();
-        assert_eq!(state_t1.status, rt1.status);
+        assert_eq!(state_t1.status, rt1.execution().status);
     }
 
     /// Helper: assert file shadow plan matches SQL-rebuilt plan on the fields the
@@ -578,7 +580,8 @@ mod tests {
                 .find(|task| task.task_id == ft.id)
                 .expect("task execution written");
             assert_eq!(
-                execution.status, rt.status,
+                execution.status,
+                rt.execution().status,
                 "[{run_id}] task {} status",
                 ft.id
             );
@@ -666,7 +669,7 @@ mod tests {
             .iter()
             .find(|task| task.task_id == "t2")
             .unwrap();
-        assert_eq!(t2.status, TodoStatus::Skipped);
+        assert_eq!(t2.status, echo_agent::tasks::TaskStatus::Skipped);
     }
 
     /// Parity across multiple runs: events and plans must not cross-contaminate.

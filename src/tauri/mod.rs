@@ -17,10 +17,12 @@ use std::sync::Arc;
 use tauri::Emitter;
 
 fn task_id_from_subagent_execution_id(execution_id: &str) -> Option<String> {
-    execution_id
-        .rsplit_once(':')
-        .filter(|(task_id, attempt)| !task_id.is_empty() && attempt.parse::<u32>().is_ok())
-        .map(|(task_id, _)| task_id.to_string())
+    let mut parts = execution_id.rsplitn(3, ':');
+    let attempt = parts.next()?;
+    let revision = parts.next()?;
+    let task_id = parts.next()?;
+    (!task_id.is_empty() && revision.parse::<u64>().is_ok() && attempt.parse::<u32>().is_ok())
+        .then(|| task_id.to_string())
 }
 
 pub fn build_tauri_app(
@@ -690,9 +692,9 @@ pub fn build_tauri_app(
                                 payload.insert("kind".into(), "subagent".into());
                                 // `task_id` identifies the stable plan node, while
                                 // `subagent_run_id` identifies this concrete attempt.
-                                // Keeping `{task_id}:{attempt}` intact prevents late
-                                // events from one retry overwriting another retry's
-                                // lifecycle, usage, or terminal result.
+                                // Keeping `{task_id}:{plan_revision}:{attempt}` intact
+                                // prevents late events from an older spec or retry
+                                // overwriting newer lifecycle, usage, or terminal data.
                                 let task_id_owned: Option<String> = execution_id
                                     .as_deref()
                                     .and_then(task_id_from_subagent_execution_id);
@@ -761,12 +763,13 @@ mod tests {
 
     #[test]
     fn execution_attempt_keeps_full_identity_and_extracts_only_the_task_join_key() {
-        let execution_id = "phase:task-1:2";
+        let execution_id = "phase:task-1:7:2";
         assert_eq!(
             task_id_from_subagent_execution_id(execution_id).as_deref(),
             Some("phase:task-1")
         );
-        assert_eq!(execution_id, "phase:task-1:2");
+        assert_eq!(execution_id, "phase:task-1:7:2");
         assert!(task_id_from_subagent_execution_id("phase:task-1").is_none());
+        assert!(task_id_from_subagent_execution_id("phase:task-1:2").is_none());
     }
 }

@@ -222,6 +222,8 @@ mod tests {
             max_retries: 0,
             failure_fingerprint: None,
             status: crate::tasks::task_runtime::types::TodoStatus::Pending,
+            status_detail: None,
+            claim: None,
             sort_order: 0,
         }
     }

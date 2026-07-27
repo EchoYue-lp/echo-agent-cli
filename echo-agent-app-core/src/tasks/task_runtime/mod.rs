@@ -47,7 +47,7 @@ pub mod worktree;
 
 pub use execute_plan_tool::ExecutePlanTool;
 pub use executor::{
-    ConcurrencyLimits, ExecError, ExecSink, PreflightRejection, RunOutcome, drive_unattended_run,
+    EkoExecutionLimits, ExecError, ExecSink, PreflightRejection, RunOutcome, drive_unattended_run,
     execute_run, launch_cron_run, launch_unattended_run, preflight_unattended_plan,
     preflight_unattended_task,
 };

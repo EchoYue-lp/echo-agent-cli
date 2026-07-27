@@ -146,9 +146,9 @@ fn emit_chat_event(
 ///
 /// `subagent_run_id` is the aggregation key the frontend store uses to group a
 /// Subagent's events into one card. It is the concrete execution id
-/// (`{task_id}:{attempt}`), never the stable PlanTask id. For non-Subagent
-/// events pass `""`; this function only attaches the field for `kind ==
-/// "subagent"`.
+/// (for formal PlanTasks, `{task_id}:{plan_revision}:{attempt}`), never the
+/// stable PlanTask id. For non-Subagent events pass `""`; this function only
+/// attaches the field for `kind == "subagent"`.
 pub(crate) fn emit_execution_event(
     app: &tauri::AppHandle,
     run_id: &str,

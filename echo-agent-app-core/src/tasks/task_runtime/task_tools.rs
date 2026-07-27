@@ -456,6 +456,8 @@ fn parse_plan_task(
         max_retries,
         failure_fingerprint: None,
         status: TodoStatus::Pending,
+        status_detail: None,
+        claim: None,
         sort_order,
     })
 }

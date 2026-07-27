@@ -3,10 +3,10 @@ import type { DomainProfile } from './DomainProfile';
 import type { PlanTaskKind } from './PlanTaskKind';
 
 /**
- * Immutable task specification stored in `plan.json`.
+ * EKO file/UI projection of the immutable framework task specification.
  *
- * Runtime state such as status, retry count, and failure fingerprints lives
- * in [`TaskExecution`] and is projected separately into `run-state.json`.
+ * This DTO preserves EKO metadata for `plan.json` and generated TypeScript;
+ * framework validation and DAG scheduling never consume it directly.
  */
 export type TaskSpec = {
   id: string;

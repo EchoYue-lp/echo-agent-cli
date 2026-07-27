@@ -49,6 +49,12 @@ pub enum StoreError {
     RecoveryBlocked { run_id: String, details: String },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimWriteOutcome {
+    Applied,
+    Superseded,
+}
+
 /// File-backed TaskRuntime store. One instance per process; cheap to clone
 /// behind `Arc`. The event stream is authoritative; plan and execution files
 /// are deterministic read projections.
@@ -703,6 +709,8 @@ impl TaskRuntimeStore {
                             reset_task_ids.push(task_id.clone());
                         }
                         apply_task_patch(task, patch);
+                        task.status_detail = None;
+                        task.claim = None;
                     }
                     PlanPatchOperation::Skip { task_id } => {
                         let task = candidate
@@ -717,6 +725,8 @@ impl TaskRuntimeStore {
                             )));
                         }
                         task.status = TodoStatus::Skipped;
+                        task.status_detail = None;
+                        task.claim = None;
                         skipped_task_ids.push(task_id.clone());
                     }
                     PlanPatchOperation::Reorder { task_ids } => {
@@ -790,38 +800,188 @@ impl TaskRuntimeStore {
             if !plan.tasks.iter().any(|t| t.id == task_id) {
                 return Err(StoreError::TaskNotFound(task_id.to_string()));
             }
-            let now = echo_agent::utils::time::now_local().to_rfc3339();
-            let started = matches!(status, TodoStatus::Running);
-            let finished = matches!(
-                status,
-                TodoStatus::Completed | TodoStatus::Failed | TodoStatus::Skipped
-            );
-            let kind = match status {
-                TodoStatus::Running => RuntimeEventKind::TaskStarted,
-                TodoStatus::Completed => RuntimeEventKind::TaskCompleted,
-                TodoStatus::Failed => RuntimeEventKind::TaskFailed,
-                TodoStatus::Skipped => RuntimeEventKind::TaskSkipped,
-                TodoStatus::Blocked => RuntimeEventKind::TaskBlocked,
-                TodoStatus::Pending => RuntimeEventKind::TodoUpdated,
+            self.append_task_status_event(run_id, task_id, status, owner_agent, summary, None)
+        })
+    }
+
+    /// Atomically claim a Pending task from one exact plan revision.
+    pub fn claim_task(
+        &self,
+        run_id: &str,
+        expected_task: &echo_agent::tasks::Task,
+        expected_revision: u64,
+    ) -> Result<echo_agent::tasks::RuntimeTaskClaimOutcome, StoreError> {
+        self.with_run_lock(run_id, || {
+            let plan = self
+                .get_plan(run_id)?
+                .ok_or_else(|| StoreError::PlanNotFound(run_id.to_string()))?;
+            if plan.revision != expected_revision {
+                return Ok(echo_agent::tasks::RuntimeTaskClaimOutcome::ReloadSnapshot);
+            }
+            let Some(task) = plan
+                .tasks
+                .iter()
+                .find(|task| task.id == expected_task.spec.id)
+            else {
+                return Ok(echo_agent::tasks::RuntimeTaskClaimOutcome::ReloadSnapshot);
             };
+            let current = task.to_task();
+            if task.status != TodoStatus::Pending || current.spec != expected_task.spec {
+                return Ok(echo_agent::tasks::RuntimeTaskClaimOutcome::ReloadSnapshot);
+            }
+            let claim = echo_agent::tasks::TaskClaim {
+                revision: expected_revision,
+                attempt: task.retry_count.saturating_add(1),
+                spec_hash: current
+                    .spec
+                    .stable_hash()
+                    .map_err(StoreError::InvalidPlan)?,
+            };
+            self.append_task_status_event(
+                run_id,
+                &task.id,
+                TodoStatus::Running,
+                Some(&task.agent_role),
+                None,
+                Some(&claim),
+            )?;
+            Ok(echo_agent::tasks::RuntimeTaskClaimOutcome::Claimed(claim))
+        })
+    }
+
+    /// Commit a status only if the same claimed attempt is still Running.
+    pub fn set_claimed_task_status(
+        &self,
+        run_id: &str,
+        task_id: &str,
+        claim: &echo_agent::tasks::TaskClaim,
+        status: TodoStatus,
+        owner_agent: Option<&str>,
+        summary: Option<&str>,
+    ) -> Result<ClaimWriteOutcome, StoreError> {
+        self.with_run_lock(run_id, || {
+            let plan = self
+                .get_plan(run_id)?
+                .ok_or_else(|| StoreError::PlanNotFound(run_id.to_string()))?;
+            let Some(task) = plan.tasks.iter().find(|task| task.id == task_id) else {
+                return Ok(ClaimWriteOutcome::Superseded);
+            };
+            if task.status != TodoStatus::Running || task.claim.as_ref() != Some(claim) {
+                return Ok(ClaimWriteOutcome::Superseded);
+            }
+            self.append_task_status_event(
+                run_id,
+                task_id,
+                status,
+                owner_agent,
+                summary,
+                Some(claim),
+            )?;
+            Ok(ClaimWriteOutcome::Applied)
+        })
+    }
+
+    /// Atomically requeue one failed claimed attempt and advance its retry
+    /// counter without exposing an unclaimed Pending window.
+    pub fn requeue_claimed_task(
+        &self,
+        run_id: &str,
+        task_id: &str,
+        claim: &echo_agent::tasks::TaskClaim,
+        failure_fingerprint: Option<&str>,
+        summary: &str,
+    ) -> Result<ClaimWriteOutcome, StoreError> {
+        self.with_run_lock(run_id, || {
+            let plan = self
+                .get_plan(run_id)?
+                .ok_or_else(|| StoreError::PlanNotFound(run_id.to_string()))?;
+            let Some(task) = plan.tasks.iter().find(|task| task.id == task_id) else {
+                return Ok(ClaimWriteOutcome::Superseded);
+            };
+            if task.status != TodoStatus::Running || task.claim.as_ref() != Some(claim) {
+                return Ok(ClaimWriteOutcome::Superseded);
+            }
+            let next = task.retry_count.saturating_add(1);
             self.shadow.append_event_line(
                 run_id,
                 Some(task_id),
                 None,
-                kind,
+                RuntimeEventKind::TodoUpdated,
                 serde_json::json!({
-                    "status": status.as_str(),
-                    "owner_agent": owner_agent,
+                    "status": TodoStatus::Pending.as_str(),
+                    "status_detail": null,
+                    "owner_agent": task.agent_role,
                     "summary": summary,
-                    // Explicit timestamps so events.jsonl can rebuild todo runtime fields
-                    // without relying on the event `timestamp` as a proxy.
-                    "started_at": if started { Some(now.as_str()) } else { None },
-                    "completed_at": if finished { Some(now.as_str()) } else { None },
+                    "retry_count": next,
+                    "failure_fingerprint": failure_fingerprint,
+                    "claim": null,
+                    "started_at": null,
+                    "completed_at": null,
                 }),
             )?;
             self.shadow.rewrite_plan(run_id)?;
-            Ok(())
+            Ok(ClaimWriteOutcome::Applied)
         })
+    }
+
+    pub fn task_claim_is_current(
+        &self,
+        run_id: &str,
+        task_id: &str,
+        claim: &echo_agent::tasks::TaskClaim,
+    ) -> Result<bool, StoreError> {
+        let plan = self
+            .get_plan(run_id)?
+            .ok_or_else(|| StoreError::PlanNotFound(run_id.to_string()))?;
+        Ok(plan.tasks.iter().any(|task| {
+            task.id == task_id
+                && task.status == TodoStatus::Running
+                && task.claim.as_ref() == Some(claim)
+        }))
+    }
+
+    fn append_task_status_event(
+        &self,
+        run_id: &str,
+        task_id: &str,
+        status: TodoStatus,
+        owner_agent: Option<&str>,
+        summary: Option<&str>,
+        claim: Option<&echo_agent::tasks::TaskClaim>,
+    ) -> Result<(), StoreError> {
+        let now = echo_agent::utils::time::now_local().to_rfc3339();
+        let started = matches!(status, TodoStatus::Running);
+        let finished = matches!(
+            status,
+            TodoStatus::Completed | TodoStatus::Failed | TodoStatus::Skipped
+        );
+        let kind = match status {
+            TodoStatus::Running => RuntimeEventKind::TaskStarted,
+            TodoStatus::Completed => RuntimeEventKind::TaskCompleted,
+            TodoStatus::Failed => RuntimeEventKind::TaskFailed,
+            TodoStatus::Skipped => RuntimeEventKind::TaskSkipped,
+            TodoStatus::Blocked => RuntimeEventKind::TaskBlocked,
+            TodoStatus::Pending => RuntimeEventKind::TodoUpdated,
+        };
+        let status_detail = matches!(status, TodoStatus::Failed | TodoStatus::Blocked)
+            .then(|| summary.unwrap_or_else(|| status.as_str()));
+        self.shadow.append_event_line(
+            run_id,
+            Some(task_id),
+            None,
+            kind,
+            serde_json::json!({
+                "status": status.as_str(),
+                "status_detail": status_detail,
+                "owner_agent": owner_agent,
+                "summary": summary,
+                "claim": claim,
+                "started_at": if started { Some(now.as_str()) } else { None },
+                "completed_at": if finished { Some(now.as_str()) } else { None },
+            }),
+        )?;
+        self.shadow.rewrite_plan(run_id)?;
+        Ok(())
     }
 
     /// Bump execution retry metadata without mutating the task specification.
@@ -1305,8 +1465,10 @@ impl TaskRuntimeStore {
                             let task = plan.as_ref().and_then(|plan| {
                                 plan.tasks.iter().find(|task| task.id == todo.task_id)
                             });
-                            let execution_id = task.map(|task| {
-                                format!("{}:{}", task.id, task.retry_count.saturating_add(1))
+                            let execution_id = task.and_then(|task| {
+                                task.claim
+                                    .as_ref()
+                                    .map(|claim| claim.execution_id(&task.id))
                             });
                             let completed_subagent = execution_id.as_deref().and_then(|id| {
                                 self.recoverable_subagent_result(&run.run_id, &todo.task_id, id)
@@ -2299,8 +2461,23 @@ mod tests {
     fn boot_recovery_reuses_completed_subagent_without_redispatch() -> Result<(), StoreError> {
         let store = fresh();
         seed_plan(&store);
-        store.set_task_status("r1", "t1", TodoStatus::Running, Some("subagent"), None)?;
-        store.record_subagent_assigned("r1", "t1", "t1:1", "subagent", 1, true)?;
+        let task = store
+            .get_plan("r1")?
+            .ok_or_else(|| StoreError::PlanNotFound("r1".to_string()))?
+            .tasks
+            .first()
+            .cloned()
+            .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
+        let claim = match store.claim_task("r1", &task.to_task(), 1)? {
+            echo_agent::tasks::RuntimeTaskClaimOutcome::Claimed(claim) => claim,
+            echo_agent::tasks::RuntimeTaskClaimOutcome::ReloadSnapshot => {
+                return Err(StoreError::InvalidPlan(
+                    "fresh task claim unexpectedly required reload".to_string(),
+                ));
+            }
+        };
+        let execution_id = claim.execution_id("t1");
+        store.record_subagent_assigned("r1", "t1", &execution_id, "subagent", 1, true)?;
         let result = SubagentTaskResult::terminal(
             SubagentRunStatus::Completed,
             "durable result",
@@ -2309,7 +2486,7 @@ mod tests {
         store.record_subagent_released(
             "r1",
             "t1",
-            "t1:1",
+            &execution_id,
             "completed",
             Some(&result),
             Some("durable full output"),
@@ -2317,7 +2494,7 @@ mod tests {
 
         assert_eq!(store.recover_incomplete(), 1);
         assert_eq!(
-            store.recoverable_subagent_result("r1", "t1", "t1:1")?,
+            store.recoverable_subagent_result("r1", "t1", &execution_id)?,
             Some(RecoverableSubagentResult {
                 result,
                 full_output: "durable full output".to_string(),
@@ -2584,6 +2761,181 @@ mod tests {
     }
 
     #[test]
+    fn claim_reloads_when_plan_patch_wins_revision_race() -> Result<(), StoreError> {
+        let store = fresh();
+        seed_plan(&store);
+        let expected = store
+            .get_plan("r1")?
+            .ok_or_else(|| StoreError::PlanNotFound("r1".to_string()))?
+            .tasks
+            .first()
+            .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?
+            .to_task();
+        store.patch_plan(
+            "r1",
+            &PlanPatchRequest {
+                base_revision: 1,
+                reason: "skip before stale dispatch claims task".to_string(),
+                operations: vec![PlanPatchOperation::Skip {
+                    task_id: "t1".to_string(),
+                }],
+            },
+        )?;
+
+        let outcome = store.claim_task("r1", &expected, 1)?;
+
+        assert_eq!(
+            outcome,
+            echo_agent::tasks::RuntimeTaskClaimOutcome::ReloadSnapshot
+        );
+        let task = store
+            .get_plan("r1")?
+            .ok_or_else(|| StoreError::PlanNotFound("r1".to_string()))?
+            .tasks
+            .into_iter()
+            .find(|task| task.id == "t1")
+            .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
+        assert_eq!(task.status, TodoStatus::Skipped);
+        assert!(task.claim.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn stale_claim_cannot_overwrite_cancelled_task() -> Result<(), StoreError> {
+        let store = fresh();
+        seed_plan(&store);
+        let expected = store
+            .get_plan("r1")?
+            .ok_or_else(|| StoreError::PlanNotFound("r1".to_string()))?
+            .tasks
+            .first()
+            .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?
+            .to_task();
+        let claim = match store.claim_task("r1", &expected, 1)? {
+            echo_agent::tasks::RuntimeTaskClaimOutcome::Claimed(claim) => claim,
+            echo_agent::tasks::RuntimeTaskClaimOutcome::ReloadSnapshot => {
+                return Err(StoreError::InvalidPlan(
+                    "fresh task claim unexpectedly required reload".to_string(),
+                ));
+            }
+        };
+        store.set_task_status(
+            "r1",
+            "t1",
+            TodoStatus::Skipped,
+            None,
+            Some("cancelled by user"),
+        )?;
+
+        let outcome = store.set_claimed_task_status(
+            "r1",
+            "t1",
+            &claim,
+            TodoStatus::Completed,
+            Some("code_reviewer"),
+            Some("stale completion"),
+        )?;
+
+        assert_eq!(outcome, ClaimWriteOutcome::Superseded);
+        let task = store
+            .get_plan("r1")?
+            .ok_or_else(|| StoreError::PlanNotFound("r1".to_string()))?
+            .tasks
+            .into_iter()
+            .find(|task| task.id == "t1")
+            .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
+        assert_eq!(task.status, TodoStatus::Skipped);
+        Ok(())
+    }
+
+    #[test]
+    fn patched_spec_uses_new_execution_identity_without_retry_bump() -> Result<(), StoreError> {
+        let store = fresh();
+        seed_plan(&store);
+        let original = store
+            .get_plan("r1")?
+            .ok_or_else(|| StoreError::PlanNotFound("r1".to_string()))?
+            .tasks
+            .first()
+            .cloned()
+            .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
+        let old_claim = echo_agent::tasks::TaskClaim {
+            revision: 1,
+            attempt: 1,
+            spec_hash: original
+                .to_task()
+                .spec
+                .stable_hash()
+                .map_err(StoreError::InvalidPlan)?,
+        };
+        let old_execution_id = old_claim.execution_id(&original.id);
+        let durable_result = SubagentTaskResult::terminal(
+            SubagentRunStatus::Completed,
+            "old spec result",
+            Vec::new(),
+        );
+        store.record_subagent_assigned("r1", "t1", &old_execution_id, "code_reviewer", 1, true)?;
+        store.record_subagent_released(
+            "r1",
+            "t1",
+            &old_execution_id,
+            "completed",
+            Some(&durable_result),
+            Some("old spec full output"),
+        )?;
+        store.set_task_status(
+            "r1",
+            "t1",
+            TodoStatus::Blocked,
+            Some("code_reviewer"),
+            Some("requires a revised contract"),
+        )?;
+        let patched = store.patch_plan(
+            "r1",
+            &PlanPatchRequest {
+                base_revision: 1,
+                reason: "change blocked task contract".to_string(),
+                operations: vec![PlanPatchOperation::Update {
+                    task_id: "t1".to_string(),
+                    patch: TaskPatch {
+                        description: Some("review the revised runtime contract".to_string()),
+                        ..Default::default()
+                    },
+                }],
+            },
+        )?;
+        let patched_task = patched
+            .tasks
+            .first()
+            .cloned()
+            .ok_or_else(|| StoreError::TaskNotFound("t1".to_string()))?;
+        assert_eq!(patched_task.retry_count, 0);
+        let new_claim = match store.claim_task("r1", &patched_task.to_task(), patched.revision)? {
+            echo_agent::tasks::RuntimeTaskClaimOutcome::Claimed(claim) => claim,
+            echo_agent::tasks::RuntimeTaskClaimOutcome::ReloadSnapshot => {
+                return Err(StoreError::InvalidPlan(
+                    "patched task claim unexpectedly required reload".to_string(),
+                ));
+            }
+        };
+        let new_execution_id = new_claim.execution_id(&patched_task.id);
+
+        assert_ne!(old_execution_id, new_execution_id);
+        assert_ne!(old_claim.spec_hash, new_claim.spec_hash);
+        assert!(
+            store
+                .recoverable_subagent_result("r1", "t1", &old_execution_id)?
+                .is_some()
+        );
+        assert!(
+            store
+                .recoverable_subagent_result("r1", "t1", &new_execution_id)?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn plan_patch_skip_preserves_spec_and_updates_execution() {
         let s = fresh();
         seed_plan(&s);
@@ -2825,6 +3177,8 @@ mod tests {
             max_retries: 3,
             failure_fingerprint: None,
             status: TodoStatus::Pending,
+            status_detail: None,
+            claim: None,
             sort_order: 0,
         }
     }

@@ -178,7 +178,7 @@ impl FileTaskStore {
         for spec in &plan.tasks {
             let default_status = execution
                 .get(spec.id.as_str())
-                .map(|task| task.status)
+                .map(|task| TodoStatus::project_task_status(&task.status))
                 .unwrap_or(TodoStatus::Pending);
             // Fold this task's Task* events to recover non-authoritative display metadata.
             let runtime = fold_task_runtime(&loaded.events, &spec.id);
@@ -438,6 +438,8 @@ mod tests {
             max_retries: 3,
             failure_fingerprint: None,
             status: TodoStatus::Pending,
+            status_detail: None,
+            claim: None,
             sort_order: 0,
         }
     }

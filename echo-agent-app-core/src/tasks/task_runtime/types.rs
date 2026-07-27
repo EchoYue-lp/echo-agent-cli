@@ -429,6 +429,24 @@ impl TodoStatus {
             )),
         }
     }
+
+    /// UI-only projection for framework states that carry richer lifecycle
+    /// semantics than the current todo badge model.
+    pub fn project_task_status(status: &echo_agent::tasks::TaskStatus) -> Self {
+        match status {
+            echo_agent::tasks::TaskStatus::Pending => TodoStatus::Pending,
+            echo_agent::tasks::TaskStatus::Running
+            | echo_agent::tasks::TaskStatus::Retrying { .. } => TodoStatus::Running,
+            echo_agent::tasks::TaskStatus::Blocked(_)
+            | echo_agent::tasks::TaskStatus::Paused(_) => TodoStatus::Blocked,
+            echo_agent::tasks::TaskStatus::Completed => TodoStatus::Completed,
+            echo_agent::tasks::TaskStatus::Failed(_)
+            | echo_agent::tasks::TaskStatus::TimedOut { .. } => TodoStatus::Failed,
+            echo_agent::tasks::TaskStatus::Skipped | echo_agent::tasks::TaskStatus::Cancelled => {
+                TodoStatus::Skipped
+            }
+        }
+    }
 }
 
 // ── Run status (state machine) ──────────────────────────────────────────
@@ -767,14 +785,18 @@ pub struct EkoTaskSpec {
     pub sort_order: i64,
 }
 
-/// EKO file/UI projection of framework task execution state.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export, rename = "TaskExecution")]
+/// EKO file projection of framework task execution state.
+///
+/// The shared `TaskStatus` remains authoritative and lossless. `TodoStatus` is
+/// derived only when building UI-facing plan/todo projections.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EkoTaskExecution {
     pub task_id: String,
-    pub status: TodoStatus,
+    pub status: echo_agent::tasks::TaskStatus,
     pub retry_count: u32,
     pub failure_fingerprint: Option<String>,
+    #[serde(default)]
+    pub claim: Option<echo_agent::tasks::TaskClaim>,
 }
 
 /// EKO-only metadata carried through the framework runtime extension point.
@@ -789,9 +811,10 @@ impl EkoTaskExecution {
     pub fn pending(task_id: impl Into<String>) -> Self {
         Self {
             task_id: task_id.into(),
-            status: TodoStatus::Pending,
+            status: echo_agent::tasks::TaskStatus::Pending,
             retry_count: 0,
             failure_fingerprint: None,
+            claim: None,
         }
     }
 }
@@ -854,6 +877,15 @@ pub struct PlanTask {
     pub max_retries: u32,
     pub failure_fingerprint: Option<String>,
     pub status: TodoStatus,
+    /// Error/block reason carried by the shared status. This is deliberately
+    /// independent from `failure_fingerprint`.
+    #[serde(default)]
+    pub status_detail: Option<String>,
+    /// Durable dispatch claim. Internal runtime state; UI joins on task and
+    /// Subagent execution ids instead.
+    #[serde(default)]
+    #[ts(skip)]
+    pub claim: Option<echo_agent::tasks::TaskClaim>,
     /// Stable sort key for display ordering. Set by plan generation (sequential
     /// index) and updated by `reorder_tasks`. Separated from `parallel_group`
     /// (which encodes parallel-fanout grouping, not display order) to avoid
@@ -882,6 +914,8 @@ impl Default for PlanTask {
             max_retries: 3,
             failure_fingerprint: None,
             status: TodoStatus::Pending,
+            status_detail: None,
+            claim: None,
             sort_order: 0,
         }
     }
@@ -911,9 +945,10 @@ impl PlanTask {
     pub fn execution(&self) -> EkoTaskExecution {
         EkoTaskExecution {
             task_id: self.id.clone(),
-            status: self.status,
+            status: self.status.to_task_status(self.status_detail.as_deref()),
             retry_count: self.retry_count,
             failure_fingerprint: self.failure_fingerprint.clone(),
+            claim: self.claim.clone(),
         }
     }
 
@@ -935,7 +970,9 @@ impl PlanTask {
             retry_count: execution.retry_count,
             max_retries: spec.max_retries,
             failure_fingerprint: execution.failure_fingerprint,
-            status: execution.status,
+            status: TodoStatus::project_task_status(&execution.status),
+            status_detail: task_status_detail(&execution.status),
+            claim: execution.claim,
             sort_order: spec.sort_order,
         }
     }
@@ -977,11 +1014,10 @@ impl PlanTask {
             },
             execution: echo_agent::tasks::TaskExecution {
                 task_id: self.id.clone(),
-                status: self
-                    .status
-                    .to_task_status(self.failure_fingerprint.as_deref()),
+                status: self.status.to_task_status(self.status_detail.as_deref()),
                 retry_count: self.retry_count,
                 failure_fingerprint: self.failure_fingerprint.clone(),
+                claim: self.claim.clone(),
             },
         }
     }
@@ -1001,28 +1037,7 @@ impl TryFrom<echo_agent::tasks::Task> for PlanTask {
         let metadata: EkoTaskMetadata = serde_json::from_value(spec.metadata)
             .map_err(|error| format!("task '{}' has invalid EKO metadata: {error}", spec.id))?;
         let status = TodoStatus::try_from_task_status(&execution.status)?;
-        let status_detail = match &execution.status {
-            echo_agent::tasks::TaskStatus::Blocked(detail)
-            | echo_agent::tasks::TaskStatus::Failed(detail) => Some(detail.clone()),
-            echo_agent::tasks::TaskStatus::Pending
-            | echo_agent::tasks::TaskStatus::Running
-            | echo_agent::tasks::TaskStatus::Completed
-            | echo_agent::tasks::TaskStatus::Skipped => None,
-            echo_agent::tasks::TaskStatus::Cancelled
-            | echo_agent::tasks::TaskStatus::TimedOut { .. }
-            | echo_agent::tasks::TaskStatus::Retrying { .. }
-            | echo_agent::tasks::TaskStatus::Paused(_) => None,
-        };
-        if let (Some(fingerprint), Some(detail)) = (
-            execution.failure_fingerprint.as_ref(),
-            status_detail.as_ref(),
-        ) && fingerprint != detail
-        {
-            return Err(format!(
-                "task '{}' status detail does not match failure fingerprint",
-                spec.id
-            ));
-        }
+        let status_detail = task_status_detail(&execution.status);
 
         Ok(Self {
             id: spec.id,
@@ -1040,10 +1055,27 @@ impl TryFrom<echo_agent::tasks::Task> for PlanTask {
             acceptance_criteria: spec.acceptance_criteria,
             retry_count: execution.retry_count,
             max_retries: spec.max_retries,
-            failure_fingerprint: execution.failure_fingerprint.or(status_detail),
+            failure_fingerprint: execution.failure_fingerprint,
             status,
+            status_detail,
+            claim: execution.claim,
             sort_order: metadata.sort_order,
         })
+    }
+}
+
+fn task_status_detail(status: &echo_agent::tasks::TaskStatus) -> Option<String> {
+    match status {
+        echo_agent::tasks::TaskStatus::Blocked(detail)
+        | echo_agent::tasks::TaskStatus::Failed(detail)
+        | echo_agent::tasks::TaskStatus::Paused(detail) => Some(detail.clone()),
+        echo_agent::tasks::TaskStatus::TimedOut { error } => Some(error.clone()),
+        echo_agent::tasks::TaskStatus::Retrying { last_error, .. } => Some(last_error.clone()),
+        echo_agent::tasks::TaskStatus::Pending
+        | echo_agent::tasks::TaskStatus::Running
+        | echo_agent::tasks::TaskStatus::Completed
+        | echo_agent::tasks::TaskStatus::Skipped
+        | echo_agent::tasks::TaskStatus::Cancelled => None,
     }
 }
 
@@ -1209,9 +1241,9 @@ pub struct Artifact {
 // 派发的运行实例。Task → SubagentRun 关联通过 task_id 查询投影得到,PlanTask
 // 不持有 executions 字段(避免污染 plan artifact)。
 //
-// `subagent_run_id` 与框架 SubagentEvent.execution_id 对齐(格式
-// "{task_id}:{attempt}"),由 TaskRuntime 派发时生成并经 ExternalRunContext
-// 透传,不再由 tauri bridge 临时分配(消除双账本)。
+// `subagent_run_id` 与框架 SubagentEvent.execution_id 对齐(正式 PlanTask 格式
+// "{task_id}:{plan_revision}:{attempt}"),由 TaskRuntime 派发时生成并经
+// ExternalRunContext 透传,不再由 tauri bridge 临时分配(消除双账本)。
 
 /// Lifecycle status of a [`SubagentRun`]. Mirrors the coarse states the
 /// frontend already renders for the unified subagent concept, minus the
@@ -1432,7 +1464,8 @@ pub struct SubagentRunUsage {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, rename = "SubagentRun")]
 pub struct SubagentRun {
-    /// Stable execution id, format "{task_id}:{attempt}". Aligns with
+    /// Stable execution id. Formal PlanTasks use
+    /// "{task_id}:{plan_revision}:{attempt}". Aligns with
     /// `SubagentEvent::execution_id`.
     pub subagent_run_id: String,
     /// Parent [`TaskRun`] id.
@@ -1727,6 +1760,8 @@ mod tests {
             max_retries: 2,
             failure_fingerprint: Some("failure-1".to_string()),
             status: TodoStatus::Running,
+            status_detail: None,
+            claim: None,
             sort_order: 10,
         };
 
@@ -1793,6 +1828,8 @@ mod tests {
             max_retries: 2,
             failure_fingerprint: Some("compile-error".to_string()),
             status: TodoStatus::Failed,
+            status_detail: Some("cargo check failed".to_string()),
+            claim: None,
             sort_order: 0,
         };
 
@@ -1800,7 +1837,11 @@ mod tests {
 
         assert_eq!(
             framework_task.execution.status,
-            echo_agent::tasks::TaskStatus::Failed("compile-error".to_string())
+            echo_agent::tasks::TaskStatus::Failed("cargo check failed".to_string())
+        );
+        assert_eq!(
+            framework_task.execution.failure_fingerprint.as_deref(),
+            Some("compile-error")
         );
         assert_eq!(
             TodoStatus::try_from_task_status(&framework_task.execution.status),

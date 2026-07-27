@@ -1,6 +1,6 @@
 # EKO Master Plan
 
-Last updated: 2026-07-25
+Last updated: 2026-07-27
 
 This file is the cross-session source of truth for the coding, data analysis,
 academic research, and medical research expansion. Detailed design rationale
@@ -60,8 +60,9 @@ evidence, and the next bounded step.
 | Logical-task worktree reuse and content-aware cleanup | Complete | `docs/2026-07-25-logical-task-worktree-reuse.md`; stable `{run_id}:{task_id}` isolation identity with attempt-scoped Subagent events |
 | Unified Subagent prompt compilation | Complete | framework commit `8f7904f`; `echo-agent-app-core/src/subagent_prompt.rs`; one registration-time system prompt and one typed invocation compiler across direct, planned, fork, teammate, and team dispatch |
 | Memory and self-evolution seam closure | Complete | `docs/2026-07-23-memory-self-evolution-closure.md`; replaceable workspace/hot-memory projections, one layered EKO write path, workspace-bound Curator, shared review integration, and stable compression dedup keys |
-| Subagent result projection and attempt identity | Complete | `docs/2026-07-17-subagent-results-and-completion.md`; full terminal output is separated from process metadata and persisted for review/recovery, TaskRuntime snapshots auto-poll to authoritative plan/task state, the right rail separates execution from acceptance, and `subagent_run_id` remains `{task_id}:{attempt}` |
+| Subagent result projection and attempt identity | Complete | `docs/2026-07-17-subagent-results-and-completion.md`; full terminal output is separated from process metadata and persisted for review/recovery, TaskRuntime snapshots auto-poll to authoritative plan/task state, the right rail separates execution from acceptance, and formal-plan `subagent_run_id` is `{task_id}:{plan_revision}:{attempt}` |
 | GUI tool execution lazy loading | Complete | `docs/2026-07-25-gui-tool-execution-lazy-loading.md`; framework commit `27bb5a4`; application commit `d8b2211`; selector stability hotfix `b8c9077`; one main/Subagent summary path, opaque `detail_ref`, 64 KiB cursor pages, file/JSONL recovery, and complete Subagent prompt/result views |
+| Runtime DAG kernel convergence and dispatch correctness | Complete | `docs/2026-07-27-runtime-dag-kernel-convergence.md`; one framework DAG loop/validator, atomic revision-safe claims, superseded-attempt rejection, revision-scoped durable results, lossless persisted status detail, and EKO-owned product resource limits |
 
 ## Current Decisions
 
@@ -109,7 +110,9 @@ Unattended execution no longer creates a duplicate run-level
 `eko-unattended-*` checkout. Read-only primary-Agent work stays in the
 authoritative checkout; mutation is forced through a formal writer PlanTask,
 whose `eko-fork-*` worktree is keyed by `{run_id}:{task_id}` and reused across
-attempts. Attempt identity remains `{task_id}:{attempt}` for events and audit.
+attempts. Formal-plan attempt identity is
+`{task_id}:{plan_revision}:{attempt}` for events and audit, while the worktree
+isolation key remains `{run_id}:{task_id}`.
 Finalization removes a checkout immediately when Git proves it has no
 uncommitted files or unique commits; changed checkouts are unlocked and retained
 for retry, review, or integration. Retained legacy branches are managed by one
@@ -180,9 +183,10 @@ conversation/message identity instead of substituting the internal
 stream therefore resolve the same formal run and remain visible while the plan
 executes.
 
-Subagent execution identity is attempt-scoped. `task_id` identifies the stable
-PlanTask node; `subagent_run_id = execution_id = {task_id}:{attempt}` identifies
-one concrete dispatch. Framework-dispatched Subagents use framework lifecycle
+Subagent execution identity is attempt-scoped and specification-aware. `task_id`
+identifies the stable PlanTask node;
+`subagent_run_id = execution_id = {task_id}:{plan_revision}:{attempt}` identifies
+one concrete formal-plan dispatch. Framework-dispatched Subagents use framework lifecycle
 events, direct primary execution uses application Subagent events, and
 TaskRuntime integration events use a separate task scope. The frontend stores
 all attempts independently, keeps terminal state monotonic, and defaults to the
@@ -211,6 +215,14 @@ execution, preserves execution checks/acceptance/artifacts without flattening,
 and uses the existing framework `PlanValidator` as the sole structural DAG
 validator. EKO validates only its Subagent/tool catalog and file-ownership
 policy. See `docs/2026-07-27-runtime-dag-kernel-convergence.md`.
+
+Dispatch is protected by an atomic `TaskClaim` containing plan revision,
+attempt, and TaskSpec hash. A claim conflict reloads the snapshot instead of
+failing the task; completion/failure/block/retry writes are accepted only for
+the still-running claim, so an old attempt cannot overwrite cancellation or a
+new plan. `run-state.json` stores shared `TaskStatus` detail independently from
+`failure_fingerprint`. The framework limits only concurrent Subagents; EKO's
+write/shell/LLM limits remain application policy in `EkoExecutionLimits`.
 
 ### Skills And Report Rendering
 
@@ -257,10 +269,11 @@ the same fact is not persisted twice. See
 ## Next Step
 
 Runtime DAG convergence is complete: the framework owns canonical
-`TaskSpec`/`TaskExecution`/`TaskStatus`, validation, and traversal; EKO owns
-only checked file/UI projections and product policy. Do not reintroduce another
-loop, validator, status model, or canonical task-spec name. Next, observe real
-long-running GUI/TUI/CLI task runs for revision-conflict,
+`TaskSpec`/`TaskExecution`/`TaskStatus`, validation, traversal, and the generic
+claim protocol; EKO owns checked file/UI projections, claim persistence, and
+product policy. Do not reintroduce another loop, validator, status model,
+canonical task-spec name, or unclaimed dispatch path. Next, observe real
+long-running GUI/TUI/CLI task runs for claim-conflict and revision-conflict,
 safe-point, logical-task worktree reuse, and clean-finalize telemetry. Review the nine retained
 legacy `eko-unattended-*` branches through the new queue before explicitly
 cleaning them. Also sample real direct, planned, fork, teammate, and team
