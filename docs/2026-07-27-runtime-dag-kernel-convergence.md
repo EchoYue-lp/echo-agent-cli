@@ -95,15 +95,40 @@ DAG loop, dependency validator, or generic retry state machine.
 - Deleted EKO's duplicate dependency/DFS validator. EKO retains only catalog
   checks (Subagent roles/tools) and file-ownership policy.
 
+## Phase 3 Completed
+
+- `PlanSpec` now compiles its hard dependencies into canonical
+  `RuntimeTaskSpec` values. Preferred and optional edges remain authoring
+  policy and do not silently become runtime blockers; all edge endpoints are
+  still validated.
+- `PlanValidator::validate(PlanSpec)` delegates identity, dependency, cycle,
+  depth, and retry checks to `validate_runtime_specs`. `PlanSpec` and
+  `TaskManager` topological-order queries call the same canonical topology
+  implementation instead of maintaining their own Kahn loops.
+- Rich framework `Task` records expose a thin immutable-spec/mutable-execution
+  projection for the runtime kernel. Authoring-only structured fields remain
+  available in metadata instead of being flattened into acceptance checks.
+- Framework `TaskExecutor::execute_all` now delegates full traversal to
+  `RuntimeDagExecutor`. Its controller only loads `TaskManager` snapshots,
+  selects an existing scheduler policy, invokes the established per-task
+  pipeline, persists outcomes, and maps status back.
+- Hooks, verifier, replanner, TaskStore, per-task timeout/retry, scheduler, and
+  background one-wave APIs remain valid framework capabilities. The previous
+  `execute_all` ready/deadlock loop and its round-timeout configuration were
+  removed.
+- Snapshot cancellation is a first-class runtime outcome, pending downstream
+  tasks can transition directly to Blocked after an upstream failure, and a
+  zero task timeout now correctly means no timeout.
+
 ## Remaining Convergence
 
-1. Reconcile the older authoring `planning::TaskSpec` and mixed-state `Task`
-   with the canonical runtime spec/execution model without discarding their
-   reasonable public framework capabilities.
-2. Route the older framework `TaskExecutor` through the same runtime kernel, or
-   delete the old mechanism only after the replacement covers its hooks,
-   verifier, replanner, timeout, and public framework use cases.
-3. Remove obsolete EKO-labelled fields/comments from generic framework APIs
+1. Finish public model convergence: the older authoring
+   `planning::TaskSpec` name and mixed-state `Task` record still overlap the
+   canonical runtime spec/execution vocabulary even though neither owns DAG
+   traversal or structural validation now. Split or rename them without
+   discarding their authoring, hook, verifier, attempt-history, and store
+   capabilities.
+2. Remove obsolete EKO-labelled fields/comments from generic framework APIs
    only when their generic meaning or replacement is clear.
 
 ## Verification
@@ -111,7 +136,11 @@ DAG loop, dependency validator, or generic retry state machine.
 - Framework runtime executor unit tests cover dependency order, safe-point plan
   revision, skipped tasks, downstream blocking, and terminal outcomes.
 - Framework `PlanValidator` tests cover acyclic runtime specs, dangling
-  dependencies, cycles, and spec/execution identity mismatch.
+  dependencies (including non-blocking authoring edges), cycles,
+  spec/execution identity mismatch, and authoring-field preservation.
+- Framework `TaskExecutor` tests cover full-kernel dependency order, failure
+  propagation, cancellation, disabled timeout, UTF-8-safe context projection,
+  and the retained per-task execution capabilities.
 - All 44 EKO executor tests pass, including durable result reuse, revision
   insertion, cancellation, review outcomes, sibling completion, worktree merge
   failure, and external in-flight observation.
